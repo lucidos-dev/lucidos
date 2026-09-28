@@ -1,23 +1,37 @@
 import { OverflowMenu, type HostOpener } from './OverflowMenu';
-import { CopyIcon, DownloadIcon, ArchiveIcon, MoveToTopIcon, PinIcon, TrashIcon } from './icons';
+import type { ComponentChildren } from 'preact';
+import { CopyIcon, DownloadIcon, ArchiveIcon, CheckIcon, MoveToTopIcon, PinIcon, StandingApplyIcon, TrashIcon } from './icons';
 import { copyThreadRef, copyThreadTitle } from '../../utils/threadRef';
 import { exportThread } from '../../utils/exportThread';
-import { resolveThreadActions } from '../../store/actions/threadActions';
+import { resolveChangeMenuActions, resolveThreadActions } from '../../store/actions/threadActions';
+import type { Action } from '../../generated/thread-lifecycle';
 import { handleSaveThread, handleUnsaveThread } from '../../store/actions/threads';
 import { handleDeleteThread } from '../../store/actions/threads-delete';
 import { canMoveToTopLevel, handleDetachThread } from '../../store/actions/threads-detach';
 import { threadIsDeletable } from '../../generated/thread-lifecycle';
-import { threadMap, effectiveThreadStatus } from '../../store/store';
+import { threadMap, effectiveThreadStatus, standingApplyThreadIds } from '../../store/store';
 import { threadInfoRows } from '../drawer/threadRowInfo';
+
+const CHANGE_ACTION_ICON: Partial<Record<Action, (armed: boolean) => ComponentChildren>> = {
+  apply: () => <CheckIcon />,
+  apply_when_settled: (armed) => <StandingApplyIcon armed={armed} />,
+  discard: () => <TrashIcon />,
+};
 
 /** Per-thread overflow (⋯) menu for a STARTED thread: a Pin/Unpin toggle first,
  *  then Copy thread reference / Copy thread title / Download thread, then the
- *  conditional Archive action, with the Info row auto-appended by <OverflowMenu>.
+ *  conditional change, Archive and Delete actions, with the Info row
+ *  auto-appended by <OverflowMenu>.
  *  Built on the shared <OverflowMenu> shell (trigger + anchored menu/Info
  *  popovers + keyboard roving + the full dismiss/Escape/inert contract).
  *
- *  **Archive and Delete sit last, right above Info.** They are the mutating
- *  actions here, so they stay off the top of the menu. A stray tap lands there,
+ *  **The change actions get their own section after Download**: Apply (or
+ *  Apply on settle), then Discard. They come from the same selector as the
+ *  thread's banner, so the menu offers exactly what the banner does, from the
+ *  thread list too.
+ *
+ *  **Archive and Delete sit last, right above Info.** They are the thread's
+ *  exits, so they stay off the top of the menu. A stray tap lands there,
  *  and so does the keyboard-open's focus. Delete sits below Archive, being the
  *  harsher of the two: it removes the thread, its sub-threads and what Lucidos
  *  learned from them, with no undo (ADR 0192). It confirms, and the
@@ -71,6 +85,8 @@ export function ThreadOverflowMenu({ threadId, title, stopPropagation, extraClas
         const saved = liveThread?.meta.saved ?? false;
         const showPin = !!liveThread && openedViaKeyboard;
         const archiveAction = resolveThreadActions(threadId).find((a) => a.kind === 'archive');
+        const changeActions = resolveChangeMenuActions(threadId);
+        const standingApplyArmed = standingApplyThreadIds.value.has(threadId);
         const movable = canMoveToTopLevel(threadId);
         // Read from the same projection facts the server gate re-asks over the
         // locked family, so the item is hidden rather than offered and refused.
@@ -107,6 +123,16 @@ export function ThreadOverflowMenu({ threadId, title, stopPropagation, extraClas
               <DownloadIcon />
               Download thread
             </button>
+            {changeActions.length > 0 && <div class="thread-overflow-divider" role="separator" />}
+            {changeActions.map((action) => (
+              <button key={action.kind} type="button" role="menuitem"
+                class={action.kind === 'discard' ? 'thread-overflow-item thread-overflow-item-danger' : 'thread-overflow-item'}
+                data-tooltip={action.tooltip}
+                onClick={run(() => { void action.invoke(); })}>
+                {CHANGE_ACTION_ICON[action.kind]?.(standingApplyArmed)}
+                {action.label}
+              </button>
+            ))}
             {(movable || archiveAction || deletable) && <div class="thread-overflow-divider" role="separator" />}
             {movable && (
               <button type="button" class="thread-overflow-item" role="menuitem"

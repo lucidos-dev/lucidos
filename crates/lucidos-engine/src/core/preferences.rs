@@ -1001,26 +1001,26 @@ mod tests {
         let (pool, db_name) = setup_test_db().await;
         let (bus, _callback_rx) = EventBus::new(pool.clone());
 
-        PreferenceStore::set(&pool, &bus, "theme", "dark", None)
+        PreferenceStore::set(&pool, &bus, "theme-mode", "dark", None)
             .await
             .unwrap();
         assert_eq!(emitted(&pool, "PreferencesChanged").await, 1);
 
-        PreferenceStore::set(&pool, &bus, "theme", "dark", None)
+        PreferenceStore::set(&pool, &bus, "theme-mode", "dark", None)
             .await
             .unwrap();
         assert_eq!(emitted(&pool, "PreferencesChanged").await, 2);
 
-        PreferenceStore::set_for_device(&pool, &bus, "theme", "light", "d1", None)
+        PreferenceStore::set_for_device(&pool, &bus, "theme-mode", "light", "d1", None)
             .await
             .unwrap();
         assert_eq!(emitted(&pool, "PreferencesChanged").await, 3);
 
-        assert!(PreferenceStore::delete(&pool, &bus, "theme", None)
+        assert!(PreferenceStore::delete(&pool, &bus, "theme-mode", None)
             .await
             .unwrap());
         assert_eq!(emitted(&pool, "PreferencesChanged").await, 4);
-        assert!(!PreferenceStore::delete(&pool, &bus, "theme", None)
+        assert!(!PreferenceStore::delete(&pool, &bus, "theme-mode", None)
             .await
             .unwrap());
         assert_eq!(
@@ -1028,6 +1028,99 @@ mod tests {
             4,
             "deleting a key that was already gone changes nothing, so it says nothing"
         );
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// The theme rename moves every stored appearance choice to its new key,
+    /// global and per device, so no device paints a default after the upgrade.
+    ///
+    /// The migrations already ran on this database, so the test seeds the old
+    /// keys and runs the files again, in order. Each is written to re-run.
+    #[tokio::test]
+    async fn the_theme_rename_keeps_every_stored_choice() {
+        const THEME_TO_THEME_MODE: &str = include_str!(
+            "../../migrations/20260928054901_rename_theme_preference_to_theme_mode.sql"
+        );
+        const LOOK_TO_THEME: &str =
+            include_str!("../../migrations/20260928061424_rename_look_preference_to_theme.sql");
+        let (pool, db_name) = setup_test_db().await;
+        sqlx::query(
+            "INSERT INTO preferences (key, value, device_id) VALUES \
+             ('theme', 'dark', NULL), \
+             ('theme', 'light', 'd1'), \
+             ('theme', 'dark', 'd2'), \
+             ('theme-mode', 'system', 'd2'), \
+             ('look', 'mono', NULL), \
+             ('look', 'nord', 'd1'), \
+             ('look-effects', 'reduce', 'd1'), \
+             ('font-family', 'look', 'd1'), \
+             ('font-family', 'inter', 'd2')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(THEME_TO_THEME_MODE)
+            .execute(&pool)
+            .await
+            .expect("the theme mode rename re-runs");
+        sqlx::raw_sql(LOOK_TO_THEME)
+            .execute(&pool)
+            .await
+            .expect("the theme rename re-runs");
+
+        let value = |key: &'static str, device: Option<&'static str>| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, String>(
+                    "SELECT value FROM preferences \
+                     WHERE key = $1 AND COALESCE(device_id, '') = COALESCE($2, '')",
+                )
+                .bind(key)
+                .bind(device)
+                .fetch_optional(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        assert_eq!(value("theme-mode", None).await.as_deref(), Some("dark"));
+        assert_eq!(
+            value("theme-mode", Some("d1")).await.as_deref(),
+            Some("light")
+        );
+        assert_eq!(
+            value("theme-mode", Some("d2")).await.as_deref(),
+            Some("system"),
+            "a row already under the new key wins"
+        );
+        assert_eq!(value("theme", None).await.as_deref(), Some("mono"));
+        assert_eq!(value("theme", Some("d1")).await.as_deref(), Some("nord"));
+        assert_eq!(
+            value("theme", Some("d2")).await,
+            None,
+            "no mode lands under the new key"
+        );
+        assert_eq!(
+            value("theme-effects", Some("d1")).await.as_deref(),
+            Some("reduce")
+        );
+        assert_eq!(
+            value("font-family", Some("d1")).await.as_deref(),
+            Some("theme")
+        );
+        assert_eq!(
+            value("font-family", Some("d2")).await.as_deref(),
+            Some("inter")
+        );
+        let left: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM preferences WHERE key IN ('look', 'look-effects')",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(left, 0, "nothing is left under an old key");
 
         pool.close().await;
         teardown_test_db(&db_name).await;
@@ -1053,13 +1146,13 @@ mod tests {
             "an internal key is not a setting and must not announce"
         );
 
-        let refused = PreferenceStore::set_silent(&pool, "theme", "dark").await;
+        let refused = PreferenceStore::set_silent(&pool, "theme-mode", "dark").await;
         assert!(
             refused.is_err(),
             "a user-visible preference must not be writable through the silent door"
         );
         assert_eq!(
-            PreferenceStore::get(&pool, "theme").await.unwrap(),
+            PreferenceStore::get(&pool, "theme-mode").await.unwrap(),
             None,
             "the refusal must happen before the write, not after"
         );

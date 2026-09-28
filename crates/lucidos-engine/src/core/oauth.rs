@@ -86,6 +86,15 @@ pub struct OAuthAccountInfo {
 /// that renewal works.
 const HAS_REFRESH_TOKEN_SQL: &str = "(COALESCE(refresh_token, '') <> '')";
 
+/// The refresh token a write may store: `None` for an absent or empty one.
+///
+/// Every token write goes through this. Each write keeps the stored token only
+/// when handed NULL. An empty answer would otherwise erase a working token and
+/// end renewal.
+fn usable_refresh_token(token: Option<&str>) -> Option<&str> {
+    token.filter(|t| !t.is_empty())
+}
+
 /// A stored OAuth account, as [`OAuthStore::connect`] left it.
 pub struct ConnectedAccount {
     pub id: Uuid,
@@ -369,6 +378,7 @@ impl OAuthStore {
         scopes: &str,
         desired_scopes: &str,
     ) -> Result<ConnectedAccount, sqlx::Error> {
+        let refresh_token = usable_refresh_token(refresh_token);
         let result = if email.is_some() {
             sqlx::query_as::<_, (Uuid, bool)>(
                 &format!(r#"
@@ -502,7 +512,7 @@ impl OAuthStore {
         .bind(id)
         .bind(access_token)
         .bind(token_expiry)
-        .bind(refresh_token)
+        .bind(usable_refresh_token(refresh_token))
         .execute(pool)
         .await?;
 
@@ -1046,6 +1056,24 @@ pub struct TokenResponse {
     pub scope: Option<String>,
 }
 
+/// The longest token lifetime taken at face value: one hundred years.
+const MAX_TOKEN_LIFETIME_SECS: i64 = 100 * 365 * 24 * 60 * 60;
+
+impl TokenResponse {
+    /// When the access token expires, counted from `now`. `None` when the
+    /// provider gave no lifetime.
+    ///
+    /// `expires_in` is the provider's number, and a "never expires" sentinel
+    /// overflows chrono's date range, which panics. So the lifetime is clamped
+    /// to `MAX_TOKEN_LIFETIME_SECS` first.
+    pub fn expiry_from(&self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        let secs = i64::try_from(self.expires_in?)
+            .unwrap_or(i64::MAX)
+            .min(MAX_TOKEN_LIFETIME_SECS);
+        Some(now + chrono::Duration::seconds(secs))
+    }
+}
+
 // Manual `Debug` so a token-exchange/refresh response never leaks its tokens
 // through `{:?}`. Non-secret fields (expiry, type, scope) stay visible.
 impl std::fmt::Debug for TokenResponse {
@@ -1274,22 +1302,21 @@ pub async fn refresh_oauth_if_needed(
         account.email.as_deref().unwrap_or("unknown")
     );
     let new_tokens = refresh_access_token(&turl, cid, csec, &refresh_token).await?;
-    let new_expiry = new_tokens
-        .expires_in
-        .map(|s| Utc::now() + chrono::Duration::seconds(s as i64));
+    let new_expiry = new_tokens.expiry_from(Utc::now());
+    let new_refresh_token = usable_refresh_token(new_tokens.refresh_token.as_deref());
     OAuthStore::update_tokens(
         pool,
         account.id,
         &new_tokens.access_token,
         new_expiry,
-        new_tokens.refresh_token.as_deref(),
+        new_refresh_token,
     )
     .await?;
+    if let Some(rt) = new_refresh_token {
+        account.refresh_token = Some(rt.to_string());
+    }
     account.access_token = new_tokens.access_token;
     account.token_expiry = new_expiry;
-    if let Some(ref rt) = new_tokens.refresh_token {
-        account.refresh_token = Some(rt.clone());
-    }
     crate::log!(
         "[OAuth] Successfully refreshed {} token, expires in {}s",
         account.provider,
@@ -2037,9 +2064,7 @@ pub async fn prepare_oauth_flow(
                 (None, None)
             };
 
-            let token_expiry = token_resp
-                .expires_in
-                .map(|secs| chrono::Utc::now() + chrono::Duration::seconds(secs as i64));
+            let token_expiry = token_resp.expiry_from(chrono::Utc::now());
 
             // What the provider granted, falling back to what was requested.
             let granted_scopes = token_resp.scope.as_deref().unwrap_or(&merged_scopes);

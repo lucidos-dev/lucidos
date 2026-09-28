@@ -3,12 +3,13 @@
  * `<head>` by the `lucidos-appearance-boot` Vite plugin.
  *
  * The shared program plus the two things that are the SHELL's and not the
- * appearance contract's: the boot-splash gradient, and the theme telemetry
+ * appearance contract's: the boot-splash gradient, and the theme mode telemetry
  * channel. Keeping them here is what lets the contract stay identical between
  * the shell and every app iframe.
  */
 import { applyAppearanceBoot } from './appearanceBoot';
 import { wsLocalGet } from '../_storage';
+import { THEME_MODE_ATTRIBUTE, THEME_MODE_STORAGE_KEY } from '../appearance';
 
 /**
  * The brand gradient, painted on the document canvas during boot.
@@ -34,30 +35,35 @@ import { wsLocalGet } from '../_storage';
 const SPLASH_BACKGROUND =
   '#145eb9 radial-gradient(125% 125% at 30% 22%, #2d83e0 0%, #0a4ea8 100%) no-repeat fixed';
 
-type ThemeLogEvt = (label: string, info: unknown) => void;
+type ThemeModeLogEvt = (label: string, info: unknown) => void;
 declare global {
   interface Window {
-    __themeLogEvt?: ThemeLogEvt;
+    __themeModeLogEvt?: ThemeModeLogEvt;
   }
 }
 
-const boot = applyAppearanceBoot({ styleReset: true, durationScale: true });
+const boot = applyAppearanceBoot({
+  styleReset: true,
+  durationScale: true,
+  adoptRenamedStorageKeys: true,
+  legacyThemeModeAttribute: false,
+});
 
 // After the shared program, which sets the flat background: same end state as
 // setting it inline there, and it keeps the gradient out of the contract.
 document.documentElement.style.background = SPLASH_BACKGROUND;
 
-// Always-on theme-flash telemetry: POST breadcrumbs to engine.log so a reported
+// Always-on theme mode flash telemetry: POST breadcrumbs to engine.log so a reported
 // flash can be traced to the transition that preceded it. The bug being hunted
 // (iOS WKWebView `matchMedia` returning a stale synchronous value at random
 // post-FOUC moments) does not reproduce on demand, so the only way to catch it
-// is to log every transition and inspect after the fact. Theme transitions fire
+// is to log every transition and inspect after the fact. Mode transitions fire
 // three to five times per cold load, which is negligible noise.
-// `window.__themeLogEvt` is the same hook `applyTheme()` uses, so both surfaces
+// `window.__themeModeLogEvt` is the same hook `applyThemeMode()` uses, so both surfaces
 // share one channel.
 try {
   const t0 = performance.now();
-  window.__themeLogEvt = (label, info) => {
+  window.__themeModeLogEvt = (label, info) => {
     // `keepalive` so the POST survives a navigation away (pageshow breadcrumbs
     // in particular can fire just before a route swap). Relative URL (ADR 0014):
     // resolves against the engine-stamped `<base href="/<slug>/">`, or `/` at a
@@ -67,26 +73,26 @@ try {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        category: 'theme',
+        category: 'theme-mode',
         message: label,
         data: Object.assign({ tMs: Math.round(performance.now() - t0) }, info),
       }),
       keepalive: true,
     }).catch(() => {});
   };
-  window.__themeLogEvt('fouc', {
+  window.__themeModeLogEvt('fouc', {
     raw: boot.raw,
-    theme: boot.theme,
+    mode: boot.mode,
     resolved: boot.resolved,
     mqLight: boot.prefersLight,
   });
   // `pageshow` fires on a bfcache restore, when this script does NOT re-run, so
   // read live values here rather than trusting the stale entry above.
   window.addEventListener('pageshow', (e) => {
-    window.__themeLogEvt?.('pageshow', {
+    window.__themeModeLogEvt?.('pageshow', {
       persisted: e.persisted,
-      dataTheme: document.documentElement.getAttribute('data-theme'),
-      rawNow: wsLocalGet('lucidos-theme'),
+      dataThemeMode: document.documentElement.getAttribute(THEME_MODE_ATTRIBUTE),
+      rawNow: wsLocalGet(THEME_MODE_STORAGE_KEY),
       mqLightNow: matchMedia('(prefers-color-scheme: light)').matches,
     });
   });

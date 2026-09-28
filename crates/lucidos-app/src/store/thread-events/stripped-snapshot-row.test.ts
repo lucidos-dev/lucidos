@@ -8,11 +8,13 @@ import type { ResponseEvent } from '../types';
  *  The engine strips `CodingAgentToolCalled.args` and
  *  `CodingAgentToolResult.result` (`api/threads/events_snapshot.rs`), because
  *  they were the bulk of a coding-agent thread's transfer and nothing renders
- *  them inline. Live SSE carries both in full.
+ *  them inline. Live SSE carries the args in full. It strips the result too
+ *  (`EmittedEvent::to_sse_json`), because the result holds the agent's whole
+ *  output. A full result row still reaches the fold from `include_context`.
  *
  *  So the fold has to serve two shapes of the same event, and this pins what
  *  each owes. A stripped row must read identically in the transcript and must
- *  carry the address the step-detail modal fetches by. A live row must carry
+ *  carry the address the step-detail modal fetches by. A full row must carry
  *  the values themselves and no marker, so the modal never fetches what it
  *  already holds. */
 

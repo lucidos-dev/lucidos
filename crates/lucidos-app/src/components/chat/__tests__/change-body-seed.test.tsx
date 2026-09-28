@@ -35,7 +35,6 @@ function makeThread(id: string): ThreadState {
       codingAgentProposed: false,
       codingAgentRequiresRestart: false,
       codingAgentIsExternalRepo: false,
-      codingAgentApplying: false,
       codingAgentHasDiff: false,
       lastRevivedAt: '',
       state: 'active',
@@ -101,7 +100,7 @@ describe('change-applied body seeding (open-jump fix)', () => {
     ], 't1', '');
 
     const applied = appliedNode(nodes, 'c1');
-    // Full description is forwarded; ChangeBody clamps to the first line itself.
+    // Full description is forwarded; ChangeEventRow clamps to the first line itself.
     expect(applied?.props.proposedChangeDesc).toBe('Fix the bug\nbody line');
     expect(applied?.props.proposedChangeFileCount).toBe(3);
   });

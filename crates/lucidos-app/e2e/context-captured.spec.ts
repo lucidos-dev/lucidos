@@ -53,7 +53,7 @@ test.describe('ContextCaptured modal', () => {
     // The other half of the split: the rest of the row opens what the step DID,
     // and that view must NOT carry a second copy of the context. A duplicate
     // there is what would make the counter a pointless door.
-    await modal.locator('.step-detail-close').click();
+    await modal.locator('[data-role="surface-close"]').click();
     await expect(modal).toHaveCount(0);
     await page
       .locator('[data-role="inline-step"]:visible [data-role="step-main"]')
@@ -109,12 +109,12 @@ test.describe('ContextCaptured modal', () => {
     // Budget bar renders immediately from the lightweight snap fields.
     await expect(modal.locator('[data-role="budget-bar"]')).toBeVisible();
 
-    // Sections appear once the lazy-fetch resolves. The "Loading sections…"
-    // placeholder may flash; the section rows are the lazy-load done signal.
+    // Sections appear once the lazy-fetch resolves. Placeholder role headers
+    // may shimmer first; the section rows are the lazy-load done signal.
     await expect(modal.locator('[data-role="section-row"]').first()).toBeVisible({ timeout: 10_000 });
     expect(await modal.locator('[data-role="section-row"]').count()).toBeGreaterThan(1);
-    // Loading + error indicators must clear after the fetch resolves.
-    await expect(modal.locator('[data-role="context-sections-loading"]')).toHaveCount(0);
+    // The skeleton and any error must clear after the fetch resolves.
+    await expect(modal.locator('.loading-fade-skeleton:not(.loading-fade-out)')).toHaveCount(0);
     await expect(modal.locator('[data-role="context-sections-error"]')).toHaveCount(0);
     // The strip + lazy-fetch contract was exercised end-to-end — at least
     // one GET /api/v1/events/:eid/context must have fired. A regression that

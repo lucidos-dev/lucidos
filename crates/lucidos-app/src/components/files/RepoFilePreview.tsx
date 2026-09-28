@@ -5,6 +5,8 @@ import { diffBodyKind } from '../../store/diffBody';
 import type { Loadable } from '../../store/types';
 import { getRepoFileContent, getChangeFileContent, repoFileUrl, changeFileUrl } from '../../api/client';
 import { loadChangeContextById } from '../../store/actions/repositories';
+import { refreshFilePreview, registerPreviewTextBody, reportPreviewTextSettled } from '../../store/actions/artifacts';
+import { usePanelRefresh } from '../../hooks/usePanelRefresh';
 import { highlightFileLines, CODE_EXTS } from '../../utils/syntaxHighlight';
 import { escapeHtml } from '../../utils/escapeHtml';
 import { renderMarkdown } from '../../utils/renderMarkdown';
@@ -14,12 +16,14 @@ import { previewExt, repoPreviewBody } from './previewBody';
 import { viewportIsMobile } from '../../utils/viewport';
 import { useLoadableFetch } from '../../hooks/useLoadableFetch';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
-import { DiffView } from './DiffView';
+import { DiffSkeleton, DiffView } from './DiffView';
 import { RenderedDiff } from './RenderedDiff';
-import { ChangesFileList } from './RepoFilesView';
+import { ChangesFileList, ChangesFileListSkeleton } from './RepoFilesView';
 import { RepoPreviewSplit } from './RepoPreviewSplit';
 import { LoadableError } from '../shared/LoadableError';
 import { LineNumberedCode, fileRows } from './LineNumberedCode';
+import { FileSourceSkeleton, ProseSkeleton } from './previewSkeletons';
+import { LoadingFade } from '../shared/LoadingFade';
 import { bridgePreviewIframeShortcuts } from './previewIframeShortcuts';
 import { withPreviewRevision } from './previewRevision';
 
@@ -83,6 +87,9 @@ export function RepoFilePreviewWithSidebar(props: Props) {
   const isActiveLayout = props.layout === (viewportIsMobile.value ? 'mobile' : 'desktop');
   // Delay the sidebar skeleton (300ms) so a fast diff load never flashes it.
   const showSidebarLoading = useDelayedLoading(repoDiff.value);
+  // A diff is pinned to its change, so it has nothing to refresh.
+  const refreshable = isActiveLayout && props.locator.mode !== 'diff';
+  usePanelRefresh(`file "${props.locator.path}"`, refreshable ? refreshFilePreview : null);
   if (!isActiveLayout) return null;
 
   const sidebar = sidebarStateFromDiff(repoDiff.value);
@@ -93,21 +100,17 @@ export function RepoFilePreviewWithSidebar(props: Props) {
 
   return (
     <RepoPreviewSplit
-      sidebar={<>
-        {sidebar.kind === 'loading' && showSidebarLoading && (
-          <div class="repo-preview-sidebar-state loading-skeleton" data-state="loading">
-            Loading changed files…
-          </div>
-        )}
-        {sidebar.kind === 'failed' && (
-          <div class="repo-preview-sidebar-state repo-preview-sidebar-error" data-state="failed">
-            Failed to load: {sidebar.error}
-          </div>
-        )}
-        {sidebar.kind === 'files' && (
-          <ChangesFileList files={sidebar.files} activePath={props.locator.path} />
-        )}
-      </>}
+      sidebar={sidebar.kind === 'failed' ? (
+        <div class="repo-preview-sidebar-state repo-preview-sidebar-error" data-state="failed">
+          Failed to load: {sidebar.error}
+        </div>
+      ) : (
+        <LoadingFade showSkeleton={sidebar.kind === 'loading' && showSidebarLoading} skeleton={<ChangesFileListSkeleton />}>
+          {sidebar.kind === 'files' && (
+            <ChangesFileList files={sidebar.files} activePath={props.locator.path} />
+          )}
+        </LoadingFade>
+      )}
       main={<RepoFilePreview {...props} />}
     />
   );
@@ -144,8 +147,17 @@ function RepoFilePreview({ locator, layout }: Props) {
   if (mode === 'diff') {
     const diff = repoDiff.value;
     if (diff.status === 'failed') return <LoadableError noun="diff" error={diff.error} />;
-    if (diff.status !== 'loaded') return showDiffLoading ? <div class="loading-spinner" /> : null;
-    const file = diff.data.files.find(f => f.path === path);
+    return (
+      <LoadingFade class="repo-preview-fade" showSkeleton={showDiffLoading} skeleton={<DiffSkeleton />}>
+        {diff.status === 'loaded' && diffBody(diff.data.files)}
+      </LoadingFade>
+    );
+  }
+
+  return <RepoFileContent repoId={repoId} path={path} gitRef={gitRef} revision={revision} />;
+
+  function diffBody(files: DiffFile[]) {
+    const file = files.find(f => f.path === path);
     if (!file) return <div class="empty-state">File not found in diff</div>;
 
     const activeChangeId = changeId ?? repoSelectedChangeId.value;
@@ -170,8 +182,6 @@ function RepoFilePreview({ locator, layout }: Props) {
         return <DiffView file={file} sideBySide={diffSideBySide.value} measureFit />;
     }
   }
-
-  return <RepoFileContent repoId={repoId} path={path} gitRef={gitRef} revision={revision} />;
 }
 
 interface RepoFileContentProps {
@@ -208,7 +218,7 @@ export function RepoFileContent({ repoId, path, changeId, gitRef, revision }: Re
   if (body === 'image' || body === 'pdf' || body === 'video' || body === 'audio') {
     return <RepoFileMedia repoId={repoId} path={path} changeId={changeId} gitRef={gitRef} revision={revision} kind={body} />;
   }
-  return <RepoFileText repoId={repoId} path={path} changeId={changeId} gitRef={gitRef} revision={revision} body={body} />;
+  return <RepoFileText key={`${repoId}:${changeId ?? ''}:${gitRef ?? ''}:${path}`} repoId={repoId} path={path} changeId={changeId} gitRef={gitRef} revision={revision} body={body} />;
 }
 
 /** Binary-media preview. Builds the file URL (same change-vs-branch ref logic as
@@ -236,11 +246,18 @@ function RepoFileText({ repoId, path, changeId, gitRef, revision, body }: RepoFi
   // the whole job here, and the engine answers `Cache-Control: no-cache`, so a
   // plain re-request already revalidates. The media branch above cache-busts
   // instead, because an element keeps its bytes until its `src` changes.
+  //
+  // Only the content pane passes a `revision`, so only there does this body
+  // hold a panel refresh open until its re-read lands. The caller keys it by
+  // file, which is what makes keeping the old text on screen safe.
+  const servesPanel = revision !== undefined;
+  useEffect(() => (servesPanel ? registerPreviewTextBody() : undefined), [servesPanel]);
   const { loadable, showLoading } = useLoadableFetch<string>(
     () => changeId
       ? getChangeFileContent(changeId, path)
       : getRepoFileContent(repoId, path, gitRef ?? undefined),
     [repoId, path, changeId, gitRef, revision],
+    { keepLoadedWhileRefetching: servesPanel, onSettled: servesPanel ? () => reportPreviewTextSettled(revision ?? 0) : undefined },
   );
 
   const ext = previewExt(path);
@@ -268,23 +285,37 @@ function RepoFileText({ repoId, path, changeId, gitRef, revision, body }: RepoFi
   );
 
   if (loadable.status === 'failed') return <LoadableError noun="file" error={loadable.error} />;
-  if (content === null) return showLoading ? <div class="loading-spinner" /> : null;
-
-  // There is no html body here. `REPO_RENDERABLE_EXTS` excludes it, so a repo
-  // HTML file renders as syntax-highlighted source. A live srcDoc iframe would
-  // show the app shell's boot splash instead of the file.
-  //
-  // `.repo-file-rendered` insets the content to match the rendered diff
-  // (.rendered-diff), so toggling between them keeps the same gutter.
-  if (body === 'markdown') return <div class="repo-file-rendered"><div class="response-content markdown-content" dangerouslySetInnerHTML={{ __html: renderedBody! }} /></div>;
-  if (body === 'csv') return <div class="repo-file-rendered" dangerouslySetInnerHTML={{ __html: renderedBody! }} />;
-  // The media variant keeps a definite height so the image's max-height:100%
-  // still fits the pane (the bare padding wrapper would leave it unconstrained).
-  if (body === 'svg') return <div class="repo-file-rendered repo-file-rendered-media"><PreviewImage src={renderedBody!} alt={path} /></div>;
-
+  // The body type is known before the read lands, so the placeholder takes
+  // the shape of what will replace it.
   return (
-    <div class="repo-file-content">
-      <LineNumberedCode rows={rows} wideLines={filePreviewWrap.value ? 'wrap' : 'pan'} />
-    </div>
+    <LoadingFade
+      class="repo-preview-fade"
+      showSkeleton={showLoading}
+      skeleton={body === 'source'
+        ? <div class="repo-file-content"><FileSourceSkeleton wideLines={filePreviewWrap.value ? 'wrap' : 'pan'} /></div>
+        : <div class="repo-file-rendered"><ProseSkeleton /></div>}
+    >
+      {content !== null && loadedBody()}
+    </LoadingFade>
   );
+
+  function loadedBody() {
+    // There is no html body here. `REPO_RENDERABLE_EXTS` excludes it, so a repo
+    // HTML file renders as syntax-highlighted source. A live srcDoc iframe would
+    // show the app shell's boot splash instead of the file.
+    //
+    // `.repo-file-rendered` insets the content to match the rendered diff
+    // (.rendered-diff), so toggling between them keeps the same gutter.
+    if (body === 'markdown') return <div class="repo-file-rendered"><div class="response-content markdown-content" dangerouslySetInnerHTML={{ __html: renderedBody! }} /></div>;
+    if (body === 'csv') return <div class="repo-file-rendered" dangerouslySetInnerHTML={{ __html: renderedBody! }} />;
+    // The media variant keeps a definite height so the image's max-height:100%
+    // still fits the pane (the bare padding wrapper would leave it unconstrained).
+    if (body === 'svg') return <div class="repo-file-rendered repo-file-rendered-media"><PreviewImage src={renderedBody!} alt={path} /></div>;
+
+    return (
+      <div class="repo-file-content">
+        <LineNumberedCode rows={rows} wideLines={filePreviewWrap.value ? 'wrap' : 'pan'} />
+      </div>
+    );
+  }
 }

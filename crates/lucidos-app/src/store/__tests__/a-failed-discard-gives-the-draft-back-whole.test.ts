@@ -56,7 +56,6 @@ function composingThread(id: string): ThreadState {
       codingAgentProposed: false,
       codingAgentRequiresRestart: false,
       codingAgentIsExternalRepo: false,
-      codingAgentApplying: false,
       codingAgentHasDiff: false,
       lastRevivedAt: '',
       messageCount: 0,

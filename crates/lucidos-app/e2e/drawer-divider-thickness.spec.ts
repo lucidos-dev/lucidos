@@ -27,7 +27,7 @@ test.describe('Drawer divider thickness', () => {
         await context.addInitScript(() => {
             localStorage.removeItem('lucidos-drawer-collapsed');
             localStorage.removeItem('lucidos-drawer-collapsed-families');
-            localStorage.setItem('lucidos-theme', 'light');
+            localStorage.setItem('lucidos-theme-mode', 'light');
         });
         clearAllThreads();
     });

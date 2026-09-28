@@ -705,6 +705,24 @@ fn should_auto_commit_on_cleanup_table() {
     }
 }
 
+/// A restart interrupts Claude Code, which still answers with a `Result`. That
+/// Result must leave the worktree dirty, so the resumed agent finds its edits
+/// exactly as it left them. Committing them made the tree read clean, and the
+/// resumed agent concluded its work was lost.
+#[test]
+fn only_a_shutdown_result_leaves_the_worktree_uncommitted() {
+    use crate::engine::thread_events::CancelCause;
+    let shutdown = |is_shutdown| classify_result(false, false, is_shutdown, None, false).0;
+    assert!(!result_auto_commits(&shutdown(true)));
+    assert!(result_auto_commits(&shutdown(false)));
+    assert!(result_auto_commits(&TerminalKind::Canceled(
+        CancelCause::UserStop
+    )));
+    assert!(result_auto_commits(&TerminalKind::Failed {
+        error: "stream interrupted".into(),
+    }));
+}
+
 #[test]
 fn conflict_resolution_cleanup_only_applies_clean_generated_turns() {
     use crate::engine::thread_events::{AbortCause, CancelCause};

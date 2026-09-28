@@ -12,7 +12,7 @@
  * turn, a rendered `.md` preview, a notification body.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { installMarkdownImageRetry } from './markdownImageRetry';
+import { installMarkdownImageRetry, isImageRetryPending } from './markdownImageRetry';
 import { MAX_ATTEMPTS, retryDelayMs } from './imageRetry';
 
 const SRC = '/dev/data/artifacts/shot.png';
@@ -126,5 +126,16 @@ describe('installMarkdownImageRetry', () => {
     vi.advanceTimersByTime(retryDelayMs(0));
     expect(img.getAttribute('src')).toBe(SRC);
     stop = installMarkdownImageRetry();
+  });
+
+  it('says a retry is pending from the failure until the re-request goes out', () => {
+    // The arrival hold reads this: a broken image reports `complete`, but its
+    // height is still on its way.
+    const img = mountImage(SRC);
+    expect(isImageRetryPending(img)).toBe(false);
+    fail(img);
+    expect(isImageRetryPending(img)).toBe(true);
+    vi.advanceTimersByTime(retryDelayMs(0));
+    expect(isImageRetryPending(img)).toBe(false);
   });
 });

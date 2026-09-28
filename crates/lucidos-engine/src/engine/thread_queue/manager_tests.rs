@@ -198,6 +198,8 @@ fn event_trigger_request(trigger_id: &str) -> ThreadQueueRequest {
     }
 }
 
+/// A top-relation spawn: attributed to its launching thread, with no callback
+/// linkage. `submit` refuses an unattributed spawn in debug builds.
 fn sub_thread_request(child_thread_id: Uuid) -> ThreadQueueRequest {
     ThreadQueueRequest::SubThread {
         // Stamped by `submit` from the submitting task's chain depth.
@@ -210,7 +212,13 @@ fn sub_thread_request(child_thread_id: Uuid) -> ThreadQueueRequest {
         model: None,
         reasoning_effort: None,
         pre_emitted_origin: None,
-        origin: None,
+        origin: Some(MessageOrigin::ThreadLink {
+            thread_id: Uuid::new_v4(),
+            title: None,
+            spawning_event_id: None,
+            mode: crate::engine::thread_events::ActorMode::Agent,
+            direction: crate::engine::thread_events::ThreadDirection::Parent,
+        }),
     }
 }
 
@@ -1550,7 +1558,6 @@ async fn emit_message_received(bus: &EventBus, thread_id: Uuid) {
             text: "hello".into(),
             user_image_hashes: vec![],
             device_id: None,
-            device: None,
             image_description: None,
             parent_thread_id: None,
             spawning_event_id: None,
@@ -1869,7 +1876,6 @@ async fn reconcile_ignores_background_thread() {
                 text: "spawned".into(),
                 user_image_hashes: vec![],
                 device_id: None,
-                device: None,
                 image_description: None,
                 parent_thread_id: None,
                 spawning_event_id: None,
@@ -1968,7 +1974,6 @@ fn affects_user_running_selects_status_transitions() {
         text: "hi".into(),
         user_image_hashes: vec![],
         device_id: None,
-        device: None,
         image_description: None,
         parent_thread_id: None,
         spawning_event_id: None,

@@ -234,10 +234,6 @@
 
   /* Confirm dialog demo — static (not in overlay) */
   .confirm-dialog-demo {
-    background: var(--bg-secondary);
-    border: 1px solid var(--border-color);
-    border-radius: 0.5rem;
-    padding: 1.25rem 1.5rem;
     max-width: 27.5rem;
   }
 
@@ -384,8 +380,8 @@
       <div class="demo-box">
         <div class="demo-box-title">Confirm Dialog Buttons</div>
         <div class="showcase-row">
-          <button class="confirm-btn confirm-btn-cancel">Cancel</button>
-          <button class="confirm-btn confirm-btn-ok">Delete</button>
+          <button class="action-btn action-btn-secondary">Cancel</button>
+          <button class="action-btn action-btn-danger">Delete</button>
         </div>
       </div>
     </div>
@@ -509,11 +505,13 @@
        ======================================== -->
   <div class="section">
     <div class="section-title">Confirm Dialog</div>
-    <div class="confirm-dialog-demo">
-      <div class="confirm-message">Are you sure you want to discard these changes? This action cannot be undone.</div>
-      <div class="confirm-actions">
-        <button class="confirm-btn confirm-btn-cancel">Cancel</button>
-        <button class="confirm-btn confirm-btn-ok">Discard</button>
+    <div class="surface surface-raised confirm-dialog-demo">
+      <div class="surface-body dialog-body">
+        <div class="confirm-message">Are you sure you want to discard these changes? This action cannot be undone.</div>
+      </div>
+      <div class="surface-foot">
+        <button class="action-btn action-btn-secondary">Cancel</button>
+        <button class="action-btn action-btn-danger">Discard</button>
       </div>
     </div>
   </div>

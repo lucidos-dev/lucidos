@@ -38,7 +38,6 @@ function buildThreadState(events: ThreadEvent[]): ThreadState {
     codingAgentProposed: false,
     codingAgentRequiresRestart: false,
     codingAgentIsExternalRepo: false,
-    codingAgentApplying: false,
     codingAgentHasDiff: false,
     lastRevivedAt: '',
     messageCount: 1,

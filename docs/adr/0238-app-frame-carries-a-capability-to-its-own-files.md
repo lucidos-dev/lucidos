@@ -104,6 +104,10 @@ unforgeable from script, so it tells the address bar from a frame.
 
 - An app ships a separate `style.css` again, and `lucidos.data.url(path)` works
   behind a gateway. The inlining advice comes out of the knowhow.
+- The pass gets a file past the gate, not past CORS. A font and a module script
+  are CORS fetches, and Chromium refused both until
+  [ADR 0289](0289-app-frames-load-fonts-and-modules-across-origins.md) granted
+  them.
 - A nested preview's relative links work, to any depth, with the artifact served
   byte-for-byte off disk.
 - **A pass is a bearer token in a URL, and the URL is visible to any document

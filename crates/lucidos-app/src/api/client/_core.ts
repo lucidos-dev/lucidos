@@ -196,8 +196,7 @@ function statusPhrase(res: Response): string {
  *  JSON keeps its `{error}` / `{reason}` field as written: the engine wrote that
  *  for the user. Markup is discarded outright, the gateway's boot splash having
  *  once rendered as a toast listing its own `<meta>` tags. Plain text keeps its
- *  FIRST LINE only, whitespace-collapsed and clamped. It stays a sentence, and
- *  can never grow the bullets `parseToastMessage` reads out of newlines. */
+ *  FIRST LINE only, whitespace-collapsed and clamped, so it stays a sentence. */
 function errorReason(res: Response, text: string, json: unknown): string {
   const obj = json as Record<string, unknown> | null | undefined;
   if (typeof obj?.error === 'string' && obj.error) return obj.error;

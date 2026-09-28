@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
-    blockExtent, contiguousRuns, crossesViewport, disclosureDurationMs, ghostOf, mountDepartureLayer, mountDisclosureMask,
+    blockExtent, contiguousRuns, crossesViewport, ghostOf, mountDepartureLayer, mountDisclosureMask,
     rollDistance, rowEndScale, startTogetherOnNextFrame, tuckTarget,
 } from './useFlipAnimation';
 
@@ -131,18 +131,6 @@ describe('rowEndScale', () => {
     it('stays full width when the row draws no line or the line has no width', () => {
         expect(rowEndScale(line, null)).toBe(1);
         expect(rowEndScale({ left: 16, width: 0 }, 36)).toBe(1);
-    });
-});
-
-describe('disclosureDurationMs', () => {
-    it('grows with the block and stays within its bounds', () => {
-        expect(disclosureDurationMs(10)).toBe(260);
-        expect(disclosureDurationMs(5000)).toBe(420);
-        expect(disclosureDurationMs(400)).toBeGreaterThan(disclosureDurationMs(350));
-    });
-
-    it('rolls a phone screen of rows well inside half a second', () => {
-        expect(disclosureDurationMs(700)).toBeLessThanOrEqual(420);
     });
 });
 

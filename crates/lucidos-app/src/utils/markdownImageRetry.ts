@@ -6,10 +6,11 @@ import { MAX_ATTEMPTS, isRetryableImageSrc, retryDelayMs, retrySrc } from './ima
  *  `renderMarkdown` emits raw `<img>` markup that every surface mounts through
  *  `dangerouslySetInnerHTML`, so those images can't be `<BlobImage>` elements
  *  and get none of its retry. The failure that shows is a truncated response.
- *  The browser reads the header, lays the element out at the right size, paints
- *  the rows it received, and fires `error` on the rest. The reported symptom
- *  was a screenshot whose top inch was correct above a tall empty box, whole
- *  again the moment the thread was reopened.
+ *  The browser reads the header, lays the element out at the right size, and
+ *  paints the rows it received above a tall empty box. This retry fires only if
+ *  the load reports `error`. On iOS a short body can arrive as a success. So
+ *  `sw.js` reads these images whole and counts the bytes. It re-fetches a
+ *  short one, and answers a network error once its own attempts run out.
  *
  *  One document-level listener covers every markdown surface: a chat turn, a
  *  rendered `.md` preview, a notification body. It sits in the CAPTURE phase
@@ -76,6 +77,12 @@ function onImageLoad(event: Event): void {
   if (!retry || retry.timer === null) return;
   clearTimeout(retry.timer);
   retry.timer = null;
+}
+
+/** Is a re-request of this failed image scheduled? The browser reports a broken
+ *  image as `complete`, but its height is still on its way. */
+export function isImageRetryPending(img: HTMLImageElement): boolean {
+  return (retries.get(img)?.timer ?? null) !== null;
 }
 
 export function installMarkdownImageRetry(): () => void {

@@ -963,7 +963,6 @@ fn switch_teardown_fingerprint_is_stable_for_the_frontend_mirror() {
 
     let device = MessageOrigin::Device {
         device_id: "dev-1".to_string(),
-        label: "My MacBook".to_string(),
     };
     assert!(
         AbortCause::EngineShutdown.promises_auto_resume(Some(&device)),
@@ -982,7 +981,7 @@ fn switch_teardown_fingerprint_is_stable_for_the_frontend_mirror() {
 /// The second producer of that fingerprint, added 2026-08-07: a restart the user
 /// starts from the gateway workspace picker. The gateway forwards the picker's
 /// device id to `/api/v1/internal/restart-intent`, which resolves it with the
-/// same `user_actor_resolved` the in-workspace switch handler uses and stashes
+/// same `user_actor` the in-workspace switch handler uses and stashes
 /// the result for the teardown emit.
 ///
 /// So the picker's contribution is exactly one thing: a device id in a header.
@@ -999,7 +998,7 @@ fn a_device_id_header_alone_produces_the_switch_fingerprints_actor() {
         crate::api::actor::HEADER_DEVICE_ID,
         axum::http::HeaderValue::from_static("picker-device"),
     );
-    let actor = crate::api::actor::user_actor(&headers, None, None)
+    let actor = crate::api::actor::user_actor(&headers, None)
         .expect("a device-id header always resolves to some actor");
     assert!(
         matches!(actor, MessageOrigin::Device { .. }),
@@ -1015,7 +1014,7 @@ fn a_device_id_header_alone_produces_the_switch_fingerprints_actor() {
     // (ADR 0169), where it used to produce an `Api { mode: Human }` one. So
     // there is nothing left to stash, and nothing that could overwrite the
     // honest System attribution.
-    let no_device = crate::api::actor::user_actor(&axum::http::HeaderMap::new(), None, None);
+    let no_device = crate::api::actor::user_actor(&axum::http::HeaderMap::new(), None);
     assert_eq!(no_device, None, "an unidentified caller is nobody");
     assert!(
         !AbortCause::EngineShutdown.promises_auto_resume(no_device.as_ref()),

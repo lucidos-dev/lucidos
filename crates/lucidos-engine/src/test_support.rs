@@ -88,6 +88,33 @@ impl crate::llm::provider::LlmProvider for ScriptedProvider {
     }
 }
 
+/// Returns the same 384-dim vector for every text. pgvector stores
+/// `vector(384)`, so anything that writes a memory entry needs this width,
+/// and every pair of texts is maximally similar.
+pub struct Fixed384Embedder;
+
+#[async_trait::async_trait]
+impl crate::memory::EmbeddingProvider for Fixed384Embedder {
+    async fn embed(
+        &self,
+        _text: &str,
+    ) -> Result<Vec<f32>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(vec![0.1f32; 384])
+    }
+    async fn embed_batch(
+        &self,
+        texts: &[&str],
+    ) -> Result<Vec<Vec<f32>>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(texts.iter().map(|_| vec![0.1f32; 384]).collect())
+    }
+    fn dimensions(&self) -> usize {
+        384
+    }
+    fn model_id(&self) -> &str {
+        "test-fixed-384"
+    }
+}
+
 /// Every auxiliary capture of one purpose on one thread, oldest first.
 pub async fn aux_captures(pool: &PgPool, thread_id: Uuid, purpose: &str) -> Vec<serde_json::Value> {
     sqlx::query_scalar::<_, serde_json::Value>(
@@ -336,7 +363,7 @@ pub async fn delete_credential(pool: &PgPool, service_name: &str) {
 /// `Device{Registered,Renamed}` emits, and a fixture has no bus of its own.
 pub async fn seed_device(pool: &PgPool, id: &str, user_agent: Option<&str>, name: Option<&str>) {
     let (bus, _callback_rx) = EventBus::new(pool.clone());
-    crate::core::DeviceStore::register(pool, &bus, id, user_agent, None)
+    crate::core::DeviceStore::register(pool, &bus, id, user_agent, None, None)
         .await
         .unwrap_or_else(|e| panic!("seed device {id}: {e}"));
     if name.is_some() {

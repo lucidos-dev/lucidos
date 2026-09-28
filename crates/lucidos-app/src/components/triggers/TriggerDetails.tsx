@@ -20,6 +20,8 @@ import { resizeTextarea, useFontMetricsResize, useWidthRemeasure } from '../chat
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { useServerBackedField, sameJson, sameSet } from '../../hooks/useServerBackedField';
 import { LoadableError } from '../shared/LoadableError';
+import { FormSkeleton } from '../shared/FormSkeleton';
+import { LoadingFade } from '../shared/LoadingFade';
 import { Explainer, FieldLabel } from '../shared/Explainer';
 import { PROSE_TEXT_ATTRS } from '../../utils/noAutofill';
 
@@ -113,6 +115,9 @@ function reindexAfterRemoval<T>(map: Record<number, T>, index: number): Record<n
   );
 }
 
+/** The edit form's leading fields, which every trigger has. */
+const TRIGGER_FORM_FIELDS = [{ label: 'Trigger Name' }, { label: 'Trigger Type' }, { label: 'Run' }, { label: 'Intent', tall: true }];
+
 export function TriggerDetails() {
   const form = activeInlineForm.value;
   // Delay the spinner (300ms) so a fast load never flashes it.
@@ -129,15 +134,9 @@ export function TriggerDetails() {
         </div>
       );
     }
-    if (showLoading) {
-      return <div class="inline-form"><div class="loading-spinner" /></div>;
-    }
-    if (triggers.value.status !== 'loaded') {
-      // Pre-delay window — keep the container mounted but show nothing yet.
-      return <div class="inline-form" />;
-    }
-    const trigger = triggers.value.data.find((t) => t.id === editingId);
-    if (!trigger) {
+    const list = triggers.value.status === 'loaded' ? triggers.value.data : null;
+    const trigger = list?.find((t) => t.id === editingId);
+    if (list && !trigger) {
       // key={editingId} forces a remount when activeInlineForm flips from
       // missing-A to missing-B in successive renders: without it, Preact reuses
       // the instance and the empty-deps useEffect never re-fires for B, leaving
@@ -145,7 +144,11 @@ export function TriggerDetails() {
       // AppUiEditModal's MissingAppCloser.
       return <MissingTriggerCloser key={editingId} />;
     }
-    return <TriggerFormInner key={editingId} editingId={editingId} existingTrigger={trigger} />;
+    return (
+      <LoadingFade showSkeleton={showLoading} skeleton={<FormSkeleton fields={TRIGGER_FORM_FIELDS} />}>
+        {trigger && <TriggerFormInner key={editingId} editingId={editingId} existingTrigger={trigger} />}
+      </LoadingFade>
+    );
   }
 
   return <TriggerFormInner key="new" existingTrigger={null} />;
@@ -602,9 +605,6 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
                     Retry
                   </button>
                 </div>
-              )}
-              {eventTypesLoadable.status === 'loading' && showEventTypesLoading && (
-                <div class="form-hint">Loading event types...</div>
               )}
 
               {subs.length === 0 && (

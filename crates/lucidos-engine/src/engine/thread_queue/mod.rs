@@ -67,6 +67,7 @@ use uuid::Uuid;
 
 use crate::engine::event_bus::{BusEvent, EventBus, SystemEvent};
 use crate::engine::thread_events::{MessageOrigin, ThreadEvent};
+use crate::engine::thread_lifecycle::ThreadStatus;
 use crate::engine::LucidosEngine;
 use crate::triggers::TriggerConfig;
 
@@ -501,6 +502,20 @@ impl ThreadQueue {
         // because a spawn submit is always awaited inline from the spawning
         // task, which is the task that owns the chain.
         request.stamp_caller_depth(crate::scheduler::user_tasks::current_event_trigger_depth());
+        // Every spawn passes here, so this is where an unattributed one is
+        // caught. Its first message would render Origin "Unknown". Tests fail
+        // loudly; a release build still spawns it, since the work is real.
+        let attributed = request.is_attributed();
+        debug_assert!(
+            attributed,
+            "spawn submitted with no origin and no parent linkage: {request:?}"
+        );
+        if !attributed {
+            log!(
+                "[ThreadQueue] unattributed {:?} spawn submitted; its first message has no origin",
+                request.kind()
+            );
+        }
         let kind = request.kind();
         let trigger_id = request.trigger_id().map(str::to_string);
         let trigger_name = trigger_id.as_deref().and_then(|t| self.trigger_name(t));
@@ -1321,7 +1336,7 @@ impl ThreadQueue {
     /// no-op. Idempotent; a cheap PK lookup that no-ops for every background
     /// thread (`initiator != 'user'`) and every already-consistent thread.
     pub async fn reconcile_user_slot(self: &Arc<Self>, thread_id: Uuid) {
-        let row: Option<(String, String, String)> = match sqlx::query_as(
+        let row: Option<(ThreadStatus, String, String)> = match sqlx::query_as(
             "SELECT status, initiator, \
                     COALESCE(NULLIF(title, ''), NULLIF(first_message, ''), '') \
              FROM thread_summaries WHERE thread_id = $1",
@@ -1349,7 +1364,7 @@ impl ThreadQueue {
         // projection, not here.
         let should_occupy = matches!(
             row.as_ref(),
-            Some((status, initiator, _)) if status == "running" && initiator == "user"
+            Some((status, initiator, _)) if *status == ThreadStatus::Running && initiator == "user"
         );
 
         let (added, removed) = {

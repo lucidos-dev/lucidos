@@ -75,7 +75,7 @@ pub(super) async fn claude_code_stop(
     // the stale-session fallback (stop?apply=true on a thread whose CC
     // already exited) carries the device that clicked the button instead of
     // collapsing to "Lucidos Engine" via the actor-missing fallback.
-    let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    let actor = super::actor::user_actor(&headers, None);
 
     // Resolve any pending question card before CC ends — otherwise its answer
     // buttons would dangle after the session goes away. A resolved card counts
@@ -185,6 +185,12 @@ fn apply_now_error(msg: &str) -> ApiError {
     if msg == crate::engine::MERGE_OWNED_BY_RESOLVER_MESSAGE {
         return ApiError::new(StatusCode::CONFLICT, msg).with_reason("resolving_conflicts");
     }
+    if msg == crate::engine::claude_code::QUESTION_OPEN_MESSAGE {
+        return ApiError::new(StatusCode::CONFLICT, msg).with_reason("question_open");
+    }
+    if msg == crate::engine::claude_code::QUESTION_UNKNOWN_MESSAGE {
+        return ApiError::new(StatusCode::CONFLICT, msg).with_reason("question_unknown");
+    }
     StatusCode::NOT_FOUND.into()
 }
 
@@ -203,7 +209,7 @@ pub(super) async fn claude_code_apply_now(
         super::thread_reach::ThreadReachVerb::Apply,
     )
     .await?;
-    let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    let actor = super::actor::user_actor(&headers, None);
     match state.engine.apply_now(thread_id, actor).await {
         Ok(_) => Ok(Json(serde_json::json!({ "status": "applying" }))),
         Err(e) => {
@@ -242,6 +248,24 @@ mod apply_now_status_tests {
                 Some("resolving_conflicts")
             )
         );
+    }
+
+    /// A parked question, or a check for one that failed, refuses as 409. As a
+    /// 404 the frontend would fall back to applying the pending change
+    /// directly, which starts the very hardening run the refusal exists to stop.
+    #[test]
+    fn a_parked_question_is_a_conflict_not_a_missing_session() {
+        use crate::engine::claude_code::{QUESTION_OPEN_MESSAGE, QUESTION_UNKNOWN_MESSAGE};
+        for (msg, slug) in [
+            (QUESTION_OPEN_MESSAGE, "question_open"),
+            (QUESTION_UNKNOWN_MESSAGE, "question_unknown"),
+        ] {
+            assert_eq!(
+                refusal(msg),
+                (StatusCode::CONFLICT, msg.to_string(), Some(slug)),
+                "{msg}"
+            );
+        }
     }
 
     /// Each claim refusal answers 409 with its own message and slug, so the
@@ -304,7 +328,7 @@ pub(super) async fn claude_code_control(
             Json(serde_json::json!({ "error": e.to_string() })),
         )
     })?;
-    let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    let actor = super::actor::user_actor(&headers, None);
     state
         .engine
         .send_agent_control_request(thread_id, body.request, actor)
@@ -423,7 +447,7 @@ pub(super) async fn claude_code_discard(
         super::thread_reach::ThreadReachVerb::Discard,
     )
     .await?;
-    let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    let actor = super::actor::user_actor(&headers, None);
     state
         .engine
         .discard_cc_changes(thread_uuid, actor)
@@ -449,7 +473,7 @@ pub(super) async fn claude_code_interrupt(
         super::thread_reach::ThreadReachVerb::Cancel,
     )
     .await?;
-    let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    let actor = super::actor::user_actor(&headers, None);
     // No question card is cancel-stamped on this route, so a `running` row it
     // settles is one this request did not write.
     match state

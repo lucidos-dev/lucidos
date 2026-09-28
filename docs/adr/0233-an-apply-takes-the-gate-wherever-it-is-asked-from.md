@@ -2,6 +2,9 @@
 
 - **Status**: Accepted
 - **Date**: 2026-09-20
+- **Narrowed by**: [0293](0293-apply-now-refuses-a-parked-question.md).
+  `apply_now` stays out of the per-change gate, but refuses a thread parked on
+  a question.
 
 ## Context
 

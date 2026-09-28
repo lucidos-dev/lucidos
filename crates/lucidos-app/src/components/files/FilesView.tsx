@@ -1,9 +1,11 @@
 import type { VNode } from 'preact';
 import { useEffect, useRef } from 'preact/hooks';
 import { artifacts, repositories, repoSource, repoFiles, repoDiff, repoViewMode, visibleWorkspaceName } from '../../store/store';
-import { uploadFiles } from '../../store/actions/artifacts';
+import { loadArtifacts, uploadFiles } from '../../store/actions/artifacts';
 import { loadRepositories } from '../../store/actions/chat';
-import { switchRepoSource } from '../../store/actions/repositories';
+import { refreshRepositories } from '../../store/actions/repositoriesLoader';
+import { refreshRepoView, switchRepoSource } from '../../store/actions/repositories';
+import { usePanelRefresh } from '../../hooks/usePanelRefresh';
 import { useDelayedLoading, useDelayedFlag } from '../../hooks/useDelayedLoading';
 import { FolderTree, folderTreeSkeletonRow } from './FolderTree';
 import { RepoFilesView, repoFilesContentReady } from './RepoFilesView';
@@ -14,10 +16,21 @@ import { ListSkeletonOf, SkeletonProvider, SkBlock } from '../shared/Skeleton';
 import { LoadingFade } from '../shared/LoadingFade';
 import { loadedOr } from '../../store/types';
 
+/** The tree on show (the workspace's, or the bound repo's with its changes)
+ *  and the source list. A diff is pinned to its change, so it is not re-read. */
+function refreshFilesPanel(): Promise<unknown> {
+  const repoId = repoSource.peek();
+  return Promise.all([
+    repoId ? refreshRepoView(repoId) : loadArtifacts(),
+    refreshRepositories(),
+  ]);
+}
+
 export function FilesView() {
   useEffect(() => {
     if (repositories.value.status === 'not-loaded') void loadRepositories();
   }, []);
+  usePanelRefresh('files', refreshFilesPanel);
   const repos = loadedOr(repositories.value, []);
 
   const isRepo = repoSource.value !== null;
@@ -60,8 +73,8 @@ export function FilesView() {
   // the top-right. The switcher row renders even without registered repos so
   // the import box always has a top row to anchor to.
   return (
-    <div class="content-view active">
-      <div class="workspace-files-view" data-drop-zone="import">
+    <div class="content-view active content-view-full-bleed" data-drop-zone="import">
+      <div class="workspace-files-view">
         <div class="files-source-switcher">
           {sourceDropdown}
           <ImportDropzone />
@@ -107,7 +120,7 @@ function RepoContentView({
   const showSkeleton = useDelayedFlag(!everShown.current);
 
   return (
-    <div class="content-view active">
+    <div class="content-view active content-view-full-bleed">
       <LoadingFade showSkeleton={showSkeleton} skeleton={<RepoViewSkeleton hasSwitcher={hasSwitcher} />}>
         {everShown.current ? (
           <>

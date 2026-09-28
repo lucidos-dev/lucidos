@@ -74,7 +74,7 @@ test.describe('Drawer section disclosure', () => {
         psql([
             ...pinnedIds.map((id, i) => seedThreadRow({ id, title: `pinned-${i}-${stamp}`, now })),
             seedThreadRow({ id: archivedId, title: `archived-${stamp}`, now }),
-            `UPDATE thread_summaries SET is_saved = true WHERE thread_id IN ('${pinnedIds.join("','")}')`,
+            `UPDATE thread_summaries SET is_saved = true, archive_state = 'inbox' WHERE thread_id IN ('${pinnedIds.join("','")}')`,
         ].join(';\n'));
 
         await navigateToApp(page);
@@ -164,7 +164,7 @@ test.describe('Drawer section disclosure', () => {
             seedThreadRow({ id: parentId, title: `nest-parent-${stamp}`, totalChildren: 1, now }),
             seedThreadRow({ id: childId, title: `nest-child-${stamp}`, parentId, now }),
             seedThreadRow({ id: randomUUID(), title: `nest-archived-${stamp}`, now }),
-            `UPDATE thread_summaries SET is_saved = true WHERE thread_id IN ('${parentId}','${childId}')`,
+            `UPDATE thread_summaries SET is_saved = true, archive_state = 'inbox' WHERE thread_id IN ('${parentId}','${childId}')`,
         ].join(';\n'));
 
         await navigateToApp(page);

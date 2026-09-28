@@ -17,9 +17,11 @@ import {
 } from '../../store/actions/app-update';
 import { packagedUpdateVersion } from '../../store/packagedUpdate';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
+import { usePanelRefresh } from '../../hooks/usePanelRefresh';
 import { renderMarkdown } from '../../utils/renderMarkdown';
 import { isNewerVersion } from '../../utils/version';
 import { lucidosVersionTooltip } from '../../utils/lucidosVersion';
+import { Disclosure } from '../shared/Disclosure';
 import { LoadableError } from '../shared/LoadableError';
 import { LoadingFade } from '../shared/LoadingFade';
 import { ListSkeletonOf, useSkeleton, SkText, SkBlock } from '../shared/Skeleton';
@@ -248,16 +250,22 @@ function ReleaseRow({
 }
 
 /**
- * A release's notes, or `null` while the row is shut.
+ * A release's notes, rolled open under its row.
  *
  * Split out of the row so the "collapsed rows cost nothing" property is a pure
- * function a test can hold, rather than something a reader has to infer from a
- * `&&` inside a component that reads a hook. Returning null (not a hidden
- * element) is the property: 43 sections of markdown are parsed and laid out only
- * as they are asked for.
+ * function a test can hold. The markdown is parsed inside `ReleaseNotes`'s own
+ * render, which a shut `<Disclosure>` never runs: 43 sections of markdown are
+ * parsed and laid out only as they are asked for.
  */
-export function releaseNotesBody(release: ChangelogRelease, open: boolean): VNode | null {
-  if (!open) return null;
+export function releaseNotesBody(release: ChangelogRelease, open: boolean): VNode {
+  return (
+    <Disclosure open={open}>
+      <ReleaseNotes release={release} />
+    </Disclosure>
+  );
+}
+
+export function ReleaseNotes({ release }: { release: ChangelogRelease }) {
   return (
     <div
       class="markdown-content whats-new-notes"
@@ -347,6 +355,7 @@ export function offeredRelease(
  * there, leaving an update on screen and out of reach.
  */
 export function WhatsNewPage() {
+  usePanelRefresh("what's new", loadChangelog);
   const loadable = changelogReleases.value;
   const release = lucidosRelease.value;
   const dirty = lucidosReleaseDirty.value;

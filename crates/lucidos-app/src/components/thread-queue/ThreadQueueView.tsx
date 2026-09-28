@@ -2,11 +2,13 @@ import { useState } from 'preact/hooks';
 import { threadQueue, threadMap } from '../../store/store';
 import {
   dropQueueEntry,
+  loadThreadQueue,
   runQueueEntryNow,
   saveCapacityPolicy,
 } from '../../store/actions/threadQueue';
 import { focusThreadOrBootstrap } from '../../store/actions/threads';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
+import { usePanelRefresh } from '../../hooks/usePanelRefresh';
 import { useServerBackedField, sameJson } from '../../hooks/useServerBackedField';
 import type { CapacityPolicy, ThreadQueueEntry } from '../../store/types';
 import { threadDisplayTitle } from '../../utils/threadTitle';
@@ -196,6 +198,7 @@ function CapacityPolicyEditor({ policy }: { policy: CapacityPolicy }) {
 }
 
 export function ThreadQueueView() {
+  usePanelRefresh('the thread queue', loadThreadQueue);
   const loadable = threadQueue.value;
   const showLoading = useDelayedLoading(loadable);
   const [policyOpen, setPolicyOpen] = useState(false);

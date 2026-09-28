@@ -1,6 +1,10 @@
 import { useCallback, useRef } from 'preact/hooks';
 import { useSignalEffect } from '@preact/signals';
 import { selectedLines, consumeLineScrollTarget } from '../../store/store';
+import { SkText, useSkeleton } from '../shared/Skeleton';
+
+/** Line widths the source view shimmers with while its file loads. */
+const SKELETON_LINE_WIDTHS = ['46%', '72%', '58%', '84%', '30%', '66%', '52%', '78%', '40%', '62%'];
 
 /** One rendered row of code. */
 export interface CodeRow {
@@ -138,7 +142,10 @@ export function codeBlockClass(selectable: boolean, wideLines: WideLineMode): st
  *  `.side-by-side-diff-side` for a diff column. */
 export function LineNumberedCode({ rows, selection = 'file', wideLines }: Props) {
   const preRef = useRef<HTMLPreElement>(null);
-  const selectable = selection === 'file';
+  const sk = useSkeleton();
+  // A placeholder is never a file view: it must not consume a scroll target
+  // that belongs to the content it stands in for.
+  const selectable = selection === 'file' && !sk;
 
   const handleLineClick = useCallback((lineNum: number, shiftKey: boolean) => {
     if (shiftKey && selectedLines.value) {
@@ -179,6 +186,19 @@ export function LineNumberedCode({ rows, selection = 'file', wideLines }: Props)
   // component to it, so a non-selectable column never subscribes and never
   // re-renders on a selection change elsewhere.
   const sel = selectable ? selectedLines.value : null;
+
+  if (sk) {
+    return (
+      <pre class={codeBlockClass(false, wideLines)} aria-hidden="true">
+        {SKELETON_LINE_WIDTHS.map((w, i) => (
+          <div key={i} class="code-line">
+            <span class="line-number">{i + 1}</span>
+            <SkText class="line-content" w={w} />
+          </div>
+        ))}
+      </pre>
+    );
+  }
 
   return (
     <pre

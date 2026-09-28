@@ -9,6 +9,8 @@ import {
 } from '../../api/client';
 import type { WebhookIngressOutage, WebhookRefusal } from '../../api/client';
 import { ListRowAddCard } from '../shared/ListRowAddCard';
+import { LoadingFade } from '../shared/LoadingFade';
+import { ListSkeletonOf, SkBlock, SkText } from '../shared/Skeleton';
 import { LoadableError } from '../shared/LoadableError';
 import { credentials, showConfirm, showToast, webhooksVersion } from '../../store/store';
 import { loadCredentials } from '../../store/actions/credentials';
@@ -19,6 +21,7 @@ import { toFailed, loadingIfFresh, type Loadable } from '../../store/types';
 import { useCoarseClock } from '../../hooks/useCoarseClock';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { useVersionedRefresh } from '../../hooks/useVersionedRefresh';
+import { usePanelRefresh } from '../../hooks/usePanelRefresh';
 import { copyToClipboard } from '../../utils/clipboard';
 import { lastDeliveryLine, lastRefusalLine } from './webhookDelivery';
 import { webhookIngressRowLine } from '../../utils/webhookIngressNotice';
@@ -46,16 +49,18 @@ const EVENT_TYPE_HINT =
 
 /** Show whatever secret a response handed back, if it handed one back.
  *
- *  It never dismisses itself, and it carries a Copy button. A bearer token is
- *  the one the user cannot get again: only its digest is stored. */
-function revealSecret(result: WebhookWithToken) {
+ *  It never dismisses itself, and a tap on it copies the token (its lone action
+ *  is the card tap). A bearer token is the one the user cannot get again: only
+ *  its digest is stored. */
+export function revealSecret(result: WebhookWithToken) {
   const reveal = secretReveal(result);
   if (!reveal) {
     showToast(`Saved ${result.name}`, 'success');
     return;
   }
+  // The Copy action is what keeps it up: an action toast waits to be answered.
+  // A delay of 0 would mean "leave at once", not "never".
   showToast(`${reveal.message} ${reveal.value}`, 'success', {
-    autoDismissMs: 0,
     action: {
       label: reveal.copyLabel,
       onClick: () => copyToClipboard(reveal.value, 'Copied'),
@@ -238,21 +243,23 @@ export function confirmWebhookDeletion(hook: Pick<Webhook, 'name'>): Promise<boo
   );
 }
 
+/** One webhook. With no `hook`, inside a `SkeletonProvider`, it draws itself
+ *  as the loading placeholder. */
 function WebhookRow(
-  { hook, outage, refusal, now, onChanged }: {
-    hook: Webhook;
-    outage: WebhookIngressOutage | null;
+  { hook, outage = null, refusal = null, now = new Date(0), onChanged = () => {} }: {
+    hook?: Webhook;
+    outage?: WebhookIngressOutage | null;
     /** This hook's own standing refusal, or null. Unlike `outage`, which is
      *  the shared path and is drawn on every enabled row. */
-    refusal: WebhookRefusal | null;
-    now: Date;
-    onChanged: () => void;
+    refusal?: WebhookRefusal | null;
+    now?: Date;
+    onChanged?: () => void;
   },
 ) {
   const [busy, setBusy] = useState(false);
   const [editing, setEditing] = useState<SignatureDraft | null>(null);
-  const delivery = lastDeliveryLine(hook, now);
-  const lastRefusal = lastRefusalLine(hook, now);
+  const delivery = hook ? lastDeliveryLine(hook, now) : null;
+  const lastRefusal = hook ? lastRefusalLine(hook, now) : null;
 
   async function change(fn: () => Promise<unknown>) {
     setBusy(true);
@@ -267,7 +274,7 @@ function WebhookRow(
   }
 
   async function saveSignature() {
-    if (!editing) return;
+    if (!hook || !editing) return;
     const hmac = draftToHmac(editing);
     if (!hmac) return;
     // Signing an unsigned hook drops its bearer token, because a hook carries
@@ -279,6 +286,7 @@ function WebhookRow(
           'stops that token working, and it cannot be recovered.\n\n' +
           'Anything presenting it has to move to the signature.',
         'Sign it',
+        { variant: 'danger' },
       );
       if (!go) return;
     }
@@ -296,6 +304,7 @@ function WebhookRow(
   /** Turning a signed hook unsigned mints a bearer token, shown once. A hook
    *  always carries exactly one verifier, so it cannot just lose this one. */
   async function removeSignature() {
+    if (!hook) return;
     await change(async () => {
       revealSecret(await updateWebhook(hook.id, { hmac: null }));
       setEditing(null);
@@ -303,7 +312,7 @@ function WebhookRow(
   }
 
   async function deleteHook() {
-    if (!(await confirmWebhookDeletion(hook))) return;
+    if (!hook || !(await confirmWebhookDeletion(hook))) return;
     await change(async () => {
       await deleteWebhook(hook.id);
     });
@@ -314,17 +323,17 @@ function WebhookRow(
   return (
     <div class="list-row">
       <div class="list-row-info">
-        <div class="title">
-          {hook.name}
-          {hook.enabled ? null : ' (off)'}
-        </div>
-        <div class="list-row-details">
-          Emits {hook.event_type}, verified by {verifierLabel(hook)}
-        </div>
-        {hook.hmac && !editing && <SignatureRow hmac={hook.hmac} />}
-        <div class="list-row-details list-row-details-prose">
-          <code>{hook.delivery_path}</code> on the hook port
-        </div>
+        <SkText class="title" as="div" w="9rem">
+          {hook?.name}
+          {hook?.enabled === false ? ' (off)' : null}
+        </SkText>
+        <SkText class="list-row-details" as="div" w="16rem">
+          {hook && <>Emits {hook.event_type}, verified by {verifierLabel(hook)}</>}
+        </SkText>
+        {hook?.hmac && !editing && <SignatureRow hmac={hook.hmac} />}
+        <SkText class="list-row-details list-row-details-prose" as="div" w="13rem">
+          {hook && <><code>{hook.delivery_path}</code> on the hook port</>}
+        </SkText>
         {delivery && <div class="list-row-details">{delivery}</div>}
         {lastRefusal && <div class="list-row-details">{lastRefusal}</div>}
         {/* The engine's own verdict on this hook, which the line above cannot
@@ -334,7 +343,7 @@ function WebhookRow(
             {webhookRefusalRowLine(refusal)}
           </div>
         )}
-        {hook.enabled && outage && (
+        {hook?.enabled && outage && (
           <div class="list-row-details webhook-ingress-warning">
             {webhookIngressRowLine(outage)}
           </div>
@@ -355,7 +364,7 @@ function WebhookRow(
               >
                 Save signature
               </button>
-              {hook.hmac && (
+              {hook?.hmac && (
                 <button
                   class="action-btn action-btn-danger"
                   disabled={busy}
@@ -372,7 +381,7 @@ function WebhookRow(
       <div class="list-row-actions">
         {/* Reopens what the hook stores, or starts a fresh draft for an
             unsigned one. */}
-        {!editing && (
+        {hook && !editing && (
           <button
             class="action-btn"
             disabled={busy}
@@ -385,22 +394,26 @@ function WebhookRow(
             Signature
           </button>
         )}
-        <button
-          class="action-btn"
-          disabled={busy}
-          onClick={() => void change(async () => {
-            await updateWebhook(hook.id, { enabled: !hook.enabled });
-          })}
-        >
-          {hook.enabled ? 'Disable' : 'Enable'}
-        </button>
-        <button
-          class="action-btn action-btn-danger"
-          disabled={busy}
-          onClick={() => void deleteHook()}
-        >
-          Delete
-        </button>
+        <SkBlock w="4.5rem" h="2rem" round>
+          <button
+            class="action-btn"
+            disabled={busy}
+            onClick={() => hook && void change(async () => {
+              await updateWebhook(hook.id, { enabled: !hook.enabled });
+            })}
+          >
+            {hook?.enabled ? 'Disable' : 'Enable'}
+          </button>
+        </SkBlock>
+        <SkBlock w="4rem" h="2rem" round>
+          <button
+            class="action-btn action-btn-danger"
+            disabled={busy}
+            onClick={() => void deleteHook()}
+          >
+            Delete
+          </button>
+        </SkBlock>
       </div>
     </div>
   );
@@ -410,16 +423,17 @@ export function WebhooksPage() {
   const [loadable, setLoadable] = useState<Loadable<Webhook[]>>({ status: 'not-loaded' });
   const showLoading = useDelayedLoading(loadable);
 
-  function reload() {
+  function reload(): Promise<void> {
     // A refetch keeps the visible list through the round-trip and swaps when
     // fresh rows land, so an SSE-driven re-read never flashes a loader.
     setLoadable(loadingIfFresh);
-    fetchWebhooks()
+    return fetchWebhooks()
       .then((rows) => setLoadable({ status: 'loaded', data: rows }))
       .catch((e: unknown) => setLoadable(toFailed(e)));
   }
 
-  useEffect(reload, []);
+  useEffect(() => { void reload(); }, []);
+  usePanelRefresh('webhooks', reload);
   // A signed hook names a credential, and this page says whether that
   // credential still exists. The signal is kept fresh by the `Credential*` SSE
   // arm, so reading it IS the subscription. This only covers a cold open.
@@ -455,23 +469,28 @@ export function WebhooksPage() {
         which is the only surface you can expose to the public internet.
       </p>
       {loadable.status === 'failed' && <LoadableError noun="webhooks" error={loadable.error} />}
+      <LoadingFade
+        showSkeleton={showLoading}
+        skeleton={<ListSkeletonOf count={2} containerClass="list-rows" row={() => <WebhookRow />} />}
+      >
+        {loadable.status === 'loaded' && (
+          <div class="list-rows">
+            {hooks.length === 0 && <div class="empty-state">No webhooks yet.</div>}
+            {hooks.map((hook) => (
+              <WebhookRow
+                key={hook.id}
+                hook={hook}
+                outage={outage}
+                refusal={refusals.get(hook.id) ?? null}
+                now={now}
+                onChanged={reload}
+              />
+            ))}
+          </div>
+        )}
+      </LoadingFade>
+      {/* Outside the fade, so a reload never unmounts a half-typed webhook. */}
       <div class="list-rows">
-        {loadable.status === 'loaded' && hooks.length === 0 && (
-          <div class="empty-state">No webhooks yet.</div>
-        )}
-        {loadable.status !== 'loaded' && loadable.status !== 'failed' && showLoading && (
-          <div class="empty-state">Loading webhooks...</div>
-        )}
-        {hooks.map((hook) => (
-          <WebhookRow
-            key={hook.id}
-            hook={hook}
-            outage={outage}
-            refusal={refusals.get(hook.id) ?? null}
-            now={now}
-            onChanged={reload}
-          />
-        ))}
         <AddWebhookForm onCreated={reload} />
       </div>
     </div>

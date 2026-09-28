@@ -304,6 +304,8 @@ export interface TriggerRunResult {
 export interface DeviceInfo {
   id: string;
   name: string | null;
+  /** The name the device got when it paired, as the gateway forwarded it. */
+  pairing_label: string | null;
   user_agent: string | null;
   push_enabled: boolean;
   last_seen_at: string;

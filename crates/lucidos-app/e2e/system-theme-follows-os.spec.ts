@@ -32,13 +32,13 @@ test.describe('system theme follows the OS', () => {
     // No stored theme, so the preference is the `system` default.
     await page.emulateMedia({ colorScheme: 'dark' });
     await gotoWithRetry(page, '/');
-    await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark');
+    await expect(page.locator('html')).toHaveAttribute('data-theme-mode', 'dark');
   });
 
   test('a flip announced while the page is visible is applied', async ({ page }) => {
     await page.emulateMedia({ colorScheme: 'light' });
 
-    await expect(page.locator('html')).toHaveAttribute('data-theme', 'light', {
+    await expect(page.locator('html')).toHaveAttribute('data-theme-mode', 'light', {
       timeout: SETTLE_GRACE_MS,
     });
   });
@@ -50,14 +50,14 @@ test.describe('system theme follows the OS', () => {
     // The guard: nothing paints while the user is not looking. This is the
     // snapshot-pass flip, and applying it is the light flash.
     await page.waitForTimeout(SETTLE_GRACE_MS);
-    await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark');
+    await expect(page.locator('html')).toHaveAttribute('data-theme-mode', 'dark');
 
     // The repair: an iOS PWA is resumed rather than reloaded, so this is the
     // only moment it gets to notice.
     await setHidden(page, false);
     await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
 
-    await expect(page.locator('html')).toHaveAttribute('data-theme', 'light', {
+    await expect(page.locator('html')).toHaveAttribute('data-theme-mode', 'light', {
       timeout: SETTLE_GRACE_MS,
     });
   });

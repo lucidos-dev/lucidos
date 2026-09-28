@@ -28,9 +28,9 @@ const partsSource = readFileSync(resolve(here, '../chat-exchange-parts.tsx'), 'u
  * Claude Code session (working/streaming/pending) keeps its panel even before any
  * events arrive.
  *
- * ResponsePanel still gates its body div on hasBody for the rare cases
- * where a panel renders without body content (queued, pending-with-no-
- * events-yet, error states).
+ * ResponsePanel still opens its body on hasBody for the rare cases where a
+ * panel renders without body content (queued, pending-with-no-events-yet,
+ * error states).
  */
 describe('Empty Continued-below panel is hidden entirely', () => {
   it('ChatExchange skips the response panel for empty non-last done/interrupted exchanges', () => {
@@ -46,13 +46,16 @@ describe('Empty Continued-below panel is hidden entirely', () => {
     expect(fn).toMatch(/showResponsePanel\s*=[^;]*!isEmptyContinued/);
   });
 
-  it('ResponsePanel still accepts hasBody and gates .response-body on it', () => {
+  it('ResponsePanel still accepts hasBody and opens .response-body on it', () => {
     expect(partsSource).toMatch(/interface ResponsePanelProps[\s\S]*?hasBody:\s*boolean/);
     const fnMatch = partsSource.match(/function ResponsePanel\(\{[\s\S]*?\n\}\n/);
     expect(fnMatch, 'ResponsePanel function not found').not.toBeNull();
     // `folded` and not `collapsed`: a headerless panel keeps no fold, having
-    // dropped the row the collapse control sits in.
-    expect(fnMatch![0]).toMatch(/hasBody\s*&&\s*!folded[\s\S]*?class="response-body"/);
+    // dropped the row the collapse control sits in. The fold rolls through
+    // `<Disclosure>`, which stays mounted so a body that stops drawing rolls
+    // away rather than vanishing (hiding steps on a step-only turn).
+    expect(fnMatch![0]).toMatch(/<Disclosure open=\{hasBody && !folded\}>\s*<div class="response-body">/);
+    expect(fnMatch![0]).not.toMatch(/hasBody\s*&&\s*\(\s*<Disclosure/);
   });
 
   it('ChatExchange passes a real content test to ResponsePanel, not a constant', () => {
@@ -60,8 +63,8 @@ describe('Empty Continued-below panel is hidden entirely', () => {
     // collapse gate. `hasEvents` is `events.length > 0`, which counts a
     // whitespace-only text chunk and a step hidden by the steps control, so
     // both read "body" on a turn drawing nothing; and two copies of one
-    // question is how the panel kept rendering the `⋯` stub off the old test
-    // after the gate was fixed. One name now, asserted in full over in
+    // question is how the panel kept folding off the old test after the gate
+    // was fixed. One name now, asserted in full over in
     // collapse-needs-a-drawn-body.test.ts.
     expect(source).toMatch(/<ResponsePanel[\s\S]*?hasBody=\{canCollapse\}/);
     expect(source).toMatch(/const canCollapse = hasResponse \|\| events\.some\(/);

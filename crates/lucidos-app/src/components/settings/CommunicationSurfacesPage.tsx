@@ -7,8 +7,12 @@ import { connectionBannerBody } from '../layout/ConnectionBanner';
 import { ingressBannerBody } from '../layout/IngressBanner';
 import { slownessBannerBody } from '../layout/SlownessBanner';
 import { refusalBannerBody } from '../layout/WebhookRefusalBanner';
+import { waitingPanelBody } from '../chat/WaitingPanel';
 import {
+  SAMPLE_CONDITION,
   SAMPLE_INGRESS_OUTAGE,
+  SAMPLE_DATABASE_EPISODE,
+  SAMPLE_DISK_EPISODE,
   SAMPLE_MEMORY_EPISODE,
   SAMPLE_UNCLEAR_EPISODE,
   SAMPLE_WEBHOOK_REFUSAL,
@@ -115,20 +119,11 @@ export function CommunicationSurfacesPage() {
         <div class="surfaces-banner-preview">
           {connectionBannerBody({ layout: 'desktop', status: 'connecting', workspace: 'dev' })}
         </div>
-        <div class="surfaces-banner-preview">
-          {slownessBannerBody({
-            layout: 'desktop',
-            episode: SAMPLE_MEMORY_EPISODE,
-            onDismiss: () => {},
-          })}
-        </div>
-        <div class="surfaces-banner-preview">
-          {slownessBannerBody({
-            layout: 'desktop',
-            episode: SAMPLE_UNCLEAR_EPISODE,
-            onDismiss: () => {},
-          })}
-        </div>
+        {[SAMPLE_DISK_EPISODE, SAMPLE_DATABASE_EPISODE, SAMPLE_MEMORY_EPISODE, SAMPLE_UNCLEAR_EPISODE].map(episode => (
+          <div class="surfaces-banner-preview" key={episode.episode_id}>
+            {slownessBannerBody({ layout: 'desktop', episode, packaged: false, onDismiss: () => {} })}
+          </div>
+        ))}
         <div class="surfaces-banner-preview">
           {ingressBannerBody({
             layout: 'desktop',
@@ -157,6 +152,28 @@ export function CommunicationSurfacesPage() {
             onOpenWebhooks: () => {},
             onDiscuss: () => {},
           })}
+        </div>
+      </div>
+
+      <div class="settings-section">
+        <div class="settings-section-title" data-search-anchor="surfaces:popovers">Popovers</div>
+        <p class="settings-row-note">
+          Detail the user opened from a control, hung from that control. A popover
+          never opens a second layer: more detail drills in, with a way back.
+        </p>
+        {/* The real body again: the waiting panel drilled into a condition.
+            It is inert, and the back link goes nowhere. */}
+        <div class="surfaces-popover-previews">
+          <div class="surface surfaces-popover-preview">
+            {waitingPanelBody({
+              threadId: '',
+              waits: [],
+              subThreads: { threads: [], unresolved: 0 },
+              condition: SAMPLE_CONDITION,
+              onBack: () => {},
+              onClose: () => {},
+            })}
+          </div>
         </div>
       </div>
 

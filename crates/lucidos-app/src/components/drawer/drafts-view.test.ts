@@ -51,7 +51,6 @@ function makeThread(id: string, overrides: MakeThreadOpts = {}): ThreadState {
       codingAgentProposed: false,
       codingAgentRequiresRestart: false,
       codingAgentIsExternalRepo: false,
-      codingAgentApplying: false,
       codingAgentHasDiff: false,
       lastRevivedAt: '',
       messageCount: 1,

@@ -464,9 +464,10 @@ async fn load_preflight_facts(
     .await?;
 
     let has_applied_changes: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM changes WHERE thread_id = ANY($1) AND status = 'applied')",
+        "SELECT EXISTS (SELECT 1 FROM changes WHERE thread_id = ANY($1) AND status = $2)",
     )
     .bind(ids)
+    .bind(crate::core::changes::ChangeStatus::Applied)
     .fetch_one(&mut **tx)
     .await?;
 
@@ -528,8 +529,7 @@ async fn blocking_members(
             row.coding_agent_is_external_repo,
         ) {
             match status {
-                ThreadStatus::Running => Some("running"),
-                ThreadStatus::WaitingForUserAnswer => Some("waiting_for_user_answer"),
+                ThreadStatus::Running | ThreadStatus::WaitingForUserAnswer => Some(status.as_str()),
                 _ => Some("pending_change"),
             }
         } else if state.engine.is_agent_running_for(row.thread_id).await {

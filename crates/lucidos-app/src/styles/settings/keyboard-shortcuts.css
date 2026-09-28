@@ -16,7 +16,7 @@
   color: var(--text-secondary);
   background: var(--bg-tertiary);
   border: 1px solid var(--border-color);
-  border-radius: 0.375rem;
+  border-radius: calc(var(--radius-control) * 0.75);
 }
 
 /* The chip doubles as the Record button: click it to rebind the shortcut. */
@@ -27,7 +27,9 @@
     color calc(0.12s * var(--duration-scale)) ease;
 }
 
-.shortcut-record-btn:hover {
-  color: var(--text-primary);
-  border-color: var(--text-secondary);
+@media (hover: hover) {
+  .shortcut-record-btn:hover {
+    color: var(--text-primary);
+    border-color: var(--text-secondary);
+  }
 }

@@ -3,6 +3,7 @@ import { confirmState } from '../../store/store';
 import { useHidePanelWebviewWhile } from '../../hooks/useHidePanelWebviewWhile';
 import { DialogMessage } from './DialogMessage';
 import { Overlay } from './Overlay';
+import { SurfaceHead } from './Surface';
 import { trapDialogTab } from './dialogFocusTrap';
 import { dialogOwnsKey } from './dialogKeyScope';
 
@@ -58,12 +59,14 @@ export function ConfirmDialog() {
     <Overlay
       open
       onClose={() => resolve(state.acknowledge === true)}
-      panelClass="confirm-dialog"
+      overlayClass="protected-surface"
+      panelClass="surface surface-raised confirm-dialog protected-surface"
       panelRole="dialog"
       ariaModal
       panelRef={dialogRef}
     >
-        {state.title && <h2 class="confirm-title">{state.title}</h2>}
+      {state.title && <SurfaceHead title={state.title} />}
+      <div class="surface-body dialog-body" tabIndex={-1}>
         <DialogMessage message={state.message} />
         {state.details && (
           // `tabIndex={-1}`, so Chrome leaves the list out of the Tab order. A
@@ -85,37 +88,38 @@ export function ConfirmDialog() {
             ))}
           </div>
         )}
-        <div class="confirm-actions">
-          {/* An acknowledgement has no Cancel: there is nothing to decline, and
-              a second button meaning the same as the first reads as a choice
-              the user does not have. Escape and an outside click still work,
-              and `resolve(true)` below is why they mean "read it". */}
-          {!state.acknowledge && state.extraAction && (
-            <button
-              class="confirm-btn confirm-btn-cancel confirm-btn-extra"
-              onClick={() => {
-                state.extraAction!.onClick();
-                resolve(false);
-              }}
-            >
-              {state.extraAction.label}
-            </button>
-          )}
-          <div class="confirm-actions-right">
-            {!state.acknowledge && (
-              <button class="confirm-btn confirm-btn-cancel" onClick={() => resolve(false)}>
-                {cancelLabel}
-              </button>
-            )}
-            <button
-              ref={okBtnRef}
-              class={`confirm-btn ${state.variant === 'default' ? 'confirm-btn-ok-default' : 'confirm-btn-ok'}`}
-              onClick={() => resolve(true)}
-            >
-              {state.okLabel}
-            </button>
-          </div>
-        </div>
+      </div>
+      <div class="surface-foot">
+        {/* An acknowledgement has no Cancel: there is nothing to decline, and
+            a second button meaning the same as the first reads as a choice
+            the user does not have. Escape and an outside click still work,
+            and `resolve(true)` below is why they mean "read it". */}
+        {!state.acknowledge && state.extraAction && (
+          <button
+            class="action-btn action-btn-secondary confirm-extra"
+            data-role="confirm-extra"
+            onClick={() => {
+              state.extraAction!.onClick();
+              resolve(false);
+            }}
+          >
+            {state.extraAction.label}
+          </button>
+        )}
+        {!state.acknowledge && (
+          <button class="action-btn action-btn-secondary" data-role="confirm-cancel" onClick={() => resolve(false)}>
+            {cancelLabel}
+          </button>
+        )}
+        <button
+          ref={okBtnRef}
+          class={`action-btn${state.variant === 'danger' ? ' action-btn-danger' : ''}`}
+          data-role="confirm-ok"
+          onClick={() => resolve(true)}
+        >
+          {state.okLabel}
+        </button>
+      </div>
     </Overlay>
   );
 }

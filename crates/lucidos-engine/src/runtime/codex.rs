@@ -927,17 +927,20 @@ async fn run_turn(
     let mut stdout_reader = BufReader::new(stdout);
     let mut stderr_reader = BufReader::new(stderr);
 
-    let mut line_buf = String::new();
+    // Bytes, read with the cancel-safe `read_until`. A mid-turn input or a
+    // control request drops the read. The part of a line already read must
+    // stay in `line_buf`. The CC driver's `driver_task` explains more.
+    let mut line_buf: Vec<u8> = Vec::new();
     let mut interrupted = false;
     let mut shutdown = false;
     'turn: loop {
         tokio::select! {
-            read_result = stdout_reader.read_line(&mut line_buf) => {
+            read_result = stdout_reader.read_until(b'\n', &mut line_buf) => {
                 match read_result {
                     Ok(0) => break 'turn,
                     Ok(_) => {
                         let events = tracker.map_line(
-                            parse_codex_line(&line_buf),
+                            parse_codex_line(&String::from_utf8_lossy(&line_buf)),
                             turn_start.elapsed().as_millis() as u64,
                         );
                         line_buf.clear();
@@ -1011,30 +1014,31 @@ async fn run_turn(
         let _ = child.start_kill();
         child.wait().await
     } else {
-        // tokio's `read_line` is not cancel-safe: when another select arm
-        // wins a poll cycle, a line already copied into `line_buf` would be
-        // silently dropped — and the next read would append fresh bytes to
-        // it, corrupting the parse (same defect the CC driver documents).
-        // Forward any pre-captured line before draining.
+        // Reached on stdout EOF or a read error. A non-empty `line_buf` holds
+        // a last line that EOF ended without a newline. Forward it before
+        // draining.
         if !line_buf.is_empty() {
             for ev in tracker.map_line(
-                parse_codex_line(&line_buf),
+                parse_codex_line(&String::from_utf8_lossy(&line_buf)),
                 turn_start.elapsed().as_millis() as u64,
             ) {
                 let _ = events_tx.send(ev);
             }
             line_buf.clear();
         }
-        // stdout EOF — drain whatever the OS still buffers, then wait.
+        // Drain whatever the OS still buffers, then wait.
         let drain_deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(500);
         loop {
-            match tokio::time::timeout_at(drain_deadline, stdout_reader.read_line(&mut line_buf))
-                .await
+            match tokio::time::timeout_at(
+                drain_deadline,
+                stdout_reader.read_until(b'\n', &mut line_buf),
+            )
+            .await
             {
                 Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
                 Ok(Ok(_)) => {
                     let events = tracker.map_line(
-                        parse_codex_line(&line_buf),
+                        parse_codex_line(&String::from_utf8_lossy(&line_buf)),
                         turn_start.elapsed().as_millis() as u64,
                     );
                     line_buf.clear();

@@ -1,4 +1,5 @@
 use lucidos_engine::api::{create_router, SharedEngine};
+use lucidos_engine::engine::thread_lifecycle::ThreadStatus;
 use lucidos_engine::engine::LucidosEngine;
 use lucidos_engine::llm::{build_active_provider, ProviderBuildContext, ProviderBuildOutcome};
 use lucidos_engine::log;
@@ -341,8 +342,17 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // A running engine forks the on-disk binary with this flag to compare build
     // ids, which is the dev "new version available" check. Bare `println!`:
     // machine-read stdout, so no `log!` prefix.
+    //
+    // `--source-state` rides on `--build-id` so a binary that predates it
+    // prints its id and exits, rather than booting an engine on an unknown flag.
     if std::env::args().skip(1).any(|a| a == "--build-id") {
-        println!("{}", lucidos_engine::ENGINE_BUILD_ID);
+        if std::env::args().skip(1).any(|a| a == "--source-state") {
+            let state = build_runtime()?
+                .block_on(lucidos_engine::engine::engine_version::own_source_state());
+            println!("{state}");
+        } else {
+            println!("{}", lucidos_engine::ENGINE_BUILD_ID);
+        }
         return Ok(());
     }
 
@@ -945,6 +955,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     shared_engine.start_parent_callback_listener();
     shared_engine.start_apply_all_driver();
     shared_engine.start_standing_apply_resolver();
+    shared_engine.start_archive_request_resolver();
     // The slot boots empty and the model is installed live once it lands, so
     // boot never waits on a multi-hundred-MB download.
     shared_engine.spawn_embedder_load();
@@ -1032,10 +1043,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // it, because the user's answer is what resumes such a thread. A thread
     // holding an *event wait* needs no exemption: a subscription does not hold
     // a turn, so it is already `idle` here (ADR 0049).
-    if let Err(e) =
-        sqlx::query("UPDATE thread_summaries SET status = 'idle' WHERE status = 'running'")
-            .execute(shared_engine.pool())
-            .await
+    if let Err(e) = sqlx::query(&format!(
+        "UPDATE thread_summaries SET status = {} WHERE status = {}",
+        ThreadStatus::Idle.sql_literal(),
+        ThreadStatus::Running.sql_literal(),
+    ))
+    .execute(shared_engine.pool())
+    .await
     {
         log!("[Startup] Failed to reset orphaned running threads: {}", e);
     }
@@ -1044,12 +1058,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Their sessions are dead after a restart, so there is nothing for the user
     // to act on. Chat threads cannot reach 'waiting', so the
     // `source='claude_code'` scope is defensive.
-    if let Err(e) = sqlx::query(
-        "UPDATE thread_summaries SET status = 'idle', \
-         coding_agent_proposed = FALSE, coding_agent_requires_restart = FALSE, \
-         coding_agent_is_external_repo = FALSE, coding_agent_applying = FALSE \
-         WHERE status = 'waiting' AND coding_agent_proposed = FALSE AND source = 'claude_code'",
-    )
+    if let Err(e) = sqlx::query(&format!(
+        "UPDATE thread_summaries SET status = {}, coding_agent_is_external_repo = FALSE \
+         WHERE status = {} AND coding_agent_proposed = FALSE AND source = 'claude_code'",
+        ThreadStatus::Idle.sql_literal(),
+        ThreadStatus::Waiting.sql_literal(),
+    ))
     .execute(shared_engine.pool())
     .await
     {
@@ -1189,11 +1203,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     shared_engine.start_wait_reentry_consumer();
     shared_engine.start_event_wait_dispatcher();
     shared_engine.start_background_task_reaper();
-    // Before either: close any `await_event` call the legacy attached-wait
-    // shape left unpaired, or the thread 400s on its next turn. Ordered first,
-    // so a wait that is ALSO re-armed below re-enters a thread whose message
-    // array is already valid.
-    shared_engine.settle_legacy_attached_event_waits().await;
     shared_engine.refire_unresolved_wait_reentries().await;
 
     // Settle the background tasks the last engine took down with it. A thread
@@ -1216,8 +1225,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Rebuild the Apply-All batch registry from the durable table and resolve
     // any batch the previous process abandoned mid-flight. Runs AFTER the agent
-    // recovery above, so a member with an auto-resuming session is observed as
-    // running rather than re-driven.
+    // recovery above and BEFORE `resume_pending_switches` below. A resume spawns
+    // asynchronously, so recovery reads the switch-resume queue to see that a
+    // member's conflict resolution is about to resume. After the drain the
+    // queue is empty and recovery would merge that resolution unfinished.
     //
     // Without it the registry comes back empty, no batch matches the eventual
     // terminal event, and the frontend's "Applying changes" toast never clears.
@@ -1232,11 +1243,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     lucidos_engine::engine::memory_consumer::spawn(shared_engine.clone());
 
     // See `engine::worktree_cleanup` module docs.
+    let cleanup_wake = std::sync::Arc::new(tokio::sync::Notify::new());
     lucidos_engine::engine::worktree_cleanup::WorktreeCleanup::spawn(
         shared_engine.pool().clone(),
         std::sync::Arc::new(shared_engine.event_bus.clone()),
         workspace_path.clone(),
         shared_engine.worktree_cleanup_active_threads(),
+        cleanup_wake.clone(),
+    );
+    // Its own task, so a stalled database cannot delay the low-disk alert.
+    lucidos_engine::engine::worktree_cleanup::DiskMonitor::spawn(
+        std::sync::Arc::new(shared_engine.event_bus.clone()),
+        workspace_path.clone(),
+        cleanup_wake,
     );
 
     // The coding-agent spawn dispatcher. ContinuationRequested triggers are
@@ -1265,6 +1284,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // that may have crashed the engine. The returned ids are what
     // `settle_unresumed_switch_threads` must NOT touch, so they are held until
     // that floor runs at the end of boot.
+    //
+    // This drains the queue, so `recover_apply_all_batches` must stay above it.
     let mut resumed_switch_threads: std::collections::HashSet<uuid::Uuid> = shared_engine
         .resume_pending_switches()
         .await

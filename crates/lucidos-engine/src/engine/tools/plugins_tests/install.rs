@@ -402,6 +402,116 @@ fn setup_is_new_skips_unchanged_update_but_spawns_on_change() {
     ));
 }
 
+fn super_slides() -> SeededPlugin {
+    SeededPlugin {
+        id: "super-slides".to_string(),
+        name: "Super Slides".to_string(),
+        version: "0.6.0".to_string(),
+    }
+}
+
+/// The origin a setup seed carries, for one occasion and confirming actor.
+fn setup_seed_origin(
+    occasion: PluginSetupOccasion,
+    actor: Option<&MessageOrigin>,
+) -> Option<MessageOrigin> {
+    match build_setup_thread_request(uuid::Uuid::new_v4(), &super_slides(), occasion, actor) {
+        crate::engine::thread_queue::ThreadQueueRequest::SubThread { origin, .. } => origin,
+        other => panic!("setup thread must be a SubThread, got: {other:?}"),
+    }
+}
+
+/// Every setup occasion seeds a typed engine origin naming the plugin and the
+/// version the popover shows. A seed with no origin reads Origin "Unknown".
+#[test]
+fn every_setup_occasion_seeds_a_typed_engine_origin() {
+    let occasions = [
+        PluginSetupOccasion::FreshInstall,
+        PluginSetupOccasion::Update {
+            from_version: Some("0.5.1".to_string()),
+        },
+        PluginSetupOccasion::Update { from_version: None },
+    ];
+    for occasion in occasions {
+        let origin = setup_seed_origin(occasion.clone(), None);
+        assert_eq!(
+            origin,
+            Some(MessageOrigin::engine(EngineReason::PluginSetup {
+                plugin_id: "super-slides".to_string(),
+                plugin_name: "Super Slides".to_string(),
+                version: "0.6.0".to_string(),
+                occasion,
+                confirmed_on_device_id: None,
+            }))
+        );
+        assert_eq!(
+            origin.as_ref().map(MessageOrigin::mode),
+            Some(crate::engine::thread_events::ActorMode::Engine)
+        );
+    }
+}
+
+/// The confirming device rides beside the engine origin, by id. Any other
+/// caller records nothing there: the popover can only name a device.
+#[test]
+fn the_setup_seed_names_the_confirming_device_and_only_a_device() {
+    let device = MessageOrigin::Device {
+        device_id: "dev-1".to_string(),
+    };
+    let reason_device = |actor| match setup_seed_origin(PluginSetupOccasion::FreshInstall, actor) {
+        Some(MessageOrigin::Engine {
+            reason:
+                EngineReason::PluginSetup {
+                    confirmed_on_device_id,
+                    ..
+                },
+        }) => confirmed_on_device_id,
+        other => panic!("expected a plugin_setup engine origin, got: {other:?}"),
+    };
+    assert_eq!(reason_device(Some(&device)).as_deref(), Some("dev-1"));
+
+    let api = MessageOrigin::Api {
+        user_agent: Some("curl/8".to_string()),
+        mode: crate::engine::thread_events::ActorMode::Human,
+        source_thread_id: None,
+    };
+    assert_eq!(reason_device(Some(&api)), None);
+    assert_eq!(reason_device(None), None);
+}
+
+/// The upstream-patch seed carries a typed engine origin, like the setup seed.
+#[test]
+fn the_upstream_patch_seed_carries_a_typed_engine_origin() {
+    let device = MessageOrigin::Device {
+        device_id: "dev-1".to_string(),
+    };
+    let req = build_upstream_patch_thread_request(
+        uuid::Uuid::new_v4(),
+        &super_slides(),
+        "artifacts/plugin-changes/super-slides/proposed-v0.6.0.patch",
+        Some(&device),
+    );
+    assert!(req.is_attributed());
+    match req {
+        crate::engine::thread_queue::ThreadQueueRequest::SubThread { origin, .. } => {
+            assert_eq!(
+                origin,
+                Some(MessageOrigin::engine(
+                    EngineReason::PluginUpstreamProposal {
+                        plugin_id: "super-slides".to_string(),
+                        plugin_name: "Super Slides".to_string(),
+                        version: "0.6.0".to_string(),
+                        patch_path: "artifacts/plugin-changes/super-slides/proposed-v0.6.0.patch"
+                            .to_string(),
+                        confirmed_on_device_id: Some("dev-1".to_string()),
+                    }
+                ))
+            );
+        }
+        other => panic!("upstream-patch thread must be a SubThread, got: {other:?}"),
+    }
+}
+
 #[test]
 fn setup_thread_request_is_a_subthread_bound_to_the_advertised_id() {
     // Regression: the setup thread must be a SubThread (so the queue's
@@ -411,7 +521,12 @@ fn setup_thread_request_is_a_subthread_bound_to_the_advertised_id() {
     // the thread and paired a Device origin with ActorMode::Agent, panicking
     // make_message_received). The bound id is what the frontend navigates to.
     let tid = uuid::Uuid::new_v4();
-    let req = build_setup_thread_request(tid, "Super Slides", &SetupOccasion::FreshInstall);
+    let req = build_setup_thread_request(
+        tid,
+        &super_slides(),
+        PluginSetupOccasion::FreshInstall,
+        None,
+    );
     match req {
         crate::engine::thread_queue::ThreadQueueRequest::SubThread {
             child_thread_id,
@@ -449,10 +564,11 @@ fn an_update_seeds_a_re_run_rather_than_a_first_install() {
     let tid = uuid::Uuid::new_v4();
     let req = build_setup_thread_request(
         tid,
-        "Super Slides",
-        &SetupOccasion::Update {
-            from: Some("0.5.1".to_string()),
+        &super_slides(),
+        PluginSetupOccasion::Update {
+            from_version: Some("0.5.1".to_string()),
         },
+        None,
     );
     match req {
         crate::engine::thread_queue::ThreadQueueRequest::SubThread {
@@ -464,7 +580,7 @@ fn an_update_seeds_a_re_run_rather_than_a_first_install() {
             ..
         } => {
             assert_eq!(child_thread_id, tid);
-            assert!(pre_emitted_origin.is_none() && origin.is_none());
+            assert!(pre_emitted_origin.is_none() && origin.is_some());
             assert_eq!(title.as_deref(), Some("Update Super Slides setup"));
             assert_eq!(
                 prompt,
@@ -495,8 +611,9 @@ fn both_setup_seeds_route_to_the_plugin_setup_knowhow() {
 
     let seed = |occasion| match build_setup_thread_request(
         uuid::Uuid::new_v4(),
-        "Super Slides",
-        &occasion,
+        &super_slides(),
+        occasion,
+        None,
     ) {
         crate::engine::thread_queue::ThreadQueueRequest::SubThread { prompt, .. } => {
             prompt.to_lowercase()
@@ -533,11 +650,11 @@ fn both_setup_seeds_route_to_the_plugin_setup_knowhow() {
     }
 
     let occasions = [
-        SetupOccasion::FreshInstall,
-        SetupOccasion::Update {
-            from: Some("0.5.1".to_string()),
+        PluginSetupOccasion::FreshInstall,
+        PluginSetupOccasion::Update {
+            from_version: Some("0.5.1".to_string()),
         },
-        SetupOccasion::Update { from: None },
+        PluginSetupOccasion::Update { from_version: None },
     ];
     for occasion in occasions {
         let prompt = seed(occasion);
@@ -547,7 +664,7 @@ fn both_setup_seeds_route_to_the_plugin_setup_knowhow() {
         );
     }
     assert!(
-        seed(SetupOccasion::FreshInstall).contains("newly installed"),
+        seed(PluginSetupOccasion::FreshInstall).contains("newly installed"),
         "the fresh-install seed must keep the phrase the route names"
     );
 
@@ -566,8 +683,12 @@ fn an_update_from_a_versionless_record_still_seeds_a_re_run() {
     // seeded a real update as a first install, and the knowhow then skipped
     // its whole reuse step and re-asked everything.
     let tid = uuid::Uuid::new_v4();
-    let req =
-        build_setup_thread_request(tid, "Super Slides", &SetupOccasion::Update { from: None });
+    let req = build_setup_thread_request(
+        tid,
+        &super_slides(),
+        PluginSetupOccasion::Update { from_version: None },
+        None,
+    );
     match req {
         crate::engine::thread_queue::ThreadQueueRequest::SubThread { title, prompt, .. } => {
             assert_eq!(title.as_deref(), Some("Update Super Slides setup"));

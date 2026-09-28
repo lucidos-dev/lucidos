@@ -6,12 +6,15 @@
 //! directly so we don't sleep on the hour-long real-world cycle.
 
 use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::json;
 use sqlx::PgPool;
+use tokio::sync::Notify;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 use uuid::Uuid;
@@ -22,7 +25,7 @@ use crate::engine::git_ops::{git_cmd, worktrees_dir};
 use crate::engine::thread_events::ThreadEvent;
 use crate::scheduler::notifications::{NavigateTarget, Tap};
 
-use super::{ActiveThreads, WorktreeCleanup};
+use super::{ActiveThreads, DiskMonitor, FreeDiskProbe, WorktreeCleanup};
 
 /// Captured at construction — matches what production sees in one pass.
 struct StaticActiveThreads(HashSet<Uuid>);
@@ -40,6 +43,21 @@ pub(crate) fn no_active_threads() -> Arc<dyn ActiveThreads> {
 
 pub(crate) fn active_threads(ids: &[Uuid]) -> Arc<dyn ActiveThreads> {
     Arc::new(StaticActiveThreads(ids.iter().copied().collect()))
+}
+
+/// Idle at the cycle's first liveness check, live at every later one: a
+/// session that started while the cycle waited on the database.
+struct LiveAfterFirstCheck(AtomicUsize);
+
+#[async_trait::async_trait]
+impl ActiveThreads for LiveAfterFirstCheck {
+    async fn is_active(&self, _thread_id: Uuid) -> bool {
+        self.0.fetch_add(1, Ordering::SeqCst) > 0
+    }
+}
+
+pub(crate) fn live_after_first_check() -> Arc<dyn ActiveThreads> {
+    Arc::new(LiveAfterFirstCheck(AtomicUsize::new(0)))
 }
 
 /// Build a minimal workspace + repo on disk: a tempdir, an initialized git
@@ -230,6 +248,30 @@ pub(crate) async fn insert_change(
     .expect("insert change row");
 }
 
+/// Insert a `pending` change owned by `thread_id`, which is what
+/// `pending_for_thread` reads.
+pub(crate) async fn insert_pending_change_for_thread(
+    pool: &PgPool,
+    thread_id: Uuid,
+    repo_root: &Path,
+) {
+    let change_id = Uuid::new_v4();
+    insert_change(
+        pool,
+        change_id,
+        "test/pending",
+        repo_root,
+        ChangeStatus::Pending,
+    )
+    .await;
+    sqlx::query("UPDATE changes SET thread_id = $2 WHERE id = $1")
+        .bind(change_id)
+        .bind(thread_id)
+        .execute(pool)
+        .await
+        .expect("tie change to thread");
+}
+
 /// Insert a thread_summaries row matching the deterministic id, optionally
 /// saved. Archive state defaults to `'inbox'` (a non-archived thread the user
 /// might still return to).
@@ -366,7 +408,7 @@ pub(crate) fn make_worker_with_active(
     WorktreeCleanup {
         pool,
         bus,
-        workspace_root: workspace,
+        workspace_root: workspace.clone(),
         interval: Duration::from_secs(60),
         free_soft_bytes: 0,
         free_hard_bytes: 0,
@@ -376,13 +418,77 @@ pub(crate) fn make_worker_with_active(
         // rely on backdated events (the Some-arm stranded path).
         stranded_grace: super::STRANDED_GRACE,
         temp_worktree_grace: super::TEMP_WORKTREE_GRACE,
-        // Default to the production threshold; tests that exercise the
-        // small-vs-large branching override this.
-        large_footprint_bytes: super::LARGE_FOOTPRINT_BYTES,
-        alerts: Mutex::new(super::AlertState::default()),
+        free_disk: super::os_free_disk_probe(workspace.clone()),
         changes,
         active_threads,
+        cleanup_wake: Arc::new(Notify::new()),
     }
+}
+
+pub(crate) const GB: u64 = 1024 * 1024 * 1024;
+
+/// A free-disk probe the test sets between reads. `None` is a failed probe.
+pub(crate) fn settable_probe(initial: Option<u64>) -> (FreeDiskProbe, Arc<Mutex<Option<u64>>>) {
+    let reading = Arc::new(Mutex::new(initial));
+    let probe_reading = reading.clone();
+    let probe: FreeDiskProbe = Arc::new(move || *probe_reading.lock().unwrap());
+    (probe, reading)
+}
+
+/// A free-disk probe that returns `readings` in order, then repeats the last
+/// one. Models free space that changes between two reads of one check.
+pub(crate) fn scripted_probe(readings: &[u64]) -> FreeDiskProbe {
+    let queue = Mutex::new(readings.iter().copied().collect::<VecDeque<u64>>());
+    Arc::new(move || {
+        let mut queue = queue.lock().unwrap();
+        if queue.len() > 1 {
+            queue.pop_front()
+        } else {
+            queue.front().copied()
+        }
+    })
+}
+
+/// A disk monitor with production thresholds and the given probe.
+pub(crate) fn make_monitor(
+    bus: Arc<EventBus>,
+    workspace: PathBuf,
+    probe: FreeDiskProbe,
+) -> DiskMonitor {
+    let mut monitor = DiskMonitor::new(bus, workspace, Arc::new(Notify::new()));
+    monitor.free_disk = probe;
+    monitor
+}
+
+/// Whether `wake` holds a wake-up. `notify_one` with no waiter stores one
+/// permit, so this also consumes it.
+pub(crate) async fn was_woken(wake: &Notify) -> bool {
+    tokio::time::timeout(Duration::from_millis(10), wake.notified())
+        .await
+        .is_ok()
+}
+
+/// A pool whose server accepts TCP connections and never answers: a stand-in
+/// for a Postgres hung on a full disk. The acquire timeout matches the
+/// engine's, so a query waits far longer than any test runs. The listener task
+/// holds every socket open until the runtime shuts down.
+pub(crate) async fn unresponsive_pool() -> PgPool {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind unresponsive listener");
+    let port = listener.local_addr().expect("listener addr").port();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((socket, _)) = listener.accept().await {
+            held.push(socket);
+        }
+    });
+    sqlx::postgres::PgPoolOptions::new()
+        .acquire_timeout(Duration::from_secs(60))
+        .connect_lazy(&format!(
+            "postgres://lucidos:lucidos@127.0.0.1:{port}/stalled"
+        ))
+        .expect("lazy pool")
 }
 
 /// Drain a pre-existing receiver for WorktreeCleaned events until `deadline`.

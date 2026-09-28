@@ -83,10 +83,19 @@ impl LucidosEngine {
             crate::core::response_style::validate_document(value)?;
         }
 
-        // The proxy reads this on every call and fails loudly on a bad value,
-        // so a bad write would break every proxied call. Refused here, where
-        // `PUT /api/v1/preferences` also arrives, not only in the tool.
-        if key == crate::core::PREF_PROXY_TIMEOUT_SECS {
+        // Any app can write the style remote, so part tokens in it pass the
+        // part grammar here, where every writer arrives (ADR 0307).
+        if key == crate::core::themes::STYLE_OVERRIDES_KEY {
+            crate::core::themes::validate_style_overrides(value)?;
+        }
+
+        // Keys whose catalog check every writer must pass, here where
+        // `PUT /api/v1/preferences` also arrives, not only in the tool:
+        // - the proxy reads its timeout on every call and fails loudly on a bad
+        //   value, so a bad write would break every proxied call;
+        // - `theme` named the light/dark mode before the rename, so an older
+        //   app still sends `theme=dark`, refused with the key it meant.
+        if key == crate::core::PREF_PROXY_TIMEOUT_SECS || key == crate::core::themes::THEME_KEY {
             if let Some(spec) = preference_catalog::lookup(key) {
                 preference_catalog::validate(spec, value)?;
             }

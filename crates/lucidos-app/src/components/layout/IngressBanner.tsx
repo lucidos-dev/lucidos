@@ -9,6 +9,7 @@ import { useCoarseClock } from '../../hooks/useCoarseClock';
 import { webhookIngressNotice } from '../../utils/webhookIngressNotice';
 import { viewportIsMobile } from '../../utils/viewport';
 import { bannerBelongsToLayout, useBannerHeightVar, type BannerLayout } from './appBanner';
+import { SurfaceToneIcon } from '../shared/Surface';
 
 /** The CSS custom property this banner publishes its measured height into. Its
  *  own, not any neighbour's: every bar can be up at once, and
@@ -64,13 +65,14 @@ export function ingressBannerBody(props: {
   const discussHandlers = composeHandlers(props.onDiscuss, () => {});
   return (
     <div ref={props.elRef} class="ingress-banner" data-layout={props.layout} role="status">
+      <SurfaceToneIcon tone="error" />
       <span class="ingress-banner-text">
         <b>{notice.title}</b>{' '}{notice.detail}
       </span>
-      <button class="action-btn" {...discussHandlers}>
+      <button class="action-btn action-btn-secondary" {...discussHandlers}>
         Discuss
       </button>
-      <button class="action-btn" onClick={props.onOpenWebhooks}>
+      <button class="action-btn action-btn-secondary" onClick={props.onOpenWebhooks}>
         Open Webhooks
       </button>
     </div>

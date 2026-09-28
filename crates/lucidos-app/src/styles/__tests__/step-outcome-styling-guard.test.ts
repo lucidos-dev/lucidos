@@ -2,8 +2,8 @@
  * Every step outcome is drawn, in both places a step is drawn.
  *
  * `StepOutcome` doubles as the CSS class name on the transcript row
- * (`.inline-step.<outcome>`) and on the detail modal's status word
- * (`.step-detail-status.<outcome>`). `stepStatus` returns `className:
+ * (`.inline-step.<outcome>`) and on the detail modal's head icon
+ * (`.step-detail-icon.<outcome>`). `stepStatus` returns `className:
  * StepOutcome`, so `tsc` catches an outcome the LABEL forgot. Nothing else in
  * the gate catches an outcome the STYLESHEET forgot: `tsc` does not read CSS,
  * and `vite build` fails only on a syntax error. The row then draws its mark in
@@ -46,8 +46,8 @@ describe('step outcome styling', () => {
     expect(steps).toContain(`.inline-step.${outcome} .step-icon`);
   });
 
-  it.each(ALL)('%s tints the step detail status word', (outcome) => {
-    expect(steps).toContain(`.step-detail-status.${outcome}`);
+  it.each(ALL)('%s tints the step detail head icon', (outcome) => {
+    expect(steps).toContain(`.step-detail-icon.${outcome}`);
   });
 
   it('the running row is deliberately unmarked, and says so', () => {

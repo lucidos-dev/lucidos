@@ -41,7 +41,7 @@ pub enum SystemEvent {
         #[serde(default)]
         tap: Tap,
         /// Who emitted the notification. Set by HTTP handlers via
-        /// `user_actor_resolved`; engine-internal sources (LLM tool, scheduler,
+        /// `user_actor`; engine-internal sources (LLM tool, scheduler,
         /// worktree cleanup, backup) pass `None`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
@@ -97,6 +97,7 @@ pub enum SystemEvent {
         applied: Vec<crate::core::changes::Change>,
         total_pending: usize,
         restart_required: bool,
+        apply_estimates: crate::engine::apply_estimate::ApplyEstimates,
     },
     BackupProgress {
         phase: String,
@@ -178,6 +179,20 @@ pub enum SystemEvent {
     RecoveryProgress {
         completed: usize,
         total: usize,
+    },
+    /// The user corrected a long-term memory. The only durable record of the
+    /// correction: every memory rebuild replays these, so a wrong fact the
+    /// extractor finds again in its source events is removed again.
+    MemoryCorrected {
+        search_query: String,
+        wrong_fact: String,
+        removed: Vec<crate::memory::CorrectedMemory>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correction: Option<String>,
+        /// The engine's clock at the correction. It stamps
+        /// `memory_entries.created_at` too, so a replay can tell a row that
+        /// came back from one that was already there.
+        recorded_at: chrono::DateTime<chrono::Utc>,
     },
     Toast {
         message: String,
@@ -274,12 +289,11 @@ pub enum SystemEvent {
         depth: u32,
         #[serde(skip_serializing)]
         transient: bool,
-        /// Who emitted the domain event. Stamped by the HTTP handler via
-        /// `user_actor_resolved` so the UI can attribute the event to the
-        /// originating device/workspace; engine-internal sources (LLM tool,
-        /// scheduler) pass `None`. Merged into the wire payload by
-        /// `to_payload` and `to_sse_json` so persisted rows and SSE frames
-        /// carry the same `actor` key as every other actor-bearing event.
+        /// Who emitted the domain event, as the engine established it. Every
+        /// live emit names one, through `LucidosEngine::emit_domain_event`.
+        /// `None` is left to the backfill replay of a row the engine wrote.
+        /// `to_payload` merges it into the wire payload and drops any `actor`
+        /// the caller wrote there.
         #[serde(skip_serializing)]
         actor: Option<MessageOrigin>,
     },
@@ -428,6 +442,14 @@ pub enum SystemEvent {
     /// informational — the handler is idempotent, so no page-side freshness gate.
     EngineBuildStateChanged {
         state: String,
+        sent_at_ms: i64,
+    },
+    /// This engine's served-frontend refresh after a frontend-only Apply
+    /// started or ended (`engine::frontend_refresh`). A pure UI POKE, like
+    /// `EngineBuildStateChanged`: the client re-reads version-status, whose
+    /// `frontend_refresh_elapsed_ms` is the truth. Transient and dev-only by
+    /// construction (`refresh_served_frontend_after_rebuild` no-ops packaged).
+    FrontendRefreshStateChanged {
         sent_at_ms: i64,
     },
     ArtifactCreated {
@@ -1136,8 +1158,8 @@ pub enum SystemEvent {
         /// Engine-assigned batch identifier — used as `aggregate_id` so the
         /// projection groups all events for one batch together.
         batch_id: Uuid,
-        /// Change IDs to apply, in pending-list order. The driver picks
-        /// `next_pending` from this list.
+        /// Change IDs to apply, in pending-list order. The driver starts
+        /// members in this order.
         change_ids: Vec<Uuid>,
         /// Who clicked Apply All. Stamps each per-change `apply_change` the
         /// driver makes so the resulting `ChangeApplied` chip reads as the
@@ -1497,6 +1519,7 @@ impl SystemEvent {
         "BackupKeyRevealed",
         "ProxyConfigRejected",
         "ThreadsDeleted",
+        "MemoryCorrected",
     ];
 
     /// Whether this event writes a row to the `events` table.
@@ -1537,6 +1560,7 @@ impl SystemEvent {
             Self::ProxyConfigRejected { .. } => "ProxyConfigRejected",
             Self::ThreadsDeleted { .. } => "ThreadsDeleted",
             Self::RecoveryProgress { .. } => "RecoveryProgress",
+            Self::MemoryCorrected { .. } => "MemoryCorrected",
             Self::Toast { .. } => "Toast",
             Self::ArtifactImported { .. } => "ArtifactImported",
             Self::TriggerCreated { .. } => "TriggerCreated",
@@ -1559,6 +1583,7 @@ impl SystemEvent {
             Self::FrontendPreviewStarted { .. } => "FrontendPreviewStarted",
             Self::FrontendPreviewStopped { .. } => "FrontendPreviewStopped",
             Self::EngineBuildStateChanged { .. } => "EngineBuildStateChanged",
+            Self::FrontendRefreshStateChanged { .. } => "FrontendRefreshStateChanged",
             Self::DomainEvent { .. } => "DomainEvent",
             Self::ArtifactCreated { .. } => "ArtifactCreated",
             Self::ArtifactUpdated { .. } => "ArtifactUpdated",
@@ -1678,6 +1703,7 @@ impl SystemEvent {
         "ProxyConfigRejected",
         "ThreadsDeleted",
         "RecoveryProgress",
+        "MemoryCorrected",
         "Toast",
         "ArtifactImported",
         "TriggerCreated",
@@ -1700,6 +1726,7 @@ impl SystemEvent {
         "FrontendPreviewStarted",
         "FrontendPreviewStopped",
         "EngineBuildStateChanged",
+        "FrontendRefreshStateChanged",
         "DomainEvent",
         "ArtifactCreated",
         "ArtifactUpdated",
@@ -1845,6 +1872,7 @@ impl SystemEvent {
             | Self::PluginCatalogScanStarted {}
             | Self::PluginCatalogScanned { .. } => "plugin_marketplace",
             Self::ThreadComposeChanged { .. } => "thread",
+            Self::MemoryCorrected { .. } => "memory",
             Self::PinnedAppPinned { .. } | Self::PinnedAppUnpinned { .. } => "pinned_app",
             Self::DeviceRegistered { .. }
             | Self::DeviceRenamed { .. }
@@ -1897,7 +1925,8 @@ impl SystemEvent {
             | Self::ServedFrontendAdvanced { .. }
             | Self::FrontendPreviewStarted { .. }
             | Self::FrontendPreviewStopped { .. }
-            | Self::EngineBuildStateChanged { .. } => "engine",
+            | Self::EngineBuildStateChanged { .. }
+            | Self::FrontendRefreshStateChanged { .. } => "engine",
             Self::EmailSent { .. } => "email",
             Self::ProxyModulesReloaded { .. } => "proxy_modules",
             Self::HandshakeScriptApproved { .. }
@@ -2052,7 +2081,7 @@ impl SystemEvent {
             | Self::TriggerGroupDeleted { payload, actor, .. } => {
                 merge_actor(payload.clone(), actor)
             }
-            Self::DomainEvent { payload, actor, .. } => merge_actor(payload.clone(), actor),
+            Self::DomainEvent { payload, actor, .. } => domain_payload(payload.clone(), actor),
             // This value is bound straight into the `events` INSERT, so a
             // silent `Null` here persists an event with no content: no
             // projection, no SSE detail, no trigger match, and nothing in the
@@ -2073,6 +2102,30 @@ impl SystemEvent {
     }
 }
 
+impl SystemEvent {
+    /// The payload key holding who emitted an event. A domain event's payload
+    /// is written by its caller, so this key is the one field in it the engine
+    /// owns.
+    pub(crate) const ACTOR_KEY: &'static str = "actor";
+}
+
+/// A domain event's wire payload: the caller's fields, and the engine's actor.
+///
+/// **A caller's own `actor` never survives, even when the engine names none.**
+/// Trigger conditions and the event-wait loop cap read `actor` straight out of
+/// this payload, so a caller-written one would pass as the engine's word. An
+/// agent could then fire an `actor.kind = device` trigger as if a person had
+/// tapped. See ADR 0150's amendment.
+fn domain_payload(
+    mut payload: serde_json::Value,
+    actor: &Option<MessageOrigin>,
+) -> serde_json::Value {
+    if let Some(obj) = payload.as_object_mut() {
+        obj.remove(SystemEvent::ACTOR_KEY);
+    }
+    merge_actor(payload, actor)
+}
+
 /// Inject an `actor` key into the payload object when an actor is present.
 /// No-op for non-object payloads (domain events with primitive/array payloads)
 /// since `actor` is conventionally a top-level object field; callers that need
@@ -2083,7 +2136,7 @@ fn merge_actor(mut payload: serde_json::Value, actor: &Option<MessageOrigin>) ->
     if let Some(a) = actor {
         if let Some(obj) = payload.as_object_mut() {
             obj.insert(
-                "actor".to_string(),
+                SystemEvent::ACTOR_KEY.to_string(),
                 serde_json::to_value(a).unwrap_or(serde_json::Value::Null),
             );
         } else {

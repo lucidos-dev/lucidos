@@ -18,10 +18,11 @@ import { SlownessBanner } from './SlownessBanner';
 import { SwipeTouch } from '../../utils/swipe';
 import { HamburgerButton, ContentBackButton, ContentForwardButton } from './ContentNav';
 import { ContentHeaderActions } from './ContentHeaderActions';
+import { ContentRefreshButton } from './RefreshIndicator';
 import { ThreadHeaderActions } from './ThreadHeaderActions';
 import { BrandMenuButton } from './HeaderMark';
 import { WorkspaceNameLabel } from './WorkspaceNameLabel';
-import { getContentTitle, getContentTitleShort, getDiffDescription, useContentTitleArrival } from './headerHelpers';
+import { getContentTitle, getContentTitleShort, getDiffDescription } from './headerHelpers';
 import { headerDblClickRegion, resolveHeaderDblClick } from './headerDblClick';
 import { createDblClickGate } from '../../utils/dblClickGate';
 import { useThreadsHeaderState } from '../../hooks/useThreadsHeaderState';
@@ -222,7 +223,6 @@ export function AppHeader() {
   const headerTitleFull = getContentTitle();
   const diffDesc = getDiffDescription();
   const showContentTitle = !!headerTitle;
-  const { titleKey, titleFade } = useContentTitleArrival();
 
   const startEditingUrl = useCallback(() => {
     if (!showUrlPreview || !url) return;
@@ -322,6 +322,7 @@ export function AppHeader() {
               focus — see ThreadsHeader. */}
           <div class="content-header-elements" onClick={() => focusPane('content')}>
             <HamburgerButton />
+            <ContentRefreshButton />
             {/* Same arrangement as the thread pane one row over, and as both
                 mobile headers: the chevrons bracket the title rather than
                 sitting in the leading cluster, so history reads as belonging to
@@ -348,15 +349,14 @@ export function AppHeader() {
                   />
                 ) : showUrlPreview ? (
                   <span
-                    key={titleKey}
-                    class={`panel-url-title${titleFade}`}
+                    class="panel-url-title"
                     onClick={startEditingUrl}
                     data-tooltip={url!}
                   >
                     {headerTitle}
                   </span>
                 ) : (
-                  <span key={titleKey} class={`pane-header-title-text${titleFade}`} data-tooltip={diffDesc || headerTitleFull} data-tooltip-tap>{headerTitle}</span>
+                  <span class="pane-header-title-text" data-tooltip={diffDesc || headerTitleFull} data-tooltip-tap>{headerTitle}</span>
                 )
               )}
               <ContentForwardButton />

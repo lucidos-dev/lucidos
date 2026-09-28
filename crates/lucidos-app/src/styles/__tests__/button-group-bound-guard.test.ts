@@ -31,6 +31,7 @@ import { block, decl } from './css-rule-helpers';
 const here: string = dirname(fileURLToPath(import.meta.url));
 const sharedCss = readFileSync(resolve(here, '../global/shared-components.css'), 'utf-8');
 const componentsCss = readFileSync(resolve(here, '../components.css'), 'utf-8');
+const surfaceCss = readFileSync(resolve(here, '../global/surface.css'), 'utf-8');
 const toastTsx = readFileSync(resolve(here, '../../components/shared/Toast.tsx'), 'utf-8');
 const confirmTsx = readFileSync(resolve(here, '../../components/shared/ConfirmDialog.tsx'), 'utf-8');
 
@@ -82,25 +83,21 @@ describe('.button-group keeps a row of buttons inside its container', () => {
     }
   });
 
-  // The dialog rows carry the same long label the toast does, inside a box that
-  // is 90% of the viewport: `Switch to new version` is the OK of the new-version
-  // confirm (ADR 0229). They do NOT wear `.button-group`, deliberately. Four
-  // dialogs share these two classes and only one of them was converted, so
-  // moving layout onto the primitive would strip the other three. Both rows are
-  // checked, since either can be the one that runs out of width.
-  it('bounds the shared dialog action rows, which do not wear the primitive', () => {
+  // A dialog's buttons carry the same long label the toast does, inside a box
+  // that is 90% of the viewport: `Switch to new version` is the OK of the
+  // new-version confirm (ADR 0229). Every surface lays its buttons out in
+  // `.surface-foot`, so that one row is the one that must wrap.
+  it('bounds the surface foot, where every dialog lays out its buttons', () => {
     expect(
       confirmTsx,
       'ConfirmDialog is the surface that grew the long label',
-    ).toContain('class="confirm-actions"');
-    for (const row of ['confirm-actions', 'confirm-actions-right']) {
-      const rule = block(componentsCss, `.${row} {`);
-      expect(decl(rule, 'display')).toBe('flex');
-      expect(
-        decl(rule, 'flex-wrap'),
-        `without flex-wrap .${row} overflows the dialog instead of stacking`,
-      ).toBe('wrap');
-      expect(decl(rule, 'justify-content')).toBe('flex-end');
-    }
+    ).toContain('class="surface-foot"');
+    const rule = block(surfaceCss, '.surface-foot {');
+    expect(decl(rule, 'display')).toBe('flex');
+    expect(
+      decl(rule, 'flex-wrap'),
+      'without flex-wrap .surface-foot overflows the dialog instead of stacking',
+    ).toBe('wrap');
+    expect(decl(rule, 'justify-content')).toBe('flex-end');
   });
 });

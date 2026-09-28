@@ -58,7 +58,6 @@ function makeThread(id: string, opts: ThreadOpts = {}): ThreadState {
         codingAgentProposed: opts.codingAgentProposed ?? false,
         codingAgentRequiresRestart: false,
         codingAgentIsExternalRepo: false,
-        codingAgentApplying: false,
         lastRevivedAt: '',
         parentThreadId: opts.parentId,
         state: 'active',

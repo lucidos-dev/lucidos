@@ -3253,7 +3253,6 @@ mod tests {
             "MessageReceived",
             &MessageOrigin::Device {
                 device_id: "d1".into(),
-                label: "Phone".into(),
             },
         )
         .await;
@@ -3438,7 +3437,6 @@ mod tests {
             "MessageReceived",
             &MessageOrigin::Device {
                 device_id: "d".into(),
-                label: "Mac".into(),
             },
         )
         .await;

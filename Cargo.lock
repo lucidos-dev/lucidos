@@ -3658,6 +3658,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "imagesize"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "edcd27d72f2f071c64249075f42e205ff93c9a4c5f6c6da53e79ed9f9832c285"
+
+[[package]]
 name = "imap-proto"
 version = "0.16.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4258,6 +4264,7 @@ dependencies = [
  "axum",
  "clap",
  "dirs",
+ "imagesize",
  "libc",
  "lucidos-build-slot",
  "lucidos-local-token",
@@ -4320,6 +4327,7 @@ dependencies = [
  "kamadak-exif",
  "lettre",
  "libc",
+ "lucidos-build-slot",
  "lucidos-file-backup-exclusion",
  "lucidos-frame-capability",
  "lucidos-local-token",
@@ -4407,6 +4415,7 @@ dependencies = [
  "axum-server",
  "chrono",
  "dotenvy",
+ "fs2",
  "futures",
  "hyper",
  "hyper-util",
@@ -4429,6 +4438,7 @@ dependencies = [
  "toml 0.8.23",
  "tower",
  "tower-http",
+ "urlencoding",
 ]
 
 [[package]]

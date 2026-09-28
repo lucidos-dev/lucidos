@@ -150,6 +150,49 @@ fn register_host_imports_succeeds() {
     register_host_imports(&mut linker).unwrap();
 }
 
+/// A signer calling `log` in a tight loop with a line as big as its whole
+/// memory. The host must stop reading and printing once the budget is spent.
+#[test]
+fn a_signer_logging_in_a_tight_loop_is_held_to_the_log_budget() {
+    const LOOPING_LOG_WAT: &str = r#"
+        (module
+          (import "env" "log" (func $log (param i32 i32)))
+          (memory (export "memory") 1)
+          (func (export "run")
+            (local $i i32)
+            (loop $again
+              (call $log (i32.const 0) (i32.const 65536))
+              (local.set $i (i32.add (local.get $i) (i32.const 1)))
+              (br_if $again (i32.lt_u (local.get $i) (i32.const 10000))))))
+    "#;
+    let engine = Engine::default();
+    let module = Module::new(&engine, wat::parse_str(LOOPING_LOG_WAT).unwrap()).unwrap();
+    let mut linker: wasmtime::Linker<HostState> = wasmtime::Linker::new(&engine);
+    register_host_imports(&mut linker).unwrap();
+    let state = HostState {
+        secrets: vec![],
+        module_name: "looping-logger".into(),
+        log_redactions: vec![],
+        limits: SignerLimits::new(),
+        log_budget: LogBudget::default(),
+    };
+    let mut store = wasmtime::Store::new(&engine, state);
+    let instance = linker.instantiate(&mut store, &module).unwrap();
+    let run = instance
+        .get_typed_func::<(), ()>(&mut store, "run")
+        .unwrap();
+    run.call(&mut store, ()).unwrap();
+
+    let budget = &store.data().log_budget;
+    assert!(budget.is_exhausted());
+    assert!(budget.lines_printed() <= LOG_LINES_PER_INVOCATION);
+    assert!(
+        budget.bytes_read() <= LOG_BYTES_PER_INVOCATION,
+        "host read {} bytes of module memory for logging",
+        budget.bytes_read()
+    );
+}
+
 // ── proxy::tests::reload_picks_up_freshly_added_wasm_files ─────────────
 
 #[tokio::test]
@@ -334,6 +377,18 @@ const TWO_TABLES_WAT: &str = r#"
     (i64.const 0)))
 "#;
 
+/// Returns an out-of-bounds `SignOutput` slice: the packed result decodes to
+/// `out_ptr = 0`, `out_len = 0xFFFF_FFFF`. This is exactly what a signer that
+/// signals an error the C way (`return -1`) produces, and it names ~4 GiB of a
+/// 16 MiB memory. The host must reject the slice before allocating. Otherwise it
+/// zeroes a 4 GiB buffer and OOM-aborts the whole engine from inside the sandbox.
+const OOB_OUTPUT_SLICE_WAT: &str = r#"
+(module
+  (memory (export "memory") 1)
+  (func (export "sign") (param i32 i32) (result i64)
+    (i64.const 4294967295)))
+"#;
+
 /// Scans its own input for a `~` (byte 0x7E) and reports whether it found one,
 /// via `x-saw: yes` or `x-saw: no`.
 ///
@@ -442,6 +497,154 @@ async fn wasm_signer_layer_kills_a_runaway_looping_signer() {
     );
 }
 
+/// How long an unrelated task may wait for a thread while signers loop.
+/// Five epoch ticks, far under the loopers' budget.
+const RESPONSIVE_WITHIN: Duration = Duration::from_millis(500);
+
+/// Spawn a 10 ms sleep that reports how long it took from spawn to wake-up.
+/// Spawn it BEFORE the loopers, so it competes with them for a thread.
+fn spawn_probe() -> tokio::task::JoinHandle<Duration> {
+    let spawned = std::time::Instant::now();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        spawned.elapsed()
+    })
+}
+
+async fn probe_latency(probe: tokio::task::JoinHandle<Duration>) -> Duration {
+    tokio::time::timeout(Duration::from_secs(20), probe)
+        .await
+        .expect("the probe must finish once the loopers end")
+        .expect("the probe task must not panic")
+}
+
+/// What one `apply` returned, and how long it took.
+type TimedApply = (
+    Result<AuthMutation, (axum::http::StatusCode, String)>,
+    Duration,
+);
+
+/// Run `apply` for `layer` on its own task, reporting the result and its time.
+fn spawn_apply(layer: Arc<WasmSignerLayer>) -> tokio::task::JoinHandle<TimedApply> {
+    tokio::spawn(async move {
+        let body = bytes::Bytes::new();
+        let prior = HashMap::new();
+        let started = std::time::Instant::now();
+        let result = layer.apply(&make_layer_input(&body, &prior)).await;
+        (result, started.elapsed())
+    })
+}
+
+/// A looping signer gives its thread back while it runs. On a runtime with
+/// ONE thread, an unrelated task still runs, and a caller's own timeout still
+/// fires, long before the signer's budget.
+#[tokio::test(flavor = "current_thread")]
+async fn a_looping_signer_yields_its_thread() {
+    let engine = Arc::new(build_wasmtime_engine().unwrap());
+    let budget = Duration::from_secs(3);
+    // One slot for the looper and one for the timed call. The timeout then
+    // cuts the wasm itself, and no parallel test waits on the global cap.
+    let slots = Arc::new(tokio::sync::Semaphore::new(2));
+    let layer = Arc::new(
+        signer_layer("runaway", LOOP_FOREVER_WAT, &engine)
+            .with_budget(budget)
+            .with_slots(slots),
+    );
+
+    let probe = spawn_probe();
+    let looper = spawn_apply(layer.clone());
+
+    let probe_took = probe_latency(probe).await;
+    assert!(
+        probe_took < RESPONSIVE_WITHIN,
+        "a looping signer held the only thread; the probe waited {probe_took:?}"
+    );
+
+    let body = bytes::Bytes::new();
+    let prior = HashMap::new();
+    let started = std::time::Instant::now();
+    let cut_short = tokio::time::timeout(
+        Duration::from_millis(300),
+        layer.apply(&make_layer_input(&body, &prior)),
+    )
+    .await;
+    let cut_after = started.elapsed();
+    assert!(cut_short.is_err(), "the caller's timeout must end the call");
+    assert!(
+        cut_after < Duration::from_secs(1),
+        "the caller's 300 ms timeout fired only after {cut_after:?}"
+    );
+
+    let (result, took) = looper.await.expect("the looper task must not panic");
+    let err = result.expect_err("a looping signer must be refused");
+    assert_eq!(err.0, axum::http::StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        err.1,
+        "signer runaway exceeded its execution budget during sign and was terminated"
+    );
+    assert!(
+        took < budget + Duration::from_secs(1),
+        "the budget must still end the call; took {took:?}"
+    );
+}
+
+/// More looping signers than worker threads leave the runtime responsive. The
+/// cap lets one run, and the rest are refused with a fixed 503 long before the
+/// budget. One slot is what production sizing gives two workers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn looping_signers_cannot_take_every_worker() {
+    let engine = Arc::new(build_wasmtime_engine().unwrap());
+    let budget = Duration::from_secs(3);
+    let slots = Arc::new(tokio::sync::Semaphore::new(1));
+
+    let probe = spawn_probe();
+    let loopers: Vec<_> = (0..6)
+        .map(|_| {
+            spawn_apply(Arc::new(
+                signer_layer("runaway", LOOP_FOREVER_WAT, &engine)
+                    .with_budget(budget)
+                    .with_slots(slots.clone()),
+            ))
+        })
+        .collect();
+
+    let probe_took = probe_latency(probe).await;
+    assert!(
+        probe_took < RESPONSIVE_WITHIN,
+        "looping signers held every worker; the probe waited {probe_took:?}"
+    );
+
+    let mut terminated = 0;
+    let mut refused = 0;
+    for looper in loopers {
+        let (result, took) = looper.await.expect("a looper task must not panic");
+        let (status, body) = result.expect_err("a looping signer must be refused");
+        match status {
+            axum::http::StatusCode::BAD_GATEWAY => {
+                assert_eq!(
+                    body,
+                    "signer runaway exceeded its execution budget during sign and was terminated"
+                );
+                assert!(took < budget + Duration::from_secs(1), "took {took:?}");
+                terminated += 1;
+            }
+            axum::http::StatusCode::SERVICE_UNAVAILABLE => {
+                assert_eq!(
+                    body,
+                    "signer runaway was refused: too many signer calls are already running"
+                );
+                assert!(
+                    took < budget,
+                    "a refusal must not wait out the budget; took {took:?}"
+                );
+                refused += 1;
+            }
+            other => panic!("unexpected status {other}: {body}"),
+        }
+    }
+    assert_eq!((terminated, refused), (1, 5));
+}
+
 /// A module declaring an oversized initial memory is refused at instantiation.
 /// The 502 names the signer and the limit, and the engine keeps working.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -506,7 +709,7 @@ async fn wasm_signer_layer_kills_a_memory_growing_signer() {
 
 /// An object-count cap reads like every other sandbox refusal: a 502 naming the
 /// signer, and an engine that keeps serving. wasmtime states this limit in its
-/// own words, so the message is asserted loosely rather than on its exact text.
+/// own words, which go to the engine log, so the body names only the stage.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wasm_signer_layer_rejects_a_module_declaring_two_tables() {
     let engine = Arc::new(build_wasmtime_engine().unwrap());
@@ -522,12 +725,163 @@ async fn wasm_signer_layer_rejects_a_module_declaring_two_tables() {
 
     assert_eq!(err.0, axum::http::StatusCode::BAD_GATEWAY);
     assert!(
-        err.1.contains("table-splitter") && err.1.contains("limit"),
-        "error must name the signer and a limit; got: {}",
+        err.1.contains("table-splitter") && err.1.contains("instantiate failed"),
+        "error must name the signer and the stage; got: {}",
         err.1
     );
 
     assert_engine_still_serves(&engine).await;
+}
+
+/// A signer that returns an out-of-bounds `SignOutput` slice (the C-style
+/// `return -1`, packing `out_len = 0xFFFF_FFFF`) must be refused with a 502 that
+/// names the out-of-bounds slice. The engine must keep serving. The failure this
+/// guards is a ~4 GiB host allocation, driven from inside the sandbox: an OOM
+/// abort of the whole engine, which is what the sandbox exists to prevent.
+///
+/// The proof is the assertion on that specific 502: only the bounds-check branch
+/// produces it. A regressed check would allocate synchronously inside one poll
+/// and OOM-abort the process, so the outer `timeout` guards only a hang, not
+/// that abort.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wasm_signer_layer_rejects_an_out_of_bounds_output_slice() {
+    let engine = Arc::new(build_wasmtime_engine().unwrap());
+    let layer = signer_layer("oob-output", OOB_OUTPUT_SLICE_WAT, &engine);
+
+    let body = bytes::Bytes::new();
+    let prior = HashMap::new();
+    let input = make_layer_input(&body, &prior);
+    let err = tokio::time::timeout(std::time::Duration::from_secs(10), layer.apply(&input))
+        .await
+        .expect("apply must return, never OOM-abort the host")
+        .expect_err("an out-of-bounds SignOutput slice must be refused");
+
+    assert_eq!(err.0, axum::http::StatusCode::BAD_GATEWAY);
+    assert!(
+        err.1.contains("oob-output") && err.1.contains("out-of-bounds"),
+        "error must name the signer and the out-of-bounds slice; got: {}",
+        err.1
+    );
+    // The module chose the packed (ptr, len). Quoting it would hand the app
+    // 8 bytes of whatever the module holds, per request.
+    let body = response_body(err).await;
+    assert!(
+        !body.contains("4294967295"),
+        "body quoted the slice: {body}"
+    );
+
+    assert_engine_still_serves(&engine).await;
+}
+
+/// A signer whose `sign` returns `output_json` verbatim from its data segment.
+fn returning_output_wat(output_json: &str) -> String {
+    format!(
+        r#"(module
+  (memory (export "memory") 1)
+  (data (i32.const 1024) "{}")
+  (func (export "sign") (param i32 i32) (result i64)
+    (i64.or (i64.shl (i64.const 1024) (i64.const 32)) (i64.const {}))))"#,
+        output_json.replace('\\', "\\\\").replace('"', "\\\""),
+        output_json.len()
+    )
+}
+
+/// The body the calling app reads: `proxy.rs` renders a layer error as-is.
+async fn response_body(err: (axum::http::StatusCode, String)) -> String {
+    use axum::response::IntoResponse as _;
+    let resp = err.into_response();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    String::from_utf8(bytes.to_vec()).unwrap()
+}
+
+/// Run a signer that returns `output_json` and return its 502 body.
+async fn rejected_output_body(name: &str, output_json: &str) -> String {
+    let engine = Arc::new(build_wasmtime_engine().unwrap());
+    let layer = signer_layer(name, &returning_output_wat(output_json), &engine);
+    let body = bytes::Bytes::new();
+    let prior = HashMap::new();
+    let input = make_layer_input(&body, &prior);
+    let err = layer
+        .apply(&input)
+        .await
+        .expect_err("the signer's output must be refused");
+    assert_eq!(err.0, axum::http::StatusCode::BAD_GATEWAY);
+    response_body(err).await
+}
+
+/// Stands in for a handshake token or a signature the module holds.
+const MODULE_HELD_SECRET: &str = "tok-module-held-s3cret";
+
+#[tokio::test]
+async fn an_invalid_header_name_never_reaches_the_502_body() {
+    let output = format!(r#"{{"add_headers":[["x-a {MODULE_HELD_SECRET}","v"]]}}"#);
+    let body = rejected_output_body("bad-name", &output).await;
+    assert!(!body.contains(MODULE_HELD_SECRET), "body leaked: {body}");
+    assert!(
+        body.contains("bad-name") && body.contains("invalid header name"),
+        "body must name the signer and the error class; got: {body}"
+    );
+}
+
+#[tokio::test]
+async fn an_unparseable_sign_output_never_reaches_the_502_body() {
+    let output = format!(r#"{{"add_headers":"{MODULE_HELD_SECRET}"}}"#);
+    let body = rejected_output_body("bad-output", &output).await;
+    assert!(!body.contains(MODULE_HELD_SECRET), "body leaked: {body}");
+    assert!(
+        body.contains("bad-output") && body.contains("unparseable SignOutput"),
+        "body must name the signer and the error class; got: {body}"
+    );
+}
+
+/// A valid name paired with an unsendable value. The proxy's own value check
+/// quotes the header name, so the signer layer must refuse the pair first.
+#[tokio::test]
+async fn a_header_name_with_an_unsendable_value_never_reaches_the_502_body() {
+    let output = format!(r#"{{"add_headers":[["x-{MODULE_HELD_SECRET}","a\u0001b"]]}}"#);
+    let body = rejected_output_body("bad-value", &output).await;
+    assert!(!body.contains(MODULE_HELD_SECRET), "body leaked: {body}");
+    assert!(
+        body.contains("bad-value") && body.contains("unsendable header value"),
+        "body must name the signer and the error class; got: {body}"
+    );
+}
+
+/// Traps inside a function the module named itself. A trap's backtrace carries
+/// that name and the code offset, and the module picks which site traps.
+const NAMED_TRAP_WAT: &str = r#"
+(module
+  (memory (export "memory") 1)
+  (func $tok_module_held_s3cret unreachable)
+  (func (export "sign") (param i32 i32) (result i64)
+    (call $tok_module_held_s3cret)
+    (i64.const 0)))
+"#;
+
+#[tokio::test]
+async fn a_trap_backtrace_never_reaches_the_502_body() {
+    let engine = Arc::new(build_wasmtime_engine().unwrap());
+    let layer = signer_layer("trapper", NAMED_TRAP_WAT, &engine);
+    let body = bytes::Bytes::new();
+    let prior = HashMap::new();
+    let input = make_layer_input(&body, &prior);
+    let err = layer
+        .apply(&input)
+        .await
+        .expect_err("a trap must be refused");
+    assert_eq!(err.0, axum::http::StatusCode::BAD_GATEWAY);
+    let body = response_body(err).await;
+    assert!(
+        !body.contains("s3cret"),
+        "body quoted the function name: {body}"
+    );
+    assert!(!body.contains("0x"), "body quoted a code offset: {body}");
+    assert!(
+        body.contains("trapper") && body.contains("sign failed"),
+        "body must name the signer and the stage; got: {body}"
+    );
 }
 
 #[tokio::test]

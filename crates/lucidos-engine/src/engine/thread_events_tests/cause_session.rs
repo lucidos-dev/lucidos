@@ -171,7 +171,6 @@ fn abort_status_verdict_keys_on_cause_and_actor() {
 
     let device = MessageOrigin::Device {
         device_id: "dev-1".to_string(),
-        label: "My MacBook".to_string(),
     };
     let system = MessageOrigin::system();
 
@@ -227,7 +226,6 @@ fn abort_status_verdict_keys_on_cause_and_actor() {
 fn paused_verdict_is_exactly_a_promised_auto_resume() {
     let device = MessageOrigin::Device {
         device_id: "dev-1".to_string(),
-        label: "My MacBook".to_string(),
     };
     let system = MessageOrigin::system();
 

@@ -7,6 +7,18 @@
 /// in correct_memory. Entries must exceed this to be considered for deletion.
 pub(crate) const MEMORY_CORRECTION_THRESHOLD: f32 = 0.65;
 
+/// Cosine similarity at which extraction treats a new fact as one it already
+/// holds, and skips it.
+pub(crate) const MEMORY_DEDUP_THRESHOLD: f64 = 0.95;
+
+/// Cosine similarity above which extraction replaces an older entry that
+/// shares an entity with the new fact.
+pub(crate) const MEMORY_SUPERSEDE_THRESHOLD: f32 = 0.85;
+
+/// How many of an entry's nearest neighbours extraction weighs for skip and
+/// supersede.
+pub(crate) const MEMORY_DEDUP_CANDIDATES: usize = 5;
+
 /// Jaccard similarity between two strings based on word sets.
 /// Returns a value between 0.0 (no overlap) and 1.0 (identical word sets).
 pub(crate) fn jaccard_similarity(a: &str, b: &str) -> f32 {

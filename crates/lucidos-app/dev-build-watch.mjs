@@ -59,11 +59,16 @@ const ERROR_TAIL_BYTES = 8000;
 
 // A clean build re-reads everything, so we only need to know "did anything
 // change", not what. Watch the bundle's inputs: the app source tree, public/
-// (sw.js / manifest / icons), the two root files that feed the build, and the
-// SDK source (aliased into the bundle as @lucidos/sdk).
+// (sw.js / manifest / icons), the Vite plugins vite.config.ts imports, the two
+// root files that feed the build, and the SDK source (aliased into the bundle
+// as @lucidos/sdk).
+// The engine mirrors both lists in `files_have_client_update`
+// (crates/lucidos-engine/src/engine/git_ops/restart_detection.rs) to decide
+// whether an Apply waits for this watch to rebuild. Change them together.
 const watchDirs = [
   resolve(APP_DIR, 'src'),
   resolve(APP_DIR, 'public'),
+  resolve(APP_DIR, 'vite'),
   resolve(APP_DIR, '../../packages/lucidos-sdk/src'),
 ];
 // The dependency manifests are watched too, and they are not bundle inputs.

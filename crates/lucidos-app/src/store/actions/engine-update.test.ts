@@ -18,13 +18,14 @@ vi.mock('../../hooks/sw-update', () => ({
   markSwUpdateDismissed: vi.fn(),
 }));
 
-import { checkEngineVersion, strandedMessage, openEngineVersionToast, resetEngineVersionToastForTest, handleFrontendUpdateDeferred, handleFrontendUpdateStranded, handleEngineBuildStateChanged, DEFERRED_HINT_STALE_AFTER_MS } from './engine-update';
+import { checkEngineVersion, strandedMessage, openEngineVersionToast, resetEngineVersionToastForTest, handleFrontendUpdateDeferred, handleFrontendUpdateStranded, handleEngineBuildStateChanged, handleFrontendRefreshStateChanged, DEFERRED_HINT_STALE_AFTER_MS } from './engine-update';
 import { engineVersionStatus, rebuildEngine } from '../../api/client';
 import { confirmAndRestartEngine, initiateEngineRestart } from './chat-changes';
 // Type-only, so it is erased before the `vi.mock` above replaces that module.
-import type { BuildFailure, PendingCommits } from '../../api/client';
+import type { BuildFailure, PendingCommits, QueuedBuild } from '../../api/client';
 import { noteAnnouncedEngineVersion, wasEngineVersionDismissed, markEngineVersionDismissed } from '../../hooks/sw-update';
-import { toasts, engineVersionReady, engineVersionPending, engineRebuildWedged, engineBuilding, engineBuildDetail, enginePendingCommits, engineRestarting, preferences, showToast, dismissToast, FRONTEND_UPDATE_DEFERRED_TOAST_KEY, FRONTEND_UPDATE_STRANDED_TOAST_KEY } from '../store';
+import { toastTap } from '../../components/shared/toastTap';
+import { toasts, engineVersionReady, engineVersionPending, engineRebuildWedged, engineBuilding, engineBuildDetail, frontendRefreshDetail, enginePendingCommits, engineRestarting, preferences, showToast, dismissToast, FRONTEND_UPDATE_DEFERRED_TOAST_KEY, FRONTEND_UPDATE_STRANDED_TOAST_KEY } from '../store';
 
 const mockStatus = vi.mocked(engineVersionStatus);
 const mockWasDismissed = vi.mocked(wasEngineVersionDismissed);
@@ -45,6 +46,8 @@ function status(over: Partial<{
   build_elapsed_ms: number;
   pending_commits: PendingCommits;
   build_failure: BuildFailure;
+  build_queued: QueuedBuild;
+  frontend_refresh_elapsed_ms: number;
 }> = {}) {
   return {
     build_id: 'eng123',
@@ -89,12 +92,44 @@ describe('checkEngineVersion — new-version surface (arrival coupled, INV-C; di
     preferences.value = { status: 'loaded', data: {} };
   });
 
+  it('narrates a queued build as waiting, with what holds the slots', async () => {
+    mockStatus.mockResolvedValue(
+      status({ build_state: 'building', build_elapsed_ms: 1_000, build_queued: { holders: ['make lint'] } }),
+    );
+    await checkEngineVersion();
+    expect(engineBuilding.value).toBe(true);
+    expect(engineBuildDetail.value?.queuedBehind).toEqual(['make lint']);
+  });
+
+  it('never lets a queued field dress up a failed build as a running one', async () => {
+    mockStatus.mockResolvedValue(
+      status({
+        build_state: 'failed',
+        build_failure: { summary: 'error: boom', repeatable: false },
+        build_queued: { holders: ['make lint'] },
+      }),
+    );
+    await checkEngineVersion();
+    expect(engineBuilding.value).toBe(false);
+    expect(engineBuildDetail.value).toBeNull();
+  });
+
+  it('never lets a queued field hold back a version that is ready to switch onto', async () => {
+    mockStatus.mockResolvedValue(
+      status({ update_available: true, build_state: 'ready', build_queued: { holders: ['make lint'] } }),
+    );
+    await checkEngineVersion();
+    expect(engineBuilding.value).toBe(false);
+    expect(engineVersionReady.value).toBe(true);
+    expect(hasSwitchToast()).toBe(true);
+  });
+
   it('sets the badge AND the Switch toast together when a newer build is ready', async () => {
     mockStatus.mockResolvedValue(status({ update_available: true, build_state: 'ready' }));
     await checkEngineVersion();
     expect(engineVersionReady.value).toBe(true); // badge
     const toast = toasts.value.find((t) => t.key === 'engine-new-version');
-    expect(toast?.action?.label).toBe('Switch to new version'); // toast
+    expect(toast?.action?.label).toBe('Switch'); // toast
     // "Later" is the explicit defer affordance (dismisses; badge stays lit).
     expect(toast?.secondaryAction?.label).toBe('Later');
     // Records the on-disk build so a later dismiss pins the right id.
@@ -167,7 +202,7 @@ describe('checkEngineVersion — new-version surface (arrival coupled, INV-C; di
     engineVersionReady.value = true;
     showToast('New version available.', 'info', {
       key: 'engine-new-version',
-      action: { label: 'Switch to new version', onClick: () => {} },
+      action: { label: 'Switch', onClick: () => {} },
     });
     expect(hasSwitchToast()).toBe(true);
     mockStatus.mockResolvedValue(status({ update_available: true, build_state: 'building' }));
@@ -289,7 +324,7 @@ describe('checkEngineVersion — new-version surface (arrival coupled, INV-C; di
     const toast = toasts.value.find((t) => t.key === 'engine-new-version');
     expect(toast?.action?.label).toBe('Rebuild');
     // Not a Switch — there's no built binary to switch onto yet.
-    expect(toast?.action?.label).not.toBe('Switch to new version');
+    expect(toast?.action?.label).not.toBe('Switch');
     expect(engineVersionReady.value).toBe(false);
   });
 
@@ -570,7 +605,7 @@ describe('checkEngineVersion: the pending version is dismissable, and the badge 
     expect(hasSwitchToast()).toBe(true);
   });
 
-  it('the badge opens nothing when nothing is pending', () => {
+  it('re-opening shows nothing when nothing is pending', () => {
     openEngineVersionToast();
     expect(hasSwitchToast()).toBe(false);
   });
@@ -796,31 +831,23 @@ describe('handleFrontendUpdateDeferred — deferral hint (keyed, freshness-gated
     const shown = deferredToasts();
     expect(shown).toHaveLength(1);
     expect(shown[0].type).toBe('info');
-    // Pops unsolicited → must not steal focus.
-    expect(shown[0].noAutofocus).toBe(true);
   });
 
-  it('offers an OK dismiss but NO Switch action — the deferral can fire mid-build, when switching is unsafe', () => {
-    // The OK just acknowledges/dismisses; the Switch affordance stays with the
-    // version-status poll's guarded toast/badge (checkEngineVersion), which
-    // withholds it until build_state is ready.
+  it('offers NO Switch action, since the deferral can fire mid-build, when switching is unsafe', () => {
+    // The Switch affordance stays with the version-status poll's guarded
+    // toast/badge (checkEngineVersion), which withholds it until the build is ready.
     handleFrontendUpdateDeferred({ sent_at_ms: Date.now() });
     const shown = deferredToasts()[0];
-    expect(shown.action?.label).toBe('OK');
-    // No Switch/restart affordance (neither primary nor secondary).
-    expect(shown.action?.label).not.toBe('Switch to new version');
+    expect(shown.action).toBeUndefined();
     expect(shown.secondaryAction).toBeUndefined();
   });
 
-  it('renders no close X — the OK is the sole dismiss (dismissable: false)', () => {
+  it('is a passive hint: a tap on the card only closes it, so it reads as no link', () => {
     handleFrontendUpdateDeferred({ sent_at_ms: Date.now() });
-    expect(deferredToasts()[0].dismissable).toBe(false);
-  });
-
-  it('the OK action dismisses the sticky hint', () => {
-    handleFrontendUpdateDeferred({ sent_at_ms: Date.now() });
-    expect(deferredToasts()).toHaveLength(1);
-    deferredToasts()[0].action?.onClick();
+    const shown = deferredToasts()[0];
+    expect(toastTap(shown)).toBe('dismiss');
+    expect(shown.persistent).toBe(true);
+    dismissToast(FRONTEND_UPDATE_DEFERRED_TOAST_KEY);
     expect(deferredToasts()).toHaveLength(0);
   });
 
@@ -871,6 +898,59 @@ describe('handleEngineBuildStateChanged — SSE poke re-runs the authoritative c
     await Promise.resolve();
     expect(engineBuilding.value).toBe(false);
     expect(engineVersionReady.value).toBe(true);
+  });
+});
+
+describe('frontend refresh after a frontend-only Apply', () => {
+  beforeEach(() => {
+    mockStatus.mockReset();
+    resetEngineVersionToastForTest();
+    mockWasDismissed.mockReset();
+    mockWasDismissed.mockReturnValue(false);
+    toasts.value = [];
+    engineBuilding.value = false;
+    engineBuildDetail.value = null;
+    frontendRefreshDetail.value = null;
+    engineRestarting.value = false;
+    preferences.value = { status: 'loaded', data: {} };
+  });
+
+  it('carries the elapsed time while the engine waits for the rebuild', async () => {
+    mockStatus.mockResolvedValue(status({ frontend_refresh_elapsed_ms: 7_000 }));
+    await checkEngineVersion();
+    expect(frontendRefreshDetail.value?.elapsedMs).toBe(7_000);
+    expect(frontendRefreshDetail.value?.anchoredAt).toBeLessThanOrEqual(Date.now());
+    // Independent of the engine build: no engine spinner for a frontend wait.
+    expect(engineBuilding.value).toBe(false);
+  });
+
+  it.each([
+    ['the wait ended', status()],
+    ['this is a packaged build', status({ packaged: true, frontend_refresh_elapsed_ms: 7_000 })],
+  ])('clears once %s', async (_case, next) => {
+    mockStatus.mockResolvedValue(status({ frontend_refresh_elapsed_ms: 7_000 }));
+    await checkEngineVersion();
+    expect(frontendRefreshDetail.value).not.toBeNull();
+    mockStatus.mockResolvedValue(next);
+    await checkEngineVersion();
+    expect(frontendRefreshDetail.value).toBeNull();
+  });
+
+  it('keeps reporting it while an ENGINE build has failed', async () => {
+    mockStatus.mockResolvedValue(
+      status({ build_state: 'failed', frontend_refresh_elapsed_ms: 3_000 }),
+    );
+    await checkEngineVersion();
+    expect(frontendRefreshDetail.value?.elapsedMs).toBe(3_000);
+  });
+
+  it('follows the re-read on a poke, never the event itself', async () => {
+    mockStatus.mockResolvedValue(status({ frontend_refresh_elapsed_ms: 1_000 }));
+    handleFrontendRefreshStateChanged();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(mockStatus).toHaveBeenCalled();
+    expect(frontendRefreshDetail.value?.elapsedMs).toBe(1_000);
   });
 });
 

@@ -1,9 +1,9 @@
 /* ── Where a number sits inside its badge ─────────────────────────────────
  *
- * One rule for every badge carrying a number or a sign, because they all had
- * the same bug. Each centred its text LINE BOX, and a line box is not the
- * digits: the baseline sits wherever the font's ascent and descent put it, and
- * those are asymmetric. So the digits rode high in every badge, and the two
+ * One rule for every badge carrying a number, a sign or a status word, because
+ * they all had the same bug. Each centred its text LINE BOX, and a line box is
+ * not the digits: the baseline sits wherever the font's ascent and descent put
+ * it, and those are asymmetric. So the digits rode high in every badge, and the two
  * engines disagreed about how high. Measured over the whole set, the worst was
  * 1.55px off in Chromium and 0.48px in WebKit, which is the same badge drawn
  * differently on iOS and on Chrome.
@@ -14,7 +14,7 @@
  * size.
  *
  * Imported LAST (see main.tsx), which is also why it can be one rule: these
- * badges come from six stylesheets, five of which set their own `display`, so
+ * badges come from many stylesheets, most of which set their own `display`, so
  * a later file re-homes their centring without doubling every selector.
  * `styles/__tests__/badge-glyph-centring.test.ts` holds that position. */
 
@@ -41,7 +41,9 @@
 .drawer-badge,
 .brand-menu-ws-badge,
 .ws-picker-badge,
-.thread-status-question-badge {
+.thread-status-question-badge,
+.app-store-status,
+.app-store-modified-chip {
     letter-spacing: normal;
 }
 
@@ -92,7 +94,9 @@
     .drawer-badge,
     .brand-menu-ws-badge,
     .ws-picker-badge,
-    .thread-status-question-badge {
+    .thread-status-question-badge,
+    .app-store-status,
+    .app-store-modified-chip {
         display: inline-block;
         text-align: center;
         align-content: end;
@@ -108,11 +112,12 @@
         padding-block: 0 var(--badge-baseline-inset);
     }
 
-    /* The one badge whose content is not text. While the engine is building,
-       the brand badge holds a spinning glyph instead of the "!", and a line box
-       trimmed to a cap band it has no part in would park it off centre. So
-       would the padding that lifts a baseline. It keeps the flex centring. */
-    .badge:has(.brand-badge-spinner) {
+    /* The one badge whose content can be an icon. While work runs, the brand
+       badge holds a spinning glyph instead of the "!", and while it waits, a
+       still hourglass. A line box trimmed to a cap band neither has would park
+       the icon off centre. So would the padding that lifts a baseline. It
+       keeps the flex centring. */
+    .badge:has(.brand-badge-spinner, .brand-badge-queued) {
         display: flex;
         align-items: center;
         justify-content: center;

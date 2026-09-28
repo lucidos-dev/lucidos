@@ -18,7 +18,7 @@ describe('lucidos.ui.applyPreferences — device-scoped fetch', () => {
     localStorage.clear();
     originalFetch = globalThis.fetch;
     fetchSpy = vi.fn(async () => new Response(
-      JSON.stringify({ preferences: { theme: 'light' } }),
+      JSON.stringify({ preferences: { 'theme-mode': 'light' } }),
       { status: 200, headers: { 'Content-Type': 'application/json' } },
     ));
     globalThis.fetch = fetchSpy as unknown as typeof globalThis.fetch;
@@ -101,7 +101,7 @@ describe('lucidos.ui.applyPreferences — device-scoped fetch', () => {
     // engine's api/sdk_iframe.css consume them. Mirrors the host-side
     // assertion in actions/preferences.test.ts.
     globalThis.fetch = vi.fn(async () => new Response(
-      JSON.stringify({ preferences: { theme: 'light', 'font-family': 'fira-code' } }),
+      JSON.stringify({ preferences: { 'theme-mode': 'light', 'font-family': 'fira-code' } }),
       { status: 200, headers: { 'Content-Type': 'application/json' } },
     )) as unknown as typeof globalThis.fetch;
 
@@ -130,7 +130,7 @@ describe('lucidos.ui.applyPreferences — device-scoped fetch', () => {
     // opposite of what this case is for. Both properties must clear rather than
     // leave a stale value behind from a previous font.
     globalThis.fetch = vi.fn(async () => new Response(
-      JSON.stringify({ preferences: { theme: 'light', 'font-family': 'inter' } }),
+      JSON.stringify({ preferences: { 'theme-mode': 'light', 'font-family': 'inter' } }),
       { status: 200, headers: { 'Content-Type': 'application/json' } },
     )) as unknown as typeof globalThis.fetch;
 
@@ -152,10 +152,31 @@ describe('lucidos.ui.applyPreferences — device-scoped fetch', () => {
     expect(inlineProps['--font-features-text']).toBe('normal');
     expect(inlineProps['--font-features-code']).toBe('normal');
   });
+
+  it.each([['vt323', 'none'], ['inter', 'face']])(
+    'says on <html> whether %s has a bold face',
+    async (font, mark) => {
+      globalThis.fetch = vi.fn(async () => new Response(
+        JSON.stringify({ preferences: { theme: 'dark', 'font-family': font } }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      )) as unknown as typeof globalThis.fetch;
+
+      const attrs: Record<string, string> = {};
+      const root = (document as any).documentElement;
+      const realSetAttribute = root.setAttribute;
+      root.setAttribute = (k: string, v: string) => { attrs[k] = v; };
+      try {
+        await lucidos.ui.applyPreferences();
+      } finally {
+        root.setAttribute = realSetAttribute;
+      }
+      expect(attrs['data-font-bold']).toBe(mark);
+    },
+  );
 });
 
 // The systemic theme bug: `applyPreferences()` ran AFTER sdk-prefs.js (which
-// synchronously seeds data-theme/--font-ui/--user-ui-scale from localStorage),
+// synchronously seeds data-theme-mode/--font-ui/--user-ui-scale from localStorage),
 // then overwrote that correct value with a hard default whenever the active
 // device had no server-scoped pref. The iPhone-PWA case (only `ui-scale` stored
 // server-side, no `theme`) flipped every app iframe to dark even though the
@@ -175,9 +196,9 @@ describe('lucidos.ui.applyPreferences — client value wins when the server lack
     )) as unknown as typeof globalThis.fetch;
   }
 
-  function captureWrites(initialDataTheme?: string) {
+  function captureWrites(initialDataThemeMode?: string) {
     const attrs: Record<string, string> = {};
-    if (initialDataTheme !== undefined) attrs['data-theme'] = initialDataTheme;
+    if (initialDataThemeMode !== undefined) attrs['data-theme-mode'] = initialDataThemeMode;
     const props: Record<string, string> = {};
     const el = document.documentElement as any;
     const real = { setAttribute: el.setAttribute, getAttribute: el.getAttribute, style: el.style };
@@ -200,8 +221,8 @@ describe('lucidos.ui.applyPreferences — client value wins when the server lack
     };
   }
 
-  async function applyWithCapture(initialDataTheme?: string) {
-    const cap = captureWrites(initialDataTheme);
+  async function applyWithCapture(initialDataThemeMode?: string) {
+    const cap = captureWrites(initialDataThemeMode);
     try {
       await lucidos.ui.applyPreferences();
     } finally {
@@ -221,43 +242,43 @@ describe('lucidos.ui.applyPreferences — client value wins when the server lack
 
   it('keeps the localStorage theme when the server has no device-scoped theme', async () => {
     // The reported iPhone-PWA case: only ui-scale stored server-side, no theme.
-    localStorage.setItem('lucidos-theme', 'light');
+    localStorage.setItem('lucidos-theme-mode', 'light');
     mockPrefs({ 'ui-scale': '125' });
 
     const cap = await applyWithCapture();
 
-    expect(cap.attrs['data-theme']).toBe('light');
+    expect(cap.attrs['data-theme-mode']).toBe('light');
   });
 
   it('does not flip to dark when the server returns no theme at all', async () => {
-    localStorage.setItem('lucidos-theme', 'light');
+    localStorage.setItem('lucidos-theme-mode', 'light');
     mockPrefs({});
 
     const cap = await applyWithCapture();
 
-    expect(cap.attrs['data-theme']).toBe('light');
+    expect(cap.attrs['data-theme-mode']).toBe('light');
   });
 
-  it('falls back to the data-theme attribute sdk-prefs.js applied when localStorage is empty', async () => {
+  it('falls back to the data-theme-mode attribute sdk-prefs.js applied when localStorage is empty', async () => {
     mockPrefs({});
 
-    // sdk-prefs.js already resolved + applied data-theme=light synchronously.
+    // sdk-prefs.js already resolved + applied data-theme-mode=light synchronously.
     const cap = await applyWithCapture('light');
 
-    expect(cap.attrs['data-theme']).toBe('light');
+    expect(cap.attrs['data-theme-mode']).toBe('light');
   });
 
   it('still lets a present server theme win over a stale localStorage value', async () => {
-    localStorage.setItem('lucidos-theme', 'dark');
-    mockPrefs({ theme: 'light' });
+    localStorage.setItem('lucidos-theme-mode', 'dark');
+    mockPrefs({ 'theme-mode': 'light' });
 
     const cap = await applyWithCapture();
 
-    expect(cap.attrs['data-theme']).toBe('light');
+    expect(cap.attrs['data-theme-mode']).toBe('light');
   });
 
   it('ignores an invalid localStorage theme and falls back to the OS', async () => {
-    localStorage.setItem('lucidos-theme', 'chartreuse');
+    localStorage.setItem('lucidos-theme-mode', 'chartreuse');
     mockPrefs({});
 
     const cap = await applyWithCapture();
@@ -265,7 +286,7 @@ describe('lucidos.ui.applyPreferences — client value wins when the server lack
     // The default is `system`, which the SDK resolves through matchMedia. The
     // test env's matchMedia answers `matches: false` for every query, so
     // `prefers-color-scheme: light` is false and this lands on dark.
-    expect(cap.attrs['data-theme']).toBe('dark');
+    expect(cap.attrs['data-theme-mode']).toBe('dark');
   });
 
   it('keeps the localStorage font when the server has no font-family', async () => {
@@ -284,5 +305,61 @@ describe('lucidos.ui.applyPreferences — client value wins when the server lack
     const cap = await applyWithCapture();
 
     expect(cap.props['--user-ui-scale']).toBe('125%');
+  });
+});
+
+// Theme suggests, user wins: an app frame resolves its UI font exactly as the
+// host does. Each case names its own theme id, because the SDK fetches a theme
+// only when the id changes.
+describe('lucidos.ui.applyPreferences: the font a theme suggests', () => {
+  let originalFetch: typeof globalThis.fetch;
+  let inlineProps: Record<string, string>;
+  let realStyle: unknown;
+
+  function mockEngine(prefs: Record<string, string>, fonts: Record<string, string>) {
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
+      const body = String(input).includes('/theme?id=')
+        ? { id: prefs.theme, resolved: { dark: {}, light: {}, fonts } }
+        : { preferences: prefs };
+      return new Response(JSON.stringify(body), {
+        status: 200, headers: { 'Content-Type': 'application/json' },
+      });
+    }) as unknown as typeof globalThis.fetch;
+  }
+
+  beforeEach(() => {
+    localStorage.clear();
+    originalFetch = globalThis.fetch;
+    inlineProps = {};
+    realStyle = (document as any).documentElement.style;
+    (document as any).documentElement.style = {
+      setProperty: (k: string, v: string) => { inlineProps[k] = v; },
+      getPropertyValue: (k: string) => inlineProps[k] ?? '',
+      removeProperty: (k: string) => { delete inlineProps[k]; },
+      background: '',
+    };
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    (document as any).documentElement.style = realStyle;
+  });
+
+  it('a device that never picked a font paints the theme font', async () => {
+    mockEngine({ 'theme-mode': 'light', theme: 'harbour-one' }, { ui: 'geist' });
+    await lucidos.ui.applyPreferences();
+    expect(inlineProps['--font-ui']).toMatch(/^'Geist',/);
+  });
+
+  it('an explicit pick wins over the theme font', async () => {
+    mockEngine({ 'theme-mode': 'light', theme: 'harbour-two', 'font-family': 'system' }, { ui: 'geist' });
+    await lucidos.ui.applyPreferences();
+    expect(inlineProps['--font-ui']).toMatch(/^system-ui,/);
+  });
+
+  it('a theme with no font falls back to Fira Code', async () => {
+    mockEngine({ 'theme-mode': 'light', theme: 'harbour-three', 'font-family': 'theme' }, {});
+    await lucidos.ui.applyPreferences();
+    expect(inlineProps['--font-ui']).toMatch(/^'Fira Code',/);
   });
 });

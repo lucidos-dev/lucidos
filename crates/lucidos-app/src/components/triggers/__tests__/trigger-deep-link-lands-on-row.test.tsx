@@ -139,6 +139,35 @@ describe('a trigger deep link lands on the ROW, not on the link pointing at it',
     expect(triggerScrollTarget.value).toBeNull();
   });
 
+  it('opens a collapsed group at once, so the scroll measures the row at rest', async () => {
+    // A roll would still be moving the row when the landing scrolls to it.
+    const animate = vi.fn(() => ({ cancel() {}, finished: new Promise(() => {}) }));
+    (HTMLElement.prototype as unknown as { animate: unknown }).animate = animate;
+    try {
+      triggerGroups.value = {
+        status: 'loaded',
+        data: [{ id: 'ci', name: 'CI', order: 0, created: '2026-01-01T00:00:00Z', member_count: 1 }],
+      };
+      triggers.value = {
+        status: 'loaded',
+        data: [{ ...trigger(TRIGGER_ID, 'Scheduled CI result'), group_id: 'ci' }],
+      };
+      collapsedTriggerGroupIds.value = new Set(['ci']);
+
+      triggerScrollTarget.value = TRIGGER_ID;
+      render(<TriggersView />, contentPane);
+      await waitFor(() => triggerScrollTarget.value === null);
+
+      const row = contentPane.querySelector<HTMLElement>(
+        `.trigger-row[data-trigger-id="${TRIGGER_ID}"]`,
+      );
+      expect(scrolled).toEqual([row]);
+      expect(animate).not.toHaveBeenCalled();
+    } finally {
+      delete (HTMLElement.prototype as unknown as { animate?: unknown }).animate;
+    }
+  });
+
   it('leaves the target unspent while no panel is mounted', async () => {
     // The chat link alone must not satisfy the landing. If it did, opening the
     // panel afterwards would find the target already gone.

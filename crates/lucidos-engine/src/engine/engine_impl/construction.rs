@@ -7,11 +7,14 @@ use super::super::*;
 impl LucidosEngine {
     pub(crate) const DEFAULT_REPO_NAME: &'static str = "Lucidos";
 
-    /// Keeps `agent_sessions` and `AgentSession` `pub(crate)` while letting
-    /// `main.rs` wire `WorktreeCleanup::spawn` from the bin crate.
+    /// The one liveness probe every worktree reclaimer asks. Keeps the three
+    /// registries it reads `pub(crate)` while letting `main.rs` wire
+    /// `WorktreeCleanup::spawn` from the bin crate.
     pub fn worktree_cleanup_active_threads(&self) -> Arc<dyn worktree_cleanup::ActiveThreads> {
-        Arc::new(worktree_cleanup::AgentSessionsActiveThreads::new(
+        Arc::new(worktree_cleanup::EngineActiveThreads::new(
             self.agent_sessions.clone(),
+            self.spawns_in_flight.clone(),
+            self.bash_background.clone(),
         ))
     }
 
@@ -709,6 +712,7 @@ impl LucidosEngine {
 
         // Migrate legacy prompts/ directories to intents/ (idempotent)
         crate::core::migrate_prompts_to_intents(&workspace_path);
+        crate::core::themes::adopt_legacy_themes_dir(&workspace_path);
 
         // Single shared connection pool for the entire engine
         let pool = sqlx::postgres::PgPoolOptions::new()
@@ -1271,11 +1275,7 @@ impl LucidosEngine {
             cancel_rebuild: AtomicBool::new(false),
             shutting_down: Arc::new(AtomicBool::new(false)),
             backup_in_progress: AtomicBool::new(false),
-            // `true`, not `false`: reaching here means the pool connected and the
-            // migrator ran, so the database WAS answering a moment ago. Starting
-            // false would make every engine report an outage until its first
-            // probe lands. See `engine::db_health`.
-            database_reachable: AtomicBool::new(true),
+            database_health: Default::default(),
             build_state: std::sync::RwLock::new(crate::engine::engine_version::BuildState::Idle),
             update_check: std::sync::Mutex::new(Default::default()),
             source_behind_cache: std::sync::Mutex::new(Default::default()),
@@ -1285,11 +1285,13 @@ impl LucidosEngine {
             self_heal_state: std::sync::Mutex::new(Default::default()),
             build_task: std::sync::Mutex::new(None),
             build_generation: std::sync::atomic::AtomicU64::new(0),
+            build_process_group: std::sync::atomic::AtomicU32::new(0),
             served_frontend: std::sync::OnceLock::new(),
             served_frontend_source: std::sync::OnceLock::new(),
             served_frontend_commit: Default::default(),
             frontend_refresh_generation: std::sync::atomic::AtomicU64::new(0),
             frontend_refresh_task: std::sync::Mutex::new(None),
+            frontend_refresh_started: std::sync::Mutex::new(None),
             frontend_worktree_pin_warned: std::sync::atomic::AtomicBool::new(false),
             frontend_preview: tokio::sync::Mutex::new(None),
             frontend_preview_lifecycle: tokio::sync::Mutex::new(()),
@@ -1370,7 +1372,7 @@ impl LucidosEngine {
                 tx
             },
             last_spawn: std::sync::Mutex::new(HashMap::new()),
-            spawns_in_flight: agent_session::SpawnsInFlight::default(),
+            spawns_in_flight: Arc::default(),
             pending_app_spawn: std::sync::Mutex::new(HashMap::new()),
             follow_up_order: Default::default(),
             cc_spawn_coalesce: agent_session::CcSpawnCoalescer::new(),
@@ -1391,6 +1393,7 @@ impl LucidosEngine {
             apply_all_batches: Arc::new(tokio::sync::Mutex::new(
                 apply_all_batches::ApplyAllRegistry::default(),
             )),
+            apply_estimates: Arc::default(),
             apply_all_drive_tx: {
                 let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
                 APPLY_ALL_DRIVE_RX.with(|cell| cell.borrow_mut().replace(rx));

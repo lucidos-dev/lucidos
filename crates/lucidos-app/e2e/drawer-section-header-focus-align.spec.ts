@@ -12,7 +12,7 @@ test.describe('Drawer section-header focus band alignment', () => {
         await context.addInitScript(() => {
             localStorage.removeItem('lucidos-drawer-collapsed');
             localStorage.removeItem('lucidos-drawer-collapsed-families');
-            localStorage.setItem('lucidos-theme', 'dark');
+            localStorage.setItem('lucidos-theme-mode', 'dark');
         });
         clearAllThreads();
     });

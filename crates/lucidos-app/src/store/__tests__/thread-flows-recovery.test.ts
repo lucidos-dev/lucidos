@@ -340,7 +340,7 @@ describe('Flow: ContinuationStarted recovery', () => {
       {
         type: 'ContinuationStarted',
         branch: 'claude-code/20260318-122816',
-        actor: { kind: 'device', device_id: 'd-1', label: 'My Mac' },
+        actor: { kind: 'device', device_id: 'd-1' },
       },
       { type: 'SessionStarted', session_id: 'cc-2', branch: 'claude-code/20260318-122816' },
       { type: 'CodingAgentTextStreamed', text: 'Continuing.' },
@@ -822,7 +822,7 @@ describe('Flow: post-restart resume reminder', () => {
       { type: 'ResponseAborted', request_event_id: 'mr-2', cause: 'recovery_after_restart' },
       // The user clicked Continue: the resume opens its own boundary and the
       // engine note tells them what the model was told about the aborted run.
-      { type: 'ContinuationStarted', actor: { kind: 'device', device_id: 'd-1', label: 'My iPhone' }, event_id: 'cs-1' },
+      { type: 'ContinuationStarted', actor: { kind: 'device', device_id: 'd-1' }, event_id: 'cs-1' },
       {
         type: 'UserPromptInjected',
         mode: 'engine',

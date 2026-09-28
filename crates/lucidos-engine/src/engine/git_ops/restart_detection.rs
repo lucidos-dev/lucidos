@@ -7,12 +7,39 @@ pub(crate) fn is_external_repo_path(repo_path: &Path, dev_root: &Path) -> bool {
     canon(repo_path) != canon(dev_root)
 }
 
+/// The crates the engine, gateway and `lucidos` CLI binaries are built from.
+/// Everything in them but tests and docs is compiled in or feeds the build.
+const BINARY_CRATES: &[&str] = &[
+    "crates/lucidos-engine/",
+    "crates/lucidos-gateway/",
+    "crates/lucidos-cli/",
+];
+
+/// Files outside [`BINARY_CRATES`] that a binary `include_str!`s or
+/// `include_bytes!`s. A running process serves the copy it was BUILT with, so
+/// only a rebuild picks up an edit. Some read as docs or frontend files by
+/// path: the changelog, the CLI skill, the stylesheet served to app iframes.
+/// `a_file_a_binary_embeds_requires_a_restart` fails when one is missing here.
+const EMBEDDED_FILES: &[&str] = &[
+    "RELEASE",
+    "CHANGELOG.md",
+    "release-notices.toml",
+    ".claude/skills/lucidos-cli/SKILL.md",
+    "crates/lucidos-app/index.html",
+    "crates/lucidos-app/public/favicon.svg",
+    "crates/lucidos-app/src/styles/global/shared-components.css",
+    "crates/lucidos-app/src/styles/generated/theme-parts-frame.css",
+];
+
 /// Check whether any of the given file paths would require an engine restart.
 /// Rust source files (excluding tests/docs), SQL migrations, the SDK bundle
-/// sources, and engine-bundled static assets all trigger a restart.
+/// sources, and every file a binary embeds all trigger a restart.
 pub(crate) fn files_require_restart(files: &[String]) -> bool {
     files.iter().any(|f| {
-        let is_rust_source = f.ends_with(".rs") || f == "Cargo.toml" || f == "Cargo.lock";
+        let is_rust_source = f.ends_with(".rs")
+            || f == "Cargo.toml"
+            || f.ends_with("/Cargo.toml")
+            || f == "Cargo.lock";
         let is_test_or_doc = f.contains("/tests/") || f.starts_with("tests/") || f.ends_with(".md");
         let is_migration =
             f.ends_with(".sql") && (f.contains("/migrations/") || f.starts_with("migrations/"));
@@ -20,39 +47,17 @@ pub(crate) fn files_require_restart(files: &[String]) -> bool {
         // `web-dev.sh -b` on engine restart; without restart the previously-
         // built dist/sdk.js keeps being served.
         let is_sdk_bundle_source = f.starts_with("packages/lucidos-sdk/") && !is_test_or_doc;
-        // include_str!'d into a Rust binary, so the running process serves the
-        // copy it was BUILT with and a rebuild is the only way to pick up an
-        // edit: the engine's /api/v1/sdk-iframe.* assets, and the app document,
-        // whose boot-splash stylesheet + mark the gateway lifts out at compile
-        // time (crates/lucidos-gateway/src/proxy.rs). Without the restart the
-        // gateway keeps serving the previous splash while the app has the new
-        // one, which is exactly the drift sharing the file removes.
-        // The changelog is one of these too, and it is the one that looks like a
-        // doc: `crate::engine::changelog` include_str!s it and serves it to the
-        // What's New panel, so an edit that skipped the restart would leave the
-        // panel showing the previous text with nothing saying why. The `.md`
-        // exclusion above gates only the Rust-source and SDK-bundle arms, so
-        // naming it here is enough.
-        // The release notices are the changelog's sibling and cost more when
-        // missed: `crate::engine::release_notices` include_str!s them, and an
-        // authored notice that never reaches a modal is an instruction the user
-        // is simply never given.
-        // The font is the odd one: it lives in the APP crate (the host's
-        // @font-face resolves it through Vite), which would otherwise read as a
-        // frontend-only change, but the engine include_bytes!s that same file to
-        // serve app iframes. One copy in the tree, two consumers, and only one
-        // of them picks up an edit without a rebuild.
-        let is_engine_bundled_asset = f == "crates/lucidos-engine/src/api/sdk_iframe.css"
-            || f == "crates/lucidos-engine/src/api/sdk_iframe_audio.js"
-            || f == "crates/lucidos-engine/src/api/sdk_fonts_fira_code.css"
-            || f == "crates/lucidos-app/src/assets/fonts/FiraCode-VF.woff2"
-            || f == "crates/lucidos-app/index.html"
-            || f == "CHANGELOG.md"
-            || f == "release-notices.toml";
+        let in_binary_crate = BINARY_CRATES.iter().any(|c| f.starts_with(c)) && !is_test_or_doc;
+        // The host's @font-face resolves the vendored fonts through Vite, and
+        // `core::fonts` embeds the same files to serve app iframes.
+        let is_vendored_font =
+            f.starts_with("crates/lucidos-app/src/assets/fonts/") && f.ends_with(".woff2");
         (is_rust_source && !is_test_or_doc)
             || is_migration
             || is_sdk_bundle_source
-            || is_engine_bundled_asset
+            || in_binary_crate
+            || is_vendored_font
+            || EMBEDDED_FILES.contains(&f.as_str())
     })
 }
 
@@ -93,15 +98,32 @@ pub(crate) fn any_iframe_bundled_file_changed(files: &[String], app_id: &str) ->
     })
 }
 
-/// Check whether any of the given file paths are frontend files that would
-/// require a client reload. TypeScript, CSS, HTML, and JavaScript files trigger this.
+/// Directories whose files feed the served client bundle. Mirrors `watchDirs`
+/// in `crates/lucidos-app/dev-build-watch.mjs`.
+pub(super) const CLIENT_BUNDLE_DIRS: &[&str] = &[
+    "crates/lucidos-app/src/",
+    "crates/lucidos-app/public/",
+    "crates/lucidos-app/vite/",
+    "packages/lucidos-sdk/src/",
+];
+
+/// Single files that feed the served client bundle. Mirrors `watchFiles` in
+/// `crates/lucidos-app/dev-build-watch.mjs`.
+pub(super) const CLIENT_BUNDLE_FILES: &[&str] = &[
+    "crates/lucidos-app/index.html",
+    "crates/lucidos-app/vite.config.ts",
+    "crates/lucidos-app/package.json",
+    "package.json",
+    "package-lock.json",
+];
+
+/// True if any of `files` is an input the build-watch rebuilds the served
+/// client from. After a frontend-only Apply the engine waits for that rebuild,
+/// so a file the watch ignores (an e2e spec, a script) must not count: no
+/// build would run, and the wait would end in a false "not served yet" warning.
 pub(crate) fn files_have_client_update(files: &[String]) -> bool {
     files.iter().any(|f| {
-        f.ends_with(".ts")
-            || f.ends_with(".tsx")
-            || f.ends_with(".css")
-            || f.ends_with(".html")
-            || f.ends_with(".js")
-            || f.ends_with(".jsx")
+        CLIENT_BUNDLE_FILES.contains(&f.as_str())
+            || CLIENT_BUNDLE_DIRS.iter().any(|dir| f.starts_with(dir))
     })
 }

@@ -11,7 +11,6 @@ fn bus_event_variants_are_constructable() {
             text: "hello".into(),
             user_image_hashes: vec![],
             device_id: None,
-            device: None,
             image_description: None,
             parent_thread_id: None,
             spawning_event_id: None,
@@ -160,7 +159,6 @@ fn thread_event_sse_json_has_seq_and_event_id() {
                 text: "hello".into(),
                 user_image_hashes: vec![],
                 device_id: None,
-                device: None,
                 image_description: None,
                 parent_thread_id: None,
                 spawning_event_id: None,
@@ -204,7 +202,6 @@ fn thread_event_sse_json_includes_meta_channel() {
                 text: "fix bug".into(),
                 user_image_hashes: vec![],
                 device_id: None,
-                device: None,
                 image_description: None,
                 parent_thread_id: None,
                 spawning_event_id: None,
@@ -245,7 +242,6 @@ fn thread_event_sse_json_omits_channel_when_none() {
                 text: "hello".into(),
                 user_image_hashes: vec![],
                 device_id: None,
-                device: None,
                 image_description: None,
                 parent_thread_id: None,
                 spawning_event_id: None,
@@ -387,6 +383,13 @@ fn system_changes_updated_matches_server_event_shape() {
             applied: vec![],
             total_pending: 0,
             restart_required: false,
+            apply_estimates: crate::engine::apply_estimate::ApplyEstimates {
+                hardening: None,
+                resolving_conflict: Some(crate::engine::apply_estimate::PhaseEstimate {
+                    typical_secs: 1080,
+                    runs: 32,
+                }),
+            },
         }),
         aggregate: None,
         depth: 0,
@@ -397,6 +400,13 @@ fn system_changes_updated_matches_server_event_shape() {
     assert_eq!(json["type"], "ChangesUpdated");
     assert_eq!(json["data"]["total_pending"], 0);
     assert_eq!(json["data"]["restart_required"], false);
+    assert_eq!(
+        json["data"]["apply_estimates"],
+        serde_json::json!({
+            "hardening": null,
+            "resolving_conflict": { "typical_secs": 1080, "runs": 32 },
+        })
+    );
 }
 
 #[test]
@@ -683,6 +693,7 @@ fn reserved_type_names_match_event_type() {
             applied: vec![],
             total_pending: 0,
             restart_required: false,
+            apply_estimates: Default::default(),
         },
         BackupProgress {
             phase: "p".into(),
@@ -841,4 +852,54 @@ fn reserved_type_names_match_event_type() {
         SystemEvent::is_reserved_type_name("ThreadEvent"),
         "ThreadEvent wrapper must be reserved so apps cannot forge thread-event frames"
     );
+}
+
+/// The live frame of one thread event, as `to_sse_json` puts it on the wire.
+fn live_event_json(event: ThreadEvent) -> serde_json::Value {
+    let emitted = EmittedEvent {
+        event_id: Uuid::new_v4(),
+        seq: Some(7),
+        created: Utc::now(),
+        typed: BusEvent::Thread {
+            thread_id: Uuid::new_v4(),
+            event,
+            meta: EventMeta::NONE,
+        },
+        aggregate: None,
+        depth: 0,
+        emitting_trigger_id: None,
+    };
+    let frame: serde_json::Value = serde_json::from_str(&emitted.to_sse_json()).unwrap();
+    frame["data"]["event"].clone()
+}
+
+#[test]
+fn a_live_coding_agent_result_leaves_its_text_for_the_modal_to_fetch() {
+    let event = live_event_json(ThreadEvent::CodingAgentToolResult {
+        name: "Bash".into(),
+        result: "test output\n".repeat(1_000),
+        coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+        tool_use_id: "toolu_1".into(),
+    });
+    assert!(
+        event.get("result").is_none(),
+        "live frame carried the output: {event}"
+    );
+    assert_eq!(event["result_stripped"], true);
+    assert_eq!(event["name"], "Bash");
+    assert_eq!(event["tool_use_id"], "toolu_1");
+    assert_eq!(event["type"], "CodingAgentToolResult");
+}
+
+#[test]
+fn a_live_chat_tool_result_keeps_its_text() {
+    let event = live_event_json(ThreadEvent::ToolResult {
+        name: "read_file".into(),
+        result: "file body".into(),
+        images: vec![],
+        success: true,
+        tool_called_event_id: None,
+    });
+    assert_eq!(event["result"], "file body");
+    assert!(event.get("result_stripped").is_none());
 }

@@ -41,14 +41,16 @@ What each piece does — include only what you need:
 | Tag | Provides | Skip if |
 |---|---|---|
 | `<title>` | Tab title | (always include — browsers require it) |
-| `<script src="/api/v1/sdk-prefs.js"></script>` | Synchronous prefs script. Sets `data-theme`, `--bg-primary`, and `--font-ui` on `<html>` (plus `--user-ui-scale` when the user has set one) *before* any subsequent stylesheet evaluates. The engine resolves this device's theme, font and scale and serves them inside the script, so an app frame needs no access to the shell's storage. It stamps `?device=` onto this one `src` to know whose to serve, and adds nothing to your document. The same script carries the device's Autocorrect switch, so `sdk.js` knows it before any field can take focus, and sets `data-motion` (§ Reduced motion). Eliminates the flash-of-default-theme between iframe load and `applyPreferences()`. **Place as early in `<head>` as possible: before `sdk-iframe.css`, before any other `<link rel="stylesheet">`, and before any inline `<style>` that reads theme vars.** Inlining `--bg-primary` directly (not just `data-theme`) is what makes the body's `background: var(--bg-primary, …)` paint correctly even when stylesheets are loaded asynchronously (JS-injected, dynamic `import()`, dev-mode bundlers like Vite that ship CSS as JS modules). | App doesn't use `sdk-iframe.css` (no FOUC to fix) |
+| `<script src="/api/v1/sdk-prefs.js"></script>` | Synchronous prefs script. Sets `data-theme-mode`, `--bg-primary`, and `--font-ui` on `<html>` (plus `--user-ui-scale` when the user has set one) *before* any subsequent stylesheet evaluates. The engine resolves this device's theme mode, theme, font and scale and serves them inside the script, so an app frame needs no access to the shell's storage. It stamps `?device=` onto this one `src` to know whose to serve, and adds nothing to your document. The same script carries the device's Autocorrect switch, so `sdk.js` knows it before any field can take focus, and sets `data-motion` (§ Reduced motion), `data-theme-effects` (§ Theme parts) and `data-font-bold` (§ Theme variables). Eliminates the flash-of-default-theme between iframe load and `applyPreferences()`. **Place as early in `<head>` as possible: before `sdk-iframe.css`, before any other `<link rel="stylesheet">`, and before any inline `<style>` that reads theme vars.** Inlining `--bg-primary` directly (not just `data-theme-mode`) is what makes the body's `background: var(--bg-primary, …)` paint correctly even when stylesheets are loaded asynchronously (JS-injected, dynamic `import()`, dev-mode bundlers like Vite that ship CSS as JS modules). | App doesn't use `sdk-iframe.css` (no FOUC to fix) |
 | `<link rel="stylesheet" href="/api/v1/sdk-iframe.css">` | Theme tokens (`--bg-primary`, `--accent`, etc.), dark/light variables, default body/input/scrollbar styling, **and Lucidos's shared component classes** (`.action-btn` + `.action-btn-confirm`/`.action-btn-danger`, `.button-group`, `.icon-btn`, `.label`, `.title`, `.segmented-control`/`.segmented-btn`, `.list-row*`, `.markdown-content`, `.progress-bar`, `.empty-state`, `.accent-link`). Use these class names and the app's buttons/lists/etc. render identically to the host shell. The body is set to `--font-size-md`, the type scale's body step, and inputs and buttons are set to `--font-ui` at the same step, so text and controls you do not size yourself land where the host shell's body text lands. Note that the body step is NOT the root font-size: the root is the user's UI scale, and `1rem` is `--font-size-xl`, a section heading. Text that names no size at all therefore comes out a step and a half larger than body, which is why the defaults above exist. | App ships its own complete stylesheet and doesn't want Lucidos theming |
 | `<script src="/api/v1/sdk-iframe-audio.js"></script>` | Monkey-patches `AudioContext` so app code reuses a gesture-unlocked instance, survives iOS PWA background cycles. **Must be in `<head>` before any code that creates an `AudioContext`.** | App doesn't play audio |
-| `<script src="/api/v1/sdk.js"></script>` | The `lucidos.*` API. Also installs iframe-only side effects, none of which needs a call from you: a link interceptor (`target="_blank"` links resolve in-frame; external `http(s)://` links route through `lucidos.ui.openExternal()`); a keyboard-shortcut forwarder (host shortcuts like focus/hide a pane, narrow/widen, new thread, search, and Escape keep working while the app has focus, because iframe keydowns otherwise never reach the host); per-app scroll memory (the app returns to where the user left it after an app switch or a reload); the Lucidos **tooltip** on any `data-tooltip` element (see § Tooltips, under lucidos.ui); and the device's **Autocorrect switch** plus a key-code guard on your text fields (see § Text fields and autocorrect). Only modifier-bearing chords and Escape are forwarded; plain typing stays in the app. | App doesn't use `lucidos.*` |
-| `lucidos.ui.applyPreferences()` | Reads the user's theme/font/scale (resolving a `system` preference to the live OS light/dark) and sets `data-theme` + CSS vars on `<html>`. Pairs with `sdk-iframe.css` to apply the right palette. | **Don't skip if you include `sdk-iframe.css`** — without it the app ignores the user's light/system setting and stays on the default dark palette. Skip only when opting out of Lucidos theming entirely. |
-| `lucidos.ui.watchPreferences()` | Re-applies preferences live: when the user changes one (SSE `PreferencesChanged`), and, under a `system` preference, when the OS light/dark appearance flips. The OS half watches `prefers-color-scheme` and the frame's own resume, on every platform, matching the host shell | Static apps that have opted out of Lucidos theming |
+| `<script src="/api/v1/sdk.js"></script>` | The `lucidos.*` API. Also installs iframe-only side effects, none of which needs a call from you: a link interceptor (`target="_blank"` links resolve in-frame; external `http(s)://` links route through `lucidos.ui.openExternal()`); a keyboard-shortcut forwarder (host shortcuts like focus/hide a pane, narrow/widen, new thread, search, and Escape keep working while the app has focus, because iframe keydowns otherwise never reach the host); per-app scroll memory (the app returns to where the user left it after an app switch or a reload); pull to refresh (a pull past the top reloads the app, see § Pull to refresh); the Lucidos **tooltip** on any `data-tooltip` element (see § Tooltips, under lucidos.ui); and the device's **Autocorrect switch** plus a key-code guard on your text fields (see § Text fields and autocorrect). Only modifier-bearing chords and Escape are forwarded; plain typing stays in the app. | App doesn't use `lucidos.*` |
+| `lucidos.ui.applyPreferences()` | Reads the user's theme mode/theme/font/scale (resolving a `system` preference to the live OS light/dark) and sets `data-theme-mode`, `data-font-bold` and CSS vars on `<html>`. Pairs with `sdk-iframe.css` to apply the right palette. | **Don't skip if you include `sdk-iframe.css`**: without it the app ignores the user's light/system setting and stays on the default dark palette. Skip only when opting out of Lucidos theming entirely. |
+| `lucidos.ui.watchPreferences()` | Re-applies preferences live: when the user changes one (SSE `PreferencesChanged`), when the active theme's file or plugin changes, and, under a `system` preference, when the OS light/dark appearance flips. The OS half watches `prefers-color-scheme` and the frame's own resume, on every platform, matching the host shell | Static apps that have opted out of Lucidos theming |
 
-**Inherit the theme by default.** A normal app includes the theme assets, calls `applyPreferences()` + `watchPreferences()`, and styles with the theme variables (below) — so it follows the user's light/dark (OS) appearance just like the rest of Lucidos. Theme integration is *technically* opt-in: the engine never auto-injects these tags, so an app that omits both `<script src="/api/v1/sdk-prefs.js">` and `<link rel="stylesheet" href="/api/v1/sdk-iframe.css">` gets no `data-theme` attribute, no CSS variables, and no Lucidos default styling. Opt out only for an app that ships its own complete visual identity (charts, games, embedded third-party UIs) — otherwise inheriting is the default, and **hardcoding colors is a bug** (a light-mode workspace gets a dark-only app, or vice versa).
+**Inherit the theme by default.** A normal app includes the theme assets, calls `applyPreferences()` + `watchPreferences()`, and styles with the theme variables (below). It then follows the user's theme and light/dark appearance like the rest of Lucidos. Theme integration is *technically* opt-in, because the engine never auto-injects these tags. An app that omits both `<script src="/api/v1/sdk-prefs.js">` and `<link rel="stylesheet" href="/api/v1/sdk-iframe.css">` gets no `data-theme-mode` attribute, no CSS variables, and no Lucidos default styling.
+
+Opt out only for an app that ships its own complete visual identity (charts, games, embedded third-party UIs). Otherwise inheriting is the default, and **hardcoding colors is a bug** (a light-mode workspace gets a dark-only app, or vice versa).
 
 **The tab icon is the one tag the engine does add.** An app opened in its own
 browser tab is a top-level document. Without a `<link rel="icon">` it shows the
@@ -80,6 +82,18 @@ gives your document a short-lived pass to its own files and stamps it into a
 `lucidos.data.url(path)` carries it too. You write nothing, and the host keeps
 the pass fresh while your app is open. See
 [ADR 0238](https://github.com/lucidos-dev/lucidos/blob/main/docs/adr/0238-app-frame-carries-a-capability-to-its-own-files.md).
+
+**The user's workspace font loads by itself.** When the user picks a font they
+installed (`system-knowhow/workspace-fonts.md`), `sdk-prefs.js` and
+`applyPreferences()` register its faces from the workspace and set `--font-ui`.
+Your app needs no code for it.
+
+**A bundled font and an ES module load too.** Ship an `@font-face` pointing at
+your own `.woff2`, or a `<script type="module">` with relative `import`s. Both
+work in every browser on every install, except that a dev engine opened with no
+gateway refuses the module in Chromium. A `fetch()` of your own files never
+works: the engine grants a load, never a read, so use `lucidos.data.read`. See
+[ADR 0289](https://github.com/lucidos-dev/lucidos/blob/main/docs/adr/0289-app-frames-load-fonts-and-modules-across-origins.md).
 
 **Do not declare your own `<base href>`.** The first base in a document wins, so
 yours would replace the pass and your files would stop loading behind a gateway.
@@ -175,23 +189,92 @@ switch: under `system` it follows the OS, and `reduce` or `full` override it.
 user who picked Reduce or Full in Lucidos. A change reaches a running app
 through `watchPreferences()`.
 
+### Theme parts
+
+An app that loads `sdk-iframe.css` paints the active theme's three frame parts
+(`themes.md` § Theme parts):
+
+| Part | Paints | Properties |
+|---|---|---|
+| `app-text` | the `body` text | `text-shadow`, `letter-spacing` |
+| `app-link` | every `a` | `text-decoration-color`, `text-shadow` |
+| `app-control` | `input`, `textarea`, `select`, `button` and the SDK select | `border-color`, `box-shadow` |
+
+The tokens arrive through your own tags: `sdk-prefs.js` at first paint, and
+`applyPreferences()` live. An app that loads the SDK without `sdk-iframe.css`
+gets the tokens and no visible effect. An app without the SDK gets nothing,
+because the engine adds no stylesheet or script to your page.
+
+**Opt out for the whole app** with `data-theme-parts="off"` on your `<html>`.
+Every part token then resets, and the rest of the SDK styling stays. There is
+no opt-in per part: the theme decides which parts it styles.
+
+```html
+<html data-theme-parts="off">
+```
+
+An element of your own may read a part token by name, with the fallback you
+would paint without it: `text-shadow: var(--part-app-text-text-shadow, none)`.
+`GET /api/v1/themes/parts` lists every token, and the names are a stable
+contract.
+
+**Key your own glows on `data-theme-effects`.** A frame that loads
+`sdk-prefs.js` or calls `applyPreferences()` gets
+`data-theme-effects="reduce"` or `"full"` on `<html>`, from the device's
+`theme-effects` preference, before first paint and live. Under `reduce` the SDK
+stylesheet drops every part shadow and filter:
+
+```css
+:root[data-theme-effects="reduce"] .badge { box-shadow: none; }
+```
+
+### Pull to refresh
+
+**A pull past the top of your app reloads it, with no code from you.** On a
+touch screen, `sdk.js` watches for a downward drag once the page is scrolled to
+the top. A scroll up that reaches the top and keeps going becomes a pull from
+that point. It posts the pull to Lucidos, which draws the arrow and
+runs the same reload as the header's Refresh button. So your app starts fresh,
+and a WIP preview stays on its WIP.
+
+It never blocks scrolling: every listener is passive. It stays out of the way
+of a gesture that is not a pull:
+
+- a drag while the page or a scrolled inner list is still below its top;
+- a mostly sideways drag, such as a carousel swipe;
+- a second finger, such as a pinch.
+
+**To own the gesture yourself, claim it.** Either of these works:
+
+- call `preventDefault()` on the `touchstart` or `touchmove`;
+- give the element a `touch-action` that keeps the vertical pan, such as
+  `touch-action: none` on a canvas or `pan-x` on a horizontal strip.
+
+A drag that starts on a claimed element is never a pull. That covers a map, a
+drawing surface or a drag handle built on Pointer Events, which never cancel
+the touch.
+
 ### Theme variables
 
-`sdk-iframe.css` defines these CSS custom properties on `<html>` and flips their values between light and dark automatically — driven by the `data-theme` attribute, which `applyPreferences()` sets (resolving `system` to the OS setting) and `watchPreferences()` keeps in sync. Style your app with `var(--name)` and it tracks the user's appearance for free. The canonical values live in the engine's `sdk-iframe.css`; **the names are the contract**:
+`sdk-iframe.css` defines these CSS custom properties on `<html>` and flips their values between light and dark automatically. The `data-theme-mode` attribute drives them: `applyPreferences()` sets it (resolving `system` to the OS setting) and `watchPreferences()` keeps it in sync. An app frame also carries the same value as `data-theme`, the name it had before, so older app styles keep working for now. Key new styles on `data-theme-mode`. Style your app with `var(--name)` and it tracks the user's appearance for free. The canonical values live in the engine's `sdk-iframe.css`; **the names are the contract**:
 
 | Group | Variables |
 |---|---|
 | Backgrounds | `--bg-primary`, `--bg-secondary`, `--bg-tertiary`, `--bg-quaternary`, `--bg-hover`, `--bg-selected` |
-| Text | `--text-primary`, `--text-secondary`, `--text-muted`, `--text-on-accent` |
+| Text | `--text-primary`, `--text-secondary`, `--text-muted`, `--text-on-accent`, `--text-strong` (bold text where the UI font has no bold face). `<html>` carries `data-font-bold="none"` for such a font and `"face"` otherwise, and `sdk-iframe.css` then paints `strong` and `b` inside `.markdown-content` with it. Key your own bold on the same attribute: `html[data-font-bold="none"] .my-label b { color: var(--text-strong); }` |
 | Border | `--border-color` |
 | Accents | `--accent`, `--accent-light`, `--accent-green`, `--accent-yellow`, `--accent-red` |
 | Focus | `--focus-ring` — a ready-made `box-shadow` value (a soft accent band) for focus indicators; the `.action-btn`/`.icon-btn` classes use it, and your own controls match the host with `:focus-visible { box-shadow: var(--focus-ring); }` |
 | Shadows | `--shadow-sm`, `--shadow-md`, `--shadow-lg` |
+| Shape | `--radius-control` (`0.5rem`), `--radius-surface` (`0.75rem`), `--radius-round` (`999px`): the theme's corner steps. The shared component classes round with them, so a square theme squares them. Scale one with `calc()` to follow the theme in your own CSS. |
 | Layout (theme-independent) | `--font-ui`, `--font-mono`, `--font-features-text`, `--font-features-code`, `--transition`, `--user-ui-scale`, plus the spacing / radius / motion scales below |
 | Stacking | `--z-tooltip` (`10000`), the layer the built-in tooltip paints on. Keep your own overlays under it, so a tooltip is never covered. |
 
-The user's UI font is **`--font-ui`** — that's the canonical token, set live to the
-user's font choice. You rarely need to apply it yourself: `sdk-iframe.css` already
+The user's **theme** retunes these values too, on top of the light and dark defaults, so style with the variables rather than copying their values. An app that lists or builds themes uses the routes in `themes.md` § For apps.
+
+The user's UI font is **`--font-ui`**, the canonical token. It is set live to the
+user's font pick, or to the font their theme suggests when they follow the theme
+(the default). You rarely need to apply it yourself: `sdk-iframe.css` already
 sets `body { font-family: var(--font-ui) }` — plus inputs and `.action-btn`, since
 form controls don't inherit the page font on their own — so any element that
 inherits gets the right font for free. (A *bare* unclassed `<button>` is the gap:
@@ -203,9 +286,10 @@ intuitive guess still resolves to the user's font instead of silently dropping t
 hardcoded fallback) — but `--font-ui` is the name to write.
 
 **`--font-features-text` and `--font-features-code` carry programming ligatures,
-and only code gets them.** Fira Code is the default UI font, so unless the user
-picked another one they resolve to `"liga" 0, "calt" 0` and `"liga" 1, "calt" 1`;
-for every other font both are `normal`. `sdk-iframe.css` applies them for you, the text one on `html, input,
+and only code gets them.** Fira Code (the default), JetBrains Mono and Cascadia
+Code ship programming ligatures. With one of them as the UI font, the two
+resolve to `"liga" 0, "calt" 0` and `"liga" 1, "calt" 1`. For every other font
+both are `normal`. `sdk-iframe.css` applies them for you, the text one on `html, input,
 textarea, select, button` and the code one on `code, pre, kbd, samp`, so a code
 block in your app ligatures `=>` and `!=` while your prose and your form fields
 render literally.
@@ -307,16 +391,14 @@ than the rest of Lucidos, with looser line spacing to match.
 itself imports via `global.css`) to the served stylesheet. There is no copy and
 nothing to keep in sync — apply these class names and your app's controls render
 exactly like the rest of Lucidos (and track the theme + UI scale for free). The
-one exception is the app-facing `.action-btn-secondary` below, which lives in the
-engine's `sdk-iframe.css` (the host has no equivalent, so it isn't in the shared
-file). The class names are the contract:
+class names are the contract:
 
 | Class | Use for |
 |---|---|
 | `.action-btn` (+ `.action-btn-confirm` green, `.action-btn-danger` red) | The filled primary CTA button — blue, with the confirm/danger variants additive (`class="action-btn action-btn-danger"`) |
 | `.action-btn-secondary` | A neutral, outlined secondary button for a lower-emphasis action beside a primary CTA — additive: `class="action-btn action-btn-secondary"`. **Use this instead of hand-rolling an off-palette outlined button.** |
 | `.button-group` | Wrap a **row of buttons** in this instead of a bare flex row. It keeps the row bound by its container: buttons that do not fit stack onto a second row rather than overflowing, and a single button whose label is wider than the row ellipsizes instead of being sliced by whatever ancestor hides its overflow. Set your own `justify-content` on the same element (the class deliberately sets none) and the buttons keep their natural widths. |
-| `.icon-btn` | A small borderless icon button (wrap an SVG sized via `--icon-size-sm`) |
+| `.icon-btn` | A small borderless icon button (wrap an SVG sized via `--icon-size-sm`). `disabled` fades it and drops its tooltip. `aria-disabled="true"` only drops the hover wash, so a busy button keeps its tooltip. |
 | `.accent-link` | An inline text link/button in the accent color |
 | `.label` | A small uppercase badge |
 | `.title` | A list/panel/modal title |
@@ -840,6 +922,8 @@ app runs in. The whole reachable set, with the methods each opens:
 | `/ui/navigate` | POST |
 | `/env-vars` | GET |
 | `/models`, `/knowhow`, `/knowhow/read`, `/health` | GET |
+| `/themes`, `/theme`, `/themes/tokens`, `/themes/parts` | GET |
+| `/themes/resolve` | POST |
 
 Most of those have a namespace of their own, which is the better way to call
 them. The generated `packages/lucidos-sdk/src/generated/app-reach.ts` is the
@@ -1164,11 +1248,12 @@ type Preferences = Record<string, string>;
 
 | Key | Values | Description |
 |-----|--------|-------------|
-| `theme` | `dark`, `light`, `system` | UI theme |
-| `font-family` | `monospace`, `system`, `inter`, `jetbrains-mono`, `ibm-plex-mono`, `fira-code` | Font (`fira-code` also enables programming ligatures, on code and `pre` blocks only, via `--font-features-text` / `--font-features-code`) |
+| `theme-mode` | `dark`, `light`, `system` | Light or dark. `system` (the default) follows the OS. Read the resolved value as `data-theme-mode` on `<html>` |
+| `font-family` | `theme`, `system`, `geist`, `atkinson-hyperlegible-next`, `inter`, `roboto`, `open-sans`, `manrope`, `source-serif-4`, `lora`, `literata`, `fira-code`, `monospace`, `geist-mono`, `atkinson-hyperlegible-mono`, `jetbrains-mono`, `ibm-plex-mono`, `source-code-pro`, `commit-mono`, `cascadia-code`, `vt323` | Font. `theme` (the default) follows the active theme's suggested font, else `fira-code`; `GET /api/v1/fonts` lists the fonts, each with its `group` (`sans`, `serif`, `mono`). `applyPreferences()` resolves it for you into `--font-ui` and loads the font from the local engine. `fira-code`, `jetbrains-mono` and `cascadia-code` also enable programming ligatures, on code and `pre` blocks only, via `--font-features-text` / `--font-features-code` |
 | `ui-scale` | Number in 12.5% steps from 75 to 200 (`75`, `87.5`, `100`, `112.5`, `125`, `137.5`, `150`, `162.5`, `175`, `187.5`, `200`); or the legacy strings `small` / `medium` / `large` (= `100` / `112.5` / `125`). Off-grid numbers snap to the nearest valid step. | Scale |
 | `autocorrect` | `true`, `false` | Whether text fields autocorrect on this device. Unset, on everywhere. `sdk.js` applies it to your fields (§ Text fields and autocorrect, under Setup) |
 | `motion` | `system`, `reduce`, `full` | Whether this device reduces motion. `system` (the default) follows the OS. Read it as `data-motion` on `<html>` (§ Reduced motion, under Setup) |
+| `theme-effects` | `system`, `reduce`, `full` | Whether this device shows a theme's part shadows, filters and scanlines. `system` (the default) drops them when the OS asks for more contrast or less transparency. Read it as `data-theme-effects` on `<html>` (§ Theme parts, under Setup) |
 
 ## lucidos.notifications — Notification Center
 
@@ -1432,7 +1517,6 @@ interface ThreadSummary {
   coding_agent_proposed: boolean;
   coding_agent_requires_restart: boolean;
   coding_agent_is_external_repo: boolean;
-  coding_agent_applying: boolean;
   last_revived_at: string | null;
   parent_thread_id?: string | null;
   parent_thread_title?: string | null;
@@ -1491,19 +1575,25 @@ lucidos.ui.enhanceSelects(root?: ParentNode): SelectInstance[]
 lucidos.ui.disableTooltips(): void
 ```
 
-`applyPreferences()` fetches user preferences and applies theme, font, and scale as CSS variables (resolving a `system` theme to the live OS light/dark). Call once on app load, and style your app with the theme variables (§ Theme variables, under Setup) so it follows the user's appearance: don't hardcode colors. For each setting it prefers the server value, then whatever the synchronous `sdk-prefs.js` script already put on `<html>`, and only then a default. So a device with no server-scoped value (e.g. only `ui-scale` stored, no `theme`) keeps the user's appearance instead of resetting to dark.
+`applyPreferences()` fetches user preferences and applies the theme mode, theme, font, and scale as CSS variables. It resolves a `system` theme mode to the live OS light or dark. Call once on app load, and style your app with the theme variables (§ Theme variables, under Setup) so it follows the user's appearance: don't hardcode colors. For each setting it prefers the server value, then whatever the synchronous `sdk-prefs.js` script already put on `<html>`, and only then a default. So a device with no server-scoped value (e.g. only `ui-scale` stored, no `theme-mode`) keeps the user's appearance instead of resetting to dark.
 
 `applyPreferences()` also applies the user's **style overrides**: the
 `style_overrides` preference holds a map of CSS custom property to value, which
-it writes onto `<html>` after theme, font and scale (so an override of one of
-those wins). That is what keeps an app's chrome matching a host the user has
+it writes onto `<html>` after the theme mode, theme, font and scale (so an override of one
+of those wins). Clearing an override uncovers the theme's value for that token. That is what keeps an app's chrome matching a host the user has
 retuned. Only custom properties are honoured, and a value containing `;`, `{`,
 `}`, `<`, `>`, `@`, a backslash, `url(`, `image-set(`, `expression(` or a
 comment opener is dropped, because the map is writable by any app and must not
-be able to inject a declaration or fetch from another origin. Nothing is
-required of an app beyond calling `applyPreferences()`.
+be able to inject a declaration or fetch from another origin. For the same
+reason an override never sets five kinds of name: a `--protected-*` token,
+which protected surfaces read, a `--z-*` stacking token, the UI font tokens,
+`--user-ui-scale`, which the UI scale preference sets, and the screen's
+scanlines, `--part-screen-background-image`, which the engine clamps the
+protected palette against. A shadow token such as `--shadow-md` is dropped if
+it reaches more than 2rem past its box. Nothing is required of an app beyond
+calling `applyPreferences()`.
 
-`watchPreferences()` subscribes to live preference changes (SSE `PreferencesChanged`) and re-applies them automatically. Call it once alongside `applyPreferences()` so the app reacts without a reload. That covers a light/dark toggle, an OS appearance change under a `system` preference, and a value retuned from the Style Remote. It also covers a flip of the device's Autocorrect switch (§ Text fields and autocorrect, under Setup).
+`watchPreferences()` subscribes to live preference changes (SSE `PreferencesChanged`) and re-applies them automatically. It also re-fetches the active theme when its file is written or deleted (`DataFileWritten`, `DataFileEdited`, `DataFileDeleted`) and when a plugin is installed or uninstalled. Call it once alongside `applyPreferences()` so the app reacts without a reload. That covers a light/dark toggle, an OS appearance change under a `system` preference, and a value retuned from the Style Remote. It also covers a flip of the device's Autocorrect switch (§ Text fields and autocorrect, under Setup).
 
 Under a `system` preference the OS appearance is watched two ways, because neither alone is enough on every client. The `prefers-color-scheme` media query covers a flip while the app is on screen. The frame's resume (`visibilitychange`, `focus`, `pageshow`) covers one announced while it was not. That is the normal case in an installed iOS PWA, which is resumed rather than reloaded. Both are sampled a moment after the event and only re-apply when the resolved theme actually moved, so a wake that changed nothing costs nothing. Your app needs to do none of this: it is inside `watchPreferences()`.
 
@@ -1780,10 +1870,15 @@ of hand-rolling your own banner.
 type ToastType = 'success' | 'info' | 'warning' | 'error';
 
 interface ToastOptions {
+  /** A bold line over the message. Only the title is bold; without one the
+   *  toast is its message alone. A non-string title throws a TypeError. */
+  title?: string;
   /** Auto-dismiss after this many ms. Omit for the host default: errors and
    *  warnings stay until dismissed; success/info auto-close. */
   durationMs?: number;
-  /** false = hide the close (X) button. Default true. */
+  /** false = never show the close (X) button, and a tap on the toast never
+   *  closes it. A toast that leaves on its own timer and has no button shows
+   *  no X either way. Default true. */
   dismissable?: boolean;
   /** Stable key for in-place replacement. A later toast with the same key
    *  updates the existing toast (message/type/etc.) instead of stacking a new
@@ -1801,13 +1896,20 @@ serializable subset is exposed — the host's toast action buttons take `onClick
 callbacks, which can't cross the app-iframe boundary, so they aren't available
 from an app.
 
+**A tap on a success or info toast closes it**, unless it is `dismissable: false`
+or `spinning`. A warning or an error stays up until its X or its timer, because
+the reader may still be reading it.
+
+**The title is explicit, and the message is plain text.** Pass `opts.title` for
+a bold line over the message. A newline in the message is a line break and
+nothing more: the host reads no heading and no list out of it. A `"• "` line is
+shown as written.
+
 **A toast is a summary, and the host bounds it.** A message longer than 2000
 characters is truncated with an ellipsis. An `'error'` toast is bounded harder:
-it is shown as ONE line, and truncated at 200 characters. So a newline in an
-error message is a space rather than a line break, and an error carries no
-bulleted list. Keep an error to a sentence, and put the detail somewhere the
-user can come back to. Every other type keeps the newline structure the host
-renders as a title over bullets.
+its title and message are each shown as ONE line, and truncated at 200
+characters. So a newline in an error is a space rather than a line break. Keep
+an error to a sentence, and put the detail somewhere the user can come back to.
 
 **Example:**
 
@@ -1815,6 +1917,9 @@ renders as a title over bullets.
 lucidos.ui.toast('Saved', 'success');
 lucidos.ui.toast('Could not reach the server', 'error');
 lucidos.ui.toast('Working on it…', 'info', { durationMs: 2000 });
+
+// A bold title over a longer message:
+lucidos.ui.toast('3 habits due today\n• Read\n• Walk', 'info', { title: 'Habit Tracker' });
 
 // Collapse a two-step status into one toast that updates in place:
 lucidos.ui.toast('Opening from Drive…', 'info', { key: 'drive-open' });

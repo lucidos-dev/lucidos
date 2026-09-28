@@ -51,7 +51,7 @@ test.describe('Change actions — mobile split button', () => {
 
       // Discarding via the menu drops the change from the pending list.
       await menu.locator('button:has-text("Discard")').first().click();
-      const confirmBtn = page.locator('.confirm-btn-ok:visible, .confirm-btn-ok-default:visible').first();
+      const confirmBtn = page.locator('[data-role="confirm-ok"]:visible').first();
       if (await confirmBtn.isVisible({ timeout: 3_000 }).catch(() => false)) {
         await confirmBtn.click();
       }

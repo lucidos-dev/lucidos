@@ -50,6 +50,9 @@ async fn health_has_expected_fields() {
         // (ADR 0037). Absent would read as "reachable" on the client, so its
         // presence is the contract.
         "database_reachable",
+        // Why it is not: the slowness warning names a used-up pool apart from
+        // a stuck database (ADR 0301).
+        "database_pool_exhausted",
     ] {
         assert!(
             body.get(field).is_some() && !body[field].is_null(),

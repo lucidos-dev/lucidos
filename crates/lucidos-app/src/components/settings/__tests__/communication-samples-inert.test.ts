@@ -83,6 +83,14 @@ describe('the communication-surface gallery is inert', () => {
     expect(page).toContain('backupReminderBody(');
     expect(page).toContain('connectionBannerBody(');
     expect(page).toContain('ingressBannerBody(');
+    expect(page).toContain('waitingPanelBody(');
+  });
+
+  it('shows the waiting panel only drilled in, where no row can stop a real wait', () => {
+    // The list view's rows carry a live Stop waiting button. The drill-in has
+    // none, and its back link is handed a handler that does nothing.
+    expect(page).toContain('condition: SAMPLE_CONDITION');
+    expect(page).toContain('onBack: () => {}');
   });
 
   it('gives the ingress bar an inert button, since its real one navigates', () => {

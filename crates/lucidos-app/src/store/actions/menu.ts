@@ -58,7 +58,7 @@ export function switchMenuItem(item: MenuItem) {
   if (item === 'apps') void loadApps();
   if (item === 'plugins') void loadInstalledPlugins();
   if (item === 'triggers') void loadTriggers();
-  if (item === 'notifications') refreshActiveNotificationsTab();
+  if (item === 'notifications') void refreshActiveNotificationsTab();
 
   pushNavState();
   revealContentPane();
@@ -124,6 +124,14 @@ export function openProviderSettings(): void {
 export function openFreeProviderSettings(): void {
   settingsScrollTarget.value = 'models:opencode-free';
   openSettingsSubview('models');
+}
+
+/** Deep-link to the Capture context per step switch in Settings → System →
+ *  Debugging. One caller, the context viewer's note on a section with no body.
+ *  It navigates and nothing else, so the user flips the switch themselves. */
+export function openCaptureContextSetting(): void {
+  settingsScrollTarget.value = 'debugging:capture-context';
+  openSettingsSubview('debugging');
 }
 
 /** Deep-link to Settings → System → Backup in a single render. Two callers: the

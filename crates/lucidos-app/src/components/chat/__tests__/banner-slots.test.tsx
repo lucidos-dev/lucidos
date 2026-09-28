@@ -50,7 +50,6 @@ function makeCCThread(id: string, overrides: Partial<ThreadState['meta']> = {}):
       codingAgentProposed: false,
       codingAgentRequiresRestart: false,
       codingAgentIsExternalRepo: false,
-      codingAgentApplying: false,
       codingAgentHasDiff: false,
       lastRevivedAt: '',
       state: 'active',
@@ -148,6 +147,21 @@ function rows(members: HeaderActionSpec[]): ComponentChildren[] {
 }
 
 describe('getBannerActions', () => {
+  it('marks every thread action, so the dead-press probe never warns about one', () => {
+    const split = getBannerActions({
+      type: 'actions', actions: DISCARD_APPLY, threadId: 'tid', isArchiving: false, showDiff: false,
+    });
+    const splitAttrs = (rowOf(split[0]) as VNode<{ attrs: Record<string, string> }>).props.attrs;
+    expect(splitAttrs).toHaveProperty('data-thread-action', '');
+    expect(splitAttrs).toHaveProperty('data-row-item', 'fold');
+
+    const plain = getBannerActions({
+      type: 'actions', actions: [ta('discard', 'Discard')], threadId: 'tid', isArchiving: false, showDiff: false,
+    });
+    const [discard] = buttonNodes(rowOf(plain[0])) as VNode<Record<string, unknown>>[];
+    expect(discard.props['data-thread-action']).toBe('');
+  });
+
   it('keeps Diff its own member, ahead of the change actions', () => {
     const members = getBannerActions({
       type: 'actions',
@@ -334,9 +348,9 @@ describe('showDiff is driven by codingAgentHasDiff alone', () => {
   });
 
   it('shows Cancel (not disabled applying) while a merge-conflict resolution runs', () => {
-    // codingAgentApplying=true + status 'running' = an apply-driven merge. Cancel
+    // Status 'running' during an apply-driven merge. Cancel
     // is best-effort but must be offered (regression fix: it used to be disabled).
-    const thread = makeCCThread('t1', { status: 'running', codingAgentApplying: true });
+    const thread = makeCCThread('t1', { status: 'running' });
     threadMap.value = new Map([['t1', thread]]);
     focusedThreadId.value = 't1';
 

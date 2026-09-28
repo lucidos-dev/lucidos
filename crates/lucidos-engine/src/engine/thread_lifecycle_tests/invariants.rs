@@ -44,20 +44,6 @@ fn terminal_events_never_set_running() {
                         "Terminal event '{}' should not set Running",
                         event_type
                     ),
-                    StatusRule::ConditionalCc(w, wo) => {
-                        assert_ne!(
-                            *w,
-                            ThreadStatus::Running,
-                            "Terminal '{}' withChanges should not be Running",
-                            event_type
-                        );
-                        assert_ne!(
-                            *wo,
-                            ThreadStatus::Running,
-                            "Terminal '{}' withoutChanges should not be Running",
-                            event_type
-                        );
-                    }
                     StatusRule::NoChange => {}
                 }
             }
@@ -114,14 +100,14 @@ fn status_transition_classification_consistency() {
                     );
                 }
             }
-            _ => {} // ConditionalCc and NoChange are fine in any class
+            _ => {} // NoChange is fine in any class
         }
     }
 }
 
 /// Cross-validate: CcFlagRule != None should only appear on CC-relevant events
 /// (Change*, ClaudeCode*, MergeConflict*, ThreadArchived). This catches accidental
-/// coding_agent_proposed/coding_agent_applying mutations on chat-only events.
+/// coding_agent_proposed mutations on chat-only events.
 #[test]
 fn cc_flag_rules_only_on_cc_relevant_events() {
     let cc_relevant_prefixes = ["Change", "CodingAgent", "MergeConflict", "ThreadArchived"];

@@ -5,6 +5,8 @@ pub(crate) mod agent_session;
 mod agentic_loop;
 mod apply_all_batches;
 pub(crate) mod apply_all_driver;
+pub(crate) mod apply_estimate;
+mod archive_request;
 pub(crate) mod aux_capture;
 pub(crate) mod aux_purpose;
 pub mod cc_permission;
@@ -35,6 +37,7 @@ pub mod frontend_preview;
 mod frontend_refresh;
 pub(crate) mod git_ops;
 pub mod http;
+pub(crate) mod image_size_hint;
 pub(crate) mod inline_question_repair;
 pub(crate) mod inline_tool_call_repair;
 pub(crate) mod loaded_knowhow;
@@ -85,6 +88,7 @@ pub(crate) use change_ops::MERGE_OWNED_BY_RESOLVER_MESSAGE;
 // refusal taxonomy: the delivery half stays reachable solely as
 // `LucidosEngine::follow_up_child_thread`, so there is no way to assemble a
 // second delivery path out of its parts.
+pub(crate) use chat::agent_archive::{AgentArchiveAck, AgentArchiveError};
 pub(crate) use chat::child_detach::{ChildDetachError, DetachAck, DetachCaller};
 pub(crate) use chat::child_follow_up::{
     ChildFollowUpError, FollowUpAck, FollowUpDelivery, FollowUpUrgency,
@@ -440,13 +444,11 @@ pub struct LucidosEngine {
     /// Acquired via `scheduler::BackupGuard::try_acquire`. POST /api/v1/backup
     /// returns 409 when the guard is held; the scheduled cron skips its tick.
     pub backup_in_progress: AtomicBool,
-    /// Is the workspace database answering? Written ONLY by the background probe
-    /// (`db_health::spawn_db_health_probe`) and read per request by
-    /// `GET /api/v1/health`, so a database outage adds no latency to the endpoint
-    /// the gateway health-checks. Starts `true`: the engine only reaches `serve`
-    /// after connecting and migrating, so anything else would be a claim without
-    /// evidence. See `engine::db_health` and ADR 0037.
-    database_reachable: AtomicBool,
+    /// Is the workspace database answering, and if not, why? Only the background
+    /// probe (`db_health::spawn_db_health_probe`) writes it. `GET /api/v1/health`
+    /// reads it per request, so an outage adds no latency to the endpoint the
+    /// gateway health-checks. See `engine::db_health` and ADR 0037.
+    database_health: db_health::DatabaseHealthCell,
     /// Dev-only background-rebuild state driving the "new version available"
     /// surface. Set by the Apply-triggered rebuild (Phase 2); read by
     /// `GET /api/v1/engine/version-status`. Idle in packaged (no source rebuild).
@@ -497,6 +499,10 @@ pub struct LucidosEngine {
     /// Monotonic generation so only the latest background rebuild updates
     /// `build_state` — a superseded build's completion is ignored.
     build_generation: std::sync::atomic::AtomicU64,
+    /// Process group of THIS engine's in-flight rebuild, or 0 when none runs.
+    /// Published only while the build's `BuildProcessGroupGuard` is armed, so
+    /// it never names a group whose leader has been reaped.
+    build_process_group: std::sync::atomic::AtomicU32,
     /// Dev-only: swappable served-frontend dir. `api::serve_frontend` reads the
     /// current snapshot path per request; a *frontend-only* Apply re-snapshots
     /// `dist/` and swaps this so the served client advances WITHOUT an engine
@@ -522,6 +528,11 @@ pub struct LucidosEngine {
     /// Handle to the in-flight served-frontend refresh task, so a later Apply can
     /// abort + supersede it. Mirrors `build_task`.
     frontend_refresh_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// The generation and start time of the last applying frontend refresh.
+    /// It counts as in flight only while that generation is still current, so
+    /// a task the peer sync aborted cannot leave the indicator on. See
+    /// `engine::frontend_refresh::live_refresh_elapsed`.
+    frontend_refresh_started: std::sync::Mutex<Option<(u64, std::time::Instant)>>,
     /// Has the worktree-pinned-frontend warning already fired this process? The
     /// check runs on the ~10s peer-sync tick, so without this it would log every
     /// tick forever. A field rather than a `static` so tests that build several
@@ -673,8 +684,9 @@ pub struct LucidosEngine {
     /// Keyed by thread_id so concurrent starts on different threads are not blocked.
     last_spawn: std::sync::Mutex<HashMap<Uuid, std::time::Instant>>,
     /// Spawns past the spawn debounce that have not returned yet. Together with
-    /// `agent_sessions` this answers whether anybody owns a thread.
-    spawns_in_flight: agent_session::SpawnsInFlight,
+    /// `agent_sessions` this answers whether anybody owns a thread. Shared with
+    /// the worktree cleanup's liveness probe.
+    spawns_in_flight: Arc<agent_session::SpawnsInFlight>,
     /// Pre-spawn map of `cc_thread_id` → `app_id` for app coding-agent
     /// threads. `spawn_agent_thread` stashes the app id here before
     /// `process_message_with_steps` runs; `run_direct_agent` pops it in to
@@ -734,6 +746,9 @@ pub struct LucidosEngine {
     /// `ChangeApplied` for the conflict member triggers the next apply
     /// via the same hook the happy path uses.
     pub(crate) apply_all_batches: Arc<tokio::sync::Mutex<apply_all_batches::ApplyAllRegistry>>,
+    /// How long hardening and conflict resolution usually take, served to the
+    /// Changes panel and its apply toasts. A cache over the events table.
+    pub(crate) apply_estimates: Arc<apply_estimate::ApplyEstimateCache>,
     /// Sender for the apply-all driver task. `emit_change_applied` /
     /// `emit_apply_failed` push `Applied` / `Failed` messages here; the
     /// driver task (spawned at engine startup via `start_apply_all_driver`)

@@ -32,7 +32,7 @@ async fn change_applied_then_idle_no_changes_stays_idle() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ChangeProposed {
-            change_id: "c1".into(),
+            change_id: test_change_id(thread_id).to_string(),
             description: Some("Fix bug".into()),
             files: vec!["src/main.rs".into()],
             requires_restart: false,
@@ -53,7 +53,7 @@ async fn change_applied_then_idle_no_changes_stays_idle() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ChangeApplied {
-            change_id: "c1".into(),
+            change_id: test_change_id(thread_id).to_string(),
             requires_restart: false,
             client_update: false,
             commits: vec![],
@@ -124,7 +124,7 @@ async fn change_applied_keeps_inbox_shows_archive() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ChangeProposed {
-            change_id: "c1".into(),
+            change_id: test_change_id(thread_id).to_string(),
             description: Some("Fix bug".into()),
             files: vec!["src/main.rs".into()],
             requires_restart: false,
@@ -145,7 +145,7 @@ async fn change_applied_keeps_inbox_shows_archive() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ChangeApplied {
-            change_id: "c1".into(),
+            change_id: test_change_id(thread_id).to_string(),
             requires_restart: false,
             client_update: false,
             commits: vec![],
@@ -172,7 +172,7 @@ async fn change_applied_keeps_inbox_shows_archive() {
         "ChangeApplied must NOT clear inbox — Archive button needs to appear"
     );
 
-    // CC flags should be cleared (ClearAll)
+    // The change is applied, so the proposal flag follows it down.
     let coding_agent_proposed: bool = sqlx::query_scalar(
         "SELECT coding_agent_proposed FROM thread_summaries WHERE thread_id = $1",
     )
@@ -217,7 +217,7 @@ async fn change_discarded_keeps_inbox_shows_archive() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ChangeProposed {
-            change_id: "c1".into(),
+            change_id: test_change_id(thread_id).to_string(),
             description: Some("Fix bug".into()),
             files: vec!["src/main.rs".into()],
             requires_restart: false,
@@ -238,7 +238,7 @@ async fn change_discarded_keeps_inbox_shows_archive() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ChangeDiscarded {
-            change_id: "c1".into(),
+            change_id: test_change_id(thread_id).to_string(),
             actor: None,
             path: String::new(),
         },
@@ -280,7 +280,7 @@ async fn apply_then_archive_moves_to_archive_section() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ChangeProposed {
-            change_id: "c1".into(),
+            change_id: test_change_id(thread_id).to_string(),
             description: Some("Fix".into()),
             files: vec!["a.rs".into()],
             requires_restart: false,
@@ -302,7 +302,7 @@ async fn apply_then_archive_moves_to_archive_section() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ChangeApplied {
-            change_id: "c1".into(),
+            change_id: test_change_id(thread_id).to_string(),
             requires_restart: false,
             client_update: false,
             commits: vec![],
@@ -992,7 +992,7 @@ async fn startup_resets_orphaned_waiting_threads_without_changes() {
     sqlx::query(
         "UPDATE thread_summaries SET status = 'idle', \
              coding_agent_proposed = FALSE, coding_agent_requires_restart = FALSE, \
-             coding_agent_is_external_repo = FALSE, coding_agent_applying = FALSE \
+             coding_agent_is_external_repo = FALSE \
              WHERE status = 'waiting' AND coding_agent_proposed = FALSE AND source = 'claude_code'",
     )
     .execute(&pool)
@@ -1036,7 +1036,7 @@ async fn startup_resets_orphaned_waiting_threads_without_changes() {
 /// ThreadArchived must clear all CC flags and set status to idle.
 /// Previously ThreadArchived was a no-op, leaving archived threads stuck in waiting.
 #[tokio::test]
-async fn thread_archived_clears_cc_flags_and_goes_idle() {
+async fn thread_archived_goes_idle_and_the_proposal_follows_the_changes_row() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _callback_rx) = EventBus::new(pool.clone());
     let thread_id = Uuid::new_v4();
@@ -1082,14 +1082,9 @@ async fn thread_archived_clears_cc_flags_and_goes_idle() {
     .await
     .unwrap();
 
-    let (status, has_changes, requires_restart, is_external, applying): (
-        String,
-        bool,
-        bool,
-        bool,
-        bool,
-    ) = sqlx::query_as(
-        "SELECT status, coding_agent_proposed, coding_agent_requires_restart, coding_agent_is_external_repo, coding_agent_applying \
+    let (status, has_changes, requires_restart, is_external): (String, bool, bool, bool) =
+        sqlx::query_as(
+            "SELECT status, coding_agent_proposed, coding_agent_requires_restart, coding_agent_is_external_repo \
              FROM thread_summaries WHERE thread_id = $1",
     )
     .bind(thread_id)
@@ -1098,18 +1093,42 @@ async fn thread_archived_clears_cc_flags_and_goes_idle() {
     .unwrap();
     assert_eq!(status, "idle", "ThreadArchived must set idle");
     assert!(
-        !has_changes,
-        "ThreadArchived must clear coding_agent_proposed"
-    );
-    assert!(
-        !requires_restart,
-        "ThreadArchived must clear coding_agent_requires_restart"
-    );
-    assert!(
         !is_external,
         "ThreadArchived must clear coding_agent_is_external_repo"
     );
-    assert!(!applying, "ThreadArchived must clear coding_agent_applying");
+    assert!(
+        has_changes && requires_restart,
+        "the change is still pending, so the proposal flags stay: they follow \
+         the changes row, not the archive"
+    );
+
+    // The external-repo archive resolves the change, and the flags follow.
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::ChangeApplied {
+            change_id: test_change_id(thread_id).to_string(),
+            requires_restart: true,
+            client_update: false,
+            commits: vec![],
+            thread_title: None,
+            actor: None,
+            pre_merge_sha: None,
+            post_merge_sha: None,
+            path: String::new(),
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+    let (has_changes, requires_restart): (bool, bool) = sqlx::query_as(
+        "SELECT coding_agent_proposed, coding_agent_requires_restart \
+         FROM thread_summaries WHERE thread_id = $1",
+    )
+    .bind(thread_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(!has_changes && !requires_restart);
 
     pool.close().await;
     teardown_test_db(&db_name).await;

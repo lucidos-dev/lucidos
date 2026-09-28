@@ -1,5 +1,8 @@
 import type { ComponentChildren } from 'preact';
+import { useState } from 'preact/hooks';
 import { plainEventName } from '../../store/thread-events';
+import { Disclosure } from '../shared/Disclosure';
+import { CheckIcon, ChevronRightIcon, CloseIcon } from '../shared/icons';
 
 /** **The event row**: one transcript marker for everything that arrives from
  *  outside the thread, and for what the thread is waiting on.
@@ -12,7 +15,7 @@ import { plainEventName } from '../../store/thread-events';
  *  event type as an accent chip in one place and prose in another. See
  *  `docs/plans/2026-08-10-one-event-row-for-the-transcript.md`.
  *
- *  The shape is a card: `mark + subject + state` on one line, then the facts,
+ *  The shape is a card: `subject + state` on one line, then the facts,
  *  then an optional fold. The same markup renders in both positions the family
  *  occupies, a response body (the wait) and an initiator panel's `details` (the
  *  other three), which is what lets one primitive serve all four.
@@ -22,8 +25,10 @@ import { plainEventName } from '../../store/thread-events';
  *  debris between the step list and the prose, so it is contained now. The
  *  ranking survives instead of the rule: `.step-note-card` (the checkpoint's
  *  Undo) still outweighs this, so a record never looks like something you can
- *  act on. The one exception is a record still waiting on the user: an open
- *  *form request* carries its Open (`action`, ADR 0275), at the same weight.
+ *  act on. Two exceptions carry `actions` at the same weight: an open *form
+ *  request*'s Open (ADR 0275), and a change's Diff and Revert.
+ *
+ *  No glyph leads the subject: the subject and the state word carry the row.
  *
  *  **It is NOT a step**, and the whole point of the file is that it stops
  *  looking like one. The event wait used to render as `.inline-step` with a
@@ -35,32 +40,20 @@ import { plainEventName } from '../../store/thread-events';
 /** Which of the four surfaces this is. Carried as `data-kind` for tests and
  *  for any kind-specific CSS; the row's LOOK never branches on it, which is
  *  what keeps the four coherent. */
-export type EventRowKind = 'wait' | 'delivery' | 'child' | 'trigger' | 'held' | 'form';
-
-/** What the mark column says. Deliberately not the kind: the mark answers "did
- *  something arrive", which is the one question all four kinds share, so a
- *  matched wait and a trigger fire get the same glyph and are told apart by
- *  their subject and their state word. */
-export type EventRowMark = 'pending' | 'arrived' | 'returned';
-
-/** Monochrome and universally available, on purpose. An emoji here would render
- *  in colour and be the one loud thing in a column of muted marks, which is the
- *  step-icon mistake in a different hat. It said "the ⏰ the trigger panel uses
- *  for its chip" until 2026-08-13, when that chip's emoji became a drawn glyph
- *  along with the last six in host chrome; the colour argument was never what
- *  kept these three as TEXT, which is the actual claim. They are marks in a
- *  column of prose, sized and coloured by the type around them, where an icon
- *  would need a box. */
-const EVENT_ROW_MARK: Record<EventRowMark, string> = {
-  pending: '○',
-  arrived: '↓',
-  returned: '↵',
-};
+export type EventRowKind = 'wait' | 'delivery' | 'child' | 'trigger' | 'held' | 'form' | 'change';
 
 /** How the state WORD is tinted. The tint groups the word, it never replaces
  *  it: every state is legible as text, so the row survives a colourblind reader
  *  and reads correctly to a screen reader. */
 export type EventRowTone = 'live' | 'arrived' | 'good' | 'bad' | 'lapsed' | 'halted' | 'none';
+
+/** The glyph before the state word. Only a pass or a fail earns one: every
+ *  other tone is a state rather than a verdict, and a mark on it would read as
+ *  a result the row never had. */
+const VERDICT_GLYPH: Partial<Record<EventRowTone, () => preact.JSX.Element>> = {
+  good: CheckIcon,
+  bad: CloseIcon,
+};
 
 /** One item on the facts line. `chip` is the shared event-type atom, and it is
  *  the ONLY way an event type is spelled anywhere in the transcript. `glue` is a
@@ -110,12 +103,14 @@ export interface EventRowFold {
    *  scrolls rather than wraps, since a wrapped sha reads as two shas. Prose
    *  gets an ordinary block. */
   pre?: boolean;
+  /** Starts unfolded. Only for a body the reader must not miss, such as the
+   *  error behind a failed apply. */
+  open?: boolean;
   body: ComponentChildren;
 }
 
 export interface EventRowProps {
   kind: EventRowKind;
-  mark: EventRowMark;
   /** Carried as `data-state` for tests and deep links. */
   state?: string;
   /** The sentence the row is about. WRAPS: it is the reason the row exists, and
@@ -126,17 +121,17 @@ export interface EventRowProps {
   stateLabel?: string;
   tone?: EventRowTone;
   /** When the row's event was recorded, already formatted, and its ISO source.
-   *  Only a row inside a response body needs one: a row in an initiator panel
-   *  sits under that panel's own timestamp. */
+   *  Drawn above the card. Only a row inside a response body needs one: a row
+   *  in an initiator panel sits under that panel's own timestamp. */
   time?: { label: string; iso: string };
   /** Falsy entries are dropped, so a caller can inline a condition rather than
    *  building the array up imperatively. Nothing is invented to fill a gap: a
    *  fact the event does not carry is simply absent, and its separator with it. */
   facts?: (EventRowFact | null | undefined | false)[];
   fold?: EventRowFold;
-  /** The one thing the reader can do from the row. Only a record that is
-   *  still waiting on the user earns one: an open form request's Open. */
-  action?: { label: string; onClick: () => void };
+  /** What the reader can do from the row: an open form request's Open, a
+   *  change's Diff and Revert. A plain record carries none. */
+  actions?: ComponentChildren;
   /** `data-role`, for the tests and for e2e selectors. */
   role?: string;
 }
@@ -148,7 +143,6 @@ export interface EventRowProps {
  *  cannot be invoked as a plain function and the tests drive this instead. */
 export function eventRowBody({
   kind,
-  mark,
   state,
   subject,
   stateLabel,
@@ -156,42 +150,64 @@ export function eventRowBody({
   time,
   facts,
   fold,
-  action,
+  actions,
   role,
 }: EventRowProps) {
   const shown = (facts ?? []).filter((f): f is EventRowFact => !!f);
-  return (
+  const Glyph = VERDICT_GLYPH[tone];
+  const card = (
     <div class="event-row" data-role={role} data-kind={kind} data-state={state}>
       {/* The subject and its verdict share the top line, so the card opens with
           one readable sentence and the state sits where the eye already is.
           They were stacked, which spent a whole line on a single word and made
           three loose lines out of what is one fact. */}
       <div class="event-row-head">
-        <span class="event-row-mark" aria-hidden="true">{EVENT_ROW_MARK[mark]}</span>
         <div class="event-row-subject">{subject}</div>
-        {(time || stateLabel) && (
-          <span class="event-row-aside">
-            {time && <time class="event-row-time" dateTime={time.iso}>{time.label}</time>}
-            {stateLabel && (
-              <span class="event-row-state" data-tone={tone}>{stateLabel}</span>
-            )}
+        {stateLabel && (
+          <span class="event-row-state" data-tone={tone}>
+            {Glyph && <span class="event-row-state-glyph" aria-hidden="true"><Glyph /></span>}
+            {stateLabel}
           </span>
         )}
       </div>
       {shown.length > 0 && <div class="event-row-meta">{renderFacts(shown)}</div>}
-      {fold && (
-        <details class="event-row-fold">
-          <summary>{fold.label}</summary>
-          {fold.pre
-            ? <pre>{fold.body}</pre>
-            : <div class="event-row-fold-body">{fold.body}</div>}
-        </details>
-      )}
-      {action && (
-        <div class="event-row-actions">
-          <button type="button" class="action-btn" onClick={action.onClick}>{action.label}</button>
-        </div>
-      )}
+      {fold && <EventRowFoldView {...fold} />}
+      {actions && <div class="event-row-actions">{actions}</div>}
+    </div>
+  );
+  // The stamp sits above the card, right-aligned, as a user bubble carries its
+  // own. Every timestamp in the transcript then reads from the same place.
+  if (!time) return card;
+  return (
+    <>
+      <time class="event-row-time" dateTime={time.iso}>{time.label}</time>
+      {card}
+    </>
+  );
+}
+
+/** The row's fold. Its own component because the open state needs a hook,
+ *  and `eventRowBody` stays hookless. */
+export function EventRowFoldView({ label, pre, open: startsOpen = false, body }: EventRowFold) {
+  const [open, setOpen] = useState(startsOpen);
+  return (
+    <div class="event-row-fold">
+      <button
+        type="button"
+        class="event-row-fold-toggle"
+        aria-expanded={open}
+        onClick={() => setOpen(!open)}
+      >
+        <span class="event-row-fold-chevron" aria-hidden="true">
+          <ChevronRightIcon size="1em" />
+        </span>
+        {label}
+      </button>
+      <Disclosure open={open}>
+        {pre
+          ? <pre class="event-row-fold-pre">{body}</pre>
+          : <div class="event-row-fold-body">{body}</div>}
+      </Disclosure>
     </div>
   );
 }
@@ -201,7 +217,7 @@ export function eventRowBody({
  *
  *  A middot goes between adjacent facts, and never touches a `glue`:
  *  "ChangeProposed or ChangeApplied" is one fact expressed as three items, not
- *  three facts. Nothing precedes the first fact, since the state pill left this
+ *  three facts. Nothing precedes the first fact, since the state word left this
  *  line for the header.
  *
  *  A middot travels with the fact after it, so a wrapped line never ends on a

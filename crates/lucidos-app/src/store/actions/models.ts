@@ -325,7 +325,7 @@ export function setModelEnabled(id: string, enabled: boolean): Promise<boolean> 
 }
 
 export async function deleteModel(id: string): Promise<void> {
-  if (!(await showConfirm(`Delete model "${id}"?`, 'Delete'))) {
+  if (!(await showConfirm(`Delete model "${id}"?`, 'Delete', { variant: 'danger' }))) {
     return;
   }
   await runModelMutation(() => deleteModelApi(id), 'Failed to delete model');

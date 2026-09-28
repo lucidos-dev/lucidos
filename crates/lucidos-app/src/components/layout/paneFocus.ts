@@ -24,9 +24,14 @@ const PANE_SELECTOR: Record<FocusedPane, string> = {
 const FOCUSABLE =
   'a[href]:not([tabindex="-1"]), button:not([disabled]):not([tabindex="-1"]), input:not([disabled]):not([tabindex="-1"]), select:not([disabled]):not([tabindex="-1"]), textarea:not([disabled]):not([tabindex="-1"]), iframe:not([tabindex="-1"]), [tabindex]:not([tabindex="-1"])';
 
-function visibleFocusables(container: HTMLElement): HTMLElement[] {
+/** Tabbable elements within `container`. Excludes an `inert` descendant, or
+ *  one inside an `inert` ancestor (the thread drawer's filter panel while
+ *  closed, `ThreadFilterCover`). The browser already skips `inert` content on
+ *  Tab and refuses to focus it, so this filter must agree. Exported for unit
+ *  testing. */
+export function visibleFocusables(container: HTMLElement): HTMLElement[] {
   return Array.from(container.querySelectorAll<HTMLElement>(FOCUSABLE)).filter(
-    (el) => el.getClientRects().length > 0,
+    (el) => el.getClientRects().length > 0 && !el.closest('[inert]'),
   );
 }
 

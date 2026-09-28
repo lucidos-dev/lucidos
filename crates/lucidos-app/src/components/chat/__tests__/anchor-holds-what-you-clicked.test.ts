@@ -84,6 +84,31 @@ describe('a turn control holds the element the reader clicked', () => {
     restoreMO();
   });
 
+  it('keeps holding it while the rows above are still rolling', () => {
+    // Both turn toggles span the transcript, so the rows ABOVE the control roll
+    // too. At 120 frames a second a roll outlasts the correction's 12 frames
+    // several times over, and the control would drift from the 13th on.
+    const restoreMO = useMockMO();
+    const container = mockContainer({ scrollTop: 1000, scrollHeight: 9000 });
+    const control = mockDynamicAnchor(container, 1300);
+    const before = viewportTop(control);
+    const frames: FrameRequestCallback[] = [];
+    const syncFrame = globalThis.requestAnimationFrame;
+    (globalThis as any).requestAnimationFrame = (cb: FrameRequestCallback) => { frames.push(cb); return 0; };
+    try {
+      withScrollAnchor(control as any, () => { control._setOffset(1310); });
+      const start = performance.now();
+      for (let frame = 1; frame <= 48 && frames.length > 0; frame++) {
+        control._setOffset(1310 + (frame / 48) * 490);
+        frames.shift()!(start + frame * 8.33);
+      }
+      expect(viewportTop(control)).toBe(before);
+    } finally {
+      (globalThis as any).requestAnimationFrame = syncFrame;
+      restoreMO();
+    }
+  });
+
   it('writes nothing when only the content BELOW it changed', () => {
     const restoreMO = useMockMO();
     // Pressing the LAST turn's control grows only what is under it. The freeze
@@ -102,8 +127,8 @@ describe('a turn control holds the element the reader clicked', () => {
 
   it('leaves the reader alone when the mutation takes the control away', () => {
     const restoreMO = useMockMO();
-    // The `⋯` stub is replaced by the body it reveals, so the anchor is gone by
-    // the time the correction runs. A detached node does not say so by measuring
+    // A mutation can take away the control that asked for it, so the anchor is
+    // gone by the time the correction runs. A detached node does not say so by measuring
     // nothing: it answers an all-zero rect, which reads as content at the very
     // top of the thread. Correcting against that would send the reader there.
     const container = mockContainer({ scrollTop: 900, scrollHeight: 4000 });
@@ -153,7 +178,7 @@ describe('a turn control holds the element the reader clicked', () => {
       restoreMO();
     });
 
-    it('moves nobody when the `⋯` stub unfolds under them', () => {
+    it('moves nobody when the pressed control leaves with the mutation', () => {
       const restoreMO = useMockMO();
       const container = mockContainer({ scrollTop: 3500, scrollHeight: 4000 });
       armedAtTheEnd(container);

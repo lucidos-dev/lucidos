@@ -11,7 +11,9 @@ import type { MarketplaceCatalog } from '../types';
 const mockFetchPluginCatalog = vi.fn();
 const mockAddPluginMarketplace = vi.fn();
 const mockRemovePluginMarketplace = vi.fn();
+const mockRescanPluginCatalog = vi.fn();
 vi.mock('../../api/client', () => ({
+  rescanPluginCatalog: (...args: unknown[]) => mockRescanPluginCatalog(...args),
   fetchPluginCatalog: (...args: unknown[]) => mockFetchPluginCatalog(...args),
   addPluginMarketplace: (...args: unknown[]) => mockAddPluginMarketplace(...args),
   removePluginMarketplace: (...args: unknown[]) => mockRemovePluginMarketplace(...args),
@@ -22,9 +24,12 @@ vi.mock('../../api/client', () => ({
 import {
   addPluginMarketplaceAction,
   loadPluginCatalog,
+  pluginCatalogScanned,
   refreshPluginCatalog,
   refreshPluginCatalogAfterMutation,
   removePluginMarketplaceAction,
+  rescanPluginCatalogAndSettle,
+  resyncPluginCatalog,
 } from './plugin-marketplaces';
 
 /** A catalog response the way the engine sends it. Typed, so a new wire field
@@ -222,6 +227,30 @@ describe('catalog refresh coalescing', () => {
     await vi.runAllTimersAsync();
 
     expect(mockFetchPluginCatalog).toHaveBeenCalledTimes(1);
+  });
+  // An awaiter must see the data it waited for. Settling when the in-flight
+  // read ends hands it the pre-mutation catalog that read already held.
+  it('settles a mid-scan mutation refresh only once its trailing read lands', async () => {
+    const before = deferredCatalog([]);
+    const trailing = deferredCatalog([{ id: 'm1', name: 'Fresh', source: 'https://github.com/example-org/example-repo' }]);
+    mockFetchPluginCatalog
+      .mockImplementationOnce(before.scan)
+      .mockImplementationOnce(trailing.scan);
+
+    void refreshPluginCatalogAfterMutation();
+    let settled = false;
+    const second = refreshPluginCatalogAfterMutation().then(() => { settled = true; });
+
+    before.release();
+    await vi.runAllTimersAsync();
+    expect(settled).toBe(false);
+
+    trailing.release();
+    await second;
+    expect(marketplaceCatalog.value).toMatchObject({
+      status: 'loaded',
+      data: { marketplaces: [{ name: 'Fresh' }] },
+    });
   });
 });
 
@@ -488,5 +517,162 @@ describe('a marketplace mutation shows its own result', () => {
     await vi.runAllTimersAsync();
 
     expect(marketplaceCatalog.value.status).toBe('loading');
+  });
+});
+
+// A scan runs on the engine's scheduler, so `PluginCatalogScanned` is how every
+// client learns one ended, whoever started it.
+describe('a scan landing', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    mockFetchPluginCatalog.mockReset().mockResolvedValue(emptyCatalog);
+    mockRescanPluginCatalog.mockReset();
+    marketplaceScanning.value = true;
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  // A failed scan ends too. Leaving the cue up would claim data is coming.
+  it('lowers the updating cue and re-reads an open catalog', async () => {
+    marketplaceCatalog.value = { status: 'loaded', data: catalogOf({ scanned_at: '2026-09-22T09:00:00Z' }) };
+    pluginCatalogScanned();
+    expect(marketplaceScanning.value).toBe(false);
+    await vi.runAllTimersAsync();
+    expect(mockFetchPluginCatalog).toHaveBeenCalledTimes(1);
+  });
+
+  // A device that never opened the panel is not made to fetch a catalog.
+  it('does not re-read a catalog nobody loaded', async () => {
+    marketplaceCatalog.value = { status: 'not-loaded' };
+    pluginCatalogScanned();
+    await vi.runAllTimersAsync();
+    expect(marketplaceScanning.value).toBe(false);
+    expect(mockFetchPluginCatalog).not.toHaveBeenCalled();
+  });
+
+  // The reported bug: a pull re-read the cached catalog, so "Updated 3 minutes
+  // ago" never moved. A refresh asks for a scan, as the freshness button does.
+  it('refreshes by asking for a scan, and settles once its result is on screen', async () => {
+    marketplaceScanning.value = false;
+    marketplaceCatalog.value = { status: 'loaded', data: catalogOf({ scanned_at: '2026-09-22T09:00:00Z' }) };
+    mockRescanPluginCatalog.mockResolvedValue({ queued: true });
+    mockFetchPluginCatalog.mockResolvedValue(catalogOf({ scanned_at: '2026-09-22T10:05:00Z' }));
+
+    let settled = false;
+    const refresh = rescanPluginCatalogAndSettle().then(() => { settled = true; });
+    await vi.runAllTimersAsync();
+    expect(mockRescanPluginCatalog).toHaveBeenCalledTimes(1);
+    expect(marketplaceScanning.value).toBe(true);
+    expect(settled).toBe(false);
+
+    pluginCatalogScanned();
+    await refresh;
+    expect(marketplaceCatalog.value).toMatchObject({ status: 'loaded', data: { scanned_at: '2026-09-22T10:05:00Z' } });
+  });
+
+  // SSE replays neither scan frame, so a phone that slept through the scan
+  // never hears it land. The next read after the request carries its result.
+  it('settles a refresh from a later read when the scan frame never arrives', async () => {
+    marketplaceScanning.value = false;
+    marketplaceCatalog.value = { status: 'loaded', data: catalogOf() };
+    mockRescanPluginCatalog.mockResolvedValue({ queued: true });
+    mockFetchPluginCatalog
+      .mockResolvedValueOnce(catalogOf({ scanning: true }))
+      .mockResolvedValueOnce(catalogOf({ scanned_at: '2026-09-22T10:05:00Z' }));
+
+    let settled = false;
+    const refresh = rescanPluginCatalogAndSettle().then(() => { settled = true; });
+    await vi.runAllTimersAsync();
+
+    await refreshPluginCatalog();
+    await vi.runAllTimersAsync();
+    expect(settled).toBe(false);
+
+    await refreshPluginCatalog();
+    await refresh;
+    expect(marketplaceCatalog.value).toMatchObject({ status: 'loaded', data: { scanned_at: '2026-09-22T10:05:00Z' } });
+  });
+
+  // A scan already running can land while the request is in flight. Its
+  // frame cannot say whether the requested scan has run, so a read after the
+  // response decides: still scanning keeps the refresh waiting.
+  it('does not settle on a scan that landed while the request was in flight', async () => {
+    marketplaceScanning.value = false;
+    marketplaceCatalog.value = { status: 'loaded', data: catalogOf() };
+    let respond!: () => void;
+    mockRescanPluginCatalog.mockReturnValue(new Promise((resolve) => { respond = () => resolve({ queued: true }); }));
+    mockFetchPluginCatalog.mockResolvedValue(catalogOf({ scanning: true }));
+
+    let settled = false;
+    const refresh = rescanPluginCatalogAndSettle().then(() => { settled = true; });
+    pluginCatalogScanned();
+    respond();
+    await vi.runAllTimersAsync();
+    expect(settled).toBe(false);
+    expect(marketplaceScanning.value).toBe(true);
+
+    mockFetchPluginCatalog.mockResolvedValue(catalogOf({ scanned_at: '2026-09-22T10:05:00Z' }));
+    pluginCatalogScanned();
+    await refresh;
+    expect(marketplaceCatalog.value).toMatchObject({ status: 'loaded', data: { scanned_at: '2026-09-22T10:05:00Z' } });
+  });
+
+  // SSE and HTTP arrive in no fixed order, so a frame after the response can
+  // still be an earlier scan's. Only a read that finds no scan running settles.
+  it('does not settle on a frame whose re-read still finds a scan running', async () => {
+    marketplaceScanning.value = false;
+    marketplaceCatalog.value = { status: 'loaded', data: catalogOf() };
+    mockRescanPluginCatalog.mockResolvedValue({ queued: true });
+    mockFetchPluginCatalog.mockResolvedValue(catalogOf({ scanning: true }));
+
+    let settled = false;
+    const refresh = rescanPluginCatalogAndSettle().then(() => { settled = true; });
+    await vi.runAllTimersAsync();
+    pluginCatalogScanned();
+    await vi.runAllTimersAsync();
+    expect(settled).toBe(false);
+
+    mockFetchPluginCatalog.mockResolvedValue(catalogOf({ scanned_at: '2026-09-22T10:05:00Z' }));
+    pluginCatalogScanned();
+    await refresh;
+    expect(marketplaceCatalog.value).toMatchObject({ status: 'loaded', data: { scanned_at: '2026-09-22T10:05:00Z' } });
+  });
+
+  // The failed catalog is the visible end. Pending on, the refresh would
+  // block every later pull on this panel.
+  it('settles on a read after the request that fails', async () => {
+    marketplaceScanning.value = false;
+    marketplaceCatalog.value = { status: 'loaded', data: catalogOf() };
+    mockRescanPluginCatalog.mockResolvedValue({ queued: true });
+    mockFetchPluginCatalog.mockRejectedValue(new ApiError(500, 'read cache: boom'));
+
+    const refresh = rescanPluginCatalogAndSettle();
+    await vi.runAllTimersAsync();
+    resyncPluginCatalog();
+    await vi.runAllTimersAsync();
+    await refresh;
+    expect(marketplaceCatalog.value.status).toBe('failed');
+  });
+
+  it('re-reads an open catalog on reconnect, and leaves an unopened one alone', async () => {
+    marketplaceCatalog.value = { status: 'not-loaded' };
+    resyncPluginCatalog();
+    await vi.runAllTimersAsync();
+    expect(mockFetchPluginCatalog).not.toHaveBeenCalled();
+
+    marketplaceCatalog.value = { status: 'loaded', data: catalogOf() };
+    resyncPluginCatalog();
+    await vi.runAllTimersAsync();
+    expect(mockFetchPluginCatalog).toHaveBeenCalledTimes(1);
+  });
+
+  it('fails a refresh whose scan request fails, and lowers the cue', async () => {
+    marketplaceScanning.value = false;
+    marketplaceCatalog.value = { status: 'loaded', data: catalogOf() };
+    mockRescanPluginCatalog.mockRejectedValue(new ApiError(500, 'scan queue: boom'));
+
+    await expect(rescanPluginCatalogAndSettle()).rejects.toThrow('boom');
+    expect(marketplaceScanning.value).toBe(false);
   });
 });

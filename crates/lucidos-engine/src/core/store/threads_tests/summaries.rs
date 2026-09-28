@@ -622,25 +622,22 @@ async fn get_recent_threads_archive_window_seam_is_gap_free() {
 }
 
 /// `count_archived_threads` powers the collapsed Archive section's count badge.
-/// It counts the archived pile — `archive_state='archived'` AND NOT saved — so
-/// the badge shows the true total instead of the loaded window. A saved+archived
-/// thread routes to the Saved section, not Archive, so it must NOT be counted;
-/// inbox threads (saved or not) belong to Review, so they're excluded too.
+/// It counts the archived pile, `archive_state='archived'`, so the badge shows
+/// the true total instead of the loaded window. Inbox threads, pinned or not,
+/// are excluded. A pinned thread is never archived (ADR 0312).
 #[tokio::test]
-async fn count_archived_threads_counts_archived_unsaved_only() {
+async fn count_archived_threads_counts_only_the_archived_pile() {
     let (pool, db) = setup_test_db().await;
     let store = EventStore::new(pool.clone());
 
     // (archive_state, is_saved) → counted?
     //   ('archived', false) ×3  → yes
-    //   ('archived', true)  ×1  → no  (shows in Saved)
-    //   ('inbox',    false) ×1  → no  (shows in Review)
-    //   ('inbox',    true)  ×1  → no  (shows in Saved)
+    //   ('inbox',    false) ×1  → no  (shows in Current)
+    //   ('inbox',    true)  ×1  → no  (shows in Pinned)
     let rows: &[(&str, bool)] = &[
         ("archived", false),
         ("archived", false),
         ("archived", false),
-        ("archived", true),
         ("inbox", false),
         ("inbox", true),
     ];
@@ -667,7 +664,7 @@ async fn count_archived_threads_counts_archived_unsaved_only() {
 
     assert_eq!(
         count, 3,
-        "only archived + unsaved threads count toward the Archive badge total"
+        "only archived threads count toward the Archive badge total"
     );
 
     teardown_test_db(&db).await;

@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 // that gap with the frame's base canvas colour, which is WHITE until something
 // inside the frame says otherwise. Everything that would say otherwise arrives
 // late and over the network: the app's own `<link>` stylesheet, and the theme
-// itself (`/api/v1/sdk-prefs.js` sets `data-theme` + an inline background, and is
+// itself (`/api/v1/sdk-prefs.js` sets `data-theme-mode` + an inline background, and is
 // a SECOND request after the HTML). So the sequence on every open is white, then
 // themed app, which reads as a flash on a dark theme and is worst on iOS where
 // the pane is the whole screen.

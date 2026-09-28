@@ -8,8 +8,9 @@ import {
   type InstallPortConflict,
   type InstallRecord,
 } from '../../api/client/control';
-import { toFailed, type Loadable } from '../../store/types';
+import { setLoadingIfFresh, toFailed, type Loadable } from '../../store/types';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
+import { usePanelRefresh } from '../../hooks/usePanelRefresh';
 import { LoadingFade } from '../shared/LoadingFade';
 import { LoadableError } from '../shared/LoadableError';
 import { ListSkeletonOf, SkText } from '../shared/Skeleton';
@@ -20,12 +21,13 @@ import { copyToClipboard } from '../../utils/clipboard';
  *
  *  No version counter and no poll: installs change when somebody runs an
  *  installer in a terminal, which emits no event this app could subscribe to.
- *  The gateway rescans on every request, so reopening the page is the refresh.
+ *  The gateway rescans on every request, so reopening the page or pulling to
+ *  refresh re-reads it, with the last list kept on screen meanwhile.
  */
 const installInventory = signal<Loadable<InstallInventory>>({ status: 'not-loaded' });
 
 async function loadInstalls(): Promise<void> {
-  installInventory.value = { status: 'loading' };
+  setLoadingIfFresh(installInventory);
   try {
     installInventory.value = { status: 'loaded', data: await fetchInstallInventory() };
   } catch (e) {
@@ -111,6 +113,7 @@ export function InstallsSection() {
   useEffect(() => {
     void loadInstalls();
   }, []);
+  usePanelRefresh('the installs on this machine', loadInstalls);
 
   const inventory = loadable.status === 'loaded' ? loadable.data : null;
   // A removal command is offered only where there is a choice to make. With one

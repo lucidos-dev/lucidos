@@ -21,7 +21,8 @@ export interface LongPressOptions {
   moveTolerancePx?: number;
 }
 
-const DEFAULT_DELAY_MS = 450;
+/** Where a still press stops being a tap, app-wide. */
+export const LONG_PRESS_DELAY_MS = 450;
 const DEFAULT_MOVE_TOLERANCE_PX = 10;
 // Upper bound for swallowing the `click` the browser pairs with the gesture's
 // pointerup. Keyed to pointerup (not to fire time) so an arbitrarily long hold
@@ -47,7 +48,7 @@ export function makeLongPressHandlers(
   onClick: () => void,
   opts: LongPressOptions = {},
 ): LongPressHandlers {
-  const delayMs = opts.delayMs ?? DEFAULT_DELAY_MS;
+  const delayMs = opts.delayMs ?? LONG_PRESS_DELAY_MS;
   const moveTolerance = opts.moveTolerancePx ?? DEFAULT_MOVE_TOLERANCE_PX;
 
   let timer: ReturnType<typeof setTimeout> | null = null;

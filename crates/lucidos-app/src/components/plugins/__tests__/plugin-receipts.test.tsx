@@ -151,8 +151,8 @@ describe('plugin uninstall receipt', () => {
     }));
 
     expect(acc.fileLists).toEqual([
-      { label: 'Deleted (1)', files: ['apps/habit-tracker/manifest.json'] },
-      { label: 'Already gone (1)', files: ['apps/habit-tracker/index.html'] },
+      { label: 'Deleted', files: ['apps/habit-tracker/manifest.json'] },
+      { label: 'Already gone', files: ['apps/habit-tracker/index.html'] },
     ]);
     expect(acc.text.join(' ')).toContain('Removed Habit Tracker');
     expect(acc.text).toContain('Uninstalled');
@@ -186,7 +186,7 @@ describe('plugin install receipt', () => {
     }));
 
     expect(acc.fileLists).toEqual([
-      { label: 'Files written (1)', files: ['apps/habit-tracker/manifest.json'] },
+      { label: 'Files installed', files: ['apps/habit-tracker/manifest.json'] },
     ]);
     expect(acc.text.join(' ')).toContain('Installed Habit Tracker');
     expect(acc.text).toContain('Installed');

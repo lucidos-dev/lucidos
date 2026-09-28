@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import type { Exchange } from './exchange';
 import { exchangeResponseEvents, exchangeStatus } from './exchange-render';
 import { statusLabel } from '../exchange-status';
-import { rendersLiveStep } from '../event-rendering';
+import { liveStepInBody, responseBody } from '../event-rendering';
 
 const TS = '2026-06-17T12:00:00Z';
 
@@ -45,7 +45,8 @@ function shimmerState(
   const status = exchangeStatus(exchange, streamingBuffer, true, false, false, false, false);
   const hasSteps = events.some(e => e.type === 'step');
   const { className } = statusLabel(status, hasSteps);
-  const liveStepOnScreen = rendersLiveStep(showSteps, collapsed, events) && rowInBand;
+  const liveRow = collapsed ? -1 : liveStepInBody(responseBody(events, { showSteps, showDetails: true, rowsHidden: 0 }));
+  const liveStepOnScreen = liveRow >= 0 && rowInBand;
   return {
     status,
     statusClass: className,
@@ -98,7 +99,7 @@ describe('exactly-one-shimmer invariant while working', () => {
   // A collapsed response panel hides the steps body, so a pending step's shimmer
   // is NOT on screen — the "Working" header must carry the shimmer instead, even
   // with steps globally expanded and a pending step in the data. (Regression:
-  // rendersLiveStep ignored the collapse and suppressed the label shimmer,
+  // the live-step check ignored the collapse and suppressed the label shimmer,
   // leaving the working turn with no shimmer at all.)
   // The gap a coding-agent turn used to have: between a `CodingAgentToolResult`
   // and the next `CodingAgentToolCalled` nothing was pending, so the transcript
@@ -152,7 +153,7 @@ describe('exactly-one-shimmer invariant while working', () => {
     held.blockedStepSeqs = new Set(held.steps.map(s => s.seq));
     const events = exchangeResponseEvents(held, true, false);
     expect(events.filter(e => e.type === 'step' && e.outcome === 'blocked')).toHaveLength(1);
-    expect(rendersLiveStep(true, false, events)).toBe(false);
+    expect(liveStepInBody(responseBody(events, { showSteps: true, showDetails: true, rowsHidden: 0 }))).toBe(-1);
     // And no derived Thinking row was added beside it: the held row IS the
     // turn's current row (`needsLiveThinkingRow`'s `anyLive`).
     expect(events.filter(e => e.type === 'step' && e.description === 'Thinking')).toHaveLength(0);

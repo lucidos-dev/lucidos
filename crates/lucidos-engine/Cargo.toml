@@ -33,6 +33,7 @@ chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
 libc = "0.2"
 lucidos-tailscale = { path = "../lucidos-tailscale" }
+lucidos-build-slot = { path = "../lucidos-build-slot" }
 lucidos-local-token = { path = "../lucidos-local-token" }
 lucidos-frame-capability = { path = "../lucidos-frame-capability" }
 lucidos-file-backup-exclusion = { path = "../lucidos-file-backup-exclusion" }

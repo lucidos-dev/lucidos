@@ -113,6 +113,17 @@ pub(crate) fn cmd_mark(ws: &Workspace) -> Result<(), BoxError> {
 /// GET the hardening state of the current branch from the parent engine.
 /// Used by `cmd_query` (printing) and `cc_stop_reminder` (deciding).
 pub(crate) fn query_state(ws: &Workspace) -> Result<HardenedState, BoxError> {
+    let (url, _branch, body) = fetch_marker(ws)?;
+    let state = body
+        .get("state")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| format!("GET {} response missing `state`: {}", url, body))?;
+    Ok(HardenedState::parse(state))
+}
+
+/// GET `/api/v1/internal/hardened-state` for the branch in `$PWD`. Returns the
+/// URL (for error messages), the branch, and the JSON body.
+fn fetch_marker(ws: &Workspace) -> Result<(String, String, serde_json::Value), BoxError> {
     let cwd = std::env::current_dir().map_err(|e| format!("Failed to read cwd: {}", e))?;
     let (repo_root, branch, _head_sha) = git_context(&cwd)?;
     let url = format!("{}/api/v1/internal/hardened-state", ws.base_url());
@@ -134,11 +145,7 @@ pub(crate) fn query_state(ws: &Workspace) -> Result<HardenedState, BoxError> {
     let body: serde_json::Value = resp
         .json()
         .map_err(|e| format!("GET {} returned non-JSON body: {}", url, e))?;
-    let state = body
-        .get("state")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| format!("GET {} response missing `state`: {}", url, body))?;
-    Ok(HardenedState::parse(state))
+    Ok((url, branch, body))
 }
 
 /// Print `FRESH`, `STALE`, or `MISSING` for the current branch to stdout.
@@ -147,6 +154,21 @@ pub(crate) fn cmd_query(ws: &Workspace) -> Result<(), BoxError> {
     let state = query_state(ws)?;
     println!("{}", state.as_str());
     Ok(())
+}
+
+/// Print the HEAD SHA the last `/harden` recorded for the current branch.
+/// No marker is an error (exit 1), so a caller cannot mistake it for a SHA.
+pub(crate) fn cmd_sha(ws: &Workspace) -> Result<(), BoxError> {
+    let (_url, branch, body) = fetch_marker(ws)?;
+    let sha = hardened_sha(&body).ok_or_else(|| format!("No harden marker for {}", branch))?;
+    println!("{}", sha);
+    Ok(())
+}
+
+fn hardened_sha(body: &serde_json::Value) -> Option<&str> {
+    body.get("head_sha")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
 }
 
 #[cfg(test)]
@@ -173,5 +195,24 @@ mod tests {
         // The HTTP body is JSON-extracted so trim is belt-and-braces, but
         // covers the case where someone pipes `lucidos hardened query` output.
         assert_eq!(HardenedState::parse("FRESH\n"), HardenedState::Fresh);
+    }
+
+    #[test]
+    fn hardened_sha_reads_the_recorded_head() {
+        let body = serde_json::json!({ "state": "STALE", "head_sha": "abc123" });
+        assert_eq!(hardened_sha(&body), Some("abc123"));
+    }
+
+    #[test]
+    fn hardened_sha_is_none_without_a_marker() {
+        assert_eq!(
+            hardened_sha(&serde_json::json!({ "state": "MISSING" })),
+            None
+        );
+        // An empty SHA must not print as one: a blank line reads as a revision.
+        assert_eq!(
+            hardened_sha(&serde_json::json!({ "state": "FRESH", "head_sha": "" })),
+            None
+        );
     }
 }

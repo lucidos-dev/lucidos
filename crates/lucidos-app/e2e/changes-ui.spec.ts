@@ -74,7 +74,7 @@ test.describe('Claude Code changes - apply and discard via UI', () => {
       await clickChangeAction(page, 'Discard');
 
       // Handle confirmation dialog if present
-      const confirmBtn = page.locator('.confirm-btn-ok:visible, .confirm-btn-ok-default:visible').first();
+      const confirmBtn = page.locator('[data-role="confirm-ok"]:visible').first();
       if (await confirmBtn.isVisible({ timeout: 3_000 }).catch(() => false)) {
         await confirmBtn.click();
       }

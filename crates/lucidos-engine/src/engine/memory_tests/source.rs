@@ -78,9 +78,9 @@ fn canonicalize_artifact_path_passes_through_already_canonical() {
 
 #[test]
 fn canonicalize_artifact_path_leaves_non_artifact_paths_alone() {
-    // A python tool writing under data/apps/ emits the data-relative path
-    // — the caller's read_artifact() will then look under data/artifacts/apps/
-    // and fail, which is the desired behavior (apps aren't memory-indexed,
+    // A python tool writing under data/apps/ emits the data-relative path.
+    // The caller's read then looks under data/artifacts/apps/
+    // and fails, which is the desired behavior (apps aren't memory-indexed,
     // matching what walk_artifact_history reports).
     assert_eq!(
         LucidosEngine::canonicalize_artifact_path("apps/foo/bar.txt"),

@@ -4,6 +4,10 @@ import { chatModels } from '../../store/store';
 import { Dropdown } from '../shared/Dropdown';
 import { LoadableError } from '../shared/LoadableError';
 import { ListRowAddCard } from '../shared/ListRowAddCard';
+import { Disclosure } from '../shared/Disclosure';
+import { LoadingFade } from '../shared/LoadingFade';
+import { ListSkeletonOf, SkBlock, SkText } from '../shared/Skeleton';
+import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { ChevronDownIcon, ChevronRightIcon } from '../shared/icons';
 import {
   setModelEnabled, deleteModel, submitNewModel, hasConfiguredRoute, resolvedRoute,
@@ -29,72 +33,86 @@ export interface RouteEditing {
 /** One registry row: the switch, the model's name and id, then the metadata
  *  cluster, and the route editor under it when open. Shared by the on list and
  *  the collapsed Off group, so a switched-off model keeps its switch and a
- *  switched-off user model keeps its Delete. */
-function modelRow(m: ModelInfo, editing?: RouteEditing) {
-  const editorOpen = editing?.id === m.id;
+ *  switched-off user model keeps its Delete. With no model, inside a
+ *  `SkeletonProvider`, it is the list's loading placeholder. */
+function modelRow(m?: ModelInfo, editing?: RouteEditing) {
+  const editorOpen = !!m && editing?.id === m.id;
   return (
-    <Fragment key={m.id}>
+    <Fragment key={m?.id}>
       <div class="model-manager-row">
-        <label class="toggle-switch">
-          <input
-            type="checkbox"
-            checked={m.enabled}
-            aria-label={`Offer ${m.label} in the model picker`}
-            onChange={(e) =>
-              void setModelEnabled(m.id, (e.currentTarget as HTMLInputElement).checked)
-            }
-          />
-          <span class="toggle-slider" />
-        </label>
+        <SkBlock w="2.25rem" h="1.25rem" round>
+          <label class="toggle-switch">
+            <input
+              type="checkbox"
+              checked={m?.enabled}
+              aria-label={`Offer ${m?.label} in the model picker`}
+              onChange={(e) =>
+                m && void setModelEnabled(m.id, (e.currentTarget as HTMLInputElement).checked)
+              }
+            />
+            <span class="toggle-slider" />
+          </label>
+        </SkBlock>
         <div class="model-manager-info">
-          <div class="model-manager-name">{m.label}</div>
-          <div class="model-manager-id">
-            {m.id} · {formatContextWindow(served(m)?.context_window ?? null)}
-          </div>
+          <SkText class="model-manager-name" as="div" w="8rem">{m?.label}</SkText>
+          <SkText class="model-manager-id" as="div" w="13rem">
+            {m && <>{m.id} · {formatContextWindow(served(m)?.context_window ?? null)}</>}
+          </SkText>
         </div>
-        <div class="model-manager-meta">
-          {/* One badge per backend that can serve this model, in the order the
-              engine resolves them. The preferred one is marked, since a pick is
-              honoured or refused rather than substituted: reading which backend
-              a turn will reach is the point of the row. */}
-          {m.routes.map((r) => (
-            <span
-              key={r.provider}
-              class="model-provider-badge"
-              data-preferred={r.provider === m.preferred_provider ? 'true' : undefined}
-              data-tooltip={r.id === m.id ? undefined : `Sent as ${r.id}`}
-            >
-              {r.provider}
-            </span>
-          ))}
-          {!hasConfiguredRoute(m) && (
-            <span
-              class="model-provider-badge model-provider-unconfigured"
-              data-tooltip="No provider set up. This model stays out of the picker until you add one under Providers"
-            >
-              not set up
-            </span>
-          )}
-          {editing && (
-            <button
-              class="action-btn"
-              aria-expanded={editorOpen}
-              onClick={() => editing.open(editorOpen ? null : m.id)}
-            >
-              Routes
-            </button>
-          )}
-          {m.source === 'user' ? (
-            <button class="action-btn action-btn-danger" onClick={() => void deleteModel(m.id)}>
-              Delete
-            </button>
-          ) : (
-            <span class="list-row-details">builtin</span>
-          )}
-        </div>
+        {m ? modelMeta(m, editorOpen, editing) : (
+          <div class="model-manager-meta"><SkBlock w="4.5rem" h="1.25rem" round /></div>
+        )}
       </div>
-      {editorOpen && <ModelRoutesEditor model={m} onClose={() => editing.open(null)} />}
+      <Disclosure open={editorOpen}>
+        {m && editing && <ModelRoutesEditor model={m} onClose={() => editing.open(null)} />}
+      </Disclosure>
     </Fragment>
+  );
+}
+
+/** A row's backend badges and actions. */
+function modelMeta(m: ModelInfo, editorOpen: boolean, editing?: RouteEditing) {
+  return (
+    <div class="model-manager-meta">
+      {/* One badge per backend that can serve this model, in the order the
+          engine resolves them. The preferred one is marked, since a pick is
+          honoured or refused rather than substituted: reading which backend
+          a turn will reach is the point of the row. */}
+      {m.routes.map((r) => (
+        <span
+          key={r.provider}
+          class="model-provider-badge"
+          data-preferred={r.provider === m.preferred_provider ? 'true' : undefined}
+          data-tooltip={r.id === m.id ? undefined : `Sent as ${r.id}`}
+        >
+          {r.provider}
+        </span>
+      ))}
+      {!hasConfiguredRoute(m) && (
+        <span
+          class="model-provider-badge model-provider-unconfigured"
+          data-tooltip="No provider set up. This model stays out of the picker until you add one under Providers"
+        >
+          not set up
+        </span>
+      )}
+      {editing && (
+        <button
+          class="action-btn"
+          aria-expanded={editorOpen}
+          onClick={() => editing.open(editorOpen ? null : m.id)}
+        >
+          Routes
+        </button>
+      )}
+      {m.source === 'user' ? (
+        <button class="action-btn action-btn-danger" onClick={() => void deleteModel(m.id)}>
+          Delete
+        </button>
+      ) : (
+        <span class="list-row-details">builtin</span>
+      )}
+    </div>
   );
 }
 
@@ -129,7 +147,7 @@ export function modelManagerList(
             {showOff ? <ChevronDownIcon size="1rem" /> : <ChevronRightIcon size="1rem" />}
             Off ({off.length})
           </button>
-          {showOff && off.map((m) => modelRow(m, editing))}
+          <Disclosure open={showOff}>{off.map((m) => modelRow(m, editing))}</Disclosure>
         </>
       )}
     </>
@@ -142,6 +160,7 @@ export function modelManagerList(
  *  actions; the chat picker re-reads it on the Model* SSE. */
 export function ModelsManager() {
   const loadable = chatModels.value;
+  const showLoading = useDelayedLoading(loadable);
   const [adding, setAdding] = useState(false);
   const [showOff, setShowOff] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -167,80 +186,85 @@ export function ModelsManager() {
       {loadable.status === 'failed' && (
         <LoadableError noun="models" error={loadable.error} />
       )}
-      {loadable.status === 'loaded' && (
-        <>
-          {modelManagerList(loadable.data, showOff, () => setShowOff((prev) => !prev), {
-            id: editingId,
-            open: setEditingId,
-          })}
-          {adding ? (
-            <div class="settings-section">
-              <div class="settings-row">
-                <span class="settings-row-label">Model id</span>
-                <input
-                  class="settings-text-input"
-                  placeholder="claude-fable-5"
-                  value={id}
-                  onInput={(e) => setId((e.currentTarget as HTMLInputElement).value)}
-                />
-              </div>
-              <div class="settings-row">
-                <span class="settings-row-label">Label</span>
-                <input
-                  class="settings-text-input"
-                  placeholder="Fable 5"
-                  value={label}
-                  onInput={(e) => setLabel((e.currentTarget as HTMLInputElement).value)}
-                />
-              </div>
-              <div class="settings-row">
-                <span class="settings-row-label">Provider</span>
-                <Dropdown options={PROVIDERS} value={provider} onChange={setProvider} />
-              </div>
-              <div class="settings-row">
-                <span class="settings-row-label">Context window</span>
-                <input
-                  class="settings-text-input"
-                  inputMode="numeric"
-                  placeholder="1048576 — leave blank to infer from the id"
-                  value={contextWindow}
-                  onInput={(e) =>
-                    setContextWindow((e.currentTarget as HTMLInputElement).value)
-                  }
-                />
-              </div>
-              <div class="settings-row">
-                <span class="settings-row-label" />
-                {/* A sentence, not a row of fields, so it takes the prose
-                    modifier: the base class is a flex row whose 0.75rem gap is
-                    the field separator (`.claude/rules/frontend.md`). */}
-                <span class="list-row-details list-row-details-prose">
-                  Tokens. Left blank, the engine guesses from the model id — and it
-                  has no rule for OpenRouter, xAI, Gemini, or local models, so they are
-                  treated as 200k however large they really are.
-                </span>
-              </div>
-              <div class="settings-row">
-                <span class="settings-row-label" />
-                <div class="settings-row-options">
-                  <button class="action-btn" onClick={() => setAdding(false)}>
-                    Cancel
-                  </button>
-                  <button
-                    class="action-btn action-btn-confirm"
-                    disabled={!id.trim() || !label.trim()}
-                    onClick={() => void add()}
-                  >
-                    Add
-                  </button>
+      <LoadingFade
+        showSkeleton={showLoading}
+        skeleton={<ListSkeletonOf count={4} row={() => modelRow()} />}
+      >
+        {loadable.status === 'loaded' && (
+          <>
+            {modelManagerList(loadable.data, showOff, () => setShowOff((prev) => !prev), {
+              id: editingId,
+              open: setEditingId,
+            })}
+            {adding ? (
+              <div class="settings-section">
+                <div class="settings-row">
+                  <span class="settings-row-label">Model id</span>
+                  <input
+                    class="settings-text-input"
+                    placeholder="claude-fable-5"
+                    value={id}
+                    onInput={(e) => setId((e.currentTarget as HTMLInputElement).value)}
+                  />
+                </div>
+                <div class="settings-row">
+                  <span class="settings-row-label">Label</span>
+                  <input
+                    class="settings-text-input"
+                    placeholder="Fable 5"
+                    value={label}
+                    onInput={(e) => setLabel((e.currentTarget as HTMLInputElement).value)}
+                  />
+                </div>
+                <div class="settings-row">
+                  <span class="settings-row-label">Provider</span>
+                  <Dropdown options={PROVIDERS} value={provider} onChange={setProvider} />
+                </div>
+                <div class="settings-row">
+                  <span class="settings-row-label">Context window</span>
+                  <input
+                    class="settings-text-input"
+                    inputMode="numeric"
+                    placeholder="1048576 (leave blank to infer from the id)"
+                    value={contextWindow}
+                    onInput={(e) =>
+                      setContextWindow((e.currentTarget as HTMLInputElement).value)
+                    }
+                  />
+                </div>
+                <div class="settings-row">
+                  <span class="settings-row-label" />
+                  {/* A sentence, not a row of fields, so it takes the prose
+                      modifier: the base class is a flex row whose 0.75rem gap is
+                      the field separator (`.claude/rules/frontend.md`). */}
+                  <span class="list-row-details list-row-details-prose">
+                    Tokens. Left blank, the engine guesses from the model id. It has
+                    no rule for OpenRouter, xAI, Gemini, or local models, so they are
+                    treated as 200k however large they really are.
+                  </span>
+                </div>
+                <div class="settings-row">
+                  <span class="settings-row-label" />
+                  <div class="settings-row-options">
+                    <button class="action-btn" onClick={() => setAdding(false)}>
+                      Cancel
+                    </button>
+                    <button
+                      class="action-btn action-btn-confirm"
+                      disabled={!id.trim() || !label.trim()}
+                      onClick={() => void add()}
+                    >
+                      Add
+                    </button>
+                  </div>
                 </div>
               </div>
-            </div>
-          ) : (
-            <ListRowAddCard label="Add Model" onClick={() => setAdding(true)} />
-          )}
-        </>
-      )}
+            ) : (
+              <ListRowAddCard label="Add Model" onClick={() => setAdding(true)} />
+            )}
+          </>
+        )}
+      </LoadingFade>
     </div>
   );
 }

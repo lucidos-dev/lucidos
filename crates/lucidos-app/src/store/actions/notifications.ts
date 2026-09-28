@@ -236,14 +236,10 @@ export async function loadMoreNotifications(): Promise<void> {
  *  browse list (`notifications`) for "All". Shared by opening the view (menu
  *  switch) and switching filters so both routes source the tab the same way and
  *  the Unread tab can never fall back to the separately-fetched browse list.
- *  Both loaders self-report failures via Loadable failed / showToast; `void` is
- *  the explicit fire-and-forget marker. */
-export function refreshActiveNotificationsTab(): void {
-  if (notificationsFilter.value === 'unread') {
-    void loadUnreadNotifications();
-  } else {
-    void loadNotifications();
-  }
+ *  Both loaders self-report failures via Loadable failed / showToast, so the
+ *  returned promise only says when the tab's data landed. */
+export function refreshActiveNotificationsTab(): Promise<void> {
+  return notificationsFilter.value === 'unread' ? loadUnreadNotifications() : loadNotifications();
 }
 
 /** Switch between "all" and "unread" filter and refresh the tab's source. The
@@ -252,7 +248,7 @@ export function refreshActiveNotificationsTab(): void {
  *  array. The "All" tab renders the paginated `notifications` browse list. */
 export function setNotificationsFilter(filter: 'all' | 'unread'): void {
   notificationsFilter.value = filter;
-  refreshActiveNotificationsTab();
+  void refreshActiveNotificationsTab();
   void savePreference('notifications_filter', filter);
 }
 
@@ -404,7 +400,7 @@ export async function viewNotification(id: string): Promise<void> {
     // Memory first. When either list already holds the row it IS the full
     // notification (see findLoadedNotification), so the detail lands on this
     // tick with no network at all: the inbox row tap, the warm push tap, and
-    // the toast [Open] for a row the page has seen all become instant.
+    // the toast tap for a row the page has seen all become instant.
     let notification = findLoadedNotification(id);
     if (!notification) {
       // Genuine miss (the cold push-tap deep link, before the unread set has

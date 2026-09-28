@@ -82,7 +82,7 @@ pub(super) async fn create_notification(
         .map_err(|e| ApiError::internal(format!("could not check event_id: {e}")))?
         .map_err(ApiError::bad_request)?;
 
-    let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    let actor = super::actor::user_actor(&headers, None);
 
     let id = state
         .engine
@@ -202,7 +202,7 @@ pub(super) async fn mark_notification_read(
     let id = query.id;
     // `mark_read` emits `NotificationRead` itself, and only when the row really
     // moved from unread to read; resolve the device actor for it.
-    let actor = crate::api::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    let actor = crate::api::actor::user_actor(&headers, None);
     let success = NotificationStore::mark_read(&state.pool, &state.engine.event_bus, id, actor)
         .await
         .map_err(|e| {
@@ -234,7 +234,7 @@ pub(super) async fn mark_all_notifications_read(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<MarkReadResponse>, (StatusCode, String)> {
-    let actor = crate::api::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    let actor = crate::api::actor::user_actor(&headers, None);
     let count = NotificationStore::mark_all_read(&state.pool, &state.engine.event_bus, actor)
         .await
         .map_err(|e| {

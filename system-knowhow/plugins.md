@@ -33,7 +33,7 @@ A plugin is a published artifact other workspaces install -- get the shape right
 
 ## Plugin layout
 
-A plugin is a directory containing `manifest.toml` at the root plus a subset of five content directories. The directories mirror `data/` one-to-one -- whatever lives at `<plugin>/<dir>/...` lands at `<workspace>/data/<dir>/...` at install time.
+A plugin is a directory containing `manifest.toml` at the root plus a subset of seven content directories. The directories mirror `data/` one-to-one -- whatever lives at `<plugin>/<dir>/...` lands at `<workspace>/data/<dir>/...` at install time.
 
 ```
 my-plugin/
@@ -45,6 +45,10 @@ my-plugin/
   auth-modules/          # optional, mirrors data/auth-modules/
                          #   ship `<name>.wasm` + optional `<name>.manifest.json` sidecar;
                          #   install auto-reloads the proxy WASM signer map
+  themes/                 # optional, mirrors data/themes/
+                         #   one `<id>.json` per theme; see themes.md
+  fonts/                 # optional, mirrors data/fonts/
+                         #   one `<slug>/` per font; see workspace-fonts.md
 ```
 
 The `manifest.json` sidecar carries only WASM-host metadata (`secret_handles`, `body_mode`, `capabilities`). The engine never auto-loads provider config from it — `data/config/apis.json` is the single source of truth for proxy entries. Plugins that ship a signer should include the matching `apis.json` snippet in the manifest's `setup` field so the install-time LLM walks the user through pasting it into `data/config/apis.json` and registering the credential.
@@ -56,8 +60,10 @@ Validation rules enforced at install (`core/plugins.rs::validate_tree` and `vali
 - `id` matches `[a-z0-9-]+`, non-empty, max 64 chars. Uppercase, underscore, dot all reject.
 - `version` parses as semver.
 - `source`, when present, looks like a git remote: starts with `https://`, `http://`, `git@`, or ends in `.git`. Bare strings, `file://` URLs, and `.lucidos-plugin` paths are not valid. `source` is optional -- omit it for archive-only plugins shared peer-to-peer (Slack drop, USB stick, attachment). `update_plugin` and `check_plugin_updates` will refuse a sourceless plugin with an explanatory error, but install and uninstall work fine.
-- Top-level entries are exactly `manifest.toml` plus a subset of `{apps, knowhow, triggers, scripts, auth-modules}`. No root README, no `LICENSE`, no `.git`, no `node_modules`, no `__MACOSX` (auto-injected by macOS Finder when zipping). Put per-plugin docs and license inside the plugin's own subtree if needed.
-- At least one of `apps/`, `knowhow/`, `triggers/`, `scripts/`, `auth-modules/` exists with at least one file. An empty `knowhow/` directory passes the top-level check but fails as `EmptyTree`.
+- Top-level entries are exactly `manifest.toml` plus a subset of `{apps, knowhow, triggers, scripts, auth-modules, themes, fonts}`. No root README, no `LICENSE`, no `.git`, no `node_modules`, no `__MACOSX` (auto-injected by macOS Finder when zipping). Put per-plugin docs and license inside the plugin's own subtree if needed. A `looks/` folder, the name themes had before ADR 0316, is refused with a hint to rename it `themes/`. A plugin installed before the rename keeps owning its moved theme files, so uninstall still removes them.
+- At least one of `apps/`, `knowhow/`, `triggers/`, `scripts/`, `auth-modules/`, `themes/`, `fonts/` exists with at least one file. An empty `knowhow/` directory passes the top-level check but fails as `EmptyTree`.
+- Every file under `themes/` is `<id>.json` and a valid theme, with an id no built-in theme uses (`InvalidTheme` otherwise). The rules are in `themes.md`, theme parts included: a part value past a cap, or a part on a protected surface, fails staging with the field, the rule and the limit (`dark.parts.chat-text.text-shadow: blur 2em is over the 0.6em cap.`).
+- Every file under `fonts/` belongs to a valid workspace font: `fonts/<slug>/font.json` plus the font files it names (`InvalidFont` otherwise). A theme in the plugin may name a workspace font only if the plugin ships it. Install is refused when the plugin's new fonts would take the workspace past 100. The rules are in `workspace-fonts.md`.
 - Hidden files (any path component starting with `.`) are silently skipped during the file walk -- `.DS_Store`, editor swap files, and friends do not get installed.
 - Symbolic links are never followed. A file symlink is skipped and a dir symlink is not walked. A top-level symlink named as a content dir is rejected. This keeps a plugin from reaching a file outside its own tree.
 - No archive entry uses `..` or absolute paths (`/`, `\`) -- zip-slip protection.
@@ -109,6 +115,8 @@ The user clicks **Confirm** (writes files, **commits them to the workspace git r
 
 **Setup runs on confirm — but only when there's *new* setup to run.** If the manifest carried a non-empty `setup` field, confirming the install spawns a **Lucidos Agent setup thread** and the user is navigated straight into it, so the author's "ask the user / wire this up" steps actually happen instead of sitting inert as panel text. The thread's first message is a short line — `Set up the newly installed <name> plugin.` — **not** a wall of agent instructions: the "how to run a plugin setup" guidance lives in `system-knowhow/plugin-setup` (the agent loads it — the chat system prompt nudges it to), and the agent reads your `setup` text by referencing the durable `PluginInstalled` event (that knowhow names the exact nested payload path). So the user sees a clean thread while the agent still gets everything it needs. This fires for **both** the Plugins panel's Install button and the agent's `install_plugin` tool (they share the confirm endpoint). The spawned thread's id is recorded in the `PluginInstalled` event (`manifest.setup_thread_id`) so the plugin's card can resolve it later. On an **update**, the setup thread spawns only when the new version's `setup` text actually **differs** (after trimming) from the currently-installed version's — a version bump that left `setup` unchanged re-runs nothing and navigates nowhere, since re-doing identical setup on every update is noise. A fresh install (or an update whose `setup` is new/changed) always spawns. The engine's background marketplace **update check** only notifies — it never installs — so it never spawns a setup thread.
 
+**The setup thread's first message is the engine's, not yours.** It carries an engine origin with the reason `plugin_setup`: the plugin, the version installed, the occasion (fresh install or update, with the prior version when known) and the device that confirmed. The message route popover shows it as "Plugin install" or "Plugin update".
+
 **An update's setup thread starts from the last run, not from scratch.** Its seed says so (`Set up <name> again: its setup instructions changed since version <prior>.`, titled `Update <name> setup`), and `system-knowhow/plugin-setup` § 1 acts on it. That section diffs your two `setup` texts, reads the `PluginSetupCompleted` record the previous run wrote, and verifies what is already wired before asking anything. So a reworded `setup` costs the user a couple of questions rather than the whole interview.
 
 What this means for plugin authors:
@@ -149,7 +157,7 @@ Marketplace HTTP surface:
 - `POST /api/v1/plugins/marketplaces` with `{ "source": "...", "name"?: "..." }` -> register or rename a marketplace.
 - `DELETE /api/v1/plugins/marketplaces/{id}` -> unregister a marketplace.
 - `GET /api/v1/plugins/catalog` -> `{ marketplaces, plugins, errors, scanned_at, scanning, scan_error }`. `marketplaces` is live from the registry; `plugins` and `errors` come from the cache. Each installed plugin row also carries `setup_thread_id`, `setup_complete`, and `app_id` to drive the card's Install→Setup→Open button.
-- `POST /api/v1/plugins/catalog/rescan` -> queue a marketplace scan. Answers `{ "queued": true }` at once; the result arrives as `PluginCatalogScanned`. A scan already running absorbs the request.
+- `POST /api/v1/plugins/catalog/rescan` -> queue a marketplace scan. Answers `{ "queued": true }` at once; the result arrives as `PluginCatalogScanned`. A scan already running goes round once more after it, so the result comes from a scan that started after the request.
 - `GET /api/v1/plugins/installed` -> `{ plugins }` from the `PluginInstalled` projection (no marketplace scan). Each row carries `id`, `name`, `version`, `source?`, `app_id?`, `content` (the shipped content-dir kinds), `files` (every installed `data/`-relative path), and `modified` + `modified_paths` (see "Local modifications" below). Backs the Plugins panel's installed-plugins view (the default **Installed only** filter) so it works offline and lists plugins whose marketplace was removed.
 - `POST /api/v1/plugins/install-request` with `{ "source": "..." }` -> stage an install request payload for the existing confirmation panel.
 - `POST /api/v1/plugins/uninstall-request` with `{ "id": "..." }` -> stage an uninstall request payload (resolves the plugin id, partitions its files into present/missing) for the uninstall confirmation panel. The button counterpart of the `uninstall_plugin` LLM tool.
@@ -548,7 +556,7 @@ The staged install panel lists the outcome for each edited file **before** you c
 
 **A file already identical to the new version is not listed at all.** It is the common shape after you publish your own edit upstream: you update back onto your own work. Those paths are written as shipped, with no row, no count, and nothing saved aside. Only the files that still differ from the new version are a decision. The comparison is by content hash, so an oversized file is judged like any other.
 
-The panel also carries one **Keep my local changes** control, on by default. Clearing it takes a clean update: every file becomes `replaced`, and every edit is saved aside. The choice reaches the engine as `?keep_local_changes=false` on the confirm. An absent flag means keep, so a caller that never showed the control cannot silently discard a patch.
+The panel also carries one **Keep my edits** control, on by default. Clearing it takes a clean update: every file becomes `replaced`, and every edit is saved aside. The choice reaches the engine as `?keep_local_changes=false` on the confirm. An absent flag means keep, so a caller that never showed the control cannot silently discard a patch.
 
 **A discarded edit is never simply deleted.** Before anything is overwritten, the engine writes your version and a `.patch` of it under `data/artifacts/plugin-local-changes/<plugin-id>/v<version>/`, with a `README.md` explaining the folder. That root is git-tracked and never auto-deleted. A clean merge saves nothing, because your edit survives in the file itself.
 
@@ -566,7 +574,7 @@ Whenever the Modified badge is up, the Plugins row offers **Propose upstream**. 
 
 1. Derives the diff from the install commit to the working tree, over the plugin's edited paths. Since the install commit is pristine, this is a patch against the version you are actually on.
 2. Writes it to `data/artifacts/plugin-local-changes/<plugin-id>/proposed-v<version>.patch`, commits it, and emits `ArtifactCreated`.
-3. Spawns a Lucidos Agent thread seeded with the plugin name and the patch path, returning its `thread_id` so the caller can navigate there.
+3. Spawns a Lucidos Agent thread seeded with the plugin name and the patch path, returning its `thread_id` so the caller can navigate there. The seed is attributed to the engine with the reason `plugin_upstream_proposal`, beside the device that asked (`system-knowhow/thread-events.md` § Engine origins).
 
 **The engine performs no GitHub operation.** No credentials, no fork, no API call. The spawned thread does that work, following the procedure below.
 

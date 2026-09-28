@@ -9,7 +9,7 @@ export interface SaveDataFileResult {
 /** Encode each path segment individually, preserving `/` separators — matches
  *  the SDK's `lucidos.data` encoding so a path like `artifacts/my notes/x.md`
  *  resolves to the same URL the engine serves. */
-function encodePathSegments(path: string): string {
+export function encodePathSegments(path: string): string {
   return path.split('/').map(encodeURIComponent).join('/');
 }
 

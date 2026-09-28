@@ -1,12 +1,12 @@
 import { API } from '../../api/client';
-import type { Change } from '../../api/client';
+import type { ApplyEstimates, Change } from '../../api/client';
 import { eventStreamTargets, openEventStream, type EventStreamTargets } from '@lucidos/event-stream';
 import { getEventStream, setEventStream } from './event-stream';
 import { fanOutEventFrame, fanOutEventStreamStatus } from './app-bridge';
-import { threadMap, focusedThreadId, changes, appliedChanges, applyingChangeIds, applyingNowThreadIds, applyAllInProgress, standingApplyThreadIds, generatedTitleIds, codingAgentSessionVersion, setFocusedThread, archivingThreadIds, removingQueuedMessageIds, queuedMessageRemovalKey } from '../store';
-import { memoryRebuildProgress, backupProgress, backupStatusVersion, backupPreferencesVersion, responseStylesVersion, appSourceEpoch, recoveryProgress, showConfirm, showToast, dismissToast, toasts, repoSource, TOAST_AUTO_DISMISS_MS } from '../store';
+import { threadMap, focusedThreadId, changes, appliedChanges, applyingChangeIds, applyingNowThreadIds, applyAllInProgress, applyAllBatch, applyAllCanceling, APPLY_ALL_SUMMARY_TOAST_KEY, applyEstimates, applyPhases, standingApplyThreadIds, generatedTitleIds, codingAgentSessionVersion, setFocusedThread, archivingThreadIds, removingQueuedMessageIds, queuedMessageRemovalKey } from '../store';
+import { memoryRebuildProgress, backupProgress, backupStatusVersion, backupPreferencesVersion, responseStylesVersion, appSourceEpoch, recoveryProgress, showConfirm, showToast, dismissToast, repoSource, TOAST_AUTO_DISMISS_MS } from '../store';
 import { isFormRequest } from '../thread-events/thread-event-types';
-import { handleEvent, isChannelDefiningEvent, makeOptimisticThreadState, modeToInitiator, PENDING_TITLE_PLACEHOLDER, type ActorMode, type ThreadAggregate, type ThreadMeta, type ThreadEvent, type TransientEvent } from '../thread-events';
+import { handleEvent, isChannelDefiningEvent, makeOptimisticThreadState, PENDING_TITLE_PLACEHOLDER, type ThreadAggregate, type ThreadMeta, type ThreadEvent, type TransientEvent } from '../thread-events';
 import { bumpThreadEvents } from '../threadActivity';
 import type { ThreadChannel } from '../store';
 import { handleNotificationSSE, loadUnreadNotifications } from './notifications';
@@ -30,6 +30,7 @@ import {
   handleFrontendUpdateDeferred,
   handleFrontendUpdateStranded,
   handleEngineBuildStateChanged,
+  handleFrontendRefreshStateChanged,
   type FrontendUpdateDeferredPayload,
   type FrontendUpdateStrandedPayload,
 } from './engine-update';
@@ -38,9 +39,10 @@ import {
   handleFrontendPreviewStopped,
 } from './frontend-preview';
 import { changeToastMessage } from './changeToast';
+import { batchSummary, clearApplyPhase, isBatchMember, openApplyPhase, setApplyPhase } from './applyProgress';
 import { scheduleServiceWorkerUpdateChecks } from '../../hooks/sw-update';
 import { syncClientUpdateFromBuild } from './client-update';
-import { loadPreferences } from './preferences';
+import { loadPreferences, refreshActiveTheme } from './preferences';
 import { loadReleaseNotices } from './releaseNotices';
 import { loadArtifacts, refreshArtifacts, invalidateFilePreview } from './artifacts';
 import { refreshAppUI, captureAppUI } from './apps';
@@ -49,7 +51,6 @@ import { closeResolvedFormRequest, openFormRequest, syncPendingFormRequests } fr
 import { setDevicePushEnabled } from './push';
 import { getDeviceId } from './devices';
 import { focusThread } from './threads';
-import { formatThreadLabel } from './thread-label';
 import { refreshRepoView } from './repositories';
 import {
   processSSEForReferences,
@@ -123,14 +124,6 @@ const BACKUP_PREFERENCE_KEYS = new Set([
   'backup_schedule',
   'backup_retention',
 ]);
-
-/** Toast key for the merge-conflict banner. Shared by the
- *  MergeConflictDetected emitter and the terminal-event resolver. The same
- *  toast then updates in place, or is dismissed at a terminal state, rather
- *  than lingering as a stale warning. */
-function mergeConflictToastKey(threadId: string, changeId: string | undefined): string {
-  return `merge-conflict-${threadId}-${changeId ?? 'no-change'}`;
-}
 
 // ---------------------------------------------------------------------------
 // Apply Now — deferred SessionEnded cleanup
@@ -216,38 +209,6 @@ function findChangeDescription(threadId: string, changeId: string): string | und
     }
   }
   return undefined;
-}
-
-/** The id of the `MergeConflictDetected` event for a change, so the conflict
- *  toast can deep-link to the turn that reports it.
- *
- *  `MergeConflictDetected` is an exchange STARTER, so its turn's root carries
- *  that id as `data-event-id` (see `stampedEventIds`). The deep-link resolves
- *  straight onto the merge panel, needing no anchor re-targeting.
- *
- *  **Highest seq wins.** A Tier-2 to Tier-3 cascade emits two for one change,
- *  and the newer one carries the resolution the toast is talking about. Ranked
- *  by the map's KEY rather than by the last match: `thread.events` iterates in
- *  insertion order, so a backfill landing after a live SSE event puts an older
- *  seq last.
- *
- *  Both emit sites rank through here, so the banner and the resolved toast it
- *  turns into can never point at different panels. `changeId` is optional to
- *  match `mergeConflictToastKey`. The two conflict events a change-less pair
- *  produces share one toast, so they must share one landing too. */
-function findMergeConflictEventId(threadId: string, changeId: string | undefined): string | undefined {
-  const thread = threadMap.value.get(threadId);
-  if (!thread) return undefined;
-  let found: string | undefined;
-  let foundSeq = -1;
-  for (const [seq, event] of thread.events) {
-    if (seq > foundSeq && event.type === 'MergeConflictDetected'
-        && event.change_id === changeId && event._eventId) {
-      found = event._eventId;
-      foundSeq = seq;
-    }
-  }
-  return found;
 }
 
 /** Route one frame's `data` payload into the store.
@@ -484,28 +445,18 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
     // The warning above already named it. A skeleton built from nothing put a
     // titleless row in the drawer, which a reload then swept away.
     if (!aggregate) return;
-    // Infer source from event type — coding-agent events mean claude_code, not chat
-    const isCcEvent = event.type === 'SessionStarted'
-      || event.type === 'ContinuationStarted'
-      || event.type.startsWith('CodingAgent');
-    const isTriggerEvent = event.type === 'TriggerStarted';
+    // Title, channel, initiator and createdAt come from the aggregate, never
+    // from this event. The event need not be the thread's first: a background
+    // WorktreeCleaned reaches archived threads the drawer never loaded.
     const isThreadStarted = event.type === 'ThreadStarted';
-    const eventFields = event as Record<string, unknown>;
-    const senderIsSystem = modeToInitiator(eventFields.mode as ActorMode | undefined) === 'system';
-    const startedMode = isThreadStarted ? (eventFields.mode as string | undefined) : undefined;
+    const startedMode = isThreadStarted ? ((event as Record<string, unknown>).mode as string | undefined) : undefined;
     map.set(threadId, makeOptimisticThreadState({
       id: threadId,
-      title: PENDING_TITLE_PLACEHOLDER,
-      channel: (isCcEvent || startedMode === 'claude_code'
-        ? 'claude_code'
-        : isTriggerEvent
-          ? 'trigger'
-          : 'chat') as ThreadMeta['channel'],
-      initiator: isTriggerEvent || senderIsSystem ? 'system' : 'user',
+      title: aggregate.title || PENDING_TITLE_PLACEHOLDER,
+      channel: aggregate.channel as ThreadMeta['channel'],
+      initiator: aggregate.initiator,
       eventsLoaded: isThreadStarted, // composing has no events to load
-      timestamp: created,
-      triggerId: isTriggerEvent ? (eventFields.trigger_id as string | undefined) : undefined,
-      triggerName: isTriggerEvent ? (eventFields.trigger_name as string | undefined) : undefined,
+      timestamp: aggregate.createdAt,
       ...(isThreadStarted ? {
         state: 'composing' as const,
         status: 'idle' as const,
@@ -695,8 +646,14 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
     }
   }
 
-  // Toast for change state transitions
+  // Toast for change state transitions. An apply's progress is told only in
+  // the Lucidos menu, so its one toast, keyed `applying-<thread>`, is the
+  // result. A batch member's success is the batch summary's to report, so it
+  // raises only its failure here.
   if (event.type === 'ChangeApplied') {
+    const lastPhase = clearApplyPhase(threadId);
+    const inBatch = isBatchMember(applyAllBatch.value, event.change_id);
+    resolveBatchMember(event.change_id);
     const desc = event.change_id ? findChangeDescription(threadId, event.change_id) : undefined;
     const requiresRestart = !!event.requires_restart;
     const clientUpdate = !!event.client_update;
@@ -708,11 +665,18 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
     // build-id check drives it once the rebuilt sw.js is served, fired on the
     // new worker's activation and nudged by
     // scheduleServiceWorkerUpdateChecks().
-    showToast(changeToastMessage('Applied', threadId, desc), 'success', {
-      key: applyKey,
-      onClick: () => focusThread(threadId),
-      autoDismissMs: TOAST_AUTO_DISMISS_MS,
-    });
+    // The Applied toast lands where the apply's thread link did: at the event
+    // that started its last phase.
+    if (inBatch) {
+      dismissToast(applyKey);
+    } else {
+      const changeId = event.change_id;
+      showToast(changeToastMessage('Applied', threadId, desc), 'success', {
+        key: applyKey,
+        onClick: () => openApplyPhase(threadId, changeId, lastPhase),
+        autoDismissMs: TOAST_AUTO_DISMISS_MS,
+      });
+    }
     // Record the restart state immediately from the thread event, rather than
     // waiting for the separate ChangesUpdated system event. If ChangesUpdated is
     // missed (SSE drop, Vite reload race), this is what lights the badge.
@@ -735,6 +699,7 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
       scheduleServiceWorkerUpdateChecks();
     }
   } else if (event.type === 'ChangeDiscarded') {
+    clearApplyPhase(threadId);
     const desc = event.change_id ? findChangeDescription(threadId, event.change_id) : undefined;
     showToast(changeToastMessage('Discarded', threadId, desc), 'success', {
       key: `discarding-${threadId}`,
@@ -745,64 +710,10 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
     const desc = event.change_id ? findChangeDescription(threadId, event.change_id) : undefined;
     showToast(changeToastMessage('Reverted', threadId, desc), 'success');
   } else if (event.type === 'ChangeApplyFailed') {
+    clearApplyPhase(threadId);
+    resolveBatchMember(event.change_id);
     const error = event.error ?? 'Unknown error';
     showToast(changeToastMessage('Failed to apply', threadId, error), 'error', { key: `applying-${threadId}`, onClick: () => focusThread(threadId) });
-  }
-
-  // The merge-conflict banner is a sticky warning, with no auto-dismiss. Once
-  // the conflict reaches a terminal state it must stop claiming to be still
-  // resolving, so transition it in place. Guarded on the toast already
-  // existing, since showToast(key) would otherwise CREATE a banner and a plain
-  // apply would spawn a spurious resolved toast. ChangeApplied updates it to
-  // resolved. ChangeApplyFailed and ChangeDiscarded dismiss it, the terminal
-  // toast above already carrying that outcome.
-  if ((event.type === 'ChangeApplied' || event.type === 'ChangeApplyFailed' || event.type === 'ChangeDiscarded')
-      && event.change_id) {
-    const conflictKey = mergeConflictToastKey(threadId, event.change_id);
-    if (toasts.value.some((t) => t.key === conflictKey)) {
-      if (event.type === 'ChangeApplied') {
-        // Same landing as the banner it replaces in place. This is one toast
-        // the reader watched change its wording, so tapping it after the
-        // resolution must still open the conflict turn. Resolved at tap time
-        // from the thread's own events, as the banner below does. The two can
-        // then never disagree, and no per-toast state is kept alive.
-        const changeId = event.change_id;
-        showToast(`Merge conflict in ${formatThreadLabel(threadId)} — resolved.`, 'success', {
-          key: conflictKey,
-          onClick: () => focusThread(threadId, {
-            targetEventId: findMergeConflictEventId(threadId, changeId) ?? null,
-          }),
-          autoDismissMs: TOAST_AUTO_DISMISS_MS,
-        });
-      } else {
-        dismissToast(conflictKey);
-      }
-    }
-  }
-
-  // The "hardening required — change will apply automatically after hardening"
-  // banner is a sticky warning (no auto-dismiss). The change applies
-  // automatically once hardening finishes, so a ChangeApplied for this thread
-  // IS the "done" signal — transition the banner in place to "applied". Guarded
-  // on the toast already existing so a plain (non-hardening) apply never spawns
-  // a spurious "Hardening applied" toast. ChangeApplyFailed / ChangeDiscarded
-  // just dismiss it — the terminal toast above already carries that outcome.
-  // Keyed by thread (no change_id — a thread hardens one change at a time),
-  // matching the MissingHardeningDetected emit below. Mirrors the merge-conflict
-  // "resolved" transition above.
-  if (event.type === 'ChangeApplied' || event.type === 'ChangeApplyFailed' || event.type === 'ChangeDiscarded') {
-    const hardeningKey = `missing-hardening-${threadId}`;
-    if (toasts.value.some((t) => t.key === hardeningKey)) {
-      if (event.type === 'ChangeApplied') {
-        showToast(`Hardening applied for ${formatThreadLabel(threadId)}.`, 'success', {
-          key: hardeningKey,
-          onClick: () => focusThread(threadId),
-          autoDismissMs: TOAST_AUTO_DISMISS_MS,
-        });
-      } else {
-        dismissToast(hardeningKey);
-      }
-    }
   }
 
   // After apply/discard/revert, reveal the app header on mobile so the result
@@ -835,42 +746,24 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
   }
 
   // Track change_id as "applying" when merge conflict resolution starts.
-  if (event.type === 'MergeConflictDetected') {
-    if (event.change_id && !applyingChangeIds.value.has(event.change_id)) {
-      applyingChangeIds.value = new Set([...applyingChangeIds.value, event.change_id]);
-    }
-    // Event-driven toast, so all three engine paths notify uniformly. Fires
-    // whatever the focus or visibility: the panel is local context, the toast
-    // a system-level cue. Keyed by thread and change, so a Tier-2 to Tier-3
-    // cascade refreshes one toast rather than stacking two identical banners.
-    //
-    // The tap deep-links to the conflict event, not just to its thread. The
-    // panel is what the toast announces, and a plain focus would land the
-    // reader at the thread's saved scroll with no conflict on screen. Ranked
-    // through the same helper the resolved transition uses, so the one toast
-    // cannot change where it goes when it changes its wording. The arriving id
-    // is the fallback for a frame carrying no `event_id`.
-    const label = formatThreadLabel(threadId);
-    showToast(`Merge conflict in ${label} — resolving automatically.`, 'warning', {
-      key: mergeConflictToastKey(threadId, event.change_id),
-      onClick: () => focusThread(threadId, {
-        targetEventId: findMergeConflictEventId(threadId, event.change_id) ?? eventId ?? null,
-      }),
-    });
+  if (event.type === 'MergeConflictDetected' && event.change_id
+      && !applyingChangeIds.value.has(event.change_id)) {
+    applyingChangeIds.value = new Set([...applyingChangeIds.value, event.change_id]);
   }
 
-  // Event-driven toast, so every path that auto-spawns a hardening session
-  // notifies uniformly. Mirrors MergeConflictDetected above. The change applies
-  // automatically once hardening finishes. The toast is the system-level cue,
-  // the in-thread initiator panel the local context. Keyed by thread, so a
-  // re-emit refreshes one toast instead of stacking. The event carries no
-  // change_id, and a thread hardens one change at a time.
-  if (event.type === 'MissingHardeningDetected') {
-    const label = formatThreadLabel(threadId);
-    showToast(`Hardening required in ${label} — change will apply automatically after hardening.`, 'warning', {
-      key: `missing-hardening-${threadId}`,
-      onClick: () => focusThread(threadId),
-    });
+  // The apply's phase. Every engine path that hardens or resolves a conflict
+  // emits one of these two, so the activity group follows them whoever started
+  // the apply. Its thread link lands on the event that started the phase. A
+  // re-propose or a hardened stamp means the apply is back to merging.
+  if (event.type === 'MergeConflictDetected' || event.type === 'MissingHardeningDetected') {
+    const phase = event.type === 'MergeConflictDetected' ? 'resolving-conflict' : 'hardening';
+    setApplyPhase(threadId, { phase, eventId: eventId ?? null, startedAt: created ?? null });
+  } else if ((event.type === 'ChangeHardened' || event.type === 'ChangeProposed')
+      && applyPhases.value.has(threadId)) {
+    // Only an apply in flight goes back to merging. A thread often hardens
+    // long before anyone applies it. A phase set then would list a merge in
+    // the menu that never started.
+    setApplyPhase(threadId, { phase: 'merging', eventId: null, startedAt: null });
   }
 
   // Per-thread "events arrived" bell — fires for every event so subscribers
@@ -887,6 +780,14 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
   if (metaChanged) {
     scheduleThreadMapFlush();
   }
+}
+
+/** Count a batch member as resolved, so the Apply All row moves to the next one. */
+function resolveBatchMember(changeId: string | undefined): void {
+  const batch = applyAllBatch.value;
+  if (!batch || !changeId || !isBatchMember(batch, changeId)
+      || batch.resolvedChangeIds.includes(changeId)) return;
+  applyAllBatch.value = { ...batch, resolvedChangeIds: [...batch.resolvedChangeIds, changeId] };
 }
 
 /** Un-arm a thread's flag once its standing apply has ended, however it ended. */
@@ -985,7 +886,12 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
       // Idempotent and self-correcting. The engine-switch toast needs no
       // equivalent, its version-status poll hiding it once
       // `wasEngineVersionDismissed` reads true. loadPreferences sets `preferences` to `failed` on error.
-      void loadPreferences().then(() => syncClientUpdateFromBuild()).catch(() => { /* best-effort re-derive */ });
+      // A `theme` write repaints even when it names the theme already painted:
+      // that is how an agent republishes a theme it edited in place.
+      void loadPreferences().then(() => {
+        if (data.key === 'theme') void refreshActiveTheme();
+        return syncClientUpdateFromBuild();
+      }).catch(() => { /* best-effort re-derive */ });
       // The Backup page does NOT read its three values out of the preferences
       // cache: they arrive from `/backup/schedule`, `/backup/providers` and
       // `/backup/retention`, which is where the provider's connected/ready
@@ -1090,6 +996,12 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
       handleEngineBuildStateChanged();
       break;
 
+    case 'FrontendRefreshStateChanged':
+      // Dev-only transient POKE: a frontend-only Apply's rebuild wait started
+      // or ended. Re-read version-status, which drives "Building frontend".
+      handleFrontendRefreshStateChanged();
+      break;
+
     case 'MemoryRebuildProgress': {
       const processed = (data.processed as number) ?? 0;
       const total = (data.total as number) ?? 0;
@@ -1125,6 +1037,8 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
       // member id; ApplyAllBatchCompleted drops the bulk flag.
       applyAllInProgress.value = true;
       const changeIds = (data.change_ids ?? []) as string[];
+      applyAllBatch.value = { changeIds, resolvedChangeIds: [], applyingChangeIds: [], resolvingChangeIds: [] };
+      applyAllCanceling.value = false;
       if (changeIds.length > 0) {
         applyingChangeIds.value = new Set([...applyingChangeIds.value, ...changeIds]);
       }
@@ -1147,7 +1061,14 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
         const next = new Set([...applyingChangeIds.value].filter((id) => !resolved.has(id)));
         if (next.size !== applyingChangeIds.value.size) applyingChangeIds.value = next;
       }
+      const total = applyAllBatch.value?.changeIds.length ?? applied.length + failed.length;
+      applyAllBatch.value = null;
+      applyAllCanceling.value = false;
       applyAllInProgress.value = false;
+      if (total > 0) {
+        const summary = batchSummary(applied.length, total);
+        showToast(summary.message, summary.type, { key: APPLY_ALL_SUMMARY_TOAST_KEY, autoDismissMs: TOAST_AUTO_DISMISS_MS });
+      }
       break;
     }
 
@@ -1191,6 +1112,7 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
       const applied = (data.applied ?? []) as Change[];
       changes.value = { status: 'loaded', data: pending };
       appliedChanges.value = { status: 'loaded', data: applied };
+      if (data.apply_estimates) applyEstimates.value = data.apply_estimates as ApplyEstimates;
       // `changesHasMore` tracks whether more APPLIED changes are pageable, and
       // the ChangesUpdated payload carries no `has_more_applied`. Its
       // `total_pending` is literally `pending.len()`, so a pending-count
@@ -1205,7 +1127,7 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
       if (repoChangesDebounce) clearTimeout(repoChangesDebounce);
       repoChangesDebounce = setTimeout(() => {
         const currentRepo = repoSource.value;
-        if (currentRepo) refreshRepoView(currentRepo);
+        if (currentRepo) void refreshRepoView(currentRepo);
       }, 300);
       break;
     }

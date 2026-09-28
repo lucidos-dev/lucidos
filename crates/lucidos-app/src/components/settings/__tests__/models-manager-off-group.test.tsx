@@ -9,6 +9,7 @@
 import { describe, it, expect } from 'vitest';
 import type { ComponentChildren, VNode } from 'preact';
 import { modelManagerList } from '../ModelsManager';
+import { Disclosure } from '../../shared/Disclosure';
 import type { ModelInfo } from '../../../api/types';
 
 /** Flatten a vnode tree to a string, keeping scalar props. Same shallow walk as
@@ -24,6 +25,8 @@ function vnodeToText(node: ComponentChildren): string {
   if (Array.isArray(node)) return node.map(vnodeToText).join('');
   const v = node as VNode<Record<string, unknown>>;
   const props = (v.props ?? {}) as Record<string, unknown>;
+  // A shut disclosure renders none of its children.
+  if (v.type === Disclosure && !props.open) return '';
   const scalar = (value: unknown) =>
     typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean';
   const attrs = Object.entries(props)

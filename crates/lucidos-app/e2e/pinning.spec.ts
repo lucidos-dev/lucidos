@@ -61,7 +61,7 @@ test.describe('Thread pin', () => {
 
     await unsaveBtn.click();
     await expect(page.locator('.confirm-dialog')).toBeVisible({ timeout: 5_000 });
-    await page.locator('.confirm-btn-ok').click();
+    await page.locator('[data-role="confirm-ok"]').click();
 
     await expect(page.locator(SAVE_BTN).first()).toBeVisible({ timeout: 5_000 });
   });

@@ -236,6 +236,7 @@ pub(super) async fn health(State(state): State<AppState>) -> (StatusCode, Json<s
     // changes are picked up without an engine restart.
     let latest_engine_version = read_engine_version();
     let latest_tauri_app_version = read_app_version();
+    let database = state.engine.database_health();
     let body = Json(serde_json::json!({
         // Deliberately still "ok" (and a 200) when `database_reachable` is false:
         // this half is about the engine PROCESS, which is answering. Failing the
@@ -250,7 +251,11 @@ pub(super) async fn health(State(state): State<AppState>) -> (StatusCode, Json<s
         // and a client that cannot tell holds a black boot splash and reports
         // the outage once per failed load. Read from an atomic the background
         // probe writes, so this never puts database latency on the endpoint.
-        "database_reachable": state.engine.database_reachable(),
+        "database_reachable": database.is_reachable(),
+        // Why it is not: `true` when the database answers but no pooled
+        // connection is free. Only ever true while `database_reachable` is
+        // false, so the slowness warning can name the right fix (ADR 0301).
+        "database_pool_exhausted": database.is_pool_exhausted(),
         "release": crate::LUCIDOS_RELEASE,
         "release_dirty": crate::LUCIDOS_RELEASE_DIRTY,
         "engine_version": engine_version,
@@ -336,7 +341,7 @@ pub(super) async fn restart_engine(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
-    let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    let actor = super::actor::user_actor(&headers, None);
     // Stash the device actor for the teardown-time boundary emit (Phase 3) and the
     // recovery auto-resume signal (Phase 4). No pre-emit here. First writer wins,
     // and this IS the first writer: the gateway's restart-intent notify fires on
@@ -952,12 +957,14 @@ pub(super) async fn emit_event(
             .into_response();
     }
 
-    // App UI emits are user-driven on a real device, so stamp the resolved
-    // actor. Persisted rows and SSE frames then carry the same `actor` key as
-    // every other actor-bearing event. The merge happens inside
-    // `SystemEvent::DomainEvent::to_payload`, so a non-object payload is
-    // preserved unchanged.
-    let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    // The caller's identity, never the payload's: `to_payload` replaces any
+    // `actor` the caller wrote. An app frame's emit carries its registered
+    // device, so it reads `device`. A thread's subprocess carries its origin
+    // token, so the `lucidos` CLI and a script trigger read as the agent.
+    let actor = match super::actor::require_user_actor_response(&headers, &state.pool).await {
+        Ok(actor) => actor,
+        Err(refusal) => return refusal,
+    };
 
     // Re-establish the caller's event-trigger chain depth on this request task.
     //

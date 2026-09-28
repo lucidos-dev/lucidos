@@ -81,7 +81,7 @@ describe('ActorMode type', () => {
 
 describe('originMode', () => {
   it('device → human', () => {
-    expect(originMode({ kind: 'device', device_id: 'd', label: 'L' })).toBe('human');
+    expect(originMode({ kind: 'device', device_id: 'd' })).toBe('human');
   });
   it('api defaults to human', () => {
     expect(originMode({ kind: 'api' })).toBe('human');

@@ -31,7 +31,6 @@ export function makeThread(id = 'thread-1', status: 'idle' | 'running' | 'waitin
       codingAgentProposed: false,
       codingAgentRequiresRestart: false,
       codingAgentIsExternalRepo: false,
-      codingAgentApplying: false,
       codingAgentHasDiff: false,
       lastRevivedAt: '',
       state: 'active',

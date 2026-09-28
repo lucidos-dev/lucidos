@@ -897,17 +897,34 @@ async fn driver_task(
     let mut child_reaped = false;
     // `stream_state` spans lines of THIS stream, and only this one. The driver
     // task owns it, so it lives and dies with the subprocess.
-    let mut line_buf = String::new();
+    //
+    // Bytes, read with `read_until`, because that is the cancel-safe read. The
+    // select below drops the read whenever another arm wins, and a large line
+    // arrives in several chunks. `read_until` keeps the chunks already read in
+    // `line_buf`. `read_line` holds them inside its future and loses them.
+    let mut line_buf: Vec<u8> = Vec::new();
     loop {
         tokio::select! {
-            read_result = stdout_reader.read_line(&mut line_buf) => {
+            read_result = stdout_reader.read_until(b'\n', &mut line_buf) => {
                 match read_result {
                     Ok(0) => {
+                        // `read_until` counts only this call's bytes. A dropped
+                        // read can leave a last line that EOF ends without a
+                        // newline, so forward what `line_buf` still holds.
+                        if !line_buf.is_empty() {
+                            let events =
+                                parse_line(&mut stream_state, &String::from_utf8_lossy(&line_buf));
+                            for ev in events {
+                                let _ = events_tx.send(ev);
+                            }
+                        }
                         log!("[ClaudeCode] driver stdout EOF — closing session");
                         break;
                     }
                     Ok(_) => {
-                        for ev in parse_line(&mut stream_state, &line_buf) {
+                        let events =
+                            parse_line(&mut stream_state, &String::from_utf8_lossy(&line_buf));
+                        for ev in events {
                             if let AgentEvent::Init { session_id: ref sid, .. } = ev {
                                 session_id = Some(sid.clone());
                             }
@@ -982,31 +999,22 @@ async fn driver_task(
                 // teardown so the safety net can auto-resume a stray-kill turn.
                 natural_exit_status = wait_result.ok();
                 child_reaped = true;
-                // tokio's `read_line` is not cancel-safe: when the stdout
-                // arm's read_line resolves Ready in the same poll cycle as
-                // wait_result, select! drops the read_line value but
-                // `*output = string` has already mutated line_buf. The
-                // captured line would be silently lost — and the next
-                // read_line would append fresh bytes to it, corrupting
-                // parse_line. Forward any pre-captured line before draining.
-                if !line_buf.is_empty() {
-                    for ev in parse_line(&mut stream_state, &line_buf) {
-                        let _ = events_tx.send(ev);
-                    }
-                    line_buf.clear();
-                }
+                // `line_buf` may hold the start of a line the dropped read had
+                // begun. The drain below appends the rest to it.
                 let drain_deadline = tokio::time::Instant::now()
                     + std::time::Duration::from_millis(500);
                 loop {
                     match tokio::time::timeout_at(
                         drain_deadline,
-                        stdout_reader.read_line(&mut line_buf),
+                        stdout_reader.read_until(b'\n', &mut line_buf),
                     )
                     .await
                     {
                         Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
                         Ok(Ok(_)) => {
-                            for ev in parse_line(&mut stream_state, &line_buf) {
+                            let events =
+                                parse_line(&mut stream_state, &String::from_utf8_lossy(&line_buf));
+                            for ev in events {
                                 if events_tx.send(ev).is_err() {
                                     line_buf.clear();
                                     break;
@@ -1014,6 +1022,14 @@ async fn driver_task(
                             }
                             line_buf.clear();
                         }
+                    }
+                }
+                // A last line CC wrote with no newline before it exited.
+                if !line_buf.is_empty() {
+                    let events =
+                        parse_line(&mut stream_state, &String::from_utf8_lossy(&line_buf));
+                    for ev in events {
+                        let _ = events_tx.send(ev);
                     }
                 }
                 break;

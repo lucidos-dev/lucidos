@@ -7,12 +7,14 @@ pub mod blobs;
 pub mod changes;
 pub mod changes_projection;
 pub mod credentials;
+pub mod data_prefixes;
 pub mod device_presence;
 pub mod devices;
 pub mod email;
 pub mod environment_variables;
 pub mod event_subscription;
 pub mod events;
+pub mod fonts;
 pub mod git_auth;
 pub mod grants;
 pub mod handshake_approvals;
@@ -38,6 +40,7 @@ pub mod slug;
 pub mod store;
 pub mod system_knowhow;
 pub mod technical_literacy;
+pub mod themes;
 pub mod user_dir;
 pub mod user_path;
 pub mod webhook_deliveries;
@@ -45,13 +48,22 @@ pub mod webhook_ingress;
 pub mod webhook_probe_token;
 pub mod webhook_refusal;
 pub mod webhooks;
+pub mod workspace_fonts;
 
 use std::borrow::Cow;
 
-/// Get the database URL from the environment, with a default for local dev.
+/// The database URL the engine booted with, or the local-dev default.
+///
+/// Read once, on the first call. Startup connects before
+/// `environment_variables::apply_to_process_env` copies the user's variables
+/// into the process env. A user variable named `DATABASE_URL` for a project
+/// script must not move later readers, such as `pg_dump`, to another database.
 pub fn database_url() -> String {
-    std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://lucidos:lucidos@localhost:5432/lucidos".to_string())
+    static BOOT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://lucidos:lucidos@localhost:5432/lucidos".to_string())
+    });
+    BOOT.clone()
 }
 
 /// Process-lifetime cache of `pg_env_vars(&database_url())`. DATABASE_URL does
@@ -288,6 +300,7 @@ pub use credentials::{
     credential_scope_covers, normalized_base_urls, AuthType, Credential, CredentialInfo,
     CredentialStore,
 };
+pub use data_prefixes::{is_known_data_prefix, known_data_prefixes_text};
 pub use devices::DeviceStore;
 pub use email::{EmailAccount, EmailAccountInfo, EmailStore};
 pub use environment_variables::{
@@ -761,6 +774,36 @@ pub fn commit_data_paths_removed(
     })
 }
 
+/// Open the workspace repo and commit files already moved on disk, each
+/// `(from, to)` pair `data/`-relative, as one commit. An old path that was
+/// never tracked is skipped, and its new path is still added. Leaves no
+/// uncommitted change behind, which an Apply would otherwise refuse.
+pub fn commit_data_paths_moved(
+    workspace_path: &std::path::Path,
+    moves: &[(String, String)],
+    message: &str,
+) -> Result<String, git2::Error> {
+    for (from, to) in moves {
+        if is_path_traversal(from) || is_path_traversal(to) {
+            return Err(git2::Error::from_str(&format!(
+                "Path traversal not allowed: {from} -> {to}"
+            )));
+        }
+    }
+    let repo = git2::Repository::open(workspace_path)?;
+    retry_while_repo_contended(|| {
+        let mut index = repo.index()?;
+        reset_index_to_head(&repo, &mut index)?;
+        for (from, to) in moves {
+            // `remove_path` errors on an untracked entry, which is fine here.
+            let _ = index.remove_path(std::path::Path::new(&format!("data/{from}")));
+            add_path_unless_ignored(&repo, &mut index, &format!("data/{to}"))?;
+        }
+        index.write()?;
+        commit_index_unless_unchanged(&repo, message)
+    })
+}
+
 /// Create a commit from the current index state.
 ///
 /// The parent is re-read from HEAD on every call, and the HEAD update libgit2
@@ -786,9 +829,9 @@ pub fn commit_index(repo: &git2::Repository, message: &str) -> Result<String, gi
 /// [`commit_index`], except that an index already identical to HEAD's tree
 /// reports HEAD's own sha instead of recording an empty commit.
 ///
-/// This is what makes the DELETE helpers safe to retry, and they are the only
-/// callers. Each removes from the working tree BEFORE the retry closure and
-/// stages the removal inside it. A competing writer can therefore commit the
+/// This is what makes the DELETE helpers and `commit_data_paths_moved` safe to
+/// retry. Each changes the working tree BEFORE the retry closure and stages the
+/// change inside it. A competing writer can therefore commit the
 /// same deletion in between. The retried attempt then resets onto that head,
 /// finds the path already untracked, and has nothing left to stage. Reporting an
 /// error there would deny a deletion that demonstrably happened, so this
@@ -861,39 +904,6 @@ pub(crate) fn add_path_unless_ignored(
         return Ok(());
     }
     index.add_path(path)
-}
-
-/// The typed `data/` subdirectories a caller-supplied path may name. Everything
-/// else under the `data/` root is gitignored config (`.env`, `postgres/`) that
-/// no caller-supplied path may reach.
-///
-/// `is_path_traversal` alone is not enough for a path that gets joined onto
-/// `data/`: it stops the path escaping the directory but says nothing about the
-/// secrets sitting inside it. A caller that only checks traversal accepts
-/// `.env` and hands the workspace credentials to whoever asked.
-///
-/// One definition, because a second copy drifts: the file tools reach it through
-/// `normalize_data_path`, email attachments through
-/// `EmailAttachment::validate_paths`. It mirrors `MUTABLE_PREFIXES` in
-/// `api/data_api.rs` (the HTTP data surface) plus `system-knowhow/`, which is
-/// engine-repo and read-only.
-pub const KNOWN_DATA_PREFIXES: [&str; 8] = [
-    "artifacts/",
-    "apps/",
-    "knowhow/",
-    "triggers/",
-    "scripts/",
-    "config/",
-    "auth-modules/",
-    "system-knowhow/",
-];
-
-/// Whether a `data/`-relative path names one of the typed subdirectories in
-/// [`KNOWN_DATA_PREFIXES`].
-pub fn is_known_data_prefix(relative_path: &str) -> bool {
-    KNOWN_DATA_PREFIXES
-        .iter()
-        .any(|p| relative_path.starts_with(p))
 }
 
 /// Whether a file extension indicates a binary file.
@@ -1008,6 +1018,36 @@ pub fn format_byte_size(bytes: usize) -> String {
         format!("{:.1} KB", bytes as f64 / 1024.0)
     } else {
         format!("{} bytes", bytes)
+    }
+}
+
+#[cfg(test)]
+mod database_url_tests {
+    use super::database_url;
+
+    /// The reported case: a user stores `DATABASE_URL` for their own project,
+    /// and startup copies it into the process env after the engine connected.
+    /// Every later backup ran `pg_dump` against that project instead.
+    #[test]
+    fn a_later_database_url_variable_does_not_move_the_engine() {
+        let booted = database_url();
+        let prior = std::env::var_os("DATABASE_URL");
+        // SAFETY: test-only. Nothing else in this crate's tests reads
+        // DATABASE_URL, which is why this names a URL no test connects to.
+        unsafe {
+            std::env::set_var(
+                "DATABASE_URL",
+                "postgres://user:pw@localhost:5432/someone_elses_app",
+            );
+        }
+        let after = database_url();
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("DATABASE_URL", v),
+                None => std::env::remove_var("DATABASE_URL"),
+            }
+        }
+        assert_eq!(after, booted);
     }
 }
 
@@ -1753,6 +1793,7 @@ pub(crate) fn tool_label(name: &str, args: &serde_json::Value) -> Option<String>
         "count_threads" => "Counting threads...".to_string(),
         "search_threads" => search_label("Searching past conversations", args),
         "detach_child_thread" => "Moving a child thread to top level...".to_string(),
+        "archive_thread" => "Archiving a thread...".to_string(),
         "list_changes" => "Listing changes...".to_string(),
         "apply_change" => "Applying change...".to_string(),
         "apply_when_settled" => "Arming a standing apply...".to_string(),
@@ -1908,6 +1949,7 @@ pub(crate) fn tool_label(name: &str, args: &serde_json::Value) -> Option<String>
             Some("count") => "Counting threads...".to_string(),
             Some("search") => search_label("Searching past conversations", args),
             Some("detach_child") => "Moving a child thread to top level...".to_string(),
+            Some("archive") => "Archiving a thread...".to_string(),
             _ => "Listing threads...".to_string(),
         },
         "mcp" => match args["action"].as_str() {

@@ -73,11 +73,6 @@ describe('turn header gutter', () => {
     ).toBe(initiatorGap);
   });
 
-  it('insets the collapsed marker to match the turn body content', () => {
-    const turnCollapsed = getBlock(inputCss, '.turn-collapsed');
-    expect(declarationValue(turnCollapsed, 'padding-left')).toBe('var(--turn-body-inset)');
-  });
-
   // The panels carry the RIGHT inset in the BASE layout (mirroring the content's
   // left inset above), so a turn sits symmetrically inside the pane. This is
   // load-bearing for the nav focus marker: it lets both marker rules below keep

@@ -15,16 +15,13 @@ use uuid::Uuid;
 
 /// A device's name, the way Settings → Devices shows it.
 async fn device_label(pool: &PgPool, device_id: &str) -> String {
-    crate::core::DeviceStore::display_name(pool, device_id)
-        .await
-        .unwrap_or_else(|| crate::core::devices::resolve_device_name(None, device_id))
+    crate::core::DeviceStore::friendly_name(pool, device_id).await
 }
 
 /// A device as an event actor.
-pub(crate) async fn device_actor(pool: &PgPool, device_id: &str) -> MessageOrigin {
+pub(crate) fn device_actor(device_id: &str) -> MessageOrigin {
     MessageOrigin::Device {
         device_id: device_id.to_string(),
-        label: device_label(pool, device_id).await,
     }
 }
 
@@ -70,10 +67,7 @@ async fn recipient(
         return Ok((Recipient::EveryDevice, None));
     };
     let label = device_label(pool, id).await;
-    let actor = MessageOrigin::Device {
-        device_id: id.to_string(),
-        label: label.clone(),
-    };
+    let actor = device_actor(id);
     let who = if chosen.is_some() {
         Recipient::Chosen(label)
     } else {
@@ -173,7 +167,7 @@ fn sent_line(what: &str, who: &Recipient) -> String {
     };
     format!(
         "Sent a request to open {what} {to}. Sent is not opened: no page confirms it acted. \
-         A device showing this thread opens it; any other offers the user an Open button. \
+         A device showing this thread opens it; any other shows a toast the user taps to open it. \
          Tell the user which device you sent it to, never that it is already on their screen."
     )
 }

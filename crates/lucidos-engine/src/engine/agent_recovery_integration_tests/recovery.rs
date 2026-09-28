@@ -892,7 +892,6 @@ async fn boot_floor_withdraws_only_the_switch_promises_it_did_not_keep() {
 
     let device = MessageOrigin::Device {
         device_id: "d1".into(),
-        label: "My iPhone".into(),
     };
 
     // Four threads interrupted by the same switch. One this boot resumed. One it
@@ -916,7 +915,6 @@ async fn boot_floor_withdraws_only_the_switch_promises_it_did_not_keep() {
                 text: "do the thing".into(),
                 user_image_hashes: vec![],
                 device_id: None,
-                device: None,
                 image_description: None,
                 parent_thread_id: None,
                 spawning_event_id: None,
@@ -1193,7 +1191,6 @@ async fn a_stray_cancel_during_teardown_costs_the_switch_its_auto_resume() {
 
     let device = MessageOrigin::Device {
         device_id: "d1".into(),
-        label: "My MacBook".into(),
     };
     // `fixed` is what the engine now writes; `buggy` is what it wrote before.
     let fixed = Uuid::new_v4();
@@ -1216,7 +1213,6 @@ async fn a_stray_cancel_during_teardown_costs_the_switch_its_auto_resume() {
                 text: "so go?".into(),
                 user_image_hashes: vec![],
                 device_id: None,
-                device: None,
                 image_description: None,
                 parent_thread_id: None,
                 spawning_event_id: None,
@@ -1417,7 +1413,6 @@ async fn an_applied_change_on_the_branch_does_not_cost_a_later_turn_its_resume()
     };
     let device = MessageOrigin::Device {
         device_id: "d1".into(),
-        label: "My iPhone".into(),
     };
 
     // Turn 1: a session on the branch, a change, and the user applying it.
@@ -1652,7 +1647,6 @@ async fn a_user_switch_auto_resumes_an_app_coding_agent_thread() {
         meta: EventMeta {
             actor: Some(MessageOrigin::Device {
                 device_id: "d1".into(),
-                label: "My MacBook".into(),
             }),
             ..cc_meta.clone()
         },

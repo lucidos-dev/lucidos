@@ -168,16 +168,15 @@
 # explicit LUCIDOS_E2E_COMPRESSOR_MAX_GB replaces its share, because an operator
 # naming a number means that number.
 #
-# LUCIDOS_E2E_COMPRESSOR_CAP_GB and _CAP_PCT are GONE, not renamed. A caller
-# still setting one is passing a knob nothing reads, so the start report names
-# it rather than letting the run look capped when it is not.
-#
 # Test seams, honored before any real host read:
 #   HOST_COMPRESSOR_GB_OVERRIDE
 #   HOST_AVAIL_GB_OVERRIDE
 #   HOST_SWAP_USED_GB_OVERRIDE
 #   HOST_PHYSMEM_GB_OVERRIDE
 #   HOST_PRESSURE_LEVEL_OVERRIDE
+
+# shellcheck source=proc_tree.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/proc_tree.sh"
 
 # A memory stop must never read as a red project, so it carries its own exit
 # code. 71 is sysexits' EX_OSERR: an OS resource condition, not a test verdict.
@@ -782,25 +781,9 @@ _host_mem_trip_grace_wait() {
     sleep "$1"
 }
 
-# $1 and its descendants, root first, one per line. The visited set keeps a
-# malformed feed with a cycle from looping.
+# $1 and its descendants, root first, one per line.
 _host_mem_descendants() {
-    _host_mem_proc_tree | awk -v root="$1" '
-        { kids[$2] = kids[$2] " " $1 }
-        END {
-            queue = root
-            while (queue != "") {
-                n = split(queue, q, " ")
-                queue = ""
-                for (i = 1; i <= n; i++) {
-                    if (q[i] in seen) continue
-                    seen[q[i]] = 1
-                    print q[i]
-                    m = split(kids[q[i]], k, " ")
-                    for (j = 1; j <= m; j++) queue = queue " " k[j]
-                }
-            }
-        }'
+    _host_mem_proc_tree | proc_tree_walk "$1"
 }
 
 # Interrupt the runner $1, or the one the runner pidfile names.
@@ -1451,13 +1434,6 @@ report_host_memory_start() {
     echo "[e2e-mem] Critical pressure stops the run when it PERSISTS through $c_of re-samples ${c_secs}s apart, or with available at or under ${collapse:-no} GB, or with any swap in use. One critical reading on its own is recorded and never stops the run: it oscillates here while memory is flat."
     echo "[e2e-mem] The corroborating signals are the kernel at warn or worse, or any swap in use. Available under the floor on its own is recorded and never stops the run."
     echo "[e2e-mem] The compressor has no survivability cap: it measures squeezed idle pages host-wide, not what this run holds."
-
-    # A retired knob that is still set would otherwise leave the run looking
-    # capped when nothing reads the value. Naming it is cheaper than a silent
-    # surprise at 06:30.
-    if [ -n "${LUCIDOS_E2E_COMPRESSOR_CAP_GB:-}${LUCIDOS_E2E_COMPRESSOR_CAP_PCT:-}" ]; then
-        echo "[e2e-mem] NOTE: LUCIDOS_E2E_COMPRESSOR_CAP_GB / _CAP_PCT is set and is no longer read. Unset it."
-    fi
 }
 
 # Final verdict for a run a stop cut short. finish calls it, so every exit path

@@ -31,7 +31,6 @@ function makeThread(id: string, overrides: Partial<ThreadMeta> = {}): ThreadStat
       codingAgentProposed: false,
       codingAgentRequiresRestart: false,
       codingAgentIsExternalRepo: false,
-      codingAgentApplying: false,
       codingAgentHasDiff: false,
       lastRevivedAt: '',
       messageCount: 1,
@@ -82,8 +81,9 @@ describe('family disclosure visibility', () => {
       { section: 'archived', status: 'idle', saved: false, activeChildren: 2 },
       // Review: inbox + no active children (all done)
       { section: 'inbox', status: 'idle', saved: false, activeChildren: 0 },
-      // Saved: default + saved + no active children
-      { section: 'archived', status: 'idle', saved: true, activeChildren: 0 },
+      // Pinned: inbox + pinned + no active children (a pinned thread is never
+      // archived, ADR 0312)
+      { section: 'inbox', status: 'idle', saved: true, activeChildren: 0 },
       // Archive: default + not saved + no active children
       { section: 'archived', status: 'idle', saved: false, activeChildren: 0 },
     ];
@@ -205,11 +205,11 @@ describe('displaySection routing with children', () => {
   });
 
   it('saved thread with active children goes to saved (save overrides everything)', () => {
-    expect(displaySection('archived', 'idle', true, true, false, false)).toBe('saved');
+    expect(displaySection('inbox', 'idle', true, true, false, false)).toBe('saved');
   });
 
   it('saved thread with all children done goes to saved', () => {
-    expect(displaySection('archived', 'idle', true, false, false, false)).toBe('saved');
+    expect(displaySection('inbox', 'idle', true, false, false, false)).toBe('saved');
   });
 
   it('running thread always goes to current regardless of children', () => {
@@ -222,7 +222,7 @@ describe('displaySection routing with children', () => {
   });
 
   it('saved thread with pending changes still saves (save wins over pending)', () => {
-    expect(displaySection('archived', 'idle', true, false, true, false)).toBe('saved');
+    expect(displaySection('inbox', 'idle', true, false, true, false)).toBe('saved');
   });
 });
 

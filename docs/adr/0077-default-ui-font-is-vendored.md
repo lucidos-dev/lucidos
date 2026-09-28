@@ -2,6 +2,7 @@
 
 - **Status**: Accepted
 - **Date**: 2026-08-13
+- **Extended by**: [ADR 0298](0298-look-fonts-make-no-third-party-request.md), which applies the same rule to a font a look suggests, and [ADR 0303](0303-bundle-every-catalog-font.md), which vendors every catalog font. No font takes the Google CDN any more, and `GOOGLE_FONT_URLS` is gone.
 
 ## Context
 

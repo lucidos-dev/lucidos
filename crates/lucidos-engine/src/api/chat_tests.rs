@@ -964,7 +964,6 @@ async fn queued_message_lookup_binds_thread_aggregate_id_as_text() {
             text: "queued".into(),
             user_image_hashes: vec![],
             device_id: None,
-            device: None,
             image_description: None,
             parent_thread_id: None,
             spawning_event_id: None,
@@ -1006,7 +1005,6 @@ async fn queued_message_lookup_binds_thread_aggregate_id_as_text() {
             text: "remove me".into(),
             user_image_hashes: vec![],
             device_id: None,
-            device: None,
             image_description: None,
             parent_thread_id: None,
             spawning_event_id: None,
@@ -1071,7 +1069,6 @@ async fn persist_message(
             text: text.into(),
             user_image_hashes: vec![],
             device_id: None,
-            device: None,
             image_description: None,
             parent_thread_id: None,
             spawning_event_id: None,
@@ -1302,4 +1299,133 @@ fn file_ctx_wins_over_repo_file_ctx_and_neither_is_none() {
         Some("artifacts/notes.md")
     );
     assert_eq!(resolve_file_ctx(None, None), None);
+}
+
+// ── claimed_device_id / origin_agrees_with_mode ─────────────────────
+
+fn headers_with(pairs: &[(&str, &str)]) -> axum::http::HeaderMap {
+    let mut h = axum::http::HeaderMap::new();
+    for (k, v) in pairs {
+        h.insert(
+            axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+            axum::http::HeaderValue::from_str(v).unwrap(),
+        );
+    }
+    h
+}
+
+#[test]
+fn the_body_device_id_wins_and_a_blank_one_falls_through_to_the_header() {
+    let h = headers_with(&[(super::super::actor::HEADER_DEVICE_ID, "dev-header")]);
+    let mut req = base_req(ActorMode::Human);
+    assert_eq!(
+        crate::api::actor::claimed_device_id(req.device_id.as_deref(), &h),
+        Some("dev-header")
+    );
+    req.device_id = Some("  ".into());
+    assert_eq!(
+        crate::api::actor::claimed_device_id(req.device_id.as_deref(), &h),
+        Some("dev-header")
+    );
+    req.device_id = Some("dev-body".into());
+    assert_eq!(
+        crate::api::actor::claimed_device_id(req.device_id.as_deref(), &h),
+        Some("dev-body")
+    );
+    assert_eq!(
+        crate::api::actor::claimed_device_id(None, &headers_with(&[])),
+        None
+    );
+}
+
+/// The gateway sends its own token beside the device header. A device id in
+/// the header alone is recorded as that device, not as the engine's own
+/// machinery. Its mode agrees with the request.
+#[test]
+fn a_header_only_device_behind_the_gateway_is_recorded_as_that_device() {
+    let token = crate::api::local_auth::publish_test_local_token();
+    let h = headers_with(&[
+        (lucidos_local_token::HEADER_LOCAL_TOKEN, token),
+        (super::super::actor::HEADER_DEVICE_ID, "dev-1"),
+    ]);
+    let req = base_req(ActorMode::Human);
+    let origin = build_message_origin(
+        &h,
+        req.mode,
+        crate::api::actor::claimed_device_id(req.device_id.as_deref(), &h),
+        None,
+        None,
+        None,
+        None,
+    );
+    assert!(
+        matches!(&origin, Some(MessageOrigin::Device { device_id }) if device_id == "dev-1"),
+        "got {origin:?}"
+    );
+    assert!(origin_agrees_with_mode(origin.as_ref(), req.mode).is_ok());
+}
+
+#[test]
+fn a_mode_the_credential_contradicts_is_a_400_not_a_panic() {
+    let agent = MessageOrigin::Api {
+        user_agent: None,
+        mode: ActorMode::Agent,
+        source_thread_id: Some(Uuid::new_v4()),
+    };
+    let refusal = origin_agrees_with_mode(Some(&agent), ActorMode::Engine)
+        .expect_err("an agent's credential cannot claim engine mode");
+    assert_eq!(refusal.status, StatusCode::BAD_REQUEST);
+    assert!(
+        refusal.message.contains("\"agent\""),
+        "the refusal names the wire value to send back: {}",
+        refusal.message
+    );
+    assert!(origin_agrees_with_mode(Some(&agent), ActorMode::Agent).is_ok());
+    assert!(origin_agrees_with_mode(None, ActorMode::Human).is_ok());
+}
+
+// ── subprocess_gate_applies ─────────────────────────────────────────
+
+/// A token holder that adds `caller_workspace` keeps the gate for an existing
+/// thread and for `mode: human`. Only an agent's create skips it, and the
+/// top-thread authority check covers that create.
+#[test]
+fn caller_workspace_skips_the_subprocess_gate_only_for_a_create() {
+    for mode in [ActorMode::Agent, ActorMode::Engine] {
+        assert!(
+            !subprocess_gate_applies(true, false, mode),
+            "an agent's create keeps the spawn-thread --relation top path"
+        );
+        assert!(
+            subprocess_gate_applies(true, true, mode),
+            "an existing target keeps the gate"
+        );
+    }
+    assert!(
+        subprocess_gate_applies(true, false, ActorMode::Human),
+        "a token holder's create cannot claim the user"
+    );
+    for exists in [true, false] {
+        assert!(subprocess_gate_applies(false, exists, ActorMode::Agent));
+    }
+}
+
+/// With the gate applied, the matrix refuses both shapes `caller_workspace`
+/// must not open: a post into an existing thread and a human create.
+#[test]
+fn a_token_holder_naming_another_workspace_cannot_post_into_an_existing_thread() {
+    let source = Some(Uuid::new_v4());
+    let other = Some(Uuid::new_v4());
+    for mode in [ActorMode::Human, ActorMode::Agent, ActorMode::Engine] {
+        assert!(subprocess_gate_applies(true, true, mode));
+        assert!(!subprocess_chat_legitimate(mode, source, other, None, true));
+    }
+    assert!(subprocess_gate_applies(true, false, ActorMode::Human));
+    assert!(!subprocess_chat_legitimate(
+        ActorMode::Human,
+        source,
+        Some(Uuid::new_v4()),
+        None,
+        false
+    ));
 }

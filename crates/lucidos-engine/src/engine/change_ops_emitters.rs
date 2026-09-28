@@ -42,6 +42,7 @@ const RESTART_REQUIRED_WINDOW: chrono::DateTime<chrono::Utc> =
 async fn changes_updated_payload(
     pool: &sqlx::PgPool,
     proj: &crate::core::changes_projection::ChangesProjection,
+    apply_estimates: crate::engine::apply_estimate::ApplyEstimates,
 ) -> Option<SystemEvent> {
     let (pending_r, applied_r, restart_r) = tokio::join!(
         crate::core::changes::list_pending_for_readers(
@@ -85,6 +86,7 @@ async fn changes_updated_payload(
         pending,
         applied,
         restart_required,
+        apply_estimates,
     })
 }
 
@@ -93,7 +95,19 @@ impl LucidosEngine {
     /// SSE client. The sole `ChangesUpdated` emitter for both the engine's own
     /// call sites and the `/api/v1/changes` handlers.
     pub(crate) async fn broadcast_changes_updated(&self) {
-        let Some(event) = changes_updated_payload(self.pool(), self.changes()).await else {
+        // A failed read skips the frame, as `changes_updated_payload` does.
+        let estimates = match self.apply_estimates.current(self.pool()).await {
+            Ok(estimates) => estimates,
+            Err(e) => {
+                log!(
+                    "[Changes] apply estimates: {}; skipping ChangesUpdated emit",
+                    e
+                );
+                return;
+            }
+        };
+        let Some(event) = changes_updated_payload(self.pool(), self.changes(), estimates).await
+        else {
             return;
         };
         self.event_bus
@@ -122,6 +136,9 @@ impl LucidosEngine {
                 log_tag,
             )
             .await;
+        // The event closes the pairing `emit_merge_conflict_detected` opened,
+        // so the panel repaints the row as no longer resolving.
+        self.broadcast_changes_updated().await;
     }
 
     /// Emit `ChangeApplyFailed` with the standard "hardening did not
@@ -498,6 +515,11 @@ impl LucidosEngine {
                 "[Changes] MergeConflictDetected",
             )
             .await;
+        // An Apply All member's conflict now belongs to a resolver, so the
+        // batch moves on to its next member (ADR 0314). Non-members no-op.
+        self.notify_apply_all(crate::engine::apply_all_driver::ApplyAllDriveMsg::Parked(
+            change_id,
+        ));
         // The event opens the pairing that `resolving_conflict` reads, so the
         // panel repaints the row as an apply in flight.
         self.broadcast_changes_updated().await;
@@ -797,7 +819,7 @@ mod tests {
             .expect("put the thread mid-turn");
 
         let proj = ChangesProjection::new(pool.clone());
-        let event = changes_updated_payload(&pool, &proj)
+        let event = changes_updated_payload(&pool, &proj, Default::default())
             .await
             .expect("every read answered");
         match event {
@@ -812,6 +834,34 @@ mod tests {
         }
 
         teardown_test_db(&db).await;
+    }
+
+    /// Both halves of the merge-resolution pairing repaint the panel. The
+    /// client reads a change's Apply button off its cached `ChangesUpdated`
+    /// list, and nothing else refreshes it.
+    ///
+    /// This test reads the source text, because no test can build a live
+    /// `LucidosEngine` to observe the emit.
+    #[test]
+    fn both_halves_of_the_merge_resolution_pairing_broadcast_changes_updated() {
+        const SRC: &str = include_str!("change_ops_emitters.rs");
+        const BROADCAST: &str = "self.broadcast_changes_updated().await;";
+        for emitter in [
+            "async fn emit_merge_conflict_detected(",
+            "async fn emit_merge_resolution_cleared(",
+        ] {
+            let start = SRC
+                .find(emitter)
+                .unwrap_or_else(|| panic!("{emitter} must still exist"));
+            let rest = &SRC[start + emitter.len()..];
+            let end = rest
+                .find("\n    pub(crate) async fn ")
+                .expect("another emitter must follow");
+            assert!(
+                rest[..end].contains(BROADCAST),
+                "{emitter} must broadcast ChangesUpdated, or clients keep a stale Apply button"
+            );
+        }
     }
 
     /// An engine-affecting change ALWAYS rebuilds, whatever else it touched.

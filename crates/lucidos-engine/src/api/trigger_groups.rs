@@ -163,7 +163,7 @@ pub(super) async fn create_trigger_group(
     headers: HeaderMap,
     Json(request): Json<CreateTriggerGroupRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    let actor = super::actor::user_actor(&headers, None);
     match state
         .engine
         .create_trigger_group_serialized(&request.name, request.order, actor)
@@ -215,7 +215,7 @@ pub(super) async fn update_trigger_group(
     Json(request): Json<UpdateTriggerGroupRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let group_id = query.id;
-    let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    let actor = super::actor::user_actor(&headers, None);
 
     if let Some(ref new_name) = request.name {
         match state
@@ -345,7 +345,7 @@ pub(super) async fn delete_trigger_group(
     }
 
     let payload = serde_json::json!({ "group_id": group_id });
-    let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    let actor = super::actor::user_actor(&headers, None);
     if let Err(e) = state
         .engine
         .event_bus
@@ -401,7 +401,7 @@ pub(super) async fn reorder_trigger_groups(
         acc
     };
 
-    let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    let actor = super::actor::user_actor(&headers, None);
     for (group_id, order) in to_change {
         if let Err(e) = emit_and_apply_reorder(
             &state.engine.event_bus,

@@ -368,20 +368,10 @@ function ownDescendants<T extends Element>(table: Element, selector: string): T[
     .filter((el) => el.closest('table') === table);
 }
 
-/** A column header's plain text, with angle brackets dropped.
- *
- *  Inline markup (`<code>`, a link) goes with them: `content: attr(data-label)`
- *  can only produce a text run, so `textContent` is the whole label.
- *
- *  **Temporary measure**, `docs/temporary-measures.md` § "Angle brackets kept
- *  out of `data-label`". The serializer writes `<` and `>` raw inside an
- *  attribute value, and `utils/linkifyPaths.ts` then re-scans this output with
- *  a tag regex. A raw `>` ends its idea of the tag mid-value. It splices a
- *  link into what is left, which puts the rest of the label in attribute-name
- *  position. Dropping the two characters costs a rare header the bracket it
- *  typed, on the phone caption only. */
+/** A column header's plain text. Inline markup (`<code>`, a link) drops out:
+ *  `content: attr(data-label)` can only produce a text run. */
 function stackLabelText(cell: Element): string {
-  return (cell.textContent ?? '').replace(/[<>]/g, '').trim();
+  return (cell.textContent ?? '').trim();
 }
 
 /** Stamp `data-stack` plus a per-cell `data-label` carrying its column header,
@@ -492,8 +482,29 @@ function prepareImages(html: string): string {
 }
 
 function prepareImagesIn(body: HTMLElement): void {
+  applySizeHintsIn(body);
   rewriteImageSourcesIn(body);
   wrapImagesIn(body);
+}
+
+/** An *image size hint*: a trailing `#<width>x<height>` on an image source,
+ *  in image pixels. The engine and `lucidos data write` add it (see
+ *  `system-knowhow/glossary.md`). */
+const SIZE_HINT = /#([1-9]\d{0,4})x([1-9]\d{0,4})$/;
+
+/** Move each size hint off the source and onto the image, where the
+ *  `[data-size-hint]` rule in host-components.css reserves the loaded box.
+ *  The source loses it, so the fetch and the image popup see the plain URL. */
+function applySizeHintsIn(body: HTMLElement): void {
+  for (const img of Array.from(body.querySelectorAll('img'))) {
+    const src = img.getAttribute('src');
+    const hint = src?.match(SIZE_HINT);
+    if (!src || !hint) continue;
+    img.setAttribute('src', src.slice(0, hint.index));
+    img.setAttribute('data-size-hint', '');
+    img.style.setProperty('--hint-w', hint[1]);
+    img.style.setProperty('--hint-h', hint[2]);
+  }
 }
 
 /** Wrap every image in the scroll container that lets an oversized screenshot

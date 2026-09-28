@@ -1,9 +1,18 @@
+// @vitest-environment jsdom
 import { describe, it, expect } from 'vitest';
 import {
   trapTargetIndex, paneTabTarget,
   shouldReconcilePaneFocus, PANE_FOCUS_REGION,
   isContentPaneIframeFocus, navigationFocusTarget,
+  visibleFocusables,
 } from './paneFocus';
+
+// jsdom never lays out, so `getClientRects()` is empty on every real element.
+// `visibleFocusables` treats that as "not visible", so stub it per-element to
+// isolate the `inert` exclusion under test.
+function stubVisible(el: HTMLElement): void {
+  el.getClientRects = () => [{}] as unknown as DOMRectList;
+}
 
 // A click inside any content-pane iframe (app, preview, PDF plugin, cross-origin
 // URL) moves the host's activeElement to the <iframe> and fires window blur; this
@@ -181,5 +190,63 @@ describe('PANE_FOCUS_REGION', () => {
     expect(PANE_FOCUS_REGION.thread).toBe('.thread-view .thread-content');
     expect(PANE_FOCUS_REGION.content).toBe('.content-pane-body');
     expect(PANE_FOCUS_REGION.drawer).toBe('.thread-drawer');
+  });
+});
+
+// The per-pane Tab trap's tabbable-elements query. A closed-but-mounted panel
+// (the thread drawer's filter view, `ThreadFilterCover`) marks itself `inert`
+// rather than unmounting, so its buttons stay real DOM. The browser already
+// skips `inert` content on Tab and refuses to focus it, so this query must
+// agree.
+describe('visibleFocusables', () => {
+  it('excludes a button inside an inert wrapper', () => {
+    const container = document.createElement('div');
+    const cover = document.createElement('div');
+    cover.setAttribute('inert', '');
+    const hidden = document.createElement('button');
+    stubVisible(hidden);
+    cover.appendChild(hidden);
+    container.appendChild(cover);
+
+    expect(visibleFocusables(container)).toEqual([]);
+  });
+
+  it('excludes an inert element itself, not just its descendants', () => {
+    const container = document.createElement('div');
+    const el = document.createElement('button');
+    el.setAttribute('inert', '');
+    stubVisible(el);
+    container.appendChild(el);
+
+    expect(visibleFocusables(container)).toEqual([]);
+  });
+
+  it('still includes an ordinary tabbable button', () => {
+    const container = document.createElement('div');
+    const button = document.createElement('button');
+    stubVisible(button);
+    container.appendChild(button);
+
+    expect(visibleFocusables(container)).toEqual([button]);
+  });
+
+  it('a real control stays reachable beside an inert closed panel', () => {
+    // Mirrors the thread drawer: one live tabbable control alongside a
+    // closed, inert filter view holding several radio-row buttons.
+    const container = document.createElement('div');
+    const live = document.createElement('button');
+    stubVisible(live);
+    container.appendChild(live);
+
+    const cover = document.createElement('div');
+    cover.setAttribute('inert', '');
+    for (let i = 0; i < 3; i++) {
+      const radio = document.createElement('button');
+      stubVisible(radio);
+      cover.appendChild(radio);
+    }
+    container.appendChild(cover);
+
+    expect(visibleFocusables(container)).toEqual([live]);
   });
 });

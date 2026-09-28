@@ -24,7 +24,7 @@ import { latestTauriAppVersion, releaseCheck, releaseNoticeView } from './store'
 import type { ReleaseNotice } from '../api/client';
 
 function notice(id: string, resolved: boolean): ReleaseNotice {
-  return { id, since: '2.0.0', title: `Notice ${id}`, body: 'Do the thing.', resolved };
+  return { id, since: '2.0.0', title: `Notice ${id}`, body: 'Do the thing.', resolved, action_deferred: false };
 }
 
 /** Put `notices` in front of the badge, with the first unresolved one owed. */

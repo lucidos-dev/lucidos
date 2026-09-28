@@ -125,7 +125,7 @@ pub(super) async fn permission_prompt(
 ///    *cause-gated resume*. See `base_path::arrived_through_gateway_proxy` for
 ///    why provenance rather than peer address is the discriminator.
 ///  * A caller with no resolvable DEVICE is rejected (400).
-///    `user_actor_resolved` falls back to `Api { mode: Human }` with no device
+///    `user_actor` falls back to `Api { mode: Human }` with no device
 ///    id, and that is not the switch fingerprint (which needs
 ///    `actor.kind = 'device'`), so stashing it would not resume anything while
 ///    still replacing the honest "System" attribution with an API caller. The
@@ -142,7 +142,7 @@ pub(super) async fn restart_intent(
         )
             .into_response();
     }
-    let actor = crate::api::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    let actor = crate::api::actor::user_actor(&headers, None);
     let Some(actor @ crate::engine::thread_events::MessageOrigin::Device { .. }) = actor else {
         return (
             StatusCode::BAD_REQUEST,
@@ -418,6 +418,9 @@ pub(super) struct QueryHardenedQuery {
 #[derive(Serialize)]
 struct QueryHardenedResponse {
     state: &'static str,
+    /// The HEAD the last `/harden` recorded. Absent when `state` is `MISSING`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    head_sha: Option<String>,
 }
 
 /// Body for `POST /api/v1/internal/mark-planned`. `state` is `"proposed"` (a
@@ -598,18 +601,23 @@ pub(super) async fn query_hardened(
     State(state): State<AppState>,
     Query(q): Query<QueryHardenedQuery>,
 ) -> impl IntoResponse {
-    use crate::engine::git_ops::HardenMarkerState;
+    use crate::engine::git_ops::{HardenMarker, HardenMarkerState};
     let repo_root = std::path::PathBuf::from(&q.repo_root);
-    let label = match state
-        .engine
-        .harden_marker_state(&repo_root, &q.branch_name)
-        .await
-    {
+    let marker = state.engine.harden_marker(&repo_root, &q.branch_name).await;
+    let label = match marker.state() {
         HardenMarkerState::Fresh => "FRESH",
         HardenMarkerState::Stale => "STALE",
         HardenMarkerState::Missing => "MISSING",
     };
-    Json(QueryHardenedResponse { state: label }).into_response()
+    let head_sha = match marker {
+        HardenMarker::Recorded { head_sha, .. } => Some(head_sha),
+        HardenMarker::Missing => None,
+    };
+    Json(QueryHardenedResponse {
+        state: label,
+        head_sha,
+    })
+    .into_response()
 }
 
 #[derive(Deserialize)]
@@ -861,11 +869,9 @@ pub(super) async fn ask_user_question(
     let answer_kinds = match outcome {
         Ok(o) => o.answer_kinds,
         Err(e) => {
-            // The hook protocol doesn't model errors — a non-200 leaves
-            // CC stuck. But we DO want to surface infrastructure
-            // failures; the alternative (silently returning an empty
-            // answers map) makes CC re-ask in a loop. 500 here lets the
-            // hook stderr-log the failure and the user retries.
+            // Both callers turn a 500 into a failed tool call carrying this
+            // text. It tells the agent to ask again with the tool
+            // (`card_not_shown_reason` in lucidos-cli).
             crate::log!(
                 "[AskUserQuestion] walk failed for {thread_id}/{}: {e}",
                 body.tool_use_id

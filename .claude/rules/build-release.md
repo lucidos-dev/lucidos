@@ -3,7 +3,6 @@ paths:
   - "scripts/build*.sh"
   - "scripts/check-staged-knowhow.sh"
   - "scripts/release*.sh"
-  - "scripts/rebuild-mirror-history.sh"
   - "scripts/lib/build_*.sh"
   - "scripts/lib/stage_runtime*.sh"
   - "scripts/lib/resource_contract*.sh"
@@ -17,14 +16,11 @@ paths:
   - "crates/lucidos-app/tauri.conf.json"
   - "scripts/lib/updater_payload*.sh"
   - "scripts/lib/codesign.sh"
-  - "scripts/lib/cargo_lock_holders_test.sh"
   # The release gate on the one version source, described under "One source of
   # truth for the version" below.
   - "scripts/lib/version_sources_test.sh"
   - "install.sh"
   - "uninstall.sh"
-  - "docker-entrypoint.sh"
-  - "Dockerfile"
   - "rust-toolchain.toml"
   - ".github/workflows/release-tarballs.yml"
   - ".github/workflows/install-smoke.yml"
@@ -70,7 +66,7 @@ cd crates/lucidos-app && cargo tauri build # Desktop app
 ./scripts/build-headless.sh --check         # validate the resource contract (offline)
 ```
 
-Dev: native engine + Docker PostgreSQL. Production: single Docker container. Makefile: `make build`, `make test`, `make run`.
+Dev: native engine + Docker PostgreSQL. Production: the `.app` and the headless tarball above, each with bundled PostgreSQL.
 
 ### GitHub Actions is release-only — there is no dev-loop CI
 
@@ -307,7 +303,7 @@ tree that is validated and a second tree that ships.
 
 **One strip implementation: `scripts/lib/release_tree.sh`.** It owns
 `RELEASE_TREE_EXCLUDE_PATHS` (internal-only paths: `docs/plans/`, `release.sh`,
-`release-to-lucidos.sh`, the one-time `rebuild-mirror-history.sh`, the
+`release-to-lucidos.sh`, the
 `release_signing` / `release_events` / `release_main_sync` /
 `release_notes` libs, and `release_tree.sh` + its test — the lib withholds
 itself; each excluded lib is sourced by a shipping script only behind an
@@ -462,8 +458,7 @@ Four things hold it together, all in `scripts/lib/release_tree.sh`:
   is the precondition,
   and it is permanent rather than a one-time step. It refuses in BOTH
   directions: fewer commits than release tags means the history is missing
-  releases (the pre-repair state: 1 against 36, with the refusal naming
-  `scripts/rebuild-mirror-history.sh`), more means something reached `main` that
+  releases (the pre-repair state was 1 against 36), more means something reached `main` that
   no release published and that nothing accounts for. Once true it
   self-maintains, since every release adds exactly one commit and one tag.
   The count is necessary but **not sufficient**, so
@@ -557,16 +552,6 @@ and that is a bug to fix at the source. Registered in `docs/temporary-measures.m
 (a mirror rebuild would re-derive a chain with no untagged commits, which is the
 removal condition).
 
-**The one-time repair still has to run once, by a human.** Chaining onto a
-one-commit `main` only ever yields a two-commit `main`, so
-`./scripts/rebuild-mirror-history.sh --push` rebuilds the 36 published releases
-as a chain first (atomic, leased per ref, with a rollback bundle and a typed
-confirmation). The precondition above is what makes that ordering enforced
-rather than remembered. The script is in `RELEASE_TREE_EXCLUDE_PATHS`: it
-sources `release_tree.sh`, which is withheld, so the copies published at v0.20.0
-and v0.20.1 can do nothing but print their own refusal. Delete it once the
-rebuilt history is on the mirror (`docs/temporary-measures.md`).
-
 ### The source side: main gets the bump, and the tag names it (ADR 0029)
 
 The same tag name means a **different object per remote**, deliberately: the
@@ -624,10 +609,7 @@ an older one exactly when the newest is an orphan.
 **One base for every "new since the last release" question.** Phase A's ahead
 count, its deleted-files gate and `--prep-preflight` all go through
 `release_prev_release_base` and `release_commits_since_release`. The base is the
-tag's commit, except for a tag in `RELEASE_TAG_CUT_OVERRIDES`. That list holds
-v0.39.2 and v0.39.3, tagged on cherry-picks before ADR 0250, and records the
-commit each was cut from. Every run re-verifies an entry, and a stale one
-refuses. It is a registered temporary measure.
+tag's own commit (ADR 0250).
 
 Offline-tested by `scripts/lib/release_main_sync_test.sh`: every landing state
 against throwaway repos, the conflict-abort, the by-SHA mirror push into a local

@@ -114,7 +114,8 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   `linkifyPaths.attributes.test.ts`. Delete `stackLabelText`'s `replace` in
   its own change, and confirm both that test and the pinning test above pass
   with a header carrying `>`.
-- **Status:** `active`
+- **Status:** `removed` 2026-09-27. The `replace` is gone, and the pinning
+  test now asserts a header's `>` survives with no handler after linkifying.
 
 ### Focused-field reveal probe
 
@@ -150,7 +151,8 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   The failed tap left no trace in the log. Nothing could say whether iOS
   delivered the touch, whether a click followed, or what cancelled it. The line
   carries the verdict, whether an overlay was open, and how many page mutations
-  landed while the finger was down.
+  landed while the finger was down. A lone neutral action is now a tap on the
+  whole card (the *toast tap*), so the probe logs a card press as `toast body`.
 - **Removal / resolution condition:** a reported episode produces a
   `[Client/toast-press]` line that names the cause, and that cause is fixed. Or
   two months pass with no episode reported. Verify by confirming no open work
@@ -242,11 +244,19 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   one cost most of a session on the tenth report. `lsof -p $(cat
   <ws>/.lucidos/engine.pid)` names the file the live engine actually writes.
 
-  Each line names the face and the verdict. The fourteen are `served`,
+  Each line names the face and the verdict. The fifteen are `served`,
   `swallowed`, `clicked`, `canceled`, `missed`, `dead`, `multi-touch`,
-  `no-lift`, `click-no-touch`, `keyboard-touch`, `covered`, `stray-click`,
-  `untouched` and `silent-since-keyboard`. It carries the travel, the row and
-  face boxes, the viewport block and the `data-keyboard-active` flag.
+  `long-hold`, `no-lift`, `click-no-touch`, `keyboard-touch`, `covered`,
+  `stray-click`, `untouched` and `silent-since-keyboard`. It carries the travel,
+  the row and face boxes, the viewport block and the `data-keyboard-active`
+  flag.
+
+  A press that ended also carries `heldMs`, touchdown to lift or cancel.
+  A still press held past the app's long-press delay is `long-hold`, never
+  `dead`, because iOS owes no click for a hold. Every pill in the row writes
+  lines, but a thread action (Apply, Discard, Archive, marked
+  `data-thread-action`) never raises the warning toast: none has been reported
+  dead. The composer's own controls still warn.
 
   **Six verdicts are retired and no line can carry one again.** `activated`
   meant the probe had clicked the commit face itself, retired by
@@ -788,7 +798,10 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   `git tag --list 'v*' --sort=-v:refname | head -1`. Keep
   `release_commits_since_release` itself: it is where every consumer counts new
   work.
-- **Status:** `active`
+- **Status:** `removed` 2026-09-27. The newest local tag is v0.40.1, so
+  neither entry could be read again. `release_prev_release_base` now returns
+  the tag's own commit, and the `prev-tag-cut` base kind and the Mode 2 refusal
+  went with the list.
 - **Not a softening of any check.** Every run re-verifies each entry: a full
   sha, and a strict ancestor of its tag's commit. A stale entry fails the
   release or the preflight by name. `release_main_sync_test.sh` verifies the
@@ -825,7 +838,9 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   withheld, exactly the case the previous removal condition warned about. Adding
   it to `RELEASE_TREE_EXCLUDE_PATHS` is done; the two published copies can do
   nothing but print their own "runs from the internal checkout" refusal.
-- **Status:** open
+- **Status:** `removed` 2026-09-27. The mirror's `main` carries 81 linear
+  release commits, so the script, its `paths:` entry and its exclusion entry
+  are gone. The Phase A refusal now points at ADR 0039.
 
 ### Legacy credential-cookie fallback
 
@@ -913,7 +928,10 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   `AWAIT_EVENT` in `llm/tool_names.rs`. Nothing is deleted from `parse` itself:
   the fallback that handles the value is load-bearing for any unknown column
   value, not just this one. The migration stays: it is applied history.
-- **Status:** open
+- **Status:** resolved 2026-09-28. The sweep's own query returned zero on every
+  workspace database in the shared cluster and in the packaged app's Postgres.
+  The sweep, its dispatcher wrapper, its `main.rs` call, the settle result and
+  the named doc comments are gone.
 
 ### Per-workspace model-cache seed and reclaim
 
@@ -1153,7 +1171,8 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   in `install.sh` (`dispatch_uninstall`, the re-exec guard) and `uninstall.sh` are
   **permanent** defence in depth, exactly like `_source_libs`, and do NOT come out
   with this row.
-- **Status:** active
+- **Status:** `removed` 2026-09-27. The front door serves `uninstall.sh`, byte
+  for byte, so the annotation is gone and the README gives the one-liner.
 - **Investigation:** n/a (publisher gap, recorded in
   `docs/plans/2026-07-30-user-facing-docs-audit.md` and previously deferred in
   `docs/plans/2026-07-29-front-door-origin-and-rc-gate.md`)
@@ -2217,6 +2236,11 @@ condition; fix the condition rather than acting on it.
   session spent the one refusal on unreported work, the render that made the
   picture, and its retry passed without the picture.
 
+  A refusal that owes words quotes the input it means, and says nothing new
+  has arrived. On 2026-09-27 a chat agent read "The user typed you a reply" as
+  a new message. It then asked the user to resend a reply it had already
+  acted on.
+
   Before 2026-09-23 a refusal could also mean the agent did answer, invisibly.
   See § "Text before a tool call arrives as hidden reasoning", now removed.
   Refusals from Claude Code sessions before that date overstate model mistakes.
@@ -2226,8 +2250,10 @@ condition; fix the condition rather than acting on it.
   picture. That is the denominator. A chat card after a typed reply with only
   notes since is already among the first group.
   Count refusals among them: tool-result rows
-  (`ToolResult` or `CodingAgentToolResult`) containing "Question card not
-  shown.". When no routed model draws a refusal, drop the module, its two call
+  (`ToolResult` or `CodingAgentToolResult`) with "Question card not shown." in
+  their first 200 chars, the gate's own window (`REFUSAL_WINDOW_CHARS`). A
+  whole coding-agent output can quote it deeper. When no routed model draws a
+  refusal, drop the module, its two call
   sites and the `refusal` field.
 - **Superseded:** `SilentWork`, the first chat-only version, lived in
   `agentic_loop/helpers.rs` for one day. Its refusals are failed `ToolResult`
@@ -2335,7 +2361,9 @@ event that retires it.
   this row and the ADR, and the nightly Step 5 spawn intent in the
   `lucidos-ops/nightly-pipeline` knowhow should name neither. Then delete the
   block and its test.
-- **Status:** active
+- **Status:** removed 2026-09-28. Three weeks of nightly cycles ran on the new
+  guard. No caller sets either variable, and the Step 5 intent names neither.
+  The block, its header note and its test are gone.
 
 ### The retired-settle notice in the pre-flight engine reclaim
 
@@ -2358,7 +2386,9 @@ event that retires it.
   row, the function and its test, and the nightly's own step intent in the
   `lucidos-ops/nightly-pipeline` knowhow should not name it. Then delete the
   function, its call and its test.
-- **Status:** active
+- **Status:** removed 2026-09-28. Nightly cycles ran on the watch, no caller
+  sets the variable, and the nightly knowhow never names it. The function, its
+  call, its test and the doc mentions are gone.
 
 ### `self_curated_context_mode` flag (ADR 0085)
 
@@ -2669,7 +2699,10 @@ event that retires it.
   `run_coding_agent`, both registered on the same reasoning and retired together.
   The `sub` alias for `--relation child` is the contrast: permanent back-compat,
   deliberately untracked.
-- **Status:** active
+- **Status:** `removed` 2026-09-27. Four releases shipped after v0.39.2
+  documented the rename. The removal carries the
+  `spawn-thread-cc-model-removed` release notice and a `removed-flags` audit
+  entry.
 
 ### `tailscale serve` pre-1.52 positional-syntax fallback
 
@@ -2742,6 +2775,76 @@ event that retires it.
   `Ok(s)` unconditionally. The engine suite must then pass with no tool reporting
   success on a failure. The two dependent sites move to a typed `Err` in the same
   change, and their prefix notes go with them.
+- **Status:** active
+
+### Legacy `data-theme` in app frames
+
+- **Added:** 2026-09-28
+- **Lives in:** `LEGACY_THEME_MODE_ATTRIBUTE` in
+  `packages/lucidos-sdk/src/appearance.ts`, the `legacyThemeModeAttribute`
+  boot option (`boot/appearanceBoot.ts`, set in `boot/iframe.ts`), and the
+  second `setAttribute` in `ui.applyPreferences` (`ui.ts`). Tests: the
+  "legacy data-theme attribute" cases in `boot/appearanceBoot.test.ts` and the
+  `data-theme` asserts in `e2e/sdk-iframe-theme.spec.ts`, and the bundle asserts
+  and module doc in `crates/lucidos-engine/src/api/sdk_prefs.rs`. App-facing
+  sentence: `system-knowhow/js-sdk.md` § Theme variables.
+- **What it is:** the light/dark attribute became `data-theme-mode` when
+  *look* became *theme* (`docs/plans/2026-09-27-look-becomes-theme.md`). App
+  styles written before that select on `[data-theme="light"]`. An app frame
+  therefore carries both attributes, so those apps keep their light styling.
+  The shell carries only the new one.
+- **Impermanent because:** it serves only app code written before the rename.
+  The workspace audit flags `data-theme` in an app, so each workspace can move
+  its apps across.
+- **Removal condition:** three releases have shipped since the one carrying
+  the audit check. Then delete the constant, the option, the second
+  `setAttribute`, their tests and the js-sdk sentence. Keep the audit check.
+- **Status:** active
+
+### Renamed appearance storage keys
+
+- **Added:** 2026-09-28
+- **Lives in:** `RENAMED_STORAGE_KEYS` in
+  `packages/lucidos-sdk/src/appearance.ts` and `adoptRenamedStorageKeys` in
+  `boot/appearanceBoot.ts` (shell only). Tests: the "storage keys renamed with
+  the theme rename" cases in `boot/appearanceBoot.test.ts`. The seed comment on
+  `'lucidos-theme'` in `crates/lucidos-app/src/utils/workspaceStorage.ts` points
+  here too.
+- **What it is:** the shell's first paint reads localStorage alone, before any
+  preference arrives. The theme rename gave three keys new names. The shell's
+  boot script moves each old value to its new name once. So the first launch
+  after the upgrade paints the user's choice, not a default frame.
+- **Impermanent because:** only a device that has not launched since the
+  rename still holds an old key, and one launch moves it.
+- **Removal condition:** three releases have shipped since the rename. Then
+  delete the list, the function, its boot option and its tests, and drop the
+  seed comment in `workspaceStorage.ts` (the seed itself stays). A device that
+  skipped all three paints one default frame, then its preferences load.
+- **Status:** active
+
+### Legacy `data/looks/` folder
+
+- **Added:** 2026-09-28
+- **Lives in:** `LEGACY_THEMES_DIR`, `adopt_legacy_themes_dir` and its two
+  halves in `crates/lucidos-engine/src/core/themes/mod.rs`, plus
+  `commit_data_paths_moved` in `crates/lucidos-engine/src/core/mod.rs`. The
+  move runs once at startup, from `engine_impl/construction.rs`. Tests: the
+  legacy folder cases in `core/themes/tests.rs`. The plugin refusal hint for a `looks/` folder
+  (`core/plugins.rs`, `UnexpectedTopLevelEntry`) reads the same constant.
+  `current_data_path` in `engine/tools/plugins/registry.rs` reads it too, so a
+  plugin installed before the rename still owns its moved files.
+- **What it is:** workspace themes lived in `data/looks/` before *look* became
+  *theme*. At startup the engine moves each file into `data/themes/`, never
+  over a file already there, and commits the move. It removes the old folder
+  once it is empty. An uncommitted move made the next Apply refuse to merge.
+- **Impermanent because:** only a workspace that has not booted since the
+  rename still has the old folder, and one boot moves it.
+- **Removal condition:** three releases have shipped since the rename. Then
+  delete the function, its halves, `commit_data_paths_moved`, the call and
+  their tests. Keep the plugin hint, which
+  costs one match arm and tells a plugin author what to rename. Keep
+  `current_data_path` until no workspace holds a `PluginInstalled` record with
+  a `looks/` path, which the workspace audit can check per workspace.
 - **Status:** active
 
 ---

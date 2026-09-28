@@ -1,8 +1,9 @@
 //! Coverage for `GET /api/v1/threads/archived-count` — the filter-scoped total
 //! that drives the collapsed Archive badge. The badge must "respect the filter"
 //! (count only archived threads matching the active channel/facet selection) and
-//! exclude inbox + saved rows, so the number is stable regardless of how many
-//! rows are paginated in.
+//! exclude inbox rows, pinned ones included, so the number is stable regardless
+//! of how many rows are paginated in. A pinned thread is never archived (ADR
+//! 0312).
 //!
 //! Isolation: each test binds its seeded rows to a FRESH `cc_repo_id` UUID and
 //! queries with `sources=claude_code&repo_ids=<that uuid>`. The `sources` gate
@@ -65,13 +66,14 @@ async fn archived_count_respects_repo_filter_and_excludes_inbox_and_saved() {
     let pool = sqlx::PgPool::connect(&db_url()).await.expect("connect db");
     let repo = uuid::Uuid::new_v4().to_string();
 
-    // 5 archived (unsaved) → counted; 1 inbox → excluded (Review, not Archive);
-    // 1 archived+saved → excluded (routes to Saved, not Archive).
+    // 5 archived → counted; 1 inbox → excluded (Current, not Archive);
+    // 1 pinned → excluded (Pinned, not Archive). A pinned row is always in the
+    // inbox, and the table refuses a pinned archived one.
     for i in 0..5 {
         seed_repo_thread(&pool, &format!("ac-arch-{i}"), &repo, "archived", false).await;
     }
     seed_repo_thread(&pool, "ac-inbox", &repo, "inbox", false).await;
-    seed_repo_thread(&pool, "ac-saved", &repo, "archived", true).await;
+    seed_repo_thread(&pool, "ac-saved", &repo, "inbox", true).await;
 
     // Decoy: an archived+unsaved claude_code thread in a DIFFERENT repo must be
     // excluded by the repo_ids facet. This is what "respects the repo filter"
@@ -83,7 +85,7 @@ async fn archived_count_respects_repo_filter_and_excludes_inbox_and_saved() {
     let count = archived_count(&repo).await;
     assert_eq!(
         count, 5,
-        "archived-count must count only archived+unsaved threads matching the repo filter"
+        "archived-count must count only archived threads matching the repo filter"
     );
 }
 

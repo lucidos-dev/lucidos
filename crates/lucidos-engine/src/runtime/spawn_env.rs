@@ -334,6 +334,21 @@ pub(crate) fn kill_child_process_group_now(pid: u32) {
     signal_child_process_group(pid, KILL_SIGNAL);
 }
 
+/// The process group `pid` belongs to, or `None` when the process is gone or
+/// the pid cannot be named. A read, never a signal.
+#[cfg(unix)]
+pub(crate) fn process_group_of(pid: u32) -> Option<u32> {
+    let pid = i32::try_from(pid).ok().filter(|p| *p > 0)?;
+    // SAFETY: getpgid takes no pointers and only reads process state.
+    let group = unsafe { libc::getpgid(pid) };
+    u32::try_from(group).ok()
+}
+
+#[cfg(not(unix))]
+pub(crate) fn process_group_of(_pid: u32) -> Option<u32> {
+    None
+}
+
 /// `SIGKILL`, named so the non-Unix build has something to compile against.
 #[cfg(unix)]
 const KILL_SIGNAL: i32 = libc::SIGKILL;
@@ -613,8 +628,15 @@ mod tests {
 
     #[cfg(unix)]
     fn pgid_of(pid: u32) -> i32 {
-        // SAFETY: getpgid is async-signal-safe and takes no pointers.
-        unsafe { libc::getpgid(pid as i32) }
+        process_group_of(pid).map_or(-1, |g| g as i32)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_pid_that_names_no_process_has_no_group() {
+        assert_eq!(process_group_of(0), None, "0 is not a process");
+        assert_eq!(process_group_of(u32::MAX), None, "past i32::MAX");
+        assert!(process_group_of(std::process::id()).is_some());
     }
 
     #[cfg(unix)]

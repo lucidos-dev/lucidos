@@ -6,9 +6,11 @@ import {
   subscriptionLine,
   waitingIndicatorBody,
   waitingPanelBody,
+  waitingPanelCondition,
   type SubThreadWait,
 } from '../WaitingPanel';
 import { eventConditionModal } from '../../../store/store';
+import { SurfaceHead } from '../../shared/Surface';
 
 const focusThreadOrBootstrap = vi.fn();
 vi.mock('../../../store/actions/threads', () => ({
@@ -23,6 +25,11 @@ function vnodeToText(node: ComponentChildren): string {
   if (typeof node === 'string' || typeof node === 'number') return String(node);
   if (Array.isArray(node)) return node.map(vnodeToText).join('');
   const v = node as VNode<Record<string, unknown> & { children?: ComponentChildren }>;
+  // The head is a pure component, so the walker expands it in place and its
+  // markup reads as rendered. Rows keep hooks, so they stay unexpanded.
+  if (v.type === SurfaceHead) {
+    return vnodeToText(SurfaceHead(v.props as Parameters<typeof SurfaceHead>[0]));
+  }
   const tag = typeof v.type === 'string' ? v.type : '';
   const attrs: string[] = [];
   for (const [k, val] of Object.entries(v.props ?? {})) {
@@ -69,7 +76,6 @@ function thread(id: string, over: Partial<ThreadMeta> = {}): ThreadState {
       codingAgentProposed: false,
       codingAgentRequiresRestart: false,
       codingAgentIsExternalRepo: false,
-      codingAgentApplying: false,
       lastRevivedAt: '',
       state: 'active',
       latestTodoList: null,
@@ -239,8 +245,8 @@ describe('waitingPanelBody', () => {
 
   it('gives the close button its own header strip, above the list', () => {
     const text = body();
-    const head = text.indexOf('prompt-bar-popover-head');
-    const close = text.indexOf('prompt-bar-popover-close');
+    const head = text.indexOf('surface-head');
+    const close = text.indexOf('surface-close');
     const list = text.indexOf('event-wait-list');
     expect(head).toBeGreaterThanOrEqual(0);
     expect(close).toBeGreaterThan(head);
@@ -250,7 +256,7 @@ describe('waitingPanelBody', () => {
   });
 
   it('renders the list inside the padded body, not directly on the shell', () => {
-    expect(body()).toContain('<div class="prompt-bar-popover-body">');
+    expect(body()).toContain('<div class="anchored-popover-body">');
     expect(body()).toContain('<ul class="event-wait-list">');
   });
 
@@ -259,7 +265,7 @@ describe('waitingPanelBody', () => {
     // Rows are their own component, so they render as an empty vnode here;
     // the list container plus the head is what this body owns.
     expect(text).toContain('event-wait-list');
-    expect((text.match(/prompt-bar-popover-head/g) ?? []).length).toBe(1);
+    expect((text.match(/class="surface-head"/g) ?? []).length).toBe(1);
   });
 
   it('omits a section it has no rows for', () => {
@@ -286,6 +292,36 @@ describe('waitingPanelBody', () => {
     expect(childrenOnly).not.toContain('waiting-panel-section-label');
   });
 
+  /** A popover never opens a second layer, so a condition replaces the list in
+   *  place, under a head that leads back to it. */
+  it('drills into a condition in place, with a way back to the list', () => {
+    const text = body({ condition: { eventType: 'CodingAgentIdled', conditions: [{ thread_id: 't1' }] } });
+    expect(text).toContain('data-role="surface-back"');
+    expect(text).toContain('Waiting for');
+    expect(text).toContain('>Condition<');
+    expect(text).toContain('data-role="waiting-condition"');
+    expect(text).toContain('data-role="event-condition-json"');
+    // The list is gone, not hidden under the condition.
+    expect(text).not.toContain('event-wait-list');
+    // The X still closes the whole panel.
+    expect(text).toContain('aria-label="Close what this thread is waiting for"');
+  });
+
+  it('steps back to the list from the drill-in', () => {
+    const onBack = vi.fn();
+    const tree = waitingPanelBody({
+      threadId: 't1',
+      waits: [wait()],
+      subThreads: NO_SUB_THREADS,
+      condition: { eventType: 'CodingAgentIdled', conditions: [{ thread_id: 't1' }] },
+      onBack,
+      onClose: NOOP,
+    }) as VNode<{ children: ComponentChildren }>;
+    const head = (tree.props.children as VNode<{ back: { onClick: () => void } }>[])[0];
+    head.props.back.onClick();
+    expect(onBack).toHaveBeenCalledOnce();
+  });
+
   it('says how many children it could not name, instead of a short list', () => {
     const text = body({ waits: [], subThreads: { threads: [thread('c1')], unresolved: 2 } });
     expect(text).toContain('data-role="waiting-sub-threads-more"');
@@ -297,11 +333,14 @@ describe('waitingPanelBody', () => {
  *  transcript.** Both go through `eventConditionDoor`, which is what keeps one
  *  affordance from acquiring two behaviours.
  *
- *  The joined LOOK survives: still one muted line reading `watching for A or B`. Only a
- *  filtered entry becomes a button, and the modal it opens stacks over this
- *  popover rather than replacing it. */
+ *  The joined LOOK survives: still one muted line reading `watching for A or B`.
+ *  Only a filtered entry becomes a button, and it drills the popover into the
+ *  condition rather than stacking a modal over it. */
 describe('the panel subscription line', () => {
-  afterEach(() => { eventConditionModal.value = null; });
+  afterEach(() => {
+    eventConditionModal.value = null;
+    waitingPanelCondition.value = null;
+  });
 
   const CONDITION = { 'workflow_run.event': 'completed' };
 
@@ -326,10 +365,12 @@ describe('the panel subscription line', () => {
     // from the one door.
     expect(button.props['aria-label']).toBe('GithubWorkflowRunStateChanged · show the condition');
     button.props.onClick();
-    expect(eventConditionModal.value).toEqual({
+    expect(waitingPanelCondition.value).toEqual({
       eventType: 'GithubWorkflowRunStateChanged',
       conditions: [CONDITION],
     });
+    // No second layer: the transcript's modal stays shut.
+    expect(eventConditionModal.value).toBeNull();
   });
 
   /** An entry with no condition promises nothing, so it must offer no door. It

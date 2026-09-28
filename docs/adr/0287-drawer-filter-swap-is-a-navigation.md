@@ -3,6 +3,10 @@
 - **Status**: Accepted
 - **Date**: 2026-09-26
 
+*Superseded in part 2026-09-26 (ADR 0291). The drawer swap dips through the
+background, and neither pane title fades any more: both switch word at once.
+The content pane's arrival cover below still holds.*
+
 ## Context
 
 ADR 0276 put every Filter change on one timing, `--duration-fast`, as

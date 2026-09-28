@@ -69,27 +69,34 @@ export function describeCron(cron: string): string {
   const parts = cron.trim().split(/\s+/);
   if (parts.length !== 6) return cron;
 
-  const [, minute, hour, dom, month, dow] = parts;
+  const [second, minute, hour, dom, month, dow] = parts;
+
+  // Every label below fires at most once a minute. A seconds field naming more
+  // than one value fires more often than any of them says.
+  if (!namesOneValue(second)) return cron;
+
+  // The frequency labels name no month, so they hold only for every month.
+  const everyDay = dom === '*' && month === '*' && dow === '*';
 
   // Every minute
-  if (minute === '*' && hour === '*' && dom === '*' && dow === '*') {
+  if (minute === '*' && hour === '*' && everyDay) {
     return 'Every minute';
   }
 
   // Every N minutes (*/N)
-  if (minute.startsWith('*/') && hour === '*' && dom === '*' && dow === '*') {
+  if (minute.startsWith('*/') && hour === '*' && everyDay) {
     const n = parseInt(minute.slice(2));
     if (!isNaN(n)) return n === 1 ? 'Every minute' : `Every ${n} minutes`;
   }
 
   // Every hour at :MM
-  if (namesOneValue(minute) && hour === '*' && dom === '*' && dow === '*') {
+  if (namesOneValue(minute) && hour === '*' && everyDay) {
     const m = parseInt(minute);
     return m === 0 ? 'Every hour' : `Every hour at :${String(m).padStart(2, '0')}`;
   }
 
-  // Every N hours
-  if (hour.startsWith('*/') && dom === '*' && dow === '*') {
+  // Every N hours, once in each: a minute field naming more fires more often.
+  if (hour.startsWith('*/') && namesOneValue(minute) && everyDay) {
     const n = parseInt(hour.slice(2));
     if (!isNaN(n)) return n === 1 ? 'Every hour' : `Every ${n} hours`;
   }

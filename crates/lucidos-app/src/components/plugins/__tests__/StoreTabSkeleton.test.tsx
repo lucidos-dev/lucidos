@@ -1,53 +1,36 @@
-import { describe, it, expect } from 'vitest';
-import type { ComponentChildren, VNode } from 'preact';
+// @vitest-environment jsdom
+import { afterEach, describe, it, expect } from 'vitest';
+import { render } from 'preact';
 import { StoreTabSkeleton } from '../StoreTab';
-import { ListSkeletonOf } from '../../shared/Skeleton';
 
-// Walk a vnode tree WITHOUT invoking function components (their hooks would throw
-// outside a real render). Record class names of host elements and which function
-// components are reached by reference. StoreTabSkeleton is pure/hookless, so
-// calling it as a plain function is safe; ListSkeletonOf stays an uninvoked child.
-function inspect(
-  node: ComponentChildren,
-  acc: { classes: string[]; types: Set<unknown> },
-): void {
-  if (node === null || node === undefined || typeof node === 'boolean') return;
-  if (typeof node === 'string' || typeof node === 'number') return;
-  if (Array.isArray(node)) {
-    node.forEach((n) => inspect(n, acc));
-    return;
-  }
-  const v = node as VNode<Record<string, unknown>>;
-  if (typeof v.type === 'function') {
-    acc.types.add(v.type); // record but do NOT recurse/invoke
-    return;
-  }
-  if (typeof v.props?.class === 'string') acc.classes.push(v.props.class);
-  inspect(v.props?.children as ComponentChildren, acc);
+let host: HTMLDivElement | null = null;
+
+function show(): HTMLDivElement {
+  host = document.createElement('div');
+  render(<StoreTabSkeleton />, host);
+  return host;
 }
 
-function render() {
-  const acc = { classes: [] as string[], types: new Set<unknown>() };
-  inspect(StoreTabSkeleton(), acc);
-  return acc;
-}
+afterEach(() => {
+  if (host) render(null, host);
+  host = null;
+});
 
-describe('StoreTabSkeleton — mirrors the loaded layout so the list does not jump', () => {
-  it('reserves a full (multi-line) category-pills bar above the list skeleton', () => {
-    // The regression fix: the loading skeleton must include a category-filter row
-    // sized to a FULLY-populated catalog (`All` + ~9 controlled-vocabulary
-    // categories). A populated bar wraps to ~2 lines in a typical pane, so a
-    // single line of a few pills lets the list rows jump down a line on a cold
-    // reload when the real wrapping bar lands. Pin enough placeholder pills that
-    // the skeleton reserves roughly the same ~2 lines.
-    const { classes } = render();
-    expect(classes).toContain('app-store-filter-pills');
-    expect(
-      classes.filter((c) => c === 'app-store-category-pill-skeleton').length,
-    ).toBeGreaterThanOrEqual(9);
+describe('StoreTabSkeleton: mirrors the loaded layout so the list does not jump', () => {
+  it('reserves a full category-pills bar above the list skeleton', () => {
+    // Sized to a FULLY populated catalog: `All` plus ~9 categories, so the
+    // skeleton's bar fills the way the real bar's does, scrolling or wrapped.
+    const pills = show().querySelectorAll('.app-store-filter-pills .app-store-filter-pill');
+    expect(pills.length).toBeGreaterThanOrEqual(10);
   });
 
-  it('renders the list skeleton (fill) below the pills placeholder', () => {
-    expect(render().types.has(ListSkeletonOf)).toBe(true);
+  it('draws each pill as the real pill box around a shimmering label', () => {
+    const pill = show().querySelector('.app-store-filter-pills .app-store-filter-pill');
+    expect(pill?.tagName).toBe('SPAN');
+    expect(pill?.querySelector('.sk-bar')).not.toBeNull();
+  });
+
+  it('draws plugin rows below the pills', () => {
+    expect(show().querySelector('.app-store-plugins .sk-bar')).not.toBeNull();
   });
 });

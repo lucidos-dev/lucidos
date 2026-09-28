@@ -283,13 +283,6 @@ impl LucidosEngine {
         let provider_override = resolved.provider.as_deref();
         let chosen_provider = resolved.as_selection().provider;
 
-        // Resolve device tooltip info for the MessageReceived event
-        let device_name = if let Some(did) = device_id {
-            crate::core::DeviceStore::tooltip_info(&self.pool, did).await
-        } else {
-            None
-        };
-
         // Generate a per-request ID for ProcessResult tracking
         let request_id = Uuid::new_v4();
         // A new thread is one where the caller didn't supply a thread_id
@@ -737,10 +730,6 @@ impl LucidosEngine {
                                 user_message,
                                 user_images,
                                 device_id,
-                                // Clone, not move: the `!send_ok` branch below now
-                                // falls through to the slow path, which reuses
-                                // `device_name` (and so does the non-CC fast-path).
-                                device_name.clone(),
                                 parent_thread_id,
                                 spawning_event_id,
                                 mode,
@@ -898,7 +887,6 @@ impl LucidosEngine {
                                 user_message,
                                 user_images,
                                 device_id,
-                                device_name.clone(),
                                 parent_thread_id,
                                 spawning_event_id,
                                 mode,
@@ -1057,7 +1045,6 @@ impl LucidosEngine {
                         user_message,
                         user_images,
                         device_id,
-                        device_name.clone(),
                         parent_thread_id,
                         spawning_event_id,
                         mode,
@@ -1481,7 +1468,6 @@ impl LucidosEngine {
                 thread_id,
                 turn_anchor: origin_id,
                 device_id,
-                event_device: device_name.as_deref(),
                 app_context: app_context.as_ref(),
                 file_context: file_context.as_deref(),
                 url_context: url_context.as_ref(),

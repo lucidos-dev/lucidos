@@ -2386,12 +2386,15 @@ impl LucidosEngine {
                 // the model sees a one-line wait notice instead. EmailConfirm
                 // passes through unredacted: its tool description already
                 // explains the confirm flow.
-                let sentinel_event = match_sentinel(split.event_text()).map(|m| {
-                    if let Some(redacted) = m.redacted_text {
-                        split.redact(redacted);
-                    }
-                    (m.label, m.event)
-                });
+                let sentinel_event =
+                    match_sentinel(&tool_call.name, &tool_call.arguments, split.event_text()).map(
+                        |m| {
+                            if let Some(redacted) = m.redacted_text {
+                                split.redact(redacted);
+                            }
+                            (m.label, m.event)
+                        },
+                    );
 
                 self.emit_tool_result(
                     thread_id,

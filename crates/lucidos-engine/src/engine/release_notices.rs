@@ -62,6 +62,10 @@ pub struct NoticeState {
     pub notice: ReleaseNotice,
     /// True once the workspace has answered it. The panel keeps showing it.
     pub resolved: bool,
+    /// True when a later owed notice carries the same action. The modal then
+    /// draws the button on that one only, so a workspace that skipped
+    /// releases runs an audit once rather than once per notice.
+    pub action_deferred: bool,
 }
 
 /// What both surfaces are drawn from.
@@ -192,13 +196,26 @@ fn owed<'a>(
 pub fn view(notices: &[ReleaseNotice], running: &Version, cursor: Option<&str>) -> NoticeView {
     let answered = answered_count(notices, cursor);
     let next_id = owed(notices, running, cursor).map(|n| n.id.clone());
-    let states = notices
+    let visible: Vec<(usize, &ReleaseNotice)> = notices
         .iter()
         .enumerate()
         .filter(|(_, n)| applies_to(n, running))
-        .map(|(i, n)| NoticeState {
-            notice: n.clone(),
-            resolved: i < answered,
+        .collect();
+    let states = visible
+        .iter()
+        .map(|&(i, n)| {
+            let resolved = i < answered;
+            // Everything after an unresolved notice is unresolved too.
+            let action_deferred = !resolved
+                && n.action_prompt.is_some()
+                && visible
+                    .iter()
+                    .any(|&(j, later)| j > i && later.action_prompt == n.action_prompt);
+            NoticeState {
+                notice: n.clone(),
+                resolved,
+                action_deferred,
+            }
         })
         .collect();
     NoticeView {
@@ -573,6 +590,65 @@ mod tests {
         assert_eq!(view.next_id, None);
         assert_eq!(ids(&view), ["a", "b", "c"]);
         assert!(view.notices.iter().all(|s| s.resolved));
+    }
+
+    fn with_action(id: &str, since: &str, prompt: &str) -> ReleaseNotice {
+        ReleaseNotice {
+            action_label: Some("Do it".to_string()),
+            action_prompt: Some(prompt.to_string()),
+            ..notice(id, since)
+        }
+    }
+
+    fn deferred(view: &NoticeView) -> Vec<bool> {
+        view.notices.iter().map(|s| s.action_deferred).collect()
+    }
+
+    /// A workspace that skipped releases owes several audit notices. One audit
+    /// at the end covers them all, so only the last draws the button.
+    #[test]
+    fn owed_notices_sharing_an_action_draw_it_once_on_the_last() {
+        let notices = vec![
+            with_action("a", "1.0.0", "Audit my workspace for drift."),
+            notice("b", "2.0.0"),
+            with_action("c", "3.0.0", "Audit my workspace for drift."),
+        ];
+        let view = view(&notices, &v("3.0.0"), None);
+        assert_eq!(deferred(&view), [true, false, false]);
+    }
+
+    #[test]
+    fn a_different_action_is_not_deferred() {
+        let notices = vec![
+            with_action("a", "1.0.0", "Audit my workspace for drift."),
+            with_action("b", "2.0.0", "Set up backups."),
+        ];
+        assert_eq!(deferred(&view(&notices, &v("2.0.0"), None)), [false, false]);
+    }
+
+    /// Deferring to a notice the release has not reached would hide the button
+    /// with nothing to carry it.
+    #[test]
+    fn an_action_is_not_deferred_to_a_notice_not_yet_visible() {
+        let notices = vec![
+            with_action("a", "1.0.0", "Audit my workspace for drift."),
+            with_action("b", "2.0.0", "Audit my workspace for drift."),
+        ];
+        assert_eq!(deferred(&view(&notices, &v("1.0.0"), None)), [false]);
+    }
+
+    /// A user who upgrades every release answers each audit notice in turn, and
+    /// each one keeps its button.
+    #[test]
+    fn a_resolved_notice_never_defers_and_is_never_deferred_to() {
+        let notices = vec![
+            with_action("a", "1.0.0", "Audit my workspace for drift."),
+            with_action("b", "2.0.0", "Audit my workspace for drift."),
+        ];
+        assert_eq!(
+            deferred(&view(&notices, &v("2.0.0"), Some("a"))),
+            [false, false]
+        );
     }
 
     #[test]

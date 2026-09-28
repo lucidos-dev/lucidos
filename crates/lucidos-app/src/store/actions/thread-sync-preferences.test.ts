@@ -151,7 +151,7 @@ describe('handleGlobalEvent: a backup preference change bumps the Backup page', 
   it('leaves the Backup page alone for every other key', () => {
     // The bump costs three HTTP reads, one of which resolves the provider's
     // connected / ready verdict. A theme flip must not pay for them.
-    for (const key of ['theme', 'chat_model', 'language', '']) {
+    for (const key of ['theme-mode', 'chat_model', 'language', '']) {
       handleGlobalEvent('PreferencesChanged', { key, value: 'x' });
     }
     handleGlobalEvent('PreferencesChanged', {});
@@ -189,7 +189,7 @@ describe('handleGlobalEvent: a provider preference re-probes /health', () => {
   it('leaves /health alone for every other key', () => {
     // The probe is an HTTP round trip plus a delayed second one. A theme flip
     // changes no provider, so it must not pay for them.
-    for (const key of ['theme', 'chat_model', '']) {
+    for (const key of ['theme-mode', 'chat_model', '']) {
       handleGlobalEvent('PreferencesChanged', { key, value: 'x' });
     }
     handleGlobalEvent('PreferencesChanged', {});

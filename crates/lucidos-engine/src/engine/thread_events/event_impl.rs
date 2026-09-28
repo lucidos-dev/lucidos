@@ -75,6 +75,14 @@ impl ThreadEvent {
         "ToolResult",
     ];
 
+    /// Drop a tool result's text from its serialized payload and mark it, so a
+    /// reader fetches it by event id. The snapshot and the live stream both
+    /// call this, which keeps a stripped result one shape everywhere.
+    pub fn strip_result_text(payload: &mut serde_json::Map<String, Value>) {
+        payload.remove("result");
+        payload.insert("result_stripped".to_string(), Value::Bool(true));
+    }
+
     /// Convert a control request into a CodingAgentSettingsChanged event,
     /// if applicable. `coding_agent` identifies which backend issued the change.
     pub fn from_control_request(
@@ -140,6 +148,7 @@ impl ThreadEvent {
             Self::ThreadSaved => "ThreadSaved",
             Self::ThreadUnsaved => "ThreadUnsaved",
             Self::ThreadArchived => "ThreadArchived",
+            Self::ThreadArchiveRequested => "ThreadArchiveRequested",
             Self::ThreadStarted { .. } => "ThreadStarted",
             Self::ThreadDiscarded { .. } => "ThreadDiscarded",
             Self::ImageUploaded { .. } => "ImageUploaded",
@@ -255,6 +264,7 @@ impl ThreadEvent {
         "ThreadSaved",
         "ThreadUnsaved",
         "ThreadArchived",
+        "ThreadArchiveRequested",
         "ThreadStarted",
         "ThreadDiscarded",
         "ImageUploaded",

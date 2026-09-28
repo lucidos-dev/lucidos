@@ -488,6 +488,7 @@ pub const TABLES: &[TableRule] = &[
         owners: &[
             "api/threads/delete.rs",
             "api/threads_compose.rs",
+            "core/changes_projection.rs",
             "core/image_migration.rs",
             "core/store/threads/backfill.rs",
             "engine/agent_recovery/has_diff.rs",

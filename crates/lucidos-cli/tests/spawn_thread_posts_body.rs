@@ -961,52 +961,48 @@ async fn spawn_thread_allows_codex_xhigh_with_no_model_named() {
     assert_eq!(body["reasoning_effort"], "xhigh");
 }
 
-/// `--coding-agent-model` is the current name; `--cc-model` is the alias kept
-/// so existing recipes keep working. Both must send the same `cc_model` field.
+/// `--coding-agent-model` sends the `cc_model` field the engine reads.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn both_model_flag_spellings_send_cc_model() {
-    for flag in ["--coding-agent-model", "--cc-model"] {
-        let (port, captured) = start_capture_server().await;
-        let tmp = tempfile::tempdir().unwrap();
-        let caller = tmp.path().join("dev");
-        write_ports_file(&caller, port);
+async fn coding_agent_model_flag_sends_cc_model() {
+    let (port, captured) = start_capture_server().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let caller = tmp.path().join("dev");
+    write_ports_file(&caller, port);
 
-        let bin = env!("CARGO_BIN_EXE_lucidos");
-        let output = std::process::Command::new(bin)
-            .args([
-                "spawn-thread",
-                "--to",
-                "dev",
-                "--cc",
-                flag,
-                "opus",
-                "--message",
-                "pick a model",
-                "--title",
-                "Model",
-                "--insecure-http",
-            ])
-            .env("LUCIDOS_WORKSPACE", &caller)
-            .env("LUCIDOS_THREAD_ID", uuid::Uuid::new_v4().to_string())
-            .env_remove("LUCIDOS_REPO")
-            .env("LUCIDOS_WORKSPACES_ROOT", tmp.path())
-            .current_dir(&caller)
-            .output()
-            .expect("spawn cli");
-        assert!(
-            output.status.success(),
-            "{} must be accepted, stderr: {}",
-            flag,
-            String::from_utf8_lossy(&output.stderr)
-        );
+    let bin = env!("CARGO_BIN_EXE_lucidos");
+    let output = std::process::Command::new(bin)
+        .args([
+            "spawn-thread",
+            "--to",
+            "dev",
+            "--cc",
+            "--coding-agent-model",
+            "opus",
+            "--message",
+            "pick a model",
+            "--title",
+            "Model",
+            "--insecure-http",
+        ])
+        .env("LUCIDOS_WORKSPACE", &caller)
+        .env("LUCIDOS_THREAD_ID", uuid::Uuid::new_v4().to_string())
+        .env_remove("LUCIDOS_REPO")
+        .env("LUCIDOS_WORKSPACES_ROOT", tmp.path())
+        .current_dir(&caller)
+        .output()
+        .expect("spawn cli");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
-        let body = captured
-            .lock()
-            .unwrap()
-            .clone()
-            .expect("server received body");
-        assert_eq!(body["cc_model"], "opus", "{} must send cc_model", flag);
-    }
+    let body = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("server received body");
+    assert_eq!(body["cc_model"], "opus");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

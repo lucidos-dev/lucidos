@@ -19,7 +19,8 @@ This complements `docs/plans/` and `docs/notes/`:
 
 One file per decision: `NNNN-short-slug.md`, numbered in order. Each entry has:
 
-- **Status** — Accepted / Superseded by NNNN / Reversed.
+- **Status**: Accepted / Superseded by NNNN / Reversed, or Proposed for a
+  draft awaiting the maintainer's decision. A Proposed entry is not yet settled.
 - **Date**.
 - **Context** — what prompted the decision.
 - **Decision** — what we chose, in one or two sentences.

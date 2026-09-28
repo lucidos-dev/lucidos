@@ -8,19 +8,22 @@ import { useDelayedFlag } from '../../hooks/useDelayedLoading';
 import { SkeletonProvider } from '../shared/Skeleton';
 import { NavigationCover } from '../shared/NavigationCover';
 import { FilePreviewPath } from '../files/FilePreviewPath';
-// The two notification views are the exception to the code-split below, because
-// `lazyComponent` renders NOTHING until its chunk lands. Every other view can
-// afford that: you reach it from the menu, already looking at the pane. You
-// reach these two from the bell in every header, and from an OS push tap. So
-// the chunk fetch sat in front of the first pixel, swallowing the inbox toolbar
-// and both skeletons. That is the reported blank panel. The pair adds under
-// 2 KB gzipped, and buys back a round-trip on the app's most latency-sensitive
-// path.
+// `lazyComponent` renders NOTHING until its chunk lands, so what the user must
+// see at once is eager. The two notification views are reached from the bell
+// in every header and from an OS push tap. Behind a chunk, its fetch swallowed
+// the inbox toolbar and both skeletons. The pair adds under 2 KB gzipped.
+// `SettingsHome` is eager for the same reason. The other views stay split, and
+// are prefetched when idle below.
 import { NotificationsView } from '../notifications/NotificationsView';
 import { NotificationDetailInline } from '../notifications/NotificationDetailInline';
+import { SettingsHome } from '../settings/SettingsHome';
 import { lazyComponent } from '../../utils/lazyComponent';
+import { prefetchWhenIdle } from '../../utils/idlePrefetch';
 import { forceWebKitRepaint } from '../../utils/webkitRepaint';
 import { onPageResume } from '../../utils/pageResume';
+import { trackPullToRefresh } from '@lucidos/pull-to-refresh';
+import { runPanelRefresh, showPullTravel } from '../../store/panelRefresh';
+import { PullRefreshAffordance } from './PullRefreshAffordance';
 
 const FilesView = lazyComponent(() => import('../files/FilesView').then(m => m.FilesView));
 const AppsView = lazyComponent(() => import('../apps/AppsView').then(m => m.AppsView));
@@ -33,6 +36,16 @@ const RepoFilePreviewWithSidebar = lazyComponent(() => import('../files/RepoFile
 const UrlPreviewInline = lazyComponent(() => import('../files/UrlPreviewInline').then(m => m.UrlPreviewInline));
 const AppUiInline = lazyComponent(() => import('../apps/AppUiInline').then(m => m.AppUiInline));
 const InlineForm = lazyComponent(() => import('./InlineForm').then(m => m.InlineForm));
+
+// A lazy view draws nothing until its chunk lands, not even its own skeleton,
+// and a rebuild renames every chunk. Every view here is one tap away, so they
+// load once the app is idle (ADR 0288) and a first open finds them in memory.
+for (const view of [
+  FilesView, AppsView, PluginsView, TriggersView, SettingsView, ChangesView,
+  FilePreviewInline, RepoFilePreviewWithSidebar, UrlPreviewInline, AppUiInline, InlineForm,
+]) {
+  prefetchWhenIdle(view);
+}
 
 /** The one state the WebKit repaint below skips: something is painted FULLSCREEN
  *  over this pane. Not merely an app panel being open.
@@ -142,6 +155,17 @@ export function ContentPane({ layout }: { layout: 'desktop' | 'mobile' }) {
     forceWebKitRepaint(bodyRef.current);
   }), []);
 
+  // Pull to refresh on whatever panel is open. A panel with nothing to refresh
+  // registers nothing, and the runner and the affordance then do nothing.
+  useEffect(() => {
+    const body = bodyRef.current;
+    if (!body) return;
+    return trackPullToRefresh(body, {
+      onPull: showPullTravel,
+      onRefresh: () => void runPanelRefresh(),
+    });
+  }, []);
+
   return (
     <div class="content-pane">
       {/* Focusable scroll region (mirrors `.thread-content`): when the focused-pane
@@ -200,7 +224,7 @@ export function ContentPane({ layout }: { layout: 'desktop' | 'mobile' }) {
             {active === 'apps' && <AppsView />}
             {active === 'plugins' && <PluginsView />}
             {active === 'triggers' && <TriggersView />}
-            {active === 'settings' && <SettingsView />}
+            {active === 'settings' && (subview === 'main' ? <SettingsHome /> : <SettingsView />)}
             {active === 'changes' && <ChangesView />}
             {active === 'notifications' && <NotificationsView />}
           </>
@@ -210,6 +234,7 @@ export function ContentPane({ layout }: { layout: 'desktop' | 'mobile' }) {
           than scrolling away with the body's content, and so a remembered
           scrollTop being restored underneath it stays hidden. */}
       <NavigationCover viewKey={viewKey} />
+      <PullRefreshAffordance />
     </div>
   );
 }

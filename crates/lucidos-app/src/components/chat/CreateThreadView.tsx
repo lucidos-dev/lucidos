@@ -24,6 +24,8 @@ import { isActive as isStatusActive } from '../../store/exchange-status';
 import { forceWebKitRepaint, settledScrollTop } from '../../utils/webkitRepaint';
 import { opensSoftwareKeyboard } from '../../utils/dom';
 import { nowMs } from '../../utils/scrollActivity';
+import { scaledDurationMs } from '../../utils/motion';
+import { DISCLOSURE_MAX_MS } from '../../utils/disclosureMotion';
 
 /** First line of a change's description and its file count, keyed by change_id.
  *  Harvested from the `ChangeProposed` events riding a thread's coding-agent
@@ -421,9 +423,14 @@ function contentOffsetTop(container: HTMLElement, el: HTMLElement): number {
  *  yet. A frame costs two rect reads, and writes only when the container is off
  *  target. The budget is cheaper than another rule to get wrong.
  *
- *  12 frames is about 200ms, well inside `SCROLL_MIN_MS`. What ends it early is
- *  the reader, never a guess about the layout. */
+ *  12 frames is about 200ms. A press that rolls rows runs on until the longest
+ *  roll has landed (`ROLL_SETTLE_SLACK_MS`). What ends it early is the reader,
+ *  never a guess about the layout. */
 const ANCHOR_SETTLE_FRAMES = 12;
+
+/** A turn toggle rolls rows ABOVE the control too, since it spans the whole
+ *  transcript. So the correction also runs until the longest roll has landed. */
+const ROLL_SETTLE_SLACK_MS = 50;
 
 /** Hold `anchor` exactly where it is while `fn` mutates the DOM around it.
  *  `anchor` is THE ELEMENT THE READER CLICKED, per the block above.
@@ -481,9 +488,8 @@ export function withScrollAnchor(anchor: Element | null | undefined, fn: () => v
     // measuring nothing: it answers an all-zero rect, which reads as content
     // that moved to the top of the thread and would send the reader there.
     //
-    // One press detaches it, the `⋯` stub replaced by the body it reveals. That
-    // reveal changes nothing ABOVE its own turn, so the freeze has already left
-    // the reader exactly right and there is nothing to correct.
+    // A press whose mutation detaches its own control has nothing to hold, so
+    // the freeze has already left the reader where they were.
     const anchored = held.isConnected;
     // Where the correction wants the container, read from the layout the
     // mutation left. One definition, because the next-frame re-check has to ask
@@ -527,7 +533,9 @@ export function withScrollAnchor(anchor: Element | null | undefined, fn: () => v
     // clamp moves the reader there as readily as anywhere else.
     if (anchored) {
       let framesLeft = ANCHOR_SETTLE_FRAMES;
-      const reassert = () => {
+      const rollsLandAt = pressedAt + scaledDurationMs(DISCLOSURE_MAX_MS) + ROLL_SETTLE_SLACK_MS;
+      let lastFrameAt = -Infinity;
+      const reassert = (frameAt: number) => {
         if (!held.isConnected || isOtherNavigationScroll(container)) return;
         // THE READER ENDS IT, and only a gesture made since the press says so.
         // A press must never fight a flick made a moment after it.
@@ -546,7 +554,11 @@ export function withScrollAnchor(anchor: Element | null | undefined, fn: () => v
           markAnchorScroll(container, target.scrollTop);
           honourAnchoredMutation(container);
         }
-        if (--framesLeft <= 0) return;
+        // The frame's own timestamp is on `nowMs`'s clock. A frame whose clock
+        // did not advance cannot be waiting on a roll, so the loop always ends.
+        const rolling = frameAt > lastFrameAt && frameAt < rollsLandAt;
+        lastFrameAt = frameAt;
+        if (--framesLeft <= 0 && !rolling) return;
         requestAnimationFrame(reassert);
       };
       requestAnimationFrame(reassert);

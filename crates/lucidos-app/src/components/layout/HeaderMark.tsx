@@ -1,5 +1,4 @@
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { createPortal } from 'preact/compat';
 import { connectionStatus, visibleWorkspaceName, searchEverywhereOpen, searchEverywhereAnchor, llmConfigured, lucidosRelease, lucidosReleaseDirty, whatsNewSeenRelease } from '../../store/store';
 import type { ConnectionStatus } from '../../store/types';
 import { hasUnreadWhatsNew } from '../../store/actions/whatsNew';
@@ -13,8 +12,10 @@ import { focusSearchInput } from '../search/searchEverywhereActions';
 import { Overlay } from '../shared/Overlay';
 import { ComposeIcon, SearchIcon, HelpIcon, LucidosMarkIcon } from '../shared/icons';
 import { confirmAndStartSetupInterview } from '../shared/setupInterview';
-import { BrandBadge, UnreadBrandBadge, unreadBadgeLabel } from './BrandBadge';
+import { BrandBadge, UnreadBrandBadge, brandBadgeLabel, unreadBadgeLabel } from './BrandBadge';
+import { liveActivityRows } from '../../store/actions/activityRows';
 import { NotificationsMenuGroup } from './NotificationsMenuRows';
+import { ActivityMenuGroup } from './ActivityMenuRows';
 import { WorkspaceRefreshRow, WorkspaceRestartRow } from './WorkspaceMenuRows';
 import { lazyComponent, whenLoaded, type PendingOpen } from '../../utils/lazyComponent';
 import { prefetchWhenIdle } from '../../utils/idlePrefetch';
@@ -39,7 +40,7 @@ prefetchWhenIdle(WorkspacesMenuRow);
  *  and which classes it carries IS this surface's behaviour, the same way it is
  *  for the workspace rows.
  *
- *  The SHORT detail. The panel is `--brand-menu-width` wide, so the explainer
+ *  The SHORT detail. The panel is `--header-surface-width` wide, so the explainer
  *  wrapped to three lines and pushed every row below it down. The connection
  *  bar states the full sentence, on screen and without a tap. */
 export function connectionNoticeRow(status: ConnectionStatus, workspace: string | null) {
@@ -56,7 +57,8 @@ export function connectionNoticeRow(status: ConnectionStatus, workspace: string 
 }
 
 /**
- * The Lucidos menu: New thread, Search everywhere, Workspaces, Refresh.
+ * The Lucidos menu: the work in flight, New thread, Search everywhere,
+ * Workspaces, Refresh.
  *
  * A CENTRED MODAL over a dimmed app, not a panel hanging off whatever opened
  * it. Three hosts open it (the mobile thread pane's centred mark, the mobile
@@ -145,31 +147,20 @@ function LucidosMenu({ open, onClose, anchor, actionsInRow }: {
 
   return (
     <>
-      {/* The dim, portaled separately from the panel and NOT as an <Overlay>
-          backdrop: `backdrop` mode renders the scrim as the panel's own
-          container, which `Overlay` only ever renders inline, and inline is
-          exactly where a `position: fixed` box cannot be trusted here (the
-          transformed `.header-nav-cluster` ancestor). Two portaled siblings
-          sidestep that. */}
-      {open && typeof document !== 'undefined' && createPortal(
-        <div class="brand-menu-scrim" aria-hidden="true" />,
-        document.body,
-      )}
-
       {/* Centred from CSS, so no measure pass and no hidden first frame: the
           panel is `position: fixed` and portaled to <body> so its offsets
           resolve against the viewport. */}
       {/* `role="menu"`, not `dialog`: the toggle advertises `aria-haspopup="menu"`
           and every row is a `menuitem`, and a `menuitem` must be owned by a
-          menu-role container to mean anything. Centred with a scrim is a
-          PLACEMENT; it does not make this a dialog. */}
+          menu-role container to mean anything. Centred is a PLACEMENT; it
+          does not make this a dialog. */}
       <Overlay
         open={open}
         onClose={onClose}
         anchor={anchor}
         backdrop={false}
         portal
-        panelClass="brand-menu"
+        panelClass="surface-box surface-raised brand-menu"
         panelRole="menu"
         panelProps={{ 'aria-label': 'Lucidos menu' }}
       >
@@ -180,6 +171,12 @@ function LucidosMenu({ open, onClose, anchor, actionsInRow }: {
             inside the panel, so a drop while the menu is open writes the notice
             in under the user's eyes rather than waiting for the next open. */}
         {connectionNoticeRow(connectionStatus.value, visibleWorkspaceName.value)}
+
+        {/* The work in flight, one row per job, which is what the spinning
+            badge on the mark advertises. Above the notifications because it is
+            what is happening NOW, and the only place its progress is told.
+            Renders nothing when nothing runs. */}
+        <ActivityMenuGroup onClose={onClose} />
 
         {/* Where the unread notifications are, this workspace included. It
             LEADS the panel because it is the news the mark's badge just
@@ -329,28 +326,24 @@ export function BrandMenuButton({ placement = 'cluster' }: { placement?: 'cluste
   // this the count would be silent on the two panes the bell never appears on,
   // which is the whole reason it rides the mark.
   const unread = unreadBadgeLabel(crossWorkspaceUnreadTotal.value);
+  // The state badge is click-through for the same reason, so the mark speaks
+  // what it stands for too: the jobs in flight, or a version to take.
+  const state = brandBadgeLabel(liveActivityRows());
   const label = [
     'Lucidos menu',
     unread,
+    state,
     inRow ? null : (sentence ?? connectionPhrase(status, visibleWorkspaceName.value)),
   ].filter(Boolean).join(' · ');
 
   return (
     <>
-      {/* The badge is a SIBLING of the mark, not a child of it.
-          `BrandBadge`'s busy state renders a real `<button>` (it opens the
-          background-activity toast), and a button inside a button is invalid
-          HTML: the inner one swallows the tap, so while the engine was
-          building, tapping the mark opened the status toast instead of the
-          menu. Desktop never hit this because its badge host is a `<span>`.
-          The slot is the positioning context both share, and it is what puts
-          the badge ON the mark's corner rather than in a flex slot beside it
-          (styles/header-mark.css). Overlapping them means sibling markup is no
-          longer the whole story, and the other two halves live in that
-          stylesheet: the busy badge's hit area is reined in, since a square
-          centred on the badge otherwise covers the mark, and the ready badge is
-          click-through, since a span with no handler is still a hit target and
-          a sibling gives its tap nothing to bubble to. */}
+      {/* The badges are SIBLINGS of the mark, not children of it. The slot is
+          the positioning context they share, and it is what puts each badge ON
+          the mark's corner rather than in a flex slot beside it
+          (styles/header-mark.css). Both badges are click-through there, so a
+          tap anywhere on the slot is a tap on the mark, which opens the menu.
+          The menu's activity group is what the state badge stands for. */}
       <span class="brand-mark-slot">
         <button
           ref={setAnchor}

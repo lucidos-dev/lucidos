@@ -7,17 +7,17 @@
  *     or a failed turn. Ordered by review tier (User Q / permission ahead of a
  *     failed turn), then most-recent-first within each tier.
  *   - "Review" — every Current/Saved thread carrying a change ready to apply
- *     (codingAgentProposed, not mid-turn). Most-recent-first.
+ *     (codingAgentProposed, Apply offered). Most-recent-first.
  *   - "Running" — every Current/Saved thread actively working on a response
  *     (effective status `running`). Most-recent-first.
  * All views bypass the channel/trigger/repo filters and the lifecycle section
  * grouping. The predicates (`threadNeedsAttention` / `threadInReview` /
  * `threadIsRunning`) are shared with the selector badge counts
  * (`attentionThreadCount` / `reviewThreadCount` / `runningThreadCount`) so the
- * counts and the filtered lists can never disagree. The needs-attention and
- * review predicates are independent: a thread that is BOTH awaiting an answer AND
- * carrying a proposed change legitimately surfaces in both views. Running is
- * mutually exclusive with both (they exclude `running`).
+ * counts and the filtered lists can never disagree. A failed thread with a
+ * proposed change surfaces in both needs-attention and review. One awaiting an
+ * answer is needs-attention only, since the open question withholds Apply.
+ * Running is mutually exclusive with both (they exclude `running`).
  */
 
 import { describe, it, expect, beforeEach } from 'vitest';
@@ -33,6 +33,7 @@ type ThreadOpts = {
     codingAgentProposed?: boolean;
     state?: ThreadMeta['state'];
     updatedAt?: string;
+    liveEventWaitCount?: number;
 };
 
 function makeThread(id: string, opts: ThreadOpts = {}): ThreadState {
@@ -55,11 +56,10 @@ function makeThread(id: string, opts: ThreadOpts = {}): ThreadState {
         codingAgentProposed: opts.codingAgentProposed ?? false,
         codingAgentRequiresRestart: false,
         codingAgentIsExternalRepo: false,
-        codingAgentApplying: false,
         lastRevivedAt: '',
         state: opts.state ?? 'active',
         latestTodoList: null,
-        liveEventWaitCount: 0,
+        liveEventWaitCount: opts.liveEventWaitCount ?? 0,
         liveEventWaits: [],
     };
     return {
@@ -195,6 +195,13 @@ describe('reviewThreads', () => {
         expect(reviewThreads(asMap([runningProposed]))).toEqual([]);
     });
 
+    it('excludes a thread parked on an event wait, whose change is not final', () => {
+        // It wakes on its delivery and commits on to the same branch, so the
+        // engine withholds Apply and the dot reads Waiting, not Changes.
+        const parked = makeThread('a', { section: 'inbox', codingAgentProposed: true, liveEventWaitCount: 1 });
+        expect(reviewThreads(asMap([parked]))).toEqual([]);
+    });
+
     it('excludes a waiting/failed thread with no proposed change (that is attention)', () => {
         const waiting = makeThread('a', { status: 'waiting_for_user_answer' });
         const failed = makeThread('b', { status: 'failed' });
@@ -292,12 +299,12 @@ describe('threadIsRunning', () => {
 });
 
 describe('a thread that is both awaiting an answer and carrying a proposed change', () => {
-    // The two views are independent surfaces — such a thread legitimately appears
-    // in both, counted once per view.
-    it('appears in both attention and review', () => {
+    // The open question withholds Apply, so the change is not ready yet. It
+    // returns to Review once the user answers and the turn settles.
+    it('appears in attention only', () => {
         const both = makeThread('both', { status: 'waiting_for_user_answer', codingAgentProposed: true });
         expect(ids(attentionThreads(asMap([both])))).toEqual(['both']);
-        expect(ids(reviewThreads(asMap([both])))).toEqual(['both']);
+        expect(reviewThreads(asMap([both]))).toEqual([]);
     });
 });
 
@@ -330,6 +337,7 @@ describe('reviewThreadCount mirrors reviewThreads', () => {
             makeThread('proposed', { codingAgentProposed: true }),
             makeThread('archived-proposed', { section: 'archived', codingAgentProposed: true }),
             makeThread('running-proposed', { status: 'running', codingAgentProposed: true }), // excluded
+            makeThread('parked-proposed', { codingAgentProposed: true, liveEventWaitCount: 1 }), // excluded
             makeThread('waiting', { status: 'waiting_for_user_answer' }),                     // attention, not review
             makeThread('idle', { status: 'idle' }),                                           // excluded
         ];

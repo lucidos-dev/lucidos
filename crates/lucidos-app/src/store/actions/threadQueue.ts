@@ -31,7 +31,7 @@ export async function runQueueEntryNow(entryId: string): Promise<void> {
 
 /** Drop a queued entry without running it (panel "Drop", with confirm). */
 export async function dropQueueEntry(entryId: string, summary: string): Promise<void> {
-  if (!(await showConfirm(`Drop queued spawn "${summary}"? It will not run.`, 'Drop'))) return;
+  if (!(await showConfirm(`Drop queued spawn "${summary}"? It will not run.`, 'Drop', { variant: 'danger' }))) return;
   try {
     await dropThreadQueueEntry(entryId);
     await loadThreadQueue();

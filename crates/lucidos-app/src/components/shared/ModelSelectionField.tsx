@@ -2,7 +2,7 @@ import { useRef, useState } from 'preact/hooks';
 import { useAnchoredPosition } from '../../hooks/useAnchoredPopover';
 import { useHidePanelWebviewWhile } from '../../hooks/useHidePanelWebviewWhile';
 import { Overlay } from './Overlay';
-import { dropdownPanelStyle } from './Dropdown';
+import { DropdownChevron, dropdownPanelStyle } from './Dropdown';
 import { ModelSelectionPicker } from './ModelSelectionPicker';
 import { useModelSelection, type ModelSelectionPatch } from '../../hooks/useModelSelection';
 import type { ModelChoice, TierChoice } from '../../store/modelSelection';
@@ -83,7 +83,7 @@ export function ModelSelectionField({
         }}
       >
         <span class="model-selection-value">{selection.label}</span>
-        <span class="dropdown-chevron">{open ? '▴' : '▾'}</span>
+        <DropdownChevron open={open} />
       </button>
       <Overlay
         open={open}
@@ -94,7 +94,7 @@ export function ModelSelectionField({
         // viewport coordinates, and a pane that is its own stacking context
         // would cap the z-index and clip the menu at its edge.
         portal
-        panelClass="dropdown-menu"
+        panelClass="surface-box dropdown-menu"
         panelRef={menuRef}
         panelStyle={dropdownPanelStyle(anchor ? anchor.getBoundingClientRect().width : null, pos)}
       >

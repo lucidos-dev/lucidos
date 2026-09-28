@@ -7,6 +7,7 @@ import {
   markThreadAnswering,
   clearThreadAnswering,
   focusedThreadId,
+  TOAST_AUTO_DISMISS_MS,
 } from '../store';
 import { loadedOr } from '../types';
 import { applyNow, applyChange, answerThreadQuestion as apiAnswerThreadQuestion, discardCCChanges, sendControlRequest, ApiError, isTransportError } from '../../api/client';
@@ -45,7 +46,12 @@ function armApplyingSafetyTimeout(threadId: string): void {
 
 /** Refusal slugs that mean something other than an apply holds the session.
  *  The engine sends one as `reason` beside the message on an Apply Now 409. */
-const NOT_APPLYING_REFUSALS = new Set(['discard_in_progress', 'session_stopping']);
+const NOT_APPLYING_REFUSALS = new Set([
+  'discard_in_progress',
+  'session_stopping',
+  'question_open',
+  'question_unknown',
+]);
 
 /** Whether an Apply Now 409 means an apply is genuinely running. An older
  *  engine sends no slug, and its only 409s were apply-held. */
@@ -64,22 +70,22 @@ export async function endClaudeCodeAndApply(threadId: string): Promise<void> {
   const next = new Map(applyingNowThreadIds.value);
   next.set(threadId, 'requesting');
   applyingNowThreadIds.value = next;
-  showToast(changeToastMessage('Applying changes', threadId), 'info', { key: `applying-${threadId}`, onClick: () => focusThread(threadId), spinning: true });
   try {
     await applyNow(threadId);
   } catch (e) {
     if (e instanceof ApiError && e.httpCode === 409) {
-      // The engine's message names what refused the apply. Re-keyed under the
-      // applying toast, so it replaces the spinner instead of stacking beside it.
+      // The engine's message names what refused the apply. Keyed under the
+      // apply's result toast, which replaces it once the apply resolves.
       const key = `applying-${threadId}`;
       const onClick = () => focusThread(threadId);
       if (refusalMeansApplying(e)) {
-        showToast(changeToastMessage('Applying changes', threadId, e.reason), 'info', { key, onClick, spinning: true });
+        showToast(changeToastMessage('Already applying', threadId, e.reason), 'info', { key, onClick, autoDismissMs: TOAST_AUTO_DISMISS_MS });
         // An apply really is running, so its SSE resolution will clear this.
         // The safety timeout covers an SSE gap dropping that resolution.
         armApplyingSafetyTimeout(threadId);
       } else {
-        // A Discard, or a stop ending the session: nothing is applying.
+        // A Discard, a stop ending the session, or a question that may still
+        // be waiting on the user: nothing is applying.
         clearApplyingNow(threadId);
         showToast(changeToastMessage('Not applied', threadId, e.reason), 'warning', { key, onClick });
       }
@@ -115,9 +121,8 @@ export async function endClaudeCodeAndApply(threadId: string): Promise<void> {
       return;
     }
     // API failed, so clear the optimistic state immediately. Every keyed error
-    // toast in this file names its thread and its cause. A keyed toast REPLACES
-    // the spinner raised at the top, and that spinner did name the thread. A
-    // bare "Failed to start apply" says neither which thread failed nor why: an
+    // toast in this file names its thread and its cause. A bare "Failed to
+    // start apply" says neither which thread failed nor why: an
     // auth refusal, a 5xx and a worktree conflict all read alike, and two
     // threads applying at once become indistinguishable.
     clearApplyingNow(threadId);

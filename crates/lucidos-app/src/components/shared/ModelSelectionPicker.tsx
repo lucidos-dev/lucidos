@@ -4,7 +4,7 @@ import {
   clampToOffered, decodePair, encodePair, filterModelRows, type ModelRow,
 } from '../../store/modelSelection';
 import type { ModelSelection } from '../../hooks/useModelSelection';
-import { pushOverlay, removeOverlay } from '../../store/overlayStack';
+import { useEscapeStep } from '../../hooks/useEscapeStep';
 import { focusIfNeeded, isTextInput } from '../../utils/dom';
 import { isTouchDevice } from '../../utils/viewport';
 import {
@@ -113,7 +113,6 @@ export function pickerFocusTarget(opts: { tierStep: boolean; searching: boolean 
 /** Which step a picker shows for an opened model. */
 type OpenStep = { model: string; step: 'tiers' } | { model: string; step: 'providers'; effort: string | null };
 
-let pickerIdCounter = 0;
 
 /** The one picker for a *model selection*, on every surface.
  *
@@ -161,11 +160,6 @@ export function ModelSelectionPicker({
   // what the filter box waits for, exactly as `Dropdown`'s does.
   const searching = useSignal(false);
   const highlight = useSignal(0);
-  // Seeded lazily: `useRef(expr)` evaluates `expr` on every render, so a
-  // template in the argument would bump the counter forever and keep only the
-  // first value.
-  const escapeId = useRef('');
-  if (!escapeId.current) escapeId.current = `model-picker-${++pickerIdCounter}`;
 
   const visible = filterModelRows(selection.rows, filter.value);
   const modelOptions = modelStepOptions(visible, selection, describeModel);
@@ -242,22 +236,11 @@ export function ModelSelectionPicker({
       ? () => stepBackFromProviders(openRow, openStep.effort)
       : backToModels;
 
-  // Escape must step BACK before it closes, and only the central overlay stack
-  // can express that: the Escape dispatcher runs in the capture phase and stops
-  // propagation, so a keydown handler here would never see the key.
-  //
-  // The stack is LIFO, so this entry must be pushed AFTER the panel's own, and
-  // both cases satisfy that structurally. The tier step is entered by a click,
+  // Escape steps BACK before it closes. The tier step is entered by a click,
   // long after the panel opened. A host passing `back` opened this picker from
-  // a list of its own, so its panel was already open too.
-  const stepBack = useRef(escapeTarget);
-  stepBack.current = escapeTarget;
-  useEffect(() => {
-    const id = escapeId.current;
-    if (stepBack.current === null) return;
-    pushOverlay({ id, dismiss: () => stepBack.current?.(), hasPanel: false });
-    return () => removeOverlay(id);
-  }, [open.value, !!back]);
+  // a list of its own, so its panel was already open too. Either way the step
+  // is pushed above the panel, which `useEscapeStep` relies on.
+  useEscapeStep(escapeTarget);
 
   function choose(option: ControlOption) {
     if (openStep && openRow) {

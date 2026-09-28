@@ -34,7 +34,6 @@ fn build_origin_user_with_caller_yields_workspace() {
         &h,
         ActorMode::Human,
         Some("dev-1"),
-        Some("dev label".into()),
         None,
         None,
         None,
@@ -64,7 +63,6 @@ fn build_origin_user_caller_takes_precedence_over_device() {
         &h,
         ActorMode::Human,
         Some("dev-1"),
-        Some("Chrome".into()),
         None,
         None,
         None,
@@ -74,62 +72,17 @@ fn build_origin_user_caller_takes_precedence_over_device() {
 }
 
 #[test]
-fn build_origin_user_with_device_id_yields_device_with_label() {
+fn build_origin_user_with_device_id_yields_the_device_id_only() {
     let h = headers_with(&[]);
-    let origin = build_message_origin(
-        &h,
-        ActorMode::Human,
-        Some("dev-1"),
-        Some("Chrome on Mac".into()),
-        None,
-        None,
-        None,
-        None,
-    );
+    let origin = build_message_origin(&h, ActorMode::Human, Some("dev-1"), None, None, None, None);
     match origin {
-        Some(MessageOrigin::Device { device_id, label }) => {
-            assert_eq!(device_id, "dev-1");
-            assert_eq!(label, "Chrome on Mac");
+        Some(origin @ MessageOrigin::Device { .. }) => {
+            assert_eq!(
+                serde_json::to_value(&origin).unwrap(),
+                serde_json::json!({ "kind": "device", "device_id": "dev-1" }),
+                "the event stores the id and never the device's name"
+            );
         }
-        other => panic!("expected Device, got {:?}", other),
-    }
-}
-
-#[test]
-fn build_origin_user_with_device_id_no_label_falls_back_to_short_id() {
-    let h = headers_with(&[]);
-    let origin = build_message_origin(
-        &h,
-        ActorMode::Human,
-        Some("abcdef0123456789"),
-        None,
-        None,
-        None,
-        None,
-        None,
-    );
-    match origin {
-        Some(MessageOrigin::Device { label, .. }) => assert_eq!(label, "device-abcdef01"),
-        other => panic!("expected Device, got {:?}", other),
-    }
-}
-
-#[test]
-fn build_origin_user_short_label_handles_short_id() {
-    // Defensive: device_id shorter than 8 chars must not panic.
-    let h = headers_with(&[]);
-    let origin = build_message_origin(
-        &h,
-        ActorMode::Human,
-        Some("ab"),
-        None,
-        None,
-        None,
-        None,
-        None,
-    );
-    match origin {
-        Some(MessageOrigin::Device { label, .. }) => assert_eq!(label, "device-ab"),
         other => panic!("expected Device, got {:?}", other),
     }
 }
@@ -140,7 +93,7 @@ fn build_origin_user_short_label_handles_short_id() {
 #[test]
 fn a_caller_with_no_credential_yields_no_actor_at_all() {
     let h = headers_with(&[("user-agent", "curl/8")]);
-    let origin = build_message_origin(&h, ActorMode::Human, None, None, None, None, None, None);
+    let origin = build_message_origin(&h, ActorMode::Human, None, None, None, None, None);
     assert_eq!(
         origin, None,
         "an unidentified caller must not be recorded as the user"
@@ -158,7 +111,7 @@ fn the_machine_local_token_names_the_engines_own_machinery() {
         ("user-agent", "lucidos-cli"),
         (lucidos_local_token::HEADER_LOCAL_TOKEN, token),
     ]);
-    let origin = build_message_origin(&h, ActorMode::Human, None, None, None, None, None, None);
+    let origin = build_message_origin(&h, ActorMode::Human, None, None, None, None, None);
     match origin {
         Some(MessageOrigin::Api {
             mode,
@@ -178,18 +131,9 @@ fn the_machine_local_token_names_the_engines_own_machinery() {
 fn a_device_outranks_the_machine_local_token() {
     let token = crate::api::local_auth::publish_test_local_token();
     let h = headers_with(&[(lucidos_local_token::HEADER_LOCAL_TOKEN, token)]);
-    let origin = build_message_origin(
-        &h,
-        ActorMode::Human,
-        Some("dev-1"),
-        Some("My MacBook".into()),
-        None,
-        None,
-        None,
-        None,
-    );
+    let origin = build_message_origin(&h, ActorMode::Human, Some("dev-1"), None, None, None, None);
     match origin {
-        Some(MessageOrigin::Device { label, .. }) => assert_eq!(label, "My MacBook"),
+        Some(MessageOrigin::Device { device_id }) => assert_eq!(device_id, "dev-1"),
         other => panic!("expected Device, got {:?}", other),
     }
 }
@@ -209,7 +153,7 @@ fn a_thread_bound_token_outranks_the_machine_local_token() {
         (HEADER_AGENT_ORIGIN_TOKEN, agent_token.as_str()),
         (lucidos_local_token::HEADER_LOCAL_TOKEN, local),
     ]);
-    let origin = build_message_origin(&h, ActorMode::Human, None, None, None, None, None, None);
+    let origin = build_message_origin(&h, ActorMode::Human, None, None, None, None, None);
     match origin {
         Some(MessageOrigin::Api {
             mode,
@@ -229,7 +173,6 @@ fn build_origin_human_mode_with_caller_yields_workspace_human_mode() {
     let origin = build_message_origin(
         &h,
         ActorMode::Human,
-        None,
         None,
         None,
         None,
@@ -259,7 +202,6 @@ fn build_origin_agent_mode_with_caller_yields_workspace_agent_mode() {
         None,
         None,
         None,
-        None,
         caller("dev", None, None, ActorMode::Agent),
     );
     match origin {
@@ -278,7 +220,6 @@ fn build_origin_engine_mode_with_caller_yields_workspace_engine_mode() {
         None,
         None,
         None,
-        None,
         caller("dev", None, None, ActorMode::Engine),
     );
     match origin {
@@ -293,7 +234,6 @@ fn build_origin_agent_mode_with_parent_thread_yields_thread_link_parent_agent_mo
     let origin = build_message_origin(
         &headers_with(&[]),
         ActorMode::Agent,
-        None,
         None,
         Some(parent_id),
         Some("parent".into()),
@@ -327,7 +267,6 @@ fn build_origin_engine_mode_with_no_parent_yields_none() {
         None,
         None,
         None,
-        None,
     );
     assert!(origin.is_none());
 }
@@ -338,7 +277,6 @@ fn build_origin_engine_mode_with_parent_thread_yields_thread_link_engine_mode() 
     let origin = build_message_origin(
         &headers_with(&[]),
         ActorMode::Engine,
-        None,
         None,
         Some(parent_id),
         None,
@@ -359,11 +297,10 @@ fn build_origin_engine_mode_with_parent_thread_yields_thread_link_engine_mode() 
 #[test]
 fn user_actor_convenience_passes_through_to_build_message_origin() {
     let h = headers_with(&[("user-agent", "curl/8")]);
-    let actor = user_actor(&h, Some("dev-1"), Some("Chrome".into()));
+    let actor = user_actor(&h, Some("dev-1"));
     match actor {
-        Some(MessageOrigin::Device { device_id, label }) => {
+        Some(MessageOrigin::Device { device_id }) => {
             assert_eq!(device_id, "dev-1");
-            assert_eq!(label, "Chrome");
         }
         other => panic!("expected Device, got {:?}", other),
     }
@@ -372,11 +309,10 @@ fn user_actor_convenience_passes_through_to_build_message_origin() {
 #[test]
 fn user_actor_falls_back_to_header_device_id_when_no_explicit_id() {
     let h = headers_with(&[("x-lucidos-device-id", "abcdef0123456789")]);
-    let actor = user_actor(&h, None, None);
+    let actor = user_actor(&h, None);
     match actor {
-        Some(MessageOrigin::Device { device_id, label }) => {
+        Some(MessageOrigin::Device { device_id }) => {
             assert_eq!(device_id, "abcdef0123456789");
-            assert_eq!(label, "device-abcdef01");
         }
         other => panic!("expected Device from header, got {:?}", other),
     }
@@ -385,63 +321,13 @@ fn user_actor_falls_back_to_header_device_id_when_no_explicit_id() {
 #[test]
 fn user_actor_explicit_id_takes_precedence_over_header() {
     let h = headers_with(&[("x-lucidos-device-id", "dev-from-header")]);
-    let actor = user_actor(&h, Some("dev-from-arg"), Some("Chrome".into()));
+    let actor = user_actor(&h, Some("dev-from-arg"));
     match actor {
-        Some(MessageOrigin::Device { device_id, label }) => {
+        Some(MessageOrigin::Device { device_id }) => {
             assert_eq!(device_id, "dev-from-arg");
-            assert_eq!(label, "Chrome");
         }
         other => panic!("expected explicit Device, got {:?}", other),
     }
-}
-
-#[tokio::test]
-async fn user_actor_resolved_enriches_device_label_from_db() {
-    // Regression: every mutating handler used to call `user_actor(.., None, None)`
-    // and never looked up the label, so events stamped Device { label: <fallback> }
-    // — visible as the bare `device-<short>` placeholder in the actor popover.
-    let (pool, db_name) = crate::test_support::setup_test_db().await;
-    crate::test_support::seed_device(
-        &pool,
-        "test-device-1",
-        Some("Mozilla/5.0"),
-        Some("My MacBook"),
-    )
-    .await;
-
-    let h = headers_with(&[("x-lucidos-device-id", "test-device-1")]);
-    let actor = user_actor_resolved(&h, &pool, None).await;
-    match actor {
-        Some(MessageOrigin::Device { device_id, label }) => {
-            assert_eq!(device_id, "test-device-1");
-            assert_eq!(
-                label, "My MacBook",
-                "label must come from devices table, not the device-<short> fallback"
-            );
-        }
-        other => panic!("expected Device with db-looked-up label, got {:?}", other),
-    }
-
-    crate::test_support::teardown_test_db(&db_name).await;
-}
-
-#[tokio::test]
-async fn user_actor_resolved_uses_explicit_device_id_override() {
-    // The settings endpoint takes device_id from the request body, not the header.
-    let (pool, db_name) = crate::test_support::setup_test_db().await;
-    crate::test_support::seed_device(&pool, "from-body", None, Some("Body Device")).await;
-
-    let h = headers_with(&[("x-lucidos-device-id", "from-header")]);
-    let actor = user_actor_resolved(&h, &pool, Some("from-body")).await;
-    match actor {
-        Some(MessageOrigin::Device { device_id, label }) => {
-            assert_eq!(device_id, "from-body", "explicit override beats header");
-            assert_eq!(label, "Body Device");
-        }
-        other => panic!("expected Device using override, got {:?}", other),
-    }
-
-    crate::test_support::teardown_test_db(&db_name).await;
 }
 
 /// The pair a mutating handler chooses between. The `Option` form answers
@@ -455,7 +341,7 @@ async fn an_unidentified_caller_resolves_to_nobody_and_is_refused() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
     let h = headers_with(&[("user-agent", "curl/8")]);
 
-    assert_eq!(user_actor_resolved(&h, &pool, None).await, None);
+    assert_eq!(user_actor(&h, None), None);
 
     let refusal = require_user_actor(&h, &pool, None)
         .await
@@ -483,7 +369,7 @@ async fn an_unidentified_caller_resolves_to_nobody_and_is_refused() {
 async fn a_registered_device_passes_the_same_gate() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
     let (bus, _rx) = crate::engine::event_bus::EventBus::new(pool.clone());
-    crate::core::DeviceStore::register(&pool, &bus, "gate-device", Some("Mozilla/5.0"), None)
+    crate::core::DeviceStore::register(&pool, &bus, "gate-device", Some("Mozilla/5.0"), None, None)
         .await
         .unwrap();
 
@@ -507,7 +393,7 @@ async fn an_unregistered_device_id_is_not_evidence() {
     // Attribution still stamps it, which is the behaviour the gate must not
     // inherit. A device that was removed keeps its name on what it already did.
     assert!(matches!(
-        user_actor_resolved(&h, &pool, None).await,
+        user_actor(&h, None),
         Some(MessageOrigin::Device { .. })
     ));
 
@@ -548,9 +434,16 @@ async fn an_unregistered_device_id_falls_through_to_the_machine_token() {
 async fn a_blank_override_does_not_swallow_a_real_device_header() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
     let (bus, _rx) = crate::engine::event_bus::EventBus::new(pool.clone());
-    crate::core::DeviceStore::register(&pool, &bus, "blank-test-device", Some("Mozilla/5.0"), None)
-        .await
-        .unwrap();
+    crate::core::DeviceStore::register(
+        &pool,
+        &bus,
+        "blank-test-device",
+        Some("Mozilla/5.0"),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
 
     let h = headers_with(&[(HEADER_DEVICE_ID, "blank-test-device")]);
     let actor = require_user_actor(&h, &pool, Some("   "))
@@ -561,23 +454,6 @@ async fn a_blank_override_does_not_swallow_a_real_device_header() {
         other => panic!("expected Device, got {:?}", other),
     }
 
-    crate::test_support::teardown_test_db(&db_name).await;
-}
-
-#[tokio::test]
-async fn user_actor_resolved_unknown_device_id_falls_back_to_short_label() {
-    // Device id in header but row missing in DB — falls back via
-    // build_message_origin's `device-<short>` derivation, never panics.
-    let (pool, db_name) = crate::test_support::setup_test_db().await;
-    let h = headers_with(&[("x-lucidos-device-id", "no-such-device")]);
-    let actor = user_actor_resolved(&h, &pool, None).await;
-    match actor {
-        Some(MessageOrigin::Device { device_id, label }) => {
-            assert_eq!(device_id, "no-such-device");
-            assert_eq!(label, "device-no-such-");
-        }
-        other => panic!("expected Device with fallback label, got {:?}", other),
-    }
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
@@ -1138,7 +1014,7 @@ fn build_origin_subprocess_overrides_human_to_agent_api() {
         ("user-agent", "curl/8.7.1"),
         (HEADER_AGENT_ORIGIN_TOKEN, &token),
     ]);
-    let origin = build_message_origin(&h, ActorMode::Human, None, None, None, None, None, None);
+    let origin = build_message_origin(&h, ActorMode::Human, None, None, None, None, None);
     match origin {
         Some(MessageOrigin::Api {
             user_agent,
@@ -1180,7 +1056,6 @@ fn build_origin_subprocess_overrides_device_id_too() {
         &h,
         ActorMode::Human,
         Some("should-be-ignored"),
-        Some("Chrome on Mac".into()),
         None,
         None,
         None,
@@ -1213,7 +1088,6 @@ fn build_origin_cross_workspace_caller_still_wins_over_subprocess() {
         None,
         None,
         None,
-        None,
         caller("dev", None, None, ActorMode::Human),
     );
     assert!(
@@ -1225,7 +1099,7 @@ fn build_origin_cross_workspace_caller_still_wins_over_subprocess() {
 }
 
 #[tokio::test]
-async fn user_actor_resolved_subprocess_token_overrides_device_lookup() {
+async fn user_actor_subprocess_token_overrides_the_device() {
     // Regression: even when the request has a device-id header that
     // resolves cleanly to a real row in the devices table, a valid
     // subprocess token MUST take precedence and produce an Api{Agent}
@@ -1241,7 +1115,7 @@ async fn user_actor_resolved_subprocess_token_overrides_device_lookup() {
         (HEADER_DEVICE_ID, "real-device"),
         (HEADER_AGENT_ORIGIN_TOKEN, &token),
     ]);
-    let actor = user_actor_resolved(&h, &pool, None).await;
+    let actor = user_actor(&h, None);
     match actor {
         Some(MessageOrigin::Api {
             mode,
@@ -1271,7 +1145,7 @@ async fn user_actor_resolved_subprocess_token_overrides_device_lookup() {
 async fn the_owners_registered_device_may_delete() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
     let (bus, _rx) = crate::engine::event_bus::EventBus::new(pool.clone());
-    crate::core::DeviceStore::register(&pool, &bus, "owner-phone", Some("Mozilla/5.0"), None)
+    crate::core::DeviceStore::register(&pool, &bus, "owner-phone", Some("Mozilla/5.0"), None, None)
         .await
         .unwrap();
 
@@ -1326,9 +1200,16 @@ async fn a_verified_agent_origin_token_may_not_delete() {
 async fn an_agent_token_beside_a_real_device_header_is_still_refused() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
     let (bus, _rx) = crate::engine::event_bus::EventBus::new(pool.clone());
-    crate::core::DeviceStore::register(&pool, &bus, "owner-laptop", Some("Mozilla/5.0"), None)
-        .await
-        .unwrap();
+    crate::core::DeviceStore::register(
+        &pool,
+        &bus,
+        "owner-laptop",
+        Some("Mozilla/5.0"),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
     init_agent_origin_secret("owner-device-gate-secret".into());
     let token = mint_agent_origin_token(Some(Uuid::new_v4()), 0, None).unwrap();
 
@@ -1424,9 +1305,16 @@ async fn a_database_blip_cannot_promote_an_invented_device() {
 async fn an_app_document_may_not_delete() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
     let (bus, _rx) = crate::engine::event_bus::EventBus::new(pool.clone());
-    crate::core::DeviceStore::register(&pool, &bus, "owner-tablet", Some("Mozilla/5.0"), None)
-        .await
-        .unwrap();
+    crate::core::DeviceStore::register(
+        &pool,
+        &bus,
+        "owner-tablet",
+        Some("Mozilla/5.0"),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
 
     let h = headers_with(&[
         (HEADER_DEVICE_ID, "owner-tablet"),
@@ -1448,4 +1336,32 @@ async fn an_app_document_may_not_delete() {
     assert!(require_owner_device(&shell, &pool).await.is_ok());
 
     crate::test_support::teardown_test_db(&db_name).await;
+}
+
+/// The gateway forwards the pairing label percent-encoded, beside the id of the
+/// device it authenticated.
+#[test]
+fn pairing_label_for_decodes_the_label_of_the_named_device() {
+    let h = headers_with(&[
+        (HEADER_DEVICE_ID, "phone-1"),
+        (HEADER_DEVICE_LABEL, "Caf%C3%A9%20iPhone"),
+    ]);
+    assert_eq!(
+        pairing_label_for(&h, "phone-1").as_deref(),
+        Some("Café iPhone")
+    );
+}
+
+/// A client moving off its old id registers that id while the gateway names the
+/// new one. The old row must not take the new device's name.
+#[test]
+fn pairing_label_for_refuses_a_device_the_header_does_not_name() {
+    let h = headers_with(&[
+        (HEADER_DEVICE_ID, "phone-1"),
+        (HEADER_DEVICE_LABEL, "Safari%20on%20iPhone"),
+    ]);
+    assert_eq!(pairing_label_for(&h, "old-local-id"), None);
+    assert_eq!(pairing_label_for(&headers_with(&[]), "phone-1"), None);
+    let blank = headers_with(&[(HEADER_DEVICE_ID, "phone-1"), (HEADER_DEVICE_LABEL, "%20")]);
+    assert_eq!(pairing_label_for(&blank, "phone-1"), None);
 }

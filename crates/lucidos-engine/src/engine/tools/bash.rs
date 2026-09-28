@@ -15,6 +15,12 @@ use tokio::io::AsyncReadExt;
 
 const MAX_OUTPUT_BYTES: usize = 100 * 1024; // 100 KB
 
+/// How much of one stream a pipe reader keeps. The model sees only the first
+/// `MAX_OUTPUT_BYTES`, and the slack covers what sanitizing strips. Past it
+/// the reader counts bytes and drops them, so a chatty command cannot grow the
+/// engine's memory without bound.
+const KEPT_BYTES_CAP: usize = 4 * MAX_OUTPUT_BYTES;
+
 /// How long the pipe readers may go with no bytes and no EOF before we call
 /// the pipes detached.
 ///
@@ -43,6 +49,8 @@ enum ShellWait {
         outcome: TaskOutcome,
         stdout: Vec<u8>,
         stderr: Vec<u8>,
+        stdout_total: u64,
+        stderr_total: u64,
     },
     /// The shell exited, but a process it detached still holds the pipes.
     /// Carries whatever drained before the grace expired.
@@ -50,6 +58,8 @@ enum ShellWait {
         outcome: TaskOutcome,
         stdout: Vec<u8>,
         stderr: Vec<u8>,
+        stdout_total: u64,
+        stderr_total: u64,
     },
     /// The shell itself never exited within the budget.
     TimedOut,
@@ -103,10 +113,9 @@ async fn drain_pipe<R: tokio::io::AsyncRead + Unpin>(mut pipe: R, sink: Arc<Pipe
             Ok(n) => {
                 sink.read_bytes.fetch_add(n as u64, Ordering::Relaxed);
                 if !sink.discard.load(Ordering::Relaxed) {
-                    sink.buf
-                        .lock()
-                        .expect("drain buffer")
-                        .extend_from_slice(&buf[..n]);
+                    let mut kept = sink.buf.lock().expect("drain buffer");
+                    let room = KEPT_BYTES_CAP.saturating_sub(kept.len());
+                    kept.extend_from_slice(&buf[..n.min(room)]);
                 }
             }
             Err(e) => {
@@ -228,18 +237,24 @@ async fn wait_for_shell(
     let outcome = TaskOutcome::from_status(status);
     let stdout = out_sink.take();
     let stderr = err_sink.take();
+    // Read after the take, so a total is never smaller than what it kept.
+    let (stdout_total, stderr_total) = (out_sink.progress(), err_sink.progress());
     release(&out_sink, &err_sink);
     Ok(if drained {
         ShellWait::Completed {
             outcome,
             stdout,
             stderr,
+            stdout_total,
+            stderr_total,
         }
     } else {
         ShellWait::Detached {
             outcome,
             stdout,
             stderr,
+            stdout_total,
+            stderr_total,
         }
     })
 }
@@ -247,9 +262,14 @@ async fn wait_for_shell(
 /// Sanitize raw subprocess bytes for storage in a jsonb event payload and
 /// truncate to the LLM-facing cap. Centralized so the sync `run_bash` and
 /// the async background path always apply the same transformation.
-fn finalize_stream(bytes: &[u8]) -> String {
+///
+/// `total` is how many bytes the stream carried, which exceeds `bytes` when
+/// the reader hit `KEPT_BYTES_CAP`.
+fn finalize_stream(bytes: &[u8], total: u64) -> String {
     let sanitized = sanitize_for_jsonb(&String::from_utf8_lossy(bytes));
-    truncate_output(&sanitized, MAX_OUTPUT_BYTES)
+    let dropped = total > bytes.len() as u64;
+    let dropped_total = dropped.then(|| usize::try_from(total).unwrap_or(usize::MAX));
+    truncate_output(&sanitized, MAX_OUTPUT_BYTES, dropped_total)
 }
 
 /// Same, but keeps the END of an oversized stream instead of the start.
@@ -317,7 +337,7 @@ impl LucidosEngine {
         // process keeps the pipes open after the shell is gone. Waiting on EOF
         // reported that as a timeout (ADR 0100).
         let waited = wait_for_shell(child, Duration::from_secs(timeout_secs)).await?;
-        let (raw_stdout, raw_stderr, detached, outcome) = match waited {
+        let (detached, outcome, raw_stdout, raw_stderr, stdout_total, stderr_total) = match waited {
             ShellWait::TimedOut => {
                 // The shell itself never exited. `wait_for_shell` has already
                 // dropped it, so the OS has SIGKILLed it by now.
@@ -327,16 +347,20 @@ impl LucidosEngine {
                 outcome,
                 stdout,
                 stderr,
-            } => (stdout, stderr, false, outcome),
+                stdout_total,
+                stderr_total,
+            } => (false, outcome, stdout, stderr, stdout_total, stderr_total),
             ShellWait::Detached {
                 outcome,
                 stdout,
                 stderr,
-            } => (stdout, stderr, true, outcome),
+                stdout_total,
+                stderr_total,
+            } => (true, outcome, stdout, stderr, stdout_total, stderr_total),
         };
 
-        let stdout = finalize_stream(&raw_stdout);
-        let stderr = finalize_stream(&raw_stderr);
+        let stdout = finalize_stream(&raw_stdout, stdout_total);
+        let stderr = finalize_stream(&raw_stderr, stderr_total);
 
         let mut response = String::new();
 
@@ -775,13 +799,18 @@ impl LucidosEngine {
     }
 }
 
-fn truncate_output(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        let end = s.floor_char_boundary(max);
-        format!("{}...\n[truncated — {} bytes total]", &s[..end], s.len())
+/// The first `max` bytes of `s`, marked when anything is cut.
+///
+/// `dropped_total` is the stream's full size when the reader stopped keeping
+/// bytes. Its note is due even when `s` fits: sanitizing can shrink a mostly
+/// binary head below `max`.
+fn truncate_output(s: &str, max: usize, dropped_total: Option<usize>) -> String {
+    if s.len() <= max && dropped_total.is_none() {
+        return s.to_string();
     }
+    let end = s.floor_char_boundary(max);
+    let total = dropped_total.unwrap_or(0).max(s.len());
+    format!("{}...\n[truncated: {} bytes total]", &s[..end], total)
 }
 
 /// Task runtime in seconds from a persisted `BackgroundBashCompleted`
@@ -891,11 +920,13 @@ mod tests {
                 outcome,
                 stdout,
                 stderr,
+                ..
             }
             | ShellWait::Detached {
                 outcome,
                 stdout,
                 stderr,
+                ..
             } => (outcome, stdout, stderr),
             other => panic!("expected the shell to exit, got {other:?}"),
         };
@@ -1005,11 +1036,13 @@ mod tests {
                 outcome,
                 stdout,
                 stderr,
+                ..
             }
             | ShellWait::Detached {
                 outcome,
                 stdout,
                 stderr,
+                ..
             } => (outcome, stdout, stderr),
             other => panic!("expected the shell to exit, got {other:?}"),
         };
@@ -1087,16 +1120,59 @@ mod tests {
         assert_eq!(stdout.len(), 8000 * 41, "every byte must survive");
     }
 
+    /// A chatty command must not grow the engine's memory without bound. The
+    /// reader keeps a bounded head and still reports the full size.
+    #[tokio::test]
+    async fn a_chatty_command_keeps_a_bounded_head_and_reports_the_full_size() {
+        let child = spawn_like_the_tool("head -c 2000000 /dev/zero | tr '\\0' a");
+        let (stdout, stdout_total) = match wait_for_shell(child, Duration::from_secs(30))
+            .await
+            .unwrap()
+        {
+            ShellWait::Completed {
+                stdout,
+                stdout_total,
+                ..
+            }
+            | ShellWait::Detached {
+                stdout,
+                stdout_total,
+                ..
+            } => (stdout, stdout_total),
+            other => panic!("expected the shell to exit, got {other:?}"),
+        };
+        assert_eq!(stdout.len(), KEPT_BYTES_CAP);
+        assert_eq!(stdout_total, 2_000_000);
+        let shown = finalize_stream(&stdout, stdout_total);
+        assert!(
+            shown.ends_with("[truncated: 2000000 bytes total]"),
+            "{}",
+            &shown[shown.len().saturating_sub(80)..]
+        );
+    }
+
+    /// A capped stream of NULs sanitizes to nothing. The note must still say
+    /// how much output there was.
+    #[test]
+    fn a_capped_stream_that_sanitizes_to_nothing_is_still_marked() {
+        let shown = finalize_stream(&[0u8; 16], 1_000_000);
+        assert!(
+            shown.ends_with("[truncated: 1000000 bytes total]"),
+            "{shown:?}"
+        );
+        assert_eq!(finalize_stream(b"ok", 2), "ok");
+    }
+
     #[test]
     fn truncate_output_short_string() {
         let s = "hello world";
-        assert_eq!(truncate_output(s, 100), "hello world");
+        assert_eq!(truncate_output(s, 100, None), "hello world");
     }
 
     #[test]
     fn truncate_output_long_string() {
         let s = "a".repeat(200);
-        let result = truncate_output(&s, 50);
+        let result = truncate_output(&s, 50, None);
         assert!(result.starts_with(&"a".repeat(50)));
         assert!(result.contains("[truncated"));
         assert!(result.contains("200 bytes total"));
@@ -1212,7 +1288,7 @@ mod tests {
     #[test]
     fn truncate_output_multibyte_boundary() {
         let s = "ééééé"; // 10 bytes in UTF-8
-        let result = truncate_output(s, 5);
+        let result = truncate_output(s, 5, None);
         assert!(result.contains("[truncated"));
     }
 }

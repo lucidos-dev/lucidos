@@ -3,6 +3,8 @@ import { signal } from '@preact/signals-core';
 
 const applyingChangeIds = signal<Set<string>>(new Set());
 const applyAllInProgress = signal(false);
+const applyAllBatch = signal<{ changeIds: readonly string[]; resolvedChangeIds: readonly string[] } | null>(null);
+const applyAllCanceling = signal(false);
 const showToast = vi.fn();
 
 vi.mock('../store', () => ({
@@ -15,6 +17,11 @@ vi.mock('../store', () => ({
   applyingChangeIds,
   applyingNowThreadIds: signal(new Map()),
   applyAllInProgress,
+  applyAllBatch,
+  applyAllCanceling,
+  APPLY_ALL_SUMMARY_TOAST_KEY: 'apply-all-summary',
+  applyPhases: signal(new Map()),
+  TOAST_AUTO_DISMISS_MS: 5000,
   generatedTitleIds: new Set(),
   codingAgentSessionVersion: signal(0),
   memoryRebuildProgress: signal(null),
@@ -79,6 +86,8 @@ describe('handleGlobalEvent — Apply All batch events', () => {
     vi.clearAllMocks();
     applyingChangeIds.value = new Set();
     applyAllInProgress.value = false;
+    applyAllBatch.value = null;
+    applyAllCanceling.value = false;
   });
 
   it('ApplyAllBatchStarted flags in-progress and marks every member as applying', () => {
@@ -88,6 +97,7 @@ describe('handleGlobalEvent — Apply All batch events', () => {
     });
 
     expect(applyAllInProgress.value).toBe(true);
+    expect(applyAllBatch.value).toEqual({ changeIds: ['c1', 'c2', 'c3'], resolvedChangeIds: [], applyingChangeIds: [], resolvingChangeIds: [] });
     expect(applyingChangeIds.value.has('c1')).toBe(true);
     expect(applyingChangeIds.value.has('c2')).toBe(true);
     expect(applyingChangeIds.value.has('c3')).toBe(true);
@@ -118,6 +128,8 @@ describe('handleGlobalEvent — Apply All batch events', () => {
     applyAllInProgress.value = true;
     applyingChangeIds.value = new Set(['c1', 'c2', 'c3']);
 
+    applyAllBatch.value = { changeIds: ['c1', 'c2', 'c3'], resolvedChangeIds: ['c1'] };
+    applyAllCanceling.value = true;
     handleGlobalEvent('ApplyAllBatchCompleted', {
       batch_id: 'batch-1',
       applied: ['c1'],
@@ -129,6 +141,22 @@ describe('handleGlobalEvent — Apply All batch events', () => {
 
     expect(applyAllInProgress.value).toBe(false);
     expect(applyingChangeIds.value.size).toBe(0);
+    expect(applyAllBatch.value).toBeNull();
+    expect(applyAllCanceling.value).toBe(false);
+    expect(showToast).toHaveBeenCalledWith(
+      'Applied 1 of 3 changes. 2 did not apply.', 'info', expect.objectContaining({ key: 'apply-all-summary' }),
+    );
+  });
+
+  it('ApplyAllBatchCompleted reports a clean run in a summary toast', () => {
+    applyAllInProgress.value = true;
+    applyAllBatch.value = { changeIds: ['c1', 'c2'], resolvedChangeIds: ['c1'] };
+
+    handleGlobalEvent('ApplyAllBatchCompleted', { batch_id: 'batch-1', applied: ['c1', 'c2'] });
+
+    expect(showToast).toHaveBeenCalledWith(
+      'Applied 2 changes', 'success', expect.objectContaining({ key: 'apply-all-summary' }),
+    );
   });
 
   it('ApplyAllBatchCompleted leaves unrelated applying ids untouched', () => {

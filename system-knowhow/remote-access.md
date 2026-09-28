@@ -735,13 +735,21 @@ An unrecognised browser suggests nothing and leaves the field blank, which is
 what keeps the fallback reachable. With neither, the device is listed as
 "Paired device".
 
-That pairing name is fixed: revoke and pair again to change it. The name on the
+That *pairing label* is fixed: revoke and pair again to change it. The name on the
 **Devices** row is not. Click it and type, and that is what the row shows from
-then on. A device with no engine row yet shows its pairing name instead.
+then on.
 
-A device with neither is listed as `device-` plus the first eight characters of
-its id, which is what an actor chip calls it too. The whole id is never the
-heading: it is unreadable, and at that length it wraps onto a second line.
+**One rule names a device everywhere**: the typed name, else the pairing label,
+else `device-` plus the first eight characters of its id. The Devices row, a
+message's Origin popover, an actor chip, and the agent's list of your devices
+all follow it. The gateway passes the pairing label to the workspace on every
+request, so the workspace knows it without asking. A device reached straight on
+an engine port has no pairing label, and skips that step.
+
+A message's Origin shows the device's current name, so a rename reaches older
+messages too. The device you are reading on is marked "(this device)". The whole
+id is never shown: it is unreadable, and at that length it wraps onto a second
+line.
 
 ### The tailnet-status endpoint
 
@@ -826,11 +834,11 @@ table), it just is not the error.
 ### The Expose run
 
 Pressing **Expose** starts a supervised run, not a single blocking call. It
-reports on the **brand badge** in the header (the shared background-activity
-surface, alongside a dev engine rebuild and the embedding-model download): the
-badge spins for the whole run from any screen, and tapping it opens the status
-toast with the current step. Every step is indeterminate, so the toast spins
-rather than showing a bar.
+narrates each step in a toast, and the **brand badge** in the header spins for
+the whole run from any screen. Close the toast and the run carries on: tap the
+Lucidos mark, and the run's line in the menu unfolds to the current step and
+its actions. Every step is indeterminate, so both spin rather than showing a
+bar.
 
 | Step | What is happening |
 |---|---|

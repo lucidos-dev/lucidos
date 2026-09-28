@@ -66,7 +66,7 @@ describe('a confirm raised by an open modal', () => {
     render(<OverlayGroup />, host);
     await settled();
 
-    void showConfirm('Replace the draft?', 'Replace');
+    void showConfirm('Replace the draft?', 'Replace', { variant: 'danger' });
     await settled();
 
     const overlays = host.querySelectorAll('.modal-overlay');

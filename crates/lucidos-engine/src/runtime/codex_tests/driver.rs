@@ -12,14 +12,22 @@ struct StubSession {
 }
 
 fn stub_driver(jsonl_body: &str, resume: Option<&str>) -> StubSession {
+    stub_driver_running(
+        &format!("cat <<'JSONL_EOF'\n{jsonl_body}\nJSONL_EOF\n"),
+        resume,
+    )
+}
+
+/// [`stub_driver`] with the stub's output left to `script_tail`, a shell
+/// snippet that runs after the argv is logged.
+fn stub_driver_running(script_tail: &str, resume: Option<&str>) -> StubSession {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let args_log = tmp.path().join("args.log");
     let script = tmp.path().join("codex-stub.sh");
     // One log line per invocation — the prompt argument is multi-line (the
     // system-prompt block), so flatten newlines before appending.
     let body = format!(
-        "#!/bin/sh\nprintf '%s' \"$*\" | tr '\\n' ' ' >> {log}\nprintf '\\n' >> {log}\ncat <<'JSONL_EOF'\n{}\nJSONL_EOF\n",
-        jsonl_body,
+        "#!/bin/sh\nprintf '%s' \"$*\" | tr '\\n' ' ' >> {log}\nprintf '\\n' >> {log}\n{script_tail}",
         log = args_log.display(),
     );
     std::fs::write(&script, body).expect("write stub");
@@ -67,8 +75,8 @@ fn stub_driver(jsonl_body: &str, resume: Option<&str>) -> StubSession {
 
 /// How long a driver test waits for the app-server to say anything.
 ///
-/// A liveness ceiling, not a claim about speed. The child is a node process
-/// plus a native binary, and the full suite runs thousands of tests at once.
+/// A liveness ceiling, not a claim about speed. The child is a `/bin/sh` stub,
+/// but the full suite runs thousands of tests at once and starves it.
 /// Ten seconds passed in isolation and timed out three of these under load,
 /// which reads as breakage in the diff and never is. A slow spawn is not the
 /// bug these tests look for, so the ceiling only has to clear a real one.
@@ -449,4 +457,66 @@ async fn interrupt_kills_in_flight_turn_and_synthesizes_canceled_result() {
             other => panic!("unexpected event during shutdown: {:?}", other),
         }
     }
+}
+
+/// A line that arrives in two chunks survives an input queued between them.
+///
+/// The stub writes half its `thread.started` line, then waits. An input sent
+/// meanwhile wins the driver's select and drops the read. A read that loses
+/// the half leaves an unparseable tail, and the turn never reports `Init`.
+#[tokio::test]
+async fn a_line_split_around_a_queued_input_still_arrives_whole() {
+    let signals = tempfile::TempDir::new().expect("tempdir");
+    let half_written = signals.path().join("half-written");
+    let go_on = signals.path().join("go-on");
+    let tail = format!(
+        "printf '%s' '{{\"type\":\"thread.started\",'\n\
+         touch '{half}'\n\
+         while [ ! -e '{go}' ]; do sleep 0.05; done\n\
+         printf '%s\\n' '\"thread_id\":\"t-1\"}}'\n\
+         cat <<'JSONL_EOF'\n{rest}\nJSONL_EOF\n",
+        half = half_written.display(),
+        go = go_on.display(),
+        rest = HAPPY_TURN.split_once('\n').expect("a multi-line turn").1,
+    );
+    let mut s = stub_driver_running(&tail, None);
+    s.agent
+        .input_tx
+        .send(AgentInput {
+            text: "ping".into(),
+            images: vec![],
+        })
+        .expect("send input");
+
+    let started = std::time::Instant::now();
+    while !half_written.exists() {
+        assert!(
+            started.elapsed() < EVENT_TIMEOUT,
+            "the stub never wrote its first half"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    // Time for the driver to read the half, then to take the queued input.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    s.agent
+        .input_tx
+        .send(AgentInput {
+            text: "later".into(),
+            images: vec![],
+        })
+        .expect("send input");
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    std::fs::write(&go_on, "").expect("release the stub");
+
+    assert!(matches!(
+        next_event(&mut s.agent).await,
+        AgentEvent::InputRead(None)
+    ));
+    let init = next_event(&mut s.agent).await;
+    assert!(
+        matches!(&init, AgentEvent::Init { session_id, .. } if session_id == "t-1"),
+        "the split line must arrive whole, got {init:?}"
+    );
+
+    s.cancel.cancel();
 }

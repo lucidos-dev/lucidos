@@ -1,9 +1,11 @@
 use super::super::LucidosEngine;
+use crate::engine::event_bus::EventBus;
+use crate::engine::memory::correction::{index_correction, record_correction};
 use crate::engine::memory::MEMORY_CORRECTION_THRESHOLD;
 use crate::engine::AuxCapture;
 use crate::llm::provider::LlmProvider;
 use crate::llm::{Message, MessageContent};
-use crate::memory::{cosine_similarity, EmbeddingProvider};
+use crate::memory::{cosine_similarity, CorrectedMemory, EmbeddingProvider};
 
 /// Which candidate entries express the wrong fact, 0-indexed, or `None` when
 /// the call failed. A failure aborts the correction: deleting a memory on a
@@ -211,6 +213,30 @@ If NONE should be deleted, reply with "none"."#,
             ));
         }
 
+        let correction = args
+            .get("correction")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
+
+        let removed: Vec<CorrectedMemory> = candidates
+            .iter()
+            .enumerate()
+            .filter(|(list_idx, _)| verified_indices.contains(list_idx))
+            .map(|(_, &(entry_idx, _))| CorrectedMemory::from(&results.entries[entry_idx]))
+            .collect();
+        let event_id = match record_correction(
+            &self.event_bus,
+            search_query,
+            wrong_fact,
+            removed,
+            correction,
+        )
+        .await
+        {
+            Ok(id) => id,
+            Err(e) => return Ok(unrecorded_correction(e)),
+        };
+
         // Delete one at a time — only the LLM-verified entries
         let mut deleted_summaries: Vec<String> = Vec::new();
         let mut skipped_summaries: Vec<String> = Vec::new();
@@ -237,55 +263,16 @@ If NONE should be deleted, reply with "none"."#,
             }
         }
 
-        if deleted_summaries.is_empty() {
-            let errors = if failed_summaries.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    "\nFailed entries:\n{}",
-                    failed_summaries
-                        .iter()
-                        .map(|s| format!("  - {}", s))
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                )
-            };
-            return Ok(format!(
-                "No memories were deleted (all deletions failed). Please try again.{}",
-                errors
-            ));
-        }
-
-        // Optionally add corrected fact
-        let correction = args
-            .get("correction")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty());
-
         if let Some(correction_text) = correction {
-            let embedding = self
-                .embedder
-                .embed(correction_text)
-                .await
-                .map_err(|e| format!("Embedding failed: {}", e))?;
-
-            let fact_id = uuid::Uuid::new_v4();
-            let source = crate::memory::pgvector::MemorySource::Event { id: fact_id };
-            index
-                .index_entry(
-                    fact_id,
-                    &source,
-                    "Memory Correction",
-                    correction_text,
-                    0.8,
-                    &[],
-                    &embedding,
-                    self.embedder.model_id(),
-                    chrono::Utc::now(),
-                    crate::memory::EXTRACTOR_VERSION,
-                )
-                .await
-                .map_err(|e| format!("Insert correction failed: {}", e))?;
+            index_correction(
+                index,
+                self.embedder.as_ref(),
+                event_id,
+                correction_text,
+                chrono::Utc::now(),
+            )
+            .await
+            .map_err(|e| format!("Insert correction failed: {}", e))?;
         }
 
         let total = deleted_summaries.len() + skipped_summaries.len() + kept_count;
@@ -341,7 +328,7 @@ If NONE should be deleted, reply with "none"."#,
         let Some(ref index) = self.memory_index else {
             return Ok("Error: memory system not available".to_string());
         };
-        correct_memory_by_id_impl(index, self.embedder.as_ref(), args).await
+        correct_memory_by_id_impl(index, self.embedder.as_ref(), &self.event_bus, args).await
     }
 
     /// `memory` action `search`: the agent's own query against long-term
@@ -439,6 +426,14 @@ If NONE should be deleted, reply with "none"."#,
     }
 }
 
+/// The tool reply when the correction event could not be written. Nothing is
+/// deleted then: a correction that is not recorded comes back on a rebuild.
+fn unrecorded_correction(e: Box<dyn std::error::Error + Send + Sync>) -> String {
+    format!(
+        "Memory correction aborted: could not record it ({e}). No changes made. Please try again."
+    )
+}
+
 /// Parse the `id` arg for `correct_memory_by_id`. Accepts a bare UUID
 /// (hyphenated or simple) and defensively tolerates a `mem-` prefix and
 /// surrounding whitespace. Returns the tool-facing error string on failure so
@@ -466,6 +461,7 @@ pub(crate) fn parse_memory_entry_id(args: &serde_json::Value) -> Result<uuid::Uu
 pub(crate) async fn correct_memory_by_id_impl(
     index: &crate::memory::PgVectorIndex,
     embedder: &dyn EmbeddingProvider,
+    bus: &EventBus,
     args: &serde_json::Value,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let id = match parse_memory_entry_id(args) {
@@ -486,48 +482,42 @@ pub(crate) async fn correct_memory_by_id_impl(
         ));
     };
 
-    let deleted = index
-        .delete(id)
-        .await
-        .map_err(|e| format!("Delete failed: {}", e))?;
-    if !deleted {
-        return Ok(format!(
-            "Memory entry {} was already gone — no changes made.",
-            id
-        ));
-    }
-    log!(@Memory, "[correct_memory_by_id] DELETED id={} topic={:?}", id, entry.topic);
-
     let correction = args
         .get("correction")
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|s| !s.is_empty());
 
-    let mut response = format!("Deleted memory entry {}:\n  - {}", id, entry.summary);
+    // The entry's own summary is the wrong fact: the user pointed at it.
+    let removed = vec![CorrectedMemory::from(&entry)];
+    let event_id =
+        match record_correction(bus, &entry.summary, &entry.summary, removed, correction).await {
+            Ok(id) => id,
+            Err(e) => return Ok(unrecorded_correction(e)),
+        };
+
+    let deleted = index
+        .delete(id)
+        .await
+        .map_err(|e| format!("Delete failed: {}", e))?;
+    // Recorded either way, so the correction below still lands.
+    let mut response = if deleted {
+        log!(@Memory, "[correct_memory_by_id] DELETED id={} topic={:?}", id, entry.topic);
+        format!("Deleted memory entry {}:\n  - {}", id, entry.summary)
+    } else {
+        format!("Memory entry {} was already gone.", id)
+    };
 
     if let Some(correction_text) = correction {
-        let embedding = embedder
-            .embed(correction_text)
-            .await
-            .map_err(|e| format!("Embedding failed: {}", e))?;
-        let fact_id = uuid::Uuid::new_v4();
-        let source = crate::memory::pgvector::MemorySource::Event { id: fact_id };
-        index
-            .index_entry(
-                fact_id,
-                &source,
-                "Memory Correction",
-                correction_text,
-                0.8,
-                &[],
-                &embedding,
-                embedder.model_id(),
-                chrono::Utc::now(),
-                crate::memory::EXTRACTOR_VERSION,
-            )
-            .await
-            .map_err(|e| format!("Insert correction failed: {}", e))?;
+        index_correction(
+            index,
+            embedder,
+            event_id,
+            correction_text,
+            chrono::Utc::now(),
+        )
+        .await
+        .map_err(|e| format!("Insert correction failed: {}", e))?;
         response.push_str(&format!("\n\nAdded corrected fact: {}", correction_text));
     }
 
@@ -539,8 +529,9 @@ mod tests {
     use super::*;
     use crate::engine::event_bus::EventBus;
     use crate::memory::{MemorySource, PgVectorIndex};
-    use crate::test_support::{aux_captures, setup_test_db, teardown_test_db, ScriptedProvider};
-    use async_trait::async_trait;
+    use crate::test_support::{
+        aux_captures, setup_test_db, teardown_test_db, Fixed384Embedder, ScriptedProvider,
+    };
     use serde_json::json;
     use uuid::Uuid;
 
@@ -643,45 +634,29 @@ mod tests {
 
     // --- correct_memory_by_id_impl (real PG + mock embedder) ---
 
-    /// pgvector stores `vector(384)`, so the correction path needs a 384-dim
-    /// embedder; `KeywordEmbedder` would emit `keywords.len()` dims. The delete
-    /// path ignores the embedder entirely.
-    struct Fixed384Embedder;
-    #[async_trait]
-    impl EmbeddingProvider for Fixed384Embedder {
-        async fn embed(
-            &self,
-            _text: &str,
-        ) -> Result<Vec<f32>, Box<dyn std::error::Error + Send + Sync>> {
-            Ok(vec![0.1f32; 384])
-        }
-        async fn embed_batch(
-            &self,
-            texts: &[&str],
-        ) -> Result<Vec<Vec<f32>>, Box<dyn std::error::Error + Send + Sync>> {
-            Ok(texts.iter().map(|_| vec![0.1f32; 384]).collect())
-        }
-        fn dimensions(&self) -> usize {
-            384
-        }
-        fn model_id(&self) -> &str {
-            "test-fixed-384"
-        }
+    async fn insert(index: &PgVectorIndex, summary: &str) -> Uuid {
+        let source = MemorySource::Event { id: Uuid::new_v4() };
+        insert_at(index, summary, &source, chrono::Utc::now()).await
     }
 
-    async fn insert(index: &PgVectorIndex, summary: &str) -> Uuid {
+    async fn insert_at(
+        index: &PgVectorIndex,
+        summary: &str,
+        source: &MemorySource,
+        src_created_at: chrono::DateTime<chrono::Utc>,
+    ) -> Uuid {
         let id = Uuid::new_v4();
         index
             .index_entry(
                 id,
-                &MemorySource::Event { id: Uuid::new_v4() },
+                source,
                 "Config",
                 summary,
                 0.8,
                 &[],
                 &vec![0.1f32; 384],
                 "test-fixed-384",
-                chrono::Utc::now(),
+                src_created_at,
                 crate::memory::EXTRACTOR_VERSION,
             )
             .await
@@ -689,10 +664,24 @@ mod tests {
         id
     }
 
+    async fn summaries(index: &PgVectorIndex, keyword: &str) -> Vec<String> {
+        let mut found: Vec<String> = index
+            .search_by_keyword(keyword, 0.0, 100)
+            .await
+            .unwrap()
+            .entries
+            .into_iter()
+            .map(|e| e.summary)
+            .collect();
+        found.sort();
+        found
+    }
+
     #[tokio::test]
     async fn delete_by_id_removes_only_the_target() {
         let (pool, db_name) = setup_test_db().await;
         let index = PgVectorIndex::new(pool.clone()).await.unwrap();
+        let (bus, _rx) = EventBus::new(pool.clone());
 
         let target = insert(&index, "Config dir is at gws-personal").await;
         let bystander = insert(&index, "User prefers dark theme").await;
@@ -700,6 +689,7 @@ mod tests {
         let out = correct_memory_by_id_impl(
             &index,
             &Fixed384Embedder,
+            &bus,
             &json!({ "id": target.to_string() }),
         )
         .await
@@ -726,11 +716,13 @@ mod tests {
     async fn unknown_id_is_a_safe_no_op() {
         let (pool, db_name) = setup_test_db().await;
         let index = PgVectorIndex::new(pool.clone()).await.unwrap();
+        let (bus, _rx) = EventBus::new(pool.clone());
 
         let survivor = insert(&index, "User prefers dark theme").await;
         let out = correct_memory_by_id_impl(
             &index,
             &Fixed384Embedder,
+            &bus,
             &json!({ "id": Uuid::new_v4().to_string() }),
         )
         .await
@@ -749,11 +741,13 @@ mod tests {
     async fn delete_with_correction_replaces_the_fact() {
         let (pool, db_name) = setup_test_db().await;
         let index = PgVectorIndex::new(pool.clone()).await.unwrap();
+        let (bus, _rx) = EventBus::new(pool.clone());
 
         let target = insert(&index, "Config dir is at gws-personal").await;
         let out = correct_memory_by_id_impl(
             &index,
             &Fixed384Embedder,
+            &bus,
             &json!({
                 "id": target.to_string(),
                 "correction": "The gws-personal config dir was deleted",
@@ -777,6 +771,58 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(stored, 1, "correction fact should be stored");
+
+        teardown_test_db(&db_name).await;
+    }
+
+    /// A full rebuild clears memory and re-extracts from the same source
+    /// events, so the extractor finds the wrong fact again. The correction must
+    /// be replayed over it, or every fix the user made silently comes back.
+    #[tokio::test]
+    async fn a_rebuild_does_not_resurrect_a_corrected_fact() {
+        let (pool, db_name) = setup_test_db().await;
+        let index = PgVectorIndex::new(pool.clone()).await.unwrap();
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let wrong = "User works at Acme Corp";
+        let right = "User works at Globex";
+
+        let target = insert(&index, wrong).await;
+        let source = index.get_by_id(target).await.unwrap().unwrap().source;
+        correct_memory_by_id_impl(
+            &index,
+            &Fixed384Embedder,
+            &bus,
+            &json!({ "id": target.to_string(), "correction": right }),
+        )
+        .await
+        .unwrap();
+
+        let corrections = crate::core::EventStore::new(pool.clone())
+            .events_of_type_chronological(crate::engine::memory::correction::MEMORY_CORRECTED)
+            .await
+            .unwrap();
+        assert_eq!(corrections.len(), 1, "the correction must be recorded");
+        let corrected_at = corrections[0].created;
+
+        // The forced rebuild: clear, then the extractor returns the wrong fact
+        // from its original source event, which predates the correction.
+        index.clear().await.unwrap();
+        insert_at(
+            &index,
+            wrong,
+            &source,
+            corrected_at - chrono::Duration::hours(1),
+        )
+        .await;
+        crate::engine::memory::correction::replay_corrections(
+            &index,
+            &Fixed384Embedder,
+            &corrections,
+        )
+        .await;
+
+        assert_eq!(summaries(&index, "Acme").await, Vec::<String>::new());
+        assert_eq!(summaries(&index, "Globex").await, vec![right.to_string()]);
 
         teardown_test_db(&db_name).await;
     }

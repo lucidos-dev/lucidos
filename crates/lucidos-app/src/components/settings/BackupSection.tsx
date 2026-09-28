@@ -1,5 +1,6 @@
 import { type ComponentChildren, type VNode } from 'preact';
 import { useState, useEffect, useRef } from 'preact/hooks';
+import { usePanelRefresh } from '../../hooks/usePanelRefresh';
 import {
   backupPreferencesVersion,
   backupProgress,
@@ -494,6 +495,15 @@ export function BackupSection() {
   //      overlap: it waits on a browser round trip, and the ready verdict it
   //      comes back to change is one of the values these reads carry.
   const appliedPreferencesVersion = useRef(backupPreferencesVersion.value);
+  /** Pulls waiting on the re-read of a version. Settled once a read of that
+   *  version or a newer one ends, applied or dropped: a dropped read yields to
+   *  a local write, whose values are already on screen. */
+  const preferenceReads = useRef<Array<{ version: number; settle: () => void }>>([]);
+  function settlePreferenceReads(upTo: number): void {
+    const waiting = preferenceReads.current;
+    preferenceReads.current = waiting.filter((w) => w.version > upTo);
+    for (const w of waiting) if (w.version <= upTo) w.settle();
+  }
   useEffect(() => {
     const version = backupPreferencesVersion.value;
     if (version <= appliedPreferencesVersion.current) return;
@@ -507,6 +517,7 @@ export function BackupSection() {
         getBackupSchedule(),
         getBackupRetention(),
       ]);
+      settlePreferenceReads(version);
       // Two refreshes can be in the air at once (one user action writes two
       // preferences), and a local action can start under either. See
       // `refreshMayApply` for what each half is protecting.
@@ -548,6 +559,21 @@ export function BackupSection() {
   })();
 
   const selectedReady = loadedProviders?.find((p) => p.id === selectedProvider)?.ready ?? false;
+
+  // A pull re-reads through the same guarded path as an SSE frame: it asks for
+  // the next preferences version, and the effect above reads and applies it.
+  // Held while a local write runs, as that effect is. The health card re-reads
+  // in place, as its poll does.
+  const writing = backupPairSaving || retentionSaving || granting;
+  usePanelRefresh('backup', writing ? null : () => {
+    const version = backupPreferencesVersion.peek() + 1;
+    const preferences = new Promise<void>((settle) => preferenceReads.current.push({ version, settle }));
+    backupPreferencesVersion.value = version;
+    return Promise.all([
+      preferences,
+      selectedProvider && selectedReady ? loadStatus({ keepPrevious: true }) : undefined,
+    ]);
+  });
 
   const progress = backupProgress.value;
 

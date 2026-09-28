@@ -1,5 +1,8 @@
-import { describe, it, expect, vi } from 'vitest';
-import { computeAnchorPosition, isOutsidePointerTarget, makeDismissHandlers, installPairedSwallow, pointAnchor } from './useAnchoredPopover';
+import { afterEach, describe, it, expect, vi } from 'vitest';
+import {
+  anchoredPanelStyle, computeAnchorPosition, isOutsidePointerTarget, makeDismissHandlers,
+  installPairedSwallow, pointAnchor,
+} from './useAnchoredPopover';
 import { notePressOutcome, takePressOutcome } from '../utils/tapGesture';
 
 function fakeAnchor(rect: { top: number; bottom: number; left: number; right: number }): HTMLElement {
@@ -94,6 +97,39 @@ describe('computeAnchorPosition', () => {
     // Unclamped this is 300 - 324 - 4 = -28, with the panel's head off the top.
     expect(pos.top).toBe(8);
     expect(pos.placement).toBe('top-start');
+  });
+
+  /** iOS shrinks only the VISUAL viewport for the keyboard: `innerHeight`
+   *  keeps the full screen. A panel must never open into the space the keys
+   *  cover. */
+  describe('with the keyboard up', () => {
+    function setVisualViewport(vv: { height: number; offsetTop: number } | undefined) {
+      Object.defineProperty(window, 'visualViewport', { value: vv, configurable: true });
+    }
+
+    afterEach(() => setVisualViewport(undefined));
+
+    it('flips above rather than opening behind the keyboard', () => {
+      setViewport(393, 852);
+      setVisualViewport({ height: 486, offsetTop: 0 });
+      const pos = computeAnchorPosition(fakeAnchor({ top: 430, bottom: 466, left: 20, right: 56 }), 342, 240);
+      expect(pos.placement).toBe('top-start');
+      expect(pos.top).toBe(430 - 342 - 4);
+    });
+
+    it('clamps the head to the visible band when the page is panned', () => {
+      setViewport(393, 852);
+      setVisualViewport({ height: 400, offsetTop: 100 });
+      const pos = computeAnchorPosition(fakeAnchor({ top: 300, bottom: 336, left: 20, right: 56 }), 324, 240);
+      // Unclamped this is 300 - 324 - 4 = -28; the visible band starts at 100.
+      expect(pos.top).toBe(108);
+    });
+  });
+
+  it('hands the container cap to the panel style, and hides it until measured', () => {
+    expect(anchoredPanelStyle(null)).toEqual({ visibility: 'hidden' });
+    expect(anchoredPanelStyle({ top: 84, left: 12, placement: 'top-start', maxWidth: 484 }))
+      .toEqual({ top: '84px', left: '12px', maxWidth: '484px' });
   });
 
   it('clamps to the left margin when the panel is wider than the viewport allows', () => {
@@ -245,6 +281,29 @@ describe('computeAnchorPosition', () => {
     );
     // desiredLeft = 350 - 380 = -30; clamp pins to the left margin.
     expect(pos.left).toBe(8);
+  });
+
+  it("align 'container-center' centres the panel in its container, wherever the anchor is", () => {
+    setViewport(393, 852);
+    // A phone's composer menu at the header palette width, 393 - 2 * 16 = 361.
+    // It leaves 16px each side, whichever side of the screen the trigger is on.
+    const leftTrigger = fakeAnchor({ top: 700, bottom: 720, left: 40, right: 70 });
+    const rightTrigger = fakeAnchor({ top: 700, bottom: 720, left: 330, right: 360 });
+    expect(computeAnchorPosition(leftTrigger, 300, 361, null, 'container-center').left).toBe(16);
+    expect(computeAnchorPosition(rightTrigger, 300, 361, null, 'container-center').left).toBe(16);
+  });
+
+  it("align 'container-center' centres on the container, not the viewport", () => {
+    setViewport(1280, 800);
+    const container = fakeAnchor({ top: 0, bottom: 800, left: 200, right: 800 }) as HTMLElement;
+    const pos = computeAnchorPosition(
+      fakeAnchor({ top: 100, bottom: 120, left: 220, right: 250 }),
+      200,
+      400,
+      container,
+      'container-center',
+    );
+    expect(pos.left).toBe(300); // 200 + (600 - 400) / 2
   });
 });
 

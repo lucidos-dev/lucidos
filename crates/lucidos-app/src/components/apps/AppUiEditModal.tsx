@@ -9,6 +9,8 @@ import { autoResizeTextarea } from '../../utils/dom';
 import { useLoadableFetch } from '../../hooks/useLoadableFetch';
 import { errorDetail } from '../../utils/errorDetail';
 import { LoadableError } from '../shared/LoadableError';
+import { FormSkeleton } from '../shared/FormSkeleton';
+import { LoadingFade } from '../shared/LoadingFade';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { useServerBackedField } from '../../hooks/useServerBackedField';
 
@@ -27,24 +29,23 @@ export function AppUiEditModal() {
       </div>
     );
   }
-  if (showLoading) {
-    return <div class="inline-form"><div class="loading-spinner" /></div>;
-  }
-  if (appsList.value.status !== 'loaded') {
-    // Pre-delay window — keep the container mounted but show nothing yet.
-    return <div class="inline-form" />;
-  }
+  const apps = appsList.value.status === 'loaded' ? appsList.value.data : null;
+  const app = apps?.find((s) => s.id === appId);
+  // key={appId} remounts the closer when the form flips from missing-A to
+  // missing-B. Without it, Preact reuses the instance, and the empty-deps
+  // useEffect never re-fires for B.
+  if (apps && !app) return <MissingAppCloser key={appId} />;
 
-  const app = appsList.value.data.find((s) => s.id === appId);
-  if (!app) {
-    // key={appId} forces a remount when activeInlineForm flips from missing-A
-    // to missing-B in successive renders — without it, Preact reuses the
-    // instance and the empty-deps useEffect never re-fires for B.
-    return <MissingAppCloser key={appId} />;
-  }
-
-  return <AppUiEditModalInner key={appId} app={app} />;
+  return (
+    <LoadingFade showSkeleton={showLoading} skeleton={<FormSkeleton fields={APP_EDIT_FORM_FIELDS} />}>
+      {app && <AppUiEditModalInner key={appId} app={app} />}
+    </LoadingFade>
+  );
 }
+
+/** The edit form's fields: its two own, then one source file whose name the
+ *  file read decides. */
+const APP_EDIT_FORM_FIELDS = [{ label: 'Name' }, { label: 'Description' }, { tall: true }];
 
 /** Closes the app-edit form when the target app no longer exists. Lives in a
  *  child component so the signal write happens in useEffect (post-commit),
@@ -162,16 +163,15 @@ function FilesEditor({
   updateFileContent: (index: number, content: string) => void;
 }) {
   if (loadable.status === 'failed') return <LoadableError noun="files" error={loadable.error} />;
-  if (loadable.status !== 'loaded') return showLoading ? <div class="loading-spinner" /> : null;
   return (
-    <>
-      {loadable.data.map((file, i) => (
+    <LoadingFade showSkeleton={showLoading} skeleton={<FormSkeleton inline={false} fields={[{ tall: true }]} />}>
+      {loadable.status === 'loaded' && loadable.data.map((file, i) => (
         <div class="form-group" key={file.name}>
           <label>{file.name}</label>
           <CodeTextarea value={file.content} onInput={(v) => updateFileContent(i, v)} />
         </div>
       ))}
-    </>
+    </LoadingFade>
   );
 }
 

@@ -4,6 +4,41 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+/// What a catch-up reports when `main` gained commits that conflict with the
+/// branch. Wrappers add context around it, so match with
+/// [`is_concurrent_main_conflict`], never by prefix.
+pub(crate) const CONCURRENT_MAIN_CONFLICT: &str = "New conflicts from concurrent main changes";
+
+/// Whether an apply failed because a change that landed meanwhile conflicts
+/// with this one. Apply All retries such a change once (ADR 0314).
+pub(crate) fn is_concurrent_main_conflict(error: &str) -> bool {
+    error.contains(CONCURRENT_MAIN_CONFLICT)
+}
+
+/// Whether a conflict resolution merged the `main` it was asked to merge.
+///
+/// Asked of the sha `main` had when the resolution began, never of `main` now.
+/// Another change may land while the agent works, and the catch-up that
+/// follows merges it in.
+///
+/// `or_unknown(false)`, and a start sha nobody could read is a "no" too. This
+/// answer authorizes a fast-forward of `main`, so only a positive may pass.
+pub(crate) async fn resolution_merged_main(
+    repo_root: &Path,
+    main_at_start: Option<&str>,
+    branch_name: &str,
+) -> bool {
+    let Some(start) = main_at_start else {
+        return false;
+    };
+    git_answer(
+        &["merge-base", "--is-ancestor", start, branch_name],
+        repo_root,
+    )
+    .await
+    .or_unknown(false)
+}
+
 /// Re-merge main into a branch to catch up with any concurrent changes.
 /// No-op when main hasn't moved. Aborts and returns Err on conflicts.
 ///
@@ -22,11 +57,7 @@ async fn catchup_with_main(
         Ok(o) => {
             let _ = git_cmd(&["merge", "--abort"], worktree_path).await;
             let stderr = String::from_utf8_lossy(&o.stderr);
-            Err(format!(
-                "New conflicts from concurrent main changes: {}",
-                stderr.trim()
-            )
-            .into())
+            Err(format!("{CONCURRENT_MAIN_CONFLICT}: {}", stderr.trim()).into())
         }
         Err(e) => Err(e.into()),
     }
@@ -221,9 +252,14 @@ pub(crate) async fn ff_merge_to_main(
 ) -> Result<(String, String), Box<dyn std::error::Error + Send + Sync>> {
     let _merge_guard = MERGE_MUTEX.lock().await;
 
-    let mut last_err: Option<Box<dyn std::error::Error + Send + Sync>> = None;
-    for attempt in 1..=3 {
-        catchup_with_main(Path::new(wt_path)).await?;
+    let mut attempt = 0;
+    let err: Box<dyn std::error::Error + Send + Sync> = loop {
+        attempt += 1;
+        // A catch-up conflict fails every retry the same way, so it ends the
+        // loop at once and takes the same cleanup as exhausted retries.
+        if let Err(e) = catchup_with_main(Path::new(wt_path)).await {
+            break e;
+        }
 
         let main_sha = branch_head_sha(repo_root, "main").await.unwrap_or_default();
         let branch_sha = branch_head_sha(repo_root, temp_branch)
@@ -246,20 +282,20 @@ pub(crate) async fn ff_merge_to_main(
                 push_main_in_background(repo_root);
                 return Ok(shas);
             }
+            Err(e) if attempt < 3 => {
+                log!(
+                    "[Changes] ff-merge attempt {}/3 failed ({}), retrying after catchup",
+                    attempt,
+                    e
+                );
+            }
             Err(e) => {
-                if attempt < 3 {
-                    log!(
-                        "[Changes] ff-merge attempt {}/3 failed ({}), retrying after catchup",
-                        attempt,
-                        e
-                    );
-                }
-                last_err = Some(e);
+                break format!("Fast-forward merge to main failed after 3 retries: {e}").into();
             }
         }
-    }
+    };
 
-    // All retries exhausted. Clean up ONLY throwaway temp state: on a Tier-2 (or
+    // The merge failed. Clean up ONLY throwaway temp state: on a Tier-2 (or
     // pruned-temp re-attach) resolution `temp_branch == feature_branch`, i.e. the
     // session ran in the THREAD's own worktree on the REAL change branch, so
     // removing the worktree and force-deleting the branch here would destroy the
@@ -272,18 +308,11 @@ pub(crate) async fn ff_merge_to_main(
         let _ = git_cmd(&["branch", "-D", temp_branch], repo_root).await;
     } else {
         log!(
-            "[Changes] ff-merge exhausted for {}: keeping the thread worktree and branch (the merge ran on the real change branch)",
+            "[Changes] ff-merge failed for {}: keeping the thread worktree and branch (the merge ran on the real change branch)",
             temp_branch
         );
     }
-    Err(format!(
-        "Fast-forward merge to main failed after 3 retries: {}",
-        last_err
-            .as_ref()
-            .map(|e| e.to_string())
-            .unwrap_or_else(|| "unknown error".to_string())
-    )
-    .into())
+    Err(err)
 }
 
 /// Check if an `origin` remote exists in the repository.
@@ -671,17 +700,123 @@ pub(crate) async fn default_local_branch(repo_root: &Path) -> String {
 }
 
 async fn resolve_default_local_branch(repo_root: &Path) -> String {
-    if let Some(branch) = origin_head_branch(repo_root).await {
-        return branch;
-    }
-    for name in &["main", "master"] {
-        if let Ok(o) = git_cmd(&["rev-parse", "--verify", name], repo_root).await {
-            if o.status.success() {
-                return name.to_string();
-            }
+    default_local_branch_from(&RefFacts::read(repo_root).await)
+}
+
+/// `origin/HEAD`'s branch when it exists locally, else `main`, else `master`.
+/// Falls back to the `"main"` guess, which [`default_diff_base`] never trusts
+/// without checking the ref exists.
+fn default_local_branch_from(facts: &RefFacts) -> String {
+    let origin_head = facts
+        .origin_head
+        .as_deref()
+        .filter(|b| facts.local(b).is_some());
+    origin_head
+        .into_iter()
+        .chain(["main", "master"])
+        .find(|b| facts.local(b).is_some())
+        .unwrap_or("main")
+        .to_string()
+}
+
+/// The branch facts the default-branch questions need, read in one launch.
+///
+/// Each launch costs tens of milliseconds on a busy macOS host, and these
+/// questions sit on the Diff button's critical path. Keep them to one launch.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct RefFacts {
+    /// Commit sha of every `refs/heads/*` and `refs/remotes/origin/*` ref.
+    shas: HashMap<String, String>,
+    /// The branch `refs/remotes/origin/HEAD` points at, e.g. `develop`. `None`
+    /// when that branch is gone from the remote, which then names no default.
+    origin_head: Option<String>,
+}
+
+impl RefFacts {
+    /// A launch that fails or times out reads as a repo with no refs. The
+    /// default branch is then the `"main"` guess, and the diff base the
+    /// primary worktree's tip. Neither authorizes a destructive step: a merge
+    /// into a missing `main` fails, and a diff base only changes what is shown.
+    pub(crate) async fn read(repo_root: &Path) -> Self {
+        let format = "--format=%(refname)%00%(objectname)%00%(symref)";
+        let args = [
+            "for-each-ref",
+            format,
+            "refs/heads/",
+            "refs/remotes/origin/",
+        ];
+        match git_cmd(&args, repo_root).await {
+            Ok(o) if o.status.success() => Self::parse(&String::from_utf8_lossy(&o.stdout)),
+            _ => Self::default(),
         }
     }
-    "main".to_string()
+
+    pub(crate) fn parse(stdout: &str) -> Self {
+        let mut facts = Self::default();
+        for line in stdout.lines() {
+            let mut fields = line.split('\0');
+            let (Some(name), Some(sha)) = (fields.next(), fields.next()) else {
+                continue;
+            };
+            let symref = fields.next().unwrap_or("");
+            if name == "refs/remotes/origin/HEAD" {
+                facts.origin_head = symref
+                    .strip_prefix("refs/remotes/origin/")
+                    .map(str::to_string);
+            } else {
+                facts.shas.insert(name.to_string(), sha.to_string());
+            }
+        }
+        facts
+    }
+
+    fn local(&self, branch: &str) -> Option<&str> {
+        self.shas
+            .get(&format!("refs/heads/{branch}"))
+            .map(String::as_str)
+    }
+
+    fn remote(&self, branch: &str) -> Option<&str> {
+        self.shas
+            .get(&format!("refs/remotes/origin/{branch}"))
+            .map(String::as_str)
+    }
+}
+
+/// What [`default_diff_base`] can settle from [`RefFacts`] alone, and the two
+/// cases that need one more launch.
+#[derive(Debug, PartialEq)]
+pub(crate) enum DiffBase {
+    Settled(String),
+    /// Both exist at different commits: `local` unless it has diverged from
+    /// `remote_tracking`, which takes a `merge-base --is-ancestor`.
+    LocalUnlessDiverged {
+        local: String,
+        remote_tracking: String,
+    },
+    PrimaryWorktreeHead,
+}
+
+pub(crate) fn diff_base_from(facts: &RefFacts) -> DiffBase {
+    let local = default_local_branch_from(facts);
+    let remote_tracking = format!("origin/{local}");
+    if let Some(local_sha) = facts.local(&local) {
+        // Equal shas are trivially "not diverged", so they skip the launch.
+        return match facts.remote(&local) {
+            Some(remote_sha) if remote_sha != local_sha => DiffBase::LocalUnlessDiverged {
+                local,
+                remote_tracking,
+            },
+            _ => DiffBase::Settled(local),
+        };
+    }
+    if facts.remote(&local).is_some() {
+        return DiffBase::Settled(remote_tracking);
+    }
+    match facts.origin_head.as_deref() {
+        Some(name) if facts.remote(name).is_some() => DiffBase::Settled(format!("origin/{name}")),
+        _ => DiffBase::PrimaryWorktreeHead,
+    }
 }
 
 /// Resolve the base ref the Diff button should diff a coding-agent thread's
@@ -714,48 +849,26 @@ async fn resolve_default_local_branch(repo_root: &Path) -> String {
 /// (the branch's true fork point) and ultimately to `HEAD`, never handing back a
 /// phantom branch name.
 pub(crate) async fn default_diff_base(repo_root: &Path) -> String {
-    let local = default_local_branch(repo_root).await;
-    let remote_tracking = format!("origin/{local}");
-
-    if git_ref_exists(repo_root, &local).await {
-        // Local default exists — prefer it, unless it has diverged from
-        // origin/<default> (migration/force-push/rebase), in which case
-        // origin/<default> holds the branch's true fork point.
-        if git_ref_exists(repo_root, &remote_tracking).await
-            && !is_ancestor(repo_root, &remote_tracking, &local).await
-        {
-            return remote_tracking;
+    match diff_base_from(&RefFacts::read(repo_root).await) {
+        DiffBase::Settled(base) => base,
+        DiffBase::LocalUnlessDiverged {
+            local,
+            remote_tracking,
+        } => {
+            if is_ancestor(repo_root, &remote_tracking, &local).await {
+                local
+            } else {
+                remote_tracking
+            }
         }
-        return local;
+        // Last resort (no origin, non-main/master default, e.g. a local
+        // `trunk`): the PRIMARY worktree's tip commit. Deliberately NOT the
+        // string `"HEAD"`. Inside a linked coding-agent worktree, `HEAD` is the
+        // thread's OWN branch, so `HEAD...HEAD` would render an empty diff.
+        DiffBase::PrimaryWorktreeHead => primary_worktree_head(repo_root)
+            .await
+            .unwrap_or_else(|| "HEAD".to_string()),
     }
-
-    // No local default branch. Diff against origin/<default> when it exists —
-    // it's the ref the external-repo worktree was cut from.
-    if git_ref_exists(repo_root, &remote_tracking).await {
-        return remote_tracking;
-    }
-
-    // `local` is the phantom `"main"` guess (or a genuinely absent branch) and
-    // origin/<local> doesn't exist either. Try origin/HEAD's real target (the
-    // default may simply not be main/master).
-    if let Some(name) = read_origin_head_ref(repo_root).await {
-        let tracking = format!("origin/{name}");
-        if git_ref_exists(repo_root, &tracking).await {
-            return tracking;
-        }
-    }
-
-    // Last resort (no origin, non-main/master default — e.g. a local `trunk`):
-    // the PRIMARY worktree's tip commit. Deliberately NOT the string `"HEAD"`:
-    // this helper also runs inside a linked coding-agent worktree (via
-    // `diff_via_worktree`), where `HEAD` is the thread's OWN branch, so a
-    // `HEAD...HEAD` range would render an empty diff instead of the branch's
-    // changes. `git worktree list --porcelain` lists the primary worktree first,
-    // so its tip is the repo's base commit regardless of which worktree we're in.
-    if let Some(sha) = primary_worktree_head(repo_root).await {
-        return sha;
-    }
-    "HEAD".to_string()
 }
 
 /// The primary (main) worktree's tip commit SHA. `git worktree list
@@ -777,10 +890,9 @@ async fn primary_worktree_head(repo_root: &Path) -> Option<String> {
 
 /// `true` if `git_ref` resolves to a commit in `repo_root`.
 ///
-/// `or_unknown(false)`: both directions fail safely at every current call site.
+/// `or_unknown(false)`: both directions fail safely at its call site.
 /// `worktree_add` either tries `-b` on an existing branch or checks out a
-/// missing one, and git refuses loudly either way; `default_diff_base` merely
-/// picks a different base to diff against. Do NOT reuse this to gate a
+/// missing one, and git refuses loudly either way. Do NOT reuse this to gate a
 /// destructive step: an unknown would read as "the ref is gone". A gate like
 /// that wants the tri-state [`git_answer`] directly, so it can refuse.
 pub(crate) async fn git_ref_exists(repo_root: &Path, git_ref: &str) -> bool {
@@ -840,15 +952,4 @@ async fn read_origin_head_ref(repo_root: &Path) -> Option<String> {
     full_ref
         .strip_prefix("refs/remotes/origin/")
         .map(str::to_string)
-}
-
-/// Resolve `origin/HEAD` to a local branch name (e.g. `develop`), verifying
-/// the local ref exists. Returns `None` if `origin/HEAD` is unset or the
-/// local ref is missing.
-async fn origin_head_branch(repo_root: &Path) -> Option<String> {
-    let branch = read_origin_head_ref(repo_root).await?;
-    let verify = git_cmd(&["rev-parse", "--verify", &branch], repo_root)
-        .await
-        .ok()?;
-    verify.status.success().then_some(branch)
 }

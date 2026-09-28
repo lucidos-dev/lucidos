@@ -17,7 +17,7 @@ import { fileURLToPath } from 'node:url';
 // @ts-expect-error: same
 import { dirname, resolve } from 'node:path';
 
-import { rulesTargeting } from './css-rule-helpers';
+import { cssRules, rulesTargeting } from './css-rule-helpers';
 
 const here: string = dirname(fileURLToPath(import.meta.url));
 const COMPONENTS: string = readFileSync(resolve(here, '../components.css'), 'utf8');
@@ -39,6 +39,15 @@ describe('a changed-files row', () => {
   it('gives each line the icon box height, so they share the first line', () => {
     const icon = soleRule(COMPONENTS, 'file-icon', '.file-icon');
     expect(row.get('line-height')).toBe(icon.get('height'));
+  });
+
+  it('draws a hairline between itself and the row above', () => {
+    const divider = cssRules(COMPONENTS).filter(
+      r => r.selector === '.file-item.repo-changed-file + .file-item.repo-changed-file::before',
+    );
+    expect(divider).toHaveLength(1);
+    expect(divider[0].body).toContain('border-top: 1px solid var(--border-color)');
+    expect(row.get('position')).toBe('relative');
   });
 });
 

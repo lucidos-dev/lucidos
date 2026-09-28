@@ -1,4 +1,4 @@
-import { signal, computed } from '@preact/signals';
+import { signal, computed, effect } from '@preact/signals';
 import {
   activeMenuItem,
   settingsSubview,
@@ -11,9 +11,10 @@ import type { SettingsSubview, InlineForm, PanelOverlay } from '../store';
 import type { MenuItem } from '../types';
 import { MENU_ITEMS } from '../types';
 import { normalizeUrl } from './artifacts';
-import { NAV_KEY } from './entityReferences';
 import { inAppBrowserAvailable } from './preferences';
 import { revealContentPane } from './pane';
+
+export const NAV_KEY = 'lucidos-nav-history';
 
 /** A snapshot of panel navigation state. */
 export interface NavEntry {
@@ -128,6 +129,48 @@ export function pushEntry(
     newCursor -= overflow;
   }
   return { stack: newStack, cursor: newCursor };
+}
+
+/** Pure: make the row at the cursor describe `entry`, then merge it with a
+ *  neighbour that now shows the same thing. A closed panel's row thereby folds
+ *  into the row beneath it. Returns null when the row already matches. */
+export function foldEntry(
+  stack: NavEntry[],
+  cursor: number,
+  entry: NavEntry,
+): { stack: NavEntry[]; cursor: number } | null {
+  if (cursor < 0 || cursor >= stack.length) return null;
+  if (statesEqual(entry, stack[cursor])) return null;
+  const newStack = [...stack];
+  newStack[cursor] = entry;
+  let newCursor = cursor;
+  if (newCursor + 1 < newStack.length && statesEqual(newStack[newCursor + 1], entry)) {
+    newStack.splice(newCursor + 1, 1);
+  }
+  if (newCursor > 0 && statesEqual(newStack[newCursor - 1], entry)) {
+    newStack.splice(newCursor, 1);
+    newCursor--;
+  }
+  return { stack: newStack, cursor: newCursor };
+}
+
+/** Pure: drop the rows `isStale` matches, and a row equal to the one kept
+ *  before it. The cursor lands on the last kept row at or before it. Returns
+ *  null when nothing is dropped. */
+export function pruneEntries(
+  stack: NavEntry[],
+  cursor: number,
+  isStale: (entry: NavEntry) => boolean,
+): { stack: NavEntry[]; cursor: number } | null {
+  const kept: NavEntry[] = [];
+  let newCursor = 0;
+  stack.forEach((entry, i) => {
+    const previous = kept[kept.length - 1];
+    if (!isStale(entry) && !(previous && statesEqual(previous, entry))) kept.push(entry);
+    if (i <= cursor) newCursor = Math.max(0, kept.length - 1);
+  });
+  if (kept.length === stack.length) return null;
+  return { stack: kept, cursor: newCursor };
 }
 
 function captureState(): NavEntry {
@@ -251,6 +294,27 @@ function ensureInitialized(): void {
   navCursor.value = 0;
 }
 
+/** Remove every row `isStale` matches, such as the rows of a deleted app. Edits
+ *  the live stack once it is loaded, else the saved copy it will load from. */
+export function pruneNavHistory(isStale: (entry: NavEntry) => boolean): void {
+  if (_initialized) {
+    const result = pruneEntries(navStack.value, navCursor.value, isStale);
+    if (!result) return;
+    navStack.value = result.stack.length > 0 ? result.stack : [captureState()];
+    navCursor.value = result.cursor;
+    saveNavState();
+    return;
+  }
+  try {
+    const saved = localStorage.getItem(NAV_KEY);
+    if (!saved) return;
+    const { stack, cursor } = JSON.parse(saved) as { stack: unknown; cursor: number };
+    if (!Array.isArray(stack)) return;
+    const result = pruneEntries(stack.map(migrateEntry), cursor, isStale);
+    if (result) localStorage.setItem(NAV_KEY, JSON.stringify(result));
+  } catch { /* corrupt data: ensureInitialized starts fresh from it anyway */ }
+}
+
 export const canGoBack = computed(() => { ensureInitialized(); return navCursor.value > 0; });
 export const canGoForward = computed(() => { ensureInitialized(); return navCursor.value < navStack.value.length - 1; });
 
@@ -298,6 +362,31 @@ export function replaceNavState(): void {
   navStack.value = newStack;
   saveNavState();
 }
+
+/** The history's invariant: the row at the cursor describes what is on screen.
+ *  A navigation earns a new row by calling `pushNavState` in the same task as
+ *  its state change. Any other change folds into the current row: a Cancel, an
+ *  Escape, a peer device resolving a panel, a deleted app's panel dropping.
+ *  Deferred to a microtask, because a navigation writes several signals
+ *  before it pushes. */
+function foldUnpushedChange(): void {
+  foldQueued = false;
+  if (!_initialized) return;
+  const result = foldEntry(navStack.value, navCursor.value, captureState());
+  if (result) {
+    navStack.value = result.stack;
+    navCursor.value = result.cursor;
+    saveNavState();
+  }
+}
+
+let foldQueued = false;
+effect(() => {
+  captureState();
+  if (foldQueued) return;
+  foldQueued = true;
+  queueMicrotask(foldUnpushedChange);
+});
 
 export function navBack(): void {
   ensureInitialized();

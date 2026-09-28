@@ -69,6 +69,22 @@ describe('app toast bridge: spinning', () => {
   });
 });
 
+describe('app toast bridge: title', () => {
+  it('shows an app title as the bold line over the message', () => {
+    toastMsg({ message: 'Nothing was built tonight.', type: 'info', title: 'Nightly skipped' });
+    expect(toasts.value[0].title).toBe('Nightly skipped');
+    expect(toasts.value[0].message).toBe('Nothing was built tonight.');
+    expect(findByClass(ToastList(), 'toast-title').length).toBe(1);
+  });
+
+  // Untrusted like every other field: only a non-empty string is a title.
+  it('ignores a title that is not a non-empty string', () => {
+    toastMsg({ message: 'One', type: 'info', title: 42 });
+    toastMsg({ message: 'Two', type: 'info', title: '' });
+    expect(toasts.value.map((t) => t.title)).toEqual([undefined, undefined]);
+  });
+});
+
 describe('app toast bridge: dismissToast', () => {
   it('removes the toast carrying that key', () => {
     toastMsg({ message: 'Reindexing…', type: 'info', key: 'reindex', spinning: true });

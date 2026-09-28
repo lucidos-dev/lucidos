@@ -177,7 +177,7 @@ describe('what was said out loud is in the transcript', () => {
       { type: 'step', description: 'Ran a query', outcome: 'success' },
       { type: 'text', md: 'Both endpoints answered live.' },
     ];
-    const { visibleEvents } = getCollapsedVisibleEvents(events);
+    const visibleEvents = getCollapsedVisibleEvents(events);
     expect(visibleEvents).toContainEqual(spokenRow({ text: 'Let me check that.' }));
   });
 });

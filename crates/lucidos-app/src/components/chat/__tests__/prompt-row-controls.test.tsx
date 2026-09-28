@@ -17,7 +17,7 @@ import type { ComponentChildren, VNode } from 'preact';
 import { FollowLiveEdgeIcon } from '../../shared/icons';
 import { CodingAgentControlMenu } from '../CodingAgentControlMenu';
 import { LucidosControlMenu } from '../LucidosControlMenu';
-import { PromptRowControls, promptRowToggles } from '../PromptRowControls';
+import { followLiveEdgeAction, PromptRowControls, promptRowToggles } from '../PromptRowControls';
 
 interface AnyVNode extends VNode<{ children?: ComponentChildren; [k: string]: unknown }> {}
 
@@ -83,6 +83,27 @@ describe('PromptRowControls', () => {
     expect(cluster('claude-code')).toEqual([CodingAgentControlMenu, FollowLiveEdgeIcon]);
   });
 
+});
+
+/** The follow toggle's on-state must not rest on colour alone. A theme without
+ *  a hue sets `--accent` to the text colour (Mono does), and there an
+ *  accent-only toggle read the same armed or not. So the magnet fills. */
+describe('the follow toggle shows its state by shape', () => {
+  const fillOf = (armed: boolean) =>
+    (FollowLiveEdgeIcon({ armed }) as AnyVNode).props.fill;
+
+  it('fills the magnet when armed and leaves it open when not', () => {
+    expect(fillOf(true)).toBe('currentColor');
+    expect(fillOf(false)).toBe('none');
+  });
+
+  it('hands the icon the same state the button claims', () => {
+    for (const composeContext of [false, true]) {
+      const action = followLiveEdgeAction(composeContext);
+      const icon = action.icon() as AnyVNode;
+      expect(icon.props.armed).toBe(action.active);
+    }
+  });
 });
 
 describe('the two fixed toggles', () => {

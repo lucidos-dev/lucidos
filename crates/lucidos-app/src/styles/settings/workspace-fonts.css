@@ -1,0 +1,53 @@
+/* Settings → Appearance → Workspace fonts: the installed fonts, each named in
+   its own face, and the install form (components/settings/WorkspaceFontsSection.tsx). */
+
+.workspace-font-rows {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-xs);
+    padding: var(--space-xs) 0 var(--space-sm) var(--space-lg);
+}
+
+.workspace-font-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-sm);
+    min-height: 2rem;
+}
+
+.workspace-font-info {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+}
+
+.workspace-font-name {
+    font-size: var(--font-size-lg);
+    color: var(--text-primary);
+    overflow-wrap: anywhere;
+}
+
+.workspace-font-meta {
+    font-size: var(--font-size-sm);
+    color: var(--text-muted);
+}
+
+.workspace-font-form {
+    padding-bottom: var(--space-sm);
+}
+
+.workspace-font-file > .settings-row-label {
+    overflow-wrap: anywhere;
+    color: var(--text-secondary);
+}
+
+.settings-text-input.workspace-font-weight {
+    min-width: 0;
+    width: 5.5rem;
+}
+
+.workspace-font-form .settings-option:disabled {
+    opacity: 0.5;
+    cursor: default;
+}

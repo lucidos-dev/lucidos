@@ -6,6 +6,7 @@ import type { ToastType } from '../types';
  *  its shape is guaranteed and each field is validated at the point of use. */
 export interface AppToastPayload {
   message?: unknown;
+  title?: unknown;
   type?: unknown;
   durationMs?: unknown;
   dismissable?: unknown;
@@ -39,6 +40,7 @@ export function handleAppToastMessage(type: string, payload: AppToastPayload): b
       ? payload.type as ToastType
       : 'info';
     showToast(payload.message, toastType, {
+      title: typeof payload.title === 'string' && payload.title.length > 0 ? payload.title : undefined,
       key: typeof payload.key === 'string' && payload.key.length > 0 ? payload.key : undefined,
       autoDismissMs: typeof payload.durationMs === 'number' ? payload.durationMs : undefined,
       dismissable: typeof payload.dismissable === 'boolean' ? payload.dismissable : undefined,

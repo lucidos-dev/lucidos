@@ -13,9 +13,62 @@ import { closeFileSearch } from './fileSearchActions';
 import { changeBadgeLabel } from './changeBadge';
 import { loadedOr } from '../../store/types';
 import { Overlay } from '../shared/Overlay';
+import { LoadingFade } from '../shared/LoadingFade';
+import { ListSkeletonOf, SkBlock, SkText, useSkeleton } from '../shared/Skeleton';
+import { useDelayedFlag } from '../../hooks/useDelayedLoading';
+import { paneUnder, usePaneCentre } from '../../hooks/usePaneCentre';
+import { CloseIcon } from '../shared/icons';
 
 function sourceBadgeLabel(source: FileSearchResult['source']): string {
   return source === 'workspace' ? 'W' : source === 'repo' ? 'R' : 'C';
+}
+
+/** One search hit. Inside a `SkeletonProvider` it is the results list's
+ *  loading placeholder. The list can hold thousands of rows, so the loaded
+ *  path is plain markup and the skeleton check runs once per row. */
+function SearchResultRow({ result, selected = false, showBadge = false, onHover, onPick }: {
+  result?: FileSearchResult;
+  selected?: boolean;
+  showBadge?: boolean;
+  onHover?: () => void;
+  onPick?: () => void;
+}) {
+  if (useSkeleton() || !result) {
+    return (
+      <div class="file-search-result" aria-hidden="true">
+        <SkBlock w="1rem" h="1rem" round />
+        <span class="file-search-result-info">
+          <SkText class="file-search-result-name" w="8rem" />
+          <SkText class="file-search-result-path" w="12rem" />
+        </span>
+      </div>
+    );
+  }
+  const name = result.path.split('/').pop() || result.path;
+  const dir = result.path.includes('/') ? result.path.substring(0, result.path.lastIndexOf('/')) : '';
+  return (
+    <button
+      class={`file-search-result${selected ? ' selected' : ''}`}
+      onMouseEnter={onHover}
+      onClick={onPick}
+    >
+      <FileTypeIcon path={result.path} className="file-search-result-icon" />
+      <span class="file-search-result-info">
+        <span class="file-search-result-name">{name}</span>
+        {dir && <span class="file-search-result-path">{dir}</span>}
+      </span>
+      {showBadge && (
+        <span class={`file-search-source-badge file-search-source-${result.source}`}>
+          {sourceBadgeLabel(result.source)}
+        </span>
+      )}
+      {result.changeStatus && (
+        <span class={`change-badge change-badge-${result.changeStatus}`}>
+          {changeBadgeLabel(result.changeStatus)}
+        </span>
+      )}
+    </button>
+  );
 }
 
 /** The open-state body. Mounted by `<Overlay>` only while the modal is open, so
@@ -41,7 +94,8 @@ function FileSearchPanel() {
 
   useEffect(() => {
     if (selectedIndex >= 0 && resultsRef.current) {
-      const el = resultsRef.current.children[selectedIndex] as HTMLElement | undefined;
+      const content = resultsRef.current.querySelector('.loading-fade-content');
+      const el = content?.children[selectedIndex] as HTMLElement | undefined;
       el?.scrollIntoView({ block: 'nearest' });
     }
   }, [selectedIndex]);
@@ -52,7 +106,7 @@ function FileSearchPanel() {
   // bubbles up to the modal's failed state only when no other source has
   // loaded AND the primary source has reached a terminal state — otherwise the
   // modal still functions on what's available, and a still-loading primary
-  // shows "Loading..." rather than a premature "Failed to load files" flash.
+  // shows its placeholder rows rather than a premature "Failed to load files".
   //
   // The repo gate runs HERE, before `anyLoaded` counts them: a change this
   // surface cannot open contributes no row, so it cannot stand in for a loaded
@@ -65,6 +119,7 @@ function FileSearchPanel() {
     primarySource.status === 'loading' || primarySource.status === 'not-loaded';
   const failed =
     primarySource.status === 'failed' || (ccChangesFailed && !anyLoaded && !primaryPending);
+  const showLoading = useDelayedFlag(!anyLoaded && !failed);
 
   const workspacePaths = isRepo ? [] : loadedOr(artifacts.value, []);
   const repoPaths = isRepo ? loadedOr(repoFiles.value, []) : [];
@@ -90,28 +145,14 @@ function FileSearchPanel() {
   // dismisses focus instead of firing click. Using onTouchEnd bypasses this.
   const closeTouchEnd = (e: TouchEvent) => { e.preventDefault(); closeFileSearch(); };
   const closeBtn = (
-    <button class="icon-btn header-icon file-search-close" onTouchEnd={closeTouchEnd} onClick={closeFileSearch} aria-label="Close search">
-      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
-        <path d="M4 4l8 8M12 4l-8 8" />
-      </svg>
+    <button class="icon-btn surface-close file-search-close" onTouchEnd={closeTouchEnd} onClick={closeFileSearch} aria-label="Close search" data-tooltip="Close search">
+      <CloseIcon />
     </button>
   );
 
-  if (!anyLoaded) {
-    return (
-      <div class="file-search-header">
-        <span class="file-search-icon" />
-        <span class="file-search-input" style="color: var(--text-muted)">
-          {failed ? 'Failed to load files' : 'Loading...'}
-        </span>
-        {closeBtn}
-      </div>
-    );
-  }
-
   return (
     <>
-      <div class="file-search-header">
+      <div class="surface-head file-search-header">
         <svg class="file-search-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
           <circle cx="7" cy="7" r="4.5" />
           <path d="M10.5 10.5L14 14" />
@@ -145,37 +186,27 @@ function FileSearchPanel() {
         {closeBtn}
       </div>
       <div class="file-search-results" ref={resultsRef}>
-        {filtered.length === 0 ? (
-          <div class="file-search-empty">No matching files</div>
+        {/* A failed source still leaves the ones that loaded searchable. */}
+        {failed && !anyLoaded ? (
+          <div class="file-search-empty error-text">Failed to load files</div>
         ) : (
-          filtered.map((result, index) => {
-            const name = result.path.split('/').pop() || result.path;
-            const dir = result.path.includes('/') ? result.path.substring(0, result.path.lastIndexOf('/')) : '';
-            return (
-              <button
-                key={`${result.source}:${result.path}`}
-                class={`file-search-result${index === selectedIndex ? ' selected' : ''}`}
-                onMouseEnter={() => setSelectedIndex(index)}
-                onClick={() => selectResult(result)}
-              >
-                <FileTypeIcon path={result.path} className="file-search-result-icon" />
-                <span class="file-search-result-info">
-                  <span class="file-search-result-name">{name}</span>
-                  {dir && <span class="file-search-result-path">{dir}</span>}
-                </span>
-                {showBadge && (
-                  <span class={`file-search-source-badge file-search-source-${result.source}`}>
-                    {sourceBadgeLabel(result.source)}
-                  </span>
-                )}
-                {result.changeStatus && (
-                  <span class={`change-badge change-badge-${result.changeStatus}`}>
-                    {changeBadgeLabel(result.changeStatus)}
-                  </span>
-                )}
-              </button>
-            );
-          })
+          // The field above is live from the first frame; only the results wait.
+          <LoadingFade showSkeleton={showLoading} skeleton={<ListSkeletonOf count={6} row={() => <SearchResultRow />} />}>
+            {anyLoaded && (filtered.length === 0 ? (
+              <div class="file-search-empty">No matching files</div>
+            ) : (
+              filtered.map((result, index) => (
+                <SearchResultRow
+                  key={`${result.source}:${result.path}`}
+                  result={result}
+                  selected={index === selectedIndex}
+                  showBadge={showBadge}
+                  onHover={() => setSelectedIndex(index)}
+                  onPick={() => selectResult(result)}
+                />
+              ))
+            ))}
+          </LoadingFade>
         )}
       </div>
     </>
@@ -183,6 +214,9 @@ function FileSearchPanel() {
 }
 
 export function FileSearchModal() {
+  // Over the Canvas pane, whose header holds the button that opens it.
+  const open = fileSearchOpen.value;
+  const paneCentre = usePaneCentre(open ? paneUnder(fileSearchAnchor.value) ?? 'canvas' : undefined);
   // keepMounted: the overlay div is NEVER removed from the DOM — iOS Safari
   // PWA's compositor leaves ghost pixels when a fixed-position layer is removed
   // from the layer tree, so closing toggles `.file-search-closed` instead. The
@@ -191,11 +225,12 @@ export function FileSearchModal() {
   // <Overlay>.
   return (
     <Overlay
-      open={fileSearchOpen.value}
+      open={open}
       onClose={closeFileSearch}
       anchor={fileSearchAnchor.value}
       overlayClass="file-search-overlay"
-      panelClass="file-search-modal"
+      panelClass="surface surface-raised surface-pane-centred file-search-modal"
+      panelStyle={paneCentre}
       keepMounted
       hiddenClass="file-search-closed"
     >

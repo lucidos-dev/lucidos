@@ -13,8 +13,8 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use lucidos_build_slot::{
-    host_ncpu, inherited_slot, BuildLimits, BuildSlotPool, SlotState, ENV_CARGO_JOBS, ENV_HELD,
-    ENV_NICE,
+    host_ncpu, inherited_slot, resolve_class, BuildLimits, BuildSlotPool, SlotClass, SlotState,
+    ENV_CARGO_JOBS, ENV_HELD, ENV_NICE, ENV_PRIORITY,
 };
 
 use crate::workspace::{resolve_from_env, BoxError, Workspace};
@@ -85,6 +85,9 @@ fn cmd_status() -> Result<u8, BoxError> {
     if pool.anyone_waiting() {
         println!("at least one build is waiting for a slot");
     }
+    if pool.priority_waiting() {
+        println!("a priority build is waiting: the next free slot goes to it");
+    }
     for state in &states {
         println!("{}", describe_slot(state));
     }
@@ -147,9 +150,10 @@ fn cmd_wrap(args: BuildSlotArgs) -> Result<u8, BoxError> {
         }
     };
 
-    let guard = match pool.try_acquire(&label) {
+    let class = resolve_class(std::env::var(ENV_PRIORITY).ok().as_deref());
+    let guard = match pool.try_acquire_as(&label, class) {
         Some(guard) => guard,
-        None => match wait_for_slot(&pool, &label, args.max_wait_secs) {
+        None => match wait_for_slot(&pool, &label, class, args.max_wait_secs) {
             Some(guard) => guard,
             None => return Ok(WAIT_TIMEOUT_EXIT),
         },
@@ -159,7 +163,12 @@ fn cmd_wrap(args: BuildSlotArgs) -> Result<u8, BoxError> {
     // Decided with the slot already in hand, so the share counts this holder.
     let caller_jobs = std::env::var(ENV_CARGO_JOBS).ok();
     let nice_raw = std::env::var(ENV_NICE).ok();
-    let limits = pool.granted_limits(host_ncpu(), caller_jobs.as_deref(), nice_raw.as_deref());
+    let limits = pool.granted_limits(
+        host_ncpu(),
+        caller_jobs.as_deref(),
+        nice_raw.as_deref(),
+        class,
+    );
     eprintln!(
         "{}",
         describe_limits(&index, pool.capacity().value, &limits)
@@ -189,17 +198,23 @@ fn cmd_wrap(args: BuildSlotArgs) -> Result<u8, BoxError> {
 fn wait_for_slot(
     pool: &BuildSlotPool,
     label: &str,
+    class: SlotClass,
     max_wait_secs: Option<u64>,
 ) -> Option<lucidos_build_slot::BuildSlotGuard> {
     let capacity = pool.capacity().value;
+    let turn = match class {
+        SlotClass::Priority => "as a priority build, so the next free one is ours",
+        SlotClass::Ordinary => "for one",
+    };
     eprintln!(
-        "lucidos build-slot: all {capacity} build slots are busy, waiting for one. \
+        "lucidos build-slot: all {capacity} build slots are busy, waiting {turn}. \
          `lucidos build-slot --status` shows who holds them."
     );
 
     let mut next_progress = PROGRESS_EVERY;
     let mut announced = false;
-    let guard = pool.acquire(label, max_wait_secs.map(Duration::from_secs), |waited| {
+    let max_wait = max_wait_secs.map(Duration::from_secs);
+    let guard = pool.acquire(label, max_wait, class, |waited| {
         // Announced from inside the wait, not before it. `acquire` raises the
         // waiting flag before this first runs. So a holder releasing during
         // the announcement's own round trip already sees a queued build, and
@@ -310,6 +325,8 @@ fn spawn_child(
     if let Some(index) = slot {
         cmd.env(ENV_HELD, index);
     }
+    // Priority belongs to this acquisition, not to the tree it admits.
+    cmd.env_remove(ENV_PRIORITY);
     if let Some(jobs) = limits.jobs {
         cmd.env(ENV_CARGO_JOBS, jobs.to_string());
     }

@@ -57,9 +57,13 @@ function trailingClusterGap(): string {
  *  failure mode is someone "tidying" these to `var(--z-modal)`, which no
  *  arithmetic over the tokens would catch. */
 describe('the menu paints above a persistent toast', () => {
-  it('the panel and its scrim are rebased above --z-toast, panel over scrim', () => {
+  it('the panel is rebased above --z-toast', () => {
     expect(decl(block(markCss, '.brand-menu {'), 'z-index')).toBe('calc(var(--z-toast) + 50)');
-    expect(decl(block(markCss, '.brand-menu-scrim {'), 'z-index')).toBe('calc(var(--z-toast) + 40)');
+  });
+
+  /** A menu dims nothing: only a surface that blocks until answered does. */
+  it('paints no scrim of its own', () => {
+    expect(markCss).not.toMatch(/\.brand-menu-scrim\b/);
   });
 });
 
@@ -132,7 +136,9 @@ describe('an unfolded action indents off the row it hangs under', () => {
     const underDot = decl(block(markCss, '.brand-menu-ws-action-under-dot {'), 'padding-left') ?? '';
     expect(underDot).toContain('var(--ws-picker-dot-size)');
     // Under a notifications row, a `.brand-menu-item` leading with the bell.
-    const underIcon = decl(block(markCss, '.brand-menu-ws-action-under-icon {'), 'padding-left') ?? '';
+    expect(decl(block(markCss, '.brand-menu-ws-action-under-icon {'), 'padding-left'))
+      .toBe('var(--brand-menu-text-column)');
+    const underIcon = decl(block(markCss, ':root {'), '--brand-menu-text-column') ?? '';
     expect(underIcon).toContain('var(--icon-size-md)');
     // Both against the spacing scale, never an eyeballed rem.
     for (const indent of [underDot, underIcon]) {
@@ -140,6 +146,44 @@ describe('an unfolded action indents off the row it hangs under', () => {
         .toMatch(/var\(--space-(xs|sm|md|lg|xl)\)/);
       expect(indent).not.toMatch(/\d+(\.\d+)?rem/);
     }
+  });
+});
+
+/** A job's unfolded detail is text hung under its row. Every line of it, the
+ *  Building changelog and an apply's thread link alike, shares the rows'
+ *  margins rather than an indent of its own. */
+describe('an activity row\'s detail shares the rows\' margins', () => {
+  const body = block(markCss, '.brand-menu-activity-body {');
+
+  it('takes the rows\' own inline padding, so its text starts under their icons', () => {
+    // Three values: the second is both inline sides.
+    const [, inline, , extra] = (decl(body, 'padding') ?? '').split(/\s+/);
+    expect(extra, 'a fourth value is a left indent of its own').toBeUndefined();
+    expect(inline).toBe(decl(block(markCss, '.brand-menu-item {'), 'padding')?.split(/\s+/)[1]);
+  });
+});
+
+/** An unfolded activity label wraps. Its spinner, time and chevron ride the
+ *  first line, and the spinner wears the label's colour, not the accent. */
+describe('an activity row keeps its mark on the first line', () => {
+  const row = block(markCss, '.brand-menu-activity-row {');
+  const line = 'var(--brand-menu-activity-line)';
+
+  it('top-aligns the row, with padding that keeps the shared height', () => {
+    expect(decl(row, 'align-items')).toBe('flex-start');
+    expect(decl(row, 'padding-block')).toContain('var(--brand-menu-row-min-height)');
+    expect(decl(row, '--brand-menu-activity-line')).toContain('var(--brand-menu-row-line-height)');
+  });
+
+  it('sizes the mark and the chevron to one line of the label', () => {
+    expect(decl(block(markCss, '.brand-menu-activity-mark {'), 'height')).toBe(line);
+    expect(decl(block(markCss, '.brand-menu-activity-chevron {'), 'height')).toBe(line);
+    expect(decl(block(markCss, '.brand-menu-activity-detail {'), 'line-height')).toBe(line);
+  });
+
+  it('draws the spinner in the label\'s colour, not the accent', () => {
+    const spinner = block(markCss, '.brand-menu-activity-mark .mini-spinner {');
+    expect(decl(spinner, '--spinner-color')).toBe('currentColor');
   });
 });
 
@@ -274,7 +318,8 @@ describe('the mark says its connection in strength alone', () => {
     ]);
 
     const cancels = cssRules(markCss).filter(r =>
-      isReducedMotionRule(r) && r.props.get('animation') === 'none');
+      isReducedMotionRule(r) && r.props.get('animation') === 'none'
+      && r.selector.slice(`${REDUCED_MOTION_ROOT} `.length).startsWith('.brand-mark'));
     expect(
       cancels.map(r => r.selector.slice(`${REDUCED_MOTION_ROOT} `.length)),
       'the reduce override must repeat the animated selector, or it loses on specificity',
@@ -414,18 +459,14 @@ describe('the badge rides the mark rather than sitting beside it', () => {
       .toContain('scale(0.74)');
   });
 
-  it('lets a tap through the READY badge, which listens for nothing', () => {
-    // Out of flow, the "!" span is a hit target that swallows taps on the
+  it('lets a tap through the state badge in every state, so it reaches the mark', () => {
+    // Out of flow, a badge span is a hit target that swallows taps on the
     // mark's corner: what is under it is the mark's BUTTON, a sibling, so there
-    // is nothing for the tap to bubble to. The busy badge is a real button and
-    // must keep its own events, hence the `:not()` rather than a paired rule.
-    const passthrough = block(markCss, '.brand-mark-slot .badge.brand-badge:not(.brand-badge-action) {');
-    expect(decl(passthrough, 'pointer-events')).toBe('none');
+    // is nothing for the tap to bubble to. The mark opens the menu that
+    // explains every badge state, so no state keeps a tap of its own.
     const base = block(markCss, '.brand-mark-slot .badge.brand-badge {');
-    expect(
-      decl(base, 'pointer-events'),
-      'the shared rule must not disable events on the badge that IS a button',
-    ).toBeNull();
+    expect(decl(base, 'pointer-events')).toBe('none');
+    expect(markCss, 'no badge variant may take its tap back').not.toContain('brand-badge-action');
   });
 
   it('beats both sheets that would re-corner it, on specificity', () => {
@@ -434,20 +475,6 @@ describe('the badge rides the mark rather than sitting beside it', () => {
     // here would parse fine, read fine, and lose.
     const targeting = rulesTargeting(markCss, 'brand-badge').map(r => r.selector);
     expect(targeting).toContain('.brand-mark-slot .badge.brand-badge');
-  });
-
-  it('reins the busy badge hit area in, so it cannot swallow the mark', () => {
-    // A square centred on the badge covers the menu's own tap target: the
-    // bottom and left edges have to stay ON the badge.
-    const hit = block(markCss, '.brand-mark-slot .brand-badge-action::after {');
-    const inset = decl(hit, 'inset') ?? '';
-    // Split on whitespace would cut the `calc()`s up, so read the two ends
-    // instead: the reach goes on top and right, and the other two edges are 0.
-    expect(inset).toContain('--header-mark-badge-hit-reach');
-    expect(
-      inset.endsWith(' 0 0'),
-      `growing down or left is what reaches the mark's centre, got "${inset}"`,
-    ).toBe(true);
   });
 });
 
@@ -568,6 +595,58 @@ describe('the nav chevrons are pinned to one shared span', () => {
   it('the chevrons and the mark cannot be squeezed by a long title', () => {
     const fixed = cssRules(markCss).find(r => r.selector.includes('.header-nav-cluster > .icon-btn'));
     expect(fixed?.props.get('flex')).toBe('0 0 auto');
+  });
+});
+
+/** The chevron's button is drawn and placed, so it stays one icon box. Its tap
+ *  target is a transparent overlay that reaches into the empty space around it.
+ *  e2e/nav-chevron-hit-target-mobile.spec.ts measures the painted result. */
+describe('the nav chevrons reach past their button for a tap', () => {
+  const rule = (selector: string): Map<string, string> => {
+    const found = cssRules(markCss).find(r => r.selector === selector);
+    expect(found, `${selector} is gone`).toBeDefined();
+    return found!.props;
+  };
+
+  it('the target is at least 44px at the 16px root', () => {
+    const target = decl(block(markCss, ':root {'), '--header-nav-hit-target') ?? '';
+    expect(target).toMatch(/^[\d.]+rem$/);
+    expect(parseFloat(target) * 16).toBeGreaterThanOrEqual(44);
+  });
+
+  it('is an out-of-flow overlay derived from the button box', () => {
+    // Absolute, so it takes no room in the cluster and moves no chevron.
+    const reach = rule('.header-nav-cluster > .nav-chevron::before');
+    expect(reach.get('content')).toBe("''");
+    expect(reach.get('position')).toBe('absolute');
+    expect(reach.get('--nav-chevron-reach'))
+      .toBe('calc((var(--header-nav-hit-target) - var(--mobile-header-icon-box)) / 2)');
+    for (const side of ['top', 'bottom']) {
+      expect(reach.get(side), `the reach is centred on the ${side} axis`).toBe('calc(-1 * var(--nav-chevron-reach))');
+    }
+  });
+
+  it('loses every overlap, because its neighbours are raised over it', () => {
+    // A disabled chevron's opacity makes it a stacking context, so a z-index
+    // on the reach would stay inside the button. The neighbours rise instead.
+    expect(rule('.header-nav-cluster > .nav-chevron::before').get('z-index')).toBeUndefined();
+    const inside = rule('.header-nav-cluster > .brand-mark-slot, .header-title-cluster > .mobile-content-title');
+    expect(inside.get('position')).toBe('relative');
+    expect(inside.get('z-index')).toBe('1');
+    // The drawer toggle and the hamburger come before the transformed cluster
+    // in the DOM, so they need the lift to paint, and hit-test, above it.
+    expect(rule('.mobile-header-row > .icon-btn').get('z-index')).toBe('1');
+  });
+
+  it('reaches twice as far toward the middle as toward the row edge', () => {
+    // The outer slot can fill with the content row's overflow trigger. The
+    // inward reach alone must then still make the full target.
+    const back = rule('.header-nav-cluster > .nav-chevron:first-child::before');
+    const forward = rule('.header-nav-cluster > .nav-chevron:last-child::before');
+    const outer = 'calc(-1 * var(--nav-chevron-reach))';
+    const inner = 'calc(-2 * var(--nav-chevron-reach))';
+    expect([back.get('left'), back.get('right')]).toEqual([outer, inner]);
+    expect([forward.get('left'), forward.get('right')]).toEqual([inner, outer]);
   });
 });
 

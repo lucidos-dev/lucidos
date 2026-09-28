@@ -145,7 +145,7 @@ function EmailConfirmDraft({ form }: { form: EmailConfirmForm }) {
   };
 
   return (
-    <div class="inline-form email-confirm">
+    <div class="inline-form email-confirm protected-surface">
       <EmailMeta request={draft} />
       <div class="form-group">
         <label>Subject</label>
@@ -179,7 +179,7 @@ function EmailConfirmDraft({ form }: { form: EmailConfirmForm }) {
  *  close the panel and return to whatever view was underneath. */
 function EmailSentReceipt({ sent, sentAt }: { sent: EmailConfirmForm['request']; sentAt: string }) {
   return (
-    <div class="inline-form email-confirm">
+    <div class="inline-form email-confirm protected-surface">
       <div class="panel-receipt-status">
         <span class="panel-receipt-badge">Sent</span>
         <span class="panel-receipt-time">{formatMessageTimestamp(sentAt)}</span>

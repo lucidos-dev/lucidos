@@ -117,7 +117,6 @@ function makeMeta(id: string, overrides: Partial<ThreadMeta>): ThreadMeta {
     codingAgentProposed: false,
     codingAgentRequiresRestart: false,
     codingAgentIsExternalRepo: false,
-    codingAgentApplying: false,
     codingAgentHasDiff: false,
     lastRevivedAt: '',
     state: 'active',

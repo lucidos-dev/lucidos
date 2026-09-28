@@ -426,7 +426,7 @@ describe('Flow: Thread status', () => {
     expect(map.get(id)!.meta.status).toBe('idle');
   });
 
-  it('CodingAgentIdled with has_changes → waiting', () => {
+  it('CodingAgentIdled with has_changes → idle', () => {
     const { map, id } = makeThread();
     insertEvents(map, id, [
       { type: 'MessageReceived', text: 'fix the bug' },
@@ -434,7 +434,7 @@ describe('Flow: Thread status', () => {
       { type: 'CodingAgentTextStreamed', text: 'Fixed.' },
       { type: 'CodingAgentIdled', has_changes: true },
     ]);
-    expect(map.get(id)!.meta.status).toBe('waiting');
+    expect(map.get(id)!.meta.status).toBe('idle');
     // has_changes is stored in the event
     const idleEvents = [...map.get(id)!.events.values()].filter(e => e.type === 'CodingAgentIdled');
     expect(idleEvents).toHaveLength(1);
@@ -665,10 +665,9 @@ describe('Flow: what the default view hides', () => {
 
     const exchanges = getExchanges(map, id);
     const events = exchangeResponseEvents(exchanges[0]);
-    const { visibleEvents, needsFallback } = getCollapsedVisibleEvents(events);
+    const visibleEvents = getCollapsedVisibleEvents(events);
 
     // Collapsed view should show the last meaningful text block
-    expect(needsFallback).toBe(false);
     const visibleText = visibleEvents.filter(e => e.type === 'text');
     expect(visibleText.length).toBeGreaterThan(0);
     expect((visibleText[0] as { md: string }).md).toBe('Final answer.');

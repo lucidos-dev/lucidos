@@ -31,10 +31,9 @@ import { assertHealthy, gotoWithRetry } from './helpers';
  *  run, and a verbatim sample line. Nothing about the assertion depends on the
  *  wording, only on it being far longer than the cap.
  *
- *  Deliberately ONE line, with no blank line to start a section. In that shape
- *  the heading is the whole message, and it has to scroll on its own with no
- *  `.toast-sections` box under it. The sectioned shape is covered by
- *  `toast-scroll-shape.spec.ts`. */
+ *  Deliberately untitled. In that shape the heading is the whole message, and
+ *  it has to scroll on its own with no `.toast-text` box under it. The titled
+ *  shape is covered by `toast-scroll-shape.spec.ts`. */
 const LONG_BODY = [
   'Memory is being squeezed: free 3.67 GB (18.32 GB reclaimable), compressor 11.40 GB, swap 0.08 GB, pressure critical.',
   'Nothing safe to reclaim automatically. Save your work and find the hogs with',
@@ -60,20 +59,20 @@ test.describe('toast height cap on mobile', () => {
 
     const geom = await page.evaluate((body: string) => {
       // Mirrors the markup `renderToast` emits (Toast.tsx). The whole body goes
-      // in `.toast-heading`, because this probe's message is ONE line: line 1
-      // is all there is, so there is no `.toast-sections` box under it. That is
-      // the case under test. A heading with nothing below it has to scroll on
-      // its own, or a long section-less message is clipped at the cap.
+      // in `.toast-heading`, because this probe's toast has no title, so there
+      // is no `.toast-text` box under it. That is the case under test. A
+      // heading with nothing below it has to scroll on its own, or a long
+      // untitled message is clipped at the cap.
       //
       // The icon, the actions row and the close X are the body's SIBLINGS. That
-      // keeps the spinner out of a scroll box, and [Open] reachable under the
-      // cap.
+      // keeps the spinner out of a scroll box, and the action button reachable
+      // under the cap.
       const container = document.createElement('div');
       container.className = 'toast-container';
       const column = document.createElement('div');
       column.className = 'toast-column';
       const toast = document.createElement('div');
-      toast.className = 'toast toast-info';
+      toast.className = 'toast surface toast-info';
       toast.innerHTML =
         '<svg class="toast-icon" viewBox="0 0 24 24"></svg>' +
         '<div class="toast-body">' +
@@ -125,7 +124,7 @@ test.describe('toast height cap on mobile', () => {
     ).toBeLessThanOrEqual(MAX_VIEWPORT_FRACTION);
 
     // On screen in full, and with its action on screen with it: a capped toast
-    // whose [Open] is below the fold would just move the problem.
+    // whose action button is below the fold would just move the problem.
     expect(geom.toastBottom).toBeLessThanOrEqual(geom.viewportHeight + 1);
     expect(geom.openHeight).toBeGreaterThan(0);
     expect(geom.openBottom).toBeLessThanOrEqual(geom.toastBottom + 1);

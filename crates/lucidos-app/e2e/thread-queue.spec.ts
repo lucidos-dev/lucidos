@@ -105,7 +105,7 @@ test.describe('thread queue panel', () => {
     // queued empty-state returns. Nothing ever ran: admission stayed at 0.
     await row.locator('.action-btn-danger').click();
     await page.locator('.confirm-dialog').waitFor({ state: 'visible', timeout: 10_000 });
-    await page.locator('.confirm-dialog .confirm-btn-ok:visible').first().click();
+    await page.locator('.confirm-dialog [data-role="confirm-ok"]:visible').first().click();
 
     await expect(
       page.locator('[data-role="thread-queue-row"]').filter({ hasText: TRIGGER_NAME }),

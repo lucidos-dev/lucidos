@@ -9,129 +9,210 @@
  */
 import { describe, it, expect, vi } from 'vitest';
 import {
-  DEFAULT_FONT_FAMILY,
+  DEFAULT_FONT_PREFERENCE,
   DEFAULT_MOTION,
-  DEFAULT_THEME,
-  FONT_FAMILY_VALUES,
+  DEFAULT_THEME_MODE,
+  EMPTY_THEME,
+  FALLBACK_FONT,
+  FOLLOW_THEME,
+  FONT_CATALOG,
+  FONT_PREFERENCES,
+  FONT_STACKS,
   FONT_FEATURES_DEFAULT,
   MOTION_PREFS,
   REDUCED_MOTION_DURATION_SCALE,
-  THEME_BG,
+  THEME_MODE_BG,
   UI_SCALE_DEFAULT,
   clampUiScale,
   durationScaleFor,
   fontFeaturesFor,
+  fontStackFor,
+  fontBoldMark,
+  weightReachesBold,
+  workspaceFontHasBold,
+  registeredFaceWeight,
   parseAnimationSpeed,
+  parseThemeEffects,
   parseMotion,
   parseUiScale,
+  resolveReducedThemeEffects,
   resolveReducedMotion,
+  resolveFont,
   resolveFontKey,
-  resolveTheme,
-  resolveThemePreference,
-  type FontFamily,
+  resolveThemeMode,
+  resolveThemeModePreference,
+  type FontId,
+  type ThemeFonts,
+  type WorkspaceFont,
 } from './appearance';
 
 describe('theme preference precedence', () => {
   it('prefers a valid server value over everything else', () => {
-    expect(resolveThemePreference('light', 'dark', () => 'dark')).toBe('light');
-    expect(resolveThemePreference('system', 'light', () => 'light')).toBe('system');
+    expect(resolveThemeModePreference('light', 'dark', () => 'dark')).toBe('light');
+    expect(resolveThemeModePreference('system', 'light', () => 'light')).toBe('system');
   });
 
   it('falls back to localStorage when the server value is missing or invalid', () => {
-    expect(resolveThemePreference(undefined, 'light', () => null)).toBe('light');
-    expect(resolveThemePreference('', 'light', () => null)).toBe('light');
-    expect(resolveThemePreference('bogus', 'dark', () => null)).toBe('dark');
+    expect(resolveThemeModePreference(undefined, 'light', () => null)).toBe('light');
+    expect(resolveThemeModePreference('', 'light', () => null)).toBe('light');
+    expect(resolveThemeModePreference('bogus', 'dark', () => null)).toBe('dark');
   });
 
-  it('falls back to the data-theme attribute when server and localStorage miss', () => {
-    expect(resolveThemePreference(undefined, null, () => 'light')).toBe('light');
-    expect(resolveThemePreference(undefined, '', () => 'dark')).toBe('dark');
+  it('falls back to the data-theme-mode attribute when server and localStorage miss', () => {
+    expect(resolveThemeModePreference(undefined, null, () => 'light')).toBe('light');
+    expect(resolveThemeModePreference(undefined, '', () => 'dark')).toBe('dark');
   });
 
   it('hard-defaults to following the OS only as a last resort', () => {
-    expect(resolveThemePreference(undefined, null, () => null)).toBe('system');
-    expect(resolveThemePreference(undefined, null, () => 'bogus')).toBe('system');
-    expect(DEFAULT_THEME).toBe('system');
+    expect(resolveThemeModePreference(undefined, null, () => null)).toBe('system');
+    expect(resolveThemeModePreference(undefined, null, () => 'bogus')).toBe('system');
+    expect(DEFAULT_THEME_MODE).toBe('system');
   });
 
   it('reads the attribute lazily, never when an earlier source already answers', () => {
     const getAttr = vi.fn(() => 'light');
-    resolveThemePreference('dark', null, getAttr);
-    resolveThemePreference(undefined, 'system', getAttr);
+    resolveThemeModePreference('dark', null, getAttr);
+    resolveThemeModePreference(undefined, 'system', getAttr);
     expect(getAttr).not.toHaveBeenCalled();
   });
 
   it('a missing server value never clobbers a present localStorage value (regression)', () => {
     // The systemic dark-flash bug: the active device had no server-scoped
-    // theme, so `prefs['theme'] || 'dark'` returned 'dark' and overwrote the
+    // theme, so `prefs['theme-mode'] || 'dark'` returned 'dark' and overwrote the
     // light value the FOUC script had already applied from localStorage.
-    expect(resolveThemePreference(undefined, 'light', () => 'light')).toBe('light');
+    expect(resolveThemeModePreference(undefined, 'light', () => 'light')).toBe('light');
   });
 });
 
 describe('resolving a theme against the OS', () => {
   it('only `system` consults the OS', () => {
-    expect(resolveTheme('light', false)).toBe('light');
-    expect(resolveTheme('dark', true)).toBe('dark');
-    expect(resolveTheme('system', true)).toBe('light');
-    expect(resolveTheme('system', false)).toBe('dark');
+    expect(resolveThemeMode('light', false)).toBe('light');
+    expect(resolveThemeMode('dark', true)).toBe('dark');
+    expect(resolveThemeMode('system', true)).toBe('light');
+    expect(resolveThemeMode('system', false)).toBe('dark');
   });
 
   it('every resolved theme has a background to paint before any stylesheet', () => {
-    expect(THEME_BG.light).toBe('#ffffff');
-    expect(THEME_BG.dark).toBe('#07172e');
+    expect(THEME_MODE_BG.light).toBe('#ffffff');
+    expect(THEME_MODE_BG.dark).toBe('#07172e');
   });
 });
 
 describe('font key resolution', () => {
-  const ALL: FontFamily[] = [
-    'monospace', 'system', 'inter', 'jetbrains-mono', 'ibm-plex-mono', 'fira-code',
-  ];
+  const ALL: FontId[] = FONT_CATALOG.map(font => font.id);
+  const NO_THEME_FONT: ThemeFonts = {};
+  const THEME_GEIST: ThemeFonts = { ui: 'geist' };
 
-  it('passes through every option the picker offers', () => {
-    for (const font of ALL) expect(resolveFontKey(font)).toBe(font);
+  it('passes through every font in the catalog', () => {
+    for (const font of ALL) expect(resolveFontKey(font, NO_THEME_FONT)).toBe(font);
   });
 
-  it('defaults anything unusable to Fira Code', () => {
+  it('an explicit pick wins over the theme', () => {
+    for (const font of ALL) expect(resolveFontKey(font, THEME_GEIST)).toBe(font);
+  });
+
+  it('follow-the-theme paints the font the theme suggests', () => {
+    expect(resolveFontKey(FOLLOW_THEME, THEME_GEIST)).toBe('geist');
+    expect(resolveFontKey(FOLLOW_THEME, { ui: 'source-serif-4' })).toBe('source-serif-4');
+  });
+
+  it('an unset or unusable value follows the theme too', () => {
     for (const stored of [null, undefined, '', 'comic-sans', 'MONOSPACE']) {
-      expect(resolveFontKey(stored)).toBe('fira-code');
+      expect(resolveFontKey(stored, THEME_GEIST)).toBe('geist');
     }
-    expect(DEFAULT_FONT_FAMILY).toBe('fira-code');
+  });
+
+  it('a theme with no font falls back to Fira Code', () => {
+    for (const stored of [FOLLOW_THEME, null, undefined, '', 'comic-sans']) {
+      expect(resolveFontKey(stored, NO_THEME_FONT)).toBe('fira-code');
+      expect(resolveFontKey(stored, EMPTY_THEME.fonts)).toBe('fira-code');
+    }
+    expect(FALLBACK_FONT).toBe('fira-code');
+  });
+
+  it('the preference defaults to following the theme', () => {
+    expect(DEFAULT_FONT_PREFERENCE).toBe(FOLLOW_THEME);
+    expect(FONT_PREFERENCES[0]).toBe(FOLLOW_THEME);
+    expect(FONT_PREFERENCES.slice(1)).toEqual(ALL);
   });
 
   it('never accepts an INHERITED key as a font', () => {
-    // The key comes out of localStorage, and `'toString' in FONT_FAMILY_VALUES`
-    // is true. Accepting it would write `Object.prototype.toString`'s source
-    // text into --font-ui, and read a function out of the ligature map so
-    // `features.text` came back undefined.
+    // The key comes out of localStorage, and `'toString' in FONT_STACKS` is
+    // true. Accepting it would write `Object.prototype.toString`'s source text
+    // into --font-ui.
     for (const stored of ['toString', 'constructor', 'valueOf', '__proto__', 'hasOwnProperty']) {
-      expect(resolveFontKey(stored)).toBe('fira-code');
+      expect(resolveFontKey(stored, NO_THEME_FONT)).toBe('fira-code');
     }
   });
 
   it('resolves a real pair for every key it can return', () => {
-    // The two halves of the same guard: whatever `resolveFontKey` hands back
-    // must index BOTH maps to real values, since the caller reads both with it.
-    for (const stored of ['toString', 'comic-sans', null, 'inter']) {
-      const key = resolveFontKey(stored);
-      expect(typeof FONT_FAMILY_VALUES[key]).toBe('string');
-      expect(typeof fontFeaturesFor(key).text).toBe('string');
-    }
-  });
-
-  it('never resolves to a key the family map lacks', () => {
-    // The load-bearing half: the caller reads BOTH maps with this key, so a key
-    // outside the map would take a stack from one and `normal` features from
-    // the other, and `normal` is not "ligatures off".
-    for (const stored of [null, 'nonsense', 'fira-code', 'inter']) {
-      expect(FONT_FAMILY_VALUES[resolveFontKey(stored)]).toBeTruthy();
+    // The caller reads BOTH maps with this key. A key outside the map would
+    // take a stack from one and `normal` features from the other, and
+    // `normal` is not "ligatures off".
+    for (const stored of ['toString', 'comic-sans', null, 'inter', FOLLOW_THEME]) {
+      for (const theme of [NO_THEME_FONT, THEME_GEIST]) {
+        const key = resolveFontKey(stored, theme);
+        expect(typeof fontStackFor(key)).toBe('string');
+        expect(typeof fontFeaturesFor(key).text).toBe('string');
+      }
     }
   });
 
   it("keeps Fira Code's fallback chain on the system mono, never bare monospace", () => {
-    const stack = FONT_FAMILY_VALUES['fira-code'];
+    const stack = FONT_STACKS['fira-code'];
     expect(stack.startsWith("'Fira Code', ui-monospace,")).toBe(true);
     expect(stack).not.toBe("'Fira Code', monospace");
+  });
+});
+
+describe('the bold mark', () => {
+  const workspaceFont = (weights: string[]): WorkspaceFont => ({
+    id: 'ws-pixel' as WorkspaceFont['id'],
+    label: 'Pixel',
+    family: 'ws-pixel' as WorkspaceFont['family'],
+    stack: "'ws-pixel', monospace",
+    group: 'mono',
+    ligatures: false,
+    faces: weights.map((weight, i) => ({ path: `pixel-${i}.woff2`, weight, style: 'normal' as const })),
+  });
+  const resolvedWorkspace = (font: WorkspaceFont) => resolveFont(font.id, {}, [font]);
+
+  it('says `none` for a catalog UI font with no bold face', () => {
+    expect(fontBoldMark(resolveFont('vt323', {}))).toBe('none');
+  });
+
+  it('says `face` for every catalog font with a bold face', () => {
+    for (const font of FONT_CATALOG.filter(f => f.bold)) {
+      expect(fontBoldMark(resolveFont(font.id, {})), font.id).toBe('face');
+    }
+  });
+
+  it('reads a workspace font by its own faces', () => {
+    expect(fontBoldMark(resolvedWorkspace(workspaceFont(['400'])))).toBe('none');
+    expect(fontBoldMark(resolvedWorkspace(workspaceFont(['400', '700'])))).toBe('face');
+    expect(fontBoldMark(resolvedWorkspace(workspaceFont(['100 900'])))).toBe('face');
+  });
+
+  it('does not count a bold italic as upright bold', () => {
+    const font = workspaceFont(['400', '700']);
+    font.faces[1].style = 'italic';
+    expect(fontBoldMark(resolvedWorkspace(font))).toBe('none');
+    expect(workspaceFontHasBold(font, 'italic')).toBe(true);
+  });
+
+  it('stretches only the heaviest face of a style with no bold up to 900', () => {
+    const font = workspaceFont(['300', '400']);
+    expect(font.faces.map(face => registeredFaceWeight(font, face))).toEqual(['300', '400 900']);
+    const single = workspaceFont(['400']);
+    expect(registeredFaceWeight(single, single.faces[0])).toBe('400 900');
+    const bold = workspaceFont(['400', '700']);
+    expect(bold.faces.map(face => registeredFaceWeight(bold, face))).toEqual(['400', '700']);
+  });
+
+  it('counts a face as bold from weight 600, at the heavy end of a range', () => {
+    expect(weightReachesBold('600')).toBe(true);
+    expect(weightReachesBold('300 500')).toBe(false);
+    expect(weightReachesBold('300 700')).toBe(true);
   });
 });
 
@@ -143,9 +224,16 @@ describe('ligature features', () => {
     });
   });
 
-  it('resolve BOTH to normal for every other font', () => {
-    for (const font of ['monospace', 'system', 'inter', 'jetbrains-mono', 'ibm-plex-mono'] as FontFamily[]) {
-      expect(fontFeaturesFor(font)).toEqual(FONT_FEATURES_DEFAULT);
+  it('resolve BOTH to normal for every font without programming ligatures', () => {
+    for (const font of FONT_CATALOG.filter(f => !f.ligatures)) {
+      expect(fontFeaturesFor(font.id)).toEqual(FONT_FEATURES_DEFAULT);
+    }
+  });
+
+  it('keep ligatures to code for every font that ships them', () => {
+    for (const id of ['fira-code', 'jetbrains-mono', 'cascadia-code'] as const) {
+      expect(fontFeaturesFor(id)).toEqual(fontFeaturesFor('fira-code'));
+      expect(fontFeaturesFor(id).text).toMatch(/"liga"\s+0/);
     }
   });
 
@@ -242,5 +330,23 @@ describe('the animation duration scale', () => {
     expect(parseAnimationSpeed('-99')).toBe(-10);
     expect(parseAnimationSpeed(null)).toBe(0);
     expect(parseAnimationSpeed('junk')).toBe(0);
+  });
+});
+
+describe('theme effects', () => {
+  it('follows either OS signal under system, and an explicit choice over both', () => {
+    expect(resolveReducedThemeEffects('system', false, false)).toBe(false);
+    expect(resolveReducedThemeEffects('system', true, false)).toBe(true);
+    expect(resolveReducedThemeEffects('system', false, true)).toBe(true);
+    expect(resolveReducedThemeEffects('reduce', false, false)).toBe(true);
+    expect(resolveReducedThemeEffects('full', true, true)).toBe(false);
+  });
+
+  it('parses only the three values, own keys only', () => {
+    expect(parseThemeEffects('reduce')).toBe('reduce');
+    expect(parseThemeEffects('full')).toBe('full');
+    expect(parseThemeEffects(null)).toBe('system');
+    expect(parseThemeEffects('toString')).toBe('system');
+    expect(parseThemeEffects('REDUCE')).toBe('system');
   });
 });

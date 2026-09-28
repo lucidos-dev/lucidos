@@ -10,7 +10,7 @@
 
 ::-webkit-scrollbar-thumb {
     background: var(--border-color);
-    border-radius: 0.25rem;
+    border-radius: calc(var(--radius-control) * 0.5);
 }
 
 ::-webkit-scrollbar-corner {
@@ -61,28 +61,29 @@
    draws itself as its own loading placeholder (mirrors the real layout by
    construction). Reuses the global `shimmer` keyframes (drawer.css). Host-only —
    these classes live in the host bundle and are never served to apps. */
+/* Both stops are translucent, so a bar shows on whatever it sits on, including
+   the many surfaces painted --bg-tertiary. The body tints the text colour, so a
+   muted line shimmers fainter, like its text. A surface with a brand background
+   overrides the two variables. */
 .sk-bar {
+    --sk-base: color-mix(in srgb, currentColor 13%, transparent);
+    --sk-shine: color-mix(in srgb, var(--accent) 30%, transparent);
     display: inline-block;
     width: 100%;
     height: 0.85em;
-    border-radius: 0.375rem;
-    background: linear-gradient(
-        90deg,
-        var(--bg-tertiary) 25%,
-        color-mix(in srgb, var(--accent) 18%, var(--bg-tertiary)) 50%,
-        var(--bg-tertiary) 75%
-    );
+    border-radius: calc(var(--radius-control) * 0.75);
+    background: linear-gradient(90deg, var(--sk-base) 25%, var(--sk-shine) 50%, var(--sk-base) 75%);
     background-size: 200% 100%;
     animation: shimmer 1.5s infinite;
     vertical-align: middle;
 }
 
 .sk-circle {
-    border-radius: 50%;
+    border-radius: var(--radius-round);
 }
 
 .sk-round {
-    border-radius: 0.5rem;
+    border-radius: var(--radius-control);
 }
 
 /* Full-pane self-skeletonizing run (ListSkeletonOf fill): the component pins an
@@ -98,14 +99,14 @@
     animation: none;
 }
 
-/* Four boxes here can hold focus without being something the user presses, and
+/* These boxes can hold focus without being something the user presses, and
    none of them paints a ring for it. Same call .thread-content
    (chat/input-messages.css) and .content-pane-body (panels/shell.css) make, and
    their comments carry the longer form.
 
    The progress dialog's body takes focus on purpose, so a modal with no Cancel
-   cannot leave the keyboard behind it (ProgressDialog.tsx). The other three
-   carry tabIndex={-1} at their render site, because Chrome promotes an
+   cannot leave the keyboard behind it (ProgressDialog.tsx). The others carry
+   tabIndex={-1} at their render site, because Chrome promotes an
    overflowing scroller with no focusable child to a Tab stop and each sits
    inside a surface whose own Tab cycle cannot name it. A click can still land
    focus on one, which is what this rule covers there.
@@ -114,12 +115,18 @@
    included. */
 .confirm-details:focus,
 .confirm-details:focus-visible,
+.dialog-body:focus,
+.dialog-body:focus-visible,
+.step-detail-body:focus,
+.step-detail-body:focus-visible,
+.explainer-body:focus,
+.explainer-body:focus-visible,
 .progress-dialog-body:focus,
 .progress-dialog-body:focus-visible,
 .toast-heading:focus,
 .toast-heading:focus-visible,
-.toast-sections:focus,
-.toast-sections:focus-visible {
+.toast-text:focus,
+.toast-text:focus-visible {
     outline: none;
 }
 
@@ -139,12 +146,10 @@
     box-shadow: inset var(--focus-ring);
 }
 
-/* Confirm dialog */
+/* The centred dialog: Confirm, Prompt, Progress and the release notice. Its
+   box is `.surface` (styles/global/surface.css); this rule only sizes it and
+   lets the body scroll inside the cap. */
 .confirm-dialog {
-    background: var(--bg-secondary);
-    border: 1px solid var(--border-color);
-    border-radius: 0.5rem;
-    padding: 1.25rem 1.5rem;
     max-width: 27.5rem;
     width: 90%;
     /* Cap height so the dialog never spills past the viewport;
@@ -154,21 +159,33 @@
     max-height: calc(var(--app-height, 100dvh) - 4rem - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px));
     display: flex;
     flex-direction: column;
-    box-shadow: var(--shadow-md);
 }
 
-.confirm-title {
-    color: var(--text-primary);
-    font-size: var(--font-size-lg);
-    font-weight: 600;
-    margin: 0 0 0.75rem;
+/* A dialog with no title opens straight on its message. */
+.dialog-body:first-child {
+    padding-top: var(--surface-inset);
 }
 
+/* The body is the part that scrolls, so the head and the buttons stay put.
+   It stays a block: a message can mix text with inline code, which a flex
+   column would break onto one line per fragment. */
+.dialog-body {
+    min-height: 0;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+}
+
+/* An untitled message is the whole dialog, so it reads at full strength. Under
+   a title it is the explanation, and steps back. */
 .confirm-message {
     color: var(--text-primary);
     font-size: var(--font-size-md);
     line-height: 1.5;
-    margin-bottom: 1.25rem;
+    margin: 0 0 var(--space-md);
+}
+
+.surface-head + .surface-body .confirm-message {
+    color: var(--text-secondary);
 }
 
 /* A multi-paragraph message (DialogMessage splits on a blank line) sits tighter
@@ -187,14 +204,14 @@
 .prompt-input {
     width: 100%;
     box-sizing: border-box;
-    margin-bottom: 1.25rem;
+    margin-bottom: var(--space-md);
     padding: 0.5rem 0.625rem;
     font-family: inherit;
     font-size: var(--font-size-md);
     color: var(--text-primary);
     background: var(--bg-primary);
     border: 1px solid var(--border-color);
-    border-radius: 0.375rem;
+    border-radius: var(--radius-control);
 }
 
 .prompt-input:focus {
@@ -212,18 +229,8 @@
     line-height: 1.5;
 }
 
-.toast-bullets {
-    list-style: disc;
-    padding-left: 1.25rem;
-    color: var(--text-secondary);
-}
-
-.toast-bullets li {
-    margin-bottom: 0.125rem;
-}
-
 .confirm-details {
-    margin: 0 0 1.25rem;
+    margin: 0 0 var(--space-md);
     font-size: var(--font-size-md);
     line-height: 1.5;
     color: var(--text-secondary);
@@ -260,17 +267,9 @@
     margin-bottom: 0.125rem;
 }
 
-/* Wraps, so a long OK label stacks instead of overflowing the box. The dialog
-   is 90% of the viewport, and its OK can be as long as `Switch to new version`
-   (ADR 0229), which is the exact label that once overflowed the toast at 320px.
-   Shared with PromptDialog, ProgressDialog and the release notice, so the rule
-   lives here rather than on the `.button-group` primitive: those three do not
-   carry that class, and moving layout onto it would strip theirs. */
-.confirm-actions {
-    display: flex;
-    flex-wrap: wrap;
-    justify-content: flex-end;
-    gap: 0.5rem;
+/* The extra action (Discard beside Keep draft) sits apart from the answer pair. */
+.confirm-extra {
+    margin-right: auto;
 }
 
 /* The progress dialog reuses .confirm-dialog's box, so only its own parts are
@@ -279,19 +278,23 @@
 .progress-dialog-body {
     display: flex;
     flex-direction: column;
+    min-height: 0;
+}
+
+.progress-dialog-readout {
+    display: flex;
+    flex-direction: column;
     gap: var(--space-md);
+}
+
+.progress-dialog-readout .confirm-message {
+    margin-bottom: 0;
 }
 
 .progress-dialog-bar {
     /* Full width of the dialog: the bar IS the readout, unlike the toast's,
        which shares its row with a message and a close button. */
     width: 100%;
-}
-
-/* The indeterminate case. Centred rather than leading the message, because with
-   no percentage to read there is nothing for the eye to track along a line. */
-.progress-dialog-spinner {
-    align-self: center;
 }
 
 /* The release-notice modal reuses .confirm-dialog's box too, so only its own
@@ -301,7 +304,7 @@
     max-width: 34rem;
 }
 
-/* Which release this came from, and where the reader is in the queue. Above the
+/* Which release this came from, and where the reader is in the queue. Under the
    title and quieter than it: the instruction is the subject, its provenance is
    not. */
 .release-notice-meta {
@@ -329,71 +332,13 @@
     line-height: 1.5;
 }
 
-/* Modal only. Scrolls inside the capped box, the same way the confirm dialog's
-   details list does, so a long notice cannot push its buttons off screen. */
-.release-notice .release-notice-body {
-    overflow-y: auto;
-    margin-bottom: 1.25rem;
-}
-
-/* Wraps for the same reason, and right-aligned so a pair that stacks keeps the
-   edge the unwrapped row sits on. */
-.confirm-actions-right {
-    display: flex;
-    flex-wrap: wrap;
-    justify-content: flex-end;
-    gap: 0.5rem;
-}
-
-.confirm-btn-extra {
-    margin-right: auto;
-}
-
-.confirm-btn {
-    padding: 0.375rem 0.75rem;
-    border-radius: 0.25rem;
-    border: none;
+/* Says why this notice draws no action button: a later one carries it. */
+.release-notice-deferred {
+    color: var(--text-muted);
     font-size: var(--font-size-sm);
-    font-family: var(--font-ui);
-    font-weight: 600;
-    cursor: pointer;
-    transition: all var(--duration-fast);
+    margin: var(--space-sm) 0 0;
 }
 
-.confirm-btn-cancel {
-    background: none;
-    color: var(--text-secondary);
-    border: 1px solid var(--border-color);
-}
-
-@media (hover: hover) {
-    .confirm-btn-cancel:hover {
-        color: var(--text-primary);
-        border-color: var(--text-secondary);
-    }
-}
-
-.confirm-btn-ok {
-    background: var(--accent-red);
-    color: var(--text-on-accent);
-}
-
-.confirm-btn-ok-default {
-    /* Shared action-button blue (see .action-btn) so every filled blue CTA
-       tracks one token across themes. */
-    background: var(--accent-action);
-    color: var(--text-on-accent);
-}
-
-@media (hover: hover) {
-    .confirm-btn-ok:hover {
-        background: color-mix(in srgb, var(--accent-red) 80%, #fff);
-    }
-
-    .confirm-btn-ok-default:hover {
-        background: color-mix(in srgb, var(--accent-action) 80%, #fff);
-    }
-}
 
 /* File preview modal (components/files/FilePreviewModal.tsx): a read-only
    glance at a cited file, over whatever the content pane is showing, opened by
@@ -404,10 +349,6 @@
    inside. `--app-height` is set by MobileSwipeContainer so iOS Safari shrinks
    correctly when the keyboard opens (raw `100vh` does not). */
 .file-preview-modal {
-    background: var(--bg-secondary);
-    border: 1px solid var(--border-color);
-    border-radius: 0.5rem;
-    box-shadow: var(--shadow-lg);
     width: min(60rem, 92vw);
     height: min(45rem, calc(var(--app-height, 100dvh) - 4rem - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px)));
     display: flex;
@@ -417,41 +358,25 @@
     font-family: var(--font-ui);
 }
 
-.file-preview-modal-header {
-    display: flex;
-    align-items: center;
-    gap: var(--space-lg);
-    padding: var(--space-md) var(--space-lg);
+.file-preview-modal > .surface-head {
+    /* The body below is full-bleed, so the head needs a rule to stand on. */
     border-bottom: 1px solid var(--border-color);
-    flex-shrink: 0;
 }
 
-/* min-width: 0 so the path below can ellipsize instead of widening the modal. */
-.file-preview-modal-title {
+/* The name over the path. min-width: 0 (from .surface-title) lets the path
+   ellipsize instead of widening the modal. */
+.file-preview-modal .surface-title {
     display: flex;
     flex-direction: column;
-    min-width: 0;
-}
-
-.file-preview-modal-name {
-    font-size: var(--font-size-md);
-    font-weight: 600;
 }
 
 .file-preview-modal-detail {
     font-size: var(--font-size-xs);
+    font-weight: 400;
     color: var(--text-secondary);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-}
-
-.file-preview-modal-actions {
-    display: flex;
-    align-items: center;
-    gap: var(--space-sm);
-    margin-left: auto;
-    flex-shrink: 0;
 }
 
 /* The escalation is a secondary affordance beside the file name, not a second
@@ -459,7 +384,7 @@
    and left "Open in Files" competing with the name it sits next to. One step
    down reads as a link and still gives a comfortable tap target (the detail
    line's --font-size-xs would not). */
-.file-preview-modal-actions .accent-link {
+.file-preview-modal .surface-actions .accent-link {
     font-size: var(--font-size-sm);
 }
 
@@ -487,7 +412,7 @@
    element `.line-numbered` sets its default on (panels/content.css), one step
    more specific, so the override cannot be lost to source order. */
 .file-preview-modal .line-numbered {
-    --code-surface: var(--bg-secondary);
+    --code-surface: var(--surface-bg);
 }
 
 /* Toast notifications — positioned below header. The container spans the full
@@ -496,6 +421,9 @@
    single full-width column. --z-toast sits above .ui-blocking-overlay so the
    restart toast stays visible when the dim overlay covers the header. */
 .toast-container {
+    /* The widest a toast gets, read by the toast and by the corner placement,
+       which sizes the container rather than the toast. */
+    --toast-max-width: 36rem;
     position: fixed;
     /* Start at the header's BOTTOM edge (--app-header-bottom, global/base.css)
        plus the stack's gap. The container is position:fixed, so its top is
@@ -583,40 +511,31 @@
     /* The card's own padding, named because the out-of-flow icon and close X
        are both placed ON it. A literal restated in those two rules is a value
        that silently stops matching the day this padding is retuned. */
-    --toast-pad-y: 0.5rem;
-    --toast-pad-x: 0.875rem;
+    --toast-pad-y: 0.625rem;
+    --toast-pad-x: var(--surface-inset);
     /* The close X's box: an .icon-btn, so a 0.875rem glyph in 0.25rem of
        padding. .toast-heading reserves this much on the right AND is at least
        this tall, which is what keeps the scroll box under it clear of the
        button. */
     --toast-close-size: 1.375rem;
-    /* The category icon's box. It is out of flow, so .toast-body pays for it as
-       left padding rather than as a flex sibling. */
+    /* The category icon's box. It is out of flow, so .toast-heading pays for it
+       as left padding rather than as a flex sibling. */
     --toast-icon-size: 1.125rem;
     /* The message's line height, named because .toast-heading's cap is a whole
        multiple of it. A literal restated there is a value that silently stops
        dividing the day this is retuned, and the whole point of that cap is
        that it divides. */
     --toast-line-height: 1.4;
-    /* Elevated surface: in DARK mode the fill sits one step above the app
-       background (--bg-tertiary, not the near-canvas --bg-secondary) and rides
-       the deeper --shadow-md, so the toast clearly floats above the chrome
-       instead of blending into it. (Light mode inverts the bg ladder, so it
-       overrides this fill to white below — see the `html[data-theme="light"]
-       .toast` rule.) Every toast keeps this plain theme bg; the per-type rules
-       below only add a frame (the border) in the toast's own category colour, so
-       the toast pops off the page via that frame, not the fill. */
-    background: var(--bg-tertiary);
-    border: 0.15625rem solid var(--border-color);
-    border-radius: 0.375rem;
+    /* The box (fill, hairline, radius, shadow) is `.surface`, which every toast
+       also wears. Tone lives in the icon alone, never in the frame. */
     padding: var(--toast-pad-y) var(--toast-pad-x);
     min-height: 2.5rem;
-    /* Cap height; the message scrolls inside (see .toast-sections) and the
-       actions row + close X are outside every scroll box, so [Open] stays
-       reachable without scrolling to find it.
+    /* Cap height; the message scrolls inside (see .toast-text) and the
+       actions row + close X are outside every scroll box, so they stay
+       reachable without scrolling to find them.
 
        A toast is a SUMMARY with somewhere to go, never the place a long body is
-       read: for a notification the full text is one [Open] away in the content
+       read: for a notification the full text is one tap away in the content
        pane, and for everything else the toast is the whole message and is short.
        So the absolute 14rem leads (roughly six lines of body plus the actions
        row), and the viewport term is only a ceiling under it, for a short screen
@@ -630,7 +549,7 @@
 
        `--app-height` keeps iOS Safari honest when the keyboard pushes the visual
        viewport up. Same min(absolute, viewport) shape as the prompt-bar popover
-       in chat/prompt-bar-popover.css. */
+       in global/anchored-popover.css. */
     max-height: min(
         14rem,
         calc(var(--app-height, 100dvh) - 6rem - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px))
@@ -638,8 +557,7 @@
     color: var(--text-primary);
     font-size: var(--font-size-md);
     width: calc(100% - 2rem);
-    max-width: 30rem;
-    box-shadow: var(--shadow-md);
+    max-width: var(--toast-max-width);
     pointer-events: auto;
     /* Entry animation. Kept in lockstep with the JS reflow (FLIP) that slides
        the toasts BELOW a newly-inserted one down to make room — see
@@ -656,7 +574,7 @@
     overflow: hidden;
 }
 
-/* The message column: the heading that stays, and the sections that scroll
+/* The message column: the heading that stays, and the text that scrolls
    under it. NOT a scroll container itself, and not an ancestor of the icon.
    The two boxes inside it own every scroll the toast has, so no rule here has
    to be switched off for the spinner.
@@ -664,8 +582,6 @@
    `min-height: 0` lets the column shrink under .toast's cap. That shrink is
    what gives the boxes inside it a bounded height to scroll in; without it they
    grow to their content and the cap just clips them.
-
-   The left padding is the gutter the out-of-flow icon sits in.
 
    `overflow-wrap` makes a long path or URL wrap instead of running off the
    card. The default is not enough. Chrome and WebKit break a long word only at
@@ -676,14 +592,17 @@
 
    `anywhere` rather than `break-word`, since it is what the app already uses
    for a path. The toast has a definite width, so the min-content difference
-   between the two cannot reach it. */
+   between the two cannot reach it.
+
+   `pre-line` keeps the caller's line breaks: a newline in a title or message
+   is a line break, and nothing reads structure out of it. */
 .toast-body {
     display: flex;
     flex-direction: column;
     gap: 0.5rem;
     min-height: 0;
-    padding-left: calc(var(--toast-icon-size) + 0.5rem);
     overflow-wrap: anywhere;
+    white-space: pre-line;
 }
 
 /* Out of the flow, so no scroll container can ever contain it. A scroll
@@ -705,30 +624,32 @@
     width: var(--toast-icon-size);
     height: var(--toast-icon-size);
     pointer-events: none;
-    /* Per-type category colour (set as --toast-accent on the .toast-{type}
-       ancestor below), which drives the icon AND the border so they always
-       match. */
+    /* Per-type category colour, set as --toast-accent on the .toast-{type}
+       ancestor below. The icon is the only part of a toast that shows tone. */
     color: var(--toast-accent);
 }
 
-/* Line 1 of the message, and the one part that does NOT scroll: it names what
-   the toast is about, so it has to survive a scroll to the last bullet.
+/* The title, or an untitled message, and the one part that does NOT scroll: it
+   names what the toast is about, so it has to survive a scroll to the end.
+
+   It is the one box beside the out-of-flow icon, so it alone pads out the
+   icon's gutter. The text under it runs the toast's full width.
 
    Two jobs beyond that, both carried by --toast-close-size. Reserving that much
    on the right keeps the text clear of the close X. Being at least that TALL is
-   what puts .toast-sections BELOW the button rather than beside it, and a
-   scroll box reaching up beside the X would draw its scrollbar under the glyph.
+   what puts .toast-text BELOW the button rather than beside it, and a scroll
+   box reaching up beside the X would draw its scrollbar under the glyph.
 
-   It is a scroll box itself for the one case with nothing under it: a message
-   with no sections is all heading, and a long one has to scroll rather than be
+   It is a scroll box itself for the one case with nothing under it: an
+   untitled message is all heading, and a long one has to scroll rather than be
    clipped at the cap. A one-line heading is already at its floor, so it cannot
    shrink and never shows a bar.
 
    WHOLE LINES ONLY, which is the third job and the reason for the two rules
    below. Flex has no reason to stop shrinking on a line boundary, so a heading
-   squeezed to make room for .toast-sections was sheared through the middle of
-   its last line: the reported 503 card showed the top halves of the glyphs that
-   carried the actual error. `flex-shrink: 0` hands the squeeze to the sections
+   squeezed to make room for the text box was sheared through the middle of its
+   last line: the reported 503 card showed the top halves of the glyphs that
+   carried the actual error. `flex-shrink: 0` hands the squeeze to the text
    box, which is what `flex: 1 1 auto; min-height: 0` there is for, and the cap
    is a whole multiple of the line height so the box always ends on a boundary.
 
@@ -745,12 +666,13 @@
     line-height: var(--toast-line-height);
     max-height: calc(6em * var(--toast-line-height));
     min-height: var(--toast-close-size);
+    padding-left: calc(var(--toast-icon-size) + 0.5rem);
     margin-right: var(--toast-close-size);
     overflow-y: auto;
     overscroll-behavior: contain;
 }
 
-/* Everything after line 1, and the toast's main scroll box: a message taller
+/* The message under a title, and the toast's main scroll box: a message taller
    than the 14rem cap is read to its last line here instead of being clipped by
    .toast's `overflow: hidden`.
 
@@ -758,39 +680,46 @@
    toast's content edge, so its scrollbar sits in the card's right rail level
    with the close glyph, rather than inside the text column with the X beyond
    it. The heading above is what makes that safe: it clears the button, and this
-   box starts below it. */
-.toast-sections {
+   box starts below it.
+
+   Under a title the message is the explanation, and steps back, as a titled
+   dialog's message does (.confirm-message). */
+.toast-text {
     flex: 1 1 auto;
     min-height: 0;
     overflow-y: auto;
     overscroll-behavior: contain;
+    line-height: var(--toast-line-height);
+    color: var(--text-secondary);
 }
 
-/* The gap to the heading is the column's own, so the first section drops the
-   margin it uses to separate itself from the section above. */
-.toast-sections > .toast-section:first-child {
-    margin-top: 0;
+/* The bold line over the message. Nothing else in a toast is bold. */
+.toast-title {
+    font-weight: 600;
 }
 
-.toast-clickable {
+/* The whole card takes the tap (`toastTap`). Only a card that ACTS shows the
+   pointer and underlines its message on hover. A dismiss still closes on a
+   click, but it is no link. The underline sits on the message: set on the
+   card, it would also reach the text of its buttons. */
+.toast[data-toast-tap="click"],
+.toast[data-toast-tap="action"] {
     cursor: pointer;
-    text-decoration: none;
 }
 
 @media (hover: hover) {
-    .toast-clickable:hover {
+    .toast[data-toast-tap="click"]:hover .toast-body,
+    .toast[data-toast-tap="action"]:hover .toast-body {
         text-decoration: underline;
         text-decoration-color: currentColor;
         text-underline-offset: 0.125rem;
     }
 }
 
-/* Linkified URLs inside a toast message (heading, section titles, bullets).
-   A long URL takes its wrap from .toast-body above, which all three of these
-   live inside. */
+/* Linkified URLs inside a toast (heading and text). A long URL takes its wrap
+   from .toast-body above, which both of these live inside. */
 .toast-heading a,
-.toast-section-title a,
-.toast-bullets a {
+.toast-text a {
     color: var(--accent);
     text-decoration: underline;
     text-decoration-color: color-mix(in srgb, var(--accent) 40%, transparent);
@@ -799,26 +728,9 @@
 
 @media (hover: hover) {
     .toast-heading a:hover,
-    .toast-section-title a:hover,
-    .toast-bullets a:hover {
+    .toast-text a:hover {
         text-decoration-color: var(--accent);
     }
-}
-
-.toast-bullets {
-    margin: 0.25rem 0 0;
-    font-size: var(--font-size-sm);
-    line-height: var(--toast-line-height);
-}
-
-.toast-section {
-    margin-top: 0.5rem;
-}
-
-.toast-section-title {
-    font-size: var(--font-size-md);
-    font-weight: 600;
-    color: var(--text-primary);
 }
 
 /* Determinate progress for a long operation the toast is narrating (a packaged
@@ -845,7 +757,7 @@
 
    Inset by the toast's padding less the .icon-btn padding the glyph sits in, so
    the GLYPH's right edge lands on the toast's content edge. That is the card's
-   right rail: .toast-sections ends there too, which is where its scrollbar is
+   right rail: .toast-text ends there too, which is where its scrollbar is
    drawn. The button's own box overhangs into the padding, where nothing else
    is. */
 .toast-close {
@@ -876,6 +788,13 @@
         outline: 0.125rem solid transparent;
         box-shadow: var(--focus-ring);
     }
+
+    /* A card that is the action focuses a hidden button (`.toast-tap-control`),
+       so the ring goes on the card it stands for, beside the card's own shadow. */
+    .toast:has(.toast-tap-control:focus) {
+        outline: 0.125rem solid transparent;
+        box-shadow: var(--focus-ring), var(--shadow-md);
+    }
 }
 
 .toast-close svg {
@@ -883,41 +802,80 @@
     height: 0.875rem;
 }
 
-/* One toast look for every type — the plain theme bg framed by the toast's own
-   CATEGORY colour (success=green, info=blue, warning=sand, error=red).
-   Each type sets --toast-accent once; the border AND the icon both read it (see
-   the `.toast-icon` rule above), so the frame and the icon always match. The fill
-   is just the theme background, inherited from the base `.toast` rule above
-   (--bg-tertiary) — no tint. Same specificity as the base `.toast` rule above —
-   border-color wins on source order (overrides only the colour of the `.toast`
-   border shorthand). Every type reads its token straight: warning used to mix
-   --accent-yellow toward --text-secondary to desaturate the old raw gold, and
-   light mode needed a further hardcoded override because that mix muddied to
-   brown. --accent-yellow is a muted sand now, so both patches are gone. */
+/* The toast's CATEGORY colour (success green, info blue, warning sand, error
+   red). Only the icon reads it: the frame stays the neutral surface hairline. */
 .toast-success { --toast-accent: var(--accent-green); }
 .toast-info    { --toast-accent: var(--accent); }
 .toast-warning { --toast-accent: var(--accent-yellow); }
 .toast-error   { --toast-accent: var(--accent-red); }
 
-/* Light-mode fill override: the bg ladder INVERTS between themes. In dark mode
-   surfaces get lighter as they rise (primary→secondary→tertiary), so the base
-   --bg-tertiary fill reads as "elevated". In light mode it inverts — tertiary
-   (#e1e4e8) is the DARKEST of the three, so that same fill renders the toast as a
-   gray slab. Elevation in light mode is toward white, so the toast sits on the
-   brightest surface (--bg-primary) and floats on its shadow + category border. */
-html[data-theme="light"] .toast { background: var(--bg-primary); }
-
-.toast-success,
-.toast-info,
-.toast-warning,
-.toast-error {
-    border-color: var(--toast-accent);
+.toast-icon svg {
+    display: block;
+    width: 100%;
+    height: 100%;
 }
 
+/* The one-line toast: icon, words, one text action, and the X when it stays.
+   Every part is in flow, so nothing needs the gutter and the reserve the
+   multi-line layout keeps for its out-of-flow icon and X.
+
+   The parts sit on the FIRST line, not on the middle of the block: each gets a
+   row of the X's height, and the words are padded to centre in that row. A
+   headline that still wraps on a narrow phone keeps its icon and action beside
+   its opening words. */
+.toast-inline {
+    flex-direction: row;
+    align-items: flex-start;
+    gap: var(--space-sm);
+}
+
+.toast-inline .toast-icon,
+.toast-inline .toast-close,
+.toast-inline .toast-actions {
+    position: static;
+    flex: none;
+    height: var(--toast-close-size);
+    display: flex;
+    align-items: center;
+}
+
+.toast-inline .toast-icon svg {
+    width: var(--toast-icon-size);
+    height: var(--toast-icon-size);
+}
+
+.toast-inline .toast-close {
+    margin-right: -0.25rem;
+}
+
+.toast-inline .toast-body {
+    flex: 1;
+}
+
+.toast-inline .toast-heading {
+    min-height: 0;
+    padding-left: 0;
+    margin-right: 0;
+    padding-top: calc((var(--toast-close-size) - 1em * var(--toast-line-height)) / 2);
+}
+
+.toast-inline .toast-actions {
+    flex-wrap: nowrap;
+}
+
+/* The spinner keeps the app's standard ring size and centres in the icon's box.
+   A ring fills its box edge to edge, so at the icon's size it reads larger than
+   a glyph. */
 .mini-spinner.toast-icon {
-    width: 1rem;
-    height: 1rem;
+    --toast-spinner-size: 0.75rem;
+    width: var(--toast-spinner-size);
+    height: var(--toast-spinner-size);
+    margin: calc((var(--toast-icon-size) - var(--toast-spinner-size)) / 2);
     --spinner-color: var(--toast-accent);
+}
+
+.toast-inline .mini-spinner.toast-icon {
+    margin-top: calc((var(--toast-close-size) - var(--toast-spinner-size)) / 2);
 }
 
 /* ─── Toast placement shapes (TEMPORARY: a comparison, see
@@ -984,7 +942,7 @@ html[data-theme="light"] .toast { background: var(--bg-primary); }
 }
 
 /* Card needs nothing beyond the static column above: the base .toast-column
-   already centres, and .toast keeps its 30rem cap. That IS the shape the
+   already centres, and .toast keeps its --toast-max-width cap. That IS the shape the
    per-pane columns replaced, kept here so the comparison has its baseline. */
 
 /* Bottom-right corner, the spot VS Code and IntelliJ both default to. Anchored
@@ -1004,7 +962,7 @@ html[data-theme="light"] .toast { background: var(--bg-primary); }
         /* The container IS the toast's width here, so .toast fills it below.
            Sizing the box rather than the toast is what puts the toast's right
            edge exactly on the inset above. */
-        width: min(30rem, calc(100vw - 2rem));
+        width: min(var(--toast-max-width), calc(100vw - 2rem));
     }
 
     /* Newest nearest the corner it enters from, so the stack grows upward and
@@ -1057,7 +1015,7 @@ html[data-theme="light"] .toast { background: var(--bg-primary); }
     content: '';
     position: absolute;
     inset: 0.5rem;
-    border-radius: 0.5rem;
+    border-radius: calc(var(--radius-surface) * 2 / 3);
     pointer-events: none;
     z-index: 1000;
 }
@@ -1081,7 +1039,7 @@ html[data-theme="light"] .toast { background: var(--bg-primary); }
     background: var(--bg-secondary);
     color: var(--text-primary);
     padding: 1rem 1.75rem;
-    border-radius: 0.5rem;
+    border-radius: calc(var(--radius-surface) * 2 / 3);
     box-shadow: var(--shadow-lg);
     font-size: var(--font-size-xl);
     font-weight: 500;
@@ -1115,7 +1073,7 @@ html[data-theme="light"] .toast { background: var(--bg-primary); }
     gap: 0.375rem;
     padding: 0.375rem 0.5rem;
     cursor: pointer;
-    border-radius: 0.25rem;
+    border-radius: calc(var(--radius-control) * 0.5);
     transition: background-color var(--duration-fast);
 }
 
@@ -1162,7 +1120,7 @@ html[data-theme="light"] .toast { background: var(--bg-primary); }
     gap: 0.5rem;
     padding: 0.3125rem 0.5rem;
     cursor: pointer;
-    border-radius: 0.25rem;
+    border-radius: calc(var(--radius-control) * 0.5);
     transition: background-color var(--duration-fast);
 }
 
@@ -1223,15 +1181,43 @@ html[data-theme="light"] .toast { background: var(--bg-primary); }
    top rather than floating to the middle. The line height equals the icon's box
    (`.file-icon`), so each of them shares a line with the path's first line. */
 .file-item.repo-changed-file {
+    position: relative;
     align-items: flex-start;
     line-height: 1.25rem;
+    padding-block: 0.5rem;
+}
+
+/* A hairline between rows, so a path wrapped onto several lines still reads as
+   one file. It starts at the path's column (padding, icon, gap) like the
+   drawer's row divider. A filled row (active or hovered) drops the lines on
+   both its edges, so no line runs along a fill. */
+.file-item.repo-changed-file + .file-item.repo-changed-file::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: calc(0.5rem + 1.25rem + 0.5rem);
+    right: 0.5rem;
+    border-top: 1px solid var(--border-color);
+    pointer-events: none;
+}
+
+.file-item.repo-changed-file + .file-item.repo-changed-file.active::before,
+.file-item.repo-changed-file.active + .file-item.repo-changed-file::before {
+    content: none;
+}
+
+@media (hover: hover) {
+    .file-item.repo-changed-file + .file-item.repo-changed-file:hover::before,
+    .file-item.repo-changed-file:hover + .file-item.repo-changed-file::before {
+        content: none;
+    }
 }
 
 /* Image thumbnails - clickable to show full size */
 .image-thumbnail {
     max-width: 18.75rem;
     max-height: 12.5rem;
-    border-radius: 0.5rem;
+    border-radius: calc(var(--radius-surface) * 2 / 3);
     border: 1px solid var(--border-color);
     cursor: pointer;
     transition: all var(--duration-normal);
@@ -1371,7 +1357,7 @@ html[data-theme="light"] .toast { background: var(--bg-primary); }
     background: rgba(0, 0, 0, 0.7);
     border: var(--image-popup-ring) solid rgba(255, 255, 255, 0.5);
     color: #fff;
-    border-radius: 50%;
+    border-radius: var(--radius-round);
     z-index: 1;
 }
 
@@ -1399,7 +1385,7 @@ html[data-theme="light"] .toast { background: var(--bg-primary); }
     transform: translateY(-50%);
     width: 3rem;
     height: 3rem;
-    border-radius: 50%;
+    border-radius: var(--radius-round);
     background: rgba(0, 0, 0, 0.6);
     border: var(--image-popup-ring) solid rgba(255, 255, 255, 0.5);
     color: #fff;
@@ -1433,7 +1419,7 @@ html[data-theme="light"] .toast { background: var(--bg-primary); }
     font-size: var(--font-size-sm);
     background: rgba(0, 0, 0, 0.6);
     padding: 0.1875rem 0.5rem;
-    border-radius: 0.625rem;
+    border-radius: calc(var(--radius-control) * 1.25);
     pointer-events: none;
 }
 
@@ -1455,8 +1441,9 @@ html[data-theme="light"] .toast { background: var(--bg-primary); }
     padding: 0.125rem;
     /* Exactly half the outer height, so the ends are true semicircles. A larger
        radius is clamped instead, and the clamp is what made the two ends
-       disagree once the height carried a fraction. */
-    border-radius: calc(1.25rem + var(--image-popup-ring));
+       disagree once the height carried a fraction. `--radius-round` only caps
+       it, so a theme that squares pills squares this one. */
+    border-radius: min(calc(1.25rem + var(--image-popup-ring)), var(--radius-round));
     background: rgba(0, 0, 0, 0.6);
     border: var(--image-popup-ring) solid rgba(255, 255, 255, 0.5);
     z-index: 1;
@@ -1467,7 +1454,7 @@ html[data-theme="light"] .toast { background: var(--bg-primary); }
     height: 2.25rem;
     padding: 0 0.5rem;
     border: none;
-    border-radius: 1.125rem;
+    border-radius: min(1.125rem, var(--radius-round));
     background: transparent;
     color: #fff;
     font-size: var(--font-size-md);
@@ -1569,7 +1556,7 @@ html[data-theme="light"] .toast { background: var(--bg-primary); }
         right: calc(1rem + env(safe-area-inset-right, 0px));
         width: 3rem;
         height: 3rem;
-        border-radius: 50%;
+        border-radius: var(--radius-round);
         background: rgba(0, 0, 0, 0.7);
         border: var(--image-popup-ring) solid rgba(255, 255, 255, 0.5);
         color: #fff;

@@ -604,7 +604,6 @@ fn the_cli_carries_the_origin_token_the_engine_minted() {
         None,
         None,
         None,
-        None,
     );
     match origin {
         Some(MessageOrigin::Api {
@@ -625,4 +624,106 @@ fn the_cli_carries_the_origin_token_the_engine_minted() {
         }
         other => panic!("expected Api {{ mode: Agent }}, got {other:?}; request was:\n{request}"),
     }
+}
+
+// ── Who emitted it: the engine says, never the payload ─────────────────────
+//
+// A trigger condition such as `{"actor.kind": "device"}` reads `payload.actor`.
+// So every surface must record its caller's real identity there, whatever the
+// caller wrote. See ADR 0150's amendment.
+
+/// What an agent would write to pass as a person tapping a button.
+fn forged_device_actor() -> serde_json::Value {
+    serde_json::json!({"kind": "device", "device_id": "forged-device"})
+}
+
+/// The `actor` the engine stored on the one event carrying `summary`.
+async fn stored_actor(summary: &str) -> serde_json::Value {
+    let pool = sqlx::PgPool::connect(&crate::support::db_url())
+        .await
+        .expect("connect to the e2e workspace database");
+    let actor: serde_json::Value =
+        sqlx::query_scalar("SELECT payload->'actor' FROM events WHERE payload->>'summary' = $1")
+            .bind(summary)
+            .fetch_one(&pool)
+            .await
+            .expect("the emitted event is stored");
+    pool.close().await;
+    actor
+}
+
+/// POST an emit as the registered e2e device, with extra headers.
+async fn emit_as_device(
+    summary: &str,
+    payload_actor: Option<serde_json::Value>,
+    app: Option<&str>,
+) {
+    let mut payload = serde_json::json!({ "summary": summary });
+    if let Some(actor) = payload_actor {
+        payload["actor"] = actor;
+    }
+    let mut request = crate::support::user_client()
+        .await
+        .post(format!("{}/api/v1/events/emit", crate::support::base_url()))
+        .json(&serde_json::json!({ "event_type": "E2eActorProbed", "payload": payload }));
+    if let Some(app_id) = app {
+        request = request.header("x-lucidos-app-id", app_id);
+    }
+    let resp = request.send().await.expect("emit request failed");
+    assert_eq!(resp.status(), 200, "events/emit should accept the event");
+}
+
+#[tokio::test]
+async fn a_cli_emit_cannot_forge_its_actor() {
+    let summary = unique_marker("cli-forged-actor");
+    let payload = serde_json::json!({ "actor": forged_device_actor() }).to_string();
+    let out = lucidos_cmd()
+        .args([
+            "events",
+            "emit",
+            "E2eActorProbed",
+            "--summary",
+            &summary,
+            "--payload",
+        ])
+        .arg(&payload)
+        .output()
+        .expect("lucidos events emit should run");
+    assert!(
+        out.status.success(),
+        "emit failed: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let actor = stored_actor(&summary).await;
+    assert_eq!(
+        actor["kind"], "api",
+        "the CLI's own identity, not the payload's: {actor}"
+    );
+}
+
+#[tokio::test]
+async fn an_http_emit_cannot_forge_its_actor() {
+    let summary = unique_marker("http-forged-actor");
+    emit_as_device(&summary, Some(forged_device_actor()), None).await;
+
+    let actor = stored_actor(&summary).await;
+    assert_eq!(actor["kind"], "device");
+    assert_eq!(
+        actor["device_id"],
+        crate::support::E2E_DEVICE_ID,
+        "the calling device, not the one the payload named: {actor}"
+    );
+}
+
+/// The Demo Director stamp flow's premise: an app frame's emit, stamped by the
+/// host bridge, still reads as the device that tapped.
+#[tokio::test]
+async fn an_app_frame_emit_reads_as_its_device() {
+    let summary = unique_marker("app-frame-actor");
+    emit_as_device(&summary, None, Some("habit-tracker")).await;
+
+    let actor = stored_actor(&summary).await;
+    assert_eq!(actor["kind"], "device", "{actor}");
+    assert_eq!(actor["device_id"], crate::support::E2E_DEVICE_ID);
 }

@@ -37,6 +37,7 @@ use crate::engine::thread_events::MessageOrigin;
 use crate::engine::types::AgentSession;
 
 use super::lifecycle::{watchdog_gate, WatchdogGate};
+use crate::engine::thread_lifecycle::ThreadStatus;
 
 /// 12 minutes. Longer than the in-loop's 10-min limit: the 2-min grace gives
 /// the in-loop watchdog the first crack. When the in-loop fires successfully
@@ -332,10 +333,10 @@ impl ExternalWatchdog {
     /// * no live `agent_sessions` entry, re-read under the lock HERE, not from
     ///   the tick's opening snapshot, which is a round-trip stale (Codex).
     async fn settle_orphaned_running(&self, live_at_snapshot: &HashSet<Uuid>) {
-        let candidates: Vec<Uuid> = match sqlx::query_scalar::<_, Uuid>(
+        let candidates: Vec<Uuid> = match sqlx::query_scalar::<_, Uuid>(&format!(
             "SELECT ts.thread_id FROM thread_summaries ts \
              WHERE ts.is_coding_agent = true \
-               AND ts.status = 'running' \
+               AND ts.status = {} \
                AND ts.last_activity < now() - make_interval(secs => $1) \
                AND ( \
                    SELECT e.event_type FROM events e \
@@ -346,7 +347,8 @@ impl ExternalWatchdog {
                    SELECT 1 FROM thread_queue q \
                    WHERE q.thread_id = ts.thread_id AND q.status = 'queued' \
                )",
-        )
+            ThreadStatus::Running.sql_literal(),
+        ))
         .bind(quiet_window_secs(self.limit_ms))
         .bind(AGENT_PRODUCED_OUTPUT_EVENT_TYPES)
         .fetch_all(&self.pool)

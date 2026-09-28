@@ -9,16 +9,17 @@
  *  turn says so in its label.
  *
  *  How each states its state is the split that took the most goes. The PAIR
- *  keeps a fixed glyph and brightens (`FullResponseIcon` records why a moving
- *  glyph was wrong for them). The COLLAPSE control is the mirror image: its
- *  glyph flips between a circled minus and plus, and its brightness never
- *  moves. Both halves and the reasons are pinned below, since either one
+ *  keeps a fixed glyph and sits on a pressed chip when on (`FullResponseIcon`
+ *  records why a swapped glyph was wrong for them). The COLLAPSE control is the
+ *  mirror image: its glyph flips between a circled minus and plus, and it never
+ *  wears the chip. Both halves and the reasons are pinned below, since either one
  *  drifting silently re-breaks a reported bug.
  */
 import { describe, expect, it } from 'vitest';
 import type { ComponentChildren, VNode } from 'preact';
 import { InitiatorPanel, ResponsePanel, turnControls } from '../chat-exchange-parts';
 import type { InitiatorDescriptor } from '../ChatExchange';
+import { Disclosure } from '../../shared/Disclosure';
 
 interface AnyVNode extends VNode<{ children?: ComponentChildren; [k: string]: unknown }> {}
 
@@ -102,7 +103,7 @@ describe('turnControls', () => {
   });
 
   it('states each control in aria-pressed', () => {
-    // The CSS keys the brightened "on" look off this same attribute, so a
+    // The CSS keys the pressed chip off this same attribute, so a
     // control that stops reporting its state also stops looking like it has one.
     const off = controls();
     for (const role of ROLES) expect(findByRole(off, role)!.props['aria-pressed'], role).toBe(false);
@@ -148,12 +149,9 @@ describe('turnControls', () => {
   });
 
   it('draws the transcript-wide pair with one fixed glyph, whatever the state', () => {
-    // The full-response control started as an unfold/fold pair, on the theory
-    // that a fixed glyph cannot say which way the next click goes. The two
-    // forms shared a box but not their ink, so the mark visibly changed size
-    // on every click while the body under it was also moving, which read as
-    // the layout dancing. `aria-pressed` plus the brightness rule carry the
-    // state for these two instead.
+    // A swapped glyph changes the mark's size on every click while the body
+    // under it moves. `aria-pressed` plus the pressed chip carry the state for
+    // these two instead.
     for (const role of ['toggle-details', 'toggle-steps']) {
       const glyph = (state: object) => findByRole(controls(state), role)!.props.children as AnyVNode;
       const base = glyph({});
@@ -183,7 +181,7 @@ describe('turnControls', () => {
 
   it('draws a circled minus to collapse and a circled plus to expand, matching the tooltip', () => {
     // The one control whose glyph changes, because it is the one with no colour
-    // to change: it is exempt from the brightness rule. Assert the MEANING, so
+    // to change: it is exempt from the pressed chip. Assert the MEANING, so
     // a swap of the two forms would contradict its own label and fail here.
     const expanded = strokes(false);
     expect(expanded.length, 'expanded: a lone minus').toBe(1);
@@ -339,5 +337,54 @@ describe('InitiatorPanel collapse control', () => {
     const header = findByClass(panel(), 'initiator-header')!;
     expect(header.props.onClick).toBeUndefined();
     expect(String(header.props.class)).toBe('initiator-header');
+  });
+});
+
+/** The fold rolls like a drawer section, through `<Disclosure>`. A bare
+ *  conditional snapped the body shut. Each panel holds exactly one, the body,
+ *  and a fold draws nothing in its place: the lit collapse control says it. */
+describe('the fold rolls', () => {
+  /** The panel's disclosures in document order. */
+  function disclosures(node: ComponentChildren): AnyVNode[] {
+    if (node === null || node === undefined || typeof node === 'boolean') return [];
+    if (typeof node === 'string' || typeof node === 'number') return [];
+    if (Array.isArray(node)) return node.flatMap(disclosures);
+    const v = node as AnyVNode;
+    return v.type === Disclosure ? [v] : disclosures(v.props?.children);
+  }
+
+  const response = (collapsed: boolean) => ResponsePanel({
+    executor: { icon: null, label: 'Claude Code' },
+    status: null,
+    timestamp: '14:32',
+    collapsed,
+    hasBody: true,
+    children: 'the reply',
+  });
+
+  const initiator = (collapsed: boolean) => InitiatorPanel({
+    initiator: { variant: 'system', icon: null, label: 'Lucidos Agent', summary: 'Forwarded message' },
+    timestamp: '14:32',
+    collapsible: true,
+    collapsed,
+    onToggle: noop,
+    actions: 'Diff',
+  });
+
+  it.each([
+    ['response', response, 'response-body'],
+    ['initiator', initiator, 'initiator-body'],
+  ] as const)('rolls the %s body through one disclosure, with nothing in its place', (_name, panel, bodyClass) => {
+    for (const collapsed of [false, true]) {
+      const rolls = disclosures(panel(collapsed));
+      expect(rolls).toHaveLength(1);
+      expect(findByClass(rolls[0].props.children, bodyClass)).not.toBeNull();
+      expect(rolls[0].props.open).toBe(!collapsed);
+    }
+  });
+
+  it('rolls the initiator footer with its body', () => {
+    const [body] = disclosures(initiator(false));
+    expect(findByClass(body.props.children, 'initiator-footer')).not.toBeNull();
   });
 });

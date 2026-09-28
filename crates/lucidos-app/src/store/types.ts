@@ -132,7 +132,7 @@ export const MENU_ITEM_LABELS: Record<MenuItem, string> = {
 export type ConnectionStatus = 'connected' | 'disconnected' | 'connecting';
 
 /** What became of a step. The value set doubles as the CSS class name
- *  (`.inline-step.<outcome>`, `.step-detail-status.<outcome>`); `stepStatus`
+ *  (`.inline-step.<outcome>`, `.step-detail-icon.<outcome>`); `stepStatus`
  *  in `thread-events/exchange-render.ts` adds the user-facing label.
  *
  *  `'unfinished'` is the killed-mid-call state: the turn died (failed /
@@ -766,13 +766,16 @@ export interface InstalledPlugin {
 
 
 // Confirm dialog state
+/** Red for an action that destroys something, blue for everything else. */
+export type ConfirmVariant = 'danger' | 'default';
+
 export interface ConfirmState {
   visible: boolean;
   message: string;
   okLabel: string;
   title?: string;
   cancelLabel?: string;
-  variant?: 'danger' | 'default';
+  variant?: ConfirmVariant;
   resolve?: (value: boolean) => void;
   extraAction?: ToastAction;
   details?: ConfirmDetails;
@@ -835,8 +838,20 @@ export interface ToastAction {
   variant?: 'danger' | 'confirm';
 }
 
+/** Progress as a run of steps: `done` is the fraction finished, and `working`
+ *  is the span of the step in flight. That step has no honest fraction of its
+ *  own, so its span pulses. */
+export interface StepProgress {
+  done: number;
+  working: number;
+}
+
 export interface ToastItem {
   id: number;
+  /** The bold line over the message. Only the title is ever bold, and a
+   *  toast without one is its message alone. */
+  title?: string;
+  /** The toast's text. A newline in it is a line break and nothing more. */
   message: string;
   type: ToastType;
   key?: string;

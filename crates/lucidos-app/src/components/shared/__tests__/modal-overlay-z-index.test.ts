@@ -95,6 +95,8 @@ describe('no backdrop overlayClass declares its own z-index', () => {
         `\\.${cls}(?![\\w-])[^\\s{,>+~]*(?:\\s*,[^{]*)?\\s*\\{([^}]*)\\}`, 'g',
       );
       for (const m of allCss.matchAll(rule)) {
+        // A rule that excludes the overlay element does not level it.
+        if (m[0].includes(':not(.modal-overlay)')) continue;
         if (/z-index:/.test(m[1])) offenders.push(cls);
       }
     }

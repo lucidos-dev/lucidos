@@ -424,7 +424,7 @@ test.describe('the step-log control holds what the reader pressed', () => {
    *  press a control the reader can actually reach from the bottom. The turns
    *  are short with their steps hidden, so the last turn's header is on screen
    *  there. The FOLD case is the reported one, and its control is on screen by
-   *  construction: a folded turn is a header and a stub. */
+   *  construction: a folded turn is only its header. */
   for (const c of [
     { role: 'toggle-steps', name: 'the step log', off: 'false', on: 'true' },
     { role: 'toggle-collapsed', name: 'the fold', off: 'true', on: 'false' },

@@ -76,7 +76,7 @@ pub struct StartupLease {
 
 impl StartupLease {
     /// True when the advisory lock is actually held (serialization is in effect).
-    /// False in the degraded fail-open path. Used for the boot log and tests.
+    /// False in the degraded fail-open path. The tests observe the lease here.
     pub fn is_acquired(&self) -> bool {
         self.acquired
     }

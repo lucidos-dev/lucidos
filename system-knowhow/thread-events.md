@@ -149,9 +149,24 @@ Persisted events are stored with `event_type` set to the variant name and `paylo
 
 - `request_event_id` — links response/terminal events back to the originating request.
 - `channel` — `"chat"` / `"claude_code"` / `"trigger"` (`EventChannel`). The `"claude_code"` wire string is the coding-agent channel for both Claude Code and Codex; the name is retained for compatibility with existing rows and clients.
-- `actor` — `MessageOrigin` of who initiated. Stamped by mutating HTTP handlers via `api/actor::user_actor_resolved`.
+- `actor`: the `MessageOrigin` of who initiated. Stamped by mutating HTTP handlers via `api/actor::user_actor`.
 
 Some variants (`ChangeApplied`, `ChangeDiscarded`, `ChangeReverted`, `ChangeApplyFailed`, `ChangeHardened`, `ThreadStarted`, `ThreadDiscarded`, `ImageUploaded`) carry `actor` as a per-variant field (predates `EventMeta`); `MessageReceived` and several others use `origin: Option<MessageOrigin>`. Treat both as the canonical "who did this" field for that event.
+
+### Engine origins: `origin.kind == "engine"`
+
+When the engine itself writes a message or prompt, the event carries `origin: { "kind": "engine", "reason": { "kind": … } }` and `mode: "engine"`. The reason says why. Two of them seed a whole thread, and name what the engine acted on:
+
+| `reason.kind` | When | Fields |
+|---|---|---|
+| `plugin_setup` | The first message of a *setup thread*, after the user confirmed an install or update with new setup instructions. | `plugin_id`, `plugin_name`, `version` (just installed), `occasion` (`{ "kind": "fresh_install" }` or `{ "kind": "update", "from_version"? }`), optional `confirmed_on_device_id` |
+| `plugin_upstream_proposal` | The first message of a thread that offers the user's local plugin edits to the plugin's author. | `plugin_id`, `plugin_name`, `version`, `patch_path`, optional `confirmed_on_device_id` |
+
+The engine wrote the words, so the engine is the origin, never the user's device. The device that confirmed rides beside it as `confirmed_on_device_id`, the id only. `from_version` is absent when the prior install record names no version.
+
+The other reasons are `continuation_started`, `orphan_recovery`, `scheduler` (with `trigger_id`, optional `trigger_name`), `harden_retrigger`, `stale_session`, `merge_conflict` and `missing_hardening`. `plugin_auto_update` is historical and no longer written.
+
+Every thread the engine spawns carries an origin or a parent link, so a thread's first message always says who started it. A row written before that shows no origin at all.
 
 ## Volume classes
 
@@ -212,11 +227,11 @@ The umbrella `CodingAgent*` family covers Claude Code and Codex (the variants ca
 | Event | When it fires | Volume | Persisted | Triggerable |
 |---|---|---|---|---|
 | `CodingAgentUserMessageSent` | A user message was relayed into the agent's input stream. | one-per-turn | yes | yes |
-| `CodingAgentPromptSent` | An engine-synthesized prompt was injected (orphan-recovery, hardening retrigger, merge-conflict explainer, post-question continuation). Carries `origin: Option<MessageOrigin>`. Audit-only, not rendered in chat. | per-action | yes | yes (use condition) |
+| `CodingAgentPromptSent` | An engine-synthesized prompt was injected (orphan-recovery, hardening retrigger, merge-conflict explainer, post-question continuation). Carries `origin: Option<MessageOrigin>`. An automated prompt (hardening retrigger, merge conflict) always carries an engine origin with its reason. Audit-only, not rendered in chat. | per-action | yes | yes (use condition) |
 | `CodingAgentTextStreamed` | One chunk of the coding agent's assistant text. Join a turn's chunks with no separator: each new text block already starts a new paragraph. A chunk never holds whitespace alone: a paragraph break leads the next chunk instead. Older rows can still hold a bare `"\n\n"`, or two blocks with no break between them. | high-volume-streaming | yes | **no (blocked)** |
 | `CodingAgentThoughtStreamed` | One chunk of the coding agent's streamed reasoning/thinking (CC's `thinking_delta`; Codex's `item/reasoning/*Delta` or `reasoning` item). Coalesced before persistence. Rendered as the live "Thinking" step's content. | high-volume-streaming | yes | **no (blocked)** |
 | `CodingAgentToolCalled` | One coding-agent tool invocation. Carries `name`, `args`, optional `description`, `tool_use_id`. | per-action | yes | yes (use condition) |
-| `CodingAgentToolResult` | The result returned to the coding agent for a prior `CodingAgentToolCalled`. Same `tool_use_id`. | per-action | yes | yes (use condition) |
+| `CodingAgentToolResult` | The result returned to the coding agent for a prior `CodingAgentToolCalled`. Same `tool_use_id` and `name`. `result` holds the whole output (rows before full storage kept 200 chars). | per-action | yes | yes (use condition) |
 | `CodingAgentIdled` | **The coding-agent turn-boundary marker.** Emitted at the end of every coding-agent turn whose Result wasn't an engine-shutdown abort. Carries `has_changes`, `is_external_repo`, `requires_restart`, `cc_session_id`, `coding_agent`, optional `reason`, optional `worktree_path`, optional `worktree_head_sha`, `bg_bash_pending` (recorded-history flag: true when the turn idled with a chat-agent `run_bash_background` task still running; **no longer gates proposal or drives any UI** — the change proposes at idle regardless of background bash, and correctness is covered by harden-at-apply). | one-per-turn | yes | yes |
 | `CodingAgentSettingsChanged` | User changed model, reasoning effort, or permission mode mid-session — and also emitted once at backend init carrying `cc_session_id` (and `claude_config_dir`, the `CLAUDE_CONFIG_DIR` the session was created under) when available so both are durable before the first `CodingAgentIdled`. The session id lets a mid-turn engine restart still resume; the config dir lets the resume re-inject the right `CLAUDE_CONFIG_DIR` so CC finds the transcript even if the user toggled the env var mid-flight. | lifecycle (rare) | yes | yes |
 | `CodingAgentPermissionRequest` | A coding agent asked to confirm a tool call, on one of two raise paths. Claude Code's MCP permission-prompt subprocess fires for a path outside the session's working directories, or `.git/` inside the worktree. Those directories are the worktree, the workspace's `data/` tree and `/tmp`; an in-worktree write, including under `.claude/`, is auto-allowed before any card. Under the `auto` permission mode CC's classifier decides instead. The Codex app-server approval bridge fires for a sandbox-escaping `command_execution` or an out-of-worktree `file_change` under `approvalPolicy: on-request`. The exec escape-hatch protocol emits none. | per-action | yes | yes |
@@ -237,19 +252,19 @@ Not prefixed `CodingAgent*` because the same machinery serves any agent that nee
 | `McpPermissionRequested` | The Lucidos Agent (chat) paused an **MCP server tool** call to ask the user — the chat mirror of `CommandPermissionRequested` for MCP tools. Renders the same `PermissionCard`; the agent loop blocks in-process. Carries `request_id`, `tool_use_id`, `server_id` (MCP registry key), `server_name` (human label), `tool_name` (bare MCP tool), `arguments_summary`. Chat-channel only; flips the thread to `waiting_for_user_answer`. **Skipped (no event, auto-approved) in two cases**: a non-interactive **trigger** thread (no human to prompt) and a server with the `auto_approve` flag set. | per-action (only when the call isn't pre-authorized) | yes | yes |
 | `McpPermissionResolved` | The above was answered (Allow once / Deny / Allow for this thread / Always allow this tool / Always allow this server), or auto-resolved by the engine (superseded / orphan / cancel). Carries `request_id`, `allowed`, optional `reason`, optional `persist_scope` (`narrow` → `Mcp(server:tool)`, `broad` → `Mcp(server:*)`, both persisted to the workspace's `mcp-allowed-tools`; `session` → in-memory per-thread). Flips the thread back to `running` **only from `waiting_for_user_answer`** (a stale resolution on an idle/terminal thread leaves the status unchanged). | per-action | yes | yes |
 | `CommandCheckpointed` | The **command guard** (ADR 0002, Phase 4) bracketed a `ReversibleDanger` command (in-workspace deletion/overwrite) with two snapshots of the workspace's git-visible content: a **pre** image on a safety ref before it ran, and a **post** image after. Diffing the pair is what tells the engine which files the command created, overwrote and deleted, so the card can offer both an Undo and a view of what changed. Emitted **after** the command returns, and only when the two images differ: a command that changed nothing git-visible (typically because its target was gitignored) emits nothing, since its Undo could neither restore nor remove anything. A failed snapshot likewise emits nothing and lets the command run unguarded. Carries `checkpoint_id` (the ref key), `command` (the inspected text), `summary` (the card line), and the counts `restores` / `removes` (what Undo would put back, and what it would delete because the command created it; both 0 on events written before the counts existed). Does not change thread status. | per-action (only when the guard is on AND a command hits the reversible lane AND it changed something git-visible) | yes | yes |
-| `CommandCheckpointReverted` | The user clicked Undo on a `CommandCheckpointed` card (or the engine resolved it): the workspace was restored from the pre image and the files the command created were removed, each only if it still matched what the command wrote. The two refs are kept, so the card's diff stays viewable afterwards. Carries `checkpoint_id`; stamped with the original turn's `request_event_id` so it groups into the same exchange as its checkpoint (the card renders reverted). | per-action | yes | yes |
+| `CommandCheckpointReverted` | The user clicked Undo on a `CommandCheckpointed` card (or the engine resolved it): the files the command created were removed, and the files it deleted or overwrote were put back from the pre image. Each path is touched only if it still holds what the command left, so a later edit survives the undo. A checkpoint with no post image restores the whole pre image instead. The two refs are kept, so the card's diff stays viewable afterwards. Carries `checkpoint_id`; stamped with the original turn's `request_event_id` so it groups into the same exchange as its checkpoint (the card renders reverted). | per-action | yes | yes |
 | `McpConsentRequested` | Legacy persisted audit-log entry (`tool`, `args`) from the pre-card MCP consent flow. No longer emitted — chat MCP consent now uses the in-thread `McpPermissionRequested` / `McpPermissionResolved` permission card above. Kept as a defined variant for replay of any historical rows. | lifecycle | yes | yes |
 
 ## Form requests
 
 A *form request* is something the agent put in front of the user to fill in or confirm. Each carries a `request_id` and a `payload` string (the JSON the client renders from, never a secret). It stays open until exactly one `FormRequestResolved` names its `request_id`. An open request changes no thread status.
 
-Because the request is persisted, a client that missed its stream frame still finds it. The client reads `GET /api/v1/form-requests/pending` on every stream open. The transcript shows each request in its turn, with an Open button while it waits.
+Only the tool named in a row opens its form. A `run_bash`, MCP or fetched result that starts with a form-request prefix opens nothing. Because the request is persisted, a client that missed its stream frame still finds it. The client reads `GET /api/v1/form-requests/pending` on every stream open. The transcript shows each request in its turn, with an Open button while it waits.
 
 | Event | When it fires | Volume | Persisted | Triggerable |
 |---|---|---|---|---|
-| `CredentialRequested` | `request_credential` or `connect_oauth_account` needs a credential the user must type or confirm. `payload` holds `service`, `prompt`, `auth_type`, and optionally `base_urls`, `defaults`, `env_var_name`, or for a widening `existing_credential_id` and `adding_base_urls`. Resolved by the credential save or by `POST /api/v1/form-requests/{request_id}/cancel`. Legacy aliases: `CredentialPromptRequested`, `CredentialRequest`. | per-action | yes | yes |
-| `PluginInstallRequested` | `install_plugin` staged an install. `payload` is the preview (manifest, file list, overwrites, optional setup). `request_id` equals its `install_id`. Resolved by `POST /api/v1/plugins/install/{install_id}/{confirm\|cancel}`. Legacy alias: `PluginInstallRequest`. | per-action | yes | yes |
+| `CredentialRequested` | `request_credential`, `connect_oauth_account` or `configure_email` needs a credential the user must type or confirm. `payload` holds `service`, `prompt`, `auth_type`, and optionally `base_urls`, `defaults`, `env_var_name`, or for a widening `existing_credential_id` and `adding_base_urls`. Resolved by the credential save or by `POST /api/v1/form-requests/{request_id}/cancel`. Legacy aliases: `CredentialPromptRequested`, `CredentialRequest`. | per-action | yes | yes |
+| `PluginInstallRequested` | `install_plugin` or `update_plugin` staged an install. `payload` is the preview (manifest, file list, overwrites, optional setup). `request_id` equals its `install_id`. Resolved by `POST /api/v1/plugins/install/{install_id}/{confirm\|cancel}`. Legacy alias: `PluginInstallRequest`. | per-action | yes | yes |
 | `PluginUninstallRequested` | `uninstall_plugin` staged an uninstall. `payload` is the preview (plugin name and version, files present and missing). `request_id` equals its `uninstall_id`. Resolved by `POST /api/v1/plugins/uninstall/{uninstall_id}/{confirm\|cancel}`. Legacy alias: `PluginUninstallRequest`. | per-action | yes | yes |
 | `EmailConfirmRequested` | `send_email` wants the user to confirm a draft. `payload` is the draft. Resolved by `POST /api/v1/email/send` or the cancel route above. Legacy alias: `EmailConfirmRequest`. | per-action | yes | yes |
 | `OAuthAuthorizationRequested` | `connect_oauth_account` asks the user's device to open the provider's authorization page. `payload` is `{target: "url", url, purpose: "oauth"}`, and the meta `actor` names the device that opens it. The flow's listener resolves it when its 120 s wait ends. | per-action | yes | yes |
@@ -269,9 +284,10 @@ The FreeText fast-path is additionally gated to **human-authored** follow-ups (`
 | `ThreadDiscarded` | A composing thread was explicitly discarded (DELETE /threads/:id). Terminal — the state-machine guard rejects all subsequent compose mutations with 410 Gone. | lifecycle | yes | yes |
 | `ThreadTitleGenerated` | The title-generation pass produced a title for the thread (background, after enough body to summarize). | lifecycle | yes | yes |
 | `ThreadTitleRenamed` | The user manually renamed the thread. | lifecycle | yes | yes |
-| `ThreadSaved` | User pinned / saved the thread. Empty payload. | lifecycle | yes | yes |
-| `ThreadUnsaved` | User unsaved. Empty payload. | lifecycle | yes | yes |
-| `ThreadArchived` | User archived. Empty payload. | lifecycle | yes | yes |
+| `ThreadSaved` | User pinned the thread. A pinned thread is never archived, so pinning an archived thread also moves it back to the inbox. Empty payload. | lifecycle | yes | yes |
+| `ThreadUnsaved` | User unpinned the thread. Empty payload. | lifecycle | yes | yes |
+| `ThreadArchived` | The thread was archived. Empty payload. `actor` says who: a device for the Archive button, or `{"kind":"api","mode":"agent","source_thread_id":…}` for an *agent archive* by that thread (ADR 0310). The engine never archives a thread by itself. The user's Archive unpins a pinned thread. An agent archive refuses one (`thread_pinned`), and an unattended trigger run never archives one. | lifecycle | yes | yes |
+| `ThreadArchiveRequested` | The thread's own agent asked to be archived once its turn ends (`threads` 'archive' with `current`). Empty payload; `actor` names the agent thread. The archive lands as a `ThreadArchived` after the thread settles, and a newer `MessageReceived` closes the request. | lifecycle | yes | yes |
 | `ImageUploaded` | A user attached an image to a compose draft (POST /api/v1/threads/:id/blobs). Carries `hash` (sha256, sole identity), `mime`, `byte_size`, optional `actor`. Bytes live exactly once at `data/blobs/<hh>/<hash>.<ext>`. | per-action | yes | yes |
 | `TriggerStarted` | A scheduled or event-driven trigger run started. Carries `trigger_id`, optional `trigger_name`, optional `prompt`, optional `invocation: TriggerInvocation` (`Schedule` or `Event { event_type, event_id?, thread_id? }`, where `thread_id` is set only for thread-scoped source events and is exposed to script triggers as `TRIGGER_EVENT_THREAD_ID`), optional `origin`, `go_to_review: bool`, optional `model`, `reasoning_effort` and `provider`. Aliases on the wire: `task_id`, `task_name` (legacy from when triggers were called "scheduled tasks"). `model` / `reasoning_effort` / `provider` record what the fire actually ran on (the trigger's own pin, else the account chat default, and for the provider the model's own preferred route). This is a trigger thread's *starter* event and it has no `MessageReceived`, so those three fields are where the per-thread model memory reads from: a follow-up on a trigger thread reuses the fire's model instead of snapping back to the account default. Absent on runs recorded before the fields existed. | lifecycle | yes | yes |
 | `TriggerCompleted` | A trigger run finished. Carries `trigger_id`, optional `trigger_name`, optional `result_summary`. Same aliases. The engine guarantees `result_summary` is a non-empty, single trimmed line for every run it emits — when a script exits 0 with no stdout it falls back to the script's last non-empty line, else `"<name> completed (exit <code>, no output)"`; an intent run with no final text falls back to `"<name> completed (no output)"`. So a blank summary never surfaces and idle-detector triggers don't read as a no-op fire flood to the learning/audit sweeps. | lifecycle | yes | yes |
@@ -293,15 +309,32 @@ changes nothing about retrievability. Delete removes the rows, and what Lucidos
 learned from them, with no undo. It is offered to the workspace owner in the UI
 and to nobody else, so no tool, CLI verb or SDK method can reach it.
 
+### Correcting a memory is a `SystemEvent` too
+
+A memory correction belongs to no thread, so `MemoryCorrected` is a
+**`SystemEvent`** on aggregate `memory` with `aggregate_id` `global`.
+
+| Event | When it fires | Volume | Persisted | Triggerable |
+|---|---|---|---|---|
+| `MemoryCorrected` | The agent corrected a long-term memory at the user's word, through the `memory` tool's `correct` or `correct_by_id` action. Carries `search_query`, `wrong_fact`, `removed` (each deleted entry's `summary`, `entities` and `source`), an optional `correction` (the fact that replaces it), and `recorded_at`. Every memory rebuild replays it, which is what keeps a corrected fact from coming back. | per-action (rare) | yes | yes |
+
 ## Changes (per-thread coding-agent change proposals)
 
 The change family is per-thread — `change_id` is the primary identifier. `ChangeProposed` is emitted **once per coding-agent turn**, at end-of-turn, gated by `may_touch_change_state_at_idle` (only on `TerminalKind::Generated`; aborts/cancels/failures don't propose). That's the "coding agent is done with real finished work" contract: Apply/proposal state waits for idle. The Diff button is separate git truth and can become available earlier when the worktree post-commit hook refreshes `coding_agent_has_diff`.
 
 `files` carries the branch's net diff, so the event is also how an **existing** change is corrected: when later commits cancel the diff out, the same `change_id` is re-emitted with `files: []`, which re-syncs the row to zero files, clears `requires_restart`, and — because `coding_agent_has_diff` is derived from `files` rather than hardcoded — stops claiming the thread has a diff. The change stays `pending`; only the user resolves it. An empty-`files` emit never *creates* a row (the reconcile refuses when the branch has no pending change), so it can't invent an empty change for a diffless session.
 
-**A coding-agent thread holds at most one pending change at a time.** A thread works on one branch/worktree; when a merge-conflict re-run (or any re-spawn) proposes on a *new* branch, `propose_change` first discards the thread's pending change(s) on the *old* branch(es) — emitting `ChangeDiscarded` for each **before** the new `ChangeProposed` (so the discard's flag-clear can't wipe the freshly-set `coding_agent_proposed`). As a backstop, `apply_change` runs the same reconcile after a *successful* apply — gated on the change actually landing (`ApplyStatus::Applied`, never `Noop`/`Hardening`/`Conflict`, which would discard a newer sibling) — so it covers the panel Apply, the no-live `apply_now` paths, and the Apply-All driver in one place; the live in-place merge path reconciles in `apply_now_success`. Without this, an orphaned `pending` row lingers on the abandoned branch and the frontend (which treats *any* pending row for the thread as "has pending changes") keeps offering Apply/Discard and never Archive. Same-branch multi-change is preserved (reconcile keys on branch/`change_id`, not "everything else"), and `discard_change` notifies the Apply-All driver so discarding a sibling that is itself a batch member advances the batch instead of stalling it. See `docs/plans/2026-07-01-orphaned-pending-change-blocks-archive.md`.
+**A coding-agent thread holds at most one pending change at a time.** A thread works on one branch and worktree. A merge-conflict re-run, or any re-spawn, can propose on a *new* branch. `propose_change` then first discards the thread's pending changes on the *old* branches. It emits `ChangeDiscarded` for each **before** the new `ChangeProposed`, so the discard's flag-clear cannot wipe the freshly-set `coding_agent_has_diff`. `coding_agent_proposed` follows the thread's pending `changes` rows, so the order does not matter for it.
 
-Legacy: historical events with empty `change_id` + `commit_sha` set are from the old per-commit git hook (deleted along with `commit_hook.rs` + `/api/v1/internal/commit-made` to enforce the "never auto-propose for unfinished work" rule). The projection still handles them on replay, but they're inert — no `thread_summaries` updates, no row inserts into `changes`. The current post-commit hook emits no `ChangeProposed`; it only refreshes `coding_agent_has_diff` through the internal `coding-agent-diff-refresh` endpoint. The DB-level `changes` table is a projection over the aggregate events only.
+As a backstop, `apply_change` runs the same reconcile after a *successful* apply. It is gated on the change actually landing (`ApplyStatus::Applied`, never `Noop`, `Hardening` or `Conflict`, which would discard a newer sibling). So it covers the panel Apply, the no-live `apply_now` paths and the Apply-All driver in one place. The live in-place merge path reconciles in `apply_now_success`.
+
+Without this, an orphaned `pending` row lingers on the abandoned branch. The frontend treats *any* pending row for the thread as "has pending changes", so it keeps offering Apply and Discard and never Archive. Same-branch multi-change is preserved, because the reconcile keys on the branch and `change_id`, not on "everything else". `discard_change` notifies the Apply-All driver, so discarding a sibling that is itself a batch member advances the batch instead of stalling it. See `docs/plans/2026-07-01-orphaned-pending-change-blocks-archive.md`.
+
+**A proposal never takes a thread off an open question.** A thread parked on an unanswered `UserQuestionAsked` keeps `waiting_for_user_answer` through a `ChangeProposed`. Recovery proposes for such a thread after a restart, and it must not offer Apply over the question. Apply Now refuses a parked thread too, with a 409 and the `question_open` reason, or `question_unknown` when it cannot check. Every other Apply route refuses a parked thread whatever its status reads. See ADR 0293.
+
+Legacy: historical events with an empty `change_id` and `commit_sha` set come from the old per-commit git hook. That hook was deleted with `commit_hook.rs` and `/api/v1/internal/commit-made`, to enforce the "never auto-propose for unfinished work" rule. The projection still handles them on replay: they update an existing pending row by branch, and never insert one. The thread's `coding_agent_proposed` and `coding_agent_requires_restart` follow that row, as they follow every `changes` write.
+
+The current post-commit hook emits no `ChangeProposed`. It only refreshes `coding_agent_has_diff` through the internal `coding-agent-diff-refresh` endpoint. The DB-level `changes` table is a projection over the aggregate events only.
 
 | Event | When it fires | Volume | Persisted | Triggerable |
 |---|---|---|---|---|
@@ -324,7 +357,7 @@ Legacy: historical events with empty `change_id` + `commit_sha` set are from the
 | `ChildThreadDetached` | A child thread was moved to top level (the thread menu's **Move to top level**, the `threads` tool's `detach_child`, or `lucidos threads detach`). Emitted on the **former parent**, never on the child. The projection cuts the edge: the child's `parent_thread_id` becomes null and it becomes a top-level thread. It wakes nothing, and the child keeps running. Carries `child_thread_id` and optional `child_thread_title`. See § `ChildThreadDetached`. | per-action | yes | yes |
 | `ContextDismissed` | **Retired by ADR 0109 and still readable.** Nothing emits it any more: `dismiss_from_context` is gone, because under *self-curated context mode* the *swept window* takes a result on its own. Existing workspaces hold rows, and the resume helper still honours every one of them, so a body an agent dropped before the change stays dropped. Carries `dismissed_event_id`, the *handle* of the event the body came from. | per-action | yes | yes |
 | `ContextKeptOpen` | The agent set one tool result's clock back to zero, by writing its address under a `[KEEP OPEN]` heading in its *working understanding*. Carries `kept_open_event_id`, the *handle* of the `ToolCalled` behind the result. Same-thread only, and only that type: a keep moves the clock on a `tool_result` block, and nothing else is one. The keep is applied where the span is parsed, so this event is the durable record rather than the mechanism. It applies once, from the reply that wrote it. It exempts the item from no pass: the trimmer at the wall takes held items last and still takes them. Reaches only a workspace running *self-curated context mode*: everywhere else nothing is swept, so a keep would say nothing. | per-action | yes | yes |
-| `WorktreeCleaned` | Background worktree cleanup ran on this thread (Phase 10.2/10.3). Carries `tier: u8` (0 = applied/clean worktree removed after the short grace; 1 = build artifacts stripped, worktree still on disk; 2 = entire worktree removed — the full-removal tier, also used for *stranded* worktrees whose git admin dir is gone), `freed_bytes: u64` (best-effort), `branch_deleted: bool` (a full removal that also dropped a fully-merged branch; always false for stranded removal). | lifecycle (rare per thread) | yes | yes |
+| `WorktreeCleaned` | Worktree cleanup ran on this thread: the background worker, a Disk Usage row button, or the page's recommended cleanup. Carries `tier: u8` (0 = a *finished worktree* removed, by the worker after the short grace or by the recommended cleanup at once; 1 = build artifacts stripped, worktree still on disk; 2 = entire worktree removed: the full-removal tier, also used for *stranded* worktrees whose git admin dir is gone), `freed_bytes: u64` (best-effort), `branch_deleted: bool` (a full removal that also dropped a fully-merged branch; always false for stranded removal). | lifecycle (rare per thread) | yes | yes |
 
 ## Event wait (a thread holding a subscription)
 
@@ -619,7 +652,7 @@ All transient names are past tense (events-only model). They cannot trigger (the
 | `PushNotificationRequested` | Request event — prompts the device to register for web push. Empty payload. Legacy alias: `PushNotificationRequest`. | lifecycle |
 | `AppUiRefreshRequested` | Tells any open app iframe with `app_id` to reload itself. Legacy alias: `RefreshAppUI`. | per-action |
 | `AppUiCaptureRequested` | Asks an open app iframe to capture state for `request_id`. The reply lands via the SDK capture path. Legacy alias: `CaptureAppUI`. | per-action |
-| `NavigationRequested` | Tells the frontend to navigate (URL, intra-app route, etc.). Carries `payload: String`. An agent navigate (`navigate_ui`) also carries an optional device `actor`: the device named in the tool's `device` argument, else the turn's *last used device*. Every page receives the event and drops it unless the actor is its own device. So exactly one device acts: it opens the target if it shows the thread, otherwise it offers an Open button. Absent for a turn with no device and for the SDK app-iframe (nil-thread) path. Nothing reports back whether a page acted. Only a connected page receives it, and nothing stores or retries it. So the `navigate_ui` result says whether the target device had Lucidos visible in the last 2 minutes. When it had not, the result offers `send_notification` with a navigate tap instead, which stays in the inbox. | per-action |
+| `NavigationRequested` | Tells the frontend to navigate (URL, intra-app route, etc.). Carries `payload: String`. An agent navigate (`navigate_ui`) also carries an optional device `actor`: the device named in the tool's `device` argument, else the turn's *last used device*. Every page receives the event and drops it unless the actor is its own device. So exactly one device acts: it opens the target if it shows the thread, otherwise it shows a toast the user taps to open it. Absent for a turn with no device and for the SDK app-iframe (nil-thread) path. Nothing reports back whether a page acted. Only a connected page receives it, and nothing stores or retries it. So the `navigate_ui` result says whether the target device had Lucidos visible in the last 2 minutes. When it had not, the result offers `send_notification` with a navigate tap instead, which stays in the inbox. | per-action |
 | `CodingAgentThreadSpawned` | A child coding-agent thread (spawned via `run_coding_agent` / `run_thread`) has started. Carries `cc_thread_id`, `title`, `agent`. SSE-only — the persisted record of the child is its own thread row. Alias: `CcThreadSpawned`. | per-action |
 | `CodingAgentDiffChanged` | A coding-agent worktree post-commit hook reconciled `coding_agent_has_diff` and the value changed. Carries `has_diff` and a full thread aggregate on SSE so the frontend can show or hide the Diff button immediately. Does **not** imply `ChangeProposed` / Apply readiness. | per-action |
 | `ChildrenCountChanged` | A parent or ancestor thread's aggregate metadata changed. Carries the full updated aggregate (`active_children_count`, `total_children_count`, `blocking_descendant_count`, `attention_descendant_count`, …). Fires when (a) a direct child terminates and the parent's active/total counts shift, or (b) any descendant's "blocking" or "attention-needing" predicate flips (Running, WaitingForUserAnswer, or `has_pending_changes` && CodingAgent — see `is_blocking` / `is_attention_needing`), in which case every ancestor on the chain receives the broadcast with its updated counts. Drives the "Active children" badge, the cascading-archive button-hide (via `blocking_descendant_count`), and the Current-bubble routing in `display_section` (via `attention_descendant_count`). | per-action |
@@ -641,7 +674,6 @@ For `CodingAgentIdled`, `UserQuestionAsked`, `UserQuestionAnswered`, and the `Co
     "text": "Summarize my open PRs.",
     "user_image_hashes": [],
     "device_id": "device-abc123",
-    "device": "My MacBook",
     "parent_thread_id": null,
     "spawning_event_id": null,
     "mode": "human",
@@ -650,14 +682,15 @@ For `CodingAgentIdled`, `UserQuestionAsked`, `UserQuestionAnswered`, and the `Co
     "provider": "anthropic",
     "origin": {
       "kind": "device",
-      "device_id": "device-abc123",
-      "label": "My MacBook"
+      "device_id": "device-abc123"
     }
   }
 }
 ```
 
 `mode` is `ActorMode` (`human` / `agent` / `engine`). `origin` is the structured `MessageOrigin` (`Device` / `Api` / `Workspace` / `ThreadLink` / `Engine` / `System`). Old DB rows may be missing `origin` — the frontend's `legacyOrigin()` synthesizes from `device_id` / `parent_thread_id`.
+
+**A device is stored by id only.** A `Device` origin or actor carries `device_id` and no name, and `MessageReceived` carries no `device` name either. Lucidos shows the device's current name wherever it appears, so a rename reaches older events. Rows written before this carry a `label` (and `device`) that nothing reads. An app gets the id and no name: no SDK call lists devices today.
 
 `voice_session_id` names the *voice session* a message was **spoken** on. No `MessageReceived` carries one today: a caller's words are a `SpokenMessageReceived` instead (ADR 0201). Rows written before that change still carry it, and the transcript still reads it to mark such a bubble as spoken.
 
@@ -689,7 +722,8 @@ So a `mode: "human"` turn an agent wrote is not a cosmetic mislabel, it is a
 record the user cannot distinguish from their own.
 
 **An agent must never post a message the engine would record as human.** The
-engine enforces this on both chat entry points: `mode: "human"` is accepted only
+engine enforces this on its one chat entry point, `POST /api/v1/chat/stream`
+(`api::chat::chat_submit`): `mode: "human"` is accepted only
 from a caller carrying a `device_id` that resolves in the `devices` table (the
 user's own client, which sends `x-lucidos-device-id` on every mutating request)
 or a `caller_workspace` (the cross-workspace contract, where the calling
@@ -701,9 +735,12 @@ origin token was held to `subprocess_chat_legitimate` (which refuses
 `mode: Human` outright), while the same subprocess shelling out to `curl`
 dropped the token, read as an ordinary external API client, and was allowed.
 Dropping your credential bought more privilege than presenting it. It no longer
-does.
+does. Adding a `caller_workspace` does not reopen it either. The engine still
+holds a subprocess to `subprocess_chat_legitimate` for a thread that already
+exists and for any `mode: "human"` post. Only its `agent` or `engine` top-thread
+create skips that check, and the top-thread authority check covers it.
 
-Two related refusals on the same path, both of which write nothing:
+Three related refusals on the same path, all of which write nothing:
 
 - **404** when `thread_id` names no existing thread and the request carries no
   create signal (`new_thread: true`, a `parent_thread_id`, or a
@@ -714,6 +751,10 @@ Two related refusals on the same path, both of which write nothing:
 - **409** when the request asserted a different workspace than the answering
   engine serves (`x-lucidos-target-workspace`). The body names the actual
   workspace.
+- **400** when the body `mode` contradicts the request's credential, for
+  example a coding-agent's origin token sent with `mode: "engine"`. The body
+  names the mode the credential carries. Send that mode. See
+  `api::chat::origin_agrees_with_mode`.
 
 If no tool covers what you were asked to do, say so. Do not hand-roll HTTP to
 the engine to get around it: see `system-knowhow/lucidos-cli.md` § "Never post
@@ -750,8 +791,7 @@ So do not infer parent-ness from a `ThreadLink` origin. Read `parent_thread_id` 
     "channel": "chat",
     "actor": {
       "kind": "device",
-      "device_id": "device-abc123",
-      "label": "My MacBook"
+      "device_id": "device-abc123"
     }
   }
 }
@@ -997,7 +1037,11 @@ Both are character counts, never a token count. The sections carry no per-sectio
 
 The result returned to the chat agentic loop for a prior `ToolCalled`. `result` is the textual output, such as bash stdout or file contents. `images` carries generated-image hashes that render inline in the chat exchange. `tool_called_event_id` names the `ToolCalled` it answers, on every live emit and on backfills from `recover_orphan_tool_calls`. It is the only reliable pairing key: a batch of pure reads runs concurrently and answers in completion order. Every engine reader and the frontend's step rows pair by it, and fall back to position only for legacy rows that lack it.
 
-**Snapshot endpoint strips the heavy field.** Mirrors the `ContextCaptured` contract above: `GET /api/v1/threads/:thread_id/events` removes `result` from `ToolResult` payloads and stamps `result_stripped: true` so the events list stays small on busy tool-heavy threads (one bash result can be 150 kB+; a long session carries hundreds, totaling ~2 MB the chat exchange never renders — only `StepDetailModal.tsx`'s `<pre class="step-detail-result">` does). Live SSE emissions still carry the full text. The strip keeps `name` + `images` inline — the step row label and generated-image rendering paths in `thread-events.ts` need them. To fetch the dropped text on demand, call `GET /api/v1/events/:event_id/tool-result` — returns `{ result: string | null }` for that single `ToolResult` event (`null` for image-only results, which never had a textual result written). Same event-id-only routing as the context endpoint. The same `?include_context=true` flag on the snapshot endpoint that opts back into `ContextCaptured.sections` now ALSO opts back into `ToolResult.result` — covers `exportThread.ts` and any future bulk consumer. `CodingAgentToolResult` is NOT stripped today; if its bash-output bloat becomes the bottleneck, the same pattern (`strip_*_content` helper + `GET /api/v1/events/:event_id/...` endpoint + a marker field) applies.
+**Snapshot endpoint strips the heavy field, for both channels.** It mirrors the `ContextCaptured` contract above. `GET /api/v1/threads/:thread_id/events` removes `result` from every `ToolResult` and `CodingAgentToolResult` payload and stamps `result_stripped: true`. One bash result can be 150 kB, and a long session carries hundreds. Only the step detail (`StepDetailModal.tsx`) renders a result, never the chat exchange. The strip keeps `name`, `images` and `tool_use_id`, which the step row label, the generated-image paths and the pairing need.
+
+To fetch the dropped text, call `GET /api/v1/events/:event_id/tool-result`. It returns `{ result: string | null }` for that one event, with `null` for an image-only result. The routing is event-id-only, like the context endpoint. `?include_context=true` on the snapshot opts back into `result` as well as `ContextCaptured.sections`; `exportThread.ts` uses it.
+
+On the live SSE stream a `ToolResult` carries its full text, and a `CodingAgentToolResult` arrives already stripped. See `CodingAgentToolResult` in [coding-agent-events](coding-agent-events.md) for why.
 
 ### `ChangeProposed`
 
@@ -1034,7 +1078,7 @@ Multiple events with the same `change_id` arrive for a branch (one per commit). 
     "client_update": false,
     "commits": ["docs: add thread-events reference"],
     "thread_title": "Document all ThreadEvents",
-    "actor": { "kind": "device", "device_id": "device-abc123", "label": "My MacBook" },
+    "actor": { "kind": "device", "device_id": "device-abc123" },
     "pre_merge_sha": "9b38db1b4…",
     "post_merge_sha": "a1b2c3d4e…",
     "path": ""
@@ -1178,7 +1222,11 @@ The event lands on the parent so that ADR 0011's recovery checks still read the 
 }
 ```
 
-`tier: 0` = an applied/clean worktree (branch at main HEAD, no pending change) removed after the short grace window. `tier: 1` = build artifacts (`target/`, `node_modules/`, `.lucidos/cache/`) stripped from a long-idle worktree (still on disk). `tier: 2` = entire worktree directory removed — both the 30-day idle sweep and *stranded* worktrees (their git admin dir under `.git/worktrees/<name>` is gone, so git can't act on them and they're deleted directly). `branch_deleted: true` only on a full removal that also dropped a fully-merged branch; stranded removal never deletes a branch (it touches no refs), so `branch_deleted` is always false there.
+- `tier: 0`: a finished worktree (clean, branch at main HEAD, no pending change) removed. The background worker waits out a short grace window first. The Disk Usage page's recommended cleanup removes it at once, on the user's request.
+- `tier: 1`: build artifacts (`target/`, `node_modules/`, `.lucidos/cache/`) stripped from an idle worktree, which stays on disk. This happens, for example, an hour after its change was applied.
+- `tier: 2`: the entire worktree directory removed. That covers the 30-day idle sweep and *stranded* worktrees. A stranded worktree's git admin dir under `.git/worktrees/<name>` is gone, so git cannot act on it.
+
+`branch_deleted: true` appears only on a full removal that also dropped a fully merged branch. A stranded removal touches no refs, so there `branch_deleted` is always false.
 
 ### `ContinuationStarted`
 

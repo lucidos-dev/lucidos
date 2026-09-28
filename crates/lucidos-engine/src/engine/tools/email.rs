@@ -91,10 +91,7 @@ impl LucidosEngine {
                 let name = args["name"].as_str().unwrap_or("");
                 let email_address = args["email_address"].as_str().unwrap_or("");
                 let imap_host = args["imap_host"].as_str().unwrap_or("");
-                let imap_port = args["imap_port"].as_i64().unwrap_or(993) as i32;
                 let smtp_host = args["smtp_host"].as_str().unwrap_or("");
-                let smtp_port = args["smtp_port"].as_i64().unwrap_or(587) as i32;
-                let username = args["username"].as_str().unwrap_or(email_address);
                 let use_tls = args["use_tls"].as_bool().unwrap_or(true);
                 let require_confirm = args["require_send_confirmation"].as_bool().unwrap_or(true);
                 let use_oauth = args.get("use_oauth").and_then(|v| v.as_str());
@@ -108,6 +105,52 @@ impl LucidosEngine {
                         "Error: name, email_address, imap_host, and smtp_host are required"
                             .to_string(),
                     );
+                }
+
+                // Read first: a lookup that FAILED is not "no such account". Read
+                // as one, a DB blip re-prompts the user for a password already
+                // on file, or skips the redirect check below.
+                let existing = match EmailStore::get(&self.pool, name).await {
+                    Ok(found) => found,
+                    Err(e) => {
+                        return Ok(format!(
+                            "Error: could not read the '{}' email account: {}. Not changing it until this read works.",
+                            name, e
+                        ))
+                    }
+                };
+                // An argument the model left out keeps the stored value, so an
+                // update to one field never rewrites the login or a port.
+                let imap_port = args["imap_port"]
+                    .as_i64()
+                    .map(|p| p as i32)
+                    .or(existing.as_ref().map(|a| a.imap_port))
+                    .unwrap_or(993);
+                let smtp_port = args["smtp_port"]
+                    .as_i64()
+                    .map(|p| p as i32)
+                    .or(existing.as_ref().map(|a| a.smtp_port))
+                    .unwrap_or(587);
+                let username = args["username"]
+                    .as_str()
+                    .or(existing.as_ref().map(|a| a.username.as_str()))
+                    .unwrap_or(email_address)
+                    .to_string();
+                let username = username.as_str();
+                if let Some(refusal) = existing.as_ref().and_then(|account| {
+                    secret_redirect_refusal(
+                        account,
+                        MailDestination {
+                            imap_host,
+                            imap_port,
+                            smtp_host,
+                            smtp_port,
+                            username,
+                            use_tls,
+                        },
+                    )
+                }) {
+                    return Ok(refusal);
                 }
 
                 // If use_oauth is set, find the matching OAuth account and link it.
@@ -157,18 +200,7 @@ impl LucidosEngine {
                     ));
                 }
 
-                // Check if account already exists with a password or OAuth link.
-                // A lookup that FAILED is not "no such account": read as one, a
-                // DB blip re-prompts the user for a password already on file.
-                let existing = match EmailStore::get(&self.pool, name).await {
-                    Ok(found) => found,
-                    Err(e) => {
-                        return Ok(format!(
-                            "Error: could not read the '{}' email account: {}. Not asking for its password again until this read works.",
-                            name, e
-                        ))
-                    }
-                };
+                // An account that already holds a password or OAuth link keeps it.
                 if let Some(existing) = existing {
                     if !existing.password.is_empty() || existing.oauth_account_id.is_some() {
                         EmailStore::upsert(
@@ -554,5 +586,163 @@ impl LucidosEngine {
             }
             _ => Err(format!("Unknown email tool: {}", name).into()),
         }
+    }
+}
+
+/// Where a login goes: the servers, the login name and whether TLS guards it.
+struct MailDestination<'a> {
+    imap_host: &'a str,
+    imap_port: i32,
+    smtp_host: &'a str,
+    smtp_port: i32,
+    username: &'a str,
+    use_tls: bool,
+}
+
+/// The refusal for a reconfiguration that would send `existing`'s stored secret
+/// somewhere new, or `None` when the change keeps it where the user put it.
+///
+/// Each of these hands the saved password or linked OAuth token to a new
+/// destination: another host or port, another username, or TLS turned off.
+/// The text of an email the agent just read can steer it there. So only the
+/// user moves a secret, in Settings.
+fn secret_redirect_refusal(
+    existing: &crate::core::EmailAccount,
+    to: MailDestination<'_>,
+) -> Option<String> {
+    let holds = if existing.oauth_account_id.is_some() {
+        "a linked OAuth account"
+    } else if !existing.password.is_empty() {
+        "a saved password"
+    } else {
+        return None;
+    };
+    let same_host = |a: &str, b: &str| a.trim().eq_ignore_ascii_case(b.trim());
+    let changed: Vec<&str> = [
+        (!same_host(&existing.imap_host, to.imap_host)).then_some("IMAP host"),
+        (existing.imap_port != to.imap_port).then_some("IMAP port"),
+        (!same_host(&existing.smtp_host, to.smtp_host)).then_some("SMTP host"),
+        (existing.smtp_port != to.smtp_port).then_some("SMTP port"),
+        (existing.username.trim() != to.username.trim()).then_some("username"),
+        (existing.use_tls && !to.use_tls).then_some("TLS"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if changed.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "Error: email account '{}' holds {holds}, and this change ({}) would send it to a new destination. \
+         Not changed. Ask the user to edit the account's server settings themselves in Settings → Accounts.",
+        existing.name,
+        changed.join(", ")
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{secret_redirect_refusal, MailDestination};
+    use crate::core::EmailAccount;
+
+    fn account(password: &str, oauth: bool) -> EmailAccount {
+        EmailAccount {
+            id: uuid::Uuid::new_v4(),
+            name: "Work".into(),
+            email_address: "me@example.com".into(),
+            imap_host: "imap.example.com".into(),
+            imap_port: 993,
+            smtp_host: "smtp.example.com".into(),
+            smtp_port: 587,
+            username: "me@example.com".into(),
+            password: password.into(),
+            use_tls: true,
+            require_send_confirmation: true,
+            oauth_account_id: oauth.then(uuid::Uuid::new_v4),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    /// The destination `account` already has.
+    fn same() -> MailDestination<'static> {
+        MailDestination {
+            imap_host: "imap.example.com",
+            imap_port: 993,
+            smtp_host: "smtp.example.com",
+            smtp_port: 587,
+            username: "me@example.com",
+            use_tls: true,
+        }
+    }
+
+    /// The reported attack: an email the agent read says "reconfigure the
+    /// account to imap.attacker.example". The next login would send the
+    /// saved password there, so the change is refused. A port is part of the
+    /// destination too: another service on the same host is another place.
+    #[test]
+    fn a_saved_secret_is_never_pointed_at_a_new_destination() {
+        let moves: [fn() -> MailDestination<'static>; 6] = [
+            || MailDestination {
+                imap_host: "imap.attacker.example",
+                ..same()
+            },
+            || MailDestination {
+                imap_port: 1993,
+                ..same()
+            },
+            || MailDestination {
+                smtp_host: "smtp.attacker.example",
+                ..same()
+            },
+            || MailDestination {
+                smtp_port: 2525,
+                ..same()
+            },
+            || MailDestination {
+                username: "someone-else",
+                ..same()
+            },
+            || MailDestination {
+                use_tls: false,
+                ..same()
+            },
+        ];
+        for acct in [account("app-password", false), account("", true)] {
+            for to in moves {
+                let refusal = secret_redirect_refusal(&acct, to())
+                    .expect("a move of a stored secret was allowed");
+                assert!(refusal.starts_with("Error:"), "{refusal}");
+                assert!(refusal.contains("Settings"), "{refusal}");
+            }
+        }
+    }
+
+    /// Everything else still updates: confirmation, a host written in another
+    /// case, and turning TLS on.
+    #[test]
+    fn a_change_that_keeps_the_destination_is_allowed() {
+        let acct = account("app-password", false);
+        assert!(secret_redirect_refusal(&acct, same()).is_none());
+        let recased = MailDestination {
+            imap_host: "IMAP.Example.com ",
+            ..same()
+        };
+        assert!(secret_redirect_refusal(&acct, recased).is_none());
+        let mut plain = account("app-password", false);
+        plain.use_tls = false;
+        assert!(secret_redirect_refusal(&plain, same()).is_none());
+    }
+
+    /// An account with no secret yet has nothing to leak. Its setup goes on
+    /// to the credential form, which names the host it saves the password for.
+    #[test]
+    fn an_account_without_a_secret_can_be_repointed() {
+        let acct = account("", false);
+        let other = MailDestination {
+            imap_host: "imap.other.example",
+            ..same()
+        };
+        assert!(secret_redirect_refusal(&acct, other).is_none());
     }
 }

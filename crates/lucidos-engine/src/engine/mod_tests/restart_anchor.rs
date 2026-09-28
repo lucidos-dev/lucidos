@@ -34,7 +34,6 @@ fn message_received(text: &str) -> ThreadEvent {
         text: text.to_string(),
         user_image_hashes: vec![],
         device_id: None,
-        device: None,
         image_description: None,
         parent_thread_id: None,
         spawning_event_id: None,
@@ -173,7 +172,6 @@ async fn queued_followup_does_not_steal_the_in_flight_anchor() {
         EventMeta {
             actor: Some(MessageOrigin::Device {
                 device_id: "dev-1".into(),
-                label: "Test Device".into(),
             }),
             ..turn_meta.clone()
         },

@@ -80,11 +80,13 @@ function landOnFilesPanel(): void {
   pushNavState();
 }
 
-export async function loadRepoFiles(repoId: string): Promise<void> {
-  // Always flip to loading: callers (selectRepoChange, viewThreadCcDiff)
-  // change repoPending.branch_name before calling, so the previous file
-  // tree is for a different ref and would be misleading if left visible.
-  repoFiles.value = { status: 'loading' };
+export async function loadRepoFiles(repoId: string, opts: { reread?: boolean } = {}): Promise<void> {
+  // Flip to loading, unless this re-reads the tree already shown: callers
+  // (selectRepoChange, viewThreadCcDiff) change repoPending.branch_name before
+  // calling, so the previous file tree is for a different ref and would be
+  // misleading if left visible.
+  if (opts.reread) setLoadingIfFresh(repoFiles);
+  else repoFiles.value = { status: 'loading' };
   const gitRef = repoPending.value?.branch_name;
   // A tree for a repo or branch the panel has since left must not land.
   const stillWanted = () => repoSource.value === repoId && repoPending.value?.branch_name === gitRef;
@@ -107,9 +109,10 @@ export function toggleRepoFolder(path: string): void {
 }
 
 /** repoFiles is cached; reload it alongside repoChanges so a merge to main
- *  shows up in the Files tree without a manual refresh. */
+ *  shows up in the Files tree without a manual refresh. Same repo, same ref,
+ *  so both stay on screen while they re-read. Also the panel's refresh. */
 export async function refreshRepoView(repoId: string): Promise<void> {
-  await Promise.all([loadRepoFiles(repoId), loadRepoChanges(repoId)]);
+  await Promise.all([loadRepoFiles(repoId, { reread: true }), loadRepoChanges(repoId)]);
 }
 
 export async function loadRepoChanges(repoId: string): Promise<void> {
@@ -129,28 +132,48 @@ export async function loadRepoChanges(repoId: string): Promise<void> {
   }
 }
 
+/** How many times `loadMoreRepoChanges` re-cursors when the list moves under
+ *  its request. Bounded, so a busy stream of applies cannot spin. */
+const MAX_REPO_CHANGES_PAGE_RETRIES = 3;
+
+/** Load the next page of a repo's applied changes (infinite scroll).
+ *
+ *  Two things can move under the request. The reader can switch the panel to
+ *  another repo, and then the page belongs to a list nobody is showing. Or
+ *  `refreshRepoView` can reload this repo's list after an apply, and appending
+ *  to the old snapshot would drop the change that just landed. The first stops
+ *  the load; the second asks again from the new tail. */
 export async function loadMoreRepoChanges(): Promise<void> {
   if (repoChangesLoadingMore.value) return;
-  const current = repoChanges.value;
-  if (current.status !== 'loaded' || !current.data.has_more) return;
   const repoId = repoSource.value;
   if (!repoId) return;
 
-  const lastApplied = current.data.applied[current.data.applied.length - 1];
-  if (!lastApplied?.resolved_at) return;
-
   repoChangesLoadingMore.value = true;
   try {
-    const before = new Date(lastApplied.resolved_at).getTime() / 1000;
-    const more = await getRepoChanges(repoId, 20, before);
-    repoChanges.value = {
-      status: 'loaded',
-      data: {
-        pending: current.data.pending,
-        applied: [...current.data.applied, ...more.applied],
-        has_more: more.has_more,
-      },
-    };
+    for (let attempt = 0; attempt < MAX_REPO_CHANGES_PAGE_RETRIES; attempt++) {
+      const base = repoChanges.value;
+      if (base.status !== 'loaded' || !base.data.has_more) return;
+      const lastApplied = base.data.applied[base.data.applied.length - 1];
+      if (!lastApplied?.resolved_at) return;
+
+      const before = new Date(lastApplied.resolved_at).getTime() / 1000;
+      const more = await getRepoChanges(repoId, 20, before);
+
+      if (repoSource.value !== repoId) return;
+      const after = repoChanges.value;
+      if (after.status !== 'loaded') return;
+      if (after !== base) continue;
+      const seen = new Set(after.data.applied.map((c) => c.id));
+      repoChanges.value = {
+        status: 'loaded',
+        data: {
+          pending: after.data.pending,
+          applied: [...after.data.applied, ...more.applied.filter((c) => !seen.has(c.id))],
+          has_more: more.has_more,
+        },
+      };
+      return;
+    }
   } catch (e: unknown) {
     showToast(`Failed to load more changes: ${errorDetail(e)}`, 'error');
   } finally {

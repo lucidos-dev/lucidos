@@ -29,7 +29,7 @@ async fn test_change_applied_reconciles_parent_active_children_count() {
     bus.emit(BusEvent::Thread {
         thread_id: child_id,
         event: ThreadEvent::ChangeApplied {
-            change_id: format!("test-cid-{child_id}"),
+            change_id: test_change_id(child_id).to_string(),
             requires_restart: false,
             client_update: false,
             commits: vec![],
@@ -95,7 +95,7 @@ async fn test_change_discarded_reconciles_parent_active_children_count() {
     bus.emit(BusEvent::Thread {
         thread_id: child_id,
         event: ThreadEvent::ChangeDiscarded {
-            change_id: format!("test-cid-{child_id}"),
+            change_id: test_change_id(child_id).to_string(),
             actor: None,
             path: String::new(),
         },
@@ -221,7 +221,6 @@ async fn test_cc_idle_multi_sibling_parent_count_remains_at_running_count() {
             text: "fan out".into(),
             user_image_hashes: vec![],
             device_id: None,
-            device: None,
             image_description: None,
             parent_thread_id: None,
             spawning_event_id: None,
@@ -246,7 +245,6 @@ async fn test_cc_idle_multi_sibling_parent_count_remains_at_running_count() {
                 text: "child".into(),
                 user_image_hashes: vec![],
                 device_id: None,
-                device: None,
                 image_description: None,
                 parent_thread_id: Some(parent_id),
                 spawning_event_id: None,
@@ -345,7 +343,6 @@ async fn test_cc_idle_with_waiting_for_user_answer_sibling_keeps_count() {
             text: "fan out".into(),
             user_image_hashes: vec![],
             device_id: None,
-            device: None,
             image_description: None,
             parent_thread_id: None,
             spawning_event_id: None,
@@ -370,7 +367,6 @@ async fn test_cc_idle_with_waiting_for_user_answer_sibling_keeps_count() {
                 text: "child".into(),
                 user_image_hashes: vec![],
                 device_id: None,
-                device: None,
                 image_description: None,
                 parent_thread_id: Some(parent_id),
                 spawning_event_id: None,

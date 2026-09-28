@@ -114,7 +114,7 @@ describe('a turn parked on an event wait', () => {
     // prose chunks, so `hidesEarlierProse` is true and a reader who turned the
     // control off sees only what follows the last of them.
     expect(hidesEarlierProse(events)).toBe(true);
-    expect(waits(getCollapsedVisibleEvents(events).visibleEvents)).toMatchObject([
+    expect(waits(getCollapsedVisibleEvents(events))).toMatchObject([
       { wait_id: 'w1', state: 'waiting', reason: REASON },
     ]);
   });
@@ -312,7 +312,7 @@ describe('a turn parked on an event wait', () => {
         cause: 'user_stop',
         on: [{ event_type: 'ChangeProposed' }],
         reason: REASON,
-        actor: { kind: 'device', device_id: 'dev-1', label: 'My iPhone' },
+        actor: { kind: 'device', device_id: 'dev-1' },
       },
     ] as ThreadEvent[]);
 

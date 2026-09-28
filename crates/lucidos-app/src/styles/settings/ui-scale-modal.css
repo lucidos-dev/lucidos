@@ -10,7 +10,9 @@
 .scale-modal {
     background: var(--bg-secondary);
     border: 1px solid var(--border-color);
-    border-radius: 0.5em;
+    /* In em, like the rest of the modal. A rem token cannot scale with em, so
+       the corner keeps its size and squares only when the theme zeroes it. */
+    border-radius: min(0.5em, var(--radius-surface) * 99);
     padding: 1.5em 2em;
     width: 18em;
     box-shadow: var(--shadow-md);
@@ -35,7 +37,6 @@
     height: 2.75em;
     outline: none;
     cursor: pointer;
-    -webkit-tap-highlight-color: transparent;
     -webkit-user-select: none;
     user-select: none;
     /* `none`, never `pan-x`: `pan-x` hands the horizontal gesture back to the
@@ -51,7 +52,7 @@
     height: 0.25em;
     margin-top: -0.125em;
     background: var(--border-color);
-    border-radius: 0.125em;
+    border-radius: min(0.125em, var(--radius-control) * 99);
 }
 
 /* Placed from the same inset span the pointer is read against
@@ -67,7 +68,7 @@
     width: var(--scale-slider-thumb);
     height: var(--scale-slider-thumb);
     margin: calc(var(--scale-slider-thumb) / -2) 0 0 calc(var(--scale-slider-thumb) / -2);
-    border-radius: 50%;
+    border-radius: var(--radius-round);
     background: var(--accent);
 }
 
@@ -101,7 +102,7 @@
     color: var(--accent);
     background: color-mix(in srgb, var(--accent) 15%, transparent);
     padding: 0.0625rem 0.375rem;
-    border-radius: 0.1875rem;
+    border-radius: calc(var(--radius-control) * 0.375);
     margin-left: 0.5rem;
 }
 
@@ -122,7 +123,7 @@
 .device-name-input {
     background: var(--bg-primary);
     border: 1px solid var(--accent);
-    border-radius: 0.1875rem;
+    border-radius: calc(var(--radius-control) * 0.375);
     color: var(--text-primary);
     font-family: var(--font-ui);
     font-size: var(--font-size-md);

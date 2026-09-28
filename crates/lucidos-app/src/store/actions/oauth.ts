@@ -231,7 +231,7 @@ export async function grantOAuthScope(provider: string, scopes: string): Promise
 }
 
 export async function disconnectOAuthAccount(id: string, provider: string): Promise<void> {
-  if (!(await showConfirm(`Disconnect ${provider} account?`, 'Disconnect'))) {
+  if (!(await showConfirm(`Disconnect ${provider} account?`, 'Disconnect', { variant: 'danger' }))) {
     return;
   }
   try {

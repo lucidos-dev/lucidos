@@ -23,6 +23,18 @@ pub(crate) async fn settle_discarded_branch(
     lookup: WorktreeLookup,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match lookup {
+        // The branch is checked out in the repo's primary checkout, where the
+        // user works. It is never a thread's tree, so a reset there would wipe
+        // their uncommitted and untracked files.
+        WorktreeLookup::Found(wt_path) if !is_linked_worktree(&wt_path) => {
+            log!(
+                "[Changes] Discarded change {}: branch {} is checked out in {}, which is not a \
+                 linked worktree; leaving that checkout and the branch alone",
+                change_id,
+                branch_name,
+                wt_path.display()
+            );
+        }
         WorktreeLookup::Found(wt_path) => {
             reset_worktree_to_main_after_discard(&wt_path).await?;
             log!(
@@ -68,6 +80,13 @@ pub(crate) async fn settle_discarded_branch(
         }
     }
     Ok(())
+}
+
+/// Whether `path` is a linked worktree, whose `.git` is a file pointing into
+/// the main repo. The primary checkout has a `.git` directory instead. An
+/// unreadable `.git` answers `false`, the side that resets nothing.
+fn is_linked_worktree(path: &Path) -> bool {
+    std::fs::symlink_metadata(path.join(".git")).is_ok_and(|meta| meta.is_file())
 }
 
 impl LucidosEngine {

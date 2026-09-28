@@ -32,10 +32,9 @@ const CHOICE_CARD_SELECTOR = `[data-role="${CHOICE_CARD_ROLE}"]`;
  *  excluded so a card mid-resolution (every button disabled) navigates nowhere. */
 const CHOICE_SELECTOR = 'button:not([disabled])';
 
-/** Prev/next direction for an arrow key. BOTH axes map to the same walk: the
- *  question card is a vertical list while the permission card mixes a horizontal
- *  primary row with stacked secondary rows, so there is no single axis that
- *  reads correctly on both. */
+/** Prev/next direction for an arrow key. BOTH axes map to the same walk. The
+ *  question card is a vertical list and the permission card is a wrapping row,
+ *  so no single axis reads correctly on both. */
 function arrowDelta(key: string): 1 | -1 | null {
   if (key === 'ArrowDown' || key === 'ArrowRight') return 1;
   if (key === 'ArrowUp' || key === 'ArrowLeft') return -1;

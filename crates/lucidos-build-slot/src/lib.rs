@@ -11,7 +11,9 @@
 //!
 //! Deliberately not a queue: whoever samples a freed slot first takes it.
 //! Arrival order is an explicit non-goal, because ticket state is exactly the
-//! stale state this design removes.
+//! stale state this design removes. The one exception is a *priority waiter*,
+//! the build a user is watching ([`SlotClass::Priority`]). While one waits,
+//! ordinary builds leave a freed slot to it (ADR 0304).
 //!
 //! A granted slot also SHAPES the build it admits, at a lower scheduling
 //! priority and with a share of the host's cores ([`BuildLimits`]). Counting
@@ -40,6 +42,10 @@ pub const ENV_POOL_DIR: &str = "LUCIDOS_BUILD_SLOT_DIR";
 /// Overrides the nice increment a granted build runs at. `0` opts out, which
 /// is what a foreground build wants.
 pub const ENV_NICE: &str = "LUCIDOS_BUILD_SLOT_NICE";
+
+/// Set to `1` to wait as a priority waiter ([`SlotClass::Priority`]). Only the
+/// engine's own background rebuild sets it.
+pub const ENV_PRIORITY: &str = "LUCIDOS_BUILD_SLOT_PRIORITY";
 
 /// The cargo variable the core share is exported as. Read as well as written:
 /// a value the caller already set always wins.
@@ -78,6 +84,29 @@ const CAPACITY_FILE: &str = "capacity";
 
 /// File waiters hold a shared lock on. See [`BuildSlotPool::anyone_waiting`].
 const WAITING_FILE: &str = "waiting.lock";
+
+/// File priority waiters hold a shared lock on. See
+/// [`BuildSlotPool::priority_waiting`].
+const PRIORITY_FILE: &str = "priority.lock";
+
+/// Who is asking for a slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotClass {
+    /// Every build nobody is watching: agent lint, tests, e2e.
+    Ordinary,
+    /// The build a user is waiting on. Ordinary builds leave a freed slot to
+    /// it, and it runs un-niced unless told otherwise.
+    Priority,
+}
+
+/// The class [`ENV_PRIORITY`] asks for. Only the exact value `1` means
+/// priority, so a typo degrades to ordinary rather than jumping the line.
+pub fn resolve_class(raw: Option<&str>) -> SlotClass {
+    match raw.map(str::trim) {
+        Some("1") => SlotClass::Priority,
+        _ => SlotClass::Ordinary,
+    }
+}
 
 /// Where a resolved slot count came from. Reported by status so a host whose
 /// participants disagree is visible rather than silent.
@@ -222,19 +251,24 @@ impl BuildLimits {
     };
 }
 
-/// The nice increment for a granted build, from [`ENV_NICE`] or the default.
+/// The nice increment for a granted build, from [`ENV_NICE`] or the class
+/// default: [`DEFAULT_NICE`] for an ordinary build, none for a priority one.
 ///
 /// Junk falls back rather than failing: a limiter that cannot read its own
 /// setting must still let the build run. A negative value resolves to zero,
 /// because raising a build's priority needs privilege we do not have and is
 /// not what this exists for.
-pub fn resolve_nice(raw: Option<&str>) -> i32 {
+pub fn resolve_nice(raw: Option<&str>, class: SlotClass) -> i32 {
+    let default = match class {
+        SlotClass::Ordinary => DEFAULT_NICE,
+        SlotClass::Priority => 0,
+    };
     let Some(text) = raw.map(str::trim).filter(|t| !t.is_empty()) else {
-        return DEFAULT_NICE;
+        return default;
     };
     text.parse::<i32>()
         .map(|n| n.clamp(0, MAX_NICE))
-        .unwrap_or(DEFAULT_NICE)
+        .unwrap_or(default)
 }
 
 /// Cores this build may use, given how many slots are held right now.
@@ -324,8 +358,23 @@ impl BuildSlotPool {
         self.dir.join(format!("slot-{index}.lock"))
     }
 
-    /// Take the first free slot, or `None` when all are held.
+    /// Take the first free slot as an ordinary build, or `None` when all are
+    /// held or a priority build is waiting for the next one.
     pub fn try_acquire(&self, label: &str) -> Option<BuildSlotGuard> {
+        self.try_acquire_as(label, SlotClass::Ordinary)
+    }
+
+    /// Take the first free slot for a build of `class`. An ordinary build
+    /// yields to a waiting priority build. Nothing raises the slot count.
+    pub fn try_acquire_as(&self, label: &str, class: SlotClass) -> Option<BuildSlotGuard> {
+        // Held until the slot walk ends, so the check and the take are one step.
+        let _turn = match class {
+            SlotClass::Priority => None,
+            SlotClass::Ordinary => match self.ordinary_turn() {
+                OrdinaryTurn::Open(held) => held,
+                OrdinaryTurn::Yield => return None,
+            },
+        };
         (0..self.capacity.value).find_map(|index| self.try_acquire_index(index, label))
     }
 
@@ -349,19 +398,25 @@ impl BuildSlotPool {
     ///
     /// The waiting flag is raised BEFORE the first `on_wait`. That is what
     /// lets a caller announce contention from inside the callback and still
-    /// be seen by a holder releasing at that moment.
+    /// be seen by a holder releasing at that moment. A priority build raises
+    /// the priority flag at the same point, and drops it with the wait.
     pub fn acquire(
         &self,
         label: &str,
         max_wait: Option<Duration>,
+        class: SlotClass,
         mut on_wait: impl FnMut(Duration),
     ) -> Option<BuildSlotGuard> {
-        if let Some(guard) = self.try_acquire(label) {
+        if let Some(guard) = self.try_acquire_as(label, class) {
             return Some(guard);
         }
         // Announce that somebody is queued behind the pool, so a releasing
         // holder knows to emit rather than staying silent on the fast path.
         let _waiting = self.mark_waiting();
+        let _priority = match class {
+            SlotClass::Priority => self.mark_priority_waiting(),
+            SlotClass::Ordinary => None,
+        };
         let started = Instant::now();
         loop {
             let waited = started.elapsed();
@@ -370,7 +425,7 @@ impl BuildSlotPool {
             }
             on_wait(waited);
             std::thread::sleep(self.poll_interval());
-            if let Some(guard) = self.try_acquire(label) {
+            if let Some(guard) = self.try_acquire_as(label, class) {
                 return Some(guard);
             }
         }
@@ -390,13 +445,7 @@ impl BuildSlotPool {
     /// `--max-wait` has exited and taken its flag with it. Gating on this would
     /// go silent for exactly the subscriber that needs waking.
     pub fn mark_waiting(&self) -> Option<WaitingFlag> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(self.dir.join(WAITING_FILE))
-            .ok()?;
+        let file = self.open_flag_file(WAITING_FILE)?;
         fs2::FileExt::try_lock_shared(&file).ok()?;
         Some(WaitingFlag { file })
     }
@@ -408,13 +457,7 @@ impl BuildSlotPool {
     /// failure direction is a redundant announcement rather than a waiter left
     /// asleep.
     pub fn anyone_waiting(&self) -> bool {
-        let Ok(file) = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(self.dir.join(WAITING_FILE))
-        else {
+        let Some(file) = self.open_flag_file(WAITING_FILE) else {
             return true;
         };
         match fs2::FileExt::try_lock_exclusive(&file) {
@@ -424,6 +467,56 @@ impl BuildSlotPool {
             }
             Err(_) => true,
         }
+    }
+
+    /// Take a shared lock on the priority file for as long as a priority build
+    /// waits. Shared, so two priority builds can wait at once. The kernel drops
+    /// it on death, so no priority claim can outlive its waiter.
+    ///
+    /// Blocking, unlike [`mark_waiting`](Self::mark_waiting). The only thing
+    /// that can hold the file exclusively is an [`ordinary_turn`], which lasts
+    /// one slot walk. A non-blocking try would lose the flag for the whole wait.
+    ///
+    /// [`ordinary_turn`]: Self::ordinary_turn
+    pub fn mark_priority_waiting(&self) -> Option<WaitingFlag> {
+        let file = self.open_flag_file(PRIORITY_FILE)?;
+        fs2::FileExt::lock_shared(&file).ok()?;
+        Some(WaitingFlag { file })
+    }
+
+    /// Is a priority build waiting for a slot right now?
+    pub fn priority_waiting(&self) -> bool {
+        matches!(self.ordinary_turn(), OrdinaryTurn::Yield)
+    }
+
+    /// May an ordinary build try the slots now?
+    ///
+    /// `Open` carries the priority file locked exclusively, and the caller
+    /// holds it across its slot walk, so no priority waiter arrives mid-walk.
+    /// Two ordinary builds checking at the same instant see each other's
+    /// lock and one yields for a poll, which is harmless.
+    ///
+    /// Fails OPEN, unlike [`anyone_waiting`](Self::anyone_waiting): a file that
+    /// cannot be opened means nobody waits. The other direction would stall
+    /// every ordinary build on the host behind a broken file.
+    fn ordinary_turn(&self) -> OrdinaryTurn {
+        let Some(file) = self.open_flag_file(PRIORITY_FILE) else {
+            return OrdinaryTurn::Open(None);
+        };
+        match fs2::FileExt::try_lock_exclusive(&file) {
+            Ok(()) => OrdinaryTurn::Open(Some(file)),
+            Err(_) => OrdinaryTurn::Yield,
+        }
+    }
+
+    fn open_flag_file(&self, name: &str) -> Option<File> {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(self.dir.join(name))
+            .ok()
     }
 
     /// Current occupancy, one entry per slot.
@@ -472,6 +565,7 @@ impl BuildSlotPool {
         ncpu: Option<usize>,
         caller_jobs: Option<&str>,
         nice_raw: Option<&str>,
+        class: SlotClass,
     ) -> BuildLimits {
         let caller_set = caller_jobs.map(str::trim).is_some_and(|v| !v.is_empty());
         let jobs = if caller_set {
@@ -480,7 +574,7 @@ impl BuildSlotPool {
             ncpu.map(|n| cpu_share(n, self.held_slots(), self.capacity.value))
         };
         BuildLimits {
-            nice: resolve_nice(nice_raw),
+            nice: resolve_nice(nice_raw, class),
             jobs,
         }
     }
@@ -540,6 +634,14 @@ impl Drop for BuildSlotGuard {
     fn drop(&mut self) {
         let _ = fs2::FileExt::unlock(&self.file);
     }
+}
+
+/// The answer to [`BuildSlotPool::ordinary_turn`].
+enum OrdinaryTurn {
+    /// Go ahead, holding this (when the file opened) until the attempt ends.
+    Open(Option<File>),
+    /// A priority build is waiting: leave the next slot to it.
+    Yield,
 }
 
 /// Evidence that this process is queued for a slot. Held for the wait only.

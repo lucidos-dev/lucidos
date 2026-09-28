@@ -184,7 +184,7 @@ test.describe('Resume after restart — boundary panels', () => {
       images: [],
       request_event_id: userMsgId,
       cause: 'engine_shutdown',
-      actor: { kind: 'device', device_id: 'd-test', label: 'My Mac' },
+      actor: { kind: 'device', device_id: 'd-test' },
     });
 
     try {
@@ -242,7 +242,7 @@ test.describe('Resume after restart — boundary panels', () => {
     });
     const recoveredPayload = JSON.stringify({
       branch: '',
-      actor: { kind: 'device', device_id: 'd-test', label: 'My Mac' },
+      actor: { kind: 'device', device_id: 'd-test' },
     });
 
     try {
@@ -301,7 +301,7 @@ test.describe('Resume after restart — boundary panels', () => {
     });
     const recoveredPayload = JSON.stringify({
       branch: '',
-      actor: { kind: 'device', device_id: 'd-test', label: 'My Mac' },
+      actor: { kind: 'device', device_id: 'd-test' },
     });
     // Engine note text must include 2 bullet-style tool lines so the subline
     // reads "Reminded the model about 2 prior tool calls".

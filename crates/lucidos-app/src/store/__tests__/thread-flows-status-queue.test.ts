@@ -373,15 +373,14 @@ describe('Change lifecycle events render as initiator panels', () => {
       { type: 'ChangeProposed', change_id: 'c-6', description: 'Fix', files: ['f.rs'] },
       { type: 'CodingAgentIdled', has_changes: true },
     ]);
-    // After CodingAgentIdled, thread status should be 'waiting'
-    expect(map.get(id)!.meta.status).toBe('waiting');
+    // After CodingAgentIdled, thread status is 'idle'
+    expect(map.get(id)!.meta.status).toBe('idle');
 
-    // MergeConflictDetected sets codingAgentApplying=true but doesn't change status
+    // MergeConflictDetected doesn't change status
     insertEvents(map, id, [
       { type: 'MergeConflictDetected', change_id: 'c-6', files: ['f.rs'] },
     ]);
-    expect(map.get(id)!.meta.status).toBe('waiting');
-    expect(map.get(id)!.meta.codingAgentApplying).toBe(true);
+    expect(map.get(id)!.meta.status).toBe('idle');
   });
 
   it('CC resumption after ChangeApplied does not leave trailing Thinking on CC exchange', () => {
@@ -724,7 +723,6 @@ describe('Bug: SSE-born scheduled trigger thread categorization', () => {
         codingAgentProposed: false,
         codingAgentRequiresRestart: false,
         codingAgentIsExternalRepo: false,
-        codingAgentApplying: false,
         codingAgentHasDiff: false,
         lastRevivedAt: '',
         state: 'active',

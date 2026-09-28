@@ -25,6 +25,7 @@ import {
   type LandingFacts,
   type ProbeViewport,
 } from '../deadPressProbe';
+import { LONG_PRESS_DELAY_MS } from '../../../hooks/useLongPress';
 
 // The probe exists because the dead-composer-button report has arrived four
 // times and says only "nothing happened". Its whole value is that the NEXT
@@ -143,8 +144,25 @@ describe('deadPressReport: the press arrived and no path took it', () => {
     rowMutations: 0,
     outcome: null,
     alone: true,
+    heldMs: 90,
     viewport: VIEWPORT,
   };
+
+  it('stays silent on a press held past a tap', () => {
+    // iOS synthesises no click for a long hold. A thumb resting on Apply while
+    // the user held the phone read as a dead tap the user never made.
+    expect(deadPressReport({ ...BASE, heldMs: 1200 })).toBeNull();
+    expect(deadPressReport({ ...BASE, heldMs: 1200, connectedAtLift: false })).toBeNull();
+  });
+
+  it('draws the hold line where the app’s own long press begins', () => {
+    expect(deadPressReport({ ...BASE, heldMs: LONG_PRESS_DELAY_MS })).not.toBeNull();
+    expect(deadPressReport({ ...BASE, heldMs: LONG_PRESS_DELAY_MS + 1 })).toBeNull();
+  });
+
+  it('says how long the finger was down', () => {
+    expect(deadPressReport(BASE)).toContain('Held 90ms.');
+  });
 
   it('stays silent on a press that shared the glass', () => {
     // WebKit synthesises no click for a multi-finger gesture, so this press
@@ -218,7 +236,12 @@ describe('deadPressReport: the press arrived and no path took it', () => {
 // path and produces no click, which is indistinguishable from the fault being
 // chased unless the app says so.
 describe('canceledPressReport: the system took the gesture', () => {
-  const BASE = { face: 'Cancel', movedPx: 0, alone: true, viewport: VIEWPORT };
+  const BASE = { face: 'Cancel', movedPx: 0, alone: true, heldMs: 90, viewport: VIEWPORT };
+
+  it('stays silent on a press held past a tap, which the system may take', () => {
+    expect(canceledPressReport({ ...BASE, heldMs: LONG_PRESS_DELAY_MS + 1 })).toBeNull();
+    expect(canceledPressReport({ ...BASE, heldMs: LONG_PRESS_DELAY_MS })).not.toBeNull();
+  });
 
   it('reports a stationary press the system still cancelled', () => {
     const report = canceledPressReport(BASE);
@@ -392,20 +415,25 @@ describe('the breadcrumb channel', () => {
   const source = readFileSync(resolve(here, '../deadPressProbe.ts'), 'utf-8');
   const code = source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
 
+  it('reads the thread-action marker the banner stamps', () => {
+    // `banner-slots.test.tsx` pins the stamping half.
+    expect(code).toContain(`'[data-thread-action]'`);
+  });
+
   it('writes one line per watched press, under one category', () => {
     expect(code).toContain(`postClientLog('composer-press'`);
   });
 
   it('records every verdict a press can end on', () => {
     for (const verdict of [
-      'dead', 'multi-touch', 'clicked', 'canceled', 'missed', 'no-lift', 'click-no-touch',
-      'covered', 'stray-click', 'untouched',
+      'dead', 'multi-touch', 'long-hold', 'clicked', 'canceled', 'missed', 'no-lift',
+      'click-no-touch', 'covered', 'stray-click', 'untouched',
     ]) {
       expect(code).toContain(`'${verdict}'`);
     }
     // 'served' and 'swallowed' come from `takePressOutcome`, not from a
     // literal here, and reach the line through the same fallback.
-    expect(code).toContain(`outcome ?? (alone ? 'dead' : 'multi-touch')`);
+    expect(code).toContain('outcome ?? unclaimedVerdict(');
   });
 
   it('dispatches nothing, on any path', () => {

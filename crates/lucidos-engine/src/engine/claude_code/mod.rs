@@ -566,6 +566,16 @@ pub(crate) fn claim_refusal_slug(holder: crate::engine::types::ChangeClaim) -> &
 pub(crate) const SESSION_STOPPING_MESSAGE: &str =
     "The coding-agent session is stopping. Try again once it has ended";
 
+/// Why Apply Now is refused while the thread is parked on a question. Applying
+/// would send a hardening or merge prompt that overtakes the question card.
+pub(crate) const QUESTION_OPEN_MESSAGE: &str =
+    "This thread is waiting for your answer to its question. Answer it first, then apply";
+
+/// Why Apply Now is refused when it could not check for a parked question. An
+/// unanswered check is not a "no".
+pub(crate) const QUESTION_UNKNOWN_MESSAGE: &str =
+    "Could not check whether this thread is waiting for your answer. Try again";
+
 /// The machine-readable reason an HTTP handler sends beside a refusal message,
 /// matched by identity. `None` for anything that is not a claim refusal. The
 /// frontend keys on it: only `apply_in_progress` means an apply is running.

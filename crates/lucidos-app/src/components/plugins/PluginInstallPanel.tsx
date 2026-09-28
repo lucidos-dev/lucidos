@@ -7,8 +7,8 @@ import {
   confirmPluginInstallAction,
 } from '../../store/actions/plugin-install';
 import { renderMarkdown } from '../../utils/renderMarkdown';
-import { formatMessageTimestamp } from '../../utils/formatTime';
 import { PluginFileList } from './PluginFileList';
+import { PluginSection, pluginPanelHeader } from './PluginSection';
 import { ProposeUpstreamButton } from './ProposeUpstreamButton';
 
 export function PluginInstallPanel() {
@@ -27,8 +27,8 @@ export function PluginInstallPanel() {
  *  panel is telling the user what is about to happen to THEIR edit. */
 const LOCAL_CHANGE_LABEL: Record<PluginLocalChangeOutcome, string> = {
   merged: 'Kept, merged into the new version',
-  conflict: 'Cannot merge, your version saved aside',
-  replaced: 'Replaced, your version saved aside',
+  conflict: 'Cannot merge, your version is saved aside',
+  replaced: 'Replaced, your version is saved aside',
   restored: 'You deleted this, the new version brings it back',
 };
 
@@ -78,30 +78,6 @@ function PluginInstallConfirm({ form }: { form: PluginInstallForm }) {
   const newFiles = req.files.filter((f) => !overwriteSet.has(f));
   const replacedOutright = plainOverwrites(req.overwrites, localChanges);
 
-  // Rendered twice — once top-right in the header, once at the bottom — so the
-  // Cancel/Install pair is reachable without scrolling past a long file list.
-  // A function (not a shared vnode) so each mount is a fresh element.
-  const renderActions = (extraClass = '') => (
-    <div class={`plugin-install-actions${extraClass ? ` ${extraClass}` : ''}`}>
-      <button
-        type="button"
-        class="action-btn action-btn-danger"
-        onClick={handleCancel}
-        disabled={busy}
-      >
-        Cancel
-      </button>
-      <button
-        type="button"
-        class="action-btn action-btn-confirm"
-        onClick={handleConfirm}
-        disabled={busy}
-      >
-        {req.overwrites.length > 0 ? 'Confirm and overwrite' : 'Install'}
-      </button>
-    </div>
-  );
-
   // The action fns resolve the panel themselves (into a receipt on success,
   // closed on failure), so busy normally never resets visibly. Reset in a
   // finally anyway so the buttons re-enable if a future path returns with the
@@ -124,28 +100,43 @@ function PluginInstallConfirm({ form }: { form: PluginInstallForm }) {
     }
   }
 
+  const actions = (
+    <div class="plugin-install-actions">
+      <button
+        type="button"
+        class="action-btn action-btn-secondary"
+        onClick={handleCancel}
+        disabled={busy}
+      >
+        Cancel
+      </button>
+      <button
+        type="button"
+        class="action-btn action-btn-confirm"
+        onClick={handleConfirm}
+        disabled={busy}
+      >
+        {req.overwrites.length > 0 ? 'Install and replace' : 'Install'}
+      </button>
+    </div>
+  );
+
   return (
-    <div class="inline-form">
+    <div class="inline-form protected-surface">
       <div class="plugin-install-panel">
-        <header class="plugin-install-header plugin-install-header-row">
-          <div class="plugin-install-header-text">
-            <h2>Install plugin</h2>
-            <div class="plugin-install-title-row">
-              <span class="plugin-install-name">{req.plugin_name}</span>
-              <span class="plugin-install-version">v{req.plugin_version}</span>
-            </div>
-            {description && <p class="plugin-install-description">{description}</p>}
-          </div>
-          {renderActions('plugin-install-actions-top')}
-        </header>
+        {pluginPanelHeader({
+          status: 'Install plugin',
+          name: req.plugin_name,
+          version: req.plugin_version,
+          description,
+          actions,
+        })}
 
         <section class="plugin-install-section">
           <div class="plugin-install-source-row">
             <span class="plugin-install-label">Source</span>
-            <span
-              class={`plugin-install-source-type plugin-install-source-type-${req.source_type}`}
-            >
-              {req.source_type === 'git' ? 'GitHub / git' : 'Archive'}
+            <span class="plugin-install-source-type">
+              {req.source_type === 'git' ? 'Git' : 'Archive'}
             </span>
           </div>
           <code class="plugin-install-source-value" data-tooltip={req.source}>
@@ -154,73 +145,69 @@ function PluginInstallConfirm({ form }: { form: PluginInstallForm }) {
         </section>
 
         {localChanges.length > 0 && (
-          <section class="plugin-install-section plugin-install-local-changes">
-            <div class="plugin-install-label">
-              Your local changes ({localChanges.length})
-            </div>
-            <p class="plugin-install-note">
-              You have edited these files since installing. Lucidos merges your
-              changes into the new version where it can, and keeps a copy plus a
-              patch under <code>data/artifacts/</code> wherever it cannot.
-            </p>
+          <PluginSection
+            label="Your edits"
+            count={localChanges.length}
+            defaultOpen
+            note={
+              <>
+                You changed these files after you installed. Lucidos merges
+                your edits into the new version where it can. Where it cannot,
+                it saves your version and a patch under <code>data/artifacts/</code>.
+              </>
+            }
+            footer={
+              <label class="plugin-install-keep-toggle">
+                <input
+                  type="checkbox"
+                  checked={keepLocal}
+                  disabled={busy}
+                  onChange={(e) => setKeepLocal((e.target as HTMLInputElement).checked)}
+                />
+                <span>
+                  Keep my edits. Turn this off to take the new version exactly
+                  as shipped.
+                </span>
+              </label>
+            }
+          >
             <ul class="plugin-install-files">
               {localChanges.map((change) => (
                 <li
                   key={change.path}
                   class={`plugin-install-file plugin-install-file-${change.outcome}`}
                 >
-                  <code>{change.path}</code>
+                  <span>{change.path}</span>
                   <span class="plugin-install-outcome">
                     {localChangeLabel(change.outcome, keepLocal)}
                   </span>
                 </li>
               ))}
             </ul>
-            <label class="plugin-install-keep-toggle">
-              <input
-                type="checkbox"
-                checked={keepLocal}
-                disabled={busy}
-                onChange={(e) => setKeepLocal((e.target as HTMLInputElement).checked)}
-              />
-              <span>
-                Keep my local changes. Clear this for a clean update that takes
-                the new version as shipped.
-              </span>
-            </label>
-          </section>
+          </PluginSection>
         )}
 
         {replacedOutright.length > 0 && (
           <PluginFileList
-            label={`Overwrites (${replacedOutright.length})`}
+            label="Files to replace"
             files={replacedOutright}
-            sectionClass="plugin-install-overwrites"
-            fileClass="plugin-install-file-overwrite"
-            note="These files already exist in your workspace and will be replaced."
+            tone="danger"
+            note="These files already exist in your workspace. Installing replaces them."
           />
         )}
 
-        {newFiles.length === 0 ? (
-          <section class="plugin-install-section">
-            <div class="plugin-install-label">New files (0)</div>
-            <p class="plugin-install-empty">No new files — every path overwrites an existing one.</p>
-          </section>
-        ) : (
-          <PluginFileList label={`New files (${newFiles.length})`} files={newFiles} />
+        {newFiles.length > 0 && (
+          <PluginFileList label="New files" files={newFiles} />
         )}
 
         {req.setup && (
-          <section class="plugin-install-section plugin-install-setup">
-            <div class="plugin-install-label">Setup instructions</div>
+          <PluginSection label="Setup steps">
             <div
               class="plugin-install-setup-body markdown-content"
               dangerouslySetInnerHTML={{ __html: renderMarkdown(req.setup) }}
             />
-          </section>
+          </PluginSection>
         )}
-
-        {renderActions()}
       </div>
     </div>
   );
@@ -233,11 +220,8 @@ function PluginInstallConfirm({ form }: { form: PluginInstallForm }) {
  *
  *  Deliberately offers NO buttons at all. Install and Cancel are gone because
  *  the files have landed and the staged `install_id` is popped. Close is gone
- *  because it broke the nav history the receipt exists to hold:
- *  `closeInlineForm()` blanks `panelOverlay` without touching the nav stack, so
- *  the cursor was left pointing at an entry describing a panel no longer on
- *  screen, and Back/Forward walked from that stale position. The header's back
- *  arrow is how you leave a receipt, same as any other panel page.
+ *  because a receipt is a page in the nav history. The header's back arrow is
+ *  how you leave it, same as any other panel page.
  *
  *  The plugin's setup instructions stay on it, since they are the one thing the
  *  user may still need after the install and the setup thread is a pane away
@@ -251,23 +235,19 @@ export function PluginInstallReceiptPanel({ form }: { form: PluginInstallForm })
   const installed = form.installed!;
   const local = installed.local_changes;
   return (
-    <div class="inline-form">
+    <div class="inline-form protected-surface">
       <div class="plugin-install-panel">
-        <header class="plugin-install-header">
-          <div class="panel-receipt-status">
-            <span class="panel-receipt-badge">Installed</span>
-            <span class="panel-receipt-time">{formatMessageTimestamp(installed.at)}</span>
-          </div>
-          <div class="plugin-install-title-row">
-            <span class="plugin-install-name">{req.plugin_name}</span>
-            <span class="plugin-install-version">v{req.plugin_version}</span>
-          </div>
-          <p class="plugin-install-description">{installed.summary}</p>
-        </header>
+        {pluginPanelHeader({
+          status: 'Installed',
+          receiptAt: installed.at,
+          name: req.plugin_name,
+          version: req.plugin_version,
+          description: installed.summary,
+        })}
 
         {local && (
-          <section class="plugin-install-section plugin-install-local-changes">
-            <div class="plugin-install-label">Your local changes</div>
+          <section class="plugin-install-section">
+            <div class="plugin-install-label">Your edits</div>
             {local.merged.length > 0 && (
               <p class="plugin-install-note">
                 Merged into the new version: {local.merged.join(', ')}.
@@ -302,20 +282,16 @@ export function PluginInstallReceiptPanel({ form }: { form: PluginInstallForm })
         )}
 
         {installed.installed_files.length > 0 && (
-          <PluginFileList
-            label={`Files written (${installed.installed_files.length})`}
-            files={installed.installed_files}
-          />
+          <PluginFileList label="Files installed" files={installed.installed_files} />
         )}
 
         {req.setup && (
-          <section class="plugin-install-section plugin-install-setup">
-            <div class="plugin-install-label">Setup instructions</div>
+          <PluginSection label="Setup steps" defaultOpen>
             <div
               class="plugin-install-setup-body markdown-content"
               dangerouslySetInnerHTML={{ __html: renderMarkdown(req.setup) }}
             />
-          </section>
+          </PluginSection>
         )}
       </div>
     </div>

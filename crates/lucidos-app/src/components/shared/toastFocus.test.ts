@@ -31,9 +31,9 @@ describe('toastAutofocusTarget', () => {
   });
 
   it('returns null when the only action is destructive AND there is no dismiss', () => {
-    // The non-dismissable Apply-All progress toast: single danger Cancel, no X.
-    // Pre-focusing Cancel would let a reflexive Enter abort the batch — so leave
-    // focus put; the button is still reachable by Tab.
+    // A non-dismissable toast whose one action is a danger Cancel, with no X.
+    // Pre-focusing Cancel would let a reflexive Enter abort the work, so focus
+    // stays put; the button is still reachable by Tab.
     expect(toastAutofocusTarget({
       action: { label: 'Cancel', onClick: () => {}, variant: 'danger' },
       dismissable: false,

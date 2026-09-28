@@ -1,3 +1,5 @@
+import { afterAll } from 'vitest';
+
 // Browser globals needed by store modules that access localStorage/matchMedia/document at load time.
 // These are minimal stubs — just enough to let modules initialize without jsdom.
 if (typeof (globalThis as any).window === 'undefined') {
@@ -42,9 +44,9 @@ if (typeof globalThis.document === 'undefined') {
       removeAttribute: () => {},
       hasAttribute: () => false,
     },
-    // Loading a web font appends a <link> here, and that is now on the DEFAULT
-    // path: Fira Code is the default UI font, so `applyPreferences()` and
-    // `applyFontFamily()` reach this on a run with no preferences set at all.
+    // Loading a web font appends a <link> here, and that is on the DEFAULT path:
+    // the fallback font is vendored and linked, so `applyPreferences()` reaches
+    // this on a run with no preferences set at all.
     // Without the stub they throw "Cannot read properties of undefined", in a
     // test that was only ever about the theme or the device id.
     head: { appendChild: () => {} },
@@ -186,4 +188,16 @@ if (typeof (globalThis as any).CSS === 'undefined') {
       return out;
     },
   };
+}
+
+// Preact schedules effects through `afterNextFrame`: a requestAnimationFrame
+// raced by a 35ms Node timer whose callback calls `cancelAnimationFrame`. A
+// jsdom file that ends inside that window loses its globals first. The timer
+// then throws "cancelAnimationFrame is not defined" as an unhandled error.
+// Node fires timers in expiry order, so waiting on a longer timer here
+// lets every pending one fire while jsdom still exists. The real setTimeout
+// is kept, so a file that leaves fake timers on cannot stall this hook.
+if (typeof (globalThis as any).requestAnimationFrame === 'function') {
+  const realSetTimeout = globalThis.setTimeout;
+  afterAll(() => new Promise<void>(resolve => realSetTimeout(resolve, 40)));
 }

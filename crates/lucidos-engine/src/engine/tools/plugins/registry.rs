@@ -190,13 +190,19 @@ impl InstalledRecord {
             .pointer("/data/manifest/manifest/name")
             .and_then(|v| v.as_str())
     }
+    /// The files this install owns, at the paths they live at now. A plugin
+    /// installed before the theme rename recorded `looks/<id>.json`, which the
+    /// engine has since moved to `themes/` (docs/temporary-measures.md § Legacy
+    /// `data/looks/` folder). Every reader goes through here, so uninstall and
+    /// update find the file where it is.
     pub(crate) fn files(&self) -> Vec<String> {
         self.payload
             .pointer("/data/files")
             .and_then(|f| f.as_array())
             .map(|arr| {
                 arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
+                    .filter_map(|v| v.as_str())
+                    .map(current_data_path)
                     .collect()
             })
             .unwrap_or_default()
@@ -788,11 +794,37 @@ fn fetch_remote_manifest_blocking(
     plugins::parse_manifest(&text).map_err(|e| e.to_string())
 }
 
+/// Where a recorded data path lives now, after the theme rename's startup move.
+fn current_data_path(recorded: &str) -> String {
+    let legacy = format!("{}/", crate::core::themes::LEGACY_THEMES_DIR);
+    match recorded.strip_prefix(&legacy) {
+        Some(rest) => format!("{}/{rest}", crate::core::themes::THEMES_DIR),
+        None => recorded.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::installed_plugin_summaries;
     use crate::test_support::{setup_test_db, teardown_test_db};
     use uuid::Uuid;
+
+    #[test]
+    fn a_file_recorded_under_looks_reads_back_under_themes() {
+        let record = super::InstalledRecord {
+            payload: serde_json::json!({
+                "data": { "files": ["looks/harbour.json", "knowhow/looks/notes.md", "apps/a/index.html"] }
+            }),
+        };
+        assert_eq!(
+            record.files(),
+            [
+                "themes/harbour.json",
+                "knowhow/looks/notes.md",
+                "apps/a/index.html"
+            ]
+        );
+    }
 
     /// A `PluginInstalled` projection must carry the plugin's `files` and the
     /// derived `content` kinds so the Plugins → Installed row can list what was

@@ -25,7 +25,7 @@ type RowWriter = (type: string, payload: string) => string;
  *  ONE copy, because the payload shape is the part that goes stale: a field the
  *  fold starts reading is easy to add to three seeders and miss in the
  *  fourth. */
-function callPair(row: RowWriter, messageId: string, useId: string, n: number): string[] {
+function callPair(row: RowWriter, messageId: string, useId: string, n: number | string): string[] {
   return [
     row('CodingAgentToolCalled',
       `{"name":"Bash","args":{"command":"echo ${n}"},"description":"Run echo ${n}",` +
@@ -121,7 +121,8 @@ function seedThreadSeveralPagesLong(): string {
     const text = t === 0 ? FIRST_TURN_TEXT : `turn ${t}`;
     rows.push(`('${messageId}', 'MessageReceived', '{"text":"${text}","mode":"human","channel":"claude_code"}'::jsonb, '${at()}', 'thread', '${threadId}', '${threadId}')`);
     for (let i = 0; i < WALK_CALLS_PER_TURN; i++) {
-      rows.push(...callPair(row, messageId, `walk-${t}-${i}`, i));
+      // Unique across turns, so a drift probe can find a row by its text.
+      rows.push(...callPair(row, messageId, `walk-${t}-${i}`, `${t}.${i}`));
     }
     rows.push(row('ResponseGenerated', `{"text":"Done ${t}.","images":[],"request_event_id":"${messageId}"}`));
   }
@@ -274,6 +275,83 @@ async function walkUpUntilHeld(page: Page, text: string, wheelless: boolean): Pr
   return false;
 }
 
+/** How far (px) the reader's content may move beyond their own scroll. Real
+ *  jumps are a turn or a page tall; this only absorbs sub-row rounding. */
+const DRIFT_TOLERANCE_PX = 24;
+
+/** Steps a drift walk may take. Each settles for `DRIFT_SETTLE_MS`, and the
+ *  sum must end inside the test timeout, or a stall loses the jumps report. */
+const DRIFT_MAX_STEPS = 200;
+const DRIFT_SETTLE_MS = 400;
+
+/** Read up in short gestures until `text` is on screen at the top. Report
+ *  whether the walk got there, and each step where the app moved the reader.
+ *
+ *  Before a gesture it pins the leaf nearest the viewport's middle by its
+ *  text. Once things settle, that leaf must have moved by the gesture alone.
+ *  A leaf that is gone counts as moved: the gesture leaves it on screen. */
+async function readUpAndMeasureDrift(
+  page: Page, text: string,
+): Promise<{ reached: boolean; jumps: string[] }> {
+  const transcript = page.locator('.thread-content').first();
+  const jumps: string[] = [];
+  for (let step = 0; step < DRIFT_MAX_STEPS; step++) {
+    const taken = await transcript.evaluate((el) => {
+      // A sticky or fixed leaf stays put while the content scrolls under it.
+      const pinned = (n: HTMLElement) => {
+        for (let a: HTMLElement | null = n; a && a !== el; a = a.parentElement) {
+          if (/sticky|fixed/.test(getComputedStyle(a).position)) return true;
+        }
+        return false;
+      };
+      const leaves = [...el.querySelectorAll<HTMLElement>('.chat-exchange *')].filter(
+        (n) => n.childElementCount === 0 && (n.textContent ?? '').trim().length > 2 && !pinned(n),
+      );
+      const count = new Map<string, number>();
+      for (const n of leaves) {
+        const t = n.textContent!.trim();
+        count.set(t, (count.get(t) ?? 0) + 1);
+      }
+      const box = el.getBoundingClientRect();
+      const mid = box.top + box.height / 2;
+      let probe: HTMLElement | null = null;
+      for (const n of leaves) {
+        if (count.get(n.textContent!.trim()) !== 1) continue;
+        const r = n.getBoundingClientRect();
+        if (r.height === 0) continue;
+        if (!probe || Math.abs(r.top - mid) < Math.abs(probe.getBoundingClientRect().top - mid)) probe = n;
+      }
+      const before = el.scrollTop;
+      const top0 = probe?.getBoundingClientRect().top ?? 0;
+      const d = Math.round(el.clientHeight * 0.3);
+      el.dispatchEvent(new WheelEvent('wheel', { deltaY: -d, bubbles: true }));
+      el.scrollTop = Math.max(0, el.scrollTop - d);
+      const moved = before - el.scrollTop;
+      return { text: probe?.textContent?.trim() ?? null, expected: top0 + moved, before };
+    });
+    await page.waitForTimeout(DRIFT_SETTLE_MS);
+    const after = await transcript.evaluate((el, probeText) => {
+      // Only a text that is still unique names the same row.
+      const matches = probeText
+        ? [...el.querySelectorAll<HTMLElement>('.chat-exchange *')].filter(
+          (n) => n.childElementCount === 0 && n.textContent?.trim() === probeText)
+        : [];
+      const top = matches.length === 1 ? matches[0].getBoundingClientRect().top : null;
+      return { top, scrollTop: el.scrollTop, scrollHeight: el.scrollHeight };
+    }, taken.text);
+    const where = `(scrollTop ${taken.before} -> ${after.scrollTop}, scrollHeight ${after.scrollHeight})`;
+    if (taken.text && after.top === null) {
+      jumps.push(`step ${step}: "${taken.text}" left the transcript ${where}`);
+    } else if (taken.text && after.top !== null && Math.abs(after.top - taken.expected) > DRIFT_TOLERANCE_PX) {
+      jumps.push(`step ${step}: "${taken.text}" off by ${Math.round(after.top - taken.expected)}px ${where}`);
+    }
+    if (await transcript.evaluate((el, t) => el.scrollTop <= 1 && (el.textContent ?? '').includes(t), text)) {
+      return { reached: true, jumps };
+    }
+  }
+  return { reached: false, jumps };
+}
+
 test.describe('Windowed transcript', () => {
   const seededThreads: string[] = [];
 
@@ -377,6 +455,23 @@ test.describe('Windowed transcript', () => {
     const wheelless = browserName === 'webkit' && isMobile;
     const reached = await walkUpUntilHeld(page, FIRST_TURN_TEXT, wheelless);
     expect(reached, 'walking up must reach the thread\'s first message').toBe(true);
+  });
+
+  /** The same walk, read slowly, and the reader must never be MOVED. Every grow
+   *  and every page landing adds height above the reader, and each must put
+   *  them back on the content they were reading. Reaching the top is not
+   *  enough: a landing that drops them somewhere else still gets there. */
+  test('reading up a paged thread never moves the reader', async ({ page }) => {
+    test.setTimeout(180_000);
+    const threadId = seedThreadSeveralPagesLong();
+    seededThreads.push(threadId);
+    await openThread(page, threadId);
+
+    const transcript = page.locator('.thread-content').first();
+    await expect(transcript.locator('.chat-exchange').first()).toBeVisible({ timeout: 60_000 });
+    const { reached, jumps } = await readUpAndMeasureDrift(page, FIRST_TURN_TEXT);
+    expect(jumps, 'no grow or page landing may move the reader off their content').toEqual([]);
+    expect(reached, 'reading up must reach the thread\'s first message').toBe(true);
   });
 
   /** The shape a reader reported: a thread of 419 events whose newest page

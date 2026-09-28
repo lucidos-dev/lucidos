@@ -713,7 +713,6 @@ mod tests {
                 text: "hi".to_string(),
                 user_image_hashes: vec![],
                 device_id: None,
-                device: None,
                 image_description: None,
                 mode: crate::engine::thread_events::ActorMode::Human,
                 model: None,

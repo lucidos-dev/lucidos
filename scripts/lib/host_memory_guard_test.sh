@@ -760,8 +760,7 @@ test_a_garbage_confirm_knob_does_not_refuse_the_gate() {
     assert_eq "0" "$rc" "the gate rejects an exponent too, rather than waiting for nothing"
     assert_says "$OUT/expsecs.out" "CRITICAL_CONFIRM_SECS='1e3'" "the gate names the exponent it rejected"
 
-    # The retired knob is named rather than silently obeyed, the same treatment
-    # the guard gives LUCIDOS_E2E_COMPRESSOR_CAP_GB.
+    # The retired knob is named rather than silently obeyed.
     bin="$(install_gate_host_stubs 11.01 "4 2" 0.00 17.28 48)"
     PATH="$bin:$PATH" PRESSURE_MAX=1 bash "$PREFLIGHT_GATE" >"$OUT/staleknob.out" 2>&1
     rc=$?
@@ -1886,24 +1885,6 @@ test_garbage_knobs_fall_back_to_defaults() {
     assert_says "$OUT/junk.out" "compressor 13.00 GB" "the boundary still reported the reading"
 }
 
-# A retired knob is worse than an unknown one: a caller who still sets it thinks
-# the run is capped when nothing reads the value. The start report names it.
-test_a_retired_cap_knob_is_named_rather_than_ignored() {
-    echo "test: setting the retired compressor cap knob is called out at start"
-    reset_state
-    HOST_COMPRESSOR_GB_OVERRIDE=4.00 HOST_AVAIL_GB_OVERRIDE=30.00 \
-        HOST_SWAP_USED_GB_OVERRIDE=0.00 HOST_PHYSMEM_GB_OVERRIDE=48 \
-        LUCIDOS_E2E_COMPRESSOR_CAP_GB=16 \
-        report_host_memory_start >"$OUT/retired.out" 2>&1
-    assert_says "$OUT/retired.out" "no longer read" "the retired knob is named"
-
-    reset_state
-    HOST_COMPRESSOR_GB_OVERRIDE=4.00 HOST_AVAIL_GB_OVERRIDE=30.00 \
-        HOST_SWAP_USED_GB_OVERRIDE=0.00 HOST_PHYSMEM_GB_OVERRIDE=48 \
-        report_host_memory_start >"$OUT/notretired.out" 2>&1
-    assert_silent_about "$OUT/notretired.out" "no longer read" "a run that does not set it hears nothing"
-}
-
 test_garbage_free_floor_knobs_fall_back() {
     echo "test: unusable free-floor knobs fall back, and 9 GB still stops on 48 GB"
     local rc
@@ -2479,7 +2460,6 @@ test_the_reading_that_stopped_an_earlier_nightly_now_runs_on
 test_explicit_absolute_ceiling_overrides_the_share
 test_compressor_percent_knob_sets_the_runaway
 test_garbage_knobs_fall_back_to_defaults
-test_a_retired_cap_knob_is_named_rather_than_ignored
 test_garbage_free_floor_knobs_fall_back
 test_garbage_swap_knob_does_not_stop_a_host_with_some_swap
 test_negative_percent_cannot_stop_everything

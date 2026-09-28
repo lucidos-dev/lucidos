@@ -20,11 +20,14 @@ import {
 import { getNetworkConfig, getTailnetStatus } from '../../api/client';
 import { SCOPE_PATH, WORKSPACE_ID } from '../../utils/basePath';
 import { Explainer } from '../shared/Explainer';
+import { LoadingFade } from '../shared/LoadingFade';
+import { ListSkeletonOf, SkBlock, SkText } from '../shared/Skeleton';
 import { AddDeviceSection } from './AddDeviceSection';
 import type { PairTarget } from './AddDeviceSection';
 import type { NetworkConfigResponse, TailnetStatusResponse } from '../../api/types';
 import { useDelayedFlag } from '../../hooks/useDelayedLoading';
-import { toFailed } from '../../store/types';
+import { usePanelRefresh } from '../../hooks/usePanelRefresh';
+import { loadingIfFresh, toFailed } from '../../store/types';
 import type { Loadable } from '../../store/types';
 import { errorDetail } from '../../utils/errorDetail';
 import { LoadableError } from '../shared/LoadableError';
@@ -500,20 +503,27 @@ export function deviceSetupState(device: {
     : { kind: 'needs-https', hostname };
 }
 
-/** A connect URL with a copy-to-clipboard button. */
-function UrlRow({ label, url, hint }: { label: string; url: string; hint?: string }) {
-  const copy = useCallback(() => copyToClipboard(url), [url]);
+/** A connect URL with a copy-to-clipboard button. With no `url`, inside a
+ *  `SkeletonProvider`, it draws itself as the loading placeholder. */
+function UrlRow({ label, url, hint }: { label?: string; url?: string; hint?: string }) {
+  const copy = useCallback(() => { if (url) copyToClipboard(url); }, [url]);
   return (
     <div class="list-row">
       <div class="list-row-info">
-        <div class="title">{label}</div>
-        <div class="list-row-details list-row-details-prose">
-          <button class="mobile-access-url-button accent-link" onClick={copy}>{url}</button>
-          {hint && <> &middot; {hint}</>}
-        </div>
+        <SkText class="title" as="div" w="6rem">{label}</SkText>
+        <SkText class="list-row-details list-row-details-prose" as="div" w="18rem">
+          {url && (
+            <>
+              <button class="mobile-access-url-button accent-link" onClick={copy}>{url}</button>
+              {hint && <> &middot; {hint}</>}
+            </>
+          )}
+        </SkText>
       </div>
       <div class="list-row-actions">
-        <button class="action-btn" onClick={copy}>Copy</button>
+        <SkBlock w="3.5rem" h="2rem" round>
+          <button class="action-btn" onClick={copy}>Copy</button>
+        </SkBlock>
       </div>
     </div>
   );
@@ -858,34 +868,38 @@ export function MobileAccessPage() {
     return url === null ? { kind: 'none' } : { kind: 'origin', url };
   }
 
-  const reload = useCallback(() => {
+  // Every read keeps what it already shows until its answer lands, so a pull
+  // to refresh re-reads in place. Resolves once all of them have settled.
+  const reload = useCallback((): Promise<unknown> => {
     // Fetched on EVERY platform: this is the only reading of concern 1 a
     // browser has, and it is also what proves a remote device is on the tailnet
     // when it reached us at a bare `100.x` address.
-    setNetConfig({ status: 'loading' });
-    getNetworkConfig().then(
+    setNetConfig(loadingIfFresh);
+    const reads: Promise<void>[] = [getNetworkConfig().then(
       (data) => setNetConfig({ status: 'loaded', data }),
       (e) => setNetConfig(toFailed(e)),
-    );
+    )];
     // Also every platform: the MagicDNS name is the address the user copies to
     // another device, and a browser has no other way to learn it.
-    setTailnetStatus({ status: 'loading' });
-    getTailnetStatus().then(
+    setTailnetStatus(loadingIfFresh);
+    reads.push(getTailnetStatus().then(
       (data) => setTailnetStatus({ status: 'loaded', data }),
       (e) => setTailnetStatus(toFailed(e)),
-    );
+    ));
     // Not a swallowed error: off the desktop app there is nothing to fetch
     // here, so there is no failure to report. Setting a failed state would
     // render the error card for a bridge this platform was never going to have.
-    if (!showMachineHalf) return;
-    setConnectInfo({ status: 'loading' });
-    getConnectInfo().then(
+    if (!showMachineHalf) return Promise.all(reads);
+    setConnectInfo(loadingIfFresh);
+    reads.push(getConnectInfo().then(
       (data) => setConnectInfo({ status: 'loaded', data }),
       (e) => setConnectInfo(toFailed(e)),
-    );
+    ));
+    return Promise.all(reads);
   }, [showMachineHalf]);
 
-  useEffect(() => { reload(); }, [reload]);
+  useEffect(() => { void reload(); }, [reload]);
+  usePanelRefresh('mobile access', reload);
 
   // Both failure toasts show the error verbatim, with NO action prefix of their
   // own. Every error `mobile.rs` returns already names what failed: the CLI
@@ -904,7 +918,7 @@ export function MobileAccessPage() {
     setBusy('up');
     try {
       await tailscaleUp(authKey.trim() || undefined);
-      reload();
+      void reload();
     } catch (e) {
       showToast(errorDetail(e), 'error');
     } finally {
@@ -913,8 +927,8 @@ export function MobileAccessPage() {
     }
   }, [authKey, reload]);
 
-  // Expose is narrated by the shared background-activity surface (the spinning
-  // brand badge, and the status toast behind it), not by this promise: the run
+  // Expose is narrated by its own toast, the spinning brand badge and its row
+  // in the Lucidos menu, not by this promise: the run
   // can legitimately wait minutes for a tailnet approval, and every step it
   // passes through arrives as a progress frame. So the outcome toast comes from
   // the terminal frame, and the `catch` here covers only what Rust could not
@@ -932,7 +946,7 @@ export function MobileAccessPage() {
       if (tailscaleServeRun.value) {
         applyTailscaleServeProgress({ phase: 'done', url });
       }
-      reload();
+      void reload();
     } catch (e) {
       // A frame already narrated this (and cleared the run), so say nothing
       // twice. A still-set run means no frame arrived, and then this is the only
@@ -987,10 +1001,18 @@ export function MobileAccessPage() {
     }
     // `connectUrlsReady` is the whole condition. The two status checks beside
     // it are what narrows the types below, which it cannot do from up there.
+    // One fade for every settled body, so the skeleton crossfades into it. The
+    // shell around it is not delay-gated, per the anchor rule above.
+    const settled = (body: ComponentChildren) => shell(
+      <LoadingFade
+        showSkeleton={showLoading}
+        skeleton={<ListSkeletonOf count={2} containerClass="list-rows" row={() => <UrlRow />} />}
+      >
+        {body}
+      </LoadingFade>,
+    );
     if (!connectUrlsReady || netConfig.status !== 'loaded' || tailnetStatus.status !== 'loaded') {
-      // Still delay-gated, so a fast load never flashes a loader. The shell
-      // around it is not, per the anchor rule above.
-      return shell(showLoading ? <div class="empty-state">Loading…</div> : null);
+      return settled(null);
     }
     const tailnet = tailnetStatus.data;
     const connect = connectInfo.status === 'loaded' ? connectInfo.data : null;
@@ -1006,14 +1028,14 @@ export function MobileAccessPage() {
     // rather than vanishing: the anchor is a search destination, so an absent
     // section drops the reader at the top of the page with no explanation.
     if (connect === null && tailnetRows.length === 0) {
-      return shell(
+      return settled(
         <div class="settings-section-desc">
         No address reaches this workspace from another device yet. The Tailscale section
         below says what is missing.
         </div>,
       );
     }
-    return shell(
+    return settled(
       <div class="list-rows">
         {connect && (
           <UrlRow

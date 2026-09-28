@@ -50,6 +50,16 @@ describe('normalizeDataPath', () => {
     );
   });
 
+  // Every tree the engine's data route accepts keeps its own path.
+  it.each([
+    'themes/harbour.json',
+    'config/apis.json',
+    'auth-modules/binance-hmac.wasm',
+    'scripts/auth/login.py',
+  ])('leaves %s unchanged', (path) => {
+    expect(normalizeDataPath(path)).toBe(path);
+  });
+
   it('handles bare filename without directory', () => {
     expect(normalizeDataPath('readme.md')).toBe('artifacts/readme.md');
   });
@@ -244,6 +254,56 @@ describe('invalidateFilePreview: only the file on screen re-reads', () => {
     actions.refreshFilePreview();
     vi.runAllTimers();
     expect(store.filePreviewRevision.value).toEqual({ path: 'knowhow/ops/deploy.md', rev: 1 });
+  });
+
+  // The panel refresh contract: the header spinner stops when the refresh
+  // settles, so it must settle once the re-read landed, and never hang.
+  it('settles a media refresh as soon as its bump is applied', async () => {
+    const { actions } = await showing('artifacts/clip.mp4');
+    let settled = false;
+    void actions.refreshFilePreview().then(() => { settled = true; });
+    vi.runAllTimers();
+    await Promise.resolve();
+    expect(settled).toBe(true);
+  });
+
+  it('settles a text refresh only once the text body reports its re-read', async () => {
+    const { actions } = await showing('knowhow/ops/deploy.md');
+    const unmount = actions.registerPreviewTextBody();
+    let settled = false;
+    void actions.refreshFilePreview().then(() => { settled = true; });
+    vi.runAllTimers();
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    // A read of the previous revision landing late does not answer it.
+    actions.reportPreviewTextSettled(0);
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    actions.reportPreviewTextSettled(1);
+    await Promise.resolve();
+    expect(settled).toBe(true);
+    unmount();
+  });
+
+  it('keeps a refresh waiting across a later bump in the debounce window', async () => {
+    const { actions } = await showing('artifacts/clip.mp4');
+    let settled = false;
+    void actions.refreshFilePreview().then(() => { settled = true; });
+    actions.invalidateFilePreview('artifacts/clip.mp4');
+    vi.runAllTimers();
+    await Promise.resolve();
+    expect(settled).toBe(true);
+  });
+
+  it('settles a waiting refresh when the text body unmounts', async () => {
+    const { actions } = await showing('knowhow/ops/deploy.md');
+    const unmount = actions.registerPreviewTextBody();
+    let settled = false;
+    void actions.refreshFilePreview().then(() => { settled = true; });
+    vi.runAllTimers();
+    unmount();
+    await Promise.resolve();
+    expect(settled).toBe(true);
   });
 
   // A repo preview is handed a parsed locator, never the encoded `repo:` string

@@ -240,14 +240,20 @@ export interface ProcessorUser {
   kind: UserKind;
 }
 
+/** What is wrong with a database an engine reported down. Mirrors the
+ *  gateway's `DatabaseProblem`. */
+export type DatabaseProblem = 'not_answering' | 'pool_exhausted';
+
 /** Why an open episode says Lucidos is slow. Mirrors the gateway's
- *  `SlownessReason`: memory shows in every workspace, unclear only in the
- *  windows of `slow_workspaces`. */
+ *  `SlownessReason`: disk and memory show in every workspace, database and
+ *  unclear only in the windows of `slow_workspaces`. */
 export type SlownessReason =
+  | { reason: 'disk'; free_bytes: number }
+  | { reason: 'database'; problem: DatabaseProblem; slow_workspaces: string[] }
   | { reason: 'memory'; top_users: MemoryUser[] }
   | { reason: 'unclear'; busiest_apps: ProcessorUser[]; slow_workspaces: string[] };
 
-/** Is Lucidos slow, and why (ADRs 0274, 0283)? Mirrors the gateway's
+/** Is Lucidos slow, and why (ADRs 0274, 0283, 0301)? Mirrors the gateway's
  *  `SlownessStatus`. */
 export type SlownessStatus =
   | { state: 'normal' }

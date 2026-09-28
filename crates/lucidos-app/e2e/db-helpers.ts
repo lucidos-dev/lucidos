@@ -250,6 +250,8 @@ export function createIframeAppFixture(id: string, files: {
   html: string;
   js: string;
   manifest?: Record<string, unknown>;
+  /** More files beside `index.html`, keyed by their name in the app folder. */
+  extra?: Record<string, string | Uint8Array>;
 }): { dir: string; cleanup: () => void } {
   const dir = resolve(WORKSPACE, 'data/apps', id);
   mkdirSync(dir, { recursive: true });
@@ -259,6 +261,9 @@ export function createIframeAppFixture(id: string, files: {
     resolve(dir, 'manifest.json'),
     JSON.stringify(files.manifest ?? { id, name: id, description: 'e2e fixture' }),
   );
+  for (const [name, body] of Object.entries(files.extra ?? {})) {
+    writeFileSync(resolve(dir, name), body);
+  }
   return {
     dir,
     cleanup: () => rmSync(dir, { recursive: true, force: true }),

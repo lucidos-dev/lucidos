@@ -210,9 +210,9 @@ async function boot() {
 
   // Packaged desktop: the shell keeps the launch window hidden until a page says
   // it has something to paint (lib.rs `window_ready_to_show`). Signal here
-  // rather than from `applyTheme`, because EVERY boot path reaches this line
+  // rather than from `applyThemeMode`, because EVERY boot path reaches this line
   // with the theme resolved and the boot splash in the markup. Neither launch
-  // that matters reaches `applyTheme`: the pre-gateway shell below returns
+  // that matters reaches `applyThemeMode`: the pre-gateway shell below returns
   // before `<App/>` mounts, and `loadPreferences` skips the repaint when the
   // stored theme is unchanged.
   if (isTauri()) windowReadyToShow();

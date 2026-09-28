@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { toasts, applyingChangeIds, applyAllInProgress, threadMap } from '../store';
+import { toasts, applyingChangeIds, applyAllInProgress, applyAllCanceling, threadMap } from '../store';
 
 // Mock the API module before importing the action
 vi.mock('../../api/client', () => ({
@@ -25,16 +25,16 @@ beforeEach(() => {
   toasts.value = [];
   applyingChangeIds.value = new Set();
   applyAllInProgress.value = false;
+  applyAllCanceling.value = false;
   threadMap.value = new Map();
   vi.clearAllMocks();
 });
 
 describe('applySingleChange feedback', () => {
   it('does NOT show an HTTP-response toast on hardening — SSE handler covers it (but tracks applying)', async () => {
-    // Apply Now hardening is surfaced by the MissingHardeningDetected SSE
-    // handler (see missing-hardening-toast.test.ts), not by this HTTP path —
-    // mirroring merge conflict. Toasting here too would double-fire whenever
-    // the user is on the hardening thread.
+    // The MissingHardeningDetected SSE handler reports hardening on the
+    // apply's own toast (apply-progress-toast.test.ts), not this HTTP path.
+    // Toasting here too would double-fire.
     mockedApply.mockResolvedValue({
       status: 'hardening',
       change_id: 'change-1',
@@ -81,7 +81,7 @@ describe('applySingleChange feedback', () => {
 
   it('does NOT show an HTTP-response toast on conflict — SSE handler covers it', async () => {
     // Apply Now conflicts are surfaced by the MergeConflictDetected SSE
-    // handler (see merge-conflict-toast.test.ts), not by this HTTP path.
+    // handler (see apply-progress-toast.test.ts), not by this HTTP path.
     // Toasting here too would double-fire whenever the user isn't on the
     // conflict thread.
     mockedApply.mockResolvedValue({
@@ -138,23 +138,20 @@ describe('applySingleChange feedback', () => {
     // Stays "in progress" — only ApplyAllBatchCompleted (SSE) clears it, so the
     // bulk button keeps showing "Applying..." through the multi-minute harden.
     expect(applyAllInProgress.value).toBe(true);
-    // No HTTP-response toast — the MissingHardeningDetected SSE handler fires it,
-    // uniform with merge conflict and single Apply (see missing-hardening-toast.test.ts).
+    // No HTTP-response toast: the Apply All row in the Lucidos menu follows
+    // the hardening from the SSE phase event (apply-progress-in-the-menu.test.ts).
     expect(toasts.value.find(t => t.message.toLowerCase().includes('harden'))).toBeUndefined();
   });
 
-  it('cancelApplyAllBatch swaps the toast to "Canceling..." and calls the cancel API', async () => {
+  it('cancelApplyAllBatch marks the batch canceling and calls the cancel API', async () => {
+    // The Apply All row reads the flag: "Canceling apply..." with no Cancel,
+    // so a second click can't fire (activityRows.test.ts).
     mockedCancelApplyAll.mockResolvedValue({ canceled_batches: 1, disarmed: 0 });
 
     await cancelApplyAllBatch();
 
     expect(mockedCancelApplyAll).toHaveBeenCalledOnce();
-    const toast = toasts.value.find((t) => t.key === 'apply-all-batch');
-    expect(toast?.message.toLowerCase()).toContain('cancel');
-    expect(toast?.spinning).toBe(true);
-    // Action is dropped on the optimistic "Canceling..." toast so a second
-    // click can't fire a second cancel.
-    expect(toast?.action).toBeUndefined();
+    expect(applyAllCanceling.value).toBe(true);
   });
 
   it('cancelApplyAllBatch surfaces an error toast when the cancel request fails', async () => {
@@ -163,6 +160,7 @@ describe('applySingleChange feedback', () => {
     await cancelApplyAllBatch();
 
     expect(toasts.value.some((t) => t.type === 'error')).toBe(true);
+    expect(applyAllCanceling.value).toBe(false);
   });
 
   it('applyAllChanges clears the in-progress flag when the request errors', async () => {
@@ -175,12 +173,9 @@ describe('applySingleChange feedback', () => {
   });
 
   it('does NOT show an HTTP-response toast when the batch stops at a conflict — SSE handler covers it', async () => {
-    // Apply All conflicts are surfaced by the MergeConflictDetected SSE handler
-    // (see merge-conflict-toast.test.ts), uniform with single Apply and Apply
-    // All's hardening case. The SSE toast is keyed and transitions in place to
-    // "resolved" once the conflict is fixed; the old unkeyed HTTP toast here
-    // could never be reached by that resolver, so it dangled forever as a stale
-    // "resolving automatically" warning after the batch had already applied.
+    // The Apply All row follows the conflict from the MergeConflictDetected
+    // phase event. An unkeyed HTTP toast here once dangled as a stale warning
+    // after the batch had applied.
     threadMap.value = new Map([
       ['thread-X', { meta: { id: 'thread-X', title: 'Big refactor' } } as any],
     ]);

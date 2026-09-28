@@ -17,14 +17,14 @@ use tokio::sync::{broadcast, mpsc};
 use uuid::Uuid;
 
 use crate::engine::thread_events::{EventMeta, ThreadEvent};
-use crate::engine::thread_lifecycle::{self, ArchiveState, ThreadType};
+use crate::engine::thread_lifecycle::{self, ArchiveState, ThreadStatus, ThreadType};
 use crate::scheduler::user_tasks::{current_event_trigger_depth, current_trigger_id};
 
 /// CC session-end status — always `'idle'`. A proposed change is a review
 /// artifact, not a parked loop, so it does not block the parent's "is my
 /// child still working?" rollup. Pending review surfaces via the
 /// `coding_agent_proposed` column (and `is_blocking` clause 3) instead.
-pub(super) const STATUS_FROM_PROPOSED_CHANGE: &str = "'idle'";
+pub(super) const STATUS_FROM_PROPOSED_CHANGE: &str = ThreadStatus::Idle.sql_literal();
 
 /// The `status` values that are a **verdict about how the turn ended**, rather
 /// than a resting state the next event may freely overwrite. Both are written by
@@ -42,16 +42,16 @@ pub(super) const STATUS_FROM_PROPOSED_CHANGE: &str = "'idle'";
 /// hole in it. `status_sql` used to answer `'waiting'` whenever a change was
 /// pending, and the drain then overwrote it within milliseconds. Say the verdict
 /// here, and let the reader rank it against a pending change.
-pub(super) const PRESERVED_STATUS_VERDICTS: &[&str] = &["failed", "paused"];
+pub(super) const PRESERVED_STATUS_VERDICTS: &[ThreadStatus] =
+    &[ThreadStatus::Failed, ThreadStatus::Paused];
 
-/// [`PRESERVED_STATUS_VERDICTS`] as a SQL `IN (...)` body. Every name is a
-/// compile-time literal, so there is nothing to parameterize and nothing to
-/// escape. Built once: the projection interpolates it on every status write.
+/// [`PRESERVED_STATUS_VERDICTS`] as a SQL `IN (...)` body. Built once: the
+/// projection interpolates it on every status write.
 pub(super) static PRESERVED_STATUS_VERDICTS_SQL: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| {
         PRESERVED_STATUS_VERDICTS
             .iter()
-            .map(|v| format!("'{v}'"))
+            .map(|v| v.sql_literal())
             .collect::<Vec<_>>()
             .join(",")
     });
@@ -76,7 +76,7 @@ pub(super) static PRESERVED_STATUS_VERDICTS_SQL: std::sync::LazyLock<String> =
 /// `'idle'`. The drain is not suppressed by `external_terminal_emitted`, which
 /// covers the duplicate terminal rather than the activity stream.
 ///
-/// Not expressible in the coarse `StatusRule::ConditionalCc` model that
+/// Not expressible in the coarse `StatusRule` model that
 /// `thread_lifecycle::status_transitions()` publishes, so the contract table
 /// stays as-is and this guard lives in the projection SQL — see the note on
 /// `CodingAgentIdled` there. The `terminal_events_never_set_running`
@@ -88,15 +88,12 @@ pub(super) fn preserving_verdict(target: &str) -> String {
     )
 }
 
-/// SET fragment that clears every CC-state column on `thread_summaries` —
-/// used identically by `ChangeApplied`, `ChangeDiscarded`, and `ThreadArchived`
-/// since the user-facing proposal lifecycle ends in all three. Add new
-/// CC-state columns here so the next "terminal proposal event" handler
-/// doesn't have to know about them.
+/// SET fragment that clears the CC-state columns on `thread_summaries` that
+/// events own, used identically by `ChangeApplied`, `ChangeDiscarded`, and
+/// `ThreadArchived`. The proposal flags are not here: they follow the
+/// `changes` table (`ChangesProjection::sync_thread_proposal`).
 pub(super) const CLEAR_CODING_AGENT_FLAGS: &str =
-    "coding_agent_proposed = FALSE, coding_agent_requires_restart = FALSE, \
-     coding_agent_is_external_repo = FALSE, coding_agent_applying = FALSE, \
-     coding_agent_has_diff = FALSE";
+    "coding_agent_is_external_repo = FALSE, coding_agent_has_diff = FALSE";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -233,6 +230,11 @@ impl EmittedEvent {
                 // event JSON so SSE consumers see the same shape as DB-loaded events.
                 if let Some(obj) = event_json.as_object_mut() {
                     meta.apply(obj);
+                    // Goes to every client for every thread, and only the step
+                    // modal reads it, which fetches it by event id.
+                    if matches!(event, ThreadEvent::CodingAgentToolResult { .. }) {
+                        ThreadEvent::strip_result_text(obj);
+                    }
                 }
                 let mut data = serde_json::json!({
                     "thread_id": thread_id.to_string(),

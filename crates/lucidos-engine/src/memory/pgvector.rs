@@ -37,13 +37,34 @@ fn to_pgvector_literal(v: &[f32]) -> String {
     )
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum MemorySource {
     #[serde(rename = "artifact")]
     Artifact { path: String, commit: String },
     #[serde(rename = "event")]
     Event { id: Uuid },
+}
+
+/// A memory entry a user correction removed: its text, its entities, and the
+/// source it was extracted from. A rebuild re-extracts under a new id but the
+/// same source, which is what lets a replay find the entry again.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CorrectedMemory {
+    pub summary: String,
+    #[serde(default)]
+    pub entities: Vec<String>,
+    pub source: MemorySource,
+}
+
+impl From<&MemoryEntry> for CorrectedMemory {
+    fn from(entry: &MemoryEntry) -> Self {
+        Self {
+            summary: entry.summary.clone(),
+            entities: entry.entities.clone(),
+            source: entry.source.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

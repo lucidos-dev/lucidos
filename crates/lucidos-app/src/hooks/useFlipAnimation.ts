@@ -2,19 +2,15 @@ import { useRef, useLayoutEffect } from 'preact/hooks';
 import { durationScale } from '../store/store';
 import { isReducedMotion } from '../utils/motion';
 import { isMobile } from '../utils/viewport';
+import { EASING_DISCLOSURE, FADE_REACH, disclosureDurationMs } from '../utils/disclosureMotion';
 
 interface Rect { top: number; left: number; width: number; height: number }
 
 const EASING_DESKTOP = 'cubic-bezier(0.22, 0, 0, 1)';
 const EASING_MOBILE = 'cubic-bezier(0.25, 0.1, 0.25, 1)'; // simpler ease for mobile perf
-// A disclosure gathers speed, then eases into its landing, on every client.
-const EASING_DISCLOSURE = 'cubic-bezier(0.4, 0, 0.2, 1)';
 const PX_PER_SEC = 600;
 const MIN_MS = 250;
 const MAX_MS = 450;
-const DISCLOSURE_PX_PER_SEC = 1200;
-const DISCLOSURE_MIN_MS = 260;
-const DISCLOSURE_MAX_MS = 420;
 // A departing copy holds full opacity through its first half. Its curve starts
 // fast, so fading from the start leaves it half gone by the first frames.
 const LINGER: Keyframe = { opacity: '1', offset: 0.5 };
@@ -208,11 +204,6 @@ function playOutDeparture(layer: HTMLElement, exits: Animation[]) {
 /** Base duration for a row that moves `distance` px, before scaling. */
 function flightDurationMs(distance: number): number {
     return Math.max(MIN_MS, Math.min(MAX_MS, distance / PX_PER_SEC * 1000));
-}
-
-/** Base duration for a disclosure that rolls `distance` px, before scaling. */
-export function disclosureDurationMs(distance: number): number {
-    return Math.min(DISCLOSURE_MAX_MS, Math.max(DISCLOSURE_MIN_MS, distance / DISCLOSURE_PX_PER_SEC * 1000));
 }
 
 /** An inert copy of a row that is about to unmount, for it to roll away as.
@@ -537,20 +528,32 @@ export function useFlipTransitions(
                 hidden.push(real);
             }
             const timing = { duration: disclosureDuration, easing: EASING_DISCLOSURE, fill: 'forwards' as const };
-            // The mask rides the anchor, and the copies slide the roll inside
-            // it, in lockstep with the rows below.
-            const atAnchor = { transform: 'translateY(0)' };
-            const drifted = { transform: `translateY(${reveal ? drift : -drift}px)` };
-            newAnims.push(mask.animate(reveal ? [drifted, atAnchor] : [atAnchor, drifted], timing));
-            const open = { transform: 'translateY(0)', opacity: '1' };
-            const shut = { transform: `translateY(${-roll}px)`, opacity: '0' };
-            for (const { id, ghost, rect } of blockRows) {
-                // A toggle that interrupts another starts where its copy was.
+            // A toggle that interrupts another starts where its copy was.
+            const startY = (id: string, rect: Rect) => {
                 const was = seen.get(id);
-                const from = !was ? (reveal ? shut : open) : reveal
-                    ? { transform: `translateY(${was.rect.top - rect.top - drift}px)`, opacity: String(was.opacity) }
-                    : { transform: 'translateY(0)', opacity: String(was.opacity) };
-                newAnims.push(ghost.animate([from, reveal ? open : shut], timing));
+                if (!was) return reveal ? -roll : 0;
+                return reveal ? was.rect.top - rect.top - drift : 0;
+            };
+            const endY = reveal ? 0 : -roll;
+            // The mask rides the anchor, and the copies slide the roll inside
+            // it, in lockstep with the rows below. Its fade reaches as far as
+            // the top copy has slid under the line.
+            const top = blockRows[0];
+            const maskAt = (driftY: number, copyY: number): Keyframe => ({
+                transform: `translateY(${driftY}px)`,
+                [FADE_REACH]: `${Math.max(0, line - (top.rect.top + copyY))}px`,
+            });
+            const drifted = reveal ? drift : -drift;
+            newAnims.push(mask.animate(reveal
+                ? [maskAt(drifted, startY(top.id, top.rect)), maskAt(0, endY)]
+                : [maskAt(0, startY(top.id, top.rect)), maskAt(drifted, endY)], timing));
+            for (const { id, ghost, rect } of blockRows) {
+                const was = seen.get(id);
+                const fromOpacity = was ? String(was.opacity) : reveal ? '0' : '1';
+                newAnims.push(ghost.animate([
+                    { transform: `translateY(${startY(id, rect)}px)`, opacity: fromOpacity },
+                    { transform: `translateY(${endY}px)`, opacity: reveal ? '1' : '0' },
+                ], timing));
                 standIns.current.set(id, ghost);
             }
             if (run.anchor && !isThreadRow(run.anchor)) {

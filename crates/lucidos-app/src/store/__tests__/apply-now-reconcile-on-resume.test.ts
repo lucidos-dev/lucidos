@@ -69,13 +69,13 @@ beforeEach(() => {
   mockFetchChanges.mockReset();
 });
 
-describe('refreshChangesState reconciles a stranded Apply Now toast on resume', () => {
-  it('clears the toast + state when the apply resolved while SSE was missed', async () => {
-    // iOS PWA suspend: the optimistic spinner toast was shown on the Apply tap,
+describe('refreshChangesState reconciles a stranded Apply Now on resume', () => {
+  it('reports the result and clears the state when the apply resolved while SSE was missed', async () => {
+    // iOS PWA suspend: the Apply tap met an apply already running,
     // the apply completed on the backend, but the ChangeApplied SSE was missed.
     applyingNowThreadIds.value = new Map([['t1', 'applying']]);
     threadMap.value = new Map([['t1', thread('t1', 'idle')]]);
-    showToast('Applying changes — T', 'info', { key: 'applying-t1', spinning: true });
+    showToast('Already applying: T', 'info', { key: 'applying-t1' });
 
     // Backend truth: no pending change for the thread; it landed in applied.
     mockFetchChanges.mockResolvedValueOnce({
@@ -86,16 +86,15 @@ describe('refreshChangesState reconciles a stranded Apply Now toast on resume', 
 
     refreshChangesState();
     await vi.waitFor(() => expect(applyingNowThreadIds.value.has('t1')).toBe(false));
-    // The sticky spinner is resolved into a success toast, not left dangling.
+    // The notice is replaced by the result, not left dangling.
     const t = toasts.value.find((x) => x.key === 'applying-t1');
     expect(t?.type).toBe('success');
-    expect(t?.spinning).not.toBe(true);
   });
 
-  it('dismisses the toast when the change is gone (discarded) and not applied', async () => {
+  it('dismisses the notice when the change is gone (discarded) and not applied', async () => {
     applyingNowThreadIds.value = new Map([['t2', 'applying']]);
     threadMap.value = new Map([['t2', thread('t2', 'idle')]]);
-    showToast('Applying changes — T', 'info', { key: 'applying-t2', spinning: true });
+    showToast('Already applying: T', 'info', { key: 'applying-t2' });
 
     mockFetchChanges.mockResolvedValueOnce({ ...baseState, pending: [], applied: [] });
 
@@ -107,7 +106,7 @@ describe('refreshChangesState reconciles a stranded Apply Now toast on resume', 
   it('keeps the state while the change is still pending (apply in progress)', async () => {
     applyingNowThreadIds.value = new Map([['t3', 'applying']]);
     threadMap.value = new Map([['t3', thread('t3', 'idle')]]);
-    showToast('Applying changes — T', 'info', { key: 'applying-t3', spinning: true });
+    showToast('Already applying: T', 'info', { key: 'applying-t3' });
 
     // Harden/merge still running on the backend → change stays pending.
     mockFetchChanges.mockResolvedValueOnce({
@@ -118,7 +117,7 @@ describe('refreshChangesState reconciles a stranded Apply Now toast on resume', 
     refreshChangesState();
     await vi.waitFor(() => expect(mockFetchChanges).toHaveBeenCalled());
     expect(applyingNowThreadIds.value.has('t3')).toBe(true);
-    expect(toasts.value.find((x) => x.key === 'applying-t3')?.spinning).toBe(true);
+    expect(toasts.value.some((x) => x.key === 'applying-t3')).toBe(true);
   });
 
   it('keeps the state while the thread is mid-turn (CC running the apply)', async () => {
@@ -126,7 +125,7 @@ describe('refreshChangesState reconciles a stranded Apply Now toast on resume', 
     // the apply has not resolved — do not clear.
     applyingNowThreadIds.value = new Map([['t4', 'requesting']]);
     threadMap.value = new Map([['t4', thread('t4', 'running')]]);
-    showToast('Applying changes — T', 'info', { key: 'applying-t4', spinning: true });
+    showToast('Already applying: T', 'info', { key: 'applying-t4' });
 
     mockFetchChanges.mockResolvedValueOnce({ ...baseState, pending: [], applied: [] });
 

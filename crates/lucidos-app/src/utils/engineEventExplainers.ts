@@ -74,7 +74,7 @@ export function describeContinuationReason(reason: string | undefined): string |
     case CONTINUATION_AUTO_RECOVERY_REASON:
       return 'The agent session stopped responding, or a stray signal killed it. Nothing restarted: the engine relaunched that one session and carried on.';
     case CONTINUATION_AUTO_RESUME_AFTER_SWITCH_REASON:
-      return 'You chose Switch to new version, which stopped this response mid-flight. The engine resumed it automatically once the new version was up.';
+      return 'You chose Switch on the new version, which stopped this response mid-flight. The engine resumed it automatically once the new version was up.';
     case CONTINUATION_AUTO_RESUME_AFTER_API_ERROR_REASON:
       return 'The connection to the model dropped part-way through the response above, so that turn failed incomplete. Nothing restarted: the engine picked the session back up and carried on. It will do this a few times in a row at most, then leave the failure standing.';
     default:
@@ -105,7 +105,58 @@ export function describeEngineReason(reason: EngineReason): string | null {
       return 'Hardening (`/harden`) must run before changes are applied. The engine queues it automatically when the marker is missing.';
     case 'plugin_auto_update':
       return `The engine found a newer version of ${reason.plugin_id} in ${reason.marketplace_name} and updated the installed plugin.`;
+    case 'plugin_setup':
+      return describePluginSetup(reason);
+    case 'plugin_upstream_proposal':
+      return `You asked to offer your local changes to ${reason.plugin_name} to its author. The engine saved them as a patch and started this thread so the Lucidos Agent can propose it upstream.`;
     case 'scheduler':
       return null;
   }
 }
+
+type PluginSetupReason = Extract<EngineReason, { kind: 'plugin_setup' }>;
+
+function describePluginSetup({ plugin_name: name, version, occasion }: PluginSetupReason): string {
+  const handOff = 'The engine started this thread so the Lucidos Agent can walk you through it.';
+  if (occasion.kind === 'fresh_install') {
+    return `You installed ${name}, and its setup needs your input. ${handOff}`;
+  }
+  const from = occasion.from_version ? ` from ${occasion.from_version}` : '';
+  return `You updated ${name}${from} to ${version}, and the new version changed its setup instructions. ${handOff} The agent reuses what you set up before.`;
+}
+
+/** The named origin of an engine-seeded thread: a label and a value for the
+ *  popover's row, and the same pair as the chip's summary line. Null for a
+ *  reason that names no thing of its own, which then shows only "Issued by". */
+export function engineReasonHeadline(reason: EngineReason): { label: string; value: string } | null {
+  switch (reason.kind) {
+    case 'plugin_setup': {
+      const { plugin_name: name, version, occasion } = reason;
+      if (occasion.kind === 'fresh_install') return { label: 'Plugin install', value: `${name} ${version}` };
+      const value = occasion.from_version ? `${name} ${occasion.from_version} → ${version}` : `${name} ${version}`;
+      return { label: 'Plugin update', value };
+    }
+    case 'plugin_upstream_proposal':
+      return { label: 'Plugin patch', value: `${reason.plugin_name} ${reason.version}` };
+    default:
+      return null;
+  }
+}
+
+/** The device that confirmed the action an engine-seeded thread follows, when
+ *  one did. The id only; the caller resolves the name. */
+export function engineReasonConfirmingDevice(reason: EngineReason): string | undefined {
+  switch (reason.kind) {
+    case 'plugin_setup':
+    case 'plugin_upstream_proposal':
+      return reason.confirmed_on_device_id;
+    default:
+      return undefined;
+  }
+}
+
+/** Why the engine acted, for an engine-seeded message that recorded no origin
+ *  at all. Rows written before the engine stamped one land here, such as an
+ *  early plugin setup seed. Says so rather than inventing a cause. */
+export const UNRECORDED_ENGINE_SEED_EXPLAINER =
+  'Lucidos wrote this message itself, not you. It was sent before Lucidos recorded why, so the reason is not known.';

@@ -108,16 +108,6 @@ _reclaim_deadline_s() { _reclaim_seconds "${LUCIDOS_RECLAIM_DEADLINE_S:-59}" 59;
 # faster poll cannot see anything a 2s one misses.
 _reclaim_poll_s() { _reclaim_seconds "${LUCIDOS_RECLAIM_POLL_S:-2}" 2; }
 
-# The retired knob, named rather than silently ignored. Honouring its old value
-# would put the 10s window back, which is the bug this replaced. Removable once
-# nothing sets it: docs/temporary-measures.md § "The retired-settle notice in
-# the pre-flight engine reclaim".
-_reclaim_warn_retired_settle() {
-    [ -n "${LUCIDOS_RECLAIM_SETTLE_S:-}" ] || return 0
-    echo "$RECLAIM_TAG NOTE: LUCIDOS_RECLAIM_SETTLE_S is retired and ignored." >&2
-    echo "$RECLAIM_TAG   The single delayed re-scan is now a poll. Set LUCIDOS_RECLAIM_QUIET_S or LUCIDOS_RECLAIM_DEADLINE_S instead." >&2
-}
-
 # ── host seams (overridden by the test) ─────────────────────────────────
 # Every one fails CLOSED when the test replaces it: an empty synthetic feed
 # means "no engines", never "fall back to the real host". Same posture as the ps
@@ -407,8 +397,6 @@ preflight_reclaim_main() {
     # Where each gateway log stood before the first stop, so a comeback is
     # explained from what was written after it and never from an older line.
     _RECLAIM_LOG_MARKS=""
-
-    _reclaim_warn_retired_settle
 
     for tool in pgrep ps; do
         if ! command -v "$tool" >/dev/null 2>&1; then

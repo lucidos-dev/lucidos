@@ -244,7 +244,6 @@ reset_host() {
     DRAIN_S=8
     set_avail "12.00 12.00"
     unset LUCIDOS_RECLAIM_KEEP
-    unset LUCIDOS_RECLAIM_SETTLE_S
     unset LUCIDOS_RECLAIM_QUIET_S
     unset LUCIDOS_RECLAIM_DEADLINE_S
 }
@@ -517,20 +516,6 @@ assert_contains "the give-up is explicit" "$STDERR" "gave up after 60s without 3
 assert_contains "and names the knob to raise" "$STDERR" "LUCIDOS_RECLAIM_DEADLINE_S"
 assert_contains "the survivor is named too" "$STDERR" \
     "WARNING: coldrun (pid 44011) is up at the end of the watch"
-
-# The old knob's value is exactly the window that hid the bug. Honouring it
-# would put the bug back, and ignoring it in silence would hide that.
-echo "preflight_reclaim: the retired settle knob is named and not honoured"
-reset_host
-LUCIDOS_RECLAIM_SETTLE_S=10
-add_proc 44011 coldrun "$COLDRUN_WS"
-add_comeback 20 77209 coldrun "$COLDRUN_WS" "$RESPAWN_LINE"
-run_reclaim
-unset LUCIDOS_RECLAIM_SETTLE_S
-assert_contains "the retirement is announced" "$STDERR" \
-    "LUCIDOS_RECLAIM_SETTLE_S is retired and ignored"
-assert_contains "it names what replaced it" "$STDERR" "LUCIDOS_RECLAIM_QUIET_S"
-assert_eq "and the 20s comeback is still caught" "$RC" "1"
 
 echo "preflight_reclaim: the window is overridable"
 reset_host

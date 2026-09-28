@@ -329,6 +329,16 @@ pub(super) fn should_auto_commit_on_cleanup(
     !should_discard && matches!(last_terminal, Some(TerminalKind::Generated))
 }
 
+/// Whether a classified `Result` commits the worktree before the idle diff
+/// probe. It does, so the probe sees edits the agent made without committing.
+///
+/// A restart is the exception, and in a `Result` it is the only `Aborted`. The
+/// engine interrupted the agent mid-turn, and the resumed agent reads a clean
+/// tree as lost work. Its dirt survives on disk for recovery either way.
+pub(super) fn result_auto_commits(terminal: &TerminalKind) -> bool {
+    !matches!(terminal, TerminalKind::Aborted(_))
+}
+
 /// Whether the session-end path may delete this thread's worktree directory.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum WorktreeRemoval {

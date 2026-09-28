@@ -60,6 +60,7 @@ function installFakeSplash(present: boolean, initialClasses: string[] = []) {
     statusEl,
     statusShown: () => statusClasses.has('boot-splash-status-shown'),
     statusIsReport: () => statusClasses.has('boot-splash-status-report'),
+    statusSwapping: () => statusClasses.has('boot-splash-status-swap'),
     hasLeaving: () => classes.has('boot-splash-leaving'),
     isRemoved: () => removed,
     fireAnimationEnd: () => splashEl.fire('animationend', splashEl),
@@ -115,9 +116,77 @@ describe('bootSplash controller', () => {
     expect(fake.statusIsReport()).toBe(true);
     expect(fake.statusShown()).toBe(true);
 
-    // And back: a service that came up leaves an ordinary one-line status.
-    c.setBootStatus('Waiting for the background service… (42s)');
-    expect(fake.statusIsReport()).toBe(false);
+    // And back: a service that came up leaves an ordinary one-line status. A
+    // different label crossfades, so the state flips once the old one is out.
+    vi.useFakeTimers();
+    try {
+      c.setBootStatus('Waiting for the background service… (42s)');
+      vi.advanceTimersByTime(150);
+      expect(fake.statusIsReport()).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // A new label is a new width. Swapped instantly, the centred line lurches
+  // sideways, so the words change only while invisible.
+  it('crossfades a new label: out, swap while invisible, back in', async () => {
+    vi.useFakeTimers();
+    try {
+      fake = installFakeSplash(true);
+      const c = await freshController();
+      c.setBootStatus('Opening your workspace…');
+      c.setBootStatus('Connecting…');
+      expect(fake.statusSwapping()).toBe(true);
+      expect(fake.statusEl.textContent).toBe('Opening your workspace…');
+      vi.advanceTimersByTime(149);
+      expect(fake.statusEl.textContent).toBe('Opening your workspace…');
+      vi.advanceTimersByTime(1);
+      expect(fake.statusEl.textContent).toBe('Connecting…');
+      expect(fake.statusSwapping()).toBe(false);
+      expect(fake.statusShown()).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('lets a later label supersede one still fading out', async () => {
+    vi.useFakeTimers();
+    try {
+      fake = installFakeSplash(true);
+      const c = await freshController();
+      c.setBootStatus('Opening your workspace…');
+      c.setBootStatus('Connecting…');
+      vi.advanceTimersByTime(100);
+      c.setBootStatus('Loading…');
+      vi.advanceTimersByTime(150);
+      expect(fake.statusEl.textContent).toBe('Loading…');
+      vi.runAllTimers();
+      expect(fake.statusEl.textContent).toBe('Loading…');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('ticks a counter in place, so the line never blinks once a second', async () => {
+    fake = installFakeSplash(true);
+    const c = await freshController();
+    c.setBootStatus('Waiting for the background service… (9s)');
+    c.setBootStatus('Waiting for the background service… (10s)');
+    expect(fake.statusSwapping()).toBe(false);
+    expect(fake.statusEl.textContent).toBe('Waiting for the background service… (10s)');
+  });
+
+  it('fades only a real change of words', async () => {
+    const c = await freshController();
+    expect(c.statusChangeFades('Opening your workspace…', 'Connecting…')).toBe(true);
+    expect(c.statusChangeFades('Starting engine…', 'Recovering sessions…')).toBe(true);
+    expect(c.statusChangeFades('Waiting… (59s)', 'Waiting… (1m 00s)')).toBe(true);
+    expect(c.statusChangeFades('Waiting… (1m 05s)', 'Waiting… (1m 06s)')).toBe(false);
+    expect(c.statusChangeFades('Connecting…', 'Connecting…')).toBe(false);
+    // Appearing and clearing are the shown class's own fade.
+    expect(c.statusChangeFades('', 'Connecting…')).toBe(false);
+    expect(c.statusChangeFades('Connecting…', '')).toBe(false);
   });
 
   it('dismiss adds the leaving class and removes the node on animationend', async () => {
@@ -691,7 +760,54 @@ describe('index.html inline boot splash', () => {
     expect(html).toMatch(/boot-splash-status[^>]*>[^<]*\S[^<]*<\/div>/);
   });
 
-  it('reserves a constant status size so the mark never shifts', () => {
+  // The mark is the one in-flow child, so it sits dead centre whatever the
+  // status says. A label that wraps, a revealed escape link, or a new width
+  // grows the foot downward and cannot nudge the mark.
+  it('hangs the status and the escape link below the mark, out of flow', () => {
+    expect(html).toMatch(/\.boot-splash-foot\s*\{[^}]*position:\s*absolute/);
+    expect(html).toMatch(
+      /\.boot-splash-foot\s*\{[^}]*top:\s*calc\(50% \+ var\(--boot-mark-size\) \/ 2 \+ var\(--boot-splash-gap\)\)/,
+    );
+    const foot = html.split('<div class="boot-splash-foot">')[1]?.split('</div>\n    </div>')[0];
+    expect(foot).toContain('class="boot-splash-status');
+    expect(foot).toContain('class="boot-splash-escape"');
+    // With no mark to hang from, the quiet cover centres its status instead.
+    expect(html).toMatch(/\.boot-splash-quiet\s+\.boot-splash-foot\s*\{\s*position:\s*static/);
+    // A fixed box never scrolls, so anything that could hang past the bottom
+    // edge re-centres the group: a failure report, a shown escape link (often
+    // the only way out), and a short window.
+    const recentre = /((?:[^{}]*\.boot-splash-foot,?\s*)+)\{\s*position:\s*static;\s*\}/g;
+    const selectors = [...html.matchAll(recentre)].map((m) => m[1]).join(' ');
+    expect(selectors).toContain('.boot-splash:has(.boot-splash-status-report) .boot-splash-foot');
+    expect(selectors).toContain('.boot-splash:has(.boot-splash-escape:not([hidden])) .boot-splash-foot');
+    expect(html).toMatch(
+      /@media \(max-height: 520px\) \{\s*\.boot-splash-foot\s*\{\s*position:\s*static;\s*\}/,
+    );
+  });
+
+  it('fades a status change out before the words swap, on both surfaces', () => {
+    const swap = /\.boot-splash-status\.boot-splash-status-swap\s*\{([^}]*)\}/.exec(html)?.[1];
+    expect(swap).toBeTruthy();
+    expect(swap).toMatch(/opacity:\s*0/);
+    // 0.15s at 1x is the delay both swappers wait out (STATUS_SWAP_MS here, the
+    // gateway poller's own literal), so the words never change while visible.
+    expect(swap).toMatch(/transition-duration:\s*calc\(0\.15s \* var\(--duration-scale, 1\)\)/);
+    // Declared after the shown rule it overrides at the same specificity.
+    expect(html.indexOf('.boot-splash-status.boot-splash-status-swap')).toBeGreaterThan(
+      html.indexOf('.boot-splash-status.boot-splash-status-shown'),
+    );
+  });
+
+  // A status box that shrinks to its words leaves the old label's edges painted
+  // on iOS when a shorter one replaces it. A fixed box repaints whole.
+  it('keeps the status box one fixed width, centring the words inside it', () => {
+    const status = /\n {6}\.boot-splash-status \{([^}]*)\}/.exec(html)?.[1];
+    expect(status).toBeTruthy();
+    expect(status).toMatch(/(^|\s)width:\s*80vw;/);
+    expect(status).toMatch(/text-align:\s*center/);
+  });
+
+  it('reserves a constant status size so the escape link never shifts', () => {
     // A fixed single-line height (not min-height) keeps the box identical whether
     // the text is present, empty, or invisible.
     expect(html).toMatch(/\.boot-splash-status\s*\{[^}]*height:\s*1\.4em/);
@@ -703,9 +819,10 @@ describe('index.html inline boot splash', () => {
     // splash is an isolated document at the browser default. So ANY rem length
     // here resolves differently across that seam, growing the mark and sliding
     // the status as the user crosses it.
-    expect(html).toMatch(/\.boot-splash-mark\s*\{[^}]*width:\s*min\(46vmin,\s*240px\)/);
-    expect(html).toMatch(/\.boot-splash-mark\s*\{[^}]*height:\s*min\(46vmin,\s*240px\)/);
-    expect(html).toMatch(/\.boot-splash\s*\{[^}]*gap:\s*24px/);
+    expect(html).toMatch(/\.boot-splash\s*\{[^}]*--boot-mark-size:\s*min\(46vmin,\s*240px\)/);
+    expect(html).toMatch(/\.boot-splash\s*\{[^}]*--boot-splash-gap:\s*24px/);
+    expect(html).toMatch(/\.boot-splash-mark\s*\{[^}]*width:\s*var\(--boot-mark-size\)/);
+    expect(html).toMatch(/\.boot-splash-mark\s*\{[^}]*height:\s*var\(--boot-mark-size\)/);
     // Type is declared once on the container, so every line on either surface
     // (the status here, the gateway's escape link) inherits the same size and
     // stack. The stack must never be var(--font-ui): a not-yet-downloaded web
@@ -913,7 +1030,7 @@ describe('index.html inline boot splash', () => {
           getPropertyValue: (key: string) =>
             key === '--bg-primary' ? (opts.bgVar ?? '#07172e') : '',
         },
-        getAttribute: (key: string) => (key === 'data-theme' ? (opts.theme ?? 'dark') : null),
+        getAttribute: (key: string) => (key === 'data-theme-mode' ? (opts.theme ?? 'dark') : null),
       };
       const body = { style: { background: GRADIENT } };
       // `refreshed` is the one-shot flag `refreshClient` stamps before reloading,
@@ -1142,10 +1259,10 @@ describe('index.html inline boot splash', () => {
     // moment boot has given up.
     it('keeps the status and the escape legible on a light-theme quiet cover', () => {
       expect(html).toMatch(
-        /\[data-theme="light"\]\s+\.boot-splash-quiet\s+\.boot-splash-status\s*\{[^}]*color:/,
+        /\[data-theme-mode="light"\]\s+\.boot-splash-quiet\s+\.boot-splash-status\s*\{[^}]*color:/,
       );
       expect(html).toMatch(
-        /\[data-theme="light"\]\s+\.boot-splash-quiet\s+\.boot-splash-escape\s*\{[^}]*color:/,
+        /\[data-theme-mode="light"\]\s+\.boot-splash-quiet\s+\.boot-splash-escape\s*\{[^}]*color:/,
       );
     });
 

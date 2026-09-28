@@ -20,7 +20,9 @@ import { useTouchActivated } from '../../hooks/useTouchActivated';
  *  Reused by the change-action banner (Apply + Discard/Archive; the Diff button
  *  sits outside this cluster) and the chat prompt's multi-select answer control
  *  (Submit + Cancel). Pass the same class on `primaryClassName`/`caretClassName`
- *  to keep the pill one colour. */
+ *  to keep the pill one colour. Both are approvals, so the face, the caret and
+ *  the menu are each a protected surface (ADR 0309). The root is not: its
+ *  stacking context would trap the menu under the controls beside it. */
 export interface SplitButtonMenuItem {
   /** Stable key for the rendered <button>. */
   key: string;
@@ -78,7 +80,7 @@ export function SplitButton(props: SplitButtonProps) {
   return (
     <div data-row-item {...attrs} class={`split-button${open.value ? ' open' : ''}`}>
       <button
-        class={`${props.primaryClassName} split-button-primary`}
+        class={`${props.primaryClassName} split-button-primary protected-surface`}
         data-tooltip={props.primaryTooltip}
         aria-label={props.primaryAriaLabel}
         disabled={props.primaryDisabled}
@@ -90,7 +92,7 @@ export function SplitButton(props: SplitButtonProps) {
       {hasMenu && (
         <button
           ref={caretRef}
-          class={`${props.caretClassName} split-button-caret${open.value ? ' open' : ''}`}
+          class={`${props.caretClassName} split-button-caret protected-surface${open.value ? ' open' : ''}`}
           aria-label={props.caretAriaLabel}
           aria-haspopup="menu"
           aria-expanded={open.value}
@@ -104,7 +106,7 @@ export function SplitButton(props: SplitButtonProps) {
         onClose={close}
         anchor={caretRef.current}
         backdrop={false}
-        panelClass="split-button-menu"
+        panelClass="split-button-menu protected-surface"
         panelRole="menu"
       >
         {props.menuItems.map((item) => (

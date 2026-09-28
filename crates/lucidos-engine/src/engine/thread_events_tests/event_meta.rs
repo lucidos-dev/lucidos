@@ -58,14 +58,16 @@ fn event_meta_actor_merges_into_payload() {
     let meta = EventMeta {
         actor: Some(MessageOrigin::Device {
             device_id: "dev-1".into(),
-            label: "Chrome on Mac".into(),
         }),
         ..EventMeta::NONE
     };
     let payload = event.to_payload(&meta);
     assert_eq!(payload["actor"]["kind"], "device");
     assert_eq!(payload["actor"]["device_id"], "dev-1");
-    assert_eq!(payload["actor"]["label"], "Chrome on Mac");
+    assert!(
+        payload["actor"].get("label").is_none(),
+        "a device actor stores its id, never its name"
+    );
 }
 
 #[test]
@@ -83,7 +85,6 @@ fn indexable_text_returns_content_for_chat_events() {
         text: "hello".into(),
         user_image_hashes: vec![],
         device_id: None,
-        device: None,
         image_description: None,
         parent_thread_id: None,
         spawning_event_id: None,

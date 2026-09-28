@@ -51,24 +51,6 @@ impl ThreadState {
         }
     }
 
-    /// Compose updates (text, images, mode) are accepted in `Composing` and
-    /// `Active`. Archived threads have `state='active'` so the gmail-revival
-    /// keystrokes flow through naturally without a separate variant.
-    pub fn can_compose(self) -> bool {
-        matches!(self, Self::Composing | Self::Active)
-    }
-
-    /// Sending a message is allowed from the same states as compose.
-    pub fn can_send(self) -> bool {
-        matches!(self, Self::Composing | Self::Active)
-    }
-
-    /// Discarding a thread is only valid from `Composing` — once a thread has
-    /// messages, the user should `Archive` it instead.
-    pub fn can_discard(self) -> bool {
-        matches!(self, Self::Composing)
-    }
-
     /// Mode (lucidos vs claude_code) is only mutable while composing — the
     /// first `MessageReceived` locks it on the thread.
     pub fn can_change_mode(self) -> bool {
@@ -81,30 +63,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn composing_allows_compose_send_discard_and_mode_change() {
-        let s = ThreadState::Composing;
-        assert!(s.can_compose());
-        assert!(s.can_send());
-        assert!(s.can_discard());
-        assert!(s.can_change_mode());
-    }
-
-    #[test]
-    fn active_allows_compose_and_send_but_not_discard_or_mode_change() {
-        let s = ThreadState::Active;
-        assert!(s.can_compose());
-        assert!(s.can_send());
-        assert!(!s.can_discard());
-        assert!(!s.can_change_mode());
-    }
-
-    #[test]
-    fn discarded_allows_nothing() {
-        let s = ThreadState::Discarded;
-        assert!(!s.can_compose());
-        assert!(!s.can_send());
-        assert!(!s.can_discard());
-        assert!(!s.can_change_mode());
+    fn only_composing_allows_a_mode_change() {
+        assert!(ThreadState::Composing.can_change_mode());
+        assert!(!ThreadState::Active.can_change_mode());
+        assert!(!ThreadState::Discarded.can_change_mode());
     }
 
     #[test]

@@ -35,6 +35,10 @@ export interface HealthInfo {
    *  behind it fails. Absent on older engines, which reads as reachable: only an
    *  explicit `false` puts the client into its degraded surface. ADR 0037. */
   database_reachable?: boolean;
+  /** Why it is not: `true` when the database answers but the engine has no
+   *  free pooled connection. Only ever true while `database_reachable` is
+   *  false. Absent on older engines, which reads as false. ADR 0301. */
+  database_pool_exhausted?: boolean;
 }
 
 /** Probe `/api/v1/health`. Failed without `httpCode` = transport unreachable;

@@ -117,7 +117,7 @@ describe('ensureThreadInMap', () => {
       coding_agent_proposed: false,
       coding_agent_requires_restart: false,
       coding_agent_is_external_repo: false,
-      coding_agent_applying: false, coding_agent_has_diff: false, last_revived_at: null,
+      coding_agent_has_diff: false, last_revived_at: null,
       state: 'active',
       compose_text: '',
       compose_images: [],
@@ -135,7 +135,7 @@ describe('ensureThreadInMap', () => {
   it('does not overwrite a thread already in the map', async () => {
     const map = new Map<string, ThreadState>();
     map.set('t1', makeThreadState('t1', {
-      meta: { id: 't1', title: 'Existing Title', channel: 'claude_code', initiator: 'user', saved: true, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', status: 'idle', codingAgentProposed: false, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, codingAgentApplying: false, lastRevivedAt: '', messageCount: 5, section: 'archived', activeChildrenCount: 0 },
+      meta: { id: 't1', title: 'Existing Title', channel: 'claude_code', initiator: 'user', saved: true, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', status: 'idle', codingAgentProposed: false, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 5, section: 'inbox', activeChildrenCount: 0 },
       eventsLoaded: true,
     }));
     threadMap.value = map;
@@ -156,7 +156,7 @@ describe('ensureThreadInMap', () => {
       coding_agent_proposed: false,
       coding_agent_requires_restart: false,
       coding_agent_is_external_repo: false,
-      coding_agent_applying: false, coding_agent_has_diff: false, last_revived_at: null,
+      coding_agent_has_diff: false, last_revived_at: null,
       state: 'active',
       compose_text: '',
       compose_images: [],
@@ -191,7 +191,6 @@ describe('ensureThreadByIdInMap', () => {
       coding_agent_proposed: false,
       coding_agent_requires_restart: false,
       coding_agent_is_external_repo: false,
-      coding_agent_applying: false,
       last_revived_at: null,
       ...overrides,
     };
@@ -247,7 +246,7 @@ describe('ensureThreadByIdInMap', () => {
   it('returns true without fetching when the thread is already in the map', async () => {
     const map = new Map<string, ThreadState>();
     map.set('already-here', makeThreadState('already-here', {
-      meta: { id: 'already-here', title: 'Already Here', channel: 'chat', initiator: 'user', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', status: 'idle', codingAgentProposed: false, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, codingAgentApplying: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
+      meta: { id: 'already-here', title: 'Already Here', channel: 'chat', initiator: 'user', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', status: 'idle', codingAgentProposed: false, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
     }));
     threadMap.value = map;
 
@@ -302,7 +301,6 @@ describe('focusThreadOrBootstrapResult, optimistic focus while bootstrapping', (
       coding_agent_proposed: false,
       coding_agent_requires_restart: false,
       coding_agent_is_external_repo: false,
-      coding_agent_applying: false,
       last_revived_at: null,
     };
   }
@@ -499,7 +497,7 @@ describe('CC thread spawned by chat — status from API is authoritative', () =>
       codingAgentProposed: false,
       codingAgentRequiresRestart: false,
       codingAgentIsExternalRepo: false,
-      codingAgentApplying: false,  // Set by SSE skeleton
+       // Set by SSE skeleton
         lastRevivedAt: '',
         messageCount: 0,
         section: 'archived',
@@ -516,7 +514,7 @@ describe('CC thread spawned by chat — status from API is authoritative', () =>
       composing: [],
       active: [],  // CC thread NOT in active set
       archive: [
-        { thread_id: 'cc-1', title: 'Fix OAuth URLs', channel: 'claude_code', last_activity: '2026-03-19T20:00:00Z', created_at: '2026-03-19T20:00:00Z', message_count: 1, section: 'archived', active_children_count: 0, status: 'idle', coding_agent_proposed: false, coding_agent_requires_restart: false, coding_agent_is_external_repo: false, coding_agent_applying: false, last_revived_at: null },
+        { thread_id: 'cc-1', title: 'Fix OAuth URLs', channel: 'claude_code', last_activity: '2026-03-19T20:00:00Z', created_at: '2026-03-19T20:00:00Z', message_count: 1, section: 'archived', active_children_count: 0, status: 'idle', coding_agent_proposed: false, coding_agent_requires_restart: false, coding_agent_is_external_repo: false, last_revived_at: null },
       ],
     });
 
@@ -544,7 +542,7 @@ describe('CC thread spawned by chat — status from API is authoritative', () =>
       codingAgentProposed: false,
       codingAgentRequiresRestart: false,
       codingAgentIsExternalRepo: false,
-      codingAgentApplying: false,  // Was running before restart
+       // Was running before restart
         lastRevivedAt: '',
         messageCount: 0,
         section: 'archived',
@@ -560,7 +558,7 @@ describe('CC thread spawned by chat — status from API is authoritative', () =>
       composing: [],
       active: [],  // Thread no longer active after restart
       archive: [
-        { thread_id: 'cc-1', title: 'Aborted Session', channel: 'claude_code', last_activity: '2026-03-19T20:00:00Z', created_at: '2026-03-19T20:00:00Z', message_count: 1, section: 'inbox', status: 'idle', coding_agent_proposed: false, coding_agent_requires_restart: false, coding_agent_is_external_repo: false, coding_agent_applying: false, last_revived_at: null, active_children_count: 0 },
+        { thread_id: 'cc-1', title: 'Aborted Session', channel: 'claude_code', last_activity: '2026-03-19T20:00:00Z', created_at: '2026-03-19T20:00:00Z', message_count: 1, section: 'inbox', status: 'idle', coding_agent_proposed: false, coding_agent_requires_restart: false, coding_agent_is_external_repo: false, last_revived_at: null, active_children_count: 0 },
       ],
     });
 
@@ -601,7 +599,7 @@ describe('event replay must not override API status', () => {
           coding_agent_proposed: false,
           coding_agent_requires_restart: false,
           coding_agent_is_external_repo: false,
-          coding_agent_applying: false, coding_agent_has_diff: false, last_revived_at: null,
+          coding_agent_has_diff: false, last_revived_at: null,
         },
       ],
       active: ['stuck-t1'],
@@ -667,7 +665,6 @@ describe('event replay must not override API status', () => {
       codingAgentProposed: false,
       codingAgentRequiresRestart: false,
       codingAgentIsExternalRepo: false,
-      codingAgentApplying: false,
       isSaved: false,
       hasResponse: true,
       lastRevivedAt: null,
@@ -692,7 +689,7 @@ describe('event replay must not override API status', () => {
     // The event must update status to 'running' — it's a real live event, not stale replay.
     const map = new Map<string, ThreadState>();
     map.set('refresh-t1', makeThreadState('refresh-t1', {
-      meta: { id: 'refresh-t1', title: 'Refresh Thread', channel: 'claude_code', saved: false, createdAt: '2026-03-28T19:00:00Z', updatedAt: '2026-03-28T19:00:00Z', status: 'idle', codingAgentProposed: false, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, codingAgentApplying: false, lastRevivedAt: '', messageCount: 1, section: 'archived', activeChildrenCount: 0 },
+      meta: { id: 'refresh-t1', title: 'Refresh Thread', channel: 'claude_code', saved: false, createdAt: '2026-03-28T19:00:00Z', updatedAt: '2026-03-28T19:00:00Z', status: 'idle', codingAgentProposed: false, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'archived', activeChildrenCount: 0 },
       eventsLoaded: true,
       lastDbSeq: 3,
     }));
@@ -724,7 +721,6 @@ describe('event replay must not override API status', () => {
       codingAgentProposed: false,
       codingAgentRequiresRestart: false,
       codingAgentIsExternalRepo: false,
-      codingAgentApplying: false,
       isSaved: false,
       hasResponse: false,
       lastRevivedAt: '2026-03-30T10:00:00Z',
@@ -1506,7 +1502,7 @@ describe('focusThread — section', () => {
   it('does not archive an inbox thread when focused', () => {
     const map = new Map<string, ThreadState>();
     map.set('t1', makeThreadState('t1', {
-      meta: { id: 't1', title: 'Inbox Thread', channel: 'chat', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', status: 'idle', codingAgentProposed: false, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, codingAgentApplying: false, lastRevivedAt: '', messageCount: 0, section: 'inbox', activeChildrenCount: 0 },
+      meta: { id: 't1', title: 'Inbox Thread', channel: 'chat', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', status: 'idle', codingAgentProposed: false, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 0, section: 'inbox', activeChildrenCount: 0 },
     }));
     threadMap.value = map;
 
@@ -1559,7 +1555,7 @@ describe('loadAllThreads — section', () => {
   it('updates section on existing threads from API', async () => {
     const map = new Map<string, ThreadState>();
     map.set('t1', makeThreadState('t1', {
-      meta: { id: 't1', title: '...', channel: 'chat', saved: false, createdAt: '', updatedAt: '2026-03-15T19:00:00Z', status: 'idle', codingAgentProposed: false, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, codingAgentApplying: false, lastRevivedAt: '', messageCount: 0, section: 'archived', activeChildrenCount: 0 },
+      meta: { id: 't1', title: '...', channel: 'chat', saved: false, createdAt: '', updatedAt: '2026-03-15T19:00:00Z', status: 'idle', codingAgentProposed: false, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 0, section: 'archived', activeChildrenCount: 0 },
     }));
     threadMap.value = map;
 
@@ -1597,7 +1593,7 @@ describe('upsertThread — updatedAt monotonic', () => {
         createdAt: '2026-03-31T19:21:38Z',
         updatedAt: '2026-03-31T19:31:54Z', // SSE-updated (newer)
         status: 'running', codingAgentProposed: false,
-        codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, codingAgentApplying: false, lastRevivedAt: '',
+        codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, lastRevivedAt: '',
         messageCount: 0, section: 'archived', activeChildrenCount: 0,
       },
     }));
@@ -1625,7 +1621,7 @@ describe('upsertThread — updatedAt monotonic', () => {
         createdAt: '2026-03-31T10:00:00Z',
         updatedAt: '2026-03-31T10:00:00Z',
         status: 'idle', codingAgentProposed: false,
-        codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, codingAgentApplying: false, lastRevivedAt: '',
+        codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, lastRevivedAt: '',
         messageCount: 0, section: 'archived', activeChildrenCount: 0,
       },
     }));

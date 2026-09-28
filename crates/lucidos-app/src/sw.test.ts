@@ -200,6 +200,112 @@ describe('Service Worker fetch handler', () => {
     expect(event.respondWith).not.toHaveBeenCalled();
   });
 
+  // A chat image is a `/data/` file, and iOS can hand a bare pass-through a
+  // corrupt body that still fires `load`. The reported symptom was a picture
+  // drawn to a third of its height above an empty box.
+  function dataImageEvent(url: string) {
+    return {
+      request: { url, method: 'GET', destination: 'image' },
+      respondWith: vi.fn(),
+    };
+  }
+
+  it('GET /data/ image: fetched explicitly, with the retry', async () => {
+    mockFetch
+      .mockRejectedValueOnce(new TypeError('Load failed'))
+      .mockResolvedValueOnce(new Response('png-bytes'));
+    const event = dataImageEvent('https://example.com/data/artifacts/ui/shot.png');
+    handlers.fetch(event);
+    expect(event.respondWith).toHaveBeenCalledTimes(1);
+    const response = await event.respondWith.mock.calls[0][0];
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    expect(await response.text()).toBe('png-bytes');
+  });
+
+  // A body can end early and still read as a success, so the worker reads the
+  // image whole and counts the bytes.
+  function pngResponse(body: string, declaredLength: number = body.length) {
+    return new Response(body, {
+      headers: { 'content-type': 'image/png', 'content-length': String(declaredLength) },
+    });
+  }
+
+  it('GET /data/ image: a body shorter than its Content-Length is fetched again', async () => {
+    mockFetch
+      .mockResolvedValueOnce(pngResponse('png', 9))
+      .mockResolvedValueOnce(pngResponse('png-bytes'));
+    const event = dataImageEvent('https://example.com/data/artifacts/ui/shot.png');
+    handlers.fetch(event);
+    const response = await event.respondWith.mock.calls[0][0];
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    expect(mockFetch.mock.calls[0][1].cache).toBeUndefined();
+    expect(mockFetch.mock.calls[1][1].cache).toBe('reload');
+    expect(await response.text()).toBe('png-bytes');
+    expect(response.headers.get('content-type')).toBe('image/png');
+    expect(response.headers.get('content-length')).toBe('9');
+  });
+
+  it('GET /data/ image: short on every attempt answers a network error, so the page retries', async () => {
+    mockFetch.mockImplementation(() => Promise.resolve(pngResponse('png', 9)));
+    const event = dataImageEvent('https://example.com/data/artifacts/ui/shot.png');
+    handlers.fetch(event);
+    const response = await event.respondWith.mock.calls[0][0];
+    expect(response.type).toBe('error');
+  });
+
+  it('GET /data/ image: a body that stalls is abandoned and fetched again', async () => {
+    vi.useFakeTimers();
+    try {
+      mockFetch
+        .mockImplementationOnce((_req: unknown, init?: { signal?: AbortSignal }) => {
+          const stalled = new ReadableStream({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode('png'));
+              init?.signal?.addEventListener('abort', () => controller.error(new Error('aborted')));
+            },
+          });
+          return Promise.resolve(new Response(stalled, { headers: { 'content-length': '9' } }));
+        })
+        .mockResolvedValueOnce(pngResponse('png-bytes'));
+      const event = dataImageEvent('https://example.com/data/artifacts/ui/shot.png');
+      handlers.fetch(event);
+      const pending = event.respondWith.mock.calls[0][0];
+      await vi.advanceTimersByTimeAsync(60_000);
+      const response = await pending;
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+      expect(await response.text()).toBe('png-bytes');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('GET /data/ image: a non-2xx answer passes through untouched', async () => {
+    mockFetch.mockResolvedValueOnce(new Response('gone', { status: 404 }));
+    const event = dataImageEvent('https://example.com/data/artifacts/ui/missing.png');
+    handlers.fetch(event);
+    const response = await event.respondWith.mock.calls[0][0];
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    expect(response.status).toBe(404);
+  });
+
+  it('GET /data/ image with a retry param: still fetched explicitly', () => {
+    const event = dataImageEvent('https://example.com/data/artifacts/ui/shot.png?retry=2');
+    handlers.fetch(event);
+    expect(event.respondWith).toHaveBeenCalledTimes(1);
+  });
+
+  it('GET /data/ non-image (a video range request, a download): left to the browser', () => {
+    const event = makeEvent('https://example.com/data/artifacts/clip.mp4');
+    handlers.fetch(event);
+    expect(event.respondWith).not.toHaveBeenCalled();
+  });
+
+  it('GET image outside /data/: left to the browser', () => {
+    const event = dataImageEvent('https://example.com/favicon.svg');
+    handlers.fetch(event);
+    expect(event.respondWith).not.toHaveBeenCalled();
+  });
+
   it('GET retries once if first fetch throws (covers iOS SW restart race)', async () => {
     mockFetch
       .mockRejectedValueOnce(new TypeError('Load failed'))

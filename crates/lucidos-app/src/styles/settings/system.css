@@ -1,17 +1,5 @@
-/* Settings → System */
-
-/* A sub-page reads down one column, capped and centred exactly as the
-   transcript and the composer are (`.thread-content > *`,
-   chat/input-messages.css). Same token, so the two cannot drift apart. Below
-   the cap this is a no-op and the panel's own --space-lg gutter is the whole
-   inset.
-
-   The System submenu that reaches these pages is deliberately NOT capped: it
-   is a Settings nav list, so it takes the width the Settings home list takes. */
-.system-page {
-    max-width: var(--content-max-width);
-    margin-inline: auto;
-}
+/* Settings → System. The column cap comes from `.content-view.active`
+   (panels/content.css), which every Settings page shares. */
 
 /* The state's two quantities, named because the note under the row derives its
    indent from them: the row's dot plus the gap after it is exactly where the
@@ -180,7 +168,7 @@
     padding: 0.5rem 0.625rem;
     margin-bottom: 0.625rem;
     background: var(--bg-tertiary);
-    border-radius: 0.25rem;
+    border-radius: calc(var(--radius-surface) / 3);
     line-height: 1.4;
 }
 

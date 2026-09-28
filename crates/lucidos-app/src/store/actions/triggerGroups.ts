@@ -80,7 +80,7 @@ export async function renameTriggerGroup(id: string, name: string): Promise<bool
 }
 
 export async function deleteTriggerGroup(id: string, name: string): Promise<void> {
-  if (!(await showConfirm(`Delete group "${name}"?`))) return;
+  if (!(await showConfirm(`Delete group "${name}"?`, 'Delete', { variant: 'danger' }))) return;
   try {
     const conflict = await apiDelete(id);
     if (conflict) {

@@ -146,15 +146,23 @@ git ls-files '*.ts' '*.tsx' | xargs grep -l '@ts-expect-error' | grep -vE '\.tes
 (cd packages/lucidos-sdk && npx tsc --noEmit -p tsconfig.json); echo "SDK EXIT: $?"
 ```
 
-The currently-accepted categories, re-counted on 2026-09-25. Every Rust
-allow and every `eslint-disable` site was unchanged, and the cfg_attr grep
-printed nothing. Only `@ts-expect-error` moved, up 21 with the test suite.
+The currently-accepted categories, re-counted on 2026-09-28. The
+`eslint-disable` sites were unchanged, and the cfg_attr grep printed
+nothing. `too_many_arguments` fell by one when `refactor(engine): events
+store a device's id, never its name` narrowed a signature.
+`@ts-expect-error` rose 47 with the test suite.
+
+**The first grep and the bare-allow audit both print one false hit.** It is
+`git_ops_tests/branch_queries.rs`, where `#[allow(dead_code)]` sits inside
+a string literal: fixture text for `production_source`, not an attribute.
+It suppresses nothing, so it is not counted below.
+
 The 2026-09-24 run removed five `cfg_attr(..., allow(dead_code))`
 silencers from the gateway's slowness watcher, which the first grep above
 had missed. The cfg_attr grep now covers that form.
 Anything not on this list is fair game to remove and re-fix:
 
-- **`#[allow(clippy::too_many_arguments)]`**, 82 sites across 52 files,
+- **`#[allow(clippy::too_many_arguments)]`**, 81 sites across 51 files,
   by far the largest category. Internal helpers that legitimately need
   that many parameters (event constructors, runtime spawn helpers,
   scheduler entry points, `LucidosEngine::new`'s boot wiring). The
@@ -162,9 +170,9 @@ Anything not on this list is fair game to remove and re-fix:
   the justification is the function's role, and the strongest form of it,
   which `LucidosEngine::new` carries, is that no two parameters share a
   type, so the argument swap the lint guards against cannot compile.
-  One of the 82 shares an attribute with `format_in_format_args`, which is
+  One of the 81 shares an attribute with `format_in_format_args`, which is
   the same site that entry counts. Grepping the bare form alone therefore
-  reports 81 across 51 files. Both numbers here count the shared attribute.
+  reports 80 across 50 files. Both numbers here count the shared attribute.
 - **`#[allow(dead_code)]`**, 4 sites: the `SpawnTrigger` taxonomy enum
   (`agent_session/spawn_dispatcher.rs`, one attribute on the enum) and test
   scaffolding (`thread_lifecycle_tests/scenario_tests.rs`,
@@ -186,8 +194,8 @@ Anything not on this list is fair game to remove and re-fix:
   (see `tauri.conf.json`), so the deprecated cross-version call is the
   correct one to keep.
 - **`// @ts-expect-error`, Node APIs available at runtime via Vitest, no
-  `@types/node` in project**, 709 sites across 245 files, every one of them
-  test-only code: 235 `*.test.ts`, nine `*.test.tsx`
+  `@types/node` in project**, 787 sites across 272 files, every one of them
+  test-only code: 260 `*.test.ts`, ten `*.test.tsx`
   (`components/chat/__tests__/question-card.test.tsx`,
   `components/chat/__tests__/welcome-onboarding.test.tsx`,
   `components/chat/__tests__/event-wait-surfaces.test.tsx`,
@@ -195,10 +203,12 @@ Anything not on this list is fair game to remove and re-fix:
   `components/chat/__tests__/pure-voice-draws-no-turn-header.test.tsx`,
   `components/picker/__tests__/pairing-code-boxes.test.tsx`,
   `components/settings/__tests__/mcp-servers-page.test.tsx`,
-  `components/shared/__tests__/apps-glyph-single-source.test.tsx` and
-  `components/shared/__tests__/system-attention-badge.test.tsx`), and one
-  Vitest-only helper, `styles/__tests__/css-rule-helpers.ts`, which imports
-  `node:fs` for two of the sites. The
+  `components/shared/__tests__/apps-glyph-single-source.test.tsx`,
+  `components/shared/__tests__/system-attention-badge.test.tsx` and
+  `styles/__tests__/brand-mark-tokens.test.tsx`), and two
+  Vitest-only helpers. `styles/__tests__/css-rule-helpers.ts` imports
+  `node:fs` for two of the sites, and
+  `components/shared/__tests__/loading-guard-scan.ts` carries three. The
   expectation is real: TS does not know about Node globals, but Vitest
   provides them. Adding
   `@types/node` to the project would contaminate the browser type-graph.
@@ -209,9 +219,9 @@ Anything not on this list is fair game to remove and re-fix:
   older wording asserted there were none, and nothing checked it. The
   count grows with the test suite, so treat a mismatch here as ordinary
   drift to restate rather than as a finding, and check only that every
-  leftover the snippet prints is still test-only code. The helper is why
-  that says test-only code rather than a test file: it lives under
-  `__tests__/` and nothing else imports it.
+  leftover the snippet prints is still test-only code. The helpers are why
+  that says test-only code rather than a test file: each lives under
+  `__tests__/` and only test files import it.
 - **`// eslint-disable-next-line`**, 9 sites across 5 files and 5 rules:
   `react-hooks/exhaustive-deps` in `hooks/useLoadableFetch.ts` (the deps
   list is intentionally narrow), `no-console` five times in
@@ -238,8 +248,8 @@ here. A bare annotation with no comment above is forbidden. If you find
 one, fix the code and remove the annotation.
 
 Check that mechanically rather than by eye. This prints every Rust allow
-whose preceding non-attribute line is not a comment, and must print
-nothing:
+whose preceding non-attribute line is not a comment. It must print
+nothing but the `branch_queries.rs` string-literal hit named above:
 
 ```sh
 for f in $(git ls-files '*.rs'); do awk -v F="$f" '

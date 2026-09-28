@@ -13,14 +13,16 @@
 //!
 //! Why "advance then spawn next" instead of "drive in a single loop": the
 //! driver task should never block waiting for an apply to complete (a
-//! conflict-resolution CC can run for minutes). Spawning the apply lets the
-//! driver immediately return to listening for the next ChangeApplied, so
-//! parallel batches are possible if a future UI feature wants them.
+//! hardening run can take many minutes). Spawning the apply lets the driver
+//! immediately return to listening for the next message.
+//!
+//! `emit_merge_conflict_detected` sends `Parked`: the member's conflict now
+//! belongs to a resolver, so the next member starts beside it (ADR 0314).
 
 use uuid::Uuid;
 
 use crate::core::changes::ChangeStatus;
-use crate::engine::apply_all_batches::{ApplyFailure, BatchProgress};
+use crate::engine::apply_all_batches::{Advance, ApplyFailure, BatchProgress};
 use crate::engine::event_bus::{BusEvent, SystemEvent};
 use crate::engine::thread_events::MessageOrigin;
 use crate::engine::LucidosEngine;
@@ -58,12 +60,71 @@ fn classify_recovered_member(status: Option<ChangeStatus>) -> RecoveredMember {
     }
 }
 
-/// Messages from `emit_change_applied` / `emit_apply_failed` to the
-/// apply-all driver task.
+/// Whether startup recovery may apply a pending batch member itself.
+#[derive(Debug, PartialEq, Eq)]
+enum RecoveredDrive {
+    /// Nobody else will resolve the member, so recovery applies it.
+    Drive,
+    /// A running session owns the member. Its terminal event advances the batch.
+    WaitForSession,
+    /// A queued resume inherits the member's open conflict resolution. The
+    /// resumed continuation re-attaches it, or closes it with `ChangeApplyFailed`.
+    WaitForResume,
+}
+
+/// A queued resume has no session yet at boot. Driving its open conflict
+/// resolution then merges code the resolver never finished.
+///
+/// With no resume queued, an open pairing is stranded and is driven, as
+/// `decide_merge_ownership` lets it through (ADR 0060). `resolution_open` is
+/// `None` when the pairing query failed or was not needed. With a resume
+/// queued, an unknown waits, because driving is the destructive direction.
+///
+/// A continuation that cannot re-attach, for example after a failed worktree
+/// lookup, leaves the pairing open. The batch then waits until the user
+/// cancels it or applies the change, or until the next boot drives it.
+fn decide_recovered_drive(
+    session_running: bool,
+    resume_queued: bool,
+    resolution_open: Option<bool>,
+) -> RecoveredDrive {
+    if session_running {
+        RecoveredDrive::WaitForSession
+    } else if resume_queued && resolution_open != Some(false) {
+        RecoveredDrive::WaitForResume
+    } else {
+        RecoveredDrive::Drive
+    }
+}
+
+/// Whether the owner of a member recovery must not drive is a resolver,
+/// which lets the queue move on. `None` when recovery drives the member.
+fn owner_is_resolving(decision: &RecoveredDrive, resolution_open: Option<bool>) -> Option<bool> {
+    match decision {
+        RecoveredDrive::Drive => None,
+        // A queued resume waits only on an open or unknown resolution.
+        RecoveredDrive::WaitForResume => Some(true),
+        // An unknown conflict state holds the queue.
+        RecoveredDrive::WaitForSession => Some(resolution_open == Some(true)),
+    }
+}
+
+/// A member's state for the batch to take in, whatever path it came from.
+/// `ChangeApplied` / `ChangeApplyFailed` send the terminal two, and
+/// `MergeConflictDetected` sends `Parked`.
 #[derive(Debug, Clone)]
 pub(crate) enum ApplyAllDriveMsg {
     Applied(Uuid),
     Failed(Uuid, String),
+    Parked(Uuid),
+}
+
+impl ApplyAllDriveMsg {
+    fn change_id(&self) -> Uuid {
+        match self {
+            Self::Applied(id) | Self::Failed(id, _) | Self::Parked(id) => *id,
+        }
+    }
 }
 
 impl LucidosEngine {
@@ -97,14 +158,7 @@ impl LucidosEngine {
         tokio::spawn(async move {
             log!("[ApplyAll] driver task started");
             while let Some(msg) = rx.recv().await {
-                match msg {
-                    ApplyAllDriveMsg::Applied(change_id) => {
-                        engine.advance_apply_all_batch(change_id, Ok(())).await;
-                    }
-                    ApplyAllDriveMsg::Failed(change_id, error) => {
-                        engine.advance_apply_all_batch(change_id, Err(error)).await;
-                    }
-                }
+                engine.advance_apply_all_batch(msg).await;
             }
             log!("[ApplyAll] driver task exiting — channel closed");
         });
@@ -165,30 +219,57 @@ impl LucidosEngine {
         let batch_id = self
             .start_apply_all_batch(change_ids.clone(), actor.clone())
             .await;
-        let first_result = self.apply_change(first.id, actor).await;
-        // Some apply_change outcomes emit no per-change terminator to notify the
-        // driver: `Noop` (already applied), `Conflict` (CC handles it later via
-        // emit_change_applied/_failed), and several early-Err paths
-        // (change-not-found, status-mismatch). Notify explicitly for the cases
-        // that would otherwise leave the batch stalled on the first change
-        // forever. The driver's record_* methods are first-write-wins, so
-        // over-notification is safe.
-        match &first_result {
-            Ok(r) if matches!(r.status, crate::engine::ApplyStatus::Noop) => {
-                self.notify_apply_all(ApplyAllDriveMsg::Applied(first.id));
-            }
-            Err(e) => {
-                self.notify_apply_all(ApplyAllDriveMsg::Failed(first.id, e.to_string()));
-            }
-            _ => {}
-        }
+        let first_result = self.apply_batch_member(first.id, actor).await;
         Ok(ApplyAllOutcome::Started {
             batch_id,
             batch_size: change_ids.len(),
             armed,
             first_branch: first.branch_name.clone(),
-            first_result: first_result.map_err(|e| e.to_string()),
+            first_result,
         })
+    }
+
+    /// Apply one member the batch started, and report what the apply cannot
+    /// report itself: `Noop` (already applied), `Conflict` owned by a resolver
+    /// that was already running, and early `Err` paths (change not found,
+    /// status mismatch). A report the apply also made is harmless: terminal
+    /// status is first-write-wins, and a second park changes nothing.
+    async fn apply_batch_member(
+        self: &std::sync::Arc<Self>,
+        change_id: Uuid,
+        actor: Option<MessageOrigin>,
+    ) -> Result<crate::engine::ApplyResult, String> {
+        let result = self
+            .apply_change(change_id, actor)
+            .await
+            .map_err(|e| e.to_string());
+        match &result {
+            Ok(r) if matches!(r.status, crate::engine::ApplyStatus::Noop) => {
+                self.notify_apply_all(ApplyAllDriveMsg::Applied(change_id));
+            }
+            Ok(r) if matches!(r.status, crate::engine::ApplyStatus::Conflict) => {
+                self.notify_apply_all(ApplyAllDriveMsg::Parked(change_id));
+            }
+            Err(e) => {
+                self.notify_apply_all(ApplyAllDriveMsg::Failed(change_id, e.clone()));
+            }
+            Ok(_) => {}
+        }
+        result
+    }
+
+    /// Start `change_id` as a background task, for the driver and recovery.
+    fn spawn_batch_member(
+        self: &std::sync::Arc<Self>,
+        change_id: Uuid,
+        actor: Option<MessageOrigin>,
+    ) {
+        let engine = self.clone();
+        tokio::spawn(async move {
+            if let Err(e) = engine.apply_batch_member(change_id, actor).await {
+                log!("[ApplyAll] apply_change({change_id}) returned Err: {e}");
+            }
+        });
     }
 
     /// Seed a new Apply All batch. Emits the durable `ApplyAllBatchStarted`
@@ -196,8 +277,8 @@ impl LucidosEngine {
     /// in-memory registry. Returns the batch_id so the HTTP handler can
     /// surface it to the caller.
     ///
-    /// The first apply is fired by the HTTP handler itself (synchronously,
-    /// so the caller gets a useful response). Subsequent applies flow
+    /// The first member is marked applying here, and the caller applies it
+    /// synchronously, so it gets a useful response. Subsequent applies flow
     /// through the driver task via `notify_apply_all`.
     pub(crate) async fn start_apply_all_batch(
         &self,
@@ -241,7 +322,8 @@ impl LucidosEngine {
                 e
             );
         }
-        let progress = BatchProgress::new(batch_id, change_ids, actor);
+        let mut progress = BatchProgress::new(batch_id, change_ids, actor);
+        progress.start_next();
         self.apply_all_batches.lock().await.insert(progress);
         log!("[ApplyAll] batch {} seeded", batch_id);
         batch_id
@@ -264,11 +346,12 @@ impl LucidosEngine {
     }
 
     /// Cancel every in-flight Apply All batch — the user clicked Cancel on the
-    /// batch toast. For each batch: remove it from the registry first (so the
-    /// driver stops advancing to the next member), interrupt the in-flight
-    /// member's live coding-agent session (the one currently hardening or
-    /// merging), mark every still-pending member canceled so the batch reads as
-    /// complete, then emit `ApplyAllBatchCompleted`.
+    /// batch toast. For each batch, in order:
+    /// 1. Remove it from the registry, so the driver stops advancing.
+    /// 2. Interrupt the live sessions of unresolved members: the one hardening
+    ///    or merging, and every parked resolver.
+    /// 3. Mark every still-pending member canceled, so the batch is complete.
+    /// 4. Emit `ApplyAllBatchCompleted`.
     ///
     /// Semantics: already-applied members stay applied; the in-flight apply
     /// aborts back to pending (best-effort — a merge that already landed before
@@ -300,10 +383,10 @@ impl LucidosEngine {
         if finals.is_empty() {
             return 0;
         }
-        // Interrupt the in-flight coding-agent session — the one pending member
-        // whose thread is mid-harden/merge. The queued members have no live
+        // Interrupt the live coding-agent sessions: the member mid-harden or
+        // merge, and every parked resolver. The queued members have no live
         // session (interrupt is a lookup miss for them), so this only touches
-        // the apply that's actually running.
+        // the applies actually running.
         for pending in &pending_by_batch {
             for &change_id in pending {
                 let thread_id = match self.changes().get_by_id(change_id).await {
@@ -370,13 +453,14 @@ impl LucidosEngine {
     /// gone → terminal (so the batch can complete); `pending` → re-drive. A
     /// fully-resolved batch emits the missing `ApplyAllBatchCompleted` now; an
     /// in-progress one is re-seeded into the live registry (so any auto-resuming
-    /// session's terminal event advances it) and its next pending member is
-    /// driven through the idempotent `apply_change` — unless that member's thread
-    /// already has a running agent session (its terminal event will advance the
-    /// re-seeded batch, so re-driving would risk a double apply).
+    /// session's terminal event advances it). Each pending member keeps the
+    /// owner a restart found (`recovered_owner`). If no owner holds the queue,
+    /// the next unowned member is driven through the idempotent
+    /// `apply_change`. An owner emits the terminal event that advances the
+    /// batch.
     ///
-    /// MUST run after agent/CC recovery so a member with an auto-resuming session
-    /// is observed as running rather than re-driven.
+    /// MUST run after agent recovery queues its switch resumes, and before
+    /// `resume_pending_switches` drains that queue.
     pub async fn recover_apply_all_batches(self: &std::sync::Arc<Self>) {
         let rows: Vec<(Uuid, Vec<Uuid>, Option<serde_json::Value>)> = match sqlx::query_as(
             "SELECT batch_id, change_ids, actor FROM apply_all_batches ORDER BY created_at",
@@ -449,50 +533,62 @@ impl LucidosEngine {
                 continue;
             }
 
-            // Still in progress — re-seed the live registry, then kick the next
-            // pending member (serial, exactly like the driver's ApplyNext arm).
-            let next = progress.next_pending();
-            self.apply_all_batches.lock().await.insert(progress);
-            let Some(change_id) = next else {
-                continue;
-            };
-            let thread_id = match self.changes().get_by_id(change_id).await {
-                Ok(Some(c)) => c.thread_id,
-                _ => None,
-            };
-            if let Some(tid) = thread_id {
-                if self.is_agent_running_for(tid).await {
-                    log!(
-                        "[ApplyAll] recovery: batch {} member {} has a running session — \
-                         waiting for its terminal event to advance",
-                        batch_id,
-                        change_id
-                    );
-                    continue;
+            // Still in progress. Restore who owns each unresolved member, then
+            // start the next one if none of them holds the queue.
+            for change_id in progress.pending_members() {
+                if let Some(resolving) = self.recovered_owner(batch_id, change_id).await {
+                    progress.restore_owned(change_id, resolving);
                 }
             }
-            log!(
-                "[ApplyAll] recovery: driving pending member {} of batch {}",
-                change_id,
-                batch_id
-            );
-            let engine = self.clone_arc();
-            tokio::spawn(async move {
-                if let Err(e) = engine.apply_change(change_id, actor).await {
-                    log!(
-                        "[ApplyAll] recovery: apply_change({change_id}) returned Err: {e} — \
-                         waiting for ChangeApplyFailed to advance the batch",
-                    );
-                }
-            });
+            let next = progress.start_next();
+            self.apply_all_batches.lock().await.insert(progress);
+            if let Some(change_id) = next {
+                log!(
+                    "[ApplyAll] recovery: driving pending member {} of batch {}",
+                    change_id,
+                    batch_id
+                );
+                self.spawn_batch_member(change_id, actor);
+            }
         }
     }
 
-    /// Update the registry for one resolved change and decide what to do
-    /// next. Called only from the driver task. Holds the registry lock just
-    /// long enough to inspect + mutate, then releases before emitting the
-    /// completion event or spawning the next apply.
-    async fn advance_apply_all_batch(&self, change_id: Uuid, result: Result<(), String>) {
+    /// Who owns a pending member at boot: `None` when nobody does and
+    /// recovery may apply it, else `Some(resolving)`. A resolver lets the
+    /// queue move on. A session doing anything else, or one whose conflict
+    /// state is unknown, holds it (ADR 0314).
+    async fn recovered_owner(&self, batch_id: Uuid, change_id: Uuid) -> Option<bool> {
+        let thread_id = match self.changes().get_by_id(change_id).await {
+            Ok(Some(c)) => c.thread_id,
+            _ => None,
+        }?;
+        let session_running = self.is_agent_running_for(thread_id).await;
+        let resume_queued = self.switch_resume_queued(thread_id);
+        let resolution_open = if resume_queued || session_running {
+            self.conflict_pairing_open_or_unknown(thread_id, change_id)
+                .await
+        } else {
+            None
+        };
+        let decision = decide_recovered_drive(session_running, resume_queued, resolution_open);
+        let resolving = owner_is_resolving(&decision, resolution_open)?;
+        log!(
+            "[ApplyAll] recovery: batch {} member {}: {:?} (resolving: {}), waiting for its \
+             terminal event",
+            batch_id,
+            change_id,
+            decision,
+            resolving
+        );
+        Some(resolving)
+    }
+
+    /// Take in one member's new state and decide what to do next. Called
+    /// only from the driver task. Holds the registry lock just long enough to
+    /// inspect + mutate, then releases before emitting the completion event
+    /// or spawning the next apply.
+    async fn advance_apply_all_batch(self: &std::sync::Arc<Self>, msg: ApplyAllDriveMsg) {
+        let change_id = msg.change_id();
         let next_step = {
             let mut reg = self.apply_all_batches.lock().await;
             let Some(batch_id) = reg.batch_for_change(change_id) else {
@@ -501,48 +597,40 @@ impl LucidosEngine {
             let batch = reg
                 .get_mut(batch_id)
                 .expect("batch_for_change just found it");
-            let state_changed = match result {
-                Ok(()) => batch.record_applied(change_id),
-                Err(error) => batch.record_failed(change_id, error),
+            let advance = match msg {
+                ApplyAllDriveMsg::Applied(id) => batch.resolve(id, Ok(())),
+                ApplyAllDriveMsg::Failed(id, error) => batch.resolve(id, Err(error)),
+                ApplyAllDriveMsg::Parked(id) => batch.park(id),
             };
-            // Duplicate terminal event for an already-resolved member (e.g.
-            // the conflict-recovery cleanup emits `ChangeApplied` and the
-            // post-CC merge re-check then emits `ChangeApplyFailed` for the
-            // same change_id). Re-running next_pending here would re-spawn
-            // apply_change on the next member, racing the in-flight call.
-            if !state_changed {
-                log!(
-                    "[ApplyAll] duplicate terminal event for {} in batch {} — skipping advance",
-                    change_id,
-                    batch_id,
-                );
-                return;
-            }
-            if batch.is_complete() {
-                let final_state = reg.remove(batch_id).expect("just confirmed via get_mut");
-                NextStep::Complete {
-                    batch_id,
-                    applied: final_state.applied_ids(),
-                    failed: final_state.failures(),
+            match advance {
+                // A duplicate or late report, e.g. the conflict-recovery
+                // cleanup emits `ChangeApplied` and the post-CC merge re-check
+                // then emits `ChangeApplyFailed` for the same change_id.
+                // Acting on it could start a second apply.
+                Advance::Duplicate => {
+                    log!(
+                        "[ApplyAll] nothing changed for {} in batch {}, skipping advance",
+                        change_id,
+                        batch_id,
+                    );
+                    return;
                 }
-            } else if let Some(next) = batch.next_pending() {
-                NextStep::ApplyNext {
+                Advance::Wait => NextStep::Wait,
+                Advance::Complete => {
+                    let final_state = reg.remove(batch_id).expect("just confirmed via get_mut");
+                    NextStep::Complete {
+                        batch_id,
+                        applied: final_state.applied_ids(),
+                        failed: final_state.failures(),
+                    }
+                }
+                Advance::Start(next) => NextStep::Start {
                     next_change: next,
                     actor: batch.actor(),
-                }
-            } else {
-                // Should be unreachable — `!is_complete()` means
-                // `next_pending().is_some()`. Defensive log keeps the door
-                // shut on a future refactor where the two methods drift.
-                log!(
-                    "[ApplyAll] inconsistency: batch {batch_id} is not complete \
-                     but next_pending is None — leaving batch in registry",
-                );
-                NextStep::Nothing
+                },
             }
         };
         match next_step {
-            NextStep::Nothing => {}
             NextStep::Complete {
                 batch_id,
                 applied,
@@ -565,26 +653,20 @@ impl LucidosEngine {
                     )
                     .await;
                 self.persist_batch_removed(batch_id).await;
-                self.broadcast_changes_updated().await;
             }
-            NextStep::ApplyNext { next_change, actor } => {
+            NextStep::Start { next_change, actor } => {
                 log!(
-                    "[ApplyAll] advancing batch to next change {} (after {})",
+                    "[ApplyAll] starting batch member {} (after {})",
                     next_change,
                     change_id
                 );
-                let engine = self.clone_arc();
-                tokio::spawn(async move {
-                    if let Err(e) = engine.apply_change(next_change, actor).await {
-                        log!(
-                            "[ApplyAll] apply_change({next_change}) returned Err: {e} — \
-                             the inner apply path should have emitted ChangeApplyFailed; \
-                             waiting for that to advance the batch",
-                        );
-                    }
-                });
+                self.spawn_batch_member(next_change, actor);
             }
+            NextStep::Wait => {}
         }
+        // The batch snapshot rides the changes list, so every state change
+        // repaints the menu.
+        self.broadcast_changes_updated().await;
     }
 }
 
@@ -611,16 +693,16 @@ pub(crate) enum ApplyAllOutcome {
 /// registry lock. Splitting the decision from the action keeps the lock
 /// scope tight and makes the control flow readable.
 enum NextStep {
-    Nothing,
     Complete {
         batch_id: Uuid,
         applied: Vec<Uuid>,
         failed: Vec<ApplyFailure>,
     },
-    ApplyNext {
+    Start {
         next_change: Uuid,
         actor: Option<MessageOrigin>,
     },
+    Wait,
 }
 
 #[cfg(test)]
@@ -653,6 +735,58 @@ mod tests {
         assert_eq!(classify_recovered_member(None), RecoveredMember::Terminal);
     }
 
+    /// A switch restart cut a conflict resolution off mid-harden. At boot its
+    /// resume is queued but not spawned, so no session runs yet.
+    #[test]
+    fn a_resuming_conflict_resolution_waits_before_its_session_spawns() {
+        assert_eq!(
+            decide_recovered_drive(false, true, Some(true)),
+            RecoveredDrive::WaitForResume
+        );
+    }
+
+    #[test]
+    fn a_resuming_thread_with_an_unknown_resolution_waits() {
+        assert_eq!(
+            decide_recovered_drive(false, true, None),
+            RecoveredDrive::WaitForResume
+        );
+    }
+
+    /// ADR 0060: after a crash nothing resumes, so an open pairing is stranded
+    /// and must not block the batch.
+    #[test]
+    fn a_stranded_conflict_resolution_is_driven() {
+        assert_eq!(
+            decide_recovered_drive(false, false, Some(true)),
+            RecoveredDrive::Drive
+        );
+        assert_eq!(
+            decide_recovered_drive(false, false, None),
+            RecoveredDrive::Drive
+        );
+    }
+
+    #[test]
+    fn a_resume_with_no_open_resolution_is_driven() {
+        assert_eq!(
+            decide_recovered_drive(false, true, Some(false)),
+            RecoveredDrive::Drive
+        );
+    }
+
+    #[test]
+    fn a_running_session_waits_whatever_else_holds() {
+        for resume_queued in [false, true] {
+            for resolution_open in [Some(false), Some(true), None] {
+                assert_eq!(
+                    decide_recovered_drive(true, resume_queued, resolution_open),
+                    RecoveredDrive::WaitForSession
+                );
+            }
+        }
+    }
+
     /// Reconstructing a batch where every member resolved (applied or
     /// discarded) yields a complete batch — recovery emits the missing
     /// `ApplyAllBatchCompleted` for it.
@@ -683,16 +817,41 @@ mod tests {
     }
 
     /// A batch with a still-`pending` member reconstructs as incomplete, and
-    /// `next_pending` points at the first pending member — the one recovery
-    /// drives through `apply_change`.
+    /// the first pending member is the one recovery drives.
     #[test]
     fn batch_with_pending_member_reconstructs_incomplete_and_drives_next() {
         let ids: Vec<Uuid> = (0..3).map(|_| Uuid::new_v4()).collect();
         let mut progress = BatchProgress::new(Uuid::new_v4(), ids.clone(), None);
-        // applied, pending, pending.
         progress.record_applied(ids[0]);
-        // ids[1], ids[2] left pending.
         assert!(!progress.is_complete());
-        assert_eq!(progress.next_pending(), Some(ids[1]));
+        assert_eq!(progress.start_next(), Some(ids[1]));
+    }
+
+    /// A restart during a parked resolution must not hold the queue behind it,
+    /// and must not re-drive it either.
+    #[test]
+    fn a_running_resolver_is_restored_beside_the_queue() {
+        let owner = owner_is_resolving(&RecoveredDrive::WaitForSession, Some(true));
+        assert_eq!(owner, Some(true));
+        let ids: Vec<Uuid> = (0..2).map(|_| Uuid::new_v4()).collect();
+        let mut progress = BatchProgress::new(Uuid::new_v4(), ids.clone(), None);
+        progress.restore_owned(ids[0], true);
+        assert_eq!(progress.start_next(), Some(ids[1]));
+    }
+
+    #[test]
+    fn a_session_not_resolving_or_unknown_holds_the_queue() {
+        for open in [Some(false), None] {
+            assert_eq!(
+                owner_is_resolving(&RecoveredDrive::WaitForSession, open),
+                Some(false)
+            );
+        }
+        assert_eq!(
+            owner_is_resolving(&RecoveredDrive::WaitForResume, None),
+            Some(true),
+            "a queued resume inherits the open resolution"
+        );
+        assert_eq!(owner_is_resolving(&RecoveredDrive::Drive, Some(true)), None);
     }
 }

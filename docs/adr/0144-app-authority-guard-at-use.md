@@ -191,6 +191,10 @@ rest run a script from the engine's own checkout, resolved through
   agent workflow does not need them either, since the file tools run in process.
   The real cost is the Files panel, which can edit any text file under `data/`.
   It loses two folders for a rule that still misses plugin install.
+  (The CLI has since learned all eight trees, so `lucidos data write` reaches
+  `scripts/` and `config/` too. That changes nothing here: the guards sit at
+  use, and the data route already took those writes from every other caller.
+  See `docs/plans/2026-09-27-cli-data-write-routes-every-data-tree.md`.)
 - **Refuse a browser-shaped write to those two folders.** Structurally sound,
   unlike a `Referer` rule, because page JavaScript cannot suppress `Sec-Fetch`
   headers. Rejected because it takes the Files panel's editing of `apis.json`

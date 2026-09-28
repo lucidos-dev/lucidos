@@ -628,7 +628,6 @@ mod settle_orphaned_running_sweep {
                 text: "hi".into(),
                 user_image_hashes: vec![],
                 device_id: None,
-                device: None,
                 image_description: None,
                 parent_thread_id: None,
                 spawning_event_id: None,
@@ -758,7 +757,6 @@ mod restart_boundary_reads {
     fn device_actor() -> MessageOrigin {
         MessageOrigin::Device {
             device_id: "dev-1".into(),
-            label: "My MacBook".into(),
         }
     }
 
@@ -773,7 +771,6 @@ mod restart_boundary_reads {
                 text: "do the thing".into(),
                 user_image_hashes: vec![],
                 device_id: None,
-                device: None,
                 image_description: None,
                 parent_thread_id: None,
                 spawning_event_id: None,

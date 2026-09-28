@@ -18,8 +18,8 @@
 //!    "You" and the source thread id flows into the route popover.
 //! 2. `caller` set → `Workspace` (other Lucidos workspace; carries optional
 //!    thread/event id from the request body)
-//! 3. `device_id` present     → `Device` (label looked up by caller from the
-//!    `devices` table)
+//! 3. `device_id` present     → `Device`, the id alone. A display resolves the
+//!    device's name from it.
 //! 4. **Machine-local token** (`X-Lucidos-Local-Token` verifies against the
 //!    mode 0600 file the gateway minted) → `Api { mode: Engine }`, the engine's
 //!    own machinery. The build-watch and the release scripts reach the engine
@@ -110,6 +110,27 @@ use uuid::Uuid;
 /// loopback port it is whatever the caller typed. That second case is the
 /// ADR 0050 posture, and the reason nothing here reads it as authorization.
 pub const HEADER_DEVICE_ID: &str = "x-lucidos-device-id";
+
+/// Header carrying the pairing label of the device in [`HEADER_DEVICE_ID`],
+/// percent-encoded. The *workspace gateway* writes both, from the device it
+/// authenticated. Display metadata only, like the id on a loopback caller.
+pub const HEADER_DEVICE_LABEL: &str = "x-lucidos-device-label";
+
+/// The pairing label the gateway forwarded, when it belongs to `device_id`.
+///
+/// A register call can name a device other than the one the gateway let in: a
+/// client moving off its old `localStorage` id still registers that id. Giving
+/// the old row the new device's label would name two rows alike, so the label
+/// is only for the device the header names.
+pub fn pairing_label_for(headers: &axum::http::HeaderMap, device_id: &str) -> Option<String> {
+    if header_str(headers, HEADER_DEVICE_ID).as_deref() != Some(device_id) {
+        return None;
+    }
+    let encoded = header_str(headers, HEADER_DEVICE_LABEL)?;
+    let label = urlencoding::decode(&encoded).ok()?;
+    let label = label.trim();
+    (!label.is_empty()).then(|| label.to_string())
+}
 
 /// Header forwarded by the `lucidos` CLI carrying the thread-bound origin
 /// token; verified against [`AGENT_ORIGIN_SECRET`] by [`subprocess_origin`].
@@ -472,14 +493,10 @@ pub struct CallerOrigin {
     pub mode: ActorMode,
 }
 
-// Aggregates eight unrelated inputs (headers + mode + device + parent-thread + caller);
-// a struct wrapper would just shift the parameters one level deeper at every call site.
-#[allow(clippy::too_many_arguments)]
 pub fn build_message_origin(
     headers: &axum::http::HeaderMap,
     mode: ActorMode,
     device_id: Option<&str>,
-    device_label: Option<String>,
     parent_thread_id: Option<Uuid>,
     parent_thread_title: Option<String>,
     spawning_event_id: Option<Uuid>,
@@ -515,8 +532,6 @@ pub fn build_message_origin(
             if let Some(id) = device_id {
                 Some(MessageOrigin::Device {
                     device_id: id.to_string(),
-                    label: device_label
-                        .unwrap_or_else(|| crate::core::devices::resolve_device_name(None, id)),
                 })
             } else if super::local_auth::is_local_process(headers) {
                 // A device wins above, because it names a person and this names
@@ -551,57 +566,27 @@ pub fn build_message_origin(
     }
 }
 
-/// Convenience: build an actor for a `User`-initiated mutating endpoint that
-/// has no parent-thread context (apply/discard/revert, settings writes, etc.).
+/// The actor for a `User`-initiated mutating endpoint with no parent-thread
+/// context (apply/discard/revert, settings writes, etc.).
 ///
-/// `device_id` and `device_label` are optional explicit overrides — when both
-/// are `None`, the header `x-lucidos-device-id` (if present) supplies the id
-/// and the resulting `Device` actor uses the `device-<short>` fallback label.
-/// Callers that have access to the `devices` table should prefer
-/// `user_actor_resolved` so the popover shows the stored device name.
+/// `device_id_override` lets a handler that receives the device id in the
+/// request body (per-device preferences) supply it; otherwise the
+/// `x-lucidos-device-id` header does.
 pub fn user_actor(
     headers: &axum::http::HeaderMap,
-    device_id: Option<&str>,
-    device_label: Option<String>,
+    device_id_override: Option<&str>,
 ) -> Option<MessageOrigin> {
-    let header_did = if device_id.is_none() {
-        header_str(headers, HEADER_DEVICE_ID)
-    } else {
-        None
-    };
-    let effective_did = device_id.or(header_did.as_deref());
+    let header_did = header_str(headers, HEADER_DEVICE_ID);
+    let effective_did = device_id_override.or(header_did.as_deref());
     build_message_origin(
         headers,
         ActorMode::Human,
         effective_did,
-        device_label,
         None,
         None,
         None,
         None,
     )
-}
-
-/// Like `user_actor` but enriches the device origin with the stored device
-/// label from the `devices` table, so the popover renders "Chrome on Mac" (or
-/// the `device-<short>` fallback) instead of an opaque id. Use this — not
-/// `user_actor` directly — at every mutating HTTP handler.
-///
-/// `device_id_override` lets handlers that receive the device id in the
-/// request body (e.g. per-device preferences) supply it explicitly; otherwise
-/// the `x-lucidos-device-id` header is used.
-pub async fn user_actor_resolved(
-    headers: &axum::http::HeaderMap,
-    pool: &PgPool,
-    device_id_override: Option<&str>,
-) -> Option<MessageOrigin> {
-    let header_did = header_str(headers, HEADER_DEVICE_ID);
-    let effective_did = device_id_override.or(header_did.as_deref());
-    let device_label = match effective_did {
-        Some(d) => crate::core::DeviceStore::display_name(pool, d).await,
-        None => None,
-    };
-    user_actor(headers, device_id_override, device_label)
 }
 
 /// What a caller is told when it presented no identity at all.
@@ -619,10 +604,10 @@ pub const UNIDENTIFIED_CALLER: &str =
 
 /// Is this device id evidence, or a header somebody typed?
 ///
-/// [`user_actor_resolved`] stamps ANY non-empty id as a `Device` actor, falling
+/// [`user_actor`] stamps ANY non-empty id as a `Device` actor, falling
 /// back to a `device-<short>` label. That is right for attribution and wrong
-/// for a gate, and `display_name` cannot tell the two apart: its `None` means
-/// absent OR a database error.
+/// for a gate, and `friendly_name` cannot tell the two apart: it names an
+/// absent device, and a failed read, as readily as a real one.
 ///
 /// A database error counts as registered. This sits on the user's own action
 /// path, so failing closed would refuse real work on a blip. Same trade and
@@ -643,7 +628,29 @@ async fn device_is_evidence(pool: &PgPool, device_id: &str) -> bool {
     }
 }
 
-/// [`user_actor_resolved`], refusing rather than returning nobody.
+/// The device id a request claims: `body`, else the `x-lucidos-device-id`
+/// header. [`require_user_actor`] and the chat attribution gate both read it
+/// here, so they cannot disagree about who is acting.
+///
+/// Blank-filter EACH source before falling back, never the winner afterwards.
+/// A present-but-blank body field would otherwise shadow a good header.
+pub(crate) fn claimed_device_id<'a>(
+    body: Option<&'a str>,
+    headers: &'a axum::http::HeaderMap,
+) -> Option<&'a str> {
+    fn blank_filtered(s: &str) -> Option<&str> {
+        let t = s.trim();
+        (!t.is_empty()).then_some(t)
+    }
+    body.and_then(blank_filtered).or_else(|| {
+        headers
+            .get(HEADER_DEVICE_ID)
+            .and_then(|v| v.to_str().ok())
+            .and_then(blank_filtered)
+    })
+}
+
+/// [`user_actor`], refusing rather than returning nobody.
 ///
 /// The one gate every mutating handler asks. A second spelling of it is how
 /// four routes drifted apart before ADR 0169, so callers take this and never
@@ -662,34 +669,13 @@ pub(crate) async fn require_user_actor(
     pool: &PgPool,
     device_id_override: Option<&str>,
 ) -> Result<MessageOrigin, super::error::ApiError> {
-    // Blank-filter EACH source before falling back, never the winner
-    // afterwards, or a blank override swallows a real header. Same order and
-    // same rule as `require_human_mode_is_attributed`.
-    let claimed = device_id_override
-        .filter(|v| !v.trim().is_empty())
-        .map(str::to_string)
-        .or_else(|| header_str(headers, HEADER_DEVICE_ID).filter(|v| !v.trim().is_empty()));
-    let device_id = match claimed.as_deref() {
+    let device_id = match claimed_device_id(device_id_override, headers) {
         Some(id) if device_is_evidence(pool, id).await => Some(id),
         _ => None,
     };
-    let device_label = match device_id {
-        Some(id) => crate::core::DeviceStore::display_name(pool, id).await,
-        None => None,
-    };
-    build_message_origin(
-        headers,
-        ActorMode::Human,
-        device_id,
-        device_label,
-        None,
-        None,
-        None,
-        None,
+    build_message_origin(headers, ActorMode::Human, device_id, None, None, None, None).ok_or_else(
+        || super::error::ApiError::new(axum::http::StatusCode::UNAUTHORIZED, UNIDENTIFIED_CALLER),
     )
-    .ok_or_else(|| {
-        super::error::ApiError::new(axum::http::StatusCode::UNAUTHORIZED, UNIDENTIFIED_CALLER)
-    })
 }
 
 /// What a caller is told when its credential is real but is not a person's.

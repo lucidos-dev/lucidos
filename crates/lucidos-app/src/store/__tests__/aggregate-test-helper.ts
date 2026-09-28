@@ -42,7 +42,6 @@ function aggregateFromMeta(meta: ThreadMeta): ThreadAggregate {
     codingAgentProposed: meta.codingAgentProposed,
     codingAgentRequiresRestart: meta.codingAgentRequiresRestart,
     codingAgentIsExternalRepo: meta.codingAgentIsExternalRepo,
-    codingAgentApplying: meta.codingAgentApplying,
     codingAgentHasDiff: meta.codingAgentHasDiff,
     isSaved: meta.saved,
     hasResponse: false,
@@ -119,7 +118,6 @@ function applyEventRules(agg: ThreadAggregate, event: ThreadEvent | TransientEve
       out.codingAgentProposed = false;
       out.codingAgentRequiresRestart = false;
       out.codingAgentIsExternalRepo = false;
-      out.codingAgentApplying = false;
       out.status = 'idle';
       return out;
     }
@@ -132,13 +130,10 @@ function applyEventRules(agg: ThreadAggregate, event: ThreadEvent | TransientEve
   ]);
   const setIdle: ReadonlySet<string> = new Set([
     'TriggerCompleted', 'ChangeApplied', 'ChangeDiscarded', 'ThreadArchived',
-  ]);
-  // ConditionalCc(Waiting, Idle) — Waiting if codingAgentProposed, else Idle
-  const conditionalWaitingIdle: ReadonlySet<string> = new Set([
     'ResponseGenerated', 'ResponseCanceled', 'SessionEnded', 'CodingAgentIdled',
   ]);
 
-  // CC flag rules — applied first so conditional_cc sees the updated state.
+  // CC flag rules.
   if (event.type === 'CodingAgentIdled') {
     if (event.has_changes !== undefined) out.codingAgentProposed = !!event.has_changes;
     if (event.requires_restart !== undefined) out.codingAgentRequiresRestart = !!event.requires_restart;
@@ -148,11 +143,8 @@ function applyEventRules(agg: ThreadAggregate, event: ThreadEvent | TransientEve
     out.codingAgentProposed = false;
     out.codingAgentRequiresRestart = false;
     out.codingAgentIsExternalRepo = false;
-    out.codingAgentApplying = false;
   } else if (t === 'MergeConflictDetected') {
-    out.codingAgentApplying = true;
   } else if (t === 'ChangeApplyFailed') {
-    out.codingAgentApplying = false;
   }
 
   // `preserving_verdict`: an event that only streams or closes out the ended
@@ -180,7 +172,6 @@ function applyEventRules(agg: ThreadAggregate, event: ThreadEvent | TransientEve
       : 'failed';
   }
   else if (t === 'UserQuestionAsked' || t === 'CodingAgentPermissionRequest' || t === 'CommandPermissionRequested' || t === 'McpPermissionRequested') out.status = 'waiting_for_user_answer' as ThreadStatus;
-  else if (conditionalWaitingIdle.has(t)) out.status = out.codingAgentProposed ? 'waiting' : 'idle';
 
   return out;
 }

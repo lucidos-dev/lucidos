@@ -39,6 +39,9 @@ class FakeEl {
 
   /** Counted, because the dead-tap rescue activates a face by clicking it. */
   clicks = 0;
+  /** Stands for `data-thread-action`, which `WaitingBanner` stamps on Apply,
+   *  Discard and Archive. */
+  threadAction = false;
 
   constructor(label: string | null, box: Box, classes: string[] = ['action-btn'], row: FakeEl | null = null) {
     this.label = label;
@@ -71,6 +74,7 @@ class FakeEl {
   }
   contains(other: unknown) { return other === this; }
   closest(sel: string) {
+    if (sel === '[data-thread-action]') return this.threadAction ? this : null;
     // A face is a real `<button>`; the row, the textarea and the transcript are
     // not. Whether a click landed on a control is what says anything could have
     // taken it. See `clickClaimedPress`.
@@ -195,6 +199,8 @@ interface Line {
   /** Contacts the glass held across the press. See `PressFingers`. */
   fingers?: number;
   fingersAtLift?: number;
+  /** How long the finger stayed down, touchdown to lift. */
+  heldMs?: number;
   /** How far the press landed from the commit face. Both settled-miss verdicts
    *  carry it. */
   reachPx?: number | null;
@@ -304,6 +310,84 @@ describe('the press ledger keeps every press it watched', () => {
     notePressOutcome('served');
     vi.advanceTimersByTime(1000);
     expect(verdicts()).toEqual(['dead', 'served']);
+  });
+
+  it('logs a still press held past a tap as a long hold, and does not toast', () => {
+    // The 13:49 report. A thumb rested on Apply, iOS owed no click for the
+    // hold, and the toast said a press the user never made had died.
+    fire('touchstart', touch(send, 350, 420));
+    vi.advanceTimersByTime(1500);
+    fire('touchend', touch(send, 350, 420));
+    vi.advanceTimersByTime(1000);
+    expect(verdicts()).toEqual(['long-hold']);
+    expect(lines()[0].heldMs).toBe(1500);
+    expect(showToast).not.toHaveBeenCalled();
+  });
+
+  it('logs a dead tap on a thread action, and does not toast', () => {
+    // The fault being chased kills the composer's own controls. Apply has never
+    // been reported dead, so a warning about it is noise.
+    const apply = new FakeEl('Apply', { left: 260, right: 322, top: 400, bottom: 444 }, ['action-btn'], row);
+    apply.threadAction = true;
+    faces = [apply, send];
+    fire('touchstart', touch(apply, 290, 420));
+    fire('touchend', touch(apply, 290, 420));
+    vi.advanceTimersByTime(1000);
+    expect(verdicts()).toEqual(['dead']);
+    expect(lines()[0].face).toBe('Apply');
+    expect(showToast).not.toHaveBeenCalled();
+  });
+
+  it('logs a cancelled tap on a thread action, and does not toast', () => {
+    const apply = new FakeEl('Apply', { left: 260, right: 322, top: 400, bottom: 444 }, ['action-btn'], row);
+    apply.threadAction = true;
+    faces = [apply, send];
+    fire('touchstart', touch(apply, 290, 420));
+    fire('touchcancel', touch(apply, 290, 420));
+    expect(verdicts()).toEqual(['canceled']);
+    expect(showToast).not.toHaveBeenCalled();
+  });
+
+  it('still toasts a dead tap on Cancel, which is a composer control', () => {
+    // Cancel went dead in answer mode once, which is why the probe watches the
+    // whole row. Only thread actions are spared the warning.
+    send.label = 'Cancel';
+    tapSend();
+    vi.advanceTimersByTime(1000);
+    expect(verdicts()).toEqual(['dead']);
+    expect(showToast).toHaveBeenCalledWith(
+      expect.stringMatching(/^Cancel did not register/),
+      'warning',
+    );
+  });
+
+  it('still toasts a cancelled tap on Send', () => {
+    fire('touchstart', touch(send, 350, 420));
+    fire('touchcancel', touch(send, 350, 420));
+    expect(showToast).toHaveBeenCalledWith(
+      expect.stringContaining('the system cancelled the touch'),
+      'warning',
+    );
+  });
+
+  it('still toasts a tap on Send the browser sent to the row', () => {
+    atPoint = row;
+    fire('touchstart', touch(row, 350, 420));
+    expect(showToast).toHaveBeenCalledWith(
+      expect.stringContaining('the tap was on the button'),
+      'warning',
+    );
+  });
+
+  it('still toasts a quick tap that nothing took', () => {
+    tapSend();
+    vi.advanceTimersByTime(1000);
+    expect(verdicts()).toEqual(['dead']);
+    expect(lines()[0].heldMs).toBe(0);
+    expect(showToast).toHaveBeenCalledWith(
+      expect.stringContaining('reached the button and nothing ran'),
+      'warning',
+    );
   });
 
   it('reports an armed press whose lift never arrived', () => {
@@ -647,9 +731,11 @@ describe('a cover the app raised itself is not a wedge', () => {
     // a cover had been up for all of them.
     settleHealthy();
     tapSend();
+    // Covered from the tap that opens the silence, so no scheduled check can
+    // fall uncovered inside it, wherever the clock's phase lands.
+    blockUi(true);
     vi.advanceTimersByTime(1000);
     postClientLog.mockClear();
-    blockUi(true);
     vi.advanceTimersByTime(30000);
     root().hasAttribute = priorHasAttribute as () => boolean;
     tapSend();

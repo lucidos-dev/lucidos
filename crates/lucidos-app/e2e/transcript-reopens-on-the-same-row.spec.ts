@@ -134,6 +134,48 @@ test.describe('A long coding-agent thread reopens on the same row', () => {
     expect(stillScrollable, 'never parked at the bottom').toBe(true);
   });
 
+  /** Reported: "I entered this thread at one spot and when I started scrolling
+   *  it was on another scroll position". A restore lands once, and turns above
+   *  the row can still grow after it: an image decodes, a row finishes drawing.
+   *  WebKit has no scroll anchoring, so nothing carried the reader with them.
+   *  The restore now takes the arrival hold. */
+  test('growth above a restored row leaves the reader on it', async ({ page }) => {
+    test.setTimeout(120_000);
+    await page.addInitScript((tid: string) => {
+      if (!sessionStorage.getItem('seeded')) {
+        localStorage.setItem('lucidos-focused-thread', tid);
+        sessionStorage.setItem('seeded', '1');
+      }
+    }, threadA);
+    await disarmFollowSeed(page);
+    await navigateToApp(page);
+    const transcript = page.locator('.thread-content').first();
+    await expect(transcript.locator('.chat-exchange').first()).toBeVisible();
+
+    // Park a couple of screens down, so rows sit above the reader.
+    await transcript.evaluate((el) => {
+      el.dispatchEvent(new WheelEvent('wheel', { deltaY: 1500, bubbles: true }));
+      el.scrollTop += 1500;
+    });
+    await page.waitForTimeout(600);
+    const parked = await rowAtTop(page);
+    expect(parked, 'a row rests on the top line').not.toBeNull();
+
+    await page.evaluate((tid) => { location.hash = `#thread=${tid}`; }, threadB);
+    await expect(transcript.locator('.chat-exchange')).toHaveCount(3);
+    await page.evaluate((tid) => { location.hash = `#thread=${tid}`; }, threadA);
+    await expect.poll(async () => (await rowAtTop(page))?.label, { timeout: 10_000 }).toBe(parked!.label);
+
+    // A turn above the row grows the way a decoding image grows it.
+    await transcript.evaluate((el) => {
+      el.querySelector<HTMLElement>('.chat-exchange')!.style.paddingTop = '900px';
+    });
+    await page.waitForTimeout(300);
+    const after = await rowAtTop(page);
+    expect(after?.label, 'the same row stays on the top line').toBe(parked!.label);
+    expect(Math.abs(after!.relTop - parked!.relTop)).toBeLessThanOrEqual(2);
+  });
+
   /** Reported: "this thread consistently opens in one position and adjusts to
    *  new after a sec or so". A reader who scrolled up into the first turn
    *  holds a window that draws the whole thread, and a reopen must keep it.
@@ -164,10 +206,15 @@ test.describe('A long coding-agent thread reopens on the same row', () => {
       await scrollUp(page, 800);
     }
     expect(await atTrueTop(), 'rests at the top of the first turn').toBe(true);
-    // Park a few rows down inside that first turn.
+    // Park a few rows down inside that first turn. The spec measures the
+    // distance to a row, because the chrome above the first row differs by
+    // layout. On a phone the header spacer, a banner and the sticky title sit there.
     await transcript.evaluate((el) => {
-      el.dispatchEvent(new WheelEvent('wheel', { deltaY: 300, bubbles: true }));
-      el.scrollTop += 300;
+      const row = Array.from(el.querySelectorAll<HTMLElement>('[data-row-event]'))
+        .find((r) => (r.textContent ?? '').includes('Run t0s5'));
+      const by = Math.round(row!.getBoundingClientRect().top - el.getBoundingClientRect().top) + 4;
+      el.dispatchEvent(new WheelEvent('wheel', { deltaY: by, bubbles: true }));
+      el.scrollTop += by;
     });
     await page.waitForTimeout(600);
     const parked = await rowAtTop(page);

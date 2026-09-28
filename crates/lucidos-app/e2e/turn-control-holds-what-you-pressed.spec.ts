@@ -265,8 +265,8 @@ async function ensureState(page: Page, seq: string, role: string, state: 'true' 
  *
  *  THE FOLD USED TO SKIP THE BOTTOM-EDGE PARK. It missed by 70px on WebKit
  *  there, which ADR 0147 recorded as the transcript not having settled. It was
- *  a CLAMP. The fold takes its rows out before the stub goes in, so the
- *  offset is clamped against a container that is briefly tiny. The correction
+ *  a CLAMP. The fold takes its rows out at once, so the offset is clamped
+ *  against a container that is briefly tiny. The correction
  *  cannot reach its target, and by the time it could, nothing was asking.
  *  `ANCHOR_SETTLE_FRAMES` in `CreateThreadView.tsx` is what re-asserts now,
  *  until the height stops moving. */

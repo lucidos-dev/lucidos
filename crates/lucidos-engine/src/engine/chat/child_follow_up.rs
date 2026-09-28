@@ -491,7 +491,6 @@ pub(crate) fn build_follow_up_message(
         None,
         None,
         None,
-        None,
         crate::engine::thread_events::ActorMode::Agent,
         None,
         None,

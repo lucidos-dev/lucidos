@@ -30,9 +30,9 @@ export interface RestartConfirmCopy {
 /** How the restart confirm should read, in whichever of its two shapes the
  *  workspace is in.
  *
- *  **A new version** is an offer, so it says what it brings before it asks. The
- *  action keeps its canonical name, *Switch to new version*: the toast, the
- *  glossary and the transcript's own explainer all call it that.
+ *  **A new version** is an offer, so it says what it brings before it asks. Its
+ *  button reads *Switch*, the same label as the toast's, because the title
+ *  already names the new version.
  *
  *  **A plain restart** brings nothing new, so it asks the short question it
  *  always asked and lists the applied changes the restart activates.
@@ -55,7 +55,7 @@ export function restartConfirmCopy(
   return {
     title: 'New version available',
     message: 'The workspace restarts. Threads that are running resume by themselves.',
-    okLabel: 'Switch to new version',
+    okLabel: 'Switch',
     // The same word the toast's secondary action uses, so declining reads the
     // same whichever surface the confirm was opened from.
     cancelLabel: 'Later',

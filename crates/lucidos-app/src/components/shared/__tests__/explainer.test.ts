@@ -85,8 +85,42 @@ describe('Explainer: delegates the dismiss contract', () => {
   });
 });
 
-describe('Explainer: the dialog escapes its host markup', () => {
-  it('portals the dialog to <body>', () => {
+describe('Explainer: opens at its icon, like the Waits panel', () => {
+  it('is an anchored popover with no scrim', () => {
+    expect(source).toMatch(/backdrop=\{false\}/);
+    expect(source).not.toMatch(/confirm-dialog/);
+    expect(source).toMatch(/useAnchoredPosition\(open \? anchor : null, panelRef, '\.pane, \.thread-drawer'\)/);
+  });
+
+  it('moves focus in only once the popover is placed', () => {
+    // Until the first measurement the panel is `visibility: hidden`, and a
+    // hidden element takes no focus. Focusing on open left the keyboard on the
+    // icon, outside the dialog it had just opened.
+    expect(source).toMatch(/if \(placed\) panelRef\.current\?\.querySelector/);
+    expect(source).toMatch(/\}, \[placed\]\);/);
+  });
+
+  it('caps its width to the pane it was measured against', () => {
+    // Without the published fit, a wide popover opened from the drawer runs
+    // out of the Conversation pane and into the Canvas pane.
+    expect(source).toMatch(/'--anchored-popover-fit': `\$\{pos\.maxWidth\}px`/);
+    const rule = hostCss.match(/\.explainer-popover \{[\s\S]*?\n\}/);
+    expect(rule, 'found the .explainer-popover rule').not.toBeNull();
+    expect(rule![0]).toMatch(/width:\s*min\([^;]*var\(--anchored-popover-fit\)/);
+  });
+
+  it('shares the anchored popover shell with the Waits panel, not a copy of it', () => {
+    expect(source).toMatch(/panelClass=\{`surface anchored-popover explainer-popover\$\{protectedClassFrom\(anchor\)\}`\}/);
+    expect(source).toMatch(/class="surface-body anchored-popover-body explainer-body"/);
+    const rule = hostCss.match(/\.explainer-popover \{[\s\S]*?\n\}/)![0];
+    for (const prop of ['position', 'z-index', 'display', 'overflow']) {
+      expect(rule, `.explainer-popover restates the shell's ${prop}`).not.toMatch(new RegExp(`\\n\\s*${prop}:`));
+    }
+  });
+});
+
+describe('Explainer: the popover escapes its host markup', () => {
+  it('portals the popover to <body>', () => {
     // An explainer is placed wherever its control is, which includes inside a
     // wrapping <label> (every checkbox row). A label forwards activation to its
     // control for clicks on any NON-interactive descendant, and a dialog's
@@ -94,14 +128,14 @@ describe('Explainer: the dialog escapes its host markup', () => {
     // the checkbox behind it every time the user tapped the explanation. The
     // button itself is exempt (it IS interactive content), which is exactly why
     // the hazard stays invisible until someone taps the copy.
-    expect(source).toMatch(/createPortal\(dialog, document\.body\)/);
+    expect(source).toMatch(/\n\s*portal\n/);
   });
 });
 
 describe('Explainer: host-only, never served to app iframes', () => {
   it('styles the explainer in host-components.css', () => {
     expect(hostCss).toMatch(/\.explainer-btn\b/);
-    expect(hostCss).toMatch(/\.explainer-dialog\b/);
+    expect(hostCss).toMatch(/\.explainer-slot\b/);
     expect(hostCss).toMatch(/\.explainer-body\b/);
   });
 
@@ -168,7 +202,7 @@ describe("Explainer: the glyph sits on the label's cap height", () => {
   });
 });
 
-describe('Explainer: the dialog is a named, focus-trapping modal', () => {
+describe('Explainer: the popover is a named, focus-trapping dialog', () => {
   it('names the panel, so a screen reader does not meet an unnamed dialog', () => {
     // The visible <h2> is not an accessible name. aria-label rather than
     // aria-labelledby, which would need an `id`.

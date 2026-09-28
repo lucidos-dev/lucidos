@@ -1,11 +1,10 @@
 /**
  * **A fold needs a body to fold.**
  *
- * Collapsing swaps the response body for a `⋯` stub, so on a turn whose body
- * draws nothing it swaps nothing for a mark: the turn does not collapse, the
- * stub APPEARS. Reported on 2026-08-10 as "it now collapses to ... when there
- * is nothing, while in flight", and in flight is where a blank body lives
- * longest.
+ * Collapsing hides the response body and lights the collapse control, so on a
+ * turn whose body draws nothing it hides nothing and lights anyway. Reported
+ * back when a fold left a stub, as "it now collapses to ... when there is
+ * nothing, while in flight". In flight is where a blank body lives longest.
  *
  * The gate was `hasEvents`, which is `events.length > 0` and answers a
  * different question. Two shapes make it run ahead of anything on screen, and
@@ -50,16 +49,15 @@ describe('a turn is collapsible only while its body draws something', () => {
 
   it('holds the fold to the same gate, so a blank turn cannot render as folded', () => {
     // Without this, a key already in the persisted `collapsedExchanges` set
-    // (the turn was folded when it had content) would draw a `⋯` over a body
-    // that has since stopped drawing anything.
+    // (the turn was folded when it had content) would light the collapse
+    // control over a body that has since stopped drawing anything.
     expect(source).toMatch(/const isCollapsed = canCollapse && collapsedExchanges\.value\.has\(/);
   });
 
   it('asks the panel the same question, rather than spelling it a second way', () => {
-    // `hasBody` decides whether the body box is rendered AND whether the `⋯`
-    // stub stands in for it. It was a duplicate `hasResponse || hasEvents`,
-    // which is exactly how the two got to disagree: the gate could be fixed
-    // while the stub kept rendering off the old test.
+    // `hasBody` decides whether the body box is rendered. It was a duplicate
+    // `hasResponse || hasEvents`, which is exactly how the two got to
+    // disagree: the gate could be fixed while the panel kept the old test.
     expect(source).toMatch(/hasBody=\{canCollapse\}/);
     expect(source).not.toMatch(/hasBody=\{hasResponse \|\| hasEvents\}/);
   });
@@ -77,7 +75,7 @@ describe('a turn is collapsible only while its body draws something', () => {
  * yours: a forwarded agent message, a question, a permission prompt.
  *
  * The same expression also decides `isInitiatorCollapsed`, so a turn a reader
- * folded before this cannot render as a stuck `⋯` stub.
+ * folded before this cannot render as a stuck fold.
  */
 describe('the initiator fold skips every chipless turn', () => {
   it('gates it on the chip test, beside the body test', () => {

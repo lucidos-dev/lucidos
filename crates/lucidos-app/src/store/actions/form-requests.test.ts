@@ -69,7 +69,7 @@ function authorizationRequest(requestId: string, deviceId: string): FormRequestE
     type: 'OAuthAuthorizationRequested',
     request_id: requestId,
     payload: JSON.stringify({ target: 'url', url: 'https://auth.example.com/authorize', purpose: 'oauth' }),
-    actor: { kind: 'device', device_id: deviceId, label: 'My MacBook' },
+    actor: { kind: 'device', device_id: deviceId },
   };
 }
 
@@ -143,7 +143,7 @@ describe('an answered request', () => {
     openFormRequest(THREAD, credentialRequest('req-1'));
     expect(activeInlineForm.value?.type).toBe('credential');
 
-    closeResolvedFormRequest('req-1', 'completed', { kind: 'device', device_id: 'device-elsewhere', label: 'My iPhone' });
+    closeResolvedFormRequest('req-1', 'completed', { kind: 'device', device_id: 'device-elsewhere' });
 
     expect(panelOverlay.value).toBeNull();
   });
@@ -151,7 +151,7 @@ describe('an answered request', () => {
   it('leaves the answering device to close its own form', () => {
     openFormRequest(THREAD, credentialRequest('req-1'));
 
-    closeResolvedFormRequest('req-1', 'completed', { kind: 'device', device_id: THIS_DEVICE, label: 'My MacBook' });
+    closeResolvedFormRequest('req-1', 'completed', { kind: 'device', device_id: THIS_DEVICE });
 
     expect(activeInlineForm.value?.type).toBe('credential');
   });
@@ -159,7 +159,7 @@ describe('an answered request', () => {
   it('closes here too when a message typed here replaced it', () => {
     openFormRequest(THREAD, credentialRequest('req-1'));
 
-    closeResolvedFormRequest('req-1', 'superseded', { kind: 'device', device_id: THIS_DEVICE, label: 'My MacBook' });
+    closeResolvedFormRequest('req-1', 'superseded', { kind: 'device', device_id: THIS_DEVICE });
 
     expect(panelOverlay.value).toBeNull();
   });

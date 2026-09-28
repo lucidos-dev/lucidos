@@ -1,7 +1,9 @@
+import { effect, signal, untracked } from '@preact/signals';
 import { preferences, showToast, removeToast, notificationsFilter, currentModel, reasoningEffort, selectedCodingAgent, clampThreadDrawerWidth } from '../store';
 import type { CodingAgent } from '../../api/types';
 import { failedIfFresh } from '../types';
-import { getPreferences, setPreference, isTransientFetchError, retryTransientRead } from '../../api/client';
+import { getPreferences, setPreference, isTransientFetchError, retryTransientRead, getTheme, ApiError } from '../../api/client';
+import { resolvedHexColor } from '../../utils/cssColor';
 import { getDeviceId } from './devices';
 import { errorDetail } from '../../utils/errorDetail';
 import { createFailureCounter } from '../../utils/failureCounter';
@@ -13,24 +15,34 @@ import { publishScrollbarGutter } from '../../utils/scrollbarGutter';
 import { setTitlebarColor, windowReadyToShow } from '../../utils/tauri';
 import {
   STYLE_OVERRIDES_KEY, STYLE_OVERRIDES_STORAGE_KEY, STYLE_RESET_PARAM,
-  isValidOverrideName, isValidOverrideValue, parseStyleOverrides,
+  isAllowedOverride, parseStyleOverrides,
   serializeStyleOverrides, styleResetRequested,
 } from '../../utils/styleOverrides';
 
 import {
-  DEFAULT_FONT_FAMILY, DEFAULT_MOTION, DEFAULT_THEME, FONT_FAMILY_VALUES, GOOGLE_FONT_URLS,
-  MOTION_PREFS, MOTION_STORAGE_KEY, SYSTEM_THEME_SETTLE_MS, THEMES, THEME_BG,
-  UI_SCALE_DEFAULT, clampUiScale, fontFeaturesFor, parseUiScale, resolveTheme,
-  type FontFamily, type MotionPref, type ThemePref,
+  DEFAULT_FONT_PREFERENCE, DEFAULT_THEME_EFFECTS, DEFAULT_THEME_ID, DEFAULT_MOTION, DEFAULT_THEME_MODE,
+  EMPTY_THEME, FONT_PREFERENCES, THEME_EFFECTS_PREFS, THEME_EFFECTS_STORAGE_KEY,
+  THEME_KEY, THEME_STORAGE_KEY, MOTION_PREFS,
+  MOTION_STORAGE_KEY, SYSTEM_THEME_MODE_SETTLE_MS, THEME_MODES, THEME_MODE_ATTRIBUTE, THEME_MODE_BG,
+  THEME_MODE_KEY, THEME_MODE_STORAGE_KEY, UI_SCALE_DEFAULT,
+  FONT_BOLD_ATTRIBUTE, WORKSPACE_FONT_STORAGE_KEY,
+  clampUiScale, fontBoldMark, isWorkspaceFontId, themeBackground, themeTokenNames, parseResolvedTheme,
+  parseUiScale, parseWorkspaceFont, replaceInlineTokens, resolveFont, resolveThemeMode,
+  sanitizeResolvedTheme,
+  type FontPreference, type ThemeEffectsPref, type MotionPref, type ResolvedTheme,
+  type ResolvedThemeMode, type ThemeMode, type WorkspaceFont,
 } from '@lucidos/appearance';
+import { registerFontsInUse } from '@lucidos/font-faces';
+import { dataMountUrl } from '../../api/client';
+import { loadWorkspaceFonts, workspaceFontList } from './workspaceFonts';
 import { motionPreference } from '../../utils/motion';
+import { themeEffectsPreference } from '../../utils/themeEffects';
 import { AUTOCORRECT_STORAGE_KEY, defaultAutocorrect } from '@lucidos/text-entry';
 
 /** Re-exported so the components that already import these from the store keep
  *  one import site. The definitions live in the appearance contract, which is
  *  the single source the two FOUC scripts and the SDK read as well. */
-export type { FontFamily } from '@lucidos/appearance';
-export type Theme = ThemePref;
+export type { FontId, FontPreference, ThemeMode } from '@lucidos/appearance';
 export {
   UI_SCALE_MIN, UI_SCALE_MAX, UI_SCALE_STEP, UI_SCALE_DEFAULT, clampUiScale,
 } from '@lucidos/appearance';
@@ -48,14 +60,17 @@ export type ImageModel = 'auto' | 'imagen-4' | 'gpt-image-1' | 'gpt-image-1.5' |
 // preference signal, writing the properties onto <html>, and re-asserting the
 // style-remote overrides afterwards.
 
-const loadedFonts = new Set<string>();
-
-let systemThemeQuery: MediaQueryList | null = null;
-let systemThemeSettleTimer: number | null = null;
-// Seeded so loadPreferences can skip a no-op applyTheme when unchanged. The
+let systemThemeModeQuery: MediaQueryList | null = null;
+let systemThemeModeSettleTimer: number | null = null;
+// Seeded so loadPreferences can skip a no-op applyThemeMode when unchanged. The
 // matching module-init install of the OS listener sits beside
-// `syncSystemThemeListener`, which cannot run before its own constants exist.
-let lastAppliedTheme: Theme = currentTheme();
+// `syncSystemThemeModeListener`, which cannot run before its own constants exist.
+let lastAppliedThemeMode: ThemeMode = currentThemeMode();
+/** The mode the page paints now, for surfaces that preview a mode (the theme
+ *  picker). `applyThemeMode` sets it; seeded from what the boot script painted. */
+export const paintedThemeMode = signal<ResolvedThemeMode>(
+  document.documentElement.getAttribute(THEME_MODE_ATTRIBUTE) === 'light' ? 'light' : 'dark',
+);
 
 // --- Generic helpers ---
 
@@ -321,9 +336,8 @@ export function applyUiScale(scale: number): void {
   const clamped = clampUiScale(scale);
   localStorage.setItem('lucidos-ui-scale', String(clamped));
   document.documentElement.style.setProperty('--user-ui-scale', `${clamped}%`);
-  // This just wrote --user-ui-scale inline, which the remote may be overriding.
-  // It leads the measurement rather than trailing it, because the override is
-  // free to retune the very property the two quantities are measured against.
+  // It leads the measurement rather than trailing it, because an override may
+  // retune the type scale the two quantities are measured against.
   reapplyStyleOverrides();
   scheduleScaleMeasurements();
   // The macOS traffic lights are centred on the header bar, whose height this
@@ -345,7 +359,7 @@ export function setUiScale(scale: number): Promise<void> {
   return savePreference('ui-scale', String(clamped), () => applyUiScale(clamped), true);
 }
 
-// --- Theme ---
+// --- Theme mode ---
 
 /** Whether the OS is asking for light right now. The one read point, so a
  *  breadcrumb can never record a different sample than the one that painted. */
@@ -353,60 +367,199 @@ function osPrefersLight(): boolean {
   return window.matchMedia('(prefers-color-scheme: light)').matches;
 }
 
-export function applyTheme(theme: Theme): void {
+export function applyThemeMode(mode: ThemeMode): void {
   const prefersLight = osPrefersLight();
-  const resolved = resolveTheme(theme, prefersLight);
-  const bg = THEME_BG[resolved];
-  // Theme-flash telemetry — index.html installs __themeLogEvt as a fetch shim
+  const resolved = resolveThemeMode(mode, prefersLight);
+  // The theme is per mode, so it is re-laid on every mode apply. Stale names
+  // go first, so the mode's own inline background below is never removed.
+  const themeTokens = activeTheme[resolved];
+  clearStaleThemeTokens(themeTokens);
+  paintedThemeMode.value = resolved;
+  const bg = themeBackground(themeTokens) ?? THEME_MODE_BG[resolved];
+  // Theme mode flash telemetry. index.html installs __themeModeLogEvt as a fetch shim
   // that POSTs to /api/v1/internal/client-log (engine.log breadcrumbs).
-  type ThemeLogEvt = (label: string, info: unknown) => void;
-  const logEvt = (window as unknown as { __themeLogEvt?: ThemeLogEvt }).__themeLogEvt;
+  type ThemeModeLogEvt = (label: string, info: unknown) => void;
+  const logEvt = (window as unknown as { __themeModeLogEvt?: ThemeModeLogEvt }).__themeModeLogEvt;
   if (logEvt) {
-    logEvt('applyTheme', {
-      input: theme,
+    logEvt('applyThemeMode', {
+      input: mode,
       resolved,
-      priorDataTheme: document.documentElement.getAttribute('data-theme'),
+      priorDataThemeMode: document.documentElement.getAttribute(THEME_MODE_ATTRIBUTE),
       mqLight: prefersLight,
     });
   }
-  localStorage.setItem('lucidos-theme', theme);
-  document.documentElement.setAttribute('data-theme', resolved);
+  localStorage.setItem(THEME_MODE_STORAGE_KEY, mode);
+  document.documentElement.setAttribute(THEME_MODE_ATTRIBUTE, resolved);
   document.documentElement.style.setProperty('--bg-primary', bg);
   // Mirrors the inline FOUC IIFE in index.html — keeps <html> covered on
   // toggle and on the next cold reload, before global.css re-applies its
   // `html { background: var(--bg-primary); }` rule.
   document.documentElement.style.background = bg;
 
+  setThemeTokens(themeTokens);
+  const themeActive = Object.keys(themeTokens).length > 0;
+  // A theme background that is not a hex literal still has to reach the canvas.
+  // The inline literal above would hide it, so the var takes its place.
+  if (themeTokens['--bg-primary'] && !themeBackground(themeTokens)) {
+    document.documentElement.style.background = 'var(--bg-primary)';
+  }
+
   const meta = document.querySelector('meta[name="theme-color"]');
   if (meta) {
-    meta.setAttribute('content', bg);
+    meta.setAttribute('content', (themeActive && resolvedHexColor('var(--bg-primary)')) || bg);
   }
 
   document.documentElement.style.colorScheme = resolved;
 
   // Tauri (packaged macOS): match the reclaimed title-bar band's behind-the-
   // webview fallback (the window background) to the in-app header — the
-  // header-gradient top stop per theme (mirrors --header-gradient in
+  // header-gradient top stop per mode (mirrors --header-gradient in
   // styles/global/base.css, like the --bg-primary literal above; the visible
   // band itself is the CSS .titlebar-strip). Best-effort and cosmetic: it runs
-  // whenever the theme is applied (incl. startup / system-theme changes) with no
-  // user-facing surface, and a failed call self-heals on the next applyTheme, so
+  // whenever the mode is applied (incl. startup / OS appearance changes) with no
+  // user-facing surface, and a failed call self-heals on the next applyThemeMode, so
   // a toast would be wrong.
   if (isTauri()) {
-    const titlebar = resolved === 'light' ? '#1a6fd0' : '#15549e';
+    const defaultTitlebar = resolved === 'light' ? '#1a6fd0' : '#15549e';
+    const titlebar = (themeActive && resolvedHexColor('var(--titlebar-strip-bg)')) || defaultTitlebar;
     setTitlebarColor(titlebar).catch((e) => console.warn('[titlebar] tint failed', e));
-    // The theme is resolved and on the document, so a window shown now shows a
-    // page in the user's theme. The shell keeps the launch window hidden until
+    // The mode is resolved and on the document, so a window shown now shows a
+    // page in the user's appearance. The shell keeps the launch window hidden until
     // it hears this. One-shot inside the wrapper, since this line also runs on
     // every toggle and system-appearance change.
     windowReadyToShow();
   }
 
-  syncSystemThemeListener(theme);
-  lastAppliedTheme = theme;
-  // This just wrote --bg-primary inline and swapped the token block wholesale,
-  // so any override of a themed token has to be re-asserted on top.
+  syncSystemThemeModeListener(mode);
+  lastAppliedThemeMode = mode;
+  // This just wrote --bg-primary and the theme inline and swapped the token
+  // block wholesale, so any override of a themed token goes back on top.
   reapplyStyleOverrides();
+}
+
+// --- Theme (a named set of token values, docs/plans/2026-09-26-looks.md) ---
+//
+// The engine resolves a theme, derivation included, and serves one map per
+// theme mode plus the fonts it suggests. This module keeps the active theme and
+// caches it for the boot script. `applyThemeMode` lays the current mode's map
+// inline on <html>, and `applyFontFamily` resolves the UI font against it. The
+// picker's list of themes lives in `store/actions/themes.ts`.
+
+/** Seeded from the boot cache, so the first apply paints what boot painted. */
+let activeTheme: ResolvedTheme = parseResolvedTheme(localStorage.getItem(THEME_STORAGE_KEY));
+/** The id last asked for. Null until this page asked, so the first preference
+ *  load always fetches. */
+let requestedThemeId: string | null = null;
+/** Every name the boot script may have set from the same cache, so switching
+ *  to a theme without one of them still removes it. */
+let appliedThemeNames: string[] = themeTokenNames(activeTheme);
+let themeLoadSeq = 0;
+
+function clearStaleThemeTokens(next: Record<string, string>): void {
+  const root = document.documentElement;
+  for (const name of appliedThemeNames) {
+    if (!(name in next)) root.style.removeProperty(name);
+  }
+}
+
+function setThemeTokens(tokens: Record<string, string>): void {
+  const root = document.documentElement;
+  for (const [name, value] of Object.entries(tokens)) root.style.setProperty(name, value);
+  appliedThemeNames = Object.keys(tokens);
+}
+
+export function currentThemeId(): string {
+  if (preferences.value.status === 'loaded') {
+    const raw = preferences.value.data[THEME_KEY];
+    if (raw) return raw;
+  }
+  return DEFAULT_THEME_ID;
+}
+
+/** Paint `theme` now, and cache it for the next cold start. The UI font is
+ *  re-resolved too, since a device that follows the theme takes its font. Not
+ *  before the preferences load: the default would mask an explicit pick. The
+ *  load applies the font itself. */
+function applyTheme(theme: ResolvedTheme): void {
+  activeTheme = theme;
+  localStorage.setItem(THEME_STORAGE_KEY, JSON.stringify(theme));
+  applyThemeMode(lastAppliedThemeMode);
+  if (preferences.value.status === 'loaded') applyFontFamily(currentFontFamily());
+}
+
+/** The refused theme this page already warned about, so a background refresh
+ *  on every preference load does not toast again. */
+let refusedThemeWarned: string | null = null;
+
+/**
+ * Fetch the active theme and paint it. Called when the `theme` preference loads
+ * or changes, and when the active theme's file is written or deleted.
+ *
+ * A theme that no longer exists paints the default, and so does one the engine
+ * now refuses, with a warning. Any other failure keeps what is painted, so a
+ * transient failure never flashes the default. The next preference load asks
+ * again. `picked` marks a theme the user just chose, who is owed a toast
+ * whenever it cannot load.
+ */
+
+export async function refreshActiveTheme(id: string = currentThemeId(), picked = false): Promise<void> {
+  const seq = ++themeLoadSeq;
+  requestedThemeId = id;
+  if (id === DEFAULT_THEME_ID) {
+    applyTheme(EMPTY_THEME);
+    return;
+  }
+  try {
+    const theme = await getTheme(id);
+    if (seq !== themeLoadSeq) return;
+    if (refusedThemeWarned === id) refusedThemeWarned = null;
+    applyTheme(sanitizeResolvedTheme(theme.resolved));
+  } catch (e) {
+    if (seq !== themeLoadSeq) return;
+    if (e instanceof ApiError && (e.httpCode === 404 || e.httpCode === 400)) {
+      applyTheme(EMPTY_THEME);
+      return;
+    }
+    // The file exists but the engine refuses it, such as a theme saved before
+    // a validation rule (ADR 0309). Its cached map must stop painting, and the
+    // user must learn why the theme changed.
+    if (e instanceof ApiError && e.httpCode === 422) {
+      applyTheme(EMPTY_THEME);
+      if (picked || refusedThemeWarned !== id) {
+        refusedThemeWarned = id;
+        showToast(`The theme "${id}" no longer passes validation, so the default theme shows: ${errorDetail(e)}`, 'warning');
+      }
+      return;
+    }
+    // Forget the request, so the next preference load asks again.
+    requestedThemeId = null;
+    if (picked) {
+      showToast(`Could not load the theme "${id}": ${errorDetail(e)}`, 'error');
+      return;
+    }
+    // Carve-out: best-effort telemetry (.claude/rules/frontend.md). No user
+    // intent is on this line: it is a background refresh after an SSE event or
+    // a preference load, and the next one asks again.
+    console.warn(`[themes] could not load theme "${id}"`, e);
+  }
+}
+
+/** Fetch only when the preference names a theme other than the one asked for. */
+function refreshActiveThemeIfChanged(): void {
+  if (currentThemeId() === requestedThemeId) return;
+  void refreshActiveTheme();
+}
+
+/** Whether a `data/` path is the active theme's file, for the SSE arms that
+ *  refresh it on a write or a delete. */
+export function isActiveThemePath(path: string | undefined): boolean {
+  return path === `themes/${currentThemeId()}.json`;
+}
+
+export function setTheme(id: string): Promise<void> {
+  // The id is passed on, because `savePreference` runs the side effect before
+  // it updates the signal `currentThemeId` reads.
+  return savePreference(THEME_KEY, id, () => void refreshActiveTheme(id, true), true);
 }
 
 // --- Following the OS under a `system` preference ---
@@ -433,7 +586,7 @@ export function applyTheme(theme: Theme): void {
  *  a hide preceded. A window that merely lost focus never went hidden, so a Mac
  *  that slept through the flip would get nothing back. That is one of the two
  *  cases this exists for. */
-const SYSTEM_THEME_RESUME_EVENTS: ReadonlyArray<readonly [EventTarget, string]> = [
+const SYSTEM_THEME_MODE_RESUME_EVENTS: ReadonlyArray<readonly [EventTarget, string]> = [
   [document, 'visibilitychange'],
   [window, 'focus'],
   [window, 'pageshow'],
@@ -446,12 +599,12 @@ const SYSTEM_THEME_RESUME_EVENTS: ReadonlyArray<readonly [EventTarget, string]> 
  *  The visibility guard is what makes the media-query listener safe on iOS: a
  *  snapshot-pass flip arrives while the app is backgrounded, so it is dropped
  *  rather than painted. */
-function refreshSystemTheme(): void {
-  if (currentTheme() !== 'system') return;
+function refreshSystemThemeMode(): void {
+  if (currentThemeMode() !== 'system') return;
   if (document.visibilityState !== 'visible') return;
-  const resolved = resolveTheme('system', osPrefersLight());
-  if (document.documentElement.getAttribute('data-theme') === resolved) return;
-  applyTheme('system');
+  const resolved = resolveThemeMode('system', osPrefersLight());
+  if (document.documentElement.getAttribute(THEME_MODE_ATTRIBUTE) === resolved) return;
+  applyThemeMode('system');
 }
 
 /** Arm one shared settle timer, which re-READS the OS when it fires. Nothing
@@ -460,100 +613,125 @@ function refreshSystemTheme(): void {
  *
  *  An already-armed timer is left alone rather than pushed back. A burst then
  *  resolves one settle delay after its first event, not after its last. */
-function scheduleSystemThemeRefresh(): void {
-  if (systemThemeSettleTimer !== null) return;
-  systemThemeSettleTimer = window.setTimeout(() => {
-    systemThemeSettleTimer = null;
-    refreshSystemTheme();
-  }, SYSTEM_THEME_SETTLE_MS);
+function scheduleSystemThemeModeRefresh(): void {
+  if (systemThemeModeSettleTimer !== null) return;
+  systemThemeModeSettleTimer = window.setTimeout(() => {
+    systemThemeModeSettleTimer = null;
+    refreshSystemThemeMode();
+  }, SYSTEM_THEME_MODE_SETTLE_MS);
 }
 
 /** Subscribe to the OS appearance while the preference is `system`, and to
- *  nothing at all otherwise. Called from every `applyTheme`, so it tears the
+ *  nothing at all otherwise. Called from every `applyThemeMode`, so it tears the
  *  previous registration down first and is safe to run repeatedly. */
-function syncSystemThemeListener(theme: Theme): void {
-  systemThemeQuery?.removeEventListener('change', scheduleSystemThemeRefresh);
-  systemThemeQuery = null;
-  for (const [target, type] of SYSTEM_THEME_RESUME_EVENTS) {
-    target.removeEventListener(type, scheduleSystemThemeRefresh);
+function syncSystemThemeModeListener(mode: ThemeMode): void {
+  systemThemeModeQuery?.removeEventListener('change', scheduleSystemThemeModeRefresh);
+  systemThemeModeQuery = null;
+  for (const [target, type] of SYSTEM_THEME_MODE_RESUME_EVENTS) {
+    target.removeEventListener(type, scheduleSystemThemeModeRefresh);
   }
-  if (systemThemeSettleTimer !== null) {
-    clearTimeout(systemThemeSettleTimer);
-    systemThemeSettleTimer = null;
+  if (systemThemeModeSettleTimer !== null) {
+    clearTimeout(systemThemeModeSettleTimer);
+    systemThemeModeSettleTimer = null;
   }
-  if (theme !== 'system') return;
+  if (mode !== 'system') return;
 
-  systemThemeQuery = window.matchMedia('(prefers-color-scheme: light)');
-  systemThemeQuery.addEventListener('change', scheduleSystemThemeRefresh);
-  for (const [target, type] of SYSTEM_THEME_RESUME_EVENTS) {
-    target.addEventListener(type, scheduleSystemThemeRefresh);
+  systemThemeModeQuery = window.matchMedia('(prefers-color-scheme: light)');
+  systemThemeModeQuery.addEventListener('change', scheduleSystemThemeModeRefresh);
+  for (const [target, type] of SYSTEM_THEME_MODE_RESUME_EVENTS) {
+    target.addEventListener(type, scheduleSystemThemeModeRefresh);
   }
 }
 
-// Module-init install. loadPreferences skips applyTheme when the stored theme
-// already matches lastAppliedTheme. Without this call a user on `system` would
+// Module-init install. loadPreferences skips applyThemeMode when the stored mode
+// already matches lastAppliedThemeMode. Without this call a user on `system` would
 // never get the OS listener attached.
-syncSystemThemeListener(lastAppliedTheme);
+syncSystemThemeModeListener(lastAppliedThemeMode);
 
-/** The device's theme, defaulting to `system` (follow the OS light/dark
+/** The device's theme mode, defaulting to `system` (follow the OS light/dark
  *  setting). A device that has explicitly picked light or dark keeps its pick:
  *  this is only what applies when nothing is stored, which is also why changing
  *  it reaches existing devices that never opened Settings.
  *
  *  The default is mirrored in the FOUC script (index.html), the iframe FOUC
- *  script (api/sdk_prefs.rs), the SDK (`resolveThemePreference`) and the
+ *  script (api/sdk_prefs.rs), the SDK (`resolveThemeModePreference`) and the
  *  preference catalog. They paint at different moments of one page load, so a
  *  disagreement between them is a visible flash. */
-export function currentTheme(): Theme {
+export function currentThemeMode(): ThemeMode {
   // localStorage fallback matches the FOUC prevention script in index.html.
   // Covers: backend missing the preference (device_id change, save failure),
   // and the loading window before the API responds.
-  return currentPreference('theme', THEMES, DEFAULT_THEME, 'lucidos-theme');
+  return currentPreference(THEME_MODE_KEY, THEME_MODES, DEFAULT_THEME_MODE, THEME_MODE_STORAGE_KEY);
 }
 
-export function setTheme(theme: Theme): Promise<void> {
-  return savePreference('theme', theme, () => applyTheme(theme), true);
+export function setThemeMode(mode: ThemeMode): Promise<void> {
+  return savePreference(THEME_MODE_KEY, mode, () => applyThemeMode(mode), true);
 }
 
 // --- Font family ---
 
-function ensureFontLoaded(font: FontFamily): void {
-  const url = GOOGLE_FONT_URLS[font];
-  if (!url || loadedFonts.has(font)) return;
-  loadedFonts.add(font);
-  const link = document.createElement('link');
-  link.rel = 'stylesheet';
-  link.href = url;
-  document.head.appendChild(link);
+/** The workspace fonts this page can paint: the installed list once it has
+ *  loaded, else the entry the boot script painted from, then the theme's own. */
+function knownWorkspaceFonts(): WorkspaceFont[] {
+  const list = workspaceFontList.value;
+  const cached = parseWorkspaceFont(localStorage.getItem(WORKSPACE_FONT_STORAGE_KEY));
+  const installed = list.status === 'loaded' ? list.data.fonts : cached ? [cached] : [];
+  return [...installed, ...activeTheme.workspace_fonts];
 }
 
-export function applyFontFamily(font: FontFamily): void {
-  ensureFontLoaded(font);
-  localStorage.setItem('lucidos-font-family', font);
-  document.documentElement.style.setProperty('--font-ui', FONT_FAMILY_VALUES[font]);
-  const features = fontFeaturesFor(font);
-  document.documentElement.style.setProperty('--font-features-text', features.text);
-  document.documentElement.style.setProperty('--font-features-code', features.code);
+/** Paint the font a preference resolves to: the user's pick, else the active
+ *  theme's, else the fallback. The RAW preference is what the boot script reads,
+ *  so it resolves against its cached theme the same way on the next cold start.
+ *
+ *  A catalog font needs no loading: the bundle declares every face, and a face
+ *  downloads once text uses it (ADR 0303). A workspace font registers its faces
+ *  here, and its entry is cached for the boot script (ADR 0308). */
+export function applyFontFamily(preference: FontPreference): void {
+  const known = knownWorkspaceFonts();
+  const font = resolveFont(preference, activeTheme.fonts, known);
+  localStorage.setItem('lucidos-font-family', preference);
+  if (font.workspaceFont) {
+    localStorage.setItem(WORKSPACE_FONT_STORAGE_KEY, JSON.stringify(font.workspaceFont));
+  } else if (workspaceFontList.value.status === 'loaded') {
+    // Only an authoritative list may clear the cache. Before it loads, a picked
+    // font is simply not known yet.
+    localStorage.removeItem(WORKSPACE_FONT_STORAGE_KEY);
+  }
+  registerFontsInUse(font, known, activeTheme.fonts.mono, dataMountUrl);
+  document.documentElement.style.setProperty('--font-ui', font.stack);
+  document.documentElement.style.setProperty('--font-features-text', font.features.text);
+  document.documentElement.style.setProperty('--font-features-code', font.features.code);
+  document.documentElement.setAttribute(FONT_BOLD_ATTRIBUTE, fontBoldMark(font));
   // This just wrote --font-ui and the two feature properties inline.
   reapplyStyleOverrides();
 }
 
-/** The device's UI font. The default and the valid set come from the appearance
- *  contract, so this and the boot scripts cannot disagree.
+/** The device's font preference, which may be `theme`. The default and the
+ *  valid set come from the appearance contract, so this and the boot scripts
+ *  cannot disagree.
  *
  *  Deliberately NOT backed by localStorage the way the theme is: `applyFontFamily`
  *  writes `lucidos-font-family` on every load for the FOUC script to read, so a
  *  cached value here would just be the previous default echoed back and would
  *  outlive a change to it. */
-export function currentFontFamily(): FontFamily {
-  return currentPreference(
-    'font-family',
-    Object.keys(FONT_FAMILY_VALUES) as FontFamily[],
-    DEFAULT_FONT_FAMILY,
-  );
+export function currentFontFamily(): FontPreference {
+  if (preferences.value.status === 'loaded') {
+    const raw = preferences.value.data['font-family'];
+    if (isWorkspaceFontId(raw)) return raw;
+  }
+  return currentPreference('font-family', FONT_PREFERENCES, DEFAULT_FONT_PREFERENCE);
 }
 
-export function setFontFamily(font: FontFamily): Promise<void> {
+// A picked workspace font paints once the list naming it has loaded, and again
+// whenever it changes: installed, removed, or shipped by a plugin.
+effect(() => {
+  if (workspaceFontList.value.status !== 'loaded') return;
+  untracked(() => {
+    if (preferences.value.status === 'loaded') applyFontFamily(currentFontFamily());
+  });
+});
+
+export function setFontFamily(font: FontPreference): Promise<void> {
   return savePreference('font-family', font, () => applyFontFamily(font), true);
 }
 
@@ -575,33 +753,31 @@ export function applyStyleOverrides(map: Record<string, string>): void {
   // map instead would leave a stale value stuck: a name whose new value fails
   // validation is still `in map`, so it would be skipped by both loops and keep
   // painting its previous value, from a function that promises to validate.
-  const applied: string[] = [];
+  // A cleared name uncovers the theme's value rather than deleting it.
+  const valid: Record<string, string> = {};
   for (const [name, value] of Object.entries(map)) {
-    if (!isValidOverrideName(name) || !isValidOverrideValue(value)) continue;
-    root.style.setProperty(name, value);
-    applied.push(name);
+    if (isAllowedOverride(name, value)) valid[name] = value;
   }
-  for (const name of appliedOverrideNames) {
-    if (!applied.includes(name)) root.style.removeProperty(name);
-  }
-  appliedOverrideNames = applied;
+  appliedOverrideNames = replaceInlineTokens(
+    root.style, appliedOverrideNames, valid, activeTheme[paintedThemeMode.value],
+  );
   localStorage.setItem(STYLE_OVERRIDES_STORAGE_KEY, serializeStyleOverrides(map));
   // A retuned --font-size-* or spacing token moves the root font size's
-  // consumers, and --user-ui-scale is itself overridable. So the remote owes the
-  // same two derived measurements a scale change does, through the same frame
-  // coalescer: it can write on every keystroke of a tuning session.
+  // consumers. So the remote owes the same two derived measurements a scale
+  // change does, through the same frame coalescer: it can write on every
+  // keystroke of a tuning session.
   scheduleScaleMeasurements();
   // The bar the macOS traffic lights are centred on moves here too, with a
-  // retuned --user-ui-scale or --desktop-bar-height. `watchTitlebarBand` is what
+  // retuned --desktop-bar-height. `watchTitlebarBand` is what
   // tells the shell, by observing the band rather than the writers.
 }
 
-/** Re-assert the overrides after something else has written the same
- *  properties inline. `applyTheme` writes `--bg-primary`, `applyUiScale` writes
- *  `--user-ui-scale`, `applyFontFamily` writes `--font-ui`: each is a property
- *  the remote is allowed to override, and each of those three calls this at the
- *  end so the override keeps winning. Without it a system-theme flip silently
- *  reverts a tuned background. */
+/** Re-assert the overrides after something else has written inline tokens.
+ *  `applyThemeMode` writes `--bg-primary`, which the remote may override, and calls
+ *  this at the end so the override keeps winning. Without it a system-theme
+ *  flip silently reverts a tuned background. The UI scale and font writers call
+ *  it too. Their own properties are reserved (ADR 0309), but an override may
+ *  still retune the type scale their measurements read. */
 export function reapplyStyleOverrides(): void {
   if (appliedOverrideNames.length === 0) return;
   const root = document.documentElement;
@@ -656,6 +832,11 @@ function applyStyleOverridesFromPreferences(): void {
       // paint immediately even if the engine is unreachable, which is a
       // plausible state for someone who just made their UI unusable.
       void clearStyleOverrides().catch((e) => console.warn('[style-remote] reset write failed', e));
+      // The theme goes too: any app can write one, so it is a second way to
+      // make the UI unreadable, and this is the way out of both.
+      if (currentThemeId() !== DEFAULT_THEME_ID) {
+        void setTheme(DEFAULT_THEME_ID).catch((e) => console.warn('[style-remote] theme reset write failed', e));
+      }
       return;
     }
     applyStyleOverrides(currentStyleOverrides());
@@ -754,6 +935,21 @@ export function setMotion(pref: MotionPref): Promise<void> {
   return savePreference('motion', pref, () => {
     localStorage.setItem(MOTION_STORAGE_KEY, pref);
     motionPreference.value = pref;
+  }, true);
+}
+
+// --- Theme effects ---
+
+/** This device's theme-effects preference, resolved like motion: a stored value,
+ *  else the mirror the boot script reads, else `system`. */
+export function currentThemeEffects(): ThemeEffectsPref {
+  return currentPreference('theme-effects', THEME_EFFECTS_PREFS, DEFAULT_THEME_EFFECTS, THEME_EFFECTS_STORAGE_KEY);
+}
+
+export function setThemeEffects(pref: ThemeEffectsPref): Promise<void> {
+  return savePreference('theme-effects', pref, () => {
+    localStorage.setItem(THEME_EFFECTS_STORAGE_KEY, pref);
+    themeEffectsPreference.value = pref;
   }, true);
 }
 
@@ -966,9 +1162,10 @@ export async function loadPreferences(): Promise<void> {
     if (mySeq !== preferencesLoadSeq) return;
     preferences.value = { status: 'loaded', data: res.preferences };
     applyUiScale(currentUiScale());
-    const t = currentTheme();
-    if (t !== lastAppliedTheme) applyTheme(t);
+    const t = currentThemeMode();
+    if (t !== lastAppliedThemeMode) applyThemeMode(t);
     applyFontFamily(currentFontFamily());
+    if (workspaceFontList.value.status === 'not-loaded') void loadWorkspaceFonts();
     currentModel.value = currentChatModel();
     reasoningEffort.value = clampEffortFor(currentChatReasoningEffort(), currentModel.value);
     notificationsFilter.value = currentNotificationsFilter();
@@ -978,7 +1175,10 @@ export async function loadPreferences(): Promise<void> {
     setProseAutocorrect(currentAutocorrect());
     cacheServedValue('motion', MOTION_STORAGE_KEY, MOTION_PREFS);
     motionPreference.value = currentMotion();
+    cacheServedValue('theme-effects', THEME_EFFECTS_STORAGE_KEY, THEME_EFFECTS_PREFS);
+    themeEffectsPreference.value = currentThemeEffects();
     selectedCodingAgent.value = currentCodingAgentDefault();
+    refreshActiveThemeIfChanged();
     // LAST, deliberately: the three applies above write properties the remote
     // is allowed to override, so the overrides go on top of them.
     applyStyleOverridesFromPreferences();

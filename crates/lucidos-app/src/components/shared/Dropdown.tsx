@@ -6,6 +6,7 @@ import { useHidePanelWebviewWhile } from '../../hooks/useHidePanelWebviewWhile';
 import { Overlay } from './Overlay';
 import { SkeletonProvider, SkText } from './Skeleton';
 import { isTypeaheadSeedKey } from './typeahead';
+import { protectedClassFrom } from './protectedSurface';
 
 export interface DropdownOption {
   value: string;
@@ -92,7 +93,8 @@ export function openMenuFocusTarget(opts: {
  *  no longer there. Pure over anything `closest`-capable, so it is testable
  *  without a DOM. */
 export function dropdownMenuClass(trigger: { closest(selector: string): unknown } | null): string {
-  return trigger?.closest('.form-group') ? 'dropdown-menu dropdown-menu-field' : 'dropdown-menu';
+  const base = trigger?.closest('.form-group') ? 'surface-box dropdown-menu dropdown-menu-field' : 'surface-box dropdown-menu';
+  return base + protectedClassFrom(trigger);
 }
 
 /** Inline style for the menu panel, given the trigger's width and the computed
@@ -123,6 +125,13 @@ export function dropdownPanelStyle(
       ? { top: `${pos.top}px`, left: `${pos.left}px` }
       : { top: '0px', left: '0px', visibility: 'hidden' }),
   };
+}
+
+/** The trigger's chevron. It draws one glyph in both states, and `.open` turns
+ *  it over. Never swap in an up glyph: it can differ in width and resize the
+ *  trigger. */
+export function DropdownChevron({ open, onClick }: { open: boolean; onClick?: () => void }) {
+  return <span class={`dropdown-chevron${open ? ' open' : ''}`} onClick={onClick}>▾</span>;
 }
 
 /** Walk `options` from `start` in direction `step` (±1), skipping any
@@ -368,11 +377,11 @@ export function Dropdown({
             }}
             onKeyDown={handleKeyDown}
           />
-          <span class="dropdown-chevron" onClick={() => {
+          <DropdownChevron open={open} onClick={() => {
             if (disabled) return;
             if (open) closeDropdown();
             else showMenu();
-          }}>{open ? '▴' : '▾'}</span>
+          }} />
         </div>
       ) : (
         <button
@@ -396,7 +405,7 @@ export function Dropdown({
               <span key={o.value} aria-hidden="true">{o.label}</span>
             ))}
           </span>
-          <span class="dropdown-chevron">{open ? '▴' : '▾'}</span>
+          <DropdownChevron open={open} />
         </button>
       )}
       <Overlay
@@ -496,7 +505,7 @@ export function DropdownSkeleton({ w }: { w: string }) {
           announced, and `.dropdown-skeleton` drops the trigger's hover tell. */}
       <span class="dropdown-trigger dropdown-skeleton" aria-hidden="true">
         <SkText w={w} />
-        <span class="dropdown-chevron">{'▾'}</span>
+        <DropdownChevron open={false} />
       </span>
     </SkeletonProvider>
   );

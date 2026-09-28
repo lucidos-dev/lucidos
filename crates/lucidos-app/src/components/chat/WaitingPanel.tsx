@@ -1,6 +1,6 @@
 import { signal, useSignal } from '@preact/signals';
 import type { ComponentChildren } from 'preact';
-import { useEffect, useRef, useState } from 'preact/hooks';
+import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
 import { cancelThreadEventWait } from '../../api/client';
 import { useAnchoredPosition } from '../../hooks/useAnchoredPopover';
 import { focusThreadOrBootstrap } from '../../store/actions/threads';
@@ -21,8 +21,13 @@ import {
   waitSubscriptionLabel,
 } from '../../store/thread-events';
 import { errorDetail } from '../../utils/errorDetail';
-import { CloseIcon, EventWaitClockIcon } from '../shared/icons';
+import { viewportIsMobile } from '../../utils/viewport';
+import { EventWaitClockIcon } from '../shared/icons';
 import { Overlay } from '../shared/Overlay';
+import { SurfaceHead } from '../shared/Surface';
+import { useEscapeStep } from '../../hooks/useEscapeStep';
+import type { EventConditionModalState } from '../../store/store';
+import { eventConditionBody, eventConditionTitle } from './eventConditionBody';
 import { ThreadStatusIcon, threadVisualStatus } from '../shared/ThreadStatusIcon';
 import type { HeaderActionSpec } from '../layout/headerActions';
 
@@ -34,10 +39,25 @@ import type { HeaderActionSpec } from '../layout/headerActions';
  *  passes the ⋯ trigger, the box the reader pressed. */
 const waitingPanelAnchor = signal<HTMLElement | null>(null);
 
+/** The condition the panel has drilled into, or null on the list. A popover
+ *  never opens a second layer, so the condition replaces the list in place,
+ *  with a way back. Exported for the tests. */
+export const waitingPanelCondition = signal<EventConditionModalState | null>(null);
+
+function openWaitingPanel(anchor: HTMLElement | null): void {
+  waitingPanelCondition.value = null;
+  waitingPanelAnchor.value = anchor;
+}
+
 /** Close the panel. Called by the composer when a fold moves controls around,
  *  since an anchor can leave the DOM under an open panel. */
 export function closeWaitingPanel(): void {
   waitingPanelAnchor.value = null;
+  waitingPanelCondition.value = null;
+}
+
+function backToWaitingList(): void {
+  waitingPanelCondition.value = null;
 }
 
 /** How often the countdown re-renders. One second is the granularity the text
@@ -139,11 +159,11 @@ export function waitingIndicatorAction(): HeaderActionSpec | null {
       // Re-pressing the button closes, which is the toggle the anchor exemption
       // in <Overlay> leaves to the control's own handler.
       onClick: (e) => {
-        const self = e.currentTarget as HTMLElement;
-        waitingPanelAnchor.value = waitingPanelAnchor.value ? null : self;
+        if (waitingPanelAnchor.value) closeWaitingPanel();
+        else openWaitingPanel(e.currentTarget as HTMLElement);
       },
     }),
-    onMenuClick: (anchor) => { waitingPanelAnchor.value = anchor; },
+    onMenuClick: openWaitingPanel,
   };
 }
 
@@ -177,7 +197,41 @@ export function WaitingPanelHost() {
   // the same clamp is what stops it running off the right edge. Passing a
   // null anchor while closed makes the hook recompute from scratch on open,
   // rather than reusing coordinates measured before the last scroll.
-  const pos = useAnchoredPosition(isOpen ? anchor : null, panelRef, '.thread-pane');
+  // On a phone it centres like the Lucidos menu, whose width it takes.
+  const pos = useAnchoredPosition(
+    isOpen ? anchor : null,
+    panelRef,
+    '.thread-pane',
+    viewportIsMobile.value ? 'container-center' : 'start',
+  );
+  // A condition whose event type no live wait watches any more is stale. The
+  // panel renders the list at once, and the signal is reset pre-paint so a
+  // stale drill-in never draws a frame.
+  const drilled = waitingPanelCondition.value;
+  const condition = drilled
+    && waits.some((w) => w.on.some((sub) => sub.event_type === drilled.eventType))
+    ? drilled
+    : null;
+  useLayoutEffect(() => {
+    if (drilled && !condition) backToWaitingList();
+  }, [drilled, condition]);
+
+  // Escape steps back to the list before it closes the panel.
+  useEscapeStep(isOpen && condition ? backToWaitingList : null);
+
+  // A drill-in replaces the control that held focus, so focus follows it: to
+  // the back link going in, and to the door it came through coming back out.
+  const drilledFrom = useRef<string | null>(null);
+  useLayoutEffect(() => {
+    const panel = panelRef.current;
+    const from = drilledFrom.current;
+    drilledFrom.current = condition?.eventType ?? null;
+    if (!panel || from === drilledFrom.current) return;
+    const target = condition
+      ? panel.querySelector<HTMLElement>('[data-role="surface-back"]')
+      : panel.querySelector<HTMLElement>(`[data-role="event-wait-condition"][data-event-type="${CSS.escape(from ?? '')}"]`);
+    target?.focus();
+  }, [condition]);
 
   return (
     <Overlay
@@ -186,8 +240,8 @@ export function WaitingPanelHost() {
       anchor={anchor}
       backdrop={false}
       portal
-      panelClass="prompt-bar-popover waiting-panel"
-      // `--prompt-bar-popover-fit` is the thread pane's usable width, the box
+      panelClass="surface anchored-popover waiting-panel"
+      // `--anchored-popover-fit` is the thread pane's usable width, the box
       // the hook clamped this panel's position into. The stylesheet's own
       // value is viewport-based, which on desktop lets the panel run out of
       // the pane and into the content pane.
@@ -195,7 +249,7 @@ export function WaitingPanelHost() {
         ? {
             top: `${pos.top}px`,
             left: `${pos.left}px`,
-            '--prompt-bar-popover-fit': `${pos.maxWidth}px`,
+            '--anchored-popover-fit': `${pos.maxWidth}px`,
           }
         : { visibility: 'hidden' }}
       panelRole="dialog"
@@ -208,6 +262,8 @@ export function WaitingPanelHost() {
             threadId: id ?? '',
             waits,
             subThreads,
+            condition,
+            onBack: backToWaitingList,
             onClose: closeWaitingPanel,
           })
         : null}
@@ -306,28 +362,38 @@ export function waitingPanelBody({
   threadId,
   waits,
   subThreads,
+  condition = null,
+  onBack = backToWaitingList,
   onClose,
 }: {
   threadId: string;
   waits: EventWaitSummary[];
   subThreads: SubThreadWait;
+  condition?: EventConditionModalState | null;
+  onBack?: () => void;
   onClose: () => void;
 }) {
+  const closeLabel = 'Close what this thread is waiting for';
+  if (condition) {
+    return (
+      <>
+        <SurfaceHead
+          back={{ label: 'Waiting for', onClick: onBack }}
+          title={eventConditionTitle(condition)}
+          onClose={onClose}
+          closeLabel={closeLabel}
+        />
+        <div class="anchored-popover-body" data-role="waiting-condition">
+          {eventConditionBody(condition)}
+        </div>
+      </>
+    );
+  }
   const labelled = waits.length > 0 && subThreadCount(subThreads) > 0;
   return (
     <>
-      <div class="prompt-bar-popover-head">
-        <span class="prompt-bar-popover-title">Waiting for</span>
-        <button
-          type="button"
-          class="icon-btn prompt-bar-popover-close"
-          aria-label="Close what this thread is waiting for"
-          onClick={onClose}
-        >
-          <CloseIcon />
-        </button>
-      </div>
-      <div class="prompt-bar-popover-body">
+      <SurfaceHead title="Waiting for" onClose={onClose} closeLabel={closeLabel} />
+      <div class="anchored-popover-body">
         {waits.length > 0 ? (
           <section class="waiting-panel-section" data-role="waiting-subscriptions">
             {labelled ? <span class="waiting-panel-section-label">Events</span> : null}
@@ -397,8 +463,8 @@ export function SubThreadRow({ child, onOpen }: { child: ThreadState; onOpen: ()
  *  text carrying its raw type as a tooltip. Repeats of one type fold into one
  *  entry, as on the transcript row.
  *
- *  The modal it opens STACKS over this popover on `overlayStack`. Escape or an
- *  outside click closes the modal and leaves the panel where it was. */
+ *  A filtered entry drills the panel into its condition in place, since a
+ *  popover never opens a second layer. Escape steps back to the list. */
 export function subscriptionLine(on: EventSubscription[]): ComponentChildren[] {
   return groupSubscriptions(on).flatMap((g, i) => {
     const glue = [<span key={`glue${i}`}>{i === 0 ? 'watching for ' : ' or '}</span>];
@@ -414,7 +480,8 @@ export function subscriptionLine(on: EventSubscription[]): ComponentChildren[] {
           data-role="event-wait-condition"
           aria-label={door.label}
           data-tooltip={door.label}
-          onClick={door.open}
+          data-event-type={g.event_type}
+          onClick={() => { waitingPanelCondition.value = door.condition; }}
         >
           {label}
         </button>

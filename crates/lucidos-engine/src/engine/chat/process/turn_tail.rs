@@ -125,7 +125,9 @@ pub(super) fn version_status(
         build_failure: None,
         shared_build_in_progress: false,
         build_elapsed_ms: None,
+        build_queued: None,
         pending_commits: None,
+        frontend_refresh_elapsed_ms: None,
     }
 }
 

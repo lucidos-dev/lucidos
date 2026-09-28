@@ -37,6 +37,12 @@ fn read_only_reason(data_path: &str) -> Option<&'static str> {
     None
 }
 
+/// Why `edit_file` refuses a theme or a workspace font file, naming the tool
+/// that does work.
+const CHECKED_WHOLE_EDIT_REFUSAL: &str = "a theme or a workspace font file is checked whole, so \
+     edit_file cannot change one. Read it, then write the whole file back with write_file, \
+     which validates it.";
+
 /// Convert a flexible "dot-bracket" path expression to an RFC 6901 JSON Pointer.
 ///
 /// Accepted syntaxes (mix freely in one path):
@@ -277,6 +283,36 @@ impl LucidosEngine {
             app_id,
             data_path
         );
+        self.event_bus.emit(BusEvent::System(event)).await?;
+        Ok(())
+    }
+
+    /// Announce a change under `themes/` or `fonts/`, as the data route does.
+    /// An open theme picker, the font list and the active theme then refresh.
+    /// A no-op for every other path.
+    async fn announce_checked_change(
+        &self,
+        data_path: &str,
+        commit: &str,
+        is_delete: bool,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if !crate::core::data_prefixes::is_checked_whole(data_path) {
+            return Ok(());
+        }
+        let (path, commit) = (data_path.to_string(), Some(commit.to_string()));
+        let event = if is_delete {
+            SystemEvent::DataFileDeleted {
+                path,
+                commit,
+                actor: None,
+            }
+        } else {
+            SystemEvent::DataFileWritten {
+                path,
+                commit,
+                actor: None,
+            }
+        };
         self.event_bus.emit(BusEvent::System(event)).await?;
         Ok(())
     }
@@ -640,6 +676,13 @@ impl LucidosEngine {
                 let (data_path, full_path) = self.resolve_data_path(raw_path)?;
                 if let Some(reason) = read_only_reason(&data_path) {
                     return Err(format!("Cannot edit '{}': {}", data_path, reason));
+                }
+                // A theme or a font file is validated whole, which a partial
+                // edit cannot honour.
+                if crate::core::data_prefixes::is_checked_whole(&data_path) {
+                    return Err(format!(
+                        "Cannot edit '{data_path}': {CHECKED_WHOLE_EDIT_REFUSAL}"
+                    ));
                 }
                 (data_path, full_path)
             }
@@ -1153,6 +1196,14 @@ impl LucidosEngine {
                     );
                 }
 
+                if let Err(reason) = crate::core::data_prefixes::validate_data_write(
+                    &self.workspace_path().join(crate::core::DATA_DIR),
+                    path,
+                    content.as_bytes(),
+                ) {
+                    return Ok(format!("Error: Cannot write '{}': {}", path, reason));
+                }
+
                 let file_exists = full_path.exists();
                 // Snapshot before writing: did the app already exist? Decides
                 // AppCreated vs nothing for a write to apps/<id>/manifest.json
@@ -1224,6 +1275,8 @@ impl LucidosEngine {
                 .await;
 
                 self.emit_app_event_for_data_path(path, app_existed_before, false)
+                    .await?;
+                self.announce_checked_change(path, &commit_sha, false)
                     .await?;
 
                 let result_action = if file_exists { "UPDATED" } else { "CREATED" };
@@ -1418,13 +1471,38 @@ impl LucidosEngine {
 
                 let _repo_guard = self.lock_workspace_repo().await;
 
+                // A theme or a font lands as the exact bytes it was checked as.
+                // They are read under the lock, so the source cannot change
+                // between check and copy.
+                let checked_bytes = if crate::core::data_prefixes::is_checked_whole(&dst_data_path)
+                {
+                    let bytes = std::fs::read(&src_path)
+                        .map_err(|e| format!("Failed to read source file: {}", e))?;
+                    if let Err(reason) = crate::core::data_prefixes::validate_data_write(
+                        &self.workspace_path().join(crate::core::DATA_DIR),
+                        &dst_data_path,
+                        &bytes,
+                    ) {
+                        return Ok(format!(
+                            "Error: Cannot copy to '{}': {}",
+                            dst_data_path, reason
+                        ));
+                    }
+                    Some(bytes)
+                } else {
+                    None
+                };
+
                 // Create parent directories
                 if let Some(parent) = dst_path.parent() {
                     std::fs::create_dir_all(parent)
                         .map_err(|e| format!("Failed to create directories: {}", e))?;
                 }
-                std::fs::copy(&src_path, &dst_path)
-                    .map_err(|e| format!("Failed to copy file: {}", e))?;
+                match &checked_bytes {
+                    Some(bytes) => std::fs::write(&dst_path, bytes),
+                    None => std::fs::copy(&src_path, &dst_path).map(|_| ()),
+                }
+                .map_err(|e| format!("Failed to copy file: {}", e))?;
 
                 // Commit
                 let commit_msg = args
@@ -1478,6 +1556,8 @@ impl LucidosEngine {
                 }
 
                 self.emit_app_event_for_data_path(&dst_data_path, app_existed_before, false)
+                    .await?;
+                self.announce_checked_change(&dst_data_path, &commit_sha, false)
                     .await?;
 
                 let result_action = if file_exists { "OVERWRITTEN" } else { "COPIED" };
@@ -1554,6 +1634,8 @@ and emits the PluginUninstalled event so the registry stays in sync.",
                 }
 
                 self.emit_app_event_for_data_path(path, app_existed_before, true)
+                    .await?;
+                self.announce_checked_change(path, &commit_sha, true)
                     .await?;
                 // A later file at this path starts unapproved, rather than
                 // inheriting the deleted one's standing.

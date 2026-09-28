@@ -295,7 +295,6 @@ async fn message_received_overrides_stale_compose_source_on_composing_to_active(
             text: "send via lucidos".into(),
             user_image_hashes: vec![],
             device_id: None,
-            device: None,
             image_description: None,
             parent_thread_id: None,
             spawning_event_id: None,
@@ -354,7 +353,6 @@ async fn stuck_thread_eviction_emits_aborted_with_system_actor() {
             text: "first message".into(),
             user_image_hashes: vec![],
             device_id: None,
-            device: None,
             image_description: None,
             parent_thread_id: None,
             spawning_event_id: None,
@@ -442,7 +440,6 @@ async fn stuck_thread_eviction_uses_child_thread_completed_as_req_id_for_chat() 
             text: "previous question".into(),
             user_image_hashes: vec![],
             device_id: None,
-            device: None,
             image_description: None,
             parent_thread_id: None,
             spawning_event_id: None,
@@ -594,7 +591,6 @@ async fn child_thread_completed_failure_summary_capped_at_200_chars() {
             text: "do thing".into(),
             user_image_hashes: vec![],
             device_id: None,
-            device: None,
             image_description: None,
             parent_thread_id: None,
             spawning_event_id: None,
@@ -618,7 +614,6 @@ async fn child_thread_completed_failure_summary_capped_at_200_chars() {
             text: "subtask".into(),
             user_image_hashes: vec![],
             device_id: None,
-            device: None,
             image_description: None,
             parent_thread_id: Some(parent_id),
             spawning_event_id: None,
@@ -725,7 +720,6 @@ async fn system_actor_activity_event_does_not_resurrect_terminated_thread() {
             text: "do a thing".into(),
             user_image_hashes: vec![],
             device_id: None,
-            device: None,
             image_description: None,
             parent_thread_id: None,
             spawning_event_id: None,
@@ -830,7 +824,6 @@ async fn system_actor_activity_event_does_not_resurrect_terminated_thread() {
             text: "live".into(),
             user_image_hashes: vec![],
             device_id: None,
-            device: None,
             image_description: None,
             parent_thread_id: None,
             spawning_event_id: None,
@@ -932,7 +925,6 @@ async fn interrupted_coding_agent_thread_keeps_paused_status() {
                 text: "fix the thing".into(),
                 user_image_hashes: vec![],
                 device_id: None,
-                device: None,
                 image_description: None,
                 parent_thread_id: None,
                 spawning_event_id: None,
@@ -980,7 +972,6 @@ async fn interrupted_coding_agent_thread_keeps_paused_status() {
                 channel: Some(EventChannel::ClaudeCode),
                 actor: Some(MessageOrigin::Device {
                     device_id: "dev-1".into(),
-                    label: "My MacBook".into(),
                 }),
                 ..EventMeta::NONE
             },
@@ -1133,14 +1124,14 @@ async fn interrupted_thread_with_a_pending_change_keeps_its_verdict() {
     };
     // A change id is workspace-wide, so the two cases below must not share one:
     // the second would land on the first's `changes` row.
-    let propose = |change_id: String| ThreadEvent::ChangeProposed {
-        change_id,
+    let propose = |thread_id: Uuid| ThreadEvent::ChangeProposed {
+        change_id: test_change_id(thread_id).to_string(),
         description: Some("Fix".into()),
         files: vec!["src/main.rs".into()],
         requires_restart: false,
         origin: None,
         commit_sha: None,
-        branch_name: "claude-code/fix".into(),
+        branch_name: format!("claude-code/fix-{thread_id}"),
         repo_root: "/tmp".into(),
         hardened: false,
         incomplete: false,
@@ -1153,7 +1144,6 @@ async fn interrupted_thread_with_a_pending_change_keeps_its_verdict() {
             "user switch",
             MessageOrigin::Device {
                 device_id: "dev-1".into(),
-                label: "My MacBook".into(),
             },
             "paused",
         ),
@@ -1185,7 +1175,7 @@ async fn interrupted_thread_with_a_pending_change_keeps_its_verdict() {
         // the thread running, and sets the flag the old override keyed on.
         bus.emit(BusEvent::Thread {
             thread_id,
-            event: propose(format!("c-earlier-{verdict}")),
+            event: propose(thread_id),
             meta: cc_meta(),
         })
         .await
@@ -1253,7 +1243,7 @@ async fn interrupted_thread_with_a_pending_change_keeps_its_verdict() {
         // The proposal the teardown itself produced, on its way out.
         bus.emit(BusEvent::Thread {
             thread_id,
-            event: propose(format!("c-teardown-{verdict}")),
+            event: propose(thread_id),
             meta: cc_meta(),
         })
         .await
@@ -1331,6 +1321,220 @@ async fn interrupted_thread_with_a_pending_change_keeps_its_verdict() {
     teardown_test_db(&db_name).await;
 }
 
+/// A proposal is bookkeeping, so it may not take a thread off a question the
+/// user can still answer. Recovery after a restart re-proposed a
+/// question-parked thread's change, and that proposal wrote `'idle'`. The
+/// thread then offered Apply, whose hardening run killed the question card,
+/// and the user's typed answer went to the wrong session. See
+/// `docs/plans/2026-09-26-a-proposed-change-keeps-the-open-question.md`.
+#[tokio::test]
+async fn a_proposal_keeps_the_thread_on_its_open_question() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+
+    let status_of = |thread_id: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, String>(
+                "SELECT status FROM thread_summaries WHERE thread_id = $1",
+            )
+            .bind(thread_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    let coding_agent = crate::runtime::CodingAgent::ClaudeCode;
+    let cc_meta = || EventMeta {
+        channel: Some(EventChannel::ClaudeCode),
+        ..EventMeta::NONE
+    };
+    let emit = |thread_id: Uuid, event: ThreadEvent| {
+        let bus = &bus;
+        async move {
+            bus.emit(BusEvent::Thread {
+                thread_id,
+                event,
+                meta: cc_meta(),
+            })
+            .await
+            .unwrap();
+        }
+    };
+    let idle = || ThreadEvent::CodingAgentIdled {
+        has_changes: true,
+        is_external_repo: false,
+        requires_restart: false,
+        cc_session_id: None,
+        coding_agent,
+        reason: None,
+        worktree_path: None,
+        worktree_head_sha: None,
+        bg_bash_pending: false,
+    };
+    let session_started = || ThreadEvent::SessionStarted {
+        coding_agent,
+        session_id: "cc-session".into(),
+        branch: "claude-code/fix".into(),
+        repo_id: None,
+        coding_agent_kind: Default::default(),
+        coding_agent_folder: String::new(),
+        app_id: None,
+    };
+    // Recovery's proposal: engine-origin, and incomplete because the turn
+    // never ended cleanly. A branch holds one pending change, so each gets
+    // its own.
+    let propose = |change_id: Uuid| ThreadEvent::ChangeProposed {
+        change_id: change_id.to_string(),
+        description: Some("Fix".into()),
+        files: vec!["src/main.rs".into()],
+        requires_restart: false,
+        origin: Some(MessageOrigin::engine(
+            crate::engine::thread_events::EngineReason::OrphanRecovery,
+        )),
+        commit_sha: None,
+        branch_name: format!("claude-code/fix-{change_id}"),
+        repo_root: "/tmp".into(),
+        hardened: false,
+        incomplete: true,
+        path: String::new(),
+        diff: String::new(),
+    };
+
+    let thread_id = Uuid::new_v4();
+    let change_id = Uuid::new_v4();
+    emit(thread_id, session_started()).await;
+    emit(
+        thread_id,
+        ThreadEvent::UserQuestionAsked {
+            tool_use_id: "tu-open".into(),
+            cc_session_id: "cc-session".into(),
+            question: "Where did you end up?".into(),
+            options: vec![],
+            worktree_path: None,
+            multi_select: false,
+        },
+    )
+    .await;
+    assert_eq!(status_of(thread_id).await, "waiting_for_user_answer");
+
+    emit(thread_id, propose(change_id)).await;
+    assert_eq!(
+        status_of(thread_id).await,
+        "waiting_for_user_answer",
+        "a proposal must not put out the question the user still owes an answer to"
+    );
+    assert_eq!(
+        crate::api::changes::change_action_refusal(
+            &pool,
+            change_id,
+            crate::engine::thread_lifecycle::Action::Apply,
+        )
+        .await
+        .unwrap(),
+        Some(crate::api::changes::ChangeActionRefusal::ThreadParked),
+        "a thread parked on a question offers no Apply, so nothing can start \
+         a hardening run over the question"
+    );
+    assert!(
+        crate::engine::agent_recovery::thread_has_unanswered_question(&pool, thread_id).await,
+        "Apply Now refuses on this predicate, so the proposal must not unpark it"
+    );
+
+    // A row the old projection already wrote to 'idle' still owes the answer.
+    // Every Apply route refuses it, although its status grants Apply.
+    let set_status = |status: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query("UPDATE thread_summaries SET status = $2 WHERE thread_id = $1")
+                .bind(thread_id)
+                .bind(status)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+    };
+    set_status("idle").await;
+    assert_eq!(
+        crate::api::changes::change_action_refusal(
+            &pool,
+            change_id,
+            crate::engine::thread_lifecycle::Action::Apply,
+        )
+        .await
+        .unwrap(),
+        Some(crate::api::changes::ChangeActionRefusal::ThreadParked),
+        "the gate reads the open question, not only the status"
+    );
+    assert!(
+        crate::core::changes::unsettled_thread_ids(&pool, std::iter::once(thread_id))
+            .await
+            .unwrap()
+            .contains(&thread_id),
+        "the bulk paths drop it too"
+    );
+    set_status("waiting_for_user_answer").await;
+
+    // Not a wedge: the answer moves the thread on, and the next idle parks it.
+    emit(
+        thread_id,
+        ThreadEvent::UserQuestionAnswered {
+            tool_use_id: "tu-open".into(),
+            answer: AnswerKind::FreeText {
+                text: "somewhere older".into(),
+            },
+        },
+    )
+    .await;
+    assert_eq!(status_of(thread_id).await, "running");
+    assert!(
+        !crate::engine::agent_recovery::thread_has_unanswered_question(&pool, thread_id).await,
+        "an answered question no longer blocks Apply Now"
+    );
+    emit(thread_id, idle()).await;
+    assert_eq!(status_of(thread_id).await, "idle");
+    let later_change = Uuid::new_v4();
+    emit(thread_id, propose(later_change)).await;
+    assert_eq!(
+        status_of(thread_id).await,
+        "idle",
+        "an answered question holds nothing"
+    );
+    assert_eq!(
+        crate::api::changes::change_action_refusal(
+            &pool,
+            later_change,
+            crate::engine::thread_lifecycle::Action::Apply,
+        )
+        .await
+        .unwrap(),
+        None,
+        "nor does it block an Apply"
+    );
+
+    // A permission card shares the status but is not a question. One left
+    // behind by an idled session is dead, so it must not hold the thread.
+    let carded = Uuid::new_v4();
+    emit(carded, session_started()).await;
+    emit(
+        carded,
+        ThreadEvent::CodingAgentPermissionRequest {
+            request_id: "req-left".into(),
+            tool_use_id: "tu-left".into(),
+            tool_name: "Bash".into(),
+            input: serde_json::json!({"command": "ls"}),
+            summary: "Bash ls".into(),
+        },
+    )
+    .await;
+    assert_eq!(status_of(carded).await, "waiting_for_user_answer");
+    emit(carded, propose(Uuid::new_v4())).await;
+    assert_eq!(status_of(carded).await, "idle");
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
 /// `paused` is the promise "the engine is bringing this turn back", so only the
 /// abort that carries such a promise may write it. Three shapes go through the
 /// real projection here, differing ONLY in the pair the verdict reads:
@@ -1356,7 +1560,6 @@ async fn only_a_user_switch_teardown_settles_a_thread_at_paused() {
 
     let device = MessageOrigin::Device {
         device_id: "dev-1".into(),
-        label: "My MacBook".into(),
     };
 
     for (case, cause, actor, expected) in [
@@ -1388,7 +1591,6 @@ async fn only_a_user_switch_teardown_settles_a_thread_at_paused() {
                 text: "do the thing".into(),
                 user_image_hashes: vec![],
                 device_id: None,
-                device: None,
                 image_description: None,
                 parent_thread_id: None,
                 spawning_event_id: None,
@@ -1477,7 +1679,6 @@ async fn shutdown_phantom_cancel_does_not_clear_the_abort_error_status() {
             text: "summarize the log".into(),
             user_image_hashes: vec![],
             device_id: None,
-            device: None,
             image_description: None,
             parent_thread_id: None,
             spawning_event_id: None,
@@ -1545,7 +1746,6 @@ async fn shutdown_phantom_cancel_does_not_clear_the_abort_error_status() {
             text: "try again".into(),
             user_image_hashes: vec![],
             device_id: None,
-            device: None,
             image_description: None,
             parent_thread_id: None,
             spawning_event_id: None,
@@ -1628,7 +1828,6 @@ async fn message_received_clears_compose_selection() {
             text: "the actual message".into(),
             user_image_hashes: vec![],
             device_id: None,
-            device: None,
             image_description: None,
             parent_thread_id: None,
             spawning_event_id: None,

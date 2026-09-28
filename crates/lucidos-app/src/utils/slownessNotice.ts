@@ -1,4 +1,4 @@
-import type { MemoryUser, ProcessorUser } from '../api/client/control';
+import type { DatabaseProblem, MemoryUser, ProcessorUser } from '../api/client/control';
 
 /** Decimal gigabytes, as the gateway's log line prints them. */
 export function formatGigabytes(bytes: number): string {
@@ -37,13 +37,41 @@ export function processorUsersPhrase(users: ProcessorUser[]): string {
   return users.map(u => `${u.name} ${u.percent}%`).join(', ');
 }
 
-/** One thing to do when Lucidos is slow and memory is not the clear cause.
- *  Same rules as {@link memoryRecommendation}, plus an honest fallback when
- *  nothing is busy: the cause is then out of reach of this measurement. */
+/** One thing to do when Lucidos is slow and no known cause holds. Same rules
+ *  as {@link memoryRecommendation}. When nothing is busy either, the cause is
+ *  out of reach of every measurement, so restarting the computer is the last
+ *  resort. */
 export function processorRecommendation(users: ProcessorUser[]): string {
   const top = busyEnoughToName(users)[0];
-  if (!top) return 'Nothing on this computer stands out as busy. If it lasts, restart the computer.';
+  if (!top) {
+    return 'Lucidos found no database or disk problem, and nothing on this computer stands out as busy. '
+      + 'If it lasts, restart the computer.';
+  }
   if (top.kind === 'lucidos') return 'Stop coding-agent threads you are not using.';
   if (top.kind === 'app') return `Quit or restart ${top.name}.`;
   return 'Quit apps you are not using.';
+}
+
+/** What restarts a stuck database. In dev the gateway runs Postgres in Docker.
+ *  A packaged install runs its own cluster, and its gateway replaces a wedged
+ *  one when Lucidos restarts. */
+function databaseRunner(packaged: boolean): string {
+  return packaged ? 'Lucidos' : 'Docker';
+}
+
+/** What to do when the database does not answer, or has no free connection. */
+export function databaseRecommendation(problem: DatabaseProblem, packaged: boolean): string {
+  if (problem === 'pool_exhausted') {
+    return 'All its database connections are busy. Stop coding-agent threads you are not using. '
+      + 'If it lasts, restart Lucidos.';
+  }
+  return `Restart ${databaseRunner(packaged)}.`;
+}
+
+/** "0.4 GB free. Free up disk space. If Lucidos stays slow after that, restart
+ *  Docker." A full disk is what stalls the database, so freeing space comes
+ *  first and the restart only if the database does not recover. */
+export function diskRecommendation(freeBytes: number, packaged: boolean): string {
+  return `${formatGigabytes(freeBytes)} free. Free up disk space. `
+    + `If Lucidos stays slow after that, restart ${databaseRunner(packaged)}.`;
 }

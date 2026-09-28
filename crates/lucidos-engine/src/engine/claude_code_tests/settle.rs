@@ -15,7 +15,6 @@ async fn seed_running_cc_thread(bus: &EventBus, thread_id: Uuid) {
             text: "do the thing".into(),
             user_image_hashes: vec![],
             device_id: None,
-            device: None,
             image_description: None,
             parent_thread_id: None,
             spawning_event_id: None,
@@ -105,7 +104,6 @@ async fn read_status(pool: &sqlx::PgPool, thread_id: Uuid) -> Option<String> {
 fn user_device_actor() -> crate::engine::thread_events::MessageOrigin {
     crate::engine::thread_events::MessageOrigin::Device {
         device_id: "test-device".into(),
-        label: "Test Device".into(),
     }
 }
 

@@ -40,7 +40,7 @@ pub(super) async fn run_thread_queue_entry_now(
     headers: axum::http::HeaderMap,
     Json(body): Json<ThreadQueueEntryAction>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let actor = super::actor::user_actor_resolved(&headers, state.engine.pool(), None).await;
+    let actor = super::actor::user_actor(&headers, None);
     state
         .engine
         .thread_queue
@@ -56,7 +56,7 @@ pub(super) async fn drop_thread_queue_entry(
     headers: axum::http::HeaderMap,
     Json(body): Json<ThreadQueueEntryAction>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let actor = super::actor::user_actor_resolved(&headers, state.engine.pool(), None).await;
+    let actor = super::actor::user_actor(&headers, None);
     state
         .engine
         .thread_queue
@@ -93,7 +93,7 @@ pub(super) async fn update_capacity_policy(
             "max_event_trigger_depth must be at least 1",
         ));
     }
-    let actor = super::actor::user_actor_resolved(&headers, state.engine.pool(), None).await;
+    let actor = super::actor::user_actor(&headers, None);
     state
         .engine
         .thread_queue

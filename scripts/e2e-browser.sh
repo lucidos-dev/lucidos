@@ -721,6 +721,18 @@ else
     # list rather than skipped inside it, so the per-project table below reports
     # what actually ran; report_webkit_excluded says what did not.
     [ -n "$SKIP_WEBKIT" ] && PROJECTS=(chromium mobile)
+    # A targeted spec runs only on the projects that do not testIgnore it.
+    if [ -n "$TEST_FILE" ]; then
+        RUNS_SPEC=()
+        for project in "${PROJECTS[@]}"; do
+            if project_runs_spec "$project" "$TEST_FILE"; then
+                RUNS_SPEC+=("$project")
+            else
+                echo "[e2e] $project ignores $TEST_FILE (playwright.config.ts testIgnore), so it does not run."
+            fi
+        done
+        PROJECTS=("${RUNS_SPEC[@]}")
+    fi
     PROJECT_RCS=()
     overall_rc=0
     echo ""

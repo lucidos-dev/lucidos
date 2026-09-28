@@ -71,7 +71,7 @@ Do **not** hardcode a scale percentage on `html` (`html { font-size: 125% }`): t
 
 ### `lucidos data path <relative> [--mkdir]`
 
-Print the absolute path that `<relative>` resolves to inside the parent workspace's `data/` directory. Same normalization as the JS SDK / artifacts UI: paths starting with `artifacts/`, `knowhow/`, `apps/`, or `triggers/` are kept as-is; anything else is prefixed with `artifacts/`.
+Print the absolute path that `<relative>` resolves to inside the parent workspace's `data/` directory. Same normalization as the artifacts UI: a path that starts with a tree the engine's data route accepts (`artifacts/`, `apps/`, `knowhow/`, `triggers/`, `config/`, `auth-modules/`, `scripts/`, `themes/`) is kept as is. Anything else is prefixed with `artifacts/`.
 
 ```bash
 $ lucidos data path data-analysis/foo/report.html
@@ -276,7 +276,7 @@ The CLI prints a `[title](thread:workspace/uuid)` markdown link on stdout — in
 | `--relation <child\|top>` | `child` = same-workspace child thread (parent gets a callback when the spawned thread finishes). `top` (default) = independent top-level thread, no callback. (`sub` is accepted as a back-compat alias for `child`.) |
 | `--parent` | DEPRECATED alias for `--relation child`. Still works; prints a stderr warning. |
 | `--repo <name>` | Repo (name or UUID) the spawned worktree is created from. Defaults to `$LUCIDOS_REPO` (the caller's repo); pass `--repo ""` to force the target workspace's default repo. |
-| `--coding-agent-model <m>` | Optional coding-agent model, either backend (`sonnet`, `opus`, `gpt-5.6-sol`). `--cc-model` is the old name, still accepted. |
+| `--coding-agent-model <m>` | Optional coding-agent model, either backend (`sonnet`, `opus`, `gpt-5.6-sol`). |
 | `--reasoning-effort <level>` | Optional thinking level for the coding agent: `low`, `medium`, `high`, `xhigh`, `max`. Overrides the backend's own default for this spawn only. Needs a coding-agent flag. Codex offers `max` on the GPT-5.6 models only, so `--coding-agent codex --reasoning-effort max` also needs `--coding-agent-model` naming one of them. The CLI refuses the spawn otherwise. |
 | `--model <m>` | Optional chat model. |
 | `--mode <m>` | Override actor mode (defaults to `agent`, correct for CC-driven spawns). |

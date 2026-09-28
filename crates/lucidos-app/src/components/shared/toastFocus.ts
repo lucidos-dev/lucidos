@@ -1,5 +1,17 @@
 import type { ToastItem } from '../../store/types';
 
+/** Whether a toast draws its close X. A toast that waits to be answered does.
+ *  So does one with a target (a button or a card `onClick`), timed or not: a
+ *  tap on its card goes somewhere, so the X is the only way to just close it.
+ *  It is also what Escape presses. A timed toast with no target leaves by
+ *  itself and draws none. A caller can withhold the X with `dismissable: false`. */
+export function toastHasClose(
+  t: Pick<ToastItem, 'dismissable' | 'persistent' | 'action' | 'secondaryAction' | 'onClick'>,
+): boolean {
+  if (t.dismissable === false) return false;
+  return t.persistent !== false || !!t.action || !!t.secondaryAction || !!t.onClick;
+}
+
 /** Which control of an action-bearing toast should receive focus when it
  *  appears, so the user can act with Enter instead of reaching for the mouse:
  *
@@ -11,22 +23,21 @@ import type { ToastItem } from '../../store/types';
  *     actions (a plain info/success toast shouldn't steal focus), when it opts
  *     out via `noAutofocus` (an UNSOLICITED toast — a notification toast — must
  *     not yank focus mid-typing / pre-arm a reflexive Enter on its default
- *     action, e.g. a notification's [Open]), or when the
- *     only thing left to focus is a destructive action with no safe dismiss
- *     (the non-dismissable Apply-All progress toast): better to leave focus put
- *     than to pre-arm Enter on a footgun. The button stays reachable via Tab.
+ *     action), or when the only thing left to focus is a destructive action
+ *     with no safe dismiss: better to leave focus put than to pre-arm Enter on
+ *     a footgun. The button stays reachable via Tab.
  *
  *  Pure (no DOM) so the selection is unit-tested; the caller resolves the
  *  returned slot to a real element and focuses it. The caller holds DOM gates of
  *  its own, one of which stands down for a focused text field. */
 export function toastAutofocusTarget(
-  t: Pick<ToastItem, 'action' | 'secondaryAction' | 'dismissable' | 'noAutofocus'>,
+  t: Pick<ToastItem, 'action' | 'secondaryAction' | 'dismissable' | 'persistent' | 'noAutofocus'>,
 ): 'primary' | 'secondary' | 'close' | null {
   if (t.noAutofocus) return null;
   if (!t.action && !t.secondaryAction) return null;
   if (t.action && t.action.variant !== 'danger') return 'primary';
   if (t.secondaryAction && t.secondaryAction.variant !== 'danger') return 'secondary';
-  if (t.dismissable !== false) return 'close';
+  if (toastHasClose(t)) return 'close';
   return null;
 }
 

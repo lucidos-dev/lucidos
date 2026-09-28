@@ -1,7 +1,9 @@
 # 0283: The slowness warning opens on a slow engine as well as on memory, and names memory only on evidence
 
 - **Status**: Accepted (amends [ADR 0274](0274-low-memory-warning-lives-in-the-gateway.md):
-  its home in the gateway, its window, and its memory-only rule all stand)
+  its home in the gateway, its window, and its memory-only rule all stand).
+  Amended by [ADR 0301](0301-slowness-names-database-and-disk.md): a full disk
+  or a stuck database is named before memory or unclear.
 - **Date**: 2026-09-25
 
 ## Context
@@ -87,8 +89,8 @@ engine as well as on the memory rule, with the same window.
 - The route moves from `/~/api/v1/control/low-memory` to
   `/~/api/v1/control/slowness`. A client and gateway of different versions show
   no bar, never an error.
-- Slowness from a full disk or disk contention shows as unclear. That is
-  honest, but it gives no disk-specific advice.
+- Slowness from disk contention shows as unclear. A full disk no longer does:
+  ADR 0301 names it.
 
 ## Alternatives considered
 

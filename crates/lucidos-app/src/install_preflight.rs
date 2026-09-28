@@ -19,7 +19,7 @@
 //! every later launch. Change that conflict and the digest changes with it, so
 //! a new conflict is a new thing to say.
 
-use lucidos_installs::{Inventory, RunningProcess, ScanRoots};
+use lucidos_installs::Inventory;
 use std::path::{Path, PathBuf};
 
 /// Where the last announcement is remembered, under the client's app-data.
@@ -100,12 +100,7 @@ pub fn should_announce(fingerprint: &str, acknowledged: Option<&str>) -> bool {
 /// dismissed. The promise is to say it once, and a user who dismisses a warning
 /// without reading it has still been told.
 pub fn take_notice(app_data: &Path, port: u16, app_version: &str) -> Option<ConflictNotice> {
-    let roots = ScanRoots::for_machine()?;
-    let running = RunningProcess {
-        exe: std::env::current_exe().ok(),
-        data_dir: Some(app_data.to_path_buf()),
-    };
-    let inventory = lucidos_installs::scan(&roots, &running);
+    let inventory = lucidos_installs::scan_this_machine(Some(app_data.to_path_buf()));
     let serving = serving_release(port);
     let notice = conflict_notice(&inventory, port, serving.as_deref(), app_version)?;
     if !should_announce(&notice.fingerprint, read_ack(app_data).as_deref()) {

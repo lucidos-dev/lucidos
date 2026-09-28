@@ -1,11 +1,11 @@
 import { computed } from '@preact/signals';
 import { useRef, useLayoutEffect } from 'preact/hooks';
 import { toasts, dismissToast, focusedPane, scaledDurationMs, splitRatio, toastPlacement } from '../../store/store';
-import type { ToastItem, ToastType } from '../../store/types';
-import { CloseIcon } from './icons';
-import { parseToastMessage, type ParsedToastMessage } from './toastMessage';
+import type { ToastAction, ToastItem } from '../../store/types';
+import { CloseIcon, ToneIcon } from './icons';
 import { linkifyText } from './linkifyText';
-import { toastAutofocusTarget, toastTabTarget } from './toastFocus';
+import { toastAutofocusTarget, toastHasClose, toastTabTarget } from './toastFocus';
+import { toastTap } from './toastTap';
 import { computeToastShifts } from './toastReflow';
 import { toastColumns, toastLayout } from './toastColumns';
 import { toastStackUrgency } from './toastUrgency';
@@ -24,6 +24,11 @@ import { progressFillWidth } from './progressBar';
 const REFLOW_DURATION_MS = 260;
 const REFLOW_EASING = 'cubic-bezier(0.22, 0, 0, 1)';
 
+/** The longest untitled message the one-line layout takes: about what fits
+ *  beside the icon and a text action in a desktop toast, at the monospace body
+ *  size. */
+export const INLINE_MESSAGE_MAX_CHARS = 60;
+
 /** Which per-pane stacks the toast container lays out this frame. Derived
  *  rather than read inline so the toast list re-renders when the LAYOUT flips,
  *  not on every `splitRatio` write: a divider drag writes the ratio on every
@@ -33,13 +38,6 @@ const paneLayout = computed(() =>
   toastLayout(viewportIsMobile.value, splitRatio.value, toastPlacement.value),
 );
 
-const icons: Record<ToastType, string> = {
-  success: '<circle cx="12" cy="12" r="10" fill="none" stroke="currentColor" stroke-width="2"/><path d="M8 12l2.5 2.5L16 9" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>',
-  info: '<circle cx="12" cy="12" r="10" fill="none" stroke="currentColor" stroke-width="2"/><line x1="12" y1="16" x2="12" y2="12" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="8" r="1" fill="currentColor"/>',
-  warning: '<path d="M12 2L1 21h22L12 2z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><line x1="12" y1="14" x2="12" y2="10" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="17" r="1" fill="currentColor"/>',
-  error: '<circle cx="12" cy="12" r="10" fill="none" stroke="currentColor" stroke-width="2"/><line x1="15" y1="9" x2="9" y2="15" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><line x1="9" y1="9" x2="15" y2="15" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>',
-};
-
 // Toast ids whose default button has already been auto-focused, so a re-render
 // (any toast added/removed/updated) never re-steals focus from where the user
 // has since moved it. Pruned to the live toasts on each render so it can't grow
@@ -47,7 +45,7 @@ const icons: Record<ToastType, string> = {
 const autofocusedToastIds = new Set<number>();
 
 /** Ref callback: focus an action toast's default button the first time it
- *  mounts so Enter acts on it immediately. The ref identity churns per render —
+ *  mounts so Enter acts on it immediately. The ref identity churns per render:
  *  the `Set` guard makes the focus fire exactly once per toast. Skips when a
  *  modal/overlay is open (it owns focus while up) — the button stays Tab-able.
  *
@@ -132,20 +130,6 @@ function handleToastKeyDown(e: KeyboardEvent): void {
   } else {
     focusables[target].focus({ preventScroll: true });
   }
-}
-
-/** One titled group of bullets, as `parseToastMessage` hands it over. */
-function renderSection(s: ParsedToastMessage['sections'][number], i: number) {
-  return (
-    <div key={i} class="toast-section">
-      {s.title && <div class="toast-section-title">{linkifyText(s.title)}</div>}
-      {s.bullets.length > 0 && (
-        <ul class="toast-bullets">
-          {s.bullets.map((b, j) => <li key={j}>{linkifyText(b)}</li>)}
-        </ul>
-      )}
-    </div>
-  );
 }
 
 /** Exported wrapper: owns the hooks that drive the toast-stack reflow (FLIP)
@@ -269,41 +253,63 @@ export function ToastList({ containerRef }: { containerRef?: { current: HTMLDivE
 /** One toast row. A plain function rather than a component so the surrounding
  *  `ToastList` stays hook-free and directly callable from unit tests.
  *
- *  The message is mounted in two boxes, and that split IS the layout. Line 1
- *  goes in the heading, outside the scroll box, so a scroll to the last bullet
- *  still shows what the toast is about. The sections box below can then run to
- *  the card's right edge, where the close X is not. See the `.toast-heading`
- *  and `.toast-sections` rules in components.css.
- *
- *  `parseToastMessage` answers `{heading: message, sections: []}` for a message
- *  with no newline, so a plain toast needs no branch: it is all heading. */
+ *  The toast is mounted in two boxes, and that split IS the layout. The title
+ *  goes in the heading, outside the scroll box. So a scroll to the end of the
+ *  message still shows what the toast is about. The text box below can then run
+ *  to the card's right edge, where the close X is not. An untitled toast is its
+ *  message alone, in the heading. See the `.toast-heading` and `.toast-text`
+ *  rules in components.css. */
 function renderToast(t: ToastItem, entryDurationMs: number) {
   const autoTarget = toastAutofocusTarget(t);
-  const { heading, sections } = parseToastMessage(t.message);
-  // A linkified URL in the message is its own destination, so a tap on it must
-  // not also fire the toast's action. The anchor cannot swallow the click
-  // itself: `onGlobalClick` is what opens it, and that listener sits on the
-  // document (see `linkifyText`). So the ancestor stands down instead.
-  const bodyAction = t.onClick;
-  const onBodyClick = bodyAction
+  // A short, single-line, untitled toast lays out on one line, with any action
+  // beside the words (`.toast-inline`). A long headline takes the block layout
+  // instead: in a row it would be squeezed into a narrow column, and its scroll
+  // box would sit mid-card beside the action.
+  const inline = !t.title && !t.message.includes('\n') && t.progress == null && !t.secondaryAction
+    && t.message.length <= INLINE_MESSAGE_MAX_CHARS;
+  const actionClass = (action: ToastAction, fallback?: string) => {
+    const variant = action.variant ? `action-btn-${action.variant}` : fallback;
+    return variant ? `action-btn ${variant}` : 'action-btn';
+  };
+  const tap = toastTap(t);
+  const tapAction = tap === 'click' ? t.onClick
+    : tap === 'action' ? t.action?.onClick
+    : tap === 'dismiss' ? () => dismissToast(t.key ?? t.id)
+    : undefined;
+  // The card takes a tap anywhere, padding and icon included. A tap on a button
+  // or a linkified URL stands down, since each is its own destination. So does
+  // the mouseup that ends a text selection inside the card. The anchor cannot
+  // swallow the click itself: `onGlobalClick` opens it from a document listener.
+  const onCardClick = tapAction
     ? (e: MouseEvent) => {
-        if ((e.target as HTMLElement | null)?.closest('a[href]')) return;
-        bodyAction();
+        if ((e.target as HTMLElement | null)?.closest('a[href], button')) return;
+        const selection = window.getSelection();
+        const card = e.currentTarget as Node;
+        if (selection && !selection.isCollapsed && card.contains(selection.anchorNode)) return;
+        tapAction();
       }
     : undefined;
+  // A card that acts keeps a real button for the keyboard and screen readers,
+  // hidden from sight. The card is no `role="button"` itself, which would hide
+  // the X and any link inside it from assistive tech.
+  const keyLabel = tap === 'action' ? t.action?.label : tap === 'click' ? 'Open' : undefined;
   return (
-    <div key={t.id} class={`toast toast-${t.type}`} style={{ animationDuration: `${entryDurationMs}ms` }} data-toast-id={t.id}>
-      {/* The icon is the body's SIBLING, positioned over the gutter the body
+    <div
+      key={t.id}
+      class={`toast surface toast-${t.type}${inline ? ' toast-inline' : ''}`}
+      style={{ animationDuration: `${entryDurationMs}ms` }}
+      data-toast-id={t.id}
+      data-toast-tap={tap ?? undefined}
+      onClick={onCardClick}
+    >
+      {/* The icon is the body's SIBLING, positioned over the gutter the heading
           pads out for it. Out of the flow it can never sit inside a scroll box,
           which is what used to shear the spinning one. */}
       {t.spinning
         ? <span class="mini-spinner toast-icon" />
-        : <svg class="toast-icon" viewBox="0 0 24 24" dangerouslySetInnerHTML={{ __html: icons[t.type] }} />
+        : <span class="toast-icon" aria-hidden="true"><ToneIcon tone={t.type} /></span>
       }
-      <div
-        class={`toast-body${t.onClick ? ' toast-clickable' : ''}`}
-        onClick={onBodyClick}
-      >
+      <div class="toast-body">
         {/* `tabIndex={-1}` on both scroll boxes, so Chrome leaves them out of
             the Tab order. It promotes an overflowing scroller with no focusable
             child to a Tab stop, and a toast that grew past the cap has two of
@@ -312,10 +318,10 @@ function renderToast(t: ToastItem, entryDurationMs: number) {
             a stop it could not name, wearing the browser's default ring around
             the message text. Losing the stop costs nothing: a click already
             blurred whatever held focus, and the buttons are unaffected. */}
-        <div class="toast-heading" tabIndex={-1}>{linkifyText(heading)}</div>
-        {sections.length > 0 && (
-          <div class="toast-sections" tabIndex={-1}>{sections.map(renderSection)}</div>
-        )}
+        <div class="toast-heading" tabIndex={-1}>
+          {t.title ? <span class="toast-title">{linkifyText(t.title)}</span> : linkifyText(t.message)}
+        </div>
+        {t.title && <div class="toast-text" tabIndex={-1}>{linkifyText(t.message)}</div>}
       </div>
       {/* Determinate progress for a long operation (a packaged update's
           download). Absent when the operation has no honest percentage: the
@@ -326,30 +332,38 @@ function renderToast(t: ToastItem, entryDurationMs: number) {
           <div class="progress-bar-fill" style={{ width: progressFillWidth(t.progress) }} />
         </div>
       )}
-      {(t.action || t.secondaryAction) && (
+      {keyLabel && (
+        <button
+          class="toast-tap-control visually-hidden"
+          ref={autoTarget === 'primary' ? (el) => autofocusToastButton(t.id, el) : undefined}
+          onClick={tapAction}
+        >{keyLabel}</button>
+      )}
+      {tap !== 'action' && (t.action || t.secondaryAction) && (
         <div class="toast-actions button-group">
           {t.secondaryAction && (
             <button
-              class={`action-btn${t.secondaryAction.variant ? ' action-btn-' + t.secondaryAction.variant : ''}`}
+              class={actionClass(t.secondaryAction, 'action-btn-secondary')}
               ref={autoTarget === 'secondary' ? (el) => autofocusToastButton(t.id, el) : undefined}
               onClick={t.secondaryAction.onClick}
             >{t.secondaryAction.label}</button>
           )}
           {t.action && (
             <button
-              class={`action-btn${t.action.variant ? ' action-btn-' + t.action.variant : ''}`}
+              class={actionClass(t.action)}
               ref={autoTarget === 'primary' ? (el) => autofocusToastButton(t.id, el) : undefined}
               onClick={t.action.onClick}
             >{t.action.label}</button>
           )}
         </div>
       )}
-      {t.dismissable !== false && (
+      {toastHasClose(t) && (
         <button
           class="icon-btn toast-close"
           ref={autoTarget === 'close' ? (el) => autofocusToastButton(t.id, el) : undefined}
           onClick={() => dismissToast(t.key ?? t.id)}
           aria-label="Dismiss"
+          data-tooltip="Dismiss"
         >
           <CloseIcon />
         </button>

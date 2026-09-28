@@ -6,7 +6,12 @@ import {
   takeReleaseNoticeAction,
 } from '../../store/actions/releaseNotices';
 import { renderMarkdown } from '../../utils/renderMarkdown';
+import { Disclosure } from '../shared/Disclosure';
 import { LoadableError } from '../shared/LoadableError';
+import { LoadingFade } from '../shared/LoadingFade';
+import { ListSkeletonOf, SkBlock, SkText } from '../shared/Skeleton';
+import { useDelayedLoading } from '../../hooks/useDelayedLoading';
+import { usePanelRefresh } from '../../hooks/usePanelRefresh';
 import { CheckIcon, ChevronDownIcon, ChevronRightIcon } from '../shared/icons';
 import type { ReleaseNotice, ReleaseNoticeView } from '../../api/client';
 
@@ -82,8 +87,26 @@ export function releaseNoticeSplit(view: ReleaseNoticeView): NoticeSplit {
  *  `action_label` is optional. Without the first, a notice carrying no action
  *  could be answered nowhere but the modal, which Escape closes for the page's
  *  life. The *System attention badge* points at this page, so the reader would
- *  arrive at a dot with nothing to press. */
-function NoticeRow({ notice, state, blockedBy }: NoticeRow & { blockedBy?: string }) {
+ *  arrive at a dot with nothing to press.
+ *
+ *  With no `notice`, inside a `SkeletonProvider`, it is the page's loading
+ *  placeholder. */
+function NoticeRow({ notice, state = 'owed', blockedBy }: Partial<NoticeRow> & { blockedBy?: string }) {
+  if (!notice) {
+    return (
+      <div class="release-notice-row" aria-hidden="true">
+        <div class="release-notice-row-head">
+          <SkText class="release-notice-row-title" w="14rem" />
+          <SkText class="release-notice-row-since" w="7rem" />
+        </div>
+        <div class="markdown-content release-notice-body">
+          <SkText as="div" w="92%" />
+          <SkText as="div" w="64%" />
+        </div>
+        <div class="release-notice-row-actions"><SkBlock w="4rem" h="2rem" round /></div>
+      </div>
+    );
+  }
   return (
     <div class="release-notice-row" data-state={state}>
       <div class="release-notice-row-head">
@@ -154,7 +177,9 @@ function NoticeRow({ notice, state, blockedBy }: NoticeRow & { blockedBy?: strin
  * Reasoning: docs/plans/2026-08-25-release-notices-own-system-subpanel.md.
  */
 export function ReleaseNoticesPage() {
+  usePanelRefresh('release notices', loadReleaseNotices);
   const loadable = releaseNoticeView.value;
+  const showLoading = useDelayedLoading(loadable);
   // Shut on arrival: the point of the fold is that a workspace owing nothing
   // opens on one quiet line. Page-local, like every other settings disclosure.
   const [showAnswered, setShowAnswered] = useState(false);
@@ -184,39 +209,44 @@ export function ReleaseNoticesPage() {
       <div class="settings-section-title" data-search-anchor="release-notices:list">
         Release notices
       </div>
-      {loaded?.notices.length === 0 && (
-        <div class="empty-state">
-          Nothing to do. A notice lands here when an upgrade needs something
-          from you, which most releases do not.
-        </div>
-      )}
-      {owed.length > 0 && (
-        <div class="release-notice-list">
-          {owed.map((row) => (
-            <NoticeRow key={row.notice.id} {...row} blockedBy={blockedBy} />
-          ))}
-        </div>
-      )}
-      {answered.length > 0 && (
-        <>
-          <button
-            type="button"
-            class="settings-disclosure-toggle release-notice-answered-toggle"
-            aria-expanded={showAnswered}
-            onClick={() => setShowAnswered(!showAnswered)}
-          >
-            {showAnswered ? <ChevronDownIcon size="1rem" /> : <ChevronRightIcon size="1rem" />}
-            Already answered ({answered.length})
-          </button>
-          {showAnswered && (
-            <div class="release-notice-list">
-              {answered.map((row) => (
-                <NoticeRow key={row.notice.id} {...row} />
-              ))}
-            </div>
-          )}
-        </>
-      )}
+      <LoadingFade
+        showSkeleton={showLoading}
+        skeleton={<ListSkeletonOf count={1} containerClass="release-notice-list" row={() => <NoticeRow />} />}
+      >
+        {loaded?.notices.length === 0 && (
+          <div class="empty-state">
+            Nothing to do. A notice lands here when an upgrade needs something
+            from you, which most releases do not.
+          </div>
+        )}
+        {owed.length > 0 && (
+          <div class="release-notice-list">
+            {owed.map((row) => (
+              <NoticeRow key={row.notice.id} {...row} blockedBy={blockedBy} />
+            ))}
+          </div>
+        )}
+        {answered.length > 0 && (
+          <>
+            <button
+              type="button"
+              class="settings-disclosure-toggle release-notice-answered-toggle"
+              aria-expanded={showAnswered}
+              onClick={() => setShowAnswered(!showAnswered)}
+            >
+              {showAnswered ? <ChevronDownIcon size="1rem" /> : <ChevronRightIcon size="1rem" />}
+              Already answered ({answered.length})
+            </button>
+            <Disclosure open={showAnswered}>
+              <div class="release-notice-list">
+                {answered.map((row) => (
+                  <NoticeRow key={row.notice.id} {...row} />
+                ))}
+              </div>
+            </Disclosure>
+          </>
+        )}
+      </LoadingFade>
     </div>
   );
 }

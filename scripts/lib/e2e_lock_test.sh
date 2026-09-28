@@ -1434,6 +1434,114 @@ assert_eq "1" "$([ -n "$(emit_call E2ELockAcquired)" ] && echo 1 || echo 0)" \
     "and the acquire is still announced, which needs no thread"
 rm -f "$EMIT_LOCK"
 
+echo ""
+echo "Test 27: two runs reclaiming one stale lock at once, exactly one wins"
+# Two runs once reclaimed the same dead owner's lock 120ms apart. Each removed
+# the file and wrote its own, so the second removal deleted the first run's
+# fresh lock and both held it. The loser then ran its API suite into the
+# winner's browser run. Each contender here is its own process, since the lock
+# names `$$`. The orphan scan is stubbed with a pause, the real `ps` latency
+# that lines every contender up between reading the stale file and replacing it.
+reset_lock_dir
+cat > "$E2E_LOCK_DIR_OVERRIDE/e2e.lock" <<EOF
+PID=999999
+THREAD_ID=ghost
+WORKTREE=/tmp/ghost
+STARTED=2020-01-01T00:00:00Z
+SCRIPT=e2e-browser
+EOF
+WINS="$TMPROOT/test-27-wins"
+GO="$TMPROOT/test-27-go"
+: > "$WINS"
+rm -f "$GO"
+contenders=""
+for n in 1 2 3 4 5 6; do
+    bash -c '
+        source "$1/scripts/lib/e2e_lock.sh"
+        _e2e_list_orphans() { sleep 0.3; }
+        while [ ! -e "$2" ]; do sleep 0.01; done
+        if acquire_e2e_lock "contender-$4" >/dev/null 2>&1; then
+            echo "$$" >> "$3"
+            sleep 2   # alive, so a late contender reads a live owner
+        fi
+    ' _ "$PROJECT_DIR" "$GO" "$WINS" "$n" &
+    contenders="$contenders $!"
+done
+sleep 0.3
+touch "$GO"
+# shellcheck disable=SC2086
+wait $contenders
+assert_eq "1" "$(wc -l < "$WINS" | tr -d ' ')" "exactly one contender holds the reclaimed lock"
+assert_eq "$(cat "$WINS")" "$(sed -n 's/^PID=//p' "$E2E_LOCK_DIR_OVERRIDE/e2e.lock")" \
+    "and the lock file names that winner"
+assert_eq "SCRIPT=" "$(tail -1 "$E2E_LOCK_DIR_OVERRIDE/e2e.lock" | cut -c1-7)" \
+    "and the winner's lock file is whole"
+
+echo ""
+echo "Test 28: a reclaimer killed mid-step leaves nothing that blocks the next one"
+stale_lock() {
+    reset_lock_dir
+    printf 'PID=999999\nTHREAD_ID=ghost\nWORKTREE=/tmp/ghost\nSTARTED=2020-01-01T00:00:00Z\nSCRIPT=e2e-browser\n' \
+        > "$E2E_LOCK_DIR_OVERRIDE/e2e.lock"
+}
+stale_lock
+perl -MFcntl=:flock -e 'open(my $m, ">>", $ARGV[0]) or die; flock($m, LOCK_EX) or die; sleep 30' \
+    "$E2E_LOCK_DIR_OVERRIDE/e2e.lock.reclaim" &
+holder=$!
+SPAWNED="$SPAWNED $holder"
+sleep 0.3
+kill -KILL "$holder"
+wait "$holder" 2>/dev/null
+started="$(date +%s)"
+acquire_e2e_lock e2e-browser >"$OUT_DIR"/test-28.out 2>&1
+assert_eq "0" "$?" "the kernel dropped the dead reclaimer's flock, so this reclaim goes ahead"
+assert_eq "1" "$([ $(( $(date +%s) - started )) -lt 5 ] && echo 1 || echo 0)" "and it did not wait"
+assert_eq "$$" "$(sed -n 's/^PID=//p' "$E2E_LOCK_DIR_OVERRIDE/e2e.lock")" "and this run holds the lock"
+release_e2e_lock
+
+echo ""
+echo "Test 29: a run that loses the reclaim names the winner, not the dead owner"
+stale_lock
+sleep 30 &
+winner=$!
+SPAWNED="$SPAWNED $winner"
+(
+    # Another run replaces the stale lock while this one is still sweeping.
+    # shellcheck disable=SC2329 # acquire_e2e_lock calls it during the stale sweep
+    _e2e_list_orphans() {
+        printf 'PID=%s\nTHREAD_ID=winner\nWORKTREE=/tmp/winner\nSTARTED=2020-01-01T00:00:01Z\nSCRIPT=e2e-api\n' \
+            "$winner" > "$E2E_LOCK_DIR_OVERRIDE/e2e.lock"
+    }
+    acquire_e2e_lock e2e-browser >"$OUT_DIR"/test-29.out 2>&1
+    echo "$?" > "$OUT_DIR"/test-29.rc
+)
+assert_eq "1" "$(cat "$OUT_DIR"/test-29.rc)" "the loser refuses"
+assert_eq "$winner" "$(sed -n 's/^PID=//p' "$E2E_LOCK_DIR_OVERRIDE/e2e.lock")" "and leaves the winner's lock in place"
+if grep -q "PID $winner (script: e2e-api)" "$OUT_DIR"/test-29.out && grep -q "Thread:   winner" "$OUT_DIR"/test-29.out; then
+    pass "the refusal names the winner"
+else
+    fail "the refusal named the wrong holder"
+    echo "  ---"; cat "$OUT_DIR"/test-29.out; echo "  ---"
+fi
+kill -KILL "$winner" 2>/dev/null
+wait "$winner" 2>/dev/null
+
+echo ""
+echo "Test 30: a new run that reused the dead PID keeps its lock"
+stale_lock
+(
+    # Same PID as the stale lock, but a different hold: its own start and run.
+    # shellcheck disable=SC2329 # acquire_e2e_lock calls it during the stale sweep
+    _e2e_list_orphans() {
+        printf 'PID=999999\nTHREAD_ID=reuser\nWORKTREE=/tmp/reuser\nSTARTED=2020-01-02T00:00:00Z\nRUN_ID=reuse-run\nSCRIPT=e2e-api\n' \
+            > "$E2E_LOCK_DIR_OVERRIDE/e2e.lock"
+    }
+    acquire_e2e_lock e2e-browser >"$OUT_DIR"/test-30.out 2>&1
+    echo "$?" > "$OUT_DIR"/test-30.rc
+)
+assert_eq "1" "$(cat "$OUT_DIR"/test-30.rc)" "the reclaimer sees a changed lock and refuses"
+assert_eq "reuse-run" "$(sed -n 's/^RUN_ID=//p' "$E2E_LOCK_DIR_OVERRIDE/e2e.lock")" "and the reuser's lock survives"
+
 # ── Summary ──────────────────────────────────────────────────────────────
 echo ""
 echo "Results: $PASS passed, $FAIL failed"

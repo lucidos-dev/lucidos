@@ -62,7 +62,7 @@ use crate::core::event_subscription::{
     validate_subscribable_event_type, SubscriptionSurface, SubscriptionVerdict,
 };
 use crate::engine::event_bus::{BusEvent, EmittedEvent};
-use crate::engine::thread_events::{ActorMode, EventMeta, EventWaitCancelCause};
+use crate::engine::thread_events::{ActorMode, EventWaitCancelCause};
 use crate::engine::{LucidosEngine, PreEmittedOrigin};
 
 impl LucidosEngine {
@@ -597,59 +597,6 @@ impl LucidosEngine {
         for wait in self.live_waits.snapshot().await {
             self.catch_up_event_wait(&wait).await;
         }
-    }
-
-    /// Close every `await_event` call left unpaired by the pre-2026-08-06
-    /// **attached** wait shape. Called once at boot, before the rebuild.
-    ///
-    /// An unpaired `tool_use` is a provider 400, so without this a thread that
-    /// was mid-wait across the upgrade fails on its very next turn and there is
-    /// no longer any code that would close the pair for it. Closing it is the
-    /// whole of what is owed: a wait still unresolved is re-armed by
-    /// `rebuild_event_waits` as an ordinary subscription and re-enters the thread
-    /// the new way, and a wait already resolved left its payload in events the
-    /// thread reads anyway.
-    ///
-    /// Temporary measure, registered in `docs/temporary-measures.md`: it is a
-    /// no-op the moment no such thread is left.
-    pub async fn settle_legacy_attached_event_waits(&self) -> usize {
-        let stranded = match super::settle_legacy_attached_event_waits(&self.pool).await {
-            Ok(rows) => rows,
-            Err(e) => {
-                crate::log!(
-                    "[EventWait] Legacy attached-wait scan failed: {}. A thread caught \
-                     mid-wait by the upgrade will fail its next turn on an unpaired \
-                     tool_use until the next restart",
-                    e
-                );
-                return 0;
-            }
-        };
-        let mut closed = 0usize;
-        for thread_id in &stranded {
-            crate::log!(
-                "[EventWait] Closing a legacy unpaired await_event call on thread {}",
-                thread_id
-            );
-            self.event_bus
-                .emit_or_log(
-                    BusEvent::Thread {
-                        thread_id: *thread_id,
-                        event: super::legacy_attached_settle_tool_result(),
-                        meta: EventMeta::NONE,
-                    },
-                    "[EventWait] ToolResult (legacy attached wait settled)",
-                )
-                .await;
-            closed += 1;
-        }
-        if closed > 0 {
-            crate::log!(
-                "[EventWait] Closed {} legacy unpaired await_event call(s)",
-                closed
-            );
-        }
-        closed
     }
 
     /// Rebuild the live-waits cache from the event store and run each wait's

@@ -29,7 +29,7 @@ vi.hoisted(() => {
 import { makeThreadState } from './threads-test-helpers';
 import { ApiError } from '../../api/client';
 import { saveThread } from '../../api/threads';
-import { threadMap, toasts } from '../store';
+import { getThreadDisplaySection, threadMap, toasts } from '../store';
 import { handleSaveThread } from './threads';
 
 // Only saveThread is exercised here; the other named exports resolve to
@@ -76,5 +76,40 @@ describe('handleSaveThread — pin error handling', () => {
     expect(mockSave).toHaveBeenCalledWith('t1');
     expect(threadMap.value.get('t1')!.meta.saved).toBe(true);
     expect(toasts.value).toHaveLength(0);
+  });
+});
+
+// A pinned thread is never archived (ADR 0312). The engine moves it to the
+// inbox in the same event, and the optimistic flip does too.
+describe('handleSaveThread: pinning an archived thread', () => {
+  beforeEach(() => {
+    threadMap.value = new Map([['t1', makeThreadState('t1', { meta: { saved: false, section: 'archived', status: 'idle' } })]]);
+    toasts.value = [];
+    mockSave.mockReset();
+  });
+
+  it('moves it to the inbox and the Pinned section before the server answers', async () => {
+    let resolve: () => void = () => {};
+    mockSave.mockImplementation(() => new Promise<void>((r) => { resolve = r; }));
+
+    const pending = handleSaveThread('t1');
+    const meta = threadMap.value.get('t1')!.meta;
+    expect(meta.saved).toBe(true);
+    expect(meta.section).toBe('inbox');
+    expect(getThreadDisplaySection(threadMap.value.get('t1')!)).toBe('saved');
+
+    resolve();
+    await pending;
+  });
+
+  it('puts it back in the archive, unpinned, when the pin fails', async () => {
+    mockSave.mockRejectedValue(new ApiError(500, 'boom'));
+
+    await handleSaveThread('t1');
+
+    const meta = threadMap.value.get('t1')!.meta;
+    expect(meta.saved).toBe(false);
+    expect(meta.section).toBe('archived');
+    expect(toasts.value).toHaveLength(1);
   });
 });

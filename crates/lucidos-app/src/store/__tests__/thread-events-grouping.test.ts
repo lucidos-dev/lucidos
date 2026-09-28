@@ -20,7 +20,6 @@ describe('aggregate-takes-precedence over event-type lookups', () => {
       codingAgentProposed: false,
       codingAgentRequiresRestart: false,
       codingAgentIsExternalRepo: false,
-      codingAgentApplying: false,
       codingAgentHasDiff: false,
       isSaved: false,
       hasResponse: true,
@@ -619,7 +618,7 @@ describe('continuableAbortIndex', () => {
       [2, {
         type: 'ResponseAborted',
         cause: 'engine_shutdown',
-        actor: { kind: 'device', device_id: 'd1', label: 'My iPhone' },
+        actor: { kind: 'device', device_id: 'd1' },
       }],
     ]);
     const exchanges = groupIntoExchanges(events);
@@ -650,7 +649,7 @@ describe('continuableAbortIndex', () => {
       [2, {
         type: 'ResponseAborted',
         cause: 'engine_shutdown',
-        actor: { kind: 'device', device_id: 'd1', label: 'My iPhone' },
+        actor: { kind: 'device', device_id: 'd1' },
       }],
       [3, { type: 'ResponseAborted', cause: 'recovery_after_restart', actor: { kind: 'system' } }],
     ]);
@@ -738,7 +737,7 @@ describe('continuableAbortIndex', () => {
 });
 
 describe('abortPromisesAutoResume', () => {
-  const device = { kind: 'device', device_id: 'd1', label: 'My iPhone' } as const;
+  const device = { kind: 'device', device_id: 'd1' } as const;
 
   it('matches only engine_shutdown AND a device actor', () => {
     expect(abortPromisesAutoResume(

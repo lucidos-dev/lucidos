@@ -27,7 +27,7 @@ import {
   type ThreadEvent,
 } from '../thread-events';
 import { statusLabel } from '../exchange-status';
-import { rendersLiveStep } from '../event-rendering';
+import { liveStepInBody, responseBody } from '../event-rendering';
 import { makeThreadState } from './thread-events-helpers';
 import type { ResponseEvent, StepOutcome } from '../types';
 
@@ -342,9 +342,9 @@ describe('nothing on screen claims the machine is busy while a card is open', ()
       const label = exchange.userEvent.type;
       expect(className, `${label} header`).not.toBe('working');
       expect(
-        rendersLiveStep(true, false, rendered),
+        liveStepInBody(responseBody(rendered, { showSteps: true, showDetails: true, rowsHidden: 0 })),
         `${label} steps`,
-      ).toBe(false);
+      ).toBe(-1);
     });
   });
 

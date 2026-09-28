@@ -160,7 +160,8 @@ entry per trigger (see *Cron coalescing* above).
 requeue do not silently fall back to Claude Code. Both spawn kinds
 (`sub-thread`, `coding-agent`) also persist their attribution (`origin`), so a
 spawn that waited behind capacity or was re-fired after a restart still names
-its *spawning thread* in the message route popover. It is separate from
+who started it in the message route popover: its *spawning thread*, or for an
+engine-seeded thread such as a plugin *setup thread*, the engine and its reason. It is separate from
 `parent_thread_id` because a *top-thread* has an origin and no callback linkage;
 entries queued before the field existed simply carry none. Every spawn kind
 also persists its **event-trigger chain depth**. A fire's spawned work therefore

@@ -11,7 +11,7 @@ use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use uuid::Uuid;
 
-use crate::api::actor::user_actor_resolved;
+use crate::api::actor::user_actor;
 use crate::api::{ApiError, AppState};
 use crate::core::blobs::write_blob_from_base64;
 use crate::engine::event_bus::{BusEvent, SystemEvent};
@@ -207,7 +207,7 @@ pub(super) async fn post_thread(
         };
     }
 
-    let actor = user_actor_resolved(&headers, state.engine.pool(), None).await;
+    let actor = user_actor(&headers, None);
     let event = BusEvent::Thread {
         thread_id: body.id,
         event: ThreadEvent::ThreadStarted {
@@ -534,7 +534,7 @@ pub(super) async fn delete_thread(
         }
     }
 
-    let actor = user_actor_resolved(&headers, state.engine.pool(), None).await;
+    let actor = user_actor(&headers, None);
     let event = BusEvent::Thread {
         thread_id: id,
         event: ThreadEvent::ThreadDiscarded {

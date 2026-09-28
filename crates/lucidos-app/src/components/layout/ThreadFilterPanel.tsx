@@ -12,6 +12,7 @@ import { draftThreadCount } from '../drawer/family-graph';
 import { DraftsIcon, AttentionIcon, ReviewIcon, RunningIcon, FilterIcon, FilteredIcon, CheckIcon, CodeIcon, StatusIcon, ThreadTypesIcon } from '../shared/icons';
 import { LucidosMark } from '../shared/LucidosMark';
 import { Explainer } from '../shared/Explainer';
+import { Disclosure } from '../shared/Disclosure';
 import { CategoryIcon } from '../shared/CategoryIcon';
 import { CHANNEL_OPTIONS } from './headerHelpers';
 import { toggleChannel, triggerFilterOptions, toggleTriggerId, toggleTriggerChannel, type TriggerFilterOption } from '../../store/triggerFilters';
@@ -528,24 +529,26 @@ function ExpandableChannelRow(props: ExpandableChannelRowProps) {
         <span class="thread-filter-channel-icon">{icon}</span>
         {label}
       </label>
-      {expanded && groups.map(group => (
-        <Fragment key={group.label || 'default'}>
-          {/* Its own class, not the change selector's
-              `.dropdown-section-header`. That one stands on a dropdown's left
-              edge, which here falls left of every row this heading spans. */}
-          {showHeaders && (
-            <div class="thread-filter-group-title">{group.label}</div>
-          )}
-          {group.items.map(child => (
-            <ChildRow
-              key={child.id}
-              child={child}
-              checked={lockstep ? channelOn : group.selected.has(child.id)}
-              onChange={lockstep ? onToggleChannel : () => group.onToggleChild(child.id)}
-            />
-          ))}
-        </Fragment>
-      ))}
+      <Disclosure open={expanded}>
+        {groups.map(group => (
+          <Fragment key={group.label || 'default'}>
+            {/* Its own class, not the change selector's
+                `.dropdown-section-header`. That one stands on a dropdown's left
+                edge, which here falls left of every row this heading spans. */}
+            {showHeaders && (
+              <div class="thread-filter-group-title">{group.label}</div>
+            )}
+            {group.items.map(child => (
+              <ChildRow
+                key={child.id}
+                child={child}
+                checked={lockstep ? channelOn : group.selected.has(child.id)}
+                onChange={lockstep ? onToggleChannel : () => group.onToggleChild(child.id)}
+              />
+            ))}
+          </Fragment>
+        ))}
+      </Disclosure>
     </Fragment>
   );
 }

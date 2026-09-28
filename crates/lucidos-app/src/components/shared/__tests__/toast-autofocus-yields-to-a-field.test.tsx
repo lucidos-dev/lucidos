@@ -49,7 +49,7 @@ afterEach(() => {
 function showVersionToast(): void {
   showToast('New version available.', 'info', {
     secondaryAction: { label: 'Later', onClick: () => {} },
-    action: { label: 'Switch to new version', onClick: () => {} },
+    action: { label: 'Switch', onClick: () => {} },
   });
 }
 
@@ -64,7 +64,7 @@ describe('toast autofocus', () => {
   it('takes the default button when the user is not in a field', () => {
     showVersionToast();
     render(<ToastList />, host);
-    expect(document.activeElement?.textContent).toBe('Switch to new version');
+    expect(document.activeElement?.textContent).toBe('Switch');
   });
 
   it('does not take it later, once it has stood down for a field', () => {

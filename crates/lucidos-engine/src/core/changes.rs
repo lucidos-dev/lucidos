@@ -126,15 +126,16 @@ impl PendingThreadState {
         }
     }
 
-    /// The thread has not finished with this change, so
-    /// `available_thread_actions` withholds Apply. Two ways to be unsettled, and
-    /// applying under either races what the session does next (real thread
-    /// 76b4ee76):
+    /// The thread has not finished with this change, so Apply is withheld.
+    /// Three ways to be unsettled, and applying under any races what the
+    /// session does next (real thread 76b4ee76):
     ///
     /// - **mid-turn**, `Running` or `WaitingForUserAnswer`;
     /// - **parked**, holding a live event wait. It wakes on the delivery and
     ///   commits on to the same branch (ADR 0106). An active sub-thread does
     ///   not count: the child writes its own worktree (ADR 0249).
+    /// - **parked on a question**, whatever the status reads. Applying would
+    ///   prompt the agent over the question card (ADR 0293).
     ///
     /// The frontend disables Apply for these and the bulk paths filter them
     /// out; the per-change Apply endpoint 409s via `guard_change_action`.
@@ -162,6 +163,38 @@ impl PendingThreadState {
     }
 }
 
+/// Whether applying a pending change would hit a merge conflict with `main`
+/// as it stands, from `git merge-tree`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConflictPrediction {
+    /// git could not answer. Never read this as clean.
+    #[default]
+    Unknown,
+    Clean,
+    Conflict,
+}
+
+impl From<&crate::engine::git_ops::MergeProbe> for ConflictPrediction {
+    fn from(probe: &crate::engine::git_ops::MergeProbe) -> Self {
+        match probe {
+            crate::engine::git_ops::MergeProbe::Clean => Self::Clean,
+            crate::engine::git_ops::MergeProbe::Conflicts(_) => Self::Conflict,
+            crate::engine::git_ops::MergeProbe::Unknown => Self::Unknown,
+        }
+    }
+}
+
+/// What an apply of a pending change faces: when its slow phase began, and
+/// whether it would conflict. Not stored: `list_pending_for_readers` fills it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PendingApplyOutlook {
+    /// When the phase in flight began: an open conflict pairing, or else an
+    /// open hardening. `None` when neither is running.
+    pub phase_started_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub predicted_conflict: ConflictPrediction,
+}
+
 /// A change's status together with the data only that status has.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChangeState {
@@ -169,6 +202,7 @@ pub enum ChangeState {
         /// Set while a Tier-3 conflict resolution is in progress.
         merge: Option<MergeWorktree>,
         thread: PendingThreadState,
+        apply: PendingApplyOutlook,
     },
     Applied(MergeShas),
     Reverted(MergeShas),
@@ -241,6 +275,13 @@ impl Change {
             _ => None,
         }
     }
+
+    pub fn apply_outlook(&self) -> Option<PendingApplyOutlook> {
+        match self.state {
+            ChangeState::Pending { apply, .. } => Some(apply),
+            _ => None,
+        }
+    }
 }
 
 /// One `changes` row as stored: every state's columns side by side.
@@ -293,6 +334,7 @@ impl TryFrom<ChangeRow> for Change {
             ChangeStatus::Pending => ChangeState::Pending {
                 merge,
                 thread: PendingThreadState::default(),
+                apply: PendingApplyOutlook::default(),
             },
             ChangeStatus::Applied => ChangeState::Applied(shas),
             ChangeStatus::Reverted => ChangeState::Reverted(shas),
@@ -352,6 +394,8 @@ struct ChangeWire<'a> {
     thread_unsettled: bool,
     thread_settling: bool,
     resolving_conflict: bool,
+    apply_phase_started_at: Option<chrono::DateTime<chrono::Utc>>,
+    predicted_conflict: Option<ConflictPrediction>,
 }
 
 impl Serialize for Change {
@@ -359,6 +403,7 @@ impl Serialize for Change {
         let merge = self.merge_worktree();
         let shas = self.merge_shas();
         let thread = self.thread_state().unwrap_or_default();
+        let apply = self.apply_outlook();
         ChangeWire {
             id: self.id,
             request_id: self.request_id,
@@ -383,6 +428,8 @@ impl Serialize for Change {
             thread_unsettled: thread.unsettled(),
             thread_settling: thread.settling(),
             resolving_conflict: thread.resolving_conflict(),
+            apply_phase_started_at: apply.and_then(|a| a.phase_started_at),
+            predicted_conflict: apply.map(|a| a.predicted_conflict),
         }
         .serialize(serializer)
     }
@@ -426,15 +473,19 @@ const LIVE_THREAD_STATUSES: [&str; 2] = ["running", "waiting_for_user_answer"];
 const PARKED_THREAD_SQL: &str = "live_event_wait_count > 0";
 
 /// Of the given thread ids, return the subset that has not finished with its
-/// change: mid-turn, or parked on an event wait. One batch query. The bulk
-/// paths filter their batch with this, so they never resolve a change whose
-/// session is still going. That is the gate the per-change endpoint enforces
-/// via `guard_change_action`.
+/// change: mid-turn, parked on an event wait, or parked on a question. One
+/// batch query. The bulk paths filter their batch with this, so they never
+/// resolve a change whose session is still going. That is the gate the
+/// per-change endpoint enforces via `guard_change_action`.
 ///
-/// This is the SQL mirror of `available_thread_actions`'s
+/// Its status clauses are the SQL mirror of `available_thread_actions`'s
 /// `live || has_live_event_waits`, and the two must agree. This one drives the
-/// bulk paths and the `thread_unsettled` flag the UI disables its buttons on.
-/// That one drives the per-thread actions and the per-change guard.
+/// bulk paths, the `thread_unsettled` flag the UI disables its buttons on, and
+/// the per-change guard. That one drives the per-thread actions.
+///
+/// The question clause has no counterpart there. It reads the events, because
+/// a row can read `idle` with its question still open (ADR 0293). Resolving
+/// its change starts a prompt that overtakes the question card.
 pub async fn unsettled_thread_ids(
     pool: &PgPool,
     thread_ids: impl Iterator<Item = Uuid>,
@@ -443,9 +494,14 @@ pub async fn unsettled_thread_ids(
     if ids.is_empty() {
         return Ok(std::collections::HashSet::new());
     }
+    // `ts.` is load-bearing: `events` has a `thread_id` column too, so a bare
+    // name inside the question subquery would bind to the event row.
     let rows: Vec<(Uuid,)> = sqlx::query_as(&format!(
-        "SELECT thread_id FROM thread_summaries \
-         WHERE thread_id = ANY($1) AND (status = ANY($2) OR {PARKED_THREAD_SQL})"
+        "SELECT ts.thread_id FROM thread_summaries ts \
+         WHERE ts.thread_id = ANY($1) \
+           AND (ts.status = ANY($2) OR ts.{PARKED_THREAD_SQL} OR {parked})",
+        parked =
+            crate::engine::agent_recovery::unanswered_question_exists_sql("ts.thread_id::text"),
     ))
     .bind(&ids)
     .bind(&LIVE_THREAD_STATUSES[..])
@@ -495,11 +551,12 @@ pub async fn pending_sub_thread_change_counts(
     let rows: Vec<(Uuid, i64)> = sqlx::query_as(&format!(
         "{SUB_THREADS_CTE} \
          SELECT s.root_id, COUNT(c.id)::bigint FROM sub_threads s \
-         JOIN changes c ON c.thread_id = s.thread_id AND c.status = 'pending' \
+         JOIN changes c ON c.thread_id = s.thread_id AND c.status = $2 \
          WHERE s.thread_id <> s.root_id \
          GROUP BY s.root_id"
     ))
     .bind(roots)
+    .bind(ChangeStatus::Pending)
     .fetch_all(pool)
     .await?;
     Ok(rows.into_iter().collect())
@@ -515,12 +572,13 @@ pub async fn sub_thread_pending_changes(
     let rows: Vec<(Uuid, Uuid, Option<String>)> = sqlx::query_as(&format!(
         "{SUB_THREADS_CTE} \
          SELECT c.id, c.thread_id, ts.title FROM sub_threads s \
-         JOIN changes c ON c.thread_id = s.thread_id AND c.status = 'pending' \
+         JOIN changes c ON c.thread_id = s.thread_id AND c.status = $2 \
          LEFT JOIN thread_summaries ts ON ts.thread_id = c.thread_id \
          WHERE s.thread_id <> s.root_id \
          ORDER BY c.created_at ASC"
     ))
     .bind(vec![root])
+    .bind(ChangeStatus::Pending)
     .fetch_all(pool)
     .await?;
     let unsettled = unsettled_thread_ids(pool, rows.iter().map(|(_, tid, _)| *tid)).await?;
@@ -610,8 +668,8 @@ pub async fn list_pending_for_readers(
     Ok(pending)
 }
 
-/// Fill the [`PendingThreadState`] of each pending Change. Three batch
-/// queries, no N+1.
+/// Fill the [`PendingThreadState`] and [`PendingApplyOutlook`] of each pending
+/// Change. Four batch queries, no N+1, and one cached git probe per change.
 ///
 /// Every query always runs, because `settling` is NOT a subset of
 /// `unsettled`. A `paused` coding-agent thread is settling, and its status is
@@ -628,24 +686,70 @@ async fn enrich_pending_state(pool: &PgPool, changes: &mut [Change]) -> Result<(
     let thread_ids = || pending().map(|(tid, _)| tid);
     let unsettled = unsettled_thread_ids(pool, thread_ids()).await?;
     let settling = crate::engine::standing_apply::settling_thread_ids(pool, thread_ids()).await?;
-    let resolving = crate::core::changes_projection::resolving_conflict_change_ids(
+    let conflicts = crate::core::changes_projection::open_conflict_pairings(
         pool,
         &pending().collect::<Vec<_>>(),
     )
     .await?;
+    let hardenings = crate::engine::apply_estimate::open_hardening_starts(
+        pool,
+        &thread_ids().collect::<Vec<_>>(),
+    )
+    .await?;
+    let predictions = predict_conflicts(changes).await;
     for change in changes.iter_mut() {
-        let (Some(tid), ChangeState::Pending { thread, .. }) =
-            (change.thread_id, &mut change.state)
-        else {
+        let id = change.id;
+        let ChangeState::Pending { thread, apply, .. } = &mut change.state else {
+            continue;
+        };
+        apply.predicted_conflict = predictions.get(&id).copied().unwrap_or_default();
+        let Some(tid) = change.thread_id else {
             continue;
         };
         *thread = PendingThreadState::new(
             unsettled.contains(&tid),
             settling.contains(&tid),
-            resolving.contains(&change.id),
+            conflicts.contains_key(&id),
         );
+        // The same rule the phase label follows, so a pairing a crash left open
+        // never lends its start time to a hardening.
+        apply.phase_started_at = if thread.resolving_conflict() {
+            conflicts.get(&id).copied()
+        } else {
+            hardenings.get(&tid).copied()
+        };
     }
     Ok(())
+}
+
+/// How many merge probes run at once. Each is a short git process.
+const CONFLICT_PROBE_CONCURRENCY: usize = 4;
+
+/// Predict, for each pending change, whether merging it into `main` would
+/// conflict. Probes are cached per pair of tips, so a repeat read runs only
+/// `rev-parse`.
+async fn predict_conflicts(changes: &[Change]) -> HashMap<Uuid, ConflictPrediction> {
+    use futures::StreamExt;
+    // Owned values, not `&Change`: a closure over a borrow makes the stream's
+    // future `Send` only for one lifetime, and every awaiting caller then
+    // fails to spawn.
+    let targets: Vec<(Uuid, String, String)> = changes
+        .iter()
+        .filter(|c| c.is_pending())
+        .map(|c| (c.id, c.repo_root.clone(), c.branch_name.clone()))
+        .collect();
+    futures::stream::iter(targets)
+        .map(|(id, repo_root, branch)| async move {
+            let probe = crate::engine::git_ops::predict_merge_into_main(
+                std::path::Path::new(&repo_root),
+                &branch,
+            )
+            .await;
+            (id, ConflictPrediction::from(&probe))
+        })
+        .buffer_unordered(CONFLICT_PROBE_CONCURRENCY)
+        .collect()
+        .await
 }
 
 /// Same as `enrich_thread_titles` but for `RestartGroup`.
@@ -729,6 +833,7 @@ mod tests {
             state: ChangeState::Pending {
                 merge: None,
                 thread: PendingThreadState::default(),
+                apply: PendingApplyOutlook::default(),
             },
             created_at: chrono::Utc::now(),
             resolved_at: None,
@@ -915,6 +1020,122 @@ mod tests {
         assert!(
             settling(&changes[0]),
             "a standing apply waits through the wait"
+        );
+
+        teardown_test_db(&db).await;
+    }
+
+    async fn thread_event(
+        pool: &PgPool,
+        thread_id: Uuid,
+        event_type: &str,
+        payload: serde_json::Value,
+        ago_secs: f64,
+    ) {
+        sqlx::query(
+            "INSERT INTO events (id, event_type, payload, created, thread_id, aggregate, aggregate_id) \
+             VALUES ($1, $2, $3, now() - make_interval(secs => $4), $5, 'thread', $6)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(event_type)
+        .bind(payload)
+        .bind(ago_secs)
+        .bind(thread_id)
+        .bind(thread_id.to_string())
+        .execute(pool)
+        .await
+        .expect("insert event");
+    }
+
+    /// The row carries when its slow phase began, so a reloaded page keeps
+    /// the elapsed time. A repo git cannot read predicts nothing.
+    #[tokio::test]
+    async fn a_pending_change_reports_when_its_slow_phase_began() {
+        let (pool, db) = setup_test_db().await;
+        let (conflicting, hardening, idle) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        // A conflict resolution runs on a live thread; see the stale case below.
+        insert_thread_summary_with_status(&pool, conflicting, "running").await;
+        let mut changes = vec![
+            make_change(Some(conflicting)),
+            make_change(Some(hardening)),
+            make_change(Some(idle)),
+        ];
+        let conflict_payload = serde_json::json!({ "change_id": changes[0].id.to_string() });
+        thread_event(
+            &pool,
+            conflicting,
+            "MissingHardeningDetected",
+            serde_json::json!({}),
+            900.0,
+        )
+        .await;
+        thread_event(
+            &pool,
+            conflicting,
+            "ChangeHardened",
+            serde_json::json!({}),
+            700.0,
+        )
+        .await;
+        thread_event(
+            &pool,
+            conflicting,
+            "MergeConflictDetected",
+            conflict_payload,
+            600.0,
+        )
+        .await;
+        thread_event(
+            &pool,
+            hardening,
+            "MissingHardeningDetected",
+            serde_json::json!({}),
+            120.0,
+        )
+        .await;
+
+        enrich_pending_state(&pool, &mut changes)
+            .await
+            .expect("enrich");
+
+        let age = |c: &Change| {
+            c.apply_outlook()
+                .and_then(|a| a.phase_started_at)
+                .map(|at| (chrono::Utc::now() - at).num_seconds())
+        };
+        assert!(
+            matches!(age(&changes[0]), Some(550..=700)),
+            "conflict began 10 min ago: {:?}",
+            age(&changes[0])
+        );
+        assert!(
+            matches!(age(&changes[1]), Some(70..=220)),
+            "hardening began 2 min ago: {:?}",
+            age(&changes[1])
+        );
+        assert_eq!(age(&changes[2]), None, "nothing slow is running");
+        for change in &changes {
+            assert_eq!(
+                change.apply_outlook().map(|a| a.predicted_conflict),
+                Some(ConflictPrediction::Unknown),
+                "/repo is no repository, so the probe cannot answer"
+            );
+        }
+
+        // Once the thread has finished, the row no longer reads as resolving,
+        // so a pairing a crash left open lends it no start time.
+        sqlx::query("UPDATE thread_summaries SET status = 'idle' WHERE thread_id = $1")
+            .bind(conflicting)
+            .execute(&pool)
+            .await
+            .expect("finish the thread");
+        enrich_pending_state(&pool, &mut changes)
+            .await
+            .expect("enrich again");
+        assert_eq!(
+            age(&changes[0]),
+            None,
+            "a stale pairing has no running phase"
         );
 
         teardown_test_db(&db).await;
@@ -1164,9 +1385,17 @@ mod tests {
                 temp_branch: "merge-tmp/x".into(),
             }),
             thread: PendingThreadState::new(true, true, true),
+            apply: PendingApplyOutlook {
+                phase_started_at: Some(
+                    chrono::DateTime::parse_from_rfc3339("2026-01-02T03:10:00Z")
+                        .unwrap()
+                        .with_timezone(&chrono::Utc),
+                ),
+                predicted_conflict: ConflictPrediction::Conflict,
+            },
         });
         let expected = format!(
-            r#"{{{IDS},{HEAD},"status":"pending","created_at":"2026-01-02T03:04:05Z","resolved_at":null,"merge_worktree_path":"/tmp/wt","merge_temp_branch":"merge-tmp/x","hardened":true,"pre_merge_sha":null,"post_merge_sha":null,"thread_title":"T","commits":["c"],"incomplete":false,"thread_unsettled":true,"thread_settling":true,"resolving_conflict":true}}"#
+            r#"{{{IDS},{HEAD},"status":"pending","created_at":"2026-01-02T03:04:05Z","resolved_at":null,"merge_worktree_path":"/tmp/wt","merge_temp_branch":"merge-tmp/x","hardened":true,"pre_merge_sha":null,"post_merge_sha":null,"thread_title":"T","commits":["c"],"incomplete":false,"thread_unsettled":true,"thread_settling":true,"resolving_conflict":true,"apply_phase_started_at":"2026-01-02T03:10:00Z","predicted_conflict":"conflict"}}"#
         );
         assert_eq!(serde_json::to_string(&change).unwrap(), expected);
     }
@@ -1178,7 +1407,7 @@ mod tests {
             post: Some("bbb".into()),
         }));
         let expected = format!(
-            r#"{{{IDS},{HEAD},"status":"applied","created_at":"2026-01-02T03:04:05Z","resolved_at":null,"merge_worktree_path":null,"merge_temp_branch":null,"hardened":true,"pre_merge_sha":"aaa","post_merge_sha":"bbb","thread_title":"T","commits":["c"],"incomplete":false,"thread_unsettled":false,"thread_settling":false,"resolving_conflict":false}}"#
+            r#"{{{IDS},{HEAD},"status":"applied","created_at":"2026-01-02T03:04:05Z","resolved_at":null,"merge_worktree_path":null,"merge_temp_branch":null,"hardened":true,"pre_merge_sha":"aaa","post_merge_sha":"bbb","thread_title":"T","commits":["c"],"incomplete":false,"thread_unsettled":false,"thread_settling":false,"resolving_conflict":false,"apply_phase_started_at":null,"predicted_conflict":null}}"#
         );
         assert_eq!(serde_json::to_string(&change).unwrap(), expected);
     }

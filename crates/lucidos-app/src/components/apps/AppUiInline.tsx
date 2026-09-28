@@ -1,7 +1,9 @@
 import { useRef, useLayoutEffect, useState, useEffect } from 'preact/hooks';
 import { currentApp, appPseudoFullscreen, appRefreshKey, scaledDurationMs } from '../../store/store';
 import { appFullscreenHost, syncAppFullscreenHost } from '../../store/appFullscreenHost';
-import { getAppFrameSrc, exitPseudoFullscreen } from '../../store/actions/apps';
+import { getAppFrameSrc, exitPseudoFullscreen, refreshAppUI } from '../../store/actions/apps';
+import { usePanelRefresh } from '../../hooks/usePanelRefresh';
+import { showPullTravel } from '../../store/panelRefresh';
 import { ExitFullscreenIcon } from '../shared/icons';
 import { viewportIsMobile } from '../../utils/viewport';
 import { useLingeringFlag } from '../../hooks/useDelayedLoading';
@@ -19,6 +21,39 @@ const COVER_FADE_SLACK_MS = 50;
 /** Reveal fuse for a frame whose `load` never arrives (a hung request). A pane
  *  covered forever is worse than whatever the frame managed to paint. */
 const COVER_MAX_MS = 3000;
+
+/** How long an app refresh waits for the new frame's `load` before it settles
+ *  anyway: the reveal fuse, plus the refresh's own debounce and some slack. */
+const REFRESH_SETTLE_MAX_MS = COVER_MAX_MS + 500;
+
+/** Counts frame mounts. A refresh waits for a frame newer than the one on
+ *  screen, whose own first load may still be pending. */
+let framesMounted = 0;
+
+/** App refreshes waiting for a frame mounted after they were asked. */
+let frameLoadWaiters: Array<{ after: number; settle: () => void }> = [];
+
+function settleFrameLoad(frame: number): void {
+  const waiting = frameLoadWaiters;
+  frameLoadWaiters = waiting.filter((w) => w.after >= frame);
+  for (const w of waiting) if (w.after < frame) w.settle();
+}
+
+/** The app panel's refresh (the panel refresh contract): reload the frame and
+ *  settle once the new one has loaded. preserveWip, because a refresh re-reads
+ *  whatever the frame points at, WIP included. Apply landing and direct
+ *  file-source edits call `refreshAppUI` with the default instead. */
+function refreshOpenApp(): Promise<void> {
+  return new Promise((resolve) => {
+    const fuse = setTimeout(settle, REFRESH_SETTLE_MAX_MS);
+    function settle() {
+      clearTimeout(fuse);
+      resolve();
+    }
+    frameLoadWaiters.push({ after: framesMounted, settle });
+    void refreshAppUI(undefined, { preserveWip: true });
+  });
+}
 
 /** Append a cache-busting query param to a URL. */
 function cacheBust(url: string, key: number): string {
@@ -49,9 +84,16 @@ function AppFrame({ src }: { src: string }) {
   // element rather than an opacity on the iframe itself.
   const [loaded, setLoaded] = useState(false);
   const coverMounted = useLingeringFlag(!loaded, scaledDurationMs(COVER_FADE_MS) + COVER_FADE_SLACK_MS);
+  const [frame] = useState(() => ++framesMounted);
+
+  // A pull the frame was posting ends with it, so the arrow comes down.
+  useEffect(() => () => showPullTravel(0), []);
 
   useEffect(() => {
-    if (loaded) return;
+    if (loaded) {
+      settleFrameLoad(frame);
+      return;
+    }
     const fuse = setTimeout(() => setLoaded(true), COVER_MAX_MS);
     return () => clearTimeout(fuse);
   }, [loaded]);
@@ -106,6 +148,7 @@ export function AppUiInline({ layout }: { layout: 'desktop' | 'mobile' }) {
   // Skip mounting the iframe in the inactive dual-rendered layout — otherwise
   // every app open spawns two iframes loading the same id.
   const isActiveLayout = layout === (viewportIsMobile.value ? 'mobile' : 'desktop');
+  usePanelRefresh(`app "${app?.name ?? ''}"`, app && isActiveLayout ? refreshOpenApp : null);
 
   // Gate the layout effect on isActiveLayout so the inactive copy doesn't fight
   // the active one over the global attribute (its cleanup would clear what the

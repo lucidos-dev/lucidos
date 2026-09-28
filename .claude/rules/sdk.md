@@ -21,6 +21,7 @@ paths:
 
 - **Update `system-knowhow/js-sdk.md` in the same commit.** Apps and audit knowhow link into specific `§ lucidos.<name>` headings — the heading is part of the contract, not just docs.
 - **Add the new symbol to `src/index.ts`** (`import { ... } from './<file>'` and into the `lucidos = { ... }` object). The IIFE bundle pulls from `index.ts` via `browser.ts`, and the frontend ES-imports from `index.ts` directly. A new file that isn't re-exported reaches neither.
+- **An iframe-only side effect with no `lucidos.*` method takes the other route.** `browser.ts` installs it, and the host reaches its shared logic through a `@lucidos/<name>` alias in `vite.config.ts` and `tsconfig.json`. The tooltip and pull to refresh work this way, so the barrel does not widen.
 
 ## Build & runtime
 

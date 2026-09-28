@@ -2951,3 +2951,105 @@ describe('a reading position that names a step row', () => {
     detach();
   });
 });
+
+describe('a restored reading position holds while the transcript settles', () => {
+  // The reported case: a thread reopened on its saved spot, and the reader
+  // found themselves elsewhere once they scrolled. Turns above the spot kept
+  // drawing after the restore, and WebKit has no scroll anchoring to carry the
+  // reader with them.
+  const IDS = ['t0', 't1', 't2', 't3', 't4', 't5'];
+  const opts = { live: () => ({}), resetOnEmpty: true, anchorsToContent: true };
+  let origRO: unknown;
+  let origMO: unknown;
+
+  beforeEach(() => {
+    localStorage.clear();
+    clearPendingEventScroll();
+    origRO = (globalThis as any).ResizeObserver;
+    origMO = (globalThis as any).MutationObserver;
+    class Inert { observe() {} disconnect() {} takeRecords() { return []; } }
+    (globalThis as any).ResizeObserver = Inert;
+    (globalThis as any).MutationObserver = Inert;
+  });
+  afterEach(() => {
+    clearPendingEventScroll();
+    (globalThis as any).ResizeObserver = origRO;
+    (globalThis as any).MutationObserver = origMO;
+  });
+
+  it('keeps a restored turn in place when a turn above it grows', () => {
+    localStorage.setItem('k', 'anchor:-150:t2');
+    const el = mockTranscript({ ids: IDS, turnHeight: 400, scrollTop: 0 });
+    const { onResize } = makeScrollObservers(el);
+    const detach = attachScrollMemory(el, 'k', opts);
+    expect(el.scrollTop).toBe(950);
+
+    el.setTurnHeightOf('t0', 900);    // an image above the spot decodes
+    onResize();
+
+    expect(el.scrollTop).toBe(1450);
+    detach();
+  });
+
+  it('keeps a restored row in place when a turn above it grows', () => {
+    localStorage.setItem('k', 'row:-10:t1-r12');
+    const el = mockTranscript({ ids: ['t0', 't1', 't2'], turnHeight: 1000, rowsPerTurn: 40, scrollTop: 0 });
+    const { onResize } = makeScrollObservers(el);
+    const detach = attachScrollMemory(el, 'k', opts);
+    expect(el.scrollTop).toBe(1310);
+
+    el.setTurnHeightOf('t0', 1600);
+    onResize();
+
+    expect(el.scrollTop).toBe(1910);
+    detach();
+  });
+
+  it('moves nobody when content grows below the restored spot', () => {
+    localStorage.setItem('k', 'anchor:-150:t1');
+    const el = mockTranscript({ ids: IDS, turnHeight: 400, scrollTop: 0 });
+    const { onResize } = makeScrollObservers(el);
+    const detach = attachScrollMemory(el, 'k', opts);
+    expect(el.scrollTop).toBe(550);
+
+    el.setTurnHeightOf('t5', 2000);   // a reply streams in at the bottom
+    onResize();
+
+    expect(el.scrollTop).toBe(550);
+    detach();
+  });
+
+  it('keeps holding when the reader scrolled just before the restore', () => {
+    // A quick switch: the reader's last gesture is still inside its window
+    // when the restore writes. The restore's own scroll event is a placement,
+    // not the reader, so it must not end the hold it just armed.
+    localStorage.setItem('k', 'anchor:-150:t2');
+    const el = mockTranscript({ ids: IDS, turnHeight: 400, scrollTop: 0 });
+    const { onScroll, onResize } = makeScrollObservers(el);
+    readerGestureForTest(el);
+    const detach = attachScrollMemory(el, 'k', opts);
+    onScroll();                       // the restore's own scroll event
+
+    el.setTurnHeightOf('t0', 900);
+    onResize();
+
+    expect(el.scrollTop).toBe(1450);
+    detach();
+  });
+
+  it('lets go once the reader scrolls', () => {
+    localStorage.setItem('k', 'anchor:-150:t2');
+    const el = mockTranscript({ ids: IDS, turnHeight: 400, scrollTop: 0 });
+    const { onScroll, onResize } = makeScrollObservers(el);
+    const detach = attachScrollMemory(el, 'k', opts);
+
+    readerGestureForTest(el);         // the reader's own hand on the transcript
+    el.scrollTop = 700;
+    onScroll();
+    el.setTurnHeightOf('t0', 900);
+    onResize();
+
+    expect(el.scrollTop).toBe(700);
+    detach();
+  });
+});

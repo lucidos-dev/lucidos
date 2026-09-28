@@ -422,7 +422,7 @@ describe('Flow: CC revival from waiting', () => {
     expect(thread.meta.status).toBe('idle');
   });
 
-  it('thread status is waiting after hardening completes with proposed changes', () => {
+  it('thread status is idle after hardening completes with proposed changes', () => {
     // Review Claude Code session completed, proposed a change, then ended.
     // Thread should show as 'waiting' (pending change), not 'idle'.
     const { map, id } = makeThread();
@@ -445,8 +445,8 @@ describe('Flow: CC revival from waiting', () => {
     ]);
 
     const thread = map.get(id)!;
-    // ChangeProposed without ChangeApplied/Discarded → pending changes → waiting
-    expect(thread.meta.status).toBe('waiting');
+    // ChangeProposed without ChangeApplied/Discarded leaves status idle
+    expect(thread.meta.status).toBe('idle');
   });
 });
 
@@ -560,7 +560,7 @@ describe('SSE event-based status transitions via handleEvent()', () => {
     expect(thread.meta.status).toBe('idle');
   });
 
-  it('CC thread with SessionEnded + pending changes → waiting', () => {
+  it('CC thread with SessionEnded + pending changes → idle', () => {
     const { map, id } = makeThread();
 
     insertEvents(map, id, [
@@ -574,12 +574,12 @@ describe('SSE event-based status transitions via handleEvent()', () => {
 
     const thread = map.get(id)!;
 
-    // SessionEnded checks codingAgentProposed (true) → waiting
-    expect(thread.meta.status).toBe('waiting');
+    // SessionEnded sets idle whatever codingAgentProposed says
+    expect(thread.meta.status).toBe('idle');
     expect(thread.meta.codingAgentProposed).toBe(true);
   });
 
-  it('CodingAgentIdled sets status=waiting', () => {
+  it('CodingAgentIdled sets status=idle', () => {
     const { map, id } = makeThread();
 
     insertEvents(map, id, [
@@ -588,8 +588,8 @@ describe('SSE event-based status transitions via handleEvent()', () => {
       { type: 'CodingAgentIdled', has_changes: true },
     ]);
 
-    // CodingAgentIdled always sets waiting
-    expect(map.get(id)!.meta.status).toBe('waiting');
+    // CodingAgentIdled always sets idle
+    expect(map.get(id)!.meta.status).toBe('idle');
   });
 
   it('MessageReceived + ToolCalled → status=running (MessageReceived sets running)', () => {
@@ -634,7 +634,6 @@ describe('SSE event-based status transitions via handleEvent()', () => {
     expect(map.get(id)!.meta.status).toBe('idle');
     expect(map.get(id)!.meta.codingAgentProposed).toBe(false);
     expect(map.get(id)!.meta.codingAgentRequiresRestart).toBe(false);
-    expect(map.get(id)!.meta.codingAgentApplying).toBe(false);
   });
 
   it('ChangeDiscarded clears CC flags and sets status=idle', () => {
@@ -769,7 +768,7 @@ describe('SessionStarted does not alter thread status', () => {
     expect(map.get(id)!.meta.status).toBe('idle');
   });
 
-  it('pending changes + SessionStarted → waiting (SessionStarted does not change status)', () => {
+  it('pending changes + SessionStarted → idle (SessionStarted does not change status)', () => {
     const { map, id } = makeThread();
     const now = Date.now();
     const t = (offset: number) => new Date(now + offset).toISOString();
@@ -785,8 +784,8 @@ describe('SessionStarted does not alter thread status', () => {
       { type: 'SessionStarted', session_id: 's2', created: t(-120000) },
     ]);
 
-    // ChangeProposed set waiting with codingAgentProposed. SessionStarted doesn't change it.
-    expect(map.get(id)!.meta.status).toBe('waiting');
+    // ChangeProposed leaves status idle. SessionStarted doesn't change it.
+    expect(map.get(id)!.meta.status).toBe('idle');
   });
 
 });

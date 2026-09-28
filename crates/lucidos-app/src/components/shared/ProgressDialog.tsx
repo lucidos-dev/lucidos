@@ -5,6 +5,7 @@ import type { ProgressDialogState } from '../../store/types';
 import { useHidePanelWebviewWhile } from '../../hooks/useHidePanelWebviewWhile';
 import { DialogMessage } from './DialogMessage';
 import { Overlay } from './Overlay';
+import { SurfaceHead } from './Surface';
 import { trapDialogTab } from './dialogFocusTrap';
 import { progressFillWidth } from './progressBar';
 
@@ -39,25 +40,32 @@ export function progressDialogBody(props: {
     // Chrome carries :focus-visible into a programmatic focus. The suppression
     // is in components.css, beside the confirm dialog's.
     <div ref={props.panelRef} class="progress-dialog-body" tabIndex={-1}>
-      <h2 class="confirm-title">{title}</h2>
-      <DialogMessage message={message} />
       {/* Determinate only where the operation has an honest percentage. A
           download does; a service restart does not, and a bar that invents one
-          is a lie the user waits on. `progressFillWidth` clamps, so a bad
-          fraction paints an empty track rather than running past its box. */}
-      {progress != null && (
-        <div class="progress-bar progress-dialog-bar">
-          <div class="progress-bar-fill" style={{ width: progressFillWidth(progress) }} />
-        </div>
-      )}
-      {progress == null && <div class="mini-spinner progress-dialog-spinner" />}
-      {cancel && (
-        <div class="confirm-actions">
-          <div class="confirm-actions-right">
-            <button class="confirm-btn confirm-btn-cancel" onClick={cancel.onClick}>
-              {cancel.label}
-            </button>
+          is a lie the user waits on. The indeterminate case leads the title. */}
+      <SurfaceHead
+        title={title}
+        icon={
+          progress == null ? (
+            <span class="surface-icon" aria-hidden="true"><span class="mini-spinner" /></span>
+          ) : undefined
+        }
+      />
+      <div class="surface-body progress-dialog-readout">
+        <DialogMessage message={message} />
+        {/* `progressFillWidth` clamps, so a bad fraction paints an empty track
+            rather than running past its box. */}
+        {progress != null && (
+          <div class="progress-bar progress-dialog-bar">
+            <div class="progress-bar-fill" style={{ width: progressFillWidth(progress) }} />
           </div>
+        )}
+      </div>
+      {cancel && (
+        <div class="surface-foot">
+          <button class="action-btn action-btn-secondary" data-role="progress-cancel" onClick={cancel.onClick}>
+            {cancel.label}
+          </button>
         </div>
       )}
     </div>
@@ -82,7 +90,7 @@ export function ProgressDialog() {
     if (!state.visible) return;
     const panel = panelRef.current;
     if (!panel) return;
-    const cancelBtn = panel.querySelector<HTMLButtonElement>('.confirm-btn-cancel');
+    const cancelBtn = panel.querySelector<HTMLButtonElement>('[data-role="progress-cancel"]');
     (cancelBtn ?? panel).focus();
 
     function handleKey(e: KeyboardEvent) {
@@ -110,7 +118,8 @@ export function ProgressDialog() {
     <Overlay
       open
       onClose={() => false}
-      panelClass="confirm-dialog progress-dialog"
+      overlayClass="protected-surface"
+      panelClass="surface surface-raised confirm-dialog progress-dialog protected-surface"
       panelRole="dialog"
       ariaModal
     >

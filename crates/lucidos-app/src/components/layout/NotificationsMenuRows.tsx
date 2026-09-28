@@ -221,15 +221,14 @@ export function notificationsMenuGroup(props: NotificationsGroupProps) {
           const mode = rowAlternate(row, props.ownId);
           return [
             notifyRow(row, props),
-            row.id !== null && row.id === props.contextId && mode !== null
-              ? workspaceActionRow({
-                  id: row.id,
-                  name: row.name,
-                  mode,
-                  indentClass: NOTIFY_ACTION_INDENT,
-                  onActivate: (m) => props.onAlternate(row, m),
-                })
-              : null,
+            row.id !== null && workspaceActionRow({
+              open: row.id === props.contextId,
+              id: row.id,
+              name: row.name,
+              mode,
+              indentClass: NOTIFY_ACTION_INDENT,
+              onActivate: (m) => props.onAlternate(row, m),
+            }),
           ];
         })}
       </div>

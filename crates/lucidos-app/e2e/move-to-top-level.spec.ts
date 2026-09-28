@@ -81,8 +81,9 @@ test.describe('Move to top level', () => {
     await expect(dialog).toBeVisible();
     await expect(dialog).toContainText('It keeps running and finishes on its own');
     // Not red: nothing is stopped or lost.
-    await expect(page.locator('.confirm-btn-ok')).toHaveCount(0);
-    await page.locator('.confirm-btn-ok-default', { hasText: 'Move out' }).click();
+    const ok = page.locator('[data-role="confirm-ok"]', { hasText: 'Move out' });
+    await expect(ok).not.toHaveClass(/\baction-btn-danger\b/);
+    await ok.click();
 
     await expect(rowWrap(page, childId)).not.toHaveClass(/is-nested/);
     expect(psql(`SELECT parent_thread_id FROM thread_summaries WHERE thread_id = '${childId}'`)).toBe('');
@@ -99,7 +100,7 @@ test.describe('Move to top level', () => {
     await openRowMenu(page, childId);
     await moveItem(page).click();
     await expect(page.locator('.confirm-dialog')).toBeVisible();
-    await page.locator('.confirm-btn-cancel').click();
+    await page.locator('[data-role="confirm-cancel"]').click();
 
     await expect(page.locator('.confirm-dialog')).toHaveCount(0);
     await expect(rowWrap(page, childId)).toHaveClass(/is-nested/);

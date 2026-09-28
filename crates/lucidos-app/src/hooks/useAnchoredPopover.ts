@@ -1,4 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
+import type { JSX } from 'preact';
 import { clampWithin } from '../utils/dom';
 import { notePressOutcome } from '../utils/tapGesture';
 import { primaryPointerIsDown } from '../utils/pointerPress';
@@ -39,8 +40,11 @@ const CLAMP_MARGIN = 8;
  *    panel grows leftward — the conventional fit for an overflow (⋯) trigger
  *    pinned to the far right of a row/header, where `'start'` would push a wide
  *    menu off-screen and the viewport clamp would then strand it near the left
- *    edge, detached from the trigger. */
-export type AnchorAlign = 'start' | 'end';
+ *    edge, detached from the trigger.
+ *  - `'container-center'`: the panel centres in the box it clamps into, and
+ *    the anchor sets only its vertical placement. For a panel sized to span its
+ *    pane, like a phone's composer menus at the header palette width. */
+export type AnchorAlign = 'start' | 'end' | 'container-center';
 
 /** What a popover is positioned against: an element, or a bare box. */
 export type AnchorBox = Pick<HTMLElement, 'getBoundingClientRect'>;
@@ -76,7 +80,7 @@ export function pointAnchor({ x, y }: ViewportPoint): AnchorBox {
  *  into view. The clamp never re-flips: a panel too tall for the space pins to
  *  the top margin and overlaps its anchor, which is strictly better than being
  *  unreachable. Surfaces should still cap their own `max-height` against the
- *  viewport so that overlap stays rare (see `.prompt-bar-popover`). */
+ *  viewport so that overlap stays rare (see `.anchored-popover`). */
 export function computeAnchorPosition(
   anchor: AnchorBox,
   panelHeight: number,
@@ -85,14 +89,24 @@ export function computeAnchorPosition(
   align: AnchorAlign = 'start',
 ): AnchorPosition {
   const rect = anchor.getBoundingClientRect();
-  const wantBelow = rect.bottom + panelHeight + CLAMP_MARGIN <= window.innerHeight;
+  // The VISUAL viewport, in the layout-viewport coordinates `fixed` uses. iOS
+  // shrinks only it for the keyboard, so `innerHeight` counts screen the keys
+  // cover, and a panel measured against it opens behind them.
+  const vv = window.visualViewport;
+  const viewTop = vv?.offsetTop ?? 0;
+  const viewBottom = vv ? vv.offsetTop + vv.height : window.innerHeight;
+  const wantBelow = rect.bottom + panelHeight + CLAMP_MARGIN <= viewBottom;
   const desiredTop = wantBelow ? rect.bottom + 4 : rect.top - panelHeight - 4;
-  const top = clampWithin(desiredTop, panelHeight, 0, window.innerHeight, CLAMP_MARGIN);
+  const top = clampWithin(desiredTop, panelHeight, viewTop, viewBottom, CLAMP_MARGIN);
   const placement: AnchorPosition['placement'] = wantBelow ? 'bottom-start' : 'top-start';
   const bounds = container?.getBoundingClientRect();
   const boundsLeft = bounds?.left ?? 0;
   const boundsRight = bounds?.right ?? window.innerWidth;
-  const desiredLeft = align === 'end' ? rect.right - panelWidth : rect.left;
+  const desiredLeft = align === 'end'
+    ? rect.right - panelWidth
+    : align === 'container-center'
+      ? (boundsLeft + boundsRight - panelWidth) / 2
+      : rect.left;
   const left = clampWithin(desiredLeft, panelWidth, boundsLeft, boundsRight, CLAMP_MARGIN);
   // A container with no room left to give is not a cap, it is a disappearing
   // act: capping to 0 renders a zero-width panel that is invisible while the
@@ -225,6 +239,16 @@ export function useAnchoredPosition(
     };
   }, [anchor, panelRef, containerSelector, align]);
   return pos;
+}
+
+/** The inline style that places a `position: fixed` panel at `pos`, no wider
+ *  than the box its `left` was clamped into. Until the first measurement lands
+ *  it stays hidden, so it never flashes at the corner its stylesheet parks it
+ *  in. */
+export function anchoredPanelStyle(pos: AnchorPosition | null): JSX.CSSProperties {
+  return pos
+    ? { top: `${pos.top}px`, left: `${pos.left}px`, maxWidth: `${pos.maxWidth}px` }
+    : { visibility: 'hidden' };
 }
 
 /** Install one-shot, capture-phase `touchend` + `click` swallowers on `document`

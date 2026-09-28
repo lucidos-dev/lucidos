@@ -384,3 +384,115 @@ async fn driver_task_detects_subprocess_exit_when_grandchild_holds_stdout_busy()
         second,
     );
 }
+
+/// A line that arrives in two chunks survives an input sent between them.
+///
+/// The child writes half a `result` line and blocks on stdin. The input wins
+/// the driver's select while the read holds that half, so the read is dropped.
+/// The child then writes the rest. A read that loses the half leaves only an
+/// unparseable tail, and no `Result` ever arrives.
+#[tokio::test]
+async fn a_line_split_around_an_input_still_arrives_whole() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let half_written = tmp.path().join("half-written");
+    let script = format!(
+        r#"printf '%s' '{{"type":"result",'; touch '{marker}'; read reply; printf '%s\n' '"result":"done","duration_ms":7}}'"#,
+        marker = half_written.display(),
+    );
+    let (mut agent, _cancel) = spawn_driver_for_test("sh", &["-c", &script]).await;
+
+    let ceiling = std::time::Duration::from_secs(30);
+    let started = std::time::Instant::now();
+    while !half_written.exists() {
+        assert!(
+            started.elapsed() < ceiling,
+            "the child never wrote its first half"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    // Time for the driver to read the half into its line buffer.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    agent
+        .input_tx
+        .send(AgentInput {
+            text: "go on".into(),
+            images: vec![],
+        })
+        .expect("send input");
+
+    let mut events = Vec::new();
+    loop {
+        let ev = tokio::time::timeout(ceiling, agent.events_rx.recv())
+            .await
+            .expect("an event before the liveness ceiling")
+            .expect("events channel open");
+        let exited = matches!(ev, AgentEvent::Exited { .. });
+        events.push(ev);
+        if exited {
+            break;
+        }
+    }
+    assert!(
+        events
+            .iter()
+            .any(|ev| matches!(ev, AgentEvent::Result { text, .. } if text == "done")),
+        "the split line must arrive whole, got {events:?}"
+    );
+}
+
+/// The stdout-EOF twin of the test above. Two inputs each drop a read: the
+/// first holds the start of the line, the second holds its newline-less end.
+/// The child then closes stdout while alive, so the next read returns `Ok(0)`
+/// with the whole line already in the buffer.
+#[tokio::test]
+async fn a_split_last_line_ended_by_stdout_eof_still_arrives() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let first = tmp.path().join("first-half");
+    let second = tmp.path().join("second-half");
+    let script = format!(
+        r#"printf '%s' '{{"type":"result",'; touch '{first}'; read a; printf '%s' '"result":"done","duration_ms":7}}'; touch '{second}'; read b; exec 1>&-; sleep 5"#,
+        first = first.display(),
+        second = second.display(),
+    );
+    let (mut agent, _cancel) = spawn_driver_for_test("sh", &["-c", &script]).await;
+
+    let ceiling = std::time::Duration::from_secs(30);
+    for marker in [&first, &second] {
+        let started = std::time::Instant::now();
+        while !marker.exists() {
+            assert!(
+                started.elapsed() < ceiling,
+                "the child never wrote {marker:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // Time for the driver to read the bytes into its line buffer.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        agent
+            .input_tx
+            .send(AgentInput {
+                text: "go on".into(),
+                images: vec![],
+            })
+            .expect("send input");
+    }
+
+    let mut events = Vec::new();
+    loop {
+        let ev = tokio::time::timeout(ceiling, agent.events_rx.recv())
+            .await
+            .expect("an event before the liveness ceiling")
+            .expect("events channel open");
+        let exited = matches!(ev, AgentEvent::Exited { .. });
+        events.push(ev);
+        if exited {
+            break;
+        }
+    }
+    assert!(
+        events
+            .iter()
+            .any(|ev| matches!(ev, AgentEvent::Result { text, .. } if text == "done")),
+        "the last line must arrive, got {events:?}"
+    );
+}

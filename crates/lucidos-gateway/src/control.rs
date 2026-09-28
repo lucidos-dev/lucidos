@@ -725,7 +725,7 @@ async fn rename(
 /// attribute a restart, and the auto-resume it authorizes, to any device it
 /// cared to name.
 fn requesting_device(device: Option<&auth::AuthenticatedDevice>) -> Option<&str> {
-    device.map(|d| d.0.as_str())
+    device.map(|d| d.id.as_str())
 }
 
 async fn restart(
@@ -969,7 +969,10 @@ mod authz_tests {
         // The value reaches the engine's restart-intent route, where it is the
         // device-actor half of `switch_was_user_initiated`. It comes from the
         // extension `enforce` stamps, so a client cannot choose it.
-        let device = auth::AuthenticatedDevice("device-1".into());
+        let device = auth::AuthenticatedDevice {
+            id: "device-1".into(),
+            label: "My iPhone".into(),
+        };
         assert_eq!(requesting_device(Some(&device)), Some("device-1"));
     }
 

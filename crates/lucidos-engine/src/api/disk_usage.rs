@@ -10,6 +10,11 @@
 //! - `GET  /api/v1/disk-usage/worktrees`               — inventory of all
 //!   `<workspace>/.lucidos/worktrees/thread-<short>` directories paired
 //!   with their thread metadata, sorted by size descending.
+//! - `POST /api/v1/disk-usage/cleanup` with body `{ "action": "recommended" }`
+//!   runs the recommended cleanup over every worktree: a finished worktree is
+//!   removed, every other one loses its build artifacts, and live or pinned
+//!   threads are skipped (`engine::worktree_cleanup::run_recommended_cleanup`).
+//!   One pass runs at a time; a second request gets a 409.
 //! - `POST /api/v1/disk-usage/worktrees/:thread_id/cleanup` with body
 //!   `{ "tier": 1 | 2 | 3 }`:
 //!   - **Tier 1** strips regenerable build artifacts (`target/`,
@@ -30,6 +35,7 @@ use axum::{
     Json, Router,
 };
 use serde::Deserialize;
+use std::sync::atomic::{AtomicBool, Ordering};
 use uuid::Uuid;
 
 use super::AppState;
@@ -37,18 +43,88 @@ use crate::engine::event_bus::BusEvent;
 use crate::engine::git_ops::worktrees_dir;
 use crate::engine::thread_events::{EventMeta, ThreadEvent};
 use crate::engine::worktree_cleanup::{
-    available_disk_bytes, deterministic_worktree_for, directory_size_bytes, inventory_worktrees,
-    is_worktree_dirty, prune_build_artifacts, remove_stranded_worktree,
-    remove_worktree_and_optionally_delete_branch, worktree_git_admin_missing, ActiveThreads,
-    AgentSessionsActiveThreads, BranchDisposal, FREE_DISK_HARD_BYTES, FREE_DISK_SOFT_BYTES,
+    deterministic_worktree_for, directory_size_bytes, inventory_worktrees, is_worktree_dirty,
+    prune_build_artifacts, remove_stranded_worktree, remove_worktree_and_optionally_delete_branch,
+    run_recommended_cleanup, volume_free_bytes, worktree_git_admin_missing, BranchDisposal,
+    RecommendedCleanupOutcome, FREE_DISK_HARD_BYTES, FREE_DISK_SOFT_BYTES,
 };
 
 /// GET /api/v1/disk-usage/worktrees — inventory of all known per-thread worktrees.
 pub(super) async fn list_worktrees(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let rows = inventory_worktrees(state.engine.pool(), state.engine.workspace_path()).await;
+    let active_threads = state.engine.worktree_cleanup_active_threads();
+    let rows = inventory_worktrees(
+        state.engine.pool(),
+        state.engine.workspace_path(),
+        active_threads.as_ref(),
+    )
+    .await;
     Ok(Json(serde_json::json!({ "worktrees": rows })))
+}
+
+/// Body for `POST /api/v1/disk-usage/cleanup`.
+#[derive(Debug, Deserialize)]
+pub struct BulkCleanupRequest {
+    pub action: BulkCleanupAction,
+}
+
+/// The one bulk action so far. Kebab-case on the wire.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum BulkCleanupAction {
+    Recommended,
+}
+
+/// Set while a recommended pass runs, so a double tap or a second device
+/// cannot start another pass over the same trees.
+static RECOMMENDED_CLEANUP_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// Clears [`RECOMMENDED_CLEANUP_RUNNING`] when the pass ends, panics included.
+struct RunningPass;
+
+impl Drop for RunningPass {
+    fn drop(&mut self) {
+        RECOMMENDED_CLEANUP_RUNNING.store(false, Ordering::SeqCst);
+    }
+}
+
+/// POST /api/v1/disk-usage/cleanup: the recommended cleanup over every worktree.
+pub(super) async fn cleanup_all(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<BulkCleanupRequest>,
+) -> Result<Json<RecommendedCleanupOutcome>, (StatusCode, String)> {
+    let BulkCleanupAction::Recommended = req.action;
+    let actor = super::actor::user_actor(&headers, None);
+    if RECOMMENDED_CLEANUP_RUNNING.swap(true, Ordering::SeqCst) {
+        return Err((
+            StatusCode::CONFLICT,
+            "A recommended cleanup is already running. Wait for it to finish.".to_string(),
+        ));
+    }
+    let running = RunningPass;
+    let engine = state.engine.clone();
+    // A spawned task, so a closed tab cannot stop the pass between worktrees.
+    let pass = tokio::spawn(async move {
+        let _running = running;
+        let active_threads = engine.worktree_cleanup_active_threads();
+        run_recommended_cleanup(
+            engine.pool(),
+            &engine.event_bus,
+            engine.workspace_path(),
+            active_threads.as_ref(),
+            actor,
+        )
+        .await
+    });
+    let outcome = pass.await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Recommended cleanup failed: {e}"),
+        )
+    })?;
+    Ok(Json(outcome))
 }
 
 /// Body for `POST /api/v1/disk-usage/worktrees/:thread_id/cleanup`.
@@ -68,7 +144,7 @@ pub(super) async fn cleanup_worktree(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let thread_uuid = Uuid::parse_str(&thread_id)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid thread_id: {}", e)))?;
-    let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    let actor = super::actor::user_actor(&headers, None);
     let worktree = deterministic_worktree_for(state.engine.workspace_path(), thread_uuid);
     if !worktree.exists() {
         return Err((
@@ -77,23 +153,24 @@ pub(super) async fn cleanup_worktree(
         ));
     }
 
-    // Ask the same question the background worker asks first, and for the same
-    // reason (`worktree_cleanup.rs`): a live coding-agent session parked on
-    // `AskUserQuestion` emits no events, so no age or dirtiness check can see
-    // it. Tier 1 strips the build artifacts a running build is using. Tiers 2
-    // and 3 delete the directory the subprocess runs in, and take its branch
-    // with them. The worker's helpers say "the caller has already skipped
-    // active", and this caller had not.
-    if AgentSessionsActiveThreads::new(state.engine.agent_sessions.clone())
+    // Ask the background worker's liveness question first, through the same
+    // probe (`ActiveThreads`). Tier 1 strips the build artifacts a running
+    // build is using. Tiers 2 and 3 delete the directory the work runs in, and
+    // take its branch with them. The worker's helpers say "the caller has
+    // already skipped active", and this caller had not.
+    if state
+        .engine
+        .worktree_cleanup_active_threads()
         .is_active(thread_uuid)
         .await
     {
         return Err((
             StatusCode::CONFLICT,
             format!(
-                "Thread {} has a live coding-agent session in this worktree. \
-                 Stop it first, or wait for it to finish: cleaning up now would \
-                 delete the tree it is working in.",
+                "Thread {} has a coding-agent session starting or running, or a \
+                 background task running, in this worktree. Stop it first, or wait \
+                 for it to finish: cleaning up now would delete the tree it is \
+                 working in.",
                 thread_uuid
             ),
         ));
@@ -108,7 +185,7 @@ pub(super) async fn cleanup_worktree(
 
     let (freed_bytes, branch_deleted) = match req.tier {
         1 => {
-            let freed = prune_build_artifacts(&worktree).unwrap_or(0);
+            let freed = prune_build_artifacts(&worktree).await.unwrap_or(0);
             (freed, false)
         }
         2 | 3 => {
@@ -196,7 +273,7 @@ pub(super) async fn summary(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let workspace = state.engine.workspace_path();
     let dir = worktrees_dir(workspace);
-    let free_bytes = available_disk_bytes(&dir).or_else(|| available_disk_bytes(workspace));
+    let free_bytes = volume_free_bytes(&dir, workspace);
     let total_bytes = fs2::total_space(&dir)
         .ok()
         .or_else(|| fs2::total_space(workspace).ok());
@@ -226,6 +303,7 @@ pub(super) fn router() -> Router<AppState> {
     Router::new()
         .route("/disk-usage/summary", get(summary))
         .route("/disk-usage/worktrees", get(list_worktrees))
+        .route("/disk-usage/cleanup", post(cleanup_all))
         .route(
             "/disk-usage/worktrees/:thread_id/cleanup",
             post(cleanup_worktree),
@@ -234,10 +312,6 @@ pub(super) fn router() -> Router<AppState> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use std::collections::HashMap;
-    use std::sync::Arc;
-
     /// This file with its test module cut off. Uncut, a scan can match its own
     /// test fixtures and pass while production has lost the thing it pins.
     fn production_src() -> String {
@@ -246,16 +320,19 @@ mod tests {
         )
     }
 
-    /// A live session answers `is_active`, and nothing else here can.
-    ///
-    /// `AgentSession::is_live` is the liveness signal, not mere presence in the
-    /// map: a phantom left by a dropped run future used to hold `true` forever
-    /// and block reclamation of a tree whose subprocess was long gone.
-    #[tokio::test]
-    async fn an_empty_session_map_reports_no_live_thread() {
-        let sessions = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-        let probe = AgentSessionsActiveThreads::new(sessions);
-        assert!(!probe.is_active(uuid::Uuid::new_v4()).await);
+    /// The handler asks the worker's own probe. A hand-built one drifts from
+    /// what the worker counts as live.
+    #[test]
+    fn the_cleanup_handler_asks_the_workers_liveness_probe() {
+        let src = production_src();
+        assert!(
+            src.contains("worktree_cleanup_active_threads()"),
+            "cleanup_worktree must ask the engine's shared liveness probe"
+        );
+        assert!(
+            !src.contains("ActiveThreads::new("),
+            "no hand-built liveness probe in the handler"
+        );
     }
 
     /// The liveness gate runs BEFORE the tier match, so every tier is covered.

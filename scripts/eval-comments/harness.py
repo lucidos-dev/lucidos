@@ -96,7 +96,6 @@ AGENT_DENY = (
     "Bash(*web-dev*)",
     "Bash(*tauri-dev*)",
     "Bash(*scripts/run.sh*)",
-    "Bash(*scripts/start.sh*)",
     "Bash(*scripts/stop.sh*)",
     "Bash(*scripts/restart.sh*)",
     "Bash(*--fresh*)",

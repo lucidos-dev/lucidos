@@ -80,10 +80,10 @@ pub enum ThreadEvent {
         /// startup migration in `core::image_migration`.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         user_image_hashes: Vec<String>,
+        /// The device the message came from, by id only. A display resolves
+        /// its name; older rows also carry a `device` name, which is ignored.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         device_id: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        device: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         image_description: Option<String>,
         /// Set when this thread was spawned by another thread. Required when
@@ -487,7 +487,11 @@ pub enum ThreadEvent {
     },
     #[serde(alias = "ClaudeCodeToolResult")]
     CodingAgentToolResult {
+        /// The tool of the call this answers. Empty on older rows and for a
+        /// call the session never saw.
         name: String,
+        /// The agent's whole output. Older rows kept only its first 200 chars.
+        /// The snapshot and the live stream both drop it; fetch it by event id.
         result: String,
         #[serde(default = "default_coding_agent_claude_code", alias = "agent")]
         coding_agent: CodingAgent,
@@ -623,6 +627,10 @@ pub enum ThreadEvent {
     ThreadSaved,
     ThreadUnsaved,
     ThreadArchived,
+    /// The thread's own agent asked to be archived once its turn ends (ADR 0310).
+    /// The actor names the agent thread. The archive request resolver runs the
+    /// Archive button's cascade after the settle; a newer message closes it.
+    ThreadArchiveRequested,
     /// A thread was created in `composing` state. Emitted by the first
     /// successful POST /threads (debounced first user input: keystroke,
     /// image attach, or mode toggle on a fresh compose). The thread can
@@ -631,7 +639,7 @@ pub enum ThreadEvent {
         /// Initial mode the user opened compose with. Mutable while the
         /// thread is `Composing`; locked on first `MessageReceived`.
         mode: String,
-        /// Stamped by `api::actor::user_actor_resolved` so the timeline
+        /// Stamped by `api::actor::user_actor` so the timeline
         /// shows which device started the draft thread.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,

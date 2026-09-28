@@ -12,7 +12,7 @@
  * beside it still draws one.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { render } from 'preact';
+import { render, type ComponentChild } from 'preact';
 
 vi.mock('../../../store/actions/threads', () => ({
   focusThreadOrBootstrap: vi.fn(),
@@ -32,7 +32,7 @@ vi.mock('../../../store/actions/chat-changes', async (importOriginal) => ({
 }));
 
 import { ChangesView, SWEEP_ONLY_TIP } from '../ChangesView';
-import { getStandingApplyControl } from '../../chat/WaitingBanner';
+import { getStandaloneActions } from '../../chat/WaitingBanner';
 import {
   changes,
   appliedChanges,
@@ -41,12 +41,20 @@ import {
   applyAllInProgress,
   standingApplyThreadIds,
   armingStandingApplyThreadIds,
+  armingStandingApplySweep,
+  disarmingAllStandingApply,
   settlingThreadCount,
   threadMap,
   focusedThreadId,
 } from '../../../store/store';
 import type { Change } from '../../../api/client';
 import type { ThreadState } from '../../../store/thread-events';
+
+/** The standing apply as the prompt row draws it, or null when it has none. */
+function standingApply(): ComponentChild | null {
+  const member = getStandaloneActions().find((m) => m.key === 'standing-apply');
+  return member?.render ? member.render({}) : null;
+}
 
 const THREAD = 'thread-1';
 
@@ -94,7 +102,6 @@ function makeThread(over: Partial<ThreadState['meta']> = {}): ThreadState {
       codingAgentProposed: true,
       codingAgentRequiresRestart: false,
       codingAgentIsExternalRepo: false,
-      codingAgentApplying: false,
       codingAgentHasDiff: true,
       lastRevivedAt: '',
       state: 'active',
@@ -125,6 +132,8 @@ beforeEach(() => {
   applyAllInProgress.value = false;
   standingApplyThreadIds.value = new Set();
   armingStandingApplyThreadIds.value = new Set();
+  armingStandingApplySweep.value = false;
+  disarmingAllStandingApply.value = false;
   settlingThreadCount.value = 1;
   disarmAll.mockClear();
   threadMap.value = new Map([[THREAD, makeThread()]]);
@@ -156,7 +165,7 @@ describe('the Changes panel row', () => {
 
   it('offers the standing apply in place of the Apply it withholds', () => {
     render(<ChangesView />, host);
-    expect(actionLabels()).toContain('Apply as it settles');
+    expect(actionLabels()).toContain('Apply on settle');
     expect(actionLabels()).not.toContain('Apply');
     expect(actionLabels()).not.toContain('Discard');
   });
@@ -164,7 +173,7 @@ describe('the Changes panel row', () => {
   it('shows the armed face, which cancels rather than re-arming', () => {
     standingApplyThreadIds.value = new Set([THREAD]);
     render(<ChangesView />, host);
-    expect(actionLabels()).toContain('✓ Applying as it settles');
+    expect(actionLabels()).toContain('✓ Applying on settle');
     expect(disabledActionButtons()).toEqual([]);
   });
 
@@ -189,7 +198,7 @@ describe('the Changes panel row', () => {
       data: [makeChange({ thread_unsettled: true, thread_settling: true, resolving_conflict: true })],
     };
     render(<ChangesView />, host);
-    expect(actionLabels()).not.toContain('Apply as it settles');
+    expect(actionLabels()).not.toContain('Apply on settle');
     expect(actionLabels()).toContain('Applying...');
     expect(host.textContent).toContain('Resolving merge conflicts');
     expect(host.textContent).not.toContain('The thread has not finished');
@@ -222,14 +231,14 @@ describe('the Changes panel bulk control', () => {
 
   it('offers the arm while nothing is armed', () => {
     render(<ChangesView />, host);
-    expect(bulkButton().textContent).toBe('Apply as they settle');
+    expect(bulkButton().textContent).toBe('Apply all on settle');
     expect(bulkButton().getAttribute('aria-pressed')).toBe('false');
   });
 
   it('shows the armed face and cancels on click, rather than re-arming', () => {
     standingApplyThreadIds.value = new Set([THREAD]);
     render(<ChangesView />, host);
-    expect(bulkButton().textContent).toBe('✓ Applying as they settle');
+    expect(bulkButton().textContent).toBe('✓ Applying all on settle');
     expect(bulkButton().getAttribute('aria-pressed')).toBe('true');
     bulkButton().click();
     expect(disarmAll).toHaveBeenCalledTimes(1);
@@ -241,7 +250,7 @@ describe('the Changes panel bulk control', () => {
   it('keeps its own face and its tooltip while the arm is in flight', () => {
     applyAllInProgress.value = true;
     render(<ChangesView />, host);
-    expect(bulkButton().textContent).toBe('Apply as they settle');
+    expect(bulkButton().textContent).toBe('Apply all on settle');
     expect(bulkButton().disabled).toBe(false);
     expect(bulkButton().getAttribute('data-tooltip')).toBe(SWEEP_ONLY_TIP);
   });
@@ -251,7 +260,24 @@ describe('the Changes panel bulk control', () => {
     applyAllInProgress.value = true;
     render(<ChangesView />, host);
     expect(bulkButton().disabled).toBe(false);
-    expect(disabledActionButtons()).not.toContain('✓ Applying as they settle');
+    expect(disabledActionButtons()).not.toContain('✓ Applying all on settle');
+  });
+
+  it('lands on the armed face the moment the sweep is pressed', () => {
+    applyAllInProgress.value = true;
+    armingStandingApplySweep.value = true;
+    render(<ChangesView />, host);
+    expect(bulkButton().textContent).toBe('✓ Applying all on settle');
+  });
+
+  // A cancel pressed mid-sweep waits for the sweep, whose arm frames land in
+  // that wait. The panel the owner pressed must not flick back to armed.
+  it('holds the unarmed face while a cancel is pending, whatever arms land', () => {
+    standingApplyThreadIds.value = new Set([THREAD]);
+    disarmingAllStandingApply.value = true;
+    render(<ChangesView />, host);
+    expect(bulkButton().textContent).toBe('Apply all on settle');
+    expect(actionLabels()).toContain('Apply on settle');
   });
 
   it('keeps the off drawn after the last thread stops working', () => {
@@ -259,7 +285,7 @@ describe('the Changes panel bulk control', () => {
     settlingThreadCount.value = 0;
     standingApplyThreadIds.value = new Set([THREAD]);
     render(<ChangesView />, host);
-    expect(bulkButton().textContent).toBe('✓ Applying as they settle');
+    expect(bulkButton().textContent).toBe('✓ Applying all on settle');
   });
 });
 
@@ -277,15 +303,15 @@ describe("the thread's own prompt row", () => {
   }
 
   it('draws no disabled action, and offers the standing apply', () => {
-    const control = getStandingApplyControl();
+    const control = standingApply();
     expect(control, 'a working coding-agent thread must offer a change action').not.toBeNull();
     render(control, host);
     expect(promptRowControl().disabled).toBe(false);
-    expect(promptRowControl().getAttribute('aria-label')).toBe('Apply as it settles');
+    expect(promptRowControl().getAttribute('aria-label')).toBe('Apply on settle');
   });
 
   it('carries a tooltip, which a disabled button would make unreachable', () => {
-    render(getStandingApplyControl(), host);
+    render(standingApply(), host);
     expect(promptRowControl().getAttribute('data-tooltip')).toBeTruthy();
   });
 
@@ -294,11 +320,11 @@ describe("the thread's own prompt row", () => {
       status: 'loaded',
       data: [makeChange({ thread_unsettled: true, thread_settling: true, resolving_conflict: true })],
     };
-    expect(getStandingApplyControl()).toBeNull();
+    expect(standingApply()).toBeNull();
   });
 
   it('offers nothing once the thread has settled, where Apply itself takes over', () => {
     threadMap.value = new Map([[THREAD, makeThread({ status: 'idle' })]]);
-    expect(getStandingApplyControl()).toBeNull();
+    expect(standingApply()).toBeNull();
   });
 });

@@ -18,8 +18,10 @@ pub(crate) mod diff;
 mod disk_usage;
 pub(crate) mod error;
 mod file_response;
+mod fonts;
 mod form_requests;
 mod frame_capability;
+mod frame_file_cors;
 mod frontend_preview;
 pub(crate) mod frontend_snapshot;
 pub(crate) mod handshake_scripts;
@@ -36,6 +38,7 @@ pub(crate) mod mutating_gate;
 mod notifications;
 #[cfg(test)]
 pub(crate) mod route_scan;
+mod themes;
 
 /// Where every `/api/v1` route is mounted, as one value.
 ///
@@ -64,7 +67,6 @@ pub(crate) mod proxy_wasm_signer;
 mod release_notices;
 mod repositories;
 mod sdk;
-mod sdk_fonts;
 mod sdk_prefs;
 mod search;
 pub(crate) mod secret_reveal;
@@ -74,7 +76,7 @@ pub(crate) mod standing_instruction;
 pub(crate) mod target_workspace;
 mod thread_queue;
 pub(crate) mod thread_reach;
-mod threads;
+pub(crate) mod threads;
 mod threads_compose;
 mod trigger_groups;
 mod triggers;
@@ -278,7 +280,7 @@ fn content_type_for_ext(ext: &str) -> &'static str {
     match ext {
         "html" | "htm" => "text/html",
         "css" => "text/css",
-        "js" => "application/javascript",
+        "js" | "mjs" => "application/javascript",
         "json" => "application/json",
         "txt" | "md" | "log" | "csv" => "text/plain",
         "xml" => "application/xml",
@@ -295,6 +297,8 @@ fn content_type_for_ext(ext: &str) -> &'static str {
         "webm" => "video/webm",
         "woff2" => "font/woff2",
         "woff" => "font/woff",
+        "ttf" => "font/ttf",
+        "otf" => "font/otf",
         _ => "application/octet-stream",
     }
 }
@@ -1426,10 +1430,11 @@ pub fn create_router(
         .merge(release_notices::router())
         .merge(repositories::router())
         .merge(sdk::router())
-        .merge(sdk_fonts::router())
+        .merge(fonts::router())
         .merge(sdk_prefs::router())
         .merge(data_api::router())
         .merge(blobs::router())
+        .merge(themes::router())
         .merge(plugins::router())
         .merge(webhooks::router())
         .merge(workspace_label::router())
@@ -1499,10 +1504,19 @@ pub fn create_router(
         api_routes.layer(axum::middleware::from_fn(browser_origin::enforce))
     };
 
+    // An app frame's own files: its bundle and the workspace's `data/` tree.
+    // Only these two load a font or a module script across the frame's opaque
+    // origin. See `api::frame_file_cors`.
+    let frame_files = Router::new()
+        .nest("/app", apps::ui_router().with_state(app_ui_state))
+        .nest_service("/data", serve_data)
+        .layer(axum::middleware::from_fn(
+            frame_file_cors::grant_font_and_script_loads,
+        ));
+
     let router = Router::new()
         .nest(API_V1_PREFIX, api_routes)
-        .nest("/app", apps::ui_router().with_state(app_ui_state))
-        .nest_service("/data", serve_data);
+        .merge(frame_files);
 
     // Unmatched (non-API, non-/app, non-/data) requests resolve the frontend
     // from the pre-built `dist/` at LUCIDOS_STATIC_DIR — the SAME serving path

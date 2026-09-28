@@ -187,7 +187,7 @@ export async function submitCredentialEdit(
  * a uuid in a dialog is not.
  */
 export async function deleteCredential(id: string, serviceName: string): Promise<void> {
-  if (!(await showConfirm(`Delete credentials for "${serviceName}"?`))) {
+  if (!(await showConfirm(`Delete credentials for "${serviceName}"?`, 'Delete', { variant: 'danger' }))) {
     return;
   }
 

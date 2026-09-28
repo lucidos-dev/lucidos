@@ -1,10 +1,11 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { threadMap, focusedThreadId, changes, confirmState, applyingNowThreadIds, discardingCCThreadIds, archivingThreadIds } from '../store';
+import { threadMap, focusedThreadId, changes, confirmState, applyingNowThreadIds, discardingCCThreadIds, archivingThreadIds, armingStandingApplyThreadIds } from '../store';
 import type { ThreadMeta, ThreadState } from '../thread-events';
 import type { Change } from '../../api/client';
 import { makeThreadState } from './threads-test-helpers';
 import { _resetComposeDraftsForTesting, getDraft } from '../composeDrafts';
-import { resolveThreadActions, resolveGlobalActions, nextCloseLayer, runCloseCascade, discardDraft, type TaggedAction } from './threadActions';
+import { resolveThreadActions, resolveChangeMenuActions, nextCloseLayer, runCloseCascade, discardDraft, type TaggedAction } from './threadActions';
+import { ARCHIVE_PINNED_CONFIRM } from './threads';
 import {
   pushOverlay,
   removeOverlay,
@@ -41,6 +42,7 @@ beforeEach(() => {
   applyingNowThreadIds.value = new Map();
   discardingCCThreadIds.value = new Set();
   archivingThreadIds.value = new Set();
+  armingStandingApplyThreadIds.value = new Set();
   confirmState.value = { visible: false, message: '', okLabel: 'Delete' };
   _resetComposeDraftsForTesting();
   _resetOverlayStackForTesting();
@@ -64,6 +66,13 @@ describe('resolveThreadActions', () => {
     const actions = resolveThreadActions('t1');
     expect(kinds(actions)).toEqual(['archive', 'unsave']);
     expect(actions[1]).toMatchObject({ category: 'save', label: '✓ Pinned' });
+  });
+
+  // A pinned thread always sits in the inbox (ADR 0312). So a settled one is
+  // offered Archive, and the user is never left with Unpin alone.
+  it('a pinned, settled coding-agent thread with no change offers Archive beside Unpin', () => {
+    setThread(makeThreadState('t1', { meta: { channel: 'claude_code', section: 'inbox', status: 'idle', saved: true } }));
+    expect(kinds(resolveThreadActions('t1'))).toEqual(['archive', 'unsave']);
   });
 
   it('CC thread with a pending change → Discard (close) + Apply (primary) + Pin', () => {
@@ -217,6 +226,48 @@ describe('resolveThreadActions', () => {
   });
 });
 
+describe('resolveChangeMenuActions', () => {
+  function proposedCcThread(extra: Partial<ThreadMeta> = {}): void {
+    setThread(makeThreadState('t1', {
+      meta: { channel: 'claude_code', section: 'inbox', status: 'idle', codingAgentProposed: true, ...extra },
+    }));
+    changes.value = { status: 'loaded', data: [pendingChangeRow('t1')] };
+  }
+
+  it('lists Apply before Discard for a pending change, and nothing else', () => {
+    proposedCcThread();
+    expect(kinds(resolveChangeMenuActions('t1'))).toEqual(['apply', 'discard']);
+  });
+
+  it('offers the standing apply while an event wait withholds Apply', () => {
+    proposedCcThread({ liveEventWaitCount: 1 });
+    expect(kinds(resolveChangeMenuActions('t1'))).toEqual(['apply_when_settled']);
+  });
+
+  it('drops the standing apply while its own request is in flight', () => {
+    proposedCcThread({ liveEventWaitCount: 1 });
+    armingStandingApplyThreadIds.value = new Set(['t1']);
+    expect(resolveChangeMenuActions('t1')).toEqual([]);
+  });
+
+  it('is empty for a thread with no change', () => {
+    setThread(makeThreadState('t1', { meta: { section: 'inbox', status: 'idle' } }));
+    expect(resolveChangeMenuActions('t1')).toEqual([]);
+  });
+
+  it('is empty while an apply is in flight', () => {
+    proposedCcThread();
+    applyingNowThreadIds.value = new Map([['t1', 'applying']]);
+    expect(resolveChangeMenuActions('t1')).toEqual([]);
+  });
+
+  it('is empty while a discard is in flight', () => {
+    proposedCcThread();
+    discardingCCThreadIds.value = new Set(['t1']);
+    expect(resolveChangeMenuActions('t1')).toEqual([]);
+  });
+});
+
 describe('overlayStack', () => {
   it('is LIFO; top reflects the most recent push', () => {
     pushOverlay({ id: 'a', dismiss: () => {}, hasPanel: true });
@@ -240,28 +291,6 @@ describe('overlayStack', () => {
     pushOverlay({ id: 'a', dismiss: () => {}, hasPanel: true });
     pushOverlay({ id: 'a', dismiss: () => {}, hasPanel: true });
     expect(overlayStack.value.filter((e) => e.id === 'a')).toHaveLength(1);
-  });
-});
-
-describe('resolveGlobalActions', () => {
-  it('prepends a dismiss-overlay action when an overlay is open', () => {
-    setThread(makeThreadState('t1', { meta: { section: 'inbox', status: 'idle' } }));
-    focusedThreadId.value = 't1';
-    pushOverlay({ id: 'modal', dismiss: () => {}, hasPanel: true });
-    const actions = resolveGlobalActions();
-    expect(actions[0]).toMatchObject({ kind: 'dismiss_overlay', category: 'dismiss' });
-    // ...followed by the focused thread's actions.
-    expect(kinds(actions).slice(1)).toEqual(['archive', 'save']);
-  });
-
-  it('with no overlay open, returns just the focused thread actions', () => {
-    setThread(makeThreadState('t1', { meta: { section: 'inbox', status: 'idle' } }));
-    focusedThreadId.value = 't1';
-    expect(kinds(resolveGlobalActions())).toEqual(['archive', 'save']);
-  });
-
-  it('with no focused thread and no overlay, returns []', () => {
-    expect(resolveGlobalActions()).toEqual([]);
   });
 });
 
@@ -302,6 +331,19 @@ describe('runCloseCascade no-op gates', () => {
 
     await runCloseCascade();
     expect(confirmState.value.visible).toBe(false);
+  });
+
+  it('archiving a pinned thread asks first, saying that it unpins', async () => {
+    setThread(makeThreadState('t1', { meta: { section: 'inbox', status: 'idle', saved: true } }));
+    focusedThreadId.value = 't1';
+
+    const pending = runCloseCascade();
+    await Promise.resolve();
+    expect(confirmState.value.visible).toBe(true);
+    expect(confirmState.value.message).toBe(ARCHIVE_PINNED_CONFIRM);
+    expect(confirmState.value.okLabel).toBe('Archive');
+    confirmState.value.resolve?.(false);
+    await pending;
   });
 
   it('opens the apply/discard choice for a thread with a pending change', async () => {

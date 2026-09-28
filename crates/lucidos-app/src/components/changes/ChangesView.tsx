@@ -1,14 +1,15 @@
 import { Fragment } from 'preact';
 import { useRef, useCallback, useEffect } from 'preact/hooks';
 import { useSignal } from '@preact/signals';
-import { changes, appliedChanges, changesHasMore, changesLoadingMore, busyChangeIds, applyAllInProgress, showConfirm, standingApplyThreadIds, settlingThreadCount } from '../../store/store';
-import { applySingleChange, discardSingleChange, applyAllChanges, discardAllChanges, revertChange, loadMoreChanges, armStandingApply, disarmStandingApply, disarmAllStandingApplies, APPLY_NEW_VERSION_TOOLTIP } from '../../store/actions/chat-changes';
+import { changes, appliedChanges, changesHasMore, changesLoadingMore, busyChangeIds, applyAllInProgress, showConfirm, standingApplyThreadIds, armingStandingApplySweep, disarmingAllStandingApply, settlingThreadCount } from '../../store/store';
+import { applySingleChange, discardSingleChange, applyAllChanges, discardAllChanges, revertChange, loadMoreChanges, armStandingApply, disarmStandingApply, disarmAllStandingApplies, refreshChangesState, APPLY_NEW_VERSION_TOOLTIP } from '../../store/actions/chat-changes';
 import { viewChangeDiff } from '../../store/actions/repositories';
 import { focusThreadOrBootstrap } from '../../store/actions/threads';
 import type { Change } from '../../api/client';
 import { formatTimeAgo } from '../../utils/formatTime';
 import { formatFileCount } from '../../utils/formatFileCount';
-import { useDelayedLoading } from '../../hooks/useDelayedLoading';
+import { useDelayedFlag, useDelayedLoading } from '../../hooks/useDelayedLoading';
+import { usePanelRefresh } from '../../hooks/usePanelRefresh';
 import { LoadableError } from '../shared/LoadableError';
 import { ListSkeletonOf, useSkeleton, SkText, SkBlock } from '../shared/Skeleton';
 import { LoadingFade } from '../shared/LoadingFade';
@@ -85,7 +86,7 @@ export function changeRowActions(change: Change, armed: boolean): ChangeRowActio
     return [
       {
         kind: 'standing',
-        label: armed ? '✓ Applying as it settles' : 'Apply as it settles',
+        label: armed ? '✓ Applying on settle' : 'Apply on settle',
         tooltip: armed
           ? 'Armed. This change applies when its thread finishes, and drops with a report if the thread stops on a question or fails. Click to cancel.'
           : `${THREAD_UNSETTLED_TIP}. Arm this and it applies the moment the thread finishes.`,
@@ -142,6 +143,8 @@ function ChangeRow({ change, busy, armed, onOpen, onDiff, onDiscard, onApply, on
               {change.resolving_conflict
                 ? ' · Resolving merge conflicts'
                 : change.thread_unsettled && ' · The thread has not finished'}
+              {!change.resolving_conflict && change.predicted_conflict === 'conflict'
+                && ' · Likely merge conflict'}
             </>
           )}
         </SkText>
@@ -198,7 +201,7 @@ export const SWEEP_ARMED_TIP =
  *  working, and how many carry a *standing apply*.
  *
  *  ADR 0168 gives Apply All a "Keep going as the rest settle" checkbox. The
- *  button reads "Apply as they settle" when nothing is pending, and it is a
+ *  button reads "Apply all on settle" when nothing is pending, and it is a
  *  TOGGLE: armed, the same control cancels. Everything falls out of three
  *  questions. Is there something to apply now, something to arm, and is
  *  anything armed already?
@@ -253,6 +256,7 @@ export function openChangeThread(change: Change): void {
 
 export function ChangesView() {
   const sentinelRef = useRef<HTMLDivElement>(null);
+  usePanelRefresh('changes', refreshChangesState);
   const busyIds = useSignal<Set<string>>(new Set());
 
   const guardedAction = useCallback((id: string, action: (id: string) => Promise<void>) => {
@@ -273,6 +277,7 @@ export function ChangesView() {
   const appliedLoadable = appliedChanges.value;
   const hasMore = changesHasMore.value;
   const loadingMore = changesLoadingMore.value;
+  const showLoadingMore = useDelayedFlag(loadingMore);
 
   // Infinite scroll: observe a sentinel at the bottom of the applied list. The
   // real scroll container is the ancestor `.content-pane-body` (overflow-y: auto
@@ -306,7 +311,7 @@ export function ChangesView() {
               : appliedLoadable.status === 'failed' ? appliedLoadable.error
               : 'Unknown error';
     return (
-      <div class="panel-content">
+      <div class="panel-content protected-surface">
         <LoadableError noun="changes" error={err} />
       </div>
     );
@@ -314,12 +319,18 @@ export function ChangesView() {
   const bothLoaded = pendingLoadable.status === 'loaded' && appliedLoadable.status === 'loaded';
 
   return (
-    <div class="panel-content">
+    <div class="panel-content protected-surface">
       <LoadingFade showSkeleton={showLoading} skeleton={<ListSkeletonOf fill containerClass="list-rows" row={() => <ChangeRow />} />}>
         {bothLoaded ? (() => {
           const pending = pendingLoadable.data;
           const applied = appliedLoadable.data;
-          const bulk = bulkApplyState(pending, settlingThreadCount.value, standingApplyThreadIds.value.size);
+          // A pending cancel holds every face unarmed. It waits for an
+          // in-flight sweep, whose arm frames would otherwise flick them back.
+          const cancelingAll = disarmingAllStandingApply.value;
+          const armedThreads = cancelingAll
+            ? 0
+            : standingApplyThreadIds.value.size || (armingStandingApplySweep.value ? 1 : 0);
+          const bulk = bulkApplyState(pending, settlingThreadCount.value, armedThreads);
           const bulkRow = bulk.show ? (
             <div class="changes-bulk-actions">
               {/* Discard All skips changes whose thread is still working
@@ -348,8 +359,8 @@ export function ChangesView() {
 
                   TWO faces, never a third. This control ARMS, so it has no
                   progress of its own to report: a press lands on the armed
-                  face, which the `StandingApplyArmed` events bring a moment
-                  later. Apply All's "Applying..." belongs to a batch this
+                  face at once, and the `StandingApplyArmed` events hold it
+                  there. Apply All's "Applying..." belongs to a batch this
                   press never starts, and wearing it flashes a narrower, faded
                   pill on the way.
 
@@ -365,7 +376,7 @@ export function ChangesView() {
                     data-tooltip={SWEEP_ARMED_TIP}
                     onClick={() => void disarmAllStandingApplies()}
                   >
-                    ✓ Applying as they settle
+                    ✓ Applying all on settle
                   </button>
                 ) : (
                   <button
@@ -374,7 +385,7 @@ export function ChangesView() {
                     data-tooltip={SWEEP_ONLY_TIP}
                     onClick={() => void applyAllChanges(true)}
                   >
-                    Apply as they settle
+                    Apply all on settle
                   </button>
                 )
               )}
@@ -410,7 +421,7 @@ export function ChangesView() {
             // doing so races (or yanks the worktree from) the live coding-agent
             // session. The server refuses it too (guard_change_action). What the
             // row offers instead is the standing apply.
-            const armed = !!change.thread_id && standingApplyThreadIds.value.has(change.thread_id);
+            const armed = !cancelingAll && !!change.thread_id && standingApplyThreadIds.value.has(change.thread_id);
             return (
               <ChangeRow
                 key={change.id}
@@ -456,7 +467,7 @@ export function ChangesView() {
                     {change.status === 'applied' ? (
                       <button class="action-btn action-btn-danger" disabled={busyIds.value.has(change.id)} onClick={async (e) => {
                         e.stopPropagation();
-                        if (await showConfirm('Revert this change? Any later applied changes that touch the same files may conflict.', 'Revert')) {
+                        if (await showConfirm('Revert this change? Any later applied changes that touch the same files may conflict.', 'Revert', { variant: 'default' })) {
                           guardedAction(change.id, revertChange);
                         }
                       }}>Revert</button>
@@ -466,13 +477,13 @@ export function ChangesView() {
                   </div>
                 </div>
               ))}
+              {/* The next page's rows, drawn above the sentinel that asked for them. */}
+              <LoadingFade showSkeleton={showLoadingMore} skeleton={<ListSkeletonOf count={2} containerClass="list-rows" row={() => <ChangeRow />} />}>
+                {null}
+              </LoadingFade>
               {hasMore && (
-                <div
-                  ref={sentinelRef}
-                  class="dropdown-panel-loading-more"
-                  style={loadingMore ? undefined : 'opacity: 0.4'}
-                >
-                  {loadingMore ? 'Loading more...' : 'Scroll for more'}
+                <div ref={sentinelRef} class="dropdown-panel-loading-more" style="opacity: 0.4">
+                  {!loadingMore && 'Scroll for more'}
                 </div>
               )}
             </>

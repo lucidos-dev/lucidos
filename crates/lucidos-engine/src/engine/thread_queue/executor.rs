@@ -12,7 +12,9 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::ThreadQueueRequest;
-use crate::engine::thread_events::{ActorMode, EventChannel, EventMeta, TriggerInvocation};
+use crate::engine::thread_events::{
+    ActorMode, EventChannel, EventMeta, MessageOrigin, TriggerInvocation,
+};
 use crate::engine::LucidosEngine;
 use crate::scheduler::user_tasks;
 
@@ -59,6 +61,9 @@ impl EngineThreadQueueExecutor {
 /// split is testable without an engine: a `relation: "top"` request must
 /// produce an event with `parent_thread_id: None` (no callback, no count bump)
 /// AND a `ThreadLink` origin naming the spawning thread.
+///
+/// The mode follows the origin, so an engine-seeded spawn (a plugin setup
+/// thread) stamps `Engine` and never trips the origin/mode check.
 pub(crate) fn eager_sub_thread_message(
     workspace: &std::path::Path,
     request: &ThreadQueueRequest,
@@ -80,10 +85,9 @@ pub(crate) fn eager_sub_thread_message(
         prompt,
         None,
         None,
-        None,
         *parent_thread_id,
         *spawning_event_id,
-        ActorMode::Agent,
+        MessageOrigin::mode_or(origin.as_ref(), ActorMode::Agent),
         model.as_deref(),
         reasoning_effort.as_deref(),
         None,
@@ -615,6 +619,47 @@ mod tests {
         assert_eq!(origin, spawning_thread_link(spawning_thread));
         assert_eq!(parent_thread_id, None);
         assert_eq!(spawning_event_id, None);
+    }
+
+    /// An engine-seeded spawn has no launching thread and no device. Its
+    /// origin is the engine, and the mode has to follow it. A hardcoded
+    /// `Agent` makes an engine origin panic `make_message_received`.
+    #[test]
+    fn eager_sub_thread_message_stamps_the_mode_its_origin_implies() {
+        use crate::engine::thread_events::{EngineReason, PluginSetupOccasion};
+
+        let origin = Some(MessageOrigin::engine(EngineReason::PluginSetup {
+            plugin_id: "habit-tracker".into(),
+            plugin_name: "Habit Tracker".into(),
+            version: "0.2.0".into(),
+            occasion: PluginSetupOccasion::FreshInstall,
+            confirmed_on_device_id: None,
+        }));
+        let request = ThreadQueueRequest::SubThread {
+            depth: 0,
+            prompt: "Set up the newly installed Habit Tracker plugin.".into(),
+            child_thread_id: Uuid::new_v4(),
+            parent_thread_id: None,
+            spawning_event_id: None,
+            title: None,
+            model: None,
+            reasoning_effort: None,
+            pre_emitted_origin: None,
+            origin: origin.clone(),
+        };
+        let event =
+            eager_sub_thread_message(std::path::Path::new("/tmp/lucidos-test-ws"), &request)
+                .expect("SubThread produces an event");
+        let ThreadEvent::MessageReceived {
+            origin: stamped,
+            mode,
+            ..
+        } = event
+        else {
+            panic!("expected MessageReceived");
+        };
+        assert_eq!(stamped, origin);
+        assert_eq!(mode, ActorMode::Engine);
     }
 
     #[test]

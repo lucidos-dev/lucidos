@@ -75,17 +75,17 @@
         var(--header-nav-min-span),
         calc(100% - 2 * var(--header-nav-edge-reserve))
     );
+    /* The chevrons' TAP target, as distinct from their 1.75rem button box,
+       which is drawn and placed. 44px at the 16px root, the platform's minimum
+       touch target. See .header-nav-cluster > .nav-chevron::before. */
+    --header-nav-hit-target: 2.75rem;
 
     /* The badge riding the mark's corner (see .brand-mark-slot below).
        - offset: a NUDGE away from the glyph's corner, on top of the derived
          inset the badge rule computes. Zero means "on the corner", which is
          where it belongs; it is here so the remote can move it without
-         reaching into the geometry.
-       - hit reach: how far the badge's touch target grows past itself, up and
-         to the right only. See the ::after rule for why it cannot grow the
-         other way. */
+         reaching into the geometry. */
     --header-mark-badge-offset: 0rem;
-    --header-mark-badge-hit-reach: 0.75rem;
     /* The unread count's box, on the opposite corner. Smaller than the base
        `.badge` (0.875rem), because that one is sized for a roomy icon button
        and here it covers most of a 1.6rem glyph. The count still has to be
@@ -125,22 +125,15 @@
        The gap below the header is NOT here: it is --header-surface-gap in
        global/base.css, beside the --app-header-bottom it pairs with, because
        every surface hung from the header shares it.
-       The width is a BUDGET, not a taste: the Workspaces row is the widest thing
-       the panel has to hold (its glyph, the word "Workspaces", and a value pill
-       carrying the workspace name), and everything in it is rem-sized in a
-       monospace face whose advance is ~0.6em, so the room a name gets is
-       arithmetic rather than a guess. 15rem left the name 7 characters and
-       ellipsised "development" down to "develo…", which identifies nothing. This
-       holds 13, so an ordinary workspace name is spelled whole and only a long
-       one falls back to the ellipsis. Widening it further is cheap on desktop
-       and is not on a phone: at the 18px mobile root (styles/mobile.css) this
-       is 315px, so on a handset narrower than ~350px the `min()` below already
-       takes over and the name ellipsises whatever this value says. */
-    --brand-menu-width: 17.5rem;
-    --brand-menu-radius: 1.25rem;
+       The panel's width is --header-surface-width (global/base.css), shared
+       with the other header palettes. The Workspaces row is the widest thing it
+       holds (its glyph, the word "Workspaces", and a value pill carrying the
+       workspace name). Everything in it is rem-sized in a monospace face whose
+       advance is ~0.6em, so the room a name gets is arithmetic. 15rem left the
+       name 7 characters and ellipsised "development" down to "develo…". 17.5rem
+       held 13, and the shared width holds more. */
     --brand-menu-frame: 0.375rem;
-    --brand-menu-item-radius: calc(var(--brand-menu-radius) - var(--brand-menu-frame));
-    --brand-menu-scrim-tint: rgba(0, 0, 0, 0.36);
+    --brand-menu-item-radius: calc(var(--radius-surface) - var(--brand-menu-frame));
     /* Every row states its line-height rather than inheriting, because the rows
        are not all the same ELEMENT: a <button>, an <a> and a <div> all wear
        `.brand-menu-item`, and a button does not inherit the document's
@@ -162,6 +155,10 @@
        and neither may guess it: the dot's box, and the offset that lands it on
        the notice's FIRST line rather than in the middle of a wrapped sentence. */
     --brand-menu-notice-dot: 0.5rem;
+    /* Where a row's label starts: its padding, the icon box every row glyph
+       takes, and its gap. An action hung under a notifications row starts
+       here too. */
+    --brand-menu-text-column: calc(var(--space-md) + var(--icon-size-md) + var(--space-sm));
     /* How much of the screen the unfolded workspace ROWS may take before they
        scroll inside the panel. Manage workspaces sits outside that box and is
        never counted here, so it cannot be scrolled away from.
@@ -245,6 +242,52 @@
 .header-nav-cluster > .icon-btn,
 .header-nav-cluster > .brand-mark-slot {
     flex: 0 0 auto;
+}
+
+/* Each chevron's tap target reaches past its button into the empty space
+   around it. A near miss then navigates instead of landing on the bare row.
+   The button box stays 1.75rem, because it is what the edge reserve places.
+
+   Transparent and positioned, like `.icon-btn.inline-icon::before`. The inward
+   reach is double the outward one: the outer slot can fill with the content
+   row's overflow trigger, and the reach toward the middle is still 44px wide.
+
+   At a high ui-scale the reach overlaps its neighbours, and every neighbour
+   must win the tap. The two rules below raise them, so no z-index goes here:
+   a disabled chevron's opacity makes it a stacking context, which would trap
+   a negative z-index inside the button. */
+.header-nav-cluster > .nav-chevron::before {
+    --nav-chevron-reach: calc((var(--header-nav-hit-target) - var(--mobile-header-icon-box)) / 2);
+    content: '';
+    position: absolute;
+    top: calc(-1 * var(--nav-chevron-reach));
+    bottom: calc(-1 * var(--nav-chevron-reach));
+}
+
+/* The chevrons' neighbours inside the cluster: the mark and the content
+   title. */
+.header-nav-cluster > .brand-mark-slot,
+.header-title-cluster > .mobile-content-title {
+    position: relative;
+    z-index: 1;
+}
+
+/* …and outside it: the row's own edge controls, the drawer toggle and the
+   hamburger. The transformed cluster otherwise paints over any that come
+   before it in the DOM. The content row's trailing actions are raised the same
+   way in mobile.css. */
+.mobile-header-row > .icon-btn {
+    z-index: 1;
+}
+
+.header-nav-cluster > .nav-chevron:first-child::before {
+    left: calc(-1 * var(--nav-chevron-reach));
+    right: calc(-2 * var(--nav-chevron-reach));
+}
+
+.header-nav-cluster > .nav-chevron:last-child::before {
+    left: calc(-2 * var(--nav-chevron-reach));
+    right: calc(-1 * var(--nav-chevron-reach));
 }
 
 /* …and the members are targets again, EXCEPT while the app is deliberately
@@ -364,6 +407,11 @@
     /* The flex-slot lift and tuck, which mean nothing out of flow and would
        otherwise offset the corner placement above. */
     margin: 0;
+    /* Purely visual in every state: the tap belongs to the mark, which opens
+       the menu that explains the badge. A positioned span is a hit target
+       whether or not it listens, and what is under it is the mark's button, a
+       SIBLING, so a tap on the corner would have nothing to bubble to. */
+    pointer-events: none;
 }
 
 /* The UNREAD COUNT, on the mark's BOTTOM-right corner.
@@ -391,40 +439,12 @@
     /* Inside its host too, for the reason the rule above gives. */
     --header-control-veil: inherit;
     --badge-height: var(--header-mark-count-size);
-    border-radius: 0.5rem;
+    border-radius: var(--radius-control);
     /* The tap belongs to the mark underneath, which opens the menu holding the
-       matching rows. Same reason the ready badge is click-through below: this
+       matching rows. Same reason the state badge above is click-through: this
        is a positioned span over a SIBLING button, so its own taps would die. */
     pointer-events: none;
     margin: 0;
-}
-
-/* The READY badge ("!") is a plain span with no handler, and overlaying it on
-   the mark is what makes that a problem: a positioned element is a hit target
-   whether or not anything listens, and here the thing underneath is the mark's
-   own button, a SIBLING rather than an ancestor, so a tap on the corner has
-   nothing to bubble to and simply dies. Beside a title the same span is
-   harmless, and on the desktop label it is better than harmless: it sits inside
-   a clickable host, which is what the "the click falls through to its host"
-   note on BrandBadge is about. Click-through restores that here.
-   `:not()` rather than a paired `pointer-events: auto` rule, so the badge that
-   IS a button (and its hit area below) is never taken away and put back. */
-.brand-mark-slot .badge.brand-badge:not(.brand-badge-action) {
-    pointer-events: none;
-}
-
-/* The busy badge's finger-sized hit area, reined in. Beside a title it can be a
-   2.75rem square centred on the badge and cost nothing; on the mark that square
-   blankets the menu's own tap target, so tapping the brand would open the
-   background-activity toast instead of the menu. That is the very
-   button-swallows-button failure the sibling markup exists to avoid, arriving
-   by geometry rather than by nesting (see BrandMenuButton). So it grows only
-   OUTWARD, up and to the right: the bottom and left edges stay on the badge, so
-   the mark keeps its centre and everything below and left of it. */
-.brand-mark-slot .brand-badge-action::after {
-    inset: calc(-1 * var(--header-mark-badge-hit-reach))
-           calc(-1 * var(--header-mark-badge-hit-reach))
-           0 0;
 }
 
 /* The mark dressed as a member of an icon run (the threads header), keeping
@@ -471,10 +491,9 @@
     padding: 0;
     border: none;
     background: none;
-    border-radius: 50%;
+    border-radius: var(--radius-round);
     cursor: pointer;
     position: relative;
-    -webkit-tap-highlight-color: transparent;
 }
 
 /* The glyph, flat in the header's own foreground scale. There is ONE rendering
@@ -598,34 +617,20 @@
 }
 
 /* ── The menu ─────────────────────────────────────────────────────────────
- * A centred modal over a dimmed app, the same shape as the workspace switcher.
+ * A menu hung from the header. It dims nothing: only a surface that blocks
+ * until it is answered takes a scrim, and a menu is not one.
  *
- * Both halves are portaled to <body> (see BrandMenuButton), and that is
- * structural rather than tidy: the mark renders inside `.header-nav-cluster`,
- * which is `transform`ed, and a transformed ancestor becomes the containing
- * block for its `position: fixed` descendants. Left in place, every offset
- * below would resolve against that cluster instead of the viewport and the
- * panel would centre itself on the mark.
+ * It is portaled to <body> (see BrandMenuButton), and that is structural rather
+ * than tidy: the mark renders inside `.header-nav-cluster`, which is
+ * `transform`ed, and a transformed ancestor becomes the containing block for
+ * its `position: fixed` descendants. Left in place, every offset below would
+ * resolve against that cluster instead of the viewport and the panel would
+ * centre itself on the mark.
  *
- * The pair sits above --z-toast, not at --z-modal, for the reason the switcher
+ * It sits above --z-toast, not at --z-modal, for the reason the switcher
  * documents in styles/panels/shell.css: a surface the user explicitly opened
  * must paint over a persistent toast ("Restart needed", "New version
- * available"), and --z-toast (2400) is deliberately above --z-modal (2300).
- * The +40/+50 split keeps the panel above its own scrim. */
-.brand-menu-scrim {
-    position: fixed;
-    inset: 0;
-    z-index: calc(var(--z-toast) + 40);
-    /* Click-through on purpose: the tap must reach `.app-shell` underneath, which
-       is what the Overlay's outside-click contract resolves against. A scrim that
-       swallowed it would leave the dismiss with no target inside the app (the same
-       reason `.app-shell` itself stays a hit target, see global/modal-overlay.css).
-       So this element is the dim and nothing else. */
-    pointer-events: none;
-    background: var(--brand-menu-scrim-tint);
-    animation: modal-in var(--duration-fast) ease;
-}
-
+ * available"), and --z-toast (2400) is deliberately above --z-modal (2300). */
 /* Centred on the HORIZONTAL axis of the pane the mark belongs to, and hung from
    the header's bottom edge: the menu belongs to the mark, so it reads as coming
    out of the row it was opened from rather than as a dialog that took over the
@@ -641,12 +646,7 @@
     top: calc(var(--app-header-bottom) + var(--header-surface-gap));
     left: 50%;
     transform: translateX(-50%);
-    /* Never wider than the phone it is centred on, frame included. */
-    width: min(var(--brand-menu-width), calc(100vw - 2 * var(--space-lg)));
-    background: var(--bg-secondary);
-    border: 1px solid var(--border-color);
-    border-radius: var(--brand-menu-radius);
-    box-shadow: var(--shadow-lg);
+    width: var(--header-surface-width);
     padding: var(--brand-menu-frame);
     /* The panel hangs from the header, so the room it has is whatever is left
        below it, and it must never claim more: it is `position: fixed`, so
@@ -695,7 +695,7 @@
     background: none;
     color: var(--text-primary);
     font-family: inherit;
-    font-size: var(--font-size-lg);
+    font-size: var(--font-size-md);
     /* Explicit, so a button row and a div row are the same height. See the
        token's own note. */
     line-height: var(--brand-menu-row-line-height);
@@ -708,11 +708,14 @@
     text-decoration: none;
     border-radius: var(--brand-menu-item-radius);
     cursor: pointer;
-    -webkit-tap-highlight-color: transparent;
 }
 
-.brand-menu-item:hover {
-    background: var(--bg-hover);
+/* Pointer hover only: on touch a `:hover` latches onto the row just tapped.
+   A static row and the confirm row do nothing themselves, so they never band. */
+@media (hover: hover) {
+    .brand-menu-item:not(.brand-menu-item-static, .brand-menu-confirm-row):hover {
+        background: var(--bg-hover);
+    }
 }
 
 /* ── The connection notice ────────────────────────────────────────────────
@@ -879,7 +882,7 @@
     width: 0.375rem;
     height: 0.375rem;
     flex: 0 0 auto;
-    border-radius: 50%;
+    border-radius: var(--radius-round);
     background: var(--accent);
 }
 
@@ -910,9 +913,9 @@
 
 /* Which way the list is about to go, in the pill and at exactly the check's
    footprint. It is not beside the pill: the panel width is a budget (see
-   --brand-menu-width) that an extra 0.75rem plus its gap overspends by about a
-   character and a half, which is what ellipsised "development" the first time
-   this was built. Taking the marker slot instead is free, and the check it
+   --header-surface-width). At the old 17.5rem an extra 0.75rem plus its gap
+   overspent it by about a character and a half, which ellipsised "development"
+   the first time this was built. Taking the marker slot instead is free, and the check it
    replaces is not lost, the unfolded list marks the current workspace with
    one. */
 .brand-menu-value-chevron {
@@ -997,17 +1000,17 @@
     text-decoration: none;
     border-radius: var(--brand-menu-item-radius);
     cursor: pointer;
-    -webkit-tap-highlight-color: transparent;
 }
 
 /* Only the rows that DO something react. The current workspace and an
    unreachable one render as <div>s, so the element selector is what tells them
-   apart without a modifier class. Unwrapped by `@media (hover: hover)` for the
-   reason `.brand-menu-item:hover` is: see that rule. */
-button.brand-menu-ws-row:hover,
-a.brand-menu-ws-row:hover {
-    background: var(--bg-hover);
-    color: var(--text-primary);
+   apart without a modifier class. */
+@media (hover: hover) {
+    button.brand-menu-ws-row:hover,
+    a.brand-menu-ws-row:hover {
+        background: var(--bg-hover);
+        color: var(--text-primary);
+    }
 }
 
 div.brand-menu-ws-row {
@@ -1041,13 +1044,242 @@ div.brand-menu-ws-row {
     --badge-height: 1lh;
     min-width: 1.125rem;
     padding: 0 var(--space-xs);
-    border-radius: 0.5625rem;
+    border-radius: calc(var(--radius-control) * 1.125);
     background: var(--accent);
     color: var(--text-on-accent);
     font-size: var(--font-size-2xs);
     font-weight: 700;
     font-variant-numeric: tabular-nums;
     text-align: center;
+}
+
+/* ── The activity group ───────────────────────────────────────────────────
+ * One row per job in flight (ActivityMenuRows.tsx): a spinner where the other
+ * rows draw an icon, the job on one line, its elapsed time or count at the
+ * trailing edge, and a chevron because the row unfolds the job's detail. */
+
+/* An unfolded label wraps, and the mark, the time and the chevron stay on its
+   FIRST line. Every item is top-aligned in a box one line tall, and the
+   padding is what a single-line row keeps of the shared min-height. */
+.brand-menu-activity-row {
+    --brand-menu-activity-line: calc(var(--font-size-md) * var(--brand-menu-row-line-height));
+    align-items: flex-start;
+    padding-block: calc((var(--brand-menu-row-min-height) - var(--brand-menu-activity-line)) / 2);
+}
+
+/* The leading slot is an icon's width, so the label lands on the same text
+   column as every other row in the panel. */
+.brand-menu-activity-mark {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex: 0 0 auto;
+    width: var(--icon-size-md);
+    height: var(--brand-menu-activity-line);
+}
+
+/* Smaller than the icon slot it sits in, so it reads as a status mark beside
+   the label rather than as a glyph louder than the row icons below it. The
+   thinner ring keeps its hole open at this size. It takes the label's colour,
+   so it reads as part of the job's line rather than as an alert. */
+.brand-menu-activity-mark .mini-spinner {
+    --spinner-color: currentColor;
+    width: 0.625rem;
+    height: 0.625rem;
+    border-width: 0.09375rem;
+}
+
+/* A job waiting its turn: the badge's still hourglass, the spinner's size. */
+.brand-menu-activity-mark svg {
+    width: 0.625rem;
+    height: 0.625rem;
+}
+
+/* The pending row's mark: the badge's own dot, since it stands for the dot. */
+.brand-menu-activity-dot {
+    width: 0.5rem;
+    height: 0.5rem;
+    border-radius: var(--radius-round);
+    background: var(--accent);
+}
+
+.brand-menu-activity-row.is-wedged .brand-menu-activity-dot {
+    background: var(--accent-yellow);
+}
+
+/* One line while folded: a long thread title ellipsizes rather than wrapping
+   the row, which is the "one line per job" the group promises. Unfolded, the
+   row shows its whole title. */
+.brand-menu-activity-label {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.brand-menu-activity-row.is-expanded .brand-menu-activity-label {
+    white-space: normal;
+    overflow-wrap: anywhere;
+}
+
+/* Tabular, so a ticking counter does not jitter the label beside it. */
+.brand-menu-activity-detail {
+    flex: 0 0 auto;
+    color: var(--text-secondary);
+    font-size: var(--font-size-sm);
+    /* The label's line box, so the smaller text centres on its first line. */
+    line-height: var(--brand-menu-activity-line);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+}
+
+/* The pending row's trailing chevron. That row never wraps, so its one line
+   is the whole content box. */
+.brand-menu-activity-row > svg {
+    align-self: center;
+    width: var(--icon-size-sm);
+    height: var(--icon-size-sm);
+}
+
+/* Which way the detail is about to go, turned the way the Workspaces row
+   turns its own. */
+.brand-menu-activity-chevron {
+    flex: 0 0 auto;
+    display: inline-flex;
+    align-items: center;
+    width: 0.75rem;
+    height: var(--brand-menu-activity-line);
+    color: var(--text-secondary);
+    transition: transform var(--duration-fast) ease;
+}
+
+.brand-menu-activity-chevron svg {
+    width: 100%;
+    height: 0.75rem;
+    display: block;
+}
+
+.brand-menu-activity-row.is-expanded .brand-menu-activity-chevron {
+    transform: rotate(180deg);
+}
+
+/* A job's detail, unfolded under its row (ActivityMenuRows.tsx). It takes the
+   rows' own padding on both sides, so its text starts under the row icons and
+   every line in the panel shares one margin. */
+.brand-menu-activity-body {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-sm);
+    padding: 0 var(--space-md) var(--space-sm);
+    color: var(--text-secondary);
+    font-size: var(--font-size-md);
+}
+
+.brand-menu-activity-note,
+.brand-menu-activity-housekeeping {
+    margin: 0;
+}
+
+.brand-menu-activity-progress {
+    position: relative;
+}
+
+/* The Apply All member in flight, beside the filled span of finished ones. It
+   pulses because the step has no fraction of its own, and an empty slot read
+   as a stalled apply. */
+.brand-menu-activity-working {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    background: var(--accent);
+    border-radius: calc(var(--radius-control) * 0.375);
+    animation: progress-pulse 2s ease-in-out infinite;
+    transition: left var(--duration-slow) ease, width var(--duration-slow) ease;
+}
+
+:root[data-motion="reduce"] .brand-menu-activity-working {
+    animation: none;
+    opacity: 0.5;
+}
+
+.brand-menu-activity-position {
+    color: var(--text-primary);
+    font-variant-numeric: tabular-nums;
+}
+
+/* A build's changelog can run long, and the menu is clipped rather than
+   scrolled, so the list scrolls inside its own cap. */
+.brand-menu-activity-changes {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-sm);
+    max-height: var(--brand-menu-ws-list-max-height);
+    overflow-y: auto;
+    overscroll-behavior: contain;
+}
+
+.brand-menu-activity-headline,
+.brand-menu-activity-group-title {
+    color: var(--text-primary);
+    font-weight: 600;
+}
+
+.brand-menu-activity-group-section ul {
+    margin: var(--space-xs) 0 0;
+    padding-left: 1.25rem;
+    font-size: var(--font-size-sm);
+}
+
+/* The thread an apply is on, as a link to the step: the phase and its times
+   on one line, the title in full under it, and the chevron beside both. The
+   title wraps here, where the row above ellipsizes it. */
+.brand-menu-activity-link {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+    column-gap: var(--space-sm);
+    width: 100%;
+    padding: var(--space-xs) 0;
+    border: none;
+    background: none;
+    color: var(--text-primary);
+    font-family: inherit;
+    font-size: inherit;
+    line-height: inherit;
+    text-align: left;
+    cursor: pointer;
+}
+
+.brand-menu-activity-phase {
+    grid-column: 1;
+    color: var(--text-secondary);
+    font-size: var(--font-size-sm);
+}
+
+.brand-menu-activity-thread {
+    grid-column: 1;
+    color: var(--accent);
+    overflow-wrap: anywhere;
+}
+
+.brand-menu-activity-link > svg {
+    grid-column: 2;
+    grid-row: 1 / span 2;
+    width: var(--icon-size-sm);
+    height: var(--icon-size-sm);
+}
+
+@media (hover: hover) {
+    .brand-menu-activity-link:hover .brand-menu-activity-thread {
+        text-decoration: underline;
+    }
+}
+
+.brand-menu-activity-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: var(--space-sm);
 }
 
 /* The way to everything the menu deliberately cannot do: create, rename,
@@ -1080,10 +1312,9 @@ div.brand-menu-ws-row {
 }
 
 /* Under a NOTIFICATIONS row, which is a `.brand-menu-item` leading with the
-   bell. Same derivation against that row's own two tokens: its padding, plus
-   the icon box every menu-row glyph takes, plus its gap. */
+   bell, so the action starts on that row's label column. */
 .brand-menu-ws-action-under-icon {
-    padding-left: calc(var(--space-md) + var(--icon-size-md) + var(--space-sm));
+    padding-left: var(--brand-menu-text-column);
 }
 
 /* Sized here rather than left to the icon, so it cannot reshape a row whose
@@ -1138,7 +1369,7 @@ div.brand-menu-ws-row {
     width: 0.4375rem;
     height: 0.4375rem;
     flex: 0 0 auto;
-    border-radius: 50%;
+    border-radius: var(--radius-round);
     background: var(--accent);
     pointer-events: none;
 }
@@ -1169,17 +1400,6 @@ div.brand-menu-ws-row {
     cursor: default;
 }
 
-/* Unconditional, NOT wrapped in `@media (hover: hover)`: the base
-   `.brand-menu-item:hover` it is cancelling is itself unwrapped, and on touch a
-   `:hover` latches after a tap and stays until the next tap elsewhere. Gated,
-   this override would not apply on a phone and the latch would leave a
-   non-interactive row looking pressed. Wins on source order at equal
-   specificity. */
-.brand-menu-item-static:hover,
-.brand-menu-confirm-row:hover {
-    background: none;
-}
-
 .brand-menu-confirm-actions {
     margin-left: auto;
     display: inline-flex;
@@ -1195,10 +1415,9 @@ div.brand-menu-ws-row {
     border: none;
     border-radius: var(--brand-menu-item-radius);
     padding: 0.1875rem var(--space-sm);
-    font: inherit;
-    /* `font` resets font-feature-settings to initial; keep inheriting it so a
-       Fira Code user does not get ligatures back here. */
-    font-feature-settings: inherit;
+    /* base.css gives a button its family and ligature setting; the UA font
+       leaves only the line height at `normal`. */
+    line-height: inherit;
     font-size: var(--font-size-sm);
     font-weight: 600;
     cursor: pointer;

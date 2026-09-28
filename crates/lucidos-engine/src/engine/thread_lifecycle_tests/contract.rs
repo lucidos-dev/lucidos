@@ -48,8 +48,10 @@ fn generate_cross_validation_fixture() -> String {
 
     // availableThreadActions: the full cross product of thread_types ×
     // statuses × sections × pending × descendants_block_archive × live_event_waits
-    // × has_unsent_draft × is_saved. Adding a `ThreadStatus` variant widens the
-    // fixture automatically; do not hardcode the case count here, it drifts.
+    // × has_unsent_draft × is_saved, minus the pinned-and-archived pair the engine
+    // cannot hold (`is_retention_legal`, ADR 0312). Adding a `ThreadStatus`
+    // variant widens the fixture automatically; do not hardcode the case count
+    // here, it drifts.
     for (tt_str, tt) in &thread_types {
         for (st_str, st) in &statuses {
             for (sec_str, sec) in &sections {
@@ -58,6 +60,9 @@ fn generate_cross_validation_fixture() -> String {
                         for &waits in &bools {
                             for &draft in &bools {
                                 for &saved in &bools {
+                                    if !is_retention_legal(*sec, saved) {
+                                        continue;
+                                    }
                                     let actions: Vec<&str> = available_thread_actions(
                                         *tt, *st, *sec, pending, dba, waits, draft, saved,
                                     )
@@ -87,10 +92,14 @@ fn generate_cross_validation_fixture() -> String {
     }
 
     // displaySection: the full cross product of sections × statuses × saved ×
-    // activeChildren × pending × attentionDescendants.
+    // activeChildren × pending × attentionDescendants, minus the same illegal
+    // pinned-and-archived pair.
     for (sec_str, sec) in &sections {
         for (st_str, st) in &statuses {
             for &saved in &bools {
+                if !is_retention_legal(*sec, saved) {
+                    continue;
+                }
                 for &active_children in &bools {
                     for &pending in &bools {
                         for &attention in &bools {
@@ -310,6 +319,13 @@ fn generate_typescript() -> String {
     out.push_str("]);\n");
 
     out
+}
+
+#[test]
+fn every_status_sql_literal_quotes_its_wire_text() {
+    for status in ThreadStatus::ALL {
+        assert_eq!(status.sql_literal(), format!("'{}'", status.as_str()));
+    }
 }
 
 // 22c. cross_validation_fixture_is_up_to_date

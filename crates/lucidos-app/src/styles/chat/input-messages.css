@@ -80,7 +80,7 @@
     margin-bottom: 0.375rem;
     background: color-mix(in srgb, var(--accent) 15%, transparent);
     border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
-    border-radius: 1rem;
+    border-radius: calc(var(--radius-control) * 2);
     font-size: var(--font-size-sm);
     color: var(--text-secondary);
     cursor: default;
@@ -110,7 +110,7 @@
     position: relative;
     width: 5rem;
     height: 5rem;
-    border-radius: 0.375rem;
+    border-radius: calc(var(--radius-surface) * 0.5);
     border: 1px solid var(--border-color);
 }
 
@@ -119,7 +119,7 @@
     height: 100%;
     object-fit: cover;
     cursor: pointer;
-    border-radius: 0.3125rem;
+    border-radius: calc(var(--radius-surface) * 5 / 12);
     overflow: hidden;
 }
 
@@ -130,7 +130,7 @@
     right: -0.375rem;
     width: 1.5rem;
     height: 1.5rem;
-    border-radius: 50%;
+    border-radius: var(--radius-round);
     background: rgba(0, 0, 0, 0.7);
     border: 1px solid rgba(255, 255, 255, 0.5);
     color: #fff;
@@ -166,7 +166,7 @@
     width: 5rem;
     height: 5rem;
     object-fit: cover;
-    border-radius: 0.25rem;
+    border-radius: calc(var(--radius-surface) / 3);
     border: 1px solid var(--border-color);
     cursor: pointer;
     /* Skeleton-toned fill so the loading <img> doesn't show the dark page
@@ -321,7 +321,7 @@
 .prompt-actions-row .icon-btn.header-icon.active[data-role="wip-preview-toggle"] {
     color: var(--accent);
     background: var(--bg-tertiary);
-    border-radius: 0.375rem;
+    border-radius: calc(var(--radius-control) * 0.75);
 }
 
 @media (hover: hover) {
@@ -335,7 +335,8 @@
  * Following the live edge is a standing mode that is on for most of a thread's
  * life, and a filled box held down that long at the end of a row of otherwise
  * unframed icons reads as a button jammed in rather than as a mode. The accent
- * alone carries the state, and the ordinary `.icon-btn:hover` background still
+ * and the magnet's own fill carry the state, the fill for looks whose accent is
+ * the text colour (Mono). The ordinary `.icon-btn:hover` background still
  * applies transiently, like every icon-btn. No hover override is needed to keep
  * the accent: this selector (0,5,0) already outranks `.icon-btn:hover` (0,2,0),
  * so the color holds under the pointer. */
@@ -372,7 +373,7 @@
 .prompt-actions-row .icon-btn.header-icon.active[data-role="call-toggle"] {
     color: var(--accent-green);
     background: color-mix(in srgb, var(--accent-green) 15%, transparent);
-    border-radius: 0.375rem;
+    border-radius: calc(var(--radius-control) * 0.75);
 }
 
 /* CALL PHASES. The rule above is the LIVE paint, and it was the only one a
@@ -588,7 +589,7 @@
     flex-wrap: wrap;
     align-items: center;
     gap: 0.5rem;
-    padding: var(--space-sm) var(--space-lg);
+    padding: 0 var(--space-lg) var(--space-sm);
 }
 
 /* The sweep checkbox beside Apply All. It reads as a modifier on the button it
@@ -667,12 +668,11 @@
 }
 
 .commands-btn .codex-icon {
-    /* The Codex mark hardcodes `stroke="var(--accent-light)"` as a presentation
-       attribute, because it stays accent-blue in those other surfaces; a
-       presentation attribute loses to any author rule, so this repaints it here
-       alone. Its stroke WIDTH is left as the artwork drew it: the fraction below
-       puts the mark in a smaller box than its neighbours, which thins the
-       painted stroke to 1.76px against the checkbox's 1.67px on its own. */
+    /* The Codex mark strokes `--codex-mark` through a presentation attribute,
+       so it keeps that colour on other surfaces. An author rule beats a
+       presentation attribute, so this rule repaints it here alone. Its stroke
+       WIDTH stays as drawn. The fraction below puts the mark in a smaller box,
+       which thins the stroke to 1.76px against the checkbox's 1.67px. */
     stroke: currentColor;
     --mark-art-fill: 0.88;
 }
@@ -720,37 +720,41 @@
     100% { transform: scale(1); }
 }
 
-/* Offset from `.control-menu`, whose height is the button's. The button wears
-   `.icon-btn.header-icon` now, so that box is 0.75rem taller than the glyph
-   inside it and the row's translateY drops the glyph a further 0.375rem: the
-   old `100% + 0.375rem` measured from the box, so the panel would sit a visible
-   0.625rem further from the mark than it used to. Flush with the box top hands
-   most of that back while leaving the button entirely uncovered. Do NOT reach
-   past it into the button's padding to close the rest: the panel is the higher
-   layer, so a strip of the anchor under it stops being the anchor, and a click
-   there would neither fire the button's own toggle nor count as outside. */
+/* Placed by `useAnchoredPosition`, which writes viewport `top`/`left` inline
+   and flips the panel above its button. The panel is portaled to <body>,
+   because a mobile swipe pane clips at its own edge. It must lay over the
+   header, at the level of the other portaled popovers. The offsets below only
+   park the hidden panel inside the viewport while it is measured.
+
+   The height caps against `--app-height`, the visualViewport height, the only
+   value that shrinks with the iOS keyboard. The hook clamps `top` as the
+   guarantee; the cap keeps that clamp from covering the button. */
 .control-dropdown {
-    position: absolute;
-    bottom: 100%;
+    position: fixed;
+    top: 0;
     left: 0;
-    background: var(--bg-secondary);
-    border: 1px solid var(--border-color);
-    border-radius: 0.5rem;
-    box-shadow: var(--shadow-sm);
     min-width: 12rem;
-    height: 20rem;
+    height: min(20rem, calc(var(--app-height, 100dvh) - 8rem));
     overflow-y: auto;
-    z-index: var(--z-dropdown);
+    z-index: calc(var(--z-control-panel) + 1);
 }
 
 /* The Lucidos Agent picker (LucidosControlMenu) reuses the coding-agent
    control-menu styles, but it holds one list rather than a filter box over
    several sections, so a fixed 20rem height would leave a large empty panel on
-   a short registry. Size to content, capped so a long list still scrolls and a
-   phone keeps the panel inside the viewport. */
+   a short registry. Size to content, capped so a long list still scrolls. */
 .control-dropdown-auto {
     height: auto;
-    max-height: min(24rem, 60vh);
+    max-height: min(24rem, calc(var(--app-height, 100dvh) - 8rem));
+}
+
+/* On a phone the panel takes the header palette width, so a long skill name
+   cannot stretch it to the screen edges. The menus centre it in the pane
+   ('container-center'). */
+@media (max-width: 768px) {
+    .control-dropdown {
+        width: var(--header-surface-width);
+    }
 }
 
 /* The frontend preview's direct actions. Buttons rather than `.control-item`
@@ -760,6 +764,13 @@
     display: flex;
     gap: var(--space-sm);
     padding: 0.25rem 0.625rem;
+}
+
+/* Until the slot's status is known, the controls wait dimmed: the popover keeps
+   its height and names no state it has not read. */
+.control-preview-row:is([data-state="not-loaded"], [data-state="loading"]) {
+    opacity: 0.5;
+    pointer-events: none;
 }
 
 /* `.action-btn` is an <a> here as well as a <button>, and the anchor needs the
@@ -803,10 +814,6 @@
     bottom: 100%;
     left: 0;
     margin-bottom: 0.25rem;
-    background: var(--bg-secondary);
-    border: 1px solid var(--border-color);
-    border-radius: 0.375rem;
-    box-shadow: var(--shadow-md);
     overflow: hidden;
     z-index: var(--z-dropdown);
     min-width: 8.75rem;
@@ -854,9 +861,6 @@
 }
 
 .camera-container {
-    background: var(--bg-primary);
-    border: 1px solid var(--border-color);
-    border-radius: 0.5rem;
     overflow: hidden;
     max-width: 40rem;
     width: 90%;
@@ -879,7 +883,7 @@
 .camera-capture-btn {
     width: 3rem;
     height: 3rem;
-    border-radius: 50%;
+    border-radius: var(--radius-round);
     border: 0.1875rem solid var(--text-primary);
     background: none;
     color: var(--text-primary);
@@ -1026,7 +1030,7 @@
     right: 1.125rem;
     width: var(--scroll-chevron-size);
     height: var(--scroll-chevron-size);
-    border-radius: 50%;
+    border-radius: var(--radius-round);
     background: color-mix(in srgb, var(--bg-secondary) 50%, transparent);
     backdrop-filter: blur(0.5rem);
     -webkit-backdrop-filter: blur(0.5rem);
@@ -1057,6 +1061,20 @@
 .scroll-to-bottom.visible {
     opacity: 0.85;
     pointer-events: auto;
+}
+
+/* On touch a near miss still scrolls, rather than reaching the step row under
+   the circle, whose context counter shares this right edge. The reach is
+   transparent and absolute, so the circle and the glyph stay put. It rides the
+   button's layer, above the transcript, and inherits `pointer-events`, so a
+   hidden chevron's reach takes no tap. */
+@media (pointer: coarse) {
+    .scroll-to-top::before,
+    .scroll-to-bottom::before {
+        content: '';
+        position: absolute;
+        inset: calc(-1 * var(--scroll-chevron-reach));
+    }
 }
 
 @media (min-width: 769px) {
@@ -1275,7 +1293,14 @@
     display: inline-block;
     width: 0.4rem;
     height: 0.4rem;
-    border-radius: 50%;
+    border-radius: var(--radius-round);
+}
+
+/* The spinner is the question badge's size. At the dot's size its open ring
+   read as a small mark sitting low on the title. */
+.thread-status .mini-spinner {
+    width: 0.7rem;
+    height: 0.7rem;
 }
 
 .progress-dot-waiting {
@@ -1301,14 +1326,14 @@
     --badge-height: 0.7rem;
     width: var(--badge-box, var(--badge-height));
     height: var(--badge-height);
-    border-radius: 50%;
+    border-radius: var(--radius-round);
     background: var(--text-secondary);
     font-size: var(--font-size-3xs);
     font-weight: 700;
     line-height: 1;
 }
 
-html[data-theme="light"] .thread-status-question-badge {
+html[data-theme-mode="light"] .thread-status-question-badge {
     background: var(--text-muted);
 }
 
@@ -1317,7 +1342,7 @@ html[data-theme="light"] .thread-status-question-badge {
     color: var(--text-on-accent);
 }
 
-html[data-theme="dark"] .thread-status-question-badge::after {
+html[data-theme-mode="dark"] .thread-status-question-badge::after {
     color: #000;
 }
 
@@ -1342,13 +1367,11 @@ html[data-theme="dark"] .thread-status-question-badge::after {
 /* Sized to PauseIcon's own 12:16 viewBox so the bars fill the box exactly, with
    no letterboxing. The status slot is a flex row that left-aligns its children
    and every other occupant fills its box, so a centered glyph would leave a
-   paused row indented against every neighbouring row's dot. 0.5rem tall sits
-   between the 0.4rem dots and the 0.7rem question badge: the glyph reads as one
-   of the status marks rather than as the largest thing in the column, which is
-   what 0.75rem made it. */
+   paused row indented against every neighbouring row's dot. It is as tall as
+   a dot. */
 .thread-status-paused-icon svg {
-    width: 0.375rem;
-    height: 0.5rem;
+    width: 0.3rem;
+    height: 0.4rem;
 }
 
 .progress-dot-failed {
@@ -1483,17 +1506,13 @@ html[data-theme="dark"] .thread-status-question-badge::after {
     height: var(--icon-size-sm);
 }
 
-/* The coding-agent brand orange, and ONLY for the coding agent's own logo.
-   This used to be declared on `.initiator-icon svg`, which reached every SVG in
-   the slot; it was harmless purely by accident, because back then the slot's
-   only other components were the Lucidos mark (its own gradient) and the Codex
-   glyph (a hardcoded stroke), leaving the Claude logo as the single icon the
-   declaration actually painted. The chrome icons inherit `currentColor` from the
-   header, so an unscoped rule would now paint "You" and "System" coding-agent
-   orange. Mirrored by `.response-executor-icon .claude-icon` in chat/response.css,
-   which is the same claim about the executor chip. */
+/* The Claude mark's colour, and ONLY for the Claude logo. The chrome icons in
+   this slot ("You", "System") inherit `currentColor` from the header, so a rule
+   on `.initiator-icon svg` would paint them the brand colour too. Mirrored by
+   `.response-executor-icon .claude-icon` in chat/response.css, which is the
+   same claim about the executor chip. */
 .initiator-icon .claude-icon {
-    color: var(--initiator-coding-agent);
+    color: var(--claude-mark);
 }
 
 .initiator-label {
@@ -1544,9 +1563,8 @@ html[data-theme="dark"] .thread-status-question-badge::after {
     color: var(--text-muted);
 }
 
-/* Chromeless turns (user bubble, change events) carry no actor chip — the
-   timestamp, and for change turns the "Change applied" summary, are the
-   route-popover triggers. */
+/* Chromeless turns (user bubble, change events) carry no actor chip, so the
+   timestamp is the route-popover trigger. */
 .initiator-timestamp-button {
     background: none;
     border: none;
@@ -1559,22 +1577,9 @@ html[data-theme="dark"] .thread-status-question-badge::after {
     color: var(--text-muted);
     padding: 0;
 }
-.initiator-summary-link {
-    background: none;
-    border: none;
-    cursor: pointer;
-    padding: 0;
-    font-family: inherit;
-    font-size: inherit;
-}
 @media (hover: hover) {
-    /* Timestamp dims to secondary; the summary keeps its reason color (green/
-       red/muted) and only gains an underline. */
     .initiator-timestamp-button:hover {
         color: var(--text-secondary);
-    }
-    .initiator-timestamp-button:hover,
-    .initiator-summary-link:hover {
         text-decoration: underline;
         text-underline-offset: 0.15rem;
     }
@@ -1598,7 +1603,7 @@ html[data-theme="dark"] .thread-status-question-badge::after {
     min-width: 0;
     background: transparent;
     border: none;
-    border-radius: 0.25rem;
+    border-radius: calc(var(--radius-control) * 0.5);
     color: inherit;
     font: inherit;
     /* `font` resets font-feature-settings to initial; keep inheriting it
@@ -1633,7 +1638,7 @@ button.initiator-actor,
    gone: its label and its turning glyph carry that scope on their own, and two
    different gaps inside a run of three icons are a claim the eye reads before
    it reads any tooltip, which landed as "two things and a stray" rather than
-   as a scope split. The class stays, since the brightness rule below still
+   as a scope split. The class stays, since the pressed-chip rule below still
    singles the control out by it. */
 .turn-controls {
     display: inline-flex;
@@ -1707,46 +1712,52 @@ button.initiator-actor,
     color: var(--text-muted);
 }
 
-/* Hover lifts an OFF control one step, to secondary rather than all the way to
-   the primary the ON state uses. Going the whole way made the two states
-   identical under the cursor (both a bright glyph on a hover chip), so the one
-   control the pointer is on was the one you could not read. The chip is the
-   hover cue; the colour stays the state cue.
+/* A lighter stroke than the artwork's 2 keeps the run quiet beside the bold
+   executor label. The colour stays full muted, above 3:1 contrast. */
+.turn-controls .icon-btn svg {
+    stroke-width: 1.75;
+}
 
-   Out-specifies the muted default above (2 classes + a pseudo-class), so this
-   holds whichever file the cascade sees last, and the ON rule below both
-   out-specifies this one (its `:not()` argument counts, making it 2 classes +
-   an attribute + a class) and comes later, so a pressed control keeps its
-   brightness while hovered. The collapse control has no ON rule to lose, so
-   hover is the only thing that moves it, which is the whole point. */
+/* Hover lifts a control's glyph to secondary and draws NO chip. The chip is
+   the ON state here, and it is the shared `.icon-btn` hover colour. A hover
+   chip would make an off control under the cursor read as on.
+
+   Out-specifies the shared hover and the muted default above (2 classes + a
+   pseudo-class). The ON rule below out-specifies this one too, since its
+   `:not()` argument counts, so a pressed control keeps its chip while hovered. */
 @media (hover: hover) {
     .turn-controls .icon-btn:hover {
         color: var(--text-secondary);
+        background: transparent;
     }
 }
 
-/* On: the glyph brightens to full-contrast text and that is the whole state,
-   deliberately NOT the accent-on-a-chip the header's active icons wear
-   (.icon-btn.filter-active in host-components.css). Those sit alone on the app
-   bar; these repeat on every turn, and a column of filled accent chips down a
-   long thread reads as a column of alerts. Muted to bright is enough contrast
-   to answer "is it on" at a glance, and it leaves the hover background as the
-   one thing that fills, in both states, so hover still reads as hover.
+/* On: the glyph sits on a pressed chip, the toolbar-toggle look. The chip is
+   the quiet hover grey, deliberately NOT the accent chip that the app bar's
+   active icons wear (.icon-btn.filter-active in host-components.css). These
+   repeat on every turn, and a column of accent chips reads as a column of
+   alerts. Secondary glyphs match the status text, so the pair never outshouts
+   the executor label beside it.
 
    The collapse control is excluded, and the scope split is why. For the pair
-   it belongs to, bright means "on, and you are seeing MORE": their off state
-   looks like nothing at all, so a turn with no steps drawn is indistinguishable
-   from a turn whose steps are hidden unless the control says which. Bright on
-   the collapse control would mean the turn is FOLDED, which is the same cue
-   inverted, sitting 0.125rem from the two it contradicts, with nothing in the
-   spacing left to hint that it answers a different question. And it reports a
-   state nothing else is hiding: the turn underneath it has become a `⋯` stub,
-   which is unmissable and is the affordance for unfolding. So it stays muted
-   in both states, hover is its only change, and `aria-pressed` carries the
-   state for a screen reader. Pinned by
-   styles/__tests__/turn-control-brightness.test.ts. */
+   it belongs to, the chip means "on, and you are seeing MORE". Their off state
+   looks like nothing at all. Without the chip, a turn with no steps drawn looks
+   the same as a turn whose steps are hidden. A chip on
+   the collapse control would mean the turn is FOLDED, the same cue inverted,
+   sitting beside the two it contradicts. So it never takes the chip, and
+   `aria-pressed` carries the state for a screen reader.
+   Pinned by styles/__tests__/turn-control-pressed-chip.test.ts. */
 .turn-controls .icon-btn[aria-pressed="true"]:not(.turn-control-collapse) {
-    color: var(--text-primary);
+    color: var(--text-secondary);
+    background: var(--bg-hover);
+}
+
+/* Folded: the plus glyph is lit, with no chip. A fold draws nothing under the
+   header, so this glyph is the only thing on screen saying the turn has more.
+   It stays lit under hover: it matches the hover rule's specificity and comes
+   after it. */
+.turn-controls .turn-control-collapse[aria-pressed="true"] {
+    color: var(--accent);
 }
 
 .initiator-body {
@@ -1766,7 +1777,7 @@ button.initiator-actor,
 }
 .user-bubble {
     background: var(--picked-surface);
-    border-radius: 0.9rem;
+    border-radius: calc(var(--radius-surface) * 1.2);
     padding: 0.55rem 0.85rem;
     max-width: 85%;
     /* Matches .response-content, so a user bubble and the reply under it set
@@ -1777,21 +1788,6 @@ button.initiator-actor,
     margin-bottom: 0;
 }
 
-/* Collapsed turn indicator — shown on ANY collapsed panel (initiator or
-   response) so a folded turn isn't an empty row: a muted "⋯" on the turn's own
-   left column, wherever the fold was clicked. */
-.turn-collapsed {
-    cursor: pointer;
-    /* Match the header/body left inset so the folded "⋯" lines up with the
-       rest of the turn content instead of sitting flush against the edge. */
-    padding-left: var(--turn-body-inset);
-}
-.turn-collapsed-dots {
-    color: var(--text-muted);
-    font-size: var(--font-size-xl);
-    line-height: 1;
-}
-
 .initiator-summary {
     font-weight: 500;
     color: var(--text-primary);
@@ -1799,7 +1795,6 @@ button.initiator-actor,
     display: block;
 }
 
-.initiator-summary + .change-body,
 .initiator-summary + .markdown-content,
 .initiator-summary + .initiator-files {
     margin-top: 0.25rem;

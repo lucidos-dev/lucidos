@@ -3,11 +3,9 @@ paths:
   - "scripts/web-dev.sh"
   - "scripts/run.sh"
   - "scripts/tauri-dev.sh"
-  - "scripts/start.sh"
   - "scripts/stop.sh"
   - "scripts/restart.sh"
   - "scripts/status.sh"
-  - "scripts/logs.sh"
   - "scripts/tail.sh"
   - "scripts/populate.sh"
   - "scripts/new-migration.sh"
@@ -17,6 +15,11 @@ paths:
   - "scripts/deps-state.sh"
   - "scripts/lib/deps_state*.sh"
   - "scripts/test-engine.sh"
+  - "scripts/harden-suites.sh"
+  - "scripts/lib/harden_suites*.sh"
+  - "scripts/harden-scope.sh"
+  - "scripts/lib/harden_scope_test.sh"
+  - "scripts/lib/proc_tree.sh"
   - "scripts/test-scripts.sh"
   - "scripts/with-build-slot.sh"
   - "scripts/lint-shell.sh"
@@ -49,6 +52,7 @@ paths:
   - "scripts/lib/preflight.sh"
   - "scripts/lib/preflight_test.sh"
   - "scripts/lib/engine_build_only_test.sh"
+  - "scripts/lib/engine_build_spares_other_builds_test.sh"
   - "scripts/lib/proc_env*.sh"
   - "scripts/lib/sleep.sh"
   - "scripts/lib/host_load_guard*.sh"
@@ -107,6 +111,8 @@ opt-in itself, and never starts a gateway.
 ./scripts/dev-codesign-setup.sh           # One-time: stable macOS code-signing identity
 ./scripts/dev-refresh-app-frontend.sh [-a <app>] [--no-build] [--restart]  # macOS: rebuild dist + sync into an installed .app's Resources/frontend + re-seal (fast frontend-only loop; native path is inert in tauri dev so the packaged app is the only place to test it)
 ./scripts/test-engine.sh [--full|--fresh] # Engine tests against a dedicated Docker PG
+./scripts/harden-suites.sh start [--early]|stop|wait|verdict  # /harden's Phase 4.5 suites: selection, the early suite run, and whether its result still counts (ADR 0292). Tested by scripts/lib/harden_suites_test.sh
+./scripts/harden-scope.sh <sha> [<base>]  # /harden Phase 0.4: MERGE_ONLY when every commit since the last hardening is a merge of main, INCREMENTAL when the branch also has commits of its own, else FULL <reason>. Tested by scripts/lib/harden_scope_test.sh
 ./scripts/test-scripts.sh                 # Run every scripts/lib/*_test.sh (= make test-scripts): per-suite pass/fail + a total, exits non-zero if any suite fails. Needs no Postgres; separate from `make lint` and the engine suite. See below
 ./scripts/preflight-reclaim-engines.sh    # Pre-flight: stop every engine that should not be running, and prove what it freed. Exits non-zero if one survived. See below
 ./scripts/memory-watch.sh --once          # Host memory watch, one tick: record any process over a share of RAM, kill one past physical RAM. See below
@@ -231,9 +237,6 @@ no-op:
   back, which the reclaim cannot prevent and must not hide. Each gateway log is
   measured before the first stop and read only from there, so an older episode
   is never quoted as this one's cause.
-- **`LUCIDOS_RECLAIM_SETTLE_S` is retired.** Honouring its 10 would put the bug
-  back, so it prints a note naming `LUCIDOS_RECLAIM_QUIET_S` and
-  `LUCIDOS_RECLAIM_DEADLINE_S`, and changes nothing.
 
 The keep list defaults to `dev personal` and matches exactly, so `devbox` is
 not caught by `dev`. Those two are the picker's first-run name suggestions. A
@@ -456,7 +459,8 @@ So a completed `build_or_find_engine` **publishes** `lucidos-engine` + `lucidos-
 and `ENGINE_BIN` / `GATEWAY_BIN` / `LUCIDOS_ENGINE_BIN` / the engine's `current_exe()` all point there. That directory is written **only by completed builds of the same profile AND feature variant** (a dev workspace at `.launch/debug/plain` and the e2e harness at `.launch/release/e2e-test-hooks`, or `.launch/debug/e2e-test-hooks` under `LUCIDOS_E2E_DEBUG=1`, are structurally disjoint). Cargo keeps uplifting to `target/<profile>/lucidos-engine`; **nothing launches from it.**
 
 - **Atomic, never destructive.** Copy to a temp name in the destination dir, then `mv -f`. A failed publish leaves the previously published binary byte-identical and removes the temp, because a build must never make the launch path missing (`No engine binary found. Run with -b` would strand every co-located workspace). The no-build path prefers the published launch binary and **falls back to cargo's uplift path with a warning** when there isn't one yet. A publish that is SIGKILLed (the coalescing Apply kills the whole build process group, and no trap catches SIGKILL) can't run its own `rm`, so `prune_dead_launch_temps` sweeps the stranded `*.tmp.<pid>` on the next publish, scoped by whether that pid is still alive: an in-flight publish belongs to someone, a dead one's cannot.
-- **Verified against HEAD.** After publishing, `published_build_state` compares the binary's build-id commit prefix with `git rev-parse --short HEAD` (prefix-matched in both directions — the two sides abbreviate to different lengths). `stale` ⇒ rebuild **once**; still stale ⇒ warn and succeed. No git / unreadable id / a `src-…` id classify `unknown` and never trigger a rebuild.
+- **Verified against HEAD.** After publishing, `published_build_state` compares the binary's build-id commit prefix with `git rev-parse --short HEAD`, prefix-matched in both directions because the two sides abbreviate to different lengths. `stale` ⇒ rebuild **once**; still stale ⇒ warn and succeed. No git / unreadable id / a `src-…` id classify `unknown` and never trigger a rebuild.
+  - **A move of HEAD alone is not stale.** On a commit mismatch the script asks the binary, `lucidos-engine --build-id --source-state`. It answers with `files_require_restart`, the classifier Apply uses. So a CSS-only merge during a long build costs no second build. Only an exact `current` clears the mismatch, so a binary that predates the flag still rebuilds. The flag rides on `--build-id` because an old binary exits on that one, where an unknown bare flag would boot an engine.
 - **Signing follows the launched binary.** `sign_engine_binary` runs on the published copies. The dev Designated Requirement is identifier + certificate leaf (no CDHash, no path), so macOS TCC grants survive the move.
 - **Staying inside the CHECKOUT is load-bearing; staying inside `target/` is not** (ADR 0063). Two things depend on the location, and both need only "somewhere under the repo root": the engine resolves the checkout by walking `current_exe()`'s ancestors for `scripts/web-dev.sh` (`paths::repo_root`, which `run_engine_build`, the shared build lock and `engine_source_matches_head` all need), and ADR 0021's worktree refusal is a pure substring test for `/.lucidos/worktrees/` on `LUCIDOS_ENGINE_BIN`. A **workspace**-local staging dir breaks the first and launders a worktree binary past the second, which is why ADR 0022 ruled that out. A **checkout**-local dot-dir keeps both, which is why the published dir now sits at `.launch/` rather than under `target/`.
 - **`cargo clean` must never be able to reach it.** That is the whole reason for the `.launch/` location. The launch dir holds the `lucidos` CLI, and `find_lucidos_cli_dir` walks up from the engine's exe to find it and prepends that dir to `PATH` for **every spawned trigger and coding-agent session**; `run_coding_agent` cannot start a Claude Code session without it. Under `target/`, one `cargo clean` therefore disabled the whole workspace out from under a running engine: on 2026-08-13 the nightly orchestrator ran one inline and produced 41 CLI-not-found trigger failures over eight hours, having also destroyed the CLI it needed to spawn the child that would have rebuilt. The checkout-shared build lock moved for the same reason: `flock` binds to an inode, so deleting the lock file mid-build releases nothing and the next builder takes an uncontended lock on a fresh inode. To reclaim the disk deliberately: `rm -rf .launch`.
@@ -483,6 +487,8 @@ and `ENGINE_BIN` / `GATEWAY_BIN` / `LUCIDOS_ENGINE_BIN` / the engine's `current_
     **Coordinated**: co-located workspaces share ONE checkout and ONE `target/`. So `run_engine_build` holds a checkout-shared advisory **build lock**, an `fs2` flock at `<repo_root>/.launch/.lucidos-engine-build.lock`. It sits outside `target/` so a `cargo clean` cannot orphan its inode, and is auto-released on drop or process death. Exactly one `web-dev.sh --engine-build` runs at a time. Others get `EngineBuildOutcome::SkippedLocked` (→ `build_state` back to `Idle`, NOT `Failed`) and observe the shared binary advance. This upholds CLAUDE.md's "never two concurrent cargo builds on the same target" rule, and that collision was the likely original cause of the wedge.
 
     Scope: the lock serializes only *engine-triggered* builds (Apply, self-heal, `POST /engine/rebuild`), and protects ONE thing: the checkout's shared `target/`. A human `web-dev.sh -b` is not coordinated by *this* lock, but by a *build slot* (ADR 0070), the machine-wide cap on concurrent heavy builds. That is a different resource: host RAM across every worktree, where the hazard is the OOM killer rather than two cargos in one directory. Both are taken on the engine-rebuild path, in that order: `run_engine_build` wins the checkout lock, then `run_engine_cargo_build` waits for a slot. The old "macOS ships no `flock` binary" reasoning is retired. The broker is the `lucidos` binary taking an `fs2` flock, and the shell only resolves it.
+    - **The engine's rebuild is a *priority waiter* for its slot** (ADR 0304). It spawns `web-dev.sh --engine-build` with `LUCIDOS_BUILD_SLOT_PRIORITY=1`, so agent builds leave the next freed slot to it and it runs un-niced. While it waits, version-status carries `build_queued` and the popover reads "New version queued". Never set the variable anywhere else.
+    - **An engine build never signals another cargo, and never deletes a `.cargo-lock`** (ADR 0294). The build waits on cargo's own lock for any cargo holding `target/`. The selector the build used to run matched the child `cargo check` of `cargo clippy` in every worktree, so `make lint` failed with a bare `Error 255`. `scripts/lib/engine_build_spares_other_builds_test.sh` pins it.
     - **The coalescing hands the lock over, it does not race it** (2026-08-05). `JoinHandle::abort()` only *requests* cancellation, so the superseded build drops its `flock` guard strictly after `abort()` returns. A replacement that probed immediately read the dying build's own guard as a peer, returned `SkippedLocked`, fell back to `Idle`, and left **no build running at all**: three back-to-back Applies produced the manual "New engine version pending / Rebuild" toast, and only the ~10s self-heal tick started the real build. Two fixes, both in `engine_version.rs`. The replacement task **awaits the superseded `JoinHandle`** (which resolves only once that task's locals, the lock guard included, are dropped) before calling `run_engine_build`. And `run_engine_build` waits up to `BUILD_LOCK_WAIT` (3s, polled) for the lock instead of taking one instantaneous sample, which also absorbs the fork-inherited-fd window that the lock tests' `eventually` helper documents. A genuine peer build lasts a minute or more, so it still yields `SkippedLocked` and the peer-build spinner.
     - **A superseded build dies with its whole process group.** `kill_on_drop(true)` reaches only the direct child, which is `web-dev.sh`; the `cargo` underneath it is a grandchild and survived, so a rapid series of Applies left superseded builds compiling against the shared `target/` next to the live one (three overlapping runs, 1m30s apart, in the dev engine log on 2026-08-05). `run_engine_build` now spawns via `spawn_env::isolate_in_process_group` and a `BuildProcessGroupGuard` SIGKILLs that group on drop, disarmed once the child is reaped so a recycled pid can never be signalled.
   - **Multi-workspace peer-build spinner** (`docs/plans/2026-07-04-multi-workspace-peer-build-spinner.md`). The `SkippedLocked` → `Idle` fallback created a UX gap: the workspace that LOST the shared lock (a bystander, OR the very workspace that clicked Apply if a peer grabbed the lock first) sat in `source_behind_head && !update_available && build_state == idle` and showed the manual "New engine version pending — Rebuild" toast even though a peer's build was in flight and WOULD advance the shared binary. Its self-heal also skipped (`engine_build_in_progress_elsewhere()` sees the peer's lock), so it was NOT short-lived. Fix: `version-status` reports **`shared_build_in_progress`** — the checkout-shared build lock is held (this engine's build or a peer's), from the same cheap non-blocking `engine_build_in_progress_elsewhere()` flock probe (no TTL cache — it forks no process, unlike `source_behind_head`). `checkEngineVersion` then lights the building spinner (`engineBuilding`) when `shared_build_in_progress && source_behind_head && !update_available && build_state == idle`, and gates the pending-Rebuild toast on `!shared_build_in_progress`, so the manual escape hatch appears only when NOTHING is building and the workspace is genuinely stuck. Once any build lands, `update_available` flips → the normal ready→Switch surface (the spinner's peer disjunct is gated on `!update_available`, so it hands off cleanly).

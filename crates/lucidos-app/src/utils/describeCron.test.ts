@@ -234,6 +234,29 @@ describe('describeCron', () => {
   it('a minute list on a daily time falls back', () => {
     expect(describeCron('0 0,30 8 * * *')).toBe('0 0,30 8 * * *');
   });
+
+  // A frequency label must never state a slower schedule than the trigger
+  // runs on. Each of these used to read as a fraction of its real run count.
+
+  it('a stepped seconds field falls back rather than reading "Every minute"', () => {
+    expect(describeCron('*/30 * * * * *')).toBe('*/30 * * * * *');
+  });
+
+  it('a wildcard seconds field falls back', () => {
+    expect(describeCron('* * * * * *')).toBe('* * * * * *');
+  });
+
+  it('a stepped minute under a stepped hour falls back rather than dropping the minutes', () => {
+    expect(describeCron('0 */5 */2 * * *')).toBe('0 */5 */2 * * *');
+  });
+
+  it('an hourly schedule limited to one month falls back', () => {
+    expect(describeCron('0 0 * * 6 *')).toBe('0 0 * * 6 *');
+  });
+
+  it('an every-N-hours schedule limited to one month falls back', () => {
+    expect(describeCron('0 0 */3 * 6 *')).toBe('0 0 */3 * 6 *');
+  });
 });
 
 describe('validateCron', () => {

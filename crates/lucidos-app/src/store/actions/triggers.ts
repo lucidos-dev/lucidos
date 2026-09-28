@@ -342,7 +342,7 @@ export async function deleteTrigger(
   triggerId: string,
   triggerName: string
 ): Promise<void> {
-  if (!(await showConfirm(`Delete trigger "${triggerName}"?`))) {
+  if (!(await showConfirm(`Delete trigger "${triggerName}"?`, 'Delete', { variant: 'danger' }))) {
     return;
   }
 

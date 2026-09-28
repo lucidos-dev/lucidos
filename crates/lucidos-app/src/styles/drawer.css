@@ -1,12 +1,13 @@
 .thread-drawer {
     /* The pane's CONTENT COLUMN: the x every row's text starts at, whether the
-       pane is showing the thread list or the filter panel that covers it. One
-       token because those two have to land on the same column (a filter row
-       0.375rem in above a thread name 1.25rem in read as two surfaces, not as
-       one pane showing something else), and because a nested row derives its
-       indent from it. Everything that uses it lives inside `.thread-drawer`, so
-       it needs no fallback; nothing outside the pane may claim it. */
-    --drawer-row-inset: 1.25rem;
+       pane is showing the thread list or the filter panel that covers it. It
+       is one token because those two have to land on the same column. On two
+       columns they read as two surfaces, not as one pane showing something
+       else. A nested row also derives its indent from it. Everything that uses
+       it lives inside `.thread-drawer`, so it needs no fallback; nothing
+       outside the pane may claim it. The status mark sits inside the title
+       line, so this column reserves no room for it. */
+    --drawer-row-inset: 0.75rem;
     /* Where a thread row's content column ends. A var because the row divider
        and a collapsed section's divider stop at the same x. The mobile block
        below moves it: two hand-synced copies drifted the moment one did. */
@@ -92,10 +93,10 @@
     pointer-events: none;
 }
 
-/* The two views swap at once, and the navigation cover over both (below)
-   fades the arriving one in, exactly as a content-pane navigation does. Never
-   a crossfade: the panel wears the list's geometry, so both drawn at once
-   print rows and options on the same lines. */
+/* The swap dips through the pane background: the navigation cover over both
+   (below) rises over the leaving view, holds, and clears off the arriving one.
+   Never a crossfade: the panel wears the list's geometry, so both drawn at
+   once print rows and options on the same lines. */
 .thread-filter-cover[data-open] {
     visibility: visible;
     pointer-events: auto;
@@ -103,6 +104,26 @@
 
 .thread-drawer:has(> .thread-filter-cover[data-open]) > .thread-drawer-list {
     visibility: hidden;
+}
+
+/* The leaving rows stop taking taps at once, as the leaving panel does. On the
+   rows, never the scroller: a scroller out of hit-testing stops panning. */
+.thread-drawer:has(> .thread-filter-cover[data-open]) > .thread-drawer-list > * {
+    pointer-events: none;
+}
+
+/* Each view shows or hides at the dip's midpoint, where the cover is opaque.
+   Only `visibility` is delayed. Opacity never animates on the views, since
+   WebKit re-compositing content up from transparent is the iOS paint-loss
+   shape. The cover is the one fade. */
+.thread-drawer > .thread-drawer-list,
+.thread-filter-cover {
+    transition: visibility 0s linear calc(var(--duration-slow) / 2);
+}
+
+:root[data-motion="reduce"] .thread-drawer > .thread-drawer-list,
+:root[data-motion="reduce"] .thread-filter-cover {
+    transition: none;
 }
 
 /* The navigation cover's host (global/host-components.css). Over the filter
@@ -231,7 +252,6 @@
     font-size: var(--font-size-md);
     color: var(--text-primary);
     cursor: pointer;
-    -webkit-tap-highlight-color: transparent;
 }
 
 /* "Include deleted" while a status view is active. It sits inside the
@@ -345,7 +365,6 @@
     color: var(--text-primary);
     cursor: pointer;
     text-align: left;
-    -webkit-tap-highlight-color: transparent;
 }
 
 /* Pointer hover only. A touch screen keeps `:hover` on the last row tapped, so
@@ -446,7 +465,7 @@
    stays centred on the column the plain numbers share. */
 .badge.drawer-view-count {
     position: static;
-    color: white;
+    color: var(--text-on-accent);
     font-size: var(--font-size-3xs);
     min-width: var(--badge-box, var(--badge-height));
     margin-right: calc((var(--badge-height) - var(--badge-box, var(--badge-height))) / 2);
@@ -475,13 +494,17 @@
     position: relative;
     /* `--thread-depth` inherits from the row wrapper for nested children (set
      * via depthStyle() in ThreadDrawer.tsx); 0 keeps top-level rows aligned.
-     * `--thread-row-pad-left` is the row's left padding — i.e. where the thread-
-     * name text starts. Shared so the bottom-edge divider `::after` below can
-     * begin at the same x (lines the divider's left up with the title text).
-     * The depth term comes from the wrapper, so the status mark outside this row
-     * indents by exactly the same amount. Its `0px` fallback keeps a
-     * hypothetical wrapper-less row on the un-indented column. */
-    --thread-row-pad-left: calc(var(--drawer-row-inset) + var(--thread-depth-offset, 0px));
+     * `--thread-row-pad-left` is the row's left padding, where the title line
+     * starts. Shared so the bottom-edge divider `::after` below can begin at
+     * the same x.
+     *
+     * `--thread-row-title-line` is the height of ONE line of the row title,
+     * stated rather than left at `line-height: normal`, which is font metrics.
+     * The row actions sit in a line of this height too. 0.9375rem
+     * is 1.15x the title's 0.8125rem, which is what Fira Code's `normal`
+     * resolved to. */
+    --thread-row-pad-left: calc(var(--drawer-row-inset) + var(--thread-depth, 0) * 1rem);
+    --thread-row-title-line: 0.9375rem;
     padding-left: var(--thread-row-pad-left);
     /* Right padding gives the action icons breathing room inside the row. */
     padding-right: var(--thread-row-pad-right);
@@ -535,32 +558,9 @@
     pointer-events: none;
 }
 
-/* `position: relative` anchors the row wrapper's absolutely-positioned
- * children (status dot, disclosure chevron, the lifted-child accent bar).
- *
- * `--thread-row-title-line` is the height of ONE line of the row title, stated
- * rather than left at `line-height: normal`. The status dot centers on the
- * title's first line by taking this as its own box height (see
- * `.thread-row-wrap > .thread-status`). That needs a line box CSS can name, and
- * `normal` is font metrics. It moves with the user's font-family preference, so
- * a dot placed against it drifts per font. 0.9375rem is 1.15x the title's
- * 0.8125rem, which is what Fira Code's `normal` resolved to, so row heights and
- * the wrapped-title rhythm are unchanged.
- *
- * `--thread-depth-offset` is how far this row's content column is pushed right
- * by its nesting depth. It lives on the wrapper because BOTH the row and the
- * status mark read it, and the mark is the wrapper's child rather than the
- * row's. Sharing one definition is what keeps a sub-thread's mark the same
- * distance from its own title as a top-level row's is. */
-.thread-row-wrap {
-    position: relative;
-    --thread-row-title-line: 0.9375rem;
-    --thread-depth-offset: calc(var(--thread-depth, 0) * 1rem);
-}
-
 /* x-position of the lifted-child accent bar: one indent step deeper per level,
  * so each nesting level's accent bar starts a step further right than its
- * parent. It is its own column, left of the status mark, which indents by the
+ * parent. It is its own column, left of the title, which indents by the
  * same step from a different origin. `--thread-depth` is set inline by
  * depthStyle() in ThreadDrawer.tsx and inherits down to the row + its
  * pseudo-elements. */
@@ -616,11 +616,9 @@
  * never land on the same row). Visual only: the row still opens on click,
  * keeps its hover background, and keeps its actions usable.
  *
- * The class rides the WRAPPER because the status dot (`.thread-status`) is the
- * wrapper's child, outside `.thread-row`, and has to dim with the rest. An
- * archived thread is never running (`displaySection` keeps a running thread in
- * Current), but it can carry a failed / paused dot, which is exactly the loud
- * cue that must dim here. */
+ * The status mark dims with the rest. An archived thread is never running,
+ * since `displaySection` keeps it in Current. It can still carry a failed or
+ * paused dot, and that loud cue must dim. */
 .thread-row-wrap.is-archived .thread-status,
 .thread-row-wrap.is-archived .thread-row-title,
 .thread-row-wrap.is-archived .thread-row-created,
@@ -631,30 +629,27 @@
 
 /* Sub-thread toggle: a "Show / Hide N sub-threads" link on its own line under
  * the date. It flows in the title column, so a long title can never run into
- * it, and it sits directly above the sub-threads it opens and closes. The auto
- * margin drops it to the row's bottom. The negative bottom margin reaches into
- * the column's padding, centring the link on the pin and ⋯ icons opposite. The
+ * it, and it sits directly above the sub-threads it opens and closes. The
  * accent is mixed toward grey so the link stays quieter than the title but
  * brighter than the date. Light mode keeps more accent, since its darker blue
  * mixed half-and-half turns slate grey. Hover lifts it to a stronger blue, with
  * no underline. One chevron rotates between the two states. The chevron turn
  * is the only tap feedback, so this rule turns off iOS's grey tap flash.
  *
- * The link never wraps. A wide chip column squeezes the title column, and a
- * button centres wrapped text, so "threads" landed alone under "Hide 2 sub-".
- * On one line it may run past the title column. That only happens when a wide
- * chip squeezes the column, and the same chip leaves free space left of the
- * pin and ⋯ on the link's line, so the link runs into that space. */
+ * The link never wraps. A button centres wrapped text, so on a narrow drawer
+ * "threads" would land alone under "Hide 2 sub-".
+ *
+ * The negative margins let the tap padding overlap its neighbours, so the
+ * spacing around the link comes from `.thread-row-family-line` alone. */
 .family-disclosure {
     align-self: flex-start;
-    -webkit-tap-highlight-color: transparent;
     display: inline-flex;
     align-items: center;
     gap: 0.1875rem;
     white-space: nowrap;
-    margin-top: auto;
-    margin-bottom: -0.125rem;
-    padding: 0.125rem 0;
+    --disclosure-pad-y: 0.125rem;
+    padding: var(--disclosure-pad-y) 0;
+    margin-block: calc(-1 * var(--disclosure-pad-y));
     background: none;
     border: none;
     font-size: var(--font-size-2xs);
@@ -668,7 +663,7 @@
 
 /* Sets only variables, so the :hover rule below still wins on colour. Hover
  * darkens past the accent, since 80% to the full accent is too small to see. */
-html[data-theme="light"] .family-disclosure {
+html[data-theme-mode="light"] .family-disclosure {
     --disclosure-accent-share: 80%;
     --disclosure-hover-color: color-mix(in srgb, var(--accent) 70%, var(--text-primary));
 }
@@ -698,7 +693,7 @@ html[data-theme="light"] .family-disclosure {
 .family-disclosure:focus-visible {
     outline: 0.125rem solid transparent;
     box-shadow: var(--focus-ring);
-    border-radius: 0.25rem;
+    border-radius: calc(var(--radius-control) * 0.5);
 }
 
 @media (hover: hover) {
@@ -720,7 +715,7 @@ html[data-theme="light"] .family-disclosure {
     min-width: var(--badge-box, var(--badge-height));
     padding: 0 0.3125rem;
     text-align: center;
-    border-radius: 0.625rem;
+    border-radius: calc(var(--radius-control) * 1.25);
     color: var(--text-secondary);
     --section-count-fill: color-mix(in srgb, var(--accent) 15%, transparent);
     background: var(--section-count-fill);
@@ -730,7 +725,7 @@ html[data-theme="light"] .family-disclosure {
 /* Dark mode: lift the accent share so the fill reads a touch bluer against the
  * darker row backgrounds (the 15% tint above looks washed out on dark). Light
  * mode keeps the base 15%, which stays distinct there already. */
-html[data-theme="dark"] .section-count-badge {
+html[data-theme-mode="dark"] .section-count-badge {
     --section-count-fill: color-mix(in srgb, var(--accent) 24%, transparent);
 }
 
@@ -773,8 +768,8 @@ html[data-theme="dark"] .section-count-badge {
  * pin already includes border widths (ThreadDrawer.tsx), so the outline doesn't
  * shift layout. Light mode's fills are already well clear of --bg-tertiary
  * (#eff2f5 vs #e1e4e8), so both chips keep the plain fill there. */
-html[data-theme="dark"] .thread-row-context,
-html[data-theme="dark"] .thread-row .message-channel-tag {
+html[data-theme-mode="dark"] .thread-row-context,
+html[data-theme-mode="dark"] .thread-row .message-channel-tag {
     border: 1px solid var(--border-color);
 }
 
@@ -784,7 +779,7 @@ html[data-theme="dark"] .thread-row .message-channel-tag {
  * neutral colour that (being more specific + loaded later) would repaint the error
  * tag neutral. Restore its red outline so the error tag keeps its identity — which
  * also finally realizes .channel-error's original intent. */
-html[data-theme="dark"] .thread-row .message-channel-tag.channel-error {
+html[data-theme-mode="dark"] .thread-row .message-channel-tag.channel-error {
     border-color: var(--accent-red);
 }
 
@@ -793,28 +788,99 @@ html[data-theme="dark"] .thread-row .message-channel-tag.channel-error {
     min-width: 0;
     display: flex;
     flex-direction: column;
-    /* The one gap between title, date and sub-thread link, so every row spaces
-     * its date the same whatever the chip column's height. */
+    /* The one gap between title, meta line and sub-thread link. */
     gap: 0.375rem;
-    /* Give wrapped titles descent room without making every row taller: this
-     * only affects row height when the title column is the tallest column. */
+    /* Descent room under the row's last line. */
     padding-bottom: 0.25rem;
-    /* Stretch to the row height, as `.thread-row-right` does, so the sub-thread
-     * link's `margin-top: auto` has free space to drop into. */
-    align-self: stretch;
 }
 
+/* A family row ends on the sub-thread line, which gets extra room below. */
+.thread-row-left:has(> .thread-row-family-line) {
+    padding-bottom: var(--space-sm);
+}
+
+/* The title text, then the row's actions at the line's right end. The bottom
+ * margin adds to the column gap, so the title has 0.875rem below it. The font
+ * size sits here rather than on the title, so the status mark's `ex` and `cap`
+ * units measure the title's own letters.
+ *
+ * The row actions overhang a one-line title. The min-height gives that title
+ * extra room below. The extra must stay under one line, so a wrapped title
+ * outgrows it and keeps its height. */
 .thread-row-title-row {
-    display: block;
-    min-width: 0;
+    display: flex;
+    align-items: flex-start;
+    gap: 0.5rem;
+    min-height: calc(var(--thread-row-title-line) + var(--space-xs));
+    margin-bottom: var(--space-sm);
+    font-size: var(--font-size-md);
     line-height: var(--thread-row-title-line);
 }
 
+.thread-row-title-text {
+    flex: 1;
+    min-width: 0;
+}
+
 .thread-row-title {
-    font-size: var(--font-size-md);
     font-weight: 400;
     overflow-wrap: break-word;
     word-break: break-word;
+}
+
+/* The date at the left, then the channel tag and the name chip at the right
+ * end of the same line. On a narrow drawer the chips wrap to a second line,
+ * still right-aligned; nothing shrinks, so the date never truncates. The gap
+ * is the only spacing. `.message-channel-tag` brings a margin from its
+ * chat-header use, and that margin would push the chips off the shared line.
+ * Items align on their first baseline, so a name chip that wraps grows
+ * downward. The chips keep one top edge and the date reads with their first line.
+ *
+ * A row with sub-threads moves its chips down to the sub-thread line. There
+ * they wrap inside their own box, laid out the same way. */
+.thread-row-meta,
+.thread-row-family-chips {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    align-items: baseline;
+    gap: 0.25rem 0.375rem;
+}
+
+.thread-row-meta > *,
+.thread-row-family-chips > * {
+    flex-shrink: 0;
+    margin: 0;
+}
+
+/* The link at the left, the chip box at the right. The link sits on the
+ * box's bottom edge, also when the chips wrap to a second line. Its negative
+ * margins cancel its padding, so its text reaches that edge. The line sits a
+ * step lower than the column gap alone would put it. */
+.thread-row-family-line {
+    display: flex;
+    align-items: flex-end;
+    gap: 0.375rem;
+    margin-top: var(--space-xs);
+}
+
+/* `align-self` beats the base rule's `flex-start`, which would pin the link
+ * to the top of the line. */
+.thread-row-family-line > .family-disclosure {
+    align-self: flex-end;
+    flex-shrink: 0;
+    margin-right: auto;
+}
+
+/* The skeleton's chip is a bare shimmer bar with no text, so it has no
+ * baseline. Aligned by its bottom edge instead, it would make the skeleton
+ * line taller than the loaded one. */
+.thread-row-meta > .sk-bar {
+    align-self: center;
+}
+
+.thread-row-meta > .thread-row-created {
+    margin-right: auto;
 }
 
 .thread-row-created {
@@ -829,9 +895,9 @@ html[data-theme="dark"] .thread-row .message-channel-tag.channel-error {
 
 /* The chip rides the title's first line, so it must not be taller than that
  * line. It is an inline-block, so it would inherit `--thread-row-title-line` as
- * its content height and add its padding on top. That grows the line box and
- * slides the title off the status dot centered on it. Its own tight line-height
- * keeps the chip inside the line. */
+ * its content height and add its padding on top. That would make the draft
+ * row taller than every other row. Its own tight line-height keeps the chip
+ * shorter than the line, and `vertical-align: top` keeps its top inside it. */
 .draft-indicator {
     display: inline-block;
     font-size: var(--font-size-2xs);
@@ -840,22 +906,13 @@ html[data-theme="dark"] .thread-row .message-channel-tag.channel-error {
     color: var(--text-muted);
     background: color-mix(in srgb, var(--accent) 15%, transparent);
     padding: 0.0625rem 0.25rem;
-    border-radius: 0.1875rem;
+    border-radius: calc(var(--radius-control) * 0.375);
     white-space: nowrap;
-    vertical-align: middle;
+    vertical-align: top;
     margin-left: 0.375rem;
 }
 
-.thread-row-right {
-    display: flex;
-    flex-direction: column;
-    align-items: flex-end;
-    gap: 0.25rem;
-    flex-shrink: 0;
-    align-self: stretch;
-}
-
-/* The repo / app / trigger NAME chip, shown under the channel/type tag. Muted
+/* The repo / app / trigger NAME chip, shown after the channel/type tag. Muted
  * so the type tag stays the primary label; a long name (e.g. a trigger like
  * "NIGHTLY BUILD → HARDEN → E2E") WRAPS onto extra lines within the chip's
  * max-width rather than truncating to an ellipsis or forcing the row wider — the
@@ -867,8 +924,8 @@ html[data-theme="dark"] .thread-row .message-channel-tag.channel-error {
  * ContextChip (ThreadDrawer.tsx) — CSS can't shrink a constrained box to the
  * longest line of wrapped text, so the JS measures the line boxes and sets an
  * explicit width, removing the dead space beside the shorter lines. The detail
- * times live in the row's long-press/hover tooltip (see threadRowInfo.ts), so
- * this column is type + name only. */
+ * times live behind the row's ⋯ menu (see threadRowInfo.ts), so the chips are
+ * type + name only. */
 .thread-row-context {
     max-width: 7rem;
     white-space: normal;
@@ -877,13 +934,16 @@ html[data-theme="dark"] .thread-row .message-channel-tag.channel-error {
     background: var(--bg-tertiary);
 }
 
+/* One title line, inheriting the title row's font and line height, so it sits
+ * on the title's baseline. The buttons inside center on the title's capital
+ * letters with the status mark's rule below. */
+.thread-row-actions-line {
+    flex-shrink: 0;
+}
+
 .thread-row-actions {
-    display: flex;
     align-items: center;
     gap: 0.25rem;
-    /* Pins actions to the row bottom; relies on `align-self: stretch` on
-     * .thread-row-right to give the auto-margin space to consume. */
-    margin-top: auto;
 }
 
 /* Action buttons (copy) reveal on hover/focus on desktop, always visible on touch. */
@@ -924,57 +984,58 @@ html[data-theme="dark"] .thread-row .message-channel-tag.channel-error {
     height: var(--icon-size-md);
 }
 
-/* The mark is the row's SIBLING, hanging off the wrapper rather than sitting
- * inside `.thread-row`. That is what the z-index below is for, and it is why the
- * mark has to take the row's depth from the wrapper instead of inheriting it as
- * layout.
- *
- * Horizontally it rides its title's column, one indent step further right per
- * nesting level, via `--thread-depth-offset`. The 0.375rem is the gap it keeps
- * left of the title text, and it is the same gap at every depth. A sub-thread's
- * mark therefore belongs to that sub-thread, rather than to the column of a row
- * several levels above it.
- *
- * Vertically this box IS the title's first line, rather than a constant tuned
- * to look like it. The wrapper and the row share a top edge, so `--space-sm`
- * starts the box where that line starts. That is the row's own padding-top,
- * from base `.list-row`. One `--thread-row-title-line` of height ends the box
- * where the line ends. `.thread-status` is a centering flex row, so whichever
- * mark the status draws lands on the line's center. Dot, spinner, "?" badge and
- * pause glyph are all shorter than the line. A literal `top` here is the bug
- * this replaced: no one value is right for two fonts at once. */
-.thread-row-wrap > .thread-status {
-    position: absolute;
-    left: calc(0.375rem + var(--thread-depth-offset, 0px));
-    top: var(--space-sm);
-    height: var(--thread-row-title-line);
-    /* Paint above the row. The dot is the wrapper's FIRST child and `.thread-row`
-     * (its sibling) is `position: relative`, so both are positioned siblings with
-     * `z-index: auto` and paint in DOM order — without this the row paints AFTER
-     * the dot and a focused/highlighted row's opaque background (`--bg-selected`)
-     * covers it, making the status dot vanish the moment a row is selected. */
-    z-index: 1;
+/* The pin's head and body fill the top of its box, and the needle hangs
+ * below. The eye reads the body, so the glyph moves down by the 2.5 of 24
+ * units between the body's center and the box's. The body then centers on
+ * the caps. */
+.thread-row-actions .pin-thread-btn svg {
+    translate: 0 calc(100% * 2.5 / 24);
 }
 
-.thread-row-wrap > .thread-status .mini-spinner {
+/* The mark starts the title's first line, and a wrapped title continues under
+ * it, flush with the row's content column. That keeps the drawer's left margin
+ * free of a column reserved for the mark.
+ *
+ * The mark centers on the capital letters, where the eye puts a title's middle.
+ * The line box's middle sits lower by an amount that differs per font.
+ * `vertical-align: middle` centers the box half an x-height above the baseline.
+ * The bottom margin of `1cap - 1ex` lifts that center to half a cap height.
+ * The box itself is zero tall, and the flex rule centers the drawn mark on it,
+ * so the mark never grows the line. An idle thread draws no mark, so it takes
+ * no room either.
+ *
+ * The row's pin and ⋯ take the same box. They are taller than the line, so
+ * they overhang it both ways and still take no room. */
+.thread-row-title-text > .thread-status,
+.thread-row-actions {
+    display: inline-flex;
+    vertical-align: middle;
+    height: 0;
+    margin-bottom: calc(1cap - 1ex);
+}
+
+.thread-row-title-text > .thread-status {
+    margin-right: 0.375rem;
+}
+
+/* A step under the header's spinner: a row title is smaller than the pane's. */
+.thread-row-title-text > .thread-status .mini-spinner {
     width: 0.5rem;
     height: 0.5rem;
-    box-sizing: border-box;
+}
+
+.thread-row-title-text > .thread-status-idle {
+    display: none;
 }
 
 @media (min-width: 769px) {
-    /* Pin actions (pin + overflow) to the row bottom on desktop too — the base
-     * `.thread-row-actions { margin-top: auto }` already does this (relies on
-     * `.thread-row-right { align-self: stretch }` for the free space to consume),
-     * so no desktop override is needed; an earlier `margin-top: 0` here defeated
-     * it and floated the icons just below the chips instead. */
+    .thread-row-actions {
+        gap: 0.125rem;
+    }
+
     .thread-row-actions .icon-btn.header-icon {
         width: 1.25rem;
         height: 1.25rem;
-    }
-
-    .thread-row-right {
-        gap: 0.125rem;
     }
 
     /* Match the row's top padding (0.5rem, from base `.list-row`) so the title
@@ -991,12 +1052,18 @@ html[data-theme="dark"] .thread-row .message-channel-tag.channel-error {
         height: 1.5rem;
     }
 
+    /* 1rem above the title and 1rem below the date (this bottom plus
+     * `.thread-row-left`'s descent room). It must stay clearly larger than the
+     * title-to-date gap, so each row reads as one group, not as loose lines. */
+    .thread-row {
+        padding-top: var(--space-lg);
+        padding-bottom: var(--space-md);
+    }
+
     /* The pin is the row's ONLY control here: the ⋯ is gone and a long press on
-     * the row opens its menu instead (useRowActionsGesture). Letting the pin
-     * slide into the vacated slot would leave that one control in the corner
-     * this change exists to leave, so the whole right column moves in to the
-     * shared --space-lg gutter. The chips above it travel with it, keeping one
-     * right edge, and both dividers track the same var. */
+     * the row opens its menu instead (useRowActionsGesture). So the pin moves
+     * in from the row's far corner to the shared --space-lg gutter, and both
+     * dividers track the same var. */
     .thread-drawer {
         --thread-row-pad-right: var(--space-lg);
     }
@@ -1005,7 +1072,7 @@ html[data-theme="dark"] .thread-row .message-channel-tag.channel-error {
      * and more padding. */
     .family-disclosure {
         font-size: var(--font-size-xs);
-        padding: 0.25rem 0;
+        --disclosure-pad-y: 0.25rem;
     }
 }
 
@@ -1070,12 +1137,6 @@ html[data-theme="dark"] .thread-row .message-channel-tag.channel-error {
     display: flex;
     align-items: center;
     justify-content: center;
-}
-
-.thread-drawer-loading {
-    font-size: var(--font-size-sm);
-    color: var(--text-secondary);
-    padding: 0.5rem;
 }
 
 /* --- FLIP animation portal: flying thread clones render here ---
@@ -1225,19 +1286,23 @@ html[data-theme="dark"] .thread-row .message-channel-tag.channel-error {
     cursor: pointer;
     -webkit-user-select: none;
     user-select: none;
-    /* Pin the header's line box to the count badge's own `line-height: 1rem`
-       (16px), so the label text and the badge share one cross-size. Otherwise
-       the badge is 1px taller than the bare 0.8125rem text line box (15px). The
-       row then grows to the badge, and `align-items: center` puts the icon and
-       label half a pixel off the grid in some sections but not others. */
+}
+
+/* Pin the header's line box to the count badge's own `line-height: 1rem`
+   (16px), so the label text and the badge share one cross-size. Otherwise
+   the badge is 1px taller than the bare 0.8125rem text line box (15px). The
+   row then grows to the badge, and `align-items: center` puts the icon and
+   label half a pixel off the grid in some sections but not others. */
+.list-section-title:has(> .section-count) {
     line-height: 1rem;
 }
 
 /* The section count: the pill with its own small number, and an open copy
  * of the number one type step larger. Only one copy shows at a time, and
  * each one rests untransformed. Chromium draws a scaling glyph from a bitmap,
- * so a copy resting at a scale would stay soft until the scale ended. */
-.list-section-title-collapsible > .section-count {
+ * so a copy resting at a scale would stay soft until the scale ended. A
+ * status-filter header never collapses, so it always shows the open copy. */
+.list-section-title > .section-count {
     position: relative;
     display: inline-flex;
     /* A hand-tuned lift, and the block below retires it wherever it can. The
@@ -1253,7 +1318,7 @@ html[data-theme="dark"] .thread-row .message-channel-tag.channel-error {
     --section-count-open-scale: 1.2;
 }
 
-.list-section-title-collapsible > .section-count > .section-count-badge {
+.list-section-title > .section-count > .section-count-badge {
     position: relative;
     /* The pill moves to `::before`, so it can animate apart from the digits.
        `isolation` keeps the layer above the header's own background and below
@@ -1278,7 +1343,7 @@ html[data-theme="dark"] .thread-row .message-channel-tag.channel-error {
 /* An open section shows its rows, so its count is a bare number. A collapsed
  * one hides them, and the pill marks that. The pill shrinks away on open and
  * springs back on collapse. Reduced motion collapses both to a swap. */
-.list-section-title-collapsible > .section-count > .section-count-badge::before {
+.list-section-title > .section-count > .section-count-badge::before {
     content: '';
     position: absolute;
     inset: 0;
@@ -1348,7 +1413,7 @@ html[data-theme="dark"] .thread-row .message-channel-tag.channel-error {
         text-box-edge: cap alphabetic;
     }
 
-    .list-section-title-collapsible > .section-count {
+    .list-section-title > .section-count {
         top: 0;
     }
 
@@ -1357,7 +1422,7 @@ html[data-theme="dark"] .thread-row .message-channel-tag.channel-error {
        grid. A baseline that crosses pixel fractions mid-animation therefore
        makes the number dip a pixel before it lands. The two baselines differ,
        so the number takes that step once, on the frame the copies swap. */
-    .list-section-title-collapsible > .section-count > .section-count-badge {
+    .list-section-title > .section-count > .section-count-badge {
         transform-origin: 50% calc(100% - var(--badge-baseline-inset));
     }
 
@@ -1406,7 +1471,7 @@ html[data-theme="dark"] .thread-row .message-channel-tag.channel-error {
    rule above, so source order (this rule is later) makes it win. */
 .thread-drawer .list-section-title-highlighted {
     background: var(--bg-secondary);
-    border-radius: 0.25rem;
+    border-radius: calc(var(--radius-control) * 0.5);
 }
 
 
@@ -1529,7 +1594,7 @@ html[data-theme="dark"] .thread-row .message-channel-tag.channel-error {
     color: var(--text-primary);
     background: var(--bg-tertiary);
     border: 1px solid var(--accent);
-    border-radius: 0.25rem;
+    border-radius: calc(var(--radius-control) * 0.5);
     padding: 0.125rem 0.25rem;
     outline: none;
     width: 100%;
@@ -1623,11 +1688,12 @@ html[data-theme="dark"] .thread-row .message-channel-tag.channel-error {
     overflow-wrap: anywhere;
     -webkit-user-select: none;
     user-select: none;
-    -webkit-tap-highlight-color: transparent;
 }
 
-.thread-title-input.thread-title-display:hover {
-    background: color-mix(in srgb, var(--accent) 15%, transparent);
+@media (hover: hover) {
+    .thread-title-input.thread-title-display:hover {
+        background: color-mix(in srgb, var(--accent) 15%, transparent);
+    }
 }
 
 /* Overlaid (transparent) on top of the display textarea so taps reach the
@@ -1682,15 +1748,17 @@ textarea.thread-title-edit-input {
     transition: color var(--duration-fast) ease;
 }
 
-.thread-title-suggestion-btn:hover {
-    color: var(--accent);
+@media (hover: hover) {
+    .thread-title-suggestion-btn:hover {
+        color: var(--accent);
+    }
 }
 
 /* Shimmer loading animation for suggestion */
 .thread-title-shimmer {
     height: 0.75rem;
     width: 60%;
-    border-radius: 0.25rem;
+    border-radius: calc(var(--radius-control) * 0.5);
     background: linear-gradient(
         90deg,
         var(--bg-tertiary) 25%,

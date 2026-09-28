@@ -178,7 +178,7 @@ export function QuestionBody({ threadId, toolUseId, question, options, multiSele
   if (multiSelect) {
     const selected = multiSelectedByToolUse.value.get(toolUseId) ?? [];
     return (
-      <div class="question-body" data-tool-use-id={toolUseId}>
+      <div class="question-body protected-surface" data-tool-use-id={toolUseId}>
         <QuestionText question={question} />
         {options.length > 0 && (
           <LiveOptions
@@ -208,7 +208,7 @@ export function QuestionBody({ threadId, toolUseId, question, options, multiSele
   };
 
   return (
-    <div class="question-body" data-tool-use-id={toolUseId}>
+    <div class="question-body protected-surface" data-tool-use-id={toolUseId}>
       <QuestionText question={question} />
       {options.length > 0 && (
         <LiveOptions toolUseId={toolUseId} options={options} onActivate={onPick} />
@@ -338,7 +338,7 @@ export function AnsweredBody({
     : resolved.kind === 'MultiSelected' ? resolved.text
     : undefined;
   return (
-    <div class="question-body question-body-answered" data-tool-use-id={toolUseId}>
+    <div class="question-body question-body-answered protected-surface" data-tool-use-id={toolUseId}>
       <QuestionText question={question} />
       {options.length > 0 && (
         <div class="question-options">
@@ -393,7 +393,7 @@ export function TerminatedQuestionBody({
   multiSelect: boolean | undefined;
 }) {
   return (
-    <div class="question-body question-body-terminated">
+    <div class="question-body question-body-terminated protected-surface">
       <QuestionText question={question} />
       {options.length > 0 && (
         <div class="question-options">

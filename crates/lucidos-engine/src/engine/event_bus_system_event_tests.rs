@@ -4,7 +4,6 @@ use crate::engine::thread_events::ActorMode;
 fn device_actor() -> MessageOrigin {
     MessageOrigin::Device {
         device_id: "dev-1".to_string(),
-        label: "My Mac".to_string(),
     }
 }
 
@@ -22,7 +21,10 @@ fn domain_event_to_payload_injects_actor_into_object() {
     let actor = payload.get("actor").expect("actor must be merged in");
     assert_eq!(actor["kind"], "device");
     assert_eq!(actor["device_id"], "dev-1");
-    assert_eq!(actor["label"], "My Mac");
+    assert!(
+        actor.get("label").is_none(),
+        "a device actor stores its id, never its name"
+    );
 }
 
 #[test]
@@ -385,6 +387,22 @@ fn engine_build_state_changed_is_transient_on_engine_aggregate() {
     let json = serde_json::to_value(&e).unwrap();
     assert_eq!(json["type"], "EngineBuildStateChanged");
     assert_eq!(json["data"]["state"], "building");
+    assert_eq!(json["data"]["sent_at_ms"], 1_700_000_000_000_i64);
+}
+
+#[test]
+fn frontend_refresh_state_changed_is_transient_on_engine_aggregate() {
+    // The frontend twin of EngineBuildStateChanged: a pure poke, so the page
+    // re-reads version-status for `frontend_refresh_elapsed_ms`.
+    let e = SystemEvent::FrontendRefreshStateChanged {
+        sent_at_ms: 1_700_000_000_000,
+    };
+    assert!(!e.is_persisted());
+    assert_eq!(e.aggregate(), "engine");
+    assert_eq!(e.event_type(), "FrontendRefreshStateChanged");
+    assert_eq!(e.aggregate_id(), "global");
+    let json = serde_json::to_value(&e).unwrap();
+    assert_eq!(json["type"], "FrontendRefreshStateChanged");
     assert_eq!(json["data"]["sent_at_ms"], 1_700_000_000_000_i64);
 }
 

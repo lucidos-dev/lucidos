@@ -1,7 +1,7 @@
 use uuid::Uuid;
 
 use super::PreEmittedOrigin;
-use crate::engine::thread_events::ActorMode;
+use crate::engine::thread_events::{ActorMode, MessageOrigin};
 use crate::engine::LucidosEngine;
 
 impl LucidosEngine {
@@ -38,7 +38,7 @@ impl LucidosEngine {
         caller_title: Option<&str>,
         model: Option<String>,
         reasoning_effort: Option<String>,
-        origin: Option<crate::engine::thread_events::MessageOrigin>,
+        origin: Option<MessageOrigin>,
     ) -> Result<(Uuid, tokio::task::JoinHandle<()>), Box<dyn std::error::Error + Send + Sync>> {
         // `process_message_with_steps` does the naming, once the child's row
         // exists to hold it. The placeholder is dropped: a chat child has no
@@ -46,6 +46,8 @@ impl LucidosEngine {
         // shows its first message until a title lands.
         let caller_title = super::spawn_naming(caller_title, prompt).caller_title;
 
+        // Must match what the eager emit stamped, see `eager_sub_thread_message`.
+        let mode = MessageOrigin::mode_or(origin.as_ref(), ActorMode::Agent);
         let engine = self.clone_arc();
         let prompt_owned = prompt.to_string();
         // Carry the caller's event-trigger chain depth across the spawn. The
@@ -76,7 +78,7 @@ impl LucidosEngine {
                         None,
                         parent_thread_id,
                         spawning_event_id,
-                        ActorMode::Agent,
+                        mode,
                         None,
                         None,
                         // The Thread Queue executor persists the child's

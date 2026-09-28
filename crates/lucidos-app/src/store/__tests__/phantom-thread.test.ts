@@ -43,7 +43,6 @@ function makeThread(id: string, overrides: Partial<ThreadState['meta']> = {}): T
       codingAgentProposed: false,
       codingAgentRequiresRestart: false,
       codingAgentIsExternalRepo: false,
-      codingAgentApplying: false,
       codingAgentHasDiff: false,
       lastRevivedAt: '',
       state: 'active',
@@ -122,7 +121,7 @@ describe('Phantom thread prevention', () => {
       seq: 1,
       event: { type: 'SessionStarted', session_id: 'cc-1' },
       created: '2026-04-16T12:00:00Z',
-      aggregate: makeThreadAggregate(threadId, { channel: 'claude_code' }),
+      aggregate: makeThreadAggregate(threadId, { channel: 'claude_code', title: '' }),
     });
 
     expect(threadMap.value.has(threadId)).toBe(true);
@@ -130,6 +129,36 @@ describe('Phantom thread prevention', () => {
     expect(thread.meta.title).toBe('...');
     expect(thread.meta.channel).toBe('claude_code');
     expect(thread.eventsLoaded).toBe(false);
+  });
+
+  it('a skeleton for an old thread takes its identity from the aggregate, not the event', () => {
+    // Real case: the worktree cleanup emits WorktreeCleaned for archived coding
+    // threads the drawer never loaded. The skeleton read "Untitled Thread" with
+    // the Lucidos Agent pill. It also took the cleanup's time as its creation
+    // time, which floated it to the top of Archive. A reload fixed all three.
+    const threadId = 'old-archived-cc-thread';
+
+    handleThreadEvent({
+      thread_id: threadId,
+      seq: 42,
+      event: { type: 'WorktreeCleaned', tier: 0, freed_bytes: 1024, branch_deleted: true },
+      created: '2026-09-28T06:19:58Z',
+      aggregate: makeThreadAggregate(threadId, {
+        title: 'Update Icon Alignment and Animation',
+        channel: 'claude_code',
+        initiator: 'system',
+        createdAt: '2026-09-27T19:43:25Z',
+        lastActivity: '2026-09-27T20:10:00Z',
+        section: 'archived',
+      }),
+    });
+
+    const meta = threadMap.value.get(threadId)!.meta;
+    expect(meta.title).toBe('Update Icon Alignment and Animation');
+    expect(meta.channel).toBe('claude_code');
+    expect(meta.initiator).toBe('system');
+    expect(meta.createdAt).toBe('2026-09-27T19:43:25Z');
+    expect(meta.section).toBe('archived');
   });
 
   it('persisted event for unknown thread with NO aggregate creates nothing', () => {

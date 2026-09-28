@@ -158,7 +158,7 @@ authoritative answer.
 ## Actor attribution
 
 The handler resolves an actor from the request headers via
-`api::actor::user_actor_resolved` and stamps it onto the emitted
+`api::actor::user_actor` and stamps it onto the emitted
 `ChangeApplied` event. One header drives the agent-vs-human distinction:
 
 - **`x-lucidos-agent-origin-token`**: the *thread-bound origin token*,

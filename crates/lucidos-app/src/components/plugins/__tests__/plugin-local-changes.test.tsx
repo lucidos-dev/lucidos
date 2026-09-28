@@ -54,7 +54,7 @@ describe('the keep control rewrites what every row promises', () => {
     // to a replace. A row still claiming "Kept" would promise the opposite of
     // the request the button is about to send.
     for (const outcome of ['merged', 'conflict', 'replaced'] as const) {
-      expect(localChangeLabel(outcome, false)).toBe('Replaced, your version saved aside');
+      expect(localChangeLabel(outcome, false)).toBe('Replaced, your version is saved aside');
     }
   });
 
@@ -120,6 +120,6 @@ describe('the receipt', () => {
         }),
       }),
     );
-    expect(body).not.toContain('Your local changes');
+    expect(body).not.toContain('Your edits');
   });
 });

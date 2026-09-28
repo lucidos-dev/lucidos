@@ -42,10 +42,10 @@ describe('the plain-restart shape', () => {
 });
 
 describe('the new-version shape', () => {
-  it('keeps the canonical name of the action and offers Later', () => {
+  it('labels the action Switch and offers Later', () => {
     const copy = restartConfirmCopy(true, COMMITS, []);
     expect(copy.title).toBe('New version available');
-    expect(copy.okLabel).toBe('Switch to new version');
+    expect(copy.okLabel).toBe('Switch');
     expect(copy.cancelLabel).toBe('Later');
   });
 

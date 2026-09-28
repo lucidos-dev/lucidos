@@ -990,17 +990,31 @@ fn preview_id(payload: &str, key: &str) -> Option<uuid::Uuid> {
 /// Inspect a tool result for a form-request sentinel. On a match, return the
 /// request event to emit and the LLM-facing replacement text, if any.
 ///
+/// Only the tool that produces a sentinel may open its form. `run_bash`, an MCP
+/// tool or a fetched page passes outside text through verbatim. A prefix match
+/// alone would let that text open a trusted credential form scoped to any host.
+/// `tool_name` and `args` are the call as the model made it. A grouped tool
+/// resolves to its legacy name first.
+///
 /// The wording says the form was SENT, never shown. The engine knows it
 /// recorded the request; whether a screen drew it is the client's to know.
-pub(crate) fn match_sentinel(text: &str) -> Option<SentinelMatch> {
+pub(crate) fn match_sentinel(
+    tool_name: &str,
+    args: &serde_json::Value,
+    text: &str,
+) -> Option<SentinelMatch> {
     use super::super::thread_events::ThreadEvent;
     use super::super::tools::credentials::CREDENTIAL_REQUEST_PREFIX;
     use super::super::tools::plugins::{
         PLUGIN_INSTALL_REQUEST_PREFIX, PLUGIN_UNINSTALL_REQUEST_PREFIX,
     };
+    use crate::llm::tool_names as tn;
+
+    let tool = super::super::tools::dispatch_name(tool_name, args).ok()?;
 
     type SentinelEntry = (
         &'static str,
+        &'static [&'static str],
         &'static str,
         fn(String) -> Option<ThreadEvent>,
         Option<&'static str>,
@@ -1008,6 +1022,11 @@ pub(crate) fn match_sentinel(text: &str) -> Option<SentinelMatch> {
     let entries: &[SentinelEntry] = &[
         (
             CREDENTIAL_REQUEST_PREFIX,
+            &[
+                tn::REQUEST_CREDENTIAL,
+                tn::CONNECT_OAUTH_ACCOUNT,
+                tn::CONFIGURE_EMAIL,
+            ],
             "[AgenticLoop] CredentialRequested",
             |payload| {
                 Some(ThreadEvent::CredentialRequested {
@@ -1019,6 +1038,7 @@ pub(crate) fn match_sentinel(text: &str) -> Option<SentinelMatch> {
         ),
         (
             PLUGIN_INSTALL_REQUEST_PREFIX,
+            &[tn::INSTALL_PLUGIN, tn::UPDATE_PLUGIN],
             "[AgenticLoop] PluginInstallRequested",
             |payload| {
                 Some(ThreadEvent::PluginInstallRequested {
@@ -1030,6 +1050,7 @@ pub(crate) fn match_sentinel(text: &str) -> Option<SentinelMatch> {
         ),
         (
             PLUGIN_UNINSTALL_REQUEST_PREFIX,
+            &[tn::UNINSTALL_PLUGIN],
             "[AgenticLoop] PluginUninstallRequested",
             |payload| {
                 Some(ThreadEvent::PluginUninstallRequested {
@@ -1041,6 +1062,7 @@ pub(crate) fn match_sentinel(text: &str) -> Option<SentinelMatch> {
         ),
         (
             "[EMAIL_CONFIRM]",
+            &[tn::SEND_EMAIL],
             "[AgenticLoop] EmailConfirmRequested",
             |payload| {
                 Some(ThreadEvent::EmailConfirmRequested {
@@ -1052,8 +1074,8 @@ pub(crate) fn match_sentinel(text: &str) -> Option<SentinelMatch> {
         ),
     ];
 
-    for &(prefix, label, ctor, redacted) in entries {
-        if !text.starts_with(prefix) {
+    for &(prefix, producers, label, ctor, redacted) in entries {
+        if !producers.contains(&tool) || !text.starts_with(prefix) {
             continue;
         }
         let after = &text[prefix.len()..];

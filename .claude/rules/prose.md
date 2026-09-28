@@ -29,6 +29,17 @@ written as comments and belong elsewhere:
 Content that outgrows the block limit below is a doc, an ADR or a plan. Link to
 it instead.
 
+**A comment never defends a shortcut, workaround or known-wrong behaviour.**
+The next reader, human or agent, takes it as settled design and builds on it.
+Fix the root cause. Failing that, register a temporary measure, or record a
+known limitation in a plan or an ADR. An invariant ("callers must hold the
+lock") is still fine.
+
+- Bad: `// Polling each second is fine for now.`
+- Good: `// Polls until SSE covers lists (docs/temporary-measures.md).`
+
+Pilot: `docs/plans/2026-09-25-comment-ablation-pilot-results.md`.
+
 ## Hard limits
 
 Four, every one checked on added lines only:
@@ -53,16 +64,12 @@ Four, every one checked on added lines only:
 ## Where the numbers come from
 
 The sentence, paragraph and noun-cluster limits are ASD-STE100 Issue 9,
-Simplified Technical English. ISO 24495-1:2023 supplies the frame: a reader
-should find what they need, understand it, and use it. For anything left
-unspecified here, follow Google's developer documentation style guide.
+Simplified Technical English. For anything left unspecified here, follow
+Google's developer documentation style guide.
 
 **STE's dictionary is not adopted.** It bans "verify", "check", "confirm" and
 "ensure" in favour of "make sure", and those four are our canonical words.
 Vocabulary belongs to `.claude/rules/glossary.md`.
-
-ASD owns STE's copyright and its text may not be redistributed, so this file
-cites the limits and quotes none of it.
 
 ## Not retroactive: no sweep unless commissioned
 
@@ -75,14 +82,8 @@ touched. Rewording a line counts as adding it: touch a line and you own it.
 
 ## Enforcement
 
-Two deterministic gates, over markdown and `//`-comment sources only. Both are
-diff-scoped, added-lines-only, and hard failures:
-
-- **Write time**: `.claude/hooks/prose.sh`, a `PreToolUse` hook on `Edit` and
-  `Write`.
-- **Review time**: `./scripts/check-prose.sh`, run by `/harden` Phase 4.5 for
-  every diff. That is the layer covering Codex, which has no hooks.
-
-Both share `scripts/lib/prose_scan.sh`, the single source of truth for the four
-limits, tested by `scripts/lib/prose_scan_test.sh`. The review-only rules are an
-angle in the `code-review` skill. Nothing but this text reaches a chat reply.
+The four limits are hard failures on added lines, over markdown and
+`//`-comment sources: `.claude/hooks/prose.sh` at write time, and
+`./scripts/check-prose.sh` in `/harden`. Mechanism: `docs/glossary.md` § Prose
+gate. The review-only rules are a `code-review` angle. Nothing but this text
+reaches a chat reply.

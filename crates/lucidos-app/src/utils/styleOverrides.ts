@@ -21,6 +21,8 @@ export {
   STYLE_RESET_PARAM,
   MAX_STYLE_OVERRIDES,
   MAX_STYLE_VALUE_LENGTH,
+  isAllowedOverride,
+  isReservedOverrideName,
   isValidOverrideName,
   isValidOverrideValue,
   parseStyleOverrides,

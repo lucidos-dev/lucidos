@@ -1320,3 +1320,148 @@ async fn a_rename_beside_an_edit_stages_both() {
         String::from_utf8_lossy(&after.stdout)
     );
 }
+
+/// Commit `content` to `file` in `dir` on whatever branch is checked out.
+async fn commit_file(dir: &Path, file: &str, content: &str, message: &str) {
+    tokio::fs::write(dir.join(file), content).await.unwrap();
+    git_cmd(&["add", "."], dir).await.unwrap();
+    git_cmd(&["commit", "-m", message], dir).await.unwrap();
+}
+
+async fn sha_of(repo: &Path, rev: &str) -> String {
+    let out = git_cmd(&["rev-parse", rev], repo).await.unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// A worktree on a new `branch` cut from main. Its one commit edits
+/// `init.txt`, so a later main edit of that file conflicts.
+async fn conflicting_branch_worktree(
+    repo: &Path,
+    branch: &str,
+) -> (tempfile::TempDir, std::path::PathBuf) {
+    let wt_tmp = tempfile::tempdir().unwrap();
+    let wt_dir = wt_tmp.path().join("wt");
+    git_cmd(
+        &[
+            "worktree",
+            "add",
+            "-b",
+            branch,
+            wt_dir.to_str().unwrap(),
+            "main",
+        ],
+        repo,
+    )
+    .await
+    .unwrap();
+    commit_file(&wt_dir, "init.txt", "branch edit", "branch edit").await;
+    (wt_tmp, wt_dir)
+}
+
+/// The reported Tier 1 failure: a resolution merged main, then another change
+/// landed on main before it finished. It asked whether main NOW was an
+/// ancestor, so the clean landing below it read as an unfinished merge.
+#[tokio::test]
+async fn a_resolution_that_merged_its_start_main_passes_after_main_moves() {
+    let (_tmp, repo) = make_test_repo().await;
+    let (_wt_tmp, wt_dir) = conflicting_branch_worktree(&repo, "feature").await;
+    let _ = git_cmd(&["checkout", "main"], &repo).await;
+    commit_file(&repo, "earlier.txt", "earlier", "earlier main change").await;
+    let main_at_start = sha_of(&repo, "main").await;
+
+    git_cmd(&["merge", "main", "--no-edit"], &wt_dir)
+        .await
+        .unwrap();
+    commit_file(
+        &repo,
+        "later.txt",
+        "later",
+        "a change that landed meanwhile",
+    )
+    .await;
+
+    assert!(
+        resolution_merged_main(&repo, Some(&main_at_start), "feature").await,
+        "the branch merged the main it was asked to merge"
+    );
+    let result = catchup_and_ff_to_main(&repo, &wt_dir, "feature").await;
+    assert!(
+        result.is_ok(),
+        "the catch-up merges the rest: {:?}",
+        result.err()
+    );
+    assert!(repo.join("later.txt").exists());
+}
+
+#[tokio::test]
+async fn a_resolution_that_never_merged_main_does_not_pass() {
+    let (_tmp, repo) = make_test_repo().await;
+    let (_wt_tmp, _wt_dir) = conflicting_branch_worktree(&repo, "feature").await;
+    let _ = git_cmd(&["checkout", "main"], &repo).await;
+    commit_file(&repo, "earlier.txt", "earlier", "earlier main change").await;
+    let main_at_start = sha_of(&repo, "main").await;
+
+    assert!(!resolution_merged_main(&repo, Some(&main_at_start), "feature").await);
+    assert!(
+        !resolution_merged_main(&repo, None, "feature").await,
+        "a start sha nobody could read must not authorize the fast-forward"
+    );
+}
+
+/// A Tier-3 resolution whose catch-up hits a new conflict left its temp
+/// worktree and branch behind, because the error skipped the cleanup.
+#[tokio::test]
+async fn a_tier3_catchup_conflict_removes_the_temp_state_and_reads_as_a_collision() {
+    let (_tmp, repo) = make_test_repo().await;
+    git_cmd(&["branch", "feature"], &repo).await.unwrap();
+    let (_wt_tmp, wt_dir) = conflicting_branch_worktree(&repo, "merge-tmp/x").await;
+    let _ = git_cmd(&["checkout", "main"], &repo).await;
+    commit_file(&repo, "init.txt", "main edit", "conflicting main change").await;
+
+    let err = ff_merge_to_main(&repo, wt_dir.to_str().unwrap(), "merge-tmp/x", "feature")
+        .await
+        .expect_err("the catch-up conflicts");
+
+    assert!(is_concurrent_main_conflict(&err.to_string()), "{err}");
+    assert!(!wt_dir.exists(), "the temp worktree must go");
+    assert!(!git_ref_exists(&repo, "refs/heads/merge-tmp/x").await);
+    assert!(
+        git_ref_exists(&repo, "refs/heads/feature").await,
+        "the change branch is not this attempt's to delete"
+    );
+}
+
+/// The Tier-2 half: the session ran in the thread's own worktree on the real
+/// change branch, which a failed merge must never delete (ADR 0035).
+#[tokio::test]
+async fn a_tier2_catchup_conflict_keeps_the_thread_worktree_and_branch() {
+    let (_tmp, repo) = make_test_repo().await;
+    let (_wt_tmp, wt_dir) = conflicting_branch_worktree(&repo, "feature").await;
+    let _ = git_cmd(&["checkout", "main"], &repo).await;
+    commit_file(&repo, "init.txt", "main edit", "conflicting main change").await;
+
+    let err = ff_merge_to_main(&repo, wt_dir.to_str().unwrap(), "feature", "feature")
+        .await
+        .expect_err("the catch-up conflicts");
+
+    assert!(is_concurrent_main_conflict(&err.to_string()), "{err}");
+    assert!(wt_dir.exists());
+    assert!(git_ref_exists(&repo, "refs/heads/feature").await);
+}
+
+/// Both landing paths wrap the catch-up error in their own words, so the
+/// retry has to recognise it inside either wrapper.
+#[test]
+fn a_concurrent_main_conflict_is_recognised_inside_its_wrappers() {
+    let raw = format!("{CONCURRENT_MAIN_CONFLICT}: CONFLICT (content)");
+    assert!(is_concurrent_main_conflict(&raw));
+    assert!(is_concurrent_main_conflict(&format!(
+        "ff-merge to main failed after CC merge: {raw}"
+    )));
+    assert!(is_concurrent_main_conflict(&format!(
+        "Merge failed after conflict resolution: {raw}"
+    )));
+    assert!(!is_concurrent_main_conflict(
+        "Fast-forward merge to main failed after 3 retries: update-ref failed"
+    ));
+}

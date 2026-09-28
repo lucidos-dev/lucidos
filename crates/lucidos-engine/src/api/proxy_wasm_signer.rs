@@ -3,15 +3,18 @@
 
 use crate::api::hex::hex_lower;
 use crate::api::proxy_auth_layer::{AuthLayer, AuthMutation, BodyView, LayerInput};
-use crate::api::proxy_wasm_host::{register_host_imports, HostState};
+use crate::api::proxy_wasm_host::{register_host_imports, HostState, LogBudget};
 use async_trait::async_trait;
-use axum::http::{HeaderName, StatusCode};
+use axum::http::{HeaderName, HeaderValue, StatusCode};
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::path::Path;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, LazyLock};
+use std::time::{Duration, Instant};
+use tokio::sync::Semaphore;
 use wasmtime::{
     Config, Engine, Linker, Module, ResourceLimiter, Store, StoreLimits, StoreLimitsBuilder,
+    UpdateDeadline,
 };
 
 pub struct CompiledModule {
@@ -78,6 +81,33 @@ pub const WITHHELD_HEADER_VALUE: &str = "[withheld: grant read_prior_headers]";
 /// epoch interruption (see [`build_wasmtime_engine`] + [`WasmSignerLayer`]).
 pub const WASM_SIGNER_BUDGET: Duration = Duration::from_secs(5);
 
+/// Longest a signer call waits for a free slot in [`SIGNER_SLOTS`] before it
+/// is refused with a 503. A real signer holds its slot for about a
+/// millisecond, so only a pile-up of runaway signers waits this long.
+const SIGNER_SLOT_WAIT: Duration = Duration::from_secs(1);
+
+/// Engine-wide cap on signer calls running at once.
+///
+/// A running signer holds a tokio worker between epoch yields. Without a cap,
+/// enough runaway signers could occupy every worker at the same time. Then
+/// the UI, SSE, the agent and triggers would stall until the budgets ran out.
+/// The cap keeps most workers free for everything else.
+///
+/// Sized from the runtime the first signer layer is built on, which is the
+/// engine's own. `TOKIO_WORKER_THREADS` can make that differ from the core count.
+static SIGNER_SLOTS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| {
+    let workers = tokio::runtime::Handle::try_current().map_or_else(
+        |_| std::thread::available_parallelism().map_or(1, NonZeroUsize::get),
+        |runtime| runtime.metrics().num_workers(),
+    );
+    Arc::new(Semaphore::new(signer_slots_for(workers)))
+});
+
+/// Signer slots for a runtime with `workers` threads: a quarter, at least one.
+fn signer_slots_for(workers: usize) -> usize {
+    (workers / 4).max(1)
+}
+
 /// Maximum linear memory one signer invocation may occupy.
 ///
 /// The layer hands a module at most a 1MB raw body. So 16 MiB is over ten
@@ -110,7 +140,7 @@ const WASM_SIGNER_MAX_TABLES: usize = 1;
 ///
 /// Only the two growth caps appear here. wasmtime reads the object counts and
 /// refuses instantiation itself, with no callback to record. Those trip the
-/// instantiate error path and quote wasmtime's own wording.
+/// instantiate error path, which logs wasmtime's own wording.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SignerCap {
     Memory,
@@ -310,9 +340,9 @@ pub async fn jit_selftest() -> Result<(), String> {
     let module =
         Module::new(&engine, SELFTEST_MODULE).map_err(|e| format!("compile selftest: {e}"))?;
     let mut store: Store<()> = Store::new(&engine, ());
-    // Same shape as `WasmSignerLayer::apply`: epoch interruption is on for the
-    // whole engine, so a store that never sets a deadline is a wedge waiting to
-    // happen.
+    // Epoch interruption is on for the whole engine, so a store that never sets
+    // a deadline is a wedge waiting to happen. Plain trap mode is enough here:
+    // the module returns a constant and runs once, at build time.
     store.set_epoch_deadline(epoch_deadline_ticks(SELFTEST_BUDGET));
     store.epoch_deadline_trap();
     let linker: Linker<()> = Linker::new(&engine);
@@ -344,19 +374,47 @@ fn epoch_deadline_ticks(budget: Duration) -> u64 {
     (ticks as u64).max(1)
 }
 
+/// Epoch-deadline callback for one signer call: yield the thread at every
+/// tick, and trap once `deadline` has passed.
+///
+/// Every host import is synchronous, so a looping module never yields by
+/// itself. In plain trap mode it holds its tokio worker for the whole budget,
+/// and no timeout around the call can fire. Yielding gives the worker back each
+/// tick. The wall-clock deadline keeps the total budget, however long the
+/// yields wait to resume.
+///
+/// The trap is the same `Trap::Interrupt` as trap mode, so [`sandbox_or`] still
+/// reports it with the fixed "exceeded its execution budget" body. Tokio's own
+/// `yield_now` lets the worker drive timers and IO before it resumes the module.
+fn yield_until<T>(
+    deadline: Instant,
+) -> impl FnMut(wasmtime::StoreContextMut<T>) -> wasmtime::Result<UpdateDeadline> + Send + Sync + 'static
+{
+    move |_| {
+        if Instant::now() >= deadline {
+            return Err(wasmtime::Trap::Interrupt.into());
+        }
+        Ok(UpdateDeadline::YieldCustom(
+            1,
+            Box::pin(tokio::task::yield_now()),
+        ))
+    }
+}
+
 /// Map a wasmtime call error to a `(StatusCode, message)`.
 ///
 /// Two sandbox faults read alike, and both give `BAD_GATEWAY`, because a
 /// runaway signer is a module fault. One is a resource cap recorded by
 /// [`SignerLimits`]. The other is an epoch-deadline trip, arriving as
 /// `Trap::Interrupt`. The cap is checked first, since it is the more specific
-/// fact. Any other error keeps `stage`'s default status and embeds the wasm
-/// message.
+/// fact. Any other error keeps `stage`'s default status, and its wasm message
+/// goes to the log only: a trap backtrace carries a code offset the module chose.
 fn sandbox_or(
     signer: &str,
     stage: &str,
     default_status: StatusCode,
     tripped: Option<SignerCap>,
+    redactions: &[String],
     e: wasmtime::Error,
 ) -> (StatusCode, String) {
     if let Some(cap) = tripped {
@@ -376,10 +434,31 @@ fn sandbox_or(
             ),
         );
     }
-    (
+    signer_fault(
         default_status,
-        format!("signer {signer} {stage} failed: {e}"),
+        signer,
+        &format!("{stage} failed"),
+        &format!("{e:?}"),
+        redactions,
     )
+}
+
+/// Refuse a signer call with a body that names only the signer and `what`.
+///
+/// `detail` carries what the module chose: its output, a trap site, a slice it
+/// packed. That can encode a token it holds or a signature over data the app
+/// chose, and redaction cannot catch the second. So the detail goes to the
+/// engine log, scrubbed, and never into the body the app reads.
+fn signer_fault(
+    status: StatusCode,
+    signer: &str,
+    what: &str,
+    detail: &str,
+    redactions: &[String],
+) -> (StatusCode, String) {
+    let detail = crate::core::redact_secret_values(detail, redactions);
+    crate::log!("[wasm-signer:{signer}] {what}: {detail}");
+    (status, format!("signer {signer} {what}"))
 }
 
 /// True iff both halves of a capability grant are present: the module's own
@@ -590,6 +669,9 @@ pub struct WasmSignerLayer {
     /// sign). Enforced via the engine's epoch interruption. Defaults to
     /// [`WASM_SIGNER_BUDGET`]; tests inject a short budget to exercise the trip.
     budget: Duration,
+    /// Slots this call competes for. [`SIGNER_SLOTS`] in production; tests
+    /// inject their own so parallel tests do not share one cap.
+    slots: Arc<Semaphore>,
 }
 
 impl WasmSignerLayer {
@@ -609,12 +691,19 @@ impl WasmSignerLayer {
             credential_handles,
             granted_capabilities,
             budget: WASM_SIGNER_BUDGET,
+            slots: SIGNER_SLOTS.clone(),
         }
     }
 
     /// Override the execution budget (test seam — production uses the default).
     pub fn with_budget(mut self, budget: Duration) -> Self {
         self.budget = budget;
+        self
+    }
+
+    /// Override the concurrency cap (test seam: production uses [`SIGNER_SLOTS`]).
+    pub fn with_slots(mut self, slots: Arc<Semaphore>) -> Self {
+        self.slots = slots;
         self
     }
 
@@ -751,14 +840,26 @@ impl AuthLayer for WasmSignerLayer {
             )
         })?;
 
-        // 3. Spin up a fresh wasmtime Store + Linker for this call. The scrub
-        //    list came from the real prior outputs above, so `log()` stays
-        //    closed to upstream auth material even for a granted signer.
+        // 3. Take a signer slot, then spin up a fresh wasmtime Store + Linker
+        //    for this call. The scrub list came from the real prior outputs
+        //    above, so `log()` stays closed to upstream auth material even for
+        //    a granted signer.
+        let Ok(Ok(_slot)) = tokio::time::timeout(SIGNER_SLOT_WAIT, self.slots.acquire()).await
+        else {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "signer {} was refused: too many signer calls are already running",
+                    self.module.name
+                ),
+            ));
+        };
         let host_state = HostState {
             secrets,
             module_name: self.module.name.clone(),
             log_redactions,
             limits: SignerLimits::new(),
+            log_budget: LogBudget::default(),
         };
         let mut store: Store<HostState> = Store::new(&self.engine, host_state);
         // Enforce the resource ceilings: memory, table elements and object
@@ -766,13 +867,10 @@ impl AuthLayer for WasmSignerLayer {
         // initial memory is refused at instantiation, not after the host has
         // already reserved it. See `SignerLimits`.
         store.limiter(|s| &mut s.limits);
-        // Enforce the execution budget: the engine's epoch ticker advances every
-        // EPOCH_TICK, and the store traps once `budget` worth of ticks elapse.
-        // Set BEFORE instantiate so instantiate + alloc + sign are all bounded —
-        // this is what kills a runaway/non-terminating signer instead of letting
-        // it pin this task forever.
-        store.set_epoch_deadline(epoch_deadline_ticks(self.budget));
-        store.epoch_deadline_trap();
+        // Enforce the execution budget. Set BEFORE instantiate, so instantiate,
+        // alloc and sign share one budget. See `yield_until`.
+        store.set_epoch_deadline(1);
+        store.epoch_deadline_callback(yield_until(Instant::now() + self.budget));
         let mut linker: Linker<HostState> = Linker::new(&self.engine);
         register_host_imports(&mut linker).map_err(|e| {
             (
@@ -795,6 +893,7 @@ impl AuthLayer for WasmSignerLayer {
                 "instantiate",
                 StatusCode::BAD_GATEWAY,
                 store.data().limits.tripped(),
+                &store.data().log_redactions,
                 e,
             )
         })?;
@@ -831,6 +930,7 @@ impl AuthLayer for WasmSignerLayer {
                     "alloc",
                     StatusCode::INTERNAL_SERVER_ERROR,
                     store.data().limits.tripped(),
+                    &store.data().log_redactions,
                     e,
                 )
             })?
@@ -847,11 +947,10 @@ impl AuthLayer for WasmSignerLayer {
             })?;
 
         // 6. Call sign and decode the packed (out_ptr, out_len). The epoch
-        //    deadline (set on the store above) is the real budget — it traps a
-        //    runaway loop. The `tokio::time::timeout` is a secondary bound for a
-        //    hang that DOES yield (e.g. a future async host import); it cannot
-        //    by itself interrupt a tight CPU loop, since that never yields back
-        //    to be polled. Grace > one epoch tick so the epoch trap wins first.
+        //    callback set on the store above is the budget: it traps a runaway
+        //    loop. The `tokio::time::timeout` is a secondary bound, and it can
+        //    fire because the running module yields every epoch tick. Grace >
+        //    one epoch tick, so the epoch trap and its named stage win first.
         let sign_call = sign.call_async(&mut store, (in_ptr, in_len));
         let outcome = tokio::time::timeout(self.budget + Duration::from_secs(2), sign_call).await;
         let packed = match outcome {
@@ -862,6 +961,7 @@ impl AuthLayer for WasmSignerLayer {
                     "sign",
                     StatusCode::BAD_GATEWAY,
                     store.data().limits.tripped(),
+                    &store.data().log_redactions,
                     e,
                 ))
             }
@@ -888,33 +988,34 @@ impl AuthLayer for WasmSignerLayer {
         // sandbox. Any slice a real module returns lies inside its memory (the
         // `memory.read` below would fail otherwise), so this rejects nothing
         // that used to work; it only turns the OOM into a 502.
+        let reject = |class: &str, detail: String| {
+            signer_fault(
+                StatusCode::BAD_GATEWAY,
+                &self.module.name,
+                &format!("returned {class}"),
+                &detail,
+                &store.data().log_redactions,
+            )
+        };
         let mem_size = memory.data_size(&store);
         if out_ptr
             .checked_add(out_len)
             .is_none_or(|end| end > mem_size)
         {
-            return Err((
-                StatusCode::BAD_GATEWAY,
-                format!(
-                    "signer {} returned an out-of-bounds SignOutput slice at {out_ptr}/{out_len} \
-                     (module memory is {mem_size} bytes)",
-                    self.module.name
-                ),
+            return Err(reject(
+                "an out-of-bounds SignOutput slice",
+                format!("{out_ptr}/{out_len} (module memory is {mem_size} bytes)"),
             ));
         }
         let mut out_buf = vec![0u8; out_len];
         memory.read(&store, out_ptr, &mut out_buf).map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("read SignOutput from module memory at {out_ptr}/{out_len}: {e}"),
+            reject(
+                "an unreadable SignOutput slice",
+                format!("{out_ptr}/{out_len}: {e}"),
             )
         })?;
-        let output: SignOutput = serde_json::from_slice(&out_buf).map_err(|e| {
-            (
-                StatusCode::BAD_GATEWAY,
-                format!("parse SignOutput from {}: {e}", self.module.name),
-            )
-        })?;
+        let output: SignOutput = serde_json::from_slice(&out_buf)
+            .map_err(|e| reject("an unparseable SignOutput", e.to_string()))?;
 
         // 8. Capability gate: replace_body needs both manifest + grant.
         if output.replace_body.is_some() && !self.has_capability(CAP_REPLACE_BODY) {
@@ -930,15 +1031,17 @@ impl AuthLayer for WasmSignerLayer {
         // 9. Build AuthMutation.
         let mut add_headers = Vec::with_capacity(output.add_headers.len());
         for (name, value) in output.add_headers {
-            let header_name = HeaderName::from_bytes(name.as_bytes()).map_err(|e| {
-                (
-                    StatusCode::BAD_GATEWAY,
-                    format!(
-                        "signer {} returned invalid header name '{name}': {e}",
-                        self.module.name
-                    ),
-                )
-            })?;
+            let header_name = HeaderName::from_bytes(name.as_bytes())
+                .map_err(|e| reject("an invalid header name", format!("{name:?}: {e}")))?;
+            // The proxy's own value check quotes the header name in its body,
+            // and the module chose that name. So refuse the value here first.
+            // The value can be the credential, so the log names the header only.
+            if HeaderValue::from_str(&value).is_err() {
+                return Err(reject(
+                    "an unsendable header value",
+                    format!("for header {name:?}"),
+                ));
+            }
             add_headers.push((header_name, value));
         }
         // Signers are stateless — cache_was_hit defaults to false.
@@ -1024,6 +1127,20 @@ mod tests {
         assert_eq!(out.add_query.len(), 2);
         let body = out.replace_body.unwrap();
         assert_eq!(&body[..], b"hi");
+    }
+
+    #[test]
+    fn signer_slots_leave_most_workers_free() {
+        assert_eq!(signer_slots_for(1), 1);
+        assert_eq!(signer_slots_for(2), 1);
+        assert_eq!(signer_slots_for(8), 2);
+        assert_eq!(signer_slots_for(16), 4);
+        for workers in 2..=256 {
+            assert!(
+                signer_slots_for(workers) < workers,
+                "{workers} workers must keep one free of signers"
+            );
+        }
     }
 
     // Wasmtime-`Engine`-creating tests for this module live in

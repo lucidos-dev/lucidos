@@ -20,12 +20,8 @@ impl LucidosEngine {
         Self::spawn_cc_task_guarded(engine.clone(), thread_id, async move {
             let prompt = "Your changes have not been hardened. Run /harden now.";
 
-            // Engine-retriggered harden: stamp with the dedicated reason so the
-            // route popover surfaces "Engine · Harden auto-retrigger" instead of
-            // "Unknown".
-            let origin = Some(MessageOrigin::engine(EngineReason::HardenRetrigger));
             let origin_id = match engine
-                .emit_automated_prompt(thread_id, prompt, origin)
+                .emit_automated_prompt(thread_id, prompt, EngineReason::HardenRetrigger)
                 .await
             {
                 Ok(id) => id,

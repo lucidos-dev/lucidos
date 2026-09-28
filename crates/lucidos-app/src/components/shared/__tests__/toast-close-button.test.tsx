@@ -26,13 +26,13 @@ beforeEach(() => {
   engineRestarting.value = false;
 });
 
-describe('Toast close button — gated by dismissable flag', () => {
+describe('Toast close button: shown on a toast that stays or has a target', () => {
   it('omits .toast-close when dismissable: false', () => {
     showToast('Downloading embedding model', 'info', { key: 'model-download', spinning: true, dismissable: false });
     expect(findByClass(ToastList(), 'toast-close').length).toBe(0);
   });
 
-  it('renders .toast-close on warning toasts (dismissable defaults to true)', () => {
+  it('renders .toast-close on a keyed toast that waits to be answered', () => {
     showToast('Engine restart required.', 'warning', {
       key: 'restart-required',
       action: { label: 'Restart', onClick: () => {} },
@@ -40,13 +40,45 @@ describe('Toast close button — gated by dismissable flag', () => {
     expect(findByClass(ToastList(), 'toast-close').length).toBe(1);
   });
 
-  it('renders .toast-close on plain info toasts (no opts → dismissable defaults to true)', () => {
-    showToast('Hello', 'info');
+  it('renders .toast-close on an error, which never times out', () => {
+    showToast('Could not stop waiting', 'error');
+    expect(findByClass(ToastList(), 'toast-close').length).toBe(1);
+  });
+
+  it('omits .toast-close on a plain info toast, which leaves on its own', () => {
+    showToast('Trigger saved', 'success');
+    expect(findByClass(ToastList(), 'toast-close').length).toBe(0);
+  });
+
+  it('omits .toast-close on a keyed toast its caller put on a timer', () => {
+    showToast('Build finished', 'success', { key: 'build-done', autoDismissMs: 8000 });
+    expect(findByClass(ToastList(), 'toast-close').length).toBe(0);
+  });
+
+  it('renders .toast-close on a timed toast with a button, so Escape has a way out', () => {
+    showToast('Build finished', 'success', {
+      key: 'build-done',
+      autoDismissMs: 8000,
+      action: { label: 'Open', onClick: () => {} },
+    });
+    expect(findByClass(ToastList(), 'toast-close').length).toBe(1);
+  });
+
+  it('renders .toast-close on a timed toast whose card opens a target', () => {
+    showToast('Thread finished', 'success', { autoDismissMs: 8000, onClick: () => {} });
+    expect(findByClass(ToastList(), 'toast-close').length).toBe(1);
+  });
+
+  it('renders .toast-close on a timed toast whose card runs its action', () => {
+    showToast('Build finished', 'info', {
+      autoDismissMs: 8000,
+      action: { label: 'Open', onClick: () => {} },
+    });
     expect(findByClass(ToastList(), 'toast-close').length).toBe(1);
   });
 
   it('the close button click dismisses a dismissable toast', () => {
-    showToast('Hello', 'info');
+    showToast('Could not stop waiting', 'error');
     const buttons = findByClass(ToastList(), 'toast-close');
     expect(buttons.length).toBe(1);
     const onClick = (buttons[0].props as { onClick?: () => void }).onClick;

@@ -55,9 +55,9 @@ describe('Apply Now: Scenario A3 — clean merge (happy path)', () => {
     handleEventWithAgg(map, 't1', 6, { type: 'ResponseGenerated' }, '2026-01-01T00:00:10Z');
     handleEventWithAgg(map, 't1', 7, { type: 'CodingAgentIdled', has_changes: true } as any, '2026-01-01T00:00:11Z');
 
-    // Thread status: waiting (idle with changes)
-    expect(thread.meta.status).toBe('waiting');
-    expect(getCodingAgentWaitingInfo(thread.meta)).toEqual({ proposed: true, isExternalRepo: false, requiresRestart: false, applying: false });
+    // Thread status: idle, with the change proposed
+    expect(thread.meta.status).toBe('idle');
+    expect(getCodingAgentWaitingInfo(thread.meta)).toEqual({ proposed: true, isExternalRepo: false, requiresRestart: false });
 
     // 3. Backend proposes change, merges, emits ChangeApplied → ChangeProposed + ChangeApplied + SessionEnded
     handleEventWithAgg(map, 't1', 8, { type: 'ChangeProposed', change_id: 'c-1', description: 'Fix', files: ['lib.rs'] } as any, '2026-01-01T00:00:12Z');
@@ -89,7 +89,7 @@ describe('Apply Now: Scenario A1 — hardening not done', () => {
     handleEventWithAgg(map, 't1', 3, { type: 'CodingAgentTextStreamed', text: 'Done.' }, TS);
     handleEventWithAgg(map, 't1', 4, { type: 'ResponseGenerated' }, '2026-01-01T00:00:05Z');
     handleEventWithAgg(map, 't1', 5, { type: 'CodingAgentIdled', has_changes: true } as any, '2026-01-01T00:00:06Z');
-    expect(thread.meta.status).toBe('waiting');
+    expect(thread.meta.status).toBe('idle');
 
     // 3. Backend sends review follow-up — CC works
     // First need a MessageReceived or CodingAgentUserMessageSent to resume
@@ -116,7 +116,7 @@ describe('Apply Now: Scenario A1 — hardening not done', () => {
     expect(getCodingAgentWaitingInfo(thread.meta)).toBeNull();
   });
 
-  it('review fails → ChangeApplyFailed → thread stays waiting, banner shows error', () => {
+  it('review fails → ChangeApplyFailed → change stays pending, banner shows error', () => {
     const thread = makeThread({ eventsLoaded: true, meta: { ...makeThread().meta, channel: 'claude_code' } });
     const map = new Map([['t1', thread]]);
 
@@ -129,8 +129,8 @@ describe('Apply Now: Scenario A1 — hardening not done', () => {
     // ChangeApplyFailed arrives (e.g., repo has uncommitted changes)
     handleEventWithAgg(map, 't1', 6, { type: 'ChangeApplyFailed', change_id: 'c-1', error: 'uncommitted changes' } as any, '2026-01-01T00:00:05Z');
 
-    // Thread stays waiting — change is still pending, user can retry
-    expect(thread.meta.status).toBe('waiting');
+    // Thread stays idle; the change is still pending, so the user can retry
+    expect(thread.meta.status).toBe('idle');
 
     // ChangeApplyFailed is its own initiator panel exchange (system action,
     // surfaces the error in the body).
@@ -155,7 +155,7 @@ describe('Apply Now: Scenario A4 — no commits to apply (branch already merged)
     handleEventWithAgg(map, 't1', 5, { type: 'CodingAgentIdled', has_changes: true } as any, '2026-01-01T00:00:06Z');
 
     expect(thread.meta.codingAgentProposed).toBe(true);
-    expect(thread.meta.status).toBe('waiting');
+    expect(thread.meta.status).toBe('idle');
 
     // 3. ChangeApplied clears CC flags and sets status to idle
     handleEventWithAgg(map, 't1', 6, { type: 'ChangeApplied', change_id: 'c-1' } as any, '2026-01-01T00:00:07Z');
@@ -182,18 +182,17 @@ describe('Apply Now: Scenario A2 — merge conflict', () => {
     handleEventWithAgg(map, 't1', 5, { type: 'CodingAgentIdled', has_changes: true } as any, t(-16000));
     handleEventWithAgg(map, 't1', 6, { type: 'SessionEnded' }, t(-15000));
 
-    expect(thread.meta.status).toBe('waiting');
+    expect(thread.meta.status).toBe('idle');
 
     // 2. Apply triggered → backend detects merge conflict
     handleEventWithAgg(map, 't1', 7, { type: 'MergeConflictDetected', change_id: 'c-1', files: ['main.rs'] } as any, t(-5000));
 
-    // MergeConflictDetected sets codingAgentApplying=true, status stays waiting
-    expect(thread.meta.codingAgentApplying).toBe(true);
+    // MergeConflictDetected leaves status idle
 
     // 3. Conflict resolution Claude Code session works
     handleEventWithAgg(map, 't1', 8, { type: 'SessionStarted', session_id: 's2' }, t(-4000));
-    // SessionStarted doesn't change status — still waiting
-    expect(thread.meta.status).toBe('waiting');
+    // SessionStarted doesn't change status: still idle
+    expect(thread.meta.status).toBe('idle');
     // CodingAgentPromptSent sets running
     handleEventWithAgg(map, 't1', 8.5, { type: 'CodingAgentPromptSent', text: 'Resolve merge conflict' } as any, t(-3500));
     expect(thread.meta.status).toBe('running');
@@ -220,7 +219,7 @@ describe('Apply Now: Scenario A2 — merge conflict', () => {
     expect(exchanges[2].userEvent.type).toBe('ChangeApplied');
   });
 
-  it('conflict resolution fails → ChangeApplyFailed → thread waiting, can retry', () => {
+  it('conflict resolution fails → ChangeApplyFailed → change stays pending, can retry', () => {
     const thread = makeThread({ eventsLoaded: true, meta: { ...makeThread().meta, channel: 'claude_code' } });
     const map = new Map([['t1', thread]]);
 
@@ -234,8 +233,8 @@ describe('Apply Now: Scenario A2 — merge conflict', () => {
     handleEventWithAgg(map, 't1', 6, { type: 'MergeConflictDetected', change_id: 'c-1', files: ['a.rs'] } as any, '2026-01-01T00:00:05Z');
     handleEventWithAgg(map, 't1', 7, { type: 'ChangeApplyFailed', change_id: 'c-1', error: 'could not resolve conflicts' } as any, '2026-01-01T00:00:06Z');
 
-    // Thread stays waiting — change still pending, user can retry
-    expect(thread.meta.status).toBe('waiting');
+    // Thread stays idle; the change is still pending, so the user can retry
+    expect(thread.meta.status).toBe('idle');
   });
 });
 
@@ -325,7 +324,7 @@ describe('ThreadTitleRenamed event handling', () => {
     expect(thread.meta.status).toBe('idle');
   });
 
-  it('ThreadSaved does not change waiting Claude Code session to running', () => {
+  it('ThreadSaved does not change an idle Claude Code session to running', () => {
     const thread = makeThread({ eventsLoaded: true, meta: { ...makeThread().meta, channel: 'claude_code' } });
     const map = new Map([['t1', thread]]);
 
@@ -333,14 +332,14 @@ describe('ThreadTitleRenamed event handling', () => {
     handleEventWithAgg(map, 't1', 2, { type: 'SessionStarted', session_id: 's1' }, '2026-01-01T00:00:01Z');
     handleEventWithAgg(map, 't1', 3, { type: 'CodingAgentIdled', has_changes: true } as any, '2026-01-01T00:00:02Z');
 
-    expect(thread.meta.status).toBe('waiting');
+    expect(thread.meta.status).toBe('idle');
 
-    // Saving the thread should NOT change status from waiting to running
+    // Saving the thread should NOT change status from idle to running
     handleEventWithAgg(map, 't1', 4, { type: 'ThreadSaved' }, '2026-01-01T00:00:03Z');
-    expect(thread.meta.status).toBe('waiting');
+    expect(thread.meta.status).toBe('idle');
   });
 
-  it('ThreadUnsaved does not change waiting Claude Code session to running', () => {
+  it('ThreadUnsaved does not change an idle Claude Code session to running', () => {
     const thread = makeThread({ eventsLoaded: true, meta: { ...makeThread().meta, channel: 'claude_code' } });
     const map = new Map([['t1', thread]]);
 
@@ -348,10 +347,10 @@ describe('ThreadTitleRenamed event handling', () => {
     handleEventWithAgg(map, 't1', 2, { type: 'SessionStarted', session_id: 's1' }, '2026-01-01T00:00:01Z');
     handleEventWithAgg(map, 't1', 3, { type: 'CodingAgentIdled', has_changes: true } as any, '2026-01-01T00:00:02Z');
 
-    expect(thread.meta.status).toBe('waiting');
+    expect(thread.meta.status).toBe('idle');
 
     handleEventWithAgg(map, 't1', 4, { type: 'ThreadUnsaved' }, '2026-01-01T00:00:03Z');
-    expect(thread.meta.status).toBe('waiting');
+    expect(thread.meta.status).toBe('idle');
   });
 
   it('ThreadSaved does not change idle thread to running', () => {
@@ -483,7 +482,7 @@ describe('Backend-authoritative liveness: meta.status from backend', () => {
     expect(thread.meta.status).toBe('idle');
   });
 
-  it('CodingAgentIdled with has_changes transitions running → waiting', () => {
+  it('CodingAgentIdled with has_changes transitions running → idle', () => {
     const thread = makeThread({
       eventsLoaded: true,
       meta: { ...makeThread().meta, channel: 'claude_code', status: 'running' },
@@ -495,7 +494,7 @@ describe('Backend-authoritative liveness: meta.status from backend', () => {
     expect(thread.meta.status).toBe('running');
 
     handleEventWithAgg(map, 't1', 3, { type: 'CodingAgentIdled', has_changes: true } as any, '2026-01-01T00:00:02Z');
-    expect(thread.meta.status).toBe('waiting');
+    expect(thread.meta.status).toBe('idle');
     expect(thread.meta.codingAgentProposed).toBe(true);
   });
 });

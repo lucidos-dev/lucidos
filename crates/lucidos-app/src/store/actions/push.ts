@@ -1,7 +1,9 @@
 import { API, json, mutatingFetch, throwIfNotOk } from '../../api/client';
 import { showToast, showConfirm } from '../store';
 import { devices, getDeviceId, toggleDevicePush, disablePushForDevices } from './devices';
-import { isTauri, isIOS, isStandalone, isMobileDeviceUserAgent, thisDeviceIsMobile, describeDeviceUserAgent } from '../../utils/platform';
+import { isTauri, isIOS, isStandalone, isMobileDeviceUserAgent, thisDeviceIsMobile } from '../../utils/platform';
+import { deviceName } from '../../utils/deviceFriendlyName';
+import { pairedDevices, pairedRows } from './pairedDevices';
 import { errorDetail } from '../../utils/errorDetail';
 import { withBase, SCOPE_PATH } from '../../utils/basePath';
 import { isDevServerBundle, DEV_SERVER_SW_REASON } from '../../utils/devServerBundle';
@@ -308,10 +310,8 @@ export function otherPushEnabledMobileDevices(
   );
 }
 
-/** How a device is named in prose the user reads: what they called it, else what
- *  its user-agent says it is. */
 function deviceLabel(device: DeviceInfo): string {
-  return device.name || describeDeviceUserAgent(device.user_agent);
+  return deviceName(device.id, device, pairedRows(pairedDevices.value)?.find((p) => p.id === device.id));
 }
 
 /**
@@ -347,6 +347,7 @@ async function offerToSilenceOtherMobileDevices(currentDeviceId: string): Promis
       : `Your other ${others.length} mobile devices still get a push for everything too. Turn it off there, so only this device buzzes?`,
     'Turn off',
     {
+      variant: 'default',
       title: 'Only notify this device?',
       cancelLabel: 'Keep them on',
       details: {

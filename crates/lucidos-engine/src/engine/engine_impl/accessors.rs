@@ -299,12 +299,12 @@ impl LucidosEngine {
         crate::engine::git_ops::record_hardened(&self.pool, repo_root, branch_name, head_sha).await
     }
 
-    pub(crate) async fn harden_marker_state(
+    pub(crate) async fn harden_marker(
         &self,
         repo_root: &std::path::Path,
         branch_name: &str,
-    ) -> crate::engine::git_ops::HardenMarkerState {
-        crate::engine::git_ops::harden_marker_state(&self.pool, repo_root, branch_name).await
+    ) -> crate::engine::git_ops::HardenMarker {
+        crate::engine::git_ops::harden_marker(&self.pool, repo_root, branch_name).await
     }
 
     /// Record a Planned marker (the `implementation-plan` enforcement floor).
@@ -463,7 +463,7 @@ impl LucidosEngine {
 /// - A leading `data/` is stripped — LLMs often pass the full workspace-relative path.
 /// - `.lucidos/…` is handled by [`normalize_lucidos_path`] BEFORE the untyped
 ///   default, because it names the ephemeral scratch tree outside `data/`.
-/// - A known typed prefix ([`crate::core::KNOWN_DATA_PREFIXES`]) is kept as-is.
+/// - A data prefix ([`crate::core::data_prefixes`]) is kept as-is.
 /// - An *untyped* bare path (no `data/` prefix) defaults under `artifacts/`, the
 ///   catch-all content store — so `write_file('report.md')` lands sensibly at
 ///   `artifacts/report.md`.
@@ -474,10 +474,8 @@ impl LucidosEngine {
 ///   secret into the tracked artifacts repo. Loose data-root files are written
 ///   with `run_python` instead.
 ///
-/// The typed set matches `api/data_api.rs`'s `MUTABLE_PREFIXES` (the HTTP data
-/// surface) plus `system-knowhow/` (engine-repo, read-only): both must recognize
-/// the same `data/` subdirs or the file tools and the HTTP API disagree on where
-/// `scripts/` etc. land.
+/// The data route reads the same list, so the file tools and the HTTP API
+/// cannot disagree about where a folder's paths land.
 fn normalize_data_path(relative_path: &str) -> Result<String, String> {
     if crate::api::is_path_traversal(relative_path) {
         return Err("Path traversal not allowed".to_string());
@@ -500,10 +498,11 @@ fn normalize_data_path(relative_path: &str) -> Result<String, String> {
     }
     if had_data_prefix {
         return Err(format!(
-            "'data/{stripped}' is not writable by file tools — the data/ root holds only typed \
-             subdirectories (artifacts/, apps/, knowhow/, triggers/, scripts/, config/, auth-modules/). \
-             For a loose data-root file like data/.env (gitignored config), use run_python: \
-             open('data/.env', 'w'). For content, target a typed subdir, e.g. artifacts/{stripped}."
+            "'data/{stripped}' is not writable by file tools. The data/ root holds only typed \
+             subdirectories ({}). For a loose data-root file like data/.env (gitignored config), \
+             use run_python: open('data/.env', 'w'). For content, target a typed subdir, e.g. \
+             artifacts/{stripped}.",
+            crate::core::known_data_prefixes_text()
         ));
     }
     Ok(format!("artifacts/{stripped}"))
@@ -661,6 +660,22 @@ mod normalize_data_path_tests {
         ] {
             assert_eq!(normalize_data_path(p).unwrap(), p);
         }
+    }
+
+    /// The file tools and the data route read one list, so a prefix the route
+    /// accepts can never be misrouted under `artifacts/` by the tools. Looping
+    /// over the list keeps the test honest when a prefix is added.
+    #[test]
+    fn every_data_prefix_resolves_to_itself() {
+        for prefix in crate::core::data_prefixes::known_data_prefixes() {
+            let path = format!("{prefix}x.json");
+            assert_eq!(normalize_data_path(&path).unwrap(), path);
+            assert_eq!(normalize_data_path(&format!("data/{path}")).unwrap(), path);
+        }
+        assert_eq!(
+            normalize_data_path("themes/phosphor.json").unwrap(),
+            "themes/phosphor.json"
+        );
     }
 
     #[test]

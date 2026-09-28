@@ -219,7 +219,7 @@ async fn create_webhook(
         _ => None,
     };
 
-    let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    let actor = super::actor::user_actor(&headers, None);
     let slug = workspace_slug(&state);
     let (hook, token) = WebhookStore::create(
         &state.pool,
@@ -590,7 +590,7 @@ async fn update_webhook(
         }
     };
 
-    let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    let actor = super::actor::user_actor(&headers, None);
     let slug = workspace_slug(&state);
     let (updated, token) = WebhookStore::update(
         &state.pool,
@@ -629,7 +629,7 @@ async fn delete_webhook(
     headers: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
-    let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    let actor = super::actor::user_actor(&headers, None);
     let removed = WebhookStore::delete(&state.pool, &state.engine.event_bus, id, actor)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
@@ -834,7 +834,7 @@ async fn deliver(
         .engine
         // No trigger: a webhook delivery arrives from outside the workspace, so
         // no fire of ours emitted it and it must wake every subscriber.
-        .emit_domain_event(&hook.event_type, payload, Some(actor), None)
+        .emit_domain_event(&hook.event_type, payload, actor, None)
         .await
     {
         Ok(event_id) => {

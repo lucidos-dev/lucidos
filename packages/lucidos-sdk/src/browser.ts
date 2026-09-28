@@ -2,6 +2,7 @@
 import { lucidos } from './index';
 import { installScrollMemory } from './scroll';
 import { installKeyboardForwarding } from './keyboardForward';
+import { installAppPullToRefresh } from './pullToRefresh';
 import { installTooltips } from './tooltip';
 import { primeDevicePreferences } from './ui';
 import { installAutocorrectStamp } from './autocorrectStamp';
@@ -63,6 +64,9 @@ if (typeof document !== 'undefined') {
   // up to the parent — iframe keydowns never reach the host document otherwise,
   // so shortcuts die whenever an app has focus. See keyboardForward.ts.
   installKeyboardForwarding();
+  // A pull past the top of the app asks the host to refresh it, as the header's
+  // Refresh does. The frame captures every touch, so only the SDK can see it.
+  installAppPullToRefresh();
 
   document.addEventListener('click', (e: MouseEvent) => {
     const target = e.target as Element | null;

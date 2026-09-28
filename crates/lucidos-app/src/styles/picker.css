@@ -82,7 +82,7 @@
   height: 2rem;
   padding: 0;
   border: none;
-  border-radius: 0.5rem;
+  border-radius: var(--radius-control);
   background: transparent;
   color: rgba(255, 255, 255, 0.55);
   cursor: pointer;
@@ -92,9 +92,11 @@
   width: 1.125rem;
   height: 1.125rem;
 }
-.ws-picker-reload:hover {
-  background: rgba(255, 255, 255, 0.18);
-  color: #fff;
+@media (hover: hover) {
+  .ws-picker-reload:hover {
+    background: rgba(255, 255, 255, 0.18);
+    color: #fff;
+  }
 }
 .ws-picker-reload:disabled {
   cursor: default;
@@ -103,8 +105,10 @@
 .ws-picker-reload.has-update {
   color: #ffd45e;
 }
-.ws-picker-reload.has-update:hover {
-  color: #ffdf7e;
+@media (hover: hover) {
+  .ws-picker-reload.has-update:hover {
+    color: #ffdf7e;
+  }
 }
 .ws-picker-reload.has-update::after {
   content: '';
@@ -113,7 +117,7 @@
   right: 0.25rem;
   width: 0.5rem;
   height: 0.5rem;
-  border-radius: 50%;
+  border-radius: var(--radius-round);
   background: #ffd45e;
   box-shadow: 0 0 0 0.125rem rgba(10, 78, 168, 0.9);
 }
@@ -144,7 +148,7 @@
   height: 2rem;
   padding: 0;
   border: none;
-  border-radius: 0.5rem;
+  border-radius: var(--radius-control);
   background: transparent;
   color: rgba(255, 255, 255, 0.55);
   cursor: pointer;
@@ -154,9 +158,11 @@
   width: 1.125rem;
   height: 1.125rem;
 }
-.ws-picker-net-btn:hover {
-  background: rgba(255, 255, 255, 0.18);
-  color: #fff;
+@media (hover: hover) {
+  .ws-picker-net-btn:hover {
+    background: rgba(255, 255, 255, 0.18);
+    color: #fff;
+  }
 }
 .ws-picker-net-btn:disabled {
   cursor: default;
@@ -252,13 +258,13 @@
      leaves the spacing exactly as if it were not there. */
   background: rgba(0, 0, 0, 0.18);
   border: 1px solid rgba(255, 255, 255, 0.14);
-  border-radius: 0.5rem;
+  border-radius: var(--radius-control);
 }
 .ws-picker-net-mode {
   flex: 1 1 0;
   padding: 0.375rem 0.25rem;
   border: none;
-  border-radius: 0.375rem;
+  border-radius: calc(var(--radius-control) * 0.75);
   background: transparent;
   color: rgba(255, 255, 255, 0.7);
   font-size: var(--font-size-sm);
@@ -267,9 +273,11 @@
   cursor: pointer;
   transition: background var(--duration-fast) ease, color var(--duration-fast) ease;
 }
-.ws-picker-net-mode:hover:not(.active) {
-  background: rgba(255, 255, 255, 0.08);
-  color: #fff;
+@media (hover: hover) {
+  .ws-picker-net-mode:hover:not(.active) {
+    background: rgba(255, 255, 255, 0.08);
+    color: #fff;
+  }
 }
 .ws-picker-net-mode.active {
   background: rgba(255, 255, 255, 0.92);
@@ -307,15 +315,20 @@
   font-weight: 600;
   color: #bcd8ff;
   cursor: pointer;
-  border-radius: 0.25rem;
+  border-radius: calc(var(--radius-control) * 0.5);
 }
-.ws-picker-net-detected:hover,
 .ws-picker-net-detected:focus-visible,
-.ws-picker-net-retry:hover,
 .ws-picker-net-retry:focus-visible {
   color: #e7f1ff;
   text-decoration: underline;
   outline: none;
+}
+@media (hover: hover) {
+  .ws-picker-net-detected:hover,
+  .ws-picker-net-retry:hover {
+    color: #e7f1ff;
+    text-decoration: underline;
+  }
 }
 .ws-picker-net-error {
   display: block;
@@ -373,7 +386,7 @@
   /* Corner radius + shadow are kept proportional to the mark size (the original
      5rem mark used 1.375rem / 0.75rem / 1.75rem) so the squircle shape and depth
      read the same at this smaller size instead of over-rounding. */
-  border-radius: 0.825rem;
+  border-radius: calc(var(--radius-control) * 1.65);
   filter: drop-shadow(0 0.45rem 1.05rem rgba(3, 33, 80, 0.55));
 }
 
@@ -449,7 +462,7 @@
   background: rgba(0, 0, 0, 0.22);
   border: 1px solid rgba(255, 138, 128, 0.6);
   color: #ffd9d4;
-  border-radius: 0.625rem;
+  border-radius: calc(var(--radius-surface) * 5 / 6);
   padding: 0.625rem 0.875rem;
   margin-bottom: 1rem;
   font-size: var(--font-size-lg);
@@ -461,19 +474,13 @@
    leaves), so its row height is the real row's by construction and the
    skeleton→list handoff does not reflow. Every cell a loaded row always draws
    therefore has a placeholder: the dot, the name, the backup line under it, and
-   the 2rem action block. The picker sits on the brand-blue gradient, so re-skin the
-   shared `.sk-bar` fill (theme-token by default) to a white-on-blue translucent
-   shimmer in this context; structure + the `shimmer` animation stay shared.
+   the 2rem action block. The picker sits on the brand-blue gradient, where an
+   accent shine would vanish, so its two bar colours are white-on-blue instead.
    Scoped to the whole picker so both the workspace-list rows and the Network
    access popover skeleton share the shimmer. */
 .ws-picker .sk-bar {
-  background: linear-gradient(
-    90deg,
-    rgba(255, 255, 255, 0.08) 25%,
-    rgba(255, 255, 255, 0.2) 50%,
-    rgba(255, 255, 255, 0.08) 75%
-  );
-  background-size: 200% 100%;
+  --sk-base: rgba(255, 255, 255, 0.08);
+  --sk-shine: rgba(255, 255, 255, 0.2);
 }
 
 /* ── List / rows (flat, no card) ─────────────────────────────────────────── */
@@ -500,6 +507,12 @@
    rather than on the row, so the live style remote can reach them (see the
    header of styles/header-mark.css for why that matters). */
 :root {
+  /* The picker's popovers (row menu, reload and stop confirms, network access).
+     The gateway page wears its own brand skin rather than the app theme, so
+     its surface colours are named here once instead of in each rule. */
+  --ws-picker-surface: #0c3f86;
+  --ws-picker-surface-edge: rgba(255, 255, 255, 0.2);
+  --ws-picker-surface-shadow: 0 0.5rem 1.5rem rgba(3, 25, 60, 0.55);
   --ws-picker-dot-size: 0.625rem;
   --ws-picker-row-gap: 0.75rem;
   /* The name's line-height, named because the dot derives its offset from it:
@@ -534,14 +547,18 @@
   display: flex;
   flex-direction: column;
   padding: 0.625rem 0.625rem 0.625rem 0.75rem;
-  border-radius: 0.625rem;
+  border-radius: calc(var(--radius-surface) * 5 / 6);
   cursor: pointer;
   transition: background var(--duration-fast) ease;
 }
-.ws-picker-open:hover,
 .ws-picker-open:focus-visible {
   background: rgba(255, 255, 255, 0.1);
   outline: none;
+}
+@media (hover: hover) {
+  .ws-picker-open:hover {
+    background: rgba(255, 255, 255, 0.1);
+  }
 }
 
 /* The row's three cells (dot · name · actions), on one line and staying there.
@@ -557,7 +574,7 @@
   flex: 0 0 auto;
   width: var(--ws-picker-dot-size);
   height: var(--ws-picker-dot-size);
-  border-radius: 50%;
+  border-radius: var(--radius-round);
   background: rgba(255, 255, 255, 0.45);
 }
 
@@ -686,7 +703,7 @@
   min-width: var(--badge-box, var(--badge-height));
   height: var(--badge-height);
   padding: 0 0.375rem;
-  border-radius: 0.625rem;
+  border-radius: calc(var(--radius-control) * 1.25);
   background: rgba(255, 255, 255, 0.92);
   color: #0a3d91;
   font-size: var(--font-size-sm);
@@ -712,7 +729,7 @@
   height: 2rem;
   padding: 0;
   border: none;
-  border-radius: 0.5rem;
+  border-radius: var(--radius-control);
   background: transparent;
   color: rgba(255, 255, 255, 0.8);
   cursor: pointer;
@@ -722,9 +739,11 @@
   width: 1.125rem;
   height: 1.125rem;
 }
-.ws-picker-icon:hover {
-  background: rgba(255, 255, 255, 0.18);
-  color: #fff;
+@media (hover: hover) {
+  .ws-picker-icon:hover {
+    background: rgba(255, 255, 255, 0.18);
+    color: #fff;
+  }
 }
 .ws-picker-icon:disabled {
   opacity: 0.4;
@@ -736,15 +755,19 @@
   background: rgba(255, 255, 255, 0.16);
   color: #fff;
 }
-.ws-picker-icon-play:hover {
-  background: rgba(255, 255, 255, 0.32);
+@media (hover: hover) {
+  .ws-picker-icon-play:hover {
+    background: rgba(255, 255, 255, 0.32);
+  }
 }
 
 /* Stop reuses the play pill, but warns on hover — stopping is destructive
    (the workspace becomes unreachable until restarted). */
-.ws-picker-icon-stop:hover:not(:disabled) {
-  background: rgba(248, 81, 73, 0.9);
-  color: #fff;
+@media (hover: hover) {
+  .ws-picker-icon-stop:hover:not(:disabled) {
+    background: rgba(248, 81, 73, 0.9);
+    color: #fff;
+  }
 }
 
 /* Positioned wrapper so the (backdrop-less) stop-confirm <Overlay> can hang
@@ -775,12 +798,12 @@
   display: flex;
   flex-direction: column;
   padding: 0.25rem;
-  border-radius: 0.625rem;
+  border-radius: var(--radius-surface);
   /* Solid panel so it reads above the translucent rows; brand-dark with a hairline
      edge and a soft drop shadow for separation. */
-  background: #0c3f86;
-  border: 1px solid rgba(255, 255, 255, 0.2);
-  box-shadow: 0 0.5rem 1.5rem rgba(3, 25, 60, 0.55);
+  background: var(--ws-picker-surface);
+  border: 1px solid var(--ws-picker-surface-edge);
+  box-shadow: var(--ws-picker-surface-shadow);
 }
 
 .ws-picker-menu-item {
@@ -790,7 +813,7 @@
   width: 100%;
   padding: 0.5rem 0.625rem;
   border: none;
-  border-radius: 0.4375rem;
+  border-radius: calc(var(--radius-control) * 0.875);
   background: transparent;
   color: #fff;
   font-size: var(--font-size-lg);
@@ -805,15 +828,19 @@
   height: 1.0625rem;
   color: rgba(255, 255, 255, 0.75);
 }
-.ws-picker-menu-item:hover:not(:disabled) { background: rgba(255, 255, 255, 0.16); }
+@media (hover: hover) {
+  .ws-picker-menu-item:hover:not(:disabled) { background: rgba(255, 255, 255, 0.16); }
+}
 .ws-picker-menu-item:disabled { opacity: 0.5; cursor: default; }
 /* Autostart-on: warm gold, matching the old toggle's "on" state. */
 .ws-picker-menu-item.is-on svg { color: #ffd45e; }
-.ws-picker-menu-item-danger:hover:not(:disabled) {
-  background: rgba(248, 81, 73, 0.3);
-  color: #ffd9d4;
+@media (hover: hover) {
+  .ws-picker-menu-item-danger:hover:not(:disabled) {
+    background: rgba(248, 81, 73, 0.3);
+    color: #ffd9d4;
+  }
+  .ws-picker-menu-item-danger:hover:not(:disabled) svg { color: #ffd9d4; }
 }
-.ws-picker-menu-item-danger:hover:not(:disabled) svg { color: #ffd9d4; }
 
 /* ── Anchored confirm popover (gateway reload) ───────────────────────────── */
 
@@ -822,10 +849,10 @@
   z-index: var(--z-float);
   width: 16rem;
   padding: 0.75rem;
-  border-radius: 0.625rem;
-  background: #0c3f86;
-  border: 1px solid rgba(255, 255, 255, 0.2);
-  box-shadow: 0 0.5rem 1.5rem rgba(3, 25, 60, 0.55);
+  border-radius: var(--radius-surface);
+  background: var(--ws-picker-surface);
+  border: 1px solid var(--ws-picker-surface-edge);
+  box-shadow: var(--ws-picker-surface-shadow);
   text-align: left;
 }
 /* The reload icon sits just left of the settings gear (right: 2.25rem), so the
@@ -884,7 +911,7 @@
   min-width: 8rem;
   background: rgba(0, 0, 0, 0.22);
   border: 1px solid rgba(255, 255, 255, 0.28);
-  border-radius: 0.5rem;
+  border-radius: var(--radius-control);
   color: #fff;
   padding: 0.4375rem 0.625rem;
   font-size: var(--font-size-xl);
@@ -900,19 +927,25 @@
   border: 1px solid rgba(255, 255, 255, 0.28);
   background: rgba(255, 255, 255, 0.14);
   color: #fff;
-  border-radius: 0.5rem;
+  border-radius: var(--radius-control);
   padding: 0.4375rem 0.875rem;
   font-size: var(--font-size-lg);
   font-weight: 500;
   cursor: pointer;
   transition: background var(--duration-fast) ease;
 }
-.ws-picker-btn:hover:not(:disabled) { background: rgba(255, 255, 255, 0.24); }
+@media (hover: hover) {
+  .ws-picker-btn:hover:not(:disabled) { background: rgba(255, 255, 255, 0.24); }
+}
 .ws-picker-btn:disabled { opacity: 0.45; cursor: default; }
 .ws-picker-btn-confirm { background: #2ea043; border-color: transparent; }
-.ws-picker-btn-confirm:hover:not(:disabled) { background: #3fb950; }
+@media (hover: hover) {
+  .ws-picker-btn-confirm:hover:not(:disabled) { background: #3fb950; }
+}
 .ws-picker-btn-danger { background: #da3633; border-color: transparent; }
-.ws-picker-btn-danger:hover:not(:disabled) { background: #f85149; }
+@media (hover: hover) {
+  .ws-picker-btn-danger:hover:not(:disabled) { background: #f85149; }
+}
 
 /* Create form: stacks the quick-fill suggestion chips above the name-input row. */
 .ws-picker-create {
@@ -940,16 +973,18 @@
   border: 1px solid rgba(255, 255, 255, 0.32);
   background: rgba(255, 255, 255, 0.1);
   color: #fff;
-  border-radius: 1rem;
+  border-radius: calc(var(--radius-control) * 2);
   padding: 0.25rem 0.75rem;
   font-size: var(--font-size-md);
   font-weight: 500;
   cursor: pointer;
   transition: background var(--duration-fast) ease, border-color var(--duration-fast) ease;
 }
-.ws-picker-suggestion:hover:not(:disabled) {
-  background: rgba(255, 255, 255, 0.2);
-  border-color: rgba(255, 255, 255, 0.6);
+@media (hover: hover) {
+  .ws-picker-suggestion:hover:not(:disabled) {
+    background: rgba(255, 255, 255, 0.2);
+    border-color: rgba(255, 255, 255, 0.6);
+  }
 }
 .ws-picker-suggestion:disabled { opacity: 0.45; cursor: default; }
 
@@ -970,16 +1005,18 @@
   border: 1px dashed rgba(255, 255, 255, 0.4);
   background: transparent;
   color: #fff;
-  border-radius: 0.625rem;
+  border-radius: calc(var(--radius-surface) * 5 / 6);
   padding: 0.625rem 1.125rem;
   font-size: var(--font-size-xl);
   font-weight: 500;
   cursor: pointer;
   transition: background var(--duration-fast) ease, border-color var(--duration-fast) ease;
 }
-.ws-picker-new:hover:not(:disabled) {
-  background: rgba(255, 255, 255, 0.12);
-  border-color: rgba(255, 255, 255, 0.7);
+@media (hover: hover) {
+  .ws-picker-new:hover:not(:disabled) {
+    background: rgba(255, 255, 255, 0.12);
+    border-color: rgba(255, 255, 255, 0.7);
+  }
 }
 .ws-picker-new:disabled { opacity: 0.45; cursor: default; }
 /* The entry point whose form is unfolded below it: solid border and a lifted
@@ -1049,7 +1086,7 @@
 .ws-picker-lead code {
   font-size: inherit;
   padding: 0 0.1875rem;
-  border-radius: 0.25rem;
+  border-radius: calc(var(--radius-control) * 0.5);
   background: rgba(0, 0, 0, 0.25);
 }
 
@@ -1073,16 +1110,18 @@
   min-height: 3rem;
   padding: 0.75rem 1rem;
   border: 1px dashed rgba(255, 255, 255, 0.45);
-  border-radius: 0.625rem;
+  border-radius: calc(var(--radius-surface) * 5 / 6);
   color: rgba(255, 255, 255, 0.8);
   font-size: var(--font-size-lg);
   text-align: center;
   cursor: pointer;
   transition: background var(--duration-fast) ease, border-color var(--duration-fast) ease;
 }
-.ws-picker-restore-drop:hover {
-  background: rgba(255, 255, 255, 0.1);
-  border-color: rgba(255, 255, 255, 0.7);
+@media (hover: hover) {
+  .ws-picker-restore-drop:hover {
+    background: rgba(255, 255, 255, 0.1);
+    border-color: rgba(255, 255, 255, 0.7);
+  }
 }
 /* A chosen file must be unmistakable: the empty and filled states differed only
    by their text, so a form that had silently lost its file looked ready. */
@@ -1117,7 +1156,7 @@
   flex-wrap: wrap;
   margin-top: 1.25rem;
   padding: 0.625rem 0.875rem;
-  border-radius: 0.625rem;
+  border-radius: calc(var(--radius-surface) * 5 / 6);
   font-size: var(--font-size-lg);
   background: rgba(0, 0, 0, 0.22);
   border: 1px solid rgba(255, 255, 255, 0.18);
@@ -1251,7 +1290,7 @@
   padding: 0.625rem 0.75rem;
   margin-bottom: 0.5rem;
   border: 1px solid var(--border-color);
-  border-radius: 0.5rem;
+  border-radius: var(--radius-control);
   background: var(--bg-secondary);
   color: var(--text-primary);
   /* 1rem, so iOS Safari does not zoom the page when the field takes focus. */
@@ -1319,7 +1358,7 @@
      takes over once the boxes are narrower than the digits they hold. */
   height: min(3rem, 18cqi);
   border: 1px solid var(--border-color);
-  border-radius: 0.5rem;
+  border-radius: calc(var(--radius-surface) * 2 / 3);
   background: var(--bg-secondary);
   color: var(--text-primary);
   font-family: var(--font-mono);
@@ -1379,7 +1418,7 @@
 .pairing-submit {
   padding: 0.75rem 1rem;
   border: none;
-  border-radius: 0.5rem;
+  border-radius: var(--radius-control);
   background: var(--accent-action);
   color: var(--text-on-accent);
   font-size: var(--font-size-lg);
@@ -1412,7 +1451,7 @@
 .pairing-aside {
   margin-bottom: 0.75rem;
   padding: 0.875rem;
-  border-radius: 0.5rem;
+  border-radius: calc(var(--radius-surface) * 2 / 3);
   background: var(--bg-tertiary);
 }
 
@@ -1450,7 +1489,7 @@
   width: 100%;
   aspect-ratio: 1;
   margin-bottom: 0.75rem;
-  border-radius: 0.5rem;
+  border-radius: calc(var(--radius-surface) * 2 / 3);
   background: var(--bg-secondary);
   object-fit: cover;
 }
@@ -1458,7 +1497,7 @@
 .pairing-secondary {
   padding: 0.5rem 0.875rem;
   border: 1px solid var(--border-color);
-  border-radius: 0.5rem;
+  border-radius: var(--radius-control);
   background: var(--bg-secondary);
   color: var(--text-primary);
   font-size: var(--font-size-md);

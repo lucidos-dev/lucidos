@@ -6,6 +6,7 @@ import { isReducedMotion } from '../../utils/motion';
 import { postClientLog } from '../../utils/clientLog';
 import { USER_SCROLL_WINDOW_MS, nowMs } from '../../utils/scrollActivity';
 import { isMobile } from '../../utils/viewport';
+import { isImageRetryPending } from '../../utils/markdownImageRetry';
 import { applyNavFocus, clearNavFocus, navFocusElement } from '../shared/focusMarker';
 
 /** Shared scroll-position signals for the chat area.
@@ -157,14 +158,20 @@ let _heldAnimTarget: HeldGlide | null = null;
  *  hold's releasing round lands inside its own glide. See `freezeLandingGlide`,
  *  the one writer: a RIDE reads this field and never sets it. */
 let _heldGlideFrozenTop: number | null = null;
+/** Moves the tween in flight's captured `start` by `delta`, or null with no
+ *  tween. `markAnchorScroll` calls it: an anchor write re-bases the offset
+ *  under the reader, so the start the tween eases from has to move with it.
+ *  The tween never reads `scrollTop` after its first frame (ADR 0065). */
+let _shiftTweenStart: ((delta: number) => void) | null = null;
 /** Forget the tween: no rAF pending, and nobody owning one. EVERY way a tween
- *  ends goes through this, the natural landing included. So all three fields
- *  above mean "in flight" rather than "was in flight last time". */
+ *  ends goes through this, the natural landing included. So every field
+ *  above means "in flight" rather than "was in flight last time". */
 function endScrollAnim() {
   _scrollAnimRaf = null;
   _heldAnim = false;
   _heldAnimTarget = null;
   _heldGlideFrozenTop = null;
+  _shiftTweenStart = null;
 }
 function cancelScrollAnim() {
   if (_scrollAnimRaf !== null) cancelAnimationFrame(_scrollAnimRaf);
@@ -255,7 +262,9 @@ export function markNavigationScroll(el: HTMLElement, top: number) {
  *  sliding chrome, so what they pressed went behind a header and a title.
  *  See `isAnchorScroll`. */
 export function markAnchorScroll(el: HTMLElement, top: number): void {
+  const before = el.scrollTop;
   markNavigationScroll(el, top);
+  if (_shiftTweenStart && el === resolveTarget()) _shiftTweenStart(el.scrollTop - before);
   _navScrollKind = 'anchor';
   for (const listener of _anchorScrollListeners) listener(el);
 }
@@ -370,9 +379,16 @@ function forgetNavigationStamp(el: HTMLElement): void {
  *
  *  A held write's OWN event lands on the stamp, and `isWhereWeHeldIt` excludes
  *  it a term earlier. So a scroll that is NOT on the stamp cannot be that
- *  write's event, and the clock has nothing to add. */
+ *  write's event, and the clock has nothing to add.
+ *
+ *  An ANCHOR write inside the ride's own glide is not one either, for the
+ *  reason `honourAnchoredMutation` keeps the ride: the glide re-aims at the
+ *  edge. A history fold's hold lands there on a deep link into a long thread,
+ *  and must not park the ride short of the question. */
 function isPlacementScroll(el: HTMLElement): boolean {
-  return _navScrollKind !== 'held' && isNavigationScroll(el);
+  if (_navScrollKind === 'held') return false;
+  if (_navScrollKind === 'anchor' && rideGlideInFlight()) return false;
+  return isNavigationScroll(el);
 }
 
 /** Was this scroll event the app holding the reader on their own content, i.e.
@@ -667,13 +683,20 @@ const LANDING_HOLD_MS = 8000;
  *  asked, so only the CHANGE is common to both.
  *
  *  The rows, and NOT `.response-body`'s own children. Those are the SECTION
- *  wrappers `splitEventSections` produces, one per `section_break`, and a
- *  resuming agent appends into the wrapper that is already there. Counted at
- *  that level a card's turn never changes, so the hold would run to its
- *  backstop and drag the reader through the reply. See `ChatExchange`. */
+ *  wrappers `responseBody` produces, one per `section_break`, and a resuming
+ *  agent appends into the wrapper that is already there. Counted at that level
+ *  a card's turn never changes, so the hold would run to its backstop and drag
+ *  the reader through the reply. See `ChatExchange`.
+ *
+ *  For the same reason it looks inside each row's `<Disclosure>`. A run of
+ *  steps is one Disclosure, and a new step joins the run already there. The
+ *  hidden-step hairline is chrome, not something the agent drew. */
+export const DRAWN_ROW_SELECTOR = '.response-content > :not(.disclosure), '
+  + '.response-content > .disclosure > .disclosure-body > :not(.response-elision)';
+
 function drawnRows(turn: HTMLElement): number {
   if (typeof turn.querySelectorAll !== 'function') return 0;
-  return turn.querySelectorAll('.response-content > *').length;
+  return turn.querySelectorAll(DRAWN_ROW_SELECTOR).length;
 }
 
 /** Is this turn a QUEUED follow-up, which will never draw a response of its
@@ -1078,6 +1101,9 @@ function carryHeldScroll(el: HTMLElement): void {
  *  not landed, not because of the press. Its frames re-aim at the edge, so it
  *  goes on. */
 export function honourAnchoredMutation(el: HTMLElement): void {
+  // A press is the reader acting, so an arrival stops holding its target
+  // and the pressed control stays where it was (ADR 0147).
+  _arrivalHold = null;
   carryHeldScroll(el);
   if (_follow.value === 'riding' && !isAtLiveEdge(el) && !rideGlideInFlight()) stopFollowingBottom();
 }
@@ -1334,7 +1360,12 @@ function attachReaderGestures(el: HTMLElement): () => void {
     //
     // Marked generously, for any unconsumed scroll key wherever it lands. A key
     // the control DOES consume moves nothing and fires no scroll event.
-    if (e.target !== el) { markRevealScroll(el); return; }
+    if (e.target !== el) {
+      // The reader is moving by keyboard, so an arrival lets go of them.
+      _arrivalHold = null;
+      markRevealScroll(el);
+      return;
+    }
     stampGesture(el);
   };
   /** FOCUS LANDING somewhere inside the transcript, the OTHER way the container
@@ -1354,8 +1385,16 @@ function attachReaderGestures(el: HTMLElement): () => void {
    *  `focusin` rather than `focus` because it BUBBLES, so one listener covers
    *  every control inside the container. It is dispatched during the focus
    *  operation, a frame or more before the scroll event it causes. That puts the
-   *  stamp inside `NAV_SCROLL_EVENT_WINDOW_MS` of that event. */
-  const onFocusIn = () => markRevealScroll(el);
+   *  stamp inside `NAV_SCROLL_EVENT_WINDOW_MS` of that event.
+   *
+   *  Focus on a control outside an arrival's target is the reader moving
+   *  on, so the hold lets go. Focus inside the target keeps it, as does pane
+   *  focus on the container itself, which scrolls nothing. */
+  const onFocusIn = (e: FocusEvent) => {
+    const to = e.target as Node | null;
+    if (_arrivalHold && to !== el && !_arrivalHold.target.contains(to)) _arrivalHold = null;
+    markRevealScroll(el);
+  };
 
   el.addEventListener('pointerdown', onDown as EventListener, { passive: true });
   el.addEventListener('pointermove', onDrag as EventListener, { passive: true });
@@ -1669,6 +1708,9 @@ function rideToLiveEdge(el: HTMLElement): void {
  *  which makes the composer's two calls for one send one submit. See the guard
  *  itself for why the rule stops there. */
 function followSubmit(resolveTurn: TurnResolver, holds = true): void {
+  // A submit sends the reader to the live edge, so an arrival hold would pull
+  // them back to the event they have just acted on.
+  _arrivalHold = null;
   const el = resolveTarget();
   if (!el) return;
   if (_follow.value !== 'off') {
@@ -1960,11 +2002,12 @@ function keepTheLiveEdge(el: HTMLElement): boolean {
   return true;
 }
 
-/** What one growth round owes the reader, which is at most ONE of two things. A
- *  submit's landing is in hand, so give it its round. Or the follow is armed,
- *  so keep them on the live edge. Never both, because a submit arms nothing and
- *  arming drops a pending landing (`armFollowOn`). Nothing at all for a reader
- *  who asked for neither.
+/** What one growth round owes the reader, which is at most ONE of three
+ *  things. A submit's landing is in hand, so give it its round. A deep link or
+ *  a restore has just put the reader somewhere, so keep them there
+ *  (`holdTheArrival`). Or
+ *  the follow is armed, so keep them on the live edge. Nothing at all for a
+ *  reader who asked for none of these.
  *
  *  Stands down while a tween owns the scroll. A tween re-reads its own target
  *  every frame, so a write beside it would fight the easing rather than help it.
@@ -1990,8 +2033,119 @@ function honourGrowth(el: HTMLElement): void {
     honourLanding(el);
     return;
   }
+  if (holdTheArrival(el)) return;
   if (wakeParkedRide(el)) return;
   keepTheLiveEdge(el);
+}
+
+/** Where the reader has just ARRIVED, held where they came to rest, or null.
+ *  Two arrivals take it: a deep link that has landed, and a restore that put
+ *  the reader back on their saved place (`holdRestoredPlace`).
+ *
+ *  The transcript keeps changing size after either: turns above the target
+ *  finish drawing, images decode, and older history folds in. None of it fires
+ *  a scroll event, and WebKit has no scroll anchoring. So without this the
+ *  reader stayed where the arrival left them while the target moved away.
+ *
+ *  It ends on anything the reader does, a ride taking over, or the target
+ *  leaving the DOM (docs/glossary.md § Arrival hold lists them). Otherwise it ends
+ *  once no correction has moved the transcript for `ARRIVAL_HOLD_QUIET_MS` and no
+ *  image above the target is still loading, or at `ARRIVAL_HOLD_MAX_MS`. A
+ *  transcript image reserves no height, and on a phone it can decode seconds
+ *  after the landing.
+ *
+ *  `quietUntil` and `endsBy` are `nowMs()` deadlines. `imagesLoading` is read
+ *  at the end of each round, because the round an image's decode triggers
+ *  already finds that image complete. */
+let _arrivalHold: {
+  target: HTMLElement;
+  relTop: number | null;
+  quietUntil: number;
+  endsBy: number;
+  imagesLoading: boolean;
+} | null = null;
+
+/** Where `target` sits in `c`'s viewport, measured from its top. */
+function viewportTopOf(target: HTMLElement, c: HTMLElement): number {
+  return target.getBoundingClientRect().top - c.getBoundingClientRect().top;
+}
+
+/** Is an image before `target` in `c` still loading? Its height arrives when
+ *  it decodes, and moves the target then. A failed image waiting for its retry
+ *  counts. A lazy image may never load, so it does not. */
+function imageAboveStillLoading(target: HTMLElement, c: HTMLElement): boolean {
+  for (const img of c.querySelectorAll?.('img') ?? []) {
+    if (img.loading === 'lazy' || (img.complete && !isImageRetryPending(img))) continue;
+    if (img.compareDocumentPosition(target) & img.DOCUMENT_POSITION_FOLLOWING) return true;
+  }
+  return false;
+}
+
+/** Arm the hold on an arrival's target. The baseline is taken once the
+ *  arrival has come to rest, since its own motion is not a shift. */
+function armArrivalHold(target: HTMLElement): void {
+  const now = nowMs();
+  _arrivalHold = {
+    target,
+    relTop: null,
+    quietUntil: now + ARRIVAL_HOLD_QUIET_MS,
+    endsBy: now + ARRIVAL_HOLD_MAX_MS,
+    imagesLoading: false,
+  };
+}
+function settleArrivalHold(target: HTMLElement, c: HTMLElement | null = resolveTarget()): void {
+  if (!c || _arrivalHold?.target !== target) return;
+  _arrivalHold.relTop = viewportTopOf(target, c);
+  _arrivalHold.quietUntil = nowMs() + ARRIVAL_HOLD_QUIET_MS;
+  _arrivalHold.imagesLoading = imageAboveStillLoading(target, c);
+}
+
+/** Hold `target`, which a restore has just put back where the reader left it,
+ *  while the transcript `c` settles. The restore is one write with no motion,
+ *  so the hold is armed and settled in the same step. */
+export function holdRestoredPlace(c: HTMLElement, target: HTMLElement): void {
+  armArrivalHold(target);
+  settleArrivalHold(target, c);
+}
+
+/** Put an arrival's target back where it rested in the viewport, after one
+ *  growth round. Reports whether the hold is still live, so the round writes
+ *  nothing else.
+ *
+ *  Measured in the VIEWPORT, never in the content and never as a landing line.
+ *  Growth below the target moves nothing, so it moves nobody (ADR 0064). A
+ *  history fold's own hold or a width reflow may already have put the target
+ *  back, and then this one has nothing to add.
+ *
+ *  A tween in flight re-reads the target every frame, so the hold stands down
+ *  until its landing settles. A RIDE owns the live edge, so the hold gives way. */
+function holdTheArrival(el: HTMLElement): boolean {
+  const hold = _arrivalHold;
+  if (!hold) return false;
+  const now = nowMs();
+  // The saved reading covers an image that decoded this round. The fresh one
+  // covers an image inserted since the saved reading was taken.
+  const settled = now >= hold.quietUntil && !hold.imagesLoading
+    && !imageAboveStillLoading(hold.target, el);
+  if (
+    settled || now >= hold.endsBy
+    || hold.target.isConnected === false || _follow.value === 'riding'
+  ) {
+    _arrivalHold = null;
+    return false;
+  }
+  if (_scrollAnimRaf !== null || hold.relTop === null) return true;
+  // Against the resting place itself, so shifts too small to act on alone add
+  // up across rounds instead of being dropped one at a time.
+  const shift = viewportTopOf(hold.target, el) - hold.relTop;
+  if (Math.abs(shift) > 1) {
+    const before = el.scrollTop;
+    markAnchorScroll(el, before + shift);
+    // A write the browser clamped moved nothing, so the transcript is still.
+    if (el.scrollTop !== before) hold.quietUntil = now + ARRIVAL_HOLD_QUIET_MS;
+  }
+  hold.imagesLoading = imageAboveStillLoading(hold.target, el);
+  return true;
 }
 
 /** The frame a carrying ride has pending, or null. One at a time: a second
@@ -2088,6 +2242,7 @@ function reportRideLandedShort(short: number, edge: number, view: number): void 
  *  - `start` is captured on the FIRST frame, after the render-all
  *    scroll-anchoring shift has settled. Thereafter the position is a pure
  *    function of elapsed time and `scrollTop` is never READ again, only written.
+ *    An anchor write shifts `start` by its own delta (`_shiftTweenStart`).
  *    There is no yield guard, so an explicit chevron tap always reaches its
  *    target.
  *  - `duration` scales with the initial distance, clamped. The tween ends
@@ -2108,6 +2263,8 @@ function animateScroll(
   let start = 0;
   let startTime = 0;
   let duration = SCROLL_MIN_MS;
+  // Before the first frame there is nothing to carry: `start` is read then.
+  _shiftTweenStart = (delta) => { if (started) start += delta; };
   const step = (now: number) => {
     const cur = resolveTarget();
     if (!cur) { endScrollAnim(); return; }
@@ -2166,15 +2323,16 @@ function landingTargetOf(el: HTMLElement): (c: HTMLElement) => number {
  *  element still growing as markdown or images render is therefore tracked, and
  *  so is the whole transcript re-anchoring after a render-all. Reduced motion
  *  jumps instantly. */
-function smoothScrollToElement(el: HTMLElement): void {
+function smoothScrollToElement(el: HTMLElement, onDone?: () => void): void {
   const targetOf = landingTargetOf(el);
   if (isReducedMotion()) {
     cancelScrollAnim();
     const c = resolveTarget();
     if (c) markNavigationScroll(c, Math.max(0, targetOf(c)));
+    onDone?.();
     return;
   }
-  animateScroll(targetOf);
+  animateScroll(targetOf, onDone);
 }
 
 /** Smoothly scroll the active chat container to the VERY top: the up chevron's
@@ -2308,6 +2466,11 @@ export const EVENT_RESOLVE_DEADLINE_MS = 4000;
  *  genuinely stalled reaches it. ThreadView's "Taking too long?" fuse is the
  *  longest of those, at 8s. */
 export const EVENT_RESOLVE_MAX_WAIT_MS = 20000;
+/** How long an arrival holds its target once nothing has moved it
+ *  (`_arrivalHold`). The budget of one lazily loading thread. */
+const ARRIVAL_HOLD_QUIET_MS = EVENT_RESOLVE_DEADLINE_MS;
+/** The longest an arrival holds its target, however long growth goes on. */
+const ARRIVAL_HOLD_MAX_MS = EVENT_RESOLVE_MAX_WAIT_MS;
 /** How long to keep the deep-link claim alive after a SYNCHRONOUS resolve. A
  *  fallback for browsers where `scrollend` is unsupported or unreliable, and
  *  released earlier if `scrollend` fires first. `smoothScrollToElement`'s tween
@@ -2538,6 +2701,8 @@ function scrollToSelectorAndPulse(
   // until the claim releases. ThreadView keeps the thread fully rendered
   // afterwards, so the reader is not snapped back to the windowed tail mid-read.
   deepLinkRenderAll.value = true;
+  // An earlier arrival's hold would pull the reader back to ITS target.
+  _arrivalHold = null;
 
   // Release this call's claim, but only if it is still ours. A second deep link
   // started mid-flight has overwritten the slot, and its own release handles
@@ -2746,7 +2911,8 @@ function scrollToSelectorAndPulse(
       // event, and that ask is durable rather than a moment's position. A parked
       // ride would carry the reader off it the moment the thread woke.
       stopFollowingBottom();
-      smoothScrollToElement(target);
+      armArrivalHold(target);
+      smoothScrollToElement(target, () => settleArrivalHold(target));
     }
     // Record and announce the landing AFTER the scroll above. Two things read
     // this, and the second is why the order matters. One wants to know the link
@@ -2991,6 +3157,7 @@ export function scrollToChangeAndPulse(changeId: string, opts?: DeepLinkOptions)
  *  focus (no target event) calls this so the prior deep-link's suppression
  *  can't leak onto the newly-focused thread's load. */
 export function clearPendingEventScroll(): void {
+  _arrivalHold = null;
   _pendingEventScrollClaim = null;
   _pendingEventScrollResolved = false;
   _pendingEventScrollLandedOffEdge = false;
@@ -3375,7 +3542,7 @@ export function makeScrollObservers(el: HTMLElement) {
   // got going yet says nothing about whether the reader wants it.
   function onScroll() {
     if (!isElementVisible(el)) return;
-    // All four are questions about the scroll being HANDLED, so all four are
+    // All five are questions about the scroll being HANDLED, so all five are
     // read before anything below can write over the answer, and each once. The
     // gesture and placement windows are wall-clock, and a second read could
     // land the other side of an edge.
@@ -3383,7 +3550,12 @@ export function makeScrollObservers(el: HTMLElement) {
     const tookOver = !isWhereWeHeldIt(el);
     const gesture = readerGestureActive(el);
     const placement = isPlacementScroll(el);
+    const whereWePutIt = isWhereWeLastScrolledIt(el);
     forgetNavigationStamp(el);
+    // The gesture window reaches back past the arrival, so the arrival's own
+    // write reads as a gesture too. That write leaves the container where it
+    // put it. A scroll that finds it anywhere else is the reader.
+    if (gesture && !whereWePutIt) _arrivalHold = null;
     if (_follow.value === 'riding') {
       if (scrollLeavesTheRide(atEdge, tookOver, gesture, placement)) leaveTheRideByScroll();
       else if (!atEdge && tookOver) keepTheLiveEdge(el);
@@ -3403,13 +3575,15 @@ export function makeScrollObservers(el: HTMLElement) {
     // The reader has moved, so the reflow anchor has to follow them.
     recordAnchor();
   }
-  // Resize events. A resize moves the reader for exactly two reasons, and both
+  // Resize events. A resize moves the reader for exactly three reasons, and all
   // are things they asked for:
   //
   //  - they ASKED to ride the live edge, so the app must not slide the edge out
   //    from under them. `keepTheLiveEdge`, whether the BOX changed or the
   //    CONTENT grew;
-  //  - they just SUBMITTED and the turn their landing waits for has rendered.
+  //  - they just SUBMITTED and the turn their landing waits for has rendered;
+  //  - content moved what they just arrived at: a deep link's target, or the
+  //    place a restore put them back on (`holdTheArrival`).
   //
   // For everyone else it moves nobody, whatever grew and however far off the
   // bottom it leaves them. A streaming reply, a decoded image, an expanded step

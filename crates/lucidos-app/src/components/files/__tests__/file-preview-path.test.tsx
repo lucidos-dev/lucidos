@@ -1,12 +1,14 @@
+// @vitest-environment jsdom
 /**
  * The two surfaces that show a file's PATH rather than its name, and the one
  * that deliberately still shows a name.
  *
- * Components are invoked as plain functions and the returned vnode tree is
- * flattened (the repo idiom, no DOM render library), so only hook-free
- * components can be passed in, which all three of these are.
+ * The hook-free components are invoked as plain functions and the returned
+ * vnode tree is flattened. The changed-files row reads the skeleton context,
+ * so it is rendered into the DOM instead.
  */
 import { describe, it, expect, vi } from 'vitest';
+import { render } from 'preact';
 import type { DiffFile } from '../../../store/store';
 import { vnodeToText } from '../../chat/__tests__/vnodeToText';
 import { FilePreviewPath } from '../FilePreviewPath';
@@ -47,10 +49,10 @@ describe('FilePreviewPath', () => {
 
 describe('the changed-files list vs the file tree', () => {
   it('gives a changed-files row the wrapping `file-path` box, since it holds a whole path', () => {
-    const out = vnodeToText(
-      <ChangesFileList files={[changedFile('system-knowhow/workspace-audit.md')]} />,
-    );
-    expect(out).toContain('<span class="file-name file-path">system-knowhow/workspace-audit.md</span>');
+    const host = document.createElement('div');
+    render(<ChangesFileList files={[changedFile('system-knowhow/workspace-audit.md')]} />, host);
+    expect(host.innerHTML).toContain('<span class="file-name file-path">system-knowhow/workspace-audit.md</span>');
+    render(null, host);
   });
 
   it('leaves a tree row on the ellipsising `file-name` box, since it holds a bare name', () => {

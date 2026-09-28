@@ -133,7 +133,6 @@
     justify-content: space-between;
     padding: 0.625rem 0;
     cursor: pointer;
-    -webkit-tap-highlight-color: transparent;
 }
 
 .settings-nav-row:focus-visible {
@@ -276,6 +275,18 @@
     width: 100%;
 }
 
+/* The label's padding-top suits a control as tall as a dropdown. A lone
+   .settings-option button is shorter, so pinned to the top it sits above the
+   label's text. Centre the two on each other instead. Only a label and its
+   button: a note beside a button keeps its layout. */
+.settings-row:has(> .settings-row-label + .settings-option) {
+    align-items: center;
+}
+
+.settings-row:has(> .settings-row-label + .settings-option) > .settings-row-label {
+    padding-top: 0;
+}
+
 /* A sub-setting nested under the row above it (e.g. the command-guard judge
    controls under the master "Command guard" toggle). Indented so the hierarchy
    reads at a glance. */
@@ -307,7 +318,7 @@
     /* The border stays 1px in every state so the box never shifts; hover only
        swaps its colour for a glow ring. */
     border: 1px solid var(--border-color);
-    border-radius: 0.375rem;
+    border-radius: calc(var(--radius-control) * 0.75);
     padding: 0.1875rem 0.5rem;
     font-family: var(--font-ui);
     font-size: var(--font-size-xs);
@@ -329,7 +340,7 @@
     }
 
     /* Restrained on white, where the dark-mode bloom reads as a blue smudge. */
-    html[data-theme="light"] .settings-option:hover {
+    html[data-theme-mode="light"] .settings-option:hover {
         box-shadow:
             0 0 0.125rem 0.03125rem color-mix(in srgb, var(--accent) 32%, transparent),
             0 0 0.3125rem color-mix(in srgb, var(--accent) 12%, transparent);
@@ -340,7 +351,7 @@
 .settings-text-input {
     background: var(--bg-tertiary);
     border: 1px solid var(--border-color);
-    border-radius: 0.25rem;
+    border-radius: calc(var(--radius-control) * 0.5);
     padding: 0.25rem 0.5rem;
     font-family: var(--font-ui);
     font-size: var(--font-size-md);
@@ -420,17 +431,17 @@
     text-transform: uppercase;
     letter-spacing: 0.03em;
     border: 1px solid var(--border-color);
-    border-radius: 0.25rem;
+    border-radius: calc(var(--radius-control) * 0.5);
     padding: 0.0625rem 0.3125rem;
     color: var(--text-secondary);
     white-space: nowrap;
 }
 
-/* A bare text button carrying a chevron, opening a group of rows below it. Two
-   settings pages use it: an MCP row's tool list, and the switched-off models at
-   the end of the Models list. Lives here rather than beside either one, because
-   this file is where the settings-wide classes are (.settings-section-title,
-   .settings-text-input, .model-provider-badge). */
+/* A bare text button carrying a chevron, opening a group of rows below it:
+   an MCP row's tool list, the switched-off models, the theme grid. Lives here
+   rather than beside any one of them, because this file is where the
+   settings-wide classes are (.settings-section-title, .settings-text-input,
+   .model-provider-badge). */
 .settings-disclosure-toggle {
     display: flex;
     align-items: center;
@@ -456,7 +467,7 @@
 .settings-disclosure-toggle:focus-visible {
     outline: 0.125rem solid transparent;
     box-shadow: var(--focus-ring);
-    border-radius: 0.25rem;
+    border-radius: calc(var(--radius-control) * 0.5);
 }
 
 .settings-disclosure-toggle svg {
@@ -567,7 +578,7 @@
        card, and .add-device above already holds the shared left edge. */
     padding: var(--space-md);
     background: var(--bg-tertiary);
-    border-radius: 0.5rem;
+    border-radius: calc(var(--radius-surface) * 2 / 3);
     min-width: 0;
     /* Inside the stack this divides the column's height. The zero basis is what
        makes the split EVEN: from their own heights the two fallbacks would only
@@ -624,7 +635,7 @@
     aspect-ratio: 1;
     padding: 0.5rem;
     background: #fff;
-    border-radius: 0.375rem;
+    border-radius: calc(var(--radius-surface) * 0.5);
     /* A vector at one unit per module. Without this the browser smooths the
        squares and a marginal camera loses the small ones. */
     image-rendering: pixelated;

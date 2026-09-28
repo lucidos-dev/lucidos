@@ -16,7 +16,8 @@
 //! could produce.
 
 use std::fs;
-use std::process::Command;
+use std::io::Write;
+use std::process::{Command, Output, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
@@ -38,6 +39,16 @@ struct Captured {
 /// a receiver the test drains after running the CLI. `status` is what the stub
 /// answers with, so the failure path can be driven too.
 fn spawn_stub_engine(status: StatusCode) -> (u16, Receiver<Captured>) {
+    let body = if status.is_success() {
+        r#"{"success":true}"#
+    } else {
+        r#"{"error":"disk on fire"}"#
+    };
+    spawn_stub_engine_replying(status, body)
+}
+
+/// [`spawn_stub_engine`] with a chosen response body.
+fn spawn_stub_engine_replying(status: StatusCode, body: &'static str) -> (u16, Receiver<Captured>) {
     let (tx, rx) = mpsc::channel();
     let tx = Arc::new(Mutex::new(tx));
     let (port_tx, port_rx) = mpsc::channel();
@@ -50,7 +61,7 @@ fn spawn_stub_engine(status: StatusCode) -> (u16, Receiver<Captured>) {
         rt.block_on(async move {
             let app = Router::new()
                 .route("/api/v1/data/*path", put(capture))
-                .with_state((tx, status));
+                .with_state((tx, status, body));
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("bind");
@@ -65,11 +76,13 @@ fn spawn_stub_engine(status: StatusCode) -> (u16, Receiver<Captured>) {
     (port, rx)
 }
 
+type StubState = (Arc<Mutex<Sender<Captured>>>, StatusCode, &'static str);
+
 async fn capture(
-    State((tx, status)): State<(Arc<Mutex<Sender<Captured>>>, StatusCode)>,
+    State((tx, status, reply)): State<StubState>,
     AxumPath(path): AxumPath<String>,
     body: Bytes,
-) -> (StatusCode, String) {
+) -> (StatusCode, &'static str) {
     tx.lock()
         .expect("lock")
         .send(Captured {
@@ -77,11 +90,7 @@ async fn capture(
             body: body.to_vec(),
         })
         .expect("record request");
-    if status.is_success() {
-        (status, r#"{"success":true}"#.to_string())
-    } else {
-        (status, r#"{"error":"disk on fire"}"#.to_string())
-    }
+    (status, reply)
 }
 
 fn write_ports(workspace: &std::path::Path, port: u16) {
@@ -328,6 +337,91 @@ fn write_fails_loudly_when_the_engine_rejects_it() {
     // The request really was attempted (the failure is the engine's answer, not
     // the CLI declining to try).
     assert!(requests.recv().is_ok());
+}
+
+/// Run `lucidos data write <path>` against the workspace, with `content` on
+/// stdin, the way `system-knowhow/themes.md` § "Make a theme" documents it.
+fn data_write_from_stdin(workspace: &std::path::Path, path: &str, content: &str) -> Output {
+    let mut child = Command::new(LUCIDOS)
+        .args(["data", "write", path])
+        .current_dir(workspace)
+        .env_remove("LUCIDOS_WORKSPACE")
+        .env_remove("LUCIDOS_API_BASE_URL")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("lucidos binary should run");
+    child
+        .stdin
+        .take()
+        .expect("stdin is piped")
+        .write_all(content.as_bytes())
+        .expect("write stdin");
+    child.wait_with_output().expect("lucidos should exit")
+}
+
+/// A theme under `artifacts/themes/` is a file the themes platform never reads,
+/// and the engine checks theme rules only under `themes/`.
+#[test]
+fn the_documented_theme_command_writes_under_themes() {
+    let (port, requests) = spawn_stub_engine(StatusCode::OK);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().join("ws");
+    write_ports(&workspace, port);
+
+    let theme = r##"{"name":"Harbour","dark":{"--accent":"#d4a650"}}"##;
+    let out = data_write_from_stdin(&workspace, "themes/harbour.json", theme);
+    assert!(
+        out.status.success(),
+        "lucidos data write failed: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let req = requests
+        .recv()
+        .expect("engine must have received the write");
+    assert_eq!(req.path, "themes/harbour.json");
+    assert_eq!(req.body, theme.as_bytes());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "[harbour.json](themes/harbour.json)"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.trim().ends_with("ws/data/themes/harbour.json"),
+        "stderr must name data/themes/, got: {stderr}"
+    );
+}
+
+#[test]
+fn a_refused_theme_exits_non_zero_with_the_engines_reason() {
+    // The body `write_data` answers for a theme that breaks a rule.
+    const REFUSAL: &str = r#"{"error":"`dark`: the value of --accent is empty, longer than 120 characters, or uses a banned form (url(), ;, braces, @, backslash, a comment)"}"#;
+    let (port, requests) = spawn_stub_engine_replying(StatusCode::UNPROCESSABLE_ENTITY, REFUSAL);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().join("ws");
+    write_ports(&workspace, port);
+
+    let theme = r#"{"name":"Leaky","dark":{"--accent":"url(x)"}}"#;
+    let out = data_write_from_stdin(&workspace, "themes/leaky.json", theme);
+
+    assert!(!out.status.success(), "a refused theme must exit non-zero");
+    assert_eq!(
+        requests.recv().expect("the engine judged it").path,
+        "themes/leaky.json"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "",
+        "no chat link for a theme that was not saved"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("422"), "got: {stderr}");
+    assert!(stderr.contains("banned form (url()"), "got: {stderr}");
+    assert!(!workspace.join("data").exists(), "the CLI wrote nothing");
 }
 
 #[test]

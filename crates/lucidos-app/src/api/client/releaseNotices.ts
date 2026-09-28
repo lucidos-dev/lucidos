@@ -20,6 +20,9 @@ export interface ReleaseNotice {
   action_prompt?: string;
   /** True once this workspace has answered it. The panel keeps showing it. */
   resolved: boolean;
+  /** True when a later owed notice carries the same action, so the modal
+   *  draws the button there instead. One audit then covers several notices. */
+  action_deferred: boolean;
 }
 
 /** Everything both surfaces are drawn from, in one response so they cannot

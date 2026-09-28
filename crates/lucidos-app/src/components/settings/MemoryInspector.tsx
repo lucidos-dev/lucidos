@@ -1,13 +1,16 @@
 import { useState, useEffect, useCallback, useRef } from 'preact/hooks';
 import { signal } from '@preact/signals';
 import { getMemoryStats, getMemoryEntries, getMemorySource, rebuildMemory, cancelMemoryRebuild } from '../../api/client';
-import { showToast, memoryRebuildProgress } from '../../store/store';
-import { useDelayedLoading } from '../../hooks/useDelayedLoading';
+import { showToast, memoryRebuildProgress, memoryEntriesVersion } from '../../store/store';
+import { useDelayedFlag, useDelayedLoading } from '../../hooks/useDelayedLoading';
+import { usePanelRefresh } from '../../hooks/usePanelRefresh';
+import { useVersionedRefresh } from '../../hooks/useVersionedRefresh';
 import { Dropdown } from '../shared/Dropdown';
 import { LoadableError } from '../shared/LoadableError';
-import { ListSkeletonOf, useSkeleton, SkText, SkBlock } from '../shared/Skeleton';
+import { ListSkeletonOf, useSkeleton, SkText, SkBlock, SkeletonProvider } from '../shared/Skeleton';
 import { LoadingFade } from '../shared/LoadingFade';
-import { toFailed } from '../../store/types';
+import { Disclosure } from '../shared/Disclosure';
+import { setLoadingIfFresh, toFailed } from '../../store/types';
 import { formatTimeAgo, formatDateTime } from '../../utils/formatTime';
 import { errorDetail } from '../../utils/errorDetail';
 import { copyToClipboard } from '../../utils/clipboard';
@@ -24,7 +27,7 @@ const statsLoadable = signal<Loadable<MemoryStatsResponse>>({ status: 'not-loade
 const entriesLoadable = signal<Loadable<{ entries: MemoryEntryInfo[]; total: number; has_more: boolean }>>({ status: 'not-loaded' });
 
 async function loadStats() {
-  statsLoadable.value = { status: 'loading' };
+  setLoadingIfFresh(statsLoadable);
   try {
     const data = await getMemoryStats();
     statsLoadable.value = { status: 'loaded', data };
@@ -67,6 +70,58 @@ function ImportanceBar({ distribution, selected, onToggle }: {
   );
 }
 
+/** The stats strip. Its labels are known up front; with no `stats`, inside a
+ *  `SkeletonProvider`, its figures and importance bar shimmer. */
+function MemoryStatsBar({ stats, importanceFilter = new Set(), onToggle = () => {} }: {
+  stats?: MemoryStatsResponse;
+  importanceFilter?: Set<ImportanceLevel>;
+  onToggle?: (level: ImportanceLevel) => void;
+}) {
+  const d = stats?.importance_distribution;
+  const hasFilter = importanceFilter.size > 0 && importanceFilter.size < 4;
+  const filteredTotal = stats && d && (hasFilter
+    ? (importanceFilter.has('low') ? d.low : 0)
+      + (importanceFilter.has('medium') ? d.medium : 0)
+      + (importanceFilter.has('high') ? d.high : 0)
+      + (importanceFilter.has('critical') ? d.critical : 0)
+    : stats.total);
+  return (
+    <div class="memory-stats-bar">
+      <div class="memory-stat">
+        <SkText class="memory-stat-value" w="3rem">{filteredTotal?.toLocaleString()}</SkText>
+        <span class="memory-stat-label">{hasFilter ? 'Filtered' : 'Total'}</span>
+      </div>
+      <div class="memory-stat">
+        <SkText class="memory-stat-value" w="3rem">{stats?.event_count.toLocaleString()}</SkText>
+        <span class="memory-stat-label">Events</span>
+      </div>
+      <div class="memory-stat">
+        <SkText class="memory-stat-value" w="3rem">{stats?.artifact_count.toLocaleString()}</SkText>
+        <span class="memory-stat-label">Artifacts</span>
+      </div>
+      {d
+        ? <ImportanceBar distribution={d} selected={importanceFilter} onToggle={onToggle} />
+        : <div class="memory-importance-bar"><SkBlock w="100%" h="100%" /></div>}
+    </div>
+  );
+}
+
+/** Line widths a source block shimmers with while it loads. */
+const SOURCE_SKELETON_LINES = ['70%', '88%', '55%', '80%'];
+
+/** A memory's source text. Under a `SkeletonProvider` it draws its own box
+ *  with shimmer lines. */
+function SourceBlock({ text }: { text?: string }) {
+  if (useSkeleton()) {
+    return (
+      <pre class="memory-source-pre" aria-hidden="true">
+        {SOURCE_SKELETON_LINES.map((w) => <SkText key={w} as="div" w={w} />)}
+      </pre>
+    );
+  }
+  return <pre class="memory-source-pre">{text}</pre>;
+}
+
 function importanceDotClass(importance: number): string {
   if (importance >= 0.8) return 'critical';
   if (importance >= 0.6) return 'high';
@@ -85,13 +140,13 @@ function MemoryEntryRow({ entry }: { entry?: MemoryEntryInfo }) {
   const [expanded, setExpanded] = useState(false);
   const [sourceData, setSourceData] = useState<Loadable<MemorySourceResponse>>({ status: 'not-loaded' });
   const [sourceVisible, setSourceVisible] = useState(false);
+  const showSourceLoading = useDelayedLoading(sourceData);
 
   async function toggleSource() {
-    if (sourceData.status === 'loaded') {
+    if (sourceData.status === 'loaded' || sourceData.status === 'loading') {
       setSourceVisible(!sourceVisible);
       return;
     }
-    if (sourceData.status === 'loading') return;
     if (!entry) return;
     setSourceData({ status: 'loading' });
     setSourceVisible(true);
@@ -138,64 +193,75 @@ function MemoryEntryRow({ entry }: { entry?: MemoryEntryInfo }) {
           )}
         </div>
 
-        {!sk && expanded && entry && (
-          <div class="memory-entry-details">
-            <div class="memory-detail-row">
-              <span class="memory-detail-label">ID:</span>
-              <button
-                type="button"
-                class="memory-id-value"
-                data-tooltip="Copy id"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  copyToClipboard(entry.id, 'Memory id copied');
-                }}
-              >
-                {entry.id}
-              </button>
-            </div>
-            <div class="memory-detail-row">
-              <span class="memory-detail-label">Importance:</span>
-              <span>{entry.importance.toFixed(2)}</span>
-            </div>
-            {entry.entities.length > 0 && (
+        <Disclosure open={!sk && expanded && !!entry}>
+          {entry && (
+            <div class="memory-entry-details">
               <div class="memory-detail-row">
-                <span class="memory-detail-label">Entities:</span>
-                <span>{entry.entities.join(', ')}</span>
+                <span class="memory-detail-label">ID:</span>
+                <button
+                  type="button"
+                  class="memory-id-value"
+                  data-tooltip="Copy id"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    copyToClipboard(entry.id, 'Memory id copied');
+                  }}
+                >
+                  {entry.id}
+                </button>
               </div>
-            )}
-            <div class="memory-detail-row">
-              <span class="memory-detail-label">Source:</span>
-              <span>
-                {entry.source.type === 'event'
-                  ? `Event ${entry.source.id}`
-                  : `${entry.source.path} @ ${entry.source.commit}`}
-              </span>
+              <div class="memory-detail-row">
+                <span class="memory-detail-label">Importance:</span>
+                <span>{entry.importance.toFixed(2)}</span>
+              </div>
+              {entry.entities.length > 0 && (
+                <div class="memory-detail-row">
+                  <span class="memory-detail-label">Entities:</span>
+                  <span>{entry.entities.join(', ')}</span>
+                </div>
+              )}
+              <div class="memory-detail-row">
+                <span class="memory-detail-label">Source:</span>
+                <span>
+                  {entry.source.type === 'event'
+                    ? `Event ${entry.source.id}`
+                    : `${entry.source.path} @ ${entry.source.commit}`}
+                </span>
+              </div>
+              <button
+                class="action-btn memory-view-source-btn"
+                onClick={(e) => { e.stopPropagation(); void toggleSource(); }}
+              >
+                {sourceVisible ? 'Hide source' : 'View source'}
+              </button>
+              {sourceData.status === 'failed' && (
+                <div class="memory-source-error">Failed to load source: {sourceData.error}</div>
+              )}
+              {/* Rolls open with the skeleton once the read is slow, or with the
+                  source itself on a fast one. */}
+              <Disclosure open={sourceVisible && (sourceData.status === 'loaded' || showSourceLoading)}>
+                <LoadingFade
+                  showSkeleton={showSourceLoading}
+                  skeleton={<SkeletonProvider><div class="memory-source-content"><SourceBlock /></div></SkeletonProvider>}
+                >
+                  {sourceData.status === 'loaded' && (
+                    <div class="memory-source-content">
+                      {sourceData.data.source_type === 'event' && sourceData.data.event && (
+                        <SourceBlock text={JSON.stringify(sourceData.data.event.payload, null, 2)} />
+                      )}
+                      {sourceData.data.source_type === 'event' && !sourceData.data.event && (
+                        <div class="memory-source-unavailable">Source event no longer available</div>
+                      )}
+                      {sourceData.data.source_type === 'artifact' && sourceData.data.artifact && (
+                        <SourceBlock text={sourceData.data.artifact.content} />
+                      )}
+                    </div>
+                  )}
+                </LoadingFade>
+              </Disclosure>
             </div>
-            <button
-              class="action-btn memory-view-source-btn"
-              onClick={(e) => { e.stopPropagation(); void toggleSource(); }}
-            >
-              {sourceData.status === 'loading' ? 'Loading...' : sourceVisible ? 'Hide source' : 'View source'}
-            </button>
-            {sourceData.status === 'failed' && (
-              <div class="memory-source-error">Failed to load source: {sourceData.error}</div>
-            )}
-            {sourceVisible && sourceData.status === 'loaded' && (
-              <div class="memory-source-content">
-                {sourceData.data.source_type === 'event' && sourceData.data.event && (
-                  <pre class="memory-source-pre">{JSON.stringify(sourceData.data.event.payload, null, 2)}</pre>
-                )}
-                {sourceData.data.source_type === 'event' && !sourceData.data.event && (
-                  <div class="memory-source-unavailable">Source event no longer available</div>
-                )}
-                {sourceData.data.source_type === 'artifact' && sourceData.data.artifact && (
-                  <pre class="memory-source-pre">{sourceData.data.artifact.content}</pre>
-                )}
-              </div>
-            )}
-          </div>
-        )}
+          )}
+        </Disclosure>
       </div>
     </div>
   );
@@ -211,17 +277,25 @@ export function MemoryInspector() {
   const stats = statsLoadable.value;
   const entries = entriesLoadable.value;
   const rebuild = memoryRebuildProgress.value;
-  const showStatsLoading = useDelayedLoading(stats);
-  const showEntriesLoading = useDelayedLoading(entries);
+  const statsPending = stats.status === 'not-loaded' || stats.status === 'loading';
+  const entriesPending = entries.status === 'not-loaded' || entries.status === 'loading';
+  // One gate for both reads, so their skeletons arrive in one wave. Each still
+  // clears on its own read.
+  const gate = useDelayedFlag(statsPending || entriesPending);
+  const showStatsLoading = gate && statsPending;
+  const showEntriesLoading = gate && entriesPending;
 
   const importanceParam = [...importanceFilter].join(',');
 
   // Numbers each read of the entries. A filter or page change can start a read
   // before the last one answers, and only the newest may land.
   const entriesRequest = useRef(0);
-  const loadEntries = useCallback(async (newOffset: number) => {
+  // A re-read of the page on show keeps it visible. A new filter or page is
+  // different entries, so it blanks rather than show the old ones as its own.
+  const loadEntries = useCallback(async (newOffset: number, { reread = false }: { reread?: boolean } = {}) => {
     const request = ++entriesRequest.current;
-    entriesLoadable.value = { status: 'loading' };
+    if (reread) setLoadingIfFresh(entriesLoadable);
+    else entriesLoadable.value = { status: 'loading' };
     try {
       const data = await getMemoryEntries({
         limit: PAGE_SIZE,
@@ -235,6 +309,13 @@ export function MemoryInspector() {
       if (request === entriesRequest.current) entriesLoadable.value = toFailed(e);
     }
   }, [sourceFilter, sortBy, importanceParam]);
+
+  const reread = () => Promise.all([
+    loadStats(),
+    loadEntries(offset, { reread: true }),
+  ]);
+  usePanelRefresh('memory', reread);
+  useVersionedRefresh(memoryEntriesVersion.value, false, () => void reread());
 
   const prevRebuilding = useRef(false);
 
@@ -285,35 +366,12 @@ export function MemoryInspector() {
     if (stats.status === 'failed') {
       return <LoadableError noun="stats" error={stats.error} />;
     }
-    if (stats.status !== 'loaded') {
-      if (!showStatsLoading) return null;
-      return <div class="loading-spinner" />;
-    }
-    const s = stats.data;
-    const d = s.importance_distribution;
-    const hasFilter = importanceFilter.size > 0 && importanceFilter.size < 4;
-    const filteredTotal = hasFilter
-      ? (importanceFilter.has('low') ? d.low : 0)
-        + (importanceFilter.has('medium') ? d.medium : 0)
-        + (importanceFilter.has('high') ? d.high : 0)
-        + (importanceFilter.has('critical') ? d.critical : 0)
-      : s.total;
     return (
-      <div class="memory-stats-bar">
-        <div class="memory-stat">
-          <span class="memory-stat-value">{filteredTotal.toLocaleString()}</span>
-          <span class="memory-stat-label">{hasFilter ? 'Filtered' : 'Total'}</span>
-        </div>
-        <div class="memory-stat">
-          <span class="memory-stat-value">{s.event_count.toLocaleString()}</span>
-          <span class="memory-stat-label">Events</span>
-        </div>
-        <div class="memory-stat">
-          <span class="memory-stat-value">{s.artifact_count.toLocaleString()}</span>
-          <span class="memory-stat-label">Artifacts</span>
-        </div>
-        <ImportanceBar distribution={d} selected={importanceFilter} onToggle={toggleImportance} />
-      </div>
+      <LoadingFade showSkeleton={showStatsLoading} skeleton={<SkeletonProvider><MemoryStatsBar /></SkeletonProvider>}>
+        {stats.status === 'loaded' && (
+          <MemoryStatsBar stats={stats.data} importanceFilter={importanceFilter} onToggle={toggleImportance} />
+        )}
+      </LoadingFade>
     );
   }
 

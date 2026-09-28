@@ -55,7 +55,7 @@ function answer(value: boolean): void {
 function raiseVersionToast(): void {
   showToast('New version available.', 'info', {
     key: NEW_VERSION_TOAST_KEY,
-    action: { label: 'Switch to new version', onClick: () => {} },
+    action: { label: 'Switch', onClick: () => {} },
   });
 }
 
@@ -79,7 +79,7 @@ describe('a new version is ready', () => {
     const state = confirmState.value;
     expect(state.visible).toBe(true);
     expect(state.title).toBe('New version available');
-    expect(state.okLabel).toBe('Switch to new version');
+    expect(state.okLabel).toBe('Switch');
     expect(state.cancelLabel).toBe('Later');
     expect(state.details?.groups).toEqual([
       { header: 'New', items: ['a thing', 'another thing'] },

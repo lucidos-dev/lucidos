@@ -6,8 +6,12 @@ import type { DiffFile } from '../../store/store';
 import type { Loadable } from '../../store/types';
 import { toFailed } from '../../store/types';
 import { InlineDiffList } from '../files/RepoFilesView';
+import { DiffSkeleton } from '../files/DiffView';
+import { LoadingFade } from '../shared/LoadingFade';
 import { LoadableError } from '../shared/LoadableError';
+import { usePaneCentre } from '../../hooks/usePaneCentre';
 import { Overlay } from '../shared/Overlay';
+import { SurfaceHead } from '../shared/Surface';
 
 function close() {
   checkpointDiffModal.value = null;
@@ -32,6 +36,7 @@ export function CheckpointDiffModal() {
   const checkpointId = checkpoint?.checkpoint_id;
   const [loadable, setLoadable] = useState<Loadable<CheckpointDiff>>({ status: 'loading' });
   const showLoading = useDelayedLoading(loadable);
+  const paneCentre = usePaneCentre('conversation');
 
   // Keyed on the id rather than the event object: the card re-renders (and
   // hands us a fresh object) when the paired revert lands, and refetching the
@@ -53,30 +58,36 @@ export function CheckpointDiffModal() {
       open
       onClose={close}
       overlayClass="step-detail-overlay"
-      panelClass="step-detail-modal checkpoint-diff-modal"
+      panelClass="surface surface-raised surface-pane-centred step-detail-modal checkpoint-diff-modal"
+      panelStyle={paneCentre}
       panelRole="dialog"
       ariaModal
       dataRole="checkpoint-diff-modal"
     >
-      <div class="step-detail-description">{checkpoint.summary}</div>
-      <code class="step-detail-full">{checkpoint.command}</code>
-      <div class="step-detail-section-label">What this step changed</div>
-      {loadable.status === 'failed' && <LoadableError error={loadable.error} noun="the diff" />}
-      {loadable.status === 'loading' && (showLoading ? <div class="loading-spinner" /> : null)}
-      {loadable.status === 'loaded' && (
-        // A reclaimed pair is not an empty diff, and must not read as one. The
-        // snapshots behind an old card are dropped after 30 days, and cards
-        // written before the post image existed never had a second side to
-        // diff against.
-        loadable.data.reclaimed
-          ? (
-            <div class="empty-state">
-              {'The snapshots behind this step have been reclaimed, so its changes can no longer be shown.'}
-            </div>
-          )
-          : <InlineDiffList files={loadable.data.files} />
-      )}
-      <button class="action-btn step-detail-close" onClick={close}>Close</button>
+      <SurfaceHead title="Checkpoint" onClose={close} closeLabel="Close checkpoint" />
+      <div class="surface-body step-detail-body" tabIndex={-1}>
+        <div class="step-detail-description">{checkpoint.summary}</div>
+        <code class="step-detail-full">{checkpoint.command}</code>
+        <div class="step-detail-section-label">What this step changed</div>
+        {loadable.status === 'failed' && <LoadableError error={loadable.error} noun="the diff" />}
+        {loadable.status !== 'failed' && (
+          <LoadingFade showSkeleton={showLoading} skeleton={<DiffSkeleton files={2} class="folder-tree" />}>
+            {loadable.status === 'loaded' && (
+              // A reclaimed pair is not an empty diff, and must not read as one.
+              // The snapshots behind an old card are dropped after 30 days. Cards
+              // written before the post image existed never had a second side to
+              // diff against.
+              loadable.data.reclaimed
+                ? (
+                  <div class="empty-state">
+                    {'The snapshots behind this step have been reclaimed, so its changes can no longer be shown.'}
+                  </div>
+                )
+                : <InlineDiffList files={loadable.data.files} />
+            )}
+          </LoadingFade>
+        )}
+      </div>
     </Overlay>
   );
 }

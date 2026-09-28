@@ -1,3 +1,4 @@
+use crate::engine::thread_lifecycle::ThreadStatus;
 use serde::{Deserialize, Serialize};
 
 /// Why a `ResponseCanceled` was emitted. Cancellation is always a user-driven
@@ -181,8 +182,8 @@ impl AbortCause {
     pub fn status_sql(&self, actor: Option<&super::MessageOrigin>) -> &'static str {
         match self {
             Self::StaleSettle => crate::engine::event_bus::STATUS_FROM_PROPOSED_CHANGE,
-            _ if self.promises_auto_resume(actor) => "'paused'",
-            _ => "'failed'",
+            _ if self.promises_auto_resume(actor) => ThreadStatus::Paused.sql_literal(),
+            _ => ThreadStatus::Failed.sql_literal(),
         }
     }
 }

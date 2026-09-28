@@ -615,6 +615,11 @@ describe('chat link click — the bug-report scenario', () => {
     ['knowhow/myapp/notes.md', 'knowhow/myapp/notes.md'],
     ['triggers/daily/run.md', 'triggers/daily/run.md'],
     ['system-knowhow/js-sdk.md', 'system-knowhow/js-sdk.md'],
+    // The link `lucidos data write themes/harbour.json` prints, and the other
+    // trees the engine serves beside it.
+    ['themes/harbour.json', 'themes/harbour.json'],
+    ['config/apis.json', 'config/apis.json'],
+    ['scripts/auth/login.py', 'scripts/auth/login.py'],
     ['artifacts/report.html?v=2', 'artifacts/report.html'],
     ['artifacts/report.html#top', 'artifacts/report.html'],
   ])('DATA PATH %s → openArtifact(%s)', (href, expected) => {
@@ -649,7 +654,7 @@ describe('chat link click — the bug-report scenario', () => {
     'some/unknown/path.md',
     'unknown-panel',
     'artifacts',          // a bare sub-tree is a directory, not a file
-    'config/apis.json',   // a real data/ sub-tree, but not one served for preview
+    'postgres/pg.conf',   // under data/, but the engine never serves it
     '/data',
   ])('CLOSED: unclaimed relative href %s is swallowed with a toast', (href) => {
     const e = mkEvent(mkAnchor(href));

@@ -581,7 +581,7 @@ describe('wipPreviewThreadId is a nav-tracked axis', () => {
 // the email and credential forms carry no request id at all, and the plugin
 // ones are staged on the engine, which a reload never touches.
 describe('restoreState restores every entry overlay on reload', () => {
-  // Mirrors NAV_KEY in entityReferences.ts (the key restoreState reads/writes).
+  // Mirrors NAV_KEY in navigation.ts (the key restoreState reads/writes).
   const NAV_KEY = 'lucidos-nav-history';
 
   beforeEach(() => {
@@ -870,5 +870,202 @@ describe('walking history reaches a pending email-confirm', () => {
     const { nav } = await seeded(2);
     expect(nav.navHistory.value.stack).toEqual(STACK);
     expect(nav.navHistory.value.cursor).toBe(2);
+  });
+});
+
+// A close that skips a push (Cancel, Escape, a peer device resolving the
+// panel, a deleted app) folds its row into the one beneath. So Uninstall,
+// Cancel, Install, Back returns to Plugins.
+describe('a change without a push folds into the row at the cursor', () => {
+  const uninstallForm: PanelOverlay = {
+    type: 'form',
+    form: {
+      type: 'plugin-uninstall',
+      request: {
+        uninstall_id: 'u-1',
+        plugin_id: 'habit-tracker',
+        plugin_version: '1.0.0',
+        plugin_name: 'Habit Tracker',
+        files_present: [],
+        files_missing: [],
+      },
+    },
+  };
+  const installForm: PanelOverlay = {
+    type: 'form',
+    form: {
+      type: 'plugin-install',
+      request: {
+        install_id: 'i-1',
+        source: 'git://example.com/habit-tracker',
+        source_type: 'git',
+        manifest: {},
+        files: [],
+        overwrites: [],
+        plugin_id: 'habit-tracker',
+        plugin_version: '1.0.0',
+        plugin_name: 'Habit Tracker',
+      },
+    },
+  };
+
+  beforeEach(() => {
+    vi.resetModules();
+    localStorage.clear();
+    localStorage.setItem('lucidos-nav-history', JSON.stringify({
+      stack: [makeEntry({ menuItem: 'plugins' })],
+      cursor: 0,
+    }));
+  });
+
+  afterEach(() => {
+    localStorage.clear();
+  });
+
+  async function onPlugins() {
+    const nav = await import('./navigation');
+    const store = await import('../store');
+    void nav.canGoBack.value;
+    return { nav, store };
+  }
+
+  /** The folding runs once the task that changed the state is over. */
+  const settle = () => new Promise<void>((resolve) => queueMicrotask(resolve));
+
+  it('Back after cancel, then install, returns to Plugins', async () => {
+    const { nav, store } = await onPlugins();
+    store.panelOverlay.value = uninstallForm;
+    nav.pushNavState();
+    store.closeInlineForm();
+    await settle();
+    store.panelOverlay.value = installForm;
+    nav.pushNavState();
+
+    nav.navBack();
+
+    expect(store.panelOverlay.value).toBeNull();
+    expect(store.activeMenuItem.value).toBe('plugins');
+    expect(nav.canGoBack.value).toBe(false);
+  });
+
+  it('closing a panel drops its row, keeping the history ahead of it', async () => {
+    const { nav, store } = await onPlugins();
+    store.panelOverlay.value = uninstallForm;
+    nav.pushNavState();
+    store.panelOverlay.value = installForm;
+    nav.pushNavState();
+    nav.navBack();
+    store.closeInlineForm();
+    await settle();
+
+    const { stack, cursor } = nav.navHistory.value;
+    expect(stack.map((e) => e.overlay?.type ?? null)).toEqual([null, 'form']);
+    expect(cursor).toBe(0);
+    nav.navForward();
+    expect(store.panelOverlay.value).toEqual(installForm);
+  });
+
+  it('a navigation that pushes in the same task is left alone', async () => {
+    const { nav, store } = await onPlugins();
+    store.panelOverlay.value = uninstallForm;
+    nav.pushNavState();
+    await settle();
+
+    const { stack, cursor } = nav.navHistory.value;
+    expect(stack).toHaveLength(2);
+    expect(cursor).toBe(1);
+  });
+});
+
+describe('foldEntry', () => {
+  const plugins = makeEntry({ menuItem: 'plugins' });
+  const panel = makeEntry({ menuItem: 'plugins', overlay: { type: 'file-preview', path: 'a.md' } });
+  const other = makeEntry({ menuItem: 'apps' });
+
+  async function fold(stack: NavEntry[], cursor: number, entry: NavEntry) {
+    const { foldEntry } = await import('./navigation');
+    return foldEntry(stack as never, cursor, entry as never);
+  }
+
+  it('is a no-op when the row already matches', async () => {
+    expect(await fold([plugins, panel], 1, panel)).toBeNull();
+  });
+
+  it('refuses a cursor out of range', async () => {
+    expect(await fold([plugins], 3, other)).toBeNull();
+  });
+
+  it('rewrites the row in place when no neighbour matches', async () => {
+    expect(await fold([plugins, panel], 1, other)).toEqual({ stack: [plugins, other], cursor: 1 });
+  });
+
+  it('merges into the row behind, moving the cursor onto it', async () => {
+    expect(await fold([plugins, panel, other], 1, plugins))
+      .toEqual({ stack: [plugins, other], cursor: 0 });
+  });
+
+  it('merges with the row ahead, keeping the cursor', async () => {
+    expect(await fold([other, panel, plugins], 1, plugins))
+      .toEqual({ stack: [other, plugins], cursor: 1 });
+  });
+});
+
+describe('pruneEntries', () => {
+  const files = makeEntry();
+  const app = makeEntry({ overlay: { type: 'app-ui', app: { id: 'habit-tracker', name: 'Habit Tracker', description: '' } } });
+  const apps = makeEntry({ menuItem: 'apps' });
+  const isApp = (e: NavEntry) => e.overlay?.type === 'app-ui';
+
+  async function prune(stack: NavEntry[], cursor: number) {
+    const { pruneEntries } = await import('./navigation');
+    return pruneEntries(stack as never, cursor, isApp as never);
+  }
+
+  it('is a no-op when nothing is stale', async () => {
+    expect(await prune([files, apps], 1)).toBeNull();
+  });
+
+  it('moves the cursor onto the last kept row at or before it', async () => {
+    expect(await prune([files, app, apps], 1)).toEqual({ stack: [files, apps], cursor: 0 });
+  });
+
+  it('merges the equal rows a removal leaves side by side', async () => {
+    expect(await prune([files, app, files, apps], 3)).toEqual({ stack: [files, apps], cursor: 1 });
+  });
+
+  it('keeps the cursor on the first row when every earlier row is stale', async () => {
+    expect(await prune([app, apps], 0)).toEqual({ stack: [apps], cursor: 0 });
+  });
+});
+
+// The prune edits the stack in memory, so no later save can write a deleted
+// app's rows back into the saved copy.
+describe('pruneNavHistory edits the live stack', () => {
+  const app: PanelOverlay = { type: 'app-ui', app: { id: 'habit-tracker', name: 'Habit Tracker', description: '' } };
+
+  beforeEach(() => {
+    vi.resetModules();
+    localStorage.clear();
+    localStorage.setItem('lucidos-nav-history', JSON.stringify({
+      stack: [makeEntry({ overlay: app }), makeEntry(), makeEntry({ overlay: app })],
+      cursor: 2,
+    }));
+  });
+
+  afterEach(() => {
+    localStorage.clear();
+  });
+
+  it('a deleted app leaves no row behind, in memory or in the saved copy', async () => {
+    const nav = await import('./navigation');
+    const store = await import('../store');
+    void nav.canGoBack.value;
+
+    nav.pruneNavHistory((e) => e.overlay?.type === 'app-ui');
+    store.panelOverlay.value = null;
+    await new Promise<void>((resolve) => queueMicrotask(resolve));
+
+    expect(nav.navHistory.value).toEqual({ stack: [makeEntry()], cursor: 0 });
+    expect(JSON.parse(localStorage.getItem('lucidos-nav-history')!).stack).toEqual([makeEntry()]);
   });
 });

@@ -564,6 +564,7 @@ EVENTS (the `events` tool):
 
 PARALLEL WORK (FAN-OUT):
 - run_coding_agent starts a coding-agent thread for code work; run_thread starts a Lucidos thread for non-code work; follow_up_child_thread steers a child you already spawned, and `threads` 'detach_child' stops waiting for one. You can only address your own DIRECT children, which the `threads` tool's 'list' action lists with `my_children: true`.
+- Nothing archives a thread for you. Once a child's change is applied and you expect no follow-up, archive it with `threads` 'archive'. Leave it open while a follow-up, a question, a pending change or a live event wait remains.
 - The resume callback that reports a child's result back here only works for same-workspace children spawned with these tools.
 - For a pipeline where step N depends on step N-1, spawn ONE child per response and wait for the callback. Never batch sequential spawns into one response.
 - SPAWN SPARINGLY. Default to doing the work yourself. Spawn only for genuinely independent subtasks that gain from running in parallel, never for what a few sequential tool calls would do, and never one thread per item in a list. Maximum __MAX_CHILDREN_PER_THREAD__ children per thread, maximum depth 3.
@@ -1313,7 +1314,21 @@ mod tests {
     /// FILE REFERENCES: real pictures, one per option, never ASCII art. A
     /// coding agent drew colour options in ASCII, then repeated one sheet of
     /// all four on every option.
-    const ALWAYS_LOADED_BUDGET_CHARS: usize = 121_568;
+    ///
+    /// Raised by 160 to a measured 121,728 for themes: the `themes` knowhow's
+    /// routing line and the `theme` preference. The routing line is how the
+    /// agent learns a user can ask for a theme. So a theme is reachable from
+    /// the prompt, not only from Settings (docs/plans/2026-09-26-looks.md).
+    ///
+    /// Raised by 416 to a measured 122,144 for `threads` 'archive' and its rule
+    /// in PARALLEL WORK (ADR 0310). Nothing archives a thread on its own, so an
+    /// orchestrator is told when to close the children it applied.
+    ///
+    /// Raised by 199 to a measured 122,343 for workspace fonts: the
+    /// `workspace-fonts` knowhow's routing line, and `ws-<slug>` in the
+    /// `font-family` preference. The routing line is how the agent learns it
+    /// can install a font (docs/plans/2026-09-27-workspace-fonts.md).
+    const ALWAYS_LOADED_BUDGET_CHARS: usize = 122_343;
 
     /// The hand-written flat tool schemas the chat agent is offered.
     ///
@@ -1641,13 +1656,14 @@ mod tests {
         ),
         (
             "threads",
-            2_060,
-            "a third and fourth action on a domain whose two existing schemas \
+            2_243,
+            "three more actions on a domain whose two existing schemas \
              are almost entirely a spelled-out `status` enum pinned to \
              `ThreadStatus::ALL` by a test, repeated across both because \
              `llm_schema` is a const JSON literal and cannot compose. `search` \
-             adds its own summary, `(requires: q)` and two properties, and \
-             `detach_child` its summary and a `thread_id` (ADR 0278)",
+             adds its own summary, `(requires: q)` and two properties, \
+             `detach_child` its summary and a `thread_id` (ADR 0278), and \
+             `archive` the same again (ADR 0310)",
         ),
         (
             "events",

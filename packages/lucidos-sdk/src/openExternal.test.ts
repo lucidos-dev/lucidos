@@ -71,6 +71,8 @@ vi.mock('./_fetch', () => ({
   },
   // `ui.ts` builds the locally-served Fira Code stylesheet URL with this.
   apiUrl: (suffix: string) => `/api/v1${suffix}`,
+  // ...and a workspace font's face URLs with this.
+  dataMountUrl: (path: string) => `/data/${path}`,
 }));
 
 describe('ui.openExternal', () => {

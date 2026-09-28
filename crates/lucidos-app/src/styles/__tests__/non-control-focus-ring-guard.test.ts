@@ -2,14 +2,14 @@
  * A surface that is not a control paints no focus ring.
  *
  * Two ways one of these boxes takes focus. `ProgressDialog` focuses its own
- * body, so a modal with no Cancel keeps the keyboard. Chrome promotes the four
+ * body, so a modal with no Cancel keeps the keyboard. Chrome promotes the
  * scroll boxes to Tab stops, which it does to any overflowing scroller holding
  * no focusable child. Either way the box ends up `:focus-visible` and wears the
  * browser's ring around a block of text. The report was the restart dialog,
  * framed while the user typed.
  *
  * Each box states its own Tab contract, because hiding a ring alone would
- * leave a stop nothing announces. Three declare `tabIndex={-1}`, so the
+ * leave a stop nothing announces. The scroll boxes declare `tabIndex={-1}`, so the
  * promotion never happens and only a click can focus them. The file preview
  * goes the other way: nothing traps Tab there, so it declares a named region
  * and wears our own ring.
@@ -41,9 +41,12 @@ const SHEETS: Array<{ file: string; css: string }> = styleSheetPaths(STYLES_ROOT
  *  class here when a new one appears, together with its suppression. */
 const SURFACES = [
   'progress-dialog-body', // the restart dialog's body, focused for containment
-  'confirm-details',      // the confirm dialog's scrolling detail list
-  'toast-heading',        // line 1 of a toast message, a scroll box on its own
-  'toast-sections',       // the rest of a toast message, the toast's main scroll box
+  'confirm-details',      // the confirm dialog's detail list
+  'dialog-body',          // the scrolling body of every centred dialog
+  'step-detail-body',     // the scrolling body of the step-detail family
+  'explainer-body',       // the explainer popover's scrolling copy
+  'toast-heading',        // a toast's title, or its untitled message, a scroll box on its own
+  'toast-text',           // a toast's message under its title, the main scroll box
 ] as const;
 
 /** Both pseudo-classes, because they are not interchangeable here. Chrome only
@@ -115,7 +118,7 @@ describe('non-control surfaces paint no focus ring', () => {
 const TAB_EXCLUDED: ReadonlyArray<readonly [cls: string, source: string]> = [
   ['confirm-details', 'components/shared/ConfirmDialog.tsx'],
   ['toast-heading', 'components/shared/Toast.tsx'],
-  ['toast-sections', 'components/shared/Toast.tsx'],
+  ['toast-text', 'components/shared/Toast.tsx'],
 ];
 
 /** The one that goes the other way. Nothing traps Tab in the file preview

@@ -79,8 +79,19 @@ describe('nav focus marker paint: background highlight, not a frame', () => {
     // The glow: blurred OUTER layers bleeding past the edge. Counting the non-inset
     // layers is what separates "a flat tint" from "a spotlight".
     const outerLayers = layers(shadow).filter(l => !l.includes('inset'));
-    expect(outerLayers.length).toBeGreaterThanOrEqual(2);
-    expect(outerLayers.every(l => /0\s+0\s+[\d.]+rem/.test(l))).toBe(true);
+    const glowLayers = outerLayers.filter(l => /^0\s+0\s+[\d.]+rem\s/.test(l));
+    expect(glowLayers.length).toBeGreaterThanOrEqual(2);
+    expect(outerLayers.length).toBe(glowLayers.length + 1);
+  });
+
+  it('draws a hairline border whose strength each theme sets', () => {
+    // The border is a zero-blur 1px spread layer on the same box-shadow, so it ramps on
+    // and dissolves with the wash. Light needs it: over white the wash alone is faint.
+    // Dark sets the strength to 0%, which keeps its marker frameless.
+    const shadow = declaration(block('.nav-focus-stuck'), 'box-shadow');
+    const border = layers(shadow).filter(l => /^0\s+0\s+0\s+1px\s/.test(l));
+    expect(border).toHaveLength(1);
+    expect(border[0]).toContain('var(--nav-focus-border-alpha)');
   });
 
   it('paints no visible frame', () => {
@@ -137,7 +148,7 @@ describe('nav focus marker paint: background highlight, not a frame', () => {
     // reads host-components.css and would stay green through that.
     const themeBlock = (selector: string): string => {
       // No nested braces inside a theme block, so `[^}]*` is the whole body. Anchored
-      // at column 0 so a longer selector (html.ios-pwa[data-theme="dark"], which
+      // at column 0 so a longer selector (html.ios-pwa[data-theme-mode="dark"], which
       // overrides only the header blues) can't be mistaken for the base theme block.
       const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       const body = baseCss.match(new RegExp(`^${escaped}\\s*\\{([^}]*)\\}`, 'm'))?.[1];
@@ -149,11 +160,17 @@ describe('nav focus marker paint: background highlight, not a frame', () => {
     // which passes every scan in this file while painting the exact accent wash the
     // recolour removed. Requiring a hex here closes that back door, and the marker
     // block's own no-literals rule is what keeps the hex on this side of the split.
-    for (const selector of ['html, html[data-theme="dark"]', 'html[data-theme="light"]']) {
+    for (const selector of ['html, html[data-theme-mode="dark"]', 'html[data-theme-mode="light"]']) {
       expect(declaration(themeBlock(selector), '--nav-focus-glow')).toMatch(
         /^#[0-9a-fA-F]{3,8}$/,
       );
+      // The border's strength is a percentage inside the same color-mix, so a missing
+      // one drops the whole box-shadow exactly like a missing glow token.
+      expect(declaration(themeBlock(selector), '--nav-focus-border-alpha')).toMatch(/^\d+%$/);
     }
+    expect(declaration(themeBlock('html, html[data-theme-mode="dark"]'), '--nav-focus-border-alpha')).toBe(
+      '0%',
+    );
   });
 
   it('turns on by rising to full and STOPPING there, with nothing to sag back from', () => {
@@ -177,7 +194,7 @@ describe('nav focus marker paint: background highlight, not a frame', () => {
     // `.every()` over [] is true, so moving the fill to another property would make
     // this assertion report green while checking nothing. `not.toBe('')` only proves
     // the keyframe BODY parsed.
-    expect(layers(declaration(zeroStop, 'box-shadow')).length).toBe(3);
+    expect(layers(declaration(zeroStop, 'box-shadow')).length).toBe(4);
     expect(layers(declaration(zeroStop, 'box-shadow')).every(l => l.includes('transparent'))).toBe(
       true,
     );

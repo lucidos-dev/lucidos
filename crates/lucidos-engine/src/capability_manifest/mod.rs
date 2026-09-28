@@ -378,7 +378,7 @@ const PREF_KEY_ARG: Arg = Arg {
     enum_values: &[],
     required: true,
     loc: ArgIn::Query,
-    description: "e.g. 'theme', 'language', 'timezone', 'chat_model'.",
+    description: "e.g. 'theme-mode', 'language', 'timezone', 'chat_model'.",
 };
 const PREF_VALUE_ARG: Arg = Arg {
     name: "value",
@@ -428,7 +428,7 @@ const PREFERENCES_OPS: &[Operation] = &[
         // passes a device id, so the grouped tool omits it (unlike CLI/SDK).
         llm_schema: Some(
             r#"{
-              "key": {"type":"string","description":"e.g. 'theme', 'language', 'timezone', 'chat_model'. The 'get' action lists every settable key."},
+              "key": {"type":"string","description":"e.g. 'theme-mode', 'language', 'timezone', 'chat_model'. The 'get' action lists every settable key."},
               "value": {"type":"string","description":"A string: 'true'/'false', '125', or an allowed enum value from the 'get' action."}
             }"#,
         ),
@@ -1798,12 +1798,30 @@ const THREADS_OPS: &[Operation] = &[
         cli: Some(false),
         sdk: Some(false),
     },
+    Operation {
+        action: "archive",
+        summary: "Archive YOUR thread ('current', after this turn) or a direct child of yours \
+                  (now). The Archive button's refusals apply. (requires: thread_id)",
+        method: Method::Post,
+        path: "/threads/:thread_id/archive",
+        args: &[],
+        cli_name: "archive",
+        sdk_name: "archive",
+        mutating: true,
+        llm_alias: Some("archive_thread"),
+        llm_schema: Some(
+            r#"{"thread_id":{"type":"string","description":"'current', or a direct child's uuid."}}"#,
+        ),
+        llm: None,
+        cli: Some(false),
+        sdk: Some(false),
+    },
 ];
 
 const THREADS_DOMAIN: Domain = Domain {
     name: "threads",
     tool_name: "threads",
-    tool_summary: "Read threads, cheaper than querying events for what exists and its status, or stop awaiting a child. 'list' and 'count' share filters. To START a thread use run_thread or run_coding_agent, to REDIRECT one follow_up_child_thread.",
+    tool_summary: "Read threads, cheaper than querying events for what exists and its status, stop awaiting a child, or archive a finished one. 'list' and 'count' share filters. To START a thread use run_thread or run_coding_agent, to REDIRECT one follow_up_child_thread.",
     llm: true,
     // The `lucidos threads list|count` CLI is hand-written (kept, not regenerated)
     // and no SDK consumer needs this. Grouped LLM tool only.
@@ -3254,10 +3272,11 @@ mod tests {
         let threads = domains().iter().find(|d| d.name == "threads").unwrap();
         // `search` answers "we talked about this", which `list` structurally
         // cannot: it filters by status and channel and never by topic.
-        // `detach_child` stops waiting for a child (ADR 0278).
+        // `detach_child` stops waiting for a child (ADR 0278). `archive` closes
+        // the caller or one of its children (ADR 0310).
         assert_eq!(
             threads.actions(),
-            vec!["list", "count", "search", "detach_child"]
+            vec!["list", "count", "search", "detach_child", "archive"]
         );
         assert!(threads.llm && !threads.cli && !threads.sdk);
         assert_eq!(domain_for_tool("list_threads").unwrap().name, "threads");

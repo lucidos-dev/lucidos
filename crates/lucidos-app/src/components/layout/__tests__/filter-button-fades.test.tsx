@@ -2,10 +2,10 @@
 /**
  * The Filter button's glyph and badge fade rather than swap. Each keeps every
  * state it can show MOUNTED and flips which one is shown, so the CSS transition
- * runs on nodes that already exist. The pane title is the other shape: it
- * arrives with the drawer's navigation cover, as a fresh keyed element.
+ * runs on nodes that already exist. The pane title does not fade: it switches
+ * word at once.
  *
- * These tests pin both shapes. The frames are covered by
+ * These tests pin the DOM the CSS keys on. The frames are covered by
  * `e2e/threads-header-filter-transitions.spec.ts`.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
@@ -99,7 +99,7 @@ describe('the needs-attention badge fades both ways', () => {
   });
 });
 
-describe('the pane title arrives with the drawer view', () => {
+describe('the pane title switches word at once', () => {
   const show = (filters: boolean) => act(() => {
     if (filters) openThreadFilterPanel(); else closeThreadFilterPanel();
     render(<ThreadsPaneTitle class="threads-header-title" />, host);
@@ -108,26 +108,12 @@ describe('the pane title arrives with the drawer view', () => {
 
   afterEach(() => closeThreadFilterPanel());
 
-  it('says what the pane shows, and does not fade on the first render', () => {
+  it('says what the pane shows, in one plain element with the header centring', () => {
     show(false);
     expect(title().textContent).toBe('Threads');
-    expect(title().classList.contains('threads-header-title')).toBe(true);
-    expect(title().classList.contains('nav-arrive')).toBe(false);
-  });
-
-  it('arrives as a fresh element on each swap, so its fade replays', () => {
-    show(false);
-    const threads = title();
+    expect(title().className).toBe('threads-header-title');
+    expect(layers()).toHaveLength(0);
     show(true);
-    expect(title()).not.toBe(threads);
     expect(title().textContent).toBe('Filters');
-    expect(title().classList.contains('nav-arrive')).toBe(true);
-    // The header centring still applies to the arriving word.
-    expect(title().classList.contains('threads-header-title')).toBe(true);
-    const filters = title();
-    show(false);
-    expect(title()).not.toBe(filters);
-    expect(title().textContent).toBe('Threads');
-    expect(title().classList.contains('nav-arrive')).toBe(true);
   });
 });

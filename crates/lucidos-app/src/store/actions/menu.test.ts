@@ -3,6 +3,7 @@ import {
   activeMenuItem,
   panelOverlay,
   settingsSubview,
+  settingsScrollTarget,
   currentApp,
   previewFile,
   panelUrl,
@@ -49,7 +50,7 @@ vi.mock('../../api/client', () => ({
   listDevices: vi.fn().mockResolvedValue({ devices: [] }),
 }));
 
-const { switchMenuItem, openSettingsSubview, setActiveMenu, landOnAccountsWithOverlay, openBackupSettings, openWebhookSettings } = await import('./menu');
+const { switchMenuItem, openSettingsSubview, setActiveMenu, landOnAccountsWithOverlay, openBackupSettings, openWebhookSettings, openCaptureContextSetting } = await import('./menu');
 
 const fakeApp: App = {
   id: 'trip-planner',
@@ -345,6 +346,28 @@ describe('openWebhookSettings', () => {
     openWebhookSettings();
     expect(activeMenuItem.value).toBe('settings');
     expect(settingsSubview.value).toBe('webhooks');
+    expect(revealContentPane).toHaveBeenCalledTimes(1);
+    expect(pushNavState).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('openCaptureContextSetting', () => {
+  beforeEach(() => {
+    activeMenuItem.value = 'files';
+    settingsSubview.value = 'main';
+    settingsScrollTarget.value = null;
+    panelOverlay.value = null;
+    pushNavState.mockClear();
+    revealContentPane.mockClear();
+  });
+
+  it('lands on the Capture context row in Settings > Debugging', () => {
+    // The context viewer's link on a section with no body. The scroll target
+    // is what puts the user on the switch rather than at the top of the page.
+    openCaptureContextSetting();
+    expect(activeMenuItem.value).toBe('settings');
+    expect(settingsSubview.value).toBe('debugging');
+    expect(settingsScrollTarget.value).toBe('debugging:capture-context');
     expect(revealContentPane).toHaveBeenCalledTimes(1);
     expect(pushNavState).toHaveBeenCalledTimes(1);
   });

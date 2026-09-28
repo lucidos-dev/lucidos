@@ -10,15 +10,15 @@
  * as an engine build or an update is pending: a mark that moves for reasons the
  * user cannot see.
  *
- * Overlaying it costs one thing back, which is the second half of the contract:
- * the ready-state badge is a plain span with no handler, and a positioned
- * element is a hit target whether or not anything listens, so on the mark's
- * corner it swallowed the tap (the mark is its SIBLING, not its ancestor, so
- * there was nothing to bubble to). It is click-through here.
+ * Overlaying it costs one thing back, which is the second half of the contract.
+ * A positioned element is a hit target even with no listener. The badge is the
+ * mark's SIBLING, not its ancestor, so a tap on it has nothing to bubble to.
+ * So every badge state is a plain, click-through span. A tap anywhere on the
+ * mark opens the Lucidos menu, whose activity group explains the badge.
  *
- * The badge only renders while background activity is in flight, so a probe
+ * The badge only renders while something is in flight or waiting, so a probe
  * carrying its classes is spliced into the live header and read off the same
- * cascade a real badge would get, then removed before anything can paint.
+ * cascade a real badge would get, then removed.
  */
 import { test, expect } from './fixtures';
 import { assertHealthy, navigateToApp } from './helpers';
@@ -97,4 +97,35 @@ test.describe('Header brand badge', () => {
     expect(m.pointerEvents, 'the badge with no handler must not eat taps on the mark')
       .toBe('none');
   });
+
+  /** The mark always opens the menu, whatever its badge shows. */
+  for (const [state, classes] of [
+    ['busy', 'badge brand-badge'],
+    ['pending', 'badge brand-badge brand-badge-dot'],
+  ] as const) {
+    test(`a tap on the ${state} badge opens the Lucidos menu`, async ({ page }) => {
+      await assertHealthy(page);
+      await navigateToApp(page);
+
+      const box = await page.waitForFunction((cls: string) => {
+        const host = [...document.querySelectorAll<HTMLElement>('.brand-mark-slot')]
+          .reverse()
+          .find((el) => el.getBoundingClientRect().width > 0);
+        if (!host) return null;
+        const probe = document.createElement('span');
+        probe.className = cls;
+        probe.dataset.role = 'badge-probe';
+        host.appendChild(probe);
+        const r = probe.getBoundingClientRect();
+        if (r.height === 0) { probe.remove(); return null; }
+        return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+      }, classes);
+      const { x, y } = (await box.jsonValue())!;
+
+      await page.mouse.click(x, y);
+      await expect(page.locator('[role="menu"][aria-label="Lucidos menu"]')).toBeVisible();
+
+      await page.evaluate(() => document.querySelector('[data-role="badge-probe"]')?.remove());
+    });
+  }
 });

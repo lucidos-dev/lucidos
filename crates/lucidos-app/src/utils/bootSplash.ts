@@ -23,6 +23,10 @@ import { startIdlePrefetch } from './idlePrefetch';
 const SPLASH_SELECTOR = '.boot-splash';
 const STATUS_SELECTOR = '.boot-splash-status';
 const LEAVING_CLASS = 'boot-splash-leaving';
+// The `.boot-splash-status-swap` fade-out in index.html, at 1x. The words swap
+// once it has run, while the line is invisible.
+const SWAP_CLASS = 'boot-splash-status-swap';
+const STATUS_SWAP_MS = 150;
 // Set by the inline handover script in index.html when the gateway boot splash
 // had already built the mark on this url, so this document skips its reveal.
 const FORMED_CLASS_SELECTOR = '.boot-splash-formed';
@@ -72,9 +76,23 @@ export function bootSplashPlaysNoReveal(): boolean {
   );
 }
 
+/** Does replacing the words on screen with `next` fade out and back in, rather
+ *  than swap in place? A new label does: it is a new width, and an instant swap
+ *  makes the centred line lurch sideways. A ticking counter does not
+ *  ("… (9s)" to "… (10s)"), or the line would blink every second. Appearing
+ *  from, or clearing to, nothing is the shown class's own fade. Pure. */
+export function statusChangeFades(shown: string, next: string): boolean {
+  if (shown === '' || next === '') return false;
+  const withoutCounters = (text: string) => text.replace(/\d+/g, '0');
+  return withoutCounters(shown) !== withoutCounters(next);
+}
+
+let pendingSwap: number | undefined;
+
 /** Update the status line under the mark (e.g. "Opening your workspace…",
  *  "Connecting…") and fade it in (it starts hidden so a fast load never flashes
- *  text). No-op if the splash is absent.
+ *  text). A different label crossfades (see {@link statusChangeFades}). No-op if
+ *  the splash is absent.
  *
  *  A label carrying line breaks is a FAILURE REPORT, not a status: the packaged
  *  desktop sends one when the background service has crash-looped
@@ -85,9 +103,19 @@ export function bootSplashPlaysNoReveal(): boolean {
 export function setBootStatus(text: string): void {
   const el = document.querySelector(SPLASH_SELECTOR + ' ' + STATUS_SELECTOR);
   if (!el) return;
-  el.textContent = text;
-  el.classList.toggle('boot-splash-status-shown', text.length > 0);
-  el.classList.toggle('boot-splash-status-report', text.includes('\n'));
+  window.clearTimeout(pendingSwap);
+  const write = () => {
+    el.textContent = text;
+    el.classList.toggle(SWAP_CLASS, false);
+    el.classList.toggle('boot-splash-status-shown', text.length > 0);
+    el.classList.toggle('boot-splash-status-report', text.includes('\n'));
+  };
+  if (!statusChangeFades(el.textContent ?? '', text)) {
+    write();
+    return;
+  }
+  el.classList.toggle(SWAP_CLASS, true);
+  pendingSwap = window.setTimeout(write, scaledDurationMs(STATUS_SWAP_MS));
 }
 
 /** Reveal the inline splash's gateway escape link, when this document has one to

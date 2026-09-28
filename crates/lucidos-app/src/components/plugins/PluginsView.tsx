@@ -104,11 +104,6 @@ export function PluginsView() {
           </button>
         </div>
 
-        {/* How old the plugin rows are, beside the controls that filter them.
-            The list comes from a cache the engine refreshes on a timer, so the
-            panel says its age rather than pretending the rows are live. */}
-        <CatalogFreshness />
-
         <Dropdown
           class="plugins-marketplace-filter"
           options={marketplaceDropdownOptions(marketplaces)}
@@ -123,6 +118,15 @@ export function PluginsView() {
             pluginsMarketplaceFilter.value = value === ALL_MARKETPLACES ? null : value;
           }}
         />
+      </div>
+
+      {/* How old the plugin rows are, under the controls that filter them.
+          The list comes from a cache the engine refreshes on a timer, so the
+          panel says its age rather than pretending the rows are live. The
+          line holds its height while the value is absent, so the list below
+          does not move when the catalog lands. */}
+      <div class="plugins-freshness-line">
+        <CatalogFreshness />
       </div>
 
       {appSearchOpen.value && <PluginSearchBar />}

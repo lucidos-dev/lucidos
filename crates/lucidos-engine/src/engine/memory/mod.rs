@@ -4,7 +4,9 @@
 //! - [`read`]: the agent's on-demand search, and the walk from a memory back
 //!   to its source event.
 //! - [`rebuild`] — batch/derived operations: artifact summaries, user-profile
-//!   generation, full/incremental rebuild, correction replay, post-import hook.
+//!   generation, full/incremental rebuild, post-import hook.
+//! - [`correction`]: the `MemoryCorrected` record of a user correction, and
+//!   its replay at the end of every rebuild.
 //! - [`scoring`] — pure similarity/decay helpers (Jaccard, age, relevance).
 //! - [`embedder_retry`] — background recovery for a degraded (empty)
 //!   `EmbedderSlot` boot (offline first-run model download).
@@ -14,6 +16,7 @@
 //! `MEMORY_CORRECTION_THRESHOLD` are re-exported here so existing
 //! `engine::memory::<name>` paths keep resolving.
 
+pub(crate) mod correction;
 mod embedder_retry;
 mod extract;
 mod read;

@@ -4,8 +4,12 @@ import { describe, it, expect, beforeEach, afterEach, vi, type Mock } from 'vite
 // and so no test fires a real POST at an engine that is not there.
 const { postClientLog } = vi.hoisted(() => ({ postClientLog: vi.fn() }));
 vi.mock('../../../utils/clientLog', () => ({ postClientLog }));
+// Whether a failed markdown image has a re-request scheduled. Mocked so a test
+// can put an image in the complete-but-retrying state the browser reports.
+const { isImageRetryPending } = vi.hoisted(() => ({ isImageRetryPending: vi.fn(() => false) }));
+vi.mock('../../../utils/markdownImageRetry', () => ({ isImageRetryPending }));
 
-import { scrollToEventAndPulse, scrollToChangeAndPulse, hasPendingEventScroll, clearPendingEventScroll, followingLiveEdge, followSurvivesScroll, makeScrollObservers, scrollToBottom, scrollToTop, isEventInViewport, isHeaderPinnedForScroll, setActiveScrollElement, setFollowLiveEdge, setTranscriptLive, readerGestureForTest, stopFollowingBottom, resumeFollowingBottom, EVENT_RESOLVE_DEADLINE_MS, EVENT_RESOLVE_MAX_WAIT_MS } from '../scrollState';
+import { scrollToEventAndPulse, scrollToChangeAndPulse, hasPendingEventScroll, honourAnchoredMutation, markAnchorScroll, clearPendingEventScroll, followingLiveEdge, followSurvivesScroll, makeScrollObservers, scrollToBottom, scrollToTop, isEventInViewport, isHeaderPinnedForScroll, setActiveScrollElement, setFollowLiveEdge, setTranscriptLive, readerGestureForTest, stopFollowingBottom, resumeFollowingBottom, EVENT_RESOLVE_DEADLINE_MS, EVENT_RESOLVE_MAX_WAIT_MS } from '../scrollState';
 import { navFocusElement, clearNavFocus, NAV_FOCUS_FADE_MS, NAV_FOCUS_HOLD_MS, NAV_FOCUS_RAMP_MS } from '../../shared/focusMarker';
 
 /** Is a marker the CURRENT landing? Asked the way `scrollState` asks it. */
@@ -143,6 +147,7 @@ beforeEach(() => {
   roCallback = null;
   roDisconnects = 0;
   postClientLog.mockClear();
+  isImageRetryPending.mockReturnValue(false);
   // Reset module-level deep-link claim state so a held claim (a sync resolve now
   // holds it across the smooth-scroll settle; an unresolved async path holds it
   // until its deadline) can't leak into the next test.
@@ -491,6 +496,375 @@ describe('a deep-link landing retires a standing follow only when it lands OFF t
     onResize();
 
     expect(container.scrollTop).toBe(3000);
+  });
+
+  /** A match whose place in the content can move, as it does when turns above
+   *  it finish drawing or older history folds in. */
+  function makeMovableEl(start: number) {
+    const at = { top: start };
+    const el = {
+      parentElement: null,
+      isConnected: true,
+      getBoundingClientRect: () => ({
+        width: 200, height: 200, top: at.top - container.scrollTop, bottom: at.top - container.scrollTop + 200, left: 0, right: 200,
+      }),
+      classList: { add: () => {}, remove: () => {} },
+    } as any;
+    return { el, at };
+  }
+
+  it('holds a landed question on its landing line when content grows above it', () => {
+    // THE REPORTED CASE. The link lands, the glide ends, and only then do the
+    // turns above the question finish drawing. Nothing moved the reader with
+    // them, so they were left reading older turns above the question.
+    const { el, at } = makeMovableEl(3000);
+    restore = installFakeDom({ dataEventMatches: [el] });
+    const { onResize } = makeScrollObservers(container);
+
+    scrollToEventAndPulse('e-7');
+    vi.advanceTimersByTime(1500);
+    expect(container.scrollTop).toBe(3000);
+
+    at.top = 4200;                    // 1200px drew above the question
+    onResize();
+
+    expect(container.scrollTop).toBe(4200);
+  });
+
+  it('adds nothing when another correction already put the question back', () => {
+    // Older history folds in above, and the fold's own hold moves the reader
+    // down by exactly what arrived. The growth round that follows must not
+    // move them a second time.
+    const { el, at } = makeMovableEl(3000);
+    restore = installFakeDom({ dataEventMatches: [el] });
+    const { onResize } = makeScrollObservers(container);
+
+    scrollToEventAndPulse('e-7');
+    vi.advanceTimersByTime(1500);
+
+    at.top = 11000;                            // 8000px folded in above
+    markAnchorScroll(container, 11000);        // and the fold's hold followed it
+    onResize();
+
+    expect(container.scrollTop).toBe(11000);
+  });
+
+  it('adds up shifts too small to act on alone', () => {
+    // An animated expansion above the question grows a pixel a round. Each
+    // round is under the write threshold, so only their sum can be acted on.
+    const { el, at } = makeMovableEl(3000);
+    restore = installFakeDom({ dataEventMatches: [el] });
+    const { onResize } = makeScrollObservers(container);
+
+    scrollToEventAndPulse('e-7');
+    vi.advanceTimersByTime(1500);
+
+    for (let i = 1; i <= 5; i++) {
+      at.top = 3000 + i;
+      onResize();
+    }
+
+    expect(container.scrollTop).toBeGreaterThanOrEqual(3004);
+  });
+
+  it('moves nobody when content grows BELOW a landed question', () => {
+    // A landing near the bottom is clamped to the live edge. A streaming reply
+    // below the question moves the edge but not the question. So the hold must
+    // not carry the reader down with the reply (ADR 0064).
+    let top = 0;
+    Object.defineProperty(container, 'scrollTop', {
+      configurable: true,
+      get: () => top,
+      set: (v: number) => { top = Math.min(Math.max(0, v), container.scrollHeight - container.clientHeight); },
+    });
+    const { el } = makeMovableEl(9900);
+    restore = installFakeDom({ dataEventMatches: [el] });
+    const { onResize } = makeScrollObservers(container);
+
+    scrollToEventAndPulse('e-7');
+    vi.advanceTimersByTime(1500);
+    expect(container.scrollTop).toBe(9200);
+
+    container.scrollHeight = 20000;
+    onResize();
+
+    expect(container.scrollTop).toBe(9200);
+  });
+
+  it('lets go of a landed question once the reader presses a turn control', () => {
+    // The press holds the control still (ADR 0147). A hold on the link's
+    // target writing after it would slide the control away.
+    const { el, at } = makeMovableEl(3000);
+    restore = installFakeDom({ dataEventMatches: [el] });
+    const { onResize } = makeScrollObservers(container);
+
+    scrollToEventAndPulse('e-7');
+    vi.advanceTimersByTime(1500);
+
+    honourAnchoredMutation(container);
+    at.top = 4200;
+    onResize();
+
+    expect(container.scrollTop).toBe(3000);
+  });
+
+  it('lets go of a landed question once the reader scrolls', () => {
+    const { el, at } = makeMovableEl(3000);
+    restore = installFakeDom({ dataEventMatches: [el] });
+    const { onScroll, onResize } = makeScrollObservers(container);
+
+    scrollToEventAndPulse('e-7');
+    vi.advanceTimersByTime(1500);
+
+    readerGestureForTest(container);  // the reader's own hand on the transcript
+    container.scrollTop = 2500;
+    onScroll();
+    at.top = 4200;
+    onResize();
+
+    expect(container.scrollTop).toBe(2500);
+  });
+
+  it('keeps holding a landed question while growth above it keeps arriving', () => {
+    // An image above the question reserves no height, and on a phone the ones
+    // above keep decoding for seconds. Each correction restarts the quiet window.
+    const { el, at } = makeMovableEl(3000);
+    restore = installFakeDom({ dataEventMatches: [el] });
+    const { onResize } = makeScrollObservers(container);
+
+    scrollToEventAndPulse('e-7');
+    vi.advanceTimersByTime(1500);
+
+    for (let i = 1; i <= 4; i++) {
+      vi.advanceTimersByTime(2500);   // each gap is inside the quiet window
+      at.top = 3000 + i * 300;
+      onResize();
+    }
+
+    expect(container.scrollTop).toBe(4200);
+  });
+
+  it('lets go of a landed question once nothing has moved it for the quiet window', () => {
+    const { el, at } = makeMovableEl(3000);
+    restore = installFakeDom({ dataEventMatches: [el] });
+    const { onResize } = makeScrollObservers(container);
+
+    scrollToEventAndPulse('e-7');
+    vi.advanceTimersByTime(1500 + EVENT_RESOLVE_DEADLINE_MS);
+
+    at.top = 4200;
+    onResize();
+
+    expect(container.scrollTop).toBe(3000);
+  });
+
+  it('lets go of a landed question at the cap, even while growth keeps arriving', () => {
+    // A transcript that never stops growing above the target cannot pin the
+    // reader for good.
+    const { el, at } = makeMovableEl(3000);
+    restore = installFakeDom({ dataEventMatches: [el] });
+    const { onResize } = makeScrollObservers(container);
+
+    scrollToEventAndPulse('e-7');
+    let top = 3000;
+    for (let t = 0; t < EVENT_RESOLVE_MAX_WAIT_MS; t += 2000) {
+      vi.advanceTimersByTime(2000);
+      top += 100;
+      at.top = top;
+      onResize();
+    }
+    const heldAt = container.scrollTop;
+
+    vi.advanceTimersByTime(2000);
+    at.top = top + 500;
+    onResize();
+
+    expect(container.scrollTop).toBe(heldAt);
+  });
+
+  /** An image before the target in the transcript, loading until `complete`. */
+  function imageAbove(loading: 'auto' | 'lazy' = 'auto') {
+    const DOCUMENT_POSITION_FOLLOWING = 4;
+    const img = { complete: false, loading, DOCUMENT_POSITION_FOLLOWING, compareDocumentPosition: () => DOCUMENT_POSITION_FOLLOWING };
+    container.querySelectorAll = (sel: string) => (sel === 'img' ? [img] : []);
+    return img;
+  }
+
+  it('keeps holding past the quiet window while an image above the question loads', () => {
+    // A slow image on a phone: nothing moves for longer than the window, then
+    // it decodes and pushes the question down.
+    const img = imageAbove();
+    const { el, at } = makeMovableEl(3000);
+    restore = installFakeDom({ dataEventMatches: [el] });
+    const { onResize } = makeScrollObservers(container);
+
+    scrollToEventAndPulse('e-7');
+    vi.advanceTimersByTime(1500 + 8000);
+
+    img.complete = true;
+    at.top = 4200;
+    onResize();
+
+    expect(container.scrollTop).toBe(4200);
+
+    vi.advanceTimersByTime(EVENT_RESOLVE_DEADLINE_MS);   // quiet again, and loaded
+    at.top = 4600;
+    onResize();
+
+    expect(container.scrollTop).toBe(4200);
+  });
+
+  it('keeps holding while an image above the question waits to retry', () => {
+    // A failed image reports complete, but its re-request is scheduled and its
+    // height is still on its way.
+    const img = imageAbove();
+    img.complete = true;
+    isImageRetryPending.mockReturnValue(true);
+    const { el, at } = makeMovableEl(3000);
+    restore = installFakeDom({ dataEventMatches: [el] });
+    const { onResize } = makeScrollObservers(container);
+
+    scrollToEventAndPulse('e-7');
+    vi.advanceTimersByTime(1500 + 8000);
+
+    isImageRetryPending.mockReturnValue(false);   // the retry went out and loaded
+    at.top = 4200;
+    onResize();
+
+    expect(container.scrollTop).toBe(4200);
+  });
+
+  it('waits for an image inserted above the question after the last reading', () => {
+    // A turn above renders later, bringing an image the saved reading never saw.
+    container.querySelectorAll = () => [];
+    const { el, at } = makeMovableEl(3000);
+    restore = installFakeDom({ dataEventMatches: [el] });
+    const { onResize } = makeScrollObservers(container);
+
+    scrollToEventAndPulse('e-7');
+    vi.advanceTimersByTime(1500 + 8000);
+
+    imageAbove();                     // inserted, still loading
+    at.top = 3100;                    // its insertion's own growth
+    onResize();
+
+    expect(container.scrollTop).toBe(3100);
+  });
+
+  it('does not wait for a lazy image, which may never load', () => {
+    imageAbove('lazy');
+    const { el, at } = makeMovableEl(3000);
+    restore = installFakeDom({ dataEventMatches: [el] });
+    const { onResize } = makeScrollObservers(container);
+
+    scrollToEventAndPulse('e-7');
+    vi.advanceTimersByTime(1500 + EVENT_RESOLVE_DEADLINE_MS);
+
+    at.top = 4200;
+    onResize();
+
+    expect(container.scrollTop).toBe(3000);
+  });
+
+  it('lets the quiet window run out when the browser clamps every correction', () => {
+    // A correction that cannot move the container is not the transcript
+    // settling, so it must not keep the hold alive to the cap.
+    let top = 0;
+    Object.defineProperty(container, 'scrollTop', {
+      configurable: true,
+      get: () => top,
+      set: (v: number) => { top = Math.min(Math.max(0, v), container.scrollHeight - container.clientHeight); },
+    });
+    const { el, at } = makeMovableEl(9800);
+    restore = installFakeDom({ dataEventMatches: [el] });
+    const { onResize } = makeScrollObservers(container);
+
+    scrollToEventAndPulse('e-7');
+    vi.advanceTimersByTime(1500);
+    at.top = 9900;                    // it drops, and the edge will not follow
+    for (let i = 0; i < 4; i++) {
+      vi.advanceTimersByTime(1500);
+      onResize();
+    }
+    container.scrollHeight = 10400;   // an image above it, after the window
+    at.top = 10300;
+    onResize();
+
+    expect(container.scrollTop).toBe(9200);
+  });
+
+  /** Record the container's listeners, so a test can fire the focus a Tab or a
+   *  focused control lands inside the transcript. */
+  function listenOn(c: any): Record<string, (e: unknown) => void> {
+    const listeners: Record<string, (e: unknown) => void> = {};
+    c.addEventListener = (type: string, fn: (e: unknown) => void) => { listeners[type] = fn; };
+    return listeners;
+  }
+
+  it('lets go of a landed question once focus moves to a control outside it', () => {
+    const listeners = listenOn(container);
+    const { el, at } = makeMovableEl(3000);
+    el.contains = () => false;
+    restore = installFakeDom({ dataEventMatches: [el] });
+    const { onResize } = makeScrollObservers(container);
+
+    scrollToEventAndPulse('e-7');
+    vi.advanceTimersByTime(1500);
+
+    listeners.focusin({ target: {} });
+    at.top = 4200;
+    onResize();
+
+    expect(container.scrollTop).toBe(3000);
+  });
+
+  it('keeps holding when focus lands inside the question or on the transcript itself', () => {
+    const listeners = listenOn(container);
+    const { el, at } = makeMovableEl(3000);
+    let inside = true;
+    el.contains = () => inside;
+    restore = installFakeDom({ dataEventMatches: [el] });
+    const { onResize } = makeScrollObservers(container);
+
+    scrollToEventAndPulse('e-7');
+    vi.advanceTimersByTime(1500);
+
+    listeners.focusin({ target: {} });          // the card's first choice
+    inside = false;
+    listeners.focusin({ target: container });   // desktop pane focus
+    at.top = 4200;
+    onResize();
+
+    expect(container.scrollTop).toBe(4200);
+  });
+
+  it('keeps a question landed at the live edge on screen as images above it decode', () => {
+    // THE REPORTED PUSH TAP. The question is the newest turn, so the landing is
+    // clamped to the live edge with the card near the bottom of the viewport.
+    // Every image above it that decodes later pushes it further below the fold.
+    let top = 0;
+    Object.defineProperty(container, 'scrollTop', {
+      configurable: true,
+      get: () => top,
+      set: (v: number) => { top = Math.min(Math.max(0, v), container.scrollHeight - container.clientHeight); },
+    });
+    const { el, at } = makeMovableEl(9800);
+    restore = installFakeDom({ dataEventMatches: [el] });
+    const { onResize } = makeScrollObservers(container);
+
+    scrollToEventAndPulse('e-7');
+    vi.advanceTimersByTime(1500);
+    expect(container.scrollTop).toBe(9200);
+
+    for (let i = 1; i <= 3; i++) {
+      vi.advanceTimersByTime(2500);   // images decode seconds apart
+      container.scrollHeight = 10000 + i * 400;
+      at.top = 9800 + i * 400;
+      onResize();
+    }
+
+    expect(container.scrollTop).toBe(10400);
+    expect(el.getBoundingClientRect().top).toBe(600);
   });
 
   it('measures the landing, so a target just short of the edge still ends it', () => {

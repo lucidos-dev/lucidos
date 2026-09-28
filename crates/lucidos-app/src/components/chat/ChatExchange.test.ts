@@ -25,7 +25,7 @@ describe('describeExecutor', () => {
   it('uses the Codex app mark instead of a red code glyph', () => {
     const icon = CodexIcon() as VNode;
     const props = icon.props as Record<string, unknown>;
-    expect(props.stroke).toBe('var(--accent-light)');
+    expect(props.stroke).toBe('var(--codex-mark, var(--accent-light))');
     expect(props['stroke-width']).toBe('2.25');
     const group = icon.props.children as VNode;
     expect((group.props as Record<string, unknown>).transform).toBe('translate(-1.2 -1.2) scale(1.1)');
@@ -40,7 +40,7 @@ describe('describeExecutor', () => {
 
 describe('actorInitiator (closed set: You / Lucidos Agent / Lucidos Engine / System / API caller)', () => {
   it('device → You (the only origin that is unambiguously the user)', () => {
-    const { icon, label } = actorInitiator({ kind: 'device', device_id: 'd', label: 'L' });
+    const { icon, label } = actorInitiator({ kind: 'device', device_id: 'd' });
     expect(label).toBe('You');
     expect((icon as VNode).type).toBe(PersonIcon);
   });
@@ -113,7 +113,7 @@ describe('actorInitiator (closed set: You / Lucidos Agent / Lucidos Engine / Sys
 describe('shouldShowResponseStatusBadge', () => {
   const ev = (type: string, rest: Record<string, unknown> = {}) =>
     ({ type, ...rest }) as unknown as ThreadEvent;
-  const device = { kind: 'device', device_id: 'd1', label: 'My MacBook' };
+  const device = { kind: 'device', device_id: 'd1' };
 
   it('hides the canceled badge on a UserQuestionAsked exchange (question card owns the cancel signal)', () => {
     expect(shouldShowResponseStatusBadge(ev('UserQuestionAsked'), 'canceled')).toBe(false);

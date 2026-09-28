@@ -117,8 +117,8 @@ mod tests {
     /// It would offer the user a language that pins no code, which is the
     /// defect this module fixed, arriving through the other file.
     ///
-    /// A `.tsx`-only diff does not compile this, so `/harden` Phase 4.5 carries
-    /// a row pointing `LocaleSection.tsx` at `voice::language`.
+    /// `/harden` runs this for a `.tsx`-only diff because the `include_str!`
+    /// makes `LocaleSection.tsx` a compile input, which selects the Rust suite.
     #[test]
     fn every_language_the_dropdown_offers_resolves_to_a_code() {
         let start = LOCALE_SECTION

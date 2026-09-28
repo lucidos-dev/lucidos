@@ -87,6 +87,8 @@
 #   2. live-PID lock          → hard-fail (another run is live)
 #   3. stale lock, no orphans → reclaim (as before)
 #   4. stale lock + orphans   → sweep; reclaim if clean, else refuse
+# A reclaim is one step under a flock (`_e2e_reclaim_stale_lock`), so of two
+# runs reclaiming the same stale lock, one wins and the other refuses.
 
 E2E_LOCK_OWNED=""
 
@@ -451,11 +453,17 @@ EOF
 #
 # `|| [ -n "$key" ]` catches a file whose LAST line has no trailing newline:
 # `read` returns non-zero there having already filled the variables, so the plain
-# form silently drops that line. Our own writer uses a heredoc and always ends
-# with one, but SCRIPT is written last, so a hand-written or truncated lock file
+# form silently drops that line. Our own writer always ends with one, but
+# SCRIPT is written last, so a hand-written or truncated lock file
 # would lose exactly the field the refusal names.
 _e2e_read_lock_file() {
-    local file="$1" key val
+    [ -f "$1" ] || { _e2e_parse_lock_text < /dev/null; return 1; }
+    _e2e_parse_lock_text < "$1"
+}
+
+# Fill the `_E2E_LK_*` fields from lock text on stdin.
+_e2e_parse_lock_text() {
+    local key val
     _E2E_LK_PID=""
     _E2E_LK_THREAD=""
     _E2E_LK_WORKTREE=""
@@ -463,7 +471,6 @@ _e2e_read_lock_file() {
     _E2E_LK_STARTED_EPOCH=""
     _E2E_LK_SCRIPT=""
     _E2E_LK_RUN_ID=""
-    [ -f "$file" ] || return 1
     while IFS='=' read -r key val || [ -n "$key" ]; do
         case "$key" in
             PID)           _E2E_LK_PID="$val" ;;
@@ -474,28 +481,57 @@ _e2e_read_lock_file() {
             SCRIPT)        _E2E_LK_SCRIPT="$val" ;;
             RUN_ID)        _E2E_LK_RUN_ID="$val" ;;
         esac
-    done < "$file"
+    done
     return 0
 }
 
+# The lock file's contents, naming this process. RUN_ID goes before SCRIPT so
+# SCRIPT stays last (see the reader above).
+_e2e_lock_content() {
+    local script_name="$1" run_id="$2"
+    printf 'PID=%s\nTHREAD_ID=%s\nWORKTREE=%s\nSTARTED=%s\nSTARTED_EPOCH=%s\nRUN_ID=%s\nSCRIPT=%s\n' \
+        "$$" "${LUCIDOS_THREAD_ID:-unknown}" "$PWD" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        "$(date +%s)" "$run_id" "$script_name"
+}
+
 # Atomic create-or-fail using noclobber. Returns 0 on success, non-zero if file exists.
-# RUN_ID goes before SCRIPT so SCRIPT stays last (see the reader above).
 _e2e_lock_write() {
-    local lock_file="$1" script_name="$2" run_id="$3"
-    local thread_id="${LUCIDOS_THREAD_ID:-unknown}"
-    local started started_epoch
-    started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    started_epoch="$(date +%s)"
-    (set -C; cat > "$lock_file" <<EOF
-PID=$$
-THREAD_ID=$thread_id
-WORKTREE=$PWD
-STARTED=$started
-STARTED_EPOCH=$started_epoch
-RUN_ID=$run_id
-SCRIPT=$script_name
-EOF
-    ) 2>/dev/null
+    local lock_file="$1" content
+    content="$(_e2e_lock_content "$2" "$3")"
+    (set -C; printf '%s\n' "$content" > "$lock_file") 2>/dev/null
+}
+
+# Replace a stale lock whose contents are still exactly `stale`, as read before
+# the orphan sweep. Returns 0 once this run holds the lock.
+#
+# Two runs can find the same stale lock, so check-and-replace must be one step.
+# It runs under an exclusive `flock` on `<lock>.reclaim`: its holder re-reads the
+# lock, and replaces it only if it is unchanged. The whole file, not just its
+# PID, so a new run that reused the dead PID keeps its lock. The kernel drops
+# a flock when its holder dies, so a killed reclaimer leaves nothing to break.
+# Perl holds it because macOS ships no `flock` command.
+_e2e_reclaim_stale_lock() {
+    local lock_file="$1" stale="$2" content
+    if ! command -v perl >/dev/null 2>&1; then
+        echo "[e2e-lock] ERROR: reclaiming a stale lock needs perl, which is not on PATH." >&2
+        echo "[e2e-lock] Install it, or remove $lock_file once no e2e run is live." >&2
+        return 1
+    fi
+    content="$(_e2e_lock_content "$3" "$4")"
+    perl -MFcntl=:DEFAULT,:flock -e '
+        my ($lock, $stale, $content) = @ARGV;
+        open(my $mutex, ">>", "$lock.reclaim") or exit 2;
+        flock($mutex, LOCK_EX) or exit 2;
+        if (open(my $held, "<", $lock)) {
+            my $now = do { local $/; <$held> } // "";
+            $now =~ s/\n+\z//;
+            exit 1 unless $now eq $stale;
+            unlink $lock or exit 1;
+        }
+        sysopen(my $out, $lock, O_WRONLY | O_CREAT | O_EXCL) or exit 1;
+        print $out "$content\n" or exit 1;
+        close $out or exit 1;
+    ' "$lock_file" "$stale" "$content"
 }
 
 # ── announcing a hold (the E2ELock* domain events) ──────────────────────
@@ -861,14 +897,13 @@ acquire_e2e_lock() {
         return 0
     fi
 
-    # File exists: read all metadata in one pass. The read can still fail if the
-    # holder released in the window since the write above. `|| :` is defensive
-    # rather than load-bearing today: a bare non-zero call takes `set -e` with
-    # it, but both entry points invoke this as `acquire_e2e_lock <label> ||
-    # exit 1`, and a `||` list suppresses errexit inside the function. It is here
-    # so a future bare caller cannot turn that refusal into a silent exit. The
-    # same is NOT true of `release_e2e_lock`, which runs bare from an EXIT trap.
-    _e2e_read_lock_file "$lock_file" || :
+    # File exists: read it ONCE. The stale decision and the snapshot the reclaim
+    # compares must come from the same contents, or a lock taken in between gets
+    # replaced. A holder that released since the write above leaves every field
+    # empty, which is not stale and falls through to the refusal.
+    local existing_raw
+    existing_raw="$(cat "$lock_file" 2>/dev/null)" || :
+    _e2e_parse_lock_text <<< "$existing_raw"
     local existing_pid="$_E2E_LK_PID" existing_thread="$_E2E_LK_THREAD"
     local existing_wt="$_E2E_LK_WORKTREE" existing_started="$_E2E_LK_STARTED"
     local existing_started_epoch="$_E2E_LK_STARTED_EPOCH"
@@ -921,8 +956,7 @@ EOF
             fi
             echo "[e2e-lock] orphans reaped — reclaiming the stale lock" >&2
         fi
-        rm -f "$lock_file"
-        if _e2e_lock_write "$lock_file" "$script_name" "$run_id"; then
+        if _e2e_reclaim_stale_lock "$lock_file" "$existing_raw" "$script_name" "$run_id"; then
             E2E_LOCK_OWNED="$lock_file"
             _e2e_export_run_id "$run_id"
             # The dead owner's hold is over, and a waiter blocked on that hold
@@ -954,6 +988,12 @@ EOF
             E2E_LOCK_ANNOUNCE_PID=$!
             return 0
         fi
+        # Another run won the reclaim. Name it, not the dead owner, so the
+        # refusal and its cross-workspace note describe the live hold.
+        _e2e_read_lock_file "$lock_file" || :
+        existing_pid="$_E2E_LK_PID" existing_thread="$_E2E_LK_THREAD"
+        existing_wt="$_E2E_LK_WORKTREE" existing_started="$_E2E_LK_STARTED"
+        existing_script="$_E2E_LK_SCRIPT"
     fi
 
     echo ""

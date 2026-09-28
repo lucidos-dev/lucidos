@@ -226,12 +226,13 @@ mod tests {
     /// caller can refuse it instead of never seeing it.
     #[test]
     fn a_computed_path_is_recorded_with_no_literal() {
-        let hits = scan_api_routes();
-        assert!(
-            hits.iter()
-                .any(|h| h.path.is_empty() && h.file == "sdk_fonts.rs"),
-            "the version-stamped font route is built at registration"
-        );
+        let src =
+            "pub fn router() -> Router {\n    Router::new().route(&built_path(), get(serve))\n}\n";
+        let mut hits = Vec::new();
+        collect_routes(src, "computed.rs", &mut hits);
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].path.is_empty());
+        assert_eq!(hits[0].func, "router");
     }
 
     #[test]

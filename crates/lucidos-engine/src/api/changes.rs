@@ -70,7 +70,15 @@ pub(super) async fn list_changes(
     // cross-reload truth for the "Applying changes…" toast — the driving
     // `applyAllInProgress` signal resets on reload and the ApplyAllBatch* SSE
     // events aren't replayed. Joined with the other reads — independent query.
-    let (pending_r, applied_r, client_update_r, restart_groups_r, apply_all_r, settling_r) = tokio::join!(
+    let (
+        pending_r,
+        applied_r,
+        client_update_r,
+        restart_groups_r,
+        apply_all_r,
+        settling_r,
+        apply_estimates_r,
+    ) = tokio::join!(
         crate::core::changes::list_pending_for_readers(
             pool,
             proj,
@@ -84,6 +92,7 @@ pub(super) async fn list_changes(
         sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM apply_all_batches)")
             .fetch_one(pool),
         crate::engine::standing_apply::count_sweep_candidates(pool),
+        state.engine.apply_estimates.current(pool),
     );
     let pending = pending_r.map_err(ApiError::db)?;
     let mut applied = applied_r.map_err(ApiError::db)?;
@@ -91,6 +100,7 @@ pub(super) async fn list_changes(
     let mut restart_groups = restart_groups_r.map_err(ApiError::db)?;
     let apply_all_in_progress = apply_all_r.map_err(ApiError::db)?;
     let settling_thread_count = settling_r.map_err(ApiError::db)?;
+    let apply_estimates = apply_estimates_r.map_err(ApiError::db)?;
     let has_more_applied = applied.len() as i64 > limit;
     if has_more_applied {
         applied.truncate(limit as usize);
@@ -112,14 +122,21 @@ pub(super) async fn list_changes(
         "client_update_available": client_update,
         "has_more_applied": has_more_applied,
         "apply_all_in_progress": apply_all_in_progress,
+        // Which member is in flight and how far the batch got, so a reload
+        // keeps "thread N of M". Null while startup recovery has yet to
+        // re-seed the registry, even when `apply_all_in_progress` is true.
+        "apply_all_batch": state.engine.apply_all_batches.lock().await.snapshot(),
         // Threads carrying a standing apply. Keyed by THREAD, not by change: a
         // sweep arms a thread that has proposed nothing yet, and the prompt row
         // still has to render its armed state.
         "standing_apply_thread_ids": state.engine.armed_standing_apply_threads(),
         // Coding-agent threads still settling, so a sweep has something to arm.
-        // The panel offers "Apply as they settle" off this, and cannot derive
+        // The panel offers "Apply all on settle" off this, and cannot derive
         // it: its thread map holds only the loaded window.
         "settling_thread_count": settling_thread_count,
+        // How long hardening and conflict resolution usually take here, for
+        // the apply toasts. Each is null until enough runs exist.
+        "apply_estimates": apply_estimates,
     })))
 }
 
@@ -241,24 +258,32 @@ pub(crate) async fn change_action_refusal(
         return Ok(None);
     }
     let actions = crate::api::threads::available_thread_actions_for(pool, thread_id).await?;
-    if actions.contains(&action) {
+    // Asked even when the selector grants the action. The selector reads the
+    // status alone, and a thread can read `idle` with its question still open
+    // (see `unsettled_thread_ids`). They otherwise agree, so this adds no
+    // refusal beyond that one.
+    let unsettled = crate::core::changes::unsettled_thread_ids(pool, std::iter::once(thread_id))
+        .await?
+        .contains(&thread_id);
+    if actions.contains(&action) && !unsettled {
         return Ok(None);
     }
-    // Two extra reads, on the refusal path only. They ask the two canonical
-    // predicates rather than a third copy of their SQL, which is the drift this
-    // whole function exists to stop. `settling` is asked first because a
+    // They ask the canonical predicates rather than a third copy of their SQL,
+    // which is the drift this whole function exists to stop. An open question
+    // comes first: a standing apply drops on one, so naming it would point the
+    // caller at a control that ends at once. `settling` comes next, because a
     // settling thread is often also unsettled, and settling is the stronger,
     // actionable answer.
+    if crate::engine::agent_recovery::thread_parked_on_question(pool, thread_id).await? {
+        return Ok(Some(ChangeActionRefusal::ThreadParked));
+    }
     if crate::engine::standing_apply::settling_thread_ids(pool, std::iter::once(thread_id))
         .await?
         .contains(&thread_id)
     {
         return Ok(Some(ChangeActionRefusal::ThreadSettling));
     }
-    if crate::core::changes::unsettled_thread_ids(pool, std::iter::once(thread_id))
-        .await?
-        .contains(&thread_id)
-    {
+    if unsettled {
         return Ok(Some(ChangeActionRefusal::ThreadParked));
     }
     Ok(Some(ChangeActionRefusal::ActionUnavailable))
@@ -445,7 +470,7 @@ pub(super) async fn disarm_standing_apply(
 
 /// DELETE /api/v1/standing-applies: take back every standing apply here.
 ///
-/// The workspace-scope off, which the Changes panel's "Apply as they settle"
+/// The workspace-scope off, which the Changes panel's "Apply all on settle"
 /// toggle presses. It drops a single arm as readily as a swept one. That panel
 /// draws ONE armed state for the workspace, so its off has to mean the same.
 ///
@@ -495,8 +520,8 @@ pub(super) fn empty_apply_all_refusal(total_pending: usize, unsettled: usize) ->
     }
 }
 
-/// What "Apply as they settle" says once it has armed. Pure.
-pub(super) fn apply_as_they_settle_message(armed: usize) -> String {
+/// What "Apply all on settle" says once it has armed. Pure.
+pub(super) fn apply_all_on_settle_message(armed: usize) -> String {
     match armed {
         0 => "No thread is still settling, so there is nothing to apply as it settles.".into(),
         1 => "Will apply 1 thread's change as it settles.".into(),
@@ -541,7 +566,7 @@ pub(super) async fn apply_all_changes(
         ApplyAllOutcome::Started { .. } => (0, 0, 0),
     };
     if let ApplyAllOutcome::NothingToApply { .. } = outcome {
-        // With the checkbox on, the sweep IS the action: "Apply as they settle".
+        // With the checkbox on, the sweep IS the action: "Apply all on settle".
         if !query.keep_going {
             return Err(ApiError::bad_request(empty_apply_all_refusal(
                 total_pending,
@@ -552,7 +577,7 @@ pub(super) async fn apply_all_changes(
         return Ok(Json(serde_json::json!({
             "batch_size": 0,
             "armed": armed,
-            "message": apply_as_they_settle_message(armed),
+            "message": apply_all_on_settle_message(armed),
         })));
     }
     let ApplyAllOutcome::Started {
@@ -947,6 +972,7 @@ mod tests {
 
         let facts = |status: &str, waits: bool| SettleFacts {
             status: status.to_string(),
+            parked_on_question: false,
             live_event_waits: waits,
             has_diff: true,
             armed_change: ArmedChange::Ready(Uuid::new_v4()),

@@ -78,7 +78,7 @@ function mobileInlinePadding(className: string): string[] {
 const barRules = cssRules(shellCss).filter(r => r.selector.includes('connection-banner'));
 
 /** Every custom property base.css declares on the document root, whichever host
- *  it uses: the `:root` tokens block, and the `html` / `html[data-theme=…]`
+ *  it uses: the `:root` tokens block, and the `html` / `html[data-theme-mode=…]`
  *  blocks the themed colours live on (a theme has to out-specify `:root`, which
  *  is why the colours are not in it). */
 const rootDeclared = new Set<string>(

@@ -27,8 +27,8 @@ describe('windowReadyToShow', () => {
     expect(invoke).toHaveBeenCalledTimes(1);
     expect(invoke).toHaveBeenCalledWith('window_ready_to_show', undefined);
 
-    // Its callers repeat. `applyTheme` runs on every theme toggle and every
-    // system-appearance change, and `boot()` and `applyTheme` both fire in the
+    // Its callers repeat. `applyThemeMode` runs on every theme toggle and every
+    // system-appearance change, and `boot()` and `applyThemeMode` both fire in the
     // same document. A second signal would re-show a window the user may have
     // dismissed to the menu bar since, so the module-level flag swallows it.
     windowReadyToShow();

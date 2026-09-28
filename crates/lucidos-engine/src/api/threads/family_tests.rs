@@ -44,6 +44,7 @@ fn row(
         archive_state: archive_state.to_string(),
         coding_agent_proposed,
         coding_agent_is_external_repo,
+        is_saved: false,
     }
 }
 
@@ -81,7 +82,6 @@ async fn spawn_idle_parent(bus: &EventBus) -> Uuid {
             text: "do something".into(),
             user_image_hashes: vec![],
             device_id: None,
-            device: None,
             image_description: None,
             parent_thread_id: None,
             spawning_event_id: None,
@@ -176,7 +176,6 @@ async fn spawn_child(bus: &EventBus, pool: &PgPool, parent_id: Uuid, bring_to_id
             text: "child task".into(),
             user_image_hashes: vec![],
             device_id: None,
-            device: None,
             image_description: None,
             parent_thread_id: Some(parent_id),
             spawning_event_id: None,
@@ -258,7 +257,6 @@ async fn spawn_cc_child(
             text: "cc task".into(),
             user_image_hashes: vec![],
             device_id: None,
-            device: None,
             image_description: None,
             parent_thread_id: Some(parent_id),
             spawning_event_id: None,
@@ -310,13 +308,13 @@ async fn spawn_cc_child(
         bus.emit(BusEvent::Thread {
             thread_id: child_id,
             event: ThreadEvent::ChangeProposed {
-                change_id: format!("test-cid-{}", child_id),
+                change_id: Uuid::new_v4().to_string(),
                 description: Some("Test change".into()),
                 files: vec!["test.rs".into()],
                 requires_restart: false,
                 origin: None,
                 commit_sha: None,
-                branch_name: "claude-code/test".into(),
+                branch_name: format!("claude-code/test-{child_id}"),
                 repo_root: "/tmp".into(),
                 hardened: false,
                 incomplete: false,
@@ -345,7 +343,6 @@ async fn spawn_idle_chat_child(bus: &EventBus, pool: &PgPool, parent_id: Uuid) -
             text: "delegated task".into(),
             user_image_hashes: vec![],
             device_id: None,
-            device: None,
             image_description: None,
             parent_thread_id: Some(parent_id),
             spawning_event_id: None,
@@ -631,14 +628,9 @@ async fn archive_already_archived_parent_archives_resurfaced_descendant() {
 async fn archive_rejects_parent_cc_with_pending_changes() {
     // In-workspace CC parent with a pending change is NOT archivable. The
     // user must Apply or Discard the change first. Without this gate the
-    // ThreadArchived projection clears coding_agent_proposed via
-    // CLEAR_CODING_AGENT_FLAGS, the change row is left dangling in the
-    // changes table, and the thread routes to Archive instead of Review —
-    // the cca058432 "pending changes survive into Review when archived"
-    // contract was never wired up (the projection always cleared the
-    // column the routing depended on). Aligns with `resolve_actions`,
-    // which already returns [Discard, Apply] — never Archive — in this
-    // state.
+    // change row is left pending while the thread sits in Archive. Aligns
+    // with `resolve_actions`, which returns [Discard, Apply] and never
+    // Archive in this state.
     let parent_id = Uuid::new_v4();
     let family = vec![cc_with_pending(parent_id)];
     let (status, body) = expect_reject(
@@ -778,7 +770,6 @@ async fn orphaned_question_does_not_block_cascade_and_is_lookup_visible() {
             text: "cc task".into(),
             user_image_hashes: vec![],
             device_id: None,
-            device: None,
             image_description: None,
             parent_thread_id: Some(parent_id),
             spawning_event_id: None,
@@ -901,7 +892,6 @@ async fn archive_rejects_when_fresh_cc_child_is_running_without_idle() {
             text: "fresh cc child".into(),
             user_image_hashes: vec![],
             device_id: None,
-            device: None,
             image_description: None,
             parent_thread_id: Some(parent_id),
             spawning_event_id: None,

@@ -45,6 +45,29 @@ export interface Change {
    *  thread works only to finish that apply, and its completion lands the
    *  change, so no standing apply is offered. Defaults to false. */
   resolving_conflict?: boolean;
+  /** When the slow phase in flight began: an open conflict resolution, or an
+   *  open hardening. Null when neither runs, and on non-pending changes. */
+  apply_phase_started_at?: string | null;
+  /** Whether merging this change into `main` as it stands would conflict,
+   *  from `git merge-tree`. `unknown` when git could not answer. Null on
+   *  non-pending changes. */
+  predicted_conflict?: ConflictPrediction | null;
+}
+
+/** Mirrors the engine's `ConflictPrediction`. */
+export type ConflictPrediction = 'unknown' | 'clean' | 'conflict';
+
+/** How long one slow apply phase usually takes in this workspace. */
+export interface PhaseEstimate {
+  typical_secs: number;
+  runs: number;
+}
+
+/** Mirrors the engine's `ApplyEstimates`. A phase is null until enough runs
+ *  exist to estimate it. */
+export interface ApplyEstimates {
+  hardening: PhaseEstimate | null;
+  resolving_conflict: PhaseEstimate | null;
 }
 
 /** One thread's contribution to the current restart-required toast: derived
@@ -64,18 +87,31 @@ export interface ChangesState {
   client_update_available: boolean;
   has_more_applied: boolean;
   /** True when an Apply All batch is live on the engine. Lets a reloaded page
-   *  rehydrate the sticky "Applying changes…" toast — the driving
-   *  `applyAllInProgress` signal resets on reload and the ApplyAllBatch* SSE
+   *  bring back the Apply All row in the Lucidos menu: the driving
+   *  `applyAllInProgress` signal resets on reload, and the ApplyAllBatch* SSE
    *  events aren't replayed. */
   apply_all_in_progress: boolean;
+  /** The running batch's members in apply order and what each is doing, so a
+   *  reload keeps "change N of M". Null while no batch runs, and briefly after
+   *  an engine restart. Absent on an older payload, as are the two member
+   *  lists on an engine from before ADR 0314. */
+  apply_all_batch?: {
+    change_ids: string[];
+    resolved_change_ids: string[];
+    applying_change_ids?: string[];
+    resolving_change_ids?: string[];
+  } | null;
   /** Threads carrying a *standing apply*. Keyed by thread, not by change: a
    *  sweep arms a thread that has proposed nothing yet, and its prompt row
    *  still renders the armed state. Absent on an older payload. */
   standing_apply_thread_ids?: string[];
   /** Coding-agent threads still settling, so a sweep has something to arm.
-   *  The Changes panel offers "Apply as they settle" off this. It cannot derive it:
+   *  The Changes panel offers "Apply all on settle" off this. It cannot derive it:
    *  `threadMap` holds only the loaded window. Absent on an older payload. */
   settling_thread_count?: number;
+  /** How long hardening and conflict resolution usually take here. Absent on
+   *  an older payload. */
+  apply_estimates?: ApplyEstimates;
 }
 
 export async function fetchChanges(params?: {
@@ -156,7 +192,7 @@ export interface ApplyAllResult {
  *
  *  With `keepGoing`, it also arms a *standing apply* on every thread still
  *  working, so each one applies as it lands. That is the whole action when
- *  nothing is pending, and the button reads "Apply as they settle" there. */
+ *  nothing is pending, and the button reads "Apply all on settle" there. */
 export async function applyAllChanges(keepGoing = false): Promise<ApplyAllResult> {
   const qs = keepGoing ? '?keep_going=true' : '';
   return json(`${API}/changes/apply-all${qs}`, { method: 'POST' }, APPLY_TIMEOUT_MS);
@@ -318,6 +354,10 @@ export interface EngineVersionStatus {
    *  the two disagree. The client anchors this to its own `Date.now()` at
    *  receipt and counts up locally, so skew never reaches the number. */
   build_elapsed_ms?: number;
+  /** Present while THIS engine's rebuild waits for a *build slot* instead of
+   *  compiling. Absent while it compiles, when idle, for a co-located peer's
+   *  build, and when packaged. */
+  build_queued?: QueuedBuild;
   /** The commits a Switch would bring, grouped by what they are (see
    *  `PendingCommits` for which commits count). Two surfaces read it,
    *  the status toast while a rebuild runs and the new-version confirm once one
@@ -327,6 +367,17 @@ export interface EngineVersionStatus {
    *  no surface would show it), never "none pending". A present object with
    *  `total: 0` is the only way to say there is nothing to bring. */
   pending_commits?: PendingCommits;
+  /** How long THIS engine has waited for the build-watch to republish `dist/`
+   *  after a frontend-only Apply, in ms. Absent when no such wait is running,
+   *  when packaged, and on an engine too old to report it. Elapsed for the
+   *  reason `build_elapsed_ms` gives. */
+  frontend_refresh_elapsed_ms?: number;
+}
+
+/** A rebuild waiting for a build slot. `holders` names what holds each slot,
+ *  by the label its wrapper recorded. */
+export interface QueuedBuild {
+  holders: string[];
 }
 
 /** Why a background build failed, reduced to what a toast can carry.

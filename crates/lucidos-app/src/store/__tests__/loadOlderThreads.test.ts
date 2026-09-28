@@ -43,7 +43,6 @@ function summary(over: Partial<ThreadSummary> & { thread_id: string; created_at:
     coding_agent_proposed: false,
     coding_agent_requires_restart: false,
     coding_agent_is_external_repo: false,
-    coding_agent_applying: false,
     last_revived_at: null,
     parent_thread_id: null,
     state: 'active',

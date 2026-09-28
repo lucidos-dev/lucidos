@@ -68,7 +68,7 @@ Three things bound the damage. The difference check means only a *changed*
 value paints at all, which is that commit's own guard, kept. Nothing acts on an
 event's value, so a lie shorter than the settle delay never lands. And
 `applyTheme` samples the media query once, handing that value to both the paint
-and its `__themeLogEvt` breadcrumb, so a recurrence is legible in `engine.log`.
+and its `__themeModeLogEvt` breadcrumb, so a recurrence is legible in `engine.log`.
 
 The settle delay is not a measured number. It was picked to outlast the
 snapshot pass, which is fast, and 300ms is imperceptible on a theme change. If

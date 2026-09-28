@@ -5,7 +5,8 @@
  * The cover and the panel inside it stay mounted, so opening costs no render.
  * The open SIGNAL drives everything at once: the overlay stack, the pressed
  * Filter button, and the cover's `data-open` and `inert`. Each swap mounts a
- * fresh navigation cover, the same one a content-pane navigation gets.
+ * fresh navigation cover playing the `dip`: it rises over the leaving view and
+ * clears off the arriving one, while the CSS swaps the views at its midpoint.
  *
  * jsdom runs no animations, so these tests pin the DOM states the CSS keys on.
  * The frames themselves are covered by
@@ -90,8 +91,9 @@ describe('the filter panel swaps under a navigation cover, and the signal leads'
     // After the filter cover, so it paints over it at any equal z-index too.
     expect(cover().nextElementSibling).toBe(opening);
     expect(opening!.getAttribute('aria-hidden')).toBe('true');
+    expect(opening!.classList.contains('nav-cover-dip')).toBe(true);
     act(() => { closeThreadFilterPanel(); });
-    // A new element, so its animation restarts from opaque.
+    // A new element, so its animation restarts.
     expect(navCover()).not.toBeNull();
     expect(navCover()).not.toBe(opening);
   });

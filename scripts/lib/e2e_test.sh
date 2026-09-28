@@ -724,6 +724,49 @@ test_every_mobile_webkit_spec_filter_selects_exactly_one_file() {
     fi
 }
 
+# ── project_runs_spec ─────────────────────────────────────────────────
+test_project_runs_spec_mirrors_test_ignore() {
+    echo "test: project_runs_spec skips exactly the projects that testIgnore a spec"
+    local row project spec want got
+    for row in \
+        "chromium chat.spec.ts yes" \
+        "mobile chat.spec.ts yes" \
+        "mobile-webkit chat.spec.ts yes" \
+        "chromium header-desktop.spec.ts yes" \
+        "mobile header-desktop.spec.ts no" \
+        "mobile-webkit e2e/header-desktop.spec.ts no" \
+        "chromium swipe-mobile.spec.ts no" \
+        "mobile swipe-mobile.spec.ts yes" \
+        "mobile-webkit swipe-mobile.spec.ts yes"; do
+        read -r project spec want <<<"$row"
+        if project_runs_spec "$project" "$spec"; then got=yes; else got=no; fi
+        if [ "$got" = "$want" ]; then
+            pass "$project runs $spec: $want"
+        else
+            fail "$project runs $spec: expected $want, got $got"
+        fi
+    done
+}
+
+# The helper restates playwright.config.ts, so pin the config to what it says.
+test_project_runs_spec_matches_the_playwright_config() {
+    echo "test: playwright.config.ts still carries the testIgnore patterns project_runs_spec mirrors"
+    local config n
+    config="$(cd "$SCRIPT_DIR/../.." && pwd)/crates/lucidos-app/playwright.config.ts"
+    n=$(grep -c "testIgnore: /-mobile\\\\.spec\\\\.ts\$/," "$config")
+    if [ "$n" = 1 ]; then
+        pass "one project ignores -mobile specs"
+    else
+        fail "expected one -mobile testIgnore in $config, found $n"
+    fi
+    n=$(grep -c "testIgnore: /-desktop\\\\.spec\\\\.ts\$/," "$config")
+    if [ "$n" = 2 ]; then
+        pass "two projects ignore -desktop specs"
+    else
+        fail "expected two -desktop testIgnores in $config, found $n"
+    fi
+}
+
 # ── summarise_playwright_log / report_playwright_totals ───────────────
 # A project runs in chunks and prints a summary per invocation, so its own
 # verdict exists only if the harness adds them up. These pin the adding up and
@@ -854,6 +897,8 @@ test_playwright_filter_anchors_the_basename
 test_playwright_filter_escapes_regex_metacharacters
 test_playwright_filter_does_not_match_a_longer_sibling
 test_every_mobile_webkit_spec_filter_selects_exactly_one_file
+test_project_runs_spec_mirrors_test_ignore
+test_project_runs_spec_matches_the_playwright_config
 test_prune_removes_empty_dir
 test_prune_removes_dir_with_dangling_gitdir
 test_prune_keeps_live_worktree

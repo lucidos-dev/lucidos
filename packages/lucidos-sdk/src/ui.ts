@@ -1,13 +1,22 @@
-import { apiUrl, requestVoid } from './_fetch';
+import { SdkError, apiUrl, dataMountUrl, request, requestVoid } from './_fetch';
 import { assertPlainObject, assertString } from './_validate';
 import { wsLocalGet } from './_storage';
 import {
-  DEFAULT_FONT_FAMILY, FONT_FAMILY_VALUES, GOOGLE_FONT_URLS, MOTION_STORAGE_KEY,
-  REDUCED_MOTION_QUERY, SYSTEM_THEME_SETTLE_MS, THEME_BG,
-  fontFeaturesFor, motionAttribute, parseMotion, parseStyleOverrides, parseUiScale, resolveFontKey, resolveTheme,
-  resolveReducedMotion, resolveThemePreference,
-  type FontFamily, type MotionPref, type ThemePref,
+  DEFAULT_THEME_ID, EMPTY_THEME,
+  THEME_EFFECTS_STORAGE_KEY, THEME_KEY, THEME_SEED_KEY, THEME_STORAGE_KEY, MORE_CONTRAST_QUERY,
+  MOTION_STORAGE_KEY, REDUCED_MOTION_QUERY, REDUCED_TRANSPARENCY_QUERY,
+  FONT_BOLD_ATTRIBUTE, SYSTEM_THEME_MODE_SETTLE_MS, THEME_MODE_ATTRIBUTE, THEME_MODE_BG, THEME_MODE_KEY,
+  THEME_MODE_STORAGE_KEY, LEGACY_THEME_MODE_ATTRIBUTE, WORKSPACE_FONT_SEED_KEY,
+  fontBoldMark, fontEntry, isFontId, isWorkspaceFontId, themeBackground, themeEffectsAttribute, themeTokenNames,
+  motionAttribute, parseThemeEffects, parseMotion, resolveReducedThemeEffects,
+  parseResolvedTheme, parseStyleOverrides, parseUiScale, parseWorkspaceFont,
+  replaceInlineTokens, resolveFont, resolveThemeMode, sanitizeResolvedTheme, sanitizeWorkspaceFonts,
+  resolveReducedMotion, resolveThemeModePreference,
+  type FontId, type FontKey, type ThemeEffectsPref, type MotionPref, type ResolvedTheme,
+  type ThemeMode, type WorkspaceFont,
 } from './appearance';
+import { registerFontsInUse } from './fontFaces';
+import { servedPrefs } from './boot/appearanceBoot';
 import { preferences as prefsModule } from './preferences';
 import { isIOSAgent } from './platform';
 import { applyAutocorrectPreference } from './autocorrectStamp';
@@ -22,48 +31,57 @@ import type { NavigateTarget, NavigateUi } from './notifications';
  *  in lockstep with the engine `navigate_ui` tool. */
 export type NavigateParams = Omit<NavigateUi, 'target'>;
 
-/** The stylesheet to load for a font key, or `undefined` for a font already on
- *  the device.
+/** The stylesheet to load for a font, or `undefined` for a font already on the
+ *  device.
  *
- *  Fira Code resolves to the LOCAL engine, never to Google, because it is the
- *  default: a workspace is a self-contained local install, so its ordinary
- *  appearance must not depend on a third-party origin being reachable
- *  (`crates/lucidos-engine/src/api/sdk_fonts.rs` carries the full reasoning).
- *  Resolved per call rather than held in a map, because `apiUrl` reads a base
- *  URL that `configure({ baseUrl })` can still change. */
-export function webFontUrl(fontKey: FontFamily): string | undefined {
-  if (fontKey === DEFAULT_FONT_FAMILY) return apiUrl('/fonts/fira-code.css');
-  return GOOGLE_FONT_URLS[fontKey];
+ *  Every other font is vendored and resolves to the LOCAL engine, so it works
+ *  offline and tells no third party anything (`crates/lucidos-engine/src/api/fonts.rs`,
+ *  ADR 0303). Resolved per call rather than held in a map, because `apiUrl`
+ *  reads a base URL that `configure({ baseUrl })` can still change. */
+export function webFontUrl(fontKey: FontId): string | undefined {
+  return fontEntry(fontKey).source === 'vendored' ? apiUrl(`/fonts/${fontKey}.css`) : undefined;
+}
+
+/** The stylesheets a frame needs: its UI font's and the theme's code font's.
+ *  A workspace font has none: its faces register directly (`fontFaces.ts`). */
+export function webFontUrls(fontKey: FontKey, theme: ResolvedTheme): string[] {
+  const keys = new Set<FontId>();
+  for (const key of [fontKey, theme.fonts.mono]) if (isFontId(key)) keys.add(key);
+  return [...keys].map(webFontUrl).filter((url): url is string => !!url);
 }
 
 const loadedFonts = new Set<string>();
 let watchingPrefs = false;
-/** The theme PREFERENCE the last `applyPreferences()` settled on, which is what
+/** The theme mode PREFERENCE the last `applyPreferences()` settled on, which is what
  *  says whether this frame follows the OS at all. `null` until the first run. */
-let lastThemePreference: ThemePref | null = null;
-let systemThemeSettleTimer: ReturnType<typeof setTimeout> | null = null;
+let lastThemeModePreference: ThemeMode | null = null;
+let systemThemeModeSettleTimer: ReturnType<typeof setTimeout> | null = null;
 /** Kept alive for as long as its listener must be. See `watchPreferences`. */
-let systemThemeQuery: MediaQueryList | null = null;
+let systemThemeModeQuery: MediaQueryList | null = null;
 /** The motion preference at the last apply, so an OS flip can re-resolve it. */
 let lastMotionPreference: MotionPref | null = null;
-/** Held for the same WebKit reason as `systemThemeQuery`. */
+/** Held for the same WebKit reason as `systemThemeModeQuery`. */
 let reducedMotionQuery: MediaQueryList | null = null;
+/** The theme-effects preference at the last apply, for the same reason. */
+let lastThemeEffectsPreference: ThemeEffectsPref | null = null;
+/** The two OS signals `system` theme effects follow, held like the others. */
+let themeEffectsQueries: MediaQueryList[] = [];
 
 /** Whether the OS is asking for light right now. */
 function osPrefersLight(): boolean {
   return window.matchMedia('(prefers-color-scheme: light)').matches;
 }
 
-/** Which theme preference this frame is on.
+/** Which theme mode preference this frame is on.
  *
  *  Before the first `applyPreferences()` resolves, fall back to the precedence
  *  the boot script already used. An app may call `watchPreferences()` first, or
  *  not await the fetch, and an OS flip in that window must not be dropped. */
-function currentThemePreference(): ThemePref {
-  return lastThemePreference ?? resolveThemePreference(
+function currentThemeModePreference(): ThemeMode {
+  return lastThemeModePreference ?? resolveThemeModePreference(
     undefined,
-    wsLocalGet('lucidos-theme'),
-    () => document.documentElement.getAttribute('data-theme'),
+    wsLocalGet(THEME_MODE_STORAGE_KEY),
+    () => document.documentElement.getAttribute(THEME_MODE_ATTRIBUTE),
   );
 }
 
@@ -114,10 +132,15 @@ export type ToastType = 'success' | 'info' | 'warning' | 'error';
 const TOAST_TYPES: readonly ToastType[] = ['success', 'info', 'warning', 'error'];
 
 export interface ToastOptions {
+  /** A bold line over the message. Only the title is bold; without one the
+   *  toast is its message alone. A newline in the message is a line break,
+   *  and never makes a title. */
+  title?: string;
   /** Auto-dismiss after this many ms. Omit for the host default: an error or
    *  warning stays until dismissed, success and info auto-close. */
   durationMs?: number;
-  /** false = hide the close (X) button. Default true. */
+  /** false = never show the close (X) button. A toast that leaves on its own
+   *  timer and has no button shows none either way. Default true. */
   dismissable?: boolean;
   /** Stable key for in-place replacement. A later toast with the same key
    *  updates the existing toast instead of stacking a new one, so an
@@ -272,6 +295,7 @@ function applyDevicePreferences(prefs: Record<string, string>, attempt: number):
   cacheExternalLinkTarget(prefs['external_link_target']);
   applyAutocorrectPreference(prefs);
   applyMotionPreference(prefs);
+  applyThemeEffectsPreference(prefs);
 }
 
 /** Put the device's resolved motion on `<html>` as `data-motion`. It is the
@@ -290,6 +314,29 @@ function resolveMotionAttribute(): void {
   document.documentElement.setAttribute(
     'data-motion', motionAttribute(resolveReducedMotion(lastMotionPreference, osReduces)),
   );
+}
+
+/** Put the device's resolved theme effects on `<html>` as `data-theme-effects`,
+ *  as `sdk-prefs.js` does at first paint. `sdk-iframe.css` then drops part
+ *  shadows and filters on `reduce`, and an app may key its own glows on it. */
+function applyThemeEffectsPreference(prefs: Record<string, string>): void {
+  lastThemeEffectsPreference = parseThemeEffects(
+    prefs['theme-effects'] || wsLocalGet(THEME_EFFECTS_STORAGE_KEY),
+  );
+  resolveThemeEffectsAttribute();
+}
+
+/** Re-resolve `data-theme-effects` from the kept preference and the live OS
+ *  signals. Needs no fetch. */
+function resolveThemeEffectsAttribute(): void {
+  if (typeof document === 'undefined' || lastThemeEffectsPreference === null) return;
+  const matches = (query: string) => window.matchMedia?.(query).matches === true;
+  const reduced = resolveReducedThemeEffects(
+    lastThemeEffectsPreference,
+    matches(REDUCED_TRANSPARENCY_QUERY),
+    matches(MORE_CONTRAST_QUERY),
+  );
+  document.documentElement.setAttribute('data-theme-effects', themeEffectsAttribute(reduced));
 }
 
 /** Read this device's preferences once at load, without `applyPreferences`.
@@ -334,7 +381,7 @@ function inIOSStandalone(): boolean {
 const HTTP_SCHEME_RE = /^https?:\/\//i;
 
 /** Names this module currently has written. A name dropped from the map is
- *  then removed on a live re-apply, rather than stuck at its last value. */
+ *  then cleared on a live re-apply, rather than stuck at its last value. */
 let appliedOverrideNames: string[] = [];
 
 /**
@@ -347,61 +394,145 @@ let appliedOverrideNames: string[] = [];
  * all of them. One copy is what stops that.
  *
  * A corrupt map parses to empty, which costs the app no theme and also clears
- * anything a previous apply had set.
+ * anything a previous apply had set. A cleared name falls back to `beneath`,
+ * the theme's value, so dropping an override never drops the theme with it.
  */
-function applyStyleOverrides(raw: string | null | undefined): void {
-  const map = parseStyleOverrides(raw);
-  const root = document.documentElement;
-  const applied = Object.keys(map);
-  for (const name of applied) root.style.setProperty(name, map[name]);
-  for (const name of appliedOverrideNames) {
-    if (!applied.includes(name)) root.style.removeProperty(name);
+function applyStyleOverrides(raw: string | null | undefined, beneath: Record<string, string>): void {
+  appliedOverrideNames = replaceInlineTokens(
+    document.documentElement.style, appliedOverrideNames, parseStyleOverrides(raw), beneath,
+  );
+}
+
+/** The active theme. Seeded from what the boot script painted, so an app that
+ *  never reaches the engine keeps its first-paint theme and font. */
+let activeTheme: ResolvedTheme = parseResolvedTheme(
+  servedPrefs()?.[THEME_SEED_KEY] ?? wsLocalGet(THEME_STORAGE_KEY),
+);
+/** The names this module has written. Seeded with every name the boot script
+ *  may have set, so a switch away from a theme removes all of them. */
+let appliedThemeNames: string[] = themeTokenNames(activeTheme);
+/** The theme id `activeTheme` holds. Null until a fetch lands, so the first apply
+ *  fetches, and so does every apply after a failed one. */
+let themeId: string | null = null;
+/** Set when the active theme's file or plugin changed, so the next apply
+ *  fetches again although the id is the same. */
+let themeStale = false;
+
+/** The workspace fonts this frame holds entries for, besides the theme's own.
+ *  Seeded with the one the engine resolved for first paint. */
+const seededWorkspaceFont = parseWorkspaceFont(servedPrefs()?.[WORKSPACE_FONT_SEED_KEY]);
+let workspaceFonts: WorkspaceFont[] = seededWorkspaceFont ? [seededWorkspaceFont] : [];
+/** Set when the list may have changed, so the next apply that needs a
+ *  workspace font fetches it. A frame with no seed has never seen the list. */
+let workspaceFontsStale = seededWorkspaceFont === null;
+
+/** The workspace fonts `GET /api/v1/fonts` lists, or null on a failure, which
+ *  keeps the entries already held. */
+async function fetchWorkspaceFonts(): Promise<WorkspaceFont[] | null> {
+  try {
+    const listing = await request<{ fonts?: Array<{ source?: unknown }> }>('/fonts');
+    return sanitizeWorkspaceFonts((listing?.fonts ?? []).filter(f => f?.source === 'workspace'));
+  } catch (err) {
+    console.warn('[lucidos-sdk] could not load the workspace fonts:', err);
+    return null;
   }
-  appliedOverrideNames = applied;
+}
+
+/** Fetch the theme a device's preferences name. A theme that no longer exists is
+ *  the default theme. Any other failure answers null, which keeps the theme
+ *  already painted until the next apply retries. */
+async function fetchTheme(id: string): Promise<ResolvedTheme | null> {
+  if (id === DEFAULT_THEME_ID) return EMPTY_THEME;
+  try {
+    const theme = await request<{ resolved?: unknown }>(`/theme?id=${encodeURIComponent(id)}`);
+    return sanitizeResolvedTheme(theme?.resolved);
+  } catch (err) {
+    if (err instanceof SdkError && (err.httpCode === 404 || err.httpCode === 400)) return EMPTY_THEME;
+    console.warn(`[lucidos-sdk] could not load theme "${id}":`, err);
+    return null;
+  }
 }
 
 export const ui = {
-  /** Fetch user preferences and apply theme, font, scale as CSS variables. */
+  /** Fetch user preferences and apply the theme mode, theme, font and scale as CSS
+   *  variables. */
   async applyPreferences(): Promise<void> {
     const attempt = ++devicePreferencesIssued;
     const prefs = await prefsModule.get();
 
-    // Theme: prefer the value the synchronous sdk-prefs.js resolver already
-    // applied (server, then localStorage, then data-theme) over a hard default,
-    // so a missing server-scoped theme can't flip the iframe to dark. Then
-    // resolve "system" against the OS.
+    // Theme mode: prefer the value the synchronous sdk-prefs.js resolver
+    // already applied (server, then localStorage, then the attribute) over a
+    // hard default. A missing server-scoped mode then can't flip the iframe to
+    // dark. Then resolve "system" against the OS.
     //
     // The preference is kept, not just its resolution: `watchPreferences` has
     // to know whether this frame follows the OS before it acts on an OS flip.
-    lastThemePreference = resolveThemePreference(
-      prefs['theme'],
-      wsLocalGet('lucidos-theme'),
-      () => document.documentElement.getAttribute('data-theme'),
+    lastThemeModePreference = resolveThemeModePreference(
+      prefs[THEME_MODE_KEY],
+      wsLocalGet(THEME_MODE_STORAGE_KEY),
+      () => document.documentElement.getAttribute(THEME_MODE_ATTRIBUTE),
     );
-    const theme = resolveTheme(lastThemePreference, osPrefersLight());
-    const bg = THEME_BG[theme];
-    document.documentElement.setAttribute('data-theme', theme);
-    document.documentElement.style.setProperty('--bg-primary', bg);
+    const mode = resolveThemeMode(lastThemeModePreference, osPrefersLight());
+    // The theme is fetched only when it changed, so a mode flip or an unrelated
+    // preference costs no request.
+    const nextThemeId = prefs[THEME_KEY] || DEFAULT_THEME_ID;
+    if (nextThemeId !== themeId || themeStale) {
+      const theme = await fetchTheme(nextThemeId);
+      // A newer apply started while this one fetched, and its answer wins.
+      if (attempt !== devicePreferencesIssued) return;
+      if (theme) {
+        activeTheme = theme;
+        themeId = nextThemeId;
+        themeStale = false;
+      }
+    }
+    const themeTokens = activeTheme[mode];
+    const root = document.documentElement;
+    // Stale names go first, so the theme's own inline background below is
+    // never removed.
+    for (const name of appliedThemeNames) {
+      if (!(name in themeTokens)) root.style.removeProperty(name);
+    }
+    const bg = themeBackground(themeTokens) ?? THEME_MODE_BG[mode];
+    root.setAttribute(THEME_MODE_ATTRIBUTE, mode);
+    // For app styles written before the rename (docs/temporary-measures.md
+    // § Legacy `data-theme` in app frames).
+    root.setAttribute(LEGACY_THEME_MODE_ATTRIBUTE, mode);
+    root.style.setProperty('--bg-primary', bg);
     // Mirrors sdk-prefs.js: keeps <html> covered before/after the iframe's
     // stylesheet applies its bg rule (iOS WKWebView underlying white).
-    document.documentElement.style.background = bg;
+    root.style.background = bg;
+    appliedThemeNames = replaceInlineTokens(root.style, [], themeTokens);
+    // A background that is not a hex literal reaches the canvas through the var.
+    if (themeTokens['--bg-primary'] && !themeBackground(themeTokens)) root.style.background = 'var(--bg-primary)';
 
-    // Font: load the web font on demand, map to CSS value. Fall back to the
-    // `lucidos-font-family` localStorage value sdk-prefs.js read before the
-    // hard default, so a missing server value doesn't reset the client font.
-    const fontKey = resolveFontKey(prefs['font-family'] || wsLocalGet('lucidos-font-family'));
-    const fontUrl = webFontUrl(fontKey);
-    if (fontUrl && !loadedFonts.has(fontKey)) {
-      loadedFonts.add(fontKey);
+    // Font: the user's pick, else the theme's, else the fallback. Fall back to
+    // the `lucidos-font-family` localStorage value sdk-prefs.js read, so a
+    // missing server value doesn't reset the client font.
+    const storedFont = prefs['font-family'] || wsLocalGet('lucidos-font-family');
+    if (isWorkspaceFontId(storedFont) && workspaceFontsStale) {
+      const listed = await fetchWorkspaceFonts();
+      if (attempt !== devicePreferencesIssued) return;
+      if (listed) {
+        workspaceFonts = listed;
+        workspaceFontsStale = false;
+      }
+    }
+    const known = [...workspaceFonts, ...activeTheme.workspace_fonts];
+    const font = resolveFont(storedFont, activeTheme.fonts, known);
+    registerFontsInUse(font, known, activeTheme.fonts.mono, dataMountUrl);
+    for (const url of webFontUrls(font.key, activeTheme)) {
+      if (loadedFonts.has(url)) continue;
+      loadedFonts.add(url);
       const link = document.createElement('link');
       link.rel = 'stylesheet';
-      link.href = fontUrl;
+      link.href = url;
       document.head.appendChild(link);
     }
-    document.documentElement.style.setProperty('--font-ui', FONT_FAMILY_VALUES[fontKey]);
-    const features = fontFeaturesFor(fontKey);
-    document.documentElement.style.setProperty('--font-features-text', features.text);
-    document.documentElement.style.setProperty('--font-features-code', features.code);
+    document.documentElement.style.setProperty('--font-ui', font.stack);
+    document.documentElement.style.setProperty('--font-features-text', font.features.text);
+    document.documentElement.style.setProperty('--font-features-code', font.features.code);
+    document.documentElement.setAttribute(FONT_BOLD_ATTRIBUTE, fontBoldMark(font));
 
     // Fall back to the `lucidos-ui-scale` localStorage value sdk-prefs.js read
     // so a missing server value doesn't drop the client-applied scale.
@@ -414,12 +545,11 @@ export const ui = {
     }
 
     // The live style remote's custom property overrides. LAST, because the
-    // three applies above write properties (--bg-primary, --font-ui,
-    // --user-ui-scale) the remote is allowed to override, and inline properties
-    // are last-write-wins. This is the LIVE half of the same map sdk-prefs.js
+    // theme apply above writes --bg-primary, which the remote may override,
+    // and inline properties are last-write-wins. This is the LIVE half of the same map sdk-prefs.js
     // seeds at first paint: without it, a value retuned in the shell reaches
     // every open app iframe only on its next reload.
-    applyStyleOverrides(prefs['style_overrides'] || wsLocalGet('lucidos-style-overrides'));
+    applyStyleOverrides(prefs['style_overrides'] || wsLocalGet('lucidos-style-overrides'), themeTokens);
 
     // The external-link target, which openExternal reads WITHOUT awaiting, the
     // Autocorrect switch and motion. A live re-apply is what lets a watching app
@@ -432,15 +562,48 @@ export const ui = {
     watchingPrefs = true;
     // Best-effort live re-application. A transient prefs-fetch failure must not
     // surface as an unhandled rejection: the next PreferencesChanged or
-    // OS-theme flip re-runs applyPreferences, and the app keeps its
-    // already-applied theme meanwhile. Warn, so a persistent failure is still
+    // OS light/dark flip re-runs applyPreferences, and the app keeps its
+    // already-applied appearance meanwhile. Warn, so a persistent failure is still
     // visible to a developer.
     const reapply = () => {
       ui.applyPreferences().catch((err) => {
         console.warn('[lucidos-sdk] live preference re-apply failed:', err);
       });
     };
-    sse.on('PreferencesChanged', reapply);
+    sse.on('PreferencesChanged', (data: unknown) => {
+      // A `theme` write refetches even when it names the theme already painted:
+      // that is how an agent republishes a theme it edited in place.
+      const key = (data as { key?: unknown } | null)?.key;
+      if (key === THEME_KEY) themeStale = true;
+      if (key === 'font-family') workspaceFontsStale = true;
+      reapply();
+    });
+    // Editing the active theme's file, or installing or removing the plugin
+    // that ships it, repaints every frame showing it.
+    const refetchTheme = () => {
+      themeStale = true;
+      reapply();
+    };
+    // A workspace font changing can change the active theme too, since the
+    // theme resolves the fonts it names.
+    const refetchIfActiveTheme = (data: unknown) => {
+      const path = (data as { path?: unknown } | null)?.path;
+      if (typeof path === 'string' && path.startsWith('fonts/')) {
+        workspaceFontsStale = true;
+        refetchTheme();
+      } else if (themeId !== null && path === `themes/${themeId}.json`) {
+        refetchTheme();
+      }
+    };
+    sse.on('DataFileWritten', refetchIfActiveTheme);
+    sse.on('DataFileEdited', refetchIfActiveTheme);
+    sse.on('DataFileDeleted', refetchIfActiveTheme);
+    const refetchThemeAndFonts = () => {
+      workspaceFontsStale = true;
+      refetchTheme();
+    };
+    sse.on('PluginInstalled', refetchThemeAndFonts);
+    sse.on('PluginUninstalled', refetchThemeAndFonts);
     sse.connect();
     if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return;
 
@@ -453,24 +616,24 @@ export const ui = {
     //
     // Sampling here rather than inside `applyPreferences` is what keeps a wake
     // that changed nothing free: `applyPreferences` fetches.
-    const refreshSystemTheme = () => {
-      systemThemeSettleTimer = null;
-      if (currentThemePreference() !== 'system') return;
+    const refreshSystemThemeMode = () => {
+      systemThemeModeSettleTimer = null;
+      if (currentThemeModePreference() !== 'system') return;
       if (document.visibilityState !== 'visible') return;
-      const resolved = resolveTheme('system', osPrefersLight());
-      if (document.documentElement.getAttribute('data-theme') === resolved) return;
+      const resolved = resolveThemeMode('system', osPrefersLight());
+      if (document.documentElement.getAttribute(THEME_MODE_ATTRIBUTE) === resolved) return;
       reapply();
     };
     const scheduleRefresh = () => {
-      if (systemThemeSettleTimer !== null) return;
-      systemThemeSettleTimer = setTimeout(refreshSystemTheme, SYSTEM_THEME_SETTLE_MS);
+      if (systemThemeModeSettleTimer !== null) return;
+      systemThemeModeSettleTimer = setTimeout(refreshSystemThemeMode, SYSTEM_THEME_MODE_SETTLE_MS);
     };
     // Held in a variable rather than subscribed to inline. A `MediaQueryList`
     // with no strong reference has historically been collected in WebKit, which
     // takes its listener with it. `preferences.ts` keeps its own for the same
     // reason, and this is the engine where the theme has to keep working.
-    systemThemeQuery = window.matchMedia('(prefers-color-scheme: light)');
-    systemThemeQuery.addEventListener('change', scheduleRefresh);
+    systemThemeModeQuery = window.matchMedia('(prefers-color-scheme: light)');
+    systemThemeModeQuery.addEventListener('change', scheduleRefresh);
     document.addEventListener('visibilitychange', scheduleRefresh);
     window.addEventListener('focus', scheduleRefresh);
     window.addEventListener('pageshow', scheduleRefresh);
@@ -478,6 +641,9 @@ export const ui = {
     // PreferencesChanged either, so the media query drives it.
     reducedMotionQuery = window.matchMedia(REDUCED_MOTION_QUERY);
     reducedMotionQuery.addEventListener('change', resolveMotionAttribute);
+    // The same holds for the two signals `system` theme effects follow.
+    themeEffectsQueries = [REDUCED_TRANSPARENCY_QUERY, MORE_CONTRAST_QUERY].map(q => window.matchMedia(q));
+    for (const query of themeEffectsQueries) query.addEventListener('change', resolveThemeEffectsAttribute);
   },
 
   /**
@@ -604,8 +770,8 @@ export const ui = {
    * Show a transient toast rendered by the host shell (above all app content,
    * themed by the user's preferences). Fire-and-forget, with no result.
    *
-   * Only the serializable subset of the host toast is exposed: `message`, the
-   * `type` severity, and `opts`. The host's action-button callbacks cannot
+   * Only the serializable subset of the host toast is exposed: `message`,
+   * the `type` severity, and `opts` (an optional `title` among them). The host's action-button callbacks cannot
    * cross the postMessage boundary, so they are deliberately unavailable here.
    * An unknown `type` degrades to `info`.
    */
@@ -613,10 +779,14 @@ export const ui = {
     if (typeof message !== 'string' || message.length === 0) {
       throw new TypeError('lucidos.ui.toast: message must be a non-empty string');
     }
+    if (opts?.title !== undefined && typeof opts.title !== 'string') {
+      throw new TypeError('lucidos.ui.toast: opts.title must be a string');
+    }
     const safeType: ToastType = TOAST_TYPES.includes(type) ? type : 'info';
     const payload = {
       message,
       type: safeType,
+      title: opts?.title ? opts.title : undefined,
       durationMs: opts && typeof opts.durationMs === 'number' ? opts.durationMs : undefined,
       dismissable: opts && typeof opts.dismissable === 'boolean' ? opts.dismissable : undefined,
       key: opts && typeof opts.key === 'string' && opts.key.length > 0 ? opts.key : undefined,
@@ -625,7 +795,7 @@ export const ui = {
     // No host parent, so surface via console: a standalone testing context then
     // still sees the feedback instead of silence.
     if (window.parent === window) {
-      const line = `[lucidos.ui.toast:${safeType}] ${message}`;
+      const line = `[lucidos.ui.toast:${safeType}] ${payload.title ? `${payload.title}: ` : ''}${message}`;
       if (safeType === 'error') console.error(line);
       else if (safeType === 'warning') console.warn(line);
       else console.log(line);

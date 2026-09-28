@@ -41,7 +41,7 @@ describe('the What\'s New badge dot', () => {
     // What IS its own: an empty box stays round, where `.badge` pads and
     // line-boxes for a glyph.
     expect(decl(corner, 'padding')).toBe('0');
-    expect(decl(corner, 'border-radius')).toBe('50%');
+    expect(decl(corner, 'border-radius')).toBe('var(--radius-round)');
   });
 
   it('outranks `.badge`, which a later sheet would otherwise win on order', () => {

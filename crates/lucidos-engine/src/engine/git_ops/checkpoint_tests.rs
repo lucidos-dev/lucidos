@@ -27,15 +27,9 @@ async fn init_repo(root: &Path) {
     git(&["config", "user.name", "Test"], root).await;
 }
 
-/// The whole undo, as the engine performs it: restore the pre image, then drop
-/// what the command created.
+/// The whole undo, as the engine performs it.
 async fn undo(root: &Path, id: &str) -> u32 {
-    restore_command_checkpoint(root, id).await.unwrap();
-    let effects = diff_checkpoint_effects(root, id).await.unwrap();
-    match effects {
-        Some(e) => remove_created_files(root, id, &e.created).await,
-        None => 0,
-    }
+    revert_command_effects(root, id).await.unwrap()
 }
 
 #[tokio::test]
@@ -122,6 +116,150 @@ async fn undo_removes_only_what_the_command_created() {
     assert!(root.join("later.txt").exists());
     assert!(root.join("later-dir/x.txt").exists());
     assert!(root.join("seed.txt").exists());
+}
+
+/// The pre image is a snapshot of the whole tree. Undo may put back only what
+/// the command itself deleted or overwrote, and never a later edit elsewhere.
+#[tokio::test]
+async fn undo_restores_only_what_the_command_deleted_or_overwrote() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init_repo(root).await;
+    fs::write(root.join("deleted.txt"), "deleted by the command").unwrap();
+    fs::write(root.join("overwritten.txt"), "before the command").unwrap();
+    fs::write(root.join("unrelated.txt"), "v1").unwrap();
+    git(&["add", "-A"], root).await;
+    git(&["commit", "-m", "init"], root).await;
+
+    let id = "cccccccc-cccc-cccc-cccc-cccccccccccc";
+    create_command_checkpoint(root, id).await.unwrap();
+    fs::remove_file(root.join("deleted.txt")).unwrap();
+    fs::write(root.join("overwritten.txt"), "clobbered").unwrap();
+    create_command_post_image(root, id).await.unwrap();
+
+    // Later work the command never touched.
+    fs::write(root.join("unrelated.txt"), "v2, edited after the command").unwrap();
+
+    undo(root, id).await;
+    assert_eq!(
+        fs::read_to_string(root.join("deleted.txt")).unwrap(),
+        "deleted by the command"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("overwritten.txt")).unwrap(),
+        "before the command"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("unrelated.txt")).unwrap(),
+        "v2, edited after the command",
+        "undo must not revert an edit the command did not make"
+    );
+}
+
+/// The restore half keeps a later edit exactly as the removal half does.
+#[tokio::test]
+async fn an_overwritten_file_edited_again_or_a_deleted_file_recreated_is_kept() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init_repo(root).await;
+    fs::write(root.join("overwritten.txt"), "original").unwrap();
+    fs::write(root.join("deleted.txt"), "original").unwrap();
+    git(&["add", "-A"], root).await;
+    git(&["commit", "-m", "init"], root).await;
+
+    let id = "dddddddd-dddd-dddd-dddd-dddddddddddd";
+    create_command_checkpoint(root, id).await.unwrap();
+    fs::write(root.join("overwritten.txt"), "clobbered").unwrap();
+    fs::remove_file(root.join("deleted.txt")).unwrap();
+    create_command_post_image(root, id).await.unwrap();
+
+    fs::write(root.join("overwritten.txt"), "edited by hand").unwrap();
+    fs::write(root.join("deleted.txt"), "recreated by hand").unwrap();
+
+    undo(root, id).await;
+    assert_eq!(
+        fs::read_to_string(root.join("overwritten.txt")).unwrap(),
+        "edited by hand"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("deleted.txt")).unwrap(),
+        "recreated by hand"
+    );
+}
+
+/// A command that deleted a whole directory gets it back, parents included.
+#[tokio::test]
+async fn undo_restores_a_deleted_directory_tree() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init_repo(root).await;
+    fs::create_dir_all(root.join("data/app/sub")).unwrap();
+    fs::write(root.join("data/app/sub/a.txt"), "a").unwrap();
+    fs::write(root.join("data/app/b.txt"), "b").unwrap();
+    git(&["add", "-A"], root).await;
+    git(&["commit", "-m", "init"], root).await;
+
+    let id = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee";
+    create_command_checkpoint(root, id).await.unwrap();
+    fs::remove_dir_all(root.join("data/app")).unwrap();
+    create_command_post_image(root, id).await.unwrap();
+
+    undo(root, id).await;
+    assert_eq!(
+        fs::read_to_string(root.join("data/app/sub/a.txt")).unwrap(),
+        "a"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("data/app/b.txt")).unwrap(),
+        "b"
+    );
+}
+
+/// The command replaced a directory with a file of the same name. Undo
+/// removes the file before it restores, so the directory's contents come back.
+#[tokio::test]
+async fn undo_puts_back_a_directory_the_command_replaced_with_a_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init_repo(root).await;
+    fs::create_dir_all(root.join("data/cfg")).unwrap();
+    fs::write(root.join("data/cfg/x"), "inner").unwrap();
+    git(&["add", "-A"], root).await;
+    git(&["commit", "-m", "init"], root).await;
+
+    let id = "abababab-abab-abab-abab-abababababab";
+    create_command_checkpoint(root, id).await.unwrap();
+    fs::remove_dir_all(root.join("data/cfg")).unwrap();
+    fs::write(root.join("data/cfg"), "a file now").unwrap();
+    create_command_post_image(root, id).await.unwrap();
+
+    assert_eq!(undo(root, id).await, 1);
+    assert_eq!(
+        fs::read_to_string(root.join("data/cfg/x")).unwrap(),
+        "inner"
+    );
+}
+
+/// The reverse swap: a file replaced by a directory of the same name.
+#[tokio::test]
+async fn undo_puts_back_a_file_the_command_replaced_with_a_directory() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init_repo(root).await;
+    fs::create_dir_all(root.join("data")).unwrap();
+    fs::write(root.join("data/foo"), "a file").unwrap();
+    git(&["add", "-A"], root).await;
+    git(&["commit", "-m", "init"], root).await;
+
+    let id = "cdcdcdcd-cdcd-cdcd-cdcd-cdcdcdcdcdcd";
+    create_command_checkpoint(root, id).await.unwrap();
+    fs::remove_file(root.join("data/foo")).unwrap();
+    fs::create_dir_all(root.join("data/foo")).unwrap();
+    fs::write(root.join("data/foo/x"), "inner").unwrap();
+    create_command_post_image(root, id).await.unwrap();
+
+    assert_eq!(undo(root, id).await, 1);
+    assert_eq!(fs::read_to_string(root.join("data/foo")).unwrap(), "a file");
 }
 
 #[tokio::test]

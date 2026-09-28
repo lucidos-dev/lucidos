@@ -45,6 +45,25 @@ describe('describeInitiator — label is WHO, summary is WHAT', () => {
     expect(desc.variant).toBe('lucidos');
   });
 
+  it('engine-seeded MessageReceived: the summary names the plugin, not "Forwarded message"', () => {
+    const ex = exchangeWith({
+      type: 'MessageReceived',
+      text: 'Set up ⏰ Habit Tracker again: its setup instructions changed since version 0.1.3.',
+      mode: 'engine',
+      channel: 'chat',
+      origin: {
+        kind: 'engine',
+        reason: {
+          kind: 'plugin_setup', plugin_id: 'habit-tracker', plugin_name: '⏰ Habit Tracker', version: '0.1.4',
+          occasion: { kind: 'update', from_version: '0.1.3' },
+        },
+      },
+    });
+    const desc = describeInitiator(ex, '<p>x</p>', [], 'tid');
+    expect(desc.label).toBe('Lucidos Engine');
+    expect(desc.summary).toBe('Plugin update: ⏰ Habit Tracker 0.1.3 → 0.1.4');
+  });
+
   it('agent-mode MessageReceived with no sender on record: summary "Forwarded message"', () => {
     const ex = exchangeWith({ type: 'MessageReceived', text: 'x', mode: 'agent', channel: 'chat' });
     expect(describeInitiator(ex, '<p>x</p>', [], 'tid').summary).toBe('Forwarded message');
@@ -97,7 +116,7 @@ describe('describeInitiator — label is WHO, summary is WHAT', () => {
     // action IS the label, no separate summary; attribution is in the popover.
     const ex = exchangeWith({
       type: 'ContinuationStarted',
-      actor: { kind: 'device', device_id: 'd-1', label: 'My Mac' },
+      actor: { kind: 'device', device_id: 'd-1' },
     });
     const desc = describeInitiator(ex, '', [], 'tid');
     expect(desc.icon).toBeNull();
@@ -159,7 +178,7 @@ describe('describeInitiator — label is WHO, summary is WHAT', () => {
     const ex = exchangeWith({
       type: 'ResponseAborted',
       cause: 'engine_shutdown',
-      actor: { kind: 'device', device_id: 'd-1', label: 'iOS Safari PWA' },
+      actor: { kind: 'device', device_id: 'd-1' },
     });
     const desc = describeInitiator(ex, '', [], 'tid');
     expect(desc.icon).toBeNull();
@@ -179,7 +198,7 @@ describe('describeInitiator — label is WHO, summary is WHAT', () => {
     // whatever the cause, a device-attributed abort IS something the user did.
     const ex = exchangeWith({
       type: 'ResponseAborted',
-      actor: { kind: 'device', device_id: 'd-1', label: 'iOS Safari PWA' },
+      actor: { kind: 'device', device_id: 'd-1' },
     });
     const desc = describeInitiator(ex, '', [], 'tid');
     expect(desc.icon).toBeNull();
@@ -197,7 +216,7 @@ describe('describeInitiator — label is WHO, summary is WHAT', () => {
       wait_id: 'w1',
       cause: 'user_stop',
       reason: "tonight's E2E suite to pass",
-      actor: { kind: 'device', device_id: 'd-1', label: 'iOS Safari PWA' },
+      actor: { kind: 'device', device_id: 'd-1' },
     });
     const desc = describeInitiator(ex, '', [], 'tid');
     expect(desc.icon).toBeNull();
@@ -230,7 +249,7 @@ describe('describeInitiator — label is WHO, summary is WHAT', () => {
   it('ResponseCanceled with a device actor: still chromeless "Response canceled" (actor surfaces in the popover, not the chip)', () => {
     const ex = exchangeWith({
       type: 'ResponseCanceled',
-      actor: { kind: 'device', device_id: 'd1', label: 'iPhone' },
+      actor: { kind: 'device', device_id: 'd1' },
     });
     const desc = describeInitiator(ex, '', [], 'tid');
     expect(desc.label).toBe('Response canceled');
@@ -327,8 +346,9 @@ describe('describeInitiator — label is WHO, summary is WHAT', () => {
     expect(desc.variant).toBe('lucidos');
   });
 
-  // Change lifecycle events: label is the actor (who did it), summary is the action.
-  it('ChangeApplied (engine actor): label is engine, summary "Change applied"', () => {
+  // Change lifecycle events: label is the actor (who did it). The change event row in
+  // the body says the action, so the panel draws no summary line.
+  it('ChangeApplied (engine actor): label is engine, change event row', () => {
     const ex = exchangeWith({
       type: 'ChangeApplied',
       change_id: 'c1',
@@ -336,57 +356,63 @@ describe('describeInitiator — label is WHO, summary is WHAT', () => {
     });
     const desc = describeInitiator(ex, '', [], 'tid');
     expect(desc.label).toBe(ENGINE_LABEL);
-    expect(desc.summary).toBe('Change applied');
+    expect(desc.summary).toBeUndefined();
+    expect((desc.details as { type?: { name?: string } })?.type?.name).toBe('ChangeEventRow');
     expect(desc.accent).toBe('change-applied');
   });
 
-  it('ChangeApplied (device actor): label "You", summary "Change applied"', () => {
+  it('ChangeApplied (device actor): label "You", change event row', () => {
     const ex = exchangeWith({
       type: 'ChangeApplied',
       change_id: 'c1',
-      actor: { kind: 'device', device_id: 'd1', label: 'iPhone' },
+      actor: { kind: 'device', device_id: 'd1' },
     });
     const desc = describeInitiator(ex, '', [], 'tid');
     expect(desc.label).toBe('You');
-    expect(desc.summary).toBe('Change applied');
+    expect(desc.summary).toBeUndefined();
+    expect((desc.details as { type?: { name?: string } })?.type?.name).toBe('ChangeEventRow');
   });
 
   it('ChangeApplied (no actor): defaults to engine label', () => {
     const ex = exchangeWith({ type: 'ChangeApplied', change_id: 'c1' });
     const desc = describeInitiator(ex, '', [], 'tid');
     expect(desc.label).toBe(ENGINE_LABEL);
-    expect(desc.summary).toBe('Change applied');
+    expect(desc.summary).toBeUndefined();
+    expect((desc.details as { type?: { name?: string } })?.type?.name).toBe('ChangeEventRow');
   });
 
-  it('ChangeDiscarded (device): label "You", summary "Change discarded"', () => {
+  it('ChangeDiscarded (device): label "You", change event row', () => {
     const ex = exchangeWith({
       type: 'ChangeDiscarded',
       change_id: 'c1',
-      actor: { kind: 'device', device_id: 'd1', label: 'Mac' },
+      actor: { kind: 'device', device_id: 'd1' },
     });
     const desc = describeInitiator(ex, '', [], 'tid');
     expect(desc.label).toBe('You');
-    expect(desc.summary).toBe('Change discarded');
+    expect(desc.summary).toBeUndefined();
+    expect((desc.details as { type?: { name?: string } })?.type?.name).toBe('ChangeEventRow');
     expect(desc.accent).toBe('change-discarded');
   });
 
-  it('ChangeReverted (device): label "You", summary "Change reverted"', () => {
+  it('ChangeReverted (device): label "You", change event row', () => {
     const ex = exchangeWith({
       type: 'ChangeReverted',
       change_id: 'c1',
-      actor: { kind: 'device', device_id: 'd1', label: 'Mac' },
+      actor: { kind: 'device', device_id: 'd1' },
     });
     const desc = describeInitiator(ex, '', [], 'tid');
     expect(desc.label).toBe('You');
-    expect(desc.summary).toBe('Change reverted');
+    expect(desc.summary).toBeUndefined();
+    expect((desc.details as { type?: { name?: string } })?.type?.name).toBe('ChangeEventRow');
     expect(desc.accent).toBe('change-reverted');
   });
 
-  it('ChangeApplyFailed: label is engine, summary "Change failed"', () => {
+  it('ChangeApplyFailed: label is engine, change event row', () => {
     const ex = exchangeWith({ type: 'ChangeApplyFailed', change_id: 'c1', error: 'boom' });
     const desc = describeInitiator(ex, '', [], 'tid');
     expect(desc.label).toBe(ENGINE_LABEL);
-    expect(desc.summary).toBe('Change failed');
+    expect(desc.summary).toBeUndefined();
+    expect((desc.details as { type?: { name?: string } })?.type?.name).toBe('ChangeEventRow');
     expect(desc.accent).toBe('change-failed');
   });
 
@@ -453,7 +479,7 @@ describe('describeInitiator — user control turns render iconless (ResponseCanc
     const ex = exchangeWith({
       type: 'UserPromptInjected',
       text: 'do X',
-      origin: { kind: 'device', device_id: 'd-1', label: 'Mac' },
+      origin: { kind: 'device', device_id: 'd-1' },
     });
     const desc = describeInitiator(ex, '<p>do X</p>', [], 'tid');
     expect(desc.icon).toBeNull();

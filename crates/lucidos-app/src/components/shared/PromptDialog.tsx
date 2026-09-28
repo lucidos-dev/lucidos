@@ -3,6 +3,7 @@ import { promptState } from '../../store/store';
 import { useHidePanelWebviewWhile } from '../../hooks/useHidePanelWebviewWhile';
 import { DialogMessage } from './DialogMessage';
 import { Overlay } from './Overlay';
+import { SurfaceHead } from './Surface';
 import { trapDialogTab } from './dialogFocusTrap';
 import { dialogOwnsKey } from './dialogKeyScope';
 import { PROSE_TEXT_ATTRS } from '../../utils/noAutofill';
@@ -107,12 +108,14 @@ export function PromptDialog() {
     <Overlay
       open
       onClose={() => close(null)}
-      panelClass="confirm-dialog"
+      overlayClass="protected-surface"
+      panelClass="surface surface-raised confirm-dialog protected-surface"
       panelRole="dialog"
       ariaModal
       panelRef={dialogRef}
     >
-        {state.title && <h2 class="confirm-title">{state.title}</h2>}
+      {state.title && <SurfaceHead title={state.title} />}
+      <div class="surface-body dialog-body" tabIndex={-1}>
         <DialogMessage message={state.message} />
         {/* The answer is free-form natural language (the dialog is driven by the
             LLM's ask-the-user payload), so both branches are prose fields. */}
@@ -123,16 +126,15 @@ export function PromptDialog() {
         ) : (
           <input type="text" class="prompt-input" placeholder={state.placeholder} onInput={recordDraft} {...PROSE_TEXT_ATTRS} />
         )}
-        <div class="confirm-actions">
-          <div class="confirm-actions-right">
-            <button class="confirm-btn confirm-btn-cancel" onClick={() => close(null)}>
-              {cancelLabel}
-            </button>
-            <button class="confirm-btn confirm-btn-ok-default" onClick={submit}>
-              {okLabel}
-            </button>
-          </div>
-        </div>
+      </div>
+      <div class="surface-foot">
+        <button class="action-btn action-btn-secondary" data-role="prompt-cancel" onClick={() => close(null)}>
+          {cancelLabel}
+        </button>
+        <button class="action-btn" data-role="prompt-ok" onClick={submit}>
+          {okLabel}
+        </button>
+      </div>
     </Overlay>
   );
 }

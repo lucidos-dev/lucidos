@@ -46,10 +46,29 @@ describe('visibleSlownessEpisode', () => {
     expect(visibleSlownessEpisode(unclear(['dev']), null, null)).toBeNull();
   });
 
+  it('shows a full disk in every workspace', () => {
+    const disk: SlownessStatus = { state: 'slow', episode_id: 'd', reason: 'disk', free_bytes: 4e8 };
+    expect(visibleSlownessEpisode(disk, null, 'dev')).toEqual(disk);
+    expect(visibleSlownessEpisode(disk, null, 'notes')).toEqual(disk);
+  });
+
+  it('shows a stuck database only in a workspace that reported it', () => {
+    const database: SlownessStatus = {
+      state: 'slow',
+      episode_id: 'b',
+      reason: 'database',
+      problem: 'not_answering',
+      slow_workspaces: ['dev'],
+    };
+    expect(visibleSlownessEpisode(database, null, 'dev')).toEqual(database);
+    expect(visibleSlownessEpisode(database, null, 'notes')).toBeNull();
+    expect(visibleSlownessEpisode(database, null, null)).toBeNull();
+  });
+
   it('shows nothing for a normal machine, an unknown answer, or an unknown reason', () => {
     expect(visibleSlownessEpisode({ state: 'normal' }, null, 'dev')).toBeNull();
     expect(visibleSlownessEpisode(null, null, 'dev')).toBeNull();
-    const future = { state: 'slow', episode_id: 'f', reason: 'disk' } as unknown as SlownessStatus;
+    const future = { state: 'slow', episode_id: 'f', reason: 'network' } as unknown as SlownessStatus;
     expect(visibleSlownessEpisode(future, null, 'dev')).toBeNull();
   });
 

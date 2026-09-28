@@ -8,6 +8,7 @@ import { runWithConcurrency } from '../../utils/concurrentPool';
 import { refreshChangesState, clearRestartInFlight, RESTART_LS_KEY, RESTART_FAILURE_TOAST_KEY } from './chat-changes';
 import { loadUnreadNotifications } from './notifications';
 import { loadThreadQueue } from './threadQueue';
+import { resyncPluginCatalog } from './plugin-marketplaces';
 import { loadPreferences } from './preferences';
 import { loadReleaseNotices } from './releaseNotices';
 import { releaseNoticeDismissed } from '../releaseNotices';
@@ -207,6 +208,7 @@ function runResumeSync(): void {
   // slept through those events wakes holding entries that have since drained.
   // That panel is where an operator looks when background work seems stuck.
   void loadThreadQueue();
+  resyncPluginCatalog();
 
   // Incrementally refresh the FOCUSED thread (append-only event log: existing
   // events stay, we just fetch what's new via ?after=maxSeq). It is the one
@@ -340,8 +342,12 @@ export const DATABASE_UNREACHABLE_TOAST_KEY = 'database-unreachable';
  *  dev workspace's Postgres is a Docker container (ADR 0014 §6/§7), so naming
  *  Docker is a fact there. A packaged install runs a bundled Postgres it manages
  *  itself, where "start Docker" would be actively misleading, so it gets the
- *  condition without a guessed fix. */
-export function databaseUnreachableMessage(packaged: boolean): string {
+ *  condition without a guessed fix. A used-up pool is neither: the database
+ *  answers, so Docker is fine and the fix is Lucidos itself (ADR 0301). */
+export function databaseUnreachableMessage(packaged: boolean, poolExhausted: boolean): string {
+  if (poolExhausted) {
+    return "All of Lucidos's database connections are busy, so nothing can load. If it lasts, restart Lucidos.";
+  }
   const cause = "Lucidos can't reach its database, so nothing can load.";
   return packaged ? cause : `${cause} Check that Docker is running.`;
 }
@@ -362,7 +368,8 @@ export function syncDatabaseReachability(health: HealthInfo): void {
   const reachable = health.database_reachable !== false;
   if (!reachable) {
     databaseReachable.value = false;
-    showToast(databaseUnreachableMessage(health.packaged === true), 'error', {
+    const message = databaseUnreachableMessage(health.packaged === true, health.database_pool_exhausted === true);
+    showToast(message, 'error', {
       key: DATABASE_UNREACHABLE_TOAST_KEY,
       showWhileUnavailable: true,
       // Not dismissable, and no auto-dismiss: it is the ONLY thing reporting an

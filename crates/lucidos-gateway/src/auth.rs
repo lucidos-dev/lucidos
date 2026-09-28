@@ -118,15 +118,34 @@ pub enum Authorization {
     Unauthorized,
 }
 
-/// The device id [`crate::auth_api::enforce`] resolved, stamped onto the
-/// request for the proxy to forward.
+/// The device [`crate::auth_api::enforce`] resolved, stamped onto the request
+/// for the proxy to forward.
 ///
 /// A request extension rather than a header, because a client can send a header
 /// and cannot send an extension. The proxy strips every inbound
-/// `x-lucidos-device-id` and re-injects from this, so an absent extension
-/// forwards no id at all.
+/// `x-lucidos-device-id` and `x-lucidos-device-label` and re-injects from this,
+/// so an absent extension forwards neither.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AuthenticatedDevice(pub String);
+pub struct AuthenticatedDevice {
+    pub id: String,
+    /// The pairing label. The engine falls back to it when nobody typed a name,
+    /// so a device is called the same thing on every surface.
+    pub label: String,
+}
+
+impl AuthenticatedDevice {
+    /// The headers that tell the engine who this is. The label is
+    /// percent-encoded, because it is user text and a header value is bytes.
+    pub fn forwarded_headers(&self) -> [(&'static str, String); 2] {
+        [
+            (crate::stack::HEADER_DEVICE_ID, self.id.clone()),
+            (
+                crate::stack::HEADER_DEVICE_LABEL,
+                urlencoding::encode(&self.label).into_owned(),
+            ),
+        ]
+    }
+}
 
 /// One paired device, as persisted.
 ///

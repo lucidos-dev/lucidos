@@ -22,6 +22,12 @@ const MOUNTED_ELSEWHERE: &[(&str, &str, &str)] = &[
         "nested at /app, outside /api/v1, so the hatch cannot address it",
     ),
     (
+        "frame_file_cors.rs",
+        "answer",
+        "an inline test's own router",
+    ),
+    ("fonts.rs", "answer", "an inline test's own router"),
+    (
         "local_auth.rs",
         "an_open_door_streams_a_body_instead_of_collecting_it",
         "an inline test's own router",
@@ -41,11 +47,7 @@ const MOUNTED_ELSEWHERE: &[(&str, &str, &str)] = &[
 /// around the question. It lives beside the scan because the scan is its only
 /// reader: the running gate matches on the route axum reports, which is the
 /// built string.
-///
-/// The font bytes are version-stamped into their own filename, which is what
-/// lets them be cached as immutable. Pinning that literal would make a font
-/// upgrade edit a table for no gain.
-const COMPUTED_ROUTE_REACH: &[(&str, &str, Reach)] = &[("sdk_fonts.rs", "router", Asset)];
+const COMPUTED_ROUTE_REACH: &[(&str, &str, Reach)] = &[];
 
 /// Every route the `/api/v1` router serves, with the methods each answers.
 ///

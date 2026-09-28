@@ -1485,14 +1485,7 @@ fn refuse_unstable_bundle_location(app: &AppHandle) {
 /// Called BEFORE the destructive steps, since they trash the bundle this
 /// process is running from. Read-only.
 pub fn leftover_installs(app_data: &Path) -> Vec<String> {
-    let Some(roots) = lucidos_installs::ScanRoots::for_machine() else {
-        return Vec::new();
-    };
-    let running = lucidos_installs::RunningProcess {
-        exe: std::env::current_exe().ok(),
-        data_dir: Some(app_data.to_path_buf()),
-    };
-    let inventory = lucidos_installs::scan(&roots, &running);
+    let inventory = lucidos_installs::scan_this_machine(Some(app_data.to_path_buf()));
     // Exactly what this uninstaller removes: the bundle it is running from.
     lucidos_installs::leftovers_report(&inventory, |i| i.running_here)
 }

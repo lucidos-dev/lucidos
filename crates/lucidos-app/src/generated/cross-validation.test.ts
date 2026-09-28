@@ -37,6 +37,11 @@ type TestCase = AvailableThreadActionsCase | DisplaySectionCase | ThreadIsDeleta
 // that has branching logic, add it to this set AND to generate_cross_validation_fixture().
 const FUNCTIONS_REQUIRING_CROSS_VALIDATION = new Set(['availableThreadActions', 'displaySection', 'threadIsDeletable']);
 
+// (section, isSaved) pairs a thread can hold: inbox unpinned, inbox pinned and
+// archived unpinned. A pinned thread is never archived (ADR 0312), so the
+// fixture holds no pinned archived case.
+const LEGAL_RETENTION_PAIRS = 3;
+
 describe('Cross-validation: generated TS matches Rust', () => {
   const cases = fixture.cases as TestCase[];
 
@@ -44,12 +49,12 @@ describe('Cross-validation: generated TS matches Rust', () => {
     const availableThreadActionsCases = cases.filter((c): c is AvailableThreadActionsCase => c.fn === 'availableThreadActions');
 
     it(`has exhaustive coverage (${availableThreadActionsCases.length} cases)`, () => {
-      // 2 threadTypes × N statuses × 2 sections × 2 pending ×
-      // 2 descendantsBlockArchive × 2 hasLiveEventWaits × 2 hasUnsentDraft ×
-      // 2 isSaved.
+      // 2 threadTypes × N statuses × LEGAL_RETENTION_PAIRS (section, isSaved) ×
+      // 2 pending × 2 descendantsBlockArchive × 2 hasLiveEventWaits ×
+      // 2 hasUnsentDraft.
       // Derived from THREAD_STATUSES rather than hardcoded, because the literal
       // product went stale on every new ThreadStatus variant.
-      expect(availableThreadActionsCases.length).toBe(2 * THREAD_STATUSES.length * 2 ** 6);
+      expect(availableThreadActionsCases.length).toBe(2 * THREAD_STATUSES.length * LEGAL_RETENTION_PAIRS * 2 ** 4);
     });
 
     for (const tc of availableThreadActionsCases) {
@@ -76,9 +81,9 @@ describe('Cross-validation: generated TS matches Rust', () => {
     const displaySectionCases = cases.filter((c): c is DisplaySectionCase => c.fn === 'displaySection');
 
     it(`has exhaustive coverage (${displaySectionCases.length} cases)`, () => {
-      // 2 sections × N statuses × 2 saved × 2 activeChildren × 2 pending ×
-      // 2 attentionDescendants. Derived, same reason as above.
-      expect(displaySectionCases.length).toBe(2 * THREAD_STATUSES.length * 2 ** 4);
+      // LEGAL_RETENTION_PAIRS (section, saved) × N statuses × 2 activeChildren ×
+      // 2 pending × 2 attentionDescendants. Derived, same reason as above.
+      expect(displaySectionCases.length).toBe(LEGAL_RETENTION_PAIRS * THREAD_STATUSES.length * 2 ** 3);
     });
 
     for (const tc of displaySectionCases) {
@@ -124,6 +129,16 @@ describe('Cross-validation: generated TS matches Rust', () => {
         expect(result).toBe(tc.expected);
       });
     }
+  });
+
+  describe('retention', () => {
+    it('no case is both pinned and archived', () => {
+      const illegal = cases.filter((c) =>
+        (c.fn === 'availableThreadActions' && c.args[2] === 'archived' && c.args[7]) ||
+        (c.fn === 'displaySection' && c.args[0] === 'archived' && c.args[2]),
+      );
+      expect(illegal).toEqual([]);
+    });
   });
 
   describe('coverage meta-test', () => {

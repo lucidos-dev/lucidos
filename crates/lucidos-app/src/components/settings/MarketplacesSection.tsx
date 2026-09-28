@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'preact/hooks';
 import { marketplaceCatalog } from '../../store/store';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
+import { usePanelRefresh } from '../../hooks/usePanelRefresh';
 import { useInlineRename } from '../../hooks/useInlineRename';
 import { LoadableError } from '../shared/LoadableError';
 import { ListSkeletonOf, useSkeleton, SkText, SkBlock } from '../shared/Skeleton';
@@ -11,6 +12,7 @@ import { PROSE_TEXT_ATTRS } from '../../utils/noAutofill';
 import {
   addPluginMarketplaceAction,
   loadPluginCatalog,
+  refreshPluginCatalog,
   removePluginMarketplaceAction,
   renamePluginMarketplaceAction,
 } from '../../store/actions/plugin-marketplaces';
@@ -106,6 +108,7 @@ function MarketplaceRow({ marketplace }: { marketplace?: PluginMarketplace }) {
  *  marketplaces) the Store scans for installable plugins. Moved here out of the
  *  Store toolbar so the Store itself is just a searchable plugin list. */
 export function MarketplacesSection() {
+  usePanelRefresh('marketplaces', refreshPluginCatalog);
   const loadable = marketplaceCatalog.value;
   const showLoading = useDelayedLoading(loadable);
   const [source, setSource] = useState('');

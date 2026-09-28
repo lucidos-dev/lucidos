@@ -1,6 +1,7 @@
 import type { ComponentType } from 'preact';
 import { scrolledFromTop } from '../chat/scrollState';
 import { SearchIcon } from '../shared/icons';
+import { MobileRefreshIndicator } from './RefreshIndicator';
 import { PinThreadButton } from '../shared/PinThreadButton';
 import { ThreadOverflowMenu } from '../shared/ThreadOverflowMenu';
 import { ThreadBackButton, ThreadForwardButton } from '../shared/ThreadNav';
@@ -8,7 +9,7 @@ import { ThreadToggleButton } from '../shared/ThreadToggleButton';
 import { HamburgerButton, ContentBackButton, ContentForwardButton } from './ContentNav';
 import { ContentHeaderActions } from './ContentHeaderActions';
 import { BrandMenuButton } from './HeaderMark';
-import { getContentTitle, getContentTitleShort, getDiffDescription, useContentTitleArrival } from './headerHelpers';
+import { getContentTitle, getContentTitleShort, getDiffDescription } from './headerHelpers';
 import { threadSearchQuery, mobileView, MOBILE_VIEWS, focusedThreadId, threadMap, type MobileView } from '../../store/store';
 import { navigateToPane } from '../../store/actions/pane';
 import { useThreadsHeaderState } from '../../hooks/useThreadsHeaderState';
@@ -173,6 +174,7 @@ function MobileContentHeader() {
     <div class="mobile-content-header">
       <div class="mobile-header-row">
         <HamburgerButton />
+        <MobileRefreshIndicator />
         <div class="pane-header-spacer" />
         <div class="header-nav-cluster header-title-cluster">
           <ContentBackButton />
@@ -185,16 +187,13 @@ function MobileContentHeader() {
   );
 }
 
-/** The content title between the chevrons. Its own component, so the fade's
- *  hook stays out of the header row, which tests walk by calling it. */
+/** The content title between the chevrons. */
 function MobileContentTitle() {
   const title = getContentTitleShort();
-  const { titleKey, titleFade } = useContentTitleArrival();
   if (!title) return null;
   return (
     <span
-      key={titleKey}
-      class={`pane-header-title mobile-content-title${titleFade}`}
+      class="pane-header-title mobile-content-title"
       data-tooltip={getDiffDescription() || getContentTitle()}
       data-tooltip-tap
     >

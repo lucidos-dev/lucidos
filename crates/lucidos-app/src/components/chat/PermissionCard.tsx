@@ -81,7 +81,7 @@ function renderFileChangeQuestion(input: Record<string, unknown>) {
   if (changes.length === 0) {
     // Nothing was announced for this item. Say the least that is still true,
     // and pass codex's own explanation through when it sent one.
-    const reason = typeof input.reason === 'string' ? input.reason.trim() : '';
+    const reason = inputText(input, 'reason');
     return (
       <>
         The coding agent wants to change files{reason ? `: ${reason}` : ''}. Allow?
@@ -114,6 +114,31 @@ function renderFileChangeQuestion(input: Record<string, unknown>) {
   );
 }
 
+/** A trimmed string field of a tool input, or `''`. */
+function inputText(input: Record<string, unknown>, key: string): string {
+  const value = input[key];
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+/** The command a card asks about, shown whole in a capped, scrolling block.
+ *  Never truncated: the ask above it is the agent's claim, and this is what
+ *  actually runs. */
+function CommandBlock({ command }: { command: string }) {
+  return <pre class="permission-command"><code>{command}</code></pre>;
+}
+
+/** The card for a shell command. The agent's own words lead (Claude Code's
+ *  `description`, Codex's `reason`), because that is the question the user is
+ *  answering. The command sits under it for the user to check. */
+function renderCommandAsk(ask: string, command: string) {
+  return (
+    <>
+      {ask || 'The coding agent wants to run this command.'}
+      <CommandBlock command={command} />
+    </>
+  );
+}
+
 /** Frame the prompt around the tool name itself ("the **Edit** tool on `/path`")
  *  rather than burying it as a flat prefix in the summary. The original wording
  *  ("Claude Code wants to use Edit /path") read like a sentence about an action
@@ -129,23 +154,24 @@ function renderFileChangeQuestion(input: Record<string, unknown>) {
  *  identifiers that surface nowhere else, so the same framing produced "wants
  *  to use the file_change tool. Allow?": a security decision phrased in
  *  protocol jargon, about files it did not name. Those two say what the agent
- *  wants to DO instead, and `command_execution` borrows the command-guard
- *  card's wording so the two "wants to run" prompts read alike. */
+ *  wants to DO instead.
+ *
+ *  **Shell commands lead with the agent's words**, see `renderCommandAsk`. */
 export function renderQuestion(
   toolName: string,
   summary: string,
   input: Record<string, unknown> = {},
 ) {
   if (toolName === 'file_change') return renderFileChangeQuestion(input);
+  // Untrimmed: the block shows exactly the bytes that will run.
+  const command = typeof input.command === 'string' && input.command.trim() ? input.command : '';
   if (toolName === 'command_execution') {
-    const command = typeof input.command === 'string' ? input.command.trim() : '';
-    return command ? (
-      <>
-        The coding agent wants to run <code>{command}</code>. Allow?
-      </>
-    ) : (
-      <>The coding agent wants to run a command. Allow?</>
-    );
+    return command
+      ? renderCommandAsk(inputText(input, 'reason'), command)
+      : <>The coding agent wants to run a command. Allow?</>;
+  }
+  if (toolName === 'Bash' && command) {
+    return renderCommandAsk(inputText(input, 'description'), command);
   }
   const space = summary.indexOf(' ');
   const arg = space === -1 ? null : summary.slice(space + 1);
@@ -356,7 +382,6 @@ type ButtonSpec = {
   btnClass: string;
   label: ComponentChildren;
   ariaLabel: string;
-  row: 'primary' | 'secondary';
   onClick: () => void;
 };
 
@@ -403,9 +428,9 @@ function renderPermissionButton(
   );
 }
 
-/** The shared card chrome: a question line + a primary row + one row per
- *  secondary button. Each permission card (coding-agent, command-guard, MCP)
- *  builds its own `buttons` and feeds them here. */
+/** The shared card chrome: a question and one wrapping row of buttons. Each
+ *  permission card (coding-agent, command-guard, MCP) builds its own `buttons`
+ *  and feeds them here. */
 function PermissionBodyShell({
   requestId,
   question,
@@ -423,15 +448,13 @@ function PermissionBodyShell({
   terminated: boolean;
   note: string | null;
 }) {
-  const primary = buttons.filter(b => b.row === 'primary');
-  const secondary = buttons.filter(b => b.row === 'secondary');
   const bodyStateClass = answered ? ' permission-body-answered'
     : terminated ? ' permission-body-terminated'
     : '';
   const state = { selected, answered, terminated };
   // A live card is a *choice card* (see `choiceCardNav.ts`): arrows step across
-  // its buttons (the primary row and every secondary row, in DOM order) and
-  // "Allow once" takes focus on arrival so Enter resolves it. The marker and the
+  // its buttons in DOM order, and "Allow once" takes focus on arrival so Enter
+  // resolves it. The marker and the
   // seed are both gated on live, so a resolved card is inert to the keyboard.
   // The seed is latched to the card's ARRIVAL inside `seedChoiceCardFocus`.
   // `live` is not a one-way flip: a failed resolve rolls the optimistic pending
@@ -444,7 +467,7 @@ function PermissionBodyShell({
   }, [live, requestId]);
   return (
     <div
-      class={`permission-body${bodyStateClass}`}
+      class={`permission-body protected-surface${bodyStateClass}`}
       data-request-id={requestId}
       data-role={live ? CHOICE_CARD_ROLE : undefined}
       ref={ref}
@@ -452,13 +475,8 @@ function PermissionBodyShell({
     >
       <div class="permission-text">{question}</div>
       <div class="permission-actions">
-        {primary.map(spec => renderPermissionButton(spec, state))}
+        {buttons.map(spec => renderPermissionButton(spec, state))}
       </div>
-      {secondary.map(spec => (
-        <div key={spec.choice} class="permission-actions permission-actions-secondary">
-          {renderPermissionButton(spec, state)}
-        </div>
-      ))}
       {note && <div class="permission-resolution-note">{note}</div>}
     </div>
   );
@@ -524,7 +542,6 @@ export function PermissionBody({ event, resolved, terminated }: PermissionBodyPr
       btnClass: 'action-btn action-btn-danger',
       label: 'Deny',
       ariaLabel: 'Deny this permission request',
-      row: 'primary',
       onClick: () => void decide(false),
     },
     {
@@ -532,31 +549,27 @@ export function PermissionBody({ event, resolved, terminated }: PermissionBodyPr
       btnClass: 'action-btn action-btn-confirm',
       label: 'Allow once',
       ariaLabel: 'Allow this permission request once',
-      row: 'primary',
       onClick: () => void decide(true),
     },
     ...(showSession ? [{
       choice: 'session' as const,
-      btnClass: 'action-btn action-btn-confirm',
+      btnClass: 'action-btn action-btn-secondary',
       label: 'Allow for this thread',
       ariaLabel: `Allow ${session ?? event.tool_name} for the rest of this thread`,
-      row: 'secondary' as const,
       onClick: () => void decide(true, 'session'),
     }] : []),
     ...(narrow ? [{
       choice: 'narrow' as const,
-      btnClass: 'action-btn action-btn-confirm',
+      btnClass: 'action-btn action-btn-secondary',
       label: <>Always allow <code>{narrow}</code></>,
       ariaLabel: `Always allow ${narrow}`,
-      row: 'secondary' as const,
       onClick: () => void decide(true, 'narrow'),
     }] : []),
     ...(showBroad ? [{
       choice: 'broad' as const,
-      btnClass: 'action-btn',
+      btnClass: 'action-btn action-btn-secondary',
       label: 'Always allow',
       ariaLabel: `Always allow ${event.tool_name}`,
-      row: 'secondary' as const,
       onClick: () => void decide(true, 'broad'),
     }] : []),
   ];
@@ -769,7 +782,6 @@ export function CommandPermissionBody({ event, resolved, terminated }: CommandPe
       btnClass: 'action-btn action-btn-danger',
       label: 'Deny',
       ariaLabel: 'Deny running this command',
-      row: 'primary',
       onClick: () => void decide(false),
     },
     {
@@ -777,31 +789,27 @@ export function CommandPermissionBody({ event, resolved, terminated }: CommandPe
       btnClass: 'action-btn action-btn-confirm',
       label: 'Allow once',
       ariaLabel: 'Allow this command once',
-      row: 'primary',
       onClick: () => void decide(true),
     },
     {
       choice: 'session',
-      btnClass: 'action-btn action-btn-confirm',
+      btnClass: 'action-btn action-btn-secondary',
       label: 'Allow for this thread',
       ariaLabel: `Allow ${sessionLabelText ?? 'this command'} for the rest of this thread`,
-      row: 'secondary',
       onClick: () => void decide(true, 'session'),
     },
     ...(narrow ? [{
       choice: 'narrow' as const,
-      btnClass: 'action-btn action-btn-confirm',
+      btnClass: 'action-btn action-btn-secondary',
       label: <>Always allow <code>{narrow}</code></>,
       ariaLabel: `Always allow ${narrow}`,
-      row: 'secondary' as const,
       onClick: () => void decide(true, 'narrow'),
     }] : []),
     {
       choice: 'broad',
-      btnClass: 'action-btn',
+      btnClass: 'action-btn action-btn-secondary',
       label: 'Always allow',
       ariaLabel: isBash ? 'Always allow any shell command' : 'Always allow any Python',
-      row: 'secondary',
       onClick: () => void decide(true, 'broad'),
     },
   ];
@@ -819,12 +827,13 @@ export function CommandPermissionBody({ event, resolved, terminated }: CommandPe
   );
 }
 
-/** The question line for a command-guard card: the command itself plus the
- *  risk summary the guard produced. */
+/** The question for a command-guard card: the risk summary the guard produced,
+ *  then the command in the same block the coding-agent card uses. */
 export function renderCommandQuestion(command: string, summary: string) {
   return (
     <>
-      The Lucidos Agent wants to run <code>{command}</code>. {summary} Allow?
+      The Lucidos Agent wants to run this command. {summary}
+      <CommandBlock command={command} />
     </>
   );
 }
@@ -866,7 +875,6 @@ export function McpPermissionBody({ event, resolved, terminated }: McpPermission
       btnClass: 'action-btn action-btn-danger',
       label: 'Deny',
       ariaLabel: `Deny calling ${event.tool_name} on ${event.server_name}`,
-      row: 'primary',
       onClick: () => void decide(false),
     },
     {
@@ -874,31 +882,27 @@ export function McpPermissionBody({ event, resolved, terminated }: McpPermission
       btnClass: 'action-btn action-btn-confirm',
       label: 'Allow once',
       ariaLabel: 'Allow this MCP tool call once',
-      row: 'primary',
       onClick: () => void decide(true),
     },
     {
       choice: 'session',
-      btnClass: 'action-btn action-btn-confirm',
+      btnClass: 'action-btn action-btn-secondary',
       label: 'Allow for this thread',
       ariaLabel: `Allow ${event.tool_name} for the rest of this thread`,
-      row: 'secondary',
       onClick: () => void decide(true, 'session'),
     },
     {
       choice: 'narrow',
-      btnClass: 'action-btn action-btn-confirm',
+      btnClass: 'action-btn action-btn-secondary',
       label: <>Always allow <code>{event.tool_name}</code></>,
       ariaLabel: `Always allow ${event.tool_name} on ${event.server_name}`,
-      row: 'secondary',
       onClick: () => void decide(true, 'narrow'),
     },
     {
       choice: 'broad',
-      btnClass: 'action-btn',
+      btnClass: 'action-btn action-btn-secondary',
       label: <>Always allow <strong>{event.server_name}</strong></>,
       ariaLabel: `Always allow any tool on ${event.server_name}`,
-      row: 'secondary',
       onClick: () => void decide(true, 'broad'),
     },
   ];

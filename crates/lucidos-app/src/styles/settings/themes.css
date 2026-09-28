@@ -1,0 +1,195 @@
+/* Settings → Appearance → Theme: a card per theme, each previewing itself.
+   The preview element carries the theme's tokens as its own custom properties
+   (components/settings/ThemePicker.tsx), so every var() inside it resolves to
+   that theme, not to the page's. */
+
+.theme-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(9rem, 1fr));
+    gap: var(--space-sm);
+    padding: var(--space-sm) 0;
+}
+
+.theme-families {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-sm);
+    padding: var(--space-sm) 0;
+}
+
+.theme-family .theme-grid {
+    padding: var(--space-xs) 0 0;
+}
+
+.theme-family-name {
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+}
+
+.theme-card {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-xs);
+    padding: var(--space-xs);
+    background: none;
+    border: 1px solid transparent;
+    border-radius: var(--radius-surface);
+    color: var(--text-primary);
+    text-align: left;
+    cursor: pointer;
+}
+
+.theme-card.selected {
+    border-color: var(--accent);
+    outline: 1px solid var(--accent);
+}
+
+.theme-card:focus-visible {
+    outline: none;
+    box-shadow: var(--focus-ring);
+}
+
+@media (hover: hover) {
+    .theme-card:not(.selected):hover {
+        background: var(--bg-hover);
+    }
+}
+
+.theme-card-meta {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: var(--space-xs);
+    padding-inline: var(--space-xs);
+    font-size: var(--font-size-sm);
+    /* The card sets both to its own theme's font (themeFontStyle), so each name
+       reads in the font that theme paints. */
+    font-family: var(--font-ui);
+    font-feature-settings: var(--font-features-text, normal);
+}
+
+.theme-card-name {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.theme-card-modes {
+    flex-shrink: 0;
+    font-size: var(--font-size-2xs);
+    color: var(--text-muted);
+}
+
+/* The folded summary's hint that the card unfolds the whole gallery. */
+.theme-toggle-count {
+    display: inline-flex;
+    flex-shrink: 0;
+    align-items: center;
+    white-space: nowrap;
+    font-size: var(--font-size-2xs);
+    color: var(--text-muted);
+}
+
+.theme-preview {
+    display: flex;
+    flex-direction: column;
+    height: 5rem;
+    overflow: hidden;
+    background: var(--bg-primary);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-control);
+}
+
+.theme-preview-header {
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+    height: 1.25rem;
+    padding: 0 0.375rem;
+    background: var(--header-gradient);
+}
+
+.theme-preview-dot {
+    width: 0.3125rem;
+    height: 0.3125rem;
+    border-radius: var(--radius-round);
+    background: var(--header-fg-muted);
+}
+
+/* The focused pane's header segment: the wash and the underline, both cues a
+   theme can tune. */
+.theme-preview-focus {
+    position: absolute;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    width: 45%;
+    background-color: var(--focus-header-tint);
+    box-shadow: inset 0 calc(-1 * var(--focus-header-underline-width)) 0 0 var(--focus-header-underline);
+}
+
+.theme-preview-body {
+    display: flex;
+    flex: 1;
+    align-items: flex-start;
+    gap: 0.375rem;
+    padding: 0.375rem;
+}
+
+.theme-preview-panel {
+    display: flex;
+    flex: 1;
+    flex-direction: column;
+    gap: 0.25rem;
+    padding: 0.3125rem;
+    background: var(--bg-secondary);
+    border-radius: calc(var(--radius-control) / 2);
+}
+
+.theme-preview-line {
+    width: 70%;
+    height: 0.1875rem;
+    border-radius: calc(var(--radius-control) * 0.25);
+    background: var(--text-secondary);
+}
+
+.theme-preview-line-strong {
+    width: 90%;
+    background: var(--text-primary);
+}
+
+.theme-preview-line-muted {
+    width: 45%;
+    background: var(--text-muted);
+}
+
+.theme-preview-side {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 0.375rem;
+}
+
+.theme-preview-button {
+    width: 1.75rem;
+    height: 0.625rem;
+    border-radius: calc(var(--radius-control) / 2);
+    background: var(--accent-action);
+}
+
+.theme-preview-status {
+    display: flex;
+    gap: 0.1875rem;
+}
+
+.theme-preview-status i {
+    width: 0.3125rem;
+    height: 0.3125rem;
+    border-radius: var(--radius-round);
+}
+
+.theme-preview-green { background: var(--accent-green); }
+.theme-preview-yellow { background: var(--accent-yellow); }
+.theme-preview-red { background: var(--accent-red); }

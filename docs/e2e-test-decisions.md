@@ -93,6 +93,10 @@ The old reclaim treated "owner dead" as "safe to start fresh". On 2026-06-21 the
 
 The four states: no lock → acquire; live-PID lock → hard-fail; stale + no orphans → reclaim; stale + orphans → sweep then reclaim, else refuse.
 
+**A reclaim is one step, so two runs cannot both win it.** Two runs that find the same stale lock both reclaim it. Each used to remove it and write its own, so the second removal deleted the first run's fresh lock, and both held it. That let an API run write threads into a browser run's workspace mid-suite.
+
+The replace now runs under an exclusive `flock` on `e2e.lock.reclaim`, and the reclaimer replaces the lock only if it is unchanged since it read it. The whole file is compared, so a new run that reused the dead PID keeps its lock. The loser then reads the winner's live lock and refuses, naming the winner. The kernel drops a flock when its holder dies, so a killed reclaimer leaves nothing behind. Perl holds it, since macOS ships no `flock` command.
+
 Deliberately *not* swept: any `vite`/web-dev server. Under ADR 0014 e2e runs a one-shot `vite build` with no long-lived server. A name-based match would risk SIGKILLing the checkout-level shared build-watch that serves other workspaces.
 
 Lock logic lives in `scripts/lib/e2e_lock.sh`. `scripts/lib/e2e_lock_test.sh` covers it: run it directly, with no harness. It is hermetic, fakes orphans with sleepers, and never spawns a browser.
@@ -552,8 +556,7 @@ months of host samples with no freeze, and it tracks host load as much as
 memory: one warn sample sat at load average 254.
 
 **Two ceilings were retired.** `LUCIDOS_E2E_COMPRESSOR_CAP_GB` and `_CAP_PCT`
-are gone, not renamed. Setting one is named at run start rather than left
-looking like a cap. The absolute 16 GB cap they replaced was calibrated on
+are gone, not renamed, and nothing reads them. The absolute 16 GB cap they replaced was calibrated on
 17.41 GB, the compressor reading at the recorded freeze. That night also read
 free 0.04 GB under pressure critical. A healthy night stopped at 17.11 GB with
 free 4.16 GB under pressure normal, so the compressor was the one number the two

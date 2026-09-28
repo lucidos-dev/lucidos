@@ -464,17 +464,28 @@ pub(crate) async fn reconcile_descendant_counts_from(
 
 /// `is_blocking` in SQL, over a descendant row aliased `d`. Shared by the
 /// in-tx reconcile and the boot rebuild, so the two cannot drift apart.
-const BLOCKING_DESCENDANT_FILTER: &str = "d.status IN ('running','waiting_for_user_answer') \
-     OR (d.archive_state <> 'archived' \
-         AND d.coding_agent_proposed AND d.is_coding_agent \
-         AND NOT d.coding_agent_is_external_repo)";
+static BLOCKING_DESCENDANT_FILTER: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        "d.status IN ({running},{waiting_for_user_answer}) \
+         OR (d.archive_state <> 'archived' \
+             AND d.coding_agent_proposed AND d.is_coding_agent \
+             AND NOT d.coding_agent_is_external_repo)",
+        running = ThreadStatus::Running.sql_literal(),
+        waiting_for_user_answer = ThreadStatus::WaitingForUserAnswer.sql_literal(),
+    )
+});
 
 /// `is_attention_needing` in SQL, over a descendant row aliased `d`.
-const ATTENTION_DESCENDANT_FILTER: &str = "d.status = 'waiting_for_user_answer' \
-     OR (d.archive_state <> 'archived' \
-         AND ((d.coding_agent_proposed AND d.is_coding_agent \
-               AND NOT d.coding_agent_is_external_repo) \
-              OR d.is_stopped_child))";
+static ATTENTION_DESCENDANT_FILTER: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        "d.status = {waiting_for_user_answer} \
+         OR (d.archive_state <> 'archived' \
+             AND ((d.coding_agent_proposed AND d.is_coding_agent \
+                   AND NOT d.coding_agent_is_external_repo) \
+                  OR d.is_stopped_child))",
+        waiting_for_user_answer = ThreadStatus::WaitingForUserAnswer.sql_literal(),
+    )
+});
 
 /// The shared recompute. `base` seeds the rows to reconcile from `$1`, and the
 /// walk then climbs from those to every ancestor.
@@ -507,9 +518,9 @@ async fn reconcile_descendant_counts(
          ), \
          new_counts AS ( \
             SELECT a.thread_id AS root_id, \
-                   COALESCE(COUNT(*) FILTER (WHERE {BLOCKING_DESCENDANT_FILTER}), 0)::int \
+                   COALESCE(COUNT(*) FILTER (WHERE {blocking}), 0)::int \
                        AS blocking_cnt, \
-                   COALESCE(COUNT(*) FILTER (WHERE {ATTENTION_DESCENDANT_FILTER}), 0)::int \
+                   COALESCE(COUNT(*) FILTER (WHERE {attention}), 0)::int \
                        AS attention_cnt \
             FROM ancestors a \
             LEFT JOIN descendants d ON d.root_id = a.thread_id \
@@ -522,7 +533,9 @@ async fn reconcile_descendant_counts(
          WHERE u.thread_id = nc.root_id \
            AND (u.blocking_descendant_count != nc.blocking_cnt \
                 OR u.attention_descendant_count != nc.attention_cnt) \
-         RETURNING u.thread_id"
+         RETURNING u.thread_id",
+        blocking = &*BLOCKING_DESCENDANT_FILTER,
+        attention = &*ATTENTION_DESCENDANT_FILTER,
     ))
     .bind(anchor)
     .fetch_all(&mut **tx)
@@ -759,12 +772,14 @@ impl EventBus {
                  attention_descendant_count = COALESCE(sub.attention_cnt, 0) \
              FROM ( \
                  SELECT d.root_id, \
-                        COUNT(*) FILTER (WHERE {BLOCKING_DESCENDANT_FILTER}) AS blocking_cnt, \
-                        COUNT(*) FILTER (WHERE {ATTENTION_DESCENDANT_FILTER}) AS attention_cnt \
+                        COUNT(*) FILTER (WHERE {blocking}) AS blocking_cnt, \
+                        COUNT(*) FILTER (WHERE {attention}) AS attention_cnt \
                  FROM descendants d \
                  GROUP BY d.root_id \
              ) sub \
              WHERE u.thread_id = sub.root_id",
+            blocking = &*BLOCKING_DESCENDANT_FILTER,
+            attention = &*ATTENTION_DESCENDANT_FILTER,
         ))
         .execute(pool)
         .await?;

@@ -12,7 +12,9 @@ import {
   renderOriginSection,
 } from './MessageRoutePanel';
 import { appsList, repositories } from '../../store/store';
-import type { Exchange, StoredEvent, ThreadMeta } from '../../store/thread-events';
+import { devices } from '../../store/actions/devices';
+import { pairedDevices } from '../../store/actions/pairedDevices';
+import type { EngineReason, Exchange, StoredEvent, ThreadMeta } from '../../store/thread-events';
 
 /** Wrap a single StoredEvent as an Exchange so each test can keep declaring
  *  the userEvent inline — `resolveOrigin` takes the full exchange (it walks
@@ -20,6 +22,16 @@ import type { Exchange, StoredEvent, ThreadMeta } from '../../store/thread-event
  *  below). */
 function exch(userEvent: StoredEvent, steps: Exchange['steps'] = []): Exchange {
   return { userEvent, userSeq: 1, steps };
+}
+
+
+/** Seed the devices list a device origin's name is read from. */
+function seedDevice(id: string, name: string): void {
+  pairedDevices.value = { status: 'loaded', data: [] };
+  devices.value = {
+    status: 'loaded',
+    data: [{ id, name, pairing_label: null, user_agent: null, push_enabled: false, last_seen_at: '', created_at: '' }],
+  };
 }
 
 describe('resolveOrigin', () => {
@@ -40,9 +52,8 @@ describe('resolveOrigin', () => {
       text: 'hi',
       mode: 'human',
       device_id: 'dev-1',
-      device: 'Chrome',
     };
-    expect(resolveOrigin(exch(ev))).toEqual({ kind: 'device', device_id: 'dev-1', label: 'Chrome' });
+    expect(resolveOrigin(exch(ev))).toEqual({ kind: 'device', device_id: 'dev-1' });
   });
 
   it('synthesizes a ThreadLink (direction=parent) origin for agent-mode legacy events', () => {
@@ -140,9 +151,9 @@ describe('resolveOrigin', () => {
   it('prefers a persisted origin over the intrinsic engine default', () => {
     const ev: StoredEvent = {
       type: 'MergeConflictDetected',
-      origin: { kind: 'device', device_id: 'd1', label: 'Chrome on Mac' },
+      origin: { kind: 'device', device_id: 'd1' },
     };
-    expect(resolveOrigin(exch(ev))).toEqual({ kind: 'device', device_id: 'd1', label: 'Chrome on Mac' });
+    expect(resolveOrigin(exch(ev))).toEqual({ kind: 'device', device_id: 'd1' });
   });
 
   // ResponseAborted is deliberately NOT in the intrinsic map: its own branch in
@@ -161,12 +172,11 @@ describe('resolveOrigin', () => {
     const ev: StoredEvent = {
       type: 'ContinuationStarted',
       branch: '',
-      actor: { kind: 'device', device_id: 'dev-ios', label: 'iOS Safari PWA' },
+      actor: { kind: 'device', device_id: 'dev-ios' },
     };
     expect(resolveOrigin(exch(ev))).toEqual({
       kind: 'device',
-      device_id: 'dev-ios',
-      label: 'iOS Safari PWA',
+      device_id: 'dev-ios'
     });
   });
 
@@ -179,9 +189,9 @@ describe('resolveOrigin', () => {
     const ev: StoredEvent = {
       type: 'ChangeApplied',
       change_id: 'c1',
-      actor: { kind: 'device', device_id: 'd1', label: 'Chrome on Mac' },
+      actor: { kind: 'device', device_id: 'd1' },
     };
-    expect(resolveOrigin(exch(ev))).toEqual({ kind: 'device', device_id: 'd1', label: 'Chrome on Mac' });
+    expect(resolveOrigin(exch(ev))).toEqual({ kind: 'device', device_id: 'd1' });
   });
 
   it('surfaces the actor on ChangeApplyFailed (so the failure has auditability)', () => {
@@ -212,10 +222,10 @@ describe('resolveOrigin', () => {
       type: 'UserQuestionAnswered',
       tool_use_id: 'tu1',
       answer: { kind: 'Selected', option_id: 'a' },
-      actor: { kind: 'device', device_id: 'dev-ipad', label: 'iPad Safari' },
+      actor: { kind: 'device', device_id: 'dev-ipad' },
     } as unknown as StoredEvent;
     expect(resolveOrigin(exch(userEvent, [{ seq: 2, event: answered }]))).toEqual({
-      kind: 'device', device_id: 'dev-ipad', label: 'iPad Safari',
+      kind: 'device', device_id: 'dev-ipad'
     });
   });
 
@@ -243,10 +253,10 @@ describe('resolveOrigin', () => {
       type: 'CodingAgentPermissionResolved',
       request_id: 'r1',
       allowed: true,
-      actor: { kind: 'device', device_id: 'dev-mac', label: 'Chrome on Mac' },
+      actor: { kind: 'device', device_id: 'dev-mac' },
     } as unknown as StoredEvent;
     expect(resolveOrigin(exch(userEvent, [{ seq: 2, event: resolved }]))).toEqual({
-      kind: 'device', device_id: 'dev-mac', label: 'Chrome on Mac',
+      kind: 'device', device_id: 'dev-mac'
     });
   });
 
@@ -532,8 +542,9 @@ describe('executorExtras', () => {
 });
 
 describe('renderChannelSection', () => {
-  it('device origin renders device label', () => {
-    const node = renderChannelSection({ kind: 'device', device_id: 'd1', label: 'Chrome on Mac' });
+  it('device origin renders the name the devices list holds for its id', () => {
+    seedDevice('d1', 'Chrome on Mac');
+    const node = renderChannelSection({ kind: 'device', device_id: 'd1' });
     expect(JSON.stringify(node)).toContain('Chrome on Mac');
   });
   it('api origin renders user-agent', () => {
@@ -631,7 +642,7 @@ describe('renderAuditSection', () => {
     expect(node).toBeNull();
   });
   it('device/api/v1/engine origin renders nothing', () => {
-    expect(renderAuditSection({ kind: 'device', device_id: 'd', label: 'L' })).toBeNull();
+    expect(renderAuditSection({ kind: 'device', device_id: 'd' })).toBeNull();
     expect(renderAuditSection({ kind: 'api' })).toBeNull();
     expect(renderAuditSection({ kind: 'engine', reason: { kind: 'session_recovered' } })).toBeNull();
   });
@@ -661,7 +672,7 @@ describe('renderOriginSection', () => {
     expect(s).toContain('Issued by');
     expect(s).toContain('Lucidos Engine');
     expect(s).toContain('Why this resumed');
-    expect(s).toMatch(/Switch to new version/i);
+    expect(s).toMatch(/chose Switch on the new version/);
     expect(s).not.toContain('Unknown');
   });
 
@@ -698,11 +709,12 @@ describe('renderOriginSection', () => {
   // The device that clicked Continue still owns the turn: it must read as its
   // own device, never as the engine.
   it('attributes a user-clicked Continue to the clicking device, not the engine', () => {
+    seedDevice('d1', 'iOS Safari PWA');
     const s = origin({
       type: 'ContinuationStarted',
       branch: '',
       reason: 'user_clicked_continue',
-      actor: { kind: 'device', device_id: 'd1', label: 'iOS Safari PWA' },
+      actor: { kind: 'device', device_id: 'd1' },
     });
     expect(s).toContain('iOS Safari PWA');
     expect(s).not.toContain('Lucidos Engine');
@@ -726,6 +738,113 @@ describe('renderOriginSection', () => {
 
   it('still falls back to Unknown for a genuinely unattributed event', () => {
     expect(origin({ type: 'MessageReceived', text: 'hi', mode: 'human' })).toContain('Unknown');
+  });
+});
+
+/** One fixture per `EngineReason` kind. A new kind is a `tsc` error until it
+ *  gets a row here, so the "never Unknown" sweep below cannot skip it. */
+const EVERY_ENGINE_REASON: { [K in EngineReason['kind']]: Extract<EngineReason, { kind: K }> } = {
+  continuation_started: { kind: 'continuation_started' },
+  session_recovered: { kind: 'session_recovered' },
+  orphan_recovery: { kind: 'orphan_recovery' },
+  scheduler: { kind: 'scheduler', trigger_id: 't1', trigger_name: 'nightly' },
+  harden_retrigger: { kind: 'harden_retrigger' },
+  stale_session: { kind: 'stale_session' },
+  merge_conflict: { kind: 'merge_conflict' },
+  missing_hardening: { kind: 'missing_hardening' },
+  plugin_auto_update: {
+    kind: 'plugin_auto_update', plugin_id: 'habit-tracker', marketplace_id: 'm1', marketplace_name: 'Example Market',
+  },
+  plugin_setup: {
+    kind: 'plugin_setup', plugin_id: 'habit-tracker', plugin_name: '⏰ Habit Tracker', version: '0.1.4',
+    occasion: { kind: 'fresh_install' },
+  },
+  plugin_upstream_proposal: {
+    kind: 'plugin_upstream_proposal', plugin_id: 'habit-tracker', plugin_name: '⏰ Habit Tracker', version: '0.1.4',
+    patch_path: 'artifacts/plugin-changes/habit-tracker/proposed-v0.1.4.patch',
+  },
+};
+
+describe('the popover never reads Unknown for engine-authored work', () => {
+  const origin = (userEvent: StoredEvent): string =>
+    JSON.stringify(renderOriginSection(exch(userEvent), undefined, () => undefined));
+
+  // Engine-seeded first messages, such as the plugin setup seed.
+  it.each(Object.values(EVERY_ENGINE_REASON))('an engine-seeded message with reason $kind', (reason) => {
+    const s = origin({ type: 'MessageReceived', text: 'seed', mode: 'engine', origin: { kind: 'engine', reason } });
+    expect(s).toContain('Lucidos Engine');
+    expect(s).not.toContain('Unknown');
+  });
+
+  it.each(Object.values(EVERY_ENGINE_REASON))('an engine prompt with reason $kind', (reason) => {
+    const s = origin({ type: 'CodingAgentPromptSent', text: 'prompt', origin: { kind: 'engine', reason } });
+    expect(s).not.toContain('Unknown');
+  });
+
+  it.each([
+    { type: 'ContinuationStarted', branch: '' },
+    { type: 'MissingHardeningDetected' },
+    { type: 'MergeConflictDetected', files: ['a.rs'] },
+  ] as StoredEvent[])('an actor-less $type', (userEvent) => {
+    expect(origin(userEvent)).not.toContain('Unknown');
+  });
+
+  // Rows written before the engine stamped an origin: an old plugin setup seed
+  // is agent-mode with no origin, no parent and no device. The chip already
+  // says "Lucidos Engine", so the panel says so too, and admits the reason
+  // was not recorded rather than inventing one.
+  it.each(['agent', 'engine'] as const)('a legacy %s-mode message with nothing recorded', (mode) => {
+    const s = origin({ type: 'MessageReceived', text: 'Set up X again.', mode });
+    expect(s).toContain('Issued by');
+    expect(s).toContain('Lucidos Engine');
+    expect(s).toContain('Why the engine acted');
+    expect(s).toMatch(/not known/);
+    expect(s).not.toContain('Unknown');
+  });
+});
+
+describe('plugin seeds name what the engine acted on', () => {
+  const origin = (reason: EngineReason): string => JSON.stringify(renderOriginSection(
+    exch({ type: 'MessageReceived', text: 'seed', mode: 'engine', origin: { kind: 'engine', reason } }),
+    undefined,
+    () => undefined,
+  ));
+  const setup = (occasion: Extract<EngineReason, { kind: 'plugin_setup' }>['occasion'], device?: string): EngineReason => ({
+    kind: 'plugin_setup', plugin_id: 'habit-tracker', plugin_name: '⏰ Habit Tracker', version: '0.1.4',
+    occasion, confirmed_on_device_id: device,
+  });
+
+  it('an update from a known version names both versions and the confirming device', () => {
+    seedDevice('d1', 'My iPhone');
+    const s = origin(setup({ kind: 'update', from_version: '0.1.3' }, 'd1'));
+    expect(s).toContain('Plugin update');
+    expect(s).toContain('⏰ Habit Tracker 0.1.3 → 0.1.4');
+    expect(s).toContain('Confirmed on');
+    expect(s).toContain('My iPhone');
+    expect(s).toMatch(/You updated ⏰ Habit Tracker from 0\.1\.3 to 0\.1\.4/);
+  });
+
+  it('an update from an unrecorded version names only the new one', () => {
+    const s = origin(setup({ kind: 'update' }));
+    expect(s).toContain('Plugin update');
+    expect(s).toContain('⏰ Habit Tracker 0.1.4');
+    expect(s).not.toContain('→');
+    expect(s).toMatch(/You updated ⏰ Habit Tracker to 0\.1\.4/);
+    // No device recorded: no row claims one.
+    expect(s).not.toContain('Confirmed on');
+  });
+
+  it('a fresh install reads as an install', () => {
+    const s = origin(setup({ kind: 'fresh_install' }));
+    expect(s).toContain('Plugin install');
+    expect(s).toMatch(/You installed ⏰ Habit Tracker/);
+  });
+
+  it('a patch proposal names the plugin', () => {
+    const s = origin(EVERY_ENGINE_REASON.plugin_upstream_proposal);
+    expect(s).toContain('Plugin patch');
+    expect(s).toContain('⏰ Habit Tracker 0.1.4');
+    expect(s).toMatch(/propose it upstream/);
   });
 });
 
@@ -837,7 +956,7 @@ describe('route rows contribute exactly two grid cells', () => {
       renderOriginSection(exch(userEvent), 'Parent title', () => 'Live title');
     expectTwoCellRows(section({
       type: 'MessageReceived', text: 'hi', mode: 'human',
-      origin: { kind: 'device', device_id: 'd1', label: 'Chrome on Mac' },
+      origin: { kind: 'device', device_id: 'd1' },
     }), 1);
     // The row that broke the grid before it was wrapped: an API origin from a
     // Lucidos subprocess renders a user-agent AND a deep-link to the spawning

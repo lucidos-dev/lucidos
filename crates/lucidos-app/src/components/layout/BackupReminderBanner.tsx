@@ -4,6 +4,7 @@ import { backupReminderVisible, dismissBackupReminder } from '../../store/action
 import { openBackupSettings } from '../../store/actions/menu';
 import { viewportIsMobile } from '../../utils/viewport';
 import { CloseIcon } from '../shared/icons';
+import { SurfaceToneIcon } from '../shared/Surface';
 import { bannerBelongsToLayout, useBannerHeightVar, type BannerLayout } from './appBanner';
 
 /** The CSS custom property this banner publishes its measured height into.
@@ -35,16 +36,18 @@ export function backupReminderBody(props: {
 }): VNode {
   return (
     <div ref={props.elRef} class="backup-reminder" data-layout={props.layout} role="status">
+      <SurfaceToneIcon tone="warning" />
       <span class="backup-reminder-text">
         Backup is off. Nothing in this workspace is being copied anywhere else.
       </span>
-      <button class="action-btn action-btn-confirm" onClick={props.onSetUp}>
+      <button class="action-btn" onClick={props.onSetUp}>
         Set up backup
       </button>
       <button
-        class="icon-btn backup-reminder-close"
+        class="icon-btn surface-close backup-reminder-close"
         onClick={props.onDismiss}
         aria-label="Dismiss backup reminder"
+        data-tooltip="Dismiss backup reminder"
       >
         <CloseIcon />
       </button>

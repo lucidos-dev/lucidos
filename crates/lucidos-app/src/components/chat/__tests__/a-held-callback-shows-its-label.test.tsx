@@ -6,6 +6,7 @@
  */
 import { afterEach, beforeEach, expect, it } from 'vitest';
 import { render } from 'preact';
+import { act } from 'preact/test-utils';
 import { ChatExchange } from '../ChatExchange';
 import type { Exchange } from '../../../store/thread-events';
 
@@ -28,27 +29,31 @@ beforeEach(() => {
   document.body.appendChild(host);
 });
 
+// Rendering inside act flushes effects before the test ends. A bare render
+// leaves Preact's after-paint timer pending past jsdom's teardown.
 afterEach(() => {
-  render(null, host);
+  act(() => { render(null, host); });
   host.remove();
 });
 
 it('shows "Held until you reply" on a delivery waiting behind a question', () => {
-  render(
-    <ChatExchange
-      exchange={DELIVERY}
-      revision={0}
-      streamingBuffer=""
-      isLast={true}
-      threadId="tid"
-      threadIsCC={false}
-      threadCodingAgent="claude-code"
-      threadIdle={true}
-      threadAwaitingAnswer={true}
-      threadCanceling={false}
-    />,
-    host,
-  );
+  act(() => {
+    render(
+      <ChatExchange
+        exchange={DELIVERY}
+        revision={0}
+        streamingBuffer=""
+        isLast={true}
+        threadId="tid"
+        threadIsCC={false}
+        threadCodingAgent="claude-code"
+        threadIdle={true}
+        threadAwaitingAnswer={true}
+        threadCanceling={false}
+      />,
+      host,
+    );
+  });
   const badge = host.querySelector('.exchange-status-label');
   expect(badge?.textContent).toContain('Held until you reply');
   expect(host.textContent).not.toContain('Requesting');

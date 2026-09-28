@@ -1,82 +1,78 @@
-import { describe, it, expect } from 'vitest';
-import type { ComponentChildren, VNode } from 'preact';
+// @vitest-environment jsdom
+import { afterEach, beforeEach, describe, it, expect } from 'vitest';
+import { render } from 'preact';
+import { act } from 'preact/test-utils';
 import { directoryPickerBody } from '../DirectoryPicker';
 import type { BrowseResult } from '../../../api/client';
 import type { Loadable } from '../../../store/types';
 
-/** Flatten a vnode tree into a string with the class attribute preserved
- *  so we can assert on per-state CSS classes. Mirrors the pattern used in
- *  permission-card.test.tsx / question-card.test.tsx. */
-function vnodeToText(node: ComponentChildren): string {
-  if (node === null || node === undefined || typeof node === 'boolean') return '';
-  if (typeof node === 'string' || typeof node === 'number') return String(node);
-  if (Array.isArray(node)) return node.map(vnodeToText).join('');
-  const v = node as VNode<{ children?: ComponentChildren; class?: string; ['data-state']?: string }>;
-  const tag = typeof v.type === 'string' ? v.type : '';
-  const cls = v.props?.class ? ` class="${v.props.class}"` : '';
-  const state = v.props?.['data-state'] ? ` data-state="${v.props['data-state']}"` : '';
-  const inner = vnodeToText(v.props?.children);
-  return tag ? `<${tag}${cls}${state}>${inner}</${tag}>` : inner;
-}
-
 const NOOP = () => {};
+let host: HTMLDivElement;
 
-function callBody(data: Loadable<BrowseResult>, currentPath = '/some/path', showLoading = false) {
-  return directoryPickerBody({
-    data,
-    showLoading,
-    currentPath,
-    selectedIndex: -1,
-    onGoUp: NOOP,
-    onSelectDir: NOOP,
-    onHoverIndex: NOOP,
+function show(data: Loadable<BrowseResult>, currentPath = '/some/path', showLoading = false) {
+  act(() => {
+    render(
+      <div class="dir-picker-list">
+        {directoryPickerBody({
+          data,
+          showLoading,
+          currentPath,
+          selectedIndex: -1,
+          onGoUp: NOOP,
+          onSelectDir: NOOP,
+          onHoverIndex: NOOP,
+        })}
+      </div>,
+      host,
+    );
   });
+  return host.firstElementChild!;
 }
+
+beforeEach(() => {
+  host = document.createElement('div');
+  document.body.appendChild(host);
+});
+
+afterEach(() => {
+  render(null, host);
+  host.remove();
+});
 
 describe('directoryPickerBody (Loadable discipline)', () => {
-  it('shows the skeleton only once the delay has elapsed (showLoading=true)', () => {
-    const text = vnodeToText(callBody({ status: 'loading' }, '/some/path', true));
-    expect(text).toContain('loading-skeleton');
-    expect(text).toMatch(/data-state="loading"/);
+  it('draws directory rows as the skeleton once the delay has elapsed (showLoading=true)', () => {
+    const list = show({ status: 'loading' }, '/some/path', true);
+    expect(list.querySelectorAll('.loading-fade-skeleton .dir-picker-row').length).toBeGreaterThan(0);
+    expect(list.querySelector('.loading-fade-skeleton .dir-picker-name .sk-bar')).not.toBeNull();
+    expect(list.textContent).not.toContain('Loading');
   });
 
-  it('loading before the delay (showLoading=false) renders nothing — no skeleton flash', () => {
-    const text = vnodeToText(callBody({ status: 'loading' }, '/some/path', false));
-    expect(text).not.toContain('loading-skeleton');
-    expect(text).toBe('');
+  it('loading before the delay (showLoading=false) renders nothing: no skeleton flash', () => {
+    const list = show({ status: 'loading' }, '/some/path', false);
+    expect(list.querySelector('.sk-bar')).toBeNull();
+    expect(list.textContent).toBe('');
   });
 
   it('failed state renders an error UI (distinct from empty + carries the error message)', () => {
-    const text = vnodeToText(callBody({ status: 'failed', error: 'Permission denied' }));
-    expect(text).toContain('dir-picker-error');
-    expect(text).toContain('Permission denied');
-    expect(text).toMatch(/data-state="failed"/);
+    const list = show({ status: 'failed', error: 'Permission denied' });
+    const error = list.querySelector('.dir-picker-error');
+    expect(error?.textContent).toContain('Permission denied');
+    expect(error?.getAttribute('data-state')).toBe('failed');
   });
 
   it('loaded-empty renders the empty UI (and NOT the skeleton/error classes)', () => {
-    const data: Loadable<BrowseResult> = {
-      status: 'loaded',
-      data: { path: '/x', directories: [], is_git_repo: false },
-    };
-    const text = vnodeToText(callBody(data, '/x'));
-    expect(text).toContain('dir-picker-empty');
-    expect(text).not.toContain('loading-skeleton');
-    expect(text).not.toContain('dir-picker-error');
-    expect(text).toContain('No subdirectories');
+    const list = show({ status: 'loaded', data: { path: '/', directories: [], is_git_repo: false } }, '/');
+    expect(list.querySelector('.dir-picker-empty')?.textContent).toBe('No subdirectories');
+    expect(list.querySelector('.sk-bar')).toBeNull();
+    expect(list.querySelector('.dir-picker-error')).toBeNull();
   });
 
   it('loaded with directories renders rows (and NOT the empty/skeleton/error classes)', () => {
-    const data: Loadable<BrowseResult> = {
-      status: 'loaded',
-      data: { path: '/x', directories: ['alpha', 'beta'], is_git_repo: false },
-    };
-    const text = vnodeToText(callBody(data, '/x'));
-    expect(text).toContain('alpha');
-    expect(text).toContain('beta');
-    expect(text).toContain('dir-picker-row');
-    // The "no subdirectories" empty message must not appear when there are dirs.
-    expect(text).not.toContain('No subdirectories');
-    expect(text).not.toContain('loading-skeleton');
-    expect(text).not.toContain('dir-picker-error');
+    const list = show({ status: 'loaded', data: { path: '/x', directories: ['alpha', 'beta'], is_git_repo: false } }, '/x');
+    const names = [...list.querySelectorAll('.dir-picker-row .dir-picker-name')].map((n) => n.textContent);
+    expect(names).toEqual(['..', 'alpha', 'beta']);
+    expect(list.textContent).not.toContain('No subdirectories');
+    expect(list.querySelector('.sk-bar')).toBeNull();
+    expect(list.querySelector('.dir-picker-error')).toBeNull();
   });
 });

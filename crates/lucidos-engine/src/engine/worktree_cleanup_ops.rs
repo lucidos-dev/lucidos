@@ -55,6 +55,91 @@ pub(crate) fn available_disk_bytes(path: &Path) -> Option<u64> {
     fs2::available_space(path).ok()
 }
 
+/// Free space on the volume hosting the workspace's worktrees. Falls back to
+/// the workspace root when the worktrees dir is missing: both share a volume.
+pub(crate) fn volume_free_bytes(worktrees_dir: &Path, workspace_root: &Path) -> Option<u64> {
+    available_disk_bytes(worktrees_dir).or_else(|| available_disk_bytes(workspace_root))
+}
+
+/// Reads free bytes on the workspace volume. Every caller probes again at the
+/// moment it decides, because free space can change by hundreds of GB while a
+/// cycle waits on the database. Tests script the readings.
+pub(crate) type FreeDiskProbe = Arc<dyn Fn() -> Option<u64> + Send + Sync>;
+
+/// The worktrees path is resolved once here, so a probe never creates it.
+pub(crate) fn os_free_disk_probe(workspace_root: PathBuf) -> FreeDiskProbe {
+    let dir = worktrees_dir(&workspace_root);
+    Arc::new(move || volume_free_bytes(&dir, &workspace_root))
+}
+
+/// How tight free disk is, ordered so that a worsening compares greater.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum PressureLevel {
+    Comfortable,
+    Soft,
+    Hard,
+}
+
+/// One free-disk reading, classified against the worker's thresholds.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DiskPressure {
+    pub free_bytes: Option<u64>,
+    pub under_soft: bool,
+    pub under_hard: bool,
+}
+
+impl DiskPressure {
+    /// A failed probe reads as no pressure: it never opens the retention gate.
+    pub(crate) fn classify(free_bytes: Option<u64>, soft_bytes: u64, hard_bytes: u64) -> Self {
+        Self {
+            free_bytes,
+            under_soft: free_bytes.is_some_and(|b| b < soft_bytes),
+            under_hard: free_bytes.is_some_and(|b| b < hard_bytes),
+        }
+    }
+
+    /// Tier 1 idle window: [`TIER_1_IDLE`], `forced` under soft pressure, and
+    /// zero under hard pressure. Liveness, not idle age, protects a tree then.
+    pub(crate) fn tier1_idle(&self, forced: Duration) -> Duration {
+        if self.under_hard {
+            Duration::ZERO
+        } else if self.under_soft {
+            forced
+        } else {
+            TIER_1_IDLE
+        }
+    }
+
+    pub(crate) fn level(&self) -> PressureLevel {
+        if self.under_hard {
+            PressureLevel::Hard
+        } else if self.under_soft {
+            PressureLevel::Soft
+        } else {
+            PressureLevel::Comfortable
+        }
+    }
+
+    /// Tier 0 and orphan-path grace: [`TIER_0_GRACE`], or zero under hard
+    /// pressure. One value for both, since each proves zero information on disk.
+    pub(crate) fn zero_info_grace(&self) -> Duration {
+        if self.under_hard {
+            Duration::ZERO
+        } else {
+            TIER_0_GRACE
+        }
+    }
+
+    /// The part of `freed` that counts toward the "Lucidos reclaimed disk
+    /// space" report, which covers only reclamation under hard pressure.
+    pub(crate) fn hard_reclaimed(&self, freed: Option<u64>) -> u64 {
+        match freed {
+            Some(bytes) if self.under_hard => bytes,
+            _ => 0,
+        }
+    }
+}
+
 /// Time since `path`'s mtime, or `None` if the metadata read fails. Used by
 /// the orphan-path sweep to apply a grace window without an event stream.
 pub(crate) fn directory_age(path: &Path) -> Option<Duration> {
@@ -66,6 +151,11 @@ pub(crate) fn directory_age(path: &Path) -> Option<Duration> {
 /// Sum file sizes under `path` recursively. Best-effort — silently skips
 /// entries we can't stat. Returns 0 if the path doesn't exist.
 pub(crate) fn directory_size_bytes(path: &Path) -> u64 {
+    directory_size_bytes_skipping(path, &[])
+}
+
+/// [`directory_size_bytes`], leaving out the subtrees rooted at `skip`.
+fn directory_size_bytes_skipping(path: &Path, skip: &[PathBuf]) -> u64 {
     let mut total: u64 = 0;
     let mut stack = vec![path.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -75,7 +165,10 @@ pub(crate) fn directory_size_bytes(path: &Path) -> u64 {
         for entry in entries.flatten() {
             let Ok(meta) = entry.metadata() else { continue };
             if meta.is_dir() {
-                stack.push(entry.path());
+                let child = entry.path();
+                if !skip.contains(&child) {
+                    stack.push(child);
+                }
             } else if meta.is_file() {
                 total = total.saturating_add(meta.len());
             }
@@ -83,6 +176,145 @@ pub(crate) fn directory_size_bytes(path: &Path) -> u64 {
         }
     }
     total
+}
+
+/// A worktree's size, and the part Tier 1 would strip.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct WorktreeSize {
+    pub total_bytes: u64,
+    pub artifact_bytes: u64,
+}
+
+/// Measure a worktree in one walk: every file is read once, either inside one
+/// of `artifact_dirs` or outside all of them. Pass [`prunable_artifact_dirs`],
+/// so the artifact share is what a strip would free.
+pub(crate) fn worktree_size_breakdown(worktree: &Path, artifact_dirs: &[&str]) -> WorktreeSize {
+    let artifact_dirs: Vec<PathBuf> = artifact_dirs.iter().map(|sub| worktree.join(sub)).collect();
+    let artifact_bytes: u64 = artifact_dirs
+        .iter()
+        .map(|dir| directory_size_bytes(dir))
+        .sum();
+    let rest = directory_size_bytes_skipping(worktree, &artifact_dirs);
+    WorktreeSize {
+        total_bytes: rest.saturating_add(artifact_bytes),
+        artifact_bytes,
+    }
+}
+
+/// A *finished worktree* holds nothing that removing it would lose: no owed
+/// fan-in, no pending change, a clean `git status`, and a branch with no
+/// commits ahead of main. Tier 0 and the recommended cleanup both ask this.
+/// Liveness and pins are the caller's question.
+///
+/// Every unanswered probe answers "not finished", because "finished"
+/// authorizes a removal.
+pub(crate) async fn is_finished_worktree(
+    pool: &PgPool,
+    changes: &crate::core::changes_projection::ChangesProjection,
+    thread_id: Uuid,
+    worktree: &Path,
+) -> bool {
+    if has_pending_fan_in(pool, thread_id).await {
+        return false;
+    }
+    match changes.pending_for_thread(thread_id).await {
+        Ok(pending) if pending.is_empty() => {}
+        Ok(_) => return false,
+        Err(e) => {
+            log!(
+                "[WorktreeCleanup] pending_for_thread({}) failed: {}; not finished",
+                thread_id,
+                e
+            );
+            return false;
+        }
+    }
+    if is_worktree_dirty(worktree).await {
+        return false;
+    }
+    let Some(branch) = crate::engine::git_ops::worktree_current_branch(worktree).await else {
+        return false;
+    };
+    let Some(repo_root) = resolve_repo_root_from_worktree(worktree).await else {
+        return false;
+    };
+    // An unanswered `git log` reads as "has commits".
+    !has_branch_commits(&repo_root, &branch).await
+}
+
+/// Whether the user pinned the thread. An unknown thread is not pinned.
+pub(crate) async fn thread_is_saved(pool: &PgPool, thread_id: Uuid) -> Result<bool, sqlx::Error> {
+    let row: Option<(bool,)> =
+        sqlx::query_as("SELECT is_saved FROM thread_summaries WHERE thread_id = $1")
+            .bind(thread_id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.map(|(p,)| p).unwrap_or(false))
+}
+
+/// True iff `thread_id` owes a parent↔child fan-in, so its worktree must stay
+/// (ADR 0011, weakness B2). Two windows count:
+///   (a) `active_children_count > 0`: a direct child is still running, and
+///       the parent resumes when it finishes. A *stopped child* counts the
+///       same way, since the parent is still owed its card (ADR 0252).
+///   (b) the thread's latest persisted event is a `ChildThreadCompleted`,
+///       ignoring `ChildThreadStopped` and `ChildThreadDetached` notes. The
+///       parent has not processed that child yet. B1's boot sweep
+///       (`refire_unprocessed_child_completions`) selects on the same thing.
+///
+/// Both windows are needed: the child's terminal event decrements
+/// `active_children_count` in the same transaction that persists
+/// `ChildThreadCompleted`, so the count is already 0 when the parent owes a
+/// resume. On a DB error returns `true` (keep the worktree).
+pub(crate) async fn has_pending_fan_in(pool: &PgPool, thread_id: Uuid) -> bool {
+    // (a) direct children still running, or stopped and still owed.
+    match sqlx::query_scalar::<_, bool>(
+        "SELECT t.active_children_count > 0 OR EXISTS ( \
+             SELECT 1 FROM thread_summaries c \
+             WHERE c.parent_thread_id = t.thread_id AND c.is_stopped_child \
+               AND c.archive_state <> 'archived') \
+         FROM thread_summaries t WHERE t.thread_id = $1",
+    )
+    .bind(thread_id)
+    .fetch_optional(pool)
+    .await
+    {
+        Ok(Some(true)) => return true,
+        Ok(_) => {}
+        Err(e) => {
+            log!(
+                "[WorktreeCleanup] children lookup failed for thread {}: {}; keeping worktree",
+                thread_id,
+                e
+            );
+            return true;
+        }
+    }
+    // (b) a completed-but-unprocessed child completion is the thread's last
+    // persisted word (no resume emitted a later event). A sibling's
+    // `ChildThreadStopped` or `ChildThreadDetached` note wakes nothing, so
+    // it cannot have processed the card, and it must not hide it.
+    match sqlx::query_scalar::<_, String>(
+        "SELECT event_type FROM events \
+         WHERE aggregate = 'thread' AND aggregate_id = $1::text \
+           AND event_type NOT IN ('ChildThreadStopped', 'ChildThreadDetached') \
+         ORDER BY sequence DESC LIMIT 1",
+    )
+    .bind(thread_id)
+    .fetch_optional(pool)
+    .await
+    {
+        Ok(Some(event_type)) => event_type == "ChildThreadCompleted",
+        Ok(None) => false,
+        Err(e) => {
+            log!(
+                "[WorktreeCleanup] latest-event lookup failed for thread {}: {}; keeping worktree",
+                thread_id,
+                e
+            );
+            true
+        }
+    }
 }
 
 /// Resolve the main working tree (the one whose `.git` is a real directory,
@@ -252,22 +484,13 @@ pub(crate) struct RemoveWorktreeOutcome {
 /// worker (Tier 1) and by the disk-usage settings page so the user can
 /// reclaim space on demand without waiting for the hourly tick.
 ///
-/// Returns the bytes freed, or `None` if there was nothing to prune.
-pub(crate) fn prune_build_artifacts(worktree: &Path) -> Option<u64> {
+/// A directory that holds tracked files is source, whatever its name, and is
+/// skipped. Returns the bytes freed, or `None` if there was nothing to prune.
+pub(crate) async fn prune_build_artifacts(worktree: &Path) -> Option<u64> {
     let mut freed: u64 = 0;
     let mut pruned: Vec<&'static str> = Vec::new();
-    for sub in TIER_1_PRUNE_DIRS {
+    for sub in prunable_artifact_dirs(worktree).await {
         let target = worktree.join(sub);
-        if !target.exists() {
-            continue;
-        }
-        if !is_safe_subpath(worktree, &target) {
-            log!(
-                "[WorktreeCleanup] refusing prune of suspicious path {}",
-                target.display()
-            );
-            continue;
-        }
         let size = directory_size_bytes(&target);
         match std::fs::remove_dir_all(&target) {
             Ok(()) => {
@@ -294,6 +517,45 @@ pub(crate) fn prune_build_artifacts(worktree: &Path) -> Option<u64> {
         );
         Some(freed)
     }
+}
+
+/// The artifact directories a strip would delete: present, inside the
+/// worktree, and holding no tracked file. The strip and the Disk Usage
+/// estimate both ask this, so the estimate promises only what a strip frees.
+pub(crate) async fn prunable_artifact_dirs(worktree: &Path) -> Vec<&'static str> {
+    let mut prunable = Vec::new();
+    for &sub in TIER_1_PRUNE_DIRS {
+        let target = worktree.join(sub);
+        if !target.exists() {
+            continue;
+        }
+        if !is_safe_subpath(worktree, &target) {
+            log!(
+                "[WorktreeCleanup] refusing prune of suspicious path {}",
+                target.display()
+            );
+            continue;
+        }
+        if holds_tracked_files(worktree, sub).await {
+            log!(
+                "[WorktreeCleanup] not pruning {}: it holds tracked files, or git could not say",
+                target.display()
+            );
+            continue;
+        }
+        prunable.push(sub);
+    }
+    prunable
+}
+
+/// Whether git tracks anything under `sub`. An unanswered probe counts as
+/// tracked, because a "no" here authorizes a delete.
+async fn holds_tracked_files(worktree: &Path, sub: &str) -> bool {
+    crate::engine::git_ops::git_answer_when_ok(&["ls-files", "-z", "--", sub], worktree, |o| {
+        !o.stdout.is_empty()
+    })
+    .await
+    .or_unknown(true)
 }
 
 /// Remove a worktree directory, and delete its branch per `disposal`.
@@ -419,16 +681,22 @@ pub(crate) async fn remove_worktree_and_optionally_delete_branch(
 
 /// One row in the disk-usage inventory served by `/api/v1/disk-usage/worktrees`.
 /// Combines on-disk facts (path, size, dirty) with thread metadata
-/// (title, last activity, saved).
+/// (title, last activity, saved) and what the recommended cleanup would do.
 #[derive(Debug, serde::Serialize)]
 pub struct WorktreeInventoryRow {
     pub thread_id: Uuid,
     pub thread_title: Option<String>,
     pub worktree_path: String,
     pub size_bytes: u64,
+    /// The part of `size_bytes` a build-artifact strip would free.
+    pub artifact_bytes: u64,
     pub last_activity: Option<chrono::DateTime<Utc>>,
     pub is_dirty: bool,
     pub is_saved: bool,
+    /// Live work in the tree right now, per [`ActiveThreads`].
+    pub is_active: bool,
+    /// Not active, and [`is_finished_worktree`]: removing it loses nothing.
+    pub is_finished: bool,
 }
 
 /// Snapshot the worktrees directory and pair each `thread-<short>` directory
@@ -440,7 +708,9 @@ pub struct WorktreeInventoryRow {
 pub(crate) async fn inventory_worktrees(
     pool: &sqlx::PgPool,
     workspace_root: &Path,
+    active_threads: &dyn ActiveThreads,
 ) -> Vec<WorktreeInventoryRow> {
+    let changes = crate::core::changes_projection::ChangesProjection::new(pool.clone());
     let dir = worktrees_dir(workspace_root);
     let entries = match std::fs::read_dir(&dir) {
         Ok(e) => e,
@@ -453,35 +723,80 @@ pub(crate) async fn inventory_worktrees(
             return Vec::new();
         }
     };
-    let mut rows: Vec<WorktreeInventoryRow> = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        let Some(short) = parse_thread_short(name) else {
-            continue;
-        };
-        let thread_id = match lookup_thread_by_short(pool, &short).await {
-            ShortThreadLookup::Found(id) => id,
-            ShortThreadLookup::NotFound | ShortThreadLookup::Unknown => continue,
-        };
-        let size_bytes = directory_size_bytes(&path);
-        let is_dirty = is_worktree_dirty(&path).await;
-        let (title, is_saved) = lookup_thread_summary(pool, thread_id).await;
-        let last_activity = lookup_last_activity(pool, thread_id).await;
-        rows.push(WorktreeInventoryRow {
-            thread_id,
-            thread_title: title,
-            worktree_path: path.to_string_lossy().into_owned(),
-            size_bytes,
-            last_activity,
-            is_dirty,
-            is_saved,
-        });
-    }
+    let candidates: Vec<(PathBuf, String)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let short = parse_thread_short(path.file_name()?.to_str()?)?;
+            Some((path, short))
+        })
+        .collect();
+    let mut rows: Vec<WorktreeInventoryRow> = {
+        use futures::StreamExt;
+        futures::stream::iter(
+            candidates
+                .into_iter()
+                .map(|(path, short)| inventory_row(pool, &changes, active_threads, path, short)),
+        )
+        .buffer_unordered(INVENTORY_CONCURRENCY)
+        .filter_map(std::future::ready)
+        .collect()
+        .await
+    };
     rows.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
     rows
+}
+
+/// How many worktrees [`inventory_worktrees`] reads at once. Each one walks a
+/// directory tree and runs git, so a small bound keeps the disk busy without
+/// starving the rest of the engine.
+const INVENTORY_CONCURRENCY: usize = 4;
+
+/// One worktree's row, or `None` when its short id resolves to no single thread.
+async fn inventory_row(
+    pool: &sqlx::PgPool,
+    changes: &crate::core::changes_projection::ChangesProjection,
+    active_threads: &dyn ActiveThreads,
+    path: PathBuf,
+    short: String,
+) -> Option<WorktreeInventoryRow> {
+    let thread_id = match lookup_thread_by_short(pool, &short).await {
+        ShortThreadLookup::Found(id) => id,
+        ShortThreadLookup::NotFound | ShortThreadLookup::Unknown => return None,
+    };
+    let prunable = prunable_artifact_dirs(&path).await;
+    let walk_path = path.clone();
+    let size = tokio::task::spawn_blocking(move || worktree_size_breakdown(&walk_path, &prunable));
+    let (size, is_dirty, (title, is_saved), last_activity, is_active) = tokio::join!(
+        size,
+        is_worktree_dirty(&path),
+        lookup_thread_summary(pool, thread_id),
+        lookup_last_activity(pool, thread_id),
+        active_threads.is_active(thread_id),
+    );
+    let size = size.unwrap_or_else(|e| {
+        log!(
+            "[WorktreeCleanup] size walk of {} failed: {}",
+            path.display(),
+            e
+        );
+        WorktreeSize::default()
+    });
+    // A dirty or live tree is never finished, so skip the git and DB checks.
+    let is_finished =
+        !is_dirty && !is_active && is_finished_worktree(pool, changes, thread_id, &path).await;
+    Some(WorktreeInventoryRow {
+        thread_id,
+        thread_title: title,
+        worktree_path: path.to_string_lossy().into_owned(),
+        size_bytes: size.total_bytes,
+        artifact_bytes: size.artifact_bytes,
+        last_activity,
+        is_dirty,
+        is_saved,
+        is_active,
+        is_finished,
+    })
 }
 
 /// The answer to "which thread owns this `thread-<8-hex>` directory?".
@@ -516,19 +831,13 @@ pub(crate) enum ShortThreadLookup {
 /// acting on the wrong thread, or than mistaking a database blip for proof that
 /// nobody owns the directory.
 pub(crate) async fn lookup_thread_by_short(pool: &sqlx::PgPool, short: &str) -> ShortThreadLookup {
-    // The id column is uuid; cast to text for the prefix LIKE. We match
-    // against `aggregate_id` (the canonical per-event thread id) instead
-    // of the legacy `thread_id` column to stay aligned with the rest of
-    // the codebase.
     let pattern = format!("{}%", short);
-    let rows: Vec<(Uuid,)> = match sqlx::query_as(
-        "SELECT DISTINCT aggregate_id::uuid FROM events \
-         WHERE aggregate = 'thread' AND aggregate_id LIKE $1 \
-         LIMIT 2",
-    )
-    .bind(pattern)
-    .fetch_all(pool)
-    .await
+    let rows: Vec<(Uuid,)> = match sqlx::query_as(SHORT_THREAD_LOOKUP_SQL)
+        .bind(pattern)
+        .bind(short)
+        .bind(prefix_upper_bound(short))
+        .fetch_all(pool)
+        .await
     {
         Ok(rows) => rows,
         Err(e) => {
@@ -554,6 +863,28 @@ pub(crate) async fn lookup_thread_by_short(pool: &sqlx::PgPool, short: &str) -> 
     }
 }
 
+/// Binds: the LIKE pattern, the short id, and [`prefix_upper_bound`] of it.
+///
+/// It matches on `aggregate_id`, the canonical per-event thread id, not the
+/// legacy `thread_id` column. The LIKE decides the match. The byte-order range
+/// beside it is what `idx_events_thread_aggregate_id_pattern` serves, even
+/// under a generic plan, where a bound LIKE pattern cannot use an index.
+pub(crate) const SHORT_THREAD_LOOKUP_SQL: &str = "SELECT DISTINCT aggregate_id::uuid FROM events \
+     WHERE aggregate = 'thread' AND aggregate_id LIKE $1 \
+       AND aggregate_id ~>=~ $2 AND aggregate_id ~<~ $3 \
+     LIMIT 2";
+
+/// The least string, in byte order, above every string that starts with
+/// `prefix`. `prefix` is lowercase hex, so bumping its last byte never
+/// overflows.
+pub(crate) fn prefix_upper_bound(prefix: &str) -> String {
+    let mut bytes = prefix.as_bytes().to_vec();
+    if let Some(last) = bytes.last_mut() {
+        *last += 1;
+    }
+    String::from_utf8(bytes).expect("a hex digit plus one is still ASCII")
+}
+
 /// Time since the most recent thread event, or `None` when no events exist
 /// (a stranded worktree) or the lookup fails. The cleanup worker treats
 /// `None` as "don't act" rather than guessing.
@@ -568,10 +899,9 @@ pub(crate) async fn lookup_thread_by_short(pool: &sqlx::PgPool, short: &str) -> 
 /// A negative age (the drift pointing the other way) clamps to zero, so a
 /// freshly-emitted event never reads as ancient.
 pub(crate) async fn last_activity_age(pool: &sqlx::PgPool, thread_id: Uuid) -> Option<Duration> {
-    let row: Option<(Option<i64>,)> = sqlx::query_as(
-        "SELECT EXTRACT(EPOCH FROM now() - MAX(created))::bigint FROM events \
-         WHERE aggregate = 'thread' AND aggregate_id = $1::text",
-    )
+    let row: Option<(Option<i64>,)> = sqlx::query_as(&format!(
+        "SELECT EXTRACT(EPOCH FROM now() - MAX(created))::bigint {THREAD_EVENT_CREATED_FENCED}"
+    ))
     .bind(thread_id)
     .fetch_optional(pool)
     .await
@@ -579,6 +909,17 @@ pub(crate) async fn last_activity_age(pool: &sqlx::PgPool, thread_id: Uuid) -> O
     let secs = row.and_then(|(opt,)| opt)?;
     Some(Duration::from_secs(secs.max(0) as u64))
 }
+
+/// The `FROM` clause both last-activity reads aggregate `MAX(created)` over.
+///
+/// `OFFSET 0` fences the subquery, so the planner reads the thread's rows
+/// through an index on `aggregate_id`. Unfenced, it answers
+/// `MAX(created)` by walking `idx_events_created` backwards and filtering,
+/// which reads millions of rows for a quiet thread. Keep `MAX(created)` rather
+/// than the newest row by `sequence`: a backfill writes old-dated rows late,
+/// and reading one as the newest would make a live thread look idle.
+pub(crate) const THREAD_EVENT_CREATED_FENCED: &str = "FROM (SELECT created FROM events \
+     WHERE aggregate = 'thread' AND aggregate_id = $1::text OFFSET 0) thread_events";
 
 pub(crate) async fn lookup_thread_summary(
     pool: &sqlx::PgPool,
@@ -601,10 +942,9 @@ pub(crate) async fn lookup_last_activity(
     pool: &sqlx::PgPool,
     thread_id: Uuid,
 ) -> Option<chrono::DateTime<Utc>> {
-    let row: Option<(Option<chrono::DateTime<Utc>>,)> = sqlx::query_as(
-        "SELECT MAX(created) FROM events \
-         WHERE aggregate = 'thread' AND aggregate_id = $1::text",
-    )
+    let row: Option<(Option<chrono::DateTime<Utc>>,)> = sqlx::query_as(&format!(
+        "SELECT MAX(created) {THREAD_EVENT_CREATED_FENCED}"
+    ))
     .bind(thread_id)
     .fetch_optional(pool)
     .await

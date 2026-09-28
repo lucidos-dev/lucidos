@@ -36,6 +36,10 @@
 #
 # One action per notice, at most. Two things to do is two notices, because
 # acting closes the modal and moves the reader on to the next one.
+#
+# Reuse an action_prompt verbatim when a notice asks for the same thing as an
+# earlier one. Among the notices a workspace owes, the modal draws a shared
+# action only on the last, so a reader who skipped releases runs it once.
 
 [[notice]]
 id = "run-a-workspace-audit"
@@ -94,6 +98,54 @@ still opens and simply stops remembering your settings. A workspace audit finds 
 every affected app and says what each one needs. Expect real changes rather \
 than renames, and a few that wait on us: an app reaching a corner of the API \
 the SDK does not cover yet has nothing to move onto.
+"""
+action_label = "Audit my workspace"
+action_prompt = "Audit my workspace for drift."
+
+[[notice]]
+id = "thread-summary-drops-coding-agent-applying"
+since = "0.40.2"
+title = "A thread field your apps could read was removed"
+body = """
+Thread summaries no longer carry `coding_agent_applying`. Lucidos never acted \
+on it, and it could stay `true` long after a merge had finished.
+
+An app, script or recipe that still reads it usually gets nothing back, with \
+no error to say so. A workspace audit finds any code that still reads it and \
+says what to do.
+"""
+action_label = "Audit my workspace"
+action_prompt = "Audit my workspace for drift."
+
+[[notice]]
+id = "cli-misrouted-looks-and-config"
+since = "0.40.2"
+title = "Some files you saved may be in the wrong folder"
+body = """
+`lucidos data write` used to file three folders under `artifacts/`: \
+`config/`, `auth-modules/` and `scripts/`. So an `apis.json` saved that way \
+never loaded, and a signer or script saved that way was never found. Nothing \
+said so.
+
+The command now writes each file where it belongs. A file saved before the \
+fix still sits under `artifacts/`, where nothing reads it. A workspace audit \
+finds any such file and says how to move it.
+"""
+action_label = "Audit my workspace"
+action_prompt = "Audit my workspace for drift."
+
+[[notice]]
+id = "spawn-thread-cc-model-removed"
+since = "0.40.2"
+title = "One old spawn flag was removed"
+body = """
+`lucidos spawn-thread` no longer accepts `--cc-model`. Use \
+`--coding-agent-model` instead, with the same value. The new name has been \
+documented since 0.39.2.
+
+A recipe, trigger or script that still passes the old flag will now fail with \
+an unknown-argument error instead of running. A workspace audit finds any \
+such call and says what to change.
 """
 action_label = "Audit my workspace"
 action_prompt = "Audit my workspace for drift."

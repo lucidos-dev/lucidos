@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en" translate="no" data-theme="dark">
+<html lang="en" translate="no" data-theme-mode="dark">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover, interactive-widget=resizes-visual">
@@ -41,8 +41,6 @@
     <link rel="apple-touch-startup-image" media="(device-width: 428px) and (device-height: 926px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" href="splash/splash-1284x2778.png">
     <link rel="apple-touch-startup-image" media="(device-width: 430px) and (device-height: 932px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" href="splash/splash-1290x2796.png">
     <link rel="apple-touch-startup-image" media="(device-width: 440px) and (device-height: 956px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" href="splash/splash-1320x2868.png">
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <!--
       PWA cold-start fast path (the load-bearing smoothness fix). When the picker
       (server-stamped <base href="/~/">) would auto-open the last workspace, do the
@@ -124,7 +122,7 @@
     <!-- lucidos:appearance-boot -->
     <script>
       (function() {
-        var t = document.documentElement.getAttribute('data-theme') || 'dark';
+        var t = document.documentElement.getAttribute('data-theme-mode') || 'dark';
         document.documentElement.style.colorScheme = t;
         var m = document.querySelector('meta[name="theme-color"]');
         if (m) m.setAttribute('content', t === 'light' ? '#ffffff' : '#07172e');
@@ -163,8 +161,9 @@
           reveal is skipped entirely: the mark just keeps standing, and there is
           no min-reveal to wait out.
 
-      STATUS LINE — constant size always (incl. when invisible) so the mark never
-      shifts, and a baked default ("Opening your workspace…") shown from first
+      STATUS LINE: hangs below the mark, out of flow, so no status change can
+      move the mark, and a change crossfades rather than snapping to the new
+      width. A baked default ("Opening your workspace…") shows from first
       paint. This SAME text is baked into both documents; the auto-open path does
       NOT override it, so the status is byte-identical across the picker→workspace
       reload — it neither vanishes ("message that disappears immediately") nor
@@ -207,8 +206,13 @@
         flex-direction: column;
         align-items: center;
         justify-content: center;
-        /* px, not rem: see the no-rem rule in the comment above. */
-        gap: 24px;
+        /* px, not rem: see the no-rem rule in the comment above. 240px is what
+           the old 15rem mark cap resolved to at a default 16px root. */
+        --boot-mark-size: min(46vmin, 240px);
+        --boot-splash-gap: 24px;
+        /* Only spaces anything when the foot is back in flow (see
+           .boot-splash-foot): normally the mark is the one in-flow child. */
+        gap: var(--boot-splash-gap);
         background: radial-gradient(125% 125% at 30% 22%, #2d83e0 0%, #0a4ea8 100%);
         /* Type for the whole splash, set once here so every line on either
            surface inherits it (the gateway adds an escape link; this document's
@@ -245,10 +249,8 @@
         pointer-events: none;
       }
       .boot-splash-mark {
-        /* px, not rem: see the no-rem rule in the comment above. 240px is what
-           the old 15rem cap resolved to at a default 16px root. */
-        width: min(46vmin, 240px);
-        height: min(46vmin, 240px);
+        width: var(--boot-mark-size);
+        height: var(--boot-mark-size);
         /* Reveal the WHOLE mark as one compositor layer (svg-root transform +
            opacity), then breathe. The previous reveal animated transform:scale on
            each SVG shape (.bs-tile/.bs-spark) — iOS WebKit does NOT GPU-composite
@@ -260,6 +262,30 @@
         transform-origin: center;
         animation: boot-mark-reveal calc(0.6s * var(--duration-scale, 1)) cubic-bezier(0.34, 1.56, 0.64, 1) both,
                    boot-mark-breathe 2.8s ease-in-out calc(1.3s * var(--duration-scale, 1)) infinite;
+      }
+      /* Everything under the mark: the status line and the escape link. It
+         hangs from the mark's bottom edge, out of flow, so the mark alone is
+         centred. A status that changes, wraps, or gains a link below it then
+         grows downward and can never move the mark. */
+      .boot-splash-foot {
+        position: absolute;
+        top: calc(50% + var(--boot-mark-size) / 2 + var(--boot-splash-gap));
+        left: 0;
+        right: 0;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: var(--boot-splash-gap);
+      }
+      /* Hung under the mark, the foot can run past the bottom edge, and a
+         fixed box never scrolls. Two cases re-centre the whole group instead.
+         A failure report runs to eight lines. A shown escape link is often the
+         only way out, so it must stay reachable. Both are failure states,
+         entered once. A short window is the third case. */
+      .boot-splash:has(.boot-splash-status-report) .boot-splash-foot,
+      .boot-splash:has(.boot-splash-escape:not([hidden])) .boot-splash-foot { position: static; }
+      @media (max-height: 520px) {
+        .boot-splash-foot { position: static; }
       }
       /* Picker (about to reload): hide the mark so the reveal happens ONLY in the
          workspace. Space is reserved (visibility, not display) so the status line
@@ -293,6 +319,8 @@
         background: var(--bg-primary, #07172e);
       }
       .boot-splash-quiet .boot-splash-mark { display: none; }
+      /* No mark to hang from, so the status takes the centre itself. */
+      .boot-splash-quiet .boot-splash-foot { position: static; }
       /* Both foregrounds on this splash are hardcoded white, which is right on
          the brand gradient and wrong on a quiet cover: in light theme
          --bg-primary is #ffffff, so the delayed status ("Connecting…",
@@ -300,15 +328,15 @@
          workspace", the ONLY way out of a stopped direct-port workspace) would
          both be white on white. That would make "quiet, but not silent"
          literally false for a light-theme user, at exactly the moment boot has
-         given up. Keyed on data-theme, which the FOUC script resolves before
+         given up. Keyed on data-theme-mode, which the FOUC script resolves before
          first paint, so it holds even when the bundle CSS never loads, which is
          precisely the case the escape link exists for. Values mirror
          --text-primary in styles/global/base.css; px/hex only, per the no-rem
          rule above. */
-      [data-theme="light"] .boot-splash-quiet .boot-splash-status {
+      [data-theme-mode="light"] .boot-splash-quiet .boot-splash-status {
         color: rgba(31, 35, 40, 0.82);
       }
-      [data-theme="light"] .boot-splash-quiet .boot-splash-escape { color: #1f2328; }
+      [data-theme-mode="light"] .boot-splash-quiet .boot-splash-escape { color: #1f2328; }
       /* Nothing branded to fade out, so the cover leaves faster than a launch
          splash does. Two-class specificity (0,2,0), which is what lets it beat
          the `animation` shorthand on .boot-splash-leaving below. The
@@ -321,10 +349,16 @@
            nothing else. */
         color: rgba(255, 255, 255, 0.82);
         /* Constant size, reserved identically whether the text is present,
-           empty, or invisible, so the mark above it never shifts. One line at
-           the inherited 1.4 line-height. */
+           empty, or invisible, so the escape link below it never shifts. One
+           line at the inherited 1.4 line-height. */
         height: 1.4em;
-        max-width: 80vw;
+        /* A fixed width, not one that shrinks to the words. When a shorter
+           label replaces a longer one, iOS WebKit leaves the old label's edges
+           painted where the box shrank. The two then read as one garbled line.
+           A box that never resizes repaints whole. */
+        width: 80vw;
+        text-align: center;
+        will-change: opacity;
         white-space: nowrap;
         overflow: hidden;
         text-overflow: ellipsis;
@@ -332,6 +366,15 @@
         transition: opacity calc(0.3s * var(--duration-scale, 1)) ease;
       }
       .boot-splash-status.boot-splash-status-shown { opacity: 1; }
+      /* A status CHANGE: fade the old words out, swap them while invisible,
+         and let the shown rule above fade the new ones in. A new label is a
+         new width, and an instant swap lurches the centred line sideways.
+         Both surfaces run it: src/utils/bootSplash.ts and the gateway page's
+         poller wait out this 0.15s before they swap. */
+      .boot-splash-status.boot-splash-status-swap {
+        opacity: 0;
+        transition-duration: calc(0.15s * var(--duration-scale, 1));
+      }
       /* A FAILURE REPORT, which is several lines rather than one: what went
          wrong, the reason the background service gave, and where to read more
          (desktop.rs `crash_loop_label`). The one-line rules above exist so the
@@ -355,7 +398,6 @@
            overflow, and this is the form every WebKit the gateway splash can
            land in already supports. */
         overflow-wrap: break-word;
-        text-align: center;
         text-overflow: clip;
       }
       /* The one action a splash can offer when boot cannot proceed: a link out.
@@ -469,14 +511,16 @@
         </g>
       </svg>
       <!-- lucidos-boot-splash-mark-end -->
-      <div class="boot-splash-status boot-splash-status-shown" role="status" aria-live="polite">Opening your workspace…</div>
-      <!-- The way out of a workspace this document cannot reach, revealed only
-           when boot has given up (see the watchdog below and
-           src/utils/bootSplash.ts). `hidden` until then, and it carries no href
-           until one is built, so a healthy boot has nothing here to see or tap.
-           Kept OUTSIDE the mark markers: the gateway splash lifts only the mark
-           and renders its own escape link. -->
-      <a class="boot-splash-escape" hidden></a>
+      <div class="boot-splash-foot">
+        <div class="boot-splash-status boot-splash-status-shown" role="status" aria-live="polite">Opening your workspace…</div>
+        <!-- The way out of a workspace this document cannot reach, revealed only
+             when boot has given up (see the watchdog below and
+             src/utils/bootSplash.ts). `hidden` until then, and it carries no href
+             until one is built, so a healthy boot has nothing here to see or tap.
+             Kept OUTSIDE the mark markers: the gateway splash lifts only the mark
+             and renders its own escape link. -->
+        <a class="boot-splash-escape" hidden></a>
+      </div>
     </div>
     <script>
       // Gateway-splash handover, before first paint. The gateway serves its own
@@ -655,12 +699,12 @@
           if (status) { status.textContent = ''; status.classList.remove('boot-splash-status-shown'); }
         }
         // The flat colour the FOUC script above already resolved for this theme.
-        // Recomputed from data-theme when that script could not run (a browser
+        // Recomputed from data-theme-mode when that script could not run (a browser
         // refusing localStorage throws out of it), so the canvas can never keep the
         // gradient while the cover on top of it is flat.
         var d = document.documentElement;
         var bg = d.style.getPropertyValue('--bg-primary') ||
-          (d.getAttribute('data-theme') === 'light' ? '#ffffff' : '#07172e');
+          (d.getAttribute('data-theme-mode') === 'light' ? '#ffffff' : '#07172e');
         d.style.background = bg;
         if (document.body) document.body.style.background = bg;
       })();

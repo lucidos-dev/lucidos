@@ -1,6 +1,8 @@
 use super::actor::build_message_origin;
 use super::*;
-use crate::engine::thread_events::{ActorMode, EventChannel, EventMeta, ThreadEvent};
+use crate::engine::thread_events::{
+    ActorMode, EventChannel, EventMeta, MessageOrigin, ThreadEvent,
+};
 use crate::engine::thread_lifecycle::ThreadType;
 use crate::engine::thread_state::ThreadState;
 use crate::engine::InjectedPrompt;
@@ -44,6 +46,24 @@ pub(crate) fn subprocess_chat_legitimate(
             target_matches_source || (parent_matches_source && !target_exists)
         }
     }
+}
+
+/// Does the subprocess gate run for this request?
+///
+/// A `caller_workspace` skips it only for an agent's create. `lucidos
+/// spawn-thread --relation top` sends that field even for this workspace, and
+/// the top-thread authority check covers that create. `validate_mode_and_spawn`
+/// refuses the field beside a parent, so every such create is a top-thread one.
+///
+/// The field is a body value anyone can send. So it must not buy a token holder
+/// an existing thread or `mode: human`. A call from another workspace holds no
+/// token this engine minted, so the gate never fires for it anyway.
+pub(crate) fn subprocess_gate_applies(
+    caller_workspace_present: bool,
+    target_exists: bool,
+    mode: ActorMode,
+) -> bool {
+    !(caller_workspace_present && !target_exists && mode != ActorMode::Human)
 }
 
 /// What the engine tells a caller that tried to record a turn as the user
@@ -92,12 +112,11 @@ pub(crate) fn human_mode_is_attributed(
 }
 
 /// Resolve the device evidence for `request` and refuse a `mode: human` claim
-/// that has none. Called by BOTH chat entry points before any other work, so a
-/// refusal writes nothing.
+/// that has none. `chat_submit` calls it before any other work, so a refusal
+/// writes nothing.
 ///
-/// The device id precedence mirrors `actor::user_actor_resolved`: the body
-/// field wins, then the `x-lucidos-device-id` header. The two must agree or the
-/// gate would accept a shape the origin builder then stamps differently.
+/// The device id comes from `actor::claimed_device_id`, which the origin
+/// builder reads too.
 ///
 /// A database error counts as attributed. The probe sits on the user's own send
 /// path, so failing closed would refuse real messages.
@@ -111,26 +130,7 @@ async fn require_human_mode_is_attributed(
     if request.mode != ActorMode::Human {
         return Ok(());
     }
-    // Blank-filter EACH source BEFORE falling back, not the winner afterwards.
-    // `Some("")` is a present-but-empty body field and `Option::or` keeps it.
-    // Filtering after the fallback would let an empty `device_id` shadow a good
-    // `x-lucidos-device-id` header and refuse a device-attributed request.
-    // A nested `fn`, not a closure: it borrows from its argument, keeping both
-    // sources `&str`.
-    fn blank_filtered(s: &str) -> Option<&str> {
-        let t = s.trim();
-        (!t.is_empty()).then_some(t)
-    }
-    let device_id = request
-        .device_id
-        .as_deref()
-        .and_then(blank_filtered)
-        .or_else(|| {
-            headers
-                .get(super::actor::HEADER_DEVICE_ID)
-                .and_then(|v| v.to_str().ok())
-                .and_then(blank_filtered)
-        });
+    let device_id = super::actor::claimed_device_id(request.device_id.as_deref(), headers);
     let device_attributed = match device_id {
         Some(id) => match crate::core::DeviceStore::is_registered(pool, id).await {
             Ok(exists) => exists,
@@ -163,6 +163,30 @@ async fn require_human_mode_is_attributed(
         StatusCode::FORBIDDEN,
         HUMAN_MODE_UNATTRIBUTED,
     ))
+}
+
+/// Refuse a body `mode` that the request's credential contradicts.
+///
+/// `make_message_received` treats an origin whose mode differs from the
+/// request's as a broken invariant and panics. So the mismatch must stop here
+/// as a 400, before anything is written. A subprocess token claiming
+/// `mode: engine` is the known shape: its origin is always an agent's.
+pub(crate) fn origin_agrees_with_mode(
+    origin: Option<&MessageOrigin>,
+    mode: ActorMode,
+) -> Result<(), ApiError> {
+    match origin {
+        Some(origin) if origin.mode() != mode => Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "mode \"{}\" does not match this request's credential, which identifies \
+                 the sender as \"{}\". Send the mode your credential carries.",
+                mode.as_str(),
+                origin.mode().as_str()
+            ),
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// What the engine tells a caller that addressed a `thread_id` naming nothing.
@@ -645,7 +669,7 @@ async fn remove_queued_message(
         return Err(StatusCode::CONFLICT);
     }
 
-    let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    let actor = super::actor::user_actor(&headers, None);
     state
         .engine
         .event_bus
@@ -753,11 +777,9 @@ pub(super) async fn chat_submit(
         }
     }
 
-    // Subprocess gate — see `subprocess_chat_legitimate` for the matrix.
-    // Skipped on the cross-workspace path: those requests have their own
-    // origin contract (Workspace variant) and don't route through the
-    // per-engine subprocess token channel.
-    if request.caller_workspace.is_none() {
+    // Subprocess gate: see `subprocess_chat_legitimate` for the matrix, and
+    // `subprocess_gate_applies` for when `caller_workspace` skips it.
+    if subprocess_gate_applies(request.caller_workspace.is_some(), thread_exists, mode) {
         if let crate::api::actor::SubprocessOrigin::Subprocess {
             source_thread_id, ..
         } = crate::api::actor::subprocess_origin(&headers)
@@ -787,9 +809,9 @@ pub(super) async fn chat_submit(
     // the tree reaches it: only the owner's standing instruction does (ADR 0168
     // clauses 1 and 4).
     //
-    // Outside the `caller_workspace` guard above, deliberately. `lucidos
-    // spawn-thread --relation top` sends that field even for THIS workspace, so
-    // a gate inside it would miss every same-workspace top-thread spawn. A call
+    // Outside the subprocess gate above, deliberately. `lucidos spawn-thread
+    // --relation top` sends `caller_workspace` even for THIS workspace, and that
+    // create skips the subprocess gate, so only this check sees it. A call
     // from another workspace's engine holds no token this engine minted, so it
     // is unaffected and keeps vouching for its own human.
     if !thread_exists && parent_thread_id.is_none() {
@@ -828,41 +850,27 @@ pub(super) async fn chat_submit(
     let model = request.model.clone();
     let reasoning_effort = request.reasoning_effort.clone();
     let provider = request.provider.clone();
-    let device_id = request.device_id.clone();
+    let device_id =
+        super::actor::claimed_device_id(request.device_id.as_deref(), &headers).map(str::to_string);
 
-    // A cross-workspace caller takes precedence over `device_id` in
-    // `build_message_origin`, so skip the device-name lookup when one is
-    // present. The lookups are otherwise independent, so run them concurrently.
-    let workspace_caller_present = request.caller_workspace.is_some();
-    let device_lookup = async {
-        match device_id.as_deref() {
-            Some(did) if !workspace_caller_present => {
-                crate::core::DeviceStore::display_name(state.engine.pool(), did).await
-            }
-            _ => None,
-        }
-    };
     // Parent title is best-effort display metadata stamped onto the new thread's
     // origin — a transient DB error shouldn't fail the user's send.
-    let parent_lookup = async {
-        match parent_thread_id {
-            Some(ptid) => state
-                .engine
-                .event_store()
-                .get_thread_title(ptid)
-                .await
-                .unwrap_or_else(|e| {
-                    log!(
-                        "[Chat] Failed to load parent thread title for {}: {}",
-                        ptid,
-                        e
-                    );
-                    None
-                }),
-            None => None,
-        }
+    let parent_thread_title = match parent_thread_id {
+        Some(ptid) => state
+            .engine
+            .event_store()
+            .get_thread_title(ptid)
+            .await
+            .unwrap_or_else(|e| {
+                log!(
+                    "[Chat] Failed to load parent thread title for {}: {}",
+                    ptid,
+                    e
+                );
+                None
+            }),
+        None => None,
     };
-    let (device_label, parent_thread_title) = tokio::join!(device_lookup, parent_lookup);
 
     let caller =
         request
@@ -881,12 +889,12 @@ pub(super) async fn chat_submit(
         &headers,
         mode,
         device_id.as_deref(),
-        device_label,
         parent_thread_id,
         parent_thread_title,
         spawning_event_id,
         caller,
     );
+    origin_agrees_with_mode(origin.as_ref(), mode)?;
 
     let app_ctx = request.app_context;
     let file_ctx = resolve_file_ctx(
@@ -1485,7 +1493,7 @@ pub(super) async fn cancel_chat(
     // cancel-thread call, and the settle fallback. It stamps
     // `ResponseCanceled.actor` / `ResponseAborted.actor`, so the timeline
     // records which device clicked Stop.
-    let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    let actor = super::actor::user_actor(&headers, None);
     // Resolve any pending question card before firing the cancel token.
     // Otherwise the chat agent's `ask_user_question` tool stays blocked on
     // `walk_question_batch.recv()`, which has no cancel-aware select, and the

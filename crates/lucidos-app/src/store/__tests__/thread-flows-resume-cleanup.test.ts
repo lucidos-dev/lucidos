@@ -810,7 +810,7 @@ describe('coding-agent turn with no terminator must not read Working forever', (
 describe('an abort boundary must not read Working while the engine is down', () => {
   const now = Date.now();
   const t = (offset: number) => new Date(now + offset).toISOString();
-  const device = { kind: 'device', device_id: 'd1', label: 'My MacBook' } as const;
+  const device = { kind: 'device', device_id: 'd1' } as const;
 
   /** The reproduced teardown: a turn in flight, the boundary abort, then the
    *  dying subprocess's last two events landing under it.

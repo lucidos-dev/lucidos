@@ -29,6 +29,7 @@ use crate::core::plugin_marketplaces::{
 };
 use crate::core::plugins::PLUGIN_ARCHIVE_EXT;
 use crate::engine::thread_events::FormRequestOutcome;
+use crate::engine::thread_lifecycle::ThreadStatus;
 use crate::engine::tools::plugins::marketplaces::MarketplaceWriteError;
 use crate::engine::tools::plugins::{
     cancel_pending_install, cancel_pending_uninstall, confirm_pending_install,
@@ -36,6 +37,7 @@ use crate::engine::tools::plugins::{
     stage_install_request, stage_uninstall_request, LocalChangeReport,
     PLUGIN_INSTALL_REQUEST_PREFIX, PLUGIN_UNINSTALL_REQUEST_PREFIX,
 };
+use crate::scheduler::plugin_updates::ScanCause;
 
 /// Plugin archives are mostly text bundles; cap well below the router-wide
 /// `DefaultBodyLimit` that `api/mod.rs` layers over the merged API router. The
@@ -202,7 +204,7 @@ pub(super) async fn add_marketplace_handler(
     headers: HeaderMap,
     Json(body): Json<AddMarketplaceRequest>,
 ) -> Result<Json<AddMarketplaceResponse>, (StatusCode, Json<JsonValue>)> {
-    let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    let actor = super::actor::user_actor(&headers, None);
     let registration = state
         .engine
         .register_plugin_marketplace(&body.source, body.name.as_deref(), actor)
@@ -228,7 +230,7 @@ pub(super) async fn remove_marketplace_handler(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<RemoveMarketplaceResponse>, (StatusCode, Json<JsonValue>)> {
-    let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    let actor = super::actor::user_actor(&headers, None);
     let removal = state
         .engine
         .unregister_plugin_marketplace(&id, actor)
@@ -292,7 +294,7 @@ pub(super) async fn catalog(
 
     let due = plugin_catalog_cache::needs_rescan(&cached, now);
     if due {
-        spawn_rescan(&state);
+        spawn_rescan(&state, ScanCause::Routine);
     }
     // A scan this request just queued counts as running. Otherwise a cold
     // workspace answers "nothing cached, nothing scanning", which the panel
@@ -315,11 +317,11 @@ pub(super) async fn catalog(
 
 /// `POST /api/v1/plugins/catalog/rescan`, the panel's manual refresh.
 ///
-/// Returns as soon as the scan is queued. A scan already running absorbs the
-/// request through the same single-flight guard the scheduler uses, so leaning
-/// on the button cannot stack clone passes.
+/// Returns as soon as the scan is queued. A scan already running goes round
+/// once more after it, so the answer is a scan that started after the request.
+/// The claim is a single flag, so leaning on the button queues one pass at most.
 pub(super) async fn rescan_catalog(State(state): State<AppState>) -> Json<JsonValue> {
-    spawn_rescan(&state);
+    spawn_rescan(&state, ScanCause::Requested);
     Json(serde_json::json!({ "queued": true }))
 }
 
@@ -327,17 +329,13 @@ pub(super) async fn rescan_catalog(State(state): State<AppState>) -> Json<JsonVa
 ///
 /// The cache is stamped BEFORE the spawn, so this request and the next one both
 /// already know a scan is under way. See `note_scan_queued`.
-fn spawn_rescan(state: &AppState) {
+fn spawn_rescan(state: &AppState, cause: ScanCause) {
     crate::scheduler::plugin_updates::note_scan_queued(&state.workspace_path);
     let engine = state.engine.clone();
     let pool = state.pool.clone();
     tokio::spawn(async move {
-        crate::scheduler::plugin_updates::run_plugin_marketplace_update_check(
-            engine,
-            pool,
-            crate::scheduler::plugin_updates::ScanCause::Routine,
-        )
-        .await;
+        crate::scheduler::plugin_updates::run_plugin_marketplace_update_check(engine, pool, cause)
+            .await;
     });
 }
 
@@ -365,8 +363,11 @@ pub(super) async fn installed(
 /// `waiting_for_user_answer` (the two `ThreadStatus` values that mean the setup
 /// agent is still mid-turn or blocked on the user). Pure, so the boundary is
 /// unit-testable.
-fn setup_status_is_complete(status: &str) -> bool {
-    !matches!(status, "running" | "waiting_for_user_answer")
+fn setup_status_is_complete(status: ThreadStatus) -> bool {
+    !matches!(
+        status,
+        ThreadStatus::Running | ThreadStatus::WaitingForUserAnswer
+    )
 }
 
 /// Resolve a setup thread's completion for the Plugins panel card from the two
@@ -381,7 +382,7 @@ fn setup_status_is_complete(status: &str) -> bool {
 ///   of a "Setup" button that 404s on click.
 ///
 /// Pure, so the present/pending/gone boundaries are unit-testable.
-fn resolve_setup_complete(summary_status: Option<&str>, in_queue: bool) -> bool {
+fn resolve_setup_complete(summary_status: Option<ThreadStatus>, in_queue: bool) -> bool {
     match summary_status {
         Some(status) => setup_status_is_complete(status),
         None => !in_queue,
@@ -406,9 +407,9 @@ async fn mark_setup_complete(pool: &sqlx::PgPool, catalog: &mut MarketplaceCatal
     if ids.is_empty() {
         return;
     }
-    let status_by_id: std::collections::HashMap<Uuid, String> = match sqlx::query_as::<
+    let status_by_id: std::collections::HashMap<Uuid, ThreadStatus> = match sqlx::query_as::<
         _,
-        (Uuid, String),
+        (Uuid, ThreadStatus),
     >(
         "SELECT thread_id, status FROM thread_summaries WHERE thread_id = ANY($1)",
     )
@@ -448,7 +449,7 @@ async fn mark_setup_complete(pool: &sqlx::PgPool, catalog: &mut MarketplaceCatal
         {
             let in_queue = queue_lookup_failed || queued_ids.contains(&tid);
             plugin.setup_complete =
-                resolve_setup_complete(status_by_id.get(&tid).map(String::as_str), in_queue);
+                resolve_setup_complete(status_by_id.get(&tid).copied(), in_queue);
         }
     }
 }
@@ -672,7 +673,7 @@ pub(super) async fn confirm_install(
     Query(query): Query<ConfirmInstallQuery>,
 ) -> Result<Json<ConfirmInstallResponse>, (StatusCode, Json<JsonValue>)> {
     prune_uploads_older_than(&uploads_root(&state.workspace_path), UPLOAD_TTL).await;
-    let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    let actor = super::actor::user_actor(&headers, None);
     let result = confirm_pending_install(
         &state.engine,
         &install_id,
@@ -711,7 +712,7 @@ pub(super) async fn cancel_install(
     Path(install_id): Path<String>,
 ) -> Result<Json<JsonValue>, (StatusCode, Json<JsonValue>)> {
     prune_uploads_older_than(&uploads_root(&state.workspace_path), UPLOAD_TTL).await;
-    let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    let actor = super::actor::user_actor(&headers, None);
     let result = cancel_pending_install(&state.engine, &install_id, actor.clone()).await;
     settle_plugin_request(
         &state,
@@ -744,7 +745,7 @@ pub(super) async fn confirm_uninstall(
     headers: HeaderMap,
     Path(uninstall_id): Path<String>,
 ) -> Result<Json<ConfirmUninstallResponse>, (StatusCode, Json<JsonValue>)> {
-    let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    let actor = super::actor::user_actor(&headers, None);
     let result = confirm_pending_uninstall(&state.engine, &uninstall_id, actor.clone()).await;
     settle_plugin_request(
         &state,
@@ -772,7 +773,7 @@ pub(super) async fn cancel_uninstall(
     headers: HeaderMap,
     Path(uninstall_id): Path<String>,
 ) -> Result<Json<JsonValue>, (StatusCode, Json<JsonValue>)> {
-    let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    let actor = super::actor::user_actor(&headers, None);
     let result = cancel_pending_uninstall(&state.engine, &uninstall_id, actor.clone()).await;
     settle_plugin_request(
         &state,
@@ -804,7 +805,7 @@ pub(super) async fn propose_upstream(
     if id.is_empty() {
         return Err(err(StatusCode::BAD_REQUEST, "id is required"));
     }
-    let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    let actor = super::actor::user_actor(&headers, None);
     match propose_local_patch_upstream(&state.engine, id, actor).await {
         Ok(outcome) => Ok(Json(ProposeUpstreamResponse {
             patch_path: outcome.patch_path,
@@ -856,6 +857,7 @@ mod tests {
     use crate::core::plugin_marketplaces::{
         MarketplaceCatalog, MarketplacePlugin, MarketplacePluginStatus,
     };
+    use crate::engine::thread_lifecycle::ThreadStatus;
     use crate::test_support::{setup_test_db, teardown_test_db};
     use uuid::Uuid;
 
@@ -896,13 +898,15 @@ mod tests {
 
     #[test]
     fn setup_complete_only_when_not_running_or_waiting() {
-        // The two `ThreadStatus` strings that mean the setup agent is still
-        // mid-turn or blocked on the user → not done.
-        assert!(!setup_status_is_complete("running"));
-        assert!(!setup_status_is_complete("waiting_for_user_answer"));
-        // The settled `ThreadStatus` values → done (button flips to Open).
-        assert!(setup_status_is_complete("idle"));
-        assert!(setup_status_is_complete("failed"));
+        // The two statuses that mean the setup agent is still mid-turn or
+        // blocked on the user → not done.
+        assert!(!setup_status_is_complete(ThreadStatus::Running));
+        assert!(!setup_status_is_complete(
+            ThreadStatus::WaitingForUserAnswer
+        ));
+        // The settled statuses → done (button flips to Open).
+        assert!(setup_status_is_complete(ThreadStatus::Idle));
+        assert!(setup_status_is_complete(ThreadStatus::Failed));
     }
 
     fn installed_plugin_with_setup_thread(tid: Uuid) -> MarketplacePlugin {
@@ -983,12 +987,12 @@ mod tests {
     #[test]
     fn resolve_setup_complete_present_pending_gone() {
         // Present → lifecycle status decides.
-        assert!(!resolve_setup_complete(Some("running"), false));
+        assert!(!resolve_setup_complete(Some(ThreadStatus::Running), false));
         assert!(!resolve_setup_complete(
-            Some("waiting_for_user_answer"),
+            Some(ThreadStatus::WaitingForUserAnswer),
             false
         ));
-        assert!(resolve_setup_complete(Some("idle"), false));
+        assert!(resolve_setup_complete(Some(ThreadStatus::Idle), false));
         // Absent but queued → still pending (card keeps Setup, no flicker).
         assert!(!resolve_setup_complete(None, true));
         // Absent and not queued → gone → complete (card falls through to Open).

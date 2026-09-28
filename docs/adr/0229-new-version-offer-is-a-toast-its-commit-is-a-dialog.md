@@ -56,6 +56,11 @@ quotes the button back to the user when a switch interrupts a turn. Renaming it
 to *Update* would have moved three surfaces and a sentence in the transcript,
 for a word.
 
+**Amended: the button now reads *Switch*.** The user asked for the shorter
+label. The toast and the confirm's title both say *New version available*, so
+the verb alone is enough. The canonical term is unchanged. The glossary and the
+explainer moved with the label, as the last alternative below asks.
+
 ## Consequences
 
 - Taking the offer costs one more tap than it did. That tap buys the list, and

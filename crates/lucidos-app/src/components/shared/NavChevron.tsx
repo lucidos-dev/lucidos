@@ -98,7 +98,7 @@ export function NavChevron({
         anchor={anchor}
         backdrop={false}
         portal
-        panelClass="dropdown-menu nav-history-menu"
+        panelClass="surface-box dropdown-menu nav-history-menu"
         panelRef={menuRef}
         panelStyle={anchor && pos
           ? { position: 'fixed', top: `${pos.top}px`, left: `${pos.left}px` }

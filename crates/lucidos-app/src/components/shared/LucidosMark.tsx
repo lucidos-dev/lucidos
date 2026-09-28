@@ -12,6 +12,8 @@ import { useId } from 'preact/hooks';
 //     4th tile), authored in a 0..100 grid, solid white.
 //   - gradient: radial azure→cobalt, light source upper-left. CSS equivalent
 //     `radial-gradient(125% 125% at 30% 22%, #2d83e0 0%, #0a4ea8 100%)`.
+//   - colours: a theme retunes them through the `--lucidos-mark-*` tokens. The
+//     brand values below are each token's default and its var() fallback.
 //   - the mark fills ~78% of the square canvas, centered (SCALE_FULLBLEED — the
 //     unmasked / lightly-masked regime; this inline glyph is never platform-
 //     masked, so it tracks the full-bleed app-icon scale, not the maskable one);
@@ -21,6 +23,7 @@ import { useId } from 'preact/hooks';
 const MARK_SCALE = 0.78; // SCALE_FULLBLEED — mark fraction of the canvas
 const TILE_RADIUS = 22; // FAVICON_SVG_RADIUS * 100 — rounded-rect bg corner
 const GRAD = { cx: 30, cy: 22, r: 125, from: '#2d83e0', to: '#0a4ea8' };
+const GLYPH_FILL = '#ffffff';
 // translate offset that centers the scaled mark grid inside the 0..100 viewBox.
 const OFFSET = (100 - 100 * MARK_SCALE) / 2; // 11
 // Spark path (cubic beziers), verbatim from the generator's SPARK_D.
@@ -75,8 +78,8 @@ export function LucidosMark({
           cy={GRAD.cy}
           r={GRAD.r}
         >
-          <stop offset="0" stop-color={GRAD.from} />
-          <stop offset="1" stop-color={GRAD.to} />
+          <stop offset="0" stop-color={`var(--lucidos-mark-bg-top, ${GRAD.from})`} />
+          <stop offset="1" stop-color={`var(--lucidos-mark-bg-bottom, ${GRAD.to})`} />
         </radialGradient>
       </defs>
       {background && (
@@ -90,7 +93,12 @@ export function LucidosMark({
           fill={`url(#${gradId})`}
         />
       )}
-      <g transform={`translate(${OFFSET} ${OFFSET}) scale(${MARK_SCALE})`} fill="#ffffff">
+      {/* A presentation attribute, so an author rule still repaints the glyph
+          (the thread filter paints it `currentColor`). */}
+      <g
+        transform={`translate(${OFFSET} ${OFFSET}) scale(${MARK_SCALE})`}
+        fill={`var(--lucidos-mark-fg, ${GLYPH_FILL})`}
+      >
         <rect class="lmk-tile lmk-tile-1" x="17" y="17" width="29" height="29" rx="7" />
         <rect class="lmk-tile lmk-tile-2" x="17" y="54" width="29" height="29" rx="7" />
         <rect class="lmk-tile lmk-tile-3" x="54" y="54" width="29" height="29" rx="7" />

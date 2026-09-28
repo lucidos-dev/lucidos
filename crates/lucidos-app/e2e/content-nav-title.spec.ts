@@ -2,9 +2,9 @@ import { test, expect, type Page } from './fixtures';
 import { assertHealthy, navigateToApp, openTriggersPanel, clickVisibleElement, isMobileViewport } from './helpers';
 
 // A content-pane navigation fades its view in from behind the navigation cover,
-// and the header title arrives with it: a fresh element keyed on the same view
-// key, fading in on the same curve from the same frame. The drawer's
-// Threads/Filters swap does the same (threads-header-filter-transitions.spec).
+// while the header title switches word at once, with no fade of its own. The
+// drawer's Threads/Filters swap dips instead
+// (threads-header-filter-transitions.spec).
 // Unsuffixed, so it runs on desktop Chromium, phone Chromium and iPhone WebKit.
 
 /** The slider's slowest position: 0.1x, so --duration-normal lasts 2s. */
@@ -37,7 +37,7 @@ async function navigateAndSample(page: Page, label: string): Promise<{ frames: F
     item.click();
     await new Promise(r => requestAnimationFrame(r));
     const anims = document.getAnimations().filter((a): a is CSSAnimation =>
-      a instanceof CSSAnimation && (a.animationName === 'nav-cover-clear' || a.animationName === 'nav-arrive'));
+      a instanceof CSSAnimation && a.animationName === 'nav-cover-clear');
     await Promise.all(anims.map(a => a.ready));
     const starts = anims.map(a => a.startTime as number);
     const frames = [read()];
@@ -53,7 +53,7 @@ async function navigateAndSample(page: Page, label: string): Promise<{ frames: F
 test.describe('a content-pane navigation', () => {
   test.beforeEach(async ({ page }) => { await assertHealthy(page); });
 
-  test('the title arrives with the view, on the cover\'s curve', async ({ page }) => {
+  test('the view fades in while the title switches at once', async ({ page }) => {
     await page.addInitScript((pos) => localStorage.setItem('lucidos-animation-speed-slider', pos), SLOWEST);
     await navigateToApp(page);
     await openTriggersPanel(page);
@@ -62,18 +62,14 @@ test.describe('a content-pane navigation', () => {
     const { frames, starts } = await navigateAndSample(page, 'Files');
     const mid = (v: number) => v > 0.05 && v < 0.95;
 
-    expect(starts.length, 'the cover and the title did not both animate').toBeGreaterThanOrEqual(2);
-    expect(Math.max(...starts) - Math.min(...starts), 'the title and the cover started apart').toBeLessThan(1);
+    expect(starts.length, 'the view did not fade').toBe(1);
     expect(frames[0].veil, 'the swap frame was not covered').toBeGreaterThan(0.9);
-    expect(frames.filter(f => mid(f.opacity)).length, 'the title never faded in').toBeGreaterThan(5);
+    expect(frames.filter(f => mid(f.veil)).length, 'the view never faded in').toBeGreaterThan(5);
     for (const [i, f] of frames.entries()) {
       expect(f.text, `frame ${i}: the title lagged the view`).toBe('Files');
-      if (f.veil >= 0) {
-        expect(Math.abs(f.opacity - (1 - f.veil)), `frame ${i}: the title and the view drifted apart`).toBeLessThan(0.15);
-      }
+      expect(f.opacity, `frame ${i}: the title faded`).toBe(1);
     }
     expect(frames.at(-1)!.veil, 'the cover outlived its fuse').toBe(-1);
-    expect(frames.at(-1)!.opacity).toBe(1);
   });
 
   test('with motion reduced the title shows at once', async ({ page }) => {

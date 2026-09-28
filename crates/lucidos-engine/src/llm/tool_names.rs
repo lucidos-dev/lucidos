@@ -128,14 +128,15 @@ pub const QUERY_EVENTS: &str = "query_events";
 pub const COUNT_EVENTS: &str = "count_events";
 pub const LIST_EVENT_TYPES: &str = "list_event_types";
 
-// Thread reads, plus moving a child to top level: the grouped `threads` tool
-// (list/count/search/detach_child) from the capability parity manifest; the flat names below stay as
-// back-compat aliases. (Spawning is the standalone run_thread/run_coding_agent.)
+// Thread reads, moving a child to top level, and archiving: the grouped
+// `threads` tool (list/count/search/detach_child/archive) from the capability
+// parity manifest; the flat names below stay as back-compat aliases. (Spawning is the standalone run_thread/run_coding_agent.)
 pub const THREADS: &str = "threads";
 pub const LIST_THREADS: &str = "list_threads";
 pub const COUNT_THREADS: &str = "count_threads";
 pub const SEARCH_THREADS: &str = "search_threads";
 pub const DETACH_CHILD_THREAD: &str = "detach_child_thread";
+pub const ARCHIVE_THREAD: &str = "archive_thread";
 
 // Changes (pending coding-agent-proposed changes) — grouped `changes` tool
 // (list/apply) from the capability parity manifest; flat names below are aliases.
@@ -175,11 +176,6 @@ pub const NAVIGATE_UI: &str = "navigate_ui";
 pub const ASK_USER_QUESTION: &str = "ask_user_question";
 /// Subscribe to an event and be re-opened as a new turn when it arrives. Returns
 /// immediately and does not end the turn. See `engine::event_wait` and ADR 0047.
-///
-/// One thing outside the tool layer keys on this name and cannot import it from
-/// a tool module without a cycle: the boot sweep
-/// `event_wait::settle_legacy_attached_event_waits`, which closes the unpaired
-/// `await_event` calls left by the pre-2026-08-06 shape.
 pub const AWAIT_EVENT: &str = "await_event";
 /// Read the calling thread's own live subscriptions. The answer to "is that
 /// watch still armed?", which the agent previously had no way to get right.

@@ -3,19 +3,20 @@ import { test, expect, type Page } from './fixtures';
 import { assertHealthy, navigateToApp, openThreadDrawer, isMobileViewport } from './helpers';
 import { clearAllThreads, psql, seedThreadRow } from './db-helpers';
 
-// The threads Filter's fades. The Threads/Filters swap moves like a page
-// navigation: the leaving view goes at once, the shared navigation cover clears
-// off the arriving one, and the pane title arrives on the same curve. The
-// Filter button's glyph and badge are button feedback, on --duration-fast.
+// The threads Filter's fades. The Threads/Filters swap dips through the pane
+// background: the navigation cover rises over the leaving view, holds while the
+// views swap, and clears off the arriving one. The pane title switches word at
+// once, with no fade. The Filter button's glyph and badge are button feedback,
+// on --duration-fast.
 // Unsuffixed, so it runs on desktop Chromium, phone Chromium and iPhone WebKit.
 //
 // Most tests slow every animation tenfold through the Animation speed slider,
 // so each fade spans about 90 to 120 frames and a sampled frame lands mid-fade.
 
-/** The slider's slowest position: 0.1x, so --duration-normal lasts 2s. */
+/** The slider's slowest position: 0.1x, so --duration-slow lasts 3s. */
 const SLOWEST = '-10';
-/** A slowed arrival, plus its fuse and room for the frame it lands on. */
-const SLOW_FADE_MS = 2_900;
+/** A slowed dip, plus its fuse and room for the frame it lands on. */
+const SLOW_FADE_MS = 3_600;
 
 interface Frame {
   /** The navigation cover's opacity, or -1 once it has unmounted. */
@@ -127,7 +128,7 @@ test.describe('Threads Filter fades', () => {
 
   test.afterEach(() => clearAllThreads());
 
-  test('each swap fades the arriving view in from behind the cover, both ways', async ({ page }) => {
+  test('each swap dips through the background, both ways', async ({ page }) => {
     await open(page);
     const { opening, closing } = await page.evaluate(async (ms) => {
       const fx = (window as unknown as { __fx: any }).__fx;
@@ -138,58 +139,69 @@ test.describe('Threads Filter fades', () => {
       return { opening, closing };
     }, SLOW_FADE_MS) as { opening: Frame[]; closing: Frame[] };
 
-    const arrives = (frames: Frame[], phase: string, word: string) => {
-      // The veil starts opaque, clears steadily, then unmounts on its fuse.
-      expect(frames[0].veil, `${phase}: the swap frame was not covered`).toBeGreaterThan(0.9);
-      expect(frames.filter(f => mid(f.veil)).length, `${phase}: the view never faded in`).toBeGreaterThan(5);
-      for (let i = 1; i < frames.length; i++) {
-        if (frames[i].veil < 0) continue;
-        expect(frames[i].veil, `${phase} frame ${i}: the veil went backwards`).toBeLessThanOrEqual(frames[i - 1].veil + 0.01);
-      }
-      expect(frames.at(-1)!.veil, `${phase}: the veil outlived its fuse`).toBe(-1);
-      // The title's new word arrives with it, on the same curve.
+    const dips = (frames: Frame[], phase: string, leaving: 'threads' | 'filters') => {
+      const arriving = leaving === 'threads' ? 'filters' : 'threads';
+      const shows = (f: Frame) => (f.listVisible ? 'threads' : f.panelVisible ? 'filters' : 'none');
       for (const [i, f] of frames.entries()) {
-        expect(f.titleText, `${phase} frame ${i}: the title lagged the view`).toBe(word);
-        expect(Math.abs(f.titleOpacity - (1 - Math.max(f.veil, 0))), `${phase} frame ${i}: the title and the view drifted apart`)
-          .toBeLessThan(0.15);
+        expect(f.listVisible && f.panelVisible, `${phase} frame ${i}: rows and options drawn together`).toBe(false);
       }
-      expect(frames.at(-1)!.titleOpacity).toBe(1);
+      // It starts over the leaving view, from transparent.
+      expect(shows(frames[0]), `${phase}: the leaving view went before the dip`).toBe(leaving);
+      expect(frames[0].veil, `${phase}: the cover started opaque`).toBeLessThan(0.2);
+      // One swap, and it lands under an opaque cover.
+      const swap = frames.findIndex(f => shows(f) === arriving);
+      expect(swap, `${phase}: the arriving view never showed`).toBeGreaterThan(0);
+      expect(frames.slice(swap).every(f => shows(f) === arriving), `${phase}: the views swapped back`).toBe(true);
+      expect(frames[swap - 1].veil, `${phase}: the leaving view went under a thin cover`).toBeGreaterThan(0.9);
+      expect(frames[swap].veil, `${phase}: the arriving view showed under a thin cover`).toBeGreaterThan(0.9);
+      // The cover rises steadily, then falls steadily, then unmounts.
+      const rising = frames.slice(0, swap);
+      const falling = frames.slice(swap).filter(f => f.veil >= 0);
+      expect(rising.filter(f => mid(f.veil)).length, `${phase}: the leaving view never faded out`).toBeGreaterThan(5);
+      expect(falling.filter(f => mid(f.veil)).length, `${phase}: the arriving view never faded in`).toBeGreaterThan(5);
+      for (let i = 1; i < rising.length; i++) {
+        expect(rising[i].veil, `${phase} frame ${i}: the cover fell before the swap`).toBeGreaterThanOrEqual(rising[i - 1].veil - 0.01);
+      }
+      for (let i = 1; i < falling.length; i++) {
+        expect(falling[i].veil, `${phase} frame ${swap + i}: the cover rose after the swap`).toBeLessThanOrEqual(falling[i - 1].veil + 0.01);
+      }
+      expect(frames.at(-1)!.veil, `${phase}: the cover outlived its fuse`).toBe(-1);
+      // The title does not fade: it says the arriving view from the first frame.
+      const word = arriving === 'threads' ? 'Threads' : 'Filters';
+      for (const [i, f] of frames.entries()) {
+        expect(f.titleText, `${phase} frame ${i}: the title lagged the tap`).toBe(word);
+        expect(f.titleOpacity, `${phase} frame ${i}: the title faded`).toBe(1);
+      }
     };
 
-    // Open: the list goes at once, and the options show under the veil.
-    for (const [i, f] of opening.entries()) {
-      expect(f.listVisible, `open frame ${i}: the list shows under options`).toBe(false);
-      expect(f.panelVisible, `open frame ${i}: the options are not up`).toBe(true);
-    }
-    arrives(opening, 'open', 'Filters');
-
-    // Close: the options go at once, and the list shows under the veil.
-    for (const [i, f] of closing.entries()) {
-      expect(f.coverVisible, `close frame ${i}: the options show over the list`).toBe(false);
-      expect(f.listVisible, `close frame ${i}: the list is not there to fade in`).toBe(true);
-    }
-    arrives(closing, 'close', 'Threads');
+    dips(opening, 'open', 'threads');
+    dips(closing, 'close', 'filters');
     // Kept mounted, so the next open costs no render.
     expect(closing.at(-1)!.panel, 'the panel was unmounted').toBe(true);
   });
 
-  test('a swap during a fade restarts from the opaque cover, with no remount', async ({ page }) => {
+  test('a swap during a dip restarts the dip, with no remount', async ({ page }) => {
     await open(page);
     const result = await page.evaluate(async () => {
       const fx = (window as unknown as { __fx: any }).__fx;
       fx.toggle();
       const panel = fx.cover().querySelector('.thread-filter-panel');
-      await fx.until((f: Frame) => f.veil >= 0 && f.veil < 0.6);
-      const at = fx.read().veil;
+      const first = fx.veil();
+      await fx.until((f: Frame) => f.veil > 0.4 && f.listVisible);
       fx.toggle();
       await new Promise(r => requestAnimationFrame(r));
-      return { at, after: fx.read(), samePanel: fx.cover().querySelector('.thread-filter-panel') === panel };
-    }) as { at: number; after: Frame; samePanel: boolean };
+      const after = fx.read();
+      const restarted = fx.veil() !== first;
+      const settled = await fx.until((f: Frame) => f.veil === -1);
+      return { after, restarted, settled, end: fx.read(), samePanel: fx.cover().querySelector('.thread-filter-panel') === panel };
+    }) as { after: Frame; restarted: boolean; settled: boolean; end: Frame; samePanel: boolean };
 
-    expect(result.at, 'the swap missed the fade').toBeGreaterThan(0.2);
-    expect(result.after.veil, 'the new swap inherited the old fade').toBeGreaterThan(0.9);
-    expect(result.after.listVisible).toBe(true);
-    expect(result.after.titleText).toBe('Threads');
+    expect(result.restarted, 'the new swap reused the old cover').toBe(true);
+    expect(result.after.veil, 'the new dip did not start from its beginning').toBeLessThan(0.2);
+    expect(result.after.panelVisible, 'the reversed panel showed').toBe(false);
+    expect(result.settled).toBe(true);
+    expect(result.end.listVisible).toBe(true);
+    expect(result.end.titleText).toBe('Threads');
     expect(result.samePanel, 'the swap remounted the panel').toBe(true);
   });
 
@@ -200,12 +212,13 @@ test.describe('Threads Filter fades', () => {
       fx.toggle();
       await fx.until((f: Frame) => f.veil === -1);
       fx.toggle();
-      await new Promise(r => requestAnimationFrame(r));
+      // Mid-dip, while the leaving panel is still on screen.
+      await fx.until((f: Frame) => f.veil > 0.3);
       const cover = fx.cover() as HTMLElement;
       const box = cover.getBoundingClientRect();
       const hit = document.elementFromPoint(box.left + box.width / 2, box.top + box.height / 2);
       return {
-        stillFading: fx.read().veil > 0.5,
+        stillFading: fx.read().panelVisible,
         inert: cover.inert,
         hitInside: !!hit && cover.contains(hit),
         hitVeil: !!hit && hit === fx.veil(),
@@ -217,6 +230,22 @@ test.describe('Threads Filter fades', () => {
     expect(result.hitInside, 'a pointer still lands on the leaving panel').toBe(false);
     expect(result.hitVeil, 'the veil takes the pointer').toBe(false);
     expect(result.focusInside).toBe(false);
+  });
+
+  test('the leaving list takes no tap, while the list still pans', async ({ page }) => {
+    await open(page);
+    const result = await page.evaluate(async () => {
+      const fx = (window as unknown as { __fx: any }).__fx;
+      fx.toggle();
+      // Mid-dip, while the leaving list is still on screen.
+      await fx.until((f: Frame) => f.veil > 0.3 && f.listVisible);
+      const list = fx.cover().parentElement.querySelector('.thread-drawer-list') as HTMLElement;
+      const box = list.getBoundingClientRect();
+      const hit = document.elementFromPoint(box.left + box.width / 2, box.top + box.height / 2);
+      return { onScreen: fx.read().listVisible, hitRow: !!hit && hit !== list && list.contains(hit) };
+    });
+    expect(result.onScreen, 'the check missed the dip').toBe(true);
+    expect(result.hitRow, 'a pointer still lands on a leaving row').toBe(false);
   });
 
   test('the glyph crossfades on a type filter, a status pick, and back', async ({ page }) => {
@@ -245,7 +274,7 @@ test.describe('Threads Filter fades', () => {
     // A status pick closes the panel: glyph, title and view all move together.
     frames = await run('Review');
     expect(crossfaded(frames, 'all', 'review'), 'funnel to status did not fade').toBe(true);
-    expect(frames.some(f => f.titleText === 'Threads' && mid(f.titleOpacity)), 'the title did not arrive').toBe(true);
+    expect(frames.every(f => f.titleText === 'Threads' && f.titleOpacity === 1), 'the title did not switch at once').toBe(true);
     settledOn(frames, 'review');
 
     await run('toggle');
@@ -313,7 +342,7 @@ test.describe('Threads Filter fades', () => {
     expect(g.badgeCy).toBeLessThan(g.glyphCy);
   });
 
-  test('the cover, the title and the button fades start in the same frame', async ({ page }) => {
+  test('the cover and the button fades start in the same frame, and the title never animates', async ({ page }) => {
     await open(page);
     const starts = await page.evaluate(async () => {
       const fx = (window as unknown as { __fx: any }).__fx;
@@ -325,14 +354,17 @@ test.describe('Threads Filter fades', () => {
         const anims = document.getAnimations().filter((a) => {
           const target = (a.effect as KeyframeEffect).target as Node;
           if (!scope.some(s => s.contains(target))) return false;
-          if (a instanceof CSSAnimation) return a.animationName === 'nav-cover-clear' || a.animationName === 'nav-arrive';
+          if (a instanceof CSSAnimation) return a.animationName === 'nav-cover-dip';
           return a instanceof CSSTransition && a.transitionProperty === 'opacity';
         });
         await Promise.all(anims.map(a => a.ready));
-        return anims.map(a => ({
-          what: a instanceof CSSAnimation ? a.animationName : ((a.effect as KeyframeEffect).target as HTMLElement).className,
-          start: a.startTime as number,
-        }));
+        return anims.map(a => {
+          const target = (a.effect as KeyframeEffect).target as HTMLElement;
+          return {
+            what: a instanceof CSSAnimation ? a.animationName : fx.title().contains(target) ? 'title' : target.className,
+            start: a.startTime as number,
+          };
+        });
       };
       fx.toggle();
       const opening = await collect();
@@ -344,8 +376,8 @@ test.describe('Threads Filter fades', () => {
 
     for (const [phase, list] of Object.entries(starts)) {
       const names = list.map(a => a.what).join(' | ');
-      expect(names, `${phase}: the view did not fade`).toContain('nav-cover-clear');
-      expect(names, `${phase}: the title did not arrive`).toContain('nav-arrive');
+      expect(names, `${phase}: the view did not dip`).toContain('nav-cover-dip');
+      expect(names, `${phase}: the title animated`).not.toContain('title');
       const times = list.map(a => a.start);
       expect(Math.max(...times) - Math.min(...times), `${phase}: fades started apart (${names})`)
         .toBeLessThan(1);
@@ -357,23 +389,21 @@ test.describe('Threads Filter fades', () => {
     await open(page, { slow: false });
     const result = await page.evaluate(async () => {
       const fx = (window as unknown as { __fx: any }).__fx;
-      const seconds = (el: Element | null) => Math.max(
-        ...getComputedStyle(el!).transitionDuration.split(',').map(s => parseFloat(s)),
-      );
+      const seconds = (el: Element | null, of: 'transitionDuration' | 'transitionDelay' = 'transitionDuration') =>
+        Math.max(...getComputedStyle(el!)[of].split(',').map(s => parseFloat(s)));
       fx.toggle();
       await new Promise(r => requestAnimationFrame(r));
       await new Promise(r => requestAnimationFrame(r));
       const opened = fx.read();
       const button = fx.button() as HTMLElement;
       const durations = {
+        // The swap is a 0s transition, so its delay is what reduced motion drops.
+        swap: seconds(fx.cover(), 'transitionDelay'),
         glyph: seconds(button.querySelector('.filter-glyph .crossfade-layer')),
         wrapper: seconds(button.querySelector('.filter-glyph')),
         badge: seconds(button.querySelector('.badge')),
       };
-      const animated = {
-        veil: fx.veil() ? getComputedStyle(fx.veil()).animationName : 'none',
-        title: getComputedStyle(fx.title()).animationName,
-      };
+      const animated = fx.veil() ? getComputedStyle(fx.veil()).animationName : 'none';
       fx.toggle();
       await new Promise(r => requestAnimationFrame(r));
       await new Promise(r => requestAnimationFrame(r));
@@ -381,16 +411,16 @@ test.describe('Threads Filter fades', () => {
     });
     expect(result.opened.veil, 'the veil is drawn under reduced motion').toBeLessThanOrEqual(0);
     expect(result.opened.titleText).toBe('Filters');
-    expect(result.opened.titleOpacity).toBe(1);
     expect(result.opened.panelVisible).toBe(true);
+    expect(result.opened.listVisible).toBe(false);
     for (const [what, s] of Object.entries(result.durations)) {
       expect(s, `${what} still animates under reduced motion`).toBeLessThan(0.001);
     }
-    expect(result.animated).toEqual({ veil: 'none', title: 'none' });
+    expect(result.animated).toBe('none');
     expect(result.closed.coverVisible).toBe(false);
+    expect(result.closed.listVisible).toBe(true);
     expect(result.closed.veil).toBeLessThanOrEqual(0);
     expect(result.closed.titleText).toBe('Threads');
-    expect(result.closed.titleOpacity).toBe(1);
   });
 
   test('a panel restored open by a reload shows at once, with no fade', async ({ page }) => {
@@ -402,7 +432,7 @@ test.describe('Threads Filter fades', () => {
       const fx = (window as unknown as { __fx: any }).__fx;
       const cover = fx?.cover();
       if (!cover?.hasAttribute('data-open')) return null;
-      return { veil: !!fx.veil(), title: fx.title()?.getAnimations().length ?? -1, text: fx.title()?.textContent };
+      return { veil: !!fx.veil(), title: fx.title()?.getAnimations({ subtree: true }).length ?? -1, text: fx.read().titleText };
     }, undefined, { timeout: 15_000, polling: 'raf' });
     expect(await boot.jsonValue()).toEqual({ veil: false, title: 0, text: 'Filters' });
     await page.evaluate(() => (window as unknown as { __fx: any }).__fx.toggle());

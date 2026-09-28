@@ -23,7 +23,6 @@ export function StoppedChildNotice({ meta }: { meta: ThreadMeta }) {
     <div class="stopped-child-notice" data-role="stopped-child-notice">
       {eventRowBody({
         kind: 'child',
-        mark: 'pending',
         state: 'stopped',
         role: 'stopped-child-notice-row',
         subject: (
@@ -32,7 +31,7 @@ export function StoppedChildNotice({ meta }: { meta: ThreadMeta }) {
             {threadLink(meta.parentThreadId, meta.parentThreadTitle)}
           </>
         ),
-        stateLabel: 'waiting for you',
+        stateLabel: 'Waiting for you',
         tone: 'halted',
         facts: [
           { kind: 'text', text: STOPPED_CHILD_CONTINUE },

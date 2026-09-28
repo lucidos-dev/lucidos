@@ -566,9 +566,9 @@ fn test_describe_grouped_tools_by_action() {
     assert_eq!(
         describe_tool(
             "preferences",
-            &serde_json::json!({ "action": "set", "key": "theme" })
+            &serde_json::json!({ "action": "set", "key": "theme-mode" })
         ),
-        "Updating theme setting..."
+        "Updating theme-mode setting..."
     );
     assert_eq!(
         describe_tool("preferences", &serde_json::json!({ "action": "get" })),

@@ -109,7 +109,7 @@ pub async fn remove_repository(
     axum::extract::Path(id): axum::extract::Path<Uuid>,
     headers: HeaderMap,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let actor = crate::api::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    let actor = crate::api::actor::user_actor(&headers, None);
     match RepositoryStore::unregister(&state.pool, &state.engine.event_bus, id, actor).await {
         Ok(true) => Ok(StatusCode::NO_CONTENT),
         Ok(false) => Err((StatusCode::NOT_FOUND, "Repository not found".to_string())),
@@ -206,16 +206,9 @@ async fn git_show_file(repo_root: &std::path::Path, git_ref: &str, path: &str) -
     }
 
     let object = format!("{git_ref}:{path}");
-    let output = match tokio::process::Command::new("git")
-        .args(["show", &object])
-        .current_dir(repo_root)
-        .output()
-        .await
-    {
+    let output = match crate::engine::git_ops::git_cmd(&["show", &object], repo_root).await {
         Ok(o) => o,
-        Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, format!("git error: {e}")).into_response()
-        }
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
 
     if !output.status.success() {

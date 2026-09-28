@@ -1956,7 +1956,6 @@ async fn seed_thread(bus: &EventBus, thread_id: Uuid) {
             text: "start the work".into(),
             user_image_hashes: vec![],
             device_id: None,
-            device: None,
             image_description: None,
             parent_thread_id: None,
             spawning_event_id: None,
@@ -2317,7 +2316,6 @@ fn an_agent_message() -> ThreadEvent {
         text: "[CHILD THREAD COMPLETED]".into(),
         user_image_hashes: vec![],
         device_id: None,
-        device: None,
         image_description: None,
         parent_thread_id: None,
         spawning_event_id: None,
@@ -2473,8 +2471,8 @@ async fn recent_subscriptions_skips_waits_another_thread_ended() {
 }
 
 /// The loop the cap still exists for: a thread woken by its own events, or by
-/// an event nobody can attribute. The `emit_event` tool writes domain events
-/// with no actor, so "unknown" must never read as "someone else".
+/// an event nobody can attribute to a thread. The `emit_event` tool's actor
+/// names no thread, so "unknown" must never read as "someone else".
 #[tokio::test]
 async fn recent_subscriptions_counts_self_wakes_unattributed_wakes_and_timeouts() {
     let (pool, db_name) = setup_test_db().await;
@@ -2487,7 +2485,13 @@ async fn recent_subscriptions_counts_self_wakes_unattributed_wakes_and_timeouts(
     let own = seed_thread_event(&bus, waiter, an_agent_message()).await;
     subscribe_and_deliver(&bus, waiter, own).await;
 
-    let anonymous = emit_domain_event(&bus, None).await;
+    let anonymous = emit_domain_event(
+        &bus,
+        Some(MessageOrigin::Agent {
+            agent: crate::engine::thread_events::AgentParticipant::LucidosAgent,
+        }),
+    )
+    .await;
     subscribe_and_deliver(&bus, waiter, anonymous).await;
 
     let own_script = emit_domain_event(
@@ -2560,7 +2564,6 @@ async fn recent_subscriptions_resets_on_a_human_answer_only() {
         "toolu_human",
         MessageOrigin::Device {
             device_id: "test-device".into(),
-            label: "Test Device".into(),
         },
     ))
     .await

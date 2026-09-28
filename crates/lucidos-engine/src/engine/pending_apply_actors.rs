@@ -64,10 +64,9 @@ impl PendingApplyActors {
 mod tests {
     use super::*;
 
-    fn device(id: &str, label: &str) -> MessageOrigin {
+    fn device(id: &str) -> MessageOrigin {
         MessageOrigin::Device {
             device_id: id.into(),
-            label: label.into(),
         }
     }
 
@@ -75,7 +74,7 @@ mod tests {
     fn stash_then_take_round_trips_the_actor() {
         let store = PendingApplyActors::default();
         let id = Uuid::new_v4();
-        let actor = device("iphone-1", "iOS Safari PWA");
+        let actor = device("iphone-1");
 
         store.stash(id, actor.clone());
 
@@ -86,7 +85,7 @@ mod tests {
     fn take_is_one_shot() {
         let store = PendingApplyActors::default();
         let id = Uuid::new_v4();
-        store.stash(id, device("d", "l"));
+        store.stash(id, device("d"));
 
         assert!(store.take(id).is_some());
         assert!(
@@ -109,8 +108,8 @@ mod tests {
         // eventually fires must see B (the active intent), not A.
         let store = PendingApplyActors::default();
         let id = Uuid::new_v4();
-        store.stash(id, device("phone", "Phone"));
-        store.stash(id, device("laptop", "Laptop"));
+        store.stash(id, device("phone"));
+        store.stash(id, device("laptop"));
 
         match store.take(id) {
             Some(MessageOrigin::Device { device_id, .. }) => assert_eq!(device_id, "laptop"),
@@ -123,8 +122,8 @@ mod tests {
         let store = PendingApplyActors::default();
         let a = Uuid::new_v4();
         let b = Uuid::new_v4();
-        store.stash(a, device("a-id", "A"));
-        store.stash(b, device("b-id", "B"));
+        store.stash(a, device("a-id"));
+        store.stash(b, device("b-id"));
 
         match store.take(a) {
             Some(MessageOrigin::Device { device_id, .. }) => assert_eq!(device_id, "a-id"),

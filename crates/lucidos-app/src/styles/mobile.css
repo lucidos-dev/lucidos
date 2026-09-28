@@ -84,9 +84,8 @@
     left: 0;
     right: 0;
     bottom: 0;
-    background: rgba(0, 0, 0, 0.5);
+    background: var(--scrim);
     z-index: 200;
-    -webkit-tap-highlight-color: transparent;
 }
 
 .drawer {
@@ -194,7 +193,6 @@
     min-height: 2.75rem;
     display: flex;
     align-items: center;
-    -webkit-tap-highlight-color: transparent;
 }
 
 @media (hover: hover) {
@@ -217,7 +215,7 @@
     color: var(--text-on-accent);
     font-size: var(--font-size-xs);
     font-weight: 600;
-    border-radius: 0.5625rem;
+    border-radius: calc(var(--radius-control) * 1.125);
     /* The design height, which styles/badges.css rounds to whole pixels. */
     --badge-height: 1.25rem;
     min-width: var(--badge-box, var(--badge-height));
@@ -307,7 +305,7 @@
 
     /* Rounder textarea corners to match phone screen rounding */
     .prompt-box {
-        border-radius: 1.5rem;
+        border-radius: calc(var(--radius-surface) * 2);
     }
 
     /* List rows — stack vertically so actions don't cramp text. */
@@ -438,6 +436,15 @@
     .toast {
         max-width: 100%;
     }
+
+    /* Two or more buttons share the actions row, so the first starts on the
+       icon's left edge and the last ends under the close X. A wrapped button
+       fills its own row. A lone button keeps its natural width at the right,
+       as on desktop. The one-line toast keeps its action beside the words, so
+       it is excluded. */
+    .toast:not(.toast-inline) .toast-actions > .action-btn:not(:only-child) {
+        flex: 1 1 auto;
+    }
 }
 
 
@@ -470,6 +477,25 @@
         flex-direction: column;
         align-items: stretch;
         height: auto;
+    }
+
+    /* Content scrolling up dissolves into the page before it reaches the bar.
+       The right inset keeps a classic scrollbar out of the fade. */
+    .app-header::after {
+        content: '';
+        position: absolute;
+        left: 0;
+        right: var(--scrollbar-gutter-width);
+        top: 100%;
+        height: var(--mobile-header-fade);
+        background: linear-gradient(to bottom, var(--bg-primary), transparent);
+        pointer-events: none;
+    }
+
+    /* A thread's sticky title bar sits under the header and carries its own
+       fade (.mobile-thread-title-row::after), so this one would only shade it. */
+    .app-header[data-mobile-view="thread"]::after {
+        display: none;
     }
 
     /* Show the right mobile header section based on current view */
@@ -582,6 +608,64 @@
     .mobile-header-row .icon-btn.header-icon {
         width: var(--mobile-header-icon-box);
         height: var(--mobile-header-icon-box);
+    }
+
+    /* A panel refresh (MobileRefreshIndicator), in the leading slot the edge
+       reserve holds. A status, not a target. The spinner and the check share
+       one cell and crossfade once the spinner's minimum hold has run. Each
+       glyph fades itself: a fade on the slot as well would multiply with the
+       check's and blink it out. */
+    .mobile-refresh-indicator {
+        display: inline-grid;
+        place-items: center;
+        flex-shrink: 0;
+        width: var(--mobile-header-icon-box);
+        height: var(--mobile-header-icon-box);
+        color: var(--header-fg-muted);
+        pointer-events: none;
+    }
+
+    /* The spinner shrinks away as the check grows into its place. `scale`
+       rather than `transform`, which the spin animation owns. */
+    .mobile-refresh-indicator svg {
+        grid-area: 1 / 1;
+        width: var(--icon-size-lg);
+        height: var(--icon-size-lg);
+        transition: opacity var(--duration-slow) ease, scale var(--duration-slow) ease;
+    }
+
+    /* The spin is an activity indicator, so it keeps a literal duration. It
+       runs through the crossfade to the check, since stopping would snap the
+       arrow upright mid-fade. It stops at rest, where a hidden spin still
+       costs frames. */
+    .mobile-refresh-indicator:not([data-state="idle"]) svg:not(.refresh-check) {
+        animation: spin 1s linear infinite;
+    }
+
+    :root[data-motion="reduce"] .mobile-refresh-indicator:not([data-state="idle"]) svg:not(.refresh-check) {
+        animation: none;
+    }
+
+    /* The arrow shows only while refreshing. Keyed on `done` alone, it would
+       fade back in over the check as the indicator leaves. */
+    .mobile-refresh-indicator:not([data-state="refreshing"]) svg:not(.refresh-check) {
+        opacity: 0;
+        scale: 0.6;
+    }
+
+    /* The check grows in, then fades out at full size. Its `scale` resets
+       only once it is invisible, so the exit reads as a fade. */
+    .mobile-refresh-indicator .refresh-check {
+        color: var(--header-fg);
+        opacity: 0;
+        scale: 0.6;
+        transition: opacity var(--duration-emphasis) ease-in-out, scale 0s var(--duration-emphasis);
+    }
+
+    .mobile-refresh-indicator[data-state="done"] .refresh-check {
+        opacity: 1;
+        scale: 1;
+        transition: opacity var(--duration-slow) ease, scale var(--duration-slow) ease;
     }
 
     /* Title-bar copy/pin: height matches the title text (~1.14rem) so the
@@ -751,7 +835,6 @@
         background: var(--bg-secondary);
         -webkit-user-select: none;
         user-select: none;
-        -webkit-tap-highlight-color: transparent;
         flex-shrink: 0;
         position: sticky;
         /* Tracks the header's bottom edge via CSS vars from useHideOnScroll.
@@ -1001,6 +1084,12 @@
         height: calc(var(--mobile-header-height, calc(2.75rem + env(safe-area-inset-top, 0px))) + var(--anchor-subpixel, 0px));
     }
 
+    /* The pull arrow drops from under the overlaid header, where the pane's
+       spacer above ends, not from behind the header. */
+    .mobile-swipe-pane .content-pane {
+        --pull-refresh-top: var(--app-header-bottom);
+    }
+
     /* The inline form (trigger/credential/app/plugin editors) sits INSIDE the
        .content-pane-body scroll container, which already carries the ::before
        header spacer above. Its desktop `height: 100%` + own `overflow-y: auto`
@@ -1199,7 +1288,7 @@
             right: 0;
             height: 100%;
             transform-origin: 0 0;
-            border-radius: 0.125rem;
+            border-radius: calc(var(--radius-control) * 0.25);
             /* Weight lives in the COLOUR, not in `opacity`, which is reserved as
                the fade channel the hook drives. A solid --text-muted bar reads
                loud against the transcript for something the eye should only
@@ -1230,7 +1319,7 @@
            show through during a swipe — iOS Safari renders iframes in their
            own compositor layers that don't always honor an ancestor's
            overflow:hidden during transforms. */
-        background: var(--bg-primary);
+        background-color: var(--bg-primary);
         /* Establish a stacking context per pane so z-indexes inside one
            pane (sticky title bar, prompt area, edge-swipe zones) cannot
            paint above a sibling pane during transition. */
@@ -1366,7 +1455,7 @@
             var(--mobile-header-height, calc(2.75rem + env(safe-area-inset-top, 0px))),
             env(safe-area-inset-top, 0px)
         );
-        padding-top: 0.5rem;
+        padding-top: var(--header-surface-gap);
     }
 }
 
@@ -1427,13 +1516,12 @@
         pointer-events: auto;
         width: var(--mobile-dot-size);
         height: var(--mobile-dot-size);
-        border-radius: 50%;
+        border-radius: var(--radius-round);
         border: none;
         padding: 0;
         background: var(--header-fg-muted, var(--text-muted));
         opacity: 0.3;
         cursor: pointer;
-        -webkit-tap-highlight-color: transparent;
         /* The active dot "blooms on like a light": on activate the dot ITSELF
            swaps muted→fill, gains the glow, and brightens, so all three
            properties transition together (0.33s ease-out) to make the body + soft

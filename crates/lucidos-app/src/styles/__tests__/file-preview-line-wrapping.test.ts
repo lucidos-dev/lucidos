@@ -157,11 +157,11 @@ describe('the surface the gutter paints', () => {
     expect(base[0].props.get('--code-surface')).toBe('var(--bg-primary)');
   });
 
-  // The modal is a --bg-secondary panel, so the default would paint a band in
-  // the wrong grey. Declared on the same element, one step more specific, so
-  // source order cannot decide it.
+  // The modal is a `.surface` on --surface-bg, not the content pane's fill, so
+  // the default would paint a band in the wrong colour. Declared on the same
+  // element, one step more specific, so source order cannot decide it.
   it('follows the preview modal onto its own panel colour', () => {
     const inModal = ruleWith(COMPONENTS, 'line-numbered', 'file-preview-modal');
-    expect(inModal.props.get('--code-surface')).toBe('var(--bg-secondary)');
+    expect(inModal.props.get('--code-surface')).toBe('var(--surface-bg)');
   });
 });

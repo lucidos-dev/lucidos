@@ -40,10 +40,25 @@ function releaseOverlayInert(): void {
 // anchor inherits the inert and re-activating it can't fire its own handler (the
 // click would route through the outside-dismiss path, and Playwright/a careful
 // user can't land on it at all). Returns the cleanup that unmarks the same node.
+//
+// Counted per node, because two overlays can share one anchor: the Lucidos menu
+// and a job's detail popover both hang from the mark, and a menu row closes one
+// as it opens the other. The mark stays until the last of them lets go.
+const anchorMarks = new WeakMap<HTMLElement, number>();
+
 function markAnchorInteractive(anchor: HTMLElement | null): () => void {
   if (!anchor) return () => {};
+  anchorMarks.set(anchor, (anchorMarks.get(anchor) ?? 0) + 1);
   anchor.setAttribute('data-overlay-anchor', '');
-  return () => anchor.removeAttribute('data-overlay-anchor');
+  return () => {
+    const left = (anchorMarks.get(anchor) ?? 1) - 1;
+    if (left > 0) {
+      anchorMarks.set(anchor, left);
+      return;
+    }
+    anchorMarks.delete(anchor);
+    anchor.removeAttribute('data-overlay-anchor');
+  };
 }
 
 export interface OverlayProps {

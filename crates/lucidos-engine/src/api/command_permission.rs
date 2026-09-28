@@ -34,7 +34,7 @@ pub(super) async fn submit_command_consent(
     headers: HeaderMap,
     Json(body): Json<CommandConsentRequest>,
 ) -> impl IntoResponse {
-    let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    let actor = super::actor::user_actor(&headers, None);
     let answered = resolve_command_permission(
         &state.engine,
         body.request_id,

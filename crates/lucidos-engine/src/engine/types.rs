@@ -623,8 +623,6 @@ pub struct AgentSession {
     /// The turn reached its boundary. Only the run loop writes it, because the
     /// loop keeps a local copy in step (`only_the_run_loop_writes_the_session_phase`).
     pub is_waiting: bool,
-    pub has_changes: bool,
-    pub requires_restart: bool,
     /// Reason the most recent `stop_agent` call fired, or `None` when the
     /// session has never been stopped (or the stop signal came from the
     /// engine-shutdown direct-notify path, which sets `shutting_down` instead).
@@ -675,8 +673,9 @@ pub struct AgentSession {
     /// restarts.
     pub redirect_followup_pending: bool,
     /// Generic stop signal for the run_session loop. Fired by `stop_agent` for
-    /// every user-driven termination (Cancel, Apply, Discard, Archive) and by
-    /// the engine shutdown timeout. The stop arm reads `pending_stop` and
+    /// every user-driven termination (Cancel, Apply, Discard, Archive). The
+    /// engine shutdown sweep fires it directly: at once for a thread parked on a
+    /// question, otherwise after its interrupt timeout. The stop arm reads `pending_stop` and
     /// `shutting_down` to decide what (if anything) to emit — only a real
     /// `UserStop` on an actively-working CC produces `ResponseCanceled`.
     pub stop: std::sync::Arc<tokio::sync::Notify>,
@@ -708,8 +707,8 @@ pub struct AgentSession {
     /// unrelated turn on the same thread would otherwise refuse every Apply for
     /// the length of that turn.
     pub conflict: Option<ConflictBinding>,
-    /// Set to true when the CC process exits. Checked by `apply_now_inner`
-    /// after waking from `idle_notify` to detect CC death vs normal idle.
+    /// Set to true when the run loop decides the subprocess exits. Read through
+    /// [`Self::is_live`]; `wait_for_idle` asks that only when its timeout fires.
     pub process_exited: bool,
     /// Path to the worktree this Claude Code session is working in.
     pub worktree_path: Option<std::path::PathBuf>,
@@ -717,9 +716,9 @@ pub struct AgentSession {
     pub branch_name: Option<String>,
     /// Root of the repo (for git operations during apply).
     pub repo_root: Option<std::path::PathBuf>,
-    /// Claude Code's session ID (from the "system" init event).
-    /// Used for `--resume` on follow-ups and engine restart.
-    pub cc_session_id: Option<String>,
+    /// The backend's session ID, from its init event. Claude Code and Codex
+    /// both write it. Used for `--resume` on follow-ups and engine restart.
+    pub backend_session_id: Option<String>,
     /// Epoch millis of the last event received from this Claude Code session.
     /// Used by `apply_now` for liveness-based timeout instead of fixed wall-clock.
     pub last_event_at: std::sync::Arc<std::sync::atomic::AtomicI64>,
@@ -775,8 +774,8 @@ pub struct AgentSession {
     pub skill_commands: Vec<String>,
     /// Current model reported by CC (from the system init event's `model` field).
     pub current_model: Option<String>,
-    /// Current reasoning effort level (low/medium/high).
-    /// Not reported in CC's init event — only set via control request.
+    /// Current reasoning effort level (low/medium/high). Seeded at spawn and
+    /// updated by a control request, because CC's init event does not report it.
     pub current_reasoning_effort: Option<String>,
     /// Set by `answer_pending_question` when a user answers an `AskUserQuestion`
     /// on a *live* subprocess (CC continues its turn in-place once the blocked
@@ -889,8 +888,6 @@ impl AgentSession {
         Self {
             msg_tx,
             is_waiting: true,
-            has_changes: false,
-            requires_restart: false,
             pending_stop: None,
             cancel_actor: None,
             redirect_followup: false,
@@ -904,7 +901,7 @@ impl AgentSession {
             worktree_path: None,
             branch_name: None,
             repo_root: None,
-            cc_session_id: None,
+            backend_session_id: None,
             shutting_down: Arc::new(AtomicBool::new(false)),
             external_terminal_emitted: Arc::new(AtomicBool::new(false)),
             external_continuation_requested: Arc::new(AtomicBool::new(false)),

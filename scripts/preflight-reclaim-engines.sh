@@ -28,10 +28,6 @@
 #   LUCIDOS_RECLAIM_DEADLINE_S  cap on the whole watch (default 59)
 #   LUCIDOS_RECLAIM_POLL_S      seconds between scans (default 2)
 #
-# LUCIDOS_RECLAIM_SETTLE_S is RETIRED. Its 10s was shorter than a respawn, which
-# is the bug the watch replaced, so setting it now prints a note and changes
-# nothing.
-#
 # Exit status: 0 when every reclaimable engine is down afterwards. 1 when one
 # survived or came back, when one could not be aimed at, or when stop.sh failed.
 # A reclaim that cannot show what it freed must not look like success.

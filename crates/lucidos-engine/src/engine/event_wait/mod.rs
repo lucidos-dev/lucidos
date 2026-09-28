@@ -538,8 +538,6 @@ pub async fn arming_lookback_matches(
     })
 }
 
-use crate::llm::tool_names::AWAIT_EVENT;
-
 /// The one thing a *delivery* has to say beyond the payload.
 ///
 /// Delivery is the only resolution that CONSUMES the subscription, and it was
@@ -907,9 +905,8 @@ pub const DEADLINE_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::fr
 /// re-driving it would double-run a turn.
 ///
 /// A legacy attached delivery anchored on the paired `ToolResult` instead, and
-/// is deliberately NOT selected. `settle_legacy_attached_event_waits` closes
-/// that shape out once, so an old-world re-entry is settled rather than
-/// re-driven into a turn with no slot for it. Discarded threads are skipped
+/// is deliberately NOT selected: an old-world re-entry has no slot in a turn to
+/// be re-driven into. Discarded threads are skipped
 /// too: reviving a thread the user threw away, to read an event it no longer
 /// cares about, is the archive-curtain problem in another costume.
 pub async fn lost_wait_reentries(
@@ -1003,65 +1000,6 @@ pub async fn wait_delivery_names_any(
             );
             false
         }
-    }
-}
-
-/// One-off boot sweep for threads caught mid-**attached** wait by the upgrade
-/// that removed that shape (ADR 0049).
-///
-/// Such a thread has an `await_event` `ToolCalled` with no `ToolResult`, which
-/// is a provider 400 on its very next turn. Closing the pair is all that is
-/// owed. `rebuild_live_waits` re-arms any unresolved wait as an ordinary
-/// subscription, and any resolved one has its payload sitting in the events the
-/// thread will read anyway.
-///
-/// Returns the threads that still carry one. Temporary measure: see
-/// `docs/temporary-measures.md`.
-pub async fn settle_legacy_attached_event_waits(
-    pool: &sqlx::PgPool,
-) -> Result<Vec<Uuid>, Box<dyn std::error::Error + Send + Sync>> {
-    let rows: Vec<(String,)> = sqlx::query_as(
-        "SELECT tc.aggregate_id \
-         FROM events tc \
-         JOIN thread_summaries t ON t.thread_id = tc.aggregate_id::uuid \
-         WHERE tc.aggregate = 'thread' \
-           AND tc.event_type = 'ToolCalled' \
-           AND tc.payload->>'name' = $1 \
-           AND t.state IS DISTINCT FROM 'discarded' \
-           AND NOT EXISTS ( \
-               SELECT 1 FROM events tr \
-               WHERE tr.aggregate = 'thread' \
-                 AND tr.aggregate_id = tc.aggregate_id \
-                 AND tr.sequence > tc.sequence \
-                 AND tr.event_type = 'ToolResult' \
-                 AND tr.payload->>'name' = $1 \
-           ) \
-         ORDER BY tc.sequence",
-    )
-    .bind(AWAIT_EVENT)
-    .fetch_all(pool)
-    .await?;
-
-    Ok(rows
-        .into_iter()
-        .filter_map(|(thread_str,)| thread_str.parse::<Uuid>().ok())
-        .collect())
-}
-
-/// The `ToolResult` [`settle_legacy_attached_event_waits`] writes to close an
-/// old attached call. Says plainly that nothing was lost, so a model reading it
-/// on resume does not re-subscribe out of doubt.
-pub fn legacy_attached_settle_tool_result() -> ThreadEvent {
-    ThreadEvent::ToolResult {
-        name: AWAIT_EVENT.to_string(),
-        result: "Lucidos was upgraded while this call was open. Subscriptions no longer \
-                 hold a turn open: any subscription of yours that is still live will re-open \
-                 this thread as a new message when it matches, exactly as before. Nothing \
-                 was lost and nothing needs re-registering. Carry on."
-            .to_string(),
-        images: vec![],
-        success: true,
-        tool_called_event_id: None,
     }
 }
 

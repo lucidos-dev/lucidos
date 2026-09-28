@@ -22,9 +22,9 @@ use crate::engine::agent_session::io_helpers::{drain_lost_followups, lost_follow
 use crate::engine::agent_session::lifecycle::{
     classify_result, idle_action, is_definitive_session_not_found, is_resume_settle_result,
     is_stale_resume_signal, may_touch_change_state_at_idle, require_agent_input,
-    reset_per_turn_flags, should_auto_commit_on_cleanup, starts_turn_after_terminal,
-    terminal_clears_user_hit_stop, terminate_decision, watchdog_gate, IdleAction,
-    StaleResumeInputs, TerminalKind, TerminateDecision, TurnTerminal, WatchdogGate,
+    reset_per_turn_flags, result_auto_commits, should_auto_commit_on_cleanup,
+    starts_turn_after_terminal, terminal_clears_user_hit_stop, terminate_decision, watchdog_gate,
+    IdleAction, StaleResumeInputs, TerminalKind, TerminateDecision, TurnTerminal, WatchdogGate,
     WATCHDOG_DIAG_LOG_THRESHOLD_MS, WATCHDOG_HUNG_TOOL_CEILING_MS, WATCHDOG_INACTIVITY_LIMIT_MS,
     WATCHDOG_TICK_INTERVAL_SECS,
 };
@@ -870,8 +870,6 @@ impl LucidosEngine {
             let session = AgentSession {
                 msg_tx: msg_tx.clone(),
                 is_waiting: false,
-                has_changes: false,
-                requires_restart: false,
                 pending_stop: None,
                 cancel_actor: None,
                 redirect_followup: false,
@@ -889,7 +887,7 @@ impl LucidosEngine {
                 worktree_path: worktree_path.clone(),
                 branch_name: Some(branch_name.clone()),
                 repo_root: Some(repo_root.clone()),
-                cc_session_id: None,
+                backend_session_id: None,
                 last_event_at: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(
                     now_epoch_millis(),
                 )),
@@ -1078,6 +1076,7 @@ impl LucidosEngine {
         // bool is the right shape. Mirrored on `AgentSession` so the external
         // watchdog sees the same atomic from outside this `select!`.
         let tools_in_flight = tools_in_flight_shared;
+        let mut tool_names = super::super::tool_output::ToolNamesById::default();
         // last_terminal_kind: terminal emitted by the most recently completed
         // turn. Drives `should_auto_commit_on_cleanup`, so the cleanup commits
         // only when the last turn ended Generated. Every other terminal leaves
@@ -1294,7 +1293,7 @@ impl LucidosEngine {
                             let cache_update = {
                                 let mut sessions = self.agent_sessions.lock().await;
                                 if let Some(s) = sessions.get_mut(&thread_id) {
-                                    s.cc_session_id = Some(cc_sid.clone());
+                                    s.backend_session_id = Some(cc_sid.clone());
                                     // Always update from Init: CC reports the full
                                     // model id, which is authoritative over any
                                     // alias the user selected.
@@ -1473,6 +1472,7 @@ impl LucidosEngine {
                             // even for a terse model that emits no text. Gates
                             // the stale-resume heuristic below.
                             tool_calls_seen = tool_calls_seen.saturating_add(1);
+                            tool_names.record(&id, &name);
                             if crate::runtime::is_user_question_tool(&name) {
                                 // Question flow: the subprocess blocks until the
                                 // user answers, and the engine renders the card
@@ -1514,16 +1514,17 @@ impl LucidosEngine {
                         // release the in-flight slot in case a pre-terminal
                         // ToolUse incremented it, then drop the event without
                         // emitting. `release_tool_slot` floors at 0, so an
-                        // unpaired result is a no-op.
-                        AgentEvent::ToolResult { .. } if emitted_terminal_event => {
+                        // unpaired result is a no-op. Its call's name is
+                        // dropped too, so a reused id cannot inherit it.
+                        AgentEvent::ToolResult { id, .. } if emitted_terminal_event => {
                             release_tool_slot(&tools_in_flight);
+                            tool_names.take(&id);
                             log!(
                                 "[AgentSession] Dropping post-terminal straggler tool result for thread {} — would resurrect 'running' on an idled thread",
                                 thread_id
                             );
                         }
                         AgentEvent::ToolResult { output, status: _, id } => {
-                            let summary: String = output.chars().take(200).collect();
                             // Re-arm the watchdog if this was the last in-flight
                             // tool. Floored at 0 so an unpaired ToolResult cannot
                             // underflow (see `release_tool_slot`).
@@ -1531,8 +1532,8 @@ impl LucidosEngine {
                             self.event_bus.emit_or_log(crate::engine::event_bus::BusEvent::Thread {
                                 thread_id,
                                 event: crate::engine::thread_events::ThreadEvent::CodingAgentToolResult {
-                                    name: String::new(),
-                                    result: summary,
+                                    name: tool_names.take(&id),
+                                    result: super::super::tool_output::stored_tool_output(&output),
                                     coding_agent,
                                     tool_use_id: id,
                                 },
@@ -1903,11 +1904,10 @@ impl LucidosEngine {
                                         claude_thought_buf.clear();
                                         last_thought_persisted_len = 0;
                                         // Auto-commit dirty files before checking
-                                        // for changes. The agent may edit files
-                                        // through Bash without committing, and
-                                        // the three-dot diff below would then see
-                                        // nothing and never propose a change.
-                                        if let Some(ref wt) = worktree_path {
+                                        // for changes, unless a restart ended the
+                                        // turn. See `result_auto_commits`.
+                                        let commits = last_terminal_kind.as_ref().is_some_and(result_auto_commits);
+                                        if let Some(wt) = worktree_path.as_ref().filter(|_| commits) {
                                             auto_commit_preserving_marker(&self.pool, wt, &repo_root, &branch_name, "Coding agent changes (auto-committed)").await;
                                         }
                                         // Resolve the branch and probe the diff
@@ -1946,8 +1946,6 @@ impl LucidosEngine {
                                             let mut sessions = self.agent_sessions.lock().await;
                                             if let Some(s) = sessions.get_mut(&thread_id) {
                                                 crate::engine::agent_session::lifecycle::mark_turn_boundary(s);
-                                                s.has_changes = wt_has_changes;
-                                                s.requires_restart = wt_requires_restart;
                                                 // Keep ONE branch name per session. An
                                                 // adoption above moved the run loop onto
                                                 // the worktree's real branch. Without this

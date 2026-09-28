@@ -1352,6 +1352,16 @@ make_build_id_stub() {
     chmod +x "$path"
 }
 
+# A build-id stub that also answers `--build-id --source-state` with $3.
+make_source_state_stub() {
+    local path="$1" id="$2" state="$3"
+    mkdir -p "$(dirname "$path")"
+    # shellcheck disable=SC2016 # ${1:-} and ${2:-} belong to the GENERATED script
+    printf '#!/bin/bash\n[ "${1:-}" = "--build-id" ] || exit 0\nif [ "${2:-}" = "--source-state" ]; then printf "%%s\\n" "%s"; else printf "%%s\\n" "%s"; fi\n' \
+        "$state" "$id" > "$path"
+    chmod +x "$path"
+}
+
 test_launch_bin_dir_is_per_profile_and_variant() {
     echo "test: the launch dir is keyed by BOTH profile and feature variant"
 
@@ -1692,12 +1702,37 @@ test_published_build_state_classifies_against_head() {
         fail "prefix comparison is not symmetric"
     fi
 
-    # A binary from a different commit — the case the retry exists for.
+    # A binary from a different commit: the case the retry exists for. This
+    # stub cannot answer --source-state, like a binary that predates the flag.
     make_build_id_stub "$stub" "0123456789abc"
     if [ "$(published_build_state "$stub")" = "stale" ]; then
-        pass "a different commit reads as stale"
+        pass "a different commit reads as stale when the binary cannot say more"
     else
         fail "a different commit was not detected as stale"
+    fi
+
+    # HEAD moved only by files that need no restart: no second build.
+    make_source_state_stub "$stub" "0123456789abc" "current"
+    if [ "$(published_build_state "$stub")" = "current" ]; then
+        pass "a move that needs no restart keeps the binary current"
+    else
+        fail "a no-restart move still reads as $(published_build_state "$stub")"
+    fi
+
+    # HEAD moved by engine source: the retry still runs.
+    make_source_state_stub "$stub" "0123456789abc" "stale"
+    if [ "$(published_build_state "$stub")" = "stale" ]; then
+        pass "a move that needs a restart reads as stale"
+    else
+        fail "a restart move misread as $(published_build_state "$stub")"
+    fi
+
+    # The binary could not tell (git failed): keep the old answer, stale.
+    make_source_state_stub "$stub" "0123456789abc" "unknown"
+    if [ "$(published_build_state "$stub")" = "stale" ]; then
+        pass "an unanswerable source check stays stale"
+    else
+        fail "an unanswerable source check misread as $(published_build_state "$stub")"
     fi
 
     # Indeterminate must never read as stale: a rebuild cannot fix any of these,

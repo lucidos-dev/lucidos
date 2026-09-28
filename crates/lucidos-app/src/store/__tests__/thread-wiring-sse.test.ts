@@ -39,7 +39,7 @@ describe('SSE skeleton must not prevent DB backfill', () => {
     // Frontend connects to SSE late, misses MessageReceived, gets later CC events.
     // SSE creates skeleton with eventsLoaded=true, so loadThreadEvents skips DB load.
     const skeleton: ThreadState = {
-      meta: { id: 'recovery-1', title: 'Recovering...', channel: 'claude_code', initiator: 'user', saved: false, createdAt: '', updatedAt: '', status: 'idle', codingAgentProposed: false, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, codingAgentApplying: false, codingAgentHasDiff: false, lastRevivedAt: '', messageCount: 0, section: 'archived', activeChildrenCount: 0, totalChildrenCount: 0, blockingDescendantCount: 0, attentionDescendantCount: 0, liveEventWaitCount: 0, state: 'active', latestTodoList: null, liveEventWaits: [] },
+      meta: { id: 'recovery-1', title: 'Recovering...', channel: 'claude_code', initiator: 'user', saved: false, createdAt: '', updatedAt: '', status: 'idle', codingAgentProposed: false, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, codingAgentHasDiff: false, lastRevivedAt: '', messageCount: 0, section: 'archived', activeChildrenCount: 0, totalChildrenCount: 0, blockingDescendantCount: 0, attentionDescendantCount: 0, liveEventWaitCount: 0, state: 'active', latestTodoList: null, liveEventWaits: [] },
       events: new Map(),
       streamingBuffer: '',
       eventsLoaded: true, // Old CodingAgentThreadSpawned behavior — now fixed to false
@@ -65,7 +65,7 @@ describe('SSE skeleton must not prevent DB backfill', () => {
     // After the fix: skeleton.eventsLoaded=false, so loadThreadEvents runs,
     // loads MessageReceived from DB, and the thread shows its messages.
     const skeleton: ThreadState = {
-      meta: { id: 'recovery-1', title: 'Recovering...', channel: 'claude_code', initiator: 'user', saved: false, createdAt: '', updatedAt: '', status: 'idle', codingAgentProposed: false, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, codingAgentApplying: false, codingAgentHasDiff: false, lastRevivedAt: '', messageCount: 0, section: 'archived', activeChildrenCount: 0, totalChildrenCount: 0, blockingDescendantCount: 0, attentionDescendantCount: 0, liveEventWaitCount: 0, state: 'active', latestTodoList: null, liveEventWaits: [] },
+      meta: { id: 'recovery-1', title: 'Recovering...', channel: 'claude_code', initiator: 'user', saved: false, createdAt: '', updatedAt: '', status: 'idle', codingAgentProposed: false, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, codingAgentHasDiff: false, lastRevivedAt: '', messageCount: 0, section: 'archived', activeChildrenCount: 0, totalChildrenCount: 0, blockingDescendantCount: 0, attentionDescendantCount: 0, liveEventWaitCount: 0, state: 'active', latestTodoList: null, liveEventWaits: [] },
       events: new Map(),
       streamingBuffer: '',
       eventsLoaded: false, // Fix: allows DB backfill
@@ -371,10 +371,9 @@ describe('getCodingAgentWaitingInfo', () => {
     thread.meta.codingAgentProposed = true;
     thread.meta.codingAgentRequiresRestart = false;
     thread.meta.codingAgentIsExternalRepo = false;
-    thread.meta.codingAgentApplying = false;
 
     const info = getCodingAgentWaitingInfo(thread.meta);
-    expect(info).toEqual({ proposed: true, isExternalRepo: false, requiresRestart: false, applying: false });
+    expect(info).toEqual({ proposed: true, isExternalRepo: false, requiresRestart: false });
   });
 
   it('CodingAgentIdled with has_changes=true updates meta', () => {
@@ -384,10 +383,10 @@ describe('getCodingAgentWaitingInfo', () => {
     handleEventWithAgg(map, 't1', 2, { type: 'SessionStarted', session_id: 's1' }, '2026-01-01T00:00:01Z');
     handleEventWithAgg(map, 't1', 3, { type: 'CodingAgentIdled', has_changes: true } as any, '2026-01-01T00:00:02Z');
 
-    expect(thread.meta.status).toBe('waiting');
+    expect(thread.meta.status).toBe('idle');
     expect(thread.meta.codingAgentProposed).toBe(true);
     const info = getCodingAgentWaitingInfo(thread.meta);
-    expect(info).toEqual({ proposed: true, isExternalRepo: false, requiresRestart: false, applying: false });
+    expect(info).toEqual({ proposed: true, isExternalRepo: false, requiresRestart: false });
   });
 
   it('CodingAgentIdled with requires_restart=true updates meta', () => {
@@ -398,7 +397,7 @@ describe('getCodingAgentWaitingInfo', () => {
 
     expect(thread.meta.codingAgentRequiresRestart).toBe(true);
     const info = getCodingAgentWaitingInfo(thread.meta);
-    expect(info).toEqual({ proposed: true, isExternalRepo: false, requiresRestart: true, applying: false });
+    expect(info).toEqual({ proposed: true, isExternalRepo: false, requiresRestart: true });
   });
 
   it('SessionEnded after ResponseGenerated (no changes) → idle, no waiting info', () => {
@@ -424,15 +423,6 @@ describe('getCodingAgentWaitingInfo', () => {
     expect(getCodingAgentWaitingInfo(thread.meta)).toBeNull();
   });
 
-  it('MergeConflictDetected sets codingAgentApplying=true', () => {
-    const thread = makeThread({ meta: { ...makeThread().meta, channel: 'claude_code' } });
-    const map = new Map([['t1', thread]]);
-    handleEventWithAgg(map, 't1', 1, { type: 'MessageReceived', text: 'fix it' }, '2026-01-01T00:00:00Z');
-    handleEventWithAgg(map, 't1', 2, { type: 'CodingAgentIdled', has_changes: true } as any, '2026-01-01T00:00:02Z');
-    handleEventWithAgg(map, 't1', 3, { type: 'MergeConflictDetected', change_id: 'c-1', files: ['a.rs'] } as any, '2026-01-01T00:00:03Z');
-
-    expect(thread.meta.codingAgentApplying).toBe(true);
-  });
 
   it('ChangeApplied clears all CC flags and sets status to idle', () => {
     const thread = makeThread({ meta: { ...makeThread().meta, channel: 'claude_code' } });
@@ -444,7 +434,6 @@ describe('getCodingAgentWaitingInfo', () => {
 
     expect(thread.meta.status).toBe('idle');
     expect(thread.meta.codingAgentProposed).toBe(false);
-    expect(thread.meta.codingAgentApplying).toBe(false);
     expect(getCodingAgentWaitingInfo(thread.meta)).toBeNull();
   });
 
@@ -519,7 +508,6 @@ describe('Focused thread preserved across reload', () => {
       coding_agent_proposed: false,
       coding_agent_requires_restart: false,
       coding_agent_is_external_repo: false,
-      coding_agent_applying: false,
       coding_agent_has_diff: false,
       last_revived_at: null,
       state: 'active',
@@ -567,7 +555,6 @@ describe('Focused thread preserved across reload', () => {
       coding_agent_proposed: true,
       coding_agent_requires_restart: false,
       coding_agent_is_external_repo: false,
-      coding_agent_applying: false,
       coding_agent_has_diff: false,
       last_revived_at: null,
       state: 'active',

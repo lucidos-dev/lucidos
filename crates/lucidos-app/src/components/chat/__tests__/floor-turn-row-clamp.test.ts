@@ -55,14 +55,15 @@ describe('the body is chosen by the questions the window asks', () => {
   const source: string = readFileSync(
     join(dirname(fileURLToPath(import.meta.url)), '..', 'ChatExchange.tsx'), 'utf8');
 
-  it('takes the clamp path by the shared predicate', () => {
-    expect(source).toContain('const clampApplies = headClampApplies(events, showDetails);');
-    expect(source).toMatch(/if \(clampApplies\) \{\s*(\/\/.*\s*)*visible = rowsHidden > 0/);
+  it('hands the clamp to the body, which picks its path by the shared predicate', () => {
+    // `responseBody` asks `headClampApplies`, the question `rowsDrawnByClamp`
+    // asks. Its tests pin that the clamp applies only on that path.
+    expect(source).toContain('responseBody(events, { showSteps, showDetails, rowsHidden })');
   });
 
   it('builds no body for a folded turn, and asks the shared helper whether it is', () => {
     expect(source).toContain('turnBodyFolded(collapsedExchanges.value, threadId, exchange)');
-    expect(source).toContain('if (hasEvents && !bodyFolded) {');
+    expect(source).toContain('hasEvents && !bodyFolded ? responseBody(');
   });
 
   it('reads a fold by thread and turn', () => {

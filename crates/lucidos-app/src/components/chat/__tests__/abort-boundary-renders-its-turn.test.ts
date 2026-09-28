@@ -33,7 +33,7 @@ const source = readFileSync(resolve(here, '../ChatExchange.tsx'), 'utf-8');
  * back open too far. A boundary also picks up the DRAIN of whatever the teardown
  * killed, and a coding-agent subprocess signs off with a bare `"\n\n"`;
  * `exchangeResponseEvents` turns that into a `text` event, so `hasEvents` was
- * true while `renderResponseEvents` (which needs `evt.md?.trim()`) drew nothing.
+ * true while `responseBody` (which needs `isMeaningfulText`) drew nothing.
  * The switch-teardown boundary got an empty response panel whose only visible
  * content was a status badge reading "Working" over a stopped engine. The gate
  * therefore asks `hasRenderableResponseContent`, the mirror of what the renderer

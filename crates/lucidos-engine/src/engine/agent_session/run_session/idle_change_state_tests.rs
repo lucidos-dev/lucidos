@@ -51,7 +51,6 @@ async fn seed_thread(bus: &EventBus, thread_id: Uuid) {
             text: "implement the ticket".into(),
             user_image_hashes: vec![],
             device_id: None,
-            device: None,
             image_description: None,
             parent_thread_id: None,
             spawning_event_id: None,

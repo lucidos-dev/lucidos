@@ -58,6 +58,18 @@ export function apiRequest(page: Page) {
   };
 }
 
+/** Set a device-scoped preference for the device this page registered, the
+ *  way Settings does. Waits for the shell to have registered one. */
+export async function setDevicePreference(page: Page, key: string, value: string): Promise<void> {
+  let device: string | null = null;
+  await expect.poll(async () => (device = await pageDeviceId(page)), {
+    message: 'the shell registered a device',
+  }).toBeTruthy();
+  const res = await apiRequest(page).put(`/api/v1/preferences?key=${key}`, { data: { value, device_id: device } });
+  expect(res.ok(), `${key}=${value}`).toBe(true);
+  expect((await res.json()).success, `${key}=${value}`).toBe(true);
+}
+
 /** CSS selector for the body of a rendered user message (initiator panel).
  *  Centralized so a UI rename only requires changing this one constant. */
 export const USER_MSG_SELECTOR = '.initiator-panel-user .initiator-body';

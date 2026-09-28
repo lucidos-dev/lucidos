@@ -164,6 +164,27 @@ pub(crate) fn cmd_detach(ws: &Workspace, child_thread_id: &str) -> Result<(), Bo
     send_and_print("POST", &url, http_client()?.post(&url))
 }
 
+/// `lucidos threads archive`: archive this thread or one of its own direct
+/// children (ADR 0310).
+///
+/// Like `detach`, the caller is never stated. `current` goes to the engine as
+/// written, and it resolves the alias against the origin token, so the CLI
+/// cannot aim it at another thread. The only check here keeps the value one
+/// path segment; the engine owns what the segment may name.
+pub(crate) fn cmd_archive(ws: &Workspace, thread: &str) -> Result<(), BoxError> {
+    let target = thread.trim();
+    if target.is_empty() || target.contains(['/', '?', '#']) || target.contains(char::is_whitespace)
+    {
+        return Err(format!(
+            "--thread takes `current` or a child thread's uuid, and '{target}' is neither. \
+             Run `lucidos threads list --my-children` to find a child's id."
+        )
+        .into());
+    }
+    let url = format!("{}/api/v1/threads/{target}/archive", ws.base_url());
+    send_and_print("POST", &url, http_client()?.post(&url))
+}
+
 /// Default `--event-id` from the spawning event, the way `spawn-thread`
 /// defaults `--caller-event-id`.
 pub(crate) fn event_id_from_env() -> Option<String> {

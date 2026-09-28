@@ -44,7 +44,7 @@ pub(super) async fn submit_mcp_consent(
     headers: HeaderMap,
     Json(body): Json<McpConsentResponse>,
 ) -> impl IntoResponse {
-    let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    let actor = super::actor::user_actor(&headers, None);
     let answered = resolve_coding_agent_permission(
         &state.engine,
         body.request_id,
@@ -80,7 +80,7 @@ pub(super) async fn set_mcp_auto_approve(
     headers: HeaderMap,
     Json(body): Json<McpAutoApproveRequest>,
 ) -> impl IntoResponse {
-    let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    let actor = super::actor::user_actor(&headers, None);
     match state
         .engine
         .mcp_manager
@@ -270,7 +270,7 @@ pub(super) async fn set_mcp_disabled_tools(
     Path(id): Path<String>,
     Json(body): Json<McpDisabledToolsRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    let actor = super::actor::user_actor(&headers, None);
     let stored = state
         .engine
         .mcp_manager

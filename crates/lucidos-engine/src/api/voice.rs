@@ -54,7 +54,7 @@ async fn voice(
     let (session_id, slot) = admit(&state.pool, &state.engine.voice_sessions, thread_id).await?;
 
     let provider = crate::voice::build::provider_for(&state.engine).await;
-    let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    let actor = super::actor::user_actor(&headers, None);
 
     Ok(upgrade
         .max_message_size(MAX_FRAME_BYTES)

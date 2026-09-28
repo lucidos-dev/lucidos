@@ -4,6 +4,7 @@ use super::EventStore;
 use crate::core::event_subscription::EventSubscription;
 use crate::core::EventRow;
 use crate::engine::thread_lifecycle::{ArchiveState, ThreadStatus};
+use crate::engine::thread_state::ThreadState;
 use serde::{Deserialize, Serialize};
 
 /// Preference marker: set after `backfill_trigger_id_v5_to_config_id` runs
@@ -193,11 +194,9 @@ pub struct ThreadSummary {
     /// and its parent is still owed the card that settles it (ADR 0252).
     /// Counts toward attention and never toward blocking.
     pub is_stopped_child: bool,
-    /// Thread status, computed by the backend. One of the six
-    /// [`ThreadStatus`] values as written by `as_str`: `idle`, `running`,
-    /// `waiting`, `waiting_for_user_answer`, `paused`, `failed`. Nothing
-    /// writes `waiting` any more; it survives on historical rows.
-    pub status: String,
+    /// Thread status, computed by the backend. Nothing writes `waiting` any
+    /// more; it survives on historical rows.
+    pub status: ThreadStatus,
     /// Whether the coding-agent branch has any diff against main on disk — pure git
     /// truth. Set by the projection on `ChangeProposed`, cleared on
     /// `ChangeApplied` / `ChangeDiscarded` / `ThreadArchived`, seeded at
@@ -217,8 +216,6 @@ pub struct ThreadSummary {
     /// Done/Archive instead, and `archive_thread` marks pending changes as
     /// applied so they don't sit forever.
     pub coding_agent_is_external_repo: bool,
-    /// Whether a merge conflict is being resolved.
-    pub coding_agent_applying: bool,
     /// When the thread last entered the 'running' state (for IN PROGRESS sort order).
     pub last_revived_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Parent thread that spawned this one (for sub-thread navigation).
@@ -264,7 +261,7 @@ pub struct ThreadSummary {
     /// to the archive flag (`archive_state` / wire field `section`): an archived
     /// thread carries `state='active'` plus `archive_state='archived'`.
     /// Frontends filter to render the drafts section as `state == 'composing'`.
-    pub state: String,
+    pub state: ThreadState,
     /// In-progress compose text. Empty string when the user has nothing typed.
     pub compose_text: String,
     /// Currently-attached compose image URLs. JSON array; empty when none.
@@ -400,7 +397,6 @@ struct ThreadRow {
     /// Only meaningful when `coding_agent_proposed = true`.
     coding_agent_requires_restart: bool,
     coding_agent_is_external_repo: bool,
-    coding_agent_applying: bool,
     last_revived_at: Option<chrono::DateTime<chrono::Utc>>,
     is_saved: bool,
     has_response: bool,
@@ -448,7 +444,7 @@ pub struct ThreadAggregate {
     pub last_agent_action: chrono::DateTime<chrono::Utc>,
     pub message_count: i64,
     pub section: String,
-    pub status: String,
+    pub status: ThreadStatus,
     pub active_children_count: i64,
     /// See `ThreadSummary::waiting_children_count`. Carried on the per-event
     /// SSE aggregate so a parent's Waiting dot follows its children live.
@@ -490,7 +486,6 @@ pub struct ThreadAggregate {
     /// Only meaningful when `coding_agent_proposed = true`.
     pub coding_agent_requires_restart: bool,
     pub coding_agent_is_external_repo: bool,
-    pub coding_agent_applying: bool,
     pub is_saved: bool,
     pub has_response: bool,
     pub last_revived_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -515,7 +510,7 @@ pub struct ThreadAggregate {
     /// Backend — see `ThreadSummary::coding_agent`. Wire field: `codingAgent`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub coding_agent: Option<String>,
-    pub state: String,
+    pub state: ThreadState,
 }
 
 /// Fetch the projection snapshot for a thread. Polymorphic over executor —
@@ -555,7 +550,7 @@ fn row_to_thread_aggregate(
         last_agent_action: r.last_agent_action,
         message_count: r.message_count,
         section: r.section,
-        status: r.status,
+        status: ThreadStatus::parse(&r.status),
         active_children_count: r.active_children_count,
         waiting_children_count: r.waiting_children_count,
         total_children_count: r.total_children_count,
@@ -568,7 +563,6 @@ fn row_to_thread_aggregate(
         coding_agent_proposed: r.coding_agent_proposed,
         coding_agent_requires_restart: r.coding_agent_requires_restart,
         coding_agent_is_external_repo: r.coding_agent_is_external_repo,
-        coding_agent_applying: r.coding_agent_applying,
         is_saved: r.is_saved,
         has_response: r.has_response,
         last_revived_at: r.last_revived_at,
@@ -581,7 +575,7 @@ fn row_to_thread_aggregate(
         coding_agent_kind: r.coding_agent_kind,
         coding_agent_folder: r.coding_agent_folder,
         coding_agent: r.coding_agent,
-        state: r.state,
+        state: ThreadState::from_db_str(&r.state)?,
     })
 }
 
@@ -609,7 +603,7 @@ fn thread_cols(alias: &str) -> String {
         {a}.blocking_descendant_count::bigint, {a}.attention_descendant_count::bigint, {a}.is_stopped_child, \
         {a}.live_event_wait_count::bigint, {a}.live_event_waits, \
         {a}.status, {a}.coding_agent_has_diff, {a}.coding_agent_proposed, {a}.coding_agent_requires_restart, \
-        {a}.coding_agent_is_external_repo, {a}.coding_agent_applying, {a}.last_revived_at, \
+        {a}.coding_agent_is_external_repo, {a}.last_revived_at, \
         {a}.is_saved, {a}.has_response, \
         {a}.parent_thread_id::text AS parent_thread_id, \
         (SELECT p.title FROM thread_summaries p WHERE p.thread_id = {a}.parent_thread_id) AS parent_thread_title, \
@@ -670,55 +664,56 @@ impl EventStore {
     fn rows_to_thread_summaries(
         rows: Vec<ThreadRow>,
     ) -> Result<Vec<ThreadSummary>, Box<dyn std::error::Error + Send + Sync>> {
-        rows.into_iter()
-            .map(|r| {
-                Ok(ThreadSummary {
-                    thread_id: r.thread_id,
-                    title: format_display_title(r.title, r.first_message),
-                    channel: r.source,
-                    initiator: LegacyInitiator::from_db_str(r.initiator.as_str())?,
-                    created_at: r.created_at,
-                    last_activity: r.last_activity,
-                    last_user_action: r.last_user_action,
-                    last_agent_action: r.last_agent_action,
-                    message_count: r.message_count,
-                    saved: r.is_saved,
-                    section: r.section,
-                    active_children_count: r.active_children_count,
-                    waiting_children_count: r.waiting_children_count,
-                    total_children_count: r.total_children_count,
-                    blocking_descendant_count: r.blocking_descendant_count,
-                    attention_descendant_count: r.attention_descendant_count,
-                    is_stopped_child: r.is_stopped_child,
-                    live_event_wait_count: r.live_event_wait_count,
-                    live_event_waits: r.live_event_waits.0,
-                    status: r.status,
-                    coding_agent_has_diff: r.coding_agent_has_diff,
-                    coding_agent_proposed: r.coding_agent_proposed,
-                    coding_agent_requires_restart: r.coding_agent_requires_restart,
-                    coding_agent_is_external_repo: r.coding_agent_is_external_repo,
-                    coding_agent_applying: r.coding_agent_applying,
-                    last_revived_at: r.last_revived_at,
-                    parent_thread_id: r.parent_thread_id,
-                    parent_thread_title: r.parent_thread_title,
-                    trigger_id: r.trigger_id,
-                    trigger_name: r.trigger_name,
-                    cc_repo_id: r.cc_repo_id,
-                    cc_repo_name: r.cc_repo_name,
-                    coding_agent_kind: r.coding_agent_kind,
-                    coding_agent_folder: r.coding_agent_folder,
-                    coding_agent: r.coding_agent,
-                    state: r.state,
-                    compose_text: r.compose_text,
-                    compose_images: r.compose_images,
-                    compose_mode: r.compose_mode,
-                    compose_selection: r.compose_selection,
-                    compose_epoch: r.compose_epoch,
-                    pending_sub_thread_change_count: None,
-                })
-            })
-            .collect()
+        rows.into_iter().map(row_to_thread_summary).collect()
     }
+}
+
+fn row_to_thread_summary(
+    r: ThreadRow,
+) -> Result<ThreadSummary, Box<dyn std::error::Error + Send + Sync>> {
+    Ok(ThreadSummary {
+        thread_id: r.thread_id,
+        title: format_display_title(r.title, r.first_message),
+        channel: r.source,
+        initiator: LegacyInitiator::from_db_str(r.initiator.as_str())?,
+        created_at: r.created_at,
+        last_activity: r.last_activity,
+        last_user_action: r.last_user_action,
+        last_agent_action: r.last_agent_action,
+        message_count: r.message_count,
+        saved: r.is_saved,
+        section: r.section,
+        active_children_count: r.active_children_count,
+        waiting_children_count: r.waiting_children_count,
+        total_children_count: r.total_children_count,
+        blocking_descendant_count: r.blocking_descendant_count,
+        attention_descendant_count: r.attention_descendant_count,
+        is_stopped_child: r.is_stopped_child,
+        live_event_wait_count: r.live_event_wait_count,
+        live_event_waits: r.live_event_waits.0,
+        status: ThreadStatus::parse(&r.status),
+        coding_agent_has_diff: r.coding_agent_has_diff,
+        coding_agent_proposed: r.coding_agent_proposed,
+        coding_agent_requires_restart: r.coding_agent_requires_restart,
+        coding_agent_is_external_repo: r.coding_agent_is_external_repo,
+        last_revived_at: r.last_revived_at,
+        parent_thread_id: r.parent_thread_id,
+        parent_thread_title: r.parent_thread_title,
+        trigger_id: r.trigger_id,
+        trigger_name: r.trigger_name,
+        cc_repo_id: r.cc_repo_id,
+        cc_repo_name: r.cc_repo_name,
+        coding_agent_kind: r.coding_agent_kind,
+        coding_agent_folder: r.coding_agent_folder,
+        coding_agent: r.coding_agent,
+        state: ThreadState::from_db_str(&r.state)?,
+        compose_text: r.compose_text,
+        compose_images: r.compose_images,
+        compose_mode: r.compose_mode,
+        compose_selection: r.compose_selection,
+        compose_epoch: r.compose_epoch,
+        pending_sub_thread_change_count: None,
+    })
 }
 
 /// Search result for a thread, with a relevance score.
@@ -928,3 +923,7 @@ mod extraction_tests;
 #[cfg(test)]
 #[path = "../threads_tests/turn_clock.rs"]
 mod turn_clock_tests;
+
+#[cfg(test)]
+#[path = "../threads_tests/wire_fixture.rs"]
+mod wire_fixture_tests;

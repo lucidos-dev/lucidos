@@ -1,9 +1,8 @@
-import { showToast, dismissToast, removeToast, toasts, engineVersionReady, engineVersionPending, engineRebuildWedged, engineBuilding, engineBuildDetail, enginePendingCommits, engineRestarting, preferences, NEW_VERSION_TOAST_KEY, FRONTEND_UPDATE_DEFERRED_TOAST_KEY, FRONTEND_UPDATE_STRANDED_TOAST_KEY } from '../store';
+import { showToast, dismissToast, removeToast, toasts, engineVersionReady, engineVersionPending, engineRebuildWedged, engineBuilding, engineBuildDetail, frontendRefreshDetail, enginePendingCommits, engineRestarting, preferences, NEW_VERSION_TOAST_KEY, FRONTEND_UPDATE_DEFERRED_TOAST_KEY, FRONTEND_UPDATE_STRANDED_TOAST_KEY } from '../store';
 import { engineVersionStatus, rebuildEngine } from '../../api/client';
 import type { EngineVersionStatus, PendingCommits } from '../../api/client';
 import { confirmAndRestartEngine } from './chat-changes';
 import { noteAnnouncedEngineVersion, wasEngineVersionDismissed } from '../../hooks/sw-update';
-import { syncBackgroundActivityToast } from './backgroundActivity';
 import { errorDetail } from '../../utils/errorDetail';
 
 /** Kick off the dev engine rebuild — the "Rebuild" escape hatch behind the
@@ -64,7 +63,14 @@ function setEngineBuilding(
     elapsedMs: status?.build_elapsed_ms ?? null,
     anchoredAt: Date.now(),
     pendingCommits: commits,
+    queuedBehind: status?.build_queued?.holders,
   };
+}
+
+/** The ONE writer of `frontendRefreshDetail`. Anchored to the client clock
+ *  like `setEngineBuilding`, so the counter never mixes the two clocks. */
+function setFrontendRefresh(elapsedMs: number | undefined): void {
+  frontendRefreshDetail.value = elapsedMs == null ? null : { elapsedMs, anchoredAt: Date.now() };
 }
 
 /** The wire's pending-commits payload, or `null` when this engine cannot speak
@@ -151,7 +157,7 @@ function renderVersionToast(shape: VersionAnnouncement): void {
       // build and hiding the toast while the reload badge stays lit.
       secondaryAction: later,
       action: {
-        label: 'Switch to new version',
+        label: 'Switch',
         onClick: () => { void confirmAndRestartEngine(); },
       },
     });
@@ -277,7 +283,7 @@ let lastAnnouncedId: string | undefined;
 let reopenedVersionId: string | undefined;
 
 /** Forget which version was last announced and which was re-opened. Test seam
- *  only, mirroring `resetBackgroundActivityToastForTest`: these two outlive any
+ *  only, mirroring `resetBackgroundActivityForTest`: these two outlive any
  *  signal a test resets, so without it one test's badge tap grants the next
  *  test's toast an exemption it never asked for. */
 export function resetEngineVersionToastForTest(): void {
@@ -313,20 +319,7 @@ export function openEngineVersionToast(): void {
  *  intent, so a failed poll is logged, not toasted — the next poll retries, and
  *  the user-facing failure surface is the switch action's own toast. */
 export async function checkEngineVersion(): Promise<void> {
-  try {
-    await pollEngineVersion();
-  } finally {
-    // `engineBuilding` is one of the two things the background-activity toast
-    // narrates, and `pollEngineVersion` clears it on several EARLY-return paths
-    // (packaged, build failed). Syncing only at its happy-path end left an open
-    // toast reading "Building new version" after a build had already failed,
-    // with nothing to correct it on a workspace whose model is long since
-    // cached. A `finally` covers every exit, including the throw path.
-    //
-    // Safe to call unconditionally: it only ever updates a toast that is
-    // already on screen, and never opens one.
-    syncBackgroundActivityToast();
-  }
+  await pollEngineVersion();
 }
 
 async function pollEngineVersion(): Promise<void> {
@@ -359,8 +352,12 @@ async function pollEngineVersion(): Promise<void> {
   if (status.packaged) {
     setEngineBuilding(false);
     setEngineVersionPending(false);
+    setFrontendRefresh(undefined);
     return;
   }
+  // Before the build-failed early return: a failed ENGINE build says nothing
+  // about a frontend-only Apply's rebuild, which runs on its own.
+  setFrontendRefresh(status.frontend_refresh_elapsed_ms);
 
   if (status.build_state === 'failed') {
     engineVersionReady.value = false;
@@ -508,6 +505,13 @@ export function handleEngineBuildStateChanged(): void {
   void checkEngineVersion();
 }
 
+/** SSE handler for the engine's `FrontendRefreshStateChanged` poke, sent when
+ *  a frontend-only Apply's refresh starts and ends. Same pure-poke contract as
+ *  `handleEngineBuildStateChanged`: the indicator follows the re-read. */
+export function handleFrontendRefreshStateChanged(): void {
+  void checkEngineVersion();
+}
+
 /** Start the periodic engine version-status poll (immediately + every
  *  {@link ENGINE_UPDATE_POLL_MS}). Idempotent. */
 export function startEngineUpdateChecks(): void {
@@ -578,27 +582,14 @@ export function handleFrontendUpdateDeferred(payload: FrontendUpdateDeferredPayl
   if (Date.now() - payload.sent_at_ms > DEFERRED_HINT_STALE_AFTER_MS) {
     return;
   }
-  // Pops unsolicited (the user applied a change, didn't ask for a toast) → don't
-  // steal focus. Persists until acknowledged or until the Switch clears it
-  // (initiateEngineRestart removes this key).
-  //
-  // Sticky, action-less hint → give it an explicit OK the user acknowledges,
-  // rather than only a corner X: `dismissable: false` drops the redundant close
-  // X so the OK is the sole dismiss (it does the same job as the X did). The OK
-  // just dismisses — deliberately NOT a Switch, since the deferral can fire
-  // mid-build when switching is unsafe (see the doc comment above).
+  // Persists until the user closes it or the Switch clears it
+  // (initiateEngineRestart removes this key). It carries no action: a tap on
+  // the card only closes it, and an action here would make the card read as
+  // a link.
   showToast(
-    "Frontend change applied — it'll take effect when you switch to the new version.",
+    "Frontend change applied. It'll take effect when you switch to the new version.",
     'info',
-    {
-      key: FRONTEND_UPDATE_DEFERRED_TOAST_KEY,
-      noAutofocus: true,
-      dismissable: false,
-      action: {
-        label: 'OK',
-        onClick: () => { dismissToast(FRONTEND_UPDATE_DEFERRED_TOAST_KEY); },
-      },
-    },
+    { key: FRONTEND_UPDATE_DEFERRED_TOAST_KEY },
   );
 }
 

@@ -44,9 +44,9 @@ const stylesDir: string = resolve(here, '..');
 const badgesCss: string = readFileSync(resolve(stylesDir, 'badges.css'), 'utf-8');
 const mainTsx: string = readFileSync(resolve(stylesDir, '..', 'main.tsx'), 'utf-8');
 
-/** Every badge whose content is a number or a sign, so every badge that has a
- *  glyph to centre. A badge drawing only a dot is deliberately absent: it has
- *  no text, and the trim would be a no-op on it. */
+/** Every badge whose content is a number, a sign or a status word, so every
+ *  badge that has a glyph to centre. A badge drawing only a dot is deliberately
+ *  absent: it has no text, and the trim would be a no-op on it. */
 const GLYPH_BADGES = [
   'badge',                          // header counts, the "!" state badge, the unread count
   'drawer-view-count',              // the thread filter's per-view counts
@@ -55,6 +55,8 @@ const GLYPH_BADGES = [
   'brand-menu-ws-badge',            // unread per workspace, in the menu and the switcher
   'ws-picker-badge',                // unread per workspace, in the gateway picker
   'thread-status-question-badge',   // the "?" on a thread waiting for an answer
+  'app-store-status',               // a plugin's "Installed v1.2.3" / version pill
+  'app-store-modified-chip',        // a plugin's "Modified" pill
 ];
 
 /** The two badges that wear `.badge` and draw only a dot. No glyph, so no cap
@@ -115,16 +117,26 @@ describe('one rule centres the glyph in every badge that has one', () => {
     expect(selectorList(tracking!.selector)).toEqual(GLYPH_BADGES.map(c => `.${c}`));
   });
 
-  it('leaves the one badge whose content is not text on flex centring', () => {
-    // While the engine builds, the brand badge holds a spinning glyph instead
-    // of the "!". A line box trimmed to a cap band it has no part in would park
-    // that glyph off centre, and so would the padding that lifts a baseline.
-    const spinner = cssRules(badgesCss)
-      .find(r => r.selector === '.badge:has(.brand-badge-spinner)');
-    expect(spinner?.props.get('display')).toBe('flex');
-    expect(spinner?.props.get('align-items')).toBe('center');
-    expect(spinner?.props.get('text-box-trim')).toBe('none');
-    expect(spinner?.props.get('padding-block')).toBe('0');
+  it('leaves the badge on flex centring while it draws an icon', () => {
+    // While work runs, the brand badge holds a spinning glyph instead of the
+    // "!", and while it waits, a still hourglass. Neither has a cap band. A
+    // line box trimmed to one parks the icon off centre, and so does the
+    // padding that lifts a baseline.
+    const icon = cssRules(badgesCss)
+      .find(r => r.selector === '.badge:has(.brand-badge-spinner, .brand-badge-queued)');
+    expect(icon?.props.get('display')).toBe('flex');
+    expect(icon?.props.get('align-items')).toBe('center');
+    expect(icon?.props.get('text-box-trim')).toBe('none');
+    expect(icon?.props.get('padding-block')).toBe('0');
+  });
+
+  it('names every icon the brand badge can draw in that exemption', () => {
+    // An icon wrapper BrandBadge renders but the exemption omits rides high.
+    const badgeTsx: string = readFileSync(
+      resolve(stylesDir, '..', 'components', 'layout', 'BrandBadge.tsx'), 'utf-8');
+    const wrappers = [...badgeTsx.matchAll(/class="(brand-badge-[a-z]+)"><[A-Z]\w*Icon \/>/g)]
+      .map(m => m[1]);
+    expect(wrappers.sort()).toEqual(['brand-badge-queued', 'brand-badge-spinner']);
   });
 });
 
@@ -148,7 +160,7 @@ describe('the pill and the baseline sit on whole pixels', () => {
   it('never makes a pill taller than its design', () => {
     // The section count is exactly as tall as the header's line. One pixel
     // more grows the row and puts the label off the pixel grid, which
-    // `.list-section-title-collapsible` in drawer.css records.
+    // `.list-section-title:has(> .section-count)` in drawer.css records.
     const box = shared!.props.get('--badge-box') ?? '';
     expect(box.endsWith(', var(--badge-floor))'), 'the clamp caps the box at the design').toBe(true);
     expect(shared!.props.get('height')).toBe('var(--badge-box)');
@@ -336,10 +348,10 @@ describe('a drawer section and its count share one cap band', () => {
     // gate, because a browser without the trim still has the gap to correct.
     // It sits on the wrapper, so it moves both copies of the number.
     const retired = gated.find(r =>
-      r.selector === '.list-section-title-collapsible > .section-count');
+      r.selector === '.list-section-title > .section-count');
     expect(retired?.props.get('top')).toBe('0');
     const base = cssRules(drawerCss).find(r =>
-      r.selector === '.list-section-title-collapsible > .section-count'
+      r.selector === '.list-section-title > .section-count'
       && r.atRules === '');
     expect(base?.props.get('top'), 'the untrimmed fallback keeps its lift').toBe('-0.0625rem');
   });

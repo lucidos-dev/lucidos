@@ -24,6 +24,8 @@
        (e.g. compose button). Outside-click dismiss is owned by the central
        <Overlay> component (useDismissOnOutside + overlayStack). */
     pointer-events: none;
+    /* A palette dims nothing: only a surface that blocks takes the scrim. */
+    background: none;
 }
 
 @media (max-width: 768px) {
@@ -47,21 +49,16 @@
     pointer-events: auto;
     display: flex;
     flex-direction: column;
-    max-width: 40rem;
+    /* Narrowed to its pane, so it never straddles the divider (usePaneCentre). */
+    max-width: min(var(--header-surface-width), var(--pane-fit, 100%));
     width: 100%;
-    background: var(--bg-secondary);
-    border: 1px solid var(--border-color);
-    border-radius: 0.5rem;
-    box-shadow: var(--shadow-lg);
     max-height: min(32rem, 80vh);
     overflow: hidden;
 }
 
+/* The row is a `.surface-head`, so it takes the surface inset from there. The
+   rule under it separates the input from the results. */
 .search-everywhere-header {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-    padding: 0.625rem 0.75rem;
     border-bottom: 1px solid var(--border-color);
 }
 
@@ -91,124 +88,50 @@
     color: var(--text-muted);
 }
 
-/* The seven categories don't fit a phone's width, so the strip pans instead of
-   squeezing them. `overscroll-behavior-x: contain` stops a pan carried past
-   either end from chaining outward, which on iOS is the browser's own
-   back-gesture. The scrollbar is suppressed rather than left to sit on the
-   0.5rem-tall sliver under the tabs: unlike the transcript, this strip carries
-   its own affordance, since the tab clipped at the edge is what says there is
-   more to the right. */
+/* The categories are chips that WRAP, so every one is on screen at any width
+   and none needs a gesture to reach. Never make this strip scroll sideways. */
 .search-everywhere-tabs {
     display: flex;
-    flex-direction: row;
-    gap: 0;
+    flex-wrap: wrap;
+    gap: var(--space-xs);
     border-bottom: 1px solid var(--border-color);
-    padding: 0 0.5rem;
-    overflow-x: auto;
-    /* Required, not tidiness: `overflow-x: auto` alone computes the other axis
-       to `auto` too, and this strip's content box does not land on a whole
-       pixel at a scaled root (35.19px inside a 35px scrollport at the 112.5%
-       UI scale, measured in both engines). A fraction of a pixel is enough for
-       a touch scroller to be draggable, and dragging a one-line tab strip
-       carries the tabs' bottom padding out of view. */
-    overflow-y: hidden;
-    /* The other half of being a scroll container: a flex item with visible
-       overflow gets an automatic minimum size, and losing it makes this strip
-       freely shrinkable inside the modal's column. `.search-everywhere-results`
-       would take no share of any deficit (`flex: 1` gives it a 0% basis, and
-       shrinkage is weighted by basis), so the whole of it lands here. Measured
-       on an equivalent minimal strip in both engines: 35px down to 8px, the tab
-       squashed to 16px. See search-tab-strip-guard.test.ts. */
+    /* A chip's side padding, read by the chip below. Taking it off the inset
+       puts the first label on the surface inset, under the search icon. */
+    --search-tab-pad-x: 0.625rem;
+    padding: var(--space-sm) calc(var(--surface-inset) - var(--search-tab-pad-x));
+    /* The results list takes the column's slack, never the chips. */
     flex-shrink: 0;
-    overscroll-behavior-x: contain;
-    scrollbar-width: none;
-    /* Keeps that affordance alive when Tab lands on a category the strip had to
-       scroll to: scrollIntoView respects scroll-padding, so it stops a sliver
-       short of the edge and the next tab stays clipped into view instead of the
-       strip looking like it ends at the tab it just revealed. */
-    scroll-padding-inline: 1.5rem;
-}
-
-.search-everywhere-tabs::-webkit-scrollbar {
-    display: none;
 }
 
 .search-everywhere-tab {
-    position: relative;
-    padding: 0.375rem 0.75rem;
+    padding: var(--space-xs) var(--search-tab-pad-x);
     font-size: var(--font-size-sm);
     font-family: var(--font-ui);
+    line-height: 1.4;
     background: none;
     border: none;
-    color: var(--text-muted);
+    border-radius: var(--radius-control);
+    color: var(--text-secondary);
     cursor: pointer;
-    /* Transparent, and never given a colour: it reserves the indicator's track
-       so nothing shifts when a tab becomes active. The line itself is ::after. */
-    border-bottom: 0.125rem solid transparent;
-    transition: color var(--duration-fast);
-    /* A flex item shrinks by default, which is what wrapped "Triggers" onto two
-       lines and let the labels compress instead of overflowing. */
-    flex-shrink: 0;
+    transition: color var(--duration-fast), background-color var(--duration-fast);
     white-space: nowrap;
 }
 
-/* Both indicators this strip has, the active category and a keyboard-focused
-   one, are the SAME plain line: one rounded bar under the label, differing only
-   in colour. Focus used to be an inset --focus-ring band instead, which drew a
-   tab-shaped rectangle around the label and read as chrome the strip has
-   nowhere else.
-   The bar is a pseudo-element rather than the border-bottom above, because
-   `border-radius` rounds the element's CORNER, tapering the whole box, and a
-   2px-tall border under a 35px-tall tab barely picks the curve up at all. It
-   rides ON the transparent border (`bottom` is negative because an absolutely
-   positioned child is placed against the PADDING box, so -0.125rem puts its
-   bottom edge on the border box's) and is therefore inside the tab's own box,
-   out of reach of the strip's `overflow-y: hidden`. */
-.search-everywhere-tab::after {
-    content: '';
-    position: absolute;
-    left: 0;
-    right: 0;
-    bottom: -0.125rem;
-    height: 0.125rem;
-    /* Half the height: the ends are fully round rather than merely eased. */
-    border-radius: 0.0625rem;
-    background: transparent;
-    transition: background-color var(--duration-fast);
-}
-
 .search-everywhere-tab.active {
+    background: var(--picked-surface);
     color: var(--accent);
-}
-
-.search-everywhere-tab.active::after {
-    background: var(--accent);
 }
 
 /* The transparent outline is the forced-colors fallback, same as
    .icon-btn:focus-visible. */
 .search-everywhere-tab:focus-visible {
     outline: 0.125rem solid transparent;
-}
-
-/* AFTER the active rule, not before, and that ordering is the whole focus
-   indicator: the two ::after selectors carry equal specificity, so whichever is
-   written second wins. Written first, focus was invisible on the ONE tab a user
-   is most likely to Tab onto, the active one, which already wore an accent line
-   and would have kept it.
-   --text-primary rather than a tint of the accent because this line is now the
-   entire indicator and has to clear the 3:1 non-text contrast floor alone. A
-   tint does not, in either theme, and the --focus-ring band it replaced was no
-   better (the same accent at 55%); a tint dark enough to pass would be the
-   active line with a rounding error. The active category is still marked while
-   focused, by its accent LABEL, which the focus state leaves alone. Ratios are
-   not quoted here because both sides of them are theme tokens. */
-.search-everywhere-tab:focus-visible::after {
-    background: var(--text-primary);
+    box-shadow: var(--focus-ring);
 }
 
 @media (hover: hover) {
-    .search-everywhere-tab:hover {
+    .search-everywhere-tab:not(.active):hover {
+        background: var(--bg-hover);
         color: var(--text-primary);
     }
 }
@@ -221,7 +144,7 @@
 }
 
 .search-everywhere-section-header {
-    padding: 0.375rem 0.75rem;
+    padding: 0.375rem var(--surface-inset);
     font-size: var(--font-size-2xs);
     font-weight: 600;
     color: var(--text-muted);
@@ -235,25 +158,22 @@
     align-items: center;
     gap: 0.5rem;
     width: 100%;
-    padding: 0.375rem 0.75rem;
+    padding: 0.375rem var(--surface-inset);
     background: none;
     border: none;
     color: inherit;
-    font: inherit;
-    /* `font` resets font-feature-settings to initial; keep inheriting it so a
-       Fira Code user does not get ligatures back on a result title or path.
-       Guarded by styles/__tests__/font-ligature-scope-guard.test.ts. */
-    font-feature-settings: inherit;
+    /* base.css already gives a button the family, size and ligature setting;
+       the line height is the one thing its UA font leaves at `normal`. */
+    line-height: inherit;
     text-align: left;
     cursor: pointer;
     transition: background-color var(--duration-fast);
 }
 
-.search-everywhere-result.selected {
-    background: var(--bg-hover);
-}
-
+/* `.selected` is the keyboard cursor, which a tap also sets through
+   `mouseenter`. A phone has no keyboard to move it, so it paints nothing there. */
 @media (hover: hover) {
+    .search-everywhere-result.selected,
     .search-everywhere-result:hover {
         background: var(--bg-hover);
     }
@@ -294,10 +214,4 @@
     color: var(--text-muted);
     font-size: var(--font-size-sm);
     font-family: var(--font-ui);
-}
-
-.search-everywhere-loading {
-    display: flex;
-    justify-content: center;
-    padding: 1.5rem;
 }

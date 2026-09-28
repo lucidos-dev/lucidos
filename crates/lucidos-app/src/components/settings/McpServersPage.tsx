@@ -18,6 +18,8 @@ import { toFailed, type Loadable } from '../../store/types';
 import { errorDetail } from '../../utils/errorDetail';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { useVersionedRefresh } from '../../hooks/useVersionedRefresh';
+import { usePanelRefresh } from '../../hooks/usePanelRefresh';
+import { Disclosure } from '../shared/Disclosure';
 import { Explainer } from '../shared/Explainer';
 import { ChevronDownIcon, ChevronRightIcon } from '../shared/icons';
 import { LoadableError } from '../shared/LoadableError';
@@ -198,11 +200,13 @@ export function mcpServerRow(props: McpServerRowProps): VNode {
           </SkBlock>
         </div>
       </div>
-      {expanded && !sk && server && (
-        <div class="mcp-tool-list">
-          {sortToolsByCost(server.tools).map((tool) => mcpToolRow(tool, props))}
-        </div>
-      )}
+      <Disclosure open={expanded && !sk && !!server}>
+        {server && (
+          <div class="mcp-tool-list">
+            {sortToolsByCost(server.tools).map((tool) => mcpToolRow(tool, props))}
+          </div>
+        )}
+      </Disclosure>
     </div>
   );
 }
@@ -402,6 +406,12 @@ export function McpServersPage() {
       void refresh(() => localWrites.current === startedAt);
     },
   );
+  // The same re-read for a pull, with the same two guards: held while a row
+  // verb runs, and dropped if a local write lands under it.
+  usePanelRefresh('MCP servers', Object.keys(pending).length > 0 ? null : () => {
+    const startedAt = localWrites.current;
+    return refresh(() => localWrites.current === startedAt);
+  });
 
   async function runVerb(server: McpServerStatus, verb: McpRowVerb, call: () => Promise<void>) {
     localWrites.current++;

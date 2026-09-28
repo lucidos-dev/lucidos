@@ -1160,4 +1160,35 @@ mod unknown_worktree_lookup_is_not_a_no {
             "the discarded branch is back at main"
         );
     }
+
+    /// `git worktree list` names the primary checkout too. A user who checked
+    /// the thread's branch out there to try it must not lose their files.
+    #[tokio::test]
+    async fn a_branch_checked_out_in_the_primary_checkout_is_never_reset() {
+        let (_tmp, repo, _wt) = make_repo_and_worktree(BRANCH).await;
+        git_cmd(&["checkout", "-b", UNHELD], &repo).await.unwrap();
+        std::fs::write(repo.join("tracked-work.txt"), "committed on the branch").unwrap();
+        git_cmd(&["add", "tracked-work.txt"], &repo).await.unwrap();
+        git_cmd(&["commit", "-m", "feat: work"], &repo)
+            .await
+            .unwrap();
+        std::fs::write(repo.join("scratch.txt"), "the user's untracked notes").unwrap();
+        let before = rev_parse(&repo, UNHELD).await;
+
+        settle_discarded_branch(
+            &repo,
+            UNHELD,
+            Uuid::new_v4(),
+            WorktreeLookup::Found(repo.clone()),
+        )
+        .await
+        .expect("the change is still discarded; the primary checkout is left alone");
+
+        assert_eq!(
+            std::fs::read_to_string(repo.join("scratch.txt")).unwrap(),
+            "the user's untracked notes",
+            "git clean -fd must not run in the primary checkout"
+        );
+        assert_eq!(rev_parse(&repo, UNHELD).await, before);
+    }
 }

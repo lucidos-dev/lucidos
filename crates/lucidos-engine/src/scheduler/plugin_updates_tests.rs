@@ -286,6 +286,16 @@ mod scan_requeue {
         });
     }
 
+    /// A user's rescan must get a scan that starts after it asked. A running
+    /// scan may predate the ask. A refused joiner also left its queued stamp
+    /// pinning `scanning` on until the next tick.
+    #[test]
+    fn a_requested_scan_leaves_a_trailing_pass_and_a_routine_one_joins() {
+        assert!(ScanCause::Requested.leaves_trailing_pass());
+        assert!(ScanCause::RegistryChanged.leaves_trailing_pass());
+        assert!(!ScanCause::Routine.leaves_trailing_pass());
+    }
+
     /// Whoever takes the slot clears the claim, and does so BEFORE reading the
     /// registry. That ordering is what makes the flag race-free: the pass that
     /// clears it is a pass whose read comes after the write.

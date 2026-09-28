@@ -3,9 +3,10 @@ use crate::engine::change_ops::{
 };
 use crate::engine::git_ops::{
     auto_commit_preserving_marker, auto_commit_safe_files_if_dirty, auto_commit_worktree,
-    branch_changed_files, catchup_and_ff_to_main, commits_in_range, default_local_branch,
-    describe_branch_changes, files_have_client_update, files_require_restart, git_cmd, git_ran_ok,
-    has_branch_commits, push_main_in_background,
+    branch_changed_files, branch_head_sha, catchup_and_ff_to_main, commits_in_range,
+    default_local_branch, describe_branch_changes, files_have_client_update, files_require_restart,
+    git_answer_when_ok, git_cmd, git_ran_ok, has_branch_commits, push_main_in_background,
+    resolution_merged_main,
 };
 use crate::engine::thread_events::{EventChannel, MessageOrigin};
 use crate::engine::{AgentUserInput, LucidosEngine};
@@ -217,6 +218,30 @@ impl LucidosEngine {
                 thread_id
             );
             return Err(MERGE_OWNED_BY_RESOLVER_MESSAGE.into());
+        }
+
+        // Both branches below prompt the agent: a live session gets the review
+        // or merge prompt, and a missing harden marker starts a hardening run.
+        // Either prompt overtakes a question the user can still answer, and
+        // the typed answer then reaches the wrong session. So refuse first.
+        match crate::engine::agent_recovery::thread_parked_on_question(self.pool(), thread_id).await
+        {
+            Ok(false) => {}
+            Ok(true) => {
+                log!(
+                    "[ApplyNow] Refused for thread {}: it is parked on a question",
+                    thread_id
+                );
+                return Err(crate::engine::claude_code::QUESTION_OPEN_MESSAGE.into());
+            }
+            Err(e) => {
+                log!(
+                    "[ApplyNow] Refused for thread {}: could not check for a parked question: {}",
+                    thread_id,
+                    e
+                );
+                return Err(crate::engine::claude_code::QUESTION_UNKNOWN_MESSAGE.into());
+            }
         }
 
         // Extract session metadata — if no live session, fall back to stale handling
@@ -461,38 +486,12 @@ impl LucidosEngine {
         }
     }
 
-    /// Send a follow-up message to CC, wait for it to go idle, check it's alive,
-    /// then auto-commit any changes it made.
-    pub(crate) async fn send_and_wait(
-        &self,
-        thread_id: Uuid,
-        msg_tx: &tokio::sync::mpsc::UnboundedSender<AgentUserInput>,
-        idle_notify: &tokio::sync::Notify,
-        worktree_path: &Path,
-        message: &str,
-        context: &str,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        log!("[ApplyNow] {} — sending follow-up to CC", context);
-        msg_tx
-            .send(AgentUserInput {
-                text: message.to_string(),
-                images: None,
-                origin_event_id: None,
-                kind: crate::engine::AgentInputKind::User,
-            })
-            .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
-                "Session channel closed".into()
-            })?;
-        self.wait_and_commit(thread_id, idle_notify, worktree_path, context)
-            .await
-    }
-
     /// Wait for CC to go idle, then auto-commit any changes it made.
     ///
     /// Propagates `git add` / `git commit` failures via `Err`. A silent failure
     /// here would lose a real CC change — the apply-now caller treats the
     /// returned `Ok` as proof the iteration produced a committed snapshot
-    /// before moving on to the next step (hardening, tests, merge).
+    /// before moving on to the next step (hardening, merge).
     pub(crate) async fn wait_and_commit(
         &self,
         thread_id: Uuid,
@@ -557,21 +556,9 @@ impl LucidosEngine {
             )
             .await?;
 
-            // Step 2b: Run tests after hardening to verify changes didn't break anything
-            self.send_and_wait(
-                thread_id,
-                msg_tx,
-                idle_notify,
-                worktree_path,
-                "Hardening is done. Now run the test suite to verify nothing is broken: \
-                `make test` and `cd crates/lucidos-app && npm test`. \
-                If any tests fail, fix them before proceeding.",
-                "waiting for post-hardening tests",
-            )
-            .await?;
-
-            // A canceled `/harden` reaches `wait_and_commit`'s idle state too,
-            // so the marker is the proof — not the wait returning Ok.
+            // `/harden` ran the suites this change needs. A canceled `/harden`
+            // reaches `wait_and_commit`'s idle state too, so the marker is the
+            // proof, not the wait returning Ok.
             if !branch_is_hardened(&self.pool, self.changes(), repo_root, branch_name).await {
                 log!(
                     "[ApplyNow] Hardening session ended without writing marker for branch {} — aborting apply",
@@ -594,6 +581,44 @@ impl LucidosEngine {
                 self.mark_session_idle(thread_id, worktree_path).await;
                 return Ok(());
             }
+        }
+
+        // Step 1 only logs a failed auto-commit. A tree still dirty here holds
+        // work that never reached the branch. Every path below ends in a reset
+        // that would wipe it, including a merge of the commits that did land.
+        // An unanswered probe counts as dirty. Submodules are left out: the
+        // auto-commit cannot stage inside one, and the reset never touches one.
+        let still_dirty = git_answer_when_ok(
+            &["status", "--porcelain", "--ignore-submodules=all"],
+            worktree_path,
+            |o| !o.stdout.is_empty(),
+        )
+        .await;
+        if still_dirty.or_unknown(true) {
+            log!(
+                "[ApplyNow] Branch {}'s worktree is still dirty (or unreadable) after the \
+                 auto-commit. Leaving the worktree untouched",
+                branch_name
+            );
+            self.event_bus
+                .emit_or_log(
+                    BusEvent::Thread {
+                        thread_id,
+                        event: ThreadEvent::ChangeApplyFailed {
+                            change_id: String::new(),
+                            error: "Could not confirm the coding agent's changes were \
+                                    committed, so nothing was applied. The files are still in \
+                                    the worktree."
+                                .to_string(),
+                            actor: actor.clone(),
+                        },
+                        meta: EventMeta::NONE,
+                    },
+                    "[ApplyNow] ChangeApplyFailed (auto-commit failed)",
+                )
+                .await;
+            self.mark_session_idle(thread_id, worktree_path).await;
+            return Ok(());
         }
 
         // Step 3: Check for commits
@@ -874,6 +899,7 @@ impl LucidosEngine {
         // is already running, so the binding belongs here.
         self.bind_session_to_conflict_resolution(thread_id, change_id)
             .await;
+        let main_at_start = branch_head_sha(repo_root, "main").await;
         let prompt = self
             .start_merge_and_get_prompt(thread_id, change_id, conflict_files, "main", None, None)
             .await;
@@ -910,17 +936,9 @@ impl LucidosEngine {
             );
         }
 
-        // Verify CC completed the merge. `or_unknown(false)`: a probe that
-        // could not run must not authorize the fast-forward below. A `false`
-        // costs the user one retry, while an unverified `true` would ff main
-        // onto a branch that never took the merge (`.claude/rules/rust.md`).
-        let main_merged = crate::engine::git_ops::git_answer(
-            &["merge-base", "--is-ancestor", "main", branch_name],
-            repo_root,
-        )
-        .await
-        .or_unknown(false);
-        if !main_merged {
+        // Verify CC completed the merge it was asked for. Changes that landed
+        // on main since are the catch-up's to merge, below.
+        if !resolution_merged_main(repo_root, main_at_start.as_deref(), branch_name).await {
             return Err(
                 "Coding agent session ended without completing the merge. Try applying again."
                     .into(),
@@ -1268,16 +1286,12 @@ impl LucidosEngine {
         use crate::engine::event_bus::BusEvent;
         use crate::engine::thread_events::{EventMeta, ThreadEvent};
 
-        let cc_sid = {
-            let mut sessions = self.agent_sessions.lock().await;
-            if let Some(s) = sessions.get_mut(&thread_id) {
-                s.has_changes = false;
-                s.requires_restart = false;
-            }
-            sessions
-                .get(&thread_id)
-                .and_then(|s| s.cc_session_id.clone())
-        };
+        let cc_sid = self
+            .agent_sessions
+            .lock()
+            .await
+            .get(&thread_id)
+            .and_then(|s| s.backend_session_id.clone());
 
         let coding_agent = self.thread_coding_agent(thread_id).await;
         self.event_bus
@@ -1308,34 +1322,17 @@ impl LucidosEngine {
     }
 }
 
-/// Probe `main` against HEAD to detect merge conflicts without touching the
-/// worktree. Returns the list of conflicting paths (empty for clean merges).
-/// Uses `git merge-tree` (read-only, no index/working-tree mutation) so it's
-/// safe to run alongside other operations in the same worktree.
+/// The paths a merge of `main` into the worktree's HEAD would conflict on, for
+/// the conflict prompt and panel. Empty for a clean merge, and for a probe git
+/// could not answer: the merge session runs either way and finds the conflicts
+/// itself, so an unknown list costs only the preview.
 pub(crate) async fn probe_merge_conflicts(worktree_path: &Path) -> Vec<String> {
-    // `--name-only` (Git 2.40+) prints one conflicting path per line on stdout;
-    // exit code 1 = conflicts present, 0 = clean. Anything else is unexpected.
-    let out = match git_cmd(
-        &["merge-tree", "--name-only", "HEAD", "main"],
-        worktree_path,
-    )
-    .await
-    {
-        Ok(o) => o,
-        Err(e) => {
-            log!(
-                "[MergeViaCC] probe_merge_conflicts: merge-tree failed: {}",
-                e
-            );
-            return Vec::new();
+    match crate::engine::git_ops::probe_merge(worktree_path, "HEAD", "main").await {
+        crate::engine::git_ops::MergeProbe::Conflicts(files) => files,
+        crate::engine::git_ops::MergeProbe::Clean | crate::engine::git_ops::MergeProbe::Unknown => {
+            Vec::new()
         }
-    };
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(String::from)
-        .collect()
+    }
 }
 
 #[cfg(test)]
@@ -1532,6 +1529,60 @@ mod tests {
             writers,
             vec![("engine/agent_session/apply_now.rs".to_string(), 1)],
             "only `release_change_claim` may clear the claim"
+        );
+    }
+
+    /// Apply Now asks about a parked question before either branch can prompt
+    /// the agent. Checked after the claim or the fast path, a hardening run
+    /// could already be on its way. The predicate itself is pinned by
+    /// `a_proposal_keeps_the_thread_on_its_open_question`.
+    #[test]
+    fn apply_now_refuses_a_parked_question_before_it_prompts_anything() {
+        let src = include_str!("apply_now.rs");
+        let body = &src[src.find("pub async fn apply_now(").unwrap()..];
+        let at = |needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("apply_now no longer contains {needle:?}"))
+        };
+        for refusal in ["QUESTION_OPEN_MESSAGE", "QUESTION_UNKNOWN_MESSAGE"] {
+            for later in [
+                "session.change_claim = Some(",
+                "pending_for_thread(thread_id)",
+                "end_stale_waiting_session(",
+            ] {
+                assert!(
+                    at(refusal) < at(later),
+                    "{refusal} must be returned before {later:?}"
+                );
+            }
+        }
+    }
+
+    /// Step 1's auto-commit only logs a failure, so a branch can sit under a
+    /// worktree still holding uncommitted work, with or without earlier
+    /// commits. The dirtiness gate has to run before the first reset on every
+    /// path, or Apply wipes that work.
+    #[test]
+    fn a_failed_auto_commit_is_caught_before_any_merge_or_reset() {
+        let src = include_str!("apply_now.rs");
+        let body = &src[src.find("async fn apply_now_inner(").unwrap()..];
+        let at = |needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("apply_now_inner no longer contains {needle:?}"))
+        };
+        let gate = at("still_dirty.or_unknown(true)");
+        assert!(at("auto_commit_preserving_marker(") < gate);
+        assert!(
+            gate < at("let has_commits"),
+            "the gate must cover both the commits and the no-commits path"
+        );
+        assert!(
+            gate < at(".merge_via_cc_session("),
+            "the gate must precede the merge"
+        );
+        assert!(
+            gate < at("self.reset_worktree_and_idle("),
+            "the dirtiness gate must precede every reset in apply_now_inner"
         );
     }
 

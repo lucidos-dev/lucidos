@@ -19,6 +19,7 @@ import { Explainer } from '../shared/Explainer';
 import { LoadableError } from '../shared/LoadableError';
 import { ListRowAddCard } from '../shared/ListRowAddCard';
 import { Overlay } from '../shared/Overlay';
+import { SurfaceHead } from '../shared/Surface';
 import { PROSE_TEXT_ATTRS } from '../../utils/noAutofill';
 import {
   STANDARD_ID,
@@ -241,7 +242,7 @@ function StyleRow({
     const question = shipped
       ? `Reset "${style.label}" to the wording Lucidos ships?`
       : `Delete the "${style.label}" style?`;
-    if (!(await showConfirm(question, shipped ? 'Reset' : 'Delete'))) return;
+    if (!(await showConfirm(question, shipped ? 'Reset' : 'Delete', { variant: 'danger' }))) return;
     await saveStyleDocument((current) => documentWithout(current, style.id));
   }
 
@@ -350,13 +351,13 @@ function StyleEditorModal({
       open
       onClose={onDone}
       overlayClass="style-editor-overlay"
-      panelClass="style-editor-modal"
+      panelClass="surface surface-raised style-editor-modal"
       panelRole="dialog"
       ariaModal
       dataRole="response-style-editor"
       panelProps={{ 'aria-label': title }}
     >
-      <h2 class="style-editor-title">{title}</h2>
+      <SurfaceHead title={title} onClose={onDone} closeLabel={`Close ${title}`} />
       {/* What a style is for. Above the fields rather than under them, so the
           reader meets it first. Each field then says what goes in it. */}
       <p class="style-editor-intro">
@@ -395,7 +396,7 @@ function StyleEditorModal({
           {used} of {MAX_INSTRUCTION_CHARS} characters
         </span>
         <div class="style-editor-actions">
-          <button class="action-btn" onClick={onDone}>
+          <button class="action-btn action-btn-secondary" onClick={onDone}>
             Cancel
           </button>
           <button

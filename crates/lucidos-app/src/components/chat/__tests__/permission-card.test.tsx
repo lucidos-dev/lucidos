@@ -95,7 +95,6 @@ describe('renderQuestion, the Codex backend tools', () => {
       expect(text).not.toContain('file_change');
       expect(text).not.toContain('command_execution');
       expect(text).toContain('The coding agent wants to');
-      expect(text).toContain('Allow?');
     }
   });
 
@@ -188,14 +187,65 @@ describe('renderQuestion, the Codex backend tools', () => {
     }
   });
 
-  it('asks about a command the same way the command-guard card does', () => {
+  it('leads with codex\'s reason and still shows the whole command', () => {
     const text = vnodeToText(
       renderQuestion('command_execution', 'command_execution sudo rm -rf /x', {
         command: 'sudo rm -rf /x',
         cwd: '/wt',
+        reason: 'Remove the stale build dir, so the next build starts clean',
       }),
     );
-    expect(text).toContain('wants to run <code>sudo rm -rf /x</code>. Allow?');
+    expect(text).toContain('Remove the stale build dir, so the next build starts clean');
+    expect(text).toContain('<code>sudo rm -rf /x</code>');
+  });
+});
+
+describe('renderQuestion, a Claude Code shell command', () => {
+  const longCommand =
+    "sed -n '/^## Triggers/,+3p' /Users/me/.claude/projects/x/tool-results/abc.txt | head -40; lucidos knowhow list 2>/dev/null | grep -i trigger";
+
+  it('leads with the agent\'s own description of what and why', () => {
+    const text = vnodeToText(
+      renderQuestion('Bash', `Bash ${longCommand}`, {
+        command: longCommand,
+        description: 'Read the Triggers section of the saved output, to see how triggers get installed',
+      }),
+    );
+    expect(text).toContain('Read the Triggers section of the saved output, to see how triggers get installed');
+    expect(text.indexOf('Read the Triggers')).toBeLessThan(text.indexOf('<code>'));
+  });
+
+  it('shows the command verbatim under the description, never cut short', () => {
+    // The description is the agent's claim; the command is what runs. The user
+    // must be able to read every byte of it before allowing.
+    const text = vnodeToText(
+      renderQuestion('Bash', `Bash ${longCommand}`, {
+        command: longCommand,
+        description: 'Read the Triggers section',
+      }),
+    );
+    expect(text).toContain(`<code>${longCommand}</code>`);
+  });
+
+  it('shows the command byte for byte, surrounding whitespace included', () => {
+    const script = "\npython3 - <<'EOF'\nprint(1)\nEOF\n";
+    const text = vnodeToText(
+      renderQuestion('Bash', 'Bash python3', { command: script, description: 'Print 1' }),
+    );
+    expect(text).toContain(`<code>${script}</code>`);
+  });
+
+  it('keeps the command out of the sentence', () => {
+    const text = vnodeToText(
+      renderQuestion('Bash', 'Bash ls', { command: 'ls', description: 'List files' }),
+    );
+    expect(text).not.toContain('the <strong>Bash</strong> tool on');
+  });
+
+  it('falls back to a plain ask when the agent gave no description', () => {
+    const text = vnodeToText(renderQuestion('Bash', 'Bash git status', { command: 'git status' }));
+    expect(text).toContain('The coding agent wants to run this command.');
+    expect(text).toContain('<code>git status</code>');
   });
 });
 

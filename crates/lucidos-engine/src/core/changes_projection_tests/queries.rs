@@ -357,7 +357,7 @@ async fn client_update_since_detects_frontend_files() {
     emit(
         &bus,
         thread,
-        proposed_with_files(id, "b", "/r", vec!["src/app.ts"]),
+        proposed_with_files(id, "b", "/r", vec!["crates/lucidos-app/src/app.ts"]),
     )
     .await;
     emit(&bus, thread, applied_event(id, &["c"], false)).await;
@@ -369,7 +369,7 @@ async fn client_update_since_detects_frontend_files() {
 }
 
 #[tokio::test]
-async fn client_update_since_ignores_non_frontend_files() {
+async fn client_update_since_ignores_files_outside_the_bundle() {
     let (pool, db) = setup_test_db().await;
     let (bus, _cb_rx) = EventBus::new(pool.clone());
     let thread = Uuid::new_v4();
@@ -380,7 +380,16 @@ async fn client_update_since_ignores_non_frontend_files() {
     emit(
         &bus,
         thread,
-        proposed_with_files(id, "b", "/r", vec!["src/lib.rs", "Cargo.toml"]),
+        proposed_with_files(
+            id,
+            "b",
+            "/r",
+            vec![
+                "crates/lucidos-engine/src/lib.rs",
+                "Cargo.toml",
+                "crates/lucidos-app/e2e/thread.spec.ts",
+            ],
+        ),
     )
     .await;
     emit(&bus, thread, applied_event(id, &["c"], false)).await;
@@ -402,7 +411,7 @@ async fn client_update_since_ignores_pre_cutoff() {
     emit(
         &bus,
         thread,
-        proposed_with_files(id, "b", "/r", vec!["src/app.tsx"]),
+        proposed_with_files(id, "b", "/r", vec!["crates/lucidos-app/src/app.tsx"]),
     )
     .await;
     emit(&bus, thread, applied_event(id, &["c"], false)).await;

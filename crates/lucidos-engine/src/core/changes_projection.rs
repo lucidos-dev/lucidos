@@ -28,23 +28,24 @@ const SELECT_CHANGE: &str =
 const MERGE_PAIRING_EVENT_TYPES: &str = "'MergeConflictDetected','MergeResolutionCleared',\
      'ChangeApplyFailed','ChangeApplied','ChangeDiscarded'";
 
-/// Of the given `(thread_id, change_id)` pairs, the change ids whose
-/// conflict-resolution pairing is open: their latest merge-lifecycle event is
+/// Of the given `(thread_id, change_id)` pairs, the changes whose
+/// conflict-resolution pairing is open, each with when it opened. A pairing is
+/// open when the change's latest merge-lifecycle event is
 /// `MergeConflictDetected`. One batch query, and the single definition of an
 /// open pairing. It does not check the row is pending; callers do.
-pub async fn resolving_conflict_change_ids(
+pub async fn open_conflict_pairings(
     pool: &PgPool,
     pairs: &[(Uuid, Uuid)],
-) -> sqlx::Result<std::collections::HashSet<Uuid>> {
+) -> sqlx::Result<std::collections::HashMap<Uuid, DateTime<Utc>>> {
     if pairs.is_empty() {
-        return Ok(std::collections::HashSet::new());
+        return Ok(std::collections::HashMap::new());
     }
     let thread_ids: Vec<String> = pairs.iter().map(|(t, _)| t.to_string()).collect();
     let change_ids: Vec<String> = pairs.iter().map(|(_, c)| c.to_string()).collect();
-    let open: Vec<String> = sqlx::query_scalar(&format!(
-        "SELECT change_id FROM ( \
+    let open: Vec<(String, DateTime<Utc>)> = sqlx::query_as(&format!(
+        "SELECT change_id, created FROM ( \
             SELECT DISTINCT ON (payload->>'change_id') \
-                   payload->>'change_id' AS change_id, event_type \
+                   payload->>'change_id' AS change_id, event_type, created \
             FROM events \
             WHERE aggregate_id = ANY($1) \
               AND payload->>'change_id' = ANY($2) \
@@ -58,8 +59,8 @@ pub async fn resolving_conflict_change_ids(
     .fetch_all(pool)
     .await?;
     Ok(open
-        .iter()
-        .filter_map(|id| Uuid::parse_str(id).ok())
+        .into_iter()
+        .filter_map(|(id, at)| Uuid::parse_str(&id).ok().map(|id| (id, at)))
         .collect())
 }
 
@@ -95,6 +96,36 @@ impl ChangesProjection {
     }
 
     // --- Write API (called from event_bus inside the event commit tx) ---
+
+    /// Recompute a thread's `coding_agent_proposed` and
+    /// `coding_agent_requires_restart` from its pending changes. The two
+    /// columns are a cache of this table, and nothing else writes them. Every
+    /// write below that moves a change in or out of `pending` calls this in its
+    /// transaction, as does one that changes a restart flag.
+    pub(crate) async fn sync_thread_proposal<'e, E>(
+        executor: E,
+        thread_id: Uuid,
+    ) -> sqlx::Result<()>
+    where
+        E: sqlx::Executor<'e, Database = Postgres>,
+    {
+        sqlx::query(
+            "UPDATE thread_summaries t SET \
+                coding_agent_proposed = p.pending, \
+                coding_agent_requires_restart = p.requires_restart \
+             FROM (SELECT COUNT(*) > 0 AS pending, \
+                          COALESCE(bool_or(requires_restart), FALSE) AS requires_restart \
+                   FROM changes WHERE thread_id = $1 AND status = $2) p \
+             WHERE t.thread_id = $1 \
+               AND (t.coding_agent_proposed, t.coding_agent_requires_restart) \
+                   IS DISTINCT FROM (p.pending, p.requires_restart)",
+        )
+        .bind(thread_id)
+        .bind(ChangeStatus::Pending)
+        .execute(executor)
+        .await?;
+        Ok(())
+    }
 
     /// Insert (or update on re-emit) the row for an aggregate `ChangeProposed`.
     /// `request_id` is `Uuid::nil()` — the event payload doesn't carry it; auto-apply
@@ -147,7 +178,7 @@ impl ChangesProjection {
         .bind(ChangeStatus::Pending)
         .execute(&mut **tx)
         .await?;
-        Ok(())
+        Self::sync_thread_proposal(&mut **tx, thread_id).await
     }
 
     /// Per-commit `ChangeProposed` (empty change_id, commit_sha set): bump
@@ -160,18 +191,23 @@ impl ChangesProjection {
         description: Option<&str>,
         requires_restart: bool,
     ) -> sqlx::Result<()> {
-        sqlx::query(
+        let thread_ids: Vec<Option<Uuid>> = sqlx::query_scalar(
             "UPDATE changes SET \
              description = COALESCE($2, description), \
              requires_restart = requires_restart OR $3, \
              hardened = FALSE \
-             WHERE branch_name = $1 AND status = 'pending'",
+             WHERE branch_name = $1 AND status = $4 \
+             RETURNING thread_id",
         )
         .bind(branch_name)
         .bind(description)
         .bind(requires_restart)
-        .execute(&mut **tx)
+        .bind(ChangeStatus::Pending)
+        .fetch_all(&mut **tx)
         .await?;
+        for thread_id in thread_ids.into_iter().flatten() {
+            Self::sync_thread_proposal(&mut **tx, thread_id).await?;
+        }
         Ok(())
     }
 
@@ -186,13 +222,14 @@ impl ChangesProjection {
         let Some(id) = parse_change_id(change_id) else {
             return Ok(());
         };
-        let res = sqlx::query(
+        let row: Option<Option<Uuid>> = sqlx::query_scalar(
             "UPDATE changes SET status = $6, resolved_at = NOW(), \
              requires_restart = $2, \
              commits = CASE WHEN cardinality($3::text[]) > 0 THEN $3 ELSE commits END, \
              pre_merge_sha = COALESCE($4, pre_merge_sha), \
              post_merge_sha = COALESCE($5, post_merge_sha) \
-             WHERE id = $1",
+             WHERE id = $1 \
+             RETURNING thread_id",
         )
         .bind(id)
         .bind(requires_restart)
@@ -200,10 +237,14 @@ impl ChangesProjection {
         .bind(pre_merge_sha)
         .bind(post_merge_sha)
         .bind(ChangeStatus::Applied)
-        .execute(&mut **tx)
+        .fetch_optional(&mut **tx)
         .await?;
-        if res.rows_affected() == 0 {
-            crate::log!("[ChangesProjection] write_applied: no row for {} — missing aggregate ChangeProposed?", id);
+        match row {
+            None => {
+                crate::log!("[ChangesProjection] write_applied: no row for {}: missing aggregate ChangeProposed?", id);
+            }
+            Some(Some(thread_id)) => Self::sync_thread_proposal(&mut **tx, thread_id).await?,
+            Some(None) => {}
         }
         Ok(())
     }
@@ -252,13 +293,19 @@ impl ChangesProjection {
         let Some(id) = parse_change_id(change_id) else {
             return Ok(());
         };
-        let res = sqlx::query("UPDATE changes SET status = $2, resolved_at = NOW() WHERE id = $1")
-            .bind(id)
-            .bind(status)
-            .execute(&mut **tx)
-            .await?;
-        if res.rows_affected() == 0 {
-            crate::log!("[ChangesProjection] write_status({}) for {}: no row — missing aggregate ChangeProposed?", status, id);
+        let row: Option<Option<Uuid>> = sqlx::query_scalar(
+            "UPDATE changes SET status = $2, resolved_at = NOW() WHERE id = $1 RETURNING thread_id",
+        )
+        .bind(id)
+        .bind(status)
+        .fetch_optional(&mut **tx)
+        .await?;
+        match row {
+            None => {
+                crate::log!("[ChangesProjection] write_status({}) for {}: no row, missing aggregate ChangeProposed?", status, id);
+            }
+            Some(Some(thread_id)) => Self::sync_thread_proposal(&mut **tx, thread_id).await?,
+            Some(None) => {}
         }
         Ok(())
     }
@@ -324,8 +371,9 @@ impl ChangesProjection {
     /// All pending changes, ordered by created_at ASC.
     pub async fn list_pending(&self) -> sqlx::Result<Vec<Change>> {
         sqlx::query_as(&format!(
-            "{SELECT_CHANGE} WHERE status = 'pending' ORDER BY created_at ASC"
+            "{SELECT_CHANGE} WHERE status = $1 ORDER BY created_at ASC"
         ))
+        .bind(ChangeStatus::Pending)
         .fetch_all(&self.pool)
         .await
     }
@@ -341,9 +389,10 @@ impl ChangesProjection {
     /// Get the pending change for a given branch, if one exists.
     pub async fn get_pending_by_branch(&self, branch_name: &str) -> sqlx::Result<Option<Change>> {
         sqlx::query_as(&format!(
-            "{SELECT_CHANGE} WHERE branch_name = $1 AND status = 'pending' LIMIT 1"
+            "{SELECT_CHANGE} WHERE branch_name = $1 AND status = $2 LIMIT 1"
         ))
         .bind(branch_name)
+        .bind(ChangeStatus::Pending)
         .fetch_optional(&self.pool)
         .await
     }
@@ -351,9 +400,10 @@ impl ChangesProjection {
     /// All pending changes for a specific thread.
     pub async fn pending_for_thread(&self, thread_id: Uuid) -> sqlx::Result<Vec<Change>> {
         sqlx::query_as(&format!(
-            "{SELECT_CHANGE} WHERE status = 'pending' AND thread_id = $1 ORDER BY created_at ASC"
+            "{SELECT_CHANGE} WHERE status = $2 AND thread_id = $1 ORDER BY created_at ASC"
         ))
         .bind(thread_id)
+        .bind(ChangeStatus::Pending)
         .fetch_all(&self.pool)
         .await
     }
@@ -425,8 +475,8 @@ impl ChangesProjection {
         thread_id: Uuid,
         change_id: Uuid,
     ) -> sqlx::Result<bool> {
-        let open = resolving_conflict_change_ids(&self.pool, &[(thread_id, change_id)]).await?;
-        if !open.contains(&change_id) {
+        let open = open_conflict_pairings(&self.pool, &[(thread_id, change_id)]).await?;
+        if !open.contains_key(&change_id) {
             return Ok(false);
         }
         Ok(self
@@ -443,10 +493,11 @@ impl ChangesProjection {
     ) -> sqlx::Result<bool> {
         sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS(SELECT 1 FROM changes \
-             WHERE status = 'pending' AND branch_name = $1 AND id <> $2)",
+             WHERE status = $3 AND branch_name = $1 AND id <> $2)",
         )
         .bind(branch_name)
         .bind(exclude_id)
+        .bind(ChangeStatus::Pending)
         .fetch_one(&self.pool)
         .await
     }
@@ -459,12 +510,14 @@ impl ChangesProjection {
         before: Option<DateTime<Utc>>,
     ) -> sqlx::Result<Vec<Change>> {
         sqlx::query_as(&format!(
-            "{SELECT_CHANGE} WHERE status IN ('applied', 'reverted') \
+            "{SELECT_CHANGE} WHERE status IN ($3, $4) \
              AND ($2::timestamptz IS NULL OR resolved_at < $2) \
              ORDER BY resolved_at DESC NULLS LAST LIMIT $1"
         ))
         .bind(limit.max(0))
         .bind(before)
+        .bind(ChangeStatus::Applied)
+        .bind(ChangeStatus::Reverted)
         .fetch_all(&self.pool)
         .await
     }
@@ -482,22 +535,25 @@ impl ChangesProjection {
     ) -> sqlx::Result<(Vec<Change>, Vec<Change>, bool)> {
         let fetch_limit = applied_limit.max(0) + 1;
         let pending_sql = format!(
-            "{SELECT_CHANGE} WHERE status = 'pending' AND repo_root = $1 \
+            "{SELECT_CHANGE} WHERE status = $2 AND repo_root = $1 \
              ORDER BY created_at ASC"
         );
         let applied_sql = format!(
-            "{SELECT_CHANGE} WHERE status IN ('applied', 'reverted') AND repo_root = $1 \
+            "{SELECT_CHANGE} WHERE status IN ($4, $5) AND repo_root = $1 \
              AND ($3::timestamptz IS NULL OR resolved_at < $3) \
              ORDER BY resolved_at DESC NULLS LAST LIMIT $2"
         );
         let (pending_r, applied_r) = tokio::join!(
             sqlx::query_as(&pending_sql)
                 .bind(repo_root)
+                .bind(ChangeStatus::Pending)
                 .fetch_all(&self.pool),
             sqlx::query_as(&applied_sql)
                 .bind(repo_root)
                 .bind(fetch_limit)
                 .bind(before)
+                .bind(ChangeStatus::Applied)
+                .bind(ChangeStatus::Reverted)
                 .fetch_all(&self.pool),
         );
 
@@ -516,26 +572,27 @@ impl ChangesProjection {
     pub async fn requires_restart_since(&self, since: DateTime<Utc>) -> sqlx::Result<bool> {
         sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS(SELECT 1 FROM changes \
-             WHERE status = 'applied' AND requires_restart AND resolved_at > $1)",
+             WHERE status = $2 AND requires_restart AND resolved_at > $1)",
         )
         .bind(since)
+        .bind(ChangeStatus::Applied)
         .fetch_one(&self.pool)
         .await
     }
 
-    /// Whether any applied change since `since` touches frontend files
-    /// (`.ts`, `.tsx`, `.css`, `.html`, `.js`, `.jsx`). Used to nudge clients
-    /// to reload after a hot-fix.
+    /// Whether any applied change since `since` touches an input of the served
+    /// client bundle, by the same rule the Apply path uses
+    /// (`files_have_client_update`).
     pub async fn client_update_since(&self, since: DateTime<Utc>) -> sqlx::Result<bool> {
-        sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(SELECT 1 FROM changes c, unnest(c.files) AS f \
-             WHERE c.status = 'applied' AND c.resolved_at > $1 \
-             AND (f LIKE '%.ts' OR f LIKE '%.tsx' OR f LIKE '%.css' \
-                  OR f LIKE '%.html' OR f LIKE '%.js' OR f LIKE '%.jsx'))",
+        let files: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT f FROM changes c, unnest(c.files) AS f \
+             WHERE c.status = $2 AND c.resolved_at > $1",
         )
         .bind(since)
-        .fetch_one(&self.pool)
-        .await
+        .bind(ChangeStatus::Applied)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(crate::engine::git_ops::files_have_client_update(&files))
     }
 
     /// Restart groups (one per originating thread) for restart-required
@@ -548,10 +605,11 @@ impl ChangesProjection {
     ) -> sqlx::Result<Vec<RestartGroup>> {
         let rows: Vec<(Option<Uuid>, Vec<String>)> = sqlx::query_as(
             "SELECT thread_id, commits FROM changes \
-             WHERE status = 'applied' AND requires_restart AND resolved_at > $1 \
+             WHERE status = $2 AND requires_restart AND resolved_at > $1 \
              ORDER BY resolved_at ASC",
         )
         .bind(since)
+        .bind(ChangeStatus::Applied)
         .fetch_all(&self.pool)
         .await?;
 
@@ -578,8 +636,9 @@ impl ChangesProjection {
     /// startup cleanup of stale merge dirs).
     pub async fn with_merge_worktree(&self) -> sqlx::Result<Vec<Change>> {
         sqlx::query_as(&format!(
-            "{SELECT_CHANGE} WHERE status = 'pending' AND merge_worktree_path IS NOT NULL"
+            "{SELECT_CHANGE} WHERE status = $1 AND merge_worktree_path IS NOT NULL"
         ))
+        .bind(ChangeStatus::Pending)
         .fetch_all(&self.pool)
         .await
     }
@@ -782,7 +841,13 @@ async fn rebuild_one_from_events(pool: &PgPool, change_id: Uuid) -> sqlx::Result
     .await?;
 
     // ON CONFLICT skip means a concurrent write beat us — don't claim recovery.
-    Ok(res.rows_affected() > 0)
+    if res.rows_affected() == 0 {
+        return Ok(false);
+    }
+    if let Some(thread_id) = first.2 {
+        ChangesProjection::sync_thread_proposal(pool, thread_id).await?;
+    }
+    Ok(true)
 }
 
 #[cfg(test)]

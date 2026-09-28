@@ -1,8 +1,9 @@
 use super::events_snapshot::{
-    is_tool_call_event, rename_legacy_section_size, rename_legacy_section_size_in_payload,
-    strip_app_capture_in_tool_result, strip_context_capture_sections,
-    strip_image_content_in_tool_result, strip_inline_image_payloads, strip_tool_call_args,
-    strip_tool_result_content,
+    is_tool_call_event, label_legacy_coding_agent_preview, rename_legacy_section_size,
+    rename_legacy_section_size_in_payload, strip_app_capture_in_tool_result,
+    strip_context_capture_sections, strip_image_content_in_tool_result,
+    strip_inline_image_payloads, strip_tool_call_args, strip_tool_result_content,
+    LEGACY_PREVIEW_NOTE,
 };
 use crate::core::ThreadEventRow;
 use chrono::Utc;
@@ -356,6 +357,42 @@ fn tool_result_strip_covers_the_coding_agent_channel() {
     // The inline step row pairs by `tool_use_id` and labels by `name`.
     assert_eq!(obj.get("name"), Some(&json!("Bash")));
     assert_eq!(obj.get("tool_use_id"), Some(&json!("tu-A")));
+}
+
+#[test]
+fn an_old_200_char_coding_agent_result_is_served_with_a_note() {
+    let preview = "x".repeat(199) + "é";
+    let mut row = row(
+        "CodingAgentToolResult",
+        json!({ "name": "", "result": preview.clone() }),
+    );
+    label_legacy_coding_agent_preview(&mut row);
+    assert_eq!(
+        row.payload["result"],
+        json!(format!("{preview}{LEGACY_PREVIEW_NOTE}"))
+    );
+}
+
+#[test]
+fn a_whole_coding_agent_result_is_served_as_stored() {
+    for result in ["x".repeat(199), "x".repeat(201), "x".repeat(5_000)] {
+        let mut row = row(
+            "CodingAgentToolResult",
+            json!({ "name": "Bash", "result": result.clone() }),
+        );
+        label_legacy_coding_agent_preview(&mut row);
+        assert_eq!(row.payload["result"], json!(result));
+    }
+}
+
+#[test]
+fn a_chat_tool_result_of_200_chars_gets_no_note() {
+    let mut row = row(
+        "ToolResult",
+        json!({ "name": "read_file", "result": "x".repeat(200) }),
+    );
+    label_legacy_coding_agent_preview(&mut row);
+    assert_eq!(row.payload["result"], json!("x".repeat(200)));
 }
 
 #[test]

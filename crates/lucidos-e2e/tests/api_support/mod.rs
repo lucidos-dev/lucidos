@@ -121,7 +121,7 @@ pub fn capacity_policy_lock() -> &'static tokio::sync::Mutex<()> {
 /// concurrently with EACH OTHER and only the exclusive windows are exclusive.
 /// Writers take `read()`.
 ///
-/// TWO KINDS of holder take `write()`, and the second is easy to miss.
+/// THREE KINDS of holder take `write()`, and the last two are easy to miss.
 ///
 /// The snapshot is the first. The second is **any test that MERGES**. The
 /// engine refuses to merge into a tree with uncommitted changes. A `read()`
@@ -137,15 +137,23 @@ pub fn capacity_policy_lock() -> &'static tokio::sync::Mutex<()> {
 ///
 /// An apply the test expects to be REFUSED merges nothing and needs no guard.
 ///
+/// The third is **any test that runs `git commit` in the workspace itself**.
+/// Git reads the index before it locks it. So a commit racing an engine data
+/// write writes back a stale index, and one side's staged files drop out of it.
+///
 /// **Every writer has to take it, so this is an obligation on new tests too.**
 /// A lock the checkpoint test holds against only SOME writers still lets the
-/// rest recreate the card. The writers today are the three apply tests, the two
-/// trigger tests (their script files appearing and being removed), the
-/// file-edit tests, the CLI data-write test, and the app-seeding helper. The
-/// handshake-approval test is one too, for its `data/scripts` and `data/config`
-/// writes. If you add a test that creates, edits or deletes a non-ignored file
+/// rest recreate the card. The writers today:
+///
+/// - the three apply tests;
+/// - the two trigger tests, whose script files appear and are removed;
+/// - the file-edit tests and the agent file-tool tests;
+/// - the CLI data-write test;
+/// - the handshake-approval test, for its `data/scripts` and `data/config` writes.
+///
+/// If you add a test that creates, edits or deletes a non-ignored file
 /// under the e2e workspace, take a `read()` guard across that mutation. Take a
-/// `write()` one if the mutation is a merge. Writes under
+/// `write()` one if the mutation is a merge or your own commit. Writes under
 /// `.lucidos/` and `data/blobs/` need nothing: the workspace gitignores both, so
 /// no snapshot ever sees them.
 ///
@@ -345,13 +353,42 @@ pub fn git_in(dir: &Path, args: &[&str]) -> std::process::Output {
     }
 }
 
+/// `<prefix>-<millis>`, never repeated within this process.
+///
+/// The tests run concurrently, so two can ask in the same millisecond. A
+/// repeat hands both the same thread, and each reads the other's result.
 pub fn unique_marker(prefix: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
-    let ts = SystemTime::now()
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
-        .as_millis();
-    format!("{}-{}", prefix, ts)
+        .as_millis() as u64;
+    let prev = LAST
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |last| {
+            Some(now.max(last + 1))
+        })
+        .unwrap();
+    format!("{}-{}", prefix, now.max(prev + 1))
+}
+
+#[test]
+fn unique_marker_never_repeats_inside_one_millisecond() {
+    let markers: std::collections::HashSet<String> =
+        (0..1000).map(|_| unique_marker("same")).collect();
+    assert_eq!(markers.len(), 1000);
+}
+
+/// A fresh name for a workspace font's directory, one the engine's slug rule
+/// accepts.
+pub fn e2e_font_slug(prefix: &str) -> String {
+    let slug = format!("{prefix}-{:016x}", uuid::Uuid::new_v4().as_u64_pair().0);
+    assert!(
+        slug.len() <= lucidos_engine::core::workspace_fonts::MAX_SLUG_LEN,
+        "{slug} is longer than a font directory name may be"
+    );
+    slug
 }
 
 /// Seed (or upsert) a CC-classified `thread_summaries` row. Required before

@@ -6,6 +6,7 @@ import {
   EVENT_RESOLVE_DEADLINE_MS,
   followSurvivesScroll,
   hasPendingEventScroll,
+  holdRestoredPlace,
   markNavigationScroll,
   onDeepLinkClaimed,
   onDeepLinkResolved,
@@ -14,7 +15,7 @@ import {
   applyFollowSeed,
   type FollowResumeFrom,
 } from '../components/chat/scrollState';
-import { ANCHOR_ATTR, anchorTargetTop, anchorTurnIsClamped, readRowAnchor, readScrollAnchor, rowTargetTop, type RowAnchor, type ScrollAnchor } from '../components/chat/scrollAnchor';
+import { ANCHOR_ATTR, anchorRow, anchorTargetTop, anchorTurn, anchorTurnIsClamped, readRowAnchor, readScrollAnchor, rowTargetTop, type RowAnchor, type ScrollAnchor } from '../components/chat/scrollAnchor';
 import { onPageHide, onPageWake } from '../utils/pageVisit';
 import { postClientLog } from '../utils/clientLog';
 import { watchUserAction } from '../utils/userAction';
@@ -487,6 +488,18 @@ export function attachScrollMemory(
     return Math.max(0, el.scrollHeight - el.clientHeight);
   };
 
+  /** Put the reader at `top`, which `offsetFor` resolved from `record`, and
+   *  hold the turn or row the record names while the transcript settles. Turns
+   *  above it keep drawing after the write, and no browser anchoring carries
+   *  the reader with them. An offset names nothing to hold. */
+  const placeFromRecord = (record: SavedScroll, top: number) => {
+    markNavigationScroll(el, top);
+    const target = record.kind === 'anchor' ? anchorTurn(el, record)
+      : record.kind === 'row' ? anchorRow(el, record)
+      : null;
+    if (target) holdRestoredPlace(el, target);
+  };
+
   /** Put the reader where the record's PLACE says.
    *
    *  A turn lands NOW when it is already rendered, which is every revisit
@@ -519,7 +532,7 @@ export function attachScrollMemory(
       if (!final) keepWaitingForAnchor();
       return;
     }
-    markNavigationScroll(el, top);
+    placeFromRecord(saved, top);
     reportRestore(el.scrollTop < el.scrollHeight - el.clientHeight - 1 ? 'landed' : 'landed-at-bottom');
     stopRestore();
   };
@@ -703,8 +716,8 @@ export function attachScrollMemory(
         const rescueTop = recorded === null ? null : offsetFor(recorded);
         if (recorded?.kind === 'live-edge') {
           resumeFollowingBottom(el);
-        } else if (rescueTop !== null) {
-          markNavigationScroll(el, rescueTop);
+        } else if (recorded !== null && rescueTop !== null) {
+          placeFromRecord(recorded, rescueTop);
         } else if (resetOnEmpty) {
           // Either there was no position, or there is one the content cannot
           // hold. Both open the thread where a thread with no position opens, at

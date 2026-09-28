@@ -12,6 +12,7 @@ import type { ProgressDialogState } from '../../store/types';
 import type { AppUpdateRunning } from '../../utils/tauri';
 import type { DropdownOption } from '../shared/Dropdown';
 import type { WebhookIngressOutage, WebhookRefusal } from '../../api/client';
+import type { EventConditionModalState } from '../../store/store';
 import type { SlownessEpisode } from '../../store/actions/slowness';
 
 /** Everything the communication-surface gallery fires, kept out of the page so
@@ -171,6 +172,24 @@ export const SAMPLE_UNCLEAR_EPISODE: SlownessEpisode = {
   slow_workspaces: ['dev'],
 };
 
+/** An engine that answers while its database does not, as when Docker's VM
+ *  stalls. The bar names the database and how to restart it. */
+export const SAMPLE_DATABASE_EPISODE: SlownessEpisode = {
+  state: 'slow',
+  episode_id: 'sample-database',
+  reason: 'database',
+  problem: 'not_answering',
+  slow_workspaces: ['dev'],
+};
+
+/** A nearly full disk, which stalls the database behind it. */
+export const SAMPLE_DISK_EPISODE: SlownessEpisode = {
+  state: 'slow',
+  episode_id: 'sample-disk',
+  reason: 'disk',
+  free_bytes: 4e8,
+};
+
 /** The other cause, which wants different words and a different fix.
  *
  *  Here the hook is on, the path is fine, and the deliveries reach the verifier
@@ -187,10 +206,19 @@ export const SAMPLE_WEBHOOK_VERIFICATION_REFUSAL: WebhookRefusal = {
   refusing_secs: 97_200,
 };
 
+// --- Popovers ---
+
+/** The condition the waiting panel drills into. */
+export const SAMPLE_CONDITION: EventConditionModalState = {
+  eventType: 'PullRequestReviewed',
+  conditions: [{ repo: 'example-org/example-repo', pr: 412 }],
+};
+
 // --- Dialogs ---
 
 export function sampleConfirmDanger(): void {
   void showConfirm('Delete the trigger "Daily digest"? This cannot be undone.', 'Delete', {
+    variant: 'danger',
     title: 'Delete trigger',
   });
 }

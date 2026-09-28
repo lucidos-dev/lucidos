@@ -22,6 +22,11 @@
     --radius-sm: 0.25rem;
     --radius-md: 0.375rem;
     --radius-lg: 0.5rem;
+    /* The theme's corner steps, which shared-components.css reads. Keep in sync
+       with base.css. */
+    --radius-control: 0.5rem;
+    --radius-surface: 0.75rem;
+    --radius-round: 999px;
     --transition: 0.15s ease;
 
     /* Z-index for the shared #tooltip rules appended from shared-components.css.
@@ -76,7 +81,7 @@
 }
 
 /* Dark theme (default) */
-html, html[data-theme="dark"] {
+html, html[data-theme-mode="dark"] {
     color-scheme: dark;
     /* Very dark blue (logo hue) — mirror of base.css dark ladder so app
        iframes share the parent's surfaces. Keep in sync with base.css. */
@@ -91,6 +96,8 @@ html, html[data-theme="dark"] {
     --text-secondary: #8b949e;
     --text-muted: #6e7681;
     --text-on-accent: #fff;
+    /* Bold text where the UI font has no bold face. Keep in sync with base.css. */
+    --text-strong: color-mix(in oklab, var(--text-primary) 60%, white);
     --accent: #58a6ff;
     --accent-light: #7ab8ff;
     /* Action-button blue — the filled-CTA color, lifted off the brand blue
@@ -109,7 +116,7 @@ html, html[data-theme="dark"] {
 }
 
 /* Light theme */
-html[data-theme="light"] {
+html[data-theme-mode="light"] {
     color-scheme: light;
     --bg-primary: #ffffff;
     --bg-secondary: #f6f8fa;
@@ -122,6 +129,7 @@ html[data-theme="light"] {
     --text-secondary: #656d76;
     --text-muted: #8b949e;
     --text-on-accent: #fff;
+    --text-strong: color-mix(in oklab, var(--text-primary) 60%, black);
     --accent: #0969da;
     --accent-light: #218bff;
     /* Light mode anchors the filled CTA on the brand blue. Keep in sync with
@@ -168,8 +176,9 @@ body {
 /* Programming ligatures belong to CODE, never to prose. sdk-prefs.js
    (api/sdk_prefs.rs) and applyPreferences (packages/lucidos-sdk/src/ui.ts)
    publish two values on <html>: --font-features-text and --font-features-code.
-   For Fira Code they are '"liga" 0, "calt" 0' and '"liga" 1, "calt" 1'; for
-   every other font both are `normal`. These two rules are their ONLY consumers
+   For a font with programming ligatures (`ligatures` in the font catalog) they
+   are '"liga" 0, "calt" 0' and '"liga" 1, "calt" 1'; for every other font both
+   are `normal`. These two rules are their ONLY consumers
    in an app iframe, mirroring the host's rules in styles/global/base.css.
 
    Fira Code's `calt` re-spaces dot runs, so a typed `...` reads as two dots
@@ -345,28 +354,6 @@ button:hover {
     opacity: 0.6;
 }
 
-/* Secondary action button — IFRAME-ONLY: a neutral, outlined sibling of
-   .action-btn for a lower-emphasis action beside a primary CTA. Apps frequently
-   need a second button next to a primary one; the host shell uses other
-   affordances (.icon-btn / .accent-link / .dropdown-trigger) and has no
-   equivalent, so this lives here rather than in the shared component layer (it
-   would be dead code in the host bundle). The shared .action-btn is appended
-   AFTER this file, so use a COMPOUND selector (.action-btn.action-btn-secondary,
-   specificity 0,2,0) to win regardless of source order. Apply as
-   class="action-btn action-btn-secondary". */
-.action-btn.action-btn-secondary {
-    background-color: transparent;
-    border: 1px solid var(--border-color);
-    color: var(--text-primary);
-}
-
-@media (hover: hover) {
-    .action-btn.action-btn-secondary:hover {
-        background-color: var(--bg-hover);
-        border-color: var(--text-muted);
-    }
-}
-
 /* Scrollbar */
 ::-webkit-scrollbar {
     width: 0.375rem;
@@ -384,4 +371,25 @@ button:hover {
 
 ::-webkit-scrollbar-thumb:hover {
     background: var(--text-muted);
+}
+
+/* Theme parts for app frames (ADR 0307). An app that loads this stylesheet
+   paints the frame parts of the active theme; one without the SDK paints none.
+   Each rule reads one part token, with a fallback equal to the value above.
+   Last in the file, so the Select trigger's border shorthand does not undo it.
+   `data-theme-parts="off"` on the app's <html> resets every part token (see
+   the generated rules appended below). */
+body {
+    text-shadow: var(--part-app-text-text-shadow, none);
+    letter-spacing: var(--part-app-text-letter-spacing, normal);
+}
+
+a {
+    text-decoration-color: var(--part-app-link-text-decoration-color, currentcolor);
+    text-shadow: var(--part-app-link-text-shadow, var(--part-app-text-text-shadow, none));
+}
+
+input, textarea, select, button, .lucidos-select-trigger {
+    border-color: var(--part-app-control-border-color, var(--border-color));
+    box-shadow: var(--part-app-control-box-shadow, none);
 }

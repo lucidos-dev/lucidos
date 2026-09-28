@@ -154,7 +154,7 @@ that is ADR 0169. Clause 4 is not enforceable until it lands.
   for the four verbs above. Both become wrong rather than incomplete, and both
   are amended in the change that lands this.
 - **Apply All gains a "Keep going as the rest settle" checkbox.** It reads
-  "Apply as they settle" when nothing is pending. That is the sweep: everything
+  "Apply all on settle" when nothing is pending. That is the sweep: everything
   pending, plus everything still working, as each one lands.
 - **A single change gains a standing apply.** That is the selection, and it is
   not redundant beside the sweep. The owner may have two threads running, one

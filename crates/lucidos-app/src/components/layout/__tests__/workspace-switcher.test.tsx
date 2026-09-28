@@ -21,6 +21,8 @@
  */
 import { describe, it, expect, vi } from 'vitest';
 import type { VNode } from 'preact';
+vi.mock('../../shared/Disclosure', () => import('../../shared/__tests__/disclosureStub'));
+
 import { workspacesMenuRow, workspaceSwitcherList, skeletonShape, initiallyExpanded } from '../WorkspaceSwitcher';
 import type { SwitcherListProps } from '../WorkspaceSwitcher';
 import { vnodeToText } from '../../chat/__tests__/vnodeToText';

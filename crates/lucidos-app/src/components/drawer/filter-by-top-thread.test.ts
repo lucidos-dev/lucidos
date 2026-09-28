@@ -41,7 +41,6 @@ function makeThread(
         codingAgentProposed: false,
         codingAgentRequiresRestart: false,
         codingAgentIsExternalRepo: false,
-        codingAgentApplying: false,
         lastRevivedAt: '',
         parentThreadId: opts.parentId,
         triggerId: opts.triggerId,

@@ -99,15 +99,15 @@ test.describe('Child-completion row', () => {
     const head = row.locator('.event-row-head');
     await expect(head).toContainText('Child thread returned:');
     const state = head.locator('.event-row-state');
-    await expect(state).toHaveText('success');
+    await expect(state).toHaveText('Success');
     await expect(state).toHaveAttribute('data-tone', 'good');
     const titleLink = head.locator(`button.accent-link[data-thread-id="${childId}"]`);
     await expect(titleLink).toHaveText('Refactor the foo helper');
 
-    const fold = row.locator('details.event-row-fold');
+    const fold = row.locator('.event-row-fold');
     const foldBody = fold.locator('.event-row-fold-body');
-    await expect(foldBody).toBeHidden();
-    await fold.locator('summary').click();
+    await expect(foldBody).toHaveCount(0);
+    await fold.locator('.event-row-fold-toggle').click();
     await expect(foldBody).toBeVisible();
     await expect(foldBody).toContainText('Cleaned up the if/else ladder.');
   });
@@ -124,7 +124,7 @@ test.describe('Child-completion row', () => {
     await expect(row).toHaveAttribute('data-state', 'failure');
     await expect(row.locator('.event-row-head')).toContainText('Child thread failed:');
     const state = row.locator('.event-row-state');
-    await expect(state).toHaveText('failure');
+    await expect(state).toHaveText('Failure');
     await expect(state).toHaveAttribute('data-tone', 'bad');
   });
 
@@ -140,7 +140,7 @@ test.describe('Child-completion row', () => {
     await expect(row).toHaveAttribute('data-state', 'no_changes');
     await expect(row.locator('.event-row-head')).toContainText('Child thread returned:');
     const state = row.locator('.event-row-state');
-    await expect(state).toHaveText('no changes');
+    await expect(state).toHaveText('No changes');
     await expect(state).toHaveAttribute('data-tone', 'none');
   });
 
@@ -156,9 +156,9 @@ test.describe('Child-completion row', () => {
     await expect(row).toHaveAttribute('data-state', 'canceled');
     await expect(row.locator('.event-row-head')).toContainText('Child thread canceled:');
     const state = row.locator('.event-row-state');
-    await expect(state).toHaveText('canceled');
+    await expect(state).toHaveText('Canceled');
     await expect(state).toHaveAttribute('data-tone', 'halted');
-    await expect(row.locator('details.event-row-fold')).toHaveCount(0);
+    await expect(row.locator('.event-row-fold')).toHaveCount(0);
   });
 
   test('pending changes the child left are stated on the facts line', async ({ page }) => {

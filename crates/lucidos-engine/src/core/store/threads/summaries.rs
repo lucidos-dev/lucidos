@@ -53,12 +53,12 @@ impl EventStore {
     /// injected ahead of its `created_at` position; archived `failed` /
     /// `waiting_for_user_answer` threads reach the drawer purely via
     /// `get_older_threads` pagination, at their true date (so the Archive pile stays
-    /// gap-free). There is no `coding_agent_proposed` bypass because an
-    /// archived-proposed thread is an impossible state: a thread with a pending
+    /// gap-free). There is no `coding_agent_proposed` bypass because the archive
+    /// endpoint cannot produce an archived-proposed thread: a thread with a pending
     /// in-workspace change has no Archive action (`is_blocking` → `[Discard, Apply]`
     /// only), and external-repo archiving emits `ChangeApplied` for each pending
-    /// change before `ThreadArchived`, so the row is no longer proposed once
-    /// archived. Active threads (`running` / `waiting_for_user_answer`) likewise
+    /// change before `ThreadArchived`. A legacy orphan archived before that gate
+    /// pages in at its date like any archived row. Active threads (`running` / `waiting_for_user_answer`) likewise
     /// surface via the unbounded inbox clause — they can't be archived while active.
     ///
     /// The INNER candidate filter (`has_response OR status = ANY($1) OR
@@ -350,12 +350,13 @@ impl EventStore {
         &self,
         limit: i64,
     ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
-        let rows: Vec<(Option<String>,)> = sqlx::query_as(
+        let rows: Vec<(Option<String>,)> = sqlx::query_as(&format!(
             "SELECT title FROM thread_summaries \
-             WHERE status = 'waiting_for_user_answer' \
+             WHERE status = {} \
                AND state = 'active' AND archive_state = 'inbox' \
              ORDER BY last_activity DESC LIMIT $1",
-        )
+            ThreadStatus::WaitingForUserAnswer.sql_literal(),
+        ))
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
@@ -481,12 +482,12 @@ impl EventStore {
         Ok(count)
     }
 
-    /// Total threads in the Archive pile **matching the active drawer filter** —
-    /// `archive_state='archived'` and not saved (a saved+archived thread routes
-    /// to the Saved section, not Archive). Drives the collapsed Archive
-    /// section's count badge, which would otherwise show only the loaded window
-    /// (`get_recent_threads`'s `archive_limit` global slice + scroll-paginated
-    /// rows) — a gross undercount on workspaces with hundreds of archived threads.
+    /// Total threads in the Archive pile **matching the active drawer filter**:
+    /// `archive_state='archived'`, which is never pinned (ADR 0312). Drives the
+    /// collapsed Archive section's count badge. Without it the badge would show
+    /// only the loaded window (`get_recent_threads`'s `archive_limit` global
+    /// slice + scroll-paginated rows). That undercounts badly on workspaces with
+    /// hundreds of archived threads.
     ///
     /// The filter is `channel_facet_filter_sql`, shared verbatim with
     /// [`Self::get_older_threads`] so the badge total stays in lockstep with what
@@ -519,8 +520,7 @@ impl EventStore {
         // app_ids($5) — facet positions 2..=5 match the shared filter helper.
         let sql = format!(
             "SELECT COUNT(*)::bigint FROM thread_summaries t \
-             WHERE t.archive_state = $1 AND t.is_saved = FALSE \
-               AND {filter}",
+             WHERE t.archive_state = $1 AND {filter}",
             filter = channel_facet_filter_sql("t", 2, 3, 4, 5),
         );
         let (count,): (i64,) = sqlx::query_as(&sql)

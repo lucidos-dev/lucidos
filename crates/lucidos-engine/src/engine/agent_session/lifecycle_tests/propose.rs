@@ -135,7 +135,6 @@ fn reset_per_turn_flags_clears_all_flags() {
     let mut withheld_api_error = Some("API Error: dropped".to_string());
     let mut cancel_actor = Some(crate::engine::thread_events::MessageOrigin::Device {
         device_id: "ios-1".into(),
-        label: "My iPhone".into(),
     });
 
     reset_per_turn_flags(

@@ -109,7 +109,7 @@ subprocesses.
 
 Print the absolute filesystem path that `<relative>` resolves to inside the parent workspace's `data/` directory.
 
-Path normalization matches `normalizeDataPath()` in the artifacts UI: paths starting with `artifacts/`, `knowhow/`, `apps/`, or `triggers/` are kept; anything else is prefixed with `artifacts/`.
+A path that starts with a `data/` tree the engine's data route accepts is kept as is. Those trees are `artifacts/`, `apps/`, `knowhow/`, `triggers/`, `config/`, `auth-modules/`, `scripts/`, `themes/` and `fonts/`. Anything else is prefixed with `artifacts/`. `normalizeDataPath()` in the UI follows the same rule, so `themes/harbour.json` means `data/themes/harbour.json` everywhere.
 
 ```bash
 $ lucidos data path artifacts/data-analysis/foo/report.html
@@ -138,7 +138,14 @@ appearing on disk: the engine commits it to the `data/` repo and announces it
 `artifacts/`), so the Files panel refreshes live, the memory index picks the
 file up, an `on_event: ArtifactCreated` trigger sees it, and the chat link below
 resolves. Content is limited to 100 MiB per write. A failed write is an error:
-the command exits non-zero and prints no link.
+the command exits non-zero, prints the engine's reason on stderr, and prints no
+link.
+
+The engine checks the rules a tree has before anything reaches disk. A file
+under `themes/` must be a valid theme (`system-knowhow/themes.md` § "Make a
+theme"). A file under `fonts/` must be a workspace font's `font.json` or one of
+its font files (`system-knowhow/workspace-fonts.md`). A refused write exits
+non-zero with the reason and writes nothing.
 
 Under the Codex sandbox this works without a writable-root grant, because it is
 an HTTP call rather than a write outside the worktree.
@@ -169,9 +176,15 @@ user what you drew:
 
 ```bash
 $ lucidos data write artifacts/design/options.png --from /tmp/options.png
-![options.png](artifacts/design/options.png)   # stdout
-The user cannot see this picture yet. ...      # stderr, before the path
+![options.png](artifacts/design/options.png#1600x1200)   # stdout
+The user cannot see this picture yet. ...                # stderr, before the path
 ```
+
+The `#1600x1200` ending is an *image size hint*: the picture's size in
+pixels. It lets the thread hold the picture's space before the picture loads,
+so nothing jumps when it arrives. Keep it when you paste the line. A picture
+whose size the CLI cannot be sure of (an SVG, or a photo carrying EXIF data)
+prints without one.
 
 Saving a picture shows the user nothing. It appears only where you paste that
 line. If a question card comes next, put the line on the card: in its question,
@@ -398,6 +411,23 @@ $ lucidos threads detach --thread 9c1f2b40-...
 - **It frees no child slot**, and it cannot be undone.
 - A thread already at top level is a 409, and an unknown id a 404.
 
+### `lucidos threads archive --thread <current|child-uuid>`
+
+Archive this thread, or one of its own direct children (ADR 0310). Wraps `POST /api/v1/threads/<id>/archive`, which runs the same cascade as the Archive button.
+
+```bash
+$ lucidos threads archive --thread 9c1f2b40-...
+{"archived":["9c1f2b40-..."],"skipped":[]}
+
+$ lucidos threads archive --thread current
+{"requested":"4b7e0c11-...","detail":"This thread is archived once its turn ends and it has settled."}
+```
+
+- **From inside a thread you can archive only yourself and your own DIRECT children.** The engine reads the calling thread off the origin token, and resolves `current` to it. Anything else is a 403 with `not_your_thread`, an unknown id a 404, and a discarded thread a 409. Outside a thread, with no origin token, it archives any thread, as the Archive button does.
+- **A child is archived now**, with its own sub-threads. **`current` is archived once this turn ends** and the thread has settled. A new message into it before then keeps it open.
+- **The Archive button's refusals apply.** A running target or one waiting on the user is a 409 with `parent_not_archivable`. A pending change is `parent_has_pending_changes`, and a blocking sub-thread is `descendants_blocking`. Each body carries a `message` saying what to do. A pinned target is a 409 with `thread_pinned`: only the user archives a pinned thread. A pinned sub-thread of the target stays open and is listed under `skipped`.
+- **Archive once the change is applied and no follow-up is expected.** Archiving lets the worktree be reclaimed, so a later follow-up rebuilds it.
+
 ### `lucidos spawn-thread --to <WS> --message <M> [--coding-agent <backend>] [--folder <path> | --repo <name>] [--relation child|top] [--title <T>] [--model <M>] [--coding-agent-model <M>] [--reasoning-effort <level>]`
 
 Start a new *thread* in another (or this same) workspace: a *chat thread* by default, or a *coding-agent thread* with a coding-agent flag. `--to` takes an absolute path, or a bare workspace name. A bare name resolves against `$LUCIDOS_WORKSPACES_ROOT` when set, else the directory holding your own workspace, else `~/workspaces`. So a sibling of the calling workspace is always reachable by name. Caller provenance (`caller_*` fields) defaults from `$LUCIDOS_WORKSPACE` / `$LUCIDOS_THREAD_ID` / `$LUCIDOS_EVENT_ID`, which the engine sets on every spawned subprocess. Prints a clickable `[title](thread:<ws>/<uuid>)` markdown link on stdout.
@@ -413,7 +443,7 @@ A top-thread sits directly under the workspace rather than under you, so creatin
 
 **Model and reasoning level (either backend):**
 
-- `--coding-agent-model <m>`: the model the coding agent runs on (`sonnet`, `opus`, `gpt-5.6-sol`). `--cc-model` is the old name, still accepted.
+- `--coding-agent-model <m>`: the model the coding agent runs on (`sonnet`, `opus`, `gpt-5.6-sol`).
 - `--reasoning-effort <level>`: how hard the coding agent thinks. One of `low`, `medium`, `high`, `xhigh`, `max`. It pins the level for this spawn only, overriding the backend's own default. It needs a coding-agent flag, and the CLI refuses an unknown level before sending anything. A chat-thread spawn reads a different ladder and does not take this flag.
 
 **Codex offers `max` on the GPT-5.6 models only, so pair the two.** `--reasoning-effort max --coding-agent codex` needs `--coding-agent-model` naming one of those models, and the CLI refuses the spawn otherwise. That includes naming no model at all: the engine tests the restriction against the model in the request, so `max` with no model is dropped before Codex is ever asked. Every level below `max` is unrestricted on both backends and needs no model.
@@ -670,6 +700,11 @@ Notes that matter:
   entirely, which is what a foreground build you are waiting on wants. Note
   that a nice increment cannot be lowered again by a non-root process, so this
   is a choice made before the build starts.
+- **The Apply build goes first.** The engine's own background rebuild waits
+  as a *priority waiter*: while it waits, your build leaves a freed slot to
+  it, and `--status` says so. It never takes a slot beyond the count, and it
+  never stops a running build. Do not set `LUCIDOS_BUILD_SLOT_PRIORITY`
+  yourself: it exists for the build the user is watching.
 - **It never blocks a build it cannot govern.** No `lucidos` binary, no
   writable pool, or no engine to announce to all mean the command just runs. A
   host that will not report its core count means no share is exported, and the
@@ -1174,7 +1209,9 @@ $ CID=$(lucidos changes list | jq -r '.pending[0].id')
 $ lucidos changes apply "$CID"
 ```
 
-The response carries `pending`, `applied` (recently applied), `total_pending`, and `restart_required`. Each pending change has `id` / `branch_name` / `description` / `status` / `file_count` / `requires_restart` / `thread_id` / `thread_title` / `thread_unsettled` / `thread_settling` / `resolving_conflict`. Exit non-zero on transport / HTTP error.
+The response carries `pending`, `applied` (recently applied), `total_pending`, and `restart_required`. Each pending change has `id` / `branch_name` / `description` / `status` / `file_count` / `requires_restart` / `thread_id` / `thread_title`. Its apply state is `thread_unsettled` / `thread_settling` / `resolving_conflict` / `apply_phase_started_at` / `predicted_conflict`. Exit non-zero on transport / HTTP error.
+
+`predicted_conflict` is `conflict`, `clean` or `unknown`: would merging the change into `main` right now conflict. `unknown` means git could not answer, so never read it as clean. `apply_phase_started_at` is when a running hardening or conflict resolution began.
 
 **`thread_unsettled: true` means the proposing thread is still working on the change**: mid-turn, on a question card, resolving a merge conflict, or watching an event. `apply` refuses it for exactly that reason, so never report such a change as finished. `thread_settling` is the part of that a *standing apply* can wait out. `resolving_conflict` means an apply of it is merging now.
 
@@ -1293,6 +1330,18 @@ workspace slug). `$LUCIDOS_API_BASE_URL` is the exact base this engine answers
 on: loopback `http://` under the gateway, `https://` self-signed in the legacy
 single-engine model. See `docs/apply-change-api.md` for the apply response shape
 and the full workflow.
+
+### `lucidos hardened mark` / `lucidos hardened query` / `lucidos hardened sha`
+
+Record or read the hardening marker (see *Hardening* in the glossary): the HEAD SHA the last `/harden` run covered on a *Lucidos-source* coding-agent branch. All three resolve repo_root and branch from `$PWD`'s git worktree. They wrap `POST /api/v1/internal/mark-hardened` and `GET /api/v1/internal/hardened-state`.
+
+```bash
+lucidos hardened mark    # /harden Phase 5: record HEAD as hardened
+lucidos hardened query   # FRESH (HEAD matches), STALE (commits since), or MISSING
+lucidos hardened sha     # the recorded SHA, fresh or stale; exit 1 when MISSING
+```
+
+`query` prints exactly one of the three words, because `/harden` Phase 0 and the `pre-push.sh` hook compare it literally. `sha` feeds `/harden`'s merge-only check, which asks whether every commit since that SHA is a merge of main. Apply consumes the marker, so a freshly applied branch reads `MISSING`. You don't normally call these by hand: `/harden` drives them.
 
 ### `lucidos planned mark (--plan <path> | --simple "<reason>" | --security-fix "<reason>" --files <csv>)` / `lucidos planned approve` / `lucidos planned state`
 

@@ -167,7 +167,7 @@ pub(super) async fn delete_app(
 
     // The manager emits `AppDeleted` from inside the write path, so resolve the
     // device actor and hand it over (see `AppManager`'s type doc).
-    let actor = crate::api::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    let actor = crate::api::actor::user_actor(&headers, None);
     match state
         .app_manager
         .delete_app(&state.engine.event_bus, &query.id, actor)
@@ -216,7 +216,7 @@ pub(super) async fn update_app(
             }
         },
     };
-    let actor = crate::api::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    let actor = crate::api::actor::user_actor(&headers, None);
     match state
         .app_manager
         .update_app_metadata(
@@ -290,7 +290,7 @@ pub(super) async fn write_app_source(
         };
         files.push((name, content));
     }
-    let actor = crate::api::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    let actor = crate::api::actor::user_actor(&headers, None);
     match state
         .app_manager
         .write_app_source(&state.engine.event_bus, &app_id, &files, actor)

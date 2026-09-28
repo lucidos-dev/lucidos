@@ -203,7 +203,7 @@
    wraps the trailing/middle "…" or "..." emitted by Rust `describe_tool` /
    `describe_cc_tool`. */
 .ellipsis-marker {
-    color: var(--accent-notable);
+    color: var(--text-muted);
     font-weight: 600;
     letter-spacing: 0.05em;
     padding: 0 0.125rem;
@@ -353,7 +353,7 @@
     padding: var(--space-xs) var(--context-row-inset) var(--space-xs)
         calc(var(--context-row-inset) + var(--context-depth) * var(--context-indent));
     border: 0;
-    border-radius: 0.25rem;
+    border-radius: calc(var(--radius-control) * 0.5);
     background: transparent;
     text-align: left;
     cursor: pointer;
@@ -489,7 +489,7 @@
     background: var(--bg-tertiary);
     border: 1px solid var(--border-color);
     padding: var(--space-sm);
-    border-radius: 0.25rem;
+    border-radius: calc(var(--radius-surface) / 3);
     margin: var(--space-xs) var(--context-row-inset) var(--space-sm)
         calc(var(--context-row-inset) + (var(--context-depth) + 1) * var(--context-indent));
     max-height: 18.75rem;
@@ -504,108 +504,104 @@
     font-style: italic;
 }
 
-/* The lazy sections fetch's two non-loaded states (`ContextSectionsArea`).
-   They render INSTEAD of `.context-sections`, so they cannot read that block's
-   own custom properties; the inset they stand on is spelled with the shared
-   spacing token, matching what a row inside the tree resolves to. */
-.context-sections-loading,
+/* The lazy sections fetch's failed state (`ContextSectionsArea`). It renders
+   INSTEAD of `.context-sections`, so it cannot read that block's own custom
+   properties; the inset it stands on is spelled with the shared spacing token,
+   matching what a row inside the tree resolves to. */
 .context-sections-error {
     padding: var(--space-xs) var(--space-sm);
     font-size: var(--font-size-sm);
-}
-
-.context-sections-loading {
-    color: var(--text-muted);
-}
-
-.context-sections-error {
     color: var(--accent-red);
 }
 
-/* Top-aligned so the modal stays put as section rows expand/collapse —
- * centered would re-center on every toggle and visibly dance. */
+/* Top-aligned so the modal stays put as section rows expand/collapse:
+   centered would re-center on every toggle and visibly dance. Each gap clears
+   its safe-area inset, or on an iPhone the head slides under the status bar. */
 .step-detail-overlay {
+    --step-detail-gap-top: max(5vh, calc(env(safe-area-inset-top, 0px) + var(--space-lg)));
+    --step-detail-gap-bottom: max(5vh, calc(env(safe-area-inset-bottom, 0px) + var(--space-lg)));
     align-items: flex-start;
-    padding-top: 5vh;
+    padding-top: var(--step-detail-gap-top);
 }
 
+/* The box is `.surface`; this sizes it and keeps the head pinned while the
+   body scrolls. `--app-height` tracks the visible viewport, which raw `vh`
+   does not on iOS. It centres over the Conversation pane through
+   `.surface-pane-centred`. */
 .step-detail-modal {
-    background: var(--bg-secondary);
-    border: 1px solid var(--border-color);
-    border-radius: 0.75rem;
-    box-shadow: var(--shadow-lg);
-    padding: var(--space-xl) var(--space-lg) var(--space-lg);
     width: min(40rem, 90vw);
-    max-height: 90vh;
-    overflow-y: auto;
-    /* The panel is the scroller, so a flick that reaches its end must not
-       chain out to whatever is behind the scrim. */
-    overscroll-behavior: contain;
+    max-height: calc(var(--app-height, 100dvh) - var(--step-detail-gap-top) - var(--step-detail-gap-bottom));
     display: flex;
     flex-direction: column;
-    gap: var(--space-md);
-    color: var(--text-primary);
+    overflow: hidden;
     font-family: var(--font-ui);
 }
 
-/* The eyebrow row. It rides tight above the description it labels, so the pair
-   reads as one heading rather than two stacked lines: the negative margin is
-   the panel's own --space-md column gap pulled back to --space-xs, and it is
-   the only place in this modal that overrides that gap. */
-.step-detail-header {
+.step-detail-body {
     display: flex;
-    align-items: baseline;
-    justify-content: space-between;
-    gap: var(--space-lg);
-    font-size: var(--font-size-xs);
-    margin-bottom: calc(var(--space-xs) - var(--space-md));
+    flex-direction: column;
+    gap: var(--space-md);
+    min-height: 0;
+    overflow-y: auto;
+    /* The body is the scroller, so a flick that reaches its end must not
+       chain out to whatever is behind the scrim. */
+    overscroll-behavior: contain;
+    color: var(--text-primary);
 }
 
-.step-detail-status {
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
-    font-weight: 600;
-    color: var(--text-muted);
+/* The step's outcome, as the head's tone icon: the same thin mark the transcript
+   row draws, and the only coloured thing on the surface (ADR 0290). It is drawn
+   smaller than the icon box, since a 12-unit stroke scaled to the full box
+   reads heavier than the title beside it.
+
+   The mark leads the title inline, and the body keeps the head's left edge
+   rather than indenting under the title. The box hugs the mark so the mark
+   itself sits on that edge. */
+.surface-icon.step-detail-icon {
+    width: auto;
 }
 
-.step-detail-status.success {
+.surface-icon.step-detail-icon svg {
+    width: 0.75rem;
+    height: 0.75rem;
+    overflow: visible;
+}
+
+.step-detail-icon.success {
     color: var(--accent-green);
 }
 
-.step-detail-status.error {
+.step-detail-icon.error {
     color: var(--accent-red);
 }
 
-.step-detail-status.pending {
+.step-detail-icon.pending {
     color: var(--text-muted);
 }
 
-.step-detail-status.unfinished {
+.step-detail-icon.unfinished {
     color: var(--text-muted);
 }
 
-.step-detail-status.blocked {
+.step-detail-icon.blocked {
     color: var(--accent-notable);
 }
 
-.step-detail-status.denied {
+.step-detail-icon.denied {
     color: var(--text-muted);
 }
 
-/* One-line explanation under the description, for a step whose result area is
+/* One-line explanation under the step, for a step whose result area is
    empty with no obvious reason. See `STEP_DETAIL_NOTE`. */
 .step-detail-note {
     color: var(--text-secondary);
     font-size: var(--font-size-md);
 }
 
-.step-detail-timestamp {
-    color: var(--text-muted);
-    font-family: var(--font-mono, monospace);
-}
-
+/* A lead line under the head, not a second heading: the head title is the
+   surface's one heading. */
 .step-detail-description {
-    font-size: var(--font-size-xl);
+    font-size: var(--font-size-md);
     font-weight: 500;
     overflow-wrap: break-word;
     word-break: break-word;
@@ -622,7 +618,7 @@
 .step-detail-reasoning {
     background: var(--bg-tertiary);
     border: 1px solid var(--border-color);
-    border-radius: 0.375rem;
+    border-radius: calc(var(--radius-surface) * 0.5);
     padding: 0.625rem 0.75rem;
     font-family: var(--font-mono, monospace);
     font-size: var(--font-size-md);
@@ -643,11 +639,6 @@
     color: var(--text-secondary);
 }
 
-.step-detail-close {
-    align-self: flex-end;
-    margin-top: 0.25rem;
-}
-
 .step-detail-section-label {
     font-size: var(--font-size-sm);
     text-transform: uppercase;
@@ -660,7 +651,7 @@
 .step-detail-result {
     background: var(--bg-tertiary);
     border: 1px solid var(--border-color);
-    border-radius: 0.375rem;
+    border-radius: calc(var(--radius-surface) * 0.5);
     padding: 0.625rem 0.75rem;
     font-family: var(--font-mono, monospace);
     font-size: var(--font-size-md);
@@ -670,6 +661,26 @@
     margin: 0;
     max-height: 25rem;
     overflow-y: auto;
+}
+
+/* The card part (ADR 0313): a theme may draw a double frame on the bordered
+   blocks a step shows. After every base rule above and in chat/response.css. */
+.copyable-block,
+.step-detail-full,
+.step-detail-reasoning,
+.step-detail-result {
+    border-style: var(--part-card-border-style, solid);
+    border-width: var(--part-card-border-width, 1px);
+    border-color: var(--part-card-border-color, var(--border-color));
+}
+
+/* A lazily fetched block wraps its label and box in one `LoadingFade`, so the
+   body's column gap has to be restated inside it. */
+.step-detail-fade .loading-fade-content,
+.step-detail-fade .loading-fade-skeleton {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-md);
 }
 
 .step-detail-context {
@@ -692,7 +703,7 @@
     background: var(--bg-tertiary);
     border: 1px solid var(--border-color);
     padding: 0.0625rem 0.375rem;
-    border-radius: 0.25rem;
+    border-radius: calc(var(--radius-control) * 0.5);
     font-size: inherit;
 }
 
@@ -749,7 +760,7 @@
     background: var(--bg-tertiary);
     color: var(--text-muted);
     padding: 0.0625rem 0.375rem;
-    border-radius: 0.1875rem;
+    border-radius: calc(var(--radius-control) * 0.375);
     font-size: var(--font-size-2xs);
     text-transform: uppercase;
     letter-spacing: 0.05em;
@@ -777,7 +788,7 @@
     padding: 0.5rem 0.75rem;
     background: var(--bg-tertiary);
     border: 1px solid var(--border-subtle, var(--bg-tertiary));
-    border-radius: 0.375rem;
+    border-radius: calc(var(--radius-surface) * 0.5);
     font-size: var(--font-size-md);
 }
 

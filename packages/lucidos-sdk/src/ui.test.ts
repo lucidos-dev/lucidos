@@ -1,30 +1,68 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 // The theme-precedence cases this file used to carry now live beside the rule
-// itself, in `appearance.test.ts`. `resolveThemePreference` moved into the
+// itself, in `appearance.test.ts`. `resolveThemeModePreference` moved into the
 // shared appearance contract when the four hand-copied versions of it were
 // collapsed into one.
-import { ui, webFontUrl } from './ui';
+import { ui, webFontUrl, webFontUrls } from './ui';
+import { EMPTY_THEME, FONT_CATALOG, FOLLOW_THEME, parseResolvedTheme, resolveFontKey } from './appearance';
 
 describe('webFontUrl', () => {
-  it('serves the DEFAULT font from the local engine, never from Google', () => {
-    const url = webFontUrl('fira-code');
-    expect(url).toBe('/api/v1/fonts/fira-code.css');
-    // The point of vendoring it: a workspace with no internet must still
-    // render its own default font. A googleapis host here is the regression.
-    expect(url).not.toContain('googleapis');
+  it('serves every vendored font from the local engine, never from Google', () => {
+    expect(webFontUrl('fira-code')).toBe('/api/v1/fonts/fira-code.css');
+    for (const font of FONT_CATALOG.filter(f => f.source === 'vendored')) {
+      const url = webFontUrl(font.id);
+      expect(url).toBe(`/api/v1/fonts/${font.id}.css`);
+      // A workspace with no internet must still render it.
+      expect(url).not.toContain('googleapis');
+    }
   });
 
-  it('still fetches the opt-in fonts from Google', () => {
+  // ADR 0303: the three fonts that once loaded from Google are bundled too.
+  it('serves the fonts that once came from Google locally as well', () => {
     for (const key of ['inter', 'jetbrains-mono', 'ibm-plex-mono'] as const) {
-      expect(webFontUrl(key)).toContain('fonts.googleapis.com');
+      expect(webFontUrl(key)).toBe(`/api/v1/fonts/${key}.css`);
+    }
+  });
+
+  it('every catalog font is vendored or on the device', () => {
+    for (const font of FONT_CATALOG) {
+      expect(['vendored', 'device']).toContain(font.source);
     }
   });
 
   it('has nothing to load for fonts already on the device', () => {
-    // No garbage case: the parameter is a `FontFamily`, and `resolveFontKey`
-    // (the only producer) cannot hand out a key outside the set.
+    // No garbage case: the parameter is a `FontId`, and `resolveFontKey` (the
+    // only producer) cannot hand out a key outside the set.
     expect(webFontUrl('monospace')).toBeUndefined();
     expect(webFontUrl('system')).toBeUndefined();
+  });
+});
+
+describe('webFontUrls', () => {
+  it('loads the UI font and the theme code font, once each', () => {
+    const theme = parseResolvedTheme(JSON.stringify({ fonts: { ui: 'geist', mono: 'geist-mono' } }));
+    expect(webFontUrls('geist', theme)).toEqual([
+      '/api/v1/fonts/geist.css',
+      '/api/v1/fonts/geist-mono.css',
+    ]);
+    expect(webFontUrls('fira-code', EMPTY_THEME)).toEqual(['/api/v1/fonts/fira-code.css']);
+  });
+
+  // ADR 0303: a theme may now name Inter or JetBrains Mono, and both load
+  // from the local engine.
+  it('a theme naming a font that once came from Google loads it locally', () => {
+    const theme = parseResolvedTheme(JSON.stringify({ fonts: { ui: 'inter', mono: 'jetbrains-mono' } }));
+    const key = resolveFontKey(FOLLOW_THEME, theme.fonts);
+    expect(key).toBe('inter');
+    expect(webFontUrls(key, theme)).toEqual([
+      '/api/v1/fonts/inter.css',
+      '/api/v1/fonts/jetbrains-mono.css',
+    ]);
+  });
+
+  it('a forged cache naming an unknown font paints the fallback', () => {
+    const forged = parseResolvedTheme(JSON.stringify({ fonts: { ui: 'comic-sans' } }));
+    expect(resolveFontKey(FOLLOW_THEME, forged.fonts)).toBe('fira-code');
   });
 });
 
@@ -108,6 +146,8 @@ describe('ui.watchPreferences: live theme reaction wiring', () => {
   let getMock: ReturnType<typeof vi.fn>;
   let mqChangeListeners: Array<() => void>;
   let motionChangeListeners: Array<() => void>;
+  let effectsChangeListeners: Array<() => void>;
+  let mqContrast: boolean;
   let mqQueries: string[];
   let origMatchMedia: unknown;
   let mqLight: boolean;
@@ -134,9 +174,11 @@ describe('ui.watchPreferences: live theme reaction wiring', () => {
     vi.useFakeTimers();
     sseOn = vi.fn();
     sseConnect = vi.fn();
-    getMock = vi.fn().mockResolvedValue({ theme: 'system' });
+    getMock = vi.fn().mockResolvedValue({ 'theme-mode': 'system' });
     mqChangeListeners = [];
     motionChangeListeners = [];
+    effectsChangeListeners = [];
+    mqContrast = false;
     mqQueries = [];
     mqLight = false;
     mqReduce = false;
@@ -155,10 +197,15 @@ describe('ui.watchPreferences: live theme reaction wiring', () => {
     (globalThis as { matchMedia?: unknown }).matchMedia = (q: string) => {
       mqQueries.push(q);
       const motion = q.includes('reduced-motion');
+      const effects = q.includes('reduced-transparency') || q.includes('prefers-contrast');
       return {
-        get matches() { return motion ? mqReduce : mqLight; },
+        get matches() {
+          if (effects) return q.includes('prefers-contrast') && mqContrast;
+          return motion ? mqReduce : mqLight;
+        },
         addEventListener: (type: string, fn: () => void) => {
-          if (type === 'change') (motion ? motionChangeListeners : mqChangeListeners).push(fn);
+          if (type !== 'change') return;
+          (effects ? effectsChangeListeners : motion ? motionChangeListeners : mqChangeListeners).push(fn);
         },
         removeEventListener: () => {},
       };
@@ -242,8 +289,8 @@ describe('ui.watchPreferences: live theme reaction wiring', () => {
     // An app may call `watchPreferences()` first, or not await the fetch. The
     // boot script already read the preference out of localStorage, so an OS
     // flip in that window is not dropped.
-    localStorage.setItem('lucidos-theme', 'system');
-    attrs['data-theme'] = 'dark';
+    localStorage.setItem('lucidos-theme-mode', 'system');
+    attrs['data-theme-mode'] = 'dark';
     const { ui: freshUi } = await import('./ui');
     freshUi.watchPreferences();
 
@@ -252,11 +299,11 @@ describe('ui.watchPreferences: live theme reaction wiring', () => {
     vi.advanceTimersByTime(500);
 
     expect(getMock).toHaveBeenCalled();
-    localStorage.removeItem('lucidos-theme');
+    localStorage.removeItem('lucidos-theme-mode');
   });
 
   it('leaves a frame on an explicit theme alone', async () => {
-    getMock.mockResolvedValue({ theme: 'dark' });
+    getMock.mockResolvedValue({ 'theme-mode': 'dark' });
     await watchingOnSystem();
 
     mqLight = true;
@@ -271,7 +318,12 @@ describe('ui.watchPreferences: live theme reaction wiring', () => {
     const { ui: freshUi } = await import('./ui');
     freshUi.watchPreferences();
     freshUi.watchPreferences();
-    expect(sseOn).toHaveBeenCalledTimes(1);
+    // One subscription per event: preferences, and every event that can
+    // change the active theme's file.
+    expect(sseOn.mock.calls.map(call => call[0])).toEqual([
+      'PreferencesChanged', 'DataFileWritten', 'DataFileEdited', 'DataFileDeleted',
+      'PluginInstalled', 'PluginUninstalled',
+    ]);
     expect(sseConnect).toHaveBeenCalledTimes(1);
     expect(mqChangeListeners).toHaveLength(1);
     expect(motionChangeListeners).toHaveLength(1);
@@ -289,13 +341,31 @@ describe('ui.watchPreferences: live theme reaction wiring', () => {
   });
 
   it('keeps an explicit Full when the OS asks to reduce', async () => {
-    getMock.mockResolvedValue({ theme: 'system', motion: 'full' });
+    getMock.mockResolvedValue({ 'theme-mode': 'system', motion: 'full' });
     await watchingOnSystem();
 
     mqReduce = true;
     motionChangeListeners[0]();
 
     expect(attrs['data-motion']).toBe('full');
+  });
+
+  it('follows an OS contrast flip under system theme effects, with no fetch', async () => {
+    await watchingOnSystem();
+    expect(attrs['data-theme-effects']).toBe('full');
+    expect(effectsChangeListeners).toHaveLength(2);
+
+    mqContrast = true;
+    effectsChangeListeners[1]();
+
+    expect(attrs['data-theme-effects']).toBe('reduce');
+    expect(getMock).not.toHaveBeenCalled();
+  });
+
+  it('applies an explicit theme-effects preference over the OS', async () => {
+    getMock.mockResolvedValue({ 'theme-mode': 'system', 'theme-effects': 'reduce' });
+    await watchingOnSystem();
+    expect(attrs['data-theme-effects']).toBe('reduce');
   });
 });
 
@@ -318,7 +388,7 @@ describe('lucidos.ui.toast', () => {
     const ret = ui.toast('Saved', 'success', { durationMs: 2000, dismissable: false });
     expect(ret).toBeUndefined();
     expect(postMessage).toHaveBeenCalledWith(
-      { type: 'lucidos:ui:toast', payload: { message: 'Saved', type: 'success', durationMs: 2000, dismissable: false, key: undefined, spinning: undefined } },
+      { type: 'lucidos:ui:toast', payload: { message: 'Saved', type: 'success', durationMs: 2000, dismissable: false, title: undefined, key: undefined, spinning: undefined } },
       '*',
     );
   });
@@ -326,7 +396,7 @@ describe('lucidos.ui.toast', () => {
   it('defaults type to info and leaves opts undefined when omitted', () => {
     ui.toast('Heads up');
     expect(postMessage).toHaveBeenCalledWith(
-      { type: 'lucidos:ui:toast', payload: { message: 'Heads up', type: 'info', durationMs: undefined, dismissable: undefined, key: undefined, spinning: undefined } },
+      { type: 'lucidos:ui:toast', payload: { message: 'Heads up', type: 'info', durationMs: undefined, dismissable: undefined, title: undefined, key: undefined, spinning: undefined } },
       '*',
     );
   });
@@ -343,6 +413,18 @@ describe('lucidos.ui.toast', () => {
     expect(postMessage.mock.calls[0][0].payload.spinning).toBeUndefined();
     ui.toast('Bad spinner', 'info', { spinning: 'yes' as unknown as boolean });
     expect(postMessage.mock.calls[1][0].payload.spinning).toBeUndefined();
+  });
+
+  it('forwards opts.title, and drops an empty one', () => {
+    ui.toast('Nothing was built tonight.', 'info', { title: 'Nightly release prep: skipped' });
+    expect(postMessage.mock.calls[0][0].payload.title).toBe('Nightly release prep: skipped');
+    ui.toast('Untitled', 'info', { title: '' });
+    expect(postMessage.mock.calls[1][0].payload.title).toBeUndefined();
+  });
+
+  it('throws TypeError on a non-string title (programming error)', () => {
+    expect(() => ui.toast('x', 'info', { title: 42 as unknown as string })).toThrow(TypeError);
+    expect(postMessage).not.toHaveBeenCalled();
   });
 
   it('forwards opts.key for in-place replacement when provided', () => {

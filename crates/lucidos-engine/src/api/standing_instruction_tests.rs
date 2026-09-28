@@ -21,7 +21,6 @@ async fn open_turn(bus: &EventBus, thread_id: Uuid, mode: ActorMode, origin: Mes
             text: "work".into(),
             user_image_hashes: vec![],
             device_id: None,
-            device: None,
             image_description: None,
             parent_thread_id: None,
             spawning_event_id: None,
@@ -42,7 +41,6 @@ async fn open_turn(bus: &EventBus, thread_id: Uuid, mode: ActorMode, origin: Mes
 fn device() -> MessageOrigin {
     MessageOrigin::Device {
         device_id: "device-abc".into(),
-        label: "My MacBook".into(),
     }
 }
 

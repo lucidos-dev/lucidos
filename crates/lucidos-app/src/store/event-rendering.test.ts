@@ -1,5 +1,8 @@
 import { describe, it, expect } from 'vitest';
-import { drawsResponseRow, headClampApplies, liveStepIndex, rendersLiveStep, rowsDrawnByClamp } from './event-rendering';
+import {
+  drawsResponseRow, getCollapsedVisibleEvents, headClampApplies, liveStepInBody, responseBody, rowsDrawnByClamp,
+  type BodySection,
+} from './event-rendering';
 import type { ResponseEvent, StepOutcome } from './types';
 
 const step = (outcome: StepOutcome): ResponseEvent => ({
@@ -9,70 +12,136 @@ const step = (outcome: StepOutcome): ResponseEvent => ({
 });
 const text = (md: string): ResponseEvent => ({ type: 'text', md });
 
-describe('rendersLiveStep', () => {
-  it('is true when steps are expanded, panel not collapsed, and a pending step is drawn', () => {
-    expect(rendersLiveStep(true, false, [text('hi'), step('pending')])).toBe(true);
-  });
+const body = (events: ResponseEvent[], showSteps = true, showDetails = true, rowsHidden = 0) =>
+  responseBody(events, { showSteps, showDetails, rowsHidden });
 
-  it('is false when steps are hidden, even if a pending step exists', () => {
-    // The "Show steps" collapsed-toggle state: the live step draws no row, so
-    // the "Working" label must carry the shimmer instead.
-    expect(rendersLiveStep(false, false, [text('hi'), step('pending')])).toBe(false);
-  });
-
-  it('is false when the response panel is collapsed, even with a pending step', () => {
-    // Collapse hides the whole steps body (only the header status shows), so the
-    // pending step draws no shimmer and the label must carry it instead.
-    expect(rendersLiveStep(true, true, [text('hi'), step('pending')])).toBe(false);
-  });
-
-  it('is false when steps are expanded but every visible step has resolved', () => {
-    expect(rendersLiveStep(true, false, [step('success'), step('error'), text('done')])).toBe(false);
-  });
-
-  it('is false for an unfinished step: the turn died, nothing is running', () => {
-    // A step killed mid-call is TERMINAL, not live. If it counted as a live
-    // step it would suppress the "Working"/status shimmer on a dead turn and
-    // (via `.running-shimmer`) animate a row nothing is working on.
-    expect(rendersLiveStep(true, false, [step('unfinished')])).toBe(false);
-    expect(rendersLiveStep(true, false, [step('success'), step('unfinished')])).toBe(false);
-  });
-
-  it('is false when there are no step events at all', () => {
-    expect(rendersLiveStep(true, false, [text('just text')])).toBe(false);
-    expect(rendersLiveStep(true, false, [])).toBe(false);
-  });
-});
-
-/** The index `ChatExchange` marks a row by, so the header label can read where
- *  that row sits. It has to agree with `rendersLiveStep` on what a live row is,
- *  and it has to name the FIRST one. */
-describe('liveStepIndex', () => {
-  it('is the position of the pending row in the drawn list', () => {
-    expect(liveStepIndex(true, false, [text('hi'), step('success'), step('pending')])).toBe(2);
+/** The live step `ChatExchange` marks, so the header label can read where it
+ *  sits. It names the FIRST pending row the body DRAWS, by its index in the
+ *  turn's events. */
+describe('liveStepInBody', () => {
+  it('names the pending row by its index in the turn', () => {
+    expect(liveStepInBody(body([text('hi'), step('success'), step('pending')]))).toBe(2);
   });
 
   it('names the FIRST pending row when parallel calls leave several', () => {
     // The "Working" label sits above every row, so the first pending row is the
-    // first one the reader meets coming down from it. Naming the last would let
-    // the label shimmer over a visible row above it.
-    expect(liveStepIndex(true, false, [step('pending'), step('pending')])).toBe(0);
+    // first one the reader meets coming down from it.
+    expect(liveStepInBody(body([step('pending'), step('pending')]))).toBe(0);
   });
 
-  it('is -1 wherever no row is drawn, matching rendersLiveStep', () => {
-    const pending = [text('hi'), step('pending')];
-    expect(liveStepIndex(false, false, pending)).toBe(-1);
-    expect(liveStepIndex(true, true, pending)).toBe(-1);
-    expect(liveStepIndex(true, false, [step('success'), step('blocked')])).toBe(-1);
-    expect(liveStepIndex(true, false, [])).toBe(-1);
+  it('is -1 when steps are hidden, so the label carries the shimmer', () => {
+    expect(liveStepInBody(body([text('hi'), step('pending')], false))).toBe(-1);
+  });
+
+  it('is -1 when no drawn step is pending', () => {
+    expect(liveStepInBody(body([step('success'), step('error'), text('done')]))).toBe(-1);
+    // A step killed mid-call is terminal; a blocked one waits on the reader.
+    expect(liveStepInBody(body([step('success'), step('unfinished')]))).toBe(-1);
+    expect(liveStepInBody(body([step('success'), step('blocked')]))).toBe(-1);
+    expect(liveStepInBody(body([text('just text')]))).toBe(-1);
+    expect(liveStepInBody(body([]))).toBe(-1);
+  });
+
+  it('is -1 for a pending step the full response hides', () => {
+    // Details off keeps only what follows the last prose chunk.
+    expect(liveStepInBody(body([text('a'), step('pending'), text('b')], true, false))).toBe(-1);
+  });
+});
+
+/** The rows a body draws, flattened: every open row's events plus every marker. */
+function drawn(sections: BodySection[]): ResponseEvent[] {
+  return sections.flatMap(s => s.rows.flatMap((r): ResponseEvent[] => {
+    if (r.kind === 'marker') return [r.event];
+    if (!r.open) return [];
+    return r.kind === 'text' ? [r.event] : r.steps.map(x => x.event);
+  }));
+}
+
+/** Every row's key, the identity Preact matches it by. */
+function keys(sections: BodySection[]): string[] {
+  return sections.flatMap(s => s.rows.map(r => `${s.key}/${r.kind}${r.key}`));
+}
+
+/** The body the two toggles roll. Each toggle state must still DRAW what it
+ *  drew when hiding meant not rendering, and no toggle may move a row's key:
+ *  a moved key remounts the row, which then snaps instead of rolling. */
+describe('responseBody', () => {
+  const image: ResponseEvent = { type: 'image', base64: '', mime_type: 'image/png' };
+  const turns: Record<string, ResponseEvent[]> = {
+    'prose, steps, prose': [text('plan'), step('success'), step('success'), text('done')],
+    'a coding-agent turn': [text('\n'), step('success'), text('\n'), step('success'), text('look'), text(' '), step('pending')],
+    'a marker among steps': [text('first'), step('success'), image, step('success'), text('last'), step('success')],
+    'sectioned': [text('a'), step('success'), { type: 'section_break', channel: 'main' }, step('success'), text('b')],
+    'steps only': [step('success'), step('success')],
+    'one answer': [step('success'), text('only answer')],
+  };
+  const settings = [
+    [true, true], [true, false], [false, true], [false, false],
+  ] as const;
+
+  for (const [name, events] of Object.entries(turns)) {
+    it(`draws what the old paths drew: ${name}`, () => {
+      for (const [showSteps, showDetails] of settings) {
+        for (const rowsHidden of [0, 1, 2]) {
+          const clamped = headClampApplies(events, showDetails);
+          const before = (clamped ? events.slice(rowsHidden) : getCollapsedVisibleEvents(events))
+            .filter(e => drawsResponseRow(e, showSteps));
+          expect(drawn(body(events, showSteps, showDetails, rowsHidden)), `${showSteps}/${showDetails}/${rowsHidden}`)
+            .toEqual(before);
+        }
+      }
+    });
+
+    it(`keeps every row's key through both toggles: ${name}`, () => {
+      const first = keys(body(events));
+      for (const [showSteps, showDetails] of settings) {
+        expect(keys(body(events, showSteps, showDetails))).toEqual(first);
+      }
+    });
+  }
+
+  it('runs steps together across the blank chunks between them', () => {
+    const [section] = body(turns['a coding-agent turn']);
+    expect(section.rows.map(r => r.kind)).toEqual(['steps', 'text', 'steps']);
+  });
+
+  it('splits a run at a marker, which neither toggle hides', () => {
+    const [section] = body(turns['a marker among steps'], false, false);
+    expect(section.rows.map(r => r.kind)).toEqual(['text', 'steps', 'marker', 'steps', 'text', 'steps']);
+    expect(section.rows.find(r => r.kind === 'marker')).toMatchObject({ event: image });
+  });
+
+  it('marks a hidden run between two drawn chunks for the hairline, and no other', () => {
+    const elided = (events: ResponseEvent[], showSteps: boolean, showDetails: boolean) =>
+      body(events, showSteps, showDetails).flatMap(s => s.rows)
+        .filter(r => r.kind === 'steps').map(r => r.kind === 'steps' && r.elided);
+    const events = [text('plan'), step('success'), text('done'), step('success')];
+    // Between the two chunks: marked. After the last one: nothing to mark off.
+    expect(elided(events, false, true)).toEqual([true, false]);
+    // Steps on draws the run itself.
+    expect(elided(events, true, true)).toEqual([false, false]);
+    // The full response off hides the chunk before the run, so no boundary.
+    expect(elided(events, false, false)).toEqual([false, false]);
+    // A marker on one side is not a chunk.
+    expect(elided([text('a'), step('success'), { type: 'empty' }], false, true)).toEqual([false]);
+  });
+
+  it('keys a section by its first event', () => {
+    expect(body(turns.sectioned).map(s => s.key)).toEqual([0, 3]);
+  });
+
+  it('keys a run by its first step even when the clamp cuts that step', () => {
+    const events = [step('success'), step('success'), step('success'), text('done')];
+    const [section] = body(events, true, true, 1);
+    expect(section.rows[0]).toMatchObject({ kind: 'steps', key: 0 });
+    expect(section.rows[0].kind === 'steps' && section.rows[0].steps.map(s => s.index)).toEqual([1, 2]);
   });
 });
 
 /** What the response body is DRAWING, which is what decides whether the turn
- *  has anything to fold. The fold swaps the body for a `⋯` stub, so a turn that
- *  draws nothing and folds anyway swaps nothing for a mark: it does not
- *  collapse, it APPEARS. Reported while a coding-agent turn was in flight,
- *  which is where a blank body lives longest. */
+ *  has anything to fold. A turn that draws nothing and folds anyway hides
+ *  nothing, yet lights its collapse control as if it did. Reported while a
+ *  coding-agent turn was in flight, which is where a blank body lives longest. */
 describe('drawsResponseRow', () => {
   it('draws a text event only when it has visible text', () => {
     // A whitespace-only chunk is the norm, not a curiosity: one is pushed for
@@ -125,12 +194,12 @@ describe('drawsResponseRow', () => {
   });
 
   it('draws nothing for the kinds the response renderer has no arm for', () => {
-    // The reason this is an allow-list. `renderResponseEvents` draws five of the
-    // nine kinds and falls through to `null` for the rest, so a deny-list
-    // ("anything that is not a blank text") would count these as body content.
+    // The reason this is an allow-list. `responseBody` draws a row for some
+    // kinds and none for these. A deny-list ("anything that is not a blank
+    // text") would count them as body content.
     // A question and a permission render as initiator-panel dividers with their
-    // own fold, not as response rows; a `section_break` is consumed by
-    // `splitEventSections`. A turn holding only these has an empty body.
+    // own fold, not as response rows; a `section_break` splits
+    // `responseBody` into sections. A turn holding only these has an empty body.
     const undrawn: ResponseEvent[] = [
       { type: 'section_break', channel: 'main' },
       { type: 'question', tool_use_id: 't1', question: 'Which?', options: [] },

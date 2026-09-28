@@ -418,10 +418,8 @@ export function composingThreads(threads: ReadonlyMap<string, ThreadState>): Thr
 
 export type NestedThread = { thread: ThreadState; depth: number };
 
-/** CSS-variable style for a row wrapper. drawer.css turns it into
- *  `--thread-depth-offset`, which widens the row's left padding one step per
- *  level and shifts the status icon by the same step. So a sub-thread's icon
- *  keeps the distance to its own title. Typed as a string-keyed map so
+/** CSS-variable style for a row wrapper. drawer.css widens the row's left
+ *  padding one step per level from it. Typed as a string-keyed map so
  *  TypeScript accepts the custom property, since CSSProperties doesn't model
  *  `--*` keys. */
 export function depthStyle(depth: number): { [key: string]: string } {

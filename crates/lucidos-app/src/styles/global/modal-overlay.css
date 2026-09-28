@@ -2,7 +2,7 @@
 .modal-overlay {
     position: fixed;
     inset: 0;
-    background: rgba(0, 0, 0, 0.5);
+    background: var(--scrim);
     z-index: var(--z-modal);
     display: flex;
     align-items: center;
@@ -25,7 +25,7 @@
     position: fixed;
     inset: 0;
     z-index: calc(var(--z-modal) + 50);
-    background: rgba(0, 0, 0, 0.5);
+    background: var(--scrim);
     display: flex;
     align-items: center;
     justify-content: center;
@@ -101,24 +101,6 @@
     to { transform: rotate(360deg); }
 }
 
-/* Shared "fetching…" placeholder marker. Lets a loading row look distinct
- * from a "loaded with zero items" row without each component growing its own
- * keyframes block. */
-@keyframes loading-pulse {
-    0%, 100% { opacity: 0.5; }
-    50% { opacity: 0.85; }
-}
-.loading-skeleton {
-    font-style: italic;
-    opacity: 0.7;
-    animation: loading-pulse 1.4s ease-in-out infinite;
-}
-
-/* Reduced motion: the dimmed italic already says "fetching", so it rests. */
-:root[data-motion="reduce"] .loading-skeleton {
-    animation: none;
-}
-
 /* AI running-text shimmer — the standard "actively working" affordance: a
  * highlight band sweeps across the text itself (clipped to the glyphs) instead
  * of a separate spinner. Applied to text that should read as "live" — the
@@ -185,28 +167,6 @@
     box-sizing: border-box;
 }
 
-/* Centered loading spinner — full-width centered ring for view/panel loading states */
-.loading-spinner {
-    display: flex;
-    justify-content: center;
-    align-items: center;
-    padding: 3rem 0;
-    width: 100%;
-}
-
-.loading-spinner::after {
-    --spinner-color: var(--text-secondary);
-    content: '';
-    display: block;
-    width: 1.5rem;
-    height: 1.5rem;
-    border: var(--spinner-weight) solid var(--spinner-color);
-    border-top-color: transparent;
-    border-radius: 50%;
-    box-sizing: border-box;
-    animation: spin 0.8s linear infinite;
-}
-
 :root[data-motion="reduce"] .list-row,
 :root[data-motion="reduce"] .list-row-add-card,
 :root[data-motion="reduce"] .action-btn,
@@ -220,8 +180,7 @@
     transition: none;
 }
 
-:root[data-motion="reduce"] .mini-spinner,
-:root[data-motion="reduce"] .loading-spinner::after {
+:root[data-motion="reduce"] .mini-spinner {
     animation: none;
 }
 

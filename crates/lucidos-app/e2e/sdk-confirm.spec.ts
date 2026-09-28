@@ -89,12 +89,14 @@ test.describe('SDK lucidos.ui.confirm — host renders modal, returns Promise<bo
 
     // Modal must render in the parent (host), not inside the iframe.
     await expect(page.locator('.confirm-dialog')).toBeVisible();
-    await expect(page.locator('.confirm-title')).toHaveText('Delete node?');
+    await expect(page.locator('.confirm-dialog .surface-title')).toHaveText('Delete node?');
     await expect(page.locator('.confirm-message')).toContainText('Reduce CPAC by 50%');
-    await expect(page.locator('.confirm-btn-ok')).toHaveText('Delete');
-    await expect(page.locator('.confirm-btn-cancel').first()).toHaveText('Keep');
+    await expect(page.locator('[data-role="confirm-ok"]')).toHaveText('Delete');
+    // `danger: true` is the only thing that paints the OK red.
+    await expect(page.locator('[data-role="confirm-ok"]')).toHaveClass(/\baction-btn-danger\b/);
+    await expect(page.locator('[data-role="confirm-cancel"]').first()).toHaveText('Keep');
 
-    await page.locator('.confirm-btn-ok').click();
+    await page.locator('[data-role="confirm-ok"]').click();
     expect(await resultPromise).toBe(true);
     await expect(loc.locator('#result')).toHaveText('yes');
   });
@@ -105,7 +107,7 @@ test.describe('SDK lucidos.ui.confirm — host renders modal, returns Promise<bo
       (window as unknown as { runConfirm: (o: unknown) => Promise<boolean> }).runConfirm({ message: 'Continue?' })
     );
     await expect(page.locator('.confirm-dialog')).toBeVisible();
-    await page.locator('.confirm-btn-cancel').first().click();
+    await page.locator('[data-role="confirm-cancel"]').first().click();
     expect(await resultPromise).toBe(false);
   });
 
@@ -181,7 +183,7 @@ test.describe('SDK lucidos.ui.confirm — host renders modal, returns Promise<bo
 
     expect(await first).toBe(false);
 
-    await page.locator('.confirm-btn-ok').click();
+    await page.locator('[data-role="confirm-ok"]').click();
     expect(await second).toBe(true);
   });
 
@@ -190,8 +192,10 @@ test.describe('SDK lucidos.ui.confirm — host renders modal, returns Promise<bo
     const resultPromise = frame.evaluate(() =>
       (window as unknown as { runConfirm: (o: unknown) => Promise<boolean> }).runConfirm({ message: 'OK?', danger: false })
     );
-    await expect(page.locator('.confirm-btn-ok-default')).toBeVisible();
-    await page.locator('.confirm-btn-ok-default').click();
+    const ok = page.locator('[data-role="confirm-ok"]');
+    await expect(ok).toBeVisible();
+    await expect(ok).not.toHaveClass(/\baction-btn-danger\b/);
+    await ok.click();
     expect(await resultPromise).toBe(true);
   });
 });

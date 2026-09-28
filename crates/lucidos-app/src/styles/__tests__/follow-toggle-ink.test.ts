@@ -104,7 +104,7 @@ function inkFraction(ds: string[], side: number): { x: number; y: number } {
 
 /** The `d` of every path the named icon draws, plus its square viewBox side. */
 function glyph(name: string): { ds: string[]; side: number } {
-  const body = new RegExp(`export function ${name}\\(\\) \\{([\\s\\S]*?)\\n\\}`).exec(icons);
+  const body = new RegExp(`export function ${name}\\([^)]*\\) \\{([\\s\\S]*?)\\n\\}`).exec(icons);
   expect(body, `icons.tsx no longer exports ${name}()`).not.toBeNull();
   const view = /viewBox="0 0 (\d+) \1"/.exec(body![1]);
   expect(view, `${name} is not on a square viewBox`).not.toBeNull();

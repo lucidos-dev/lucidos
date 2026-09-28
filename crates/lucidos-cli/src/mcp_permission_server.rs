@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::io::{BufRead, Write};
 
+use crate::ask_user_question_hook::{card_not_shown_reason, post_question};
 use crate::http::permission_prompt_client;
 use crate::workspace::{resolve_from_env, BoxError};
 
@@ -363,17 +364,24 @@ fn call_ask_user_question(
         session_id: "",
         questions,
     };
-    let resp = client
-        .post(&endpoint)
-        .json(&body)
-        .send()
-        .map_err(|e| format!("HTTP failed: {}", e))?
-        .error_for_status()
-        .map_err(|e| format!("HTTP status: {}", e))?
-        .json::<AskUserQuestionResponseBody>()
-        .map_err(|e| format!("HTTP body parse: {}", e))?;
+    Ok(
+        match post_question::<AskUserQuestionResponseBody>(client, &endpoint, &body) {
+            Ok(resp) => ask_tool_result(&resp, question),
+            Err(cause) => card_not_shown_result(&cause),
+        },
+    )
+}
 
-    Ok(ask_tool_result(&resp, question))
+/// A failed request is a tool error with retry guidance, not a protocol error.
+/// The agent then asks again with the tool rather than in prose.
+fn card_not_shown_result(cause: &str) -> Value {
+    serde_json::json!({
+        "content": [{
+            "type": "text",
+            "text": card_not_shown_reason(TOOL_ASK_USER_QUESTION, cause)
+        }],
+        "isError": true
+    })
 }
 
 /// One option in the engine's wire shape. The schema advertises plain labels,
@@ -426,6 +434,30 @@ mod tests {
 
     fn dummy_client() -> reqwest::blocking::Client {
         reqwest::blocking::Client::new()
+    }
+
+    /// An unreachable engine is a tool error with retry guidance, never a bare
+    /// protocol error.
+    #[test]
+    fn an_unreachable_engine_returns_retry_guidance_as_a_tool_error() {
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let params = serde_json::json!({
+            "arguments": { "question": "Approve the plan?", "options": ["Approve", "Request changes"] }
+        });
+        let result = call_ask_user_question(
+            &params,
+            &dummy_client(),
+            &format!("http://127.0.0.1:{port}"),
+            "tid",
+        )
+        .expect("a failed request is still a tool result");
+        assert_eq!(result["isError"], true);
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("call ask_user_question again"), "{text}");
+        assert!(text.contains("Do not ask in prose"), "{text}");
     }
 
     #[test]

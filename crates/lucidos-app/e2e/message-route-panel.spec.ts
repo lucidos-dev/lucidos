@@ -32,8 +32,8 @@ test.describe('Message route panel', () => {
     await expect(panel).toContainText('Origin');
 
     // The frontend always sends x-lucidos-device-id (auto-generated in
-    // localStorage on first call), so origin is Device with the engine-derived
-    // fallback label "device-<short id>" until the user names the device.
+    // localStorage on first call), so origin is Device. The popover names it
+    // from the devices list: "device-<short id>" until the device has a name.
     const originSection = panel.locator('.route-section').first();
     await expect(originSection).toContainText(/API client|device-|Workspace/);
 
@@ -173,6 +173,60 @@ test.describe('Message route panel', () => {
       // instead of the old "Engine · Auto-resumed after restart" single-line label.
       await expect(originSection).toContainText('Why the engine acted');
       await expect(originSection).toContainText(/auto-resumed/i);
+    } finally {
+      psql([
+        `DELETE FROM events WHERE aggregate_id = '${threadId}'`,
+        `DELETE FROM thread_summaries WHERE thread_id = '${threadId}'`,
+      ].join(';\n'));
+    }
+  });
+
+  // A plugin setup seed carries a typed plugin_setup reason, and the popover
+  // names the update from it. This is the payload the engine writes.
+  test('a plugin setup seed names the plugin update, never Unknown', async ({ page }) => {
+    const threadId = randomUUID();
+    const eventId = randomUUID();
+    const respId = randomUUID();
+    const now = new Date().toISOString();
+    const seedPayload = JSON.stringify({
+      text: 'Set up Habit Tracker again: its setup instructions changed since version 0.1.3.',
+      channel: 'chat',
+      mode: 'engine',
+      origin: {
+        kind: 'engine',
+        reason: {
+          kind: 'plugin_setup',
+          plugin_id: 'habit-tracker',
+          plugin_name: 'Habit Tracker',
+          version: '0.1.4',
+          occasion: { kind: 'update', from_version: '0.1.3' },
+        },
+      },
+    });
+
+    try {
+      psql([
+        `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, is_coding_agent, active_children_count, coding_agent_proposed, coding_agent_requires_restart, coding_agent_is_external_repo) VALUES ('${threadId}', 'Update Habit Tracker setup', 'chat', '${now}', 1, false, true, 'done', 'inbox', false, 0, false, false, false)`,
+        `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${eventId}', 'MessageReceived', '${seedPayload}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
+        `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${respId}', 'ResponseGenerated', '{"text":"ok","images":[]}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
+      ].join(';\n'));
+
+      await page.addInitScript((tid: string) => {
+        localStorage.setItem('lucidos-focused-thread', tid);
+      }, threadId);
+      await navigateToApp(page);
+      await assertHealthy(page);
+
+      const badge = page.locator('.initiator-actor:visible').first();
+      await expect(badge).toBeVisible();
+      await badge.click();
+
+      const originSection = page.locator('.message-route-panel .route-section').first();
+      await expect(originSection).toContainText('Lucidos Engine');
+      await expect(originSection).toContainText('Plugin update');
+      await expect(originSection).toContainText('Habit Tracker 0.1.3 → 0.1.4');
+      await expect(originSection).toContainText('Why the engine acted');
+      await expect(originSection).not.toContainText('Unknown');
     } finally {
       psql([
         `DELETE FROM events WHERE aggregate_id = '${threadId}'`,

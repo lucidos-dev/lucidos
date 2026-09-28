@@ -7,9 +7,12 @@ import { highlightFileLines, CODE_EXTS } from '../../utils/syntaxHighlight';
 import { escapeHtml } from '../../utils/escapeHtml';
 import { getRemPx } from '../../utils/dom';
 import { SideBySideDiff } from './sideBySideDiff';
+import { SkBlock, SkText, SkeletonProvider } from '../shared/Skeleton';
 
 interface Props {
-  file: DiffFile;
+  /** Absent only inside a `SkeletonProvider`, where the card draws itself as a
+   *  loading placeholder (see `DiffSkeleton`). */
+  file?: DiffFile;
   /** Render the two columns side by side instead of unified hunks. Honoured
    *  only when there is room for them (see `fitsSideBySide`). */
   sideBySide?: boolean;
@@ -45,8 +48,21 @@ export function fitsSideBySide(widthPx: number, remPx: number): boolean {
   return widthPx >= SIDE_BY_SIDE_MIN_REM * remPx;
 }
 
+/** Line widths one placeholder hunk shimmers with. */
+const DIFF_SKELETON_LINES = ['62%', '80%', '48%', '71%', '35%'];
+
+/** `files` diff cards drawn as loading placeholders, from `DiffView` itself. */
+export function DiffSkeleton({ files = 1, class: cls }: { files?: number; class?: string }) {
+  return (
+    <SkeletonProvider>
+      <div class={cls} aria-hidden="true">
+        {Array.from({ length: files }, (_, i) => <DiffView key={i} />)}
+      </div>
+    </SkeletonProvider>
+  );
+}
+
 export function DiffView({ file, sideBySide = false, measureFit = false }: Props) {
-  const stats = diffStats(file);
   const rootRef = useRef<HTMLDivElement>(null);
 
   // The diff root is already the scroll container, so it is the element whose
@@ -69,6 +85,28 @@ export function DiffView({ file, sideBySide = false, measureFit = false }: Props
   // changed file, and none of them can act on the fit.
   const showSideBySide = sideBySide && diffFitsSideBySide.value;
 
+  if (!file) {
+    return (
+      <div class="diff-view">
+        <div class="diff-header">
+          <SkBlock w="3.5rem" h="1rem" round />
+          <SkText class="diff-path" w="14rem" />
+        </div>
+        <div class="diff-hunk">
+          <div class="diff-hunk-header"><SkText w="9rem" /></div>
+          {DIFF_SKELETON_LINES.map((w) => (
+            <div key={w} class="diff-line diff-line-context">
+              <span class="diff-line-num diff-line-num-old" />
+              <span class="diff-line-num diff-line-num-new" />
+              <span class="diff-line-marker"> </span>
+              <SkText class="diff-line-content" w={w} />
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  }
+  const stats = diffStats(file);
   return (
     <div class="diff-view" ref={rootRef}>
       <div class="diff-header">

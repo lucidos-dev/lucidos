@@ -589,25 +589,35 @@ pub async fn probe_health(client: &reqwest::Client, scheme: &str, port: u16) -> 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct EngineProbe {
     pub outcome: ProbeOutcome,
-    /// `true` unless a healthy engine reported otherwise (ADR 0037).
-    pub database_reachable: bool,
+    /// `Reachable` unless a healthy engine reported otherwise.
+    pub database: DatabaseHealth,
 }
 
-/// [`probe_health`], also reading `database_reachable` from the same body, so
+/// What an engine's health body says about its database (ADRs 0037, 0301).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DatabaseHealth {
+    Reachable,
+    /// The database itself does not answer.
+    NotAnswering,
+    /// The database answers, but the engine has no free pooled connection.
+    PoolExhausted,
+}
+
+/// [`probe_health`], also reading the database health from the same body, so
 /// the slowness watch costs the supervisor no second request (ADR 0283).
 pub async fn probe_engine(client: &reqwest::Client, scheme: &str, port: u16) -> EngineProbe {
     let url = format!("{scheme}://127.0.0.1:{port}/api/v1/health");
     let outcome = |outcome| EngineProbe {
         outcome,
-        database_reachable: true,
+        database: DatabaseHealth::Reachable,
     };
     match client.get(&url).send().await {
         Ok(r) if r.status().is_success() => EngineProbe {
             outcome: ProbeOutcome::Healthy,
-            database_reachable: r
+            database: r
                 .text()
                 .await
-                .map_or(true, |body| database_reachable(&body)),
+                .map_or(DatabaseHealth::Reachable, |body| database_health(&body)),
         },
         Ok(_) => outcome(ProbeOutcome::Other),
         Err(e) if e.is_timeout() => outcome(ProbeOutcome::Slow),
@@ -616,13 +626,20 @@ pub async fn probe_engine(client: &reqwest::Client, scheme: &str, port: u16) -> 
     }
 }
 
-/// `database_reachable` from a health body. Only an explicit `false` counts:
-/// an older engine omits the field, and must never read as an outage.
-fn database_reachable(body: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(body)
-        .ok()
-        .and_then(|health| health.get("database_reachable")?.as_bool())
-        .unwrap_or(true)
+/// The database health in a health body. Only an explicit `false` for
+/// `database_reachable` is an outage, and only an explicit `true` for
+/// `database_pool_exhausted` blames the pool. An older engine omits either
+/// field, and must never read as worse than it said.
+fn database_health(body: &str) -> DatabaseHealth {
+    let Ok(health) = serde_json::from_str::<serde_json::Value>(body) else {
+        return DatabaseHealth::Reachable;
+    };
+    let flag = |key: &str| health.get(key).and_then(serde_json::Value::as_bool);
+    match (flag("database_reachable"), flag("database_pool_exhausted")) {
+        (Some(false), Some(true)) => DatabaseHealth::PoolExhausted,
+        (Some(false), _) => DatabaseHealth::NotAnswering,
+        _ => DatabaseHealth::Reachable,
+    }
 }
 
 /// An engine found answering on a registered port, and when it says it started.
@@ -764,6 +781,10 @@ fn parse_last_successful_backup(body: &str) -> Option<LastSuccessfulBackup> {
 /// as the CLI's copy of the token header.
 pub const HEADER_DEVICE_ID: &str = "x-lucidos-device-id";
 
+/// Header carrying the authenticated device's pairing label, percent-encoded.
+/// Mirrors `api::actor::HEADER_DEVICE_LABEL` in `lucidos-engine`, same rule.
+pub const HEADER_DEVICE_LABEL: &str = "x-lucidos-device-label";
+
 /// How long the restart-intent notify may take before it is abandoned. Short on
 /// purpose: this sits in front of a user-visible Restart click, and the restart
 /// proceeds regardless. Well clear of a loopback round-trip to a healthy
@@ -852,15 +873,30 @@ mod tests {
 
     #[test]
     fn only_an_explicit_false_reads_as_an_unreachable_database() {
-        assert!(!database_reachable(
-            r#"{"status":"ok","database_reachable":false}"#
-        ));
-        assert!(database_reachable(
-            r#"{"status":"ok","database_reachable":true}"#
-        ));
-        // An older engine, and a body that is not JSON at all.
-        assert!(database_reachable(r#"{"status":"ok"}"#));
-        assert!(database_reachable("not json"));
+        use DatabaseHealth::*;
+        let table = [
+            (r#"{"database_reachable":false}"#, NotAnswering),
+            (
+                r#"{"database_reachable":false,"database_pool_exhausted":false}"#,
+                NotAnswering,
+            ),
+            (
+                r#"{"database_reachable":false,"database_pool_exhausted":true}"#,
+                PoolExhausted,
+            ),
+            (r#"{"database_reachable":true}"#, Reachable),
+            // A pool flag never overrides a reachable database.
+            (
+                r#"{"database_reachable":true,"database_pool_exhausted":true}"#,
+                Reachable,
+            ),
+            // An older engine, and a body that is not JSON at all.
+            (r#"{"status":"ok"}"#, Reachable),
+            ("not json", Reachable),
+        ];
+        for (body, report) in table {
+            assert_eq!(database_health(body), report, "{body}");
+        }
     }
 
     /// A child that is still running is live, and probing it must NOT reap or

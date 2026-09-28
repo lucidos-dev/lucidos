@@ -13,7 +13,7 @@ use axum::Router;
 use uuid::Uuid;
 
 mod actions;
-mod archive;
+pub(crate) mod archive;
 mod background_tasks;
 mod delete;
 mod detach;
@@ -186,6 +186,13 @@ pub(super) fn router() -> Router<super::AppState> {
         // Move a child to top level. `:thread_id` is the CHILD, and who may
         // move it depends on whether the caller carries an origin token.
         .route("/threads/:thread_id/detach", post(detach::detach_thread))
+        // Archive on the caller's own authority (ADR 0310). `:thread_id` is
+        // the target; an origin token limits it to the caller or one of its
+        // direct children.
+        .route(
+            "/threads/:thread_id/archive",
+            post(archive::archive_thread_as_caller),
+        )
         .route(
             "/threads/:thread_id/cc-diff",
             get(super::repositories::get_thread_cc_diff),

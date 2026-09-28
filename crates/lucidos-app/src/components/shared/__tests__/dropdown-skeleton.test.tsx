@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import type { ComponentChildren, VNode } from 'preact';
-import { DropdownSkeleton } from '../Dropdown';
+import { DropdownChevron, DropdownSkeleton } from '../Dropdown';
 
 /** The one property that makes this skeleton worth having: it wears the REAL
  *  trigger's box, so its height comes from the same CSS rule as the control that
@@ -18,6 +18,13 @@ function collectClasses(node: ComponentChildren, out: string[] = []): string[] {
   const v = node as VNode<{ children?: ComponentChildren; class?: string }>;
   if (v.props?.class) out.push(v.props.class);
   return collectClasses(v.props?.children, out);
+}
+
+function containsType(node: ComponentChildren, type: unknown): boolean {
+  if (node === null || node === undefined || typeof node !== 'object') return false;
+  if (Array.isArray(node)) return node.some(n => containsType(n, type));
+  const v = node as VNode<{ children?: ComponentChildren }>;
+  return v.type === type || containsType(v.props?.children, type);
 }
 
 function firstWithClass(node: ComponentChildren, cls: string): VNode<Record<string, unknown>> | null {
@@ -45,7 +52,7 @@ describe('DropdownSkeleton', () => {
     // The trigger is a flex row of label + chevron with a gap between them.
     // Drop the chevron and every slow-loading dropdown grows on settle, which
     // is the exact layout shift the skeleton exists to prevent.
-    expect(collectClasses(tree)).toContain('dropdown-chevron');
+    expect(containsType(tree, DropdownChevron)).toBe(true);
   });
 
   it('is decorative: hidden from assistive tech, and not a focusable button', () => {

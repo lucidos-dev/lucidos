@@ -1,4 +1,4 @@
-import type { ComponentChildren } from 'preact';
+import { Fragment, type ComponentChildren } from 'preact';
 import type { Signal } from '@preact/signals';
 import { memo } from 'preact/compat';
 import { useMemo, useState } from 'preact/hooks';
@@ -14,16 +14,18 @@ import { withScrollAnchor } from './CreateThreadView';
 import { QuestionBody } from './QuestionCard';
 import { CommandPermissionBody, McpPermissionBody, PermissionBody } from './PermissionCard';
 import { ChildCompletionRow, ChildMovedOutRow, ChildStoppedRow } from './ChildCompletionRow';
-import { headClampApplies, getCollapsedVisibleEvents, splitEventSections, liveStepIndex, drawsResponseRow } from '../../store/event-rendering';
+import { drawsResponseRow, liveStepInBody, responseBody, type BodyRow } from '../../store/event-rendering';
+import { Disclosure } from '../shared/Disclosure';
 import { statusLabel as getStatusLabel, isActive as isStatusActive, isTerminated } from '../../store/exchange-status';
 import { formatMessageTimestamp } from '../../utils/formatTime';
 import { renderMarkdown } from '../../utils/renderMarkdown';
 import { linkifyPaths } from '../../utils/linkifyPaths';
 import { handleMarkdownLinkClick } from '../shared/markdownLinkClick';
 import { FormRequestRow } from './FormRequestRow';
-import { ChangeBody, CheckpointCard, ContinueButton, EventDeliveryBody, EventWaitRow, FileList, HeldMessageRow, GeneratedImage, InitiatorPanel, InlineStep, LivePartialBody, LiveUtteranceBody, MarkdownBlock, ResponsePanel, ResumeNoteBody, SpokenChip, SpokenReply, TriggerFiredBody, UserMessageBody, changeAccent, changeActions, describeExecutor, turnControls } from './chat-exchange-parts';
+import { ChangeEventRow, CheckpointCard, ContinueButton, EventDeliveryBody, EventWaitRow, FileList, HeldMessageRow, GeneratedImage, InitiatorPanel, InlineStep, LivePartialBody, LiveUtteranceBody, MarkdownBlock, ResponsePanel, ResumeNoteBody, SpokenChip, SpokenReply, TriggerFiredBody, UserMessageBody, changeAccent, describeExecutor, turnControls } from './chat-exchange-parts';
 import { TrashIcon, PowerIcon, PersonIcon, ApiPlugIcon, TriggerFiredIcon, WarningIcon, ContinuedIcon } from '../shared/icons';
 import { useOnScreenInTranscript } from '../../hooks/useOnScreenInTranscript';
+import { engineReasonHeadline } from '../../utils/engineEventExplainers';
 
 // Stable refs so the `loadedOr` fallback does not yield a fresh [] each render.
 // Without these, every dependent useMemo invalidates on every render while
@@ -108,7 +110,7 @@ interface Props {
   rowsHidden?: number;
   /** First line of the in-thread `ChangeProposed` description + its file count
    *  for this exchange's change_id (built once per thread in `renderExchanges`).
-   *  Seeds <ChangeBody> so a change-lifecycle panel paints at its final height
+   *  Seeds <ChangeEventRow> so a change-lifecycle panel paints at its final height
    *  on first open, before the per-id `Change` lazy-fetch lands — fixing the
    *  open-path jump. Undefined for non-change exchanges (and when no matching
    *  ChangeProposed rode the thread). Primitives, so the memo stays cheap. */
@@ -184,10 +186,8 @@ export function isUserBubbleEvent(userEvent: { type: string }): boolean {
  *  that by pressing one named thing, so that thing is what must not move. See
  *  `withScrollAnchor`.
  *
- *  Read before `fn` runs, because the mutation can take the node away: the `⋯`
- *  stub is replaced by the body it reveals. `withScrollAnchor` then writes
- *  nothing, which is exact for that press. An unfold changes nothing above its
- *  own turn, so the freeze has already left the reader where they belong. */
+ *  Read before `fn` runs, because the mutation can take the node away.
+ *  `withScrollAnchor` then writes nothing. */
 function heldOnThePress(fn: () => void): (e: MouseEvent) => void {
   return (e) => withScrollAnchor(e.currentTarget as HTMLElement | null, fn);
 }
@@ -227,18 +227,16 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
   );
 
   const hasEvents = events.length > 0;
-  const hasSections = events.some(e => e.type === 'section_break');
-  const clampApplies = headClampApplies(events, showDetails);
   const hasSteps = steps.length > 0 || events.some(e => e.type === 'step');
 
   // Is there a body to fold, and therefore a body to draw at all? One
   // definition, because `hasBody` on the panel below asks the same thing.
   //
-  // Deliberately NOT `hasEvents`. A fold swaps the body for a `⋯` stub, so on
-  // a turn whose body draws nothing it swaps nothing for a mark. In flight that
-  // is a real case. A coding-agent turn emits a whitespace-only text event
-  // before every tool call. A reader with steps off sees nothing else, so
-  // `events.length` runs ahead of anything on screen.
+  // Deliberately NOT `hasEvents`. A fold hides the body and lights the control,
+  // so on a turn whose body draws nothing it hides nothing and still lights. In
+  // flight that is a real case. A coding-agent turn emits a whitespace-only
+  // text event before every tool call. A reader with steps off sees nothing
+  // else, so `events.length` runs ahead of anything on screen.
   //
   // Asking `drawsResponseRow` instead leaves the control dead exactly while the
   // turn is blank, lighting up with its first drawn row. Turning steps OFF can
@@ -267,7 +265,7 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
   // fires on is often one where `canCollapse` is false BECAUSE the thing being
   // revealed is hidden. A folded step-only turn with steps off draws nothing,
   // so it reads as uncollapsible until the click that turns steps on. Gated,
-  // that click leaves the key in the store and the turn folds back to `⋯` the
+  // that click leaves the key in the store and the turn folds back up the
   // instant its steps become drawable. `expandExchange` no-ops when the key is
   // absent, so the unconditional call costs nothing on an unfolded turn.
   function reveal(setting: Signal<boolean>) {
@@ -303,10 +301,9 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
     });
   }
 
-  // Folding this turn. One definition, because the header's collapse control
-  // and the `⋯` stub the fold leaves behind are two ways into the same action.
-  // Anchored like the other two: a fold that shrinks the transcript past its
-  // own pane clamps the offset, and the reader is owed their control back.
+  // Folding this turn, from the header's collapse control. Anchored like the
+  // other two: a fold that shrinks the transcript past its own pane clamps the
+  // offset, and the reader is owed their control back.
   const toggleCollapsed = heldOnThePress(() => toggleExchangeCollapsed(threadId, exchange.userSeq));
   const toggleInitiator = heldOnThePress(() => toggleInitiatorCollapsed(threadId, exchange.userSeq));
 
@@ -323,63 +320,28 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
     onToggleCollapsed: toggleCollapsed,
   });
 
-  const { visibleEvents, collapsedFallbackText } = useMemo(() => {
-    let visible: ResponseEvent[] = [];
-    let fallback = '';
-    // A folded turn mounts no body, so it renders no markdown for one. That is
-    // also what the render window counts it as (`rowsDrawnByClamp`).
-    if (hasEvents && !bodyFolded) {
-      if (clampApplies) {
-        // The render window's head clamp, applied HERE and nowhere earlier.
-        // Every verdict above reads the full `events`: whether this turn has
-        // sections, whether it is an empty continuation, whether its divider
-        // body is suppressed. Those describe the TURN and must not change
-        // because its head is off screen.
-        visible = rowsHidden > 0 ? events.slice(rowsHidden) : events;
-      } else {
-        // A collapsed turn is already down to a handful of rows. The clamp has
-        // nothing to save there, and would cut into what the collapse chose to
-        // keep. `rowsHidden` counts the UNCOLLAPSED list either way.
-        const collapsed = getCollapsedVisibleEvents(events);
-        visible = collapsed.visibleEvents;
-        if (collapsed.needsFallback) {
-          fallback = responseHtmlCombined;
-        }
-      }
-    }
-    return { visibleEvents: visible, collapsedFallbackText: fallback };
-  }, [hasEvents, bodyFolded, clampApplies, events, responseHtmlCombined, rowsHidden]);
-
-  // Sections tagged with each section's base index in `visibleEvents`, so
-  // `renderResponseEvents` can key rows stably as the list grows during
-  // streaming. `splitEventSections` drops the break markers, so re-walking
-  // `visibleEvents` recovers each section's offset.
+  // The body as rows, each told whether the two toggles draw it, so a toggle
+  // rolls a row rather than dropping it. A folded turn mounts no body, so it
+  // renders no markdown for one. That is also what the render window counts it
+  // as (`rowsDrawnByClamp`).
   //
+  // The render window's head clamp (`rowsHidden`) applies inside `responseBody`
+  // and nowhere earlier. Every verdict above reads the full `events`, since
+  // those describe the TURN and must not change because its head is off screen.
   // The open cost is bounded twice, both by ThreadView: which EXCHANGES render,
   // on a step budget, and how many of the FLOOR exchange's rows do, on a row
-  // budget (`threadWindow.ts`). `visibleEvents` above already carries the
-  // second, so this walks only what is drawn.
-  //
-  // The clamp that used to sit here was a different thing: it shipped a "Show
-  // earlier steps" expander the reader found confusing, and THAT is not coming
-  // back. The head arrives by scrolling now, with no control of its own.
-  const renderedSections = useMemo(() => {
-    const sections = splitEventSections(visibleEvents);
-    let cursor = 0;
-    return sections.map((events) => {
-      while (cursor < visibleEvents.length && visibleEvents[cursor].type === 'section_break') cursor++;
-      const base = cursor;
-      cursor += events.length;
-      return { events, base };
-    });
-  }, [visibleEvents]);
+  // budget (`threadWindow.ts`).
+  const sections = useMemo(
+    () => (hasEvents && !bodyFolded ? responseBody(events, { showSteps, showDetails, rowsHidden }) : []),
+    [hasEvents, bodyFolded, events, showSteps, showDetails, rowsHidden],
+  );
 
   // Exactly one running-text shimmer at a time, and it has to be one the reader
   // can SEE. While the live step row is on screen its shimmer is the affordance,
   // so the "Working" label drops to a plain static one. Otherwise the label
   // shimmers as the sole affordance.
   //
-  // Two halves, because drawn and seen are different questions. `liveStepIndex`
+  // Two halves, because drawn and seen are different questions. `liveStepInBody`
   // answers the first from data alone: steps hidden, this exchange collapsed, or
   // no pending step. The hook answers the second, and it is the half that used
   // to be missing. A coding-agent turn always carries a live row, derived by
@@ -392,7 +354,8 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
   // `useState`, so the setter IS the ref callback: a stable identity, which is
   // what stops Preact re-running the ref on every render of a live turn.
   const [liveStepRow, setLiveStepRow] = useState<HTMLElement | null>(null);
-  const liveRowIndex = liveStepIndex(showSteps, isCollapsed, visibleEvents);
+  // A folded turn draws no step, so its label carries the shimmer.
+  const liveRowIndex = isCollapsed ? -1 : liveStepInBody(sections);
   // Gated on the index because the ref does NOT clear itself when a row stops
   // being the live one. Preact clears a ref only on unmount, or when a
   // DIFFERENT ref replaces it on the same element. So a row that settles IN
@@ -406,20 +369,19 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
   // the workspace has many artifacts. Without memoization, every re-render of
   // this exchange (signal fire from threadMap/artifacts/appsList during SSE
   // activity) reruns the full scan and blocks the main thread.
-  const visibleTextHtmls = useMemo(() => {
+  // Only drawn chunks. A closed row's Disclosure shows the markup it last drew
+  // open, so it never reads this map.
+  const chunkHtmls = useMemo(() => {
     const map = new Map<ResponseEvent, string>();
-    for (const evt of visibleEvents) {
-      if (evt.type === 'text' && evt.md?.trim()) {
-        map.set(evt, linkifyPaths(renderMarkdown(evt.md), artifactPaths, apps));
+    for (const { rows } of sections) {
+      for (const row of rows) {
+        if (row.kind === 'text' && row.open) {
+          map.set(row.event, linkifyPaths(renderMarkdown(row.event.md), artifactPaths, apps));
+        }
       }
     }
     return map;
-  }, [visibleEvents, artifactPaths, apps]);
-
-  const collapsedFallbackHtml = useMemo(
-    () => linkifyPaths(collapsedFallbackText, artifactPaths, apps),
-    [collapsedFallbackText, artifactPaths, apps],
-  );
+  }, [sections, artifactPaths, apps]);
 
   const responseHtmlLinkified = useMemo(
     // The streaming buffer's html changes every token, so its linkify opts out
@@ -535,64 +497,73 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
   // an empty box under the caller's bubble.
   const speechOnlyHasWords = !isSpeechOnly || canCollapse;
   const showResponsePanel = (!isChangePanel || isChangeContinuation) && (!isAbortPanel || isTerminatedContinuation) && (!isCancelPanel || isTerminatedContinuation) && !isTurnlessPanel && !isUnansweredDivider && !isEmptyContinued && !isQueuedUserMessage && !isLiveRow && speechOnlyHasWords && (hasResponse || hasEvents || showStatus);
-  let initiatorActions: ComponentChildren | undefined;
-  if (isChangePanel) {
-    initiatorActions = changeActions(
-      (exchange.userEvent as { change_id?: string }).change_id,
-      exchange.userEvent.type === 'ChangeApplyFailed',
-      // ChangeApplied always resolves to at least a Revert button. Reserving
-      // the footer row while the Change row loads stops the buttons shifting
-      // the panel down on first open, mirroring the body's ChangeProposed seed.
-      exchange.userEvent.type === 'ChangeApplied',
-    );
-  } else if (isAbortPanel && isContinuableAbort) {
-    initiatorActions = <ContinueButton threadId={threadId} />;
-  }
+  // A change turn's Diff and Revert live inside its card (`ChangeEventRow`).
+  const initiatorActions = isAbortPanel && isContinuableAbort
+    ? <ContinueButton threadId={threadId} />
+    : undefined;
   const executor = describeExecutor(threadIsCC, threadCodingAgent);
 
-  function renderResponseEvents(eventsList: ResponseEvent[], baseIndex = 0) {
-    return eventsList.map((evt, i) => {
-      // Key by ABSOLUTE index in `visibleEvents`, not the local per-section
-      // slice index. `splitEventSections` hands each section its base offset,
-      // so a row's key is stable even as earlier sections grow during
-      // streaming. That keeps the visible rows stable rather than re-rendering
-      // the whole tail on each streamed event.
-      const k = baseIndex + i;
-      if (evt.type === 'text' && evt.md?.trim()) {
+  // Keyed by the row's index in the whole turn (`responseBody`). So no toggle,
+  // no head clamp and no new chunk remounts a row that stays drawn.
+  function renderRow(row: BodyRow) {
+    switch (row.kind) {
+      case 'text':
         // Classed so the chunk can own the space around itself. Interleaved
         // with step rows, a markdown paragraph's bottom-only margin is all that
         // separates prose from a log row, putting the air on one side. See
         // `.response-chunk` in chat/response.css.
-        return <div key={`t${k}`} class="response-chunk" dangerouslySetInnerHTML={{ __html: visibleTextHtmls.get(evt)! }} />;
-      }
-      // `evt.type === 'step'` is `isStepMechanics` spelled inline, for the type
-      // narrowing `InlineStep` needs. It is the ONLY row the toggle hides.
-      //
-      // The live row is marked so the header label can read where it sits.
-      // MOVING the mark is safe in either direction. Preact clears the old ref
-      // during the diff and applies the new one after it. So a clear can never
-      // land on top of a set. Losing the mark entirely is the case Preact does
-      // not handle, and the reader above gates on the index for exactly that.
-      if (evt.type === 'step' && showSteps) return <InlineStep key={`s${k}`} event={evt} rowRef={k === liveRowIndex ? setLiveStepRow : undefined} />;
-      if (evt.type === 'image') return <GeneratedImage key={`img${k}`} event={evt} />;
-      if (evt.type === 'checkpoint') return <CheckpointCard key={`cp${k}`} event={evt} />;
-      // Ungated, like the event row below. It is what the caller HEARD, no
-      // audio is kept, and the written answer beside it is a different thing:
-      // the talker says what an answer means rather than reading it out.
-      if (evt.type === 'spoken_reply') return <SpokenReply key={`sr${k}`} event={evt} />;
-      // Ungated, like every other marker. The park is the transcript's only
-      // record that the thread subscribed to something. The clock indicator
-      // holds the LIVE half and drops the wait as it resolves. A toggle
-      // defaulting to off would leave a resolved wait recorded nowhere.
-      if (evt.type === 'event_wait') return <EventWaitRow key={`ew${k}`} event={evt} />;
-      // Ungated too: a held message is the user's cue that a reply is owed.
-      if (evt.type === 'held_message') return <HeldMessageRow key={`hm${k}`} event={evt} />;
-      // Ungated: an open one is how the user reaches a form they closed or
-      // never saw, and a resolved one records how the request ended.
-      if (evt.type === 'form_request') return <FormRequestRow key={`fr${k}`} row={evt} threadId={threadId} />;
-      if (evt.type === 'empty') return <div key={`e${k}`} class="response-empty-note">{'The model returned an empty response.'}</div>;
-      return null;
-    });
+        return (
+          <Disclosure key={`t${row.key}`} open={row.open}>
+            <div class="response-chunk" dangerouslySetInnerHTML={{ __html: chunkHtmls.get(row.event) ?? '' }} />
+          </Disclosure>
+        );
+      case 'steps':
+        // The live row is marked so the header label can read where it sits.
+        // MOVING the mark is safe in either direction. Preact clears the old ref
+        // during the diff and applies the new one after it. So a clear can never
+        // land on top of a set. Losing the mark entirely is the case Preact does
+        // not handle, and the reader above gates on the index for exactly that.
+        //
+        // The hairline for hidden steps rolls in as the run rolls out, so the
+        // gap between the two chunks never jumps when either roll lands. The
+        // pair is keyed as one: an unkeyed group matches its neighbours by
+        // position and remounts both rows when the head clamp shifts.
+        return (
+          <Fragment key={`s${row.key}`}>
+            <Disclosure open={row.open}>
+              {row.steps.map(({ event, index }) => (
+                <InlineStep key={index} event={event} rowRef={index === liveRowIndex ? setLiveStepRow : undefined} />
+              ))}
+            </Disclosure>
+            <Disclosure open={row.elided}>
+              <div class="response-elision" aria-hidden="true" />
+            </Disclosure>
+          </Fragment>
+        );
+      case 'marker':
+        return renderMarker(row.event, row.key);
+    }
+  }
+
+  function renderMarker(evt: ResponseEvent, k: number) {
+    if (evt.type === 'image') return <GeneratedImage key={`img${k}`} event={evt} />;
+    if (evt.type === 'checkpoint') return <CheckpointCard key={`cp${k}`} event={evt} />;
+    // Ungated, like the event row below. It is what the caller HEARD, no
+    // audio is kept, and the written answer beside it is a different thing:
+    // the talker says what an answer means rather than reading it out.
+    if (evt.type === 'spoken_reply') return <SpokenReply key={`sr${k}`} event={evt} />;
+    // Ungated, like every other marker. The park is the transcript's only
+    // record that the thread subscribed to something. The clock indicator
+    // holds the LIVE half and drops the wait as it resolves. A toggle
+    // defaulting to off would leave a resolved wait recorded nowhere.
+    if (evt.type === 'event_wait') return <EventWaitRow key={`ew${k}`} event={evt} />;
+    // Ungated too: a held message is the user's cue that a reply is owed.
+    if (evt.type === 'held_message') return <HeldMessageRow key={`hm${k}`} event={evt} />;
+    // Ungated: an open one is how the user reaches a form they closed or
+    // never saw, and a resolved one records how the request ended.
+    if (evt.type === 'form_request') return <FormRequestRow key={`fr${k}`} row={evt} threadId={threadId} />;
+    if (evt.type === 'empty') return <div key={`e${k}`} class="response-empty-note">{'The model returned an empty response.'}</div>;
+    return null;
   }
 
   // Identity for keyboard turn-nav's Enter toggle (see
@@ -602,7 +573,7 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
   // is a no-op there.
   //
   // A speech-only turn folds neither half. Both its panels draw headerless, so
-  // there is no `⋯` stub and nothing to unfold a fold with.
+  // there is no collapse control to unfold a fold with.
   const collapseKind = isSpeechOnly ? undefined
     : canCollapse ? 'response'
       : canCollapseInitiator ? 'initiator' : undefined;
@@ -670,25 +641,16 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
           ) : null}
           timestamp={formatMessageTimestamp(responseTimestamp || timestamp)}
           collapsed={isCollapsed}
-          onToggle={canCollapse ? toggleCollapsed : undefined}
         >
-          {hasEvents && hasSections ? (
-            renderedSections.map(({ events: section, base }) => (
-              <div class="response-content markdown-content" key={`sec-${base}`} onClick={handleLinkClick}>
-                {renderResponseEvents(section, base)}
+          {hasEvents ? (
+            sections.map(({ key, rows }) => (
+              <div class="response-content markdown-content" key={`sec-${key}`} onClick={handleLinkClick}>
+                {rows.map(renderRow)}
               </div>
             ))
           ) : (
             <div class="response-content markdown-content" onClick={handleLinkClick}>
-              {hasEvents ? (
-                collapsedFallbackText ? (
-                  <div dangerouslySetInnerHTML={{ __html: collapsedFallbackHtml }} />
-                ) : (
-                  renderResponseEvents(visibleEvents)
-                )
-              ) : (
-                <div dangerouslySetInnerHTML={{ __html: responseHtmlLinkified }} />
-              )}
+              <div dangerouslySetInnerHTML={{ __html: responseHtmlLinkified }} />
             </div>
           )}
           {isEngineLimit && (
@@ -918,15 +880,19 @@ function initiatorSummary(exchange: Exchange): string {
     case 'MissingHardeningDetected': return 'Hardening required';
     case 'MergeConflictDetected':    return 'Merging changes from main';
     case 'CodingAgentPromptSent':    return 'Engine-injected prompt';
-    case 'ChangeApplied':            return 'Change applied';
-    case 'ChangeDiscarded':          return 'Change discarded';
-    case 'ChangeReverted':           return 'Change reverted';
-    case 'ChangeApplyFailed':        return 'Change failed';
+    // No summary line: the change event row carries the description and a state badge.
+    case 'ChangeApplied':
+    case 'ChangeDiscarded':
+    case 'ChangeReverted':
+    case 'ChangeApplyFailed':        return '';
     case 'UserPromptInjected':       return 'Auto-prompt sent';
     case 'EventWaitCanceled':        return eventWaitStoppedSummary(ev.reason);
     case 'MessageReceived': {
       if (ev.origin?.kind === 'api') return 'API message';
       if (modeToInitiator(ev.mode) !== 'system') return '';
+      // An engine-seeded thread names what it is about, as the popover does.
+      const headline = ev.origin?.kind === 'engine' ? engineReasonHeadline(ev.origin.reason) : null;
+      if (headline) return `${headline.label}: ${headline.value}`;
       // The chip says only "Lucidos Agent", so the summary names the sender.
       const sender = agentMessageSender(ev.origin);
       const said = sender ? `Message from ${sender}` : 'Forwarded message';
@@ -1068,7 +1034,7 @@ export function describeInitiator(
   threadIsCC: boolean = false,
   threadCodingAgent: CodingAgent = 'claude-code',
   /** First line of the in-thread `ChangeProposed` description and its file
-   *  count, forwarded to <ChangeBody> for the change-lifecycle arms. The body
+   *  count, forwarded to <ChangeEventRow> for the change-lifecycle arms. The body
    *  then paints at full height on first open. */
   proposedChangeDesc?: string,
   proposedChangeFileCount?: number,
@@ -1181,18 +1147,19 @@ export function describeInitiator(
     case 'ChangeApplied':
     case 'ChangeDiscarded':
     case 'ChangeReverted':
+    case 'ChangeApplyFailed':
       return {
         variant: 'system', accent: changeAccent(ev.type),
         ...actorInitiator(ev.actor),
-        summary,
-        details: <ChangeBody changeId={ev.change_id} seedDescription={proposedChangeDesc} seedFileCount={proposedChangeFileCount} />,
-      };
-    case 'ChangeApplyFailed':
-      return {
-        variant: 'system', accent: 'change-failed',
-        ...actorInitiator(ev.actor),
-        summary,
-        details: <ChangeBody changeId={ev.change_id} error={ev.error} seedDescription={proposedChangeDesc} seedFileCount={proposedChangeFileCount} />,
+        details: (
+          <ChangeEventRow
+            type={ev.type}
+            changeId={ev.change_id}
+            error={ev.type === 'ChangeApplyFailed' ? ev.error : undefined}
+            seedDescription={proposedChangeDesc}
+            seedFileCount={proposedChangeFileCount}
+          />
+        ),
       };
     case 'UserPromptInjected':
       // Legacy rows lack `origin` and fall back to the engine label. A

@@ -1,6 +1,7 @@
 import type { ComponentChildren } from 'preact';
 import { LoadableToggle } from '../shared/LoadableToggle';
 import { Explainer } from '../shared/Explainer';
+import { Disclosure } from '../shared/Disclosure';
 
 /** The markup every provider on Settings → Models → Providers wears: a header
  *  row that is always there, and config rows that are there only while the
@@ -66,7 +67,7 @@ export function ProviderBlockFrame(props: {
           />
         </div>
       </div>
-      {props.open && props.children}
+      <Disclosure open={props.open}>{props.children}</Disclosure>
     </>
   );
 }

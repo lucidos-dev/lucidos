@@ -11,6 +11,8 @@ use chrono::{DateTime, Utc};
 use std::sync::atomic::Ordering;
 use uuid::Uuid;
 
+use super::scoring::{MEMORY_DEDUP_CANDIDATES, MEMORY_DEDUP_THRESHOLD, MEMORY_SUPERSEDE_THRESHOLD};
+
 impl LucidosEngine {
     pub(crate) async fn extraction_context_base(&self) -> String {
         let user_summary: String = self
@@ -206,9 +208,9 @@ impl LucidosEngine {
         }
     }
 
-    /// Normalize an artifact path coming off the EventBus into the form expected
-    /// by `read_artifact` and `MemorySource::Artifact { path, .. }` — i.e. relative
-    /// to `data/artifacts/`.
+    /// Normalize an artifact path coming off the EventBus into the form
+    /// `MemorySource::Artifact { path, .. }` expects: relative to
+    /// `data/artifacts/`.
     ///
     /// Sources of inconsistency this hides:
     /// - `tools/files.rs`, `tools/import.rs`, `tools/email.rs` already strip the
@@ -217,7 +219,7 @@ impl LucidosEngine {
     ///   data-relative path → for files under `data/artifacts/` the path arrives
     ///   prefixed ("artifacts/output.csv"). For files under other data subdirs
     ///   (apps/, knowhow/) the prefix is different and they are not artifacts at
-    ///   all — the caller's subsequent `read_artifact` will fail and the consumer
+    ///   all. The caller's subsequent read fails and the consumer
     ///   silently skips, matching `walk_artifact_history` which only sees
     ///   `data/artifacts/` paths.
     pub(crate) fn canonicalize_artifact_path(path: &str) -> &str {
@@ -460,10 +462,6 @@ impl LucidosEngine {
             }
         };
 
-        // Dedup thresholds
-        const MEMORY_DEDUP_THRESHOLD: f64 = 0.95; // Skip (near-duplicate)
-        const MEMORY_SUPERSEDE_THRESHOLD: f32 = 0.85; // Replace old with new (passed to SQL)
-
         enum DedupAction {
             Skip,
             Supersede(Vec<Uuid>),
@@ -478,7 +476,12 @@ impl LucidosEngine {
             let chunk_futures: Vec<_> = chunk
                 .iter()
                 .map(|embedding| {
-                    index.find_similar(embedding, MEMORY_SUPERSEDE_THRESHOLD, 5, embedding_model)
+                    index.find_similar(
+                        embedding,
+                        MEMORY_SUPERSEDE_THRESHOLD,
+                        MEMORY_DEDUP_CANDIDATES,
+                        embedding_model,
+                    )
                 })
                 .collect();
             similarity_results.extend(futures::future::join_all(chunk_futures).await);

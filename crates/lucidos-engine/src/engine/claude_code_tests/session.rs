@@ -444,7 +444,6 @@ async fn cancel_actor_field_stores_and_drains() {
     // Stamp (mirrors interrupt_agent's live-session branch).
     let actor = MessageOrigin::Device {
         device_id: "ios-1".into(),
-        label: "My iPhone".into(),
     };
     session.cancel_actor = Some(actor.clone());
 

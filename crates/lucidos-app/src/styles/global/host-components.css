@@ -39,7 +39,9 @@
         `.nav-focus-stuck` is (0,1,0), so hovering a marked plugin row would win
         the cascade and the MARKER would vanish under the pointer. As a shadow
         there is no cascade to lose: both paint, hover tint beneath, wash above;
-     2. + 3. the two outer layers are the glow: a tight halo hugging the edge and
+     2. the hairline border, a 1px spread with no blur. Its strength is
+        --nav-focus-border-alpha: light draws it, dark sets 0% and stays frameless;
+     3. + 4. the two outer layers are the glow: a tight halo hugging the edge and
         a wide soft bloom past it. That bloom IS the spotlight; a center-bright
         radial gradient was rejected because the marked elements are wide, short
         rows and panels, where a radial reads as an uneven horizontal wash.
@@ -73,9 +75,10 @@
    the whole conversation. Always-on; not applied to apps or whole-pane opens
    (trigger detail, file preview). */
 .nav-focus-stuck {
-    border-radius: 0.375rem;
+    border-radius: calc(var(--radius-control) * 0.75);
     box-shadow:
         inset 0 0 0 100vmax color-mix(in srgb, var(--nav-focus-glow) 16%, transparent),
+        0 0 0 1px color-mix(in srgb, var(--nav-focus-glow) var(--nav-focus-border-alpha), transparent),
         0 0 0.375rem color-mix(in srgb, var(--nav-focus-glow) 28%, transparent),
         0 0 1.5rem color-mix(in srgb, var(--nav-focus-glow) 15%, transparent);
     animation: nav-focus-spotlight-on calc(0.45s * var(--duration-scale)) ease-out;
@@ -132,6 +135,7 @@
     0% {
         box-shadow:
             inset 0 0 0 100vmax transparent,
+            0 0 0 1px transparent,
             0 0 0.375rem transparent,
             0 0 1.5rem transparent;
     }
@@ -193,6 +197,7 @@
     to {
         box-shadow:
             inset 0 0 0 100vmax transparent,
+            0 0 0 1px transparent,
             0 0 0.375rem transparent,
             0 0 1.5rem transparent;
     }
@@ -238,7 +243,6 @@
     --icon-tap-target: 2.25rem;
     position: relative;
     justify-content: center;
-    -webkit-tap-highlight-color: transparent;
 }
 
 /* Both chrome bands take the target as their BOX. Each sits in a strip that
@@ -401,7 +405,7 @@
 .icon-btn.view-selector-active {
     color: var(--accent);
     background: var(--bg-tertiary);
-    border-radius: 0.375rem;
+    border-radius: calc(var(--radius-control) * 0.75);
 }
 
 @media (hover: hover) {
@@ -443,10 +447,10 @@
 }
 
 /* The navigation cover (components/shared/NavigationCover.tsx): an opaque
-   theme surface that every arriving view of a pane fades in from, so a view
-   switch never shows its swap frame. It clears on its own animation and never
-   waits on the view. Its host sets the z-index: the content pane
-   (panels/shell.css) and the thread drawer (drawer.css).
+   theme surface that hides a pane's view swap, so a switch never shows its swap
+   frame. It plays its own animation and never waits on the view. Its host sets
+   the z-index: the content pane (panels/shell.css) and the thread drawer
+   (drawer.css).
 
    Named a cover, never a "reveal": `revealContentPane()` is a different thing
    (swipe to the pane on mobile, focus its pane group on desktop). Every surface
@@ -465,30 +469,27 @@
     to { opacity: 0; }
 }
 
-/* The cover's mirror, for a pane's header title: it fades in with the arriving
-   view, on the same curve and from the same frame. It rests transparent, so a
-   first frame the animation misses shows nothing rather than a flash of the
-   word. The cover rests opaque for the same reason. */
-.nav-arrive {
+/* The `dip`: the cover rises over the leaving view, holds opaque across the
+   midpoint where its host swaps the views, and clears off the arriving one. It
+   rests transparent, so a first frame the animation misses still shows the
+   leaving view rather than a flash of background. The hold absorbs a frame or
+   two of late start, so the swap still lands under an opaque cover. */
+.nav-cover.nav-cover-dip {
     opacity: 0;
-    animation: nav-arrive var(--duration-normal) ease-out forwards;
+    animation: nav-cover-dip var(--duration-slow) ease-in-out forwards;
 }
 
-@keyframes nav-arrive {
-    from { opacity: 0; }
-    to { opacity: 1; }
+@keyframes nav-cover-dip {
+    0% { opacity: 0; }
+    45%, 55% { opacity: 1; }
+    100% { opacity: 0; }
 }
 
 /* No animation. The cover is transparent from its first frame, since it stays
-   mounted until its fuse, and the title shows at once. */
+   mounted until its fuse. */
 :root[data-motion="reduce"] .nav-cover {
     animation: none;
     opacity: 0;
-}
-
-:root[data-motion="reduce"] .nav-arrive {
-    animation: none;
-    opacity: 1;
 }
 
 /* Send → Cancel morph button. Always rendered at the same JSX position
@@ -524,7 +525,7 @@
     width: 1.625rem;
     height: 1.625rem;
     padding: 0;
-    border-radius: 50%;
+    border-radius: var(--radius-round);
     display: inline-flex;
     align-items: center;
     justify-content: center;
@@ -605,15 +606,15 @@
     backdrop-filter: blur(0.625rem) saturate(1.2);
     border: 1px solid color-mix(in srgb, var(--border-color) 80%, transparent);
     border-bottom: none;
-    border-radius: 0.5rem 0.5rem 0 0;
+    border-radius: var(--radius-surface) var(--radius-surface) 0 0;
     /* Up-only shadow so the unit lifts off the chat content above without
      * casting onto (and darkening the seam over) the primary row below. */
-    box-shadow: 0 -0.5rem 1.5rem -0.25rem rgba(0, 0, 0, 0.1);
+    box-shadow: var(--shadow-up);
     z-index: var(--z-dropdown);
     animation: split-button-menu-in var(--duration-normal) ease;
 }
 
-html[data-theme="dark"] .split-button-menu {
+html[data-theme-mode="dark"] .split-button-menu {
     box-shadow: 0 -0.5rem 1.5rem -0.25rem rgba(0, 0, 0, 0.4);
 }
 
@@ -647,13 +648,13 @@ html[data-theme="dark"] .split-button-menu {
     background: color-mix(in srgb, var(--bg-secondary) 86%, transparent);
     border: 1px solid color-mix(in srgb, var(--border-color) 80%, transparent);
     border-top: none;
-    border-radius: 0 0 0.5rem 0.5rem;
+    border-radius: 0 0 var(--radius-control) var(--radius-control);
     /* Down-only shadow (mirrors the menu's up-only) so the unit grounds at the
      * bottom without bleeding a shadow up through the translucent menu seam. */
     box-shadow: 0 0.5rem 1.5rem -0.25rem rgba(0, 0, 0, 0.1);
 }
 
-html[data-theme="dark"] .split-button.open::before {
+html[data-theme-mode="dark"] .split-button.open::before {
     box-shadow: 0 0.5rem 1.5rem -0.25rem rgba(0, 0, 0, 0.4);
 }
 
@@ -692,7 +693,7 @@ html[data-theme="dark"] .split-button.open::before {
 .dropdown-trigger {
     background: var(--bg-secondary);
     border: 1px solid var(--border-color);
-    border-radius: 0.375rem;
+    border-radius: calc(var(--radius-control) * 0.75);
     color: var(--text-primary);
     font-family: var(--font-ui);
     font-size: var(--font-size-xs);
@@ -794,6 +795,15 @@ html[data-theme="dark"] .split-button.open::before {
     margin-left: auto;
     font-size: var(--font-size-2xs);
     color: var(--text-muted);
+    /* Open flips this glyph rather than drawing `▴`, which can differ in
+       width and resize the trigger. The flip is vertical, so asymmetric
+       horizontal padding cannot move the glyph sideways. */
+    display: inline-block;
+    transition: transform var(--duration-fast);
+}
+
+.dropdown-chevron.open {
+    transform: scaleY(-1);
 }
 
 /* Default styling for `.dropdown-menu` is `position: absolute`, anchored
@@ -840,9 +850,6 @@ html[data-theme="dark"] .split-button.open::before {
     max-width: min(24rem, calc(100vw - 1rem));
     max-height: 18.75rem;
     overflow-y: auto;
-    background: var(--bg-secondary);
-    border: 1px solid var(--border-color);
-    border-radius: 0.375rem;
     z-index: calc(var(--z-control-panel) + 1);
 }
 
@@ -885,10 +892,6 @@ html[data-theme="dark"] .split-button.open::before {
      * wraps instead (see `.thread-overflow-item`). */
     max-width: min(22rem, calc(100vw - 1rem));
     padding: 0.25rem;
-    background: var(--bg-secondary);
-    border: 1px solid var(--border-color);
-    border-radius: 0.5rem;
-    box-shadow: var(--shadow-md);
     z-index: calc(var(--z-control-panel) + 1);
 }
 
@@ -900,7 +903,7 @@ html[data-theme="dark"] .split-button.open::before {
     padding: 0.5rem 0.625rem;
     background: none;
     border: none;
-    border-radius: 0.375rem;
+    border-radius: calc(var(--radius-control) * 0.75);
     color: var(--text-primary);
     font-size: var(--font-size-md);
     font-family: var(--font-ui);
@@ -1008,11 +1011,8 @@ html[data-theme="dark"] .split-button.open::before {
 .thread-info-popover {
     width: max-content;
     min-width: 12rem;
-    padding: 0.625rem 0.75rem;
-    background: var(--bg-secondary);
-    border: 1px solid var(--border-color);
-    border-radius: 0.5rem;
-    box-shadow: var(--shadow-md);
+    /* A body-only popover: its text sits on the surface inset. */
+    padding: var(--space-sm) var(--surface-inset);
     z-index: calc(var(--z-control-panel) + 1);
 }
 
@@ -1048,7 +1048,7 @@ html[data-theme="dark"] .split-button.open::before {
     flex: none;
     width: 0.4rem;
     height: 0.4rem;
-    border-radius: 50%;
+    border-radius: var(--radius-round);
     background: var(--text-muted);
 }
 
@@ -1126,11 +1126,10 @@ html[data-theme="dark"] .split-button.open::before {
     min-width: 0;
 }
 
-/* Muted to match Search Everywhere's result icons; brand marks that paint
- * their own color (the Lucidos gradient, the Codex accent stroke) ignore it.
- * The Claude mark fills with `currentColor`, so it's tinted to its brand orange
- * below — the same `--initiator-coding-agent` it wears in the chat executor
- * chip — rather than reading as a muted gray glyph. */
+/* Muted to match Search Everywhere's result icons. The Lucidos and Codex marks
+ * paint their own colours and ignore it. The Claude mark fills with
+ * `currentColor`, so it takes `--claude-mark` below, as on the chat's actor
+ * chips, rather than reading as a muted gray glyph. */
 .nav-history-icon {
     flex-shrink: 0;
     display: inline-flex;
@@ -1142,7 +1141,7 @@ html[data-theme="dark"] .split-button.open::before {
 }
 
 .nav-history-icon .claude-icon {
-    color: var(--initiator-coding-agent);
+    color: var(--claude-mark);
 }
 
 .nav-history-icon svg {
@@ -1219,7 +1218,7 @@ html[data-theme="dark"] .split-button.open::before {
     right: 0.5rem;
     width: 0.3125rem;
     height: 0.3125rem;
-    border-radius: 50%;
+    border-radius: var(--radius-round);
     background: var(--accent);
 }
 
@@ -1287,7 +1286,7 @@ html[data-theme="dark"] .split-button.open::before {
     align-items: center;
     background: var(--bg-secondary);
     border: 1px solid var(--border-color);
-    border-radius: 0.375rem;
+    border-radius: calc(var(--radius-control) * 0.75);
     transition: border-color var(--duration-normal);
 }
 
@@ -1332,6 +1331,46 @@ html[data-theme="dark"] .split-button.open::before {
     transition: none;
 }
 
+/* `<Disclosure>` (components/shared/Disclosure.tsx). The body is its own
+   formatting context, so a child's margin stays inside the height the roll
+   measures. `:where` leaves a site's `bodyClass` free to lay it out instead.
+
+   The clip exists only mid-roll: at rest it would cut focus rings and
+   tooltips. It also drops a flex item's automatic minimum height, so the box
+   must not shrink, or a capped flex scroller squashes it to nothing. */
+.disclosure {
+    flex-shrink: 0;
+}
+
+:where(.disclosure-body) {
+    display: flow-root;
+}
+
+.disclosure.is-rolling {
+    overflow: hidden;
+}
+
+/* Rows rolling under the reveal line dissolve into it instead of meeting a
+   hard edge, as the transcript does under the thread title. Both clipping
+   boxes animate the reach (FADE_REACH, utils/disclosureMotion.ts): how far
+   their rows have slid under the line. Rows at rest are never dimmed.
+
+   Registered so the reach interpolates. `@property` is dropped inside a
+   conditional rule, so it stays at top level. */
+@property --disclosure-fade-reach {
+    syntax: '<length>';
+    inherits: false;
+    initial-value: 0px;
+}
+
+.disclosure.is-rolling,
+.flip-disclosure-mask {
+    -webkit-mask-image: linear-gradient(
+        to bottom, transparent 0, #000 min(var(--disclosure-fade-reach), var(--disclosure-fade)));
+    mask-image: linear-gradient(
+        to bottom, transparent 0, #000 min(var(--disclosure-fade-reach), var(--disclosure-fade)));
+}
+
 /* "See all statuses" shortcut sitting under a status-filter view's empty-state
    message (thread drawer). A small gap separates it from the message; the link
    itself is .accent-link (shared). Host-chrome only. */
@@ -1349,18 +1388,15 @@ html[data-theme="dark"] .split-button.open::before {
     font-size: var(--font-size-md);
 }
 
-/* ── Explainer: the info icon and the dialog it opens ────────────────────────
+/* ── Explainer: the info icon and the popover it opens ───────────────────────
    The one affordance replacing paragraphs of muted prose that used to sit
    permanently under the controls they describe (components/shared/Explainer.tsx,
    docs/glossary.md § explainer). HOST-ONLY: it is built on <Overlay>, whose
    machinery no app iframe has, so these classes are deliberately NOT in
    shared-components.css and never reach /api/v1/sdk-iframe.css.
 
-   The dialog is deliberately the SAME chrome as .confirm-dialog (surface,
-   border, radius, shadow, and the --app-height-aware height cap that lets long
-   copy scroll inside rather than spill past the viewport on iOS). One dialog
-   look for the app; only the body typography differs, because an explainer's
-   copy is JSX with code spans and lists while a confirm's is one string. */
+   The popover is a .surface, so only its placement caps and its body
+   typography live here: an explainer's copy is JSX with code spans and lists. */
 /* THE ICON NEVER WRAPS AWAY FROM ITS LABEL. A button is an atomic inline and
    line breaking allows a break in front of one, so a label squeezed by the
    control beside it drops the glyph onto a line of its own, under the text. The
@@ -1444,37 +1480,20 @@ html[data-theme="dark"] .split-button.open::before {
     }
 }
 
-.explainer-dialog {
-    background: var(--bg-secondary);
-    border: 1px solid var(--border-color);
-    border-radius: 0.5rem;
-    padding: 1.25rem 1.5rem;
-    max-width: 27.5rem;
-    width: 90%;
-    /* Same cap as .confirm-dialog: --app-height is set by MobileSwipeContainer
-       so iOS Safari shrinks correctly when the keyboard opens (raw 100vh does
-       not). The body scrolls inside it. */
-    max-height: calc(var(--app-height, 100dvh) - 4rem - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px));
-    display: flex;
-    flex-direction: column;
-    box-shadow: var(--shadow-md);
+/* The popover the icon opens, on the anchored popover shell
+   (global/anchored-popover.css). Only its own caps live here. It opens down
+   from a label as often as up, so it takes more of the viewport's height than
+   the shell's bottom-bar default. */
+.explainer-popover {
+    width: min(24rem, var(--anchored-popover-fit));
+    max-height: min(24rem, calc(var(--app-height, 100dvh) - 4rem));
 }
 
-.explainer-title {
+/* Explainer copy is the whole point of the popover, so it reads at full
+   strength. The shell's body class makes it the scroller. */
+.surface-body.explainer-body {
     color: var(--text-primary);
-    font-size: var(--font-size-lg);
-    font-weight: 600;
-    margin: 0 0 var(--space-md);
-}
-
-/* The scrolling part: a long explainer keeps its title and its Close button
-   pinned while the copy scrolls, rather than the whole dialog outgrowing the cap. */
-.explainer-body {
-    color: var(--text-primary);
-    font-size: var(--font-size-md);
-    line-height: 1.5;
-    overflow-y: auto;
-    min-height: 0;
+    overscroll-behavior: contain;
 }
 
 .explainer-body p {
@@ -1500,14 +1519,7 @@ html[data-theme="dark"] .split-button.open::before {
     font-size: var(--font-size-sm);
     background: var(--bg-tertiary);
     padding: 0.0625rem 0.25rem;
-    border-radius: 0.1875rem;
-}
-
-.explainer-actions {
-    display: flex;
-    justify-content: flex-end;
-    margin-top: 1.25rem;
-    flex-shrink: 0;
+    border-radius: calc(var(--radius-control) * 0.375);
 }
 
 /* Control-menu lists. Host chrome, shared across panes: the prompt bar's two
@@ -1540,7 +1552,7 @@ html[data-theme="dark"] .split-button.open::before {
 .control-input {
     padding: 0.375rem 0.5rem;
     border: 1px solid var(--border-color);
-    border-radius: 0.25rem;
+    border-radius: calc(var(--radius-control) * 0.5);
     background: var(--bg-primary);
     color: var(--text-primary);
     font-size: var(--font-size-md);
@@ -1573,15 +1585,20 @@ html[data-theme="dark"] .split-button.open::before {
     text-align: left;
     background: none;
     border: none;
-    border-radius: 0.25rem;
+    border-radius: calc(var(--radius-control) * 0.5);
     color: var(--text-primary);
     font-size: var(--font-size-md);
     cursor: pointer;
 }
 
-.control-item:hover,
-.control-item-active {
-    background: var(--bg-hover);
+/* The active item is the keyboard cursor, seeded on open. A phone has no
+   keyboard to move it, and a tap sets it through `mouseenter`, so there it
+   would only paint a stray band. */
+@media (hover: hover) {
+    .control-item:hover,
+    .control-item-active {
+        background: var(--bg-hover);
+    }
 }
 
 /* The way back to the list this one was opened from. Muted, because it is an
@@ -1654,7 +1671,7 @@ html[data-theme="dark"] .split-button.open::before {
     display: inline-block;
     width: 0.375rem;
     height: 0.375rem;
-    border-radius: 50%;
+    border-radius: var(--radius-round);
     background: var(--accent);
 }
 
@@ -1680,7 +1697,7 @@ html[data-theme="dark"] .split-button.open::before {
     min-height: 0.5rem;
     padding: 0;
     line-height: 0;
-    border-radius: 50%;
+    border-radius: var(--radius-round);
 }
 
 /* Glues the dot to the label it marks, which is the word-joiner pattern
@@ -1709,4 +1726,141 @@ html[data-theme="dark"] .split-button.open::before {
    something that cannot happen. */
 .markdown-content .image-scroll-wrapper > img, .question-body .image-scroll-wrapper > img {
     cursor: zoom-in;
+}
+
+/* A picture with a size hint holds its loaded box before its bytes arrive, so
+   nothing below it moves when it lands. HOST ONLY: the host renderer stamps the
+   hint (`renderMarkdown.ts` `applySizeHintsIn`), never an app iframe. The width
+   is what the shared cap gives the loaded picture: its natural width, or less
+   when that would put it over the cap. Once loaded, the picture's own ratio
+   wins (`auto`) and `contain` letterboxes it, so a wrong hint never stretches
+   it. */
+.image-scroll-wrapper > img[data-size-hint] {
+    width: min(
+        calc(var(--hint-w) * 1px),
+        calc(var(--image-max-height) * var(--hint-w) / var(--hint-h))
+    );
+    aspect-ratio: auto var(--hint-w) / var(--hint-h);
+    object-fit: contain;
+}
+
+/* A markdown image that failed to load gives way to a notice naming it
+   (`utils/markdownImageFallback.ts`). HOST ONLY: the script that swaps them runs
+   in the host, never in an app iframe. The surface prefix outranks the
+   `display: block` each surface gives its images, `chat.css` loading later. */
+.markdown-content .image-scroll-wrapper > img[data-load-failed],
+.question-body .image-scroll-wrapper > img[data-load-failed] {
+    display: none;
+}
+
+.markdown-image-unavailable {
+    display: inline-block;
+    max-width: 100%;
+    padding: var(--space-sm) var(--space-md);
+    border: 1px dashed var(--border-color);
+    border-radius: var(--radius-control);
+    color: var(--text-muted);
+    font-size: var(--font-size-sm);
+}
+
+.markdown-image-unavailable > code {
+    display: block;
+    margin-top: var(--space-xs);
+    overflow-wrap: anywhere;
+}
+
+/* ── Theme parts (ADR 0307) ─────────────────────────────────────────────────
+   Each rule reads one part token under the selector theme-parts.json names,
+   with a fallback equal to what the element paints without a theme. A theme
+   sets the token through its `parts`; it never writes a selector. The inherited
+   paint properties go on leaf text only, so no card inside a container picks
+   them up, and protected surfaces reset every part token anyway.
+   styles/__tests__/theme-part-consumers.test.ts pins every rule to the catalog. */
+.response-body .response-chunk,
+.response-body > .response-content > div:not([class]),
+.initiator-panel-bubble .user-bubble > .markdown-content {
+    color: var(--part-chat-text-color, currentcolor);
+    text-shadow: var(--part-chat-text-text-shadow, none);
+    letter-spacing: var(--part-chat-text-letter-spacing, normal);
+}
+
+/* Bold text and list markers set their own colour in shared-components.css,
+   so they follow a chat text colour here. */
+:is(.response-body .response-chunk, .response-body > .response-content > div:not([class]), .initiator-panel-bubble .user-bubble > .markdown-content) strong,
+:is(.response-body .response-chunk, .response-body > .response-content > div:not([class]), .initiator-panel-bubble .user-bubble > .markdown-content) li::marker {
+    color: var(--part-chat-text-color, var(--text-primary));
+}
+
+html[data-font-bold="none"] :is(.response-body .response-chunk, .response-body > .response-content > div:not([class]), .initiator-panel-bubble .user-bubble > .markdown-content) :is(strong, b) {
+    color: var(--text-strong);
+}
+
+:is(.response-body .response-chunk, .response-body > .response-content > div:not([class]), .initiator-panel-bubble .user-bubble > .markdown-content) :is(h1, h2, h3, h4, h5, h6) {
+    color: var(--part-chat-heading-color, var(--part-chat-text-color, var(--text-primary)));
+    text-shadow: var(--part-chat-heading-text-shadow, var(--part-chat-text-text-shadow, none));
+    letter-spacing: var(--part-chat-heading-letter-spacing, var(--part-chat-text-letter-spacing, normal));
+}
+
+:is(.response-body .response-chunk, .response-body > .response-content > div:not([class]), .initiator-panel-bubble .user-bubble > .markdown-content) a {
+    color: var(--part-chat-link-color, var(--accent));
+    text-shadow: var(--part-chat-link-text-shadow, var(--part-chat-text-text-shadow, none));
+}
+
+:is(.response-body .response-chunk, .response-body > .response-content > div:not([class]), .initiator-panel-bubble .user-bubble > .markdown-content) code:not(pre > code) {
+    color: var(--part-inline-code-color, var(--accent));
+    background-color: var(--part-inline-code-background-color, var(--bg-tertiary));
+}
+
+:is(.response-body .response-chunk, .response-body > .response-content > div:not([class]), .initiator-panel-bubble .user-bubble > .markdown-content) pre {
+    background-color: var(--part-code-block-background-color, var(--bg-tertiary));
+    box-shadow: var(--part-code-block-box-shadow, none);
+    text-shadow: var(--part-code-block-text-shadow, var(--part-chat-text-text-shadow, none));
+}
+
+.initiator-label,
+.response-executor-label {
+    text-shadow: var(--part-actor-label-text-shadow, none);
+    letter-spacing: var(--part-actor-label-letter-spacing, normal);
+}
+
+.initiator-icon svg,
+.response-executor-icon svg {
+    filter: var(--part-actor-icon-filter, none);
+}
+
+.app-header .icon-btn svg {
+    filter: var(--part-header-icon-filter, none);
+}
+
+.threads-header-title,
+.mobile-header-title,
+.mobile-content-title,
+.workspace-name-label,
+.pane-header-title-text,
+.panel-url-title,
+.thread-title-display {
+    text-shadow: var(--part-header-title-text-shadow, none);
+    letter-spacing: var(--part-header-title-letter-spacing, normal);
+}
+
+/* The chat composer only: the trigger form's Intent field shares .prompt-box.
+   panels/previews.css loads later, so its :focus-within accent border wins. It
+   can overlap scrolled messages, so its shadow is inset only. */
+.prompt-area .prompt-box {
+    background-color: var(--part-composer-background-color, var(--bg-secondary));
+    border-color: var(--part-composer-border-color, color-mix(in srgb, var(--border-color) 50%, transparent));
+    box-shadow: var(--part-composer-box-shadow, none);
+}
+
+.prompt-area .prompt-row .prompt-textarea {
+    color: var(--part-composer-text-color, var(--text-primary));
+    caret-color: var(--part-composer-text-caret-color, auto);
+    caret-shape: var(--part-composer-text-caret-shape, auto);
+    text-shadow: var(--part-composer-text-text-shadow, none);
+    letter-spacing: var(--part-composer-text-letter-spacing, normal);
+}
+
+/* A blinking caret is motion, so reduced motion holds it steady. */
+:root[data-motion="reduce"] .prompt-area .prompt-row .prompt-textarea {
+    caret-animation: manual;
 }

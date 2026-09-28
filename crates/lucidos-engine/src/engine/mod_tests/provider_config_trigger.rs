@@ -60,7 +60,7 @@ fn a_provider_preference_triggers_a_rebuild() {
 /// Vertex tokens for nothing.
 #[test]
 fn an_unrelated_preference_does_not_trigger_a_rebuild() {
-    for key in ["theme", "timezone", "chat_model", "ui_scale"] {
+    for key in ["theme-mode", "timezone", "chat_model", "ui_scale"] {
         assert!(provider_config_trigger(&pref(key)).is_none(), "{key}");
     }
 }

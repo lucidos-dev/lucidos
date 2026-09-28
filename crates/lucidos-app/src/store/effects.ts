@@ -1,7 +1,6 @@
 import { effect, untracked } from '@preact/signals';
-import { pageTitle, visibleWorkspaceName, animationSpeed, toastPlacement, durationScale, stepsExpanded, detailsExpanded, expandedFolders, threadDrawerOpen, selectedScope, notificationsFilter, collapsedExchanges, collapsedInitiators, filePreviewSource, filePreviewWrap, diffWholeFile, diffSideBySide, filePreviewEditing, previewFile, viewingNotification, repoSelectedChangeId, inputMode, showToast, dismissToast, applyAllInProgress, engineRestarting, focusedThreadId, threadMap, isThreadStreaming, SELECTED_CHANGE_KEY, STEPS_EXPANDED_KEY, DETAILS_EXPANDED_KEY, persistTurnControl } from './store';
+import { pageTitle, visibleWorkspaceName, animationSpeed, toastPlacement, durationScale, stepsExpanded, detailsExpanded, expandedFolders, threadDrawerOpen, selectedScope, notificationsFilter, collapsedExchanges, collapsedInitiators, filePreviewSource, filePreviewWrap, diffWholeFile, diffSideBySide, filePreviewEditing, previewFile, viewingNotification, repoSelectedChangeId, inputMode, showToast, dismissToast, engineRestarting, focusedThreadId, threadMap, isThreadStreaming, SELECTED_CHANGE_KEY, STEPS_EXPANDED_KEY, DETAILS_EXPANDED_KEY, persistTurnControl } from './store';
 import { clientRefreshing } from '../hooks/sw-update';
-import { cancelApplyAllBatch } from './actions/chat-changes';
 import { handleRestartTimeout } from './actions/connection';
 import { onNotificationDetailClosed } from './actions/notifications';
 import { installSeenTargetWatch } from './actions/notification-visit';
@@ -15,6 +14,7 @@ import { isOnCall } from '../voice/callState';
 import { syncWorkspaceAppBadge } from './actions/app-badge';
 import { pushNativeWindowTitle } from '../utils/windowTitle';
 import { installMotionAttribute } from '../utils/motion';
+import { installThemeEffectsAttribute } from '../utils/themeEffects';
 import { ANIMATION_SPEED_STORAGE_KEY } from '@lucidos/appearance';
 
 // Sync page title with unread count and workspace name
@@ -74,6 +74,10 @@ effect(() => {
 // Publish the resolved motion as `data-motion` on <html>, which every reduced
 // motion rule in the stylesheets keys on. The boot script set the first value.
 installMotionAttribute();
+
+// Publish the resolved theme effects as `data-theme-effects`, which the generated
+// theme part rules key on to drop part shadows and filters.
+installThemeEffectsAttribute();
 
 // Persist the toast-placement pick, device-local like the slider above.
 // Temporary, and it goes when the shape is chosen (docs/temporary-measures.md).
@@ -227,38 +231,6 @@ effect(() => {
     dismissToast('update-available');
     showToast('Refreshing...', 'info', { key: 'refreshing', spinning: true, dismissable: false, showWhileUnavailable: true });
   });
-});
-
-// Sticky spinner toast for the lifetime of an Apply All batch. applyAllInProgress
-// is the single source of truth (set optimistically on click + by the
-// ApplyAllBatchStarted SSE, cleared by ApplyAllBatchCompleted or an HTTP error),
-// so driving the toast from it here keeps one show/dismiss pair instead of
-// scattering them across the four flip sites. Like the restart/refresh spinners
-// it's non-dismissable — the batch (which can sit for minutes hardening a member)
-// is genuinely in flight and clears its own toast when it finishes. The
-// `shown` transition guard mirrors the `lastPreviewFile` pattern above: it acts
-// only on the true↔false edges so the false init pass doesn't churn the `toasts`
-// signal with a no-op dismiss. `untracked` keeps the effect's sole dependency
-// `applyAllInProgress` — showToast/dismissToast read AND write `toasts`, so
-// tracking them here would self-trigger the effect ("Cycle detected").
-let applyAllToastShown = false;
-effect(() => {
-  const active = applyAllInProgress.value;
-  if (active && !applyAllToastShown) {
-    applyAllToastShown = true;
-    // Cancel action stops the whole batch (aborts the in-flight hardening/merge,
-    // leaves the rest pending). dismissable:false — the spinner clears itself
-    // when ApplyAllBatchCompleted lands; the action is the deliberate way out.
-    untracked(() => showToast('Applying changes...', 'info', {
-      key: 'apply-all-batch',
-      spinning: true,
-      dismissable: false,
-      action: { label: 'Cancel', onClick: () => void cancelApplyAllBatch(), variant: 'danger' },
-    }));
-  } else if (!active && applyAllToastShown) {
-    applyAllToastShown = false;
-    untracked(() => dismissToast('apply-all-batch'));
-  }
 });
 
 // Engine-restart safety timeout. The initiating tab no longer mounts the

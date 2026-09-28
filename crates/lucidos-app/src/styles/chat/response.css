@@ -65,7 +65,7 @@
    the reasoning lives: the two chips sit one above the other in a turn and must
    tint the same way. */
 .response-executor-icon .claude-icon {
-    color: var(--initiator-coding-agent);
+    color: var(--claude-mark);
 }
 
 .response-executor-label {
@@ -181,8 +181,10 @@
     color: var(--text-secondary);
 }
 
-.resume-note > summary:hover {
-    color: var(--text-primary);
+@media (hover: hover) {
+    .resume-note > summary:hover {
+        color: var(--text-primary);
+    }
 }
 
 .resume-note-body {
@@ -195,16 +197,6 @@
     line-height: 1.4;
     color: var(--text-secondary);
 }
-
-/* Reason colors — the ONLY surviving variant color on a flat turn. The name is
-   now plain; only the summary line is tinted to convey *why* the engine spoke
-   (trigger fired, change applied/failed/discarded/reverted). Applies whether the
-   summary is a plain <div> or the clickable .initiator-summary-link button. */
-.initiator-panel-trigger          .initiator-summary { color: var(--reason-trigger); }
-.initiator-panel-change-applied   .initiator-summary { color: var(--reason-applied); }
-.initiator-panel-change-failed    .initiator-summary { color: var(--reason-failed); }
-.initiator-panel-change-discarded .initiator-summary,
-.initiator-panel-change-reverted  .initiator-summary { color: var(--reason-muted); }
 
 /* Action buttons (Diff/Revert) render in a footer at the bottom-right of the
    turn — keeps the timestamp alone in the header's top-right slot.
@@ -222,34 +214,7 @@
     padding: 0.5rem 0 0;
 }
 
-/* --- Change body — surfaces description, file count, and error message
-   inside a change-lifecycle initiator panel. */
-.change-body {
-    display: flex;
-    flex-direction: column;
-    gap: 0.25rem;
-    font-size: var(--font-size-sm);
-}
-
-.change-body-desc {
-    color: var(--text-muted);
-    word-break: break-word;
-}
-
-.change-body-meta {
-    color: var(--text-muted);
-    font-size: var(--font-size-xs);
-}
-
-.change-body-error {
-    color: var(--text-primary);
-    word-break: break-word;
-    padding: 0.375rem 0.5rem;
-    background: color-mix(in srgb, var(--accent-red) 8%, transparent);
-    border-radius: 0.25rem;
-}
-
-/* Invisible stand-in for the Diff/Revert buttons of a ChangeApplied panel
+/* Invisible stand-in for the Diff/Revert buttons of a ChangeApplied card
    while its Change row is still loading on first open. Occupies the exact
    button-row height so the real actions slot in without a vertical shift
    (see changeActions' reserveWhileLoading). */
@@ -529,10 +494,16 @@
     margin-bottom: 0;
 }
 
-/* Two chunks touching means the step between them is HIDDEN: with Hide steps
-   on, a step (and an event wait) renders as null, so `text, step, text` leaves
-   two chunk divs as siblings. The even margin above is the gap to a step ROW,
-   and it is too tight for the boundary this becomes once the row is gone.
+/* Each chunk rolls inside its own `<Disclosure>` (ChatExchange.tsx). That
+   box's body is a flow-root, so the roll carries the chunk's margin with its
+   text. No rule here may key on which row sits NEXT to a chunk. Rows come and
+   go as the toggles roll, so a neighbour rule changes the gap the moment a row
+   lands, and the page jumps.
+
+   Two chunks with hidden steps between them get a boundary of their own, the
+   `.response-elision` row. `responseBody` marks the step run as `elided` and
+   the row rolls in as the steps roll out. The chunks' even margin above is the
+   gap to a step ROW, and it is too tight for the boundary once the row is gone.
 
    Whitespace alone used to carry that boundary, at the 0.75rem `.markdown-content
    p` uses, and air is a poor thing to carry it with: the column runs at 1.5
@@ -557,26 +528,11 @@
    tighten from 1.61x to 1.49x exactly when the user asked for more room. The
    1px hairline is the one thing that does NOT scale, for the reason below.
 
-   Both sides of the boundary are set, and the pair is what makes this gap
-   independent of the base rule above. Adjacent-sibling margins collapse to the
-   LARGER of the two, so which half does the work depends on which value is
-   bigger: at the 0.375rem the base used to carry, the first chunk alone would
-   have held the gap above the tick at 6px against 5px below it, and the
-   `:has()` rule is what stopped it. The base is 0.25rem now, under the
-   boundary, so that half is currently belt and braces. It stays: the base is a
-   tuned number that moves when the step run's rhythm is retuned, and this
-   boundary is not supposed to move with it.
-
-   `:has()` takes the specificity of its argument, so both rules are (0,2,0)
-   against the base rule's (0,1,0) and win on specificity rather than source
-   order. Widening the base rule instead would space every chunk off its step
-   rows, which is the thing being avoided. */
-.response-chunk + .response-chunk {
-    margin-top: 0.3125rem;
-}
-
-.response-chunk:has(+ .response-chunk) {
-    margin-bottom: 0.3125rem;
+   The row supplies what the chunks' margins do not. Each chunk keeps its
+   0.25rem, and the row adds 0.0625rem either side of the hairline, so the air
+   on each side is still 0.3125rem. */
+.response-elision {
+    padding: 0.0625rem 0;
 }
 
 /* The elision mark. Spans the full text column and fades in and back out across
@@ -615,10 +571,6 @@
    A solid full-width rule was rejected before any of this: ten of those down one
    screen is furniture, while ten of these read as a rhythm.
 
-   Not matched by `.response-chunk > :first-child` above, which is an element
-   selector, so the chunk's first real child still gets its margin-top zeroed and
-   sits directly under the mark.
-
    `height` is a literal 1px for the same reason the rem rule exempts border
    widths: this IS a hairline. A rem value would land on a fraction at a scaled
    root and be silently snapped, which on a 1px line is the difference between
@@ -633,7 +585,7 @@
    missing does not, and a forced CanvasText rule would paint the exact thing the
    gradient exists to avoid: a hard, full-contrast line across the whole column
    at every hidden step. */
-.response-chunk + .response-chunk::before {
+.response-elision::before {
     content: '';
     display: block;
     height: 1px;
@@ -643,7 +595,6 @@
         var(--border-color) 15%,
         transparent
     );
-    margin-bottom: 0.3125rem;
 }
 
 .response-content li p {
@@ -827,7 +778,7 @@
 }
 
 .thread-skeleton-block {
-    border-radius: 0.4rem;
+    border-radius: calc(var(--radius-control) * 0.8);
     background: linear-gradient(
         90deg,
         var(--bg-tertiary) 25%,
@@ -842,7 +793,7 @@
     align-self: flex-end;
     width: 42%;
     height: 2.25rem;
-    border-radius: 0.75rem;
+    border-radius: var(--radius-surface);
 }
 
 .thread-skeleton-line {
@@ -970,7 +921,7 @@
     padding: 0.25rem 0.625rem;
     background: transparent;
     border: none;
-    border-radius: 999px;
+    border-radius: var(--radius-round);
     color: var(--text-muted);
     font-size: var(--font-size-xs);
     font-weight: 500;
@@ -982,10 +933,12 @@
                 opacity var(--duration-fast) ease;
 }
 
-.welcome-dismiss:hover {
-    color: var(--text-secondary);
-    background: var(--bg-hover);
-    opacity: 1;
+@media (hover: hover) {
+    .welcome-dismiss:hover {
+        color: var(--text-secondary);
+        background: var(--bg-hover);
+        opacity: 1;
+    }
 }
 
 /* Thread empty state — fallback when no exchanges render. The error/empty
@@ -1073,11 +1026,11 @@
 }
 
 .question-option-indicator-radio {
-    border-radius: 50%;
+    border-radius: var(--radius-round);
 }
 
 .question-option-indicator-checkbox {
-    border-radius: 0.1875rem;
+    border-radius: calc(var(--radius-control) * 0.375);
 }
 
 .question-option-indicator-selected {
@@ -1132,7 +1085,7 @@
     padding: 0.75rem calc(var(--turn-surface-inset) - 1px);
     background: var(--bg-tertiary);
     border: 1px solid var(--border-color);
-    border-radius: 0.5rem;
+    border-radius: var(--radius-control);
     color: var(--text-primary);
     text-align: left;
     white-space: normal;
@@ -1254,9 +1207,9 @@
 .question-body .image-scroll-wrapper > img {
     display: block;
     max-width: none;
-    max-height: 24rem;
+    max-height: var(--image-max-height);
     height: auto;
-    border-radius: 0.25rem;
+    border-radius: calc(var(--radius-surface) / 3);
 }
 
 /* Highlighted: the picked option in Selected answers — accent tint, no border
@@ -1367,28 +1320,42 @@
 
 .permission-text {
     color: var(--text-primary);
-    font-weight: 500;
     line-height: 1.5;
     word-break: break-word;
 }
 
-/* The two detail blocks a permission card can carry under its question: the
-   MCP card's tool arguments, and the coding-agent card's list of files a
-   multi-file Codex patch touches. Shared shell, because both are the same
-   thing visually: a dimmed inset panel, capped in height and scrollable, so a
-   big args blob or a large patch can't push the buttons off screen. */
+/* The detail blocks a permission card can carry under its question: a shell
+   command, the MCP card's tool arguments, and the files a multi-file Codex
+   patch touches. One shell, because all are the same thing visually: a dimmed
+   inset panel, capped in height and scrollable, so a big blob can't push the
+   buttons off screen. */
+.permission-command,
 .permission-mcp-args,
 .permission-file-list {
     margin: 0.5rem 0 0;
     padding: 0.5rem 0.625rem;
-    background: var(--bg-secondary, rgba(127, 127, 127, 0.1));
-    border-radius: 0.375rem;
+    background: var(--bg-secondary);
+    border-radius: calc(var(--radius-surface) * 0.5);
     font-size: var(--font-size-md);
     font-weight: 400;
     color: var(--text-secondary);
     word-break: break-word;
     max-height: 12rem;
     overflow: auto;
+}
+
+/* A command is shown whole and never cut short, so it scrolls instead. It is
+   evidence under the agent's own words, so it sits a step smaller and quieter
+   than them. `anywhere` breaks a long path that has no spaces. The cap lands
+   mid-line on purpose: a half-cut line is the only scroll cue on iOS, which
+   hides scrollbars. */
+.permission-command {
+    max-height: calc(4.5 * 1.45em + 1rem);
+    font-family: var(--font-mono, ui-monospace, SFMono-Regular, monospace);
+    font-size: var(--font-size-sm);
+    line-height: 1.45;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
 }
 
 /* Args are one preformatted blob; the file list is rows. */
@@ -1439,10 +1406,6 @@
     }
 }
 
-.permission-actions-secondary {
-    margin-top: -0.375rem;
-}
-
 /* Why the engine resolved a card nobody clicked. Muted, because the struck
    buttons above already carry the outcome; this only says who decided. */
 .permission-resolution-note {
@@ -1453,7 +1416,7 @@
     word-break: break-word;
 }
 
-.permission-actions-secondary code {
+.permission-actions code {
     font-family: var(--font-mono, ui-monospace, SFMono-Regular, monospace);
     font-size: 0.875em;
 }
@@ -1531,7 +1494,7 @@
     line-height: 1.5;
     padding: 0.375rem 0.625rem;
     border: 1px solid var(--border-color);
-    border-radius: 0.375rem;
+    border-radius: calc(var(--radius-control) * 0.75);
     background: var(--bg-primary);
     color: var(--text-primary);
     box-sizing: border-box;
@@ -1555,7 +1518,7 @@
     display: inline;
     background: var(--bg-tertiary);
     border: 1px solid var(--border-color);
-    border-radius: 0.25rem;
+    border-radius: calc(var(--radius-surface) / 3);
     padding: 0.125rem 0.375rem;
     color: var(--text-primary);
     -webkit-box-decoration-break: clone;
@@ -1606,7 +1569,7 @@
     cursor: pointer;
     padding: 0.125rem;
     line-height: 0;
-    border-radius: 0.1875rem;
+    border-radius: calc(var(--radius-control) * 0.375);
     transition: color var(--duration-fast) ease;
 }
 
@@ -1615,14 +1578,13 @@
     height: var(--icon-size-sm);
 }
 
-.copy-btn:hover {
-    color: var(--text-primary);
+@media (hover: hover) {
+    .copy-btn:hover {
+        color: var(--text-primary);
+    }
 }
 
-.copy-btn-copied {
-    color: var(--accent-green);
-}
-
+.copy-btn-copied,
 .copy-btn-copied:hover {
     color: var(--accent-green);
 }

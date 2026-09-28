@@ -73,8 +73,6 @@ export type ThreadAggregate = {
    *  can't be Applied via the engine merge flow — the WaitingBanner shows
    *  Done / Archive instead. */
   codingAgentIsExternalRepo: boolean;
-  /** Whether a merge conflict is being resolved. */
-  codingAgentApplying: boolean;
   isSaved: boolean;
   hasResponse: boolean;
   lastRevivedAt: string | null;
@@ -136,7 +134,6 @@ export function applyAggregateToMeta(meta: ThreadMeta, agg: ThreadAggregate): bo
   if (meta.codingAgentProposed !== agg.codingAgentProposed) { meta.codingAgentProposed = agg.codingAgentProposed; changed = true; }
   if (meta.codingAgentRequiresRestart !== agg.codingAgentRequiresRestart) { meta.codingAgentRequiresRestart = agg.codingAgentRequiresRestart; changed = true; }
   if (meta.codingAgentIsExternalRepo !== agg.codingAgentIsExternalRepo) { meta.codingAgentIsExternalRepo = agg.codingAgentIsExternalRepo; changed = true; }
-  if (meta.codingAgentApplying !== agg.codingAgentApplying) { meta.codingAgentApplying = agg.codingAgentApplying; changed = true; }
   if (meta.saved !== agg.isSaved) { meta.saved = agg.isSaved; changed = true; }
   // updatedAt / messageCount: overlay unconditionally, do NOT mark changed
   meta.messageCount = agg.messageCount;
@@ -255,8 +252,6 @@ export type ThreadMeta = {
   /** Whether the Claude Code session is bound to an external repo — drives the
    *  WaitingBanner Done / Archive vs Apply choice. */
   codingAgentIsExternalRepo: boolean;
-  /** Whether a merge conflict is being resolved. */
-  codingAgentApplying: boolean;
   /** When the thread last entered 'running' state (for IN PROGRESS sort order). */
   lastRevivedAt: string;
   /** Set when mode != 'human' on the initial MessageReceived. */
@@ -510,7 +505,6 @@ export function makeOptimisticThreadState(opts: {
       codingAgentProposed: false,
       codingAgentRequiresRestart: false,
       codingAgentIsExternalRepo: false,
-      codingAgentApplying: false,
       lastRevivedAt: ts,
       triggerId: opts.triggerId,
       triggerName: opts.triggerName,
@@ -625,7 +619,6 @@ export type CodingAgentWaitingInfo = {
   proposed: boolean;
   isExternalRepo: boolean;
   requiresRestart: boolean;
-  applying: boolean;
 };
 
 /** Get CC waiting info from thread meta. Returns null for non-CC threads,
@@ -640,6 +633,5 @@ export function getCodingAgentWaitingInfo(meta: ThreadMeta): CodingAgentWaitingI
     proposed: meta.codingAgentProposed,
     isExternalRepo: meta.codingAgentIsExternalRepo,
     requiresRestart: meta.codingAgentRequiresRestart,
-    applying: meta.codingAgentApplying,
   };
 }

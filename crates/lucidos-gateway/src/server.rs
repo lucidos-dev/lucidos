@@ -97,7 +97,7 @@ const EXTERNAL_RELEASE_MISSES: u32 = 5;
 /// recovery. The embedding model is not part of that budget, since it loads in
 /// the background. The escape exists because an alive-but-unreachable engine is
 /// never marked `Unhealthy`, so without a time budget the splash would
-/// meta-refresh forever.
+/// poll forever.
 const BOOT_ESCAPE_BUDGET: Duration = Duration::from_secs(240);
 
 /// One workspace's live boot-window state. `since` is when the window OPENED,
@@ -1045,6 +1045,19 @@ impl GatewayState {
             .map(|pid| pid as i32)
             .chain(postmaster)
             .collect()
+    }
+
+    /// The directories whose disk the slowness warning watches: every running
+    /// workspace, and the app data directory that holds the packaged
+    /// Postgres cluster.
+    async fn slowness_volumes(&self) -> Vec<PathBuf> {
+        let stacks: Vec<_> = self.inner.stacks.lock().await.values().cloned().collect();
+        let mut volumes = Vec::with_capacity(stacks.len() + 1);
+        for stack in stacks {
+            volumes.push(stack.lock().await.resolved_dir.clone());
+        }
+        volumes.push(self.app_data().clone());
+        volumes
     }
 
     /// Every Lucidos install on this machine, scanned fresh.
@@ -2380,8 +2393,8 @@ impl GatewayState {
             }
             if outcome == ProbeOutcome::Healthy {
                 // An engine that answered is alive and past its boot.
-                if slowness::probe_is_slow(outcome, true, true, probe.database_reachable) {
-                    self.slowness().record_slow(&t.id);
+                if let Some(sign) = slowness::slow_sign(outcome, true, true, probe.database) {
+                    self.slowness().record_slow(&t.id, sign);
                 }
                 s.health = Health::Healthy;
                 s.restart_attempts = 0;
@@ -2405,8 +2418,10 @@ impl GatewayState {
 
             let since_spawn = s.last_spawn.map(|t| t.elapsed()).unwrap_or(Duration::MAX);
             let alive = engine_process_alive(&mut s);
-            if slowness::probe_is_slow(outcome, alive, since_spawn >= BOOT_GRACE, true) {
-                self.slowness().record_slow(&t.id);
+            if let Some(sign) =
+                slowness::slow_sign(outcome, alive, since_spawn >= BOOT_GRACE, probe.database)
+            {
+                self.slowness().record_slow(&t.id, sign);
             }
             // Count this miss; a healthy probe resets it. Only a DEAD process
             // is ever culled, so a load spike cannot cull a working engine.
@@ -2768,7 +2783,7 @@ fn stop_engine_process(s: &mut StackRuntime) {
 /// Validate `LUCIDOS_ENGINE_BIN` points at a real, executable regular file.
 /// Checking only that the var is SET is not enough: a missing, corrupt or
 /// quarantined binary then surfaces as a per-workspace spawn error that
-/// meta-refreshes the boot splash until the escape budget runs out.
+/// keeps the boot splash polling until the escape budget runs out.
 fn validate_engine_bin(path: &Path) -> Result<(), BoxError> {
     // An engine binary inside a coding-agent worktree pins every spawned engine
     // to a throwaway checkout frozen at one commit (ADR 0021). Fail at boot with
@@ -3090,8 +3105,11 @@ pub async fn run() -> Result<(), BoxError> {
             loop {
                 let sampler = watcher.clone();
                 let engines = sampler.running_engines().await;
+                let volumes = sampler.slowness_volumes().await;
                 let _ = tokio::task::spawn_blocking(move || {
-                    sampler.slowness().sample(|| sampler.lucidos_roots(engines))
+                    sampler
+                        .slowness()
+                        .sample(|| sampler.lucidos_roots(engines), &volumes)
                 })
                 .await;
                 tokio::time::sleep(slowness::SAMPLE_INTERVAL).await;
@@ -3513,7 +3531,7 @@ async fn fallback(State(state): State<GatewayState>, req: axum::extract::Request
                     let id = slug.clone();
                     tokio::spawn(async move { st.lazy_start(&id).await });
                     // Default until the background lazy-start records a phase.
-                    // The meta-refresh picks up later phases.
+                    // The page's poll picks up later phases.
                     return proxy::starting_page(&state.boot_splash_label(&slug));
                 }
                 return (

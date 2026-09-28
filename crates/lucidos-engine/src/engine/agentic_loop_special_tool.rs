@@ -1208,12 +1208,13 @@ impl LucidosEngine {
                 // The same form-request handling as the main loop. Without it a
                 // form this sub-loop asks for never opens, and its raw JSON
                 // reaches the model as if the call had returned.
-                let form_request = super::match_sentinel(&result).map(|m| {
-                    if let Some(redacted) = m.redacted_text {
-                        result = redacted;
-                    }
-                    (m.label, m.event)
-                });
+                let form_request =
+                    super::match_sentinel(&tc.name, &tc.arguments, &result).map(|m| {
+                        if let Some(redacted) = m.redacted_text {
+                            result = redacted;
+                        }
+                        (m.label, m.event)
+                    });
                 self.event_bus
                     .emit_or_log(
                         BusEvent::Thread {
@@ -1623,7 +1624,6 @@ mod tests {
             "do the thing",
             None,
             None,
-            None,
             parent_thread_id,
             spawning_event_id,
             ActorMode::Agent,
@@ -1636,7 +1636,6 @@ mod tests {
         let explicit = crate::engine::chat::make_message_received(
             workspace,
             "do the thing",
-            None,
             None,
             None,
             parent_thread_id,

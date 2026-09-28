@@ -539,8 +539,8 @@ mod tests {
     /// here and nowhere else can never be turned off. A title changed here
     /// leaves the settings screen naming the old one.
     ///
-    /// A `.ts`-only diff does not compile this, so `/harden` Phase 4.5 carries
-    /// a row pointing `preferences.ts` at `voice::sections`.
+    /// `/harden` runs this for a `.ts`-only diff because the `include_str!`
+    /// makes `preferences.ts` a compile input, which selects the Rust suite.
     #[test]
     fn the_settings_toggles_mirror_this_registry() {
         let start = MIRROR

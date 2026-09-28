@@ -9,6 +9,7 @@ vi.mock('../../../store/actions/threads', () => ({
 }));
 
 import { ChildCompletionRow } from '../ChildCompletionRow';
+import { EventRowFoldView } from '../EventRow';
 import { focusThreadOrBootstrap } from '../../../store/actions/threads';
 
 interface AnyVNode extends VNode<{ children?: ComponentChildren; class?: string; [k: string]: unknown }> {}
@@ -36,19 +37,19 @@ function findByClass(node: ComponentChildren, cls: string): AnyVNode | null {
   return findByClass(v.props?.children, cls);
 }
 
-function findByTag(node: ComponentChildren, tag: string): AnyVNode | null {
+function findByType(node: ComponentChildren, type: unknown): AnyVNode | null {
   if (node === null || node === undefined || typeof node === 'boolean') return null;
   if (typeof node === 'string' || typeof node === 'number') return null;
   if (Array.isArray(node)) {
     for (const c of node) {
-      const m = findByTag(c, tag);
+      const m = findByType(c, type);
       if (m) return m;
     }
     return null;
   }
   const v = node as AnyVNode;
-  if (v.type === tag) return v;
-  return findByTag(v.props?.children, tag);
+  if (v.type === type) return v;
+  return findByType(v.props?.children, type);
 }
 
 const baseProps = {
@@ -78,7 +79,7 @@ describe('ChildCompletionRow', () => {
     // The one event row that legitimately shows a verdict, because the verdict
     // it reports is the CHILD's outcome rather than the row's own.
     const pill = findByClass(tree, 'event-row-state');
-    expect(vnodeText(pill)).toBe('success');
+    expect(vnodeText(pill)).toBe('Success');
     expect(pill!.props['data-tone']).toBe('good');
   });
 
@@ -137,19 +138,17 @@ describe('ChildCompletionRow', () => {
   /** One fold, labelled by what it holds, the same as the delivery's `Payload` and
    *  the trigger's `Prompt`. It was "Show summary", which is an instruction
    *  where the other two are nouns. */
-  it('renders agent summary inside a collapsed <details> disclosure', () => {
+  it('renders agent summary inside a collapsed fold', () => {
     const tree = ChildCompletionRow(baseProps);
-    const details = findByClass(tree, 'event-row-fold');
-    expect(details).not.toBeNull();
-    expect(details!.type).toBe('details');
-    expect((details!.props as Record<string, unknown>).open).toBeUndefined();
-    const summary = findByTag(details, 'summary');
-    expect(vnodeText(summary)).toBe('Summary');
+    const fold = findByType(tree, EventRowFoldView);
+    expect(fold).not.toBeNull();
+    expect(fold!.props.open).toBeUndefined();
+    expect(fold!.props.label).toBe('Summary');
   });
 
   it('omits the disclosure when the agent summary is empty', () => {
     const tree = ChildCompletionRow({ ...baseProps, summary: '' });
-    expect(findByClass(tree, 'event-row-fold')).toBeNull();
+    expect(findByType(tree, EventRowFoldView)).toBeNull();
   });
 
   /** The four appear together in one stream, so each has to be distinguishable
@@ -157,10 +156,10 @@ describe('ChildCompletionRow', () => {
    *  state word carries the verdict, so `success` and `no_changes` share a verb
    *  and are still told apart. */
   it.each([
-    { status: 'success' as const, prefix: 'Child thread returned:', word: 'success', tone: 'good' },
-    { status: 'failure' as const, prefix: 'Child thread failed:', word: 'failure', tone: 'bad' },
-    { status: 'no_changes' as const, prefix: 'Child thread returned:', word: 'no changes', tone: 'none' },
-    { status: 'canceled' as const, prefix: 'Child thread canceled:', word: 'canceled', tone: 'halted' },
+    { status: 'success' as const, prefix: 'Child thread returned:', word: 'Success', tone: 'good' },
+    { status: 'failure' as const, prefix: 'Child thread failed:', word: 'Failure', tone: 'bad' },
+    { status: 'no_changes' as const, prefix: 'Child thread returned:', word: 'No changes', tone: 'none' },
+    { status: 'canceled' as const, prefix: 'Child thread canceled:', word: 'Canceled', tone: 'halted' },
   ])('status=$status: prefix "$prefix" with the word "$word"', ({ status, prefix, word, tone }) => {
     const tree = ChildCompletionRow({ ...baseProps, status });
     expect(vnodeText(findByClass(tree, 'event-row-subject'))).toContain(prefix);

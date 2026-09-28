@@ -1,10 +1,10 @@
 /**
  * The appearance FOUC script: one program, embedded in two documents.
  *
- * It resolves the device's theme, font, ligature settings, UI scale, motion and
- * style overrides from localStorage and writes them onto `<html>` **before any module
- * loads**, so the first frame is already the user's appearance instead of a
- * default that gets corrected a moment later.
+ * It resolves the device's appearance from localStorage: theme mode, theme,
+ * font, ligature settings, UI scale, motion, theme effects and style overrides.
+ * It writes them onto `<html>` **before any module loads**, so the first frame
+ * is already the user's appearance, not a default corrected a moment later.
  *
  * **Why it is bundled rather than imported.** Both embed sites need
  * parser-blocking JavaScript with no imports and no network round trip:
@@ -20,7 +20,7 @@
  * construction and were held together by source-scanning guards. esbuild
  * removes the premise: one source, two dependency-free IIFEs, built by
  * `npm run build` into `../generated/` and checked in (see the staleness test,
- * and `api/sdk_fonts.rs` for why a committed artifact rather than a build-time
+ * and `api/sdk_prefs.rs` for why a committed artifact rather than a build-time
  * dependency).
  *
  * Keep this file free of anything the two documents do not share. The shell's
@@ -29,28 +29,48 @@
  */
 import {
   ANIMATION_SPEED_STORAGE_KEY,
-  FONT_FAMILY_VALUES,
+  THEME_EFFECTS_STORAGE_KEY,
+  THEME_SEED_KEY,
+  THEME_STORAGE_KEY,
+  MORE_CONTRAST_QUERY,
   MOTION_STORAGE_KEY,
+  REDUCED_TRANSPARENCY_QUERY,
   REDUCED_MOTION_QUERY,
+  RENAMED_STORAGE_KEYS,
   STYLE_OVERRIDES_STORAGE_KEY,
-  THEMES,
-  THEME_BG,
-  DEFAULT_THEME,
+  LEGACY_THEME_MODE_ATTRIBUTE,
+  THEME_MODE_ATTRIBUTE,
+  THEME_MODE_KEY,
+  THEME_MODE_STORAGE_KEY,
+  THEME_MODES,
+  THEME_MODE_BG,
+  DEFAULT_THEME_MODE,
   durationScaleFor,
-  fontFeaturesFor,
+  themeBackground,
+  FONT_BOLD_ATTRIBUTE,
+  fontBoldMark,
+  themeEffectsAttribute,
+  parseThemeEffects,
+  parseResolvedTheme,
+  resolveReducedThemeEffects,
   motionAttribute,
   parseAnimationSpeed,
   parseMotion,
   parseStyleOverrides,
   parseUiScale,
-  resolveFontKey,
+  parseWorkspaceFont,
+  resolveFont,
   resolveReducedMotion,
-  resolveTheme,
+  resolveThemeMode,
   styleResetRequested,
-  type ResolvedTheme,
-  type ThemePref,
+  WORKSPACE_FONT_SEED_KEY,
+  WORKSPACE_FONT_STORAGE_KEY,
+  type ResolvedThemeMode,
+  type ThemeMode,
 } from '../appearance';
-import { wsLocalGet, wsLocalRemove } from '../_storage';
+import { dataMountUrl } from '../_fetch';
+import { inWorkspace, wsLocalGet, wsLocalRemove, wsLocalSet } from '../_storage';
+import { registerFontsInUse } from '../fontFaces';
 
 export interface BootOptions {
   /**
@@ -68,13 +88,25 @@ export interface BootOptions {
    * inline value here would beat it.
    */
   durationScale: boolean;
+  /**
+   * Adopt each old storage key's value under its new name, once. Shell only:
+   * the shell owns these keys, and an app frame is seeded by the engine
+   * (docs/temporary-measures.md § Renamed appearance storage keys).
+   */
+  adoptRenamedStorageKeys: boolean;
+  /**
+   * Also paint the resolved mode as the legacy `data-theme`, for app styles
+   * written before the rename. App frames only (docs/temporary-measures.md
+   * § Legacy `data-theme` in app frames).
+   */
+  legacyThemeModeAttribute: boolean;
 }
 
 export interface BootResult {
   /** The raw stored value, for the shell's telemetry. */
   raw: string | null;
-  theme: ThemePref;
-  resolved: ResolvedTheme;
+  mode: ThemeMode;
+  resolved: ResolvedThemeMode;
   prefersLight: boolean;
   reducedMotion: boolean;
 }
@@ -127,28 +159,47 @@ export function applyAppearanceBoot(opts: BootOptions): BootResult {
   const d = document.documentElement;
   const served = servedPrefs();
 
-  // Theme. Nothing saved means follow the OS.
-  const raw = seeded(served, 'theme', 'lucidos-theme');
-  const theme = raw && (THEMES as readonly string[]).includes(raw)
-    ? raw as ThemePref
-    : DEFAULT_THEME;
+  if (opts.adoptRenamedStorageKeys) adoptRenamedStorageKeys();
+
+  // Theme mode. Nothing saved means follow the OS.
+  const raw = seeded(served, THEME_MODE_KEY, THEME_MODE_STORAGE_KEY);
+  const mode = raw && (THEME_MODES as readonly string[]).includes(raw)
+    ? raw as ThemeMode
+    : DEFAULT_THEME_MODE;
   const prefersLight = matchMedia('(prefers-color-scheme: light)').matches;
-  const resolved = resolveTheme(theme, prefersLight);
-  d.setAttribute('data-theme', resolved);
-  const bg = THEME_BG[resolved];
+  const resolved = resolveThemeMode(mode, prefersLight);
+  d.setAttribute(THEME_MODE_ATTRIBUTE, resolved);
+  if (opts.legacyThemeModeAttribute) d.setAttribute(LEGACY_THEME_MODE_ATTRIBUTE, resolved);
+  // `?style-reset` is the way out of an unreadable theme as well as of the
+  // overrides, so it drops the theme's cache too.
+  const styleReset = opts.styleReset && styleResetRequested(location.search);
+  if (styleReset) wsLocalRemove(THEME_STORAGE_KEY);
+  // The theme, for this mode's map and its fonts. A corrupt seed parses to the
+  // empty theme.
+  const theme = parseResolvedTheme(seeded(served, THEME_SEED_KEY, THEME_STORAGE_KEY));
+  const themeTokens = theme[resolved];
+  const bg = themeBackground(themeTokens) ?? THEME_MODE_BG[resolved];
   d.style.setProperty('--bg-primary', bg);
   // Inline `background` as well as the custom property: it covers the iOS
   // WKWebView white flash on a PWA cold restart, before any stylesheet has
   // applied its own `html { background: var(--bg-primary) }` rule.
   d.style.background = bg;
 
-  // Font. The key is resolved ONCE and both maps are then read with it, which
-  // is what keeps the family and its ligature settings from disagreeing.
-  const fontKey = resolveFontKey(seeded(served, 'font-family', 'lucidos-font-family'));
-  d.style.setProperty('--font-ui', FONT_FAMILY_VALUES[fontKey]);
-  const features = fontFeaturesFor(fontKey);
-  d.style.setProperty('--font-features-text', features.text);
-  d.style.setProperty('--font-features-code', features.code);
+  // Font: the user's pick, else the theme's, else the fallback. The key is
+  // resolved ONCE and both maps are then read with it, which is what keeps the
+  // family and its ligature settings from disagreeing. A workspace font paints
+  // only with an entry at hand: the picked one's, and the theme's own.
+  const picked = parseWorkspaceFont(
+    seeded(served, WORKSPACE_FONT_SEED_KEY, WORKSPACE_FONT_STORAGE_KEY),
+  );
+  const known = picked ? [picked, ...theme.workspace_fonts] : theme.workspace_fonts;
+  const font = resolveFont(seeded(served, 'font-family', 'lucidos-font-family'), theme.fonts, known);
+  d.style.setProperty('--font-ui', font.stack);
+  d.style.setProperty('--font-features-text', font.features.text);
+  d.style.setProperty('--font-features-code', font.features.code);
+  d.setAttribute(FONT_BOLD_ATTRIBUTE, fontBoldMark(font));
+  // The theme's code font rides in its tokens; its faces register here too.
+  registerFontsInUse(font, known, theme.fonts.mono, dataMountUrl);
 
   // Scale. Snapped to the grid here, so a pre-grid saved value like "115" does
   // not paint at 115% for one frame before the app boots, re-clamps to 112.5%
@@ -174,11 +225,28 @@ export function applyAppearanceBoot(opts: BootOptions): BootResult {
     d.style.setProperty('--duration-scale', String(durationScaleFor(position, reducedMotion)));
   }
 
+  // Theme effects, before first paint, so a device on `reduce` never shows a
+  // theme's glow for a frame. CSS drops the part shadows and filters.
+  const reducedThemeEffects = resolveReducedThemeEffects(
+    parseThemeEffects(seeded(served, 'theme-effects', THEME_EFFECTS_STORAGE_KEY)),
+    matchMedia(REDUCED_TRANSPARENCY_QUERY).matches,
+    matchMedia(MORE_CONTRAST_QUERY).matches,
+  );
+  d.setAttribute('data-theme-effects', themeEffectsAttribute(reducedThemeEffects));
+
+  // The theme sits between the stylesheet and the style remote, so an override
+  // still wins over it.
+  for (const name of Object.keys(themeTokens)) {
+    d.style.setProperty(name, themeTokens[name]);
+  }
+  // A background that is not a hex literal reaches the canvas through the var.
+  if (themeTokens['--bg-primary'] && !themeBackground(themeTokens)) d.style.background = 'var(--bg-primary)';
+
   // The live style remote's first-paint seed. LAST on purpose: everything above
   // writes properties the remote is allowed to override, and inline properties
   // are last-write-wins.
   try {
-    if (opts.styleReset && styleResetRequested(location.search)) {
+    if (styleReset) {
       wsLocalRemove(STYLE_OVERRIDES_STORAGE_KEY);
     } else {
       const overrides = parseStyleOverrides(
@@ -192,5 +260,20 @@ export function applyAppearanceBoot(opts: BootOptions): BootResult {
     /* a corrupt map must never break FOUC */
   }
 
-  return { raw, theme, resolved, prefersLight, reducedMotion };
+  return { raw, mode, resolved, prefersLight, reducedMotion };
+}
+
+/** Move each renamed key's value to its new name, unless the new name already
+ *  holds one. The old key is removed either way (docs/temporary-measures.md
+ *  § Renamed appearance storage keys). */
+function adoptRenamedStorageKeys(): void {
+  // The picker has no workspace, and there the raw old key is the seed a new
+  // workspace copies from (`workspaceStorage.ts`), so it stays.
+  if (!inWorkspace()) return;
+  for (const [from, to] of RENAMED_STORAGE_KEYS) {
+    const old = wsLocalGet(from);
+    if (old === null) continue;
+    if (wsLocalGet(to) === null) wsLocalSet(to, old);
+    wsLocalRemove(from);
+  }
 }

@@ -267,33 +267,27 @@ See `docs/e2e-test-decisions.md` for the rationale.
 staging, `crates/lucidos-app/src/desktop.rs` service/gateway wiring, the embedded
 Postgres provisioning, or the gateway's boot/control surface.
 
-## Never run the engine suite while a Codex review is in flight
+## The Codex driver tests fail under load
 
-`runtime::codex::driver_tests` drives a real `codex app-server`, and the Codex
-reviewer `/harden` launches is another client of the same CLI. Run the two
-together and that module fails: on 2026-08-10 a merge-hardening run overlapped
-them and got **twelve failures out of 5,325**, on a run that took 539s against
-the usual 82s, and all seven of that module's tests passed in isolation moments
-later with nothing else running.
+`runtime::codex::driver_tests` and `runtime::codex_app_server::driver_tests`
+spawn a `/bin/sh` stub from a temp dir, never the real `codex`. They share no
+state with a Codex review. What they do have is 30 s and 60 s event timeouts.
+On 2026-08-10 a merge-hardening run overlapped the engine suite with a Codex
+review and got **twelve failures out of 5,325**. The run took 539s against the
+usual 82s, and every failing test passed in isolation moments later.
 
-The failures are indistinguishable from real breakage in the diff, which is the
-whole cost: they point at Codex-driver code the branch never touched, and
-chasing them is a wasted debugging pass on a suite that was never red.
+The failures look like real breakage in the diff, which is the whole cost: they
+point at Codex-driver code the branch never touched.
 
 Two rules follow:
 
-- **Join the Codex review before starting `make test`.** `/harden` already
-  joins Phase 1's review in Phase 3, so the ordinary flow is safe. The way in is
-  a SECOND review (a later iteration, or a re-review after fixes) launched and
-  then left running while the suite starts.
-- **Never accept a `runtime::codex::driver_tests` failure as a finding** until
-  you have re-run that module alone (`./scripts/test-engine.sh -- --
-  runtime::codex::driver_tests`) with no Codex process active. If it passes
-  there, it was contention.
-
-Same shape as the parallel-`cargo test` prohibition in `CLAUDE.md`, and a
-different resource: that one is about RAM, this one is about a single external
-CLI two clients are competing for.
+- **`/harden` runs these two modules alone, after the Codex review is
+  joined.** Its early suite run skips them (`scripts/harden-suites.sh`, ADR
+  0292) and runs them narrowly in `wait`.
+- **Never accept a driver-test failure as a finding** until you have re-run
+  that module alone on a quiet host (`./scripts/test-engine.sh -- --
+  runtime::codex::driver_tests runtime::codex_app_server::driver_tests`). If
+  it passes there, it was load.
 
 ## Test Level Selection
 

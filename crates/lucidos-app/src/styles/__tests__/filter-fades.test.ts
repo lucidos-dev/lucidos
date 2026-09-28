@@ -4,9 +4,9 @@
  * Two timings, on purpose:
  * - THE BUTTON. The glyph, its badge and the pressed highlight are button
  *   feedback, on `--duration-fast` like every header icon.
- * - THE VIEW. Threads and Filters swap like a content-pane navigation: the
- *   shared navigation cover clears off the arriving view, and the pane title
- *   arrives on the same curve.
+ * - THE VIEW. Threads and Filters dip through the pane background on
+ *   `--duration-slow`: the shared navigation cover rises, holds while the views
+ *   swap, and clears. The pane title switches word at once.
  *
  * One guard is a specific failure: THE RIM. The header paints a resting icon in
  * translucent white. Two translucent shapes stacked mid-crossfade paint their
@@ -58,12 +58,46 @@ describe('the button fades on --duration-fast', () => {
   });
 });
 
-describe('the view and its title move like a page navigation', () => {
-  it('the cover clears and the title arrives on one timing', () => {
+/** The one @keyframes block with this name, as its raw body. */
+function keyframes(name: string): string {
+  const css = readFileSync(resolve(here, '..', 'global/host-components.css'), 'utf-8');
+  const m = css.match(new RegExp(`@keyframes ${name}\\s*\\{([\\s\\S]*?)\\n\\}`));
+  expect(m, `no @keyframes ${name}`).not.toBeNull();
+  return m![1];
+}
+
+describe('the view dips on one timing', () => {
+  it('the drawer cover dips on --duration-slow, resting transparent', () => {
+    const dip = rule(host, '.nav-cover.nav-cover-dip');
+    expect(dip.props.get('animation')).toBe('nav-cover-dip var(--duration-slow) ease-in-out forwards');
+    // A late first frame shows the leaving view, never a flash of background.
+    expect(dip.props.get('opacity')).toBe('0');
+  });
+
+  it('the cover holds opaque across the midpoint, where the views swap', () => {
+    const body = keyframes('nav-cover-dip').replace(/\s+/g, ' ');
+    expect(body).toContain('0% { opacity: 0; }');
+    expect(body).toContain('45%, 55% { opacity: 1; }');
+    expect(body).toContain('100% { opacity: 0; }');
+  });
+
+  it('the views swap at the midpoint, on the same token', () => {
+    const swap = rule(drawer, '.thread-drawer > .thread-drawer-list, .thread-filter-cover');
+    expect([...swap.props.entries()]).toEqual([
+      ['transition', 'visibility 0s linear calc(var(--duration-slow) / 2)'],
+    ]);
+  });
+
+  it("the drawer cover's fuse mirrors --duration-slow, so it outlives the dip at any speed", () => {
+    const cover = readFileSync(resolve(here, '..', '../components/shared/NavigationCover.tsx'), 'utf-8');
+    expect(cover).toMatch(/dip: \{ class: 'nav-cover nav-cover-dip', animMs: 300 \}/);
+    const base = readFileSync(resolve(here, '..', 'global/base.css'), 'utf-8');
+    expect(base).toMatch(/--duration-slow: calc\(0\.3s \* var\(--duration-scale\)\);/);
+  });
+
+  it('the content pane keeps its arrival cover', () => {
     expect(rule(host, '.nav-cover').props.get('animation'))
       .toBe('nav-cover-clear var(--duration-normal) ease-out forwards');
-    expect(rule(host, '.nav-arrive').props.get('animation'))
-      .toBe('nav-arrive var(--duration-normal) ease-out forwards');
   });
 
   it('the drawer hosts the shared cover rather than a copy', () => {
@@ -83,7 +117,8 @@ describe('the rim is painted once', () => {
   });
 
   it('the muted tone and the wrapper read one alpha', () => {
-    const bar = shell.find(r => r.props.has('--header-fg-muted-alpha'));
+    // The header tokens live in the theme blocks, where a theme can reach them.
+    const bar = sheet('global/base.css').find(r => r.props.has('--header-fg-muted-alpha'));
     expect(bar, 'no rule declares --header-fg-muted-alpha').toBeDefined();
     expect(bar!.props.get('--header-fg-muted')).toContain('var(--header-fg-muted-alpha)');
   });
@@ -103,6 +138,20 @@ describe('the rim is painted once', () => {
   });
 });
 
+// A fade lifts its element onto a compositing layer for as long as it runs,
+// and a layer snaps to whole pixels. The button sits at a fractional y. So on a
+// real iPhone the glyph and badge can hop as a fade begins and drop back after.
+// Emulators paint without that compositing, so this scan is the guard.
+describe('nothing in the button hops when a fade starts or ends', () => {
+  it.each([
+    '.app-header .filter-glyph',
+    '.app-header .filter-glyph > .crossfade-layer',
+    '.app-header .badge.filter-badge',
+  ])('%s stays on its own layer at rest', (selector) => {
+    expect(rule(shell, selector).props.get('will-change')).toBe('opacity');
+  });
+});
+
 describe('the badge takes no pointer while hidden', () => {
   it('turns hidden at the end of a fade out and visible at the start of a fade in', () => {
     const hidden = rule(shell, '.app-header .badge.filter-badge');
@@ -114,7 +163,7 @@ describe('the badge takes no pointer while hidden', () => {
   });
 });
 
-describe('the views swap at once under the cover', () => {
+describe('the views swap under the cover', () => {
   it('the shut cover is hidden and takes no pointer', () => {
     const shut = rule(drawer, '.thread-filter-cover');
     expect(shut.props.get('visibility')).toBe('hidden');
@@ -122,7 +171,7 @@ describe('the views swap at once under the cover', () => {
     expect(shut.props.get('background')).toBe('var(--bg-primary)');
   });
 
-  it('the open cover shows at once', () => {
+  it('the open cover shows', () => {
     const open = rule(drawer, '.thread-filter-cover[data-open]');
     expect(open.props.get('visibility')).toBe('visible');
     expect(open.props.get('pointer-events')).toBe('auto');
@@ -135,13 +184,16 @@ describe('the views swap at once under the cover', () => {
 
   it('nothing in the swap carries a fade of its own: the cover is the one fade', () => {
     // The rules styling the two views' own boxes, not the rows inside them.
+    // WebKit re-compositing content up from transparent is the iOS paint-loss
+    // shape, so only `visibility` may transition here.
     const swapping = /(\.thread-filter-cover|\.thread-drawer-list)(\[data-open\])?$/;
     const boxes = drawer.filter(r => selectorList(r.selector).some(s => swapping.test(s)));
-    // Guard the guard: the cover, the open cover and the hidden list at least.
-    expect(boxes.length).toBeGreaterThanOrEqual(3);
+    // Guard the guard: the cover, the open cover, the hidden list and the swap.
+    expect(boxes.length).toBeGreaterThanOrEqual(4);
     for (const r of boxes) {
       expect(r.props.has('opacity'), r.selector).toBe(false);
-      expect(r.props.has('transition'), r.selector).toBe(false);
+      const transition = r.props.get('transition');
+      if (transition && transition !== 'none') expect(transition, r.selector).toMatch(/^visibility 0s /);
     }
   });
 });
@@ -164,13 +216,15 @@ describe('reduced motion', () => {
     expect(reduce(rules, selector).props.get('transition')).toBe('none');
   });
 
-  it('drops the cover to transparent and shows the title at once', () => {
+  it('swaps the views at once, with no delay', () => {
+    expect(reduce(drawer, '.thread-drawer > .thread-drawer-list').props.get('transition')).toBe('none');
+    expect(reduce(drawer, '.thread-filter-cover').props.get('transition')).toBe('none');
+  });
+
+  it('drops the cover to transparent', () => {
     const cover = reduce(host, '.nav-cover');
     expect(cover.props.get('animation')).toBe('none');
     expect(cover.props.get('opacity')).toBe('0');
-    const title = reduce(host, '.nav-arrive');
-    expect(title.props.get('animation')).toBe('none');
-    expect(title.props.get('opacity')).toBe('1');
   });
 });
 
@@ -179,16 +233,12 @@ const hoversOf = (row: string) =>
 
 describe('panel rows paint no band on touch', () => {
   // A touch screen keeps :hover on the last row tapped, so an unguarded hover
-  // band stayed on that row after the tap. iOS also flashes its own grey tap
-  // highlight on a label or button unless it is turned off.
+  // band stayed on that row after the tap. The tap highlight is off app-wide
+  // (touch-paints-no-press.test.ts).
   it('.drawer-view-option hovers on a pointer only', () => {
     const hovers = hoversOf('.drawer-view-option');
     expect(hovers.length, 'no hover rule for .drawer-view-option').toBeGreaterThan(0);
     for (const h of hovers) expect(h.atRules, h.selector).toContain('@media (hover: hover)');
-  });
-
-  it.each(['.thread-filter-option', '.drawer-view-option'])('%s turns off the iOS tap highlight', (row) => {
-    expect(rule(drawer, row).props.get('-webkit-tap-highlight-color')).toBe('transparent');
   });
 });
 

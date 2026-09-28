@@ -1,7 +1,7 @@
 /* ===== Settings → Accounts (Credentials + OAuth) =====
  *
  * The Apps and Triggers panels are the reference for a list-of-rows view: their
- * `.content-view` has no padding of its own, so each `.list-row` supplies the
+ * `.content-view` has no side padding of its own, so each `.list-row` supplies the
  * shared --space-lg (1rem) gutter itself and its hover wash runs edge to edge.
  * Accounts renders inside `.settings-panel`, which adds that same 1rem as
  * container padding — so the rows used to sit at 2rem with their hover wash
@@ -12,7 +12,7 @@
 /* Pull the row list back out through the panel's horizontal gutter. `.list-row`
    then re-establishes it as its OWN padding, which is what makes the content
    land at 1rem while the hover wash reaches the pane edges — exactly the Apps /
-   Triggers rendering. Horizontal only: the panel's vertical padding is real
+   Triggers rendering. Horizontal only: the column's vertical padding is real
    spacing above the first section title. */
 .accounts-section .list-rows {
     margin-inline: calc(-1 * var(--space-lg));
@@ -78,7 +78,7 @@
 .oauth-quick-btn {
     background: none;
     border: 1px solid var(--border-color);
-    border-radius: 0.25rem;
+    border-radius: calc(var(--radius-control) * 0.5);
     padding: 0.1875rem 0.625rem;
     font-family: var(--font-ui);
     font-size: var(--font-size-xs);
@@ -110,7 +110,7 @@
     flex: 1;
     background: var(--bg-primary);
     border: 1px solid var(--border-color);
-    border-radius: 0.25rem;
+    border-radius: calc(var(--radius-control) * 0.5);
     color: var(--text-primary);
     font-family: var(--font-ui);
     font-size: var(--font-size-sm);

@@ -25,6 +25,8 @@ pub(in crate::api) struct FamilyRow {
     pub(in crate::api) archive_state: String,
     pub(in crate::api) coding_agent_proposed: bool,
     pub(in crate::api) coding_agent_is_external_repo: bool,
+    /// The pin. An agent's archive leaves a pinned member open (ADR 0312).
+    pub(in crate::api) is_saved: bool,
 }
 
 impl FamilyRow {
@@ -87,18 +89,18 @@ pub(in crate::api) async fn load_family(
         "WITH RECURSIVE family AS (
             SELECT thread_id, parent_thread_id, is_coding_agent, status,
                    archive_state, coding_agent_proposed,
-                   coding_agent_is_external_repo
+                   coding_agent_is_external_repo, is_saved
             FROM thread_summaries
             WHERE thread_id = $1
             UNION ALL
             SELECT t.thread_id, t.parent_thread_id, t.is_coding_agent, t.status,
                    t.archive_state, t.coding_agent_proposed,
-                   t.coding_agent_is_external_repo
+                   t.coding_agent_is_external_repo, t.is_saved
             FROM thread_summaries t
             JOIN family f ON t.parent_thread_id = f.thread_id
         )
         SELECT thread_id, is_coding_agent, status, archive_state,
-               coding_agent_proposed, coding_agent_is_external_repo
+               coding_agent_proposed, coding_agent_is_external_repo, is_saved
         FROM family
         FOR UPDATE",
     )
@@ -143,11 +145,7 @@ pub(in crate::api) fn classify_family(
     ) {
         return FamilyDecision::Reject {
             status: StatusCode::CONFLICT,
-            body: serde_json::json!({
-                "reason": verb.parent_blocked_reason(),
-                "parent_status": parent_row.status,
-                "has_pending_changes": parent_row.coding_agent_proposed,
-            }),
+            body: parent_blocked_body(verb, &parent_row.status, parent_row.coding_agent_proposed),
         };
     }
     if parent_row.is_coding_agent
@@ -190,6 +188,21 @@ pub(in crate::api) fn classify_family(
     }
 
     FamilyDecision::Proceed
+}
+
+/// The refusal body for a parent the verb cannot act on: running, or waiting on
+/// the user. One builder, so an agent's archive answers exactly what the
+/// Archive route does (ADR 0310).
+pub(in crate::api) fn parent_blocked_body(
+    verb: FamilyVerb,
+    parent_status: &str,
+    has_pending_changes: bool,
+) -> serde_json::Value {
+    serde_json::json!({
+        "reason": verb.parent_blocked_reason(),
+        "parent_status": parent_status,
+        "has_pending_changes": has_pending_changes,
+    })
 }
 
 /// Every member, in family order. What delete sweeps.

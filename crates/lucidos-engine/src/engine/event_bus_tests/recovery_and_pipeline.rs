@@ -117,11 +117,17 @@ async fn engine_restart_continue_cycle_leaves_parent_blocking_count_at_zero() {
         .unwrap();
         emit_cc_idle(&bus, child_id, false, None).await;
 
-        emit_change_proposed(&bus, child_id, "claude-code/test", false).await;
+        emit_change_proposed(
+            &bus,
+            child_id,
+            &format!("claude-code/test-{child_id}"),
+            false,
+        )
+        .await;
         bus.emit(BusEvent::Thread {
             thread_id: child_id,
             event: ThreadEvent::ChangeApplied {
-                change_id: format!("change-{child_id}"),
+                change_id: test_change_id(child_id).to_string(),
                 requires_restart: false,
                 client_update: false,
                 commits: vec![],
@@ -157,9 +163,16 @@ async fn a_required_user_actor_reaches_the_persisted_system_event() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _callback_rx) = EventBus::new(pool.clone());
 
-    DeviceStore::register(&pool, &bus, "test-device-emit", Some("Mozilla/5.0"), None)
-        .await
-        .unwrap();
+    DeviceStore::register(
+        &pool,
+        &bus,
+        "test-device-emit",
+        Some("Mozilla/5.0"),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
     DeviceStore::rename(&pool, &bus, "test-device-emit", Some("Test MacBook"), None)
         .await
         .unwrap();
@@ -210,11 +223,8 @@ async fn a_required_user_actor_reaches_the_persisted_system_event() {
     )
     .expect("actor deserializes");
     match actor {
-        MessageOrigin::Device { device_id, label } => {
-            assert_eq!(device_id, "test-device-emit");
-            assert_eq!(label, "Test MacBook");
-        }
-        other => panic!("expected Device actor from db lookup, got {:?}", other),
+        MessageOrigin::Device { device_id } => assert_eq!(device_id, "test-device-emit"),
+        other => panic!("expected Device actor, got {:?}", other),
     }
 
     pool.close().await;

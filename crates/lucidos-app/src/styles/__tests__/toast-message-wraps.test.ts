@@ -39,13 +39,13 @@ const BREAKING = ['anywhere', 'break-word'];
  *  rule here is the one that would break the chain: `.toast-heading a` styles
  *  the anchor, and its subject is the anchor, not the box. */
 const MESSAGE_SUBTREE_RE =
-  /\.toast-(body|heading|sections|section-title|section|bullets)\b/;
+  /\.toast-(body|heading|title|text)\b/;
 
 describe('a toast message wraps a long path', () => {
   it('breaks an over-wide token in the message column', () => {
     // On the column rather than on each box inside it: `overflow-wrap`
-    // inherits, so one declaration covers the heading, the section titles, the
-    // bullets and the linkified anchors in all three.
+    // inherits, so one declaration covers the heading, the title, the text box
+    // and the linkified anchors in them.
     const wrap = decl(block(componentsCss, '.toast-body {'), 'overflow-wrap');
     expect(BREAKING, `.toast-body sets overflow-wrap: ${wrap}`).toContain(wrap);
   });

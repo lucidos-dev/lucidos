@@ -1,13 +1,12 @@
 import { useState, useEffect, useCallback, useRef } from 'preact/hooks';
-import { currentModel, reasoningEffort, preferences, showToast, showConfirm, oauthAccounts, credentials, chatModels, settingsSubview, settingsScrollTarget, SETTINGS_NAV_ITEMS, repositories, knownOAuthProviders, oauthConnectPrefill } from '../../store/store';
-import { devices, getDeviceId, loadDevices, updateDeviceName, removeDevice } from '../../store/actions/devices';
-import { setImageModel, setTheme, setFontFamily, setChatModelSelection, currentTheme, currentFontFamily, currentUiScale, currentImageModel, currentBackgroundModel, currentBackgroundReasoning, saveModelSelection, currentVertexRegion, setVertexRegion, currentCommandGuard, setCommandGuard, currentCommandGuardJudge, setCommandGuardJudge, currentMobileHeaderSticky, setMobileHeaderSticky, currentNotificationToasts, setNotificationToasts, currentInAppBrowser, setInAppBrowser, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, currentMaxToolCalls, setMaxToolCalls, estimateTurnDuration, MAX_TOOL_CALLS_MIN, MAX_TOOL_CALLS_REPRESENTABLE, currentStyleOverrides, clearStyleOverrides, setMotion, type ExternalLinkTarget, type Theme, type FontFamily } from '../../store/actions/preferences';
-import { MOTION_PREFS, type MotionPref } from '@lucidos/appearance';
+import { currentModel, reasoningEffort, preferences, showToast, showConfirm, oauthAccounts, credentials, settingsSubview, settingsScrollTarget, repositories, knownOAuthProviders, oauthConnectPrefill } from '../../store/store';
+import { devices, getDeviceId, updateDeviceName, removeDevice } from '../../store/actions/devices';
+import { setImageModel, setThemeMode, setFontFamily, setChatModelSelection, currentThemeMode, currentFontFamily, currentUiScale, currentImageModel, currentBackgroundModel, currentBackgroundReasoning, saveModelSelection, currentVertexRegion, setVertexRegion, currentCommandGuard, setCommandGuard, currentCommandGuardJudge, setCommandGuardJudge, currentMobileHeaderSticky, setMobileHeaderSticky, currentNotificationToasts, setNotificationToasts, currentInAppBrowser, setInAppBrowser, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, currentMaxToolCalls, setMaxToolCalls, estimateTurnDuration, MAX_TOOL_CALLS_MIN, MAX_TOOL_CALLS_REPRESENTABLE, currentStyleOverrides, clearStyleOverrides, setMotion, setThemeEffects, type ExternalLinkTarget, type ThemeMode, type FontPreference } from '../../store/actions/preferences';
+import { THEME_EFFECTS_PREFS, MOTION_PREFS, type ThemeEffectsPref, type MotionPref } from '@lucidos/appearance';
 import { openScaleModal } from '../shared/scaleModalState';
 import { applyNavFocus } from '../shared/focusMarker';
 import { formatDateTime, formatShortDateWithYear } from '../../utils/formatTime';
 import {
-  loadOAuthAccounts,
   loadKnownOAuthProviders,
   disconnectOAuthAccount,
   grantOAuthScope,
@@ -26,8 +25,10 @@ import {
 import { handleNavigationRequest } from '../../store/actions/navigation-request';
 import { setDevicePushEnabled } from '../../store/actions/push';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
+import { usePanelRefresh } from '../../hooks/usePanelRefresh';
+import { SETTINGS_SECTION_REFRESH } from './settingsSectionRefresh';
 import {
-  loadChatModels, lucidosModelChoices, modelReasoningEfforts, LUCIDOS_TIER_VOCABULARY,
+  lucidosModelChoices, modelReasoningEfforts, LUCIDOS_TIER_VOCABULARY,
   rememberProvider,
 } from '../../store/actions/models';
 import { lucidosTiers, type ModelChoice } from '../../store/modelSelection';
@@ -45,7 +46,11 @@ import { LocalProviderSettings } from './LocalProviderSettings';
 import { TypeSafeJudgmentSettings } from './TypeSafeJudgmentSettings';
 import { JudgmentModelRow } from './JudgmentModelRow';
 import { Dropdown } from '../shared/Dropdown';
+import { fontOptions } from './fontOptions';
+import { WorkspaceFontsSection } from './WorkspaceFontsSection';
+import { workspaceFontList } from '../../store/actions/workspaceFonts';
 import { Explainer } from '../shared/Explainer';
+import { ThemePicker } from './ThemePicker';
 import { ListRowAddCard } from '../shared/ListRowAddCard';
 import { AllowlistEditor } from './AllowlistEditor';
 import { getCcAllowedTools, putCcAllowedTools, getAgentAllowedCommands, putAgentAllowedCommands } from '../../api/client';
@@ -54,26 +59,26 @@ import { MarketplacesSection } from './MarketplacesSection';
 import { McpServersPage } from './McpServersPage';
 import { WebhooksPage } from './WebhooksPage';
 import { MobileAccessPage } from './MobileAccessPage';
-import { usePairedDevices, revokePaired, pairedRows, pairingIsKnown } from './pairedDevices';
-import { buildDeviceRows, deviceDisplayName, deviceRowSummary, submittedDeviceName, type DeviceRowModel } from './deviceList';
+import { usePairedDevices, revokePaired } from './pairedDevices';
+import { pairedRows, pairingIsKnown } from '../../store/actions/pairedDevices';
+import { buildDeviceRows, deviceRowName, deviceRowSummary, submittedDeviceName, type DeviceRowModel } from './deviceList';
 import { NetworkAccessPage } from './NetworkAccessPage';
 import { LocaleSection } from './LocaleSection';
 import { CodingAgentBinariesSection } from './CodingAgentBinariesSection';
 import { CodingAgentPermissionSection } from './CodingAgentPermissionSection';
 import { SystemPage } from './SystemPage';
 import { SystemSubmenu } from './SystemSubmenu';
-import { SettingsNavRow } from './SettingsNavRow';
+import { warmSettingsReads } from '../../store/actions/settingsReads';
 import { isTauri, describeDeviceUserAgent } from '../../utils/platform';
 import { viewportIsMobile } from '../../utils/viewport';
 import { CredentialItem } from '../credentials/CredentialItem';
-import { openAddCredential, loadCredentials } from '../../store/actions/credentials';
+import { openAddCredential } from '../../store/actions/credentials';
 import { loadRepositories } from '../../store/actions/chat';
 import { API, mutatingFetch, throwIfNotOk } from '../../api/client';
 import { DirectoryPicker } from './DirectoryPicker';
 import { LoadableError } from '../shared/LoadableError';
 import { LoadableToggle } from '../shared/LoadableToggle';
 import { ListSkeletonOf, useSkeleton, SkText, SkBlock } from '../shared/Skeleton';
-import { systemAttentionBadge } from '../../store/systemAttentionBadge';
 import { LoadingFade } from '../shared/LoadingFade';
 import { openSettingsSubview } from '../../store/actions/menu';
 import { focusFirstFocusableWithin } from '../layout/paneFocus';
@@ -81,6 +86,7 @@ import { formatTimeAgo } from '../../utils/formatTime';
 import type { ImageModel } from '../../store/actions/preferences';
 import { errorDetail } from '../../utils/errorDetail';
 import { motionPreference, scrollBehavior } from '../../utils/motion';
+import { themeEffectsPreference } from '../../utils/themeEffects';
 
 /** Turn scope URLs into short human-readable labels. */
 function formatScopes(scopes: string): string {
@@ -112,7 +118,7 @@ function formatScopes(scopes: string): string {
 }
 
 /** System first, as in the Motion row: it is the default for both. */
-const THEMES: Array<{ value: Theme; label: string }> = [
+const THEME_MODES: Array<{ value: ThemeMode; label: string }> = [
   { value: 'system', label: 'System' },
   { value: 'light', label: 'Light' },
   { value: 'dark', label: 'Dark' },
@@ -124,15 +130,11 @@ const MOTION_LABELS: Record<MotionPref, string> = {
   full: 'Full',
 };
 
-/** Fira Code first, as in the Theme and Motion rows: it is the default. */
-const FONT_OPTIONS: Array<{ value: FontFamily; label: string }> = [
-  { value: 'fira-code', label: 'Fira Code' },
-  { value: 'monospace', label: 'Monospace' },
-  { value: 'system', label: 'System' },
-  { value: 'inter', label: 'Inter' },
-  { value: 'jetbrains-mono', label: 'JetBrains Mono' },
-  { value: 'ibm-plex-mono', label: 'IBM Plex Mono' },
-];
+const THEME_EFFECTS_LABELS: Record<ThemeEffectsPref, string> = {
+  system: 'System',
+  reduce: 'Reduce',
+  full: 'Full',
+};
 
 const EXTERNAL_LINK_TARGET_OPTIONS: Array<{ value: ExternalLinkTarget; label: string }> = [
   { value: 'safari', label: 'Safari' },
@@ -210,7 +212,7 @@ function DeviceRow({ row, editingId, setEditingId, onRevoke, gatewayAnswered }: 
   const [editValue, setEditValue] = useState('');
   const device = row?.device;
   const isCurrent = !sk && row?.isCurrent === true;
-  const displayName = row ? deviceDisplayName(row) : '';
+  const displayName = row ? deviceRowName(row) : '';
   const editing = !sk && device != null && editingId === device.id;
   const inputRef = useCallback((el: HTMLInputElement | null) => {
     if (el) { el.focus(); el.select(); }
@@ -547,34 +549,12 @@ export function SettingsView() {
   const styleOverrideCount = Object.keys(currentStyleOverrides()).length;
   const imageModel = currentImageModel();
 
-  useEffect(() => {
-    if (loadable.status === 'not-loaded') {
-      void loadDevices();
-    }
-  }, []);
+  useEffect(warmSettingsReads, []);
+  usePanelRefresh(`${settingsSubview.value} settings`, SETTINGS_SECTION_REFRESH[settingsSubview.value] ?? null);
 
+  // Beyond the warm-up above, this re-reads when the list drops back to
+  // not-loaded while a subview is open.
   useEffect(() => {
-    if (oauthAccounts.value.status === 'not-loaded') {
-      void loadOAuthAccounts();
-    }
-  }, []);
-
-  useEffect(() => {
-    if (credentials.value.status === 'not-loaded') {
-      void loadCredentials();
-    }
-  }, []);
-
-  useEffect(() => {
-    if (chatModels.value.status === 'not-loaded') {
-      void loadChatModels();
-    }
-  }, []);
-
-  useEffect(() => {
-    // Mirrors the devices/credentials/oauth effects above. Previously this
-    // ran inside `repositoriesSection()`'s render body, which fires a
-    // setState during render and trips preact lint.
     if (repositories.value.status === 'not-loaded') {
       void loadRepositories();
     }
@@ -868,6 +848,7 @@ export function SettingsView() {
     function revoke(row: DeviceRowModel) {
       if (!row.paired) return;
       void revokePaired(row.paired, {
+        name: deviceRowName(row),
         selfId: paired.selfId,
         count: rowsPaired?.length ?? 0,
         reload: paired.reload,
@@ -935,7 +916,7 @@ export function SettingsView() {
                   </div>
                   <div class="list-row-actions">
                     <button class="action-btn action-btn-danger" onClick={async () => {
-                      if (await showConfirm(`Remove "${repo.name}"?`, 'Remove')) {
+                      if (await showConfirm(`Remove "${repo.name}"?`, 'Remove', { variant: 'danger' })) {
                         try {
                           const res = await mutatingFetch(`${API}/repositories/${repo.id}`, { method: 'DELETE' });
                           await throwIfNotOk(res);
@@ -1325,33 +1306,81 @@ export function SettingsView() {
    *  the standard name for this category and the head noun of the label, the
    *  same way "Chat & triggers" is anchored `models:chat`. */
   function appearanceSection() {
-    const theme = currentTheme();
+    const mode = currentThemeMode();
     const motion = motionPreference.value;
+    const themeEffects = themeEffectsPreference.value;
     const font = currentFontFamily();
 
     return (
       <>
         <div class="settings-section">
-          <div class="settings-section-title" data-search-anchor="appearance:theme">Theme</div>
+          <div class="settings-section-title" data-search-anchor="appearance:theme">
+            Theme
+            <Explainer title="Theme">
+              <p>
+                A theme retunes the colours, the headers and how Lucidos shows
+                focus, on this device. Some themes style both light and dark,
+                some only one. Mode picks which one you see.
+              </p>
+              <p>
+                Plugins can add themes, and so can the agent: ask it for a
+                theme like the one you have in mind.
+              </p>
+            </Explainer>
+          </div>
           <div class="settings-row" data-search-anchor="appearance:mode">
             <span class="settings-row-label">Mode</span>
             <div class="segmented-control" role="group" aria-label="Theme mode">
-              {THEMES.map((t) => (
+              {THEME_MODES.map((t) => (
                 <button
                   key={t.value}
                   type="button"
-                  aria-pressed={theme === t.value}
-                  class={`segmented-btn ${theme === t.value ? 'active' : ''}`}
-                  onClick={() => void setTheme(t.value)}
+                  aria-pressed={mode === t.value}
+                  class={`segmented-btn ${mode === t.value ? 'active' : ''}`}
+                  onClick={() => void setThemeMode(t.value)}
                 >
                   {t.label}
                 </button>
               ))}
             </div>
           </div>
-          <div class="settings-row" data-search-anchor="appearance:motion">
+          <ThemePicker />
+          <div class="settings-row" data-search-anchor="appearance:theme-effects">
             <span class="settings-row-label">
-              Motion
+              Effects
+              <Explainer title="Effects">
+                <p>
+                  Whether the glows, shadows and scanlines a theme adds show on
+                  this device. System drops them when your device asks for more
+                  contrast or less transparency.
+                </p>
+                <p>
+                  Reduce keeps the theme's colours, letter spacing and borders
+                  and drops its glows and scanlines, which saves battery and
+                  sharpens text. Full shows every effect.
+                </p>
+              </Explainer>
+            </span>
+            <div class="segmented-control" role="group" aria-label="Theme effects">
+              {THEME_EFFECTS_PREFS.map((e) => (
+                <button
+                  key={e}
+                  type="button"
+                  aria-pressed={themeEffects === e}
+                  class={`segmented-btn ${themeEffects === e ? 'active' : ''}`}
+                  onClick={() => void setThemeEffects(e)}
+                >
+                  {THEME_EFFECTS_LABELS[e]}
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+        <div class="settings-section">
+          <div class="settings-section-title" data-search-anchor="appearance:motion">Motion</div>
+          <div class="settings-row">
+            <span class="settings-row-label">
+              Animation
               <Explainer title="Motion">
                 <p>
                   How much Lucidos moves on this device. System follows your
@@ -1384,11 +1413,15 @@ export function SettingsView() {
           <div class="settings-row" data-search-anchor="appearance:font">
             <span class="settings-row-label">Font</span>
             <Dropdown
-              options={FONT_OPTIONS}
+              options={workspaceFontList.value.status === 'loaded'
+                ? fontOptions(workspaceFontList.value.data.fonts, font)
+                // Unknown until the list loads, so no row claims "not installed".
+                : fontOptions([])}
               value={font}
-              onChange={(v) => void setFontFamily(v as FontFamily)}
+              onChange={(v) => void setFontFamily(v as FontPreference)}
             />
           </div>
+          <WorkspaceFontsSection />
           <div class="settings-row" data-search-anchor="appearance:ui-scale">
             <span class="settings-row-label">UI scale</span>
             <button class="settings-option" onClick={openScaleModal}>
@@ -1659,46 +1692,9 @@ export function SettingsView() {
     }
   }
 
-  if (settingsSubview.value !== 'main') {
-    return (
-      <div class="content-view active settings-panel">
-        {renderSubview()}
-      </div>
-    );
-  }
-
-  // EVERY nav item is rendered on EVERY platform. There is deliberately no
-  // filter here: a category that disappears per-device gives the app a
-  // different shape per device, makes "go to Settings → X" false for most
-  // users, and is how the iOS external-link setting once became unreachable on
-  // the only platform it applies to (it sat inside Experimental, whose row was
-  // isTauri()-gated). Platform gating belongs to a row or section INSIDE a
-  // category, where an absent control just means one fewer row on a page that
-  // still has others. See `linksSection` and the SETTINGS_NAV_ITEMS comment;
-  // pinned by `__tests__/settings-nav-structure.test.ts`.
-  //
-  // Groups are contiguous in SETTINGS_NAV_ITEMS, so a heading is emitted
-  // whenever the group changes rather than by pre-bucketing the list.
-  //
-  // `news` is read once for the whole list rather than per row: it is the same
-  // answer for every one of them, and only the System row spends it.
-  const news = systemAttentionBadge();
   return (
     <div class="content-view active settings-panel">
-      {SETTINGS_NAV_ITEMS.map(({ key, label, group }, i) => (
-        // The third step of the path into System, and still the UNION: this row
-        // leads to both causes, and the submenu below it is where they split.
-        <SettingsNavRow
-          key={key}
-          label={label}
-          badge={key === 'system' ? news : null}
-          onClick={() => openSettingsSubview(key)}
-        >
-          {group !== SETTINGS_NAV_ITEMS[i - 1]?.group && (
-            <div class="settings-nav-group-title">{group}</div>
-          )}
-        </SettingsNavRow>
-      ))}
+      {renderSubview()}
     </div>
   );
 }

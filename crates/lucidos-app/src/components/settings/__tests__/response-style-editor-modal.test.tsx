@@ -122,7 +122,7 @@ describe('the response style editor is a modal', () => {
 
     expect(panel()).not.toBeNull();
     expect(instruction().value).toBe('');
-    expect(panel()!.querySelector('.style-editor-title')?.textContent).toBe('Add a style');
+    expect(panel()!.querySelector('.surface-head .surface-title')?.textContent).toBe('Add a style');
   });
 
   it('says what each field is for, and marks its sample text as an example', async () => {
@@ -163,6 +163,16 @@ describe('the response style editor is a modal', () => {
     expect(panel()).not.toBeNull();
 
     buttonSaying('Cancel', panel()!).click();
+    await settled();
+    expect(panel()).toBeNull();
+  });
+
+  it('closes from the X in its head, like every other surface', async () => {
+    render(<ResponseStylesSection />, host);
+    editRows()[0].click();
+    await settled();
+
+    panel()!.querySelector<HTMLButtonElement>('.surface-head [data-role="surface-close"]')!.click();
     await settled();
     expect(panel()).toBeNull();
   });

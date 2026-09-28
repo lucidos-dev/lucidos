@@ -1,5 +1,7 @@
 import { contextViewer } from '../../store/store';
+import { usePaneCentre } from '../../hooks/usePaneCentre';
 import { Overlay } from '../shared/Overlay';
+import { SurfaceHead } from '../shared/Surface';
 import { ContextCapturePanel } from './ContextCapturePanel';
 import { highlightEllipsis } from './highlightEllipsis';
 
@@ -20,6 +22,7 @@ function close() {
  *  statement of which call it belongs to. */
 export function ContextViewerModal() {
   const open = contextViewer.value;
+  const paneCentre = usePaneCentre('conversation');
   if (!open) return null;
 
   return (
@@ -27,19 +30,19 @@ export function ContextViewerModal() {
       open
       onClose={close}
       overlayClass="step-detail-overlay"
-      panelClass="step-detail-modal"
+      panelClass="surface surface-raised surface-pane-centred step-detail-modal"
+      panelStyle={paneCentre}
       panelRole="dialog"
       ariaModal
       dataRole="context-captured-modal"
     >
-      <div class="step-detail-header">
-        <span class="step-detail-status">Context</span>
+      <SurfaceHead title="Context" onClose={close} closeLabel="Close context" />
+      <div class="surface-body step-detail-body" tabIndex={-1}>
+        {open.description && (
+          <div class="step-detail-description">{highlightEllipsis(open.description)}</div>
+        )}
+        <ContextCapturePanel snap={open.snapshot} />
       </div>
-      {open.description && (
-        <div class="step-detail-description">{highlightEllipsis(open.description)}</div>
-      )}
-      <ContextCapturePanel snap={open.snapshot} />
-      <button class="action-btn step-detail-close" onClick={close}>Close</button>
     </Overlay>
   );
 }

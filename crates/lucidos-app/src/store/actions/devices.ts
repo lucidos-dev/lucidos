@@ -11,6 +11,8 @@ import { isTauri, registrationUserAgent } from '../../utils/platform';
 import { trackDeviceRegistration } from '../../utils/deviceRegistration';
 import { getOrCreateDeviceId, previousDeviceId, rememberDeviceId } from '../../utils/tauri';
 import { generateUuid } from '../../utils/uuid';
+import { deviceName } from '../../utils/deviceFriendlyName';
+import { pairedDevices, pairedRows } from './pairedDevices';
 // The key is owned by the leaf that also builds the request header, so the id
 // this module mints and the id every API call sends cannot drift apart.
 import { DEVICE_ID_KEY } from '../../utils/deviceIdHeader';
@@ -46,6 +48,26 @@ async function withDeadline<T>(work: Promise<T>, ms: number, onTimeout: T): Prom
 }
 
 export const devices = signal<Loadable<DeviceInfo[]>>({ status: 'not-loaded' });
+
+/**
+ * How a turn names the device it came from, by [`deviceName`].
+ *
+ * An event stores the device's id only, so the name comes from the two lists
+ * startup loads: the engine's devices and the gateway's pairings. Those are the
+ * rows the Devices page reads, so both name a device alike, and a rename
+ * reaches every older turn. The reader's own device says so, as its row does.
+ *
+ * Empty until both lists land, rather than flashing a lesser name first.
+ */
+export function turnDeviceName(deviceId: string): string {
+  const pending = (s: string) => s === 'not-loaded' || s === 'loading';
+  const list = devices.value;
+  if (pending(list.status) || pending(pairedDevices.value.status)) return '';
+  const device = list.status === 'loaded' ? list.data.find((d) => d.id === deviceId) : undefined;
+  const paired = pairedRows(pairedDevices.value)?.find((p) => p.id === deviceId);
+  const name = deviceName(deviceId, device, paired);
+  return deviceId === getDeviceId() ? `${name} (this device)` : name;
+}
 
 /** Get or create the device ID for this browser. Used as the `device_id` query
  *  param on per-device API calls (preferences, push subscriptions, etc.). */
@@ -340,7 +362,7 @@ export async function disablePushForDevices(deviceIds: string[]): Promise<void> 
 
 /** Remove a device */
 export async function removeDevice(deviceId: string): Promise<void> {
-  const ok = await showConfirm('Remove this device? Its push subscription and preferences will be deleted.', 'Remove');
+  const ok = await showConfirm('Remove this device? Its push subscription and preferences will be deleted.', 'Remove', { variant: 'danger' });
   if (!ok) return;
   try {
     await apiDeleteDevice(deviceId);

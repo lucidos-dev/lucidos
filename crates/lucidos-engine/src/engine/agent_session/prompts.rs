@@ -78,9 +78,11 @@ const APPLY_RESTART_RULE: &str = "APPLY/RESTART: After your session ends, your c
     main — nothing happens automatically. The button label is \"Apply\" (no restart needed) or \
     \"Apply*\" (restart needed); the engine derives this from the touched files. ANY \
     of these triggers restart: a non-test `.rs` file, `Cargo.toml`, `Cargo.lock`, a `.sql` \
-    migration under `migrations/`, an SDK bundle source under `packages/lucidos-sdk/`, or an \
-    engine-bundled asset (`crates/lucidos-engine/src/api/sdk_iframe.css`, `sdk_iframe_audio.js`). \
-    Frontend-only edits (TypeScript/CSS outside those bundled assets) do NOT trigger restart.\n\n\
+    migration under `migrations/`, an SDK bundle source under `packages/lucidos-sdk/`, any \
+    non-test, non-doc file in `crates/lucidos-engine/`, `crates/lucidos-gateway/` or `crates/lucidos-cli/` \
+    (e.g. `crates/lucidos-engine/src/api/sdk_iframe.css`, `sdk_iframe_audio.js`), or a file a \
+    binary embeds (`crates/lucidos-app/src/styles/global/shared-components.css`, `index.html`, \
+    the fonts). Frontend-only edits (TypeScript/CSS outside those) do NOT trigger restart.\n\n\
     Apply never restarts Lucidos, even when you run `lucidos changes apply` yourself. It builds \
     the new version in the background; the user then taps \"Switch to new version\" to restart \
     onto it. Never tell the user an apply restarts Lucidos.\n\n\
@@ -749,6 +751,29 @@ const NO_IMPERSONATION_RULE: &str = "\n\n\
     and offer what you CAN do. A refusal reported honestly is a good turn; a refusal worked \
     around is a broken one, however well it appears to succeed.";
 
+/// Backend-independent, riding [`append_backend_rules`] like the rules above.
+///
+/// The permission card leads with the agent's own line about a command: Claude
+/// Code's Bash `description`, or the justification Codex sends as `reason`
+/// (`renderCommandAsk` in `PermissionCard.tsx`). Claude Code's own tool text
+/// asks only for what a command does. A user deciding whether to allow it also
+/// needs why, so the rule asks for both.
+const PERMISSION_ASK_RULE: &str = "\n\n\
+    SAY WHAT A COMMAND DOES AND WHY: A permission card shows a command's description as its \
+    question (Codex: your escalation justification). Write it for the user: what it does and \
+    why, like \"Read the triggers doc, to see how triggers install\", not \"Run sed\".";
+
+/// When to archive is the agent's call, not an engine rule, so it has to be
+/// told the rule (ADR 0310). Carried beside [`BACKGROUND_PROCESS_RULE`] by every
+/// flavor that can spawn a sub-thread; a merge session cannot. Mirrored for the
+/// chat agent in `chat::process::system_prompt`'s PARALLEL WORK section. Change
+/// both together.
+const ARCHIVING_THREADS_RULE: &str = "\
+    ARCHIVING THREADS: Nothing archives a thread for you. Once its change is applied and no \
+    follow-up is expected, run `lucidos threads archive --thread <child-uuid|current>` \
+    (`current` lands when your turn ends). Not while a follow-up, question, pending change or \
+    live event wait remains.";
+
 /// Append backend-specific rules — plus the backend-independent
 /// [`REASONING_NOT_VISIBLE_RULE`], which rides every prompt here — to a finished
 /// system prompt — the single
@@ -772,7 +797,7 @@ pub(super) fn append_backend_rules(
     // backend-specific teaching below.
     let prompt = format!(
         "{prompt}{REASONING_NOT_VISIBLE_RULE}{SHOWING_AN_IMAGE_RULE}\
-         {NAMES_NOT_IDS_RULE}{NO_IMPERSONATION_RULE}"
+         {NAMES_NOT_IDS_RULE}{NO_IMPERSONATION_RULE}{PERMISSION_ASK_RULE}"
     );
     match coding_agent {
         crate::runtime::CodingAgent::ClaudeCode => format!("{prompt}{PERMISSION_CONFIG_RULE}"),
@@ -833,6 +858,7 @@ pub(super) fn worktree_system_prompt(branch_name: &str, workspace_name: &str) ->
          {raise_findings}\n\n\
          {apply_confirmation}\n\n\
          {background_process}\n\n\
+         {archiving_threads}\n\n\
          SESSION SUMMARY: After hardening completes, output a structured summary of what \
          was implemented in this session. List each change with its status (committed, applied, \
          pending). Include file names and brief descriptions. This is the last thing you output \
@@ -852,6 +878,7 @@ pub(super) fn worktree_system_prompt(branch_name: &str, workspace_name: &str) ->
         raise_findings = RAISE_USER_REACHING_FINDINGS_RULE,
         apply_confirmation = APPLY_CONFIRMATION_NOTE,
         background_process = BACKGROUND_PROCESS_RULE,
+        archiving_threads = ARCHIVING_THREADS_RULE,
         process_safety = process_safety_rule(true),
     )
 }
@@ -883,6 +910,7 @@ pub(super) fn external_repo_system_prompt(
          {ask_user_question}\n\n\
          {raise_findings}\n\n\
          {background_process}\n\n\
+         {archiving_threads}\n\n\
          CRITICAL: Never run `exit` as a bash command. If the user asks you to exit or stop, \
          simply say goodbye and finish your response — the Lucidos engine manages your lifecycle. \
          Running `exit` in bash can crash the host application.{process_safety}{build_slot}",
@@ -890,6 +918,7 @@ pub(super) fn external_repo_system_prompt(
         ask_user_question = ASK_USER_QUESTION_RULE,
         raise_findings = RAISE_USER_REACHING_FINDINGS_RULE,
         background_process = BACKGROUND_PROCESS_RULE,
+        archiving_threads = ARCHIVING_THREADS_RULE,
         process_safety = process_safety_rule(false),
         build_slot = BUILD_SLOT_RULE,
     )
@@ -914,6 +943,7 @@ pub(super) fn external_repo_recovery_system_prompt(repo_name: &str, branch_name:
          {ask_user_question}\n\n\
          {raise_findings}\n\n\
          {background_process}\n\n\
+         {archiving_threads}\n\n\
          CRITICAL: Never run `exit` as a bash command.{process_safety}{build_slot}",
         branch = branch_name,
         repo = repo_name,
@@ -922,6 +952,7 @@ pub(super) fn external_repo_recovery_system_prompt(repo_name: &str, branch_name:
         ask_user_question = ASK_USER_QUESTION_RULE,
         raise_findings = RAISE_USER_REACHING_FINDINGS_RULE,
         background_process = BACKGROUND_PROCESS_RULE,
+        archiving_threads = ARCHIVING_THREADS_RULE,
         process_safety = process_safety_rule(false),
         build_slot = BUILD_SLOT_RULE,
     )
@@ -959,6 +990,7 @@ pub(super) fn recovery_system_prompt(branch_name: &str, workspace_name: &str) ->
          {raise_findings}\n\n\
          {apply_confirmation}\n\n\
          {background_process}\n\n\
+         {archiving_threads}\n\n\
          CRITICAL: Never run `exit` as a bash command.{process_safety}",
         preamble = workspace_preamble(workspace_name),
         branch = branch_name,
@@ -973,6 +1005,7 @@ pub(super) fn recovery_system_prompt(branch_name: &str, workspace_name: &str) ->
         raise_findings = RAISE_USER_REACHING_FINDINGS_RULE,
         apply_confirmation = APPLY_CONFIRMATION_NOTE,
         background_process = BACKGROUND_PROCESS_RULE,
+        archiving_threads = ARCHIVING_THREADS_RULE,
         process_safety = process_safety_rule(true),
     )
 }
@@ -1037,6 +1070,7 @@ pub(super) fn app_worktree_system_prompt(
          {raise_findings}\n\n\
          {apply_confirmation}\n\n\
          {background_process}\n\n\
+         {archiving_threads}\n\n\
          SESSION SUMMARY: Output a structured summary of what was implemented in this \
          session. List each change with a brief description. This is the last thing you \
          output before finishing.\n\n\
@@ -1048,6 +1082,7 @@ pub(super) fn app_worktree_system_prompt(
         raise_findings = RAISE_USER_REACHING_FINDINGS_RULE,
         apply_confirmation = APPLY_CONFIRMATION_NOTE,
         background_process = BACKGROUND_PROCESS_RULE,
+        archiving_threads = ARCHIVING_THREADS_RULE,
         app_knowhow = APP_KNOWHOW_RULE,
         process_safety = process_safety_rule(false),
     )
@@ -1085,6 +1120,7 @@ pub(super) fn app_worktree_recovery_system_prompt(
          {raise_findings}\n\n\
          {apply_confirmation}\n\n\
          {background_process}\n\n\
+         {archiving_threads}\n\n\
          CRITICAL: Never run `exit` as a bash command.{process_safety}",
         restart_not_rejection = RESTART_NOT_REJECTION_RULE,
         commit_cadence = COMMIT_CADENCE_RULE,
@@ -1092,6 +1128,7 @@ pub(super) fn app_worktree_recovery_system_prompt(
         raise_findings = RAISE_USER_REACHING_FINDINGS_RULE,
         apply_confirmation = APPLY_CONFIRMATION_NOTE,
         background_process = BACKGROUND_PROCESS_RULE,
+        archiving_threads = ARCHIVING_THREADS_RULE,
         app_knowhow = APP_KNOWHOW_RULE,
         process_safety = process_safety_rule(false),
     )
@@ -1141,7 +1178,8 @@ pub(crate) fn build_merge_prompt(
     // `cargo`/`tsc`/`scripts` and their session prompt opts out of `/harden`, so
     // the merge prompt must NOT tell them to run `/harden` or the Lucidos-source
     // test suites (mirrors the `is_app()` skip in `change_ops::apply_change` and
-    // `apply_now`). Lucidos-source threads keep the harden + test steps.
+    // `apply_now`). Lucidos-source threads run `/harden`, which also selects
+    // and runs the test suites for what changed.
     if is_app {
         prompt.push_str(&format!(
             "\n\
@@ -1161,9 +1199,8 @@ pub(crate) fn build_merge_prompt(
             1. Run `git merge {} --no-edit` to merge into your branch\n\
             2. If there are merge conflicts, resolve them (read the files, understand both sides, \
                edit to keep both working, `git add` each resolved file, then `git commit --no-edit`)\n\
-            3. Run `/harden` to harden the merged code\n\
-            4. Run `make test` and `cd crates/lucidos-app && npm test` to verify\n\
-            5. Fix any test failures before finishing\n\n\
+            3. Run `/harden` to harden the merged code (it runs the test suites the change needs)\n\
+            4. Fix any failures before finishing\n\n\
             If any conflict is ambiguous, ask the user before proceeding.",
             merge_target,
         ));
@@ -1178,15 +1215,23 @@ pub(crate) fn build_merge_prompt(
 mod tests {
     use super::*;
 
-    /// The Lucidos-source merge prompt keeps the `/harden` + test steps — those
-    /// commands resolve from a Lucidos-source worktree and gate the merge.
+    /// The Lucidos-source merge prompt gates the merge on `/harden`, which picks
+    /// the suites for what changed. A fixed `make test` beside it ran the Rust
+    /// suite for a CSS-only merge, after `/harden` had already tested it.
     #[test]
-    fn merge_prompt_lucidos_source_keeps_harden_and_tests() {
+    fn merge_prompt_lucidos_source_keeps_harden_without_fixed_suites() {
         let prompt = build_merge_prompt("main", None, Some("desc"), false);
         assert!(prompt.contains("git merge main"));
         assert!(prompt.contains("/harden"));
-        assert!(prompt.contains("make test"));
         assert!(prompt.contains("desc"));
+        assert!(
+            !prompt.contains("make test"),
+            "harden selects suites, the prompt must not; got: {prompt}",
+        );
+        assert!(
+            !prompt.contains("npm test"),
+            "harden selects suites, the prompt must not; got: {prompt}",
+        );
     }
 
     /// Regression: the *app* merge prompt must NOT tell the app session to run
@@ -1580,6 +1625,19 @@ mod tests {
         );
     }
 
+    /// When to archive is the agent's call (ADR 0310), so a session that can
+    /// spawn a sub-thread is told the rule. A merge session cannot spawn one.
+    #[test]
+    fn the_archiving_rule_reaches_every_flavor_that_can_spawn() {
+        let full = append_backend_rules(
+            worktree_system_prompt("feature/x", "dev"),
+            crate::runtime::CodingAgent::ClaudeCode,
+        );
+        assert!(full.contains("ARCHIVING THREADS"));
+        assert!(full.contains("lucidos threads archive"));
+        assert!(!conflict_resolution_system_prompt().contains("ARCHIVING THREADS"));
+    }
+
     /// Byte ceiling for each assembled system prompt, measured AFTER
     /// `append_backend_rules` because that is what a session actually receives.
     ///
@@ -1619,8 +1677,19 @@ mod tests {
         // are 549 bytes higher than they were, for `NO_MEMORY_FILES_RULE`.
         // Only these flavors carry it: a fact about THIS repo has to land in
         // git, where Codex and the next session on another machine read it.
-        ("worktree", "claude-code", 26003),
-        ("worktree", "codex", 24126),
+        //
+        // Those four rows and both conflict_resolution rows are 257 bytes
+        // higher for `PERMISSION_ASK_RULE`. The other rows had the slack.
+        //
+        // The same four rows rose again, by 74 (Claude Code) and 91 (Codex),
+        // for `ARCHIVING_THREADS_RULE` (ADR 0310). The other spawning flavors
+        // had the slack; a merge session does not carry it.
+        //
+        // The same four rose by 185 more when `APPLY_RESTART_RULE` learned
+        // that every file a binary embeds requires a restart. An agent that
+        // misses it promises an Apply the running engine never picks up.
+        ("worktree", "claude-code", 26519),
+        ("worktree", "codex", 24659),
         // The four external-repo rows are 569 bytes higher than they were, for
         // `BUILD_SLOT_RULE` (ADR 0070). Only these flavors carry it. A
         // Lucidos-source session is already covered, because `make lint` and
@@ -1628,8 +1697,8 @@ mod tests {
         // an instruction the session cannot use.
         ("external_repo", "claude-code", 18948),
         ("external_repo", "codex", 17071),
-        ("recovery", "claude-code", 24598),
-        ("recovery", "codex", 22721),
+        ("recovery", "claude-code", 25114),
+        ("recovery", "codex", 23254),
         ("external_repo_recovery", "claude-code", 18824),
         ("external_repo_recovery", "codex", 16947),
         ("app_worktree", "claude-code", 21590),
@@ -1640,8 +1709,8 @@ mod tests {
         // `SHOWING_AN_IMAGE_RULE` learned that saving a picture shows nothing
         // either. The other rows had the slack to absorb it. Both rose again,
         // by 384, for its visual-choice clause: a real picture per option.
-        ("conflict_resolution", "claude-code", 6310),
-        ("conflict_resolution", "codex", 7580),
+        ("conflict_resolution", "claude-code", 6567),
+        ("conflict_resolution", "codex", 7837),
     ];
 
     /// Both backends, paired with the label used in `PROMPT_FLAVOR_CEILINGS`.
@@ -1878,6 +1947,26 @@ mod tests {
                         agent.as_str()
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn coding_agent_prompts_ask_for_what_and_why_on_a_command() {
+        // The permission card leads with this line, so every flavor on both
+        // backends must ask the agent to write it for the user.
+        let flavors = all_prompt_flavors();
+        for agent in [
+            crate::runtime::CodingAgent::ClaudeCode,
+            crate::runtime::CodingAgent::Codex,
+        ] {
+            for (label, base) in &flavors {
+                let full = append_backend_rules(base.clone(), agent);
+                assert!(
+                    full.contains("SAY WHAT A COMMAND DOES AND WHY")
+                        && full.contains("Write it for the user: what it does and"),
+                    "{label} ({agent:?}) must ask for what and why on a command",
+                );
             }
         }
     }
@@ -2554,6 +2643,8 @@ mod tests {
             "`packages/lucidos-sdk/`",
             "`crates/lucidos-engine/src/api/sdk_iframe.css`",
             "sdk_iframe_audio.js",
+            "`crates/lucidos-gateway/`",
+            "`crates/lucidos-app/src/styles/global/shared-components.css`",
         ];
         let banned_phrases = [
             "\"no restart required\"",

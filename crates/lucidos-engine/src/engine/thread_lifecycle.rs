@@ -202,16 +202,42 @@ impl ThreadStatus {
     /// Mirrors `as_str` exactly; unknown values fall back to Idle
     /// (defensive: the column is only written by the projection itself, so a
     /// surprise value would indicate manual DB tampering, not a bug to crash on).
-    ///
-    /// `waiting_for_event` is the one value that reaches this from real data
-    /// without being tampering: it was a status until 2026-08-06, when a
-    /// subscription stopped holding the turn (see
-    /// `docs/plans/2026-08-06-every-event-wait-is-detached.md`). The migration
-    /// rewrites the stored rows; the fallback is what makes a row written by an
-    /// older engine against a shared database still read as what it now means,
-    /// which is `Idle`.
     pub fn parse(s: &str) -> Self {
         Self::try_parse(s).unwrap_or(Self::Idle)
+    }
+
+    /// The status as a quoted SQL literal, for status writes and filters
+    /// spliced into query text. Pinned to `as_str` by
+    /// `every_status_sql_literal_quotes_its_wire_text`.
+    pub const fn sql_literal(self) -> &'static str {
+        match self {
+            Self::Idle => "'idle'",
+            Self::Running => "'running'",
+            Self::Waiting => "'waiting'",
+            Self::WaitingForUserAnswer => "'waiting_for_user_answer'",
+            Self::Paused => "'paused'",
+            Self::Failed => "'failed'",
+        }
+    }
+}
+
+impl sqlx::Type<sqlx::Postgres> for ThreadStatus {
+    fn type_info() -> sqlx::postgres::PgTypeInfo {
+        <&str as sqlx::Type<sqlx::Postgres>>::type_info()
+    }
+
+    fn compatible(ty: &sqlx::postgres::PgTypeInfo) -> bool {
+        <&str as sqlx::Type<sqlx::Postgres>>::compatible(ty)
+    }
+}
+
+/// Lenient, like [`ThreadStatus::parse`]: the projection is the column's only
+/// writer.
+impl<'r> sqlx::Decode<'r, sqlx::Postgres> for ThreadStatus {
+    fn decode(value: sqlx::postgres::PgValueRef<'r>) -> Result<Self, sqlx::error::BoxDynError> {
+        Ok(Self::parse(<&str as sqlx::Decode<sqlx::Postgres>>::decode(
+            value,
+        )?))
     }
 }
 
@@ -252,6 +278,9 @@ pub fn classify_event(event_type: &str) -> Option<EventClass> {
         // Metadata
         "ThreadTitleGenerated" | "ThreadTitleRenamed" => EventClass::Metadata,
         "ThreadSaved" | "ThreadUnsaved" => EventClass::Metadata,
+        // A request, not the archive: the resolver's `ThreadArchived` moves
+        // the thread, so this bumps nothing.
+        "ThreadArchiveRequested" => EventClass::Metadata,
         // Queued-message removal is a pure marker over a prior MessageReceived.
         // It must not bump recency, status, section, or message count.
         "QueuedMessageRemoved" => EventClass::Metadata,
@@ -451,6 +480,7 @@ pub fn all_persisted_event_types() -> Vec<&'static str> {
         "ThreadSaved",
         "ThreadUnsaved",
         "ThreadArchived",
+        "ThreadArchiveRequested",
         "ThreadStarted",
         "ThreadDiscarded",
         "ImageUploaded",
@@ -569,7 +599,8 @@ pub struct TransitionResult {
 ///
 /// `is_unattended` is the caller's verdict that nobody is watching this run.
 /// `event_bus_projection_thread.rs` computes it, and only a trigger execution
-/// can qualify: one the user neither opted into reviewing nor followed up on.
+/// can qualify: one the user did not opt into reviewing, follow up on, or pin.
+/// A pinned thread never qualifies, so no automatic archive unpins (ADR 0312).
 /// It suppresses the inbox surfacing an event would otherwise cause, except
 /// for an event in `WAITING_FOR_USER_ANSWER_EVENTS`. The bottom guard below is
 /// the only thing that reads it.
@@ -608,8 +639,12 @@ pub fn resolve_transition(
         },
         // ChangeApplied/ChangeDiscarded: no transition — thread stays in inbox so Archive button appears
         "ChangeApplied" | "ChangeDiscarded" => no_change,
-        // ThreadArchived moves thread to archived (both thread types)
+        // ThreadArchived moves thread to archived (both thread types). Its
+        // projection unpins in the same emit (ADR 0312).
         "ThreadArchived" => to_archived,
+        // A pinned thread is never archived (ADR 0312), so pinning an archived
+        // one brings it back to the inbox.
+        "ThreadSaved" => to_inbox,
         // CC-only events illegal for Chat
         "SessionStarted"
         | "SessionEnded"
@@ -714,8 +749,8 @@ pub fn resolve_transition(
         | "ContinuationStarted"
         | "ThreadTitleGenerated"
         | "ThreadTitleRenamed"
-        | "ThreadSaved"
         | "ThreadUnsaved"
+        | "ThreadArchiveRequested"
         | "TriggerStarted"
         | "TriggerCompleted"
         | "ChangeReverted"
@@ -864,6 +899,14 @@ pub fn resolve_transition(
 
 // ── Display Section Mapping ─────────────────────────────────────────
 
+/// Can a thread hold this `archive_state` and pin at once? A pinned thread is
+/// never archived (ADR 0312). The `thread_summaries` CHECK constraint
+/// `thread_summaries_pinned_is_not_archived` refuses the pair in storage. The
+/// contract fixture skips it, so the TypeScript mirror is never judged on it.
+pub fn is_retention_legal(archive_state: ArchiveState, is_saved: bool) -> bool {
+    !is_saved || archive_state == ArchiveState::Inbox
+}
+
 /// Resolution order:
 ///   1. is_saved                                        → Saved
 ///   2. archive_state == Archived AND nothing still
@@ -871,7 +914,8 @@ pub fn resolve_transition(
 ///   3. otherwise                                       → Current
 ///
 /// Saved is the strongest claim — saving is the user's "I'll manage this
-/// manually" gesture and overrides every other route.
+/// manually" gesture and overrides every other route. A saved thread is always
+/// in the inbox ([`is_retention_legal`]), so rule 1 never hides an archive.
 ///
 /// Everything that isn't saved or archived lands in Current — the live
 /// working set. The former `Active` (running / waiting-on-a-child) and
@@ -1101,7 +1145,9 @@ pub fn is_attention_needing(
 ///   non-empty. DB-derivable, but the frontend feeds the live value from the
 ///   `composeDrafts` signal so the cascade doesn't lag the 250 ms compose
 ///   debounce.
-/// - `is_saved` — `thread_summaries.is_saved`.
+/// - `is_saved`: `thread_summaries.is_saved`. A saved thread is always in the
+///   inbox ([`is_retention_legal`]), so a settled one is offered Archive, which
+///   unpins it.
 /// - `has_live_event_waits`: projection fact (`live_event_wait_count > 0`). It
 ///   means the thread is *parked*: a delivery will wake it on its own branch.
 ///   An active sub-thread is deliberately not an input (ADR 0249).
@@ -1269,8 +1315,6 @@ pub const WAITING_FOR_USER_ANSWER_EVENTS: &[&str] = &[
 pub enum StatusRule {
     /// Set status to a fixed value.
     Set(ThreadStatus),
-    /// Status depends on coding_agent_proposed: first = with changes, second = without.
-    ConditionalCc(ThreadStatus, ThreadStatus),
     /// No status change.
     NoChange,
 }
@@ -1278,14 +1322,11 @@ pub enum StatusRule {
 /// How an event changes CC flags in thread_summaries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CcFlagRule {
-    /// Clear all CC flags (coding_agent_proposed, coding_agent_requires_restart, coding_agent_is_external_repo, coding_agent_applying).
+    /// Clear coding_agent_is_external_repo and coding_agent_has_diff. The
+    /// proposal flags follow the `changes` row the event resolves.
     ClearAll,
-    /// Set coding_agent_proposed = true.
+    /// Write a pending `changes` row, which sets coding_agent_proposed.
     SetChanges,
-    /// Set coding_agent_applying = true.
-    SetApplying,
-    /// Clear coding_agent_applying only.
-    ClearApplying,
     /// Read CC flags from event payload (CodingAgentIdled).
     FromPayload,
     /// No CC flag changes.
@@ -1353,18 +1394,19 @@ pub fn status_transitions() -> Vec<(&'static str, StatusTransition)> {
                 cc_flags: CcFlagRule::None,
             },
         ),
-        // Response completed → depends on pending changes
+        // Response completed → idle. A pending change shows through
+        // `coding_agent_proposed`, never through the status.
         (
             "ResponseGenerated",
             StatusTransition {
-                status: StatusRule::ConditionalCc(ThreadStatus::Waiting, ThreadStatus::Idle),
+                status: StatusRule::Set(ThreadStatus::Idle),
                 cc_flags: CcFlagRule::None,
             },
         ),
         (
             "ResponseCanceled",
             StatusTransition {
-                status: StatusRule::ConditionalCc(ThreadStatus::Waiting, ThreadStatus::Idle),
+                status: StatusRule::Set(ThreadStatus::Idle),
                 cc_flags: CcFlagRule::None,
             },
         ),
@@ -1374,7 +1416,7 @@ pub fn status_transitions() -> Vec<(&'static str, StatusTransition)> {
         (
             "SessionEnded",
             StatusTransition {
-                status: StatusRule::ConditionalCc(ThreadStatus::Waiting, ThreadStatus::Idle),
+                status: StatusRule::Set(ThreadStatus::Idle),
                 cc_flags: CcFlagRule::None,
             },
         ),
@@ -1388,10 +1430,8 @@ pub fn status_transitions() -> Vec<(&'static str, StatusTransition)> {
         // promised to undo and IS genuinely failed; the split lives next to the
         // cause enum, on `AbortCause::promises_auto_resume()`.
         //
-        // A pending change no longer enters into it, which is why this is
-        // `Set` rather than the `ConditionalCc(Waiting, Failed)` it was. The
-        // change surfaces through `coding_agent_proposed`, and the frontend
-        // ranks it against the verdict.
+        // A pending change does not enter into it. The change surfaces through
+        // `coding_agent_proposed`, and the frontend ranks it against the verdict.
         (
             "ResponseAborted",
             StatusTransition {
@@ -1418,20 +1458,19 @@ pub fn status_transitions() -> Vec<(&'static str, StatusTransition)> {
         // 'failed' status (`CASE WHEN status='failed' THEN 'failed' ELSE …`):
         // a failed CC turn emits `ResponseFailed` then this idle in the same
         // turn, and the idle must not downgrade the red error dot. The coarse
-        // `ConditionalCc` model can't express "preserve failed", but the
+        // `StatusRule` model can't express "preserve failed", but the
         // `terminal_events_never_set_running` invariant still holds — see the
         // CodingAgentIdled arm in `event_bus_projection_thread.rs`.
         (
             "CodingAgentIdled",
             StatusTransition {
-                status: StatusRule::ConditionalCc(ThreadStatus::Waiting, ThreadStatus::Idle),
+                status: StatusRule::Set(ThreadStatus::Idle),
                 cc_flags: CcFlagRule::FromPayload,
             },
         ),
         // ChangeProposed only sets CC flags, not status. Status is already correct:
-        // - If CC just idled → CodingAgentIdled already set 'waiting'
+        // - If CC just idled → CodingAgentIdled already set 'idle'
         // - If CC is still running (mid-session commit) → stays 'running' (no premature buttons)
-        // - SessionEnded handles the terminal status via ConditionalCc
         (
             "ChangeProposed",
             StatusTransition {
@@ -1451,20 +1490,6 @@ pub fn status_transitions() -> Vec<(&'static str, StatusTransition)> {
             StatusTransition {
                 status: StatusRule::Set(ThreadStatus::Idle),
                 cc_flags: CcFlagRule::ClearAll,
-            },
-        ),
-        (
-            "MergeConflictDetected",
-            StatusTransition {
-                status: StatusRule::NoChange,
-                cc_flags: CcFlagRule::SetApplying,
-            },
-        ),
-        (
-            "ChangeApplyFailed",
-            StatusTransition {
-                status: StatusRule::NoChange,
-                cc_flags: CcFlagRule::ClearApplying,
             },
         ),
         // Question card raised — pauses the agent (CC or chat), surfaces

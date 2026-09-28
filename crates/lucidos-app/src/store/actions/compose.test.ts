@@ -71,7 +71,6 @@ function makeThread(overrides: MakeThreadOpts = {}): ThreadState {
       codingAgentProposed: false,
       codingAgentRequiresRestart: false,
       codingAgentIsExternalRepo: false,
-      codingAgentApplying: false,
       codingAgentHasDiff: false,
       lastRevivedAt: '',
       messageCount: 0,

@@ -36,6 +36,7 @@ const TYPE_SOURCES: &[(&str, &str)] = &[
     ("AgentParticipant", "engine/thread_events/actor.rs"),
     ("EngineReason", "engine/thread_events/actor.rs"),
     ("MessageOrigin", "engine/thread_events/actor.rs"),
+    ("PluginSetupOccasion", "engine/thread_events/actor.rs"),
     ("ThreadDirection", "engine/thread_events/actor.rs"),
     ("AbortCause", "engine/thread_events/cause.rs"),
     ("CancelCause", "engine/thread_events/cause.rs"),
@@ -110,7 +111,8 @@ const META_FIELDS: &[(&str, &str, &str)] = &[
 /// The wire type has to call them optional even though Rust requires them. See
 /// `strip_context_capture_sections`, `strip_tool_result_content` and
 /// `strip_tool_call_args` in `api/threads/events_snapshot.rs`. A live SSE
-/// emission carries the full value, and a lazy fetch covers the snapshot case.
+/// emission carries the full value, except `CodingAgentToolResult.result`,
+/// which `EmittedEvent::to_sse_json` strips too. A lazy fetch covers the rest.
 ///
 /// The coding-agent rows are the heaviest a workspace holds, and for months
 /// the strips knew only the chat channel's names. `CodingAgentToolCalled.args`

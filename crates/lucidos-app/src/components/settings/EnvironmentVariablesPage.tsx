@@ -6,6 +6,7 @@ import {
   deleteEnvironmentVariable,
 } from '../../store/actions/environmentVariables';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
+import { usePanelRefresh } from '../../hooks/usePanelRefresh';
 import { LoadableError } from '../shared/LoadableError';
 import { ListSkeletonOf, useSkeleton, SkText, SkBlock } from '../shared/Skeleton';
 import { ListRowAddCard } from '../shared/ListRowAddCard';
@@ -147,6 +148,7 @@ function EnvVarRow({ envVar }: { envVar?: EnvironmentVariable }) {
 }
 
 export function EnvironmentVariablesPage() {
+  usePanelRefresh('environment variables', loadEnvironmentVariables);
   const loadable = environmentVariables.value;
   const showLoading = useDelayedLoading(loadable);
 

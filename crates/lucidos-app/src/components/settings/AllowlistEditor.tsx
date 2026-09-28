@@ -4,6 +4,7 @@ import { showToast, showConfirm, permissionGrantsVersion } from '../../store/sto
 import { errorDetail } from '../../utils/errorDetail';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { useVersionedRefresh } from '../../hooks/useVersionedRefresh';
+import { usePanelRefresh } from '../../hooks/usePanelRefresh';
 import { toFailed, loadingIfFresh, type Loadable } from '../../store/types';
 import { LoadableError } from '../shared/LoadableError';
 import { ListSkeletonOf, SkBlock } from '../shared/Skeleton';
@@ -113,12 +114,12 @@ export function AllowlistEditor(props: AllowlistEditorProps) {
     apply();
   }
 
-  function reload() {
+  function reload(): Promise<void> {
     const startedAt = edits.current;
     // Keep the rows through the round-trip, so only a first read shows a
     // loader and an SSE-driven re-read swaps in place.
     setLoadable(loadingIfFresh);
-    props.load()
+    return props.load()
       .then((contents) => {
         // A draft appeared under this read, so the file it holds is older than
         // what is on screen. Dropping the error below is right for the same
@@ -141,7 +142,9 @@ export function AllowlistEditor(props: AllowlistEditorProps) {
   }
 
   // props.load is a stable API-client function; load once on mount.
-  useEffect(reload, []);
+  useEffect(() => { void reload(); }, []);
+  // Paused while dirty, for the reason the SSE re-read below is.
+  usePanelRefresh(props.noun, dirty ? null : reload);
 
   // The agent grants a permission by writing this very file, so the editor has
   // to follow it (ADR 0118). Paused while dirty: unsaved patterns are the

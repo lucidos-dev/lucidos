@@ -25,7 +25,6 @@ const LAPTOP: &str = "device-laptop";
 fn device(id: &str) -> MessageOrigin {
     MessageOrigin::Device {
         device_id: id.to_string(),
-        label: id.to_string(),
     }
 }
 
@@ -57,7 +56,6 @@ async fn message_from(bus: &EventBus, thread_id: Uuid, from: &str) -> Uuid {
             text: "open the changelog".into(),
             user_image_hashes: vec![],
             device_id: Some(from.to_string()),
-            device: None,
             image_description: None,
             parent_thread_id: None,
             spawning_event_id: None,
@@ -200,8 +198,7 @@ async fn the_context_block_names_the_device_navigate_ui_targets() {
     answer_from(&bus, thread_id, LAPTOP).await;
 
     let resumed =
-        build_user_device_preferences_context_for_turn(&pool, thread_id, Some(anchor), None, None)
-            .await;
+        build_user_device_preferences_context_for_turn(&pool, thread_id, Some(anchor), None).await;
     assert!(
         resumed.contains(&format!("- id: {LAPTOP}")),
         "a resume names the answering device: {resumed}"
@@ -214,7 +211,6 @@ async fn the_context_block_names_the_device_navigate_ui_targets() {
         other_thread,
         Some(anchor),
         Some(PHONE),
-        None,
     )
     .await;
     assert!(

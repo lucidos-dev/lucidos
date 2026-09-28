@@ -14,7 +14,7 @@ const WHATS_NEW_CSS = readFileSync(
 );
 
 function notice(id: string, since: string, resolved: boolean): ReleaseNotice {
-  return { id, since, title: `Notice ${id}`, body: 'Do the thing.', resolved };
+  return { id, since, title: `Notice ${id}`, body: 'Do the thing.', resolved, action_deferred: false };
 }
 
 function view(notices: ReleaseNotice[], next_id: string | null): ReleaseNoticeView {
@@ -124,7 +124,7 @@ describe('the answered half', () => {
     expect(SECTION).toContain('useState(false)');
     expect(SECTION).toContain('aria-expanded={showAnswered}');
     expect(SECTION).toContain('Already answered ({answered.length})');
-    expect(SECTION).toContain('{showAnswered && (');
+    expect(SECTION).toContain('<Disclosure open={showAnswered}>');
   });
 
   it('ticks an answered row, so the state is stated and not merely implied', () => {

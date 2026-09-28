@@ -1,5 +1,13 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { linkifyPaths, extractAppTargetFromHref, extractNavTargetFromHref, extractLocalFileTarget, extractBareAppRef, extractTriggerIdFromHref, browserHandlesHref, _resetLinkifyCacheForTesting } from './linkifyPaths';
+import { linkifyPaths, extractAppTargetFromHref, extractNavTargetFromHref, extractLocalFileTarget, extractBareAppRef, extractTriggerIdFromHref, browserHandlesHref, _resetLinkifyCacheForTesting, DATA_PATH_PREFIXES, PROSE_DATA_PATH_PREFIXES } from './linkifyPaths';
+
+describe('DATA_PATH_PREFIXES', () => {
+  // `every_data_prefix_list_matches_the_engine` in the CLI crate pins the full
+  // list to the engine's. The prose list may only narrow it.
+  it('keeps the prose list a subset', () => {
+    for (const p of PROSE_DATA_PATH_PREFIXES) expect(DATA_PATH_PREFIXES).toContain(p);
+  });
+});
 
 describe('extractNavTargetFromHref', () => {
   it.each([
@@ -403,6 +411,13 @@ describe('linkifyPaths', () => {
     expect(result).toContain('data-path="artifacts/foo.md"');
   });
 
+  it('rewrites the link lucidos data write prints for a theme', () => {
+    const html = '<p><a href="themes/harbour.json">harbour.json</a></p>';
+    const result = linkifyPaths(html, [], []);
+    expect(result).toContain('class="artifact-link"');
+    expect(result).toContain('data-path="themes/harbour.json"');
+  });
+
   it('rewrites anchors with bare artifacts/ href (no data/ prefix)', () => {
     const html = '<p><a href="artifacts/foo.md">link</a></p>';
     const result = linkifyPaths(html, ['artifacts/foo.md'], []);
@@ -521,6 +536,9 @@ describe('linkifyPaths', () => {
     ['See user_profile.md for details'],
     // Glued to a preceding word: not a path, and the boundary rejects it.
     ['the xartifacts/foo.md thing'],
+    // Repo paths in a coding-agent thread share a name with a data tree.
+    ['Run scripts/e2e.sh first'],
+    ['Edit config/settings.json by hand'],
   ])('leaves %s alone in prose', (text) => {
     const result = linkifyPaths(`<p>${text}</p>`, [], []);
     expect(result).not.toContain('artifact-link');

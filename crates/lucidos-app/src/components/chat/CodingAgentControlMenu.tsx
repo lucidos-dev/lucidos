@@ -1,5 +1,5 @@
 import { Fragment } from 'preact';
-import { useSignal, useSignalEffect, signal } from '@preact/signals';
+import { useSignal, useSignalEffect, signal, untracked } from '@preact/signals';
 import { useEffect, useRef } from 'preact/hooks';
 import { showToast, codingAgentSessionVersion, codingAgentPendingModel, codingAgentPendingReasoningEffort, scopeToRepoId, engineRestarting } from '../../store/store';
 import { resolveScope, resolveCodingAgent, getComposeSelectionOverride } from '../../store/composeSelections';
@@ -10,8 +10,10 @@ import { fetchCodingAgentCommands, type CodingAgentCommandDef, type CodingAgentC
 import type { CodingAgent } from '../../api/types';
 import { ClaudeIcon, CodexIcon } from '../shared/icons';
 import { focusIfNeeded, isTextInput } from '../../utils/dom';
+import { viewportIsMobile } from '../../utils/viewport';
 import { errorDetail } from '../../utils/errorDetail';
 import { Overlay } from '../shared/Overlay';
+import { anchoredPanelStyle, useAnchoredPosition } from '../../hooks/useAnchoredPopover';
 import { useModelSelection, type ModelSelectionPatch } from '../../hooks/useModelSelection';
 import {
   decodePair, pairLabelOf, type ModelChoice, type ModelRow, type TierChoice,
@@ -20,17 +22,25 @@ import { ControlOptionList, type ControlOption } from '../shared/ControlOptionLi
 import { ModelSelectionPicker } from '../shared/ModelSelectionPicker';
 import { FrontendPreviewSection } from './FrontendPreviewSection';
 import { loadFrontendPreview } from '../../store/actions/frontend-preview';
+import { failedIfFresh, loadedOr, setLoadingIfFresh, type Loadable } from '../../store/types';
 
 // Signal for PromptInput to request opening the menu with a filter
 // Set to a string (the filter text) to open, consumed by the component
 export const codingAgentMenuOpenRequest = signal<string | null>(null);
 
-// Module-level signals — survive unmount/remount so button appears instantly.
+/** What the last commands read answered, kept across remounts. */
+interface CommandCache {
+  control: CodingAgentCommandDef[];
+  builtin: string[];
+  skill: string[];
+  hasActiveSession: boolean;
+}
+
+const NO_COMMANDS: CommandCache = { control: [], builtin: [], skill: [], hasActiveSession: false };
+
+// Module-level: survives unmount/remount so the button appears instantly.
 // Model/effort are NOT cached here — they're per-thread (from backend events).
-const persistedControlCommands = signal<CodingAgentCommandDef[] | null>(null);
-const persistedBuiltinCommands = signal<string[] | null>(null);
-const persistedSkillCommands = signal<string[] | null>(null);
-const persistedHasActiveSession = signal(false);
+const commandCache = signal<Loadable<CommandCache>>({ status: 'not-loaded' });
 
 // Max retries when commands come back empty (CC Init handshake may be in-flight)
 const MAX_EMPTY_RETRIES = 10;
@@ -76,6 +86,7 @@ interface Props {
 
 export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent }: Props) {
   const menuRef = useRef<HTMLDivElement>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
   const filterRef = useRef<HTMLInputElement>(null);
   const optionsListRef = useRef<HTMLDivElement>(null);
   const retryTimerRef = useRef<number | null>(null);
@@ -87,12 +98,13 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
   const activeCommand = useSignal<string | null>(null);
   const paramValues = useSignal<Record<string, string>>({});
   const sending = useSignal(false);
-  const controlCommands = useSignal<CodingAgentCommandDef[]>(persistedControlCommands.peek() ?? []);
-  const builtinCommands = useSignal<string[]>(persistedBuiltinCommands.peek() ?? []);
-  const skillCommands = useSignal<string[]>(persistedSkillCommands.peek() ?? []);
+  const cached = loadedOr(commandCache.peek(), NO_COMMANDS);
+  const controlCommands = useSignal<CodingAgentCommandDef[]>(cached.control);
+  const builtinCommands = useSignal<string[]>(cached.builtin);
+  const skillCommands = useSignal<string[]>(cached.skill);
   const currentModel = useSignal<CodingAgentModelValue | null>(null);
   const currentReasoningEffort = useSignal<CodingAgentReasoningEffort | null>(null);
-  const hasActiveSession = useSignal(persistedHasActiveSession.peek());
+  const hasActiveSession = useSignal(cached.hasActiveSession);
   const filter = useSignal('');
   const highlightIndex = useSignal(-1);
   // Active threads pass `threadId`; the compose view (a focused draft OR the
@@ -164,7 +176,13 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
     }
   }
 
+  /** An action, never a dependency: its response writes `commandCache`, so a
+   *  signal it reads must not subscribe the effect that called it. */
   function loadCommands() {
+    untracked(loadCommandsNow);
+  }
+
+  function loadCommandsNow() {
     clearRetryTimer();
     // Restart can take 30-90s (Rust recompile + boot) — longer than the retry
     // budget. Skip and let the engineRestarting useSignalEffect re-trigger us
@@ -183,13 +201,24 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
     // resolve the backend server-side from thread_summaries.
     const requestCodingAgent = threadId ? undefined : resolvedCodingAgent;
     const seq = ++loadSeqRef.current;
+    setLoadingIfFresh(commandCache);
     fetchCodingAgentCommands(threadId, repoId, requestCodingAgent)
       .then((res: CodingAgentCommandsResponse) => {
         if (seq !== loadSeqRef.current) return;
-        // Always update control commands (always present from backend)
-        persistedControlCommands.value = res.control_commands;
+        // Control commands always update (always present from backend); the
+        // slash lists only once the session has reported real ones.
+        const slashReady = codingAgentSlashCommandsReady(res.builtin_commands, res.skill_commands);
+        const prev = loadedOr(commandCache.value, NO_COMMANDS);
+        commandCache.value = {
+          status: 'loaded',
+          data: {
+            control: res.control_commands,
+            builtin: slashReady ? res.builtin_commands : prev.builtin,
+            skill: slashReady ? res.skill_commands : prev.skill,
+            hasActiveSession: res.has_active_session,
+          },
+        };
         controlCommands.value = res.control_commands;
-        persistedHasActiveSession.value = res.has_active_session;
         hasActiveSession.value = res.has_active_session;
         // Update model/effort from backend response (per-thread, from events).
         // Active session: values come from the live session. No session: values
@@ -210,10 +239,7 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
         }
         currentReasoningEffort.value = (res.current_reasoning_effort as CodingAgentReasoningEffort) ?? null;
         currentModel.value = (res.current_model as CodingAgentModelValue) ?? null;
-        if (codingAgentSlashCommandsReady(res.builtin_commands, res.skill_commands)) {
-          // Got real commands — update persisted state
-          persistedBuiltinCommands.value = res.builtin_commands;
-          persistedSkillCommands.value = res.skill_commands;
+        if (slashReady) {
           builtinCommands.value = res.builtin_commands;
           skillCommands.value = res.skill_commands;
           retryCountRef.current = 0;
@@ -239,6 +265,7 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
         } else {
           // The reason, not a bare generic: this fires only after every retry
           // is spent, so it is the one report the user gets.
+          commandCache.value = failedIfFresh(commandCache.value, err);
           showToast(`Failed to load coding-agent commands: ${errorDetail(err)}`, 'error');
         }
       });
@@ -308,9 +335,7 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
     resolveScope(composeThreadId);
     resolveCodingAgent(composeThreadId);
     if (threadId) return;
-    persistedControlCommands.value = null;
-    persistedBuiltinCommands.value = null;
-    persistedSkillCommands.value = null;
+    commandCache.value = { status: 'not-loaded' };
     controlCommands.value = [];
     builtinCommands.value = [];
     skillCommands.value = [];
@@ -367,9 +392,18 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
   // Scroll highlighted item into view
   useEffect(() => {
     if (highlightIndex.value < 0) return;
-    const el = menuRef.current?.querySelector('.control-item-active');
+    const el = panelRef.current?.querySelector('.control-item-active');
     el?.scrollIntoView({ block: 'nearest' });
   }, [highlightIndex.value]);
+
+  // A phone gives the panel the header palette width (.control-dropdown), so
+  // it centres in the pane rather than hanging from its button.
+  const pos = useAnchoredPosition(
+    open.value ? menuRef.current : null,
+    panelRef,
+    '.thread-pane',
+    viewportIsMobile.value ? 'container-center' : 'start',
+  );
 
   // Focus filter input when dropdown opens (autoFocus is unreliable for conditional rendering)
   useEffect(() => {
@@ -401,7 +435,7 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
     // Blur focused input before DOM removal — ensures focusout fires while
     // elements are still connected, so useHideOnScroll can restore the header.
     const active = document.activeElement as HTMLElement | null;
-    if (active && menuRef.current?.contains(active)) {
+    if (active && (menuRef.current?.contains(active) || panelRef.current?.contains(active))) {
       active.blur();
     }
     open.value = false;
@@ -643,7 +677,12 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
         onClose={close}
         anchor={menuRef.current}
         backdrop={false}
-        panelClass="control-dropdown"
+        // Portaled so it can lay over the header: a mobile swipe pane clips at
+        // its own edge and caps any z-index inside it.
+        portal
+        panelClass="surface-box control-dropdown"
+        panelRef={panelRef}
+        panelStyle={anchoredPanelStyle(pos)}
         panelProps={{ onKeyDown: handleKeyDown }}
       >
           {!cmd ? (

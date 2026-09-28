@@ -860,8 +860,8 @@ impl LucidosEngine {
         };
         let request_event_id = request_event_str.and_then(|s| Uuid::parse_str(&s).ok());
 
-        // Already reverted → idempotent no-op (the ref was deleted on the first
-        // undo; restoring again would error on the missing ref).
+        // Already reverted: a second undo is a no-op, and must not re-apply
+        // the restore over edits made since the first.
         let already: Option<Uuid> = sqlx::query_scalar(
             "SELECT thread_id FROM events \
              WHERE event_type = 'CommandCheckpointReverted' \
@@ -877,40 +877,8 @@ impl LucidosEngine {
             return Ok(());
         }
 
-        let workspace = self.workspace_path();
-        // Put back what the command deleted or overwrote …
-        crate::engine::git_ops::restore_command_checkpoint(workspace, checkpoint_id).await?;
-        // … then drop what it created. `Ok(None)` is a checkpoint with no post
-        // image (written before 2026-08-06, reclaimed by the retention sweep, or
-        // orphaned by a crash), which degrades to the restore-only behaviour
-        // those checkpoints were taken under. A diff error does the same rather
-        // than fail an undo whose restore half already landed.
-        match crate::engine::git_ops::diff_checkpoint_effects(workspace, checkpoint_id).await {
-            Ok(Some(effects)) => {
-                let removed = crate::engine::git_ops::remove_created_files(
-                    workspace,
-                    checkpoint_id,
-                    &effects.created,
-                )
-                .await;
-                crate::log!(
-                    "[CommandGuard] undo {}: restored {} file(s), removed {} of {} created",
-                    checkpoint_id,
-                    effects.restores,
-                    removed,
-                    effects.removes()
-                );
-            }
-            Ok(None) => crate::log!(
-                "[CommandGuard] undo {}: restore only (no post image for this checkpoint)",
-                checkpoint_id
-            ),
-            Err(e) => crate::log!(
-                "[CommandGuard] undo {}: restored, but the created-file diff failed ({})",
-                checkpoint_id,
-                e
-            ),
-        }
+        crate::engine::git_ops::revert_command_effects(self.workspace_path(), checkpoint_id)
+            .await?;
         // The refs deliberately survive: they are what the card's diff viewer
         // reads, and a reverted card must still be able to show what happened.
         // `prune_expired_checkpoints` reclaims them once they age out.

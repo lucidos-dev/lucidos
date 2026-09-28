@@ -21,13 +21,27 @@ use uuid::Uuid;
 /// Starts every refusal, and is how the query knows one was already sent.
 const REFUSAL_MARKER: &str = "Question card not shown.";
 
-/// The tool result a card gets when the agent owes words. Every agent's notes
-/// between tool calls arrive as text, so it asks for prose.
-const CARD_REFUSAL: &str = "Question card not shown. Since the user's last input you \
-     have written them nothing. They read only your text and your cards, never your tool results \
-     or your reasoning. If they asked something, answer it in plain prose now. If you ran tools, \
-     say what you found. Then ask your question again. If there is truly nothing to say, send \
-     the same question again unchanged: it will not be refused twice.";
+/// How far into a result the marker may sit. Codex wraps an MCP result in
+/// JSON, which puts it about 40 chars in. Coding-agent results are stored
+/// whole, so without a bound a grep quoting the marker would read as a refusal.
+const REFUSAL_WINDOW_CHARS: i32 = 200;
+
+/// The tool result a card gets when the agent owes words, after the marker
+/// and the quoted input. Every agent's notes between tool calls arrive as
+/// text, so it asks for prose.
+const OWES_WORDS: &str = "Since the user's last input you have written them nothing. They \
+     read only your text and your cards, never your tool results or your reasoning. If they asked \
+     something, answer it in plain prose now. If you ran tools, say what you found. Then ask your \
+     question again. If there is truly nothing to say, send the same question again unchanged: it \
+     will not be refused twice.";
+
+/// A refusal that quotes the user's input reads like news of a new message.
+/// An agent once asked the user to resend a reply it had already acted on.
+const NOTHING_NEW: &str = "Nothing new has arrived since. This is not a new message. Do not \
+     ask the user to resend anything.";
+
+/// Long enough to recognise the input, short enough to stay one line.
+const QUOTED_INPUT_CHARS: usize = 200;
 
 /// More than any progress note, less than any reply a card could point at.
 /// A model that thinks every turn shows its prose before a tool call only as
@@ -39,22 +53,29 @@ const NOTE_SIZED_CHARS: usize = 600;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Refusal {
     /// A typed reply got no words back, or tool work went unreported.
-    OwesWords,
+    /// `input` is the user's last input, quoted so it never reads as new.
+    OwesWords { input: LastInput },
     /// The card points "above", and all the user read since their last input
     /// is `words`, too short to hold what it points at.
     PointsAboveAtNothing { words: String },
     /// The agent saved these pictures since the user's last input, and
     /// neither its words nor the card show them.
     PictureNotShown { paths: Vec<String> },
-    /// The user typed a reply, and all they got back is progress notes,
+    /// The user typed `reply`, and all they got back is progress notes,
     /// `words`. A note summarizes a draft and never carries it.
-    OnlyNotes { words: String },
+    OnlyNotes { reply: String, words: String },
 }
 
 impl Refusal {
     pub(crate) fn text(&self) -> String {
         match self {
-            Self::OwesWords => CARD_REFUSAL.to_string(),
+            Self::OwesWords { input } => match input.quoted() {
+                Some(quoted) => format!(
+                    "{REFUSAL_MARKER} The user's last input is {quoted}. You already received \
+                     it. {NOTHING_NEW} {OWES_WORDS}"
+                ),
+                None => format!("{REFUSAL_MARKER} {OWES_WORDS}"),
+            },
             Self::PointsAboveAtNothing { words } => {
                 let seen = match words.trim() {
                     "" => "they have read nothing from you".to_string(),
@@ -87,14 +108,16 @@ impl Refusal {
                      again unchanged: it will not be refused twice."
                 )
             }
-            Self::OnlyNotes { words } => format!(
-                "{REFUSAL_MARKER} The user typed you a reply. Since then, all they have read \
-                 from you is this progress note: \"{}\". Before a tool call, your prose reaches \
-                 them only as a short note that summarizes it. So a message, steps or a draft \
-                 you wrote there reached nobody. Write your answer as your reply and end your \
-                 turn with no card: a reply reaches them in full. Or put it on the card itself. \
-                 If the note truly says it all, send the same question again unchanged: it will \
-                 not be refused twice.",
+            Self::OnlyNotes { reply, words } => format!(
+                "{REFUSAL_MARKER} The user's last input is {}. You already received it and \
+                 acted on it. {NOTHING_NEW} Since that reply, all they have read from you is \
+                 this progress note: \"{}\". Before a tool call, your prose reaches them only \
+                 as a short note that summarizes it. So a message, steps or a draft you wrote \
+                 there reached nobody. Write your answer as your reply and end your turn with \
+                 no card: a reply reaches them in full. Or put it on the card itself. If the \
+                 note truly says it all, send the same question again unchanged: it will not \
+                 be refused twice.",
+                typed_reply(reply),
                 words.trim()
             ),
         }
@@ -151,19 +174,25 @@ fn is_shown_picture(path: &str) -> bool {
 
 /// Whether `text` holds a markdown image, `![...](path)`, as the CLI prints
 /// it or with the leading `data/` the renderer also accepts. A bare path or a
-/// plain `[...](path)` link does not draw the picture, so neither counts.
+/// plain `[...](path)` link does not draw the picture, so neither counts. A
+/// fragment such as the CLI's image size hint may follow the path.
 fn shows_picture(text: &str, path: &str) -> bool {
-    let targets = [
-        format!("]({path})"),
-        format!("](<{path}>)"),
-        format!("](data/{path})"),
-        format!("](<data/{path}>)"),
-    ];
-    targets.iter().any(|target| {
-        text.match_indices(target.as_str()).any(|(at, _)| {
-            text[..at]
-                .rfind('[')
-                .is_some_and(|open| text[..open].ends_with('!'))
+    let targets = ["", "data/"].into_iter().flat_map(|prefix| {
+        [
+            (format!("]({prefix}{path}"), ")"),
+            (format!("](<{prefix}{path}"), ">)"),
+        ]
+    });
+    targets.into_iter().any(|(start, close)| {
+        text.match_indices(start.as_str()).any(|(at, _)| {
+            let rest = &text[at + start.len()..];
+            let rest = rest.strip_prefix('#').map_or(rest, |fragment| {
+                fragment.trim_start_matches(|c: char| !matches!(c, ')' | '>') && !c.is_whitespace())
+            });
+            rest.starts_with(close)
+                && text[..at]
+                    .rfind('[')
+                    .is_some_and(|open| text[..open].ends_with('!'))
         })
     })
 }
@@ -180,16 +209,16 @@ fn not_work() -> Vec<&'static str> {
     names
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LastInput {
     /// Nothing the user said is on the thread yet.
     None,
-    /// A message or an injected follow-up.
-    Message,
+    /// A message or an injected follow-up, with its text.
+    Message(String),
     /// A card answer that only picked options.
     Picked,
     /// A card answer carrying text the user typed.
-    Typed,
+    Typed(String),
 }
 
 impl LastInput {
@@ -197,11 +226,35 @@ impl LastInput {
         let typed_text = answer
             .get("text")
             .and_then(|t| t.as_str())
-            .is_some_and(|t| !t.trim().is_empty());
-        match answer.get("kind").and_then(|k| k.as_str()) {
-            Some("FreeText" | "MultiSelected") if typed_text => Self::Typed,
+            .filter(|t| !t.trim().is_empty());
+        match (answer.get("kind").and_then(|k| k.as_str()), typed_text) {
+            (Some("FreeText" | "MultiSelected"), Some(text)) => Self::Typed(text.to_string()),
             _ => Self::Picked,
         }
+    }
+
+    /// The input named and quoted, for a refusal. `None` when it has no text.
+    fn quoted(&self) -> Option<String> {
+        match self {
+            Self::Typed(text) if !text.trim().is_empty() => Some(typed_reply(text)),
+            Self::Message(text) if !text.trim().is_empty() => {
+                Some(format!("this message: \"{}\"", quote(text)))
+            }
+            _ => None,
+        }
+    }
+}
+
+fn typed_reply(text: &str) -> String {
+    format!("the reply they typed into your card: \"{}\"", quote(text))
+}
+
+/// `text` on one line, cut to [`QUOTED_INPUT_CHARS`].
+fn quote(text: &str) -> String {
+    let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    match line.char_indices().nth(QUOTED_INPUT_CHARS) {
+        Some((cut, _)) => format!("{}...", &line[..cut]),
+        None => line,
     }
 }
 
@@ -271,16 +324,19 @@ pub(crate) fn should_refuse(s: &SinceLastInput, card: &str) -> Option<Refusal> {
     if !unseen.is_empty() {
         return Some(Refusal::PictureNotShown { paths: unseen });
     }
-    let unanswered = s.last_input == LastInput::Typed && !s.spoke;
+    let unanswered = matches!(s.last_input, LastInput::Typed(_)) && !s.spoke;
     if unanswered || s.unreported_tool_calls > 0 {
-        return Some(Refusal::OwesWords);
+        return Some(Refusal::OwesWords {
+            input: s.last_input.clone(),
+        });
     }
     let words = s.words.trim();
     if words.chars().count() >= NOTE_SIZED_CHARS {
         return None;
     }
-    if s.last_input == LastInput::Typed && s.round_was_notes {
+    if let (LastInput::Typed(reply), true) = (&s.last_input, s.round_was_notes) {
         return Some(Refusal::OnlyNotes {
+            reply: reply.clone(),
             words: words.to_string(),
         });
     }
@@ -347,6 +403,7 @@ async fn read_since_last_input(
         bool,
         Option<String>,
         Option<serde_json::Value>,
+        Option<String>,
         bool,
         i64,
         bool,
@@ -359,7 +416,8 @@ async fn read_since_last_input(
     let row: Row =
         sqlx::query_as(
             "WITH last_input AS ( \
-               SELECT sequence, created, event_type, payload->'answer' AS answer FROM events \
+               SELECT sequence, created, event_type, payload->'answer' AS answer, \
+                 payload->>'text' AS text FROM events \
                WHERE thread_id = $1 \
                  AND event_type IN ('MessageReceived', 'UserPromptInjected', 'UserQuestionAnswered') \
                ORDER BY sequence DESC LIMIT 1 \
@@ -380,6 +438,7 @@ async fn read_since_last_input(
                  AND starts_with(payload->>'tool_use_id', $2 || '#')), \
                (SELECT event_type FROM last_input), \
                (SELECT answer FROM last_input), \
+               (SELECT text FROM last_input), \
                (SELECT sequence FROM last_words) IS NOT NULL, \
                (SELECT COUNT(*) FROM since \
                  WHERE event_type IN ('ToolCalled', 'CodingAgentToolCalled') \
@@ -387,7 +446,7 @@ async fn read_since_last_input(
                    AND sequence > COALESCE((SELECT sequence FROM last_words), 0)), \
                EXISTS (SELECT 1 FROM since \
                  WHERE event_type IN ('ToolResult', 'CodingAgentToolResult') \
-                   AND strpos(payload->>'result', $4) > 0), \
+                   AND strpos(left(payload->>'result', $5), $4) > 0), \
                (SELECT string_agg(payload->>'text', '' ORDER BY sequence) FROM since \
                  WHERE event_type IN ('TextStreamed', 'CodingAgentTextStreamed')), \
                (SELECT COALESCE(array_agg(DISTINCT payload->'data'->>'path'), '{}') FROM events \
@@ -401,17 +460,27 @@ async fn read_since_last_input(
         .bind(tool_use_id)
         .bind(not_work())
         .bind(REFUSAL_MARKER)
+        .bind(REFUSAL_WINDOW_CHARS)
         .fetch_one(pool)
         .await?;
-    let (already_shown, input_type, answer, spoke, unreported_tool_calls, refused, words, saved) =
-        row;
+    let (
+        already_shown,
+        input_type,
+        answer,
+        message,
+        spoke,
+        unreported_tool_calls,
+        refused,
+        words,
+        saved,
+    ) = row;
     if already_shown {
         return Ok(None);
     }
     let last_input = match (input_type.as_deref(), answer) {
         (None, _) => LastInput::None,
         (Some("UserQuestionAnswered"), Some(answer)) => LastInput::from_answer(&answer),
-        _ => LastInput::Message,
+        _ => LastInput::Message(message.unwrap_or_default()),
     };
     Ok(Some(SinceLastInput {
         last_input,

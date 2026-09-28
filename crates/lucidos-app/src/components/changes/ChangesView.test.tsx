@@ -82,7 +82,7 @@ describe('changeRowActions: never a disabled change action', () => {
       false,
     );
     expect(actions.map((a) => a.kind)).toEqual(['standing']);
-    expect(actions[0]).toMatchObject({ label: 'Apply as it settles' });
+    expect(actions[0]).toMatchObject({ label: 'Apply on settle' });
   });
 
   it('flips the standing face to a cancel once armed', () => {
@@ -90,7 +90,7 @@ describe('changeRowActions: never a disabled change action', () => {
       makeChange({ thread_unsettled: true, thread_settling: true }),
       true,
     );
-    expect(action).toMatchObject({ kind: 'standing', label: '✓ Applying as it settles' });
+    expect(action).toMatchObject({ kind: 'standing', label: '✓ Applying on settle' });
   });
 
   // A question card never settles by itself, so an arm on it drops the moment

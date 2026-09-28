@@ -26,7 +26,6 @@ describe('CC thread follow-up: channel detection', () => {
         codingAgentProposed: false,
         codingAgentRequiresRestart: false,
         codingAgentIsExternalRepo: false,
-        codingAgentApplying: false,
         codingAgentHasDiff: false,
         lastRevivedAt: '',
         state: 'active',
@@ -67,7 +66,6 @@ describe('CC thread follow-up: channel detection', () => {
         codingAgentProposed: false,
         codingAgentRequiresRestart: false,
         codingAgentIsExternalRepo: false,
-        codingAgentApplying: false,
         codingAgentHasDiff: false,
         lastRevivedAt: '',
         state: 'active',
@@ -186,7 +184,7 @@ describe('MUST TEST 1: CC change proposal → apply/discard', () => {
     expect((changeProposed as any).files).toEqual(['src/main.rs']);
   });
 
-  it('ChangeProposed must come before SessionEnded — thread waiting until change resolved', () => {
+  it('ChangeProposed must come before SessionEnded, and the change stays pending until resolved', () => {
     // Regression: backend emitted SessionEnded before ChangeProposed, causing
     // the exchange to stay stuck instead of transitioning to done.
     // After fix, ChangeProposed always precedes SessionEnded.
@@ -205,13 +203,13 @@ describe('MUST TEST 1: CC change proposal → apply/discard', () => {
       { type: 'SessionEnded' },
     ]);
 
-    // Thread stays in Waiting until change is applied/discarded
+    // Status is idle; the pending change shows through codingAgentProposed
     const status = map.get(id)!.meta.status;
-    expect(status).toBe('waiting');
+    expect(status).toBe('idle');
 
     const exchanges = getExchanges(map, id);
     expect(exchanges).toHaveLength(1);
-    // Exchange itself is 'done' (session completed), but thread is waiting for change resolution
+    // Exchange itself is 'done' (session completed), and the change still awaits resolution
     expect(exchangeStatus(exchanges[0], '', true)).toBe('done');
   });
 
@@ -352,10 +350,10 @@ describe('MUST TEST 3: CC follow-up after idle', () => {
 //   1. CC was idle (CodingAgentIdled) → user sends follow-up (MessageReceived)
 //   2. CC starts working → user hits stop → interrupt sent
 //   3. Backend emits ResponseCanceled (not ResponseGenerated) then CodingAgentIdled
-// Result: the follow-up exchange shows "Canceled", but the thread stays "Waiting"
-// because CC is still alive and idle (CodingAgentIdled is the last event).
+// Result: the follow-up exchange shows "Canceled", and the thread settles at idle
+// because CC is still alive at a turn boundary (CodingAgentIdled is the last event).
 describe('Flow: CC follow-up stopped by user', () => {
-  it('interrupted follow-up exchange shows "Canceled", thread stays "Waiting"', () => {
+  it('interrupted follow-up exchange shows "Canceled", thread settles at idle', () => {
     const { map, id } = makeThread();
     insertEvents(map, id, [
       // First exchange: CC completes work and goes idle
@@ -390,8 +388,8 @@ describe('Flow: CC follow-up stopped by user', () => {
     // Third exchange: ResponseCanceled boundary panel — 'Response canceled'
     expect(exchanges[2].userEvent.type).toBe('ResponseCanceled');
 
-    // Thread: still "Waiting" because CC is alive (last event is CodingAgentIdled)
-    expect(map.get(id)!.meta.status).toBe('waiting');
+    // Thread: idle at the turn boundary (last event is CodingAgentIdled)
+    expect(map.get(id)!.meta.status).toBe('idle');
   });
 
   it('interrupted follow-up with no work started also shows "Canceled"', () => {

@@ -30,6 +30,15 @@ export function owedReleaseNotice(): ReleaseNotice | null {
   return view.data.notices.find((n) => n.id === view.data.next_id) ?? null;
 }
 
+/** The action button the modal draws for `notice`, or `null` for none.
+ *
+ *  A deferred action belongs to a later owed notice. The reader runs it once,
+ *  at the end, rather than once per notice. */
+export function modalActionLabel(notice: ReleaseNotice): string | null {
+  if (notice.action_deferred) return null;
+  return notice.action_label ?? null;
+}
+
 /** Should the modal be up?
  *
  *  The App-level slot reads this, so the modal's own chunk is fetched only by a

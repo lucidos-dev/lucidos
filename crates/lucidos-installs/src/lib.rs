@@ -187,18 +187,6 @@ pub struct Inventory {
     pub conflicts: Vec<PortConflict>,
 }
 
-impl Inventory {
-    /// The install configured for `port`, when exactly one is.
-    ///
-    /// Ambiguity is deliberately not resolved. Two installs on one port IS the
-    /// conflict, and answering with either would be a guess.
-    pub fn serving_port(&self, port: u16) -> Option<&Install> {
-        let mut matches = self.installs.iter().filter(|i| i.port == Some(port));
-        let first = matches.next()?;
-        matches.next().is_none().then_some(first)
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Where to look, and who is asking
 // ---------------------------------------------------------------------------

@@ -74,4 +74,4 @@ LUCIDOS_WORKSPACE="$WORKSPACE" cargo run --locked --bin populate_memory
 
 echo ""
 echo "Done! Start the engine with:"
-echo "  ./scripts/start.sh -w $WORKSPACE"
+echo "  ./scripts/web-dev.sh -w $WORKSPACE -b"

@@ -197,17 +197,24 @@ export function anchorTurnIsClamped(el: HTMLElement, anchor: ScrollAnchor): bool
   return anchorTurn(el, anchor)?.hasAttribute?.(HEAD_CLAMPED_ATTR) === true;
 }
 
-function anchorTurn(el: HTMLElement, anchor: ScrollAnchor): HTMLElement | null {
+/** The turn `anchor` names, or null while it is not rendered. */
+export function anchorTurn(el: HTMLElement, anchor: ScrollAnchor): HTMLElement | null {
   if (typeof el.querySelector !== 'function') return null;
   return el.querySelector<HTMLElement>(`[${ANCHOR_ATTR}="${CSS.escape(anchor.eventId)}"]`);
+}
+
+/** The step row `anchor` names, or null while it is not drawn. */
+export function anchorRow(el: HTMLElement, anchor: RowAnchor): HTMLElement | null {
+  if (typeof el.querySelector !== 'function') return null;
+  return el.querySelector<HTMLElement>(`[${ROW_ATTR}="${CSS.escape(anchor.rowEventId)}"]`);
 }
 
 /** The `scrollTop` that puts `anchor`'s row back where it sat, or null while
  *  that row is not drawn. Same contract as `anchorTargetTop`: null is the WAIT
  *  signal, and both terms are measured now. */
 export function rowTargetTop(el: HTMLElement, anchor: RowAnchor): number | null {
-  if (typeof el.getBoundingClientRect !== 'function' || typeof el.querySelector !== 'function') return null;
-  const row = el.querySelector<HTMLElement>(`[${ROW_ATTR}="${CSS.escape(anchor.rowEventId)}"]`);
+  if (typeof el.getBoundingClientRect !== 'function') return null;
+  const row = anchorRow(el, anchor);
   if (!row || typeof row.getBoundingClientRect !== 'function') return null;
   const rect = row.getBoundingClientRect();
   if (rect.height <= 0) return null;

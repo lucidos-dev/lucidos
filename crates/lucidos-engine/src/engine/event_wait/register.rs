@@ -611,8 +611,12 @@ pub(crate) async fn delivered_event_ids(
 /// A wait is exempt only when its delivered event is positively attributed to
 /// another thread. Waiting for seven sessions one by one is progress, however
 /// fast it re-arms. Anything unattributed counts, because the `emit_event` tool
-/// writes domain events with no actor. Reading "unknown" as "someone else" would
-/// let a thread waiting on its own domain event loop unchecked.
+/// records the Lucidos Agent and names no thread. Reading "unknown" as "someone
+/// else" would let a thread waiting on its own domain event loop unchecked.
+///
+/// `payload.actor` is the engine's, never the emitter's: `to_payload` drops a
+/// caller-written one. So a thread cannot name another thread there to escape
+/// this count.
 ///
 /// A free function on the pool rather than a method, so the SQL that carries
 /// the whole cap can be tested against a real database without standing up an

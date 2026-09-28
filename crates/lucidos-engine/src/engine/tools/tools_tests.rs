@@ -843,7 +843,7 @@ fn apply_change_accepts_valid_uuid_trimming_whitespace() {
 // ============================================================================
 
 /// A settling thread gets pointed at the standing apply. The panel calls that
-/// affordance "Apply as it settles". It is the one answer that lands the
+/// affordance "Apply on settle". It is the one answer that lands the
 /// user's change without the agent asking again.
 #[test]
 fn a_refusal_for_a_settling_thread_names_apply_when_settled() {
@@ -1023,4 +1023,53 @@ fn sub_threads_of_resolves_current_and_refuses_the_rest() {
             "{bad} must be refused"
         );
     }
+}
+
+/// An agent's archive names every member it left open, pinned sub-threads
+/// included (ADR 0312). Only a target left open is an error. An already
+/// archived target with a pinned sub-thread left open is a success.
+#[test]
+fn an_agent_archive_names_what_it_left_open() {
+    use crate::api::threads::archive::{ArchiveOutcome, THREAD_PINNED};
+    use crate::engine::tools::describe_agent_archive;
+    let (target, child, pinned) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    let pinned_skip = serde_json::json!({
+        "thread_id": pinned, "reason": THREAD_PINNED, "message": "pinned"
+    });
+
+    let archived = describe_agent_archive(
+        target,
+        ArchiveOutcome {
+            archived: vec![target, child],
+            skipped: vec![pinned_skip.clone()],
+        },
+    )
+    .expect("the target was archived");
+    assert!(archived.starts_with(&format!(
+        "Archived thread {target} and 1 of its sub-threads."
+    )));
+    assert!(archived.contains(THREAD_PINNED), "{archived}");
+
+    let already = describe_agent_archive(
+        target,
+        ArchiveOutcome {
+            archived: vec![],
+            skipped: vec![pinned_skip],
+        },
+    )
+    .expect("an already archived target is not an error");
+    assert!(already.starts_with(&format!("Thread {target} was already archived.")));
+    assert!(already.contains(THREAD_PINNED), "{already}");
+
+    let left_open = describe_agent_archive(
+        target,
+        ArchiveOutcome {
+            archived: vec![],
+            skipped: vec![serde_json::json!({
+                "thread_id": target, "reason": "not_archivable", "message": "changed"
+            })],
+        },
+    )
+    .expect_err("a target left open is an error");
+    assert!(left_open.contains("was left open"), "{left_open}");
 }

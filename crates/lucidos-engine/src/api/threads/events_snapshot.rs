@@ -282,6 +282,26 @@ pub(super) fn strip_inline_image_payloads<E: HasEventPayload>(row: &mut E) {
     strip_app_capture_in_tool_result(row);
 }
 
+/// How many chars of a coding agent's output older rows kept. The writer cut
+/// every result to this length, silently, until it began storing the whole.
+const LEGACY_CODING_AGENT_PREVIEW_CHARS: usize = 200;
+
+/// The note a served old coding-agent result carries, since its row cannot say
+/// it was cut. Hedged: a whole output of exactly 200 chars reads the same.
+pub(super) const LEGACY_PREVIEW_NOTE: &str = "\n\n[Older records kept only the first 200 \
+     characters of a coding agent's output. This one may be cut short.]";
+
+/// Label an old coding-agent result on the way out, never in the store.
+pub(super) fn label_legacy_coding_agent_preview<E: HasEventPayload>(row: &mut E) {
+    if row.event_type() != "CodingAgentToolResult" {
+        return;
+    }
+    rewrite_tool_result(row, |result| {
+        (result.chars().count() == LEGACY_CODING_AGENT_PREVIEW_CHARS)
+            .then(|| format!("{result}{LEGACY_PREVIEW_NOTE}"))
+    });
+}
+
 /// Lazy-fetch payload returned by `GET /events/:event_id/context` — the
 /// pieces of a `ContextCaptured` event that the snapshot endpoint strips.
 #[derive(serde::Serialize)]
@@ -432,8 +452,7 @@ pub(super) fn strip_tool_result_content(row: &mut ThreadEventRow) {
     let Some(obj) = row.payload.as_object_mut() else {
         return;
     };
-    obj.remove("result");
-    obj.insert("result_stripped".to_string(), serde_json::Value::Bool(true));
+    crate::engine::thread_events::ThreadEvent::strip_result_text(obj);
 }
 
 /// Drop `args` from a tool call on the snapshot path. Stamp an
@@ -544,6 +563,7 @@ pub(in crate::api) async fn get_tool_result(
     // multi-megabyte; this endpoint applied no stripping at all until now, so
     // it was the one read path still shipping them in full.
     strip_inline_image_payloads(&mut row);
+    label_legacy_coding_agent_preview(&mut row);
 
     let payload_obj = row.payload.as_object().ok_or_else(|| {
         (

@@ -4,6 +4,14 @@
    after base.css so it inherits base.css's :root tokens + theme blocks, exactly
    as it did when these rules lived inside base.css. */
 @import './global/shared-components.css';
+/* The surface anatomy every toast, popover, menu and dialog is built from.
+   Before every component file, so a surface's own class refines it. */
+@import './global/surface.css';
+/* The anchored popover shell comes BEFORE every surface built on it (the
+   explainer in host-components.css, Waits and Todos in chat.css). Shell and
+   surface classes land on one element at one specificity, so source order is
+   what lets a surface's own width win. */
+@import './global/anchored-popover.css';
 /* Host-chrome components (custom <Dropdown>, send→cancel morph, icon-btn
    header/filter variants, list-row FLIP) — host bundle ONLY, never served to
    apps. Imported AFTER shared-components.css so host rules that extend a shared
@@ -11,3 +19,9 @@
    winning. */
 @import './global/host-components.css';
 @import './global/modal-overlay.css';
+/* Host only: every protected surface is shell DOM, never an app frame. */
+@import './global/protected-surface.css';
+/* Theme parts (ADR 0307): the colour tokens typed with @property, and the
+   protected, reduce and opt-out resets, generated from the part catalog. The
+   engine serves app frames their own copy, theme-parts-frame.css. */
+@import './generated/theme-parts.css';

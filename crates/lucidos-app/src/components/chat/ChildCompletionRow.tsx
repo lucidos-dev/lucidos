@@ -24,12 +24,12 @@ interface Props {
  *
  *  The four appear together in one stream, so each has to be distinguishable
  *  from the other three. `canceled` is warm rather than the cool neutral, so it
- *  is not a near-twin of the untinted `no changes` pill beside it. */
+ *  is not a near-twin of the untinted `no changes` word beside it. */
 const CHILD_STATE: Record<ChildCompletionStatus, { verb: string; label: string; tone: EventRowTone }> = {
-  success: { verb: 'returned', label: 'success', tone: 'good' },
-  failure: { verb: 'failed', label: 'failure', tone: 'bad' },
-  no_changes: { verb: 'returned', label: 'no changes', tone: 'none' },
-  canceled: { verb: 'canceled', label: 'canceled', tone: 'halted' },
+  success: { verb: 'returned', label: 'Success', tone: 'good' },
+  failure: { verb: 'failed', label: 'Failure', tone: 'bad' },
+  no_changes: { verb: 'returned', label: 'No changes', tone: 'none' },
+  canceled: { verb: 'canceled', label: 'Canceled', tone: 'halted' },
 };
 
 /** A link that opens `threadId`, labelled with its title. Routed through
@@ -48,7 +48,7 @@ export function threadLink(threadId: string, title: string | undefined | null) {
 }
 
 /** A child thread reporting back to its parent, as an **event row**. It wears
- *  the marker an event wait, an event wake and a trigger fire use. All of them say
+ *  the card an event wait, an event wake and a trigger fire use. All of them say
  *  one thing: something happened outside this thread. See
  *  `docs/plans/2026-08-10-one-event-row-for-the-transcript.md`.
  *
@@ -63,7 +63,6 @@ export function ChildCompletionRow(props: Props) {
   const below = props.subThreadPendingChanges?.length ?? 0;
   return eventRowBody({
     kind: 'child',
-    mark: 'returned',
     state: props.status,
     role: 'child-completion',
     subject: (
@@ -103,12 +102,11 @@ interface StoppedProps {
 
 /** A user Stop paused one of this thread's children, as an event row
  *  (ADR 0252). It is the parent-side half of a *stopped child*: the child is
- *  alive and waits for the user, and this thread was not woken. So the mark is
- *  the pending one, and the state says who the child is waiting for. */
+ *  alive and waits for the user, and this thread was not woken. So the state
+ *  says who the child is waiting for. */
 export function ChildStoppedRow(props: StoppedProps) {
   return eventRowBody({
     kind: 'child',
-    mark: 'pending',
     state: 'stopped',
     role: 'child-stopped',
     subject: (
@@ -117,18 +115,17 @@ export function ChildStoppedRow(props: StoppedProps) {
         {threadLink(props.childThreadId, props.childThreadTitle)}
       </>
     ),
-    stateLabel: 'waiting for you',
+    stateLabel: 'Waiting for you',
     tone: 'halted',
   });
 }
 
 /** One of this thread's children was moved to top level (ADR 0278). It is no
- *  longer this thread's child and will send it nothing, so the mark says
+ *  longer this thread's child and will send it nothing, so the state says
  *  nothing is coming. */
 export function ChildMovedOutRow(props: StoppedProps) {
   return eventRowBody({
     kind: 'child',
-    mark: 'returned',
     state: 'moved-out',
     role: 'child-moved-out',
     subject: (
@@ -137,7 +134,7 @@ export function ChildMovedOutRow(props: StoppedProps) {
         {threadLink(props.childThreadId, props.childThreadTitle)}
       </>
     ),
-    stateLabel: 'no longer waiting',
+    stateLabel: 'No longer waiting',
     tone: 'none',
   });
 }

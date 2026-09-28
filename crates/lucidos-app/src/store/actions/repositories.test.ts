@@ -42,6 +42,21 @@ describe('refreshRepoView reloads file tree after changes apply', () => {
     expect(repoFiles.value).toEqual({ status: 'loaded', data: ['README.md'] });
   });
 
+  // The panel refresh contract: a pull re-reads the tree already on screen, so
+  // it must not blank to a skeleton while the new listing is in flight.
+  it('keeps the tree on screen while it re-reads', async () => {
+    repoFiles.value = { status: 'loaded', data: ['README.md'] };
+    let release!: (files: string[]) => void;
+    mockListRepoFiles.mockImplementationOnce(() => new Promise((res) => { release = res; }));
+    mockGetRepoChanges.mockResolvedValueOnce({ pending: [], applied: [], has_more: false });
+
+    const refresh = refreshRepoView('repo-1');
+    expect(repoFiles.value).toEqual({ status: 'loaded', data: ['README.md'] });
+    release(['README.md', 'src/main.rs']);
+    await refresh;
+    expect(repoFiles.value).toEqual({ status: 'loaded', data: ['README.md', 'src/main.rs'] });
+  });
+
   it('defaults to "all" view when switching to a repo with pending changes', async () => {
     // The Lucidos repo always has pending changes from Claude Code sessions; switching
     // to it should still land on All Files, not auto-jump to the Changes tab.

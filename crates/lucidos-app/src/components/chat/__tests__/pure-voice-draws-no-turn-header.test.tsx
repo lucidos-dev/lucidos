@@ -7,7 +7,7 @@
  *  What keeps its header is the card the DOER is working under. That one holds
  *  a turn, and the header is what says so.
  */
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
 // @ts-expect-error: same
@@ -18,6 +18,8 @@ import { ResponsePanel } from '../chat-exchange-parts';
 import { vnodeToText } from './vnodeToText';
 import { isSpeechOnlyTurn } from '../../../store/thread-events';
 import type { Exchange, SequencedEvent, StoredEvent } from '../../../store/thread-events';
+
+vi.mock('../../shared/Disclosure', () => import('../../shared/__tests__/disclosureStub'));
 
 const here: string = dirname(fileURLToPath(import.meta.url));
 const chatExchangeSource: string = readFileSync(resolve(here, '../ChatExchange.tsx'), 'utf-8');
@@ -141,11 +143,10 @@ describe('the panel that draws it', () => {
 
   /** The collapse control is in the row that went, so a fold here would have
    *  no way back out. A key left in the store by an earlier fold must not
-   *  strand the words behind a stub nothing can clear. */
+   *  hide the words where nothing can unfold them. */
   it('never folds without a header, whatever the store remembers', () => {
     const drawn = vnodeToText(panel({ headerless: true, collapsed: true }));
     expect(drawn).toContain('Not much at the moment.');
-    expect(drawn).not.toContain('turn-collapsed');
   });
 });
 
@@ -161,8 +162,8 @@ describe('ChatExchange wires it in', () => {
     expect(chatExchangeSource).toMatch(/showResponsePanel\s*=[^;]*speechOnlyHasWords/);
   });
 
-  /** Neither panel draws a `⋯` stub here, so ⌘↑/⌘↓ plus Enter must not offer
-   *  a fold that nothing can undo. */
+  /** Neither panel draws a collapse control here, so ⌘↑/⌘↓ plus Enter must not
+   *  offer a fold that nothing can undo. */
   it('offers the keyboard no fold on such a turn', () => {
     expect(chatExchangeSource).toMatch(/const collapseKind = isSpeechOnly \? undefined/);
   });

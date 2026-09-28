@@ -104,7 +104,14 @@ These fire many times per turn. `CodingAgentTextStreamed` and `CodingAgentThough
 | `CodingAgentTextStreamed` | Each `text` chunk the coding agent streams to the user. One per assistant-message line / paragraph as the backend writes it. Carries what the MODEL wrote, never the backend's own API-error banner: Claude Code reports an upstream drop as a `<synthetic>` assistant message flagged `is_api_error_message`, and the engine skips it, because the identical string returns as the turn's failure reason and is already rendered from `ResponseFailed`. | **no (blocked: per-token streaming)** |
 | `CodingAgentThoughtStreamed` | Each chunk of streamed reasoning/thinking the coding agent produces before its visible output. CC sends it as a `stream_event` `thinking_delta` (text on `delta.thinking`; the persisted CC JSONL keeps only an encrypted signature, so the live stream is the only source); Codex sends `item/reasoning/summaryTextDelta` / `textDelta` (app-server) or a `reasoning` item (exec). Coalesced into a few rows per turn and rendered as the live "Thinking" step's content so a long reasoning pass shows progress. **Live on Codex, dormant on CC.** Codex: both drivers set `model_reasoning_summary=detailed` (codex's default summary mode emits no reasoning notifications at all, verified live on codex-cli 0.142.5), so Codex threads stream reasoning *summaries* into this event. CC: **dormant for the current models, and NOT provider-specific:** Anthropic's `thinking.display` defaults to `omitted` on every current model (Fable 5.1 and 5, Opus 4.7 through 5.5, Sonnet 5), so the `thinking_delta` carries empty text (signature only) and this event does not fire. That holds on **both** Vertex and the first-party Anthropic API (empirically confirmed), and even with `--thinking-display summarized` forced (an upstream Claude Code limitation in its headless `stream-json` path; the raw chain of thought is never returned regardless, since a summary is the most any display mode yields). Switching CC's provider does **not** fix it. See `docs/temporary-measures.md` § `cc-reasoning-dormant`. **Progress notes are separate.** Opus 5.5 and Fable 5.x write a short note between tool calls. The engine's Vertex relay asks for these notes, so they arrive as `CodingAgentTextStreamed`, the agent's visible text, and never as this event. | **no (blocked: per-token streaming)** |
 | `CodingAgentToolCalled` | Each tool invocation the coding agent makes. Carries `name`, `args` (full JSON), optional `description`, and `tool_use_id` so the matching `ToolResult` can be paired even when a permission prompt splits them across exchanges. | yes (use condition) |
-| `CodingAgentToolResult` | The result returned to the coding agent for a prior `ToolCalled`. Carries the same `tool_use_id`. | yes (use condition) |
+| `CodingAgentToolResult` | The result returned to the coding agent for a prior `ToolCalled`. Carries the same `tool_use_id`, and the call's tool as `name`. `result` holds the agent's whole output. See below. | yes (use condition) |
+
+**What `CodingAgentToolResult` stores.** The agent runs each tool in its own process and reads the full output there. Lucidos parses a copy of the agent's output stream to draw the steps, and this event records that copy.
+
+- **`result` is the whole output.** NUL bytes are removed and Postgres passwords are masked, as they are in the call's `args`. So a `result` condition matches anywhere in the output.
+- **Older rows hold at most 200 chars.** Until full storage, the writer silently cut every result to its first 200 chars. `GET /api/v1/events/:event_id/tool-result` serves an exactly-200-char result with a note saying it may be cut short. The stored row is not rewritten.
+- **`name` is the call's tool name**, such as `Bash`. It is empty on older rows, and on a result whose call the session never saw.
+- **Neither the snapshot nor the live stream carries `result`.** Both stamp `result_stripped: true`, and the step detail fetches the text by event id. An SDK `lucidos.sse` listener sees the stripped shape too.
 
 ### Transient — never persisted, broadcast over SSE only
 
@@ -188,6 +195,12 @@ All fields except `coding_agent` are `#[serde(skip_serializing_if = ...)]`-gated
 | `options` | `Vec<QuestionOption>` (default `[]`) | Each option is `{ id, label, description?, preview? }`. `preview` is markdown the card shows under the option: a picture or a short text sample. It comes from the option's `preview` field in the tool input, which Claude Code's native tool has. Empty for free-text-only prompts. **There is no text-entry option kind**: picking an option resolves to its `label`. So an agent-authored "Other, I'll type it" row hands that literal phrase back as the answer. The card names both real escapes itself: typing in the prompt arrives as a `FreeText` answer, and Cancel arrives as `Canceled`. Every question tool description forbids authoring an "Other" option. |
 | `worktree_path` | `Option<String>` | The CC worktree at intercept. Required for `--resume` to find the session JSONL (CC keys session storage by CWD). `None` for chat-channel questions and when the request came in without a worktree context. |
 | `multi_select` | `bool` (default `false`) | `true` when the user may pick multiple options. |
+
+The engine adds one thing to the tool input before it emits the event. Each
+workspace picture in `question`, `description` or `preview` gets an *image size
+hint* (`system-knowhow/glossary.md`), so `![A](artifacts/approach-a.png)`
+arrives as `![A](artifacts/approach-a.png#1600x1200)`. A trigger `condition`
+matching those fields sees the hint.
 
 ### `UserQuestionAnswered`
 
@@ -283,6 +296,8 @@ Used by the MCP permission-prompt subprocess (the `mcp__permission-prompt` tool 
 ```
 
 `summary` names up to three paths and then appends `+N more`. A trigger condition matching on it should key off `tool_name` and `input.changes[].path`, not the prose. If the `changes` list was never announced the `changes` key is absent and the summary falls back to `reason` / `grant_root` / the bare tool name, which is what the card degrades to as well.
+
+**The agent's own words.** A shell command carries the agent's one line on what it does and why. Claude Code sends it as `input.description` on `Bash`, and Codex as `input.reason` on `command_execution`. The card leads with that line and shows the full command under it. A notification built from this event should prefer it too, since `summary` carries the whole command. Either field can be absent, so fall back to `summary`.
 
 **Supersession.** If the user types a new message while a permission card is still pending, the engine resolves the card as `allowed: false` (`reason: "Superseded by a new message"`) before routing the typed text to the coding agent as a normal follow-up — so the buttons stop dangling instead of leaving the thread stuck on `waiting_for_user_answer` while the coding agent moves on. This mirrors the AskUserQuestion free-form path, where typing becomes a `FreeText` answer; permissions have no "answer", so the pending request is denied instead. Emitted from `resolve_pending_permissions_as_superseded` (`engine/cc_permission.rs`).
 

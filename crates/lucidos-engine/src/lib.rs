@@ -116,11 +116,14 @@ pub mod __wasm_test_internals {
         CredentialHandleConfig, LayerConfig, PipelineConfig, StaticKind,
     };
     pub use crate::api::proxy_token_cache::ProxyTokenCache;
-    pub use crate::api::proxy_wasm_host::{register_host_imports, HostState};
+    pub use crate::api::proxy_wasm_host::{
+        register_host_imports, HostState, LogBudget, LOG_BYTES_PER_INVOCATION,
+        LOG_LINES_PER_INVOCATION,
+    };
     pub use crate::api::proxy_wasm_signer::{
         build_wasmtime_engine, load_wasm_modules, BodyMode, CompiledModule, CredentialHandle,
-        SecretResolver, SignInput, SignInputBody, SignOutput, WasmManifest, WasmSignerLayer,
-        CAP_READ_PRIOR_HEADERS, CAP_REPLACE_BODY, WITHHELD_HEADER_VALUE,
+        SecretResolver, SignInput, SignInputBody, SignOutput, SignerLimits, WasmManifest,
+        WasmSignerLayer, CAP_READ_PRIOR_HEADERS, CAP_REPLACE_BODY, WITHHELD_HEADER_VALUE,
     };
     pub use wasmtime::Engine;
 

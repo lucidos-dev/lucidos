@@ -11,10 +11,11 @@ import {
 } from '../../store/store';
 import type { InstalledPlugin, Loadable, MarketplacePlugin } from '../../store/types';
 import { useDelayedFlag } from '../../hooks/useDelayedLoading';
+import { usePanelRefresh } from '../../hooks/usePanelRefresh';
 import { LoadableError } from '../shared/LoadableError';
-import { ListSkeletonOf, useSkeleton, SkText, SkBlock } from '../shared/Skeleton';
+import { ListSkeletonOf, useSkeleton, SkText, SkBlock, SkeletonProvider } from '../shared/Skeleton';
 import { LoadingFade } from '../shared/LoadingFade';
-import { refreshPluginCatalog } from '../../store/actions/plugin-marketplaces';
+import { refreshPluginCatalog, rescanPluginCatalogAndSettle } from '../../store/actions/plugin-marketplaces';
 import { installMarketplacePlugin } from '../../store/actions/plugin-install';
 import { loadInstalledPlugins } from '../../store/actions/plugins';
 import { openAppById } from '../../store/actions/apps';
@@ -50,7 +51,7 @@ function actionLabel(plugin: MarketplacePlugin): string {
  *  - not installed → Install (or Update for an out-of-date install)
  *  - installed with an unfinished setup thread → Setup (opens that thread)
  *  - installed and setup done (or none) with an app → Open (launches it)
- *  - installed with nothing to open → a disabled "Installed" label
+ *  - installed with nothing to open → no button; the status badge says it
  *  An out-of-date install always shows Update first, before Setup/Open. */
 type CardAction =
   | { kind: 'install'; label: string }
@@ -71,35 +72,47 @@ function fileCountLabel(count: number): string {
   return `${count} ${count === 1 ? 'file' : 'files'}`;
 }
 
-/** Widths of the placeholder pills in the loading skeleton — sized to mirror a
+/** Widths of the placeholder pills in the loading skeleton, one per label of a
  *  FULLY-populated category bar (`All` + the ~9 controlled-vocabulary categories,
- *  see `core/plugins.rs` PLUGIN_CATEGORIES), varied per the real labels'
- *  approximate widths. The count matters as much as the widths: a populated
- *  catalog's real bar wraps to ~2 lines in a typical pane (more at a larger UI
- *  scale), so the skeleton must reserve ~2 lines too — six narrow pills fit on
- *  one line and let the list jump down a line when the real bar lands. */
+ *  see `core/plugins.rs` PLUGIN_CATEGORIES). The skeleton uses the real bar's
+ *  class, so it scrolls on touch and wraps on a fine pointer exactly as the
+ *  real bar does. */
 const SKELETON_PILL_WIDTHS = [
-  '2.25rem', // All
-  '6.5rem', // Productivity
-  '4.25rem', // Finance
-  '3.75rem', // Health
-  '7.75rem', // Developer tools
-  '3rem', // Data
-  '7rem', // Communication
-  '5.5rem', // Automation
-  '5rem', // Lifestyle
-  '4.75rem', // Research
+  '1rem', // All
+  '5.25rem', // Productivity
+  '3rem', // Finance
+  '2.5rem', // Health
+  '6.5rem', // Developer tools
+  '1.75rem', // Data
+  '5.75rem', // Communication
+  '4.25rem', // Automation
+  '3.75rem', // Lifestyle
+  '3.5rem', // Research
 ];
+
+/** One category filter. Inside a `SkeletonProvider` it draws the pill's own
+ *  box around a shimmering label `w` wide. */
+function CategoryPill({ label, active = false, onClick, w }: {
+  label?: string;
+  active?: boolean;
+  onClick?: () => void;
+  w?: string;
+}) {
+  if (useSkeleton()) {
+    return <span class="app-store-filter-pill" aria-hidden="true"><SkText w={w} /></span>;
+  }
+  return (
+    <button type="button" class={`app-store-filter-pill${active ? ' active' : ''}`} onClick={onClick}>
+      {label}
+    </button>
+  );
+}
 
 /** Loading placeholder that MIRRORS the loaded layout (category-pills bar above
  *  the list) so the list rows don't jump down when the catalog lands and the
- *  real `.app-store-filter-pills` bar appears. The pills bar is sized to a fully
- *  populated catalog (~2 lines, see SKELETON_PILL_WIDTHS) because that is the
- *  height the real bar settles at — reserving only one line let the rows shift
- *  down a line on a cold reload once the real (wrapping) bar rendered. A sparse
- *  catalog now settles UP by at most a line, far less jarring than the old
- *  always-downward shift; a rare category-less load has no real bar at all and
- *  still settles up by the whole bar (accepted — the common case is populated).
+ *  real `.app-store-filter-pills` bar appears. On touch the bar is one line, so
+ *  only a category-less load settles up. On a fine pointer the bar wraps, so a
+ *  catalog with fewer categories than the skeleton can settle up by a line.
  *  Pure/hookless so the unit test can inspect its vnode tree (`ListSkeletonOf`
  *  stays an uninvoked child). Only ever rendered inside `<LoadingFade>`, whose
  *  wrapper is already `aria-hidden`, so no aria treatment is needed here.
@@ -107,11 +120,11 @@ const SKELETON_PILL_WIDTHS = [
 export function StoreTabSkeleton() {
   return (
     <div class="app-store">
-      <div class="app-store-filter-pills">
-        {SKELETON_PILL_WIDTHS.map((w, i) => (
-          <div class="app-store-category-pill-skeleton" style={{ width: w }} key={i} />
-        ))}
-      </div>
+      <SkeletonProvider>
+        <div class="app-store-filter-pills">
+          {SKELETON_PILL_WIDTHS.map((w, i) => <CategoryPill w={w} key={i} />)}
+        </div>
+      </SkeletonProvider>
       <ListSkeletonOf fill containerClass="list-rows app-store-plugins" row={() => <PluginStoreRow />} />
     </div>
   );
@@ -307,6 +320,15 @@ export function emptyCatalogMessage(scanning: boolean): string {
   return scanning ? 'Scanning marketplaces…' : 'No plugins found.';
 }
 
+/** The panel's refresh. The catalog half asks for a fresh scan, as the
+ *  "Updated …" control does: the mount's re-read returns the cached scan. */
+function refreshPluginsPanel(): Promise<unknown> {
+  return Promise.all([
+    rescanPluginCatalogAndSettle(),
+    loadInstalledPlugins(),
+  ]);
+}
+
 export function StoreTab() {
   const installedOnly = pluginsInstalledOnly.value;
   const catLoadable = marketplaceCatalog.value;
@@ -350,6 +372,7 @@ export function StoreTab() {
     void refreshPluginCatalog();
     void loadInstalledPlugins();
   }, []);
+  usePanelRefresh('plugins', refreshPluginsPanel);
 
   // Notification deep-link (navigate_ui target `plugins`): once the list has
   // rendered, scroll the targeted plugin's row into view and pulse it. The
@@ -498,22 +521,14 @@ function StoreTabLoaded({
     <div class="app-store">
       {availableCategories.length > 0 && (
         <div class="app-store-filter-pills" role="group" aria-label="Filter by category">
-          <button
-            type="button"
-            class={`app-store-filter-pill${!activeCategory ? ' active' : ''}`}
-            onClick={() => setSelectedCategory(null)}
-          >
-            All
-          </button>
+          <CategoryPill label="All" active={!activeCategory} onClick={() => setSelectedCategory(null)} />
           {availableCategories.map((c) => (
-            <button
-              type="button"
+            <CategoryPill
               key={c}
-              class={`app-store-filter-pill${activeCategory === c ? ' active' : ''}`}
+              label={categoryLabel(c)}
+              active={activeCategory === c}
               onClick={() => setSelectedCategory(activeCategory === c ? null : c)}
-            >
-              {categoryLabel(c)}
-            </button>
+            />
           ))}
         </div>
       )}
@@ -572,31 +587,24 @@ function PluginStoreRow({ plugin, installingSource, stageInstall }: Partial<Plug
   const isInstalled = !!plugin && plugin.status !== 'available';
   const busy = !!plugin && installingSource === plugin.source;
   const action = plugin ? cardPrimaryAction(plugin) : { kind: 'none' as const };
-  let label: string;
-  let onPrimary: (() => void) | undefined;
-  let primaryDisabled = busy;
+  let primary: { label: string; onClick: () => void } | null = null;
   switch (action.kind) {
     case 'install':
-      label = action.label;
-      onPrimary = () => plugin && void stageInstall?.(plugin);
+      primary = { label: action.label, onClick: () => plugin && void stageInstall?.(plugin) };
       break;
     case 'setup':
-      label = 'Setup';
       // The catalog surfaces this button for a present-or-queued setup thread;
       // a gone one resolves to Open. A QUEUED one has no thread_summaries row
       // at all. So a bootstrap fetch would 404, and a plain focusThread would
       // be undone by ThreadView's stale-pointer cleanup and land on the compose
       // view. `focusSpawnedThread` holds the focus until the row arrives,
       // exactly as the confirm path in plugin-install.ts does.
-      onPrimary = () => focusSpawnedThread(action.threadId);
+      primary = { label: 'Setup', onClick: () => focusSpawnedThread(action.threadId) };
       break;
     case 'open':
-      label = 'Open';
-      onPrimary = () => void openAppById(action.appId);
+      primary = { label: 'Open', onClick: () => void openAppById(action.appId) };
       break;
     case 'none':
-      label = 'Installed';
-      primaryDisabled = true;
       break;
   }
   return (
@@ -621,7 +629,7 @@ function PluginStoreRow({ plugin, installingSource, stageInstall }: Partial<Plug
           )}
         </div>
         {(sk || plugin?.description) && (
-          <SkText class="list-row-details" as="div" w="18rem">{plugin?.description}</SkText>
+          <SkText class="app-store-plugin-description" as="div" w="18rem">{plugin?.description}</SkText>
         )}
         <div class="app-store-plugin-meta">
           {(sk || plugin?.marketplace_name) && (
@@ -647,23 +655,20 @@ function PluginStoreRow({ plugin, installingSource, stageInstall }: Partial<Plug
         )}
         {isInstalled && (
           <button
-            class="action-btn action-btn-danger"
+            class="action-btn action-btn-secondary"
             type="button"
             onClick={() => plugin && void uninstallMarketplacePlugin(plugin)}
           >
             Uninstall
           </button>
         )}
-        <SkBlock w="4.5rem" h="2rem" round>
-          <button
-            class="action-btn"
-            type="button"
-            disabled={primaryDisabled}
-            onClick={onPrimary}
-          >
-            {busy ? 'Staging' : label}
-          </button>
-        </SkBlock>
+        {(sk || primary) && (
+          <SkBlock w="4.5rem" h="2rem" round>
+            <button class="action-btn" type="button" disabled={busy} onClick={primary?.onClick}>
+              {busy ? 'Staging' : primary?.label}
+            </button>
+          </SkBlock>
+        )}
       </div>
     </div>
   );

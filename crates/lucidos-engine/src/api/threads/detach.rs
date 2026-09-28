@@ -60,7 +60,7 @@ pub(in crate::api) async fn detach_thread(
         } => DetachCaller::Agent(source_thread_id),
         SubprocessOrigin::NotSubprocess => DetachCaller::User,
     };
-    let actor = crate::api::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    let actor = crate::api::actor::user_actor(&headers, None);
 
     state
         .engine

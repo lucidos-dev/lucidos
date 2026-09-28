@@ -57,6 +57,16 @@ answers an all-zero rect, which reads as content at the very top of the thread.
 An unfold changes nothing above its own turn, so the freeze has already left the
 reader right and there is nothing to write.
 
+> **Amended: the stub presses the header control.** The fold now rolls through
+> `<Disclosure>`, and the stub stays mounted, sliding away, through its exit.
+> Anchored on itself, the correction chased it and moved the reader. So a click
+> on the stub presses the turn's header collapse control, which holds still. No
+> press detaches its own target now; the detached-anchor branch stays as a guard.
+>
+> **Amended again: the stub is gone.** A fold draws nothing under the header,
+> and the collapse control's plus lights in the accent instead. The header
+> control is the only way back out of a fold, so every press anchors on it.
+
 **A clamp debt names the element it was measured for.** Collapsing to a
 transcript shorter than its pane has to clamp. The deficit is remembered, so the
 reverse press lands the reader back where they started. Keyed on the container

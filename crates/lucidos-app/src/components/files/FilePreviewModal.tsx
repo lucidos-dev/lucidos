@@ -7,7 +7,8 @@ import { closeFilePreviewModal, escalateFilePreviewModal } from '../../store/act
 import { useHidePanelWebviewWhile } from '../../hooks/useHidePanelWebviewWhile';
 import { viewportIsMobile } from '../../utils/viewport';
 import { Overlay } from '../shared/Overlay';
-import { CloseIcon, WrapTextIcon } from '../shared/icons';
+import { WrapTextIcon } from '../shared/icons';
+import { SurfaceHead } from '../shared/Surface';
 import { trapDialogTab } from '../shared/dialogFocusTrap';
 import { FilePreviewInline } from './FilePreviewInline';
 import { RepoFileContent, previewGitRef } from './RepoFilePreview';
@@ -53,7 +54,7 @@ export function filePreviewModalTitle(path: string, range: LineRange): { name: s
  *  Pure and exported so the choice is testable without a DOM. */
 export function filePreviewModalBody(path: string, layout: 'desktop' | 'mobile'): VNode {
   const repo = parseRepoPath(path);
-  if (!repo) return <FilePreviewInline path={path} layout={layout} />;
+  if (!repo) return <FilePreviewInline path={path} layout={layout} modal />;
   return (
     <RepoFileContent
       repoId={repo.repoId}
@@ -78,7 +79,6 @@ export function filePreviewModalBody(path: string, layout: 'desktop' | 'mobile')
 export function FilePreviewModal() {
   const state = filePreviewModal.value;
   const panelRef = useRef<HTMLDivElement>(null);
-  const closeRef = useRef<HTMLButtonElement>(null);
   // `undefined` means "not captured yet"; `null` is a legitimate overlay value
   // (no panel overlay), so the two must stay distinguishable.
   const openedOver = useRef<PanelOverlay | undefined>(undefined);
@@ -92,7 +92,7 @@ export function FilePreviewModal() {
   useEffect(() => {
     if (!state) { openedOver.current = undefined; return; }
     openedOver.current = panelOverlay.peek();
-    closeRef.current?.focus();
+    panelRef.current?.querySelector<HTMLButtonElement>('[data-role="surface-close"]')?.focus();
   }, [state?.id]);
 
   // A link inside the previewed document can route the shell out from under the
@@ -145,43 +145,40 @@ export function FilePreviewModal() {
       // options object, and a handler bound directly would hand it the DOM event
       // as those options.
       onClose={() => closeFilePreviewModal()}
-      panelClass="file-preview-modal"
+      panelClass="surface surface-raised file-preview-modal"
       panelRole="dialog"
       ariaModal
       dataRole="file-preview-modal"
       panelRef={panelRef}
     >
-      <div class="file-preview-modal-header">
-        <div class="file-preview-modal-title">
-          <span class="file-preview-modal-name">{name}</span>
-          <span class="file-preview-modal-detail">{detail}</span>
-        </div>
-        <div class="file-preview-modal-actions">
-          {canWrap && (
-            <button
-              class={`icon-btn file-preview-wrap-toggle${wrapOn ? ' filter-active' : ''}`}
-              aria-label={wrapOn ? 'Stop wrapping long lines' : 'Wrap long lines'}
-              aria-pressed={wrapOn}
-              data-tooltip={wrapOn ? 'Stop wrapping long lines' : 'Wrap long lines'}
-              onClick={() => { filePreviewWrap.value = !wrapOn; }}
-            >
-              <WrapTextIcon />
+      <SurfaceHead
+        title={
+          <>
+            <span class="file-preview-modal-name">{name}</span>
+            <span class="file-preview-modal-detail">{detail}</span>
+          </>
+        }
+        actions={
+          <>
+            {canWrap && (
+              <button
+                class={`icon-btn file-preview-wrap-toggle${wrapOn ? ' filter-active' : ''}`}
+                aria-label={wrapOn ? 'Stop wrapping long lines' : 'Wrap long lines'}
+                aria-pressed={wrapOn}
+                data-tooltip={wrapOn ? 'Stop wrapping long lines' : 'Wrap long lines'}
+                onClick={() => { filePreviewWrap.value = !wrapOn; }}
+              >
+                <WrapTextIcon />
+              </button>
+            )}
+            <button class="accent-link" onClick={escalateFilePreviewModal}>
+              Open in Files
             </button>
-          )}
-          <button class="accent-link" onClick={escalateFilePreviewModal}>
-            Open in Files
-          </button>
-          <button
-            ref={closeRef}
-            class="icon-btn"
-            aria-label="Close preview"
-            data-tooltip="Close preview"
-            onClick={() => closeFilePreviewModal()}
-          >
-            <CloseIcon />
-          </button>
-        </div>
-      </div>
+          </>
+        }
+        onClose={() => closeFilePreviewModal()}
+        closeLabel="Close preview"
+      />
       {/* A declared scroll region, mirroring `.content-pane-body`. The modal's
           Tab trap cycles its own controls, and `tabIndex={0}` puts the body
           among them. So a keyboard user reaches it and scrolls a long preview.

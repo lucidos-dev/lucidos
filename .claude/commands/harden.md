@@ -14,6 +14,64 @@ in `$PWD`. `FRESH` means HEAD still matches the SHA recorded by the last
 
 If the output is `ALREADY_HARDENED`, inform the user: "Already hardened — skipping." and stop. Do NOT re-run hardening.
 
+## Phase 0.4: Detect a Merge-Only or Incremental Diff
+
+A branch hardened once needs only its new lines reviewed, not its whole diff
+again. The earlier run already reviewed every line the branch wrote
+(ADR 0295, ADR 0315).
+
+```bash
+./scripts/harden-scope.sh "$(lucidos hardened sha 2>/dev/null)"
+```
+
+The first line is the answer:
+
+- `MERGE_ONLY`: every commit since the hardened SHA that is not on `main` is
+  a merge of `main`.
+- `INCREMENTAL`: the branch also has commits of its own since then, such as a
+  fix made during a merge session.
+- `FULL <reason>`: go on to Phase 0.5 as usual.
+
+The lines after it name what to review: `commit <sha>` (own commits, oldest
+first), `merge <sha>`, `overlap <path>`, and `codex-base <sha>`. The review
+covers these inputs, and nothing else:
+
+- **The new lines:** one file holding each commit's patch and each merge's
+  resolution. `git show --remerge-diff` shows what the resolver wrote against
+  git's own conflicted result, including edits to files that merged clean.
+
+  ```bash
+  mkdir -p .lucidos && {
+    for c in <each commit sha>; do git show --format='commit %H %s' "$c"; done
+    for m in <each merge sha>; do git show --remerge-diff --format= "$m"; done
+  } > .lucidos/review-target.diff
+  ```
+- **The overlap:** each `overlap` path is a file the branch changed that a
+  merge also changed. Read the branch's change there against main's new code.
+  A semantic conflict can merge clean.
+
+The phases then run as follows:
+
+- Phases 0.5 and 0.6 are skipped. Phase 0.75 is skipped for `MERGE_ONLY`,
+  which the earlier run settled. For `INCREMENTAL` it checks the new commits.
+- Phase 1 kickoff starts the early suite run unchanged. The Codex review runs
+  only when a `codex-base` line is printed, against that base. Otherwise it is
+  skipped, since its range would hold all of main's new code.
+- Phase 1 runs `code-review` with `.lucidos/review-target.diff` as its
+  target. An empty file means a clean merge with nothing resolved: note
+  "Phase 1: clean merge" and move on.
+- Phase 2 runs all three angles **inline**, as the small-diff tier does. Bug
+  detection and compliance read the review target. The regression angle reads
+  the overlap paths and each commit's files.
+- Phase 2.5 gates on the review target. Phase 3 validates inline.
+- **Phases 4, 4.5 and 5 run unchanged.** Every suite `harden-suites.sh`
+  selects for the branch still runs, because a merge that mixes sides needs
+  the full suite (`CLAUDE.md`).
+
+**Re-run the check on every iteration.** A Phase 4 fix is a new commit, and
+the marker moves only in Phase 5. So after a merge-only pass, the next pass
+answers `INCREMENTAL` and reviews the fix together with the merges.
+
 ## Phase 0.5: Detect Docs-Only Diff
 
 Run `git diff main...HEAD --name-only`. If every changed file ends in `.md` or `.txt`, the diff is **docs-only**. In docs-only mode:
@@ -22,9 +80,45 @@ Run `git diff main...HEAD --name-only`. If every changed file ends in `.md` or `
 - Skip Phase 2 Agent 1 (no code logic to bug-check).
 - Phase 2 Agents 2 and 3 (compliance, regression), Phase 3, Phase 4, Phase 5 still run.
 - Phase 2.5 auto-skips for docs-only via its own packaged-runtime gate.
-- Phase 4.5 skips the suites for docs-only, with ONE carve-out: a diff touching `system-knowhow/**` still runs the always-loaded budget tests. See its test-selection table.
+- Phase 4.5 still runs `scripts/harden-suites.sh`, which picks the suites a docs-only diff needs. A `system-knowhow/**` edit runs the always-loaded budget tests, and a compiled-in file such as `CHANGELOG.md` runs the Rust suite.
 
 Do NOT extend this fast path to "string-only" or "comment-only" `.rs` edits. Strings can carry format args, escape sequences, regexes, or be parsed at runtime — any `.rs` change keeps the full cycle.
+
+## Phase 0.6: Detect a Small Diff
+
+A small diff keeps every angle but runs Phase 2 and Phase 3 inline, even on
+Claude Code. Three subagents re-reading a one-token diff cost more than the
+review itself. The check ignores `.md` and `.txt` files, so a plan or glossary
+edit alongside a small fix does not push it over.
+
+```bash
+files=$(git diff main...HEAD --name-only -- . ':(exclude)*.md' ':(exclude)*.txt')
+lines=$(git diff main...HEAD --numstat -- . ':(exclude)*.md' ':(exclude)*.txt' \
+  | awk '{ s += ($1 == "-" ? 0 : $1) + ($2 == "-" ? 0 : $2) } END { print s + 0 }')
+n=$(printf '%s\n' "$files" | grep -c .)
+if [ "$n" -le 3 ] && [ "$lines" -le 60 ] \
+  && ! printf '%s\n' "$files" | grep -qE '\.(rs|sql|sh)$|(^|/)(Cargo\.(toml|lock)|Makefile)$'; then
+  echo "SMALL_DIFF"
+else
+  echo "FULL_DIFF"
+fi
+```
+
+In small-diff mode:
+
+- Phase 1 runs unchanged, Codex review included. It is the phase that finds
+  real bugs in small CSS diffs, such as a forced-colors regression.
+- Phase 2 runs all three angles **inline and sequentially**, as the Codex
+  bullet there describes.
+- Phase 3 validates each finding inline rather than with a subagent per finding.
+- Phase 2.5, Phase 4, Phase 4.5 and Phase 5 run unchanged.
+
+**Re-run the check on every iteration.** A fix that grows the diff past the
+threshold sends the next pass through the full procedure.
+
+A `.rs`, `.sql`, `.sh`, `Cargo.toml`, `Cargo.lock` or `Makefile` change is never
+small, whatever its size. The reason is the one Phase 0.5 gives for `.rs`
+strings, and it also keeps every Phase 2.5 surface out of this mode.
 
 ## Phase 0.75: Planning-Invariant Backstop
 
@@ -36,6 +130,48 @@ This is a backstop, not the first time invariants should appear. Do not invent a
 
 **Docs-only fast path:** if Phase 0.5 flagged this diff as docs-only, skip this phase entirely and proceed to Phase 2.
 
+### Phase 1 kickoff: start the early suite run (Claude Code only)
+
+The Phase 4.5 test suites start now and run alongside the review phases
+(ADR 0292). Format first, so the start commit is the one the suites test:
+
+```bash
+./scripts/harden-suites.sh stop
+if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+  echo "Uncommitted changes: commit them, then re-run this step."
+elif git diff main...HEAD --name-only | grep -q '\.rs$'; then
+  make fmt && { git diff --quiet || git commit -qam "style: rustfmt"; }
+fi
+```
+
+Then launch the suites in their own Bash call, with the tool's
+`run_in_background: true`:
+
+```bash
+./scripts/harden-suites.sh start --early
+```
+
+- **Codex-backend runs skip this step.** They have no background Bash, so they
+  start the suites at Phase 4.5 and wait at once.
+- **`stop` first is not padding.** It ends a run left over from an earlier
+  iteration, since two cargo runs in one worktree can OOM the host.
+- **The script decides what is selected.** A diff that selects nothing prints
+  so, and Phase 4.5's verdict is then an empty PASS.
+
+**While the early run is going, two rules hold until the Phase 4.5 join:**
+
+- **Stop it before the first fix outside `HARDEN_SAFE_PATHS`.** That regex
+  in `scripts/lib/harden_suites.sh` names the plans and ADR folders, the priors
+  ledger and the temporary-measures registry. Run
+  `./scripts/harden-suites.sh stop` before editing anything else. Tests read
+  the tree while they run, so an edit mid-run tests a mix of old and new code.
+  Each suite records what changed when it exits, so the verdict voids a run
+  whose edit is still there. An edit made and undone mid-run leaves no trace,
+  which is why the stop is the rule.
+- **Commit with explicit paths, never `git commit -a`.** An engine test
+  briefly rewrites the two `VERSION` files and restores them. An `-a` commit
+  during the run can capture that temporary content.
+
 ### Phase 1 kickoff: launch Codex review in parallel (advisory, Claude Code only)
 
 Before running the `code-review` skill, kick off a Codex review of the branch diff **in the background** so it overlaps Phases 1–3 and adds ~no wall-clock (median 97s across the 25 recorded runs on this repo, with a tail out to 11 min, so it fits inside the Claude review phases). It is a fourth reviewer running on the *same* cadence as the others: because `/harden` loops (Phase 4.5 failure → back to Phase 1), each iteration launches a fresh Codex review on the updated diff, exactly like `code-review` and the Phase 2 agents re-run.
@@ -44,10 +180,11 @@ This step is **advisory**: its findings feed the same validate→fix pipeline as
 
 - **Claude Code only.** A Codex-backed `/harden` run is already Codex reviewing this diff — skip this step and note "Codex review: skipped (Codex-backend run)".
 - **Docs-only:** this whole phase is skipped, so Codex review is skipped too (it's a code reviewer, not a prose reviewer).
+- **Merge-only or incremental (Phase 0.4):** with a `codex-base <sha>` line, set `CODEX_BASE=<sha>` at the top of the launch call below. Without one, skip this step and note "Codex review: skipped (merge in range)". The earlier run already covered the rest of the branch.
 
 Resolve the companion script (installed with the `codex` plugin; do not hardcode a path). Launch the review in **one** Bash call, so the resolved path and the launch share a shell: variables do not persist across Bash tool calls. Run that call with the tool's own `run_in_background: true`. It writes the review to `.lucidos/codex-review.out` and drops `.lucidos/codex-review.done` when it ends, which is what Phase 3 joins on: Claude Code has no blocking wait tool.
 
-The companion's `--background` flag does NOT work for `review`: it is parsed and then ignored, since only `task` honours it. So the flag is deliberately absent below, and the parallelism comes from the Bash tool instead. Passing it bought nothing and cost the phase its whole premise, since the call actually blocked for the length of the review. `--base main` matches `/harden`'s diff base of `main...HEAD`:
+The companion's `--background` flag does NOT work for `review`: it is parsed and then ignored, since only `task` honours it. So the flag is deliberately absent below, and the parallelism comes from the Bash tool instead. Passing it bought nothing and cost the phase its whole premise, since the call actually blocked for the length of the review. `--base "${CODEX_BASE:-main}"` matches `/harden`'s diff base of `main...HEAD`, or the hardened SHA in incremental mode:
 
 ```bash
 mkdir -p .lucidos && rm -f .lucidos/codex-review.done
@@ -66,7 +203,7 @@ else
     fi
   done
   if [ -n "$ready" ]; then
-    node "$CODEX_COMPANION" review --scope branch --base main --json
+    node "$CODEX_COMPANION" review --scope branch --base "${CODEX_BASE:-main}" --json
   else
     echo "Codex review: unavailable (CLI not answering after 3 probes), proceeding"
   fi
@@ -99,8 +236,8 @@ Run the **repo-owned** `code-review` skill (`.claude/skills/code-review/SKILL.md
 When `code-review` returns its findings:
 
 - **No bugs flagged:** record that, proceed to Phase 2.
-- **Bugs flagged:** for each finding, read the cited file, confirm the bug is real (false-positive triage — same standard as Phase 3 validation), and **fix the real ones directly**. Skip findings that are false positives, depend on uncertain runtime state, or duplicate something Phase 2 will catch better.
-- **Commit any fixes** before proceeding to Phase 2 — Phase 2's diff input needs to include them.
+- **Bugs flagged:** for each finding, read the cited file and confirm the bug is real, to the Phase 3 validation standard. Then **fix the real ones directly**. Skip findings that are false positives, depend on uncertain runtime state, or duplicate something Phase 2 will catch better. Run `./scripts/harden-suites.sh stop` before the first edit, per the kickoff rules above.
+- **Commit any fixes** before proceeding to Phase 2, since Phase 2's diff input needs to include them. Name the files: `git add <file>`, never `git commit -a`.
 
 Do NOT pass `--comment` (that mode posts to GitHub PRs, which Lucidos does not use).
 
@@ -124,6 +261,7 @@ Run `git diff main...HEAD` to get the current diff (including any Phase 1 fixes)
 
 **Subagents are optional — the angles are not.** Mirrors the `code-review` skill's contract:
 
+- **Small diff (Phase 0.6), merge-only or incremental (Phase 0.4):** run the three angles inline, as the Codex bullet below describes, on any backend.
 - **Claude Code:** launch the three agents as parallel subagents, all three in ONE assistant message, each with **`run_in_background: false`** (faster, independent perspectives). That flag is load-bearing under Lucidos. The Agent tool backgrounds a subagent by default and delivers its report later as a notification. The engine tears down your process group the moment your turn ends, so that notification never arrives. One message keeps the three parallel; `run_in_background: false` makes each call block and hand you its report inline. Never wait by launching a filler agent, sleeping, or asking a placeholder question.
 - **Codex / any agent without a Task tool:** you have NO subagent capability — do NOT try to spawn agents, and do NOT improvise a "simulated parallel" pass (that interleaves output and stalls the turn, which is exactly how a Codex `/harden` run dies right after Phase 1). Run all three angles **yourself, inline and sequentially** — Agent 1, then Agent 2, then Agent 3 — in this same session, collecting findings as you go. The analysis and output are identical; only the execution is serial. Then continue to Phase 3 in the same turn — do not stop or idle until Phase 5 has written the marker.
 
@@ -160,7 +298,13 @@ Check the changes against all applicable CLAUDE.md files (root and any in direct
 
 This includes **`.claude/rules/no-private-data.md`** — flag any private/personal/company-internal data the diff introduces into a shipping file (everything except `docs/plans/**` and `WORKSPACES.md` ships publicly, test fixtures and comments included). That rule is the single source of truth for the definition, the attribution carve-out, and the approved placeholders; flag against it and name the placeholder to use. (The `code-review` skill from Phase 1 carries the same check as a review angle — this agent is the compliance-side backstop.)
 
-It ALSO includes **`.claude/rules/temporary-measures.md`** — the **temporary-measures & marker-hygiene** check (one check, two faces). Apply the inclusion test to the diff: *does it add something meant to go away with a concrete condition for when?* If the diff introduces an impermanent thing — a `remove after X` / `diagnostic-only` / `temporary` / `workaround until …` comment, a new feature flag / kill-switch, a sunset back-compat shim, **OR** a bare `TODO` / `FIXME` / `HACK` / `XXX` marker — it MUST have a matching row in `docs/temporary-measures.md` (in the right typed section, with a concrete removal condition; for a measure, a parent-investigation id). Flag any such addition that lacks a registry row. **The escape valve is to register it — not to delete or reword the marker.** This closes the exact loophole the rule exists for: rewording a `TODO: remove after X` into a plain `// remove after X` comment dodged tracking, so a plain impermanence comment is treated the same as a raw marker — both need a row. Conversely, do NOT flag things on the rule's OUT list (permanent back-compat / old-data tolerance, site-local `#[allow(...)]` / `@ts-expect-error` / `eslint-disable` suppressions, ADR-recorded design decisions, open-ended tech debt) — those are tracked elsewhere or not at all.
+It ALSO includes **`.claude/rules/temporary-measures.md`**: the **temporary-measures & marker-hygiene** check (one check, three faces). Apply the inclusion test to the diff: *does it add something meant to go away with a concrete condition for when?*
+
+The first two faces are an impermanent thing and a bare marker. The impermanent thing is a `remove after X` / `diagnostic-only` / `temporary` / `workaround until …` comment, a new feature flag or kill-switch, or a sunset back-compat shim. The marker is a bare `TODO` / `FIXME` / `HACK` / `XXX`. Either MUST have a matching row in `docs/temporary-measures.md`: the right typed section, a concrete removal condition, and for a measure a parent-investigation id. Flag any such addition that lacks a row. **The escape valve is to register it, not to delete or reword the marker.**
+
+This closes the loophole the rule exists for. Rewording a `TODO: remove after X` into a plain `// remove after X` comment dodged tracking. So a plain impermanence comment counts the same as a raw marker, and both need a row. Do NOT flag things on the rule's OUT list, which are tracked elsewhere or not at all: permanent back-compat or old-data tolerance, site-local suppressions (`#[allow(...)]`, `@ts-expect-error`, `eslint-disable`), ADR-recorded design decisions, and open-ended tech debt.
+
+The third face is the **defending comment**, per `.claude/rules/prose.md` § "What a comment is for". Flag any added or changed comment that argues a shortcut, workaround or known-wrong behaviour is acceptable ("fine for now", "good enough", "deliberately skipped"). It is the same laundering one step further: the impermanence is gone from the wording, not from the code. Fix the root cause, or register the gap with a removal condition, or record it as a known limitation in a plan or ADR. A comment that states an invariant ("callers must hold the lock") is not a finding. Diff-scoped only: never flag an untouched comment in the existing tree.
 
 Do NOT flag:
 - General best practices not mentioned in CLAUDE.md
@@ -220,7 +364,7 @@ Then validate every finding (Codex's included) per the rest of this phase.
 
 ### Validate every finding
 
-Once all three angles are done, validate each issue found. (Done means the parallel subagents are joined, or, for Codex and any agent without subagents, your own three inline passes are complete.) **Per the same subagents-are-optional rule:** Claude Code launches a parallel validation subagent per finding, all in ONE message with **`run_in_background: false`** on each. Codex / any agent without a Task tool validates each finding **inline and sequentially** in this same session. Either way the validator must:
+Once all three angles are done, validate each issue found. (Done means the parallel subagents are joined, or, for Codex and any agent without subagents, your own three inline passes are complete.) **Per the same subagents-are-optional rule:** Claude Code launches a parallel validation subagent per finding, all in ONE message with **`run_in_background: false`** on each. Codex and any agent without a Task tool validate each finding **inline and sequentially** in this same session. So do a small diff (Phase 0.6) and a merge-only or incremental run (Phase 0.4). Either way the validator must:
 - Read the relevant source files (not just the diff)
 - Confirm the issue actually exists in the code
 - Discard findings that are false positives or depend on assumptions about runtime state
@@ -239,7 +383,9 @@ don't need an entry; recurring-shaped ones do.
 - If **no validated issues**: report "No bugs or compliance issues found."
 - If **validated issues found**: list each issue grouped by severity (🔴 Bug, 🟡 Nit) with file, line, and description. Fix 🔴 bugs directly. Ask the user about 🟡 nits.
 
-Commit any fixes from this phase before proceeding to Phase 4.5.
+**A failure that also fails on `main` is main's bug, and another thread may be fixing it.** Run `git merge main --no-edit` first, since main moves every few minutes. Fix it here only if it still fails after that merge.
+
+Commit any fixes from this phase before proceeding to Phase 4.5, naming the files. A fix outside `HARDEN_SAFE_PATHS` stops the early suite run first (`./scripts/harden-suites.sh stop`), per the Phase 1 kickoff rules. A new entry in `docs/code-review-priors.md` needs no stop.
 
 ## Phase 4.5: Verify Tests Pass
 
@@ -424,65 +570,61 @@ reaches the transcript, so a permission error goes nowhere. That shipped on
 2026-08-06 with `log-instructions-loaded.sh`. A hook that silently never runs
 looks exactly like a hook that was never added.
 
-### Before the Rust suites: apply rustfmt
+### Then the test suites: join, and read the verdict
 
-When `git diff main...HEAD --name-only` lists any `.rs` file, format before the
-suites run. `make lint` only checks rustfmt, and `make test` is chained after
-it, so one rewrapped line otherwise skips the whole engine suite (ADR 0270).
+`scripts/harden-suites.sh` owns the suites: which ones run, their commands,
+the early suite run, and whether its result still counts (ADR 0292). Join it
+in the foreground with `timeout: 600000`:
 
 ```bash
-if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
-  echo "Uncommitted changes: commit them, then re-run this step."
-else
-  make fmt && { git diff --quiet || git commit -qam "style: rustfmt"; }
-fi
+./scripts/harden-suites.sh wait
 ```
 
-- **Start from a clean tree.** The commit then holds rustfmt output and nothing
-  else. If the guard trips, commit the pending work, then run the step.
-- **A `style: rustfmt` commit does not send you back to Phase 1.** rustfmt is
-  deterministic and changes no behaviour, so there is nothing to re-review. Any
-  other fix still returns to Phase 1, as below.
-- **No `.rs` in the diff, no step.** A docs-only or TS-only diff skips it.
+`wait` joins the run, then runs the two Codex driver modules alone, then
+prints one line per suite and a verdict. Act on its exit status:
 
-`make lint` still runs `cargo fmt --all --check` afterwards. That is the proof
-the step ran, not a second chance to fail.
+| Exit | Verdict | Do this |
+|---|---|---|
+| 0 | PASS | Proceed to Phase 5. |
+| 1 | FAIL | Read the named log, fix, commit, return to Phase 1. |
+| 2 | RERUN | Format, start a normal run, and `wait` again (below). |
+| 3 | still running | Re-issue `wait`. It says if the Codex review is what it waits on. |
 
-### Then the test suites
+**RERUN means the early result no longer describes the branch.** A fix
+outside `HARDEN_SAFE_PATHS` landed, or the run was stopped, or no run exists.
+That is the normal outcome whenever review fixed code, and it costs no more
+than the old order did. Run the kickoff's format block, then start a normal
+run with `run_in_background: true` and `wait` again:
 
-**Join the Codex review before you start them.** The engine suite includes
-`runtime::codex::driver_tests`, which drives a real `codex app-server`, and a
-Codex review is another client of the same CLI. Run them together and those
-tests fail: on 2026-08-10 a merge-hardening run overlapped the two and got
-twelve failures in that module out of 5,325, on a run that took 539s against
-the usual 82s, and all seven passed in isolation immediately after. The
-failures look like real breakage in the diff and are not, so the cost is a
-wasted debugging pass on a red suite that was never red.
+```bash
+./scripts/harden-suites.sh start
+```
 
-Phase 1's review is already joined in Phase 3, so the ordinary flow is safe.
-The way in is launching a SECOND review (a later `/harden` iteration, or a
-re-review after fixes) and then starting the suite while it runs. If one is in
-flight, wait for it. Never treat a `runtime::codex::driver_tests` failure as a
-finding until you have re-run that module alone with no Codex process active.
+**Codex-backend and docs-only runs start here.** They have no early run, so
+they format, run `start` (Codex in the foreground), then `wait`.
 
-Run the test suites for the layers touched on this branch.
+**rustfmt runs before every start** (ADR 0270). `make lint` only checks it,
+and `make test` is chained after it, so one rewrapped line otherwise skips the
+whole engine suite. A `style: rustfmt` commit does not send you back to Phase
+1: rustfmt changes no behaviour, so there is nothing to re-review.
 
-Pick suites by `git diff main...HEAD --name-only`, applying the CLAUDE.md test-selection table:
+**The Codex driver tests run alone, after the Codex review is joined.** Both
+driver modules spawn a `/bin/sh` stub and share no state with a Codex review.
+But their 30 s and 60 s timeouts fail under load. On 2026-08-10 a run that
+overlapped the two took 539s against the usual 82s. Twelve driver tests
+failed, and every one passed alone moments later.
 
-- `.rs`, `Cargo.toml`, `Cargo.lock`, `.sql` → `make lint && make test`
-- `crates/lucidos-app/src/**/*.rs` → also `cargo test --locked -p lucidos-app --lib` (`make test` runs the ENGINE crate alone, so the client's own unit tests run nowhere else; seconds, no Postgres)
-- `crates/lucidos-cli/**` OR `crates/lucidos-engine/src/runtime/*_menu_options.json` → also `cargo test --locked -p lucidos-cli` (same reason as the row above, plus the menu-file trigger below; seconds, no Postgres)
-- `.sh`, `.shellcheckrc`, `Makefile` → `make lint`
-- `install.sh`, `uninstall.sh`, `scripts/lib/{service,stage_runtime,headless_tarball,install_common}.sh` → also `bash scripts/lib/install_test.sh` (20 s, offline)
-- `scripts/release.sh`, `scripts/lib/release_draft.sh` → also `bash scripts/lib/release_draft_test.sh` (25 s) and `bash scripts/lib/release_rc_gate_test.sh` (5 s), both offline against a stubbed `gh`
-- `.ts`, `.tsx` → `cd crates/lucidos-app && npx tsc --noEmit && npm test && npx vite build` (the build is the only local gate that runs the entry chunk budget, ADR 0288)
-- `.css` under `crates/lucidos-app/src/` → `cd crates/lucidos-app && npx vite build`
-- `crates/lucidos-engine/src/api/sdk_iframe.css` → `cd crates/lucidos-app && npm test`
-- `crates/lucidos-app/src/components/settings/LocaleSection.tsx` → `./scripts/test-engine.sh -- -- voice::language` (subsumed by `make test` when the diff also touches Rust)
-- `crates/lucidos-app/src/store/actions/preferences.ts` → `./scripts/test-engine.sh -- -- voice::sections` (subsumed by `make test` when the diff also touches Rust)
-- `system-knowhow/**` → `./scripts/test-engine.sh -- -- always_loaded_context_stays_under_budget system_knowhow_descriptions_stay_routing_sized` (subsumed by `make test` when the diff also touches Rust)
-- Docs-only → skip, EXCEPT the `system-knowhow/**` row above
-- Mixed → run both **in parallel**
+So the early run skips both modules, and `wait` runs them by themselves. If
+Phase 3 abandoned the Codex review, re-issue
+`./scripts/harden-suites.sh wait --codex-abandoned`. Never treat a driver-test
+failure as a finding until that module has run alone on a quiet host.
+
+**Suite selection lives in code.** `hs_select_suites` maps the branch's
+changed paths to suites, and `hs_suite_command` holds each suite's command.
+Both are in `scripts/lib/harden_suites.sh`, and its test pins every row.
+Change a row there, never in prose. Cargo suites run one after another in one
+lane, and every other suite runs in parallel beside them. The paragraphs below
+explain the rows a reader would not guess.
 
 **The piped installer needs a row: `make lint` cannot see its one hard
 constraint.** macOS `/bin/sh` IS bash 3.2, so `install.sh`'s re-exec guard
@@ -501,33 +643,29 @@ draft wait that decides whether Phase B adopts the rc build's tarballs or
 rebuilds all four. Both halves are release-only code, so a regression there is
 invisible until someone is mid-release.
 
-**The Locale dropdown is gated by an ENGINE test, so a `.tsx`-only edit needs
-its row.** `voice/language.rs` maps that dropdown's names to the ISO-639-1 codes
-a call's transcriber is pinned with. Its guard `include_str!`s
-`LocaleSection.tsx` to check the two still agree. The drift it catches is a
-language added to the dropdown and to nothing else, which is a frontend-only
-diff. Without the row above, that diff runs `tsc` and Vitest, neither of which
-compiles the guard, so it is inert for exactly its trigger.
+**A file a crate compiles in selects the Rust suite, whatever its extension.**
+The script lists every compile input at `start`: cargo's dep-info after any
+build, plus every `include_str!` and `include_bytes!` literal in source. So an
+edit that touches only `CHANGELOG.md`, `VERSION`, a menu JSON, `sdk_iframe.css`,
+`LocaleSection.tsx` or `preferences.ts` still runs `make lint && make test`. A
+compile input under `crates/lucidos-app/` also runs the app's own tests.
 
-**`preferences.ts` needs a row for exactly the same reason.**
-`voice/sections.rs` owns the resident-block registry, and the settings toggles
-are drawn from `VOICE_RESIDENT_SECTIONS`, a mirror of it. Its guard reads that
-mirror, and editing the mirror alone is a frontend-only diff.
+The guard behind such a file often lives on the other side of the diff. For
+example, `voice/language.rs` `include_str!`s `LocaleSection.tsx` to check the
+dropdown against its ISO-639-1 codes. A language added to the dropdown alone is
+a frontend-only diff, and `tsc` and Vitest never compile that guard. Hand-kept
+rows for such files missed `CHANGELOG.md` and the skill file this way, which is
+why the rule reads the compiler's own list.
 
-Both are the same shape as the `sdk_iframe.css` row, in the other direction.
-Neither is in `CLAUDE.md`'s table: that file is always-loaded and had 31 bytes of headroom
-under `CONTEXT_BUDGET_CEILING`, and this gate is what enforces the table anyway.
-
-**A menu JSON is the CLI row's real trigger, and it is an ENGINE-crate path.**
+**Any file the CLI source includes is a CLI-row trigger, even an ENGINE path.**
 `crates/lucidos-cli` owns no engine code, so nothing ran its tests: `make test`
 is the engine crate alone, and `make lint` compiles the CLI tests without
-running them. `spawn_thread::tests::effort_levels_match_the_backend_menus`
-`include_str!`s `cc_menu_options.json` and `codex_menu_options.json` to pin
-`--reasoning-effort` against the engine's own pickers. Editing a menu file is a
-diff in `crates/lucidos-engine/`, which routes to `make lint && make test`. So
-the one guard watching those files never fired for the change it watches. Same
-shape as the two rows above: the guard lives on the other side of the diff that
-breaks it.
+running them. Yet CLI tests `include_str!` engine files to pin the CLI against
+them: the two menu JSONs for `--reasoning-effort`, and `api/data_api.rs` plus
+the frontend's `linkifyPaths.ts` for the data prefixes. An edit to one of those
+is a diff outside `crates/lucidos-cli/`. So `start` records the CLI's own
+includes in `cli-inputs`, and a listed path selects the CLI row. A hand-kept menu-JSON row once let the guard miss the change it
+watches.
 
 **A `system-knowhow/**` edit is not a docs-only skip.** Its frontmatter `name`
 and `description` are spliced into the chat agent's routing list, which is
@@ -551,7 +689,7 @@ checkout-shared build-watch's `vite build`. The watch keeps serving the previous
 served yet", naming the build-watch instead of the CSS file that broke it, for a
 change that may not touch CSS at all. `npx vite build` is sub-second and is the
 exact command the build-watch runs, so it fails on precisely what the watch will
-fail on. Add it to the parallel launch when the diff also touches Rust or TS.
+fail on. The script runs it beside the other suites.
 
 The two CSS surfaces need **different** gates, which is why they are separate
 rows. `sdk_iframe.css` is `include_str!`d by `api/sdk.rs` and served to every
@@ -575,27 +713,9 @@ see the `Makefile`) strictly supersedes `cargo check`: same compile, plus the
 lint set, plus every tracked `*.sh`, plus a rustfmt-clean tree. It is the single
 canonical invocation; never restate its flags here.
 
-When the diff is mixed, kick the Rust and TS suites off concurrently: they're independent toolchains (cargo vs npm) with no shared state, so running them serially wastes wall-clock. (Codex, or any agent without a background Bash: run the two suites **sequentially** instead, `cargo …` then `npm …`. Parallelism is only a wall-clock optimization.)
+**`/harden` finishes in one turn.** Apply sends "Run /harden now", waits for the next idle, and then refuses a branch with no marker. So do NOT hand the suites to `lucidos background-task run` and end your turn here, as the general rule suggests for long work: that idle would read as a finished `/harden`. Claude Code has no blocking wait tool. So `start` runs under the Bash tool's `run_in_background: true`, and each suite writes an exit file under `.lucidos/harden-suites/` when it ends. `wait` joins on those files in the foreground.
 
-**`/harden` finishes in one turn.** Apply sends "Run /harden now", waits for the next idle, and then refuses a branch with no marker. So do NOT hand the suites to `lucidos background-task run` and end your turn here, as the general rule suggests for long work: that idle would read as a finished `/harden`. Claude Code has no blocking wait tool, so each suite writes an exit file when it ends, and a foreground wait joins on those files:
-
-```
-# Logs go in the worktree's own .lucidos/ (gitignored, and per-worktree, so a
-# concurrent /harden in another session cannot truncate this run's log).
-# Launch, with the Bash tool's run_in_background: true:
-mkdir -p .lucidos && rm -f .lucidos/harden-rust.exit .lucidos/harden-ts.exit
-( (make lint && make test) > .lucidos/harden-rust.log 2>&1; echo $? > .lucidos/harden-rust.exit ) &
-( (cd crates/lucidos-app && npx tsc --noEmit && npm test) > .lucidos/harden-ts.log 2>&1; echo $? > .lucidos/harden-ts.exit ) &
-wait
-
-# Join, in the foreground with timeout: 600000. Re-issue it until both exist:
-for i in $(seq 1 590); do
-  [ -f .lucidos/harden-rust.exit ] && [ -f .lucidos/harden-ts.exit ] && break; sleep 1
-done; cat .lucidos/harden-rust.exit .lucidos/harden-ts.exit
-# Then read the detail out of the logs: tail -40 on each, grep -nE "^error|test result:"
-```
-
-Each exit file holds cargo's or npm's real exit code: redirecting is not piping. The join reads a few bytes per call, so the suites' logs never flood your context.
+Each exit file holds the suite's real exit code: redirecting is not piping. `wait` and `verdict` print a few lines, so the logs never flood your context. Read the detail from the log a FAIL line names, with `tail -40` or `grep -nE "^error|test result:"`.
 
 **A jsdom test that times out at exactly the vitest default is contention, not
 a finding.** The engine suite saturates every core for minutes, and a Vitest
@@ -609,9 +729,9 @@ on their own.
 
 Run each suite un-piped: the exit-file pattern above already preserves the real exit. If you must trim, redirect to a log and capture `$?` first (`make test > /tmp/t.log 2>&1; echo "EXIT: $?"`), then read the log. A "tests pass" claim needs the real exit code AND the `test result: ok.` / `0 failed` line. See `/clean-build`'s "Reading exit codes honestly" section for the full mechanism.
 
-If everything passes, proceed to Phase 5.
+If the verdict is PASS, proceed to Phase 5.
 
-If anything fails: fix the failures (or the code that caused them), commit the fixes, and **return to Phase 1**. Fixes are new code that hasn't been reviewed by `/code-review` or the hardening agents — re-run the cycle on the updated diff. Iterate until tests pass on a fully-hardened diff.
+If it is FAIL: fix the failures (or the code that caused them), commit the fixes, and **return to Phase 1**. Fixes are new code that hasn't been reviewed by `/code-review` or the hardening agents, so re-run the cycle on the updated diff. Iterate until tests pass on a fully-hardened diff.
 
 ## Phase 5: Create Marker
 

@@ -1,6 +1,5 @@
 import { useRef } from 'preact/hooks';
 import { CrossfadeStack } from '../shared/CrossfadeStack';
-import { useArrivalFade } from '../shared/NavigationCover';
 import { drawerViewKey } from '../drawer/ThreadFilterCover';
 import { FILTER_BUTTON_GLYPHS, filterButtonState, type FilterGlyph } from './ThreadFilterPanel';
 import { threadFilterPanelOpen, toggleThreadFilterPanel } from '../../store/threadFilterPanel';
@@ -72,10 +71,8 @@ export function ThreadFilterButton({ class: extraClass, tooltip }: { class?: str
 
 /** The threads-pane title, on both layouts. It says what the pane shows: the
  *  list, or the filter panel covering it, which carries no title row of its
- *  own. Just "Filters": the pane is already the Threads pane. It arrives with
- *  the drawer's navigation cover, on the same key (`ThreadFilterCover`). */
+ *  own. Just "Filters": the pane is already the Threads pane. It switches word
+ *  at once: only the view below it moves. */
 export function ThreadsPaneTitle({ class: className }: { class: string }) {
-  const view = drawerViewKey(threadFilterPanelOpen.value);
-  const fade = useArrivalFade(view);
-  return <span key={view} class={`${className}${fade}`}>{THREADS_TITLES[view]}</span>;
+  return <span class={className}>{THREADS_TITLES[drawerViewKey(threadFilterPanelOpen.value)]}</span>;
 }

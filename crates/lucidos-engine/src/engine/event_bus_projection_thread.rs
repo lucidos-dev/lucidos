@@ -24,13 +24,17 @@ use crate::core::store::{EventWaitSummary, LegacyInitiator};
 use crate::engine::thread_events::{
     ActorMode, AnswerKind, CancelCause, EventChannel, EventMeta, MessageOrigin, ThreadEvent,
 };
-use crate::engine::thread_lifecycle::{resolve_transition, ArchiveState};
+use crate::engine::thread_lifecycle::{resolve_transition, ArchiveState, ThreadStatus};
 
 /// Whitespace `btrim` must strip when matching a submitted answer against the
 /// stored draft, so the comparison agrees with the client's `String.prototype
 /// .trim()`. Bound as a parameter because one-argument `btrim` strips spaces
 /// only — a textarea's trailing newline would otherwise defeat the match.
 const COMPOSE_TRIM_CHARS: &str = " \t\n\r\u{000b}\u{000c}";
+
+const IDLE: &str = ThreadStatus::Idle.sql_literal();
+const RUNNING: &str = ThreadStatus::Running.sql_literal();
+const WAITING_FOR_USER_ANSWER: &str = ThreadStatus::WaitingForUserAnswer.sql_literal();
 
 /// A word was spoken on this thread, so the draft it was placed from becomes
 /// an ordinary thread (ADR 0167).
@@ -184,6 +188,20 @@ static EVENT_WAIT_DROP_SQL: std::sync::LazyLock<String> =
 static EVENT_WAIT_CANCEL_SQL: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| event_wait_sql(EVENT_WAIT_WITHOUT, "last_user_action = NOW(), "));
 
+/// The status a `ChangeProposed` writes, with the thread id as `$1`.
+///
+/// A proposal is bookkeeping. It keeps a live turn, a verdict, and a question
+/// the user can still answer, and otherwise parks the thread at `'idle'`.
+/// Recovery proposes for a thread parked on a question, which must not offer
+/// Apply over it (ADR 0293). "Parked" is the recovery preserve guard's own
+/// predicate, so the two cannot disagree on it.
+static STATUS_AFTER_PROPOSAL_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    preserving_verdict(&format!(
+        "CASE WHEN status = {RUNNING} OR {parked} THEN status ELSE {IDLE} END",
+        parked = crate::engine::agent_recovery::unanswered_question_exists_sql("$1::text"),
+    ))
+});
+
 impl EventBus {
     /// Returns side-effect events to emit after the main transaction commits,
     /// alongside the list of ancestor thread IDs whose
@@ -289,9 +307,9 @@ impl EventBus {
                 // compose slot" (announce it) from "this row was just created"
                 // (nothing to announce, and no device has heard of the thread
                 // yet). `None` means the discarded-thread guard below matched.
-                let compose_epoch: Option<i64> = sqlx::query_as(
+                let compose_epoch: Option<i64> = sqlx::query_as(&format!(
                     r#"INSERT INTO thread_summaries (thread_id, first_message, source, initiator, created_at, last_activity, message_count, parent_thread_id, spawning_event_id, depth, status, last_revived_at, state, parent_callback_pending)
-                       VALUES ($1, $2, $3, $6, NOW(), NOW(), 1, $4, $7, $5, 'running', NOW(), 'active', $4 IS NOT NULL)
+                       VALUES ($1, $2, $3, $6, NOW(), NOW(), 1, $4, $7, $5, {RUNNING}, NOW(), 'active', $4 IS NOT NULL)
                        ON CONFLICT (thread_id) DO UPDATE
                        SET last_activity = NOW(),
                            parent_callback_pending = CASE WHEN $4 IS NOT NULL THEN TRUE ELSE thread_summaries.parent_callback_pending END,
@@ -301,7 +319,7 @@ impl EventBus {
                            last_user_action = CASE WHEN $8 THEN NOW() ELSE thread_summaries.last_user_action END,
                            last_agent_action = CASE WHEN $8 THEN thread_summaries.last_agent_action ELSE NOW() END,
                            message_count = thread_summaries.message_count + 1,
-                           status = 'running',
+                           status = {RUNNING},
                            last_revived_at = NOW(),
                            state = 'active',
                            first_message = COALESCE(thread_summaries.first_message, EXCLUDED.first_message),
@@ -331,8 +349,8 @@ impl EventBus {
                        -- Defense in depth: refuse to resurrect a discarded thread if a
                        -- stale MessageReceived slips past the API-layer guard.
                        WHERE thread_summaries.state != 'discarded'
-                       RETURNING compose_epoch"#,
-                )
+                       RETURNING compose_epoch"#
+                ))
                 .bind(thread_id)
                 .bind(text)
                 .bind(source)
@@ -446,9 +464,9 @@ impl EventBus {
                 // `MessageReceived` arm: only a row that already existed can
                 // have held (or be about to receive) a draft, and only the
                 // coding-agent branch consumes one.
-                let compose_epoch: Option<i64> = sqlx::query_as(
+                let compose_epoch: Option<i64> = sqlx::query_as(&format!(
                     r#"INSERT INTO thread_summaries (thread_id, source, is_coding_agent, created_at, last_activity, message_count, status, last_revived_at, cc_repo_id, coding_agent_kind, coding_agent_folder, coding_agent, state)
-                       VALUES ($1, $2, $7, NOW(), NOW(), 0, 'running', NOW(), $3, $4, $5, $6, 'active')
+                       VALUES ($1, $2, $7, NOW(), NOW(), 0, {RUNNING}, NOW(), $3, $4, $5, $6, 'active')
                        ON CONFLICT (thread_id) DO UPDATE
                        -- Monotone: a coding-agent event sets the flag and
                        -- nothing here clears it, so no ordering of events can
@@ -487,8 +505,8 @@ impl EventBus {
                            compose_epoch = thread_summaries.compose_epoch + CASE WHEN $7 THEN 1 ELSE 0 END
                        -- Defense in depth (see MessageReceived above for rationale).
                        WHERE thread_summaries.state != 'discarded'
-                       RETURNING compose_epoch"#,
-                )
+                       RETURNING compose_epoch"#
+                ))
                 .bind(thread_id)
                 .bind(source)
                 .bind(session_repo_id)
@@ -512,22 +530,22 @@ impl EventBus {
             }
             ThreadEvent::TriggerStarted { trigger_id, trigger_name, go_to_review, .. } => {
                 let source = meta.channel.as_ref().map(|c| c.as_str()).unwrap_or("trigger");
-                sqlx::query(
+                sqlx::query(&format!(
                     r#"INSERT INTO thread_summaries (thread_id, first_message, source, initiator, created_at, last_activity, message_count, status, last_revived_at, trigger_id, trigger_name, trigger_go_to_review, state)
-                       VALUES ($1, $2, $3, 'system', NOW(), NOW(), 1, 'running', NOW(), $4, $5, $6, 'active')
+                       VALUES ($1, $2, $3, 'system', NOW(), NOW(), 1, {RUNNING}, NOW(), $4, $5, $6, 'active')
                        ON CONFLICT (thread_id) DO UPDATE
                        SET last_activity = NOW(),
                            -- A trigger firing is autonomous agent activity.
                            last_agent_action = NOW(),
                            message_count = thread_summaries.message_count + 1,
-                           status = 'running',
+                           status = {RUNNING},
                            last_revived_at = NOW(),
                            state = 'active',
                            trigger_id = COALESCE(thread_summaries.trigger_id, EXCLUDED.trigger_id),
                            trigger_name = COALESCE(thread_summaries.trigger_name, EXCLUDED.trigger_name)
                        -- Defense in depth (see MessageReceived above for rationale).
-                       WHERE thread_summaries.state != 'discarded'"#,
-                )
+                       WHERE thread_summaries.state != 'discarded'"#
+                ))
                 .bind(thread_id)
                 .bind(trigger_name.as_deref())
                 .bind(source)
@@ -672,7 +690,7 @@ impl EventBus {
                 sqlx::query(&format!(
                     "UPDATE thread_summaries SET last_activity = NOW(), last_user_action = NOW(), \
                      {CLEAR_CODING_AGENT_FLAGS}, \
-                     status = 'idle' \
+                     status = {IDLE} \
                      WHERE thread_id = $1",
                 ))
                 .bind(thread_id)
@@ -698,7 +716,7 @@ impl EventBus {
                 sqlx::query(&format!(
                     "UPDATE thread_summaries SET last_activity = NOW(), last_user_action = NOW(), \
                      {CLEAR_CODING_AGENT_FLAGS}, \
-                     status = 'idle' \
+                     status = {IDLE} \
                      WHERE thread_id = $1",
                 ))
                 .bind(thread_id)
@@ -723,9 +741,9 @@ impl EventBus {
                 // question nobody has answered. The turn's first activity
                 // event sets 'running' once the agent really resumes.
                 let status = if matches!(event, ThreadEvent::UserPromptInjected { .. }) {
-                    "CASE WHEN status = 'waiting_for_user_answer' THEN status ELSE 'running' END"
+                    format!("CASE WHEN status = {WAITING_FOR_USER_ANSWER} THEN status ELSE {RUNNING} END")
                 } else {
-                    "'running'"
+                    RUNNING.to_string()
                 };
                 sqlx::query(&format!(
                     "UPDATE thread_summaries SET last_activity = NOW(), last_user_action = NOW(), message_count = message_count + 1, status = {status}, last_revived_at = NOW() WHERE thread_id = $1",
@@ -762,11 +780,22 @@ impl EventBus {
                 Vec::new()
             }
 
+            // The resolver's `ThreadArchived` moves the thread; the request
+            // itself projects nothing (ADR 0310).
+            ThreadEvent::ThreadArchiveRequested => Vec::new(),
+
             // Save/unsave
             ThreadEvent::ThreadSaved => {
-                sqlx::query(
-                    "UPDATE thread_summaries SET is_saved = TRUE WHERE thread_id = $1",
-                )
+                // The pin and the inbox land in ONE statement. A pinned thread
+                // is never archived (ADR 0312), and Postgres checks that CHECK
+                // constraint per statement, never at commit. So writing the pin
+                // alone fails on an archived row before `resolve_transition`'s
+                // move to the inbox, which says the same thing, can run.
+                sqlx::query(&format!(
+                    "UPDATE thread_summaries SET is_saved = TRUE, archive_state = '{}' \
+                     WHERE thread_id = $1",
+                    ArchiveState::Inbox.as_str()
+                ))
                 .bind(thread_id)
                 .execute(&mut **tx)
                 .await?;
@@ -783,8 +812,8 @@ impl EventBus {
             }
 
             ThreadEvent::ThreadArchived => {
-                // Clear is_saved so display priority doesn't keep the row in
-                // Saved (is_saved=true wins over archive_state='archived').
+                // Archiving unpins: a pinned thread is never archived (ADR
+                // 0312), and the table's CHECK constraint refuses the pair.
                 // The `archive_state` flip itself is written by the contract
                 // layer (`event_bus::apply_transition` →
                 // `thread_lifecycle::resolve_transition` → `to_archived`) —
@@ -800,7 +829,7 @@ impl EventBus {
                 // archives the parent as well, so the child owes it nothing. A
                 // direct archive settles through the marker, which stays.
                 sqlx::query(&format!(
-                    "UPDATE thread_summaries SET status = 'idle', \
+                    "UPDATE thread_summaries SET status = {IDLE}, \
                      is_saved = FALSE, is_stopped_child = FALSE, \
                      {CLEAR_CODING_AGENT_FLAGS} \
                      WHERE thread_id = $1",
@@ -820,13 +849,13 @@ impl EventBus {
                 // pill. Send events later re-assert source via the
                 // `source = 'chat'`-keyed CASE in MessageReceived.
                 let source = if mode == "claude_code" { "claude_code" } else { "chat" };
-                sqlx::query(
+                sqlx::query(&format!(
                     r#"INSERT INTO thread_summaries
                         (thread_id, initiator, source, created_at, last_activity, message_count,
                          state, compose_mode, status)
-                       VALUES ($1, 'user', $3, NOW(), NOW(), 0, 'composing', $2, 'idle')
-                       ON CONFLICT (thread_id) DO NOTHING"#,
-                )
+                       VALUES ($1, 'user', $3, NOW(), NOW(), 0, 'composing', $2, {IDLE})
+                       ON CONFLICT (thread_id) DO NOTHING"#
+                ))
                 .bind(thread_id)
                 .bind(mode)
                 .bind(source)
@@ -842,10 +871,11 @@ impl EventBus {
                 // without re-checking. Compose fields are wiped so a stale
                 // SSE replay can't show ghost text. archive_state moves to
                 // 'archived' to keep the invariant that no discarded row
-                // lingers in inbox-scoped queries.
+                // lingers in inbox-scoped queries. The pin clears with it,
+                // because a pinned thread is never archived (ADR 0312).
                 sqlx::query(
                     "UPDATE thread_summaries SET state = 'discarded', \
-                     archive_state = 'archived', \
+                     archive_state = 'archived', is_saved = FALSE, \
                      compose_text = '', compose_images = '[]'::jsonb, compose_mode = NULL, \
                      compose_selection = NULL \
                      WHERE thread_id = $1 AND state = 'composing'",
@@ -912,9 +942,10 @@ impl EventBus {
                 // `ResponseAborted` picks per cause, so this is the one
                 // terminal whose status never varies. Set has_response so the
                 // thread stays visible.
-                sqlx::query(
-                    "UPDATE thread_summaries SET last_agent_action = NOW(), has_response = TRUE, status = 'failed' WHERE thread_id = $1",
-                )
+                sqlx::query(&format!(
+                    "UPDATE thread_summaries SET last_agent_action = NOW(), has_response = TRUE, status = {} WHERE thread_id = $1",
+                    ThreadStatus::Failed.sql_literal(),
+                ))
                 .bind(thread_id)
                 .execute(&mut **tx)
                 .await?;
@@ -963,9 +994,9 @@ impl EventBus {
             ThreadEvent::TriggerCompleted { .. } => {
                 // Trigger run done — go idle. Set has_response so the thread
                 // appears in get_recent_threads (which filters has_response=TRUE).
-                sqlx::query(
-                    "UPDATE thread_summaries SET last_activity = NOW(), last_agent_action = NOW(), has_response = TRUE, status = 'idle' WHERE thread_id = $1",
-                )
+                sqlx::query(&format!(
+                    "UPDATE thread_summaries SET last_activity = NOW(), last_agent_action = NOW(), has_response = TRUE, status = {IDLE} WHERE thread_id = $1",
+                ))
                 .bind(thread_id)
                 .execute(&mut **tx)
                 .await?;
@@ -983,11 +1014,11 @@ impl EventBus {
                 incomplete,
                 ..
             } => {
-                // Aggregate emit (non-empty change_id) is the only writer of
-                // coding_agent_proposed. Legacy per-commit events (empty
-                // change_id, commit_sha set) survive only in historical rows
-                // and stay inert in thread_summaries — UPDATE-only into the
-                // existing changes row, so replay can't resurrect orphan chips.
+                // `coding_agent_proposed` and `coding_agent_requires_restart`
+                // follow the `changes` row this writes: see
+                // `ChangesProjection::sync_thread_proposal`. Legacy per-commit
+                // events (empty change_id, commit_sha set) survive only in
+                // historical rows, and are UPDATE-only into an existing row.
                 use crate::core::changes_projection::ChangesProjection;
                 debug_assert!(
                     !change_id.is_empty() || commit_sha.is_some(),
@@ -998,8 +1029,7 @@ impl EventBus {
                     // the emit doesn't yank the thread back to 'idle' while
                     // CC is still mid-stream. Else 'idle' — a proposed change
                     // is an artifact for review, not a parked loop. The
-                    // pending-review state is carried by coding_agent_proposed,
-                    // not by `status = 'waiting'`.
+                    // pending-review state is carried by coding_agent_proposed.
                     //
                     // `preserving_verdict` because a proposal is also one of the
                     // dying turn's trailing events: an interrupted coding-agent
@@ -1018,14 +1048,12 @@ impl EventBus {
                     // that must NOT light the thread's Diff button on a branch
                     // whose live `git diff` is empty.
                     sqlx::query(&format!(
-                        "UPDATE thread_summaries SET coding_agent_proposed = TRUE, \
-                         coding_agent_requires_restart = $2, coding_agent_has_diff = $3, \
+                        "UPDATE thread_summaries SET coding_agent_has_diff = $2, \
                          status = {} \
                          WHERE thread_id = $1",
-                        preserving_verdict("CASE WHEN status = 'running' THEN status ELSE 'idle' END")
+                        &*STATUS_AFTER_PROPOSAL_SQL
                     ))
                     .bind(thread_id)
-                    .bind(*requires_restart)
                     .bind(!files.is_empty())
                     .execute(&mut **tx)
                     .await?;
@@ -1053,35 +1081,15 @@ impl EventBus {
                 }
                 Vec::new()
             }
-            ThreadEvent::MergeConflictDetected { .. } => {
-                // Merge conflict — mark as applying.
-                sqlx::query(
-                    "UPDATE thread_summaries SET coding_agent_applying = TRUE WHERE thread_id = $1",
-                )
-                .bind(thread_id)
-                .execute(&mut **tx)
-                .await?;
-                Vec::new()
-            }
-            ThreadEvent::ChangeApplyFailed { .. } => {
-                // Apply failed — clear applying flag, stay waiting.
-                sqlx::query(
-                    "UPDATE thread_summaries SET coding_agent_applying = FALSE WHERE thread_id = $1",
-                )
-                .bind(thread_id)
-                .execute(&mut **tx)
-                .await?;
-                Vec::new()
-            }
             ThreadEvent::CodingAgentPromptSent { text, .. } => {
                 // Empty prompt = no agent intent → no status change. Real prompts
                 // always carry text (user follow-up audit trail, automated CC
                 // sessions). The contract in `status_transitions()` reflects this
                 // exception.
                 if !text.is_empty() {
-                    sqlx::query(
-                        "UPDATE thread_summaries SET status = 'running', last_revived_at = NOW() WHERE thread_id = $1",
-                    )
+                    sqlx::query(&format!(
+                        "UPDATE thread_summaries SET status = {RUNNING}, last_revived_at = NOW() WHERE thread_id = $1",
+                    ))
                     .bind(thread_id)
                     .execute(&mut **tx)
                     .await?;
@@ -1113,10 +1121,10 @@ impl EventBus {
                 // soon as the dispatcher emits the spawn. The contract's
                 // status_transitions table sets Running too; we emit the SQL
                 // here so the timestamp moves alongside it.
-                sqlx::query(
+                sqlx::query(&format!(
                     "UPDATE thread_summaries SET last_activity = NOW(), \
-                     status = 'running', last_revived_at = NOW() WHERE thread_id = $1",
-                )
+                     status = {RUNNING}, last_revived_at = NOW() WHERE thread_id = $1",
+                ))
                 .bind(thread_id)
                 .execute(&mut **tx)
                 .await?;
@@ -1229,12 +1237,12 @@ impl EventBus {
                     sqlx::query(&format!(
                         "UPDATE thread_summaries SET last_activity = NOW(), \
                          last_agent_action = NOW(), \
-                         last_revived_at = CASE WHEN status NOT IN ('running', {verdicts}) \
+                         last_revived_at = CASE WHEN status NOT IN ({RUNNING}, {verdicts}) \
                                                 THEN NOW() ELSE last_revived_at END, \
                          status = {status} \
                          WHERE thread_id = $1",
                         verdicts = &*crate::engine::event_bus::PRESERVED_STATUS_VERDICTS_SQL,
-                        status = preserving_verdict("'running'"),
+                        status = preserving_verdict(RUNNING),
                     ))
                     .bind(thread_id)
                     .execute(&mut **tx)
@@ -1255,10 +1263,10 @@ impl EventBus {
                 // The agent asking for input is agent activity (bumps
                 // last_agent_action); the user's resolution below is the user
                 // action.
-                sqlx::query(
+                sqlx::query(&format!(
                     "UPDATE thread_summaries SET last_activity = NOW(), last_agent_action = NOW(), \
-                     status = 'waiting_for_user_answer' WHERE thread_id = $1",
-                )
+                     status = {WAITING_FOR_USER_ANSWER} WHERE thread_id = $1",
+                ))
                 .bind(thread_id)
                 .execute(&mut **tx)
                 .await?;
@@ -1351,10 +1359,10 @@ impl EventBus {
             // (see `agent_question.rs`, `ANSWERED_AFTER_IDLE_REASON`). So it must
             // flip `idle -> running` UNCONDITIONALLY.
             ThreadEvent::UserQuestionAnswered { answer, .. } => {
-                sqlx::query(
+                sqlx::query(&format!(
                     "UPDATE thread_summaries SET last_activity = NOW(), last_user_action = NOW(), \
-                     status = 'running', last_revived_at = NOW() WHERE thread_id = $1",
-                )
+                     status = {RUNNING}, last_revived_at = NOW() WHERE thread_id = $1",
+                ))
                 .bind(thread_id)
                 .execute(&mut **tx)
                 .await?;
@@ -1454,12 +1462,12 @@ impl EventBus {
             ThreadEvent::CodingAgentPermissionResolved { .. }
             | ThreadEvent::CommandPermissionResolved { .. }
             | ThreadEvent::McpPermissionResolved { .. } => {
-                sqlx::query(
+                sqlx::query(&format!(
                     "UPDATE thread_summaries SET last_activity = NOW(), last_user_action = NOW(), \
-                     status = CASE WHEN status = 'waiting_for_user_answer' THEN 'running' ELSE status END, \
-                     last_revived_at = CASE WHEN status = 'waiting_for_user_answer' THEN NOW() ELSE last_revived_at END \
+                     status = CASE WHEN status = {WAITING_FOR_USER_ANSWER} THEN {RUNNING} ELSE status END, \
+                     last_revived_at = CASE WHEN status = {WAITING_FOR_USER_ANSWER} THEN NOW() ELSE last_revived_at END \
                      WHERE thread_id = $1",
-                )
+                ))
                 .bind(thread_id)
                 .execute(&mut **tx)
                 .await?;
@@ -1690,27 +1698,34 @@ impl EventBus {
             // Nor does the delegation asking for the doer. It sits beside a
             // `MessageReceived` that moves every column this one would.
             | ThreadEvent::VoiceSessionEnded { .. }
-            | ThreadEvent::WorkDelegated { .. } => Vec::new(),
+            | ThreadEvent::WorkDelegated { .. }
+            // A merge conflict and a failed apply change the change, not the
+            // thread. The `changes` table carries both.
+            | ThreadEvent::MergeConflictDetected { .. }
+            | ThreadEvent::ChangeApplyFailed { .. } => Vec::new(),
         };
 
         // Step 2: Validate and apply section transition via the lifecycle contract.
         // This runs after metadata updates so upsert events have created the row.
         let thread_type = Self::get_thread_type(tx, &thread_id).await?;
         let current = Self::get_current_section(tx, &thread_id).await?;
-        let (source, trigger_go_to_review): (Option<String>, bool) = sqlx::query_as(
-            "SELECT source, COALESCE(trigger_go_to_review, FALSE) \
-             FROM thread_summaries WHERE thread_id = $1",
-        )
-        .bind(thread_id)
-        .fetch_optional(&mut **tx)
-        .await?
-        .unwrap_or((None, false));
+        let (source, trigger_go_to_review, is_saved): (Option<String>, bool, bool) =
+            sqlx::query_as(
+                "SELECT source, COALESCE(trigger_go_to_review, FALSE), is_saved \
+                 FROM thread_summaries WHERE thread_id = $1",
+            )
+            .bind(thread_id)
+            .fetch_optional(&mut **tx)
+            .await?
+            .unwrap_or((None, false, false));
         // A trigger execution runs unattended, so its terminal event must not
-        // surface it in REVIEW. Two things make one attended again, and both
-        // are the trigger's own. `trigger_go_to_review` ("Send to Review on
-        // completion") covers reports the user is meant to read. A user
-        // follow-up covers the rest: the latest start is a human
-        // `MessageReceived`.
+        // surface it in REVIEW. Three things make one attended again.
+        // `trigger_go_to_review` ("Send to Review on completion") covers
+        // reports the user is meant to read. A pin says the user is watching,
+        // and a pinned thread is never archived (ADR 0312). A user follow-up
+        // covers the rest: the latest start is a human `MessageReceived`.
+        //
+        // The pin is read AFTER step 1, so a `ThreadSaved` sees its own write.
         //
         // Depth takes no part. A sub-thread of any kind keeps the section it
         // ran with, so a finished child stays under its parent rather than
@@ -1721,23 +1736,24 @@ impl EventBus {
         // Human to mirror `default_mode_human` on `ThreadEvent::MessageReceived`,
         // so legacy rows persisted before the field existed still read as
         // user messages.
-        let is_unattended = if source.as_deref() != Some("trigger") || trigger_go_to_review {
-            false
-        } else {
-            let human = ActorMode::Human.as_str();
-            let latest_start: Option<String> = sqlx::query_scalar(
-                "SELECT event_type FROM events WHERE aggregate_id = $1::text \
+        let is_unattended =
+            if source.as_deref() != Some("trigger") || trigger_go_to_review || is_saved {
+                false
+            } else {
+                let human = ActorMode::Human.as_str();
+                let latest_start: Option<String> = sqlx::query_scalar(
+                    "SELECT event_type FROM events WHERE aggregate_id = $1::text \
                  AND (event_type = 'TriggerStarted' \
                       OR (event_type = 'MessageReceived' \
                           AND COALESCE(payload->>'mode', $2) = $2)) \
                  ORDER BY sequence DESC LIMIT 1",
-            )
-            .bind(thread_id)
-            .bind(human)
-            .fetch_optional(&mut **tx)
-            .await?;
-            latest_start.as_deref() != Some("MessageReceived")
-        };
+                )
+                .bind(thread_id)
+                .bind(human)
+                .fetch_optional(&mut **tx)
+                .await?;
+                latest_start.as_deref() != Some("MessageReceived")
+            };
         match resolve_transition(event.event_type(), thread_type, current, is_unattended) {
             Ok(mut transition) => {
                 // CodingAgentIdled(has_changes=false) after apply/discard is a housekeeping

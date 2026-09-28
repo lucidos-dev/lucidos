@@ -60,7 +60,7 @@ describe('ChildStoppedRow', () => {
     expect(row!.props['data-state']).toBe('stopped');
     expect(vnodeText(row)).toContain('Child thread stopped:');
     expect(vnodeText(row)).toContain('Fix the ticket');
-    expect(vnodeText(findByClass(tree, 'event-row-state'))).toBe('waiting for you');
+    expect(vnodeText(findByClass(tree, 'event-row-state'))).toBe('Waiting for you');
 
     const link = findByClass(tree, 'accent-link')!;
     (link.props as unknown as { onClick: () => void }).onClick();
@@ -77,7 +77,7 @@ describe('ChildMovedOutRow', () => {
     expect(row!.props['data-state']).toBe('moved-out');
     expect(vnodeText(row)).toContain('Child thread moved to top level:');
     expect(vnodeText(row)).toContain('Write the notes');
-    expect(vnodeText(findByClass(tree, 'event-row-state'))).toBe('no longer waiting');
+    expect(vnodeText(findByClass(tree, 'event-row-state'))).toBe('No longer waiting');
 
     const link = findByClass(tree, 'accent-link')!;
     (link.props as unknown as { onClick: () => void }).onClick();

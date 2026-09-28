@@ -448,7 +448,7 @@ Reserve host imports for things wasm genuinely cannot do alone:
 - `current_time_ns` / `current_time_secs` — wasm has no clock.
 - `random_bytes` — wasm has no entropy source.
 - `hmac_sha1` / `hmac_sha256` / `hmac_sha512` — these take an opaque `secret_id` so the raw key bytes never enter wasm memory. **Always use the host import for HMAC**, never derive HMAC inside the signer (you'd need the secret in wasm, which defeats the handle indirection).
-- `log` — for engine-side observability.
+- `log`: for engine-side observability. Each invocation gets a budget. A line prints at most 4 KiB, and the host cuts the rest with a `[truncated, N more bytes]` marker. An invocation prints at most 32 lines or 16 KiB. Past that, one `log budget exhausted` line prints and later calls print nothing.
 
 Same principle outside the signer: never shell out to `sha256sum` / `shasum` / `openssl dgst` from a build script, test, or handshake script. Pure-language implementations are reproducible; system commands depend on which Unix you're on (`sha256sum` is GNU coreutils, `shasum` is BSD/Perl, neither is guaranteed on the bundled-installer machines Lucidos ships to).
 

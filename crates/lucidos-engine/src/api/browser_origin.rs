@@ -155,8 +155,10 @@ pub(super) fn origin_authority_matches_host(origin: &str, host: &str) -> bool {
 /// An app frame has an opaque origin (ADR 0227), so every request it makes reads
 /// as `cross-site` and the gate above refuses it. Its API calls are meant to be
 /// refused: they go through the host bridge instead, which asks from the shell's
-/// own origin. These do not go through anything. They are `<script>`, `<link>`
-/// and `<font>` on the app's own document, and a bridge cannot carry a tag.
+/// own origin. These do not go through anything. They are `<script>` and
+/// `<link>` tags on the app's own document, and the font a stylesheet names. A
+/// bridge cannot carry any of them. The font is also a CORS fetch, so it needs
+/// a header as well as this exemption (`fonts::router`, ADR 0289).
 ///
 /// Exempt because they carry nothing to protect. Four are the same bytes for
 /// every caller and ship on the public mirror. `sdk-prefs.js` is the one that

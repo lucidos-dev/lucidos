@@ -90,7 +90,8 @@ self.addEventListener('activate', (event) => {
 // We intercept same-origin GET /api/v1/* requests with explicit respondWith(fetch())
 // to work around an iOS Safari bug where the implicit "don't call respondWith"
 // fallback returns empty/corrupted responses after the SW is killed and restarted
-// under memory pressure (manifests as blank thread views). Built /assets/*
+// under memory pressure (manifests as blank thread views). Workspace images under
+// /data/ are fetched explicitly too, and read whole (see fetchWholeImage). Built /assets/*
 // bundles are also served Cache-first (see SHELL_CACHE) to speed up reloads.
 //
 // We DO NOT intercept non-GET methods (POST/PUT/PATCH/DELETE). iOS WebKit's body
@@ -187,6 +188,15 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
+  // A workspace image (a markdown `![](artifacts/x.png)` in a reply). On iOS its
+  // body can end early and still count as a success, so the picture draws part
+  // of its height above an empty box. See fetchWholeImage. Images only: a
+  // video's range requests stay native.
+  if (rel.startsWith('/data/') && event.request.destination === 'image') {
+    event.respondWith(fetchWholeImage(event.request));
+    return;
+  }
+
   // Content-hashed app bundles — no-op in dev (Vite never serves /assets/*).
   // Refuse to cache an HTML response here (see isHtmlResponse): a bundle deleted
   // by a later build resolves through the server's SPA fallback to index.html,
@@ -219,6 +229,69 @@ async function fetchWithRetry(request) {
     return await fetch(request);
   } catch {
     return await fetch(request);
+  }
+}
+
+const IMAGE_ATTEMPTS = 3;
+// How long an image body may go without a byte before the attempt is dropped.
+// Idle time, not total time, so a big picture on a slow link still finishes.
+const IMAGE_STALL_MS = 10_000;
+
+// An image body that ends early can still read as a success, even through an
+// explicit fetch. So read it whole here and count the bytes against
+// Content-Length. A short, stalled or failed body is fetched again. The page
+// gets one complete in-memory body, or a network error, which is what lets
+// `markdownImageRetry.ts` try again later.
+async function fetchWholeImage(request) {
+  for (let attempt = 1; attempt <= IMAGE_ATTEMPTS; attempt++) {
+    try {
+      // A retry skips the HTTP cache, which may hold the broken copy.
+      return await readWholeImage(request, attempt === 1 ? {} : { cache: 'reload' });
+    } catch {
+      /* short, stalled or failed: the next attempt starts fresh */
+    }
+  }
+  return Response.error();
+}
+
+async function readWholeImage(request, init) {
+  const controller = new AbortController();
+  let stallTimer = null;
+  const armStallTimer = () => {
+    clearTimeout(stallTimer);
+    stallTimer = setTimeout(() => controller.abort(), IMAGE_STALL_MS);
+  };
+  armStallTimer();
+  try {
+    const response = await fetch(request, { ...init, signal: controller.signal });
+    if (!response.ok || !response.body) return response;
+    const chunks = [];
+    let received = 0;
+    const reader = response.body.getReader();
+    for (;;) {
+      armStallTimer();
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      received += value.byteLength;
+    }
+    // A decoded body no longer matches the wire length, so only an unencoded
+    // one can be counted. Images are served unencoded.
+    const declared = Number(response.headers.get('content-length'));
+    if (!response.headers.has('content-encoding') && declared > 0 && received !== declared) {
+      throw new Error(`image body ended at ${received} of ${declared} bytes`);
+    }
+    // The body is decoded now, so the wire framing no longer describes it.
+    const headers = new Headers(response.headers);
+    headers.delete('content-encoding');
+    headers.set('content-length', String(received));
+    return new Response(new Blob(chunks), {
+      status: response.status,
+      statusText: response.statusText,
+      headers,
+    });
+  } finally {
+    clearTimeout(stallTimer);
   }
 }
 
@@ -317,13 +390,13 @@ async function networkFirstShell(request) {
     return Response.redirect(response.url, 302);
   }
   // The gateway answers a navigation to a stopped / cold-booting workspace with a
-  // 503 (ADR 0014 §11): the branded boot SPLASH (Retry-After + meta-refresh) for
+  // 503 (ADR 0014 §11): the branded boot SPLASH (Retry-After + a self-poll) for
   // a document navigation it lazy-starts, or a plain "workspace stopped" body.
   // Either way a 503 means the engine is NOT serving — so the cached app shell is
   // exactly the wrong thing to show: it boots and 503-storms its API calls
   // against the down engine, surfacing as a red connection dot (assets cached) or
   // a white screen (assets evicted / different build). The splash, by contrast,
-  // is a real page the user SHOULD see — its meta-refresh transitions to the app
+  // is a real page the user SHOULD see: its poller reloads into the app
   // once the engine is up. So a 503 is shown AS-IS (never cached — it's a 503),
   // independent of the `X-Lucidos-Boot-Splash` marker: the gateway is a
   // machine-global daemon that does NOT restart on a CC Apply, so a freshly-built

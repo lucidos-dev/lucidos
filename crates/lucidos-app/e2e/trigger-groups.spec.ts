@@ -36,22 +36,24 @@ function groupSection(page: Page, name: string): Locator {
 }
 
 /** Accept whatever confirm dialog is currently open (group/trigger deletes are
- *  both guarded by `showConfirm`, whose default OK button is `.confirm-btn-ok`). */
+ *  both guarded by `showConfirm`, whose OK button carries `data-role="confirm-ok"`). */
 async function confirmDialog(page: Page): Promise<void> {
   await page.locator('.confirm-dialog').waitFor({ state: 'visible', timeout: 10_000 });
-  await page.locator('.confirm-dialog .confirm-btn-ok:visible').first().click();
+  await page.locator('.confirm-dialog [data-role="confirm-ok"]:visible').first().click();
 }
 
-/** Dismiss any open toasts. On mobile the toast container overlays the panel and
- *  intercepts clicks on the group/trigger action buttons near the top; the info
- *  "created" toast auto-dismisses after 5s, but we clear it eagerly so the next
- *  click never races that window. */
+/** Clear any open toasts. On mobile the toast container overlays the panel and
+ *  intercepts clicks on the group/trigger action buttons near the top. The
+ *  helper dismisses a toast that waits to be answered from its X. The info "created" toast
+ *  has none, since it leaves by itself after 5s, so wait that out rather than
+ *  let the next click race it. */
 async function clearToasts(page: Page): Promise<void> {
   for (let i = 0; i < 5; i++) {
     const close = page.locator('.toast .toast-close').first();
-    if (!(await close.isVisible().catch(() => false))) return;
+    if (!(await close.isVisible().catch(() => false))) break;
     await close.click({ timeout: 2_000 }).catch(() => {});
   }
+  await page.locator('.toast').first().waitFor({ state: 'detached', timeout: 7_000 }).catch(() => {});
 }
 
 /** Create a group via the "New Group" card and wait for its empty section.

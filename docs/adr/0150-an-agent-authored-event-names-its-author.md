@@ -88,3 +88,43 @@ turns would group apart from the conversation they belong to.
 note's shape. Rejected as out of proportion. Voice needs one variant on an
 existing enum. A roster is a table, a projection and a read API, answering a
 question the event payload already answers.
+
+## Amendment, 2026-09-26: a domain event's actor is the engine's, and the `emit_event` tool names the Lucidos Agent
+
+**The gap.** The `emit_event` tool passed no actor. `to_payload` merged the
+engine's actor into a domain event's payload only when one was set, so an
+`actor` the agent wrote itself survived. It reached the stored row, the SSE
+frame and the trigger matcher, which resolves `actor.kind` as a field path into
+that payload. An agent could write `actor: {kind: "device"}` and fire a trigger
+gated on `{"actor.kind": "device"}` as if the user had tapped a button. The
+event-wait loop cap (ADR 0280) read `actor.source_thread_id` from the same place,
+so a forged one could also exempt a thread from its own cap.
+
+**The decision.** Three parts, each closing the gap on its own layer:
+
+- `LucidosEngine::emit_domain_event` takes a `MessageOrigin`, not an `Option`.
+  No live emit can leave the actor unnamed.
+- The `emit_event` tool records `MessageOrigin::Agent { agent: LucidosAgent }`.
+  That is this ADR's rule applied to a domain event: the agent wrote it, so the
+  event names the agent.
+- `to_payload` drops a caller-written `actor` from a domain event's payload,
+  even when the variant's actor is `None`. That shape is left to the engine's
+  own backfill replay, and the drop makes the rule hold at the one function
+  every reader goes through.
+
+**Replace, not reject.** A payload carrying `actor` is accepted, and the
+caller's value is replaced. The HTTP route has always done exactly that, and
+apps and scripts depend on it. An app that re-emits a payload it received
+would break under a reject, for no gain in safety. The engine logs each
+replacement, and the tool result tells the model its `actor` was dropped.
+
+**What it does not close.** ADR 0169 keeps a device id as attribution, not
+authentication. A process on this machine that drops its origin token and sends
+a registered `x-lucidos-device-id` is still recorded as that device. So
+`actor.kind = device` stops every forgery through a payload, and proves a tap
+only as far as the device header does.
+
+**Not recorded: which app emitted.** The host bridge stamps `x-lucidos-app-id`,
+but the only honest place to keep it is the `Device` actor, a change across
+every site that builds one. The header is also typed freely outside the shell,
+so it would add attribution without adding proof.

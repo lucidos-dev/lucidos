@@ -56,7 +56,7 @@
 
 set -euo pipefail
 
-PG_VERSION="${PG_VERSION:-18.4.0}"           # match production (Dockerfile ships PG 18)
+PG_VERSION="${PG_VERSION:-18.4.0}"           # match the bundled runtime (PG 18)
 PGVECTOR_VERSION="${PGVECTOR_VERSION:-0.8.2}"
 PORT="${PORT:-54329}"
 WORKDIR="${WORKDIR:-/tmp/lucidos-pg-pgvector-spike}"

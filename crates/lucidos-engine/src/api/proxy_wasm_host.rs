@@ -41,6 +41,100 @@ pub struct HostState {
     /// as its `ResourceLimiter`. It lives in the store data because that is
     /// the only state wasmtime hands back to the limiter callback.
     pub limits: SignerLimits,
+    /// What the `log` import may still print during this invocation.
+    pub log_budget: LogBudget,
+}
+
+/// Most module bytes one `log` call prints. The host never reads more.
+pub const LOG_LINE_MAX_BYTES: usize = 4 * 1024;
+/// Most lines one invocation prints before its log budget is spent.
+pub const LOG_LINES_PER_INVOCATION: u32 = 32;
+/// Most module bytes one invocation prints before its log budget is spent.
+pub const LOG_BYTES_PER_INVOCATION: usize = 16 * 1024;
+/// The one line printed when an invocation spends its log budget.
+pub const LOG_BUDGET_EXHAUSTED: &str =
+    "log budget exhausted, dropping further log lines from this invocation";
+
+/// Per-invocation allowance for the `log` host import.
+///
+/// Every printed line lands in `engine.log`, and nothing rotates that file.
+/// Without this, a signer logging in a loop fills the disk, and a full disk
+/// takes Postgres down with it.
+#[derive(Debug, Default)]
+pub struct LogBudget {
+    lines: u32,
+    bytes_read: usize,
+    exhausted: bool,
+}
+
+impl LogBudget {
+    pub fn lines_printed(&self) -> u32 {
+        self.lines
+    }
+
+    pub fn bytes_read(&self) -> usize {
+        self.bytes_read
+    }
+
+    pub fn is_exhausted(&self) -> bool {
+        self.exhausted
+    }
+
+    /// The line to print for one `log` call asking for `requested` bytes, or
+    /// `None` when the call prints nothing.
+    ///
+    /// `read(n)` fetches the module's first `n` bytes. `n` never exceeds
+    /// [`LOG_LINE_MAX_BYTES`] or what is left of the budget.
+    pub fn next_line<'m>(
+        &mut self,
+        requested: usize,
+        redactions: &[String],
+        read: impl FnOnce(usize) -> Option<&'m [u8]>,
+    ) -> Option<String> {
+        if self.exhausted {
+            return None;
+        }
+        let remaining = LOG_BYTES_PER_INVOCATION - self.bytes_read;
+        if self.lines == LOG_LINES_PER_INVOCATION || remaining == 0 {
+            self.exhausted = true;
+            return Some(LOG_BUDGET_EXHAUSTED.to_string());
+        }
+        let take = requested.min(LOG_LINE_MAX_BYTES).min(remaining);
+        let bytes = read(take)?;
+        self.lines += 1;
+        self.bytes_read += take;
+        Some(format_log_line(bytes, requested - take, redactions))
+    }
+}
+
+/// Redacts `bytes` and marks how many `dropped` bytes the cap cut off.
+fn format_log_line(bytes: &[u8], dropped: usize, redactions: &[String]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    if dropped == 0 {
+        return crate::core::redact_secret_values(&text, redactions);
+    }
+    // A cut inside a character leaves U+FFFD, which would hide a secret's
+    // start from `without_partial_secret_tail`.
+    let kept = without_partial_secret_tail(text.trim_end_matches('\u{FFFD}'), redactions);
+    let redacted = crate::core::redact_secret_values(kept, redactions);
+    format!("{redacted} [truncated, {dropped} more bytes]")
+}
+
+/// Cuts a trailing start of a secret, which the cap split off from its end.
+/// Redaction matches whole secrets only, so that start would print verbatim.
+fn without_partial_secret_tail<'t>(text: &'t str, redactions: &[String]) -> &'t str {
+    let cut = redactions
+        .iter()
+        .filter_map(|secret| {
+            (1..secret.len())
+                .rev()
+                .filter(|&n| secret.is_char_boundary(n))
+                .find(|&n| text.ends_with(&secret[..n]))
+                .map(|n| text.len() - n)
+        })
+        .min()
+        .unwrap_or(text.len());
+    &text[..cut]
 }
 
 // ---- Pure-Rust primitive helpers (no wasmtime types) -------------------
@@ -390,7 +484,8 @@ pub fn register_host_imports(linker: &mut Linker<HostState>) -> Result<(), wasmt
         },
     )?;
 
-    // log(ptr, len) — host-side log line, prefixed with the module name.
+    // log(ptr, len): host-side log line, prefixed with the module name, capped
+    // by the invocation's `LogBudget`.
     linker.func_wrap(
         "env",
         "log",
@@ -402,19 +497,20 @@ pub fn register_host_imports(linker: &mut Linker<HostState>) -> Result<(), wasmt
                 Ok(m) => m,
                 Err(_) => return,
             };
-            let bytes = match read_bytes(&mem, &mut caller, ptr as u32, len as u32) {
-                Ok(b) => b,
-                Err(_) => return,
-            };
-            let msg = String::from_utf8_lossy(&bytes);
-            // Scrub secret material before it reaches the log. `log` is
-            // deliberately ungated. An ungranted signer is never handed an
-            // upstream auth value, and a granted one cannot print it past this
-            // line. Gating the import would only cost a signer author the one
-            // channel they have for debugging.
-            let msg = crate::core::redact_secret_values(&msg, &caller.data().log_redactions);
-            let module_name = caller.data().module_name.clone();
-            crate::log!("[wasm-signer:{}] {}", module_name, msg);
+            let (memory, state) = mem.data_and_store_mut(&mut caller);
+            // `next_line` scrubs secret material before it reaches the log.
+            // `log` is deliberately ungated. An ungranted signer is never
+            // handed an upstream auth value, and a granted one cannot print it
+            // past this line. Gating the import would only cost a signer
+            // author the one channel they have for debugging.
+            let line = state
+                .log_budget
+                .next_line(len as usize, &state.log_redactions, |n| {
+                    memory.get(ptr as u32 as usize..)?.get(..n)
+                });
+            if let Some(line) = line {
+                crate::log!("[wasm-signer:{}] {}", state.module_name, line);
+            }
         },
     )?;
 
@@ -581,5 +677,99 @@ mod tests {
     fn base64_encode_returns_none_when_capacity_insufficient() {
         let mut out = [0u8; 4];
         assert!(base64_encode_into(b"hello", &mut out).is_none());
+    }
+
+    const TRUNCATION_MARKER_ALLOWANCE: usize = 64;
+
+    /// Drives `next_line` the way the `log` import does, over a module memory
+    /// of `memory`, and returns every line the host would print.
+    fn log_lines(budget: &mut LogBudget, memory: &[u8], calls: usize, len: usize) -> Vec<String> {
+        (0..calls)
+            .filter_map(|_| {
+                budget.next_line(len, &[], |n| {
+                    assert!(n <= LOG_LINE_MAX_BYTES, "host asked for {n} bytes");
+                    memory.get(..n)
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_tight_loop_of_huge_lines_stays_inside_the_log_budget() {
+        let memory = vec![b'A'; 16 * 1024 * 1024];
+        let mut budget = LogBudget::default();
+        let lines = log_lines(&mut budget, &memory, 10_000, memory.len());
+
+        let exhausted = lines.iter().filter(|l| *l == LOG_BUDGET_EXHAUSTED).count();
+        assert_eq!(exhausted, 1);
+        assert_eq!(lines.last().map(String::as_str), Some(LOG_BUDGET_EXHAUSTED));
+        for line in &lines {
+            assert!(line.len() <= LOG_LINE_MAX_BYTES + TRUNCATION_MARKER_ALLOWANCE);
+        }
+        let printed: usize = lines.iter().map(String::len).sum();
+        assert!(printed <= LOG_BYTES_PER_INVOCATION + lines.len() * TRUNCATION_MARKER_ALLOWANCE);
+        assert!(budget.bytes_read() <= LOG_BYTES_PER_INVOCATION);
+        assert!(lines[0].ends_with(&format!(
+            " [truncated, {} more bytes]",
+            memory.len() - LOG_LINE_MAX_BYTES
+        )));
+    }
+
+    #[test]
+    fn a_tight_loop_of_short_lines_stops_at_the_line_cap() {
+        let memory = b"retrying".to_vec();
+        let mut budget = LogBudget::default();
+        let lines = log_lines(&mut budget, &memory, 10_000, memory.len());
+
+        assert_eq!(lines.len(), LOG_LINES_PER_INVOCATION as usize + 1);
+        assert!(lines[..lines.len() - 1].iter().all(|l| l == "retrying"));
+        assert_eq!(lines.last().map(String::as_str), Some(LOG_BUDGET_EXHAUSTED));
+        assert!(budget.is_exhausted());
+    }
+
+    #[test]
+    fn an_out_of_bounds_log_prints_nothing_and_costs_nothing() {
+        let mut budget = LogBudget::default();
+        assert_eq!(budget.next_line(10, &[], |_| None), None);
+        assert_eq!((budget.lines_printed(), budget.bytes_read()), (0, 0));
+    }
+
+    #[test]
+    fn a_capped_line_still_redacts_and_never_prints_half_a_secret() {
+        let secret = "sk-live-0123456789".to_string();
+        let redactions = std::slice::from_ref(&secret);
+        // The cap cuts the second copy of the secret after its first 7 bytes.
+        let mut memory = "x".repeat(LOG_LINE_MAX_BYTES - 7 - secret.len());
+        memory.push_str(&secret);
+        memory.push_str(&secret);
+        memory.push_str("tail");
+
+        let mut budget = LogBudget::default();
+        let line = budget
+            .next_line(memory.len(), redactions, |n| memory.as_bytes().get(..n))
+            .expect("first line prints");
+
+        assert!(line.contains("[REDACTED]"));
+        assert!(
+            !line.contains(&secret[..7]),
+            "leaked a secret prefix: {line}"
+        );
+    }
+
+    #[test]
+    fn a_cap_inside_a_character_of_a_secret_still_hides_its_start() {
+        let secret = "ab\u{20AC}cdefgh".to_string();
+        // The cap lands after "ab" and the first byte of the euro sign.
+        let mut memory = "x".repeat(LOG_LINE_MAX_BYTES - 3);
+        memory.push_str(&secret);
+
+        let mut budget = LogBudget::default();
+        let line = budget
+            .next_line(memory.len(), std::slice::from_ref(&secret), |n| {
+                memory.as_bytes().get(..n)
+            })
+            .expect("first line prints");
+
+        assert!(!line.contains("ab"), "leaked a secret prefix: {line}");
     }
 }

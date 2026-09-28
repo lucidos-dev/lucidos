@@ -31,7 +31,6 @@ export interface ThreadSummary {
   coding_agent_proposed: boolean;
   coding_agent_requires_restart: boolean;
   coding_agent_is_external_repo: boolean;
-  coding_agent_applying: boolean;
   last_revived_at: string | null;
   parent_thread_id?: string | null;
   parent_thread_title?: string | null;

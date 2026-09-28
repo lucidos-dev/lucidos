@@ -1,5 +1,6 @@
 import { showToast, removeToast, latestTauriAppVersion, latestTauriAppNotes, appUpdateCheckError, appUpdateCheckInFlight, appUpdateProgress, lucidosRelease, releaseCheck, settingsScrollTarget } from '../store';
 import { isNewerVersion } from '../../utils/version';
+import type { ToastAction } from '../types';
 // The READ lives a layer up, where a surface can ask "is there an update?"
 // without importing this module's toasts, IPC and menu navigation.
 import { packagedUpdateVersion } from '../packagedUpdate';
@@ -106,10 +107,11 @@ function offerAppUpdate(version: string): void {
   // `Available`, which is where a reader who cares goes looking.
   if (thisDeviceIsMobile()) return;
   const route = updateRoute(true);
-  const action = {
-    label: route === 'install' ? 'Update & restart' : 'How to update',
-    onClick: () => { void followUpdateRoute(route); },
-  };
+  // `confirm` keeps "Update & restart" a button. A lone neutral action becomes
+  // a tap on the whole card (`toastTap`), and a stray tap must not restart.
+  const action: ToastAction = route === 'install'
+    ? { label: 'Update & restart', variant: 'confirm', onClick: () => { void followUpdateRoute(route); } }
+    : { label: 'How to update', onClick: () => { void followUpdateRoute(route); } };
   showToast(`Lucidos ${version} available`, 'info', {
     key: UPDATE_TOAST_KEY,
     action,

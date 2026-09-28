@@ -8,7 +8,7 @@
     padding: 0.375rem 0.5rem;
     margin-top: 0.5rem;
     background: var(--bg-tertiary);
-    border-radius: 0.25rem;
+    border-radius: calc(var(--radius-control) * 0.5);
     user-select: none;
 }
 
@@ -33,7 +33,7 @@
     gap: 0.5rem;
     padding: 0.625rem;
     background: var(--bg-tertiary);
-    border-radius: 0.25rem;
+    border-radius: calc(var(--radius-control) * 0.5);
 }
 
 .thread-queue-policy-grid {
@@ -55,7 +55,7 @@
     background: var(--bg-primary);
     color: var(--text-primary);
     border: 1px solid var(--border-color);
-    border-radius: 0.25rem;
+    border-radius: calc(var(--radius-control) * 0.5);
     font: inherit;
     /* `font` resets font-feature-settings to initial; keep inheriting it
        so a Fira Code user does not get ligatures back here. */

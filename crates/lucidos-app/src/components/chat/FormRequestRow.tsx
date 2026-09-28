@@ -26,14 +26,17 @@ export function FormRequestRow({ row, threadId }: { row: FormRequestRowEvent; th
   const described = describeFormRequest(row.request);
   return eventRowBody({
     kind: 'form',
-    mark: row.resolution ? 'arrived' : 'pending',
     state: row.resolution ?? 'open',
     role: 'form-request-row',
     subject: described.charAt(0).toUpperCase() + described.slice(1),
     stateLabel: state.label,
     tone: state.tone,
-    action: row.resolution
+    actions: row.resolution
       ? undefined
-      : { label: 'Open', onClick: () => openFormRequest(threadId, row.request, { byUser: true }) },
+      : (
+        <button type="button" class="action-btn" onClick={() => openFormRequest(threadId, row.request, { byUser: true })}>
+          {'Open'}
+        </button>
+      ),
   });
 }

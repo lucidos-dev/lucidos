@@ -17,12 +17,12 @@ use std::path::{Path, PathBuf};
 
 use crate::core::git_auth::GitCredentials;
 use crate::core::plugins::{
-    compare_versions, detect_conflicts, validate_tree, PlannedFile, UpdateDecision,
-    AUTH_MODULES_DIR,
+    check_font_room, compare_versions, detect_conflicts, validate_tree, PlannedFile,
+    UpdateDecision, AUTH_MODULES_DIR,
 };
 use crate::core::DATA_DIR;
 use crate::engine::event_bus::{BusEvent, EventBusEmitter, SystemEvent};
-use crate::engine::thread_events::MessageOrigin;
+use crate::engine::thread_events::{EngineReason, MessageOrigin, PluginSetupOccasion};
 use crate::engine::tools::agent_tool_actor;
 use crate::engine::trigger_writes::TriggerWrite;
 use crate::engine::LucidosEngine;
@@ -346,6 +346,9 @@ pub(crate) fn prepare_install_request(
     };
 
     let data_dir = workspace_path.join(DATA_DIR);
+    if let Err(e) = check_font_room(&planned, &data_dir) {
+        return format!("Error: {}", e);
+    }
     let overwrites = detect_conflicts(&planned, &data_dir);
     let install_id = uuid::Uuid::new_v4().to_string();
 
@@ -627,7 +630,7 @@ pub struct ConfirmedUninstall {
 /// prune empty parent directories, reload the WASM signer map if any
 /// `auth-modules/` files were touched, and emit `PluginUninstalled` (extended
 /// payload). The `actor` is the device/user who clicked Confirm; it stamps
-/// the resulting event so the popover renders a real device label. Mirrors
+/// the resulting event, and the popover names that device from its id. Mirrors
 /// `confirm_pending_install` step-for-step.
 pub async fn confirm_pending_uninstall(
     engine: &LucidosEngine,
@@ -1138,10 +1141,10 @@ pub async fn confirm_pending_install(
     };
     let prior_setup = prior.as_ref().and_then(|r| r.setup()).map(str::to_string);
     let occasion = match &prior {
-        Some(rec) => SetupOccasion::Update {
-            from: rec.version().map(str::to_string),
+        Some(rec) => PluginSetupOccasion::Update {
+            from_version: rec.version().map(str::to_string),
         },
-        None => SetupOccasion::FreshInstall,
+        None => PluginSetupOccasion::FreshInstall,
     };
     let setup_thread_id =
         setup_is_new(pending.setup.as_deref(), prior_setup.as_deref()).then(uuid::Uuid::new_v4);
@@ -1216,7 +1219,12 @@ pub async fn confirm_pending_install(
     // `setup_thread_id` is minted only when `setup_is_new` said yes, and that
     // is already false for an absent or blank `setup`.
     if let Some(thread_id) = setup_thread_id {
-        spawn_plugin_setup_thread(engine, thread_id, &pending.plugin_name, &occasion, actor).await;
+        let plugin = SeededPlugin {
+            id: pending.plugin_id.clone(),
+            name: pending.plugin_name.clone(),
+            version: pending.plugin_version.clone(),
+        };
+        spawn_plugin_setup_thread(engine, thread_id, &plugin, occasion, actor).await;
     }
 
     Ok(ConfirmedInstall {
@@ -1371,14 +1379,14 @@ pub async fn propose_local_patch_upstream(
     }
 
     let thread_id = uuid::Uuid::new_v4();
-    engine
-        .thread_queue
-        .submit(
-            build_upstream_patch_thread_request(thread_id, &plugin_name, &patch_path),
-            actor,
-            None,
-        )
-        .await;
+    let plugin = SeededPlugin {
+        id,
+        name: plugin_name,
+        version,
+    };
+    let request =
+        build_upstream_patch_thread_request(thread_id, &plugin, &patch_path, actor.as_ref());
+    engine.thread_queue.submit(request, actor, None).await;
 
     Ok(ProposedUpstream {
         patch_path,
@@ -1387,18 +1395,20 @@ pub async fn propose_local_patch_upstream(
 }
 
 /// The Thread Queue request for an upstream-patch thread. A `SubThread` for the
-/// same two reasons as the setup thread. Its `prepare` step emits the seeding
+/// same reason as the setup thread: its `prepare` step emits the seeding
 /// `MessageReceived` eagerly, so the frontend can navigate into a real thread.
-/// And it sidesteps the origin/mode validation an `AgentChat` would hit.
 ///
 /// The seed is one user-facing line naming the plugin and the patch. How to
 /// actually open the pull request lives in `system-knowhow/plugins.md`, which
-/// keeps procedure out of the prompt.
+/// keeps procedure out of the prompt. The engine wrote the line, so the engine
+/// is its origin, with the requesting device carried beside it.
 fn build_upstream_patch_thread_request(
     thread_id: uuid::Uuid,
-    plugin_name: &str,
+    plugin: &SeededPlugin,
     patch_path: &str,
+    actor: Option<&MessageOrigin>,
 ) -> crate::engine::thread_queue::ThreadQueueRequest {
+    let plugin_name = &plugin.name;
     crate::engine::thread_queue::ThreadQueueRequest::SubThread {
         // Stamped by `submit` from the submitting task's chain depth.
         depth: 0,
@@ -1413,7 +1423,35 @@ fn build_upstream_patch_thread_request(
         model: None,
         reasoning_effort: None,
         pre_emitted_origin: None,
-        origin: None,
+        origin: Some(MessageOrigin::engine(
+            EngineReason::PluginUpstreamProposal {
+                plugin_id: plugin.id.clone(),
+                plugin_name: plugin.name.clone(),
+                version: plugin.version.clone(),
+                patch_path: patch_path.to_string(),
+                confirmed_on_device_id: confirming_device_id(actor),
+            },
+        )),
+    }
+}
+
+/// The plugin an engine-seeded thread is about: what its seed names and what
+/// its `EngineReason` records.
+#[derive(Debug)]
+struct SeededPlugin {
+    id: String,
+    name: String,
+    /// The version installed now.
+    version: String,
+}
+
+/// The device behind a confirm, when a device made it. The `ThreadQueued`
+/// audit event still records any other caller. Only a device has a name the
+/// popover can show.
+fn confirming_device_id(actor: Option<&MessageOrigin>) -> Option<String> {
+    match actor {
+        Some(MessageOrigin::Device { device_id }) => Some(device_id.clone()),
+        _ => None,
     }
 }
 
@@ -1423,66 +1461,39 @@ fn build_upstream_patch_thread_request(
 /// the author's `setup` text is referenced from the `PluginInstalled` event
 /// (see `build_setup_thread_request`). Submitted through the Thread Queue like
 /// any background spawn, so it respects admission control. `thread_id` is
-/// pre-allocated by the caller (so
-/// the same id can be recorded in the `PluginInstalled` event). The submission
-/// never fails for this kind (overflow is per-trigger only), so the thread is
-/// always either admitted immediately or queued — never dropped.
+/// pre-allocated by the caller, so the same id can be recorded in the
+/// `PluginInstalled` event. The submission never fails for this kind (overflow
+/// is per-trigger only): the thread is admitted at once or queued, never
+/// dropped.
 ///
-/// Spawned as a [`ThreadQueueRequest::SubThread`], NOT `AgentChat`, for two
-/// reasons:
-/// 1. **Materialize before navigation.** The Thread Queue executor's `prepare`
-///    step emits the seeding `MessageReceived` EAGERLY — synchronously, before
-///    `submit` returns, on the immediate-admit path — so the `thread_summaries`
-///    row exists by the time this confirm responds. The frontend then navigates
-///    into a real, materializing thread instead of an empty view. (`AgentChat`
-///    has no eager prepare, so its thread didn't exist until the agent later ran.)
-/// 2. **No origin/mode panic.** `AgentChat` paired `origin: actor` — a
-///    `MessageOrigin::Device` whose `mode()` is `Human` — with `mode: Agent`.
-///    `make_message_received`'s origin/mode validation rejects that mismatch and
-///    `.expect()`s, so the setup thread's `MessageReceived` panicked and the
-///    thread never materialized. `SubThread` emits with a synthesized Agent-mode
-///    origin (`None` here, since there's no parent), sidestepping the validation.
+/// Spawned as a [`ThreadQueueRequest::SubThread`], NOT `AgentChat`, so it
+/// materializes before navigation. The executor's `prepare` step emits the
+/// seeding `MessageReceived` eagerly, before `submit` returns on the
+/// immediate-admit path. The `thread_summaries` row therefore exists by the
+/// time this confirm responds, and the frontend navigates into a real thread.
 ///
-/// `actor` still attributes the `ThreadQueued` audit event via `submit`.
+/// `actor` attributes the `ThreadQueued` audit event via `submit`, and its
+/// device (when it is one) rides on the seed's `EngineReason`.
 async fn spawn_plugin_setup_thread(
     engine: &LucidosEngine,
     thread_id: uuid::Uuid,
-    plugin_name: &str,
-    occasion: &SetupOccasion,
+    plugin: &SeededPlugin,
+    occasion: PluginSetupOccasion,
     actor: Option<MessageOrigin>,
 ) {
-    let request = build_setup_thread_request(thread_id, plugin_name, occasion);
+    let request = build_setup_thread_request(thread_id, plugin, occasion, actor.as_ref());
     engine.thread_queue.submit(request, actor, None).await;
 }
 
-/// Why a setup thread is being spawned, which is what its seed and title say.
-///
-/// A separate type rather than an `Option<version>`, because the version is
-/// decoration and the occasion is the fact. A legacy `PluginInstalled` row can
-/// name no version at all, and `installed_plugin_summaries` shows those as
-/// `unknown`. Collapsing the two would seed such an update as a first install.
-/// The agent would then skip the whole reuse step and re-ask everything, which
-/// is the failure this occasion exists to prevent.
-#[derive(Debug)]
-enum SetupOccasion {
-    FreshInstall,
-    /// The plugin was already installed. `from` is the version it was on, when
-    /// the prior record names one.
-    Update {
-        from: Option<String>,
-    },
-}
-
 /// Build the Thread Queue request for a plugin setup thread. Pure (no engine,
-/// no I/O) so the request shape is unit-testable — the `SubThread` choice and
+/// no I/O) so the request shape is unit-testable. The `SubThread` choice and
 /// the bound `child_thread_id` are load-bearing (see `spawn_plugin_setup_thread`
 /// for why), and a regression back to `AgentChat` would silently break setup.
 ///
-/// The seed is a SHORT, user-facing line — the only thing shown in the thread's
+/// The seed is a SHORT, user-facing line: the only thing shown in the thread's
 /// first bubble. The "how to run a plugin setup" meta-instructions live in
-/// `system-knowhow/plugin-setup` (loaded by the agent, see the chat system
-/// prompt's load-knowhow nudge), and the plugin author's own `setup` text is
-/// referenced from the durable `PluginInstalled` event — neither is embedded
+/// `system-knowhow/plugin-setup`, and the plugin author's own `setup` text is
+/// referenced from the durable `PluginInstalled` event. Neither is embedded
 /// here, so the user isn't shown a wall of agent instructions.
 ///
 /// An update says so in both the seed and the title. The agent then picks up
@@ -1493,24 +1504,32 @@ enum SetupOccasion {
 /// up`, which the system-prompt route and the knowhow's `description` key on.
 /// Every update seed says `again`, which is how the knowhow tells the two
 /// occasions apart.
+///
+/// The engine wrote the seed, so its origin is `EngineReason::PluginSetup`.
+/// The confirming device is secondary attribution, never the origin: a device
+/// origin would render the engine's words as the user's own.
 fn build_setup_thread_request(
     thread_id: uuid::Uuid,
-    plugin_name: &str,
-    occasion: &SetupOccasion,
+    plugin: &SeededPlugin,
+    occasion: PluginSetupOccasion,
+    actor: Option<&MessageOrigin>,
 ) -> crate::engine::thread_queue::ThreadQueueRequest {
-    let (prompt, title) = match occasion {
-        SetupOccasion::Update { from: Some(prior) } => (
+    let plugin_name = &plugin.name;
+    let (prompt, title) = match &occasion {
+        PluginSetupOccasion::Update {
+            from_version: Some(prior),
+        } => (
             format!(
                 "Set up {plugin_name} again: its setup instructions changed \
                  since version {prior}."
             ),
             format!("Update {plugin_name} setup"),
         ),
-        SetupOccasion::Update { from: None } => (
+        PluginSetupOccasion::Update { from_version: None } => (
             format!("Set up {plugin_name} again: this update changed its setup instructions."),
             format!("Update {plugin_name} setup"),
         ),
-        SetupOccasion::FreshInstall => (
+        PluginSetupOccasion::FreshInstall => (
             format!("Set up the newly installed {plugin_name} plugin."),
             format!("Set up {plugin_name}"),
         ),
@@ -1527,11 +1546,13 @@ fn build_setup_thread_request(
         model: None,
         reasoning_effort: None,
         pre_emitted_origin: None,
-        // No launching THREAD to attribute to: an install is a user action, and
-        // stamping the clicking device would be the `mode: Agent` mismatch this
-        // function's doc comment describes. Distinct from a `relation: "top"`
-        // spawn, which has no linkage but does have a spawning thread.
-        origin: None,
+        origin: Some(MessageOrigin::engine(EngineReason::PluginSetup {
+            plugin_id: plugin.id.clone(),
+            plugin_name: plugin.name.clone(),
+            version: plugin.version.clone(),
+            occasion,
+            confirmed_on_device_id: confirming_device_id(actor),
+        })),
     }
 }
 
@@ -1703,6 +1724,7 @@ pub(crate) async fn install_from_unpacked_with_bus(
     // failure, nothing copied). Cron is workspace state, not plugin content
     // (ADR 0019, plugins.md "What doesn't belong in a plugin").
     validate_plugin_triggers_event_driven(&planned)?;
+    check_font_room(&planned, &data_dir)?;
 
     let conflicts = detect_conflicts(&planned, &data_dir);
     if !conflicts.is_empty() && !overwrite {

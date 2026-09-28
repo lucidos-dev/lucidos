@@ -60,6 +60,7 @@ use uuid::Uuid;
 
 use crate::engine::event_bus::{BusEvent, EmittedEvent, EventBus};
 use crate::engine::thread_events::{EventChannel, ThreadEvent};
+use crate::engine::thread_lifecycle::ThreadStatus;
 
 /// SQL fragment listing the CC lifecycle events whose presence AFTER a trigger
 /// event implies the trigger was already picked up (CC clearly ran in response).
@@ -482,7 +483,7 @@ impl SpawnDispatcher {
              WHERE e.event_type = 'ContinuationRequested' \
                AND e.aggregate = 'thread' \
                AND t.source = 'claude_code' \
-               AND t.status = 'running' \
+               AND t.status = {} \
                AND NOT EXISTS ( \
                    SELECT 1 FROM events e2 \
                    WHERE e2.aggregate_id = e.aggregate_id \
@@ -490,6 +491,7 @@ impl SpawnDispatcher {
                      AND e2.event_type IN ({}) \
                ) \
              ORDER BY e.sequence ASC",
+            ThreadStatus::Running.sql_literal(),
             continuation_superseded_events_sql()
         ))
         .fetch_all(&self.pool)
@@ -540,7 +542,7 @@ pub(crate) async fn thread_has_unactuated_continuation(pool: &PgPool, thread_id:
                AND e.event_type = 'ContinuationRequested' \
                AND e.aggregate = 'thread' \
                AND t.source = 'claude_code' \
-               AND t.status = 'running' \
+               AND t.status = {} \
                AND NOT EXISTS ( \
                    SELECT 1 FROM events e2 \
                    WHERE e2.aggregate_id = e.aggregate_id \
@@ -548,6 +550,7 @@ pub(crate) async fn thread_has_unactuated_continuation(pool: &PgPool, thread_id:
                      AND e2.event_type IN ({}) \
                ) \
          )",
+        ThreadStatus::Running.sql_literal(),
         continuation_superseded_events_sql()
     ))
     .bind(thread_id.to_string())

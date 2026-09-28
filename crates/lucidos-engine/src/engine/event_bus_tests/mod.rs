@@ -22,7 +22,6 @@ async fn spawn_parent_child(bus: &EventBus, child_channel: EventChannel) -> (Uui
             text: "do something".into(),
             user_image_hashes: vec![],
             device_id: None,
-            device: None,
             image_description: None,
             parent_thread_id: None,
             spawning_event_id: None,
@@ -47,7 +46,6 @@ async fn spawn_parent_child(bus: &EventBus, child_channel: EventChannel) -> (Uui
             text: "child task".into(),
             user_image_hashes: vec![],
             device_id: None,
-            device: None,
             image_description: None,
             parent_thread_id: Some(parent_id),
             spawning_event_id: None,
@@ -179,7 +177,6 @@ async fn emit_thread_message(bus: &EventBus, thread_id: Uuid, parent: Option<Uui
             text: text.into(),
             user_image_hashes: vec![],
             device_id: None,
-            device: None,
             image_description: None,
             parent_thread_id: parent,
             spawning_event_id: None,
@@ -199,11 +196,28 @@ async fn emit_thread_message(bus: &EventBus, thread_id: Uuid, parent: Option<Uui
 
 /// Helper: emit CodingAgentIdled with the given flags. When `has_changes=true`,
 /// also emits a synthetic `ChangeProposed` to mirror the production CC
-/// lifecycle (idle → propose). `coding_agent_proposed` is set exclusively by
-/// `ChangeProposed`, so without the follow-up the projection column never
-/// flips. Callers that want to assert the bare-idle (no-proposal) state
-/// should construct events inline rather than use this helper.
+/// lifecycle (idle → propose). `coding_agent_proposed` follows the pending
+/// `changes` row that proposal writes. [`emit_cc_idled`] is the idle alone.
 async fn emit_cc_idle(
+    bus: &EventBus,
+    thread_id: Uuid,
+    has_changes: bool,
+    cc_session_id: Option<&str>,
+) {
+    emit_cc_idled(bus, thread_id, has_changes, cc_session_id).await;
+    if has_changes {
+        emit_change_proposed(
+            bus,
+            thread_id,
+            &format!("claude-code/test-{thread_id}"),
+            false,
+        )
+        .await;
+    }
+}
+
+/// Emit CodingAgentIdled only, with no proposal behind it.
+async fn emit_cc_idled(
     bus: &EventBus,
     thread_id: Uuid,
     has_changes: bool,
@@ -226,16 +240,16 @@ async fn emit_cc_idle(
     })
     .await
     .unwrap();
-    if has_changes {
-        emit_change_proposed(bus, thread_id, "claude-code/test", false).await;
-    }
+}
+
+/// The `changes` row id [`emit_change_proposed`] writes for `thread_id`.
+fn test_change_id(thread_id: Uuid) -> Uuid {
+    Uuid::new_v5(&Uuid::NAMESPACE_OID, thread_id.as_bytes())
 }
 
 /// Emit a vanilla `ChangeProposed` for `thread_id` and wait for it to land.
-/// `change_id` is derived from `thread_id` so multiple proposals on the same
-/// thread reuse the same row. The string `change_id` is not a UUID, so
-/// `write_proposed_aggregate` short-circuits without inserting into `changes` —
-/// fine for projection tests that only care about `thread_summaries` flips.
+/// `change_id` is derived from `thread_id`, so repeated proposals on one thread
+/// reuse one `changes` row, and [`test_change_id`] names it for a resolve.
 async fn emit_change_proposed(
     bus: &EventBus,
     thread_id: Uuid,
@@ -245,7 +259,7 @@ async fn emit_change_proposed(
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ChangeProposed {
-            change_id: format!("test-cid-{}", thread_id),
+            change_id: test_change_id(thread_id).to_string(),
             description: Some("Test change".into()),
             files: vec!["test.rs".into()],
             requires_restart,
@@ -392,7 +406,6 @@ async fn emit_cc_message_received(
             text: text.into(),
             user_image_hashes: vec![],
             device_id: None,
-            device: None,
             image_description: None,
             parent_thread_id: parent,
             spawning_event_id: None,
@@ -476,6 +489,8 @@ mod live_event_waits;
 mod origin_and_resume;
 mod parked_question_delivery;
 mod parked_thread_archive;
+mod pinned_is_never_archived;
+mod proposal_follows_changes;
 mod proposed_apply_cycle;
 mod recovery_and_pipeline;
 mod recursion_guard;

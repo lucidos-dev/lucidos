@@ -18,7 +18,7 @@ The frontend expresses **what** the user wants, not **how** the backend should d
 
 Compose drafts live in `threadMap` like any other thread (`meta.state === 'composing'`, `focusedThreadId` set). `sendCompose` (compose.ts) flips state to `'active'` BEFORE calling `sendMessage`, so `sendMessage` cannot tell first-send from follow-up by thread state alone: every plausible signal (`threadMap.get` truthy, `focusedThreadId === null`, `meta.state === 'composing'`) is wrong for at least one of optimistic insert, focused draft, or sendCompose's pre-flip.
 
-Lifecycle states: `'composing' | 'active' | 'discarded' | 'archived'` (`ThreadComposeState`).
+Lifecycle states: `'composing' | 'active' | 'discarded'` (`ThreadComposeState`). Archive is orthogonal: an archived thread keeps `state: 'active'` and carries `section: 'archived'`.
 
 **Every compose-view dropdown selection is PER-DRAFT, never a bare global signal.** Draft content already is (`composeDrafts[id]`: text, images, `mode`), and so are the dropdowns — **target/scope, coding-agent backend, Lucidos model + reasoning, coding-agent model + reasoning** live in **`composeSelections[id]`** (`store/composeSelections.ts`) as *overrides*, resolved via the `resolve*(threadId)` helpers.
 
@@ -57,9 +57,9 @@ type Loadable<T> =
 - Tab data must load on page reload via `store/startup.ts`
 - Use `ApiError` + `toFailed()`. Use `useDelayedLoading(loadable)` for loaders — true only after the load has been pending `SPINNER_DELAY_MS` (300ms), so fast loads never flash a loader. Loaders are **delay-only**: a *minimum-visible* floor was tried and rejected — holding a loader means withholding already-loaded content, which feels sluggish. The smooth skeleton **exit** is `<LoadingFade>` instead.
 
-**Never render a bare loading indicator (`<div class="loading-spinner" />`, a skeleton) immediately.** Gate it on `useDelayedLoading(loadable)` (Loadable) or `useDelayedFlag(active, delayMs?)` (boolean) from `hooks/useDelayedLoading.ts` — both delay past `SPINNER_DELAY_MS`. `useDelayedFlag` also backs non-loader fuses (e.g. the 8s "tap to reload" timeout); there it's purely the delay.
+**Never render a loader immediately.** Gate it on `useDelayedLoading(loadable)` (Loadable) or `useDelayedFlag(active, delayMs?)` (boolean) from `hooks/useDelayedLoading.ts`. Both delay past `SPINNER_DELAY_MS`. `useDelayedFlag` also backs non-loader fuses (e.g. the 8s "tap to reload" timeout); there it's purely the delay.
 
-- Prefer a **skeleton** (`<ThreadSkeleton/>`, or a self-skeletonizing row via `<ListSkeletonOf row={() => <MyRow/>} />`) for known-shape content (message threads, list rows); keep a plain spinner for inline status indicators and indeterminate "working" states.
+- **Data loading draws a skeleton, always.** There is no page spinner and no "Loading…" text. A `.mini-spinner` stays only for an indeterminate working state (a running step, a save in flight). The exceptions are the anchored popover, the single value and the single control, each below.
 - Smooth the skeleton→content handoff with **`<LoadingFade showSkeleton={delayedFlag} skeleton={<ListSkeletonOf row={() => <MyRow/>}/>}>{loaded ? content : null}</LoadingFade>`** (`components/shared/LoadingFade.tsx`) — crossfades the skeleton out as content fades in, without withholding content. ThreadView uses an equivalent fading overlay (`ThreadSkeletonOverlay`) so its scroll container is untouched.
 - **Full-screen surfaces gate the skeleton too**, including the workspace picker (`<LoadingFade showSkeleton={useDelayedFlag(listLoading)} …>`). The earlier "no competing content → show the skeleton immediately (ungated)" carve-out was wrong in practice: the picker renders its brand header + footer immediately AND its inline boot splash fades over it for ~0.65s on every open, so the sub-`SPINNER_DELAY_MS` window is never a bare blank panel: an ungated skeleton just *blinked* under the clearing splash on a fast local backend. The delay gate suppresses it on a fast load and shows it only on a genuinely slow one. Still wrap in `<LoadingFade>` for the exit crossfade.
 - **The delay gate has NO exception, and the transcript is the scar that proves it.** A timer never preempts running JavaScript, so a response landing inside `SPINNER_DELAY_MS` cancels a loader that never got a frame. A long synchronous render then paints nothing, and the transcript hit exactly that. The fix tried twice was a *hold*: raise the skeleton ahead of the gate, then apply the rows. It was reverted, and ADR 0081 records why in full. A hold's two steps ARE the two reported symptoms.
@@ -79,9 +79,15 @@ type Loadable<T> =
 - **Render N copies** through **`<ListSkeletonOf row={() => <MyRow/>} fill? containerClass=… />`**. Pass the real list's container class so spacing mirrors. Pass `fill` for a full-pane list, which measures the pane and the real row height.
 - **Trees vary rows by index**, via the `row(i)` thunk (see `folderTreeSkeletonRow`).
 - **A surface that can't take `ListSkeletonOf`'s `<div>` wrapper** still self-skeletonizes the real row markup, inside a `<SkeletonProvider>` with the same `Sk*` leaves. That covers a `<ul>/<li>` list and a brand-skinned one, such as the picker or the control-panel switcher.
-- **Re-skin `.sk-bar` with a scoped rule** when the surface isn't on the default theme background (e.g. `.ws-picker-row .sk-bar`).
+- **Shapes that are not rows reuse the same idea.** A code block draws its own box with `SkText` lines (`StepCodeBlock`). A source file draws `LineNumberedCode`'s own gutter (`FileSourceSkeleton`), and a diff draws `DiffView` cards (`DiffSkeleton`). A rendered document takes `ProseSkeleton`. A form draws its `.form-group` boxes with known labels as real text (`FormSkeleton`).
+- **`.sk-bar` is translucent**, a tint of the text colour with an accent shine, so it shows on any background, `--bg-tertiary` included. A brand-coloured surface overrides only `--sk-base` / `--sk-shine` (the picker). `styles/__tests__/sk-bar-shows-on-any-surface.test.ts` lets no other rule repaint a bar.
+- **A code-split view draws nothing, not even its skeleton, until its chunk lands**, and every rebuild renames the chunks. So what must appear at once is eager (`SettingsHome`, the notification views). `ContentPane` prefetches the rest when idle (`prefetchWhenIdle`, ADR 0288).
 
-Enforced by `components/shared/__tests__/skeleton-guard.test.ts`, a source scan: no reintroduced generic list skeleton, and every `<LoadingFade>` paired with a self-skeletonizing skeleton.
+Enforced by two source scans in `components/shared/__tests__/`, both default-deny:
+
+- **`skeleton-guard.test.ts`**: no `loading-spinner` class and no "Loading…" text. Every component that consumes a `Loadable` draws a skeleton, and every `<LoadingFade>` pairs with a self-skeletonizing one.
+- **`loadable-guard.test.ts`**: a file that imports an API read holds it in a `Loadable`, and no component keeps a `[loading, setLoading]` flag.
+- **Exemptions** name the rule that allows them, from a closed set of tags: `structure-first`, `single-value`, `working-state`, `no-visual`, `best-effort` and `returns-value`. A stale entry fails, and a `best-effort` one needs the carve-out comment below.
 
 **A single VALUE inside otherwise-real markup gets no skeleton**, unlike a whole control fed by its own read. Hold the surrounding control's box and leave the slot empty until the value lands. Such a value is typically read once at app startup rather than per open, so its missing window is a cold load. An iOS PWA is evicted from memory constantly, so an ungated bar shimmers on almost every launch. Gating it trades that for a blank slot on the same launches. Right-anchor the box so nothing already drawn moves when the value arrives, as `workspacesMenuRow`'s pill does with its chevron.
 
@@ -100,13 +106,28 @@ Decision function: `backupSlotsPending` in `components/settings/BackupSection.ts
 const loadable = myData.value;
 const showLoading = useDelayedLoading(loadable);
 if (loadable.status === 'failed') return <LoadableError noun="items" error={loadable.error} />;
-if (loadable.status !== 'loaded') {
-  if (!showLoading) return null;  // No empty container flash
-  return <div class="empty">Loading...</div>;
-}
-if (loadable.data.length === 0) return <div class="empty">No items</div>;
-// Render items
+return (
+  <LoadingFade showSkeleton={showLoading} skeleton={<ListSkeletonOf containerClass="list-rows" row={() => <ItemRow />} />}>
+    {loadable.status === 'loaded' && (loadable.data.length === 0
+      ? <div class="empty-state">No items</div>
+      : <div class="list-rows">{loadable.data.map((item) => <ItemRow key={item.id} item={item} />)}</div>)}
+  </LoadingFade>
+);
 ```
+
+## A Content Panel Joins the Panel Refresh Contract
+
+**Every content-pane view that shows fetched data registers its refresh with `usePanelRefresh`.** Pull to refresh and the header's Refresh both run it, so a view that skips it has neither. The contract is `docs/glossary.md` § Panel refresh contract: settle once the data lands, keep it on screen meanwhile, start a new read.
+
+- **Register where the data is owned.** A page component registers its own reads. A settings section drawn by a `SettingsView` function takes a row in `SETTINGS_SECTION_REFRESH` instead. A page with two data owners registers two, and a refresh runs both.
+- **Return the promise.** A `void` loader gives the header spinner nothing to wait on, so make it return what it awaits.
+- **A re-read keeps what is shown** (`setLoadingIfFresh`, `loadingIfFresh`, `keepLoadedWhileRefetching`). Blank only when the read names a different thing, such as another file or filter.
+- **Pause, never clobber, a draft.** Pass `null` while a form holds an unsaved edit.
+- **A new view takes a row** in `store/__tests__/panel-refresh-coverage.test.ts`, refreshable or static. The test fails until it does.
+
+## Inline Disclosures Roll Through `<Disclosure>`
+
+**A block the user unfolds in place renders through `<Disclosure open>`** (`components/shared/Disclosure.tsx`), never a bare `{open && …}`. That gives it the *disclosure roll* (`docs/glossary.md`), the thread drawer's own motion, from one curve and length in `utils/disclosureMotion.ts`. Pass the children unconditionally: the component unmounts them when closed and keeps them, inert, for the exit. A navigation that opens it to land on a row inside passes `instant`, since a scroll mid-roll measures a moving box. A suite that flattens vnodes with a bare call mocks it with `components/shared/__tests__/disclosureStub.ts`.
 
 ## No Hidden Errors — Fail Fast, Tell the User
 
@@ -116,7 +137,8 @@ Errors must propagate to the frontend — never silently skip, swallow, or log-o
 - **TypeScript:** Use `showToast(msg, 'error')` or `Loadable` failed state. No fire-and-forget `promise.then(...)` without `.catch()`. Avoid dynamic `import()` for actions (circular deps cause silent failures).
 - **The chain:** Backend error → HTTP → `ApiError` → `Loadable` failed → visible to user. No link may drop the error.
 - **A user-facing message never carries a raw response body.** `throwIfNotOk` (`api/client/_core.ts`) is the one place a body becomes a `reason`, and it normalizes. A JSON `{error}` / `{reason}` field is kept as the engine wrote it. Markup is discarded for a short status phrase. Plain text keeps its FIRST LINE only, whitespace-collapsed and clamped. An unnormalized body is a bug even though nothing is swallowed, because a payload is not prose.
-- **`showToast` is the second net, and neither may be re-widened.** It clamps every message it stores (`clampToastMessage`) and flattens an `error` to one line, so a failure can carry no structure. That matters because `parseToastMessage` reads a bold title and a bulleted list out of newlines. The gateway's 503 boot splash is an 8 KB HTML page, so it duly rendered as a list of its own `<meta>` tags. "Surface the body, it might be a panic" is how a web page became a card covering the transcript.
+- **`showToast` is the second net, and neither may be re-widened.** It clamps every title and message it stores (`clampToastText`) and flattens an `error` to one line, so a failure stays one sentence. The gateway's 503 boot splash is an 8 KB HTML page, and it once rendered as a list of its own `<meta>` tags. "Surface the body, it might be a panic" is how a web page became a card covering the transcript.
+- **A toast's title is explicit: `showToast(message, type, { title })`.** Only the title is bold. A newline in a message is a line break, and nothing reads a heading or a list out of it.
 - **Error messages must name the entity and the origin — never a bare generic.** Say *what* failed (id/name/path — `App "demo-director" no longer exists`, not `App no longer exists`) and, when the action wasn't a direct click, *where it came from* (`… (requested by thread "X")` / `… (requested by an app)`). A generic message with the identity stripped is a swallowed error. Thread the originating context to the error site rather than dropping it. (Regression: a `NavigationRequested` from a sibling thread toasted "App no longer exists" with no id and no source, for an app that existed on disk.)
 - **Never conclude "X doesn't exist" from a cached projection — reconfirm against the source of truth first.** Disk-/DB-backed lists (`appsList`, `artifacts`, …) are caches refreshed by SSE events; they go momentarily stale when a sibling thread mutates state. A definitive "gone" verdict (and its toast) must come *after* a re-fetch that re-reads the source (e.g. `openAppById` re-scans disk on a cache miss), not from a `list.some(...)` pre-check against the possibly-stale cache. A stale-cache pre-check that short-circuits the re-fetch is a swallowed error — it reports live entities as deleted.
 - **A disk-/DB-backed list whose freshness depends on a refresh event ⇒ EVERY mutation path must emit that event.** The list is loaded by re-scanning the source (e.g. `loadApps()` → `/apps` scans `data/apps/`); the cache only updates live because something emits the `App*`/`Artifact*`/… SSE event that the frontend's `entityReferences` arm reloads on. A mutation path that doesn't emit it leaves every open page showing stale data until a full reload. When you touch a mutation site, check it emits the event the list listens on. (Regression: the chat `write_file` tool emitted `App*` only for `artifacts/` paths, so apps created via raw file writes never refreshed the list.)
@@ -194,7 +216,9 @@ The rule has a sharp shape:
 
 When you add a new navigation entry point, add it to the test mirror in `crates/lucidos-app/src/store/actions/menu.test.ts` (or the equivalent suite) so the regression is pinned.
 
-**The view swap itself is already smoothed, so do NOT add a per-callsite fade.** `revealContentPane()` is about *which pane the user is looking at*. The crossfade between the outgoing and incoming views is the **navigation cover** (`docs/glossary.md`). `ContentPane` mounts it on every change of the **content view key**, whatever caused it. The header title arrives with it on the same key. A new navigation entry point inherits both for free.
+**The panel nav history keeps one invariant: the row at the cursor describes what is on screen.** A navigation earns a new row by calling `pushNavState()` in the same task as its state change. Any other write to `activeMenuItem`, `settingsSubview`, `panelOverlay` or `wipPreviewThreadId` folds into the current row on the next microtask (`foldUnpushedChange` in `store/actions/navigation.ts`). A closed panel's row thereby merges into the row beneath it. So a close path needs no history bookkeeping, and a push after an `await` is the one thing to avoid: the fold runs first and overwrites the row you came from.
+
+**The view swap itself is already smoothed, so do NOT add a per-callsite fade.** `revealContentPane()` is about *which pane the user is looking at*. The fade between the outgoing and incoming views is the **navigation cover** (`docs/glossary.md`). `ContentPane` mounts it on every change of the **content view key**, whatever caused it. A new navigation entry point inherits it for free.
 
 What a new *view* owes is identity, not animation. Take a `PanelOverlay` variant whose payload picks out one of several things (which file, which notification, which inline form). Resolve it in `components/layout/contentViewKey.ts`, so two of them are told apart. A variant that returns its bare type while displaying several things is the bug this replaced. It breaks the scroll memory in the same stroke.
 
@@ -299,7 +323,7 @@ What `<Overlay>` does for you (mechanism: `makeDismissHandlers` / `store/overlay
 
 `onClose` may return `false` to declare the call was a no-op — e.g. the overlay is already on its way out via a close animation and the originating signal is still `true`. Both the pointerdown path and the click-capture fallback honour it: a `false` return leaves the suppressor disarmed (and skips the inline swallow in the fallback), so the user's tap on a sibling button still reaches its handler. Returning `void` / `true` keeps the default dismiss+swallow. `closeDrawer` is the canonical user: during the 200ms slide-out it returns `false` so the hook stops eating neighbor taps mid-animation.
 
-The older `ModalOverlay` (backdrop-`onClick`) component has been **deleted**: it dismissed but did not swallow, and couldn't serve click-through overlays. **Every** overlay panel now renders through `<Overlay>`: `useDismissOnOutside` has exactly one caller (`<Overlay>`), and `<Overlay>` is the only thing that registers a *panel* into the `overlayStack`. (The stack also takes **Escape-only registrants**, the entries `hasPanel` marks out for item 0's `topPanelOverlay`: `pseudo-fullscreen`, the thread filter, and `ModelSelectionPicker`'s step.) Don't reintroduce a hand-rolled dismiss listener or a backdrop-only `onClick` close. Contract logic is unit-tested via `makeDismissHandlers` (`hooks/useAnchoredPopover.test.ts`), the stack's two questions (`store/__tests__/overlay-stack-top-panel.test.ts`) and the `<Overlay>` tripwires (`components/shared/__tests__/overlay-contract.test.ts`). Behavior is covered end-to-end by `e2e/search-everywhere-close-mobile.spec.ts` (re-tapping the anchor closes) and `e2e/overlay-compose-dismiss-mobile.spec.ts` (a touch tap on a sibling `touchend` button dismisses without firing the action).
+The older `ModalOverlay` (backdrop-`onClick`) component has been **deleted**: it dismissed but did not swallow, and couldn't serve click-through overlays. **Every** overlay panel now renders through `<Overlay>`: `useDismissOnOutside` has exactly one caller (`<Overlay>`), and `<Overlay>` is the only thing that registers a *panel* into the `overlayStack`. (The stack also takes **Escape-only registrants**, the entries `hasPanel` marks out for item 0's `topPanelOverlay`: `pseudo-fullscreen`, the thread filter, and a step inside a panel through `useEscapeStep`.) Don't reintroduce a hand-rolled dismiss listener or a backdrop-only `onClick` close. Contract logic is unit-tested via `makeDismissHandlers` (`hooks/useAnchoredPopover.test.ts`), the stack's two questions (`store/__tests__/overlay-stack-top-panel.test.ts`) and the `<Overlay>` tripwires (`components/shared/__tests__/overlay-contract.test.ts`). Behavior is covered end-to-end by `e2e/search-everywhere-close-mobile.spec.ts` (re-tapping the anchor closes) and `e2e/overlay-compose-dismiss-mobile.spec.ts` (a touch tap on a sibling `touchend` button dismisses without firing the action).
 
-**A STEP inside a panel answers Escape through the stack too.** A keydown handler cannot: the dispatcher runs in the capture phase and stops propagation. `ModelSelectionPicker` pushes a registrant whenever it has somewhere to step back to, so Escape lands there instead of closing. Registering later than the panel is what puts the step on top of it.
+**A STEP inside a panel answers Escape through the stack too.** A keydown handler cannot: the dispatcher runs in the capture phase and stops propagation. `useEscapeStep` (`hooks/useEscapeStep.ts`) pushes a registrant while there is somewhere to step back to, so Escape lands there instead of closing. Registering later than the panel is what puts the step on top of it. Its callers are `ModelSelectionPicker`'s tier and provider steps and the waiting panel's *drill-in*.
 

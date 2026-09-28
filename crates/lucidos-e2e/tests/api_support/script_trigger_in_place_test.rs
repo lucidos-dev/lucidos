@@ -79,8 +79,8 @@ async fn find_trigger_id(client: &reqwest::Client, name: &str) -> Option<String>
 /// Best-effort: the engine may hold `index.lock` for another run's auto-commit,
 /// and a failed cleanup must not fail the assertion this test exists for.
 async fn remove_and_commit(trigger_dir: &Path, slug: &str) {
-    // Removing them is a working-tree change too; same guard as the write.
-    let _tree = crate::support::workspace_tree_lock().read().await;
+    // Exclusive, because this commits in the workspace itself.
+    let _tree = crate::support::workspace_tree_lock().write().await;
     let _ = std::fs::remove_dir_all(trigger_dir);
     let pathspec = format!("data/triggers/{}", slug);
     // Pathspec form: commits the working-tree state of exactly these paths,

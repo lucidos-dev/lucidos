@@ -27,16 +27,17 @@
 use super::LucidosEngine;
 use crate::api::frontend_snapshot;
 use crate::engine::engine_version::BuildState;
+use chrono::{DateTime, Utc};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 /// How long to wait for the build-watch to republish `dist/` after a
-/// frontend-only Apply before giving up. A fresh `vite build` is sub-second here;
-/// this is generous headroom. On timeout we simply don't swap (safe no-op) — e.g.
-/// no build-watch is running, or a deterministic rebuild produced an identical
-/// BUILD_ID (nothing new to serve).
+/// frontend-only Apply before giving up. A fresh `vite build` takes a few
+/// seconds, so this is generous headroom. On timeout we don't swap. A green build after the
+/// Apply means the bundle came out identical, which is silent. Anything else
+/// warns the page with `FrontendUpdateStranded`.
 const REBUILD_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Poll cadence while waiting for the rebuild.
@@ -74,14 +75,42 @@ fn build_failure_reason(status_json: &str) -> Option<String> {
     (!reason.is_empty()).then(|| reason.to_string())
 }
 
-/// The build-watch's status for the checkout that owns `served_dir`.
+/// Pure: did the build-watch finish a green build at or after `since`?
 ///
+/// After a frontend Apply this means the build ran over the merged tree. If the
+/// BUILD_ID still did not move, the change left the bundle byte-identical (a
+/// comment, a test file) and there is nothing new to serve.
+fn build_succeeded_since(status_json: &str, since: DateTime<Utc>) -> bool {
+    let Ok(doc) = serde_json::from_str::<serde_json::Value>(status_json) else {
+        return false;
+    };
+    doc.get("ok").and_then(serde_json::Value::as_bool) == Some(true)
+        && doc
+            .get("at")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
+            .is_some_and(|at| at >= since)
+}
+
 /// `served_dir` is `<app>/dist`, and the watcher keeps its state one level up in
-/// `<app>/.build-watch/`. An absent file is the ordinary case on any stack whose
-/// watcher predates the status file, so it is a quiet `None`.
+/// `<app>/.build-watch/`.
+fn build_watch_dir(served_dir: &Path) -> Option<PathBuf> {
+    Some(served_dir.parent()?.join(".build-watch"))
+}
+
+fn read_build_status(served_dir: &Path) -> Option<String> {
+    std::fs::read_to_string(build_watch_dir(served_dir)?.join("status.json")).ok()
+}
+
+/// The build-watch's failure for the checkout that owns `served_dir`. An absent
+/// file is the ordinary case on any stack whose watcher predates the status
+/// file, so it is a quiet `None`.
 fn read_build_failure(served_dir: &Path) -> Option<String> {
-    let status = served_dir.parent()?.join(".build-watch/status.json");
-    build_failure_reason(&std::fs::read_to_string(status).ok()?)
+    build_failure_reason(&read_build_status(served_dir)?)
+}
+
+fn read_build_succeeded_since(served_dir: &Path, since: DateTime<Utc>) -> bool {
+    read_build_status(served_dir).is_some_and(|status| build_succeeded_since(&status, since))
 }
 
 /// What the build-watch is doing, as far as its pidfile can say.
@@ -145,7 +174,7 @@ fn pid_is_alive(pid: i32) -> bool {
 /// The build-watch's state for the checkout that owns `served_dir`, read from
 /// the pidfile beside the status file [`read_build_failure`] uses.
 fn read_build_watch_state(served_dir: &Path) -> BuildWatchState {
-    let Some(dir) = served_dir.parent().map(|app| app.join(".build-watch")) else {
+    let Some(dir) = build_watch_dir(served_dir) else {
         return BuildWatchState::Unknown;
     };
     let pid = std::fs::read_to_string(dir.join("pid"))
@@ -165,6 +194,16 @@ fn source_rebuilt(current_id: Option<&str>, source_id: Option<&str>) -> bool {
         (None, Some(_)) => true,
         _ => false,
     }
+}
+
+/// Pure: the elapsed time of the refresh recorded in `started`, or `None`
+/// unless it is still the current generation. The peer sync bumps the
+/// generation when it aborts the applying task, and that abort skips the
+/// task's own cleanup.
+fn live_refresh_elapsed(started: Option<(u64, Instant)>, current: u64) -> Option<Duration> {
+    started
+        .filter(|(generation, _)| *generation == current)
+        .map(|(_, at)| at.elapsed())
 }
 
 /// Pure INV-A decision: is it safe to advance the served client in-process,
@@ -253,6 +292,42 @@ impl LucidosEngine {
         self.frontend_refresh_generation.load(Ordering::SeqCst) != generation
     }
 
+    /// How long this engine's applying frontend refresh has been running, or
+    /// `None` when none is in flight. Reported as `frontend_refresh_elapsed_ms`.
+    pub(crate) fn frontend_refresh_elapsed(&self) -> Option<Duration> {
+        live_refresh_elapsed(
+            *self.frontend_refresh_started.lock().unwrap(),
+            self.frontend_refresh_generation.load(Ordering::SeqCst),
+        )
+    }
+
+    /// Every exit of the applying task ends here, so the indicator stops at
+    /// once rather than on the next poll. A newer generation owns the slot.
+    async fn finish_frontend_refresh(&self, generation: u64) {
+        {
+            let mut slot = self.frontend_refresh_started.lock().unwrap();
+            if slot.is_some_and(|(started, _)| started == generation) {
+                *slot = None;
+            }
+        }
+        self.emit_frontend_refresh_state_changed().await;
+    }
+
+    /// Emit the transient `FrontendRefreshStateChanged` UI poke. The client
+    /// re-reads version-status rather than trusting the event.
+    async fn emit_frontend_refresh_state_changed(&self) {
+        self.event_bus
+            .emit_or_log(
+                crate::engine::event_bus::BusEvent::System(
+                    crate::engine::event_bus::SystemEvent::FrontendRefreshStateChanged {
+                        sent_at_ms: crate::engine::now_epoch_millis(),
+                    },
+                ),
+                "[Frontend] FrontendRefreshStateChanged",
+            )
+            .await;
+    }
+
     /// Emit the transient `FrontendUpdateDeferred` UI signal — the page-facing
     /// hint that a frontend-only Apply's in-process served-client advance was
     /// deferred because an engine version change is pending (INV-A). Fired from
@@ -332,9 +407,7 @@ impl LucidosEngine {
     /// holds a new-engine client, so the disk gate alone would wrongly permit an
     /// advance.
     pub(crate) async fn engine_source_matches_head(&self) -> Option<bool> {
-        let commit = crate::engine::engine_version::build_id_commit(crate::ENGINE_BUILD_ID)?;
-        let root = crate::paths::repo_root().ok()?;
-        crate::engine::engine_version::no_restart_between(commit, "HEAD", &root).await
+        crate::engine::engine_version::own_source_matches_head().await
     }
 
     /// Composed INV-A gate for the APPLYING engine's own frontend-only advance:
@@ -371,10 +444,14 @@ impl LucidosEngine {
         ) else {
             return; // frontend not served (headless) — nothing to advance
         };
+        // Taken here, not inside the task: the merge has just landed, and a fast
+        // build must not finish before the task is first polled.
+        let applied_at = Utc::now();
         let generation = self
             .frontend_refresh_generation
             .fetch_add(1, Ordering::SeqCst)
             + 1;
+        *self.frontend_refresh_started.lock().unwrap() = Some((generation, Instant::now()));
         // Coalesce: abort any in-flight refresh; the new generation supersedes it.
         if let Some(old) = self.frontend_refresh_task.lock().unwrap().take() {
             old.abort();
@@ -382,9 +459,12 @@ impl LucidosEngine {
         let engine = self.clone();
         let workspace = self.workspace_path().to_path_buf();
         let task = tokio::spawn(async move {
+            engine.emit_frontend_refresh_state_changed().await;
             engine
-                .run_served_frontend_refresh(handle, source, workspace, generation)
+                .clone()
+                .run_served_frontend_refresh(handle, source, workspace, generation, applied_at)
                 .await;
+            engine.finish_frontend_refresh(generation).await;
         });
         *self.frontend_refresh_task.lock().unwrap() = Some(task);
     }
@@ -395,6 +475,7 @@ impl LucidosEngine {
         source: PathBuf,
         workspace: PathBuf,
         generation: u64,
+        applied_at: DateTime<Utc>,
     ) {
         // INV-A early-out: if an engine version change is already pending (a prior
         // mixed Apply's rebuild is in flight/ready, a newer binary is on disk, or
@@ -444,6 +525,17 @@ impl LucidosEngine {
                 let in_worktree = crate::paths::path_is_in_cc_worktree(&source);
                 let build_error = read_build_failure(&source);
                 let watch_stopped = read_build_watch_state(&source) == BuildWatchState::Stopped;
+                // Decided at the deadline rather than on the first green build,
+                // so a build queued behind it has had time to move the id.
+                if !in_worktree && !watch_stopped && read_build_succeeded_since(&source, applied_at)
+                {
+                    crate::log!(
+                        "[Frontend] frontend-only Apply: {} rebuilt with the same BUILD_ID, so \
+                         the served client is already current",
+                        source.display()
+                    );
+                    return;
+                }
                 if let Some(reason) = build_error.as_deref() {
                     crate::log!(
                         "[Frontend] the build-watch reports a FAILING build, which is why \
@@ -666,12 +758,18 @@ impl LucidosEngine {
         }
         // Advance under a fresh generation so a concurrent applying refresh
         // coalesces (only the latest generation swaps).
+        let superseded_applying_refresh = self.frontend_refresh_elapsed().is_some();
         let generation = self
             .frontend_refresh_generation
             .fetch_add(1, Ordering::SeqCst)
             + 1;
         if let Some(old) = self.frontend_refresh_task.lock().unwrap().take() {
             old.abort();
+        }
+        // The aborted task never reaches `finish_frontend_refresh`, so this
+        // takeover owes the page the end-of-refresh poke.
+        if superseded_applying_refresh {
+            self.emit_frontend_refresh_state_changed().await;
         }
         let workspace = self.workspace_path().to_path_buf();
         if self
@@ -721,10 +819,23 @@ impl LucidosEngine {
 #[cfg(test)]
 mod tests {
     use super::{
-        applying_git_gate, build_failure_reason, classify_build_watch, frontend_advance_is_safe,
-        peer_git_gate, pid_is_alive, read_build_failure, read_build_watch_state, source_rebuilt,
+        applying_git_gate, build_failure_reason, build_succeeded_since, classify_build_watch,
+        frontend_advance_is_safe, live_refresh_elapsed, peer_git_gate, pid_is_alive,
+        read_build_failure, read_build_succeeded_since, read_build_watch_state, source_rebuilt,
         BuildState, BuildWatchState,
     };
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_refresh_is_live_only_while_its_generation_is_current() {
+        let started = Instant::now() - Duration::from_secs(5);
+        let elapsed = live_refresh_elapsed(Some((3, started)), 3).expect("current generation");
+        assert!(elapsed >= Duration::from_secs(5));
+        // The peer sync took over with generation 4 and aborted the task, so
+        // its cleanup never ran. The slot still says 3, and must read as idle.
+        assert_eq!(live_refresh_elapsed(Some((3, started)), 4), None);
+        assert_eq!(live_refresh_elapsed(None, 3), None);
+    }
 
     #[test]
     fn peer_git_gate_advances_only_on_confirmed_source_parity() {
@@ -856,6 +967,61 @@ mod tests {
         // case, and must stay quiet.
         let bare = tempfile::tempdir().unwrap();
         assert_eq!(read_build_failure(&bare.path().join("dist")), None);
+    }
+
+    fn at(rfc3339: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(rfc3339)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    #[test]
+    fn a_green_build_after_the_apply_counts_as_landed() {
+        // The incident: a comment-only edit rebuilt to the same BUILD_ID, and
+        // the Apply warned that its change was "not served yet".
+        let applied = at("2026-09-26T05:15:34Z");
+        let status = r#"{"ok": true, "at": "2026-09-26T05:15:38.732Z", "error": null}"#;
+        assert!(build_succeeded_since(status, applied));
+    }
+
+    #[test]
+    fn only_a_green_build_after_the_apply_counts() {
+        let applied = at("2026-09-26T05:15:34Z");
+        for status in [
+            // Green, but from before the Apply: it never saw the change.
+            r#"{"ok": true, "at": "2026-09-26T05:02:00Z", "error": null}"#,
+            // After the Apply, but red: a real reason to warn.
+            r#"{"ok": false, "at": "2026-09-26T05:15:38Z", "error": "boom"}"#,
+            r#"{"ok": true, "at": "not a time"}"#,
+            r#"{"ok": true}"#,
+            "not json at all",
+            "",
+        ] {
+            assert!(
+                !build_succeeded_since(status, applied),
+                "counted {status:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_green_build_is_read_beside_the_served_dist() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = dir.path();
+        std::fs::create_dir_all(app.join(".build-watch")).unwrap();
+        std::fs::write(
+            app.join(".build-watch/status.json"),
+            r#"{"ok": true, "at": "2026-09-26T05:15:38Z", "error": null}"#,
+        )
+        .unwrap();
+        let applied = at("2026-09-26T05:15:34Z");
+        assert!(read_build_succeeded_since(&app.join("dist"), applied));
+
+        let bare = tempfile::tempdir().unwrap();
+        assert!(!read_build_succeeded_since(
+            &bare.path().join("dist"),
+            applied
+        ));
     }
 
     #[test]

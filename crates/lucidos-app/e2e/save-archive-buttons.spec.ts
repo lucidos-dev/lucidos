@@ -116,11 +116,11 @@ test.describe('Section-aware Save/Archive buttons', () => {
 
     await page.locator('button[aria-label="Archive thread"]:visible').first().click();
     await expect(
-      page.getByText('Are you sure you want to move this thread to the archive?'),
+      page.getByText('Archiving unpins this thread. Move it to the archive?'),
     ).toBeVisible({ timeout: 5_000 });
 
     // Two Archive buttons exist while the dialog is open — scope to the dialog.
-    await page.locator('.confirm-btn.confirm-btn-ok:visible').first().click();
+    await page.locator('[data-role="confirm-ok"]:visible').first().click();
 
     await waitForThreadInSection(page, threadId, 'archive');
     expect(await isThreadInSection(page, threadId, 'archive')).toBe(true);

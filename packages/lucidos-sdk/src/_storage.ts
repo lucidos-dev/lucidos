@@ -31,6 +31,11 @@ function workspaceSlug(): string | null {
   return seg === '' || seg === '~' ? null : seg;
 }
 
+/** Whether this realm runs inside a workspace, so its keys are namespaced. */
+export function inWorkspace(): boolean {
+  return workspaceSlug() !== null;
+}
+
 /** `ws:<slug>:<key>` in a workspace, else the raw key (picker / legacy). */
 function nsKey(key: string): string {
   const slug = workspaceSlug();
@@ -104,6 +109,17 @@ const DEVICE_ID_KEY = 'lucidos-device-id';
  */
 export function wsDeviceId(): string | null {
   return wsLocalGet(DEVICE_ID_KEY);
+}
+
+/** Write a per-workspace localStorage value (namespaced). Best-effort: a
+ *  storage-less realm keeps nothing. */
+export function wsLocalSet(key: string, value: string): void {
+  if (isBridged()) return bridgedSet(nsKey(key), value, false);
+  try {
+    localStorage.setItem(nsKey(key), value);
+  } catch {
+    /* a storage-less realm has nowhere to write */
+  }
 }
 
 /** Remove a per-workspace localStorage value (namespaced). Best-effort: used by

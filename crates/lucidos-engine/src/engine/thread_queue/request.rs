@@ -83,11 +83,10 @@ pub enum ThreadQueueRequest {
         /// rows written before the field existed, which fall back to the
         /// linkage-derived origin in `synthesize_legacy_origin`.
         ///
-        /// MUST be an `ActorMode::Agent` origin (or `None`): both emit sites
-        /// pass `ActorMode::Agent`, and `make_message_received` `.expect()`s on
-        /// a mode mismatch, so a `Device` origin here would panic the spawn
-        /// rather than mislabel it. That is why the plugin setup thread passes
-        /// `None` instead of the clicking device.
+        /// Both emit sites derive the turn's mode from this origin
+        /// (`MessageOrigin::mode_or`), so an engine-seeded spawn carries an
+        /// `Engine` origin. [`ThreadQueueRequest::is_attributed`] flags a
+        /// request that names neither an origin nor a parent.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origin: Option<MessageOrigin>,
     },
@@ -129,7 +128,8 @@ pub enum ThreadQueueRequest {
         reasoning_effort: Option<String>,
         /// Who launched this thread. Same split as `SubThread::origin`:
         /// attribution for the popover, independent of the callback linkage
-        /// above, and Agent-mode for the same reason.
+        /// above. MUST be Agent-mode: `run_agent_thread_spawn` stamps
+        /// `ActorMode::Agent`, and its only caller is the `run_coding_agent` tool.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origin: Option<MessageOrigin>,
     },
@@ -241,6 +241,34 @@ impl ThreadQueueRequest {
             | Self::CodingAgent { depth, .. }
             | Self::AgentChat { depth, .. } => *depth = caller_depth,
             Self::EventTrigger { .. } | Self::Cron { .. } => {}
+        }
+    }
+
+    /// Whether the thread this spawn starts can say who started it.
+    ///
+    /// A spawn's first `MessageReceived` takes its attribution from `origin`,
+    /// or synthesizes one from the parent linkage. A device does not count:
+    /// every spawn kind runs in Agent or Engine mode, where a device id
+    /// synthesizes nothing. Trigger kinds answer `true`, because a fire opens
+    /// with `TriggerStarted`, which names its trigger.
+    pub fn is_attributed(&self) -> bool {
+        match self {
+            Self::SubThread {
+                origin,
+                parent_thread_id,
+                ..
+            }
+            | Self::CodingAgent {
+                origin,
+                parent_thread_id,
+                ..
+            }
+            | Self::AgentChat {
+                origin,
+                parent_thread_id,
+                ..
+            } => origin.is_some() || parent_thread_id.is_some(),
+            Self::EventTrigger { .. } | Self::Cron { .. } => true,
         }
     }
 
@@ -498,6 +526,91 @@ mod tests {
         match back {
             ThreadQueueRequest::SubThread { origin, .. } => assert_eq!(origin, None),
             other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    fn bare_sub_thread(origin: Option<MessageOrigin>, parent: Option<Uuid>) -> ThreadQueueRequest {
+        ThreadQueueRequest::SubThread {
+            depth: 0,
+            prompt: "run it".into(),
+            child_thread_id: Uuid::new_v4(),
+            parent_thread_id: parent,
+            spawning_event_id: None,
+            title: None,
+            model: None,
+            reasoning_effort: None,
+            pre_emitted_origin: None,
+            origin,
+        }
+    }
+
+    /// The guard `submit` asserts. A spawn with neither an origin nor a parent
+    /// starts a thread whose first message reads Origin "Unknown". A device
+    /// does not rescue it: spawns run in Agent or Engine mode, where a device
+    /// id synthesizes no origin.
+    #[test]
+    fn a_spawn_is_attributed_only_by_an_origin_or_a_parent() {
+        use crate::engine::thread_events::EngineReason;
+
+        assert!(!bare_sub_thread(None, None).is_attributed());
+        assert!(bare_sub_thread(None, Some(Uuid::new_v4())).is_attributed());
+        assert!(bare_sub_thread(
+            Some(MessageOrigin::engine(EngineReason::MergeConflict)),
+            None
+        )
+        .is_attributed());
+
+        let cc = |device_id: Option<String>| ThreadQueueRequest::CodingAgent {
+            depth: 0,
+            prompt: "run it".into(),
+            cc_thread_id: Uuid::new_v4(),
+            image_hashes: vec![],
+            device_id,
+            parent_thread_id: None,
+            spawning_event_id: None,
+            repo_id: None,
+            title: None,
+            app_id: None,
+            coding_agent: CodingAgent::ClaudeCode,
+            model: None,
+            reasoning_effort: None,
+            origin: None,
+        };
+        assert!(!cc(Some("dev-1".into())).is_attributed());
+
+        assert!(ThreadQueueRequest::Cron {
+            trigger_id: "t".into()
+        }
+        .is_attributed());
+    }
+
+    /// A queued setup spawn can cross a restart, so its typed origin has to
+    /// survive the jsonb round-trip in every occasion.
+    #[test]
+    fn a_plugin_setup_origin_round_trips_through_the_request() {
+        use crate::engine::thread_events::{EngineReason, PluginSetupOccasion};
+
+        for occasion in [
+            PluginSetupOccasion::FreshInstall,
+            PluginSetupOccasion::Update {
+                from_version: Some("0.1.3".into()),
+            },
+            PluginSetupOccasion::Update { from_version: None },
+        ] {
+            let origin = Some(MessageOrigin::engine(EngineReason::PluginSetup {
+                plugin_id: "habit-tracker".into(),
+                plugin_name: "Habit Tracker".into(),
+                version: "0.1.4".into(),
+                occasion,
+                confirmed_on_device_id: Some("dev-1".into()),
+            }));
+            let req = bare_sub_thread(origin.clone(), None);
+            let back: ThreadQueueRequest =
+                serde_json::from_value(serde_json::to_value(&req).unwrap()).unwrap();
+            match back {
+                ThreadQueueRequest::SubThread { origin: o, .. } => assert_eq!(o, origin),
+                other => panic!("wrong variant: {other:?}"),
+            }
         }
     }
 

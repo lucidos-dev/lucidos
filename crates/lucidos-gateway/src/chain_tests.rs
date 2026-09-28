@@ -83,6 +83,8 @@ fn write_fixture(workspace: &Path) {
     )
     .expect("writing the probe app");
     std::fs::write(app.join("style.css"), STYLE).expect("writing the probe stylesheet");
+    std::fs::write(app.join("own.woff2"), "wOF2 stand-in").expect("writing the probe font");
+    std::fs::write(app.join("main.js"), "export const ok = 1;\n").expect("writing the module");
 
     let artifacts = workspace.join("data/artifacts").join(APP_ID);
     std::fs::create_dir_all(artifacts.join("next")).expect("the artifacts tree is writable");
@@ -245,4 +247,63 @@ async fn an_app_frames_own_files_load_through_a_gateway() {
         let (status, _) = get(&client, &format!("{carrier}{path}")).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "{path} must stay gated");
     }
+
+    // 8. The app's own font. A font fetch is CORS-mode, and the frame's origin
+    //    is `null`, so the engine's grant has to cross the gateway intact. A
+    //    `fetch()` of the same file gets none (ADR 0289).
+    let own_font = format!("{gateway}{}", resolve(&base, "own.woff2"));
+    let font = cross_origin(&client, reqwest::Method::GET, &own_font, "font").await;
+    assert_eq!(font.status(), StatusCode::OK, "the app's own font");
+    assert_eq!(
+        allow_origin(&font),
+        Some("*"),
+        "the grant must cross the gateway"
+    );
+    let read = cross_origin(&client, reqwest::Method::GET, &own_font, "empty").await;
+    assert_eq!(allow_origin(&read), None, "a fetch() is never granted");
+
+    // 9. The app's own module script. The engine grants a script load only to
+    //    a request the gateway forwarded, which is what this hop proves.
+    let module = format!("{gateway}{}", resolve(&base, "main.js"));
+    let script = cross_origin(&client, reqwest::Method::GET, &module, "script").await;
+    assert_eq!(script.status(), StatusCode::OK, "the app's own module");
+    assert_eq!(
+        allow_origin(&script),
+        Some("*"),
+        "a module behind the gateway"
+    );
+
+    // 10. Fira Code, the default UI font every app links. Public at the gate,
+    //     and the preflight is answered rather than refused.
+    let fira = format!("{gateway}/{slug}/api/v1/fonts/fira-code-6.2.woff2");
+    let font = cross_origin(&client, reqwest::Method::GET, &fira, "font").await;
+    assert_eq!(font.status(), StatusCode::OK, "Fira Code, cookieless");
+    assert_eq!(allow_origin(&font), Some("*"), "Fira Code's grant");
+    let preflight = cross_origin(&client, reqwest::Method::OPTIONS, &fira, "font").await;
+    assert!(preflight.status().is_success(), "{}", preflight.status());
+    assert_eq!(allow_origin(&preflight), Some("*"), "the preflight's grant");
+}
+
+/// A request shaped the way an opaque-origin frame's is, with no cookie.
+async fn cross_origin(
+    client: &reqwest::Client,
+    method: reqwest::Method,
+    url: &str,
+    dest: &str,
+) -> reqwest::Response {
+    client
+        .request(method, url)
+        .header("origin", "null")
+        .header("sec-fetch-site", "cross-site")
+        .header("sec-fetch-dest", dest)
+        .header("access-control-request-method", "GET")
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("{url} failed to send: {e}"))
+}
+
+fn allow_origin(res: &reqwest::Response) -> Option<&str> {
+    res.headers()
+        .get("access-control-allow-origin")
+        .and_then(|v| v.to_str().ok())
 }

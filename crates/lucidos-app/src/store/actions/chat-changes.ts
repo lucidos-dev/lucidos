@@ -1,7 +1,7 @@
-import { showToast, showConfirm, dismissToast, removeToast, changes, appliedChanges, lazyChanges, findChangeById, changesHasMore, changesLoadingMore, restartRequired, restartGroups, applyingChangeIds, applyingNowThreadIds, applyAllInProgress, standingApplyThreadIds, armingStandingApplyThreadIds, disarmingAllStandingApply, settlingThreadCount, threadMap, effectiveThreadStatus, isMidTurn, TOAST_AUTO_DISMISS_MS, engineRestarting, engineRestartNewVersion, engineStartedAt, engineVersion, latestEngineVersion, engineNewVersionReady, enginePackaged, enginePendingCommits, NEW_VERSION_TOAST_KEY, FRONTEND_UPDATE_DEFERRED_TOAST_KEY } from '../store';
+import { showToast, showConfirm, dismissToast, removeToast, changes, appliedChanges, lazyChanges, findChangeById, changesHasMore, changesLoadingMore, restartRequired, restartGroups, applyingChangeIds, applyingNowThreadIds, applyAllInProgress, applyAllBatch, applyAllCanceling, applyEstimates, standingApplyThreadIds, armingStandingApplyThreadIds, armingStandingApplySweep, disarmingAllStandingApply, settlingThreadCount, threadMap, effectiveThreadStatus, isMidTurn, TOAST_AUTO_DISMISS_MS, engineRestarting, engineRestartNewVersion, engineStartedAt, engineVersion, latestEngineVersion, engineNewVersionReady, enginePackaged, enginePendingCommits, NEW_VERSION_TOAST_KEY, FRONTEND_UPDATE_DEFERRED_TOAST_KEY } from '../store';
 import { changeToastMessage } from './changeToast';
 import { restartConfirmCopy } from '../restartConfirmCopy';
-import { toFailed } from '../types';
+import { loadedOr, toFailed } from '../types';
 import type { Loadable } from '../types';
 import type { RestartGroup } from '../store';
 import { applyChange as apiApply, discardChange as apiDiscard, applyAllChanges as apiApplyAll, cancelApplyAllChanges as apiCancelApplyAll, discardAllChanges as apiDiscardAll, revertChange as apiRevert, fetchChanges as apiFetchChanges, getChangeById as apiGetChangeById, armStandingApply as apiArmStandingApply, disarmStandingApply as apiDisarmStandingApply, disarmAllStandingApplies as apiDisarmAllStandingApplies, restartEngine, ApiError, isTransportError } from '../../api/client';
@@ -10,6 +10,7 @@ import { invoke } from '../../utils/tauri';
 import { isNewerVersion } from '../../utils/version';
 import { errorDetail, isAbortError } from '../../utils/errorDetail';
 import { focusThread } from './threads';
+import { reconcileApplyProgress } from './applyProgress';
 import type { Change } from '../../api/client';
 
 /** Key of the restart FAILURE toast, and of nothing else now.
@@ -357,15 +358,14 @@ export function restoreRestartState(): void {
   }
 }
 
-/** Reconcile the optimistic Apply Now state (`applyingNowThreadIds` + the
- *  sticky `applying-<threadId>` spinner toast) against backend truth fetched on
- *  resume / reconnect / startup.
+/** Reconcile the optimistic Apply Now state (`applyingNowThreadIds`) against
+ *  backend truth fetched on resume / reconnect / startup.
  *
  *  The per-thread state is normally cleared by the live ChangeApplied /
- *  ChangeApplyFailed SSE event. If that event is missed — an iOS PWA suspend, an
- *  SSE reconnect gap — the spinner toast sticks "Applying changes…" forever and
- *  the WaitingBanner stays on a disabled "Apply..." even though the change
- *  already applied. This mirrors the `apply_all_in_progress` rehydration.
+ *  ChangeApplyFailed SSE event. An iOS PWA suspend or an SSE reconnect gap can
+ *  miss it. The menu row then sticks on "Applying", and the WaitingBanner on a
+ *  disabled "Apply...", even though the change already applied. This
+ *  mirrors the `apply_all_in_progress` rehydration.
  *
  *  A thread is still genuinely applying iff its change is still pending (the row
  *  flips to `applied` only on success, staying pending through harden / merge /
@@ -425,8 +425,8 @@ function reconcileApplyingNow(pending: Change[], applied: Change[]): void {
  *  per-thread event fetches (thread-loading.ts): those are fanned out one
  *  request per loaded thread, so a single outage fires every deadline at once
  *  and they treat a timeout as transient. */
-export function refreshChangesState(): void {
-  apiFetchChanges({ limit: 15 })
+export function refreshChangesState(): Promise<void> {
+  return apiFetchChanges({ limit: 15 })
     .catch(e => {
       if ((e instanceof DOMException && e.name === 'TimeoutError') || isTransportError(e)) {
         return apiFetchChanges({ limit: 15 });
@@ -435,6 +435,7 @@ export function refreshChangesState(): void {
     })
     .then(state => {
       const applied = state.applied || [];
+      const previousPending = loadedOr(changes.value, []);
       changes.value = { status: 'loaded', data: state.pending };
       appliedChanges.value = { status: 'loaded', data: applied };
       changesHasMore.value = state.has_more_applied;
@@ -449,21 +450,36 @@ export function refreshChangesState(): void {
       }));
       // Backend is the source of truth across page reloads for the Apply All
       // batch too: the ApplyAllBatchStarted SSE that set this isn't replayed,
-      // so without this the sticky "Applying changes…" toast vanishes on reload
-      // while the batch is still running. The effects.ts edge-guard shows/hides
-      // the toast off this signal.
+      // so without this the Apply All row leaves the Lucidos menu on reload
+      // while the batch is still running. The batch's members and progress
+      // rehydrate beside the flag, so the row keeps naming the thread in
+      // flight as "thread N of M".
+      const batch = state.apply_all_batch;
+      applyAllBatch.value = batch
+        ? {
+          changeIds: batch.change_ids,
+          resolvedChangeIds: batch.resolved_change_ids,
+          applyingChangeIds: batch.applying_change_ids ?? [],
+          resolvingChangeIds: batch.resolving_change_ids ?? [],
+        }
+        : null;
+      // A Cancel whose completion event this page missed must not leave the
+      // next batch reading "Canceling".
+      if (!state.apply_all_in_progress) applyAllCanceling.value = false;
       applyAllInProgress.value = state.apply_all_in_progress ?? false;
       // Same rehydration for the standing applies: the StandingApply* SSE
       // events are not replayed, so a reload would otherwise draw an armed
       // thread as unarmed and offer to arm it again.
       standingApplyThreadIds.value = new Set(state.standing_apply_thread_ids ?? []);
       settlingThreadCount.value = state.settling_thread_count ?? 0;
-      // Same rehydration for the per-thread Apply Now state: its optimistic
-      // spinner toast + WaitingBanner "Apply..." clear only on the live
+      if (state.apply_estimates) applyEstimates.value = state.apply_estimates;
+      // Same rehydration for the per-thread Apply Now state: its menu row and
+      // the WaitingBanner "Apply..." clear only on the live
       // ChangeApplied/ChangeApplyFailed SSE event, so a missed event (iOS PWA
       // suspend, an SSE reconnect gap) strands them even though the apply
       // finished. Reconcile against the freshly-fetched backend truth.
       reconcileApplyingNow(state.pending, applied);
+      reconcileApplyProgress(previousPending, state.pending, applied);
       // The update badge is NOT lit from the applied-changes list here. It shares
       // the toast's single honest source of truth — the build-id check
       // (syncClientUpdateFromBuild), which runs on startup/resume/SW-activate and
@@ -522,12 +538,13 @@ export async function discardSingleChange(id: string): Promise<void> {
  *
  *  With `keepGoing`, the call also arms a standing apply on every thread still
  *  working, so each one applies as it lands. With nothing pending that IS the
- *  action, and the button reads "Apply as they settle". */
+ *  action, and the button reads "Apply all on settle". */
 export async function applyAllChanges(keepGoing = false): Promise<void> {
-  // Single flight, guarded here rather than by a `disabled` button. "Apply as
-  // they settle" presses this too and is never disabled: it arms, so it has no
+  // Single flight, guarded here rather than by a `disabled` button. "Apply all
+  // on settle" presses this too and is never disabled: it arms, so it has no
   // in-progress face to wear (ChangesView).
   if (applyAllInProgress.value) return;
+  armingStandingApplySweep.value = keepGoing;
   // Optimistic busy state: the batch applies the first change synchronously and
   // drives the rest in the background — including a multi-minute pause while it
   // hardens an unhardened member — so reflect "in progress" the instant the
@@ -536,18 +553,14 @@ export async function applyAllChanges(keepGoing = false): Promise<void> {
   // can't fire a second batch in the click→SSE gap.
   applyAllInProgress.value = true;
   try {
-    // Both first-change outcomes that warrant a toast — hardening
-    // (status === 'hardening') and merge conflict (conflict_thread_id) — are
-    // surfaced by their SSE handlers in thread-sync.ts (MissingHardeningDetected
-    // / MergeConflictDetected), uniform with single Apply. We deliberately do
-    // NOT fire an HTTP-response toast here. Those SSE toasts are keyed and
-    // transition in place to "applied" / "resolved" (or dismiss) once the
-    // change resolves; an unkeyed HTTP toast can't be reached by that resolver,
-    // so it dangles forever as a stale "resolving automatically" warning even
-    // after the conflict is fixed and the batch applies (the bug this avoids).
-    // Apply All stays "Applying..." via applyAllInProgress until
-    // ApplyAllBatchCompleted (SSE) clears it.
-    const result = await apiApplyAll(keepGoing);
+    // No HTTP-response toast here, whatever the first member did. The Apply
+    // All row in the Lucidos menu follows each member's hardening or merge
+    // conflict from the SSE phase events (thread-sync.ts). A toast raised here
+    // would outlive the step it named.
+    // ApplyAllBatchCompleted (SSE) clears applyAllInProgress.
+    const request = apiApplyAll(keepGoing);
+    if (keepGoing) sweepArmRequest = request;
+    const result = await request;
     // The arm-only call starts no batch, so nothing will clear the optimistic
     // busy flag. Report what it armed and release the button here. An absent
     // `batch_size` reads as "a batch started", which leaves the flag to the
@@ -561,20 +574,29 @@ export async function applyAllChanges(keepGoing = false): Promise<void> {
     // doesn't stay stuck on "Applying...".
     applyAllInProgress.value = false;
     showToast(errorDetail(e) || 'Failed to apply changes', 'error');
+  } finally {
+    // The StandingApplyArmed frames carry the armed face from here.
+    armingStandingApplySweep.value = false;
+    sweepArmRequest = null;
   }
 }
 
-/** Cancel the running Apply All batch (from the sticky batch toast). Aborts the
- *  in-flight hardening/merge and stops applying the rest; already-applied
- *  changes stay applied, the remainder return to pending. The
- *  ApplyAllBatchCompleted SSE clears `applyAllInProgress` and dismisses the
- *  toast — here we optimistically swap the toast to "Canceling..." (replacing
- *  the Cancel action so a second click can't fire) for immediate feedback. */
+/** The sweep's arm request while it is in flight. The workspace off waits for
+ *  it, or its DELETE can land first and leave the sweep's arms standing. */
+let sweepArmRequest: Promise<unknown> | null = null;
+
+/** Cancel the running Apply All batch (from its row in the Lucidos menu).
+ *  Aborts the in-flight hardening/merge and stops applying the rest;
+ *  already-applied changes stay applied, the remainder return to pending. The
+ *  ApplyAllBatchCompleted SSE clears `applyAllInProgress`. Until then
+ *  `applyAllCanceling` makes the row read "Canceling apply..." without its
+ *  Cancel, so a second click can't fire. */
 export async function cancelApplyAllBatch(): Promise<void> {
-  showToast('Canceling apply...', 'info', { key: 'apply-all-batch', spinning: true, dismissable: false });
+  applyAllCanceling.value = true;
   try {
     await apiCancelApplyAll();
   } catch (e) {
+    applyAllCanceling.value = false;
     showToast(errorDetail(e) || 'Failed to cancel apply', 'error');
   }
 }
@@ -600,17 +622,31 @@ export async function discardAllChanges(): Promise<void> {
  *  `standing-apply-canceled-reason.test.ts` fails if the two drift. */
 export const STANDING_APPLY_CANCELED = 'Canceled.';
 
+function setStandingApplyArmed(threadId: string, armed: boolean): void {
+  if (standingApplyThreadIds.value.has(threadId) === armed) return;
+  const next = new Set(standingApplyThreadIds.value);
+  if (armed) next.add(threadId);
+  else next.delete(threadId);
+  standingApplyThreadIds.value = next;
+}
+
 /** Arm a standing apply on a thread: its change applies once the thread
  *  settles, and drops with a report if the thread stops on a question or fails.
+ *
+ *  The flag fills on the press and empties again if the engine refuses. The
+ *  `StandingApplyArmed` frame that follows a success changes nothing.
  *
  *  Pass `changeId` when the thread already has a pending change, so the arm is
  *  bound to that one and cannot reach a later proposal. */
 export async function armStandingApply(threadId: string, changeId?: string): Promise<void> {
   if (armingStandingApplyThreadIds.value.has(threadId)) return;
   armingStandingApplyThreadIds.value = new Set([...armingStandingApplyThreadIds.value, threadId]);
+  const wasArmed = standingApplyThreadIds.value.has(threadId);
+  setStandingApplyArmed(threadId, true);
   try {
     await apiArmStandingApply(threadId, changeId);
   } catch (e) {
+    setStandingApplyArmed(threadId, wasArmed);
     showToast(
       changeToastMessage('Failed to arm the standing apply', threadId, errorDetail(e)),
       'error',
@@ -622,7 +658,7 @@ export async function armStandingApply(threadId: string, changeId?: string): Pro
   }
 }
 
-/** Take a standing apply back.
+/** Take a standing apply back. The flag empties on the press.
  *
  *  A 404 means the engine holds no arm for the thread, which is the state the
  *  owner asked for. The flag was stale, from an ending event this client
@@ -630,15 +666,13 @@ export async function armStandingApply(threadId: string, changeId?: string): Pro
 export async function disarmStandingApply(threadId: string): Promise<void> {
   if (armingStandingApplyThreadIds.value.has(threadId)) return;
   armingStandingApplyThreadIds.value = new Set([...armingStandingApplyThreadIds.value, threadId]);
+  const wasArmed = standingApplyThreadIds.value.has(threadId);
+  setStandingApplyArmed(threadId, false);
   try {
     await apiDisarmStandingApply(threadId);
   } catch (e) {
-    if (e instanceof ApiError && e.httpCode === 404) {
-      const armed = new Set(standingApplyThreadIds.value);
-      armed.delete(threadId);
-      standingApplyThreadIds.value = armed;
-      return;
-    }
+    if (e instanceof ApiError && e.httpCode === 404) return;
+    setStandingApplyArmed(threadId, wasArmed);
     showToast(
       changeToastMessage('Failed to cancel the standing apply', threadId, errorDetail(e)),
       'error',
@@ -651,18 +685,23 @@ export async function disarmStandingApply(threadId: string): Promise<void> {
 }
 
 /** Take every standing apply in the workspace back: the Changes panel's own
- *  off, pressed by the "Apply as they settle" toggle once it is armed.
+ *  off, pressed by the "Apply all on settle" toggle once it is armed.
  *
- *  Each dropped arm arrives back as its own `StandingApplyDropped`, so the
- *  prompt-row icon un-fills with no refetch. The engine reports the cancel
- *  reason, which those handlers deliberately leave silent: the owner clicked
- *  it, and the control already changed face. */
+ *  Every flag un-fills on the press. Each dropped arm still arrives back as its
+ *  own `StandingApplyDropped`, whose cancel reason those handlers deliberately
+ *  leave silent: the owner clicked it, and the control already changed face. */
 export async function disarmAllStandingApplies(): Promise<void> {
   if (disarmingAllStandingApply.value) return;
   disarmingAllStandingApply.value = true;
+  armingStandingApplySweep.value = false;
+  const armed = standingApplyThreadIds.value;
+  standingApplyThreadIds.value = new Set();
   try {
+    // applyAllChanges reports the sweep's own failure. This only orders the two.
+    await sweepArmRequest?.catch(() => undefined);
     await apiDisarmAllStandingApplies();
   } catch (e) {
+    standingApplyThreadIds.value = new Set([...armed, ...standingApplyThreadIds.value]);
     showToast(
       `Failed to cancel the standing applies: ${errorDetail(e)}`,
       'error',
@@ -704,27 +743,42 @@ export async function ensureChangeLoaded(id: string): Promise<void> {
   }
 }
 
+/** How many times `loadMoreChanges` re-cursors when the list moves under its
+ *  request. Bounded, so a busy stream of applies cannot spin. */
+const MAX_CHANGES_PAGE_RETRIES = 3;
+
 /** Load the next page of applied changes (infinite scroll). Pagination
- *  needs the last row's `resolved_at` as the cursor — only the `loaded`
- *  state has it. */
+ *  needs the last row's `resolved_at` as the cursor, and only the `loaded`
+ *  state has it.
+ *
+ *  A `ChangesUpdated` frame or a `refreshChangesState` can replace the list
+ *  while the page is in flight. Appending to the old snapshot would then
+ *  write back a list without the change that was just applied. So a page
+ *  whose base moved is dropped, and the next one is asked for from the new
+ *  tail. Same shape as `loadMoreNotifications`. */
 export async function loadMoreChanges(): Promise<void> {
   if (changesLoadingMore.value || !changesHasMore.value) return;
 
-  const loadable = appliedChanges.value;
-  if (loadable.status !== 'loaded') return;
-  const current = loadable.data;
-  if (current.length === 0) return;
-
-  const lastItem = current[current.length - 1];
-  const resolvedAt = lastItem.resolved_at;
-  if (!resolvedAt) return;
-  const beforeTs = new Date(resolvedAt).getTime() / 1000;
-
   changesLoadingMore.value = true;
   try {
-    const data = await apiFetchChanges({ limit: 15, before: beforeTs });
-    appliedChanges.value = { status: 'loaded', data: [...current, ...(data.applied || [])] };
-    changesHasMore.value = data.has_more_applied;
+    for (let attempt = 0; attempt < MAX_CHANGES_PAGE_RETRIES; attempt++) {
+      const base = appliedChanges.value;
+      if (base.status !== 'loaded' || base.data.length === 0) return;
+      const resolvedAt = base.data[base.data.length - 1].resolved_at;
+      if (!resolvedAt) return;
+      const beforeTs = new Date(resolvedAt).getTime() / 1000;
+
+      const data = await apiFetchChanges({ limit: 15, before: beforeTs });
+
+      const after = appliedChanges.value;
+      if (after.status !== 'loaded') return;
+      if (after !== base) continue;
+      const seen = new Set(after.data.map((c) => c.id));
+      const fresh = (data.applied || []).filter((c) => !seen.has(c.id));
+      appliedChanges.value = { status: 'loaded', data: [...after.data, ...fresh] };
+      changesHasMore.value = data.has_more_applied;
+      return;
+    }
   } catch (e) {
     showToast(`Failed to load more changes: ${errorDetail(e)}`, 'error');
   } finally {

@@ -284,7 +284,7 @@ function navEventFromDevice(sourceThreadId: string, deviceId: string) {
     event: {
       type: 'NavigationRequested',
       payload: JSON.stringify({ target: 'app', app_id: 'demo-director' }),
-      actor: { kind: 'device', device_id: deviceId, label: deviceId },
+      actor: { kind: 'device', device_id: deviceId },
     },
   };
 }

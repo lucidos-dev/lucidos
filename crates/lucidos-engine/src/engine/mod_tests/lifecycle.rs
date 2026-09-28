@@ -218,7 +218,6 @@ fn cancel_all_threads_cancels_all() {
 fn sample_device_actor(id: &str) -> thread_events::MessageOrigin {
     thread_events::MessageOrigin::Device {
         device_id: id.into(),
-        label: format!("Test device {}", id),
     }
 }
 

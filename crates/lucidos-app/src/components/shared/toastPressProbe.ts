@@ -43,7 +43,7 @@ const CLICK_GRACE_MS = 600;
 /** Far beyond any tap, so only a lost lift reaches it. */
 const LIFT_DEADLINE_MS = 4000;
 
-const TOAST_CONTROL_SELECTOR = '.toast button, .toast .toast-clickable';
+const TOAST_CONTROL_SELECTOR = '.toast button, .toast[data-toast-tap]';
 
 interface Press {
   control: Element;

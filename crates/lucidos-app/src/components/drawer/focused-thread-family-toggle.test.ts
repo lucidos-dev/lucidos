@@ -34,7 +34,6 @@ function makeThread(id: string, totalChildrenCount: number): ThreadState {
         codingAgentProposed: false,
         codingAgentRequiresRestart: false,
         codingAgentIsExternalRepo: false,
-        codingAgentApplying: false,
         lastRevivedAt: '',
         parentThreadId: undefined,
         state: 'active',

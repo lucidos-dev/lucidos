@@ -5,9 +5,9 @@
  *
  * The two hook-free components are invoked directly and their vnode trees
  * walked, the `thread-toggle-attention-badge.test.tsx` way. The other two hosts
- * are source-scanned. `Drawer` takes a hook, and `SettingsView` pulls in the
- * whole store. Standing either up would pin the mechanism rather than the
- * requirement, the reason `settings-nav-structure.test.ts` gives.
+ * are source-scanned. `Drawer` takes a hook, and `SettingsHome` warms the
+ * Settings reads on mount. Standing either up would pin the mechanism rather
+ * than the requirement, the reason `settings-nav-structure.test.ts` gives.
  *
  * What a scan can still hold there is the thing that actually goes wrong: the
  * mark landing on the wrong row, or on every row.
@@ -33,8 +33,8 @@ import { drawerClosing, drawerOpen } from '../../layout/drawerState';
 const DRAWER = readFileSync(
   fileURLToPath(new URL('../../layout/Drawer.tsx', import.meta.url)), 'utf8',
 );
-const SETTINGS = readFileSync(
-  fileURLToPath(new URL('../../settings/SettingsView.tsx', import.meta.url)), 'utf8',
+const SETTINGS_HOME = readFileSync(
+  fileURLToPath(new URL('../../settings/SettingsHome.tsx', import.meta.url)), 'utf8',
 );
 const SUBMENU = readFileSync(
   fileURLToPath(new URL('../../settings/SystemSubmenu.tsx', import.meta.url)), 'utf8',
@@ -53,7 +53,7 @@ function oweOne(): void {
   releaseNoticeView.value = {
     status: 'loaded',
     data: {
-      notices: [{ id: 'a', since: '2.0.0', title: 'Audit', body: 'Run it.', resolved: false }],
+      notices: [{ id: 'a', since: '2.0.0', title: 'Audit', body: 'Run it.', resolved: false, action_deferred: false }],
       next_id: 'a',
     },
   };
@@ -147,7 +147,7 @@ describe('the rows that carry the mark inline', () => {
   it('puts it on the System row alone, never on every Settings category', () => {
     // The home list hands the shared row a badge for `system` and null for
     // every other category, so no other row can draw a mark.
-    expect(SETTINGS).toContain('badge={key === \'system\' ? news : null}');
+    expect(SETTINGS_HOME).toContain('badge={key === \'system\' ? news : null}');
   });
 
   it('marks a System submenu row by its own source, never the union', () => {

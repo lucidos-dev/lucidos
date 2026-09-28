@@ -225,6 +225,23 @@ fn rejects_unexpected_top_level_dir() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// Themes were called looks, and a plugin built then ships `looks/`. It is
+/// refused like any unknown folder, but told which name to use instead.
+#[test]
+fn a_legacy_looks_folder_is_refused_naming_themes() {
+    let dir = tmpdir("legacylooks");
+    write_valid_plugin(&dir);
+    fs::create_dir(dir.join("looks")).unwrap();
+    fs::write(dir.join("looks/harbour.json"), "{}").unwrap();
+    let err = validate_tree(&dir).expect_err("a looks/ folder must be refused");
+    assert_eq!(
+        err,
+        ValidationError::UnexpectedTopLevelEntry("looks".into())
+    );
+    assert!(err.to_string().contains("themes/"), "{err}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn rejects_unexpected_top_level_file() {
     let dir = tmpdir("rootreadme");
@@ -258,6 +275,172 @@ fn validates_tree_with_only_auth_modules() {
     let paths: Vec<&str> = planned.iter().map(|p| p.data_relative.as_str()).collect();
     assert!(paths.contains(&"auth-modules/acme.wasm"));
     assert!(paths.contains(&"auth-modules/acme.manifest.json"));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+fn plugin_with_theme(name: &str, file: &str, body: &str) -> std::path::PathBuf {
+    let dir = tmpdir(name);
+    fs::write(dir.join("manifest.toml"), VALID_MANIFEST).unwrap();
+    let themes = dir.join("themes");
+    fs::create_dir_all(&themes).unwrap();
+    fs::write(themes.join(file), body).unwrap();
+    dir
+}
+
+#[test]
+fn validates_tree_with_only_themes() {
+    let dir = plugin_with_theme(
+        "themes",
+        "harbour.json",
+        r##"{"name":"Harbour","dark":{"--accent":"#3aa3c9"}}"##,
+    );
+    let (_, planned) = validate_tree(&dir).unwrap();
+    let paths: Vec<&str> = planned.iter().map(|p| p.data_relative.as_str()).collect();
+    assert_eq!(paths, vec!["themes/harbour.json"]);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn rejects_a_theme_that_fails_validation() {
+    for (file, body) in [
+        (
+            "leaky.json",
+            r#"{"name":"Leaky","dark":{"--bg-primary":"url(https://example.com)"}}"#,
+        ),
+        ("nord.json", r#"{"name":"Shadow"}"#),
+        ("typo.json", r#"{"name":"Typo","fonts":{"ui":"geyst"}}"#),
+        (
+            "serif-code.json",
+            r#"{"name":"Serif Code","fonts":{"mono":"lora"}}"#,
+        ),
+        ("Bad Id.json", r#"{"name":"Bad"}"#),
+        ("notes.txt", "not a theme"),
+    ] {
+        let dir = plugin_with_theme("badtheme", file, body);
+        match validate_tree(&dir) {
+            Err(ValidationError::InvalidTheme(path, _)) => {
+                assert_eq!(path, format!("themes/{file}"))
+            }
+            other => panic!("{file}: expected InvalidTheme, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+/// ADR 0309: a plugin's hostile theme fails staging with the reason, so the
+/// user sees why at install time rather than a theme that never shows.
+#[test]
+fn rejects_a_hostile_theme_with_its_reason() {
+    for (file, body, reason) in [
+        (
+            "blank.json",
+            r##"{"name":"Blank","dark":{"--bg-primary":"#101010","--text-primary":"#101010"}}"##,
+            "--text-primary on --bg-primary",
+        ),
+        (
+            "swapped.json",
+            r##"{"name":"Swapped","dark":{"--accent-green":"#f85149","--accent-red":"#3fb950"}}"##,
+            "--accent-green reads as red",
+        ),
+        (
+            "stacked.json",
+            r#"{"name":"Stacked","tokens":{"--z-modal":"0"}}"#,
+            "not a theme token",
+        ),
+        (
+            "glare.json",
+            r#"{"name":"Glare","dark":{"parts":{"chat-text":{"text-shadow":"0 0 2em red"}}}}"#,
+            "dark.parts.chat-text.text-shadow: blur 2em is over the 0.6em cap.",
+        ),
+        (
+            "cover.json",
+            r#"{"name":"Cover","parts":{"question-card":{"color":"red"}}}"#,
+            "parts.question-card: a protected surface, so a theme cannot style it.",
+        ),
+    ] {
+        let dir = plugin_with_theme("hostile", file, body);
+        let err = validate_tree(&dir).expect_err(file).to_string();
+        assert!(
+            err.contains(&format!("themes/{file} is not a valid theme")),
+            "{err}"
+        );
+        assert!(err.contains(reason), "{file}: {err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+/// A plugin shipping `fonts/<slug>/` with the given manifest and files.
+fn plugin_with_font(name: &str, manifest: &str, files: &[(&str, &[u8])]) -> std::path::PathBuf {
+    let dir = tmpdir(name);
+    fs::write(dir.join("manifest.toml"), VALID_MANIFEST).unwrap();
+    let font = dir.join("fonts/brand");
+    fs::create_dir_all(&font).unwrap();
+    fs::write(font.join("font.json"), manifest).unwrap();
+    for (file, bytes) in files {
+        fs::write(font.join(file), bytes).unwrap();
+    }
+    dir
+}
+
+const MONO_FONT: &str = r#"{"label":"Brand Mono","group":"mono","faces":[{"file":"a.woff2"}]}"#;
+
+#[test]
+fn validates_a_plugin_that_ships_a_font_and_a_theme_naming_it() {
+    let dir = plugin_with_font("font", MONO_FONT, &[("a.woff2", b"wOF2 bytes")]);
+    fs::create_dir_all(dir.join("themes")).unwrap();
+    fs::write(
+        dir.join("themes/branded.json"),
+        r#"{"name":"Branded","fonts":{"ui":"ws-brand","mono":"ws-brand"}}"#,
+    )
+    .unwrap();
+    let (_, planned) = validate_tree(&dir).unwrap();
+    let paths: Vec<&str> = planned.iter().map(|p| p.data_relative.as_str()).collect();
+    assert!(paths.contains(&"fonts/brand/font.json"), "{paths:?}");
+    assert!(paths.contains(&"fonts/brand/a.woff2"), "{paths:?}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn rejects_a_font_that_fails_validation() {
+    for (name, files) in [
+        ("missing-face", vec![]),
+        ("not-a-font", vec![("a.woff2", b"<html>".as_slice())]),
+        (
+            "stray-file",
+            vec![
+                ("a.woff2", b"wOF2 bytes".as_slice()),
+                ("readme.html", b"<p>"),
+            ],
+        ),
+    ] {
+        let dir = plugin_with_font(name, MONO_FONT, &files);
+        match validate_tree(&dir) {
+            Err(ValidationError::InvalidFont(path, _)) => {
+                assert!(path.starts_with("fonts/brand"), "{name}: {path}")
+            }
+            other => panic!("{name}: expected InvalidFont, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+/// A plugin is self-contained: it cannot lean on a font the user installed.
+#[test]
+fn rejects_a_theme_naming_a_workspace_font_the_plugin_does_not_ship() {
+    let dir = plugin_with_theme(
+        "foreignfont",
+        "branded.json",
+        r#"{"name":"Branded","fonts":{"ui":"ws-brand"}}"#,
+    );
+    match validate_tree(&dir) {
+        Err(ValidationError::InvalidTheme(_, reason)) => {
+            assert!(
+                reason.contains("not an installed workspace font"),
+                "{reason}"
+            )
+        }
+        other => panic!("expected InvalidTheme, got {other:?}"),
+    }
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -340,6 +523,29 @@ fn detects_conflicts_against_data_dir() {
     let _ = fs::remove_dir_all(&plugin_dir);
     let _ = fs::remove_dir_all(&data_dir);
     let _ = fs::remove_dir_all(&empty_data);
+}
+
+/// Install copies a plugin's files past the write-time check, so the font
+/// cap is asked here, against the fonts already installed.
+#[test]
+fn refuses_a_plugin_font_that_would_pass_the_workspace_cap() {
+    use crate::core::workspace_fonts::MAX_FONTS;
+    let dir = plugin_with_font("roomy", MONO_FONT, &[("a.woff2", b"wOF2 bytes")]);
+    let (_, planned) = validate_tree(&dir).unwrap();
+    let data_dir = tmpdir("full_fonts");
+    for i in 0..MAX_FONTS {
+        let font = data_dir.join(format!("fonts/f{i:03}"));
+        fs::create_dir_all(&font).unwrap();
+        fs::write(font.join("font.json"), MONO_FONT).unwrap();
+        fs::write(font.join("a.woff2"), b"wOF2 bytes").unwrap();
+    }
+    let err = check_font_room(&planned, &data_dir).unwrap_err();
+    assert!(err.contains("at most"), "{err}");
+    // Replacing a font the workspace already has needs no room.
+    fs::rename(data_dir.join("fonts/f000"), data_dir.join("fonts/brand")).unwrap();
+    assert!(check_font_room(&planned, &data_dir).is_ok());
+    let _ = fs::remove_dir_all(&dir);
+    let _ = fs::remove_dir_all(&data_dir);
 }
 
 // --- symlink safety ---

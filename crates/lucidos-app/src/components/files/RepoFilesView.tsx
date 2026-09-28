@@ -10,13 +10,13 @@ import { buildFolderTree } from '../../store/actions/artifacts';
 import type { FolderNode } from '../../store/actions/artifacts';
 import { useDelayedLoading, useDelayedFlag } from '../../hooks/useDelayedLoading';
 import { loadedOr, type Loadable } from '../../store/types';
-import { ListSkeletonOf } from '../shared/Skeleton';
+import { ListSkeletonOf, SkBlock, SkText } from '../shared/Skeleton';
 import { LoadingFade } from '../shared/LoadingFade';
 import { FileTypeIcon } from '../../utils/fileIcons';
 import { TreeNode, folderTreeSkeletonRow } from './FolderTree';
 import { changeBadgeLabel } from './changeBadge';
 import { diffStats } from './diffStats';
-import { DiffStatsInline, DiffView } from './DiffView';
+import { DiffSkeleton, DiffStatsInline, DiffView } from './DiffView';
 
 /** Whether the registered-repo Files view has the data its CURRENT mode renders.
  *  Each mode gates ONLY on the data it actually draws, so the view is ready as
@@ -85,16 +85,17 @@ export function RepoFilesView() {
   // controls apply) and render the inline diff. The empty bordered toolbar
   // bar was a visual artifact.
   if (!hasRepo) {
-    // A non-terminal diff (loading or not-loaded) must show the spinner, not
+    // A non-terminal diff (loading or not-loaded) must show the skeleton, not
     // fall through to InlineDiffList([]) -> "No changes". viewThreadCcDiff sets
     // loading before this view mounts, but guard not-loaded defensively too.
-    if (diffLoadable.status !== 'loaded') {
-      return diffShowLoading ? <div class="loading-spinner" /> : null;
-    }
     return (
-      <div class="artifacts-desktop">
-        <InlineDiffList files={changedFiles} />
-      </div>
+      <LoadingFade showSkeleton={diffShowLoading} skeleton={<DiffSkeleton files={2} class="folder-tree" />}>
+        {diffLoaded && (
+          <div class="artifacts-desktop">
+            <InlineDiffList files={changedFiles} />
+          </div>
+        )}
+      </LoadingFade>
     );
   }
 
@@ -156,26 +157,48 @@ export function ChangesFileList({ files, activePath }: { files: DiffFile[]; acti
         </div>
       )}
       {files.map((f, i) => (
-        <div
-          key={f.path}
-          class={`file-item repo-changed-file${f.path === activePath ? ' active' : ''}`}
-          onClick={() => openRepoFilePreview(f.path, 'diff')}
-        >
-          <FileTypeIcon path={f.path} className="file-icon" />
-          {/* `file-path`, not the tree's bare `file-name`: this row carries the
-              whole path, which wraps rather than ellipsising (components.css). */}
-          <span class="file-name file-path">{f.path}</span>
-          <DiffStatsInline additions={fileStats[i].additions} deletions={fileStats[i].deletions} />
-          <span class={`change-badge change-badge-${f.status}`}>
-            {changeBadgeLabel(f.status)}
-          </span>
-        </div>
+        <ChangedFileRow key={f.path} file={f} stats={fileStats[i]} active={f.path === activePath} />
       ))}
       {files.length === 0 && (
         <div class="empty-state">No changes</div>
       )}
     </div>
   );
+}
+
+/** One changed file. With no `file`, inside a `SkeletonProvider`, it is the
+ *  list's loading placeholder. */
+function ChangedFileRow({ file, stats, active = false }: {
+  file?: DiffFile;
+  stats?: { additions: number; deletions: number };
+  active?: boolean;
+}) {
+  return (
+    <div
+      class={`file-item repo-changed-file${active ? ' active' : ''}`}
+      onClick={file ? () => openRepoFilePreview(file.path, 'diff') : undefined}
+    >
+      <SkBlock w="1.25rem" h="1.25rem" round>
+        <FileTypeIcon path={file?.path ?? ''} className="file-icon" />
+      </SkBlock>
+      {/* `file-path`, not the tree's bare `file-name`: this row carries the
+          whole path, which wraps rather than ellipsising (components.css). */}
+      <SkText class="file-name file-path" w="11rem">{file?.path}</SkText>
+      {stats && <DiffStatsInline additions={stats.additions} deletions={stats.deletions} />}
+      <SkBlock w="1.25rem" h="1rem" round>
+        {file && (
+          <span class={`change-badge change-badge-${file.status}`}>
+            {changeBadgeLabel(file.status)}
+          </span>
+        )}
+      </SkBlock>
+    </div>
+  );
+}
+
+/** The changed-files list drawn as its loading placeholder. */
+export function ChangesFileListSkeleton() {
+  return <ListSkeletonOf count={6} containerClass="folder-tree" row={() => <ChangedFileRow />} />;
 }
 
 /** Diff renderer for app coding-agent threads (no registered repo to back the
@@ -237,7 +260,6 @@ function RepoFolderTree({ changedMap }: { changedMap: Map<string, DiffFile> }) {
             </span>
           ) : null;
         }}
-        fileClass={(file) => changedMap.has(file.path) ? 'repo-changed-file' : ''}
       />
     </div>
   );

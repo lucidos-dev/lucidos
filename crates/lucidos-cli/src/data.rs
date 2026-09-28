@@ -5,11 +5,22 @@ use crate::http::{client as http_client, send_expect_success};
 use crate::workspace::{BoxError, Workspace};
 
 /// Sub-directories of the workspace's `data/` that the CLI accepts as
-/// already-prefixed when resolving paths. The frontend has a similar list at
-/// `crates/lucidos-app/src/store/actions/artifacts.ts`, but it includes
-/// `system-knowhow/` (engine-shipped, served from the engine repo); that prefix
-/// does *not* belong here because it isn't a workspace data sub-directory.
-const DATA_PREFIXES: &[&str] = &["artifacts/", "knowhow/", "apps/", "triggers/"];
+/// already-prefixed when resolving paths. Anything else gets `artifacts/`.
+///
+/// Must equal the engine's `MUTABLE_PREFIXES` in `core/data_prefixes.rs`, the
+/// trees its write route accepts. A test below pins the two together.
+/// `system-knowhow/` is not here: it is engine-shipped and read-only.
+const DATA_PREFIXES: &[&str] = &[
+    "artifacts/",
+    "apps/",
+    "knowhow/",
+    "triggers/",
+    "config/",
+    "auth-modules/",
+    "scripts/",
+    "themes/",
+    "fonts/",
+];
 
 /// Validate `relative` and return its normalized, `data/`-rooted store path
 /// (e.g. `loose.txt` → `artifacts/loose.txt`). This store-relative form — with
@@ -42,17 +53,44 @@ pub(crate) fn resolve_data_path(ws: &Workspace, relative: &str) -> Result<PathBu
 /// An image gets markdown IMAGE syntax, which renders inline. Agents paste this
 /// line verbatim, and a plain link to a picture only opens a preview on tap.
 /// Markdown ends a bare destination at a space, so an image path holding one
-/// is angle-bracketed.
-fn chat_link(normalized: &str) -> String {
+/// is angle-bracketed. A known `size` becomes an image size hint, which lets
+/// the card or reply reserve the picture's box before it loads.
+fn chat_link(normalized: &str, size: Option<(usize, usize)>) -> String {
     let label = normalized.rsplit('/').next().unwrap_or(normalized);
     if !is_image(label) {
         return format!("[{}]({})", label, normalized);
     }
-    if normalized.contains(char::is_whitespace) {
-        format!("![{}](<{}>)", label, normalized)
+    let target = match size {
+        Some((w, h)) if (1..=MAX_HINT_SIDE).contains(&w) && (1..=MAX_HINT_SIDE).contains(&h) => {
+            format!("{normalized}#{w}x{h}")
+        }
+        _ => normalized.to_string(),
+    };
+    if target.contains(char::is_whitespace) {
+        format!("![{}](<{}>)", label, target)
     } else {
-        format!("![{}]({})", label, normalized)
+        format!("![{}]({})", label, target)
     }
+}
+
+/// The largest side the frontend reads in a size hint (five digits).
+const MAX_HINT_SIDE: usize = 99_999;
+
+/// The size a browser draws the picture in `bytes` at, when the header says it
+/// for certain. A picture carrying EXIF data may be turned a quarter by its
+/// orientation tag, which `imagesize` does not read, so it gets no size.
+fn drawn_size(bytes: &[u8]) -> Option<(usize, usize)> {
+    // JPEG's APP1 segment, PNG's `eXIf` chunk, WebP's `EXIF` chunk.
+    const EXIF_MARKERS: [&[u8]; 3] = [b"Exif\0\0", b"eXIf", b"EXIF"];
+    let head = &bytes[..bytes.len().min(64 * 1024)];
+    if EXIF_MARKERS
+        .iter()
+        .any(|marker| head.windows(marker.len()).any(|w| w == *marker))
+    {
+        return None;
+    }
+    let size = imagesize::blob_size(bytes).ok()?;
+    Some((size.width, size.height))
 }
 
 /// Printed after saving a picture. An agent saved one, told the user "I've
@@ -165,6 +203,8 @@ pub(crate) fn cmd_write(
             .map_err(|e| format!("Failed to read source file {}: {}", path.display(), e))?,
     };
 
+    let size = is_image(&normalized).then(|| drawn_size(&bytes)).flatten();
+
     let url = format!(
         "{}/api/v1/data/{}",
         ws.base_url(),
@@ -191,7 +231,7 @@ pub(crate) fn cmd_write(
     // on stdout, mirroring `lucidos spawn-thread`. This gives the agent a
     // canonical, working link to hand the user instead of inventing an
     // `artifact:`/`file:` scheme that the frontend has no handler for.
-    println!("{}", chat_link(&normalized));
+    println!("{}", chat_link(&normalized, size));
     Ok(())
 }
 
@@ -223,6 +263,54 @@ mod tests {
             let abs = resolve_data_path(&ws, &path).unwrap();
             assert_eq!(abs, PathBuf::from(format!("/ws/data/{}", path)));
         }
+    }
+
+    /// The quoted entries of the list that follows `declaration` in `source`.
+    fn quoted_list<'a>(source: &'a str, declaration: &str, quote: char) -> Vec<&'a str> {
+        let (_, rest) = source
+            .split_once(declaration)
+            .unwrap_or_else(|| panic!("{declaration} is gone"));
+        let (list, _) = rest.split_once("];").expect("the list must close");
+        let mut entries: Vec<&str> = list.split(quote).skip(1).step_by(2).collect();
+        entries.sort_unstable();
+        entries
+    }
+
+    /// The engine's `MUTABLE_PREFIXES` is the list of trees its data route
+    /// accepts. The CLI and the frontend cannot import it, so this test
+    /// reads all three sources. `/harden` runs it for an edit to any of them,
+    /// because the CLI includes them.
+    ///
+    /// A tree missing from a copy gets `artifacts/` in front, so the file
+    /// lands where nothing reads it.
+    #[test]
+    fn every_data_prefix_list_matches_the_engine() {
+        const ENGINE: &str = include_str!("../../lucidos-engine/src/core/data_prefixes.rs");
+        const FRONTEND: &str = include_str!("../../lucidos-app/src/utils/linkifyPaths.ts");
+        let engine = quoted_list(ENGINE, "pub const MUTABLE_PREFIXES: &[&str] = &[", '"');
+        assert!(engine.contains(&"themes/"), "parsed: {engine:?}");
+
+        let mut cli = DATA_PREFIXES.to_vec();
+        cli.sort_unstable();
+        assert_eq!(cli, engine, "the CLI's DATA_PREFIXES");
+
+        let frontend = quoted_list(
+            FRONTEND,
+            "export const DATA_PATH_PREFIXES: readonly string[] = [",
+            '\'',
+        );
+        let mut served = engine.clone();
+        served.push("system-knowhow/");
+        served.sort_unstable();
+        assert_eq!(frontend, served, "the frontend's DATA_PATH_PREFIXES");
+    }
+
+    #[test]
+    fn keeps_a_theme_path() {
+        assert_eq!(
+            normalize_data_path("themes/harbour.json").unwrap(),
+            "themes/harbour.json"
+        );
     }
 
     #[test]
@@ -309,7 +397,7 @@ mod tests {
         // No scheme on the target — a bare store path is what the frontend
         // linkifier rewrites to a file preview; `artifact:`/`file:` dead-ends.
         assert_eq!(
-            chat_link("artifacts/ticket-workflow/node-types-and-attributes.md"),
+            chat_link("artifacts/ticket-workflow/node-types-and-attributes.md", None),
             "[node-types-and-attributes.md](artifacts/ticket-workflow/node-types-and-attributes.md)"
         );
     }
@@ -317,7 +405,7 @@ mod tests {
     #[test]
     fn chat_link_handles_top_level_file() {
         assert_eq!(
-            chat_link("artifacts/report.html"),
+            chat_link("artifacts/report.html", None),
             "[report.html](artifacts/report.html)"
         );
     }
@@ -328,7 +416,7 @@ mod tests {
         // opens a preview on tap, so the user never sees the picture it meant
         // to show.
         assert_eq!(
-            chat_link("artifacts/design/options.png"),
+            chat_link("artifacts/design/options.png", None),
             "![options.png](artifacts/design/options.png)"
         );
     }
@@ -336,7 +424,7 @@ mod tests {
     #[test]
     fn chat_link_matches_image_extensions_case_insensitively() {
         for path in ["artifacts/a.JPG", "artifacts/a.jpeg", "artifacts/a.webp"] {
-            assert!(chat_link(path).starts_with("!["), "{path}");
+            assert!(chat_link(path, None).starts_with("!["), "{path}");
         }
     }
 
@@ -345,9 +433,64 @@ mod tests {
         // Markdown ends a bare destination at the first space, so the image
         // would render as literal text. An angle-bracketed one may hold spaces.
         assert_eq!(
-            chat_link("artifacts/quarterly chart.png"),
+            chat_link("artifacts/quarterly chart.png", None),
             "![quarterly chart.png](<artifacts/quarterly chart.png>)"
         );
+    }
+
+    #[test]
+    fn chat_link_for_a_measured_image_carries_a_size_hint() {
+        assert_eq!(
+            chat_link("artifacts/design/options.png", Some((1600, 1200))),
+            "![options.png](artifacts/design/options.png#1600x1200)"
+        );
+        assert_eq!(
+            chat_link("artifacts/quarterly chart.png", Some((800, 600))),
+            "![quarterly chart.png](<artifacts/quarterly chart.png#800x600>)"
+        );
+    }
+
+    #[test]
+    fn chat_link_drops_a_size_the_frontend_would_not_read() {
+        for size in [(0, 10), (10, 0), (100_000, 10)] {
+            assert_eq!(
+                chat_link("artifacts/a.png", Some(size)),
+                "![a.png](artifacts/a.png)"
+            );
+        }
+    }
+
+    #[test]
+    fn chat_link_for_a_non_image_ignores_a_size() {
+        assert_eq!(
+            chat_link("artifacts/report.html", Some((10, 10))),
+            "[report.html](artifacts/report.html)"
+        );
+    }
+
+    /// The PNG signature plus IHDR, which is all `blob_size` reads.
+    fn png_header(w: u32, h: u32) -> Vec<u8> {
+        let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        png.extend_from_slice(&w.to_be_bytes());
+        png.extend_from_slice(&h.to_be_bytes());
+        png.extend_from_slice(&[8, 2, 0, 0, 0]);
+        png
+    }
+
+    #[test]
+    fn a_png_header_gives_the_size_the_hint_carries() {
+        assert_eq!(drawn_size(&png_header(640, 480)), Some((640, 480)));
+    }
+
+    #[test]
+    fn a_picture_carrying_exif_gets_no_size() {
+        let mut png = png_header(640, 480);
+        png.extend_from_slice(b"\0\0\0\x08eXIfMM\0\x2a\0\0\0\x08");
+        assert_eq!(drawn_size(&png), None);
+
+        let mut jpeg = b"\xFF\xD8\xFF\xE1\0\x10Exif\0\0MM\0\x2a".to_vec();
+        jpeg.extend_from_slice(&png_header(640, 480));
+        assert_eq!(drawn_size(&jpeg), None);
     }
 
     #[test]
@@ -369,7 +512,7 @@ mod tests {
     #[test]
     fn chat_link_for_a_non_image_with_an_image_like_name_stays_a_link() {
         assert_eq!(
-            chat_link("artifacts/png-notes.md"),
+            chat_link("artifacts/png-notes.md", None),
             "[png-notes.md](artifacts/png-notes.md)"
         );
     }

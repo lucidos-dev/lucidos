@@ -18,67 +18,138 @@
  * store's module graph, which initialises a theme listener at import time.
  */
 
-export type ThemePref = 'light' | 'dark' | 'system';
-/** A theme with `system` already resolved against the OS. */
-export type ResolvedTheme = 'light' | 'dark';
+import {
+  FALLBACK_FONT,
+  FOLLOW_THEME,
+  FONT_CATALOG,
+  WORKSPACE_FONT_FALLBACKS,
+  WORKSPACE_FONT_ID_PREFIX,
+  WORKSPACE_FONT_LIMITS,
+  type FontEntry,
+  type FontGroup,
+  type FontId,
+} from './generated/font-catalog';
+import { PART_TOKEN_PREFIX, checkPartToken } from './themeParts';
 
-export type FontFamily =
-  | 'monospace'
-  | 'system'
-  | 'inter'
-  | 'jetbrains-mono'
-  | 'ibm-plex-mono'
-  | 'fira-code';
+export { FALLBACK_FONT, FOLLOW_THEME, FONT_CATALOG, WORKSPACE_FONT_ID_PREFIX, WORKSPACE_FONT_LIMITS };
+export type { FontEntry, FontGroup, FontId };
 
-export const THEMES: readonly ThemePref[] = ['light', 'dark', 'system'];
+export type ThemeMode = 'light' | 'dark' | 'system';
+/** A theme mode with `system` already resolved against the OS. */
+export type ResolvedThemeMode = 'light' | 'dark';
 
-/** What an unset `theme` preference means: follow the OS light/dark setting.
- *  A device that explicitly picked light or dark keeps its pick. */
-export const DEFAULT_THEME: ThemePref = 'system';
+export const THEME_MODES: readonly ThemeMode[] = ['light', 'dark', 'system'];
 
-/** The document background per resolved theme. Painted inline on `<html>` by
+/** The device-scoped preference holding the theme mode. */
+export const THEME_MODE_KEY = 'theme-mode';
+
+/** Workspace-scoped mirror of `theme-mode`, read by the boot script. */
+export const THEME_MODE_STORAGE_KEY = 'lucidos-theme-mode';
+
+/** The attribute every surface paints the resolved mode on. */
+export const THEME_MODE_ATTRIBUTE = 'data-theme-mode';
+
+/**
+ * The attribute an app frame also carries, for app styles written before the
+ * rename. Iframe realm only, never the shell (docs/temporary-measures.md §
+ * Legacy `data-theme` in app frames).
+ */
+export const LEGACY_THEME_MODE_ATTRIBUTE = 'data-theme';
+
+/** What an unset `theme-mode` preference means: follow the OS light/dark
+ *  setting. A device that explicitly picked light or dark keeps its pick. */
+export const DEFAULT_THEME_MODE: ThemeMode = 'system';
+
+/** The document background per resolved mode. Painted inline on `<html>` by
  *  every surface, so it is legible before any stylesheet has been parsed. */
-export const THEME_BG: Record<ResolvedTheme, string> = {
+export const THEME_MODE_BG: Record<ResolvedThemeMode, string> = {
   light: '#ffffff',
   dark: '#07172e',
 };
 
-/**
- * The CSS value each `font-family` option resolves to.
- *
- * Fira Code's chain is the FULL system-mono stack rather than a bare
- * `monospace`, because it is the default (ADR 0077). The tail is what paints
- * before the web font decodes, and on any device where it never loads, and bare
- * `monospace` is Courier. The other three keep short chains: a user who picked
- * one opted into the wait, and their natural fallback is not this stack.
- */
-export const FONT_FAMILY_VALUES: Record<FontFamily, string> = {
-  monospace: "ui-monospace, SFMono-Regular, 'SF Mono', Menlo, 'Fira Code', 'JetBrains Mono', Monaco, Consolas, monospace",
-  system: "system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
-  inter: "'Inter', system-ui, sans-serif",
-  'jetbrains-mono': "'JetBrains Mono', monospace",
-  'ibm-plex-mono': "'IBM Plex Mono', monospace",
-  'fira-code': "'Fira Code', ui-monospace, SFMono-Regular, 'SF Mono', Menlo, 'JetBrains Mono', Monaco, Consolas, monospace",
-};
+/** A workspace font's id (ADR 0308): `ws-` and the directory it lives in
+ *  under `data/fonts/`. */
+export type WorkspaceFontId = `ws-${string}`;
 
-/** What an unset `font-family` preference means. Served by the local engine
- *  (`api/sdk_fonts.rs`) rather than a CDN, so it needs no internet (ADR 0077). */
-export const DEFAULT_FONT_FAMILY: FontFamily = 'fira-code';
+/** A font a surface can paint: a catalog font or a workspace font. */
+export type FontKey = FontId | WorkspaceFontId;
 
-/**
- * Opt-in web fonts, fetched from Google the first time one is selected.
- *
- * Fira Code is deliberately absent, and the asymmetry is the point: it is the
- * DEFAULT, so it must render offline and announce no boot to a third party.
- * It is vendored instead (ADR 0077), declared as an `@font-face` in
- * `styles/global/base.css` for the host and served from the engine to app
- * iframes.
- */
-export const GOOGLE_FONT_URLS: Partial<Record<FontFamily, string>> = {
-  inter: 'https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap',
-  'jetbrains-mono': 'https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap',
-  'ibm-plex-mono': 'https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&display=swap',
-};
+/** A `font-family` preference value: a font, or follow the theme. */
+export type FontPreference = FontKey | typeof FOLLOW_THEME;
+
+/** What an unset `font-family` preference means: follow the active theme, which
+ *  falls back to {@link FALLBACK_FONT} when the theme names no font. */
+export const DEFAULT_FONT_PREFERENCE: FontPreference = FOLLOW_THEME;
+
+/** Every `font-family` value, in the order Settings lists them. */
+export const FONT_PREFERENCES: readonly FontPreference[] = [
+  FOLLOW_THEME,
+  ...FONT_CATALOG.map(font => font.id),
+];
+
+const FONTS_BY_ID = {} as Record<FontId, FontEntry>;
+for (const font of FONT_CATALOG) FONTS_BY_ID[font.id] = font;
+
+/** The CSS value each font resolves to. The fallback's stack is the full
+ *  system-mono chain (ADR 0077). It paints before the web font decodes, and on
+ *  any device where it never loads. */
+export const FONT_STACKS = {} as Record<FontId, string>;
+for (const font of FONT_CATALOG) FONT_STACKS[font.id] = font.stack;
+
+export function isFontId(value: string | null | undefined): value is FontId {
+  return !!value && hasOwn(FONTS_BY_ID, value);
+}
+
+export function fontEntry(id: FontId): FontEntry {
+  return FONTS_BY_ID[id];
+}
+
+/** Says on `<html>` whether the UI font has a bold face: `face` or `none`.
+ *  With `none`, bold text keeps the regular outlines, so the stylesheets show
+ *  it as `--text-strong` instead. */
+export const FONT_BOLD_ATTRIBUTE = 'data-font-bold';
+
+/** The lightest weight that counts as bold. The engine's font catalog uses the
+ *  same line (`core/fonts.rs`). */
+const BOLD_WEIGHT = 600;
+
+/** The heavy end of a face weight, one value or a range. */
+function heaviestWeight(weight: string): number {
+  return Number(weight.trim().split(/\s+/).pop());
+}
+
+/** A face weight reaches bold at its heaviest end. */
+export function weightReachesBold(weight: string): boolean {
+  return heaviestWeight(weight) >= BOLD_WEIGHT;
+}
+
+/** Whether a workspace font has a face of `style` that reaches bold. A bold
+ *  italic alone leaves upright bold text to be faked. */
+export function workspaceFontHasBold(
+  font: WorkspaceFont,
+  style: WorkspaceFontFace['style'] = 'normal',
+): boolean {
+  return font.faces.some(face => face.style === style && weightReachesBold(face.weight));
+}
+
+/** The weight a workspace face registers under. In a style with no bold face,
+ *  the heaviest face stretches up to 900. Bold text then paints its real
+ *  outlines instead of a smeared fake. Every other face keeps its own range,
+ *  so two light faces never compete for the same weights. */
+export function registeredFaceWeight(font: WorkspaceFont, face: WorkspaceFontFace): string {
+  if (workspaceFontHasBold(font, face.style)) return face.weight;
+  const top = font.faces
+    .filter(other => other.style === face.style)
+    .reduce((a, b) => (heaviestWeight(b.weight) > heaviestWeight(a.weight) ? b : a));
+  if (top !== face) return face.weight;
+  return `${face.weight.trim().split(/\s+/)[0]} 900`;
+}
+
+/** The `data-font-bold` value for the UI font a surface resolved. */
+export function fontBoldMark(font: ResolvedFont): 'face' | 'none' {
+  if (font.workspaceFont) return workspaceFontHasBold(font.workspaceFont) ? 'face' : 'none';
+  return isFontId(font.key) && !FONTS_BY_ID[font.key].bold ? 'none' : 'face';
+}
 
 /** The two values published as `--font-features-text` and
  *  `--font-features-code`. */
@@ -98,13 +169,14 @@ export interface FontFeaturePair {
  * typed `...` (tonsky/FiraCode#1561), and dropping the declaration disables
  * nothing.
  *
- * Every non-Fira font resolves BOTH to `normal`, which leaves its rendering
- * untouched: an unconditional `"liga" 0` would also kill the `fi` and `fl`
- * ligatures a proportional face like Inter wants.
+ * Every font without programming ligatures resolves BOTH to `normal`, which
+ * leaves its rendering untouched. An unconditional `"liga" 0` would also kill
+ * the `fi` and `fl` ligatures a proportional face like Inter wants.
  */
 export const FONT_FEATURES_DEFAULT: FontFeaturePair = { text: 'normal', code: 'normal' };
-const FONT_FEATURES: Partial<Record<FontFamily, FontFeaturePair>> = {
-  'fira-code': { text: '"liga" 0, "calt" 0', code: '"liga" 1, "calt" 1' },
+const FONT_FEATURES_LIGATURES: FontFeaturePair = {
+  text: '"liga" 0, "calt" 0',
+  code: '"liga" 1, "calt" 1',
 };
 
 export const UI_SCALE_MIN = 75;
@@ -124,15 +196,15 @@ export const LEGACY_UI_SCALES: Record<string, number> = {
 };
 
 /**
- * Which theme preference applies, given what each source knows. Precedence:
+ * Which theme mode applies, given what each source knows. Precedence:
  *
  *   1. the server-provided value, when present and valid;
- *   2. else the `lucidos-theme` localStorage value the FOUC script read;
- *   3. else the `data-theme` attribute the FOUC script already applied;
- *   4. else {@link DEFAULT_THEME}, follow the OS.
+ *   2. else the `lucidos-theme-mode` localStorage value the FOUC script read;
+ *   3. else the `data-theme-mode` attribute the FOUC script already applied;
+ *   4. else {@link DEFAULT_THEME_MODE}, follow the OS.
  *
- * Load-bearing invariant: a MISSING server theme must NEVER clobber the value
- * the synchronous client resolver already settled on. A `prefs['theme'] ||
+ * Load-bearing invariant: a MISSING server mode must NEVER clobber the value
+ * the synchronous client resolver already settled on. A `prefs['theme-mode'] ||
  * 'dark'` breaks it, flipping every app iframe to dark on a device that stored
  * only `ui-scale` while localStorage said light.
  *
@@ -140,22 +212,22 @@ export const LEGACY_UI_SCALES: Record<string, number> = {
  * the common path side-effect-free. Returns a raw preference, and the caller
  * resolves `system` via matchMedia.
  */
-export function resolveThemePreference(
+export function resolveThemeModePreference(
   server: string | undefined,
   local: string | null,
   getAttr: () => string | null,
-): ThemePref {
-  const valid = THEMES as readonly string[];
-  if (server && valid.includes(server)) return server as ThemePref;
-  if (local && valid.includes(local)) return local as ThemePref;
+): ThemeMode {
+  const valid = THEME_MODES as readonly string[];
+  if (server && valid.includes(server)) return server as ThemeMode;
+  if (local && valid.includes(local)) return local as ThemeMode;
   const attr = getAttr();
-  return attr === 'light' || attr === 'dark' ? attr : DEFAULT_THEME;
+  return attr === 'light' || attr === 'dark' ? attr : DEFAULT_THEME_MODE;
 }
 
 /** Collapse a preference to what actually paints. `system` asks the OS. */
-export function resolveTheme(theme: ThemePref, prefersLight: boolean): ResolvedTheme {
-  if (theme === 'system') return prefersLight ? 'light' : 'dark';
-  return theme;
+export function resolveThemeMode(mode: ThemeMode, prefersLight: boolean): ResolvedThemeMode {
+  if (mode === 'system') return prefersLight ? 'light' : 'dark';
+  return mode;
 }
 
 /**
@@ -171,7 +243,7 @@ export function resolveTheme(theme: ThemePref, prefersLight: boolean): ResolvedT
  * A skew between the surfaces would only mean one repainting before another,
  * so this is here for the single definition rather than for agreement.
  */
-export const SYSTEM_THEME_SETTLE_MS = 300;
+export const SYSTEM_THEME_MODE_SETTLE_MS = 300;
 
 // --- Motion ---
 
@@ -208,6 +280,47 @@ export function motionAttribute(reduced: boolean): 'reduce' | 'full' {
   return reduced ? 'reduce' : 'full';
 }
 
+// --- Theme effects ---
+
+/** The device-scoped `theme-effects` preference (ADR 0307). `reduce` drops the
+ *  shadows and filters a theme puts on its parts, and keeps part colours and
+ *  letter-spacing. `system` follows two OS signals, `full` ignores them. */
+export type ThemeEffectsPref = 'system' | 'reduce' | 'full';
+
+export const THEME_EFFECTS_PREFS: readonly ThemeEffectsPref[] = ['system', 'reduce', 'full'];
+
+export const DEFAULT_THEME_EFFECTS: ThemeEffectsPref = 'system';
+
+/** Workspace-scoped mirror of `theme-effects`, read by the boot script. */
+export const THEME_EFFECTS_STORAGE_KEY = 'lucidos-theme-effects';
+
+/** The OS signals `system` follows. A glow softens glyph edges, which is what
+ *  a user asking for more contrast or less transparency is avoiding. A browser
+ *  that does not know a query reports no match, so that half reads as false. */
+export const REDUCED_TRANSPARENCY_QUERY = '(prefers-reduced-transparency: reduce)';
+export const MORE_CONTRAST_QUERY = '(prefers-contrast: more)';
+
+export function parseThemeEffects(raw: string | null | undefined): ThemeEffectsPref {
+  return raw && (THEME_EFFECTS_PREFS as readonly string[]).includes(raw)
+    ? raw as ThemeEffectsPref
+    : DEFAULT_THEME_EFFECTS;
+}
+
+/** Whether theme effects are reduced. The single definition every surface uses. */
+export function resolveReducedThemeEffects(
+  pref: ThemeEffectsPref,
+  osReducesTransparency: boolean,
+  osPrefersMoreContrast: boolean,
+): boolean {
+  if (pref === 'system') return osReducesTransparency || osPrefersMoreContrast;
+  return pref === 'reduce';
+}
+
+/** The `data-theme-effects` value for a resolved answer. */
+export function themeEffectsAttribute(reduced: boolean): 'reduce' | 'full' {
+  return reduced ? 'reduce' : 'full';
+}
+
 /** Device-local position of the diagnostic Animation speed slider, -10..10. */
 export const ANIMATION_SPEED_STORAGE_KEY = 'lucidos-animation-speed-slider';
 export const ANIMATION_SPEED_MIN = -10;
@@ -240,35 +353,77 @@ export function durationScaleFor(sliderPosition: number, reduced: boolean): numb
 }
 
 /**
- * Which font a stored value selects, defaulting to {@link DEFAULT_FONT_FAMILY}.
+ * Which font paints the UI. The single definition every surface calls.
  *
- * Every surface resolves the KEY once and then reads both maps with it, rather
- * than defaulting each lookup separately. That is not tidiness. A stored value
- * absent from the family map would take the default STACK while the feature
- * lookup fell through to `normal`. And `normal` means the font's defaults, so
- * Fira Code's ligatures would come back on for prose.
+ *   1. an explicit font id the user picked;
+ *   2. else the font the active theme suggests;
+ *   3. else {@link FALLBACK_FONT}.
+ *
+ * An unset, unknown or `theme` stored value all follow the theme. Every surface
+ * resolves the KEY once and then reads both maps with it, rather than
+ * defaulting each lookup separately. A key absent from the stack map would take
+ * the default STACK while the feature lookup fell through to `normal`. And
+ * `normal` turns Fira Code's ligatures back on for prose.
  */
-export function resolveFontKey(stored: string | null | undefined): FontFamily {
-  return stored && hasOwn(FONT_FAMILY_VALUES, stored)
-    ? (stored as FontFamily)
-    : DEFAULT_FONT_FAMILY;
+export function resolveFontKey(
+  stored: string | null | undefined,
+  themeFonts: ThemeFonts,
+  known: readonly WorkspaceFont[] = [],
+): FontKey {
+  const usable = (value: string | null | undefined): value is FontKey =>
+    isFontId(value) || known.some(entry => entry.id === value);
+  if (stored !== FOLLOW_THEME && usable(stored)) return stored;
+  return usable(themeFonts.ui) ? themeFonts.ui : FALLBACK_FONT;
 }
 
 /** The ligature pair for a font. Only fonts that ship programming ligatures
  *  get anything but `normal`. */
-export function fontFeaturesFor(font: FontFamily): FontFeaturePair {
-  return hasOwn(FONT_FEATURES, font) ? FONT_FEATURES[font]! : FONT_FEATURES_DEFAULT;
+export function fontFeaturesFor(font: FontKey, known: readonly WorkspaceFont[] = []): FontFeaturePair {
+  const ligatures = isFontId(font)
+    ? FONTS_BY_ID[font].ligatures
+    : known.some(entry => entry.id === font && entry.ligatures);
+  return ligatures ? FONT_FEATURES_LIGATURES : FONT_FEATURES_DEFAULT;
+}
+
+/** The CSS value a font resolves to. A workspace font missing from `known`
+ *  takes the fallback's stack, as an unknown font always has. */
+export function fontStackFor(font: FontKey, known: readonly WorkspaceFont[] = []): string {
+  if (isFontId(font)) return FONT_STACKS[font];
+  return known.find(entry => entry.id === font)?.stack ?? FONT_STACKS[FALLBACK_FONT];
+}
+
+/** What a surface paints for its UI font: the resolved key, the stack and the
+ *  ligature pair read with it, and the workspace font to register, if any. */
+export interface ResolvedFont {
+  key: FontKey;
+  stack: string;
+  features: FontFeaturePair;
+  workspaceFont: WorkspaceFont | null;
+}
+
+/** {@link resolveFontKey}, then everything read with the key it settled on.
+ *  `known` is every workspace font this surface has an entry for. */
+export function resolveFont(
+  stored: string | null | undefined,
+  themeFonts: ThemeFonts,
+  known: readonly WorkspaceFont[] = [],
+): ResolvedFont {
+  const key = resolveFontKey(stored, themeFonts, known);
+  return {
+    key,
+    stack: fontStackFor(key, known),
+    features: fontFeaturesFor(key, known),
+    workspaceFont: known.find(entry => entry.id === key) ?? null,
+  };
 }
 
 /**
  * An OWN key, never an inherited one.
  *
  * Every lookup here is keyed by a value out of localStorage, and `in` (or a
- * bare index) walks the prototype chain: `'toString' in FONT_FAMILY_VALUES` is
- * true, so a stored `toString` would resolve to a FONT KEY, and the caller
- * would then write `Object.prototype.toString`'s source text into `--font-ui`.
- * The same value read out of `FONT_FEATURES` is a function rather than a pair,
- * so `features.text` would be `undefined`.
+ * bare index) walks the prototype chain: `'toString' in FONT_STACKS` is true,
+ * so a stored `toString` would resolve to a FONT KEY, and the caller would then
+ * write `Object.prototype.toString`'s source text into `--font-ui`.
  *
  * `hasOwnProperty` off the prototype rather than `Object.hasOwn`: this module
  * is bundled to es2015 for the boot script, and esbuild transforms syntax
@@ -362,6 +517,118 @@ export function isValidOverrideName(name: string): boolean {
   return NAME_RE.test(name);
 }
 
+/**
+ * Names a style override may never set, whatever its value (ADR 0309).
+ *
+ * | Names | Why |
+ * |---|---|
+ * | `--protected-*` | the palette protected surfaces read; only the engine's resolved theme carries it |
+ * | `--z-*` | the stacking scale, which decides what paints over an approval |
+ * | the UI font tokens | the user's own font pick, which a theme may not set either |
+ * | `--part-screen-background-image` | the scanlines under protected text, which the engine clamps that palette against (ADR 0313) |
+ * | `--user-ui-scale` | the root size every protected `rem` rides, set by the UI scale preference |
+ */
+const RESERVED_OVERRIDE_NAME_RE =
+  /^--(?:protected-|z-)|^--part-screen-background-image$|^--font(?:-ui|-family|-features-text|-features-code)?$|^--user-ui-scale$/;
+
+export function isReservedOverrideName(name: string): boolean {
+  return RESERVED_OVERRIDE_NAME_RE.test(name);
+}
+
+/** The theme tokens that feed a `box-shadow` or `text-shadow`. The engine's
+ *  catalog lists the same set, pinned by `theme-validation-cases.json`. */
+export const SHADOW_OVERRIDE_TOKENS: readonly string[] = [
+  '--text-glow', '--focus-pill-glow', '--focus-ring',
+  '--shadow-sm', '--shadow-md', '--shadow-lg', '--shadow-up',
+];
+
+/** How far a shadow may paint past its box, in px, and the functions it may
+ *  call. The engine holds a theme to the same (`validate_shadow_reach`). */
+const MAX_SHADOW_PX = 32;
+const PX_PER_REM = 16;
+const SHADOW_COLOUR_FUNCTIONS = new Set([
+  'rgb', 'rgba', 'hsl', 'hsla', 'hwb', 'lab', 'lch', 'oklab', 'oklch', 'color', 'color-mix',
+]);
+
+/** Split at `isSep` characters outside parentheses, dropping empty pieces. */
+function splitTopLevel(value: string, isSep: (c: string) => boolean): string[] {
+  const parts: string[] = [];
+  let depth = 0;
+  let start = 0;
+  for (let i = 0; i < value.length; i++) {
+    const c = value[i];
+    if (c === '(') depth++;
+    else if (c === ')') depth--;
+    else if (depth === 0 && isSep(c)) {
+      parts.push(value.slice(start, i));
+      start = i + 1;
+    }
+  }
+  parts.push(value.slice(start));
+  return parts.map(p => p.trim()).filter(p => p !== '');
+}
+
+/** A word that is exactly one call, `name(args)` with balanced parentheses. */
+function wholeCallName(word: string): string | null {
+  const m = /^([a-z-]+)\(([\s\S]*)\)$/.exec(word);
+  if (!m) return null;
+  let depth = 0;
+  for (const c of m[2]) {
+    if (c === '(') depth++;
+    else if (c === ')' && --depth < 0) return null;
+  }
+  return depth === 0 ? m[1] : null;
+}
+
+/** One word of a shadow in px: `null` for a keyword or colour, `undefined`
+ *  when its size cannot be checked. CSS ends a word's first token at a `+`,
+ *  and at a sign after a number, so `0+999px` is two lengths. */
+function shadowLengthPx(word: string): number | null | undefined {
+  if (!/^[0-9.+-]/.test(word)) return word.includes('+') ? undefined : null;
+  const m = /^([+-]?(?:\d+\.?\d*|\.\d+))(.*)$/.exec(word);
+  if (!m) return undefined;
+  const length = Number(m[1]);
+  if (!Number.isFinite(length)) return undefined;
+  const unit = m[2];
+  if (unit === '' && length === 0) return 0;
+  if (unit === 'px') return length;
+  if (unit === 'rem' || unit === 'em') return length * PX_PER_REM;
+  return undefined;
+}
+
+/** Whether a shadow stays within reach of its box: each layer's larger
+ *  offset, plus its spread, plus half its blur. */
+export function shadowWithinReach(value: string): boolean {
+  for (const layer of splitTopLevel(value, c => c === ',')) {
+    const lengths: number[] = [];
+    for (const raw of splitTopLevel(layer, c => /\s/.test(c))) {
+      const word = raw.toLowerCase();
+      if (word.includes('(')) {
+        const name = wholeCallName(word);
+        if (name === null || !SHADOW_COLOUR_FUNCTIONS.has(name)) return false;
+        continue;
+      }
+      const px = shadowLengthPx(word);
+      if (px === undefined) return false;
+      if (px !== null) lengths.push(px);
+    }
+    if (lengths.length === 0) continue;
+    if (lengths.length === 1 || lengths.length > 4) return false;
+    const [x, y, blur = 0, spread = 0] = lengths;
+    const reach = Math.max(Math.abs(x), Math.abs(y)) + Math.max(spread, 0) + Math.max(blur, 0) / 2;
+    if (reach > MAX_SHADOW_PX) return false;
+  }
+  return true;
+}
+
+/** Whether a style override may set `name` to `value`. The one test both
+ *  realms and the boot script apply. */
+export function isAllowedOverride(name: string, value: string): boolean {
+  if (!isValidOverrideName(name) || isReservedOverrideName(name)) return false;
+  if (!isValidOverrideValue(value)) return false;
+  return !SHADOW_OVERRIDE_TOKENS.includes(name) || shadowWithinReach(value.trim());
+}
+
 export function isValidOverrideValue(value: string): boolean {
   if (typeof value !== 'string') return false;
   const trimmed = value.trim();
@@ -379,22 +646,40 @@ export function isValidOverrideValue(value: string): boolean {
  * is also what keeps it from ever breaking first paint.
  */
 export function parseStyleOverrides(raw: string | null | undefined): Record<string, string> {
-  if (!raw) return {};
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    return {};
+  const map = sanitizeTokenMap(parseJson(raw));
+  for (const [name, value] of Object.entries(map)) {
+    if (!isAllowedOverride(name, value)) delete map[name];
   }
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+  return map;
+}
 
+function parseJson(raw: string | null | undefined): unknown {
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+/** Keep only the entries safe to hand to `setProperty`, up to the cap. The one
+ *  gate every token map passes: style overrides and themes alike. A part token
+ *  must also pass the part grammar, and lands in its canonical form. */
+function sanitizeTokenMap(value: unknown): Record<string, string> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
   const out: Record<string, string> = {};
   let n = 0;
-  for (const [name, value] of Object.entries(parsed as Record<string, unknown>)) {
+  for (const [name, token] of Object.entries(value as Record<string, unknown>)) {
     if (n >= MAX_STYLE_OVERRIDES) break;
     if (!isValidOverrideName(name)) continue;
-    if (typeof value !== 'string' || !isValidOverrideValue(value)) continue;
-    out[name] = value.trim();
+    if (typeof token !== 'string' || !isValidOverrideValue(token)) continue;
+    if (name.startsWith(PART_TOKEN_PREFIX)) {
+      const part = checkPartToken(name, token);
+      if (!('ok' in part)) continue;
+      out[name] = part.ok;
+    } else {
+      out[name] = token.trim();
+    }
     n++;
   }
   return out;
@@ -403,4 +688,253 @@ export function parseStyleOverrides(raw: string | null | undefined): Record<stri
 /** Whether the current URL asks for the overrides to be dropped. */
 export function styleResetRequested(search: string): boolean {
   return new RegExp(`[?&]${STYLE_RESET_PARAM}(?:[=&]|$)`).test(search);
+}
+
+// --- Themes ---
+//
+// A theme is a named set of token values (`docs/plans/2026-09-26-looks.md`). The
+// engine resolves it, derivation included, and serves one map per theme mode.
+// Every surface here only picks the map for the mode it painted and applies it,
+// between the stylesheet and the style overrides. The maps pass the same gate
+// as the overrides, because a workspace theme is a file any app can write.
+
+/** The device-scoped preference naming the active theme. */
+export const THEME_KEY = 'theme';
+
+/** What an unset `theme` means: the stylesheet as shipped, no inline tokens. */
+export const DEFAULT_THEME_ID = 'lucidos';
+
+/** Workspace-scoped localStorage key: the active theme, resolved, as JSON, for
+ *  the boot script. The engine seeds an app frame the same shape. */
+export const THEME_STORAGE_KEY = 'lucidos-theme-resolved';
+
+/** The seed key the engine prepends for an app frame (`api/sdk_prefs.rs`). */
+export const THEME_SEED_KEY = 'theme_resolved';
+
+/**
+ * Storage keys renamed with the theme rename, old name first. The shell's boot
+ * script adopts each old value once (docs/temporary-measures.md § Renamed
+ * appearance storage keys).
+ */
+export const RENAMED_STORAGE_KEYS: ReadonlyArray<readonly [string, string]> = [
+  ['lucidos-theme', THEME_MODE_STORAGE_KEY],
+  ['lucidos-look', THEME_STORAGE_KEY],
+  ['lucidos-look-effects', THEME_EFFECTS_STORAGE_KEY],
+];
+
+/** The fonts a theme suggests: catalog ids and well-formed workspace font ids
+ *  survive parsing. Neither kind makes a third-party request (ADR 0303, ADR
+ *  0308). A workspace font paints only where a surface holds its entry. */
+export interface ThemeFonts {
+  ui?: FontKey;
+  mono?: FontKey;
+}
+
+/** One token map per theme mode. */
+export type ThemeModeMaps = Record<ResolvedThemeMode, Record<string, string>>;
+
+/** A theme as every surface paints it: one token map per theme mode, the fonts
+ *  it suggests, and the entry of each workspace font among them. The engine's
+ *  `ResolvedTheme`, same shape. */
+export interface ResolvedTheme extends ThemeModeMaps {
+  fonts: ThemeFonts;
+  workspace_fonts: WorkspaceFont[];
+}
+
+export const EMPTY_THEME: ResolvedTheme = { dark: {}, light: {}, fonts: {}, workspace_fonts: [] };
+
+/** Parse a stored or served resolved theme. Anything malformed parses to the
+ *  empty theme, so a corrupt cache can never break first paint. */
+export function parseResolvedTheme(raw: string | null | undefined): ResolvedTheme {
+  return sanitizeResolvedTheme(parseJson(raw));
+}
+
+/** The same gate for a theme already parsed, such as one the API served. */
+export function sanitizeResolvedTheme(value: unknown): ResolvedTheme {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return EMPTY_THEME;
+  const theme = value as Record<string, unknown>;
+  return {
+    dark: sanitizeTokenMap(theme.dark),
+    light: sanitizeTokenMap(theme.light),
+    fonts: sanitizeThemeFonts(theme.fonts),
+    workspace_fonts: sanitizeWorkspaceFonts(theme.workspace_fonts),
+  };
+}
+
+function sanitizeThemeFonts(value: unknown): ThemeFonts {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  const fonts = value as Record<string, unknown>;
+  const out: ThemeFonts = {};
+  for (const slot of ['ui', 'mono'] as const) {
+    const id = fonts[slot];
+    if (typeof id === 'string' && (isFontId(id) || isWorkspaceFontId(id))) out[slot] = id;
+  }
+  return out;
+}
+
+/** Every name either mode sets: what a realm may have laid inline from a
+ *  cache, and so must be able to remove. */
+export function themeTokenNames(theme: ThemeModeMaps): string[] {
+  return [...new Set([...Object.keys(theme.dark), ...Object.keys(theme.light)])];
+}
+
+/** Where a realm writes its inline tokens: `<html>`'s style declaration. */
+export interface InlineStyle {
+  setProperty(name: string, value: string): void;
+  removeProperty(name: string): void;
+}
+
+/**
+ * Lay `next` inline and clear each name in `previous` that `next` drops.
+ *
+ * A dropped name falls back to `beneath`, the layer under this one. So
+ * clearing a style override uncovers the theme's value rather than deleting it.
+ * Returns the names now set, for the next call's `previous`.
+ */
+export function replaceInlineTokens(
+  style: InlineStyle,
+  previous: readonly string[],
+  next: Record<string, string>,
+  beneath: Record<string, string> = {},
+): string[] {
+  for (const name of previous) {
+    if (name in next) continue;
+    if (hasOwn(beneath, name)) style.setProperty(name, beneath[name]);
+    else style.removeProperty(name);
+  }
+  for (const name of Object.keys(next)) style.setProperty(name, next[name]);
+  return Object.keys(next);
+}
+
+/** The literal document background a theme paints in a mode, or null to keep
+ *  {@link THEME_MODE_BG}. Only a hex literal qualifies: this value is painted before
+ *  any stylesheet resolves a `var()`. */
+export function themeBackground(tokens: Record<string, string>): string | null {
+  const bg = tokens['--bg-primary'];
+  return bg && /^#(?:[0-9a-f]{3}|[0-9a-f]{6})$/i.test(bg) ? bg : null;
+}
+
+// --- Workspace fonts ---
+//
+// A workspace font is one the user, the agent or a plugin installed under
+// `data/fonts/<slug>/` (ADR 0308). The engine checks it and serves its entry.
+// A client still rebuilds the entry rather than trust it: an entry reaches a
+// surface from local storage too, and storage can be forged. The stack is
+// rebuilt from the id and the group, and every face path must name a font file
+// in the font's own directory. So no string from the wire reaches CSS, and no
+// face can point anywhere but the local engine's `/data` mount.
+
+/** One face of a workspace font. `path` is relative to the workspace `data/`. */
+export interface WorkspaceFontFace {
+  path: string;
+  weight: string;
+  style: 'normal' | 'italic';
+}
+
+/** A workspace font as a surface registers and paints it. The engine's
+ *  `WorkspaceFont`, less what no surface reads. */
+export interface WorkspaceFont {
+  id: WorkspaceFontId;
+  label: string;
+  /** The family its faces register under. It is the id. */
+  family: WorkspaceFontId;
+  stack: string;
+  group: FontGroup;
+  ligatures: boolean;
+  faces: WorkspaceFontFace[];
+}
+
+/** Workspace-scoped localStorage key: the entry of the workspace font the
+ *  device picked, as JSON, for the boot script. */
+export const WORKSPACE_FONT_STORAGE_KEY = 'lucidos-workspace-font';
+
+/** The seed key the engine prepends for an app frame (`api/sdk_prefs.rs`). */
+export const WORKSPACE_FONT_SEED_KEY = 'workspace_font';
+
+const WORKSPACE_FONT_SLUG = '[a-z0-9]+(?:-[a-z0-9]+)*';
+const WORKSPACE_FONT_ID = new RegExp(`^${WORKSPACE_FONT_ID_PREFIX}${WORKSPACE_FONT_SLUG}$`);
+const WORKSPACE_FONT_ID_MAX = WORKSPACE_FONT_ID_PREFIX.length + WORKSPACE_FONT_LIMITS.slug;
+const FACE_FILE = /^[A-Za-z0-9_-][A-Za-z0-9._-]{0,99}$/;
+const FACE_EXTENSION = /\.(?:woff2|woff|ttf|otf)$/i;
+const FACE_WEIGHT = /^(\d{1,4})(?: (\d{1,4}))?$/;
+const FONT_GROUPS: readonly FontGroup[] = ['sans', 'serif', 'mono'];
+
+export function isWorkspaceFontId(value: string | null | undefined): value is WorkspaceFontId {
+  return !!value && value.length <= WORKSPACE_FONT_ID_MAX && WORKSPACE_FONT_ID.test(value);
+}
+
+/** The stack a workspace font paints with: its own family, then the fixed
+ *  chain for its group. */
+export function workspaceFontStack(id: WorkspaceFontId, group: FontGroup): string {
+  return `'${id}', ${WORKSPACE_FONT_FALLBACKS[group]}`;
+}
+
+function isFaceWeight(weight: string): boolean {
+  const match = FACE_WEIGHT.exec(weight);
+  if (!match) return false;
+  const min = Number(match[1]);
+  const max = match[2] === undefined ? min : Number(match[2]);
+  return min >= 1 && max <= 1000 && min <= max;
+}
+
+function sanitizeFace(value: unknown, slug: string): WorkspaceFontFace | null {
+  if (!value || typeof value !== 'object') return null;
+  const face = value as Record<string, unknown>;
+  const { path, weight, style } = face;
+  if (typeof path !== 'string' || typeof weight !== 'string') return null;
+  const prefix = `fonts/${slug}/`;
+  const file = path.startsWith(prefix) ? path.slice(prefix.length) : '';
+  if (!FACE_FILE.test(file) || !FACE_EXTENSION.test(file)) return null;
+  if (!isFaceWeight(weight)) return null;
+  if (style !== 'normal' && style !== 'italic') return null;
+  return { path, weight, style };
+}
+
+/** A workspace font entry rebuilt from what the engine served, or null when
+ *  any part of it is malformed. */
+export function sanitizeWorkspaceFont(value: unknown): WorkspaceFont | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const font = value as Record<string, unknown>;
+  const { id, group, faces } = font;
+  if (typeof id !== 'string' || !isWorkspaceFontId(id)) return null;
+  if (typeof group !== 'string' || !(FONT_GROUPS as readonly string[]).includes(group)) return null;
+  if (!Array.isArray(faces) || faces.length === 0 || faces.length > WORKSPACE_FONT_LIMITS.faces) {
+    return null;
+  }
+  const slug = id.slice(WORKSPACE_FONT_ID_PREFIX.length);
+  const clean: WorkspaceFontFace[] = [];
+  for (const face of faces) {
+    const checked = sanitizeFace(face, slug);
+    if (!checked) return null;
+    clean.push(checked);
+  }
+  const label = typeof font.label === 'string' && font.label.trim()
+    ? font.label.slice(0, WORKSPACE_FONT_LIMITS.label)
+    : id;
+  return {
+    id,
+    label,
+    family: id,
+    stack: workspaceFontStack(id, group as FontGroup),
+    group: group as FontGroup,
+    ligatures: font.ligatures === true,
+    faces: clean,
+  };
+}
+
+/** Every well-formed entry in a served or stored list, up to the cap. */
+export function sanitizeWorkspaceFonts(value: unknown): WorkspaceFont[] {
+  if (!Array.isArray(value)) return [];
+  const out: WorkspaceFont[] = [];
+  for (const entry of value) {
+    if (out.length >= WORKSPACE_FONT_LIMITS.fonts) break;
+    const font = sanitizeWorkspaceFont(entry);
+    if (font && !out.some(known => known.id === font.id)) out.push(font);
+  }
+  return out;
+}
+
+/** Parse a stored or seeded workspace font entry. */
+export function parseWorkspaceFont(raw: string | null | undefined): WorkspaceFont | null {
+  return sanitizeWorkspaceFont(parseJson(raw));
 }

@@ -125,9 +125,9 @@ describe('describeAbortCause', () => {
 });
 
 describe('describeContinuationReason', () => {
-  it('names the Switch to new version that stopped the response', () => {
+  it('names the Switch that stopped the response', () => {
     expect(describeContinuationReason(CONTINUATION_AUTO_RESUME_AFTER_SWITCH_REASON))
-      .toMatch(/switch to new version/i);
+      .toMatch(/chose Switch on the new version/);
   });
 
   // The honesty rule `continuationStartedSummary` enforces for the turn header

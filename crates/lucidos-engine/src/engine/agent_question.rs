@@ -351,8 +351,12 @@ impl LucidosEngine {
                         event: ThreadEvent::UserQuestionAsked {
                             tool_use_id: sub_id.clone(),
                             cc_session_id: cc_session_id.clone(),
-                            question: q.question,
-                            options: q.options,
+                            question: self.with_image_size_hints(&q.question),
+                            options: q
+                                .options
+                                .into_iter()
+                                .map(|o| self.option_with_image_size_hints(o))
+                                .collect(),
                             worktree_path: None,
                             multi_select: q.multi_select,
                         },

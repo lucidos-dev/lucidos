@@ -96,7 +96,7 @@ pub(in crate::api) async fn answer_thread_question(
             Json(serde_json::json!({ "error": e.to_string() })),
         )
     })?;
-    let actor = crate::api::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    let actor = crate::api::actor::user_actor(&headers, None);
     use crate::engine::agent_question::{answer_pending_question, AnswerResult};
     match answer_pending_question(
         &state.engine,
@@ -133,7 +133,7 @@ pub(in crate::api) async fn save_thread(
         Some(true) => return Ok(StatusCode::OK),
         Some(false) => {}
     }
-    let actor = crate::api::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    let actor = crate::api::actor::user_actor(&headers, None);
 
     state
         .engine
@@ -183,7 +183,7 @@ pub(in crate::api) async fn unsave_thread(
         Some(false) => return Ok(StatusCode::OK),
         Some(true) => {}
     }
-    let actor = crate::api::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    let actor = crate::api::actor::user_actor(&headers, None);
 
     state
         .engine
@@ -220,7 +220,7 @@ pub(in crate::api) async fn rename_thread(
     if title.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "Title cannot be empty".to_string()));
     }
-    let actor = crate::api::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    let actor = crate::api::actor::user_actor(&headers, None);
 
     state
         .engine
@@ -365,7 +365,7 @@ pub(in crate::api) async fn continue_thread(
     )
     .await
     .map_err(|e| (e.status_code(), e.to_string()))?;
-    let actor = crate::api::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    let actor = crate::api::actor::user_actor(&headers, None);
 
     // Decide which dispatch path to take based on the thread's recorded type.
     let is_coding_agent: bool =
@@ -457,7 +457,7 @@ pub(in crate::api) async fn cancel_thread_event_wait(
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid thread_id: {e}")))?;
     let wait_uuid = Uuid::parse_str(&wait_id)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid wait_id: {e}")))?;
-    let actor = crate::api::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    let actor = crate::api::actor::user_actor(&headers, None);
 
     use crate::engine::event_wait::CancelWaitOutcome;
     match state

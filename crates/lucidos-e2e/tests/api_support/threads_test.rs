@@ -150,7 +150,26 @@ async fn disk_usage_worktrees_returns_inventory_shape() {
         assert!(row["size_bytes"].is_u64(), "size_bytes is integer");
         assert!(row["is_dirty"].is_boolean(), "is_dirty is boolean");
         assert!(row["is_saved"].is_boolean(), "is_saved is boolean");
+        assert!(row["artifact_bytes"].is_u64(), "artifact_bytes is integer");
+        assert!(row["is_active"].is_boolean(), "is_active is boolean");
+        assert!(row["is_finished"].is_boolean(), "is_finished is boolean");
     }
+}
+
+/// The bulk cleanup route is mounted and refuses an unknown action before it
+/// touches anything. A real pass is not run here: it would reclaim worktrees
+/// other e2e tests share this workspace with.
+#[tokio::test]
+async fn disk_usage_cleanup_refuses_an_unknown_action() {
+    let client = user_client().await;
+    let url = format!("{}/api/v1/disk-usage/cleanup", base_url());
+    let resp = client
+        .post(&url)
+        .json(&serde_json::json!({ "action": "everything" }))
+        .send()
+        .await
+        .expect("Disk usage cleanup request failed");
+    assert_eq!(resp.status(), 422);
 }
 
 #[tokio::test]

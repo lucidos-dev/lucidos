@@ -31,6 +31,9 @@ export function useLoadableFetch<T>(
      *  user typing into the very content being re-read. Read it from a ref;
      *  state read at render time is a render behind. */
     stillWanted?: () => boolean;
+    /** Called when a wanted reply lands, loaded or failed. A cancelled or
+     *  unwanted fetch never calls it. */
+    onSettled?: () => void;
   } = {},
 ): LoadableFetchResult<T> {
   const [loadable, setLoadable] = useState<Loadable<T>>({ status: 'not-loaded' });
@@ -42,8 +45,16 @@ export function useLoadableFetch<T>(
     if (opts.keepLoadedWhileRefetching) setLoadable(loadingIfFresh);
     else setLoadable({ status: 'loading' });
     fetcher()
-      .then((data) => { if (wanted()) setLoadable({ status: 'loaded', data }); })
-      .catch((e: unknown) => { if (wanted()) setLoadable(toFailed(e)); });
+      .then((data) => {
+        if (!wanted()) return;
+        setLoadable({ status: 'loaded', data });
+        opts.onSettled?.();
+      })
+      .catch((e: unknown) => {
+        if (!wanted()) return;
+        setLoadable(toFailed(e));
+        opts.onSettled?.();
+      });
     return () => { canceled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, deps);

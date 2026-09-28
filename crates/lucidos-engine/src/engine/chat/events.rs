@@ -44,7 +44,6 @@ pub(crate) fn make_message_received(
     user_message: &str,
     user_images: Option<&[crate::api::ChatImage]>,
     device_id: Option<&str>,
-    device_name: Option<String>,
     parent_thread_id: Option<Uuid>,
     spawning_event_id: Option<Uuid>,
     mode: ActorMode,
@@ -54,21 +53,13 @@ pub(crate) fn make_message_received(
     explicit_origin: Option<MessageOrigin>,
     voice_session_id: Option<Uuid>,
 ) -> crate::engine::thread_events::ThreadEvent {
-    let origin = explicit_origin.or_else(|| {
-        synthesize_legacy_origin(
-            mode,
-            device_id,
-            device_name.as_deref(),
-            parent_thread_id,
-            spawning_event_id,
-        )
-    });
+    let origin = explicit_origin
+        .or_else(|| synthesize_legacy_origin(mode, device_id, parent_thread_id, spawning_event_id));
     make_message_received_with_origin(
         workspace,
         user_message,
         user_images,
         device_id,
-        device_name,
         parent_thread_id,
         spawning_event_id,
         mode,
@@ -90,7 +81,6 @@ pub(super) fn make_message_received_with_origin(
     user_message: &str,
     user_images: Option<&[crate::api::ChatImage]>,
     device_id: Option<&str>,
-    device_name: Option<String>,
     parent_thread_id: Option<Uuid>,
     spawning_event_id: Option<Uuid>,
     mode: ActorMode,
@@ -108,7 +98,6 @@ pub(super) fn make_message_received_with_origin(
         text: user_message.to_string(),
         user_image_hashes: images_to_hashes(workspace, user_images),
         device_id: device_id.map(|s| s.to_string()),
-        device: device_name,
         image_description: None,
         parent_thread_id,
         spawning_event_id,
@@ -142,14 +131,12 @@ fn validate_origin_mode(
 fn synthesize_legacy_origin(
     mode: ActorMode,
     device_id: Option<&str>,
-    device_name: Option<&str>,
     parent_thread_id: Option<Uuid>,
     spawning_event_id: Option<Uuid>,
 ) -> Option<MessageOrigin> {
     match mode {
         ActorMode::Human => device_id.map(|id| MessageOrigin::Device {
             device_id: id.to_string(),
-            label: crate::core::devices::resolve_device_name(device_name, id),
         }),
         ActorMode::Agent => parent_thread_id.map(|id| MessageOrigin::ThreadLink {
             thread_id: id,
@@ -267,10 +254,6 @@ impl crate::engine::LucidosEngine {
             reasoning_effort,
             provider,
         } = resolved;
-        let device_name = match device_id {
-            Some(did) => crate::core::DeviceStore::tooltip_info(self.pool(), did).await,
-            None => None,
-        };
 
         use crate::engine::thread_events::{EventChannel, EventMeta};
         let emitted = self
@@ -282,7 +265,6 @@ impl crate::engine::LucidosEngine {
                     user_message,
                     user_images,
                     device_id,
-                    device_name,
                     // A human message never carries spawn linkage
                     // (`validate_mode_and_spawn` rejects it).
                     None,
@@ -452,12 +434,10 @@ mod origin_invariants {
     fn device_origin_with_human_mode_ok() {
         let origin = MessageOrigin::Device {
             device_id: "dev-1".into(),
-            label: "Chrome on Mac".into(),
         };
         let res = make_message_received_with_origin(
             std::path::Path::new(""),
             "hi",
-            None,
             None,
             None,
             None,
@@ -476,12 +456,10 @@ mod origin_invariants {
     fn device_origin_with_agent_mode_rejected() {
         let origin = MessageOrigin::Device {
             device_id: "dev-1".into(),
-            label: "Chrome on Mac".into(),
         };
         let res = make_message_received_with_origin(
             std::path::Path::new(""),
             "hi",
-            None,
             None,
             None,
             None,
@@ -510,7 +488,6 @@ mod origin_invariants {
             None,
             None,
             None,
-            None,
             ActorMode::Human,
             None,
             None,
@@ -532,7 +509,6 @@ mod origin_invariants {
         let res = make_message_received_with_origin(
             std::path::Path::new(""),
             "hi",
-            None,
             None,
             None,
             None,
@@ -565,7 +541,6 @@ mod origin_invariants {
             None,
             None,
             None,
-            None,
             ActorMode::Engine,
             None,
             None,
@@ -587,7 +562,6 @@ mod origin_invariants {
         let res = make_message_received_with_origin(
             std::path::Path::new(""),
             "hi",
-            None,
             None,
             None,
             None,
@@ -618,7 +592,6 @@ mod origin_invariants {
             None,
             None,
             None,
-            None,
             ActorMode::Human,
             None,
             None,
@@ -641,7 +614,6 @@ mod origin_invariants {
         let res = make_message_received_with_origin(
             std::path::Path::new(""),
             "hi",
-            None,
             None,
             None,
             None,
@@ -675,7 +647,6 @@ mod origin_invariants {
             None,
             None,
             None,
-            None,
             ActorMode::Agent,
             None,
             None,
@@ -698,7 +669,6 @@ mod origin_invariants {
         let res = make_message_received_with_origin(
             std::path::Path::new(""),
             "hi",
-            None,
             None,
             None,
             None,
@@ -728,7 +698,6 @@ mod origin_invariants {
             None,
             None,
             None,
-            None,
             ActorMode::Engine,
             None,
             None,
@@ -747,7 +716,6 @@ mod origin_invariants {
         let res = make_message_received_with_origin(
             std::path::Path::new(""),
             "hi",
-            None,
             None,
             None,
             None,
@@ -775,7 +743,6 @@ mod origin_invariants {
         let event = make_message_received(
             std::path::Path::new(""),
             "do the thing",
-            None,
             None,
             None,
             Some(parent_id),
@@ -830,7 +797,6 @@ mod origin_invariants {
             None,
             None,
             None,
-            None,
             ActorMode::Agent,
             None,
             None,
@@ -850,7 +816,6 @@ mod origin_invariants {
             None,
             None,
             None,
-            None,
             ActorMode::Human,
             None,
             None,
@@ -862,7 +827,6 @@ mod origin_invariants {
         let res2 = make_message_received_with_origin(
             std::path::Path::new(""),
             "hi",
-            None,
             None,
             None,
             None,
@@ -892,7 +856,6 @@ mod origin_invariants {
             Some("dev-1"),
             None,
             None,
-            None,
             ActorMode::Human,
             None,
             None,
@@ -905,7 +868,6 @@ mod origin_invariants {
             "what have I got running",
             None,
             Some("dev-1"),
-            None,
             None,
             None,
             ActorMode::Human,

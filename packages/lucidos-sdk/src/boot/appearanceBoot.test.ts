@@ -10,8 +10,22 @@
  * sees changes, and every case below states what the previous scripts did.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { applyAppearanceBoot } from './appearanceBoot';
+import { applyAppearanceBoot, type BootOptions } from './appearanceBoot';
 import { configure } from '../_fetch';
+
+/** The options each embed site passes (`host.ts`, `iframe.ts`). */
+const SHELL: BootOptions = {
+  styleReset: true,
+  durationScale: true,
+  adoptRenamedStorageKeys: true,
+  legacyThemeModeAttribute: false,
+};
+const IFRAME: BootOptions = {
+  styleReset: false,
+  durationScale: false,
+  adoptRenamedStorageKeys: false,
+  legacyThemeModeAttribute: true,
+};
 
 interface Recorded {
   props: Record<string, string>;
@@ -42,6 +56,9 @@ function setEnv(opts: {
   prefersLight?: boolean;
   /** The OS reduced-motion switch. */
   osReduces?: boolean;
+  /** The two OS signals `system` theme effects follow. */
+  osReducesTransparency?: boolean;
+  osMoreContrast?: boolean;
   stored?: Record<string, string>;
   /** What the engine resolved and prepended, for an isolated app frame. */
   served?: Record<string, string>;
@@ -70,10 +87,14 @@ function setEnv(opts: {
   };
   (globalThis as any).localStorage = {
     getItem: (k: string) => (k in store ? store[k] : null),
+    setItem: (k: string, v: string) => { store[k] = v; },
     removeItem: (k: string) => { delete store[k]; },
   };
   (globalThis as any).matchMedia = (query: string) => ({
-    matches: query.includes('reduced-motion') ? opts.osReduces ?? false : opts.prefersLight ?? false,
+    matches: query.includes('reduced-motion') ? opts.osReduces ?? false
+      : query.includes('reduced-transparency') ? opts.osReducesTransparency ?? false
+        : query.includes('prefers-contrast') ? opts.osMoreContrast ?? false
+          : opts.prefersLight ?? false,
   });
   (globalThis as any).location = {
     pathname: opts.pathname ?? '/myws/',
@@ -104,11 +125,11 @@ describe('an isolated app frame, served its values', () => {
   it('paints the served appearance with nothing in storage', () => {
     setEnv({
       prefersLight: true,
-      served: { theme: 'dark', 'font-family': 'inter', 'ui-scale': '150' },
+      served: { 'theme-mode': 'dark', 'font-family': 'inter', 'ui-scale': '150' },
     });
-    applyAppearanceBoot({ styleReset: false, durationScale: false });
+    applyAppearanceBoot(IFRAME);
 
-    expect(rec.attrs['data-theme']).toBe('dark');
+    expect(rec.attrs['data-theme-mode']).toBe('dark');
     expect(rec.props['--font-ui']).toContain("'Inter'");
     expect(rec.props['--user-ui-scale']).toBe('150%');
   });
@@ -117,51 +138,115 @@ describe('an isolated app frame, served its values', () => {
     // The precedence `appearance.ts` documents for the live re-apply, applied
     // to first paint so the two cannot disagree for a frame.
     setEnv({
-      served: { theme: 'light' },
-      stored: { 'ws:myws:lucidos-theme': 'dark' },
+      served: { 'theme-mode': 'light' },
+      stored: { 'ws:myws:lucidos-theme-mode': 'dark' },
     });
-    applyAppearanceBoot({ styleReset: false, durationScale: false });
+    applyAppearanceBoot(IFRAME);
 
-    expect(rec.attrs['data-theme']).toBe('light');
+    expect(rec.attrs['data-theme-mode']).toBe('light');
   });
 
   it('a key the engine did not resolve falls back to storage', () => {
     setEnv({
-      served: { theme: 'dark' },
+      served: { 'theme-mode': 'dark' },
       stored: { 'ws:myws:lucidos-ui-scale': '125' },
     });
-    applyAppearanceBoot({ styleReset: false, durationScale: false });
+    applyAppearanceBoot(IFRAME);
 
-    expect(rec.attrs['data-theme']).toBe('dark');
+    expect(rec.attrs['data-theme-mode']).toBe('dark');
     expect(rec.props['--user-ui-scale']).toBe('125%');
   });
 
   it('reads the pre-grid scale aliases in the same order the live re-apply does', () => {
     setEnv({ served: { 'text-size': 'large' } });
-    applyAppearanceBoot({ styleReset: false, durationScale: false });
+    applyAppearanceBoot(IFRAME);
 
     expect(rec.props['--user-ui-scale']).toBe('125%');
   });
 
   it('an empty served value is not a value, and storage answers', () => {
     setEnv({
-      served: { theme: '' },
-      stored: { 'ws:myws:lucidos-theme': 'light' },
+      served: { 'theme-mode': '' },
+      stored: { 'ws:myws:lucidos-theme-mode': 'light' },
     });
-    applyAppearanceBoot({ styleReset: false, durationScale: false });
+    applyAppearanceBoot(IFRAME);
 
+    expect(rec.attrs['data-theme-mode']).toBe('light');
+  });
+});
+
+describe('the legacy data-theme attribute', () => {
+  it('an app frame carries it beside data-theme-mode, for app styles written before the rename', () => {
+    setEnv({ served: { 'theme-mode': 'light' } });
+    applyAppearanceBoot(IFRAME);
+
+    expect(rec.attrs['data-theme-mode']).toBe('light');
     expect(rec.attrs['data-theme']).toBe('light');
+  });
+
+  it('the shell never carries it', () => {
+    setEnv({ stored: { 'ws:myws:lucidos-theme-mode': 'dark' } });
+    applyAppearanceBoot(SHELL);
+
+    expect(rec.attrs['data-theme-mode']).toBe('dark');
+    expect(rec.attrs['data-theme']).toBeUndefined();
+  });
+});
+
+describe('storage keys renamed with the theme rename', () => {
+  it('the shell adopts the old mode key, so the first paint after an upgrade keeps the pick', () => {
+    setEnv({ prefersLight: true, stored: { 'ws:myws:lucidos-theme': 'dark' } });
+    applyAppearanceBoot(SHELL);
+
+    expect(rec.attrs['data-theme-mode']).toBe('dark');
+    expect(store['ws:myws:lucidos-theme-mode']).toBe('dark');
+    expect(store['ws:myws:lucidos-theme']).toBeUndefined();
+  });
+
+  it('a value already under the new name wins, and the old key still goes', () => {
+    setEnv({
+      stored: { 'ws:myws:lucidos-theme': 'dark', 'ws:myws:lucidos-theme-mode': 'light' },
+    });
+    applyAppearanceBoot(SHELL);
+
+    expect(rec.attrs['data-theme-mode']).toBe('light');
+    expect(store['ws:myws:lucidos-theme']).toBeUndefined();
+  });
+
+  it('the old effects key is adopted too, before first paint reads it', () => {
+    setEnv({ stored: { 'ws:myws:lucidos-look-effects': 'reduce' } });
+    applyAppearanceBoot(SHELL);
+
+    expect(rec.attrs['data-theme-effects']).toBe('reduce');
+    expect(store['ws:myws:lucidos-theme-effects']).toBe('reduce');
+    expect(store['ws:myws:lucidos-look-effects']).toBeUndefined();
+  });
+
+  it('the picker leaves the raw old key alone, since new workspaces seed from it', () => {
+    setEnv({ baseUrl: '/~', stored: { 'lucidos-theme': 'dark' } });
+    applyAppearanceBoot(SHELL);
+
+    expect(store['lucidos-theme']).toBe('dark');
+    expect(store['lucidos-theme-mode']).toBeUndefined();
+  });
+
+  it('an app frame leaves the shell-owned keys alone', () => {
+    setEnv({ stored: { 'ws:myws:lucidos-theme': 'dark' } });
+    applyAppearanceBoot(IFRAME);
+
+    expect(store['ws:myws:lucidos-theme']).toBe('dark');
+    expect(store['ws:myws:lucidos-theme-mode']).toBeUndefined();
   });
 });
 
 describe('a device with nothing stored', () => {
   it('follows the OS and paints the defaults', () => {
     setEnv({ prefersLight: true });
-    const out = applyAppearanceBoot({ styleReset: true, durationScale: true });
+    const out = applyAppearanceBoot(SHELL);
 
-    expect(out.theme).toBe('system');
+    expect(out.mode).toBe('system');
     expect(out.resolved).toBe('light');
-    expect(rec.attrs['data-theme']).toBe('light');
+    expect(rec.attrs['data-theme-mode']).toBe('light');
     expect(rec.props['--bg-primary']).toBe('#ffffff');
     expect(rec.background).toBe('#ffffff');
     expect(rec.props['--font-ui']).toContain("'Fira Code'");
@@ -173,9 +258,9 @@ describe('a device with nothing stored', () => {
 
   it('resolves the same default to dark on a dark OS', () => {
     setEnv({ prefersLight: false });
-    applyAppearanceBoot({ styleReset: true, durationScale: true });
+    applyAppearanceBoot(SHELL);
 
-    expect(rec.attrs['data-theme']).toBe('dark');
+    expect(rec.attrs['data-theme-mode']).toBe('dark');
     expect(rec.props['--bg-primary']).toBe('#07172e');
   });
 });
@@ -184,16 +269,16 @@ describe('stored values win', () => {
   it('an explicit theme is not second-guessed by the OS', () => {
     setEnv({
       prefersLight: true,
-      stored: { 'ws:myws:lucidos-theme': 'dark' },
+      stored: { 'ws:myws:lucidos-theme-mode': 'dark' },
     });
-    applyAppearanceBoot({ styleReset: true, durationScale: true });
+    applyAppearanceBoot(SHELL);
 
-    expect(rec.attrs['data-theme']).toBe('dark');
+    expect(rec.attrs['data-theme-mode']).toBe('dark');
   });
 
   it('a stored font takes its own stack and its own (absent) ligatures', () => {
     setEnv({ stored: { 'ws:myws:lucidos-font-family': 'inter' } });
-    applyAppearanceBoot({ styleReset: true, durationScale: true });
+    applyAppearanceBoot(SHELL);
 
     expect(rec.props['--font-ui']).toContain("'Inter'");
     // `normal` for a font that ships no programming ligatures, so its own
@@ -206,7 +291,7 @@ describe('stored values win', () => {
     // The pairing is the point: a stack from one map with `normal` from the
     // other would put Fira Code's ligatures back on prose.
     setEnv({ stored: { 'ws:myws:lucidos-font-family': 'comic-sans' } });
-    applyAppearanceBoot({ styleReset: true, durationScale: true });
+    applyAppearanceBoot(SHELL);
 
     expect(rec.props['--font-ui']).toContain("'Fira Code'");
     expect(rec.props['--font-features-text']).toBe('"liga" 0, "calt" 0');
@@ -214,14 +299,14 @@ describe('stored values win', () => {
 
   it('snaps a pre-grid scale so it does not paint twice', () => {
     setEnv({ stored: { 'ws:myws:lucidos-ui-scale': '115' } });
-    applyAppearanceBoot({ styleReset: true, durationScale: true });
+    applyAppearanceBoot(SHELL);
 
     expect(rec.props['--user-ui-scale']).toBe('112.5%');
   });
 
   it('reads the legacy enum values old devices still carry', () => {
     setEnv({ stored: { 'ws:myws:lucidos-ui-scale': 'large' } });
-    applyAppearanceBoot({ styleReset: true, durationScale: true });
+    applyAppearanceBoot(SHELL);
 
     expect(rec.props['--user-ui-scale']).toBe('125%');
   });
@@ -233,24 +318,164 @@ describe('workspace scoping', () => {
   // itself is `_storage.ts`'s; what these pin is that the boot script goes
   // through it rather than reading raw keys.
   it('reads the per-workspace keys the shell writes', () => {
-    setEnv({ baseUrl: '/myws', stored: { 'ws:myws:lucidos-theme': 'light' } });
-    applyAppearanceBoot({ styleReset: true, durationScale: true });
-    expect(rec.attrs['data-theme']).toBe('light');
+    setEnv({ baseUrl: '/myws', stored: { 'ws:myws:lucidos-theme-mode': 'light' } });
+    applyAppearanceBoot(SHELL);
+    expect(rec.attrs['data-theme-mode']).toBe('light');
   });
 
   it('does not read the unscoped key inside a workspace', () => {
-    setEnv({ baseUrl: '/myws', stored: { 'lucidos-theme': 'light' } });
-    applyAppearanceBoot({ styleReset: true, durationScale: true });
+    setEnv({ baseUrl: '/myws', stored: { 'lucidos-theme-mode': 'light' } });
+    applyAppearanceBoot(SHELL);
     // The unscoped value belongs to no workspace, so it must not be picked up.
-    expect(rec.attrs['data-theme']).toBe('dark');
+    expect(rec.attrs['data-theme-mode']).toBe('dark');
   });
 
   it('uses raw keys for the picker and the legacy root, which have no slug', () => {
     for (const baseUrl of ['/~', '']) {
-      setEnv({ baseUrl, stored: { 'lucidos-theme': 'light' } });
-      applyAppearanceBoot({ styleReset: true, durationScale: true });
-      expect(rec.attrs['data-theme']).toBe('light');
+      setEnv({ baseUrl, stored: { 'lucidos-theme-mode': 'light' } });
+      applyAppearanceBoot(SHELL);
+      expect(rec.attrs['data-theme-mode']).toBe('light');
     }
+  });
+});
+
+describe('the theme', () => {
+  const LOOK = JSON.stringify({
+    dark: { '--bg-primary': '#2e3440', '--accent': '#88c0d0', '--leak': 'url(https://example.com)' },
+    light: { '--bg-primary': 'var(--x)', '--accent': '#5e81ac' },
+  });
+
+  it('paints the map for the resolved mode, background included', () => {
+    setEnv({ stored: { 'ws:myws:lucidos-theme-resolved': LOOK } });
+    applyAppearanceBoot(SHELL);
+
+    expect(rec.props['--accent']).toBe('#88c0d0');
+    expect(rec.props['--bg-primary']).toBe('#2e3440');
+    expect(rec.background).toBe('#2e3440');
+    expect(rec.props['--leak']).toBeUndefined();
+  });
+
+  it('paints a background that is not a hex literal through the var', () => {
+    setEnv({ prefersLight: true, stored: { 'ws:myws:lucidos-theme-resolved': LOOK } });
+    applyAppearanceBoot(SHELL);
+
+    expect(rec.props['--accent']).toBe('#5e81ac');
+    expect(rec.props['--bg-primary']).toBe('var(--x)');
+    expect(rec.background).toBe('var(--bg-primary)');
+  });
+
+  it('an isolated app frame takes the map the engine served', () => {
+    setEnv({ served: { theme_resolved: LOOK } });
+    applyAppearanceBoot(IFRAME);
+
+    expect(rec.props['--accent']).toBe('#88c0d0');
+  });
+
+  it('sits under the style remote, so an override still wins', () => {
+    setEnv({
+      stored: {
+        'ws:myws:lucidos-theme-resolved': LOOK,
+        'ws:myws:lucidos-style-overrides': JSON.stringify({ '--accent': '#ff0000' }),
+      },
+    });
+    applyAppearanceBoot(SHELL);
+
+    expect(rec.props['--accent']).toBe('#ff0000');
+  });
+
+  it('?style-reset drops the theme too, the way out of an unreadable one', () => {
+    setEnv({ search: '?style-reset', stored: { 'ws:myws:lucidos-theme-resolved': LOOK } });
+    applyAppearanceBoot(SHELL);
+
+    expect(rec.props['--accent']).toBeUndefined();
+    expect(store['ws:myws:lucidos-theme-resolved']).toBeUndefined();
+  });
+
+  it('?style-reset leaves no protected token inline, so protected surfaces paint the stylesheet defaults', () => {
+    const withPalette = JSON.stringify({
+      dark: { '--accent': '#88c0d0', '--protected-text': '#eceff4', '--protected-confirm': '#2f7a3a' },
+      light: {},
+    });
+    setEnv({ search: '?style-reset', stored: { 'ws:myws:lucidos-theme-resolved': withPalette } });
+    applyAppearanceBoot(SHELL);
+
+    expect(Object.keys(rec.props).filter(name => name.startsWith('--protected-'))).toEqual([]);
+  });
+
+  it('paints the protected palette a theme carries, but never one an override names', () => {
+    setEnv({
+      stored: {
+        'ws:myws:lucidos-theme-resolved': JSON.stringify({ dark: { '--protected-text': '#eceff4' }, light: {} }),
+        'ws:myws:lucidos-style-overrides': JSON.stringify({ '--protected-text': '#000000' }),
+      },
+    });
+    applyAppearanceBoot(SHELL);
+
+    expect(rec.props['--protected-text']).toBe('#eceff4');
+  });
+
+  it('a corrupt cache paints no theme and breaks nothing', () => {
+    setEnv({ stored: { 'ws:myws:lucidos-theme-resolved': '{oh no' } });
+    applyAppearanceBoot(SHELL);
+
+    expect(rec.props['--accent']).toBeUndefined();
+    expect(rec.background).toBe('#07172e');
+  });
+});
+
+// The pre-paint half of "theme suggests, user wins". The first frame must
+// already be the font the live apply will settle on, or it flashes.
+describe('the font a theme suggests', () => {
+  const GEIST_THEME = JSON.stringify({ dark: {}, light: {}, fonts: { ui: 'geist' } });
+
+  it('a device with no font set paints the theme font', () => {
+    setEnv({ stored: { 'ws:myws:lucidos-theme-resolved': GEIST_THEME } });
+    applyAppearanceBoot(SHELL);
+    expect(rec.props['--font-ui']).toMatch(/^'Geist',/);
+    expect(rec.props['--font-features-text']).toBe('normal');
+  });
+
+  it('`theme` paints the theme font too', () => {
+    setEnv({
+      stored: { 'ws:myws:lucidos-theme-resolved': GEIST_THEME, 'ws:myws:lucidos-font-family': 'theme' },
+    });
+    applyAppearanceBoot(SHELL);
+    expect(rec.props['--font-ui']).toMatch(/^'Geist',/);
+  });
+
+  it('an explicit pick wins over the theme font', () => {
+    setEnv({
+      stored: { 'ws:myws:lucidos-theme-resolved': GEIST_THEME, 'ws:myws:lucidos-font-family': 'inter' },
+    });
+    applyAppearanceBoot(SHELL);
+    expect(rec.props['--font-ui']).toContain("'Inter'");
+  });
+
+  it('an isolated app frame resolves against the theme the engine served', () => {
+    setEnv({ served: { theme_resolved: GEIST_THEME } });
+    applyAppearanceBoot(IFRAME);
+    expect(rec.props['--font-ui']).toMatch(/^'Geist',/);
+  });
+
+  it('a theme with no font falls back to Fira Code', () => {
+    setEnv({ stored: { 'ws:myws:lucidos-font-family': 'theme' } });
+    applyAppearanceBoot(SHELL);
+    expect(rec.props['--font-ui']).toContain("'Fira Code'");
+  });
+
+  it('a forged cache naming an unknown font paints the fallback', () => {
+    const forged = JSON.stringify({ dark: {}, light: {}, fonts: { ui: 'comic-sans' } });
+    setEnv({ stored: { 'ws:myws:lucidos-theme-resolved': forged } });
+    applyAppearanceBoot(SHELL);
+    expect(rec.props['--font-ui']).toContain("'Fira Code'");
+  });
+
+  // ADR 0303: Inter is bundled now, so a theme may suggest it.
+  it('a theme may suggest a font that once loaded from Google', () => {
+    const theme = JSON.stringify({ dark: {}, light: {}, fonts: { ui: 'inter' } });
+    setEnv({ stored: { 'ws:myws:lucidos-theme-resolved': theme } });
+    applyAppearanceBoot(SHELL);
+    expect(rec.props['--font-ui']).toMatch(/^'Inter',/);
   });
 });
 
@@ -259,7 +484,7 @@ describe('the style remote', () => {
 
   it('applies a valid map and drops the invalid entries', () => {
     setEnv({ stored: { 'ws:myws:lucidos-style-overrides': OVERRIDES } });
-    applyAppearanceBoot({ styleReset: true, durationScale: true });
+    applyAppearanceBoot(SHELL);
 
     expect(rec.props['--ok']).toBe('red');
     expect(rec.props['--bad;']).toBeUndefined();
@@ -267,7 +492,7 @@ describe('the style remote', () => {
 
   it('is applied LAST, so it wins over the properties above it', () => {
     setEnv({ stored: { 'ws:myws:lucidos-style-overrides': OVERRIDES } });
-    applyAppearanceBoot({ styleReset: true, durationScale: true });
+    applyAppearanceBoot(SHELL);
 
     // The override of --bg-primary is the honest check: it must be the value
     // that survives, and its write must come after the theme's.
@@ -277,10 +502,10 @@ describe('the style remote', () => {
 
   it('a corrupt map never breaks first paint', () => {
     setEnv({ stored: { 'ws:myws:lucidos-style-overrides': '{oh no' } });
-    applyAppearanceBoot({ styleReset: true, durationScale: true });
+    applyAppearanceBoot(SHELL);
 
     // Everything else still landed.
-    expect(rec.attrs['data-theme']).toBe('dark');
+    expect(rec.attrs['data-theme-mode']).toBe('dark');
     expect(rec.props['--font-ui']).toBeTruthy();
   });
 
@@ -289,7 +514,7 @@ describe('the style remote', () => {
       search: '?style-reset',
       stored: { 'ws:myws:lucidos-style-overrides': OVERRIDES },
     });
-    applyAppearanceBoot({ styleReset: true, durationScale: true });
+    applyAppearanceBoot(SHELL);
 
     expect(rec.props['--ok']).toBeUndefined();
     expect(store['ws:myws:lucidos-style-overrides']).toBeUndefined();
@@ -304,7 +529,7 @@ describe('the style remote', () => {
       search: '?style-reset',
       stored: { 'ws:myws:lucidos-style-overrides': OVERRIDES },
     });
-    applyAppearanceBoot({ styleReset: false, durationScale: false });
+    applyAppearanceBoot(IFRAME);
 
     expect(rec.props['--ok']).toBe('red');
     expect(store['ws:myws:lucidos-style-overrides']).toBe(OVERRIDES);
@@ -325,7 +550,7 @@ describe('motion', () => {
     ];
     for (const [stored, osReduces, expected] of cases) {
       setEnv({ osReduces, stored: stored ? { [MOTION]: stored } : {} });
-      const out = applyAppearanceBoot({ styleReset: true, durationScale: true });
+      const out = applyAppearanceBoot(SHELL);
       expect(rec.attrs['data-motion'], `${stored} with OS ${osReduces}`).toBe(expected);
       expect(out.reducedMotion).toBe(expected === 'reduce');
     }
@@ -333,23 +558,53 @@ describe('motion', () => {
 
   it('an isolated app frame takes the served value', () => {
     setEnv({ osReduces: false, served: { motion: 'reduce' } });
-    applyAppearanceBoot({ styleReset: false, durationScale: false });
+    applyAppearanceBoot(IFRAME);
     expect(rec.attrs['data-motion']).toBe('reduce');
   });
 
   it('publishes the slider scale in the shell, collapsed under reduced motion', () => {
     setEnv({ stored: { 'ws:myws:lucidos-animation-speed-slider': '-10' } });
-    applyAppearanceBoot({ styleReset: true, durationScale: true });
+    applyAppearanceBoot(SHELL);
     expect(Number(rec.props['--duration-scale'])).toBeCloseTo(10, 10);
 
     setEnv({ stored: { 'ws:myws:lucidos-animation-speed-slider': '-10', [MOTION]: 'reduce' } });
-    applyAppearanceBoot({ styleReset: true, durationScale: true });
+    applyAppearanceBoot(SHELL);
     expect(rec.props['--duration-scale']).toBe('0.001');
   });
 
   it('leaves the scale alone in an app frame, whose stylesheet pins it', () => {
     setEnv({ served: { motion: 'reduce' } });
-    applyAppearanceBoot({ styleReset: false, durationScale: false });
+    applyAppearanceBoot(IFRAME);
     expect(rec.props['--duration-scale']).toBeUndefined();
+  });
+});
+
+describe('theme effects', () => {
+  const EFFECTS = 'ws:myws:lucidos-theme-effects';
+
+  it('resolves system from both media queries and a stored value before first paint', () => {
+    const cases: Array<[string | undefined, boolean, boolean, string]> = [
+      [undefined, false, false, 'full'],
+      [undefined, true, false, 'reduce'],
+      ['system', false, true, 'reduce'],
+      ['reduce', false, false, 'reduce'],
+      ['full', true, true, 'full'],
+      ['bogus', false, true, 'reduce'],
+    ];
+    for (const [stored, transparency, contrast, expected] of cases) {
+      setEnv({
+        osReducesTransparency: transparency,
+        osMoreContrast: contrast,
+        stored: stored ? { [EFFECTS]: stored } : {},
+      });
+      applyAppearanceBoot(SHELL);
+      expect(rec.attrs['data-theme-effects'], `${stored}, ${transparency}, ${contrast}`).toBe(expected);
+    }
+  });
+
+  it('an isolated app frame takes the served value', () => {
+    setEnv({ served: { 'theme-effects': 'reduce' } });
+    applyAppearanceBoot(IFRAME);
+    expect(rec.attrs['data-theme-effects']).toBe('reduce');
   });
 });

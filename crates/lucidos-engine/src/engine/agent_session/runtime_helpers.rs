@@ -1,6 +1,6 @@
 use super::lifecycle::{stop_terminal_kind, TerminalKind};
 use super::text_buffer::CodingAgentTextBuffer;
-use crate::engine::thread_events::{EventChannel, MessageOrigin, SessionEndReason};
+use crate::engine::thread_events::{EngineReason, EventChannel, MessageOrigin, SessionEndReason};
 use crate::engine::LucidosEngine;
 use uuid::Uuid;
 
@@ -327,16 +327,14 @@ impl LucidosEngine {
     /// This ensures all events emitted by the coding-agent session have a valid
     /// `request_event_id` pointing to a real persisted event.
     ///
-    /// `origin` flows onto the event so engine-internal callers (orphan recovery,
-    /// hardening retrigger) can stamp themselves with `MessageOrigin::Engine`.
-    /// Pass `None` when the surrounding flow already carries the origin (e.g.
-    /// merge-conflict prompts emitted as part of an apply chain that has its
-    /// own actor stamping).
+    /// The engine writes every automated prompt, so `reason` is required and
+    /// the event always carries `MessageOrigin::Engine`. An origin-less prompt
+    /// that opens a thread renders Origin "Unknown" in the route popover.
     pub(crate) async fn emit_automated_prompt(
         &self,
         thread_id: Uuid,
         prompt: &str,
-        origin: Option<MessageOrigin>,
+        reason: EngineReason,
     ) -> Result<Uuid, Box<dyn std::error::Error + Send + Sync>> {
         let coding_agent = self.thread_coding_agent(thread_id).await;
         let result = self
@@ -346,7 +344,7 @@ impl LucidosEngine {
                 event: crate::engine::thread_events::ThreadEvent::CodingAgentPromptSent {
                     text: prompt.to_string(),
                     coding_agent,
-                    origin,
+                    origin: Some(MessageOrigin::engine(reason)),
                 },
                 meta: crate::engine::thread_events::EventMeta {
                     channel: Some(EventChannel::ClaudeCode),
@@ -584,7 +582,6 @@ mod tests {
         use crate::engine::thread_events::{AbortCause, EventMeta, MessageOrigin};
         let device = MessageOrigin::Device {
             device_id: "d-1".into(),
-            label: "iOS Safari PWA".into(),
         };
         let mut meta = EventMeta::NONE;
         LucidosEngine::stamp_host_actor_if_aborted(&mut meta, true, device.clone());
@@ -611,7 +608,6 @@ mod tests {
         use crate::engine::thread_events::{EventMeta, MessageOrigin};
         let device = MessageOrigin::Device {
             device_id: "d-1".into(),
-            label: "iOS Safari PWA".into(),
         };
         let mut meta = EventMeta {
             actor: Some(device.clone()),
@@ -787,7 +783,6 @@ mod tests {
                     text: "so go?".into(),
                     user_image_hashes: vec![],
                     device_id: None,
-                    device: None,
                     image_description: None,
                     parent_thread_id: None,
                     spawning_event_id: None,
@@ -820,7 +815,6 @@ mod tests {
                     request_event_id: Some(anchor),
                     actor: Some(MessageOrigin::Device {
                         device_id: "d-1".into(),
-                        label: "My MacBook".into(),
                     }),
                     ..cc_meta()
                 },

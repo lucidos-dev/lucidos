@@ -299,8 +299,8 @@ impl EmailAttachment {
     /// A traversal check alone is not enough here. The path joins onto the
     /// workspace `data/` dir, and the file is mailed to whatever address the
     /// caller named. So `.env` needs no `..` to leave the machine. Every
-    /// attachment must name a typed subdirectory from
-    /// [`super::KNOWN_DATA_PREFIXES`], the rule the file tools already apply.
+    /// attachment must name a data prefix ([`super::data_prefixes`]), the rule
+    /// the file tools already apply.
     pub fn validate_paths(paths: &[String]) -> Result<Vec<ValidatedAttachment>, String> {
         let mut validated = Vec::new();
         for rel_path in paths {
@@ -315,7 +315,7 @@ impl EmailAttachment {
                     "Invalid attachment path '{rel_path}'. An attachment must sit under one of \
                      data/'s typed subdirectories ({}), not the data/ root, which holds \
                      gitignored config.",
-                    super::KNOWN_DATA_PREFIXES.join(", ")
+                    super::known_data_prefixes_text()
                 ));
             }
             let filename = std::path::Path::new(stripped)

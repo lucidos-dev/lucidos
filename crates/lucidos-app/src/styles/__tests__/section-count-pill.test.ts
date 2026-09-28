@@ -21,7 +21,7 @@ const TRIMMED = '@supports (text-box-trim: trim-both)';
 const rule = (selector: string, atRules = '') =>
   rules.find(r => r.selector === selector && r.atRules === atRules);
 
-const COUNT = '.list-section-title-collapsible > .section-count';
+const COUNT = '.list-section-title > .section-count';
 const BADGE = `${COUNT} > .section-count-badge`;
 const COLLAPSED_BADGE = '.list-section-title-collapsible.collapsed > .section-count > .section-count-badge';
 const PILL = `${BADGE}::before`;

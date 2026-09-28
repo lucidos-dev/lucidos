@@ -508,6 +508,21 @@ impl EventStore {
         Ok(events)
     }
 
+    /// Every event of one type, oldest first. Ties on `created` fall back to
+    /// insertion order, so a replay applies them in the order they happened.
+    pub async fn events_of_type_chronological(
+        &self,
+        event_type: &str,
+    ) -> Result<Vec<EventRow>, sqlx::Error> {
+        sqlx::query_as::<_, EventRow>(
+            "SELECT id, event_type, payload, created, thread_id, sequence FROM events \
+             WHERE event_type = $1 ORDER BY created ASC, sequence ASC",
+        )
+        .bind(event_type)
+        .fetch_all(&self.pool)
+        .await
+    }
+
     /// Get thread events after a given sequence number (or all if None).
     /// Returns rows ordered by sequence ASC for replay.
     pub async fn get_thread_events_by_seq(

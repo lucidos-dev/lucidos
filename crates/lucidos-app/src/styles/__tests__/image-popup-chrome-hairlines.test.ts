@@ -45,11 +45,14 @@ const RING_PX = 2;
 /**
  * A length in px at the given root font size.
  *
- * Handles the three shapes these rules use: a rem literal, a px literal, and a
- * `calc()` summing them. Anything else throws rather than answering zero: a
- * value this test cannot read is one it cannot vouch for.
+ * Handles the shapes these rules use: a rem literal, a px literal, a `calc()`
+ * summing them, and a `min()` capping one at `--radius-round`, whose default
+ * never binds. Anything else throws rather than answering zero: a value this
+ * test cannot read is one it cannot vouch for.
  */
 function px(value: string, root: number): number {
+  const capped = value.match(/^min\((.+), var\(--radius-round\)\)$/);
+  if (capped) return px(capped[1], root);
   const calc = value.match(/^calc\((.+)\)$/);
   if (calc) return calc[1].split('+').reduce((sum, term) => sum + px(term.trim(), root), 0);
   if (value === 'var(--image-popup-ring)') return RING_PX;

@@ -93,8 +93,8 @@ const MIRRORING_TIMERS: Array<{ file: string; expr: RegExp; what: string }> = [
   },
   {
     file: '../../components/shared/NavigationCover.tsx',
-    expr: /scaledDurationMs\(NAV_COVER_ANIM_MS\) \+ NAV_COVER_SLACK_MS/,
-    what: 'ends a navigation arrival (the cover and the title fade) after its animation',
+    expr: /scaledDurationMs\(NAV_COVER_MOTIONS\[motion\]\.animMs\) \+ NAV_COVER_SLACK_MS/,
+    what: 'ends a navigation cover after its animation',
   },
   {
     file: '../../components/chat/ThreadView.tsx',
@@ -117,6 +117,11 @@ const MIRRORING_TIMERS: Array<{ file: string; expr: RegExp; what: string }> = [
     what: 'removes the boot splash if its veil fade never reports its end',
   },
   {
+    file: '../../utils/bootSplash.ts',
+    expr: /scaledDurationMs\(STATUS_SWAP_MS\)/,
+    what: 'swaps the boot status words once their fade-out has run',
+  },
+  {
     file: '../../hooks/useBootSplashReady.ts',
     expr: /scaledDurationMs\(BOOT_SPLASH_MIN_REVEAL_MS\) - elapsedMs/,
     what: 'holds a ready boot splash until its mark reveal has played',
@@ -130,6 +135,11 @@ const MIRRORING_TIMERS: Array<{ file: string; expr: RegExp; what: string }> = [
     file: '../../components/shared/focusMarker.ts',
     expr: /scaledDurationMs\(NAV_FOCUS_RAMP_MS\) \+ NAV_FOCUS_HOLD_MS/,
     what: "starts the marker's full-brightness hold where its ramp ends",
+  },
+  {
+    file: '../../components/chat/CreateThreadView.tsx',
+    expr: /scaledDurationMs\(DISCLOSURE_MAX_MS\) \+ ROLL_SETTLE_SLACK_MS/,
+    what: 'holds the pressed turn control still until the rows its toggle rolled have landed',
   },
   {
     file: '../../components/chat/promptResize.ts',

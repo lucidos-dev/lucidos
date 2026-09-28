@@ -3,27 +3,31 @@
 //! pending-change cleanup for external-repo CC descendants).
 //!
 //! The lock, the row shape and the decision live in [`super::family`], which
-//! delete shares. Only the cascade below is archive's own.
+//! delete shares. The cascade itself is [`archive_family`], which the Archive
+//! button's route and an agent's archive (ADR 0310) both run.
 
 use axum::{
-    extract::State,
+    extract::{Path, State},
     http::{HeaderMap, StatusCode},
     Json,
 };
+use uuid::Uuid;
 
 use std::collections::HashMap;
 
+use crate::api::actor::SubprocessOrigin;
 use crate::api::AppState;
 use crate::engine::agent_question::{
     answer_pending_question, lookup_pending_question_tool_use_id, AnswerResult,
 };
-use crate::engine::thread_events::AnswerKind;
-use crate::engine::thread_lifecycle::LifecycleViolation;
+use crate::engine::thread_events::{ActorMode, AnswerKind, MessageOrigin};
+use crate::engine::thread_lifecycle::{LifecycleViolation, ThreadStatus};
+use crate::engine::{AgentArchiveAck, AgentArchiveError, LucidosEngine};
 
 use super::extract_thread_uuid;
 use super::family::{
     classify_family, external_repo_pending, load_family, not_yet_archived, FamilyDecision,
-    FamilyVerb,
+    FamilyRow, FamilyVerb,
 };
 
 /// Map a reach refusal into this handler's `{reason, message}` body, the same
@@ -79,7 +83,223 @@ fn claimed_target_rejection(
     )
 }
 
+/// A refusal as a route renders it: the status and a `{reason, message, ...}`
+/// body.
+pub(crate) type ArchiveRejection = (StatusCode, axum::Json<serde_json::Value>);
+
+/// What one cascade archived, and the members it left open.
+pub(crate) struct ArchiveOutcome {
+    pub(crate) archived: Vec<Uuid>,
+    pub(crate) skipped: Vec<serde_json::Value>,
+}
+
+impl ArchiveOutcome {
+    fn into_body(self) -> axum::Json<serde_json::Value> {
+        axum::Json(serde_json::json!({ "archived": self.archived, "skipped": self.skipped }))
+    }
+}
+
+/// A refusal in the words an agent reads: the message, then the slug the
+/// Archive route answers with.
+pub(crate) fn rejection_text((_, body): &ArchiveRejection) -> String {
+    let field = |key: &str| body.get(key).and_then(|v| v.as_str()).unwrap_or_default();
+    format!("{} ({})", field("message"), field("reason"))
+}
+
+/// The Archive route's refusal for a thread waiting on the user (ADR 0259),
+/// for a caller that checks before any family is locked.
+pub(crate) fn waiting_rejection(thread_id: Uuid, has_pending_changes: bool) -> ArchiveRejection {
+    let mut body = super::family::parent_blocked_body(
+        FamilyVerb::Archive,
+        ThreadStatus::WaitingForUserAnswer.as_str(),
+        has_pending_changes,
+    );
+    body["message"] = gate_refusal_message(&body, thread_id).into();
+    (StatusCode::CONFLICT, axum::Json(body))
+}
+
+/// Slug for a pinned thread an agent tried to archive (ADR 0312).
+pub(crate) const THREAD_PINNED: &str = "thread_pinned";
+
+/// What an agent is told about a pinned thread. The pin is the user's own
+/// "keep this at hand", so only the user's Archive may unpin it.
+fn pinned_message(thread_id: Uuid) -> String {
+    format!(
+        "Thread {thread_id} is pinned by the user, so an agent cannot archive it. \
+         Leave it open, or ask the user to archive it."
+    )
+}
+
+/// The refusal an agent gets for a pinned target (ADR 0312).
+pub(crate) fn pinned_rejection(thread_id: Uuid) -> ArchiveRejection {
+    (
+        StatusCode::CONFLICT,
+        axum::Json(serde_json::json!({
+            "reason": THREAD_PINNED,
+            "message": pinned_message(thread_id),
+        })),
+    )
+}
+
+/// The family gate's refusal in words, for the `message` beside its slug.
+fn gate_refusal_message(body: &serde_json::Value, thread_id: Uuid) -> String {
+    let field = |key: &str| body.get(key).and_then(|v| v.as_str());
+    match field("reason") {
+        Some("thread_not_found") => format!("No thread {thread_id} exists in this workspace."),
+        Some("parent_not_archivable")
+            if field("parent_status") == Some(ThreadStatus::WaitingForUserAnswer.as_str()) =>
+        {
+            format!(
+                "Thread {thread_id} is waiting on the user, so it cannot be archived. \
+                 Answer or stop it first."
+            )
+        }
+        Some("parent_not_archivable") => {
+            format!("Thread {thread_id} is running, so it cannot be archived until its turn ends.")
+        }
+        Some("parent_has_pending_changes") => format!(
+            "Thread {thread_id} holds a pending change. Apply or discard it before archiving."
+        ),
+        Some("descendants_blocking") => format!(
+            "A sub-thread of {thread_id} is running, waiting on the user, or holds a pending \
+             change, so the family cannot be archived yet."
+        ),
+        _ => format!("Thread {thread_id} cannot be archived right now."),
+    }
+}
+
 /// POST /api/v1/threads/archive — cascading archive of a thread + every descendant.
+///
+/// The caller's reach is weighed first, then [`archive_family`] runs the
+/// cascade. Response:
+/// `{"archived": [<uuid>, ...], "skipped": [{thread_id, reason, message}, ...]}`.
+pub(in crate::api) async fn archive_thread(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<serde_json::Value>,
+) -> Result<axum::Json<serde_json::Value>, ArchiveRejection> {
+    let thread_uuid = extract_thread_uuid(&request).map_err(|(s, m)| {
+        (
+            s,
+            axum::Json(serde_json::json!({ "reason": "bad_request", "message": m })),
+        )
+    })?;
+    // Before the cascade, so a refusal writes nothing at all: no locked
+    // family, no cleared pending change, no cancel-stamped question card.
+    crate::api::thread_reach::refuse_without_authority(
+        &state.pool,
+        &headers,
+        Some(thread_uuid),
+        crate::api::thread_reach::ThreadReachVerb::Archive,
+    )
+    .await
+    .map_err(reach_rejection)?;
+    let actor = crate::api::actor::user_actor(&headers, None);
+    archive_family(&state.engine, thread_uuid, actor)
+        .await
+        .map(ArchiveOutcome::into_body)
+}
+
+/// `POST /api/v1/threads/:thread_id/archive`: archive on the caller's own
+/// authority (ADR 0310). Shaped like the detach route, and for the same
+/// reason: who is asking comes from the verified origin token, never the body.
+///
+/// - **A token-bearing caller** (an agent, or the CLI inside an agent session)
+///   archives only itself or one of its own direct children.
+/// - **A caller with no token** is the user's device or the local API, and
+///   runs the Archive button's cascade on any thread.
+pub(in crate::api) async fn archive_thread_as_caller(
+    State(state): State<AppState>,
+    Path(thread_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<axum::Json<serde_json::Value>, ArchiveRejection> {
+    // The token names the caller, which is what `current` resolves to. A
+    // caller with no token has no thread, so the alias is refused there.
+    let caller = match crate::api::actor::subprocess_origin(&headers) {
+        SubprocessOrigin::Subprocess {
+            source_thread_id, ..
+        } => Some(source_thread_id),
+        SubprocessOrigin::NotSubprocess => None,
+    };
+    let target = crate::api::resolve_thread_id_arg(&thread_id, caller.flatten()).map_err(|m| {
+        (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({ "reason": "bad_request", "message": m })),
+        )
+    })?;
+    match caller {
+        Some(caller_thread) => match state.engine.archive_as_agent(caller_thread, target).await {
+            Ok(ack) => Ok(agent_ack_body(ack)),
+            Err(AgentArchiveError::Refused(rejection)) => Err(rejection),
+            Err(e) => Err((
+                StatusCode::from_u16(e.status_code()).unwrap_or(StatusCode::FORBIDDEN),
+                axum::Json(serde_json::json!({ "reason": e.reason(), "message": e.to_string() })),
+            )),
+        },
+        None => {
+            let actor = crate::api::actor::user_actor(&headers, None);
+            archive_family(&state.engine, target, actor)
+                .await
+                .map(ArchiveOutcome::into_body)
+        }
+    }
+}
+
+/// The body an agent's archive answers with: what was archived now, or that
+/// the calling thread will be archived once its turn ends.
+fn agent_ack_body(ack: AgentArchiveAck) -> axum::Json<serde_json::Value> {
+    match ack {
+        AgentArchiveAck::Archived(outcome) => outcome.into_body(),
+        AgentArchiveAck::Requested { thread_id } => axum::Json(serde_json::json!({
+            "requested": thread_id,
+            "detail": "This thread is archived once its turn ends and it has settled.",
+        })),
+    }
+}
+
+/// Which members of a locked family a cascade touches.
+struct CascadePlan {
+    to_archive: Vec<Uuid>,
+    external_repo_pending: Vec<Uuid>,
+    /// Pinned members an agent's archive leaves open, reported as skipped.
+    left_pinned: Vec<Uuid>,
+}
+
+/// Plan the cascade over a family the gate has already admitted. Pure, so the
+/// pin rule is testable without an engine.
+///
+/// An agent never archives a pinned thread (ADR 0312). Its archive refuses a
+/// pinned target and leaves a pinned member open. The user's own Archive
+/// takes every member, and the drawer confirms before it unpins.
+fn plan_cascade(
+    family: &[FamilyRow],
+    target: Uuid,
+    by_agent: bool,
+) -> Result<CascadePlan, ArchiveRejection> {
+    let left_pinned: Vec<Uuid> = if by_agent {
+        family
+            .iter()
+            .filter(|r| r.is_saved)
+            .map(|r| r.thread_id)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if left_pinned.contains(&target) {
+        return Err(pinned_rejection(target));
+    }
+    let keep = |tid: &Uuid| !left_pinned.contains(tid);
+    Ok(CascadePlan {
+        to_archive: not_yet_archived(family).into_iter().filter(keep).collect(),
+        external_repo_pending: external_repo_pending(family)
+            .into_iter()
+            .filter(keep)
+            .collect(),
+        left_pinned,
+    })
+}
+
+/// The cascade the Archive button and an agent's archive both run.
 ///
 /// Inside one transaction the recursive CTE locks parent + all descendants
 /// (`FOR UPDATE`), then `classify_family` runs the parent gate and the
@@ -133,59 +353,52 @@ fn claimed_target_rejection(
 /// Discard, and the `409` names which. A member whose stop a claim refuses later,
 /// or one that parked after the lock dropped, stays unarchived and is reported.
 ///
-/// Already-archived rows are skipped, so nothing is emitted twice. Response:
-/// `{"archived": [<uuid>, ...], "skipped": [{thread_id, reason, message}, ...]}`.
-pub(in crate::api) async fn archive_thread(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(request): Json<serde_json::Value>,
-) -> Result<axum::Json<serde_json::Value>, (StatusCode, axum::Json<serde_json::Value>)> {
-    let thread_uuid = extract_thread_uuid(&request).map_err(|(s, m)| {
-        (
-            s,
-            axum::Json(serde_json::json!({ "reason": "bad_request", "message": m })),
-        )
-    })?;
-    // Before the transaction, so a refusal writes nothing at all: no locked
-    // family, no cleared pending change, no cancel-stamped question card.
-    crate::api::thread_reach::refuse_without_authority(
-        &state.pool,
-        &headers,
-        Some(thread_uuid),
-        crate::api::thread_reach::ThreadReachVerb::Archive,
-    )
-    .await
-    .map_err(reach_rejection)?;
-    // Before the transaction too, so a refused target changes nothing. A
+/// Already-archived rows are skipped, so nothing is emitted twice. The caller
+/// has already weighed who may ask; this decides only whether the family can go.
+pub(crate) async fn archive_family(
+    engine: &std::sync::Arc<LucidosEngine>,
+    thread_uuid: Uuid,
+    actor: Option<MessageOrigin>,
+) -> Result<ArchiveOutcome, ArchiveRejection> {
+    // Before the transaction, so a refused target changes nothing. A
     // single-thread archive is exactly this case, and must not answer 200.
-    if let Some(holder) = state.engine.change_claim_holder(thread_uuid).await {
+    if let Some(holder) = engine.change_claim_holder(thread_uuid).await {
         return Err(claimed_target_rejection(holder));
     }
-    let actor = crate::api::actor::user_actor_resolved(&headers, &state.pool, None).await;
 
-    let mut tx = state.engine.pool().begin().await.map_err(internal_json)?;
+    let mut tx = engine.pool().begin().await.map_err(internal_json)?;
     let family = load_family(&mut tx, thread_uuid)
         .await
         .map_err(internal_json)?;
 
-    if let FamilyDecision::Reject { status, body } =
+    if let FamilyDecision::Reject { status, mut body } =
         classify_family(&family, thread_uuid, FamilyVerb::Archive)
     {
         // Release the FOR UPDATE lock before bouncing.
         let _ = tx.rollback().await;
+        body["message"] = gate_refusal_message(&body, thread_uuid).into();
         return Err((status, axum::Json(body)));
     }
-    let to_archive = not_yet_archived(&family);
-    let external_repo_pending = external_repo_pending(&family);
+    let by_agent = actor.as_ref().is_some_and(|a| a.mode() == ActorMode::Agent);
+    let plan = match plan_cascade(&family, thread_uuid, by_agent) {
+        Ok(plan) => plan,
+        Err(rejection) => {
+            let _ = tx.rollback().await;
+            return Err(rejection);
+        }
+    };
+    let CascadePlan {
+        to_archive,
+        external_repo_pending,
+        left_pinned,
+    } = plan;
 
     // Under the lock no member can park: a new question's projection write
     // waits on it. So every question still pending here is an orphan. The loop
     // cancels exactly these, never one a member asks after the lock drops.
     let mut orphaned_questions = HashMap::new();
     for tid in &to_archive {
-        if let Some(tool_use_id) =
-            lookup_pending_question_tool_use_id(state.engine.pool(), *tid).await
-        {
+        if let Some(tool_use_id) = lookup_pending_question_tool_use_id(engine.pool(), *tid).await {
             orphaned_questions.insert(*tid, tool_use_id);
         }
     }
@@ -216,15 +429,13 @@ pub(in crate::api) async fn archive_thread(
     // these threads bypass the blocking predicate.
     let mut broadcast_changes = false;
     for tid in &external_repo_pending {
-        let pending = state
-            .engine
+        let pending = engine
             .changes()
             .pending_for_thread(*tid)
             .await
             .map_err(internal_json)?;
         for change in pending {
-            state
-                .engine
+            engine
                 .emit_change_applied(
                     *tid,
                     change.id,
@@ -241,11 +452,14 @@ pub(in crate::api) async fn archive_thread(
         }
     }
     if broadcast_changes {
-        state.engine.broadcast_changes_updated().await;
+        engine.broadcast_changes_updated().await;
     }
 
     let mut archived = Vec::with_capacity(to_archive.len());
-    let mut skipped = Vec::new();
+    let mut skipped: Vec<serde_json::Value> = left_pinned
+        .iter()
+        .map(|tid| skipped_member(*tid, THREAD_PINNED, &pinned_message(*tid)))
+        .collect();
     for tid in &to_archive {
         // Cancel-stamp the orphaned QuestionCard, if any, so its answer
         // buttons render disabled instead of dangling clickable on the
@@ -253,7 +467,7 @@ pub(in crate::api) async fn archive_thread(
         // orphaned while its thread sits idle.
         if let Some(tool_use_id) = orphaned_questions.remove(tid) {
             if let AnswerResult::Conflict(msg) = answer_pending_question(
-                &state.engine,
+                engine,
                 *tid,
                 tool_use_id,
                 AnswerKind::Canceled,
@@ -299,9 +513,8 @@ pub(in crate::api) async fn archive_thread(
         // here). `StopReason::Archive` suppresses the otherwise-spurious
         // `ResponseCanceled` (the `ThreadArchived` emit below is the
         // terminator).
-        if state.engine.is_agent_running_for(*tid).await {
-            if let Err(e) = state
-                .engine
+        if engine.is_agent_running_for(*tid).await {
+            if let Err(e) = engine
                 .stop_agent(
                     crate::engine::claude_code::StopReason::Archive,
                     Some(*tid),
@@ -322,8 +535,7 @@ pub(in crate::api) async fn archive_thread(
             }
         }
 
-        let emitted = state
-            .engine
+        let emitted = engine
             .event_bus
             .emit(crate::engine::event_bus::BusEvent::Thread {
                 thread_id: *tid,
@@ -344,19 +556,16 @@ pub(in crate::api) async fn archive_thread(
 
     // Archiving a child that still owes its parent a card settles it: a
     // stopped child (ADR 0252) or a waiting one (ADR 0254). Only the thread
-    // the user archived: a descendant caught in this cascade owes its parent
+    // the caller archived: a descendant caught in this cascade owes its parent
     // nothing, because that parent is archived too.
     if archived.contains(&thread_uuid) {
-        state
-            .engine
+        engine
             .event_bus
             .settle_child(thread_uuid, crate::engine::event_bus::ChildSettle::Archived)
             .await;
     }
 
-    Ok(axum::Json(
-        serde_json::json!({ "archived": archived, "skipped": skipped }),
-    ))
+    Ok(ArchiveOutcome { archived, skipped })
 }
 
 #[cfg(test)]
@@ -381,6 +590,97 @@ mod tests {
         assert!(
             !LEFT_OPEN_MESSAGE.to_lowercase().contains("lifecycle"),
             "a member left open is told in plain words, not engine internals"
+        );
+    }
+
+    fn idle_row(thread_id: Uuid, is_saved: bool) -> FamilyRow {
+        FamilyRow {
+            thread_id,
+            is_coding_agent: false,
+            status: ThreadStatus::Idle.as_str().to_string(),
+            archive_state: "inbox".to_string(),
+            coding_agent_proposed: false,
+            coding_agent_is_external_repo: false,
+            is_saved,
+        }
+    }
+
+    /// An agent's archive refuses a pinned target, and leaves a pinned member
+    /// open while it archives the rest. The user's Archive takes them all
+    /// (ADR 0312).
+    #[test]
+    fn an_agents_cascade_leaves_pinned_threads_alone() {
+        let (target, pinned_child, child) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let family = [
+            idle_row(target, false),
+            idle_row(pinned_child, true),
+            idle_row(child, false),
+        ];
+
+        let plan = plan_cascade(&family, target, true).expect("an unpinned target proceeds");
+        assert_eq!(plan.to_archive, vec![target, child]);
+        assert_eq!(plan.left_pinned, vec![pinned_child]);
+
+        let plan = plan_cascade(&family, target, false).expect("the user's archive proceeds");
+        assert_eq!(plan.to_archive, vec![target, pinned_child, child]);
+        assert!(plan.left_pinned.is_empty());
+
+        let pinned_target = [idle_row(target, true), idle_row(child, false)];
+        let Err((status, body)) = plan_cascade(&pinned_target, target, true) else {
+            panic!("an agent must not archive a pinned target");
+        };
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["reason"], THREAD_PINNED);
+        assert!(plan_cascade(&pinned_target, target, false).is_ok());
+    }
+
+    /// The agent's early refusal for a waiting thread is the family gate's
+    /// own body, plus the `message` every gate refusal now carries (ADR 0310).
+    #[test]
+    fn the_waiting_refusal_is_the_family_gates_body() {
+        let thread_id = Uuid::new_v4();
+        let row = super::super::family::FamilyRow {
+            thread_id,
+            is_coding_agent: true,
+            status: ThreadStatus::WaitingForUserAnswer.as_str().to_string(),
+            archive_state: "inbox".to_string(),
+            coding_agent_proposed: false,
+            coding_agent_is_external_repo: false,
+            is_saved: false,
+        };
+        let FamilyDecision::Reject { status, mut body } =
+            classify_family(&[row], thread_id, FamilyVerb::Archive)
+        else {
+            panic!("a waiting thread must be refused");
+        };
+        body["message"] = gate_refusal_message(&body, thread_id).into();
+
+        let (early_status, early_body) = waiting_rejection(thread_id, false);
+        assert_eq!(early_status, status);
+        assert_eq!(early_body.0, body);
+        assert!(rejection_text(&(early_status, early_body)).ends_with("(parent_not_archivable)"));
+    }
+
+    /// Each gate slug reads as its own sentence, and a running thread is not
+    /// told it is waiting on the user.
+    #[test]
+    fn each_gate_refusal_says_what_to_do() {
+        let id = Uuid::new_v4();
+        let message = |body: serde_json::Value| gate_refusal_message(&body, id);
+        assert!(message(serde_json::json!({
+            "reason": "parent_not_archivable", "parent_status": "running",
+        }))
+        .contains("running"));
+        assert!(message(serde_json::json!({
+            "reason": "parent_not_archivable", "parent_status": "waiting_for_user_answer",
+        }))
+        .contains("Answer or stop it first"));
+        assert!(
+            message(serde_json::json!({ "reason": "parent_has_pending_changes" }))
+                .contains("Apply or discard")
+        );
+        assert!(
+            message(serde_json::json!({ "reason": "descendants_blocking" })).contains("sub-thread")
         );
     }
 
@@ -416,7 +716,7 @@ mod tests {
         let src = crate::test_support::source_scan::read_production_source(
             &crate::test_support::source_scan::src_root().join("api/threads/archive.rs"),
         );
-        let body = &src[src.find("async fn archive_thread(").expect("handler")..];
+        let body = &src[src.find("async fn archive_family(").expect("the cascade")..];
         let check = body.find("change_claim_holder(").expect("the pre-check");
         let begin = body.find(".begin()").expect("the family transaction");
         assert!(

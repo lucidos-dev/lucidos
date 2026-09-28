@@ -36,12 +36,9 @@
         var(--app-height, 100dvh) - var(--space-lg) * 2
         - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px)
     );
-    background: var(--bg-secondary);
-    border: 1px solid var(--border-color);
-    border-radius: 0.5rem;
-    box-shadow: var(--shadow-lg);
-    /* --space-lg (1rem), the gutter every settings surface shares. */
-    padding: var(--space-lg);
+    /* The head carries its own insets; everything under it takes the surface
+       inset as side margins (below), so the panel pads only its foot. */
+    padding: 0 0 var(--surface-inset);
     display: flex;
     flex-direction: column;
     gap: var(--space-md);
@@ -68,6 +65,12 @@
     flex-shrink: 0;
 }
 
+/* The panel is the scroller, so its children stay its direct children rather
+   than moving into a body wrapper. Each one under the head sits on the inset. */
+.style-editor-modal > :not(.surface-head) {
+    margin-inline: var(--surface-inset);
+}
+
 /* A phone fits roughly a third of those characters per line. So the same
    instruction needs three times the lines, and the ceiling above would clip
    it. Take the whole screen instead: that ceiling protects a big monitor, and
@@ -76,14 +79,6 @@
     .style-editor-modal {
         height: var(--style-editor-room);
     }
-}
-
-/* The panel's own `gap` is the spacing here, so drop the heading margin
-   `shared-components.css` gives every h1 to h6. */
-.style-editor-title {
-    margin: 0;
-    font-size: var(--font-size-xl);
-    font-weight: 600;
 }
 
 .style-editor-intro {
@@ -145,7 +140,7 @@
     overscroll-behavior: contain;
     background: var(--bg-tertiary);
     border: 1px solid var(--border-color);
-    border-radius: 0.25rem;
+    border-radius: calc(var(--radius-surface) / 3);
     padding: 0.375rem 0.5rem;
     font-family: var(--font-ui);
     font-size: var(--font-size-md);
@@ -187,6 +182,6 @@
 
 .style-editor-actions {
     display: flex;
-    gap: 0.25rem;
+    gap: var(--space-sm);
     margin-left: auto;
 }

@@ -1,11 +1,14 @@
-import { useCallback, useEffect, useState } from 'preact/hooks';
+import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
 import { showToast } from '../../store/store';
 import { getCodingAgentBinaries, setPreference, deletePreference } from '../../api/client';
 import type { AgentBinaryStatus } from '../../api/types';
 import { useLoadableFetch } from '../../hooks/useLoadableFetch';
+import { usePanelRefresh } from '../../hooks/usePanelRefresh';
 import { errorDetail } from '../../utils/errorDetail';
 import { LoadableError } from '../shared/LoadableError';
 import { Explainer } from '../shared/Explainer';
+import { LoadingFade } from '../shared/LoadingFade';
+import { ListSkeletonOf, SkBlock, SkText } from '../shared/Skeleton';
 
 const AGENTS = [
   {
@@ -59,16 +62,19 @@ export function storedOverride(s: AgentBinaryStatus): string {
   return s.source === 'override' ? (s.path ?? '') : '';
 }
 
+/** One agent's binary. With no `status`, inside a `SkeletonProvider`, it
+ *  draws itself as the loading placeholder: the agent's name is known before
+ *  the read lands, so only what the read decides shimmers. */
 function AgentRow({
   agent,
   status,
-  onChanged,
+  onChanged = () => {},
 }: {
   agent: (typeof AGENTS)[number];
-  status: AgentBinaryStatus;
-  onChanged: () => void;
+  status?: AgentBinaryStatus;
+  onChanged?: () => void;
 }) {
-  const stored = storedOverride(status);
+  const stored = status ? storedOverride(status) : '';
   const [input, setInput] = useState(stored);
   const [busy, setBusy] = useState(false);
   // Re-seed the input when a reload changes the stored override (e.g. after
@@ -115,9 +121,9 @@ function AgentRow({
 
   const trimmed = input.trim();
   const dirty = trimmed !== stored;
-  const broken = status.source === 'override' && !status.valid;
-  const missing = status.source === 'not-found';
-  const version = binaryVersionLabel(status);
+  const broken = status?.source === 'override' && !status.valid;
+  const missing = status?.source === 'not-found';
+  const version = status ? binaryVersionLabel(status) : '';
   return (
     <div class="list-row repo-add-form">
       <div class="list-row-info" style={{ gap: '0.5rem' }}>
@@ -125,43 +131,51 @@ function AgentRow({
         {/* Version and source are two FIELDS: `.list-row-details` is a flex
             row whose gap IS the separator, so no glue character between them
             (an explicit one would be double-spaced). */}
-        <div
-          class={`list-row-details${broken || missing ? ' error-text' : ''}`}
-          data-role="agent-binary-status"
-        >
-          {version && <span data-role="agent-binary-version">{version}</span>}
-          <span>{binaryStatusLine(status, agent.binary)}</span>
-        </div>
+        {status ? (
+          <div
+            class={`list-row-details${broken || missing ? ' error-text' : ''}`}
+            data-role="agent-binary-status"
+          >
+            {version && <span data-role="agent-binary-version">{version}</span>}
+            <span>{binaryStatusLine(status, agent.binary)}</span>
+          </div>
+        ) : <SkText class="list-row-details" as="div" w="9rem" />}
         {/* Input and its actions share one row so Save/Clear sit level with the
             input (not the title). Both action slots are always rendered, disabled
             when their action isn't available, so the input width never shifts as
             you type. */}
         <div class="coding-agent-row-controls">
-          <input
-            class="device-name-input"
-            type="text"
-            // The resolved path lives here and nowhere else in the row: as the
-            // placeholder while detection owns it, as the value once the user
-            // overrides it. The status line above says only where it came from.
-            placeholder={status.path ?? `/path/to/${agent.binary}`}
-            value={input}
-            onInput={(e) => setInput((e.target as HTMLInputElement).value)}
-          />
+          <SkBlock w="100%" h="2rem" round>
+            <input
+              class="device-name-input"
+              type="text"
+              // The resolved path lives here and nowhere else in the row: as the
+              // placeholder while detection owns it, as the value once the user
+              // overrides it. The status line above says only where it came from.
+              placeholder={status?.path ?? `/path/to/${agent.binary}`}
+              value={input}
+              onInput={(e) => setInput((e.target as HTMLInputElement).value)}
+            />
+          </SkBlock>
           <div class="list-row-actions">
-            <button
-              class="action-btn action-btn-confirm"
-              disabled={busy || !dirty || !trimmed}
-              onClick={save}
-            >
-              Save
-            </button>
-            <button
-              class="action-btn action-btn-danger"
-              disabled={busy || !stored}
-              onClick={clear}
-            >
-              Clear
-            </button>
+            <SkBlock w="3.5rem" h="2rem" round>
+              <button
+                class="action-btn action-btn-confirm"
+                disabled={busy || !dirty || !trimmed}
+                onClick={save}
+              >
+                Save
+              </button>
+            </SkBlock>
+            <SkBlock w="3.75rem" h="2rem" round>
+              <button
+                class="action-btn action-btn-danger"
+                disabled={busy || !stored}
+                onClick={clear}
+              >
+                Clear
+              </button>
+            </SkBlock>
           </div>
         </div>
       </div>
@@ -183,28 +197,44 @@ export function CodingAgentBinariesSection() {
   // Bumped after a save/clear so the shared hook refetches (with stale-fetch
   // cancellation — a slow first response can't clobber the fresher reload).
   const [refresh, setRefresh] = useState(0);
-  const { loadable: info, showLoading } = useLoadableFetch(getCodingAgentBinaries, [refresh]);
+  // Pull-to-refresh waits here for the re-read it asked for to land.
+  const settles = useRef<Array<() => void>>([]);
+  const { loadable: info, showLoading } = useLoadableFetch(getCodingAgentBinaries, [refresh], {
+    keepLoadedWhileRefetching: true,
+    onSettled: () => {
+      const waiting = settles.current;
+      settles.current = [];
+      for (const settle of waiting) settle();
+    },
+  });
   const reload = useCallback(() => setRefresh((n) => n + 1), []);
+  usePanelRefresh('coding agent binaries', () => new Promise<void>((resolve) => {
+    settles.current.push(resolve);
+    reload();
+  }));
 
   function body() {
     if (info.status === 'failed') {
       return <LoadableError noun="coding agent binaries" error={info.error} />;
     }
-    if (info.status !== 'loaded') {
-      if (!showLoading) return null;
-      return <div class="empty-state">Loading…</div>;
-    }
     return (
-      <div class="list-rows">
-        {AGENTS.map((agent) => (
-          <AgentRow
-            key={agent.key}
-            agent={agent}
-            status={info.data[agent.key as AgentKey]}
-            onChanged={reload}
-          />
-        ))}
-      </div>
+      <LoadingFade
+        showSkeleton={showLoading}
+        skeleton={<ListSkeletonOf count={AGENTS.length} containerClass="list-rows" row={(i) => <AgentRow agent={AGENTS[i]!} />} />}
+      >
+        {info.status === 'loaded' && (
+          <div class="list-rows">
+            {AGENTS.map((agent) => (
+              <AgentRow
+                key={agent.key}
+                agent={agent}
+                status={info.data[agent.key as AgentKey]}
+                onChanged={reload}
+              />
+            ))}
+          </div>
+        )}
+      </LoadingFade>
     );
   }
 

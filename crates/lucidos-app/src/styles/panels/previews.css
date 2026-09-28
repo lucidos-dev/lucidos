@@ -96,14 +96,19 @@
     z-index: 2;
     background: var(--bg-secondary);
     border: 1px solid var(--border-color);
-    border-radius: 0.375rem;
+    border-radius: calc(var(--radius-control) * 0.75);
     opacity: 0.7;
     transition: opacity var(--duration-fast);
 }
 
-.pseudo-fullscreen-exit:hover,
 .pseudo-fullscreen-exit:active {
     opacity: 1;
+}
+
+@media (hover: hover) {
+    .pseudo-fullscreen-exit:hover {
+        opacity: 1;
+    }
 }
 
 /* --- File preview chrome (the path row, and the column holding it) --- */
@@ -169,6 +174,14 @@
     padding: var(--code-gutter-inset);
 }
 
+/* A preview body fades in from its skeleton inside this wrapper. It passes the
+   pane's height through, because the HTML iframe and the editor fill 100%, and
+   still grows with a long file. */
+.file-preview-fade {
+    height: 100%;
+    grid-template-rows: minmax(100%, auto);
+}
+
 /* Warns that the open handshake script will not run (ADR 0144). Tinted with
    the accent rather than a warning colour, because there is no warning token
    and inventing one for a single notice would be a theme decision made in the
@@ -177,7 +190,7 @@
     margin-bottom: var(--space-md);
     padding: var(--space-sm) var(--space-md);
     border: 1px solid color-mix(in srgb, var(--accent) 40%, var(--border-color));
-    border-radius: 0.375rem;
+    border-radius: calc(var(--radius-surface) * 0.5);
     background: color-mix(in srgb, var(--accent) 8%, var(--bg-tertiary));
     color: var(--text-secondary);
     font-size: var(--font-size-sm);
@@ -188,7 +201,7 @@
     /* The command is meant to be selected and pasted, so it keeps the mono
        face and a background that separates it from the sentence. */
     padding: 0 0.25rem;
-    border-radius: 0.25rem;
+    border-radius: calc(var(--radius-control) * 0.5);
     background: var(--bg-secondary);
     font-family: var(--font-mono);
     word-break: break-all;
@@ -303,7 +316,7 @@
     padding: 0.5rem 0.625rem;
     background: var(--bg-primary);
     border: 1px solid var(--border-color);
-    border-radius: 0.375rem;
+    border-radius: calc(var(--radius-control) * 0.75);
     color: var(--text-primary);
     outline: none;
 }
@@ -345,7 +358,7 @@
 .slides-pv-slide {
     background: var(--bg-secondary);
     border: 1px solid var(--border-color);
-    border-radius: 0.5rem;
+    border-radius: calc(var(--radius-surface) * 2 / 3);
     margin-bottom: 0.5rem;
     overflow: hidden;
 }
@@ -364,7 +377,7 @@
     justify-content: center;
     min-width: 1.375rem;
     height: 1.375rem;
-    border-radius: 0.25rem;
+    border-radius: calc(var(--radius-control) * 0.5);
     background: var(--bg-tertiary);
     color: var(--text-muted);
     font-size: var(--font-size-xs);
@@ -388,7 +401,7 @@
     text-transform: uppercase;
     letter-spacing: 0.05em;
     padding: 0.125rem 0.375rem;
-    border-radius: 0.1875rem;
+    border-radius: calc(var(--radius-control) * 0.375);
     background: color-mix(in srgb, var(--accent-notable) 15%, transparent);
     color: var(--accent-notable);
 }
@@ -397,7 +410,7 @@
     font-size: var(--font-size-2xs);
     font-weight: 500;
     padding: 0.125rem 0.375rem;
-    border-radius: 0.1875rem;
+    border-radius: calc(var(--radius-control) * 0.375);
     background: color-mix(in srgb, var(--accent) 15%, transparent);
     color: var(--accent);
     margin-left: auto;
@@ -422,7 +435,7 @@
     text-transform: uppercase;
     letter-spacing: 0.05em;
     padding: 0.125rem 0.375rem;
-    border-radius: 0.1875rem;
+    border-radius: calc(var(--radius-control) * 0.375);
     background: color-mix(in srgb, var(--accent) 15%, transparent);
     color: var(--accent);
 }
@@ -471,7 +484,7 @@
     font-size: var(--font-size-xs);
     background: var(--bg-tertiary);
     padding: 0.0625rem 0.25rem;
-    border-radius: 0.1875rem;
+    border-radius: calc(var(--radius-control) * 0.375);
 }
 
 /* Lists */
@@ -507,7 +520,7 @@
     padding: 0.375rem 0.625rem;
     margin-top: 0.5rem;
     background: color-mix(in srgb, var(--accent) 8%, transparent);
-    border-radius: 0.25rem;
+    border-radius: calc(var(--radius-surface) / 3);
     font-style: italic;
 }
 
@@ -519,7 +532,7 @@
 /* Card */
 .slides-pv-card {
     border: 1px solid var(--border-color);
-    border-radius: 0.375rem;
+    border-radius: calc(var(--radius-surface) * 0.5);
     padding: 0.5rem 0.625rem;
     margin-bottom: 0.375rem;
 }
@@ -568,7 +581,7 @@
     align-items: center;
     gap: 0.25rem;
     background: var(--bg-tertiary);
-    border-radius: 0.25rem;
+    border-radius: calc(var(--radius-surface) / 3);
     padding: 0.25rem 0.5rem;
     font-size: var(--font-size-xs);
     color: var(--text-primary);
@@ -588,7 +601,7 @@
     font-size: var(--font-size-xs);
     line-height: 1.5;
     background: var(--bg-tertiary);
-    border-radius: 0.25rem;
+    border-radius: calc(var(--radius-surface) / 3);
     padding: 0.5rem 0.625rem;
     overflow-x: auto;
     color: var(--text-secondary);
@@ -607,7 +620,7 @@
 .slides-pv-chip {
     font-size: var(--font-size-2xs);
     padding: 0.125rem 0.375rem;
-    border-radius: 0.75rem;
+    border-radius: calc(var(--radius-control) * 1.5);
     background: var(--bg-tertiary);
     color: var(--text-secondary);
     border: 1px solid var(--border-color);
@@ -626,7 +639,7 @@
     font-family: var(--font-ui);
     font-size: var(--font-size-2xs);
     padding: 0.125rem 0.375rem;
-    border-radius: 0.1875rem;
+    border-radius: calc(var(--radius-control) * 0.375);
     background: color-mix(in srgb, #a78bfa 15%, transparent);
     color: #a78bfa;
 }
@@ -655,7 +668,7 @@
     justify-content: center;
     min-width: 1.375rem;
     height: 1.375rem;
-    border-radius: 50%;
+    border-radius: var(--radius-round);
     background: color-mix(in srgb, var(--accent) 15%, transparent);
     color: var(--accent);
     font-size: var(--font-size-xs);
@@ -684,7 +697,7 @@
     letter-spacing: 0.05em;
     text-transform: uppercase;
     padding: 0.1875rem 0.5rem;
-    border-radius: 0.25rem;
+    border-radius: calc(var(--radius-control) * 0.5);
     background: color-mix(in srgb, var(--accent) 15%, transparent);
     color: var(--accent);
     margin-bottom: 0.5rem;
@@ -728,7 +741,7 @@
 
 .panel-url-title {
     cursor: pointer;
-    border-radius: 0.25rem;
+    border-radius: calc(var(--radius-control) * 0.5);
     padding: 0.125rem 0.375rem;
     transition: background-color var(--duration-fast);
 }
@@ -750,7 +763,7 @@
     font-family: var(--font-ui);
     background: var(--bg-primary);
     border: 1px solid var(--accent);
-    border-radius: 0.25rem;
+    border-radius: calc(var(--radius-control) * 0.5);
     color: var(--text-primary);
     outline: none;
 }
@@ -763,7 +776,7 @@
        on the same content edge as the question / change cards above it
        (chat/input-messages.css `.prompt-row .prompt-textarea`). */
     border: var(--prompt-box-border-width) solid color-mix(in srgb, var(--border-color) 50%, transparent);
-    border-radius: 1rem;
+    border-radius: calc(var(--radius-surface) * 4 / 3);
     transition: border-color var(--duration-emphasis) ease;
 }
 
@@ -784,7 +797,6 @@
     font-family: var(--font-ui);
     -webkit-appearance: none;
     appearance: none;
-    -webkit-tap-highlight-color: transparent;
     background: transparent;
     border: none;
     color: var(--text-primary);
@@ -814,15 +826,11 @@
 .message-route-panel {
     position: fixed;
     z-index: var(--z-control-panel);
-    background: var(--bg-secondary);
-    border: 1px solid var(--border-color);
-    border-radius: 0.375rem;
-    box-shadow: 0 0.25rem 1rem rgba(0, 0, 0, 0.25);
-    padding: 0.75rem 1rem;
+    /* A body-only popover: its text sits on the surface inset. */
+    padding: var(--space-md) var(--surface-inset);
     min-width: 0;
     max-width: min(24rem, calc(100vw - 1rem));
     font-size: var(--font-size-md);
-    color: var(--text-primary);
 }
 
 .message-route-panel .route-section + .route-section {
@@ -957,7 +965,7 @@
     display: inline-block;
     margin-left: 0.375rem;
     padding: 0.0625rem 0.3125rem;
-    border-radius: 0.1875rem;
+    border-radius: calc(var(--radius-control) * 0.375);
     font-size: var(--font-size-3xs);
     text-transform: uppercase;
     background: color-mix(in srgb, var(--accent) 15%, transparent);

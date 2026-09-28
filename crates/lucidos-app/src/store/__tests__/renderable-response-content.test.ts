@@ -1,5 +1,5 @@
 /**
- * `hasRenderableResponseContent` must agree with what `renderResponseEvents`
+ * `hasRenderableResponseContent` must agree with what `responseBody`
  * (ChatExchange.tsx) will actually draw.
  *
  * The two answer different questions and the difference is load-bearing: an

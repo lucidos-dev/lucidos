@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from 'preact/hooks';
-import { searchEverywhereOpen, searchEverywhereAnchor, showToast, appsList, artifacts, triggers, threadMap, settingsScrollTarget } from '../../store/store';
+import { searchEverywhereOpen, searchEverywhereAnchor, appsList, artifacts, triggers, threadMap, settingsScrollTarget, focusedPane } from '../../store/store';
 import { Overlay } from '../shared/Overlay';
 import { searchEverywhere, type SearchCategory, type SearchResultItem } from '../../api/client';
 import { focusThreadOrBootstrap } from '../../store/actions/threads';
@@ -10,13 +10,16 @@ import { viewChangeDiffById } from '../../store/actions/repositories';
 import { navigateToTrigger } from '../../store/actions/triggers';
 import { focusPaneMainControl } from '../layout/paneFocus';
 import { searchResultDestinationPane, searchResultIconCategory } from './searchEverywhereActions';
-import { useDelayedFlag } from '../../hooks/useDelayedLoading';
+import { useDelayedLoading } from '../../hooks/useDelayedLoading';
+import { paneOfFocus, paneUnder, usePaneCentre } from '../../hooks/usePaneCentre';
+import { loadedOr, toFailed, type Loadable } from '../../store/types';
+import { LoadingFade } from '../shared/LoadingFade';
+import { ListSkeletonOf, SkBlock, SkText } from '../shared/Skeleton';
 import { RECENTS_KEY } from '../../store/actions/entityReferences';
 import { SearchIcon, CloseIcon, ClearIcon } from '../shared/icons';
 import { CategoryIcon } from '../shared/CategoryIcon';
 import { getSettingsSearchResults, findSettingsEntry } from './searchIndex';
 import { getMenuSearchResults, findMenuSearchEntry } from './menuIndex';
-import { errorDetail } from '../../utils/errorDetail';
 import './SearchEverywhere.css';
 
 const CATEGORIES: { id: SearchCategory; label: string }[] = [
@@ -143,26 +146,34 @@ function getSections(results: Record<string, SearchResultItem[]>): { section: st
   return sections;
 }
 
-function ResultRow({ item, index, selected, onSelect, onHover }: {
-  item: SearchResultItem;
-  index: number;
-  selected: boolean;
-  onSelect: (item: SearchResultItem) => void;
-  onHover: (index: number) => void;
+/** One hit. With no `item`, inside a `SkeletonProvider`, it is the results
+ *  list's loading placeholder, and carries no `data-role`: the keyboard
+ *  selection counts rows by it. */
+function ResultRow({ item, index = 0, selected = false, onSelect, onHover }: {
+  item?: SearchResultItem;
+  index?: number;
+  selected?: boolean;
+  onSelect?: (item: SearchResultItem) => void;
+  onHover?: (index: number) => void;
 }) {
   return (
     <button
-      data-role="search-result"
+      data-role={item ? 'search-result' : undefined}
       class={`search-everywhere-result${selected ? ' selected' : ''}`}
-      onMouseEnter={() => onHover(index)}
-      onClick={() => onSelect(item)}
+      onMouseEnter={() => onHover?.(index)}
+      onClick={() => item && onSelect?.(item)}
+      tabIndex={item ? undefined : -1}
     >
-      <span class="search-everywhere-result-icon">
-        <CategoryIcon category={searchResultIconCategory(item)} />
-      </span>
+      <SkBlock w="1rem" h="1rem" round>
+        <span class="search-everywhere-result-icon">
+          {item && <CategoryIcon category={searchResultIconCategory(item)} />}
+        </span>
+      </SkBlock>
       <span class="search-everywhere-result-info">
-        <span class="search-everywhere-result-title">{item.title}</span>
-        {item.subtitle && <span class="search-everywhere-result-subtitle">{item.subtitle}</span>}
+        <SkText class="search-everywhere-result-title" w="9rem">{item?.title}</SkText>
+        {(!item || item.subtitle) && (
+          <SkText class="search-everywhere-result-subtitle" w="14rem">{item?.subtitle}</SkText>
+        )}
       </span>
     </button>
   );
@@ -171,29 +182,35 @@ function ResultRow({ item, index, selected, onSelect, onHover }: {
 export function SearchEverywhere() {
   const [query, setQuery] = useState('');
   const [category, setCategory] = useState<SearchCategory>('all');
-  const [results, setResults] = useState<Record<string, SearchResultItem[]>>({});
+  const [results, setResults] = useState<Loadable<Record<string, SearchResultItem[]>>>({ status: 'not-loaded' });
   const [selectedIndex, setSelectedIndex] = useState(-1);
-  const [loading, setLoading] = useState(false);
   const [recents, setRecents] = useState<SearchResultItem[]>([]);
   const inputRef = useRef<HTMLInputElement>(null);
   const resultsRef = useRef<HTMLDivElement>(null);
-  const tabsRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef<AbortController | null>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // Delay the inline search spinner (300ms) so quick searches don't flash it.
-  // Intentionally no crossfade/lingering here — incremental search must show
-  // results the instant they arrive, so the spinner just disappears on results.
-  const showSearchLoading = useDelayedFlag(loading);
+  // Placeholder rows only once a search has run past the delay gate. Results
+  // still show the instant they arrive; the fade only lets the rows go.
+  const showSearchLoading = useDelayedLoading(results);
 
   const isOpen = searchEverywhereOpen.value;
+  // Over the pane whose header holds the button that opened it. Opened with
+  // no button (a shortcut, the Lucidos menu), it follows the focused pane group.
+  // Resolved once per open: every keystroke re-renders, and it measures layout.
+  const anchor = searchEverywhereAnchor.value;
+  const focus = focusedPane.value;
+  const pane = useMemo(
+    () => (isOpen ? paneUnder(anchor) ?? paneOfFocus(focus) : undefined),
+    [isOpen, anchor, focus],
+  );
+  const paneCentre = usePaneCentre(pane);
 
   const close = useCallback(() => {
     searchEverywhereOpen.value = false;
     setQuery('');
     setCategory('all');
-    setResults({});
+    setResults({ status: 'not-loaded' });
     setSelectedIndex(-1);
-    setLoading(false);
     if (abortRef.current) abortRef.current.abort();
     if (debounceRef.current) clearTimeout(debounceRef.current);
   }, []);
@@ -206,22 +223,23 @@ export function SearchEverywhere() {
   // Fire search when query or category changes (skip in recents mode)
   useEffect(() => {
     if (!isOpen) return;
+    // Recents need no read. Settle any search still in flight, or its loading
+    // state would carry into the next one and skip the delay gate.
     if (!query && category === 'all') {
-      setLoading(false);
+      setResults({ status: 'not-loaded' });
       return;
     }
 
     if (isLocalCategory(category)) {
-      setResults({ [category]: localSection(category, query, 50) });
+      setResults({ status: 'loaded', data: { [category]: localSection(category, query, 50) } });
       setSelectedIndex(-1);
-      setLoading(false);
       return;
     }
 
     if (debounceRef.current) clearTimeout(debounceRef.current);
     if (abortRef.current) abortRef.current.abort();
 
-    setLoading(true);
+    setResults({ status: 'loading' });
     const controller = new AbortController();
     abortRef.current = controller;
 
@@ -236,19 +254,13 @@ export function SearchEverywhere() {
                 menu: localSection('menu', query, 5),
               }
             : data.results;
-          setResults(merged);
+          setResults({ status: 'loaded', data: merged });
           setSelectedIndex(-1);
         }
       } catch (err) {
         if (err instanceof DOMException && err.name === 'AbortError') return;
-        if (!controller.signal.aborted) {
-          setResults({});
-          showToast(`Search failed: ${errorDetail(err)}`, 'error');
-        }
-      } finally {
-        if (!controller.signal.aborted) {
-          setLoading(false);
-        }
+        // Failed must not read as empty: the list says so where the rows go.
+        if (!controller.signal.aborted) setResults(toFailed(err));
       }
     }, 300);
 
@@ -264,22 +276,6 @@ export function SearchEverywhere() {
       inputRef.current.focus();
     }
   }, [isOpen]);
-
-  // Keep the active category visible in the horizontally scrolling tab strip.
-  // Tab / Shift+Tab cycles the categories, and past the second or third one the
-  // next tab is off the right edge on a phone, so the keystroke would otherwise
-  // change a category the user cannot see. `block: 'nearest'` keeps it from
-  // scrolling anything vertically.
-  //
-  // `isOpen` is a dependency because reopening is the OTHER way the strip and
-  // the active tab fall out of sync: only `close()` resets the category, and
-  // the two toggle paths (the header button, the keybinding) don't go through
-  // it, so a palette reopened after Tabbing to Triggers still has that
-  // category while the remounted strip is back at scrollLeft 0.
-  useEffect(() => {
-    const el = tabsRef.current?.querySelector('[data-role="search-tab-active"]');
-    el?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
-  }, [category, isOpen]);
 
   // Scroll selected result into view
   useEffect(() => {
@@ -340,10 +336,10 @@ export function SearchEverywhere() {
   const isRecentsMode = !query && category === 'all';
 
   const flat = useMemo(
-    () => isRecentsMode ? recents : flattenResults(results, category),
+    () => isRecentsMode ? recents : flattenResults(loadedOr(results, {}), category),
     [isRecentsMode, recents, results, category],
   );
-  const sections = useMemo(() => category === 'all' && !isRecentsMode ? getSections(results) : [], [results, category, isRecentsMode]);
+  const sections = useMemo(() => category === 'all' && !isRecentsMode ? getSections(loadedOr(results, {})) : [], [results, category, isRecentsMode]);
 
   function handleKeyDown(e: KeyboardEvent) {
     if (e.key === 'Escape') {
@@ -386,18 +382,49 @@ export function SearchEverywhere() {
   // visibility via CSS to avoid ghost pixels from the will-change compositing
   // layer. anchor: the search toggle, exempt from outside-dismiss so re-tapping
   // it closes (never reopens). Both contracts live in <Overlay>.
+  function rows() {
+    if (category === 'all' && !isRecentsMode) {
+      return sections.map(({ section, items, offset }) => (
+        <div key={section}>
+          <div class="search-everywhere-section-header">{section}</div>
+          {items.map((item, i) => (
+            <ResultRow
+              key={`${item.category}:${item.id}`}
+              item={item}
+              index={offset + i}
+              selected={offset + i === selectedIndex}
+              onSelect={handleSelect}
+              onHover={setSelectedIndex}
+            />
+          ))}
+        </div>
+      ));
+    }
+    return flat.map((item, index) => (
+      <ResultRow
+        key={`${item.category}:${item.id}`}
+        item={item}
+        index={index}
+        selected={index === selectedIndex}
+        onSelect={handleSelect}
+        onHover={setSelectedIndex}
+      />
+    ));
+  }
+
   return (
     <Overlay
       open={isOpen}
       onClose={close}
       anchor={searchEverywhereAnchor.value}
       overlayClass="search-everywhere-overlay"
-      panelClass="search-everywhere-modal"
+      panelClass="surface surface-raised surface-pane-centred search-everywhere-modal"
+      panelStyle={paneCentre}
       panelRole="dialog"
       keepMounted
       hiddenClass="search-everywhere-hidden"
     >
-        <div class="search-everywhere-header">
+        <div class="surface-head search-everywhere-header">
           <span class="search-everywhere-header-icon"><SearchIcon /></span>
           <input
             ref={inputRef}
@@ -425,19 +452,20 @@ export function SearchEverywhere() {
             </button>
           )}
           <button
-            class="icon-btn search-everywhere-close"
+            class="icon-btn surface-close search-everywhere-close"
             aria-label="Close search"
+            data-tooltip="Close search"
             onClick={close}
           >
             <CloseIcon />
           </button>
         </div>
-        <div class="search-everywhere-tabs" ref={tabsRef}>
+        <div class="search-everywhere-tabs">
           {CATEGORIES.map(cat => (
             <button
               key={cat.id}
               class={`search-everywhere-tab${cat.id === category ? ' active' : ''}`}
-              data-role={cat.id === category ? 'search-tab-active' : undefined}
+              aria-pressed={cat.id === category}
               onClick={() => setCategory(cat.id)}
             >
               {cat.id === 'all' && !query ? 'Recent' : cat.label}
@@ -445,52 +473,18 @@ export function SearchEverywhere() {
           ))}
         </div>
         <div class="search-everywhere-results" ref={resultsRef}>
-          {loading && !isRecentsMode ? (
-            // Pre-delay window renders nothing (not the "No results" empty state)
-            // so a fast search neither flashes the spinner nor flashes "empty".
-            showSearchLoading ? <div class="search-everywhere-loading"><span class="mini-spinner" /></div> : null
-          ) : !hasResults ? (
-            <div class="search-everywhere-empty">
-              {query ? `No results for "${query}"` : category === 'all' ? 'No recent items' : `No ${CATEGORIES.find(c => c.id === category)!.label.toLowerCase()}`}
-            </div>
-          ) : isRecentsMode ? (
-            flat.map((item, index) => (
-              <ResultRow
-                key={`${item.category}:${item.id}`}
-                item={item}
-                index={index}
-                selected={index === selectedIndex}
-                onSelect={handleSelect}
-                onHover={setSelectedIndex}
-              />
-            ))
-          ) : category === 'all' ? (
-            sections.map(({ section, items, offset }) => (
-              <div key={section}>
-                <div class="search-everywhere-section-header">{section}</div>
-                {items.map((item, i) => (
-                  <ResultRow
-                    key={`${item.category}:${item.id}`}
-                    item={item}
-                    index={offset + i}
-                    selected={offset + i === selectedIndex}
-                    onSelect={handleSelect}
-                    onHover={setSelectedIndex}
-                  />
-                ))}
-              </div>
-            ))
+          {isRecentsMode ? (
+            hasResults ? rows() : <div class="search-everywhere-empty">No recent items</div>
+          ) : results.status === 'failed' ? (
+            <div class="search-everywhere-empty error-text">Search failed: {results.error}</div>
           ) : (
-            flat.map((item, index) => (
-              <ResultRow
-                key={`${item.category}:${item.id}`}
-                item={item}
-                index={index}
-                selected={index === selectedIndex}
-                onSelect={handleSelect}
-                onHover={setSelectedIndex}
-              />
-            ))
+            <LoadingFade showSkeleton={showSearchLoading} skeleton={<ListSkeletonOf count={5} row={() => <ResultRow />} />}>
+              {results.status === 'loaded' && (hasResults ? rows() : (
+                <div class="search-everywhere-empty">
+                  {query ? `No results for "${query}"` : `No ${CATEGORIES.find(c => c.id === category)!.label.toLowerCase()}`}
+                </div>
+              ))}
+            </LoadingFade>
           )}
         </div>
     </Overlay>

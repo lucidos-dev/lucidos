@@ -1,35 +1,20 @@
 /**
- * Background-activity actions: reading the embedding-model status, and driving
- * the status toast behind the brand badge. The pure derivation the toast renders
- * lives in `store/backgroundActivity.ts`.
+ * Background-activity actions: reading the embedding-model status, the two
+ * toasts background work may still raise, and the Expose run's narration. The
+ * pure derivation lives in `store/backgroundActivity.ts`.
  *
- * One keyed toast narrates whatever background activity is running (see
- * `store/backgroundActivity.ts`). It opens two ways:
+ * Work in flight is told in the Lucidos menu's activity group, never in a
+ * progress toast (ADR 0306). Two exceptions reach the toast layer:
  *
- *  - **By itself, once**, the first time this document sees the embedding model
- *    actually DOWNLOADING. That is the fresh-workspace case in observable
- *    terms: a warm cache never enters that state, so an existing workspace stays
- *    silent, and no first-run flag or workspace-age guess is needed.
- *  - **On demand**, when the user taps the badge.
- *
- * Once open it updates in place. Once DISMISSED it stays dismissed: later
- * frames may only update a toast that is still on screen, never resurrect one
- * the user closed. That distinction is the whole reason this module exists,
- * because `showToast` with a key creates the toast when it is absent, so a bare
- * per-frame `showToast` would pop the thing back up every few hundred
- * milliseconds.
- *
- * The toast is shared, so it also tracks WHICH work it is entitled to talk
- * about: `downloadSeen` below licenses the terminal embedding-model messages,
- * which would otherwise fire in a toast opened to watch something else.
- *
- * Updates arrive two ways, and the engine rebuild is why there are two. The
- * embedding-model download and the Expose run are each PUSHED a frame per
- * change (`EmbeddingModelStatusChanged` over SSE, `tailscale-serve-progress`
- * over Tauri), so re-rendering on each frame keeps them current. A rebuild emits
- * only its transitions, and its toast shows a seconds counter, so it also drives
- * a local 1s ticker (`ensureBuildTicker`). The ticker is held to the same rule as
- * every other update path here: it may only refresh a toast already on screen.
+ *  - **The Expose run narrates in a toast.** The user just pressed Expose, and
+ *    one of its steps blocks until they open a tailnet approval link. Settings
+ *    shows no link, so a narration hidden in the menu would stall the run
+ *    silently. Once the user closes the toast, later frames only update the
+ *    menu: `showToast` with a key creates a missing toast, so every frame goes
+ *    through the open-toast guard.
+ *  - **A download this document watched reports its outcome once**, as the
+ *    Expose run reports its own. Memory is quietly off for the whole download,
+ *    so its end is news.
  */
 
 import {
@@ -38,11 +23,13 @@ import {
   toasts,
   engineBuilding,
   engineBuildDetail,
+  frontendRefreshDetail,
   embeddingModelStatus,
   tailscaleServeRun,
 } from '../store';
 import {
-  activityToastContent,
+  embeddingModelOutcome,
+  tailscaleServeActivity,
   tailscaleServeOutcome,
   type ActivityAction,
 } from '../backgroundActivity';
@@ -58,32 +45,28 @@ import {
   type TailscaleServeProgress,
 } from '../../utils/tauri';
 
-export const BACKGROUND_ACTIVITY_TOAST_KEY = 'background-activity';
+/** The Expose run's narration while it is in flight. */
+export const SERVE_RUN_TOAST_KEY = 'tailscale-serve';
 
-/** The Expose run's OUTCOME, which is a separate surface from the in-flight
- *  narration above. Keyed so a second run replaces the first run's result
- *  instead of stacking a second copy of it. */
+/** The Expose run's OUTCOME, a separate surface from its narration. Keyed so a
+ *  second run replaces the first run's result instead of stacking a copy. */
 export const SERVE_OUTCOME_TOAST_KEY = 'tailscale-serve-outcome';
 
-/** How long the settled message (ready / stalled / failed) lingers before
- *  clearing itself. Long enough to read, short enough not to need dismissing. */
+/** A watched download's outcome, keyed the same way. */
+export const EMBEDDING_OUTCOME_TOAST_KEY = 'embedding-model-outcome';
+
+/** How long a settled message lingers before clearing itself. Long enough to
+ *  read, short enough not to need dismissing. A failure stays up. */
 const SETTLED_DISMISS_MS = 8000;
 
-/** Whether the auto-open has already fired in THIS document. Deliberately not
- *  persisted: a reload during a still-running download should show the toast
- *  again, since the information is still current and still worth having. */
-let autoOpened = false;
-
-/** Whether this document has ever seen the embedding model actually
- *  DOWNLOADING. What licenses the toast to report a terminal model outcome
- *  (see `activityToastContent`): the shared toast may resolve work it narrated,
- *  and must stay silent about work it did not.
- *
- *  Close to `autoOpened` but deliberately NOT the same flag. That one is burned
- *  only once a toast is actually on screen, so a download the restart
- *  suppression swallowed still gets its one announcement later; this one
- *  records what the MODEL did, whether or not anything was rendered. */
+/** Whether this document has watched the embedding model DOWNLOADING. Only
+ *  then may it report an outcome: `ready` is every warm-cache boot's resting
+ *  state, and announcing it there would describe work that never happened. */
 let downloadSeen = false;
+
+/** The outcome last announced, so a repeated frame does not raise it again.
+ *  Cleared when a download starts, so a retry that lands reports again. */
+let announcedOutcome: EmbeddingModelStatus['load_state']['kind'] | null = null;
 
 /** Bumped by every LIVE status frame. A snapshot read compares the value it
  *  captured before awaiting against this, and discards its result if a frame
@@ -103,12 +86,11 @@ let unlistenServe: (() => void) | null = null;
  *  listener while the first `listen` call is still in flight. */
 let subscribingServe = false;
 
-/** Reset the once-per-document auto-open. Test seam only. */
-export function resetBackgroundActivityToastForTest(): void {
-  autoOpened = false;
+/** Reset the per-document download memory. Test seam only. */
+export function resetBackgroundActivityForTest(): void {
   downloadSeen = false;
+  announcedOutcome = null;
   liveVersion = 0;
-  stopBuildTicker();
 }
 
 /** Apply a live `EmbeddingModelStatusChanged` frame. The single entry point for
@@ -116,18 +98,37 @@ export function resetBackgroundActivityToastForTest(): void {
 export function applyEmbeddingModelStatus(status: EmbeddingModelStatus): void {
   liveVersion += 1;
   embeddingModelStatus.value = status;
-  syncBackgroundActivityToast();
+  syncEmbeddingModelOutcome();
 }
 
-function toastIsOpen(): boolean {
-  return toasts.value.some((t) => t.key === BACKGROUND_ACTIVITY_TOAST_KEY);
+/** Record a download starting, or announce how a watched one ended. Safe to
+ *  call on every frame: an outcome is announced once. */
+export function syncEmbeddingModelOutcome(): void {
+  const state = embeddingModelStatus.value?.load_state;
+  if (state?.kind === 'downloading') {
+    downloadSeen = true;
+    announcedOutcome = null;
+    return;
+  }
+  if (!downloadSeen || !state || state.kind === announcedOutcome) return;
+  const outcome = embeddingModelOutcome(state);
+  if (!outcome) return;
+  showToast(outcome.message, outcome.tone, {
+    title: outcome.title,
+    key: EMBEDDING_OUTCOME_TOAST_KEY,
+    autoDismissMs: outcome.tone === 'error' ? undefined : SETTLED_DISMISS_MS,
+  });
+  // Spent only once a toast is on screen. `showToast` drops everything while
+  // the workspace is unavailable, and the next frame or resume must try again.
+  if (toasts.value.some((t) => t.key === EMBEDDING_OUTCOME_TOAST_KEY)) announcedOutcome = state.kind;
 }
 
-/** Turn an action DESCRIPTOR from the pure derivation into a real toast action.
+/** Turn an action DESCRIPTOR from the pure derivation into a real button
+ *  action, for the Expose toast and the menu detail alike.
  *
  *  The one place that knows how to perform them, which is what keeps
  *  `store/backgroundActivity.ts` a pure function of its arguments. */
-function toastAction(action: ActivityAction | undefined) {
+export function activityAction(action: ActivityAction | undefined) {
   if (!action) return undefined;
   switch (action.kind) {
     case 'open-url': {
@@ -169,41 +170,7 @@ function toastAction(action: ActivityAction | undefined) {
   }
 }
 
-/** Render the current content into the keyed toast, creating it if absent. */
-function render(): void {
-  const content = activityToastContent(
-    engineBuilding.value,
-    embeddingModelStatus.value,
-    tailscaleServeRun.value,
-    downloadSeen,
-    engineBuildDetail.value,
-  );
-  if (!content) {
-    dismissToast(BACKGROUND_ACTIVITY_TOAST_KEY);
-    stopBuildTicker();
-    return;
-  }
-  showToast(content.message, content.tone, {
-    key: BACKGROUND_ACTIVITY_TOAST_KEY,
-    // The spinner is the "something is happening" signal; `progress` is the
-    // "how far" one. A settled message needs neither.
-    spinning: !content.settled,
-    progress: content.progress,
-    action: toastAction(content.action),
-    secondaryAction: toastAction(content.secondaryAction),
-    // A settled message clears itself, EXCEPT a failure: an error the user has
-    // to read and act on must not vanish while they are reading it.
-    autoDismissMs: content.settled && content.tone !== 'error' ? SETTLED_DISMISS_MS : undefined,
-  });
-  // AFTER the showToast, never before: the ticker only runs while a toast is on
-  // screen, and on the first render of a freshly opened toast that is not true
-  // until the line above has created it. `showToast` is also suppressed outright
-  // during an engine restart, so this is the one place that knows whether a
-  // toast actually exists to tick.
-  ensureBuildTicker();
-}
-
-/** Read the embedding-model snapshot and reconcile the toast.
+/** Read the embedding-model snapshot and reconcile.
  *
  *  Called at startup and on window resume. Both are needed because the SSE
  *  frames are transient and never replayed: a fresh workspace starts its
@@ -219,7 +186,7 @@ export async function loadEmbeddingModelStatus(): Promise<void> {
     // terminal frame there is no further frame to correct the regression.
     if (readAt !== liveVersion) return;
     embeddingModelStatus.value = status;
-    syncBackgroundActivityToast();
+    syncEmbeddingModelOutcome();
   } catch (e) {
     // Best-effort telemetry (frontend.md carve-out): an unsolicited startup /
     // resume probe the user did not ask for. No toast, because failing to read
@@ -231,105 +198,47 @@ export async function loadEmbeddingModelStatus(): Promise<void> {
   }
 }
 
-/** How often the open toast re-renders while a build runs. One second, because
- *  the thing being redrawn is a seconds counter: slower and it reads as a hung
- *  build, which is the misreading the counter exists to prevent. */
-const BUILD_TICK_MS = 1000;
-
-/** The live build-timer interval, or `null` when nothing needs one. */
-let buildTicker: ReturnType<typeof setInterval> | null = null;
-
-/** Whether the toast currently has a ticking number in it: a build in flight,
- *  with an elapsed time of its own to count up. A co-located PEER's build spins
- *  the badge but reports no elapsed, so it needs no ticker. */
-function buildTimerIsLive(): boolean {
-  return engineBuilding.value && engineBuildDetail.value?.elapsedMs != null;
-}
-
-/** Start the 1s re-render if one is warranted and not already running, or stop
- *  the running one once it isn't.
- *
- *  Two conditions, both required, re-checked on every tick rather than assumed:
- *  a build with a live timer, and a toast actually on screen. Dropping the
- *  second would make this the one thing in the module that can resurrect a
- *  toast the user dismissed, since `render` creates the toast when it is absent.
- *  So the tick calls `render` only through the same open-toast guard every other
- *  update path uses, and retires itself the moment either condition fails. */
-function ensureBuildTicker(): void {
-  const wanted = buildTimerIsLive() && toastIsOpen();
-  if (!wanted) {
-    stopBuildTicker();
-    return;
-  }
-  if (buildTicker !== null) return;
-  buildTicker = setInterval(() => {
-    if (!buildTimerIsLive() || !toastIsOpen()) {
-      stopBuildTicker();
-      return;
-    }
-    render();
-  }, BUILD_TICK_MS);
-}
-
-function stopBuildTicker(): void {
-  if (buildTicker !== null) {
-    clearInterval(buildTicker);
-    buildTicker = null;
-  }
-}
-
-/** Open the status toast on demand (the brand badge was tapped). */
-export function openBackgroundActivityToast(): void {
-  render();
-}
-
-/** Reconcile the toast with the current activity. Safe to call on every frame.
- *
- *  Called from the `EmbeddingModelStatusChanged` SSE handler and from the
- *  engine-build version check, the two things that move the underlying state. */
-export function syncBackgroundActivityToast(): void {
-  const downloading = embeddingModelStatus.value?.load_state.kind === 'downloading';
-  // Every writer of `embeddingModelStatus` (the SSE frame, the snapshot read)
-  // ends here, so this is the one place that sees every state the model passes
-  // through, and therefore the one place that can record having seen it.
-  if (downloading) downloadSeen = true;
-
-  // A real download is starting and this document has not announced one yet:
-  // open unprompted, exactly once. Memory is quietly disabled for the whole
-  // download, so the user is owed the warning without having to go looking.
-  if (downloading && !autoOpened) {
-    render();
-    // Burn the one-shot only if the toast actually appeared. `showToast` is
-    // suppressed outright while the engine is restarting, and marking it opened
-    // regardless would spend the single auto-open on a call that rendered
-    // nothing, leaving this document with no announcement at all.
-    autoOpened = toastIsOpen();
-    return;
-  }
-
-  // Otherwise, update what is already on screen and nothing else. An absent
-  // toast here means either the user dismissed it or it was never opened, and
-  // in both cases they have not asked to see this.
-  if (toastIsOpen()) render();
+/** Whether a build in flight has an elapsed time of its own to count up, so
+ *  an open menu re-reads the clock. A co-located PEER's build spins the badge
+ *  but reports no elapsed, so it needs no ticker. */
+export function buildTimerIsLive(): boolean {
+  const engineTicks = engineBuilding.value && engineBuildDetail.value?.elapsedMs != null;
+  return engineTicks || frontendRefreshDetail.value?.elapsedMs != null;
 }
 
 // --- The Expose run (`tailscale serve`) ---
 
-/** Note that an Expose run has STARTED, before its first frame arrives.
+function serveToastIsOpen(): boolean {
+  return toasts.value.some((t) => t.key === SERVE_RUN_TOAST_KEY);
+}
+
+/** Draw the run's current step into its toast, creating it if absent. */
+function renderServeRun(): void {
+  const activity = tailscaleServeActivity(tailscaleServeRun.value);
+  if (!activity) {
+    dismissToast(SERVE_RUN_TOAST_KEY);
+    return;
+  }
+  const [title, message] = activity.note ? [activity.label, activity.note] : [undefined, activity.label];
+  showToast(message, 'info', {
+    title,
+    key: SERVE_RUN_TOAST_KEY,
+    spinning: true,
+    action: activityAction(activity.action),
+    secondaryAction: activityAction(activity.secondaryAction),
+  });
+}
+
+/** Note that an Expose run has STARTED, before its first frame arrives, and
+ *  open its toast.
  *
  *  Called from the button's own handler rather than waiting for Rust, because
  *  the IPC hop plus the CLI probe take long enough that the button would
  *  otherwise look dead for a moment. Same reason `installAppUpdate` paints its
- *  first frame on the click.
- *
- *  Opens the toast unconditionally, and that is the one place this run differs
- *  from the embedding-model download beside it: the download is unsolicited
- *  news, so it announces itself once per document and never again, while this
- *  is a button the user just pressed and they are owed the narration every
- *  time. */
+ *  first frame on the click. */
 export function beginTailscaleServeRun(): void {
   tailscaleServeRun.value = { phase: 'starting' };
-  render();
+  renderServeRun();
 }
 
 /** Clear the run without narrating an outcome.
@@ -340,24 +249,16 @@ export function beginTailscaleServeRun(): void {
  *  it. */
 export function clearTailscaleServeRun(): void {
   tailscaleServeRun.value = null;
-  if (toastIsOpen()) render();
+  dismissToast(SERVE_RUN_TOAST_KEY);
 }
 
 /** Apply one `tailscale-serve-progress` frame.
  *
- *  In-flight frames update the shared background-activity toast. A terminal one
- *  ends the run, releases the shared toast back to whatever else is in flight
- *  (or clears it), and reports its outcome in a toast of its OWN.
- *
- *  The separation is load-bearing rather than tidy. The shared toast narrates
- *  work IN FLIGHT, so a finished run contributes nothing to it: routing the
- *  outcome through it meant a failure was silently dropped whenever anything
- *  else was running, and a cancel took a live embedding-download narration down
- *  with it. */
+ *  An in-flight frame updates the run's toast, if the user left it open. A
+ *  terminal one ends the run and clears the narration. Its outcome gets a toast
+ *  of its OWN, so a closed narration never swallows a failure. */
 export function applyTailscaleServeProgress(frame: TailscaleServeProgress): void {
   if (frame.phase === 'done' || frame.phase === 'failed' || frame.phase === 'cancelled') {
-    // Clear first, so the shared toast re-renders without this run: it reverts
-    // to a concurrent activity, or clears when there is none.
     clearTailscaleServeRun();
     const outcome = tailscaleServeOutcome(frame);
     if (outcome) {
@@ -370,9 +271,9 @@ export function applyTailscaleServeProgress(frame: TailscaleServeProgress): void
     return;
   }
   tailscaleServeRun.value = frame;
-  // Only ever UPDATES what is on screen. An absent toast means the user closed
-  // it, and the spinning badge is how they ask for it back.
-  if (toastIsOpen()) render();
+  // An absent toast means the user closed it, and the run's row in the Lucidos
+  // menu is where they see it again.
+  if (serveToastIsOpen()) renderServeRun();
 }
 
 /** Subscribe to the Rust Expose run's progress stream. Idempotent across

@@ -788,10 +788,12 @@ function ThreadList() {
                 {sections.every(s => s.threads.length === 0) && (
                     <div class="empty-state">No threads</div>
                 )}
+                {/* The next page's rows, drawn above the sentinel that asked for them. */}
+                <LoadingFade showSkeleton={showLoadingMore} skeleton={<ListSkeletonOf count={2} row={() => <ThreadRowContent />} />}>
+                    {null}
+                </LoadingFade>
                 {hasMore && paginationAllowed && (
-                    <div ref={sentinelRef} class="thread-drawer-load-more">
-                        {showLoadingMore && <span class="thread-drawer-loading">Loading...</span>}
-                    </div>
+                    <div ref={sentinelRef} class="thread-drawer-load-more" />
                 )}
             </div>
             <div ref={portalRef} class="flip-portal" />
@@ -879,13 +881,13 @@ export function sentinelInView(sentinel: { top: number; bottom: number }, root: 
     return sentinel.top < root.bottom && sentinel.bottom > root.top;
 }
 
-/** Shared icon + label content for EVERY drawer section header — the
+/** Shared icon, label and count for EVERY drawer section header: the
  *  collapsible lifecycle headers (Pinned/Current/Archive via `DrawerSection`)
- *  and the flat alternate-view headers (Drafts/Needs attention/Results). Keeping
- *  the markup in one place means the icon-to-label spacing (owned by the
- *  `.thread-drawer .list-section-title` gap) is identical everywhere and can't
- *  drift per section. */
-function DrawerSectionHeader({ Icon, title, hasRunning }: { Icon?: ComponentType<{ size?: string }>; title: string; hasRunning?: boolean }) {
+ *  and the flat alternate-view headers (Drafts/Needs attention/Review/Running/
+ *  Results). Keeping the markup in one place means the spacing (owned by the
+ *  `.thread-drawer .list-section-title` gap) and the count's look are identical
+ *  everywhere. Results passes no count, so it draws none. */
+function DrawerSectionHeader({ Icon, title, count, hasRunning }: { Icon?: ComponentType<{ size?: string }>; title: string; count?: number; hasRunning?: boolean }) {
     return (
         <>
             {Icon && <span class="drawer-section-icon"><Icon size="0.875rem" /></span>}
@@ -896,6 +898,12 @@ function DrawerSectionHeader({ Icon, title, hasRunning }: { Icon?: ComponentType
                 read as "dimmed" against this header's weight; the in-thread
                 step/status shimmer keeps the standard direction). */}
             <span class={`drawer-section-label${hasRunning ? ' running-shimmer running-shimmer-invert' : ''}`}>{title}</span>
+            {count !== undefined && (
+                <span class="section-count">
+                    <span class="section-count-badge">{count}</span>
+                    <span class="section-count-open">{count}</span>
+                </span>
+            )}
         </>
     );
 }
@@ -927,13 +935,16 @@ function DrawerSectionTitle({ sectionKey, title, Icon, count, hasRunning, collap
              role="treeitem"
              aria-selected={highlighted}
              aria-expanded={!collapsed}>
-            <DrawerSectionHeader Icon={Icon} title={title} hasRunning={hasRunning} />
-            <span class="section-count">
-                <span class="section-count-badge">{count}</span>
-                <span class="section-count-open">{count}</span>
-            </span>
+            <DrawerSectionHeader Icon={Icon} title={title} count={count} hasRunning={hasRunning} />
         </div>
     );
+}
+
+/** The row's buttons at the right end of the title's first line. The outer
+ *  span is one title line tall. Inside it, the inner inline box centers the
+ *  buttons on the title's capital letters, as the status mark does. */
+function RowActions({ children }: { children: ComponentChildren }) {
+    return <span class="thread-row-actions-line"><span class="thread-row-actions">{children}</span></span>;
 }
 
 /** The repo / app / trigger name chip. A long name WRAPS inside the chip's CSS
@@ -1039,9 +1050,6 @@ export function ComposingThreadRow({ thread, depth = 0 }: { thread: ThreadState;
 
     return (
         <div data-flip-id={thread.meta.id} style={depthStyle(depth)} class={depth > 0 ? 'thread-row-wrap is-nested' : 'thread-row-wrap'}>
-            {/* Dot lives on the wrapper, beside the row, and takes the row's
-                depth from there. Matches ThreadRowContent. */}
-            <ThreadStatusIcon status="idle" />
             {/* The draft's structured details (Status / Type / Created) live behind
                 the ⋯ menu's Info item now, not a row tooltip — see DraftOverflowMenu. */}
             <div class={classes.join(' ')}
@@ -1056,21 +1064,24 @@ export function ComposingThreadRow({ thread, depth = 0 }: { thread: ThreadState;
                  {...gesture.handlers}>
                 <div class="thread-row-left">
                     <span class="thread-row-title-row">
-                        <span class="thread-row-title">{threadDisplayTitle(thread)}</span>
-                        <span class="draft-indicator">Draft</span>
+                        <span class="thread-row-title-text">
+                            <ThreadStatusIcon status="idle" />
+                            <span class="thread-row-title">{threadDisplayTitle(thread)}</span>
+                            <span class="draft-indicator">Draft</span>
+                        </span>
+                        {/* On mobile there is no ⋯, and an empty actions box
+                            is still a flex item that opens the row's gap. So
+                            the menu renders bare there, drawing nothing until
+                            the hold opens its portal. */}
+                        {gesture.hostOpener.trigger ? <RowActions>{draftMenu}</RowActions> : draftMenu}
                     </span>
-                    {createdLabel && <span class="thread-row-created">{createdLabel}</span>}
-                </div>
-                <div class="thread-row-right">
-                    {modeLabel && <span class="label message-channel-tag">{modeLabel}</span>}
-                    {contextName && <ContextChip name={contextName} />}
-                    {/* The actions box exists to bottom-pin the ⋯, and a draft
-                        row has nothing else in it. On mobile there is no ⋯, and
-                        an empty box is still a flex item: it would open the
-                        column's 0.25rem gap under the chips. So the menu renders
-                        bare there, drawing nothing until the hold opens its
-                        portal. */}
-                    {gesture.hostOpener.trigger ? <span class="thread-row-actions">{draftMenu}</span> : draftMenu}
+                    {(createdLabel || modeLabel || contextName) && (
+                        <span class="thread-row-meta">
+                            {createdLabel && <span class="thread-row-created">{createdLabel}</span>}
+                            {modeLabel && <span class="label message-channel-tag">{modeLabel}</span>}
+                            {contextName && <ContextChip name={contextName} />}
+                        </span>
+                    )}
                 </div>
             </div>
         </div>
@@ -1157,8 +1168,6 @@ function ThreadRowContentImpl(props: Partial<ThreadRowContentProps>) {
     if (props.isResponsibleChild) classes.push('thread-row-lifted-child');
     const wrapClasses = ['thread-row-wrap'];
     if (depth > 0) wrapClasses.push('is-nested');
-    // On the WRAPPER, not the row. The status dot is the wrapper's child, so
-    // the dim has to reach it from here to cover the whole row.
     if (props.isArchivedSubThread) wrapClasses.push('is-archived');
 
     // Shared by the disclosure button's click and keydown, so the collapse
@@ -1173,6 +1182,19 @@ function ThreadRowContentImpl(props: Partial<ThreadRowContentProps>) {
     // Every thread carries a channel tag. The guard stays so an empty label, or
     // an unknown channel, never paints an empty bordered chip.
     const channelLabel = props.channel ? formatThreadChannelLabel(props.channel, props.codingAgent) : null;
+    const hasChips = sk || !!channelLabel || !!props.contextName;
+    const chips = hasChips && (
+        <>
+            {sk ? (
+                <SkBlock w="4.5rem" h="1.15rem" round />
+            ) : channelLabel ? (
+                <span
+                    class={`label message-channel-tag${props.channel === 'error_unknown_channel' ? ' channel-error' : ''}`}
+                >{channelLabel}</span>
+            ) : null}
+            {!sk && props.contextName && <ContextChip name={props.contextName} />}
+        </>
+    );
 
     // Tap opens the thread. A desktop right-click opens the ⋯ menu at the
     // pointer. On mobile a hold opens it instead, and no ⋯ is rendered.
@@ -1182,14 +1204,10 @@ function ThreadRowContentImpl(props: Partial<ThreadRowContentProps>) {
         onPress: () => { if (props.id) void loadThreadEvents(props.id); },
     });
 
-    // The status dot is the wrapper's child, beside the row rather than inside
-    // it. The wrapper carries the row's depth, so drawer.css can indent the dot
-    // with the title from out here.
     return (
         <div class={wrapClasses.join(' ')}
              style={depthStyle(depth)}
              {...(props.flipId ? { 'data-flip-id': props.flipId } : {})}>
-            <ThreadStatusIcon status={sk ? null : (props.visualStatus ?? null)} />
             <div class={classes.join(' ')}
                  id={props.id ? navKeyDomId(props.id) : undefined}
                  data-thread-nav={props.id}
@@ -1215,55 +1233,58 @@ function ThreadRowContentImpl(props: Partial<ThreadRowContentProps>) {
                  {...gesture.handlers}>
                 <div class="thread-row-left">
                     <span class="thread-row-title-row">
-                        <SkText class="thread-row-title" w="11rem">{props.title}</SkText>
-                        {props.hasDraft && <span class="draft-indicator" data-tooltip="Has unsent draft">Draft</span>}
+                        <span class="thread-row-title-text">
+                            <ThreadStatusIcon status={sk ? null : (props.visualStatus ?? null)} />
+                            <SkText class="thread-row-title" w="11rem">{props.title}</SkText>
+                            {props.hasDraft && <span class="draft-indicator" data-tooltip="Has unsent draft">Draft</span>}
+                        </span>
+                        {!sk && props.id && (
+                            <RowActions>
+                                {/* Mouse-only (tabIndex=-1): the drawer is a single tab
+                                    stop. The keyboard reaches every row action through
+                                    the ⋯ menu via the "Open thread actions" shortcut. */}
+                                <PinThreadButton threadId={props.id} saved={props.isSaved ?? false} stopPropagation extraClass="thread-row-action" tabIndex={-1} />
+                                <ThreadOverflowMenu threadId={props.id} title={props.title ?? ''} stopPropagation extraClass="thread-row-action" tabIndex={-1} hostOpener={gesture.hostOpener} />
+                            </RowActions>
+                        )}
                     </span>
-                    {(sk || props.createdLabel) && <SkText class="thread-row-created" w="5rem">{props.createdLabel}</SkText>}
-                    {hasFamily && (
-                        <button
-                            type="button"
-                            class="family-disclosure"
-                            // Mouse-only: the drawer is a single tab stop, so per-row
-                            // controls leave the Tab order. Keyboard collapses/expands
-                            // the family via ←/→ on the highlighted row instead.
-                            tabIndex={-1}
-                            onClick={toggleFamily}
-                            onKeyDown={(e) => {
-                                // The drawer container's keydown handler intercepts
-                                // Enter at the bubble phase and preventDefaults it,
-                                // cancelling this button's Enter→click activation.
-                                // So Enter and Space are handled here instead.
-                                // `preventDefault` blocks Space page-scroll and the
-                                // native synthetic click, firing the toggle exactly
-                                // once, and `toggleFamily`'s `stopPropagation` keeps
-                                // the drawer handler off the keystroke.
-                                if (e.key === 'Enter' || e.key === ' ') {
-                                    e.preventDefault();
-                                    toggleFamily(e);
-                                }
-                            }}
-                            aria-expanded={!props.isCollapsed}>
-                            <ChevronRightIcon />
-                            {familyDisclosureLabel(props.totalChildren ?? 0, props.isCollapsed ?? false)}
-                        </button>
+                    {/* A family row carries its chips on the sub-thread line
+                        instead, leaving the date alone on this one. */}
+                    {(sk || props.createdLabel || (!hasFamily && hasChips)) && (
+                        <span class="thread-row-meta">
+                            {(sk || props.createdLabel) && <SkText class="thread-row-created" w="5rem">{props.createdLabel}</SkText>}
+                            {!hasFamily && chips}
+                        </span>
                     )}
-                </div>
-                <div class="thread-row-right">
-                    {sk ? (
-                        <SkBlock w="4.5rem" h="1.15rem" round />
-                    ) : channelLabel ? (
-                        <span
-                            class={`label message-channel-tag${props.channel === 'error_unknown_channel' ? ' channel-error' : ''}`}
-                        >{channelLabel}</span>
-                    ) : null}
-                    {!sk && props.contextName && <ContextChip name={props.contextName} />}
-                    {!sk && props.id && (
-                        <span class="thread-row-actions">
-                            {/* Mouse-only (tabIndex=-1): the drawer is a single tab
-                                stop. The keyboard reaches every row action through
-                                the ⋯ menu via the "Open thread actions" shortcut. */}
-                            <PinThreadButton threadId={props.id} saved={props.isSaved ?? false} stopPropagation extraClass="thread-row-action" tabIndex={-1} />
-                            <ThreadOverflowMenu threadId={props.id} title={props.title ?? ''} stopPropagation extraClass="thread-row-action" tabIndex={-1} hostOpener={gesture.hostOpener} />
+                    {hasFamily && (
+                        <span class="thread-row-family-line">
+                            <button
+                                type="button"
+                                class="family-disclosure"
+                                // Mouse-only: the drawer is a single tab stop, so per-row
+                                // controls leave the Tab order. Keyboard collapses/expands
+                                // the family via ←/→ on the highlighted row instead.
+                                tabIndex={-1}
+                                onClick={toggleFamily}
+                                onKeyDown={(e) => {
+                                    // The drawer container's keydown handler intercepts
+                                    // Enter at the bubble phase and preventDefaults it,
+                                    // cancelling this button's Enter→click activation.
+                                    // So Enter and Space are handled here instead.
+                                    // `preventDefault` blocks Space page-scroll and the
+                                    // native synthetic click, firing the toggle exactly
+                                    // once, and `toggleFamily`'s `stopPropagation` keeps
+                                    // the drawer handler off the keystroke.
+                                    if (e.key === 'Enter' || e.key === ' ') {
+                                        e.preventDefault();
+                                        toggleFamily(e);
+                                    }
+                                }}
+                                aria-expanded={!props.isCollapsed}>
+                                <ChevronRightIcon />
+                                {familyDisclosureLabel(props.totalChildren ?? 0, props.isCollapsed ?? false)}
+                            </button>
+                            {chips && <span class="thread-row-family-chips">{chips}</span>}
                         </span>
                     )}
                 </div>
@@ -1422,7 +1443,7 @@ function DraftsList() {
     return (
         <div>
             <div class="list-section-title">
-                <DrawerSectionHeader Icon={DraftsIcon} title="Drafts" />
+                <DrawerSectionHeader Icon={DraftsIcon} title="Drafts" count={drafts.length} />
             </div>
             {drafts.map(t => t.meta.state === 'composing'
                 ? <ComposingThreadRow key={t.meta.id} thread={t} />
@@ -1454,7 +1475,7 @@ function AttentionList() {
     return (
         <div>
             <div class="list-section-title">
-                <DrawerSectionHeader Icon={AttentionIcon} title="Needs attention" />
+                <DrawerSectionHeader Icon={AttentionIcon} title="Needs attention" count={threads.length} />
             </div>
             {threads.map(t => <ThreadRow key={t.meta.id} threadId={t.meta.id} status={effectiveThreadStatus(t)} />)}
             <FilteredViewFooter />
@@ -1482,7 +1503,7 @@ function ReviewList() {
     return (
         <div>
             <div class="list-section-title">
-                <DrawerSectionHeader title="Review" />
+                <DrawerSectionHeader title="Review" count={threads.length} />
             </div>
             {threads.map(t => <ThreadRow key={t.meta.id} threadId={t.meta.id} status={effectiveThreadStatus(t)} />)}
             <FilteredViewFooter />
@@ -1515,7 +1536,7 @@ function RunningList() {
                     returned), so the header always shimmers — the same "live"
                     affordance the lifecycle sections show while they hold a
                     running thread. */}
-                <DrawerSectionHeader Icon={RunningIcon} title="Running" hasRunning />
+                <DrawerSectionHeader Icon={RunningIcon} title="Running" count={threads.length} hasRunning />
             </div>
             {threads.map(t => <ThreadRow key={t.meta.id} threadId={t.meta.id} status={effectiveThreadStatus(t)} />)}
             <FilteredViewFooter />
@@ -1560,7 +1581,7 @@ function SearchResults() {
 function SearchResultRow({ result }: { result: ThreadSearchResult }) {
     const liveThread = threadMap.value.get(result.thread_id);
     // Prefer live status from threadMap (SSE-updated), fall back to API result
-    const status: ThreadStatus = liveThread ? effectiveThreadStatus(liveThread) : (result.status as ThreadStatus);
+    const status: ThreadStatus = liveThread ? effectiveThreadStatus(liveThread) : result.status;
     // Same formula as the live rows, fed the `status` snapshot above. A search
     // hit not yet hydrated into threadMap resolves on that status alone.
     const visualStatus = visualStatusFor(status, liveThread?.meta);

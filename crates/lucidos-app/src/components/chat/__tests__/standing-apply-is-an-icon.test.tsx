@@ -2,7 +2,7 @@
 /**
  * The prompt row's *standing apply* is an ICON with an on and off state.
  *
- * It was a green `action-btn` pill reading "Apply as it settles", and on a
+ * It was a green `action-btn` pill reading "Apply on settle", and on a
  * phone that took over half the row. No shorter label fixed it, so the label
  * went. The Changes panel keeps the text, where there is room for it, and
  * `components/changes/ChangesView.test.tsx` pins that half.
@@ -14,7 +14,7 @@
  * drift apart.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { render } from 'preact';
+import { render, type ComponentChild } from 'preact';
 
 vi.mock('../../../store/actions/threads', () => ({
   focusThreadOrBootstrap: vi.fn(),
@@ -25,7 +25,7 @@ vi.mock('../../../store/actions/repositories', () => ({
   viewThreadCcDiff: vi.fn(),
 }));
 
-import { getStandingApplyControl } from '../WaitingBanner';
+import { getStandaloneActions } from '../WaitingBanner';
 import {
   changes,
   standingApplyThreadIds,
@@ -35,6 +35,12 @@ import {
 } from '../../../store/store';
 import type { Change } from '../../../api/client';
 import type { ThreadState } from '../../../store/thread-events';
+
+/** The standing apply as the prompt row draws it, or null when it has none. */
+function standingApply(): ComponentChild | null {
+  const member = getStandaloneActions().find((m) => m.key === 'standing-apply');
+  return member?.render ? member.render({}) : null;
+}
 
 const THREAD = 'thread-1';
 
@@ -83,7 +89,6 @@ function makeThread(): ThreadState {
       codingAgentProposed: true,
       codingAgentRequiresRestart: false,
       codingAgentIsExternalRepo: false,
-      codingAgentApplying: false,
       codingAgentHasDiff: true,
       lastRevivedAt: '',
       state: 'active',
@@ -111,7 +116,7 @@ let host: HTMLDivElement;
  *  old vnode would assert a wording the row never shows.
  */
 function control(): HTMLButtonElement {
-  render(getStandingApplyControl(), host);
+  render(standingApply(), host);
   const btn = host.querySelector<HTMLButtonElement>('button[data-role="standing-apply"]');
   if (!btn) throw new Error('the prompt row draws no standing apply');
   return btn;
@@ -193,28 +198,28 @@ describe('the prompt row draws no flag where Lucidos never applies', () => {
 
   it('draws nothing for a thread on an external repo', () => {
     markExternal({ codingAgentKind: 'external' });
-    expect(getStandingApplyControl()).toBeNull();
+    expect(standingApply()).toBeNull();
   });
 
   // An old row carries the bool and no kind.
   it('draws nothing for a legacy external-repo row', () => {
     markExternal({ codingAgentIsExternalRepo: true });
-    expect(getStandingApplyControl()).toBeNull();
+    expect(standingApply()).toBeNull();
   });
 
   // The regression: this thread is running, which is exactly when the flag is
   // drawn and exactly when `getCodingAgentWaitingInfo` answers null.
   it('draws nothing before the thread has proposed anything', () => {
     markExternal({ codingAgentKind: 'external', codingAgentProposed: false });
-    expect(getStandingApplyControl()).toBeNull();
+    expect(standingApply()).toBeNull();
   });
 });
 
 describe('the icon keeps the word it stopped showing', () => {
   it('names the action for a reader in both states', () => {
-    expect(control().getAttribute('aria-label')).toBe('Apply as it settles');
+    expect(control().getAttribute('aria-label')).toBe('Apply on settle');
     standingApplyThreadIds.value = new Set([THREAD]);
-    expect(control().getAttribute('aria-label')).toBe('✓ Applying as it settles');
+    expect(control().getAttribute('aria-label')).toBe('✓ Applying on settle');
   });
 
   it('carries a tooltip that changes with the state', () => {

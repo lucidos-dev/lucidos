@@ -84,7 +84,6 @@ describe('Thread Lifecycle Scenarios (shared contract)', () => {
           codingAgentProposed: false,
           codingAgentRequiresRestart: false,
           codingAgentIsExternalRepo: false,
-          codingAgentApplying: false,
           codingAgentHasDiff: false,
           lastRevivedAt: '',
           state: 'active',

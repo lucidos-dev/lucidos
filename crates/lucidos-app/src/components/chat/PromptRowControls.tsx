@@ -111,7 +111,7 @@ export function followLiveEdgeAction(composeContext: boolean): HeaderActionSpec 
     tooltip: followOn
       ? 'Following the live edge. Click to stop, and stay where you are.'
       : 'Follow the live edge: go to the newest content and stay with it as the agent writes.',
-    icon: () => <FollowLiveEdgeIcon />,
+    icon: () => <FollowLiveEdgeIcon armed={followOn} />,
     active: followOn,
     // The row paints each toggle from its own `data-role`, so this asks for the
     // bare `active` those rules select on rather than the header's frame.

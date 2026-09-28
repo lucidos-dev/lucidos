@@ -6,11 +6,34 @@ import { selectRepoChange, loadMoreRepoChanges } from '../../store/actions/repos
 import { formatTimeAgo } from '../../utils/formatTime';
 import { formatFileCount } from '../../utils/formatFileCount';
 import type { Change } from '../../api/client';
+import { useDelayedFlag, useDelayedLoading } from '../../hooks/useDelayedLoading';
+import { DropdownChevron, DropdownSkeleton } from '../shared/Dropdown';
 import { LoadableError } from '../shared/LoadableError';
+import { LoadingFade } from '../shared/LoadingFade';
 import { Overlay } from '../shared/Overlay';
+import { ListSkeletonOf, SkText } from '../shared/Skeleton';
 
 function changeLabel(change: Change): string {
   return (change.description || 'Claude Code changes').split('\n')[0];
+}
+
+/** One change in the menu. With no `change`, inside a `SkeletonProvider`, it
+ *  is the placeholder a page still loading appends. */
+function ChangeOption({ change, active = false, showResolved = false, onPick }: {
+  change?: Change;
+  active?: boolean;
+  showResolved?: boolean;
+  onPick?: () => void;
+}) {
+  return (
+    <div class={`dropdown-option${active ? ' active' : ''}`} onClick={onPick}>
+      <SkText class="change-option-desc" w="10rem">{change && changeLabel(change)}</SkText>
+      <SkText class="change-option-meta" w="4rem">
+        {change && formatFileCount(change.file_count)}
+        {change && showResolved && change.resolved_at && ` · ${formatTimeAgo(new Date(change.resolved_at))}`}
+      </SkText>
+    </div>
+  );
 }
 
 export function ChangeSelector() {
@@ -19,19 +42,21 @@ export function ChangeSelector() {
   const listRef = useRef<HTMLDivElement>(null);
 
   const loadable = repoChanges.value;
+  const loadingMore = repoChangesLoadingMore.value;
+  const showLoading = useDelayedLoading(loadable);
+  const showLoadingMore = useDelayedFlag(loadingMore);
   if (loadable.status === 'failed') return <LoadableError error={loadable.error} noun="changes" />;
-  if (loadable.status !== 'loaded') return null;
 
-  const { pending, applied, has_more } = loadable.data;
-  if (pending.length === 0 && applied.length === 0) return null;
+  const data = loadable.status === 'loaded' ? loadable.data : null;
+  // Nothing to choose from: the control unmounts with its slot.
+  if (data && data.pending.length === 0 && data.applied.length === 0) return null;
 
   const selectedId = repoSelectedChangeId.value;
   const selected = selectedChange.value;
-  const loadingMore = repoChangesLoadingMore.value;
 
   function handleScroll() {
     const el = listRef.current;
-    if (!el || !has_more || loadingMore) return;
+    if (!el || !data?.has_more || loadingMore) return;
     if (el.scrollTop + el.clientHeight >= el.scrollHeight - 30) {
       void loadMoreRepoChanges();
     }
@@ -43,78 +68,65 @@ export function ChangeSelector() {
   }
 
   return (
-    <div class="dropdown change-selector" ref={ref}>
-      <button
-        type="button"
-        class="dropdown-trigger"
-        onClick={() => setOpen(!open)}
-      >
-        <span class="dropdown-label-text">
-          {selected
-            ? changeLabel(selected)
-            : 'View change...'}
-        </span>
-        <span class="dropdown-chevron">{open ? '\u25B4' : '\u25BE'}</span>
-      </button>
-      <Overlay
-        open={open}
-        onClose={() => setOpen(false)}
-        anchor={ref.current}
-        backdrop={false}
-        panelClass="dropdown-menu change-selector-menu"
-        panelRef={listRef}
-        panelProps={{ onScroll: handleScroll }}
-      >
-          <div
-            class={`dropdown-option${!selectedId ? ' active' : ''}`}
-            onClick={() => handleSelect(null)}
+    <LoadingFade class="dropdown-slot" showSkeleton={showLoading} skeleton={<DropdownSkeleton w="7rem" />}>
+      {data && (
+        <div class="dropdown change-selector" ref={ref}>
+          <button
+            type="button"
+            class="dropdown-trigger"
+            onClick={() => setOpen(!open)}
           >
-            Current state (no diff)
-          </div>
-          {pending.length > 0 && (
-            <>
-              <div class="dropdown-section-header">Pending</div>
-              {pending.map(c => (
-                <div
-                  key={c.id}
-                  class={`dropdown-option${c.id === selectedId ? ' active' : ''}`}
-                  onClick={() => handleSelect(c)}
-                >
-                  <span class="change-option-desc">{changeLabel(c)}</span>
-                  <span class="change-option-meta">
-                    {formatFileCount(c.file_count)}
-                  </span>
-                </div>
-              ))}
-            </>
-          )}
-          {applied.length > 0 && (
-            <>
-              <div class="dropdown-section-header">Recently Applied</div>
-              {applied.map(c => (
-                <div
-                  key={c.id}
-                  class={`dropdown-option${c.id === selectedId ? ' active' : ''}`}
-                  onClick={() => handleSelect(c)}
-                >
-                  <span class="change-option-desc">{changeLabel(c)}</span>
-                  <span class="change-option-meta">
-                    {formatFileCount(c.file_count)}
-                    {c.resolved_at && ` \u00b7 ${formatTimeAgo(new Date(c.resolved_at))}`}
-                  </span>
-                </div>
-              ))}
-            </>
-          )}
-          {loadingMore && (
-            <div class="dropdown-panel-loading-more">Loading more...</div>
-          )}
-          {!loadingMore && has_more && (
-            <div class="dropdown-panel-loading-more" style="opacity: 0.4">
-              Scroll for more
+            <span class="dropdown-label-text">
+              {selected
+                ? changeLabel(selected)
+                : 'View change...'}
+            </span>
+            <DropdownChevron open={open} />
+          </button>
+          <Overlay
+            open={open}
+            onClose={() => setOpen(false)}
+            anchor={ref.current}
+            backdrop={false}
+            panelClass="surface-box dropdown-menu change-selector-menu"
+            panelRef={listRef}
+            panelProps={{ onScroll: handleScroll }}
+          >
+            <div
+              class={`dropdown-option${!selectedId ? ' active' : ''}`}
+              onClick={() => handleSelect(null)}
+            >
+              Current state (no diff)
             </div>
-          )}
-      </Overlay>
-    </div>
+            {data.pending.length > 0 && (
+              <>
+                <div class="dropdown-section-header">Pending</div>
+                {data.pending.map(c => (
+                  <ChangeOption key={c.id} change={c} active={c.id === selectedId} onPick={() => handleSelect(c)} />
+                ))}
+              </>
+            )}
+            {data.applied.length > 0 && (
+              <>
+                <div class="dropdown-section-header">Recently Applied</div>
+                {data.applied.map(c => (
+                  <ChangeOption key={c.id} change={c} active={c.id === selectedId} showResolved onPick={() => handleSelect(c)} />
+                ))}
+              </>
+            )}
+            {/* The next page's rows, drawn at the bottom of a list that already
+                scrolls, so nothing above them moves. */}
+            <LoadingFade showSkeleton={showLoadingMore} skeleton={<ListSkeletonOf count={2} row={() => <ChangeOption />} />}>
+              {null}
+            </LoadingFade>
+            {!loadingMore && data.has_more && (
+              <div class="dropdown-panel-loading-more" style="opacity: 0.4">
+                Scroll for more
+              </div>
+            )}
+          </Overlay>
+        </div>
+      )}
+    </LoadingFade>
   );
 }

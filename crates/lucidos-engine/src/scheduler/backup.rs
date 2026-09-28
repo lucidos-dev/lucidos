@@ -139,9 +139,29 @@ async fn persist_last_run(pool: &sqlx::PgPool, run: &crate::core::backup::Backup
     }
 }
 
+/// Load the workspace's backup key, creating one if absent, and tell the user
+/// when this call created it.
+///
+/// The key is excluded from every archive, so a user who never saw it cannot
+/// restore after losing the machine. Every path that mints a key the user is
+/// not looking at goes through here: the scheduled run, a manual backup and
+/// turning a schedule on. Only `POST /backup/key` calls `ensure_key` directly,
+/// because it hands the new key straight to the user's screen.
+pub(crate) async fn ensure_backup_key(
+    engine: &SharedEngine,
+    workspace: &std::path::Path,
+) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    let (key, is_new) = crate::core::backup::crypto::ensure_key(workspace)?;
+    if is_new {
+        log!("[Backup] No backup key found; generated a new encryption key");
+        notify_backup_key_generated(engine).await;
+    }
+    Ok(key)
+}
+
 /// Execute a scheduled backup. Called by the cron job.
 pub(super) async fn run_scheduled_backup(engine: SharedEngine, provider_id: String) {
-    use crate::core::backup::{self, crypto};
+    use crate::core::backup;
 
     let Some(guard) = BackupGuard::try_acquire(&engine) else {
         log!("[Backup] Skipping scheduled backup — another backup is already running");
@@ -165,26 +185,10 @@ pub(super) async fn run_scheduled_backup(engine: SharedEngine, provider_id: Stri
         }
     };
 
-    // Ensure an encryption key exists, generating + persisting one if absent —
-    // the exact same `crypto::ensure_key` the manual / activation path uses, so
-    // the two can never produce different key formats or locations. A scheduled
-    // backup must never silently skip just because the user hasn't triggered a
-    // manual backup first.
-    let key = match crypto::ensure_key(&workspace) {
-        Ok((k, is_new)) => {
-            if is_new {
-                log!(
-                    "[Backup] No backup key found; auto-generated a new encryption key for the scheduled backup"
-                );
-                // The user has never seen this key — it was created unattended by
-                // the cron, not by them clicking through Settings → Backup. Tell
-                // them to store it safely (it can't be recovered and is required
-                // to restore), deep-linking the tap to the page where they can
-                // view + copy it.
-                notify_backup_key_generated(&engine).await;
-            }
-            k
-        }
+    // A scheduled backup must never silently skip just because the user hasn't
+    // triggered a manual backup first.
+    let key = match ensure_backup_key(&engine, &workspace).await {
+        Ok(k) => k,
         Err(e) => {
             log!("[Backup] Failed to load or generate key: {}", e);
             notify_backup_failure(
@@ -287,16 +291,15 @@ fn backup_failure_tap(
 /// page path the failure bodies name (they all point at one page, and all three
 /// named the pre-restructure route until 2026-08-07).
 const BACKUP_KEY_GENERATED_MESSAGE: &str = concat!(
-    "Your scheduled backup created a new encryption key. ",
+    "Lucidos created a new encryption key for your backups. ",
     "Store it somewhere safe: you need it to restore, and it cannot be recovered. ",
     "Open Settings → System → Backup to view and copy it."
 );
 
-/// Notify the user that the scheduled backup auto-generated a fresh encryption
-/// key. Unlike the manual flow, the user never saw this key as it was created,
-/// so they must be told to store it safely: it cannot be recovered and is
-/// required to restore. The tap deep-links to the Backup page, where the key
-/// can be revealed and copied.
+/// Notify the user that a backup path generated a fresh encryption key they
+/// never saw, so they must store it: it cannot be recovered and is required to
+/// restore. The tap deep-links to the Backup page, where the key can be
+/// revealed and copied.
 async fn notify_backup_key_generated(engine: &SharedEngine) {
     emit_backup_notification(
         engine,
@@ -649,6 +652,38 @@ mod tests {
         for tap in taps {
             let view = tapped_view(tap).expect("a deep link");
             assert!(renderable.contains(&view.as_str()), "{view}");
+        }
+    }
+
+    /// A key the user never saw makes every backup unrestorable once the
+    /// machine is lost, because the key file is excluded from the archive.
+    /// Turning a schedule on and a manual backup both minted one silently, so
+    /// the first scheduled run found it existing and sent no notification.
+    /// Only `POST /backup/key`, which shows the key, may mint around the helper.
+    #[test]
+    fn every_unattended_key_mint_goes_through_the_notifying_helper() {
+        use crate::test_support::source_scan::production_sources;
+        let allowed = [
+            ("core/backup/crypto.rs", usize::MAX),
+            ("scheduler/backup.rs", 1),
+            ("api/backup.rs", 1),
+        ];
+        for (rel, text) in production_sources() {
+            let calls =
+                text.matches("crypto::ensure_key(").count() + text.matches(" ensure_key(").count();
+            if calls == 0 {
+                continue;
+            }
+            let limit = allowed
+                .iter()
+                .find(|(path, _)| *path == rel)
+                .map(|(_, n)| *n)
+                .unwrap_or(0);
+            assert!(
+                calls <= limit,
+                "{rel} mints a backup key {calls} time(s) without notifying the user; \
+                 call scheduler::ensure_backup_key instead"
+            );
         }
     }
 }

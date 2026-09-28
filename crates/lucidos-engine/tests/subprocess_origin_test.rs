@@ -63,14 +63,13 @@ fn subprocess_curl_into_different_thread_stamps_agent_api_actor() {
     ]);
 
     // The request body would carry mode=Human (curl's default) — but the
-    // mutating endpoint handlers call `user_actor_resolved` which goes
+    // mutating endpoint handlers call `user_actor` which goes
     // through `build_message_origin(.. ActorMode::Human, .. None caller)`
     // for this shape. The subprocess override fires inside it.
     let origin = build_message_origin(
         &h,
         ActorMode::Human,
         None, // no device-id explicit override
-        None, // no device label
         None, // no parent-thread
         None,
         None,
@@ -121,7 +120,6 @@ fn subprocess_token_beats_device_id_header() {
         &h,
         ActorMode::Human,
         Some("some-real-device-id"),
-        Some("Chrome on Mac".into()),
         None,
         None,
         None,
@@ -155,7 +153,7 @@ fn external_curl_without_token_identifies_nobody() {
     token_for(None);
     let h = headers(&[("user-agent", "curl/8.7.1")]);
 
-    let origin = build_message_origin(&h, ActorMode::Human, None, None, None, None, None, None);
+    let origin = build_message_origin(&h, ActorMode::Human, None, None, None, None, None);
 
     assert_eq!(
         origin, None,
@@ -192,7 +190,7 @@ fn a_subprocess_cannot_stamp_a_thread_its_token_was_not_minted_for() {
     ]);
 
     assert_eq!(subprocess_origin(&h), SubprocessOrigin::NotSubprocess);
-    let origin = build_message_origin(&h, ActorMode::Human, None, None, None, None, None, None);
+    let origin = build_message_origin(&h, ActorMode::Human, None, None, None, None, None);
     // The forger falls through to the external-caller path, which under ADR
     // 0169 identifies nobody. That is a stronger answer than the
     // `Api { mode: Human }` this once expected, and it settles the same

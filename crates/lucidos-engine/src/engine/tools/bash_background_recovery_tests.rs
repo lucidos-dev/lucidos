@@ -17,7 +17,6 @@ async fn seed_thread(bus: &EventBus, thread_id: Uuid) {
             text: "kick off the release".into(),
             user_image_hashes: vec![],
             device_id: None,
-            device: None,
             image_description: None,
             parent_thread_id: None,
             spawning_event_id: None,
@@ -165,8 +164,7 @@ async fn a_task_past_its_own_watchdog_deadline_is_settled_too() {
     teardown_test_db(&db_name).await;
 }
 
-/// Same exclusion as `lost_wait_reentries` and
-/// `settle_legacy_attached_event_waits`. Reviving a thread the user threw away
+/// Same exclusion as `lost_wait_reentries`. Reviving a thread the user threw away
 /// is the archive-curtain problem in another costume.
 #[tokio::test]
 async fn a_discarded_threads_task_is_left_alone() {

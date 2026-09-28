@@ -263,25 +263,6 @@ fn a_conflict_fingerprint_ignores_everything_but_its_own_port() {
     );
 }
 
-#[test]
-fn a_contended_port_has_no_single_server() {
-    let fx = Fixture::new("serving");
-    fx.bundle("0.36.0");
-    fx.instance("default", DEFAULT_GATEWAY_PORT);
-    fx.dev_gateway();
-
-    let inv = scan(&fx.roots(), &RunningProcess::default());
-
-    assert!(
-        inv.serving_port(DEFAULT_GATEWAY_PORT).is_none(),
-        "two claimants means the answer is the conflict, never a guess"
-    );
-    assert_eq!(
-        inv.serving_port(DEFAULT_DEV_GATEWAY_PORT).map(|i| i.kind),
-        Some(InstallKind::SourceCheckout)
-    );
-}
-
 // ── which one is running ────────────────────────────────────────────────────
 
 #[test]

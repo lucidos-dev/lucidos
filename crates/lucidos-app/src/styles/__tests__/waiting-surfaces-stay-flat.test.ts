@@ -42,18 +42,14 @@ describe('the waiting panel draws no card inside its own card', () => {
     expect(restingFills(waitingCss, 'event-wait-item')).toEqual([]);
   });
 
-  /** Flat is not the same as dead. A row that answers nothing on press reads as
-   *  text, and on touch there is no hover to fall back on. */
-  it('leaves a sub-thread row unfilled until a pointer or a finger is on it', () => {
+  /** A pointer's hover lights the row. A finger gets no fill, as nowhere else
+   *  does (touch-paints-no-press.test.ts). */
+  it('leaves a sub-thread row unfilled until a pointer is on it', () => {
     expect(restingFills(waitingCss, 'waiting-panel-child-link')).toEqual([]);
     const lit = rulesTargeting(waitingCss, 'waiting-panel-child-link')
       .filter((rule) => INTERACTING.test(rule.selector))
       .map((rule) => rule.selector);
-    expect(lit, 'the row lost its press feedback with its fill')
-      .toEqual(expect.arrayContaining([
-        expect.stringContaining(':hover'),
-        expect.stringContaining(':active'),
-      ]));
+    expect(lit).toEqual(['.waiting-panel-child-link:hover']);
   });
 });
 

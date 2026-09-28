@@ -87,16 +87,16 @@ describe('a long toast body cannot swallow the viewport', () => {
     ).toEqual([]);
   });
 
-  it('scrolls the overflow inside the message, leaving [Open] and the X reachable', () => {
-    // Everything after line 1. This is the box the cap makes scroll.
-    const sections = block(componentsCss, '.toast-sections {');
-    expect(decl(sections, 'overflow-y')).toBe('auto');
+  it('scrolls the overflow inside the message, leaving the actions and the X reachable', () => {
+    // The message under a title. This is the box the cap makes scroll.
+    const text = block(componentsCss, '.toast-text {');
+    expect(decl(text, 'overflow-y')).toBe('auto');
     // Without this the flex item takes its content height and overflows the
-    // capped column, so the cap would clip the sections instead of scrolling
-    // them: `min-height: 0` is what lets the box shrink to the room it has.
-    expect(decl(sections, 'min-height')).toBe('0');
-    // Line 1 scrolls too, for the message that is ALL line 1: a section-less
-    // body has nothing in the box above, so a long one would be clipped.
+    // capped column, so the cap would clip the text instead of scrolling it:
+    // `min-height: 0` is what lets the box shrink to the room it has.
+    expect(decl(text, 'min-height')).toBe('0');
+    // The heading scrolls too, for an untitled message: it is all heading, with
+    // nothing in a box below, so a long one would be clipped.
     const heading = block(componentsCss, '.toast-heading {');
     expect(decl(heading, 'overflow-y')).toBe('auto');
     // The column must be able to shrink below its content inside .toast, or
@@ -135,12 +135,12 @@ describe('a long toast body cannot swallow the viewport', () => {
    * The heading ends on a line boundary, never through the middle of one.
    *
    * The reported 503 card showed its title, then the TOP HALVES of the glyphs
-   * on the next line, then the sections. Flex had squeezed the heading to make
-   * room for `.toast-sections`. It has no reason to stop shrinking on a whole
-   * line, so the line carrying the actual error was sheared away.
+   * on the next line, then the rest. Flex had squeezed the heading to make room
+   * for the box below it. It has no reason to stop shrinking on a whole line,
+   * so the line carrying the actual error was sheared away.
    *
    * Two declarations answer it, and the assertion is that they agree. The
-   * heading hands the squeeze down to the sections box, and its own ceiling is
+   * heading hands the squeeze down to the text box, and its own ceiling is
    * a whole multiple of the line height it declares. A literal `1.4` restated
    * in the `max-height` would keep passing while the line height moved out from
    * under it. That is the one way the cap stops dividing.
@@ -163,10 +163,10 @@ describe('a long toast body cannot swallow the viewport', () => {
     // And the var it multiplies is really declared on the card above it.
     expect(decl(block(componentsCss, '.toast {'), '--toast-line-height')).not.toBeNull();
 
-    // The sections box is what absorbs the squeeze the heading refuses.
-    const sections = block(componentsCss, '.toast-sections {');
-    expect(decl(sections, 'flex')).toBe('1 1 auto');
-    expect(decl(sections, 'min-height')).toBe('0');
+    // The text box is what absorbs the squeeze the heading refuses.
+    const text = block(componentsCss, '.toast-text {');
+    expect(decl(text, 'flex')).toBe('1 1 auto');
+    expect(decl(text, 'min-height')).toBe('0');
   });
 
   /**
@@ -179,7 +179,7 @@ describe('a long toast body cannot swallow the viewport', () => {
    */
   it('runs the scroll box to the toast content edge', () => {
     for (const sheet of [componentsCss, mobileCss]) {
-      const offenders = rulesTargeting(sheet, 'toast-sections')
+      const offenders = rulesTargeting(sheet, 'toast-text')
         .filter((rule) =>
           ['padding-right', 'margin-right', 'padding', 'margin', 'border-right', 'width']
             .some((p) => rule.props.has(p)),
@@ -210,7 +210,7 @@ describe('a long toast body cannot swallow the viewport', () => {
   it('keeps the spinner out of every scroll box', () => {
     const icon = block(componentsCss, '.toast-icon {');
     expect(decl(icon, 'position')).toBe('absolute');
-    // Over the gutter .toast-body pads out for it, so a clickable toast has no
+    // Over the gutter .toast-heading pads out for it, so a clickable toast has no
     // dead spot where the icon covers the message.
     expect(decl(icon, 'pointer-events')).toBe('none');
 

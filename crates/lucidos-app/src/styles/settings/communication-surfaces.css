@@ -22,7 +22,7 @@
 .surfaces-banner-preview {
     margin-top: var(--space-sm);
     border: 1px solid var(--border-color);
-    border-radius: 0.375rem;
+    border-radius: calc(var(--radius-surface) * 0.5);
     overflow: clip;
 }
 
@@ -30,4 +30,20 @@
    nothing below it here. */
 .surfaces-banner-preview > * {
     border-bottom: none;
+}
+
+/* The popover samples, side by side at a popover's own width. Each is a
+   `.surface`, so the box is the shipped one. */
+.surfaces-popover-previews {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-start;
+    gap: var(--space-md);
+    margin-top: var(--space-sm);
+}
+
+.surfaces-popover-preview {
+    flex: 1 1 18rem;
+    max-width: 24rem;
+    overflow: hidden;
 }

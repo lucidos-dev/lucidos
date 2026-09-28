@@ -2,6 +2,7 @@ import { showToast } from '../../store/store';
 import { isMobile, isTouchDevice } from '../../utils/viewport';
 import { TAP_MOVE_THRESHOLD_PX, takePressOutcome, type PressOutcome } from '../../utils/tapGesture';
 import { postClientLog } from '../../utils/clientLog';
+import { LONG_PRESS_DELAY_MS } from '../../hooks/useLongPress';
 import { relayoutShell, keyboardCloseState, type ClosePath } from '../layout/keyboardCloseRelayout';
 import { readViewport, type ProbeViewport } from './probeViewport';
 
@@ -97,6 +98,27 @@ export function pressWasAlone(f: PressFingers): boolean {
   return f.fingers <= 1 && f.fingersAtLift === 0;
 }
 
+/** Was the finger down no longer than a tap?
+ *
+ *  iOS synthesises no click for a long hold, so a held press also produces a
+ *  `touchstart`, a `touchend` and nothing else. That cost a false alarm on
+ *  Apply, which sits where a right thumb rests while holding the phone. A
+ *  resting thumb was called a dead tap the user never made.
+ *
+ *  The line is the app's own long press, so a hold that opens a row menu
+ *  elsewhere is never called a tap here. */
+export function pressWasATap(heldMs: number): boolean {
+  return heldMs <= LONG_PRESS_DELAY_MS;
+}
+
+/** What a lifted press nobody claimed is logged as. `dead` is the fault; the
+ *  other two are presses that owed no click. */
+export function unclaimedVerdict(f: { alone: boolean; heldMs: number }): 'dead' | 'multi-touch' | 'long-hold' {
+  if (!f.alone) return 'multi-touch';
+  if (!pressWasATap(f.heldMs)) return 'long-hold';
+  return 'dead';
+}
+
 export interface DeadPressFacts {
   face: string;
   /** How far the finger travelled, in screen px. */
@@ -110,6 +132,8 @@ export interface DeadPressFacts {
   outcome: PressOutcome | null;
   /** See `pressWasAlone`. */
   alone: boolean;
+  /** Touchdown to lift, in ms. See `pressWasATap`. */
+  heldMs: number;
   viewport: ProbeViewport;
 }
 
@@ -159,12 +183,13 @@ export function landingReport(f: LandingFacts): string | null {
  *  reach the log, which is where a run of swallowed Sends with no popover open
  *  would name its own cause.
  *
- *  Null too for a press that shared the glass. See `pressWasAlone`. */
+ *  Null too for a press that shared the glass, or one held past a tap. See
+ *  `pressWasAlone` and `pressWasATap`. */
 export function deadPressReport(f: DeadPressFacts): string | null {
   if (f.outcome !== null) return null;
-  if (!f.alone) return null;
+  if (unclaimedVerdict(f) !== 'dead') return null;
   if (f.movedPx > TAP_MOVE_THRESHOLD_PX) return null;
-  const tail = ` ${viewportSuffix(f.viewport)}`;
+  const tail = ` Held ${Math.round(f.heldMs)}ms. ${viewportSuffix(f.viewport)}`;
   if (!f.connectedAtLift) {
     return `${f.face} did not register: the button was replaced in the page `
       + `while your finger was on it (${f.rowMutations} row changes).` + tail;
@@ -182,17 +207,20 @@ export function deadPressReport(f: DeadPressFacts): string | null {
  *  Silent when the finger moved, because a cancelled scroll is the platform
  *  working. Only a stationary press that the system still took is the fault
  *  being chased. Silent too when the press shared the glass, on the same
- *  grounds: a pinch is a gesture the system is entitled to take. */
+ *  grounds: a pinch is a gesture the system is entitled to take. So is a long
+ *  hold, which is why a press held past a tap is silent as well. */
 export function canceledPressReport(f: {
   face: string;
   movedPx: number;
   alone: boolean;
+  heldMs: number;
   viewport: ProbeViewport;
 }): string | null {
-  if (!f.alone) return null;
+  if (unclaimedVerdict(f) !== 'dead') return null;
   if (f.movedPx > TAP_MOVE_THRESHOLD_PX) return null;
   return `${f.face} did not register: the system cancelled the touch after `
-    + `${Math.round(f.movedPx)}px. ${viewportSuffix(f.viewport)}`;
+    + `${Math.round(f.movedPx)}px, held ${Math.round(f.heldMs)}ms. `
+    + viewportSuffix(f.viewport);
 }
 
 /** The press arrived and the lift never did. WebKit owes a `touchend` or a
@@ -238,12 +266,11 @@ const TOUCH_BEHIND_CLICK_MS = 1500;
  *  stopped: a gesture that began and never finished, and a click arriving with
  *  no gesture behind it at all.
  *
- *  `multi-touch` is a press that shared the glass, which is `dead` without the
- *  fault. */
+ *  `multi-touch` is a press that shared the glass, and `long-hold` one held past
+ *  a tap. Both are `dead` without the fault. */
 type PressVerdict =
   | PressOutcome
-  | 'dead'
-  | 'multi-touch'
+  | ReturnType<typeof unclaimedVerdict>
   | 'clicked'
   | 'canceled'
   | 'missed'
@@ -465,6 +492,9 @@ function recordPress({ at, ...facts }: {
    *  behind it carries the first alone. */
   fingers?: number;
   fingersAtLift?: number;
+  /** Touchdown to lift or cancel. Only a press that ended carries it. See
+   *  `pressWasATap`. */
+  heldMs?: number;
   /** The press's own context, for a line written after the press. Absent means
    *  NOW is the press, which is true of every line written inside a handler. */
   at?: PressContext;
@@ -712,7 +742,8 @@ function liveCommitFace(): HTMLButtonElement | null {
  *  are outside the census. `underFingerReason` reads a press on either as
  *  `other-button`, the bucket it puts an icon in. Widening to them would buy a
  *  name in the log and nothing else. The wedge these checks hunt covers the
- *  whole row, so a pill still reports it. */
+ *  whole row, so a pill still logs it. A thread action never warns; see
+ *  `warnUnlessThreadAction`. */
 const ROW_SELECTOR = '.prompt-actions-row';
 const FACE_SELECTOR = '.action-btn';
 
@@ -1214,10 +1245,33 @@ function touchOf(e: TouchEvent, id: number): Touch | null {
   return null;
 }
 
+/** What `WaitingBanner` stamps on the thread's own actions in the row: Apply,
+ *  Discard, Archive, and the split button holding them. */
+const THREAD_ACTION_SELECTOR = '[data-thread-action]';
+
+function isThreadAction(face: Element): boolean {
+  return face.closest(THREAD_ACTION_SELECTOR) !== null;
+}
+
+/** Warn about a dead press, unless it was on a thread action.
+ *
+ *  The fault being chased kills the composer's own controls: Send, Submit
+ *  answer, Cancel and Stop. No thread action has been reported dead, and a
+ *  warning about Apply was a press the user never made. Every face still writes
+ *  its line, so a wedge across the whole row stays readable in the log.
+ *  Returns whether it warned. */
+function warnUnlessThreadAction(report: string | null, threadAction: boolean): boolean {
+  if (!report || threadAction) return false;
+  showToast(report, 'warning');
+  return true;
+}
+
 /** The press between `touchstart` and the lift. */
 interface ArmedPress {
   el: HTMLButtonElement;
   face: string;
+  /** See `isThreadAction`. Read at touchdown, like every other reading here. */
+  threadAction: boolean;
   /** When the press began. The outcome window is measured from here, so a claim
    *  left over from an EARLIER press can never describe this one. */
   armedAt: number;
@@ -1257,6 +1311,8 @@ interface ArmedPress {
 interface SettlingPress {
   el: HTMLButtonElement;
   face: string;
+  /** See `ArmedPress.threadAction`. */
+  threadAction: boolean;
   armedAt: number;
   movedPx: number;
   connectedAtLift: boolean;
@@ -1266,6 +1322,8 @@ interface SettlingPress {
    *  second is what the lift found still down. */
   fingers: number;
   fingersAtLift: number;
+  /** Touchdown to lift. See `pressWasATap`. */
+  heldMs: number;
   faceRect: ProbeRect | null;
   rowRect: ProbeRect | null;
   at: PressContext;
@@ -1337,6 +1395,7 @@ export function installDeadPressProbe(): void {
         verdict: 'clicked',
         movedPx: press.movedPx,
         ...fingers,
+        heldMs: press.heldMs,
         rowRect: press.rowRect,
         faceRect: press.faceRect,
         screenOff: press.screenOff,
@@ -1353,6 +1412,7 @@ export function installDeadPressProbe(): void {
       rowMutations: press.rowMutations,
       outcome,
       alone,
+      heldMs: press.heldMs,
       // The PRESS's viewport, the same one its line carries. A toast quoting
       // the ruling's instead reports a layout the press never saw, which is
       // the split that made the served lines unreadable.
@@ -1360,20 +1420,18 @@ export function installDeadPressProbe(): void {
     });
     recordPress({
       face: press.face,
-      // A shared glass is `dead` without the fault behind it: WebKit owes no
-      // click to a multi-finger gesture, so nothing was lost.
-      verdict: outcome ?? (alone ? 'dead' : 'multi-touch'),
+      verdict: outcome ?? unclaimedVerdict({ alone, heldMs: press.heldMs }),
       movedPx: press.movedPx,
       connectedAtLift: press.connectedAtLift,
       rowMutations: press.rowMutations,
       ...fingers,
-      toasted: report !== null,
+      heldMs: press.heldMs,
+      toasted: warnUnlessThreadAction(report, press.threadAction),
       rowRect: press.rowRect,
       faceRect: press.faceRect,
       screenOff: press.screenOff,
       at: press.at,
     });
-    if (report) showToast(report, 'warning');
   };
 
   /** Rule a press that reached the row and no face.
@@ -1422,13 +1480,12 @@ export function installDeadPressProbe(): void {
       connectedAtLift: press.el.isConnected,
       rowMutations: press.mutations,
       fingers: press.fingers,
-      toasted: toast && report !== null,
+      toasted: warnUnlessThreadAction(toast ? report : null, press.threadAction),
       rowRect: press.rowRect,
       faceRect: press.faceRect,
       screenOff: press.screenOff,
       at: press.at,
     });
-    if (toast && report) showToast(report, 'warning');
   };
 
   // Capture, so an inert or covered target still reports.
@@ -1557,6 +1614,7 @@ export function installDeadPressProbe(): void {
         missedBy: missedByOf(nearest),
         screenOff: screenOffset(touch),
         fingers: e.touches.length,
+        toasted: warnUnlessThreadAction(report, !!aimedAt && isThreadAction(aimedAt.el)),
         at: pressAt,
       });
       // Rule it at the lift, where the travel is known. The user recovers this
@@ -1573,12 +1631,12 @@ export function installDeadPressProbe(): void {
         fingers: e.touches.length,
         fingersAtLift: 0,
       };
-      if (report) showToast(report, 'warning');
       return;
     }
     const press: ArmedPress = {
       el: pressed,
       face: nameOf(pressed),
+      threadAction: isThreadAction(pressed),
       armedAt: Date.now(),
       startX: touch.screenX,
       startY: touch.screenY,
@@ -1669,6 +1727,7 @@ export function installDeadPressProbe(): void {
     const lifted: SettlingPress = {
       el: press.el,
       face: press.face,
+      threadAction: press.threadAction,
       armedAt: press.armedAt,
       movedPx: press.movedPx,
       connectedAtLift: press.el.isConnected,
@@ -1676,6 +1735,7 @@ export function installDeadPressProbe(): void {
       screenOff: press.screenOff,
       fingers: press.fingers,
       fingersAtLift: e.touches.length,
+      heldMs: Date.now() - press.armedAt,
       faceRect: press.faceRect,
       rowRect: press.rowRect,
       at: press.at,
@@ -1709,10 +1769,12 @@ export function installDeadPressProbe(): void {
     armed = null;
     press.observer?.disconnect();
     if (press.liftDeadline !== null) { clearTimeout(press.liftDeadline); press.liftDeadline = null; }
+    const heldMs = Date.now() - press.armedAt;
     const report = canceledPressReport({
       face: press.face,
       movedPx: press.movedPx,
       alone: pressWasAlone({ fingers: press.fingers, fingersAtLift: e.touches.length }),
+      heldMs,
       viewport: press.at.viewport,
     });
     recordPress({
@@ -1721,13 +1783,13 @@ export function installDeadPressProbe(): void {
       movedPx: press.movedPx,
       fingers: press.fingers,
       fingersAtLift: e.touches.length,
-      toasted: report !== null,
+      heldMs,
+      toasted: warnUnlessThreadAction(report, press.threadAction),
       rowRect: press.rowRect,
       faceRect: press.faceRect,
       screenOff: press.screenOff,
       at: press.at,
     });
-    if (report) showToast(report, 'warning');
   }, { capture: true, passive: true });
 
   // Only the PRESSED face settles its own press. Settling on any click let one

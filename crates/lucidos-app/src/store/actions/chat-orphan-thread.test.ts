@@ -127,7 +127,6 @@ function makeActiveThread(id: string, overrides: Partial<ThreadState['meta']> = 
       codingAgentProposed: false,
       codingAgentRequiresRestart: false,
       codingAgentIsExternalRepo: false,
-      codingAgentApplying: false,
       codingAgentHasDiff: false,
       lastRevivedAt: '',
       state: 'active',

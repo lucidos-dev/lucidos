@@ -44,4 +44,13 @@ describe('settings row alignment', () => {
     const flex = rule('.settings-row > .settings-row-label').props.get('flex');
     expect(flex?.split(/\s+/)[2]).toBe('auto');
   });
+
+  // The label's padding-top lines it up with a dropdown or segmented control.
+  // A .settings-option button is shorter, so pinned to the top it sat above
+  // the label's text ("Install font", the UI scale readout).
+  it('centres a lone option button on its label', () => {
+    const row = '.settings-row:has(> .settings-row-label + .settings-option)';
+    expect(rule(row).props.get('align-items')).toBe('center');
+    expect(rule(`${row} > .settings-row-label`).props.get('padding-top')).toBe('0');
+  });
 });

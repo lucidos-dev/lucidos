@@ -12,12 +12,15 @@ import { useDelayedFlag } from '../../hooks/useDelayedLoading';
 import { ApiError, fetchHandshakeScripts, fetchKnowhowEntries, knowhowPreviewPath, saveDataFile, type KnowhowEntry } from '../../api/client';
 import { handshakeWarningFor, type HandshakeScriptState } from './handshakeApproval';
 import { useVersionedRefresh } from '../../hooks/useVersionedRefresh';
-import { openFilePreview, refreshFilePreview } from '../../store/actions/artifacts';
+import { openFilePreview, refreshFilePreview, registerPreviewTextBody, reportPreviewTextSettled } from '../../store/actions/artifacts';
+import { usePanelRefresh } from '../../hooks/usePanelRefresh';
 import { RENDERABLE_EXTS } from './previewExts';
 import { dataPreviewBody, previewExt, type DataPreviewBody } from './previewBody';
 import { errorDetail } from '../../utils/errorDetail';
 import { LoadableError } from '../shared/LoadableError';
 import { LineNumberedCode, fileRows } from './LineNumberedCode';
+import { FileSourceSkeleton, ProseSkeleton } from './previewSkeletons';
+import { LoadingFade } from '../shared/LoadingFade';
 import { bridgePreviewIframeShortcuts } from './previewIframeShortcuts';
 import { withPreviewRevision } from './previewRevision';
 import {
@@ -68,16 +71,23 @@ interface Props {
   /** Skip mounting in the inactive dual-rendered layout — otherwise both
    *  SplitLayout and MobileSwipeContainer copies fetch and decode the file. */
   layout: 'desktop' | 'mobile';
+  /** Rendered in the app-facing preview modal rather than the content pane.
+   *  The modal has no header Refresh, so it takes no part in the pane's. */
+  modal?: boolean;
 }
 
-export function FilePreviewInline({ path, layout }: Props) {
+export function FilePreviewInline({ path, layout, modal = false }: Props) {
   const ext = previewExt(path);
-  const url = previewUrl(lucidos.data.url(path), path, filePreviewRevision.value);
+  const stamp = filePreviewRevision.value;
+  const url = previewUrl(lucidos.data.url(path), path, stamp);
+  const revision = stamp && stamp.path === path ? stamp.rev : 0;
   const body = dataPreviewBody(path, {
     sourceToggle: filePreviewSource.value,
     editing: filePreviewEditing.value,
   });
   const isActiveLayout = layout === (viewportIsMobile.value ? 'mobile' : 'desktop');
+  // Nothing to refresh under the editor: a re-read would fight the draft.
+  usePanelRefresh(`file "${path}"`, isActiveLayout && !modal && body !== 'editor' ? refreshFilePreview : null);
 
   if (!isActiveLayout) return null;
 
@@ -90,7 +100,9 @@ export function FilePreviewInline({ path, layout }: Props) {
         {body === 'pdf' && <iframe src={url} style="width:100%;height:100%;border:none;" onLoad={(e) => bridgePreviewIframeShortcuts(e.currentTarget)} />}
         {body === 'video' && <video src={url} controls style="max-width:100%;max-height:100%;" />}
         {body === 'audio' && <audio src={url} controls style="width:100%;" />}
-        {isTextBody(body) && <TextContent body={body} url={url} path={path} />}
+        {/* Keyed by file, so the text kept on screen during a re-read is
+            always this file's and never the one opened before it. */}
+        {isTextBody(body) && <TextContent key={path} body={body} url={url} path={path} revision={revision} servesPanel={!modal} />}
         {body === 'unsupported' && (
           <div class="empty-state">
             <p>Preview not available for <strong>.{ext}</strong> files</p>
@@ -268,19 +280,16 @@ function FileEditor({ path, url }: { path: string; url: string }) {
   if (loadable.status === 'failed') {
     return <LoadableError noun="file" error={loadable.error} />;
   }
-  if (loadable.status !== 'loaded' || draft === null) {
-    return showLoading ? <div class="loading-spinner" /> : null;
-  }
-
+  const ready = loadable.status === 'loaded' && draft !== null;
   const dirty = draft !== baseline;
 
   const save = async () => {
     setSaving(true);
     try {
-      await saveDataFile(path, draft);
+      await saveDataFile(path, draft ?? '');
       showToast('File saved', 'success');
       setBaseline(draft);
-      refreshFilePreview(); // bump revision so the read view re-fetches on Close
+      void refreshFilePreview(); // bump revision so the read view re-fetches on Close
     } catch (e) {
       showToast(`Failed to save: ${errorDetail(e)}`, 'error');
     } finally {
@@ -291,30 +300,34 @@ function FileEditor({ path, url }: { path: string; url: string }) {
   const leaveEditMode = () => { filePreviewEditing.value = false; };
 
   return (
-    <div class="file-editor">
-      <div class="file-editor-toolbar">
-        <EditorToolbar
-          dirty={dirty}
-          saving={saving}
-          showSaving={showSaving}
-          onClose={leaveEditMode}
-          onCancel={leaveEditMode}
-          onSave={save}
-        />
-      </div>
-      {/* A save never disables the textarea. `save` writes the draft it
-          captured and makes that content the baseline. So a keystroke landing
-          mid-save leaves the draft ahead of it, and the toolbar correctly says
-          there are unsaved changes. Disabling only dimmed the file's text for
-          an instant. A delayed disable would be worse: it would take the field
-          from someone typing in it. */}
-      <textarea
-        class="file-editor-textarea"
-        value={draft}
-        spellcheck={false}
-        onInput={(e) => setDraft((e.target as HTMLTextAreaElement).value)}
-      />
-    </div>
+    <LoadingFade class="file-preview-fade" showSkeleton={showLoading} skeleton={<FileSourceSkeleton wideLines="wrap" />}>
+      {ready && (
+        <div class="file-editor">
+          <div class="file-editor-toolbar">
+            <EditorToolbar
+              dirty={dirty}
+              saving={saving}
+              showSaving={showSaving}
+              onClose={leaveEditMode}
+              onCancel={leaveEditMode}
+              onSave={save}
+            />
+          </div>
+          {/* A save never disables the textarea. `save` writes the draft it
+              captured and makes that content the baseline. So a keystroke landing
+              mid-save leaves the draft ahead of it, and the toolbar correctly says
+              there are unsaved changes. Disabling only dimmed the file's text for
+              an instant. A delayed disable would be worse: it would take the field
+              from someone typing in it. */}
+          <textarea
+            class="file-editor-textarea"
+            value={draft ?? ''}
+            spellcheck={false}
+            onInput={(e) => setDraft((e.target as HTMLTextAreaElement).value)}
+          />
+        </div>
+      )}
+    </LoadingFade>
   );
 }
 
@@ -351,13 +364,19 @@ export function sourceLinesFor(content: string, ext: string, sourceMode: boolean
   return highlightFileLines(content, ext);
 }
 
-function TextContent({ body, url, path }: { body: TextPreviewBody; url: string; path: string }) {
+function TextContent({ body, url, path, revision, servesPanel }: {
+  body: TextPreviewBody; url: string; path: string; revision: number; servesPanel: boolean;
+}) {
   const ext = previewExt(path);
   // The Source toggle's language mapping applies exactly when the source view
   // is showing a type that HAS a rendered form. A `.rs` file is source either
   // way and takes its own grammar (see `sourceLinesFor`).
   const sourceMode = body === 'source' && RENDERABLE_EXTS.includes(ext);
-  const { loadable, showLoading } = useLoadableFetch<string>(() => fetchText(url), [url]);
+  useEffect(() => (servesPanel ? registerPreviewTextBody() : undefined), [servesPanel]);
+  const { loadable, showLoading } = useLoadableFetch<string>(() => fetchText(url), [url], {
+    keepLoadedWhileRefetching: true,
+    onSettled: servesPanel ? () => reportPreviewTextSettled(revision) : undefined,
+  });
   const loaded = loadable.status === 'loaded' ? loadable.data : null;
   const sourceRows = useMemo(
     () => fileRows(loaded === null ? [] : sourceLinesFor(loaded, ext, sourceMode)),
@@ -373,62 +392,74 @@ function TextContent({ body, url, path }: { body: TextPreviewBody; url: string; 
       </>
     );
   }
-  if (loadable.status !== 'loaded') return showLoading ? <div class="loading-spinner" /> : null;
-  const content = loadable.data;
+  const wideLines = filePreviewWrap.value ? 'wrap' : 'pan';
+  // The body type is known before the read lands, so the placeholder takes
+  // the shape of what will replace it.
+  return (
+    <LoadingFade
+      class="file-preview-fade"
+      showSkeleton={showLoading}
+      skeleton={body === 'source' ? <FileSourceSkeleton wideLines={wideLines} /> : <ProseSkeleton />}
+    >
+      {loadable.status === 'loaded' && loadedBody(loadable.data)}
+    </LoadingFade>
+  );
 
-  // An `about:srcdoc` document resolves relative and fragment hrefs against the
-  // HOST page's URL, so an artifact's own `#section` link or `img/chart.png` ref
-  // would reach for the app shell. `withPreviewBase` re-anchors resolution at the
-  // artifact's folder; `bridgePreviewIframeLinks` routes the clicks the browser
-  // would otherwise use to navigate this iframe. See previewIframeLinks.ts.
-  //
-  // `withPreviewScale` is the other half of that isolation: the document
-  // inherits no root font-size either, so it is stamped with the UI scale.
-  // Reading `currentUiScale()` here is what re-stamps it when the user moves the
-  // slider, since the read subscribes this component to the preference.
-  if (body === 'html') {
-    return (
-      <iframe
-        srcDoc={withPreviewBase(withPreviewScale(content, currentUiScale()), previewBaseHref(url))}
-        // `#fff` is functional rather than thematic, the token rule's second
-        // carve-out. An artifact is authored against a white page and usually
-        // sets no background. A themed canvas would put its black text on the
-        // dark surface and leave the document unreadable.
-        style="width:100%;height:100%;border:none;background:#fff;"
-        onLoad={(e) => {
-          bridgePreviewIframeShortcuts(e.currentTarget);
-          bridgePreviewIframeLinks(e.currentTarget, {
+  function loadedBody(content: string) {
+    // An `about:srcdoc` document resolves relative and fragment hrefs against the
+    // HOST page's URL. So an artifact's own `#section` link or `img/chart.png` ref
+    // would reach for the app shell. `withPreviewBase` re-anchors resolution at the
+    // artifact's folder; `bridgePreviewIframeLinks` routes the clicks the browser
+    // would otherwise use to navigate this iframe. See previewIframeLinks.ts.
+    //
+    // `withPreviewScale` is the other half of that isolation: the document
+    // inherits no root font-size either, so it is stamped with the UI scale.
+    // Reading `currentUiScale()` here is what re-stamps it when the user moves the
+    // slider, since the read subscribes this component to the preference.
+    if (body === 'html') {
+      return (
+        <iframe
+          srcDoc={withPreviewBase(withPreviewScale(content, currentUiScale()), previewBaseHref(url))}
+          // `#fff` is functional rather than thematic, the token rule's second
+          // carve-out. An artifact is authored against a white page and usually
+          // sets no background. A themed canvas would put its black text on the
+          // dark surface and leave the document unreadable.
+          style="width:100%;height:100%;border:none;background:#fff;"
+          onLoad={(e) => {
+            bridgePreviewIframeShortcuts(e.currentTarget);
+            bridgePreviewIframeLinks(e.currentTarget, {
+              artifactPath: path,
+              declaresOwnBase: documentDeclaresBase(content),
+            });
+          }}
+        />
+      );
+    }
+    // A markdown artifact renders into the HOST document, so its links resolve
+    // against the engine-stamped `<base href="/<slug>/">`: a plain sibling link
+    // like `notes.md` becomes `/<slug>/notes.md`, the SPA fallback serves the
+    // shell, and the whole workspace reloads. Same routing as the HTML preview,
+    // minus the fragment arm (see `PreviewLinkHost.claimFragments`).
+    if (body === 'markdown') {
+      return (
+        <div
+          class="response-content markdown-content"
+          onClick={(e) => handlePreviewLinkClick(e as unknown as MouseEvent, {
+            doc: document,
             artifactPath: path,
-            declaresOwnBase: documentDeclaresBase(content),
-          });
-        }}
-      />
-    );
+            claimFragments: false,
+          })}
+          dangerouslySetInnerHTML={{ __html: renderMarkdown(content) }}
+        />
+      );
+    }
+    if (body === 'csv') return <div dangerouslySetInnerHTML={{ __html: renderCsvTable(content) }} />;
+    if (body === 'slides') return <SlidesPreview content={content} />;
+    // Line-numbered source: code, JSON, plain text, any unknown-but-textual file,
+    // and a rich type the Source toggle asked to see raw. The same view the repo
+    // preview shows, and what a navigate carrying a line needs on screen.
+    return <LineNumberedCode rows={sourceRows} wideLines={wideLines} />;
   }
-  // A markdown artifact renders into the HOST document, so its links resolve
-  // against the engine-stamped `<base href="/<slug>/">`: a plain sibling link
-  // like `notes.md` becomes `/<slug>/notes.md`, the SPA fallback serves the
-  // shell, and the whole workspace reloads. Same routing as the HTML preview,
-  // minus the fragment arm (see `PreviewLinkHost.claimFragments`).
-  if (body === 'markdown') {
-    return (
-      <div
-        class="response-content markdown-content"
-        onClick={(e) => handlePreviewLinkClick(e as unknown as MouseEvent, {
-          doc: document,
-          artifactPath: path,
-          claimFragments: false,
-        })}
-        dangerouslySetInnerHTML={{ __html: renderMarkdown(content) }}
-      />
-    );
-  }
-  if (body === 'csv') return <div dangerouslySetInnerHTML={{ __html: renderCsvTable(content) }} />;
-  if (body === 'slides') return <SlidesPreview content={content} />;
-  // Line-numbered source: code, JSON, plain text, any unknown-but-textual file,
-  // and a rich type the Source toggle asked to see raw. The same view the repo
-  // preview shows, and what a navigate carrying a line needs on screen.
-  return <LineNumberedCode rows={sourceRows} wideLines={filePreviewWrap.value ? 'wrap' : 'pan'} />;
 }
 
 /** `knowhow/lucidos-ops/foo.md` → `lucidos-ops/foo`; same for `system-knowhow/`.

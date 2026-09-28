@@ -23,6 +23,18 @@ mod release_notices_test;
 #[path = "api_support/fonts_test.rs"]
 mod fonts_test;
 
+#[path = "api_support/themes_test.rs"]
+mod themes_test;
+
+#[path = "api_support/agent_file_tools_test.rs"]
+mod agent_file_tools_test;
+
+#[path = "api_support/workspace_fonts_test.rs"]
+mod workspace_fonts_test;
+
+#[path = "api_support/frame_file_cors_test.rs"]
+mod frame_file_cors_test;
+
 #[path = "api_support/workspace_label_test.rs"]
 mod workspace_label_test;
 
@@ -52,6 +64,9 @@ mod changes_test;
 
 #[path = "api_support/standing_apply_test.rs"]
 mod standing_apply_test;
+
+#[path = "api_support/apply_estimate_test.rs"]
+mod apply_estimate_test;
 
 #[path = "api_support/app_coding_agent_test.rs"]
 mod app_coding_agent_test;
@@ -196,6 +211,9 @@ mod follow_up_test;
 
 #[path = "api_support/detach_test.rs"]
 mod detach_test;
+
+#[path = "api_support/archive_as_caller_test.rs"]
+mod archive_as_caller_test;
 
 #[path = "api_support/coding_agent_binaries_test.rs"]
 mod coding_agent_binaries_test;

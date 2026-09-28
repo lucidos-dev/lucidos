@@ -887,6 +887,17 @@ async fn a_parents_commits_after_an_apply_come_back_as_a_new_change() {
         marker_state(&client, "hardened-state", repo_root, &branch).await,
         "MISSING"
     );
+    // `lucidos hardened sha` prints this field for `/harden`'s merge-only mode.
+    let hardened: serde_json::Value = client
+        .get(format!("{}/api/v1/internal/hardened-state", base_url()))
+        .query(&[("repo_root", repo_root), ("branch_name", branch.as_str())])
+        .send()
+        .await
+        .expect("hardened-state GET failed")
+        .json()
+        .await
+        .expect("hardened-state non-JSON");
+    assert_eq!(hardened["head_sha"].as_str(), Some(head.trim()));
 
     // The running child does not withhold the parent's Apply.
     apply_ok(&client, first).await;
@@ -997,12 +1008,8 @@ async fn a_parents_commits_after_an_apply_come_back_as_a_new_change() {
 /// An in-workspace CC thread with a pending change is NOT archivable — the
 /// archive endpoint returns 409 `parent_has_pending_changes` and emits
 /// nothing. The user must Apply or Discard the change first. Without this
-/// gate, `ThreadArchived` projects through `CLEAR_CODING_AGENT_FLAGS` and
-/// silently clears `coding_agent_proposed`, leaving the change row dangling
-/// in the `changes` table while the thread sits in Archive — the original
-/// cca058432 "pending changes survive into Review" contract never held
-/// because the projection always cleared the column the routing depended on.
-/// Aligns with `resolve_actions`, which already returns [Discard, Apply]
+/// gate, the change row is left pending in the `changes` table while the
+/// thread sits in Archive. Aligns with `resolve_actions`, which already returns [Discard, Apply]
 /// (never Archive) in this state.
 #[tokio::test]
 async fn archive_with_pending_change_is_rejected_409() {

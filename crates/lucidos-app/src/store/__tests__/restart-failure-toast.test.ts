@@ -45,13 +45,13 @@ describe('initiateEngineRestart surfaces spawn failures', () => {
   });
 
   it('dismisses the "New version available" switch toast so the dialog is the single surface', async () => {
-    // Regression: clicking "Switch to new version" stacked the progress surface
+    // Regression: clicking "Switch" stacked the progress surface
     // on top of the still-visible "New version available." toast. The switch
     // must replace that surface, not add to it.
     engineVersionReady.value = true; // a genuine new-version switch is available
     showToast('New version available.', 'info', {
       key: NEW_VERSION_TOAST_KEY,
-      action: { label: 'Switch to new version', onClick: () => {} },
+      action: { label: 'Switch', onClick: () => {} },
     });
     expect(toasts.value.some(t => t.key === NEW_VERSION_TOAST_KEY)).toBe(true);
     mockRestartEngine.mockResolvedValueOnce(undefined);

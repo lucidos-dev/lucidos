@@ -18,7 +18,7 @@
  */
 
 import { wsDeviceId } from './_storage';
-import { splitCapability } from './frameCapability';
+import { capabilityCarrier, splitCapability } from './frameCapability';
 import {
   callHost,
   fromWireResponse,
@@ -90,6 +90,13 @@ export function getBaseUrl(): string {
 export function apiUrl(suffix: string): string {
   const normalized = suffix.startsWith('/') ? suffix : `/${suffix}`;
   return `${_baseUrl}${API_V1}${normalized}`;
+}
+
+/** A workspace `data/` file as this document reaches it: the workspace prefix,
+ *  the frame's capability pass where it holds one (ADR 0238), then the static
+ *  `/data` mount. `path` must already be URL-safe. */
+export function dataMountUrl(path: string): string {
+  return `${_baseUrl}${capabilityCarrier()}/data/${path}`;
 }
 
 /** The versioned API root, with NO trailing slash, for a caller that builds

@@ -1,31 +1,14 @@
 /* Directory Picker */
 .dir-picker {
-    background: var(--bg-secondary);
-    border: 1px solid var(--border-color);
-    border-radius: 0.5rem;
     width: min(32rem, calc(100vw - 2rem));
-    max-height: min(28rem, calc(100vh - 4rem));
+    max-height: min(28rem, calc(var(--app-height, 100dvh) - 4rem));
     display: flex;
     flex-direction: column;
-    box-shadow: var(--shadow-lg);
     overflow: hidden;
 }
 
-.dir-picker-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 0.75rem 1rem;
-}
-
-.dir-picker-title {
-    font-size: var(--font-size-md);
-    font-weight: 600;
-    color: var(--text-primary);
-}
-
 .dir-picker-breadcrumb {
-    padding: 0.5rem 1rem;
+    padding: var(--space-sm) var(--surface-inset);
     min-height: 2rem;
     display: flex;
     align-items: center;
@@ -46,7 +29,7 @@
     color: var(--accent);
     cursor: pointer;
     padding: 0.0625rem 0.125rem;
-    border-radius: 0.125rem;
+    border-radius: calc(var(--radius-control) * 0.25);
 }
 
 @media (hover: hover) {
@@ -64,7 +47,7 @@
     width: 100%;
     background: var(--bg-primary);
     border: 1px solid var(--accent);
-    border-radius: 0.1875rem;
+    border-radius: calc(var(--radius-control) * 0.375);
     color: var(--text-primary);
     font-family: var(--font-ui);
     font-size: var(--font-size-sm);
@@ -86,7 +69,7 @@
     align-items: center;
     gap: 0.5rem;
     width: 100%;
-    padding: 0.375rem 1rem;
+    padding: 0.375rem var(--surface-inset);
     background: none;
     border: none;
     cursor: pointer;
@@ -96,14 +79,13 @@
     text-align: left;
 }
 
+/* `.selected` is the keyboard cursor, which a tap also sets through
+   `mouseenter`. A phone has no keyboard to move it, so it paints nothing there. */
 @media (hover: hover) {
-    .dir-picker-row:hover {
+    .dir-picker-row:hover,
+    .dir-picker-row.selected {
         background: var(--bg-hover);
     }
-}
-
-.dir-picker-row.selected {
-    background: var(--bg-hover);
 }
 
 /* Holds an inline SVG (FolderIcon / FolderUpIcon), so it is sized rather than
@@ -128,7 +110,7 @@
 }
 
 .dir-picker-empty {
-    padding: 1.5rem 1rem;
+    padding: 1.5rem var(--surface-inset);
     text-align: center;
     font-size: var(--font-size-sm);
     color: var(--text-muted);
@@ -142,7 +124,7 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 0.625rem 1rem;
+    padding: var(--space-sm) var(--surface-inset) var(--surface-inset);
 }
 
 .dir-picker-status {
@@ -157,7 +139,7 @@
     color: var(--accent-green);
     background: color-mix(in srgb, var(--accent-green) 15%, transparent);
     padding: 0.0625rem 0.375rem;
-    border-radius: 0.1875rem;
+    border-radius: calc(var(--radius-control) * 0.375);
 }
 
 .dir-picker-actions {
@@ -178,7 +160,7 @@
     padding: 0.75rem 1rem;
     background: var(--bg-secondary);
     border: 1px solid var(--border-color);
-    border-radius: 0.5rem;
+    border-radius: calc(var(--radius-surface) * 2 / 3);
 }
 
 .repo-add-input {
@@ -186,7 +168,7 @@
     min-width: 0;
     background: var(--bg-primary);
     border: 1px solid var(--border-color);
-    border-radius: 0.25rem;
+    border-radius: calc(var(--radius-control) * 0.5);
     color: var(--text-primary);
     font-family: var(--font-ui);
     font-size: var(--font-size-md);

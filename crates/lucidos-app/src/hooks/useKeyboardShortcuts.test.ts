@@ -16,7 +16,7 @@ import { fileURLToPath } from 'node:url';
 import { dispatchEscape, classifyForwardedChord, dispatchForwardedChord, dispatchPreviewIframeShortcut, shouldTypeToFocusPrompt } from './useKeyboardShortcuts';
 import { isTextInput, isThreadTranscript } from '../utils/dom';
 import { pushOverlay, _resetOverlayStackForTesting } from '../store/overlayStack';
-import { focusedPane, splitRatio } from '../store/store';
+import { focusedPane, splitRatio, searchEverywhereAnchor, searchEverywhereOpen } from '../store/store';
 
 const here: string = dirname(fileURLToPath(import.meta.url));
 
@@ -236,6 +236,27 @@ describe('dispatchForwardedChord (forwarded chord ⇒ content pane is focused)',
     dispatchForwardedChord(chord({ metaKey: true, key: 'c' }));
     expect(splitRatio.value).toBe(0.5);
     expect(focusedPane.value).toBe('thread');
+  });
+});
+
+describe('the Search everywhere shortcut', () => {
+  const searchChord = { metaKey: true, ctrlKey: false, shiftKey: true, altKey: false, key: 's' };
+
+  it('drops the anchor a past button open left, so the palette follows the focused pane', () => {
+    searchEverywhereOpen.value = false;
+    searchEverywhereAnchor.value = {} as HTMLElement;
+    dispatchForwardedChord(searchChord);
+    expect(searchEverywhereOpen.value).toBe(true);
+    expect(searchEverywhereAnchor.value).toBeNull();
+  });
+
+  it('closes an open palette without touching its anchor', () => {
+    const button = {} as HTMLElement;
+    searchEverywhereOpen.value = true;
+    searchEverywhereAnchor.value = button;
+    dispatchForwardedChord(searchChord);
+    expect(searchEverywhereOpen.value).toBe(false);
+    expect(searchEverywhereAnchor.value).toBe(button);
   });
 });
 

@@ -16,10 +16,10 @@ pub(super) async fn serve_sdk_js() -> Response {
 }
 
 /// Iframe-specific CSS: design tokens (dark/light), element defaults, the themed
-/// `lucidos.ui.Select`, the iframe-only `.action-btn-secondary`, and scrollbars.
+/// `lucidos.ui.Select`, and scrollbars.
 /// Apps include via `<link rel="stylesheet" href="/api/v1/sdk-iframe.css">`.
 /// Theme switching is driven by `lucidos.ui.applyPreferences()` setting
-/// `data-theme` on `<html>`.
+/// `data-theme-mode` on `<html>`.
 const SDK_IFRAME_BASE_CSS: &str = include_str!("sdk_iframe.css");
 
 /// Lucidos's shared component layer — the SINGLE SOURCE OF TRUTH, shared with
@@ -32,11 +32,18 @@ const SDK_IFRAME_BASE_CSS: &str = include_str!("sdk_iframe.css");
 const SHARED_COMPONENTS_CSS: &str =
     include_str!("../../../lucidos-app/src/styles/global/shared-components.css");
 
-/// The served `/api/v1/sdk-iframe.css` body — iframe tokens/defaults followed by
-/// the shared component layer. Concatenated once and cached.
+/// The theme part rules for app frames, generated from the part catalog: the
+/// `@property` rules for the frame colour tokens, the protected reset, the
+/// `theme-effects` reduce rule and the app opt-out (ADR 0307).
+const THEME_PARTS_CSS: &str =
+    include_str!("../../../lucidos-app/src/styles/generated/theme-parts-frame.css");
+
+/// The served `/api/v1/sdk-iframe.css` body: iframe tokens and defaults, the
+/// shared component layer, then the theme part rules. Concatenated once and
+/// cached.
 fn sdk_iframe_css() -> &'static str {
     static CSS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    CSS.get_or_init(|| format!("{SDK_IFRAME_BASE_CSS}\n{SHARED_COMPONENTS_CSS}"))
+    CSS.get_or_init(|| format!("{SDK_IFRAME_BASE_CSS}\n{SHARED_COMPONENTS_CSS}\n{THEME_PARTS_CSS}"))
 }
 
 /// Audio unlock shim — monkey-patches `AudioContext` so app code reuses a
@@ -219,7 +226,7 @@ pub(super) async fn ui_navigate(
         payload.get("id").and_then(|v| v.as_str())
     );
 
-    let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    let actor = super::actor::user_actor(&headers, None);
     if let Err(e) = state
         .engine
         .event_bus
@@ -256,6 +263,22 @@ pub(super) fn router() -> Router<AppState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An app that loads this stylesheet gets typed colour tokens and every
+    /// part reset. A theme's parts then paint there as in the shell, and
+    /// `data-theme-parts="off"` switches them off (ADR 0307).
+    #[test]
+    fn the_served_stylesheet_carries_the_theme_part_rules() {
+        let css = sdk_iframe_css();
+        for needle in [
+            "@property --accent {",
+            "html[data-theme-effects=\"reduce\"] body {",
+            "html[data-theme-parts=\"off\"] body {",
+            "var(--part-app-text-text-shadow, none)",
+        ] {
+            assert!(css.contains(needle), "sdk-iframe.css lacks {needle}");
+        }
+    }
 
     /// An app's `<body>` must carry the type scale's body step. Two ways to get
     /// this wrong, and the assert below covers both: leave the declaration off

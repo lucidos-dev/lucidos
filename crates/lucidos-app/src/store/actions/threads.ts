@@ -391,7 +391,7 @@ export function formatArchiveSkippedToast(skipped: ArchiveSkippedMember[]): stri
   return `${head} ${lines.join(' ')} Archive again once that is done.`;
 }
 
-function updateThreadMeta(threadId: string, patch: Partial<{ saved: boolean }>): void {
+function updateThreadMeta(threadId: string, patch: Partial<{ saved: boolean; section: ThreadSection }>): void {
   const map = new Map(threadMap.value);
   const thread = map.get(threadId);
   if (thread) {
@@ -404,7 +404,11 @@ export async function handleSaveThread(threadId: string): Promise<void> {
   const thread = threadMap.value.get(threadId);
   if (!thread || thread.meta.saved) return;
 
-  updateThreadMeta(threadId, { saved: true });
+  // A pinned thread is never archived (ADR 0312): the engine moves it to the
+  // inbox in the same event, so the optimistic flip does too.
+  const priorSection = thread.meta.section;
+  sectionMutatedAt.set(threadId, Date.now());
+  updateThreadMeta(threadId, { saved: true, section: 'inbox' });
   try {
     await saveThread(threadId);
   } catch (e) {
@@ -414,7 +418,7 @@ export async function handleSaveThread(threadId: string): Promise<void> {
     // (network, 5xx) revert + toast. The server is idempotent now, so a fresh
     // engine won't even 409 here — this is defense in depth.
     if (e instanceof ApiError && e.httpCode === 409) return;
-    updateThreadMeta(threadId, { saved: false });
+    updateThreadMeta(threadId, { saved: false, section: priorSection });
     showToast(`Failed to pin thread: ${errorDetail(e)}`, 'error');
   }
 }
@@ -423,7 +427,7 @@ export async function handleUnsaveThread(threadId: string): Promise<void> {
   const thread = threadMap.value.get(threadId);
   if (!thread || !thread.meta.saved) return;
 
-  if (!await showConfirm('Remove this thread from the Pinned section?', 'Remove')) {
+  if (!await showConfirm('Remove this thread from the Pinned section?', 'Remove', { variant: 'default' })) {
     return;
   }
 
@@ -624,17 +628,21 @@ function discardThreadDraft(threadId: string): void {
   });
 }
 
+/** The confirm before archiving a pinned thread, which unpins it. */
+export const ARCHIVE_PINNED_CONFIRM = 'Archiving unpins this thread. Move it to the archive?';
+
 export async function handleArchiveThread(threadId: string): Promise<void> {
   if (archivingThreadIds.value.has(threadId)) return;
   if (discardingCCThreadIds.value.has(threadId)) return; // Can't archive while discarding
 
-  // Archive is the only exit from Saved — confirm before dropping the row out
-  // of its parking spot. The ThreadArchived projection clears is_saved.
+  // Archiving a pinned thread unpins it: a pinned thread is never archived
+  // (ADR 0312). Confirm before it leaves the Pinned section.
   const thread = threadMap.value.get(threadId);
   if (thread?.meta.saved) {
     if (!await showConfirm(
-      'Are you sure you want to move this thread to the archive?',
+      ARCHIVE_PINNED_CONFIRM,
       'Archive',
+      { variant: 'default' },
     )) {
       return;
     }
@@ -705,12 +713,12 @@ export async function handleArchiveThread(threadId: string): Promise<void> {
   // cascade leaves the active view, visibleCandidatesAround() can't compute it.
   const candidates = visibleCandidatesAround(threadId);
 
-  // Snapshot section + codingAgentProposed on every family member so we can
-  // roll back if the API rejects (409 blocking, 500 mid-cascade). Both fields
-  // are required to leave Current: `displaySection` keeps any thread with
-  // pending changes in Current regardless of `section`. `cascade` was collected
-  // up front (above the draft confirm).
-  type Snap = { section: ThreadSection; codingAgentProposed: boolean };
+  // Snapshot section, pin and codingAgentProposed on every family member so we
+  // can roll back if the API rejects (409 blocking, 500 mid-cascade). All three
+  // are required to leave Current and Pinned: `displaySection` keeps a pinned
+  // thread in Pinned and one with pending changes in Current, whatever
+  // `section` says. `cascade` was collected up front (above the draft confirm).
+  type Snap = { section: ThreadSection; saved: boolean; codingAgentProposed: boolean };
   const snapshot = new Map<string, Snap>();
   const optimistic = new Map(threadMap.value);
   // Stamp BEFORE the flip so any in-flight GET issued before this moment is
@@ -723,11 +731,12 @@ export async function handleArchiveThread(threadId: string): Promise<void> {
     sectionMutatedAt.set(tid, flippedAt);
     snapshot.set(tid, {
       section: t.meta.section,
+      saved: t.meta.saved,
       codingAgentProposed: t.meta.codingAgentProposed,
     });
     optimistic.set(tid, {
       ...t,
-      meta: { ...t.meta, section: 'archived', codingAgentProposed: false },
+      meta: { ...t.meta, section: 'archived', saved: false, codingAgentProposed: false },
     });
   }
   threadMap.value = optimistic;

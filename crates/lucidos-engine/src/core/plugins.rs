@@ -6,8 +6,15 @@ use std::path::{Path, PathBuf};
 /// (e.g. the post-install reload trigger) cannot silently break the auto-reload.
 pub const AUTH_MODULES_DIR: &str = "auth-modules";
 
-pub(crate) const CONTENT_DIRS: [&str; 5] =
-    ["apps", "knowhow", "triggers", "scripts", AUTH_MODULES_DIR];
+pub(crate) const CONTENT_DIRS: [&str; 7] = [
+    "apps",
+    "knowhow",
+    "triggers",
+    "scripts",
+    AUTH_MODULES_DIR,
+    super::themes::THEMES_DIR,
+    super::workspace_fonts::FONTS_DIR,
+];
 
 /// File extension marking a plugin archive (renamed zip). Lowercase — callers
 /// that match on filenames should compare against `to_ascii_lowercase()`.
@@ -98,6 +105,11 @@ pub enum ValidationError {
     EmptyTree,
     UnexpectedTopLevelEntry(String),
     UnsafePath(String),
+    /// A file under `themes/` that is not a valid theme: `(path, reason)`.
+    InvalidTheme(String, String),
+    /// A file or directory under `fonts/` that is not a valid workspace font:
+    /// `(path, reason)`.
+    InvalidFont(String, String),
 }
 
 impl std::fmt::Display for ValidationError {
@@ -115,14 +127,25 @@ impl std::fmt::Display for ValidationError {
             Self::InvalidSource(s) => write!(f, "invalid source URL: {}", s),
             Self::EmptyTree => write!(
                 f,
-                "plugin has no content (none of apps/, knowhow/, triggers/, scripts/, auth-modules/ exist)"
+                "plugin has no content (none of {}/ exist)",
+                CONTENT_DIRS.join("/, ")
+            ),
+            Self::UnexpectedTopLevelEntry(e) if e == super::themes::LEGACY_THEMES_DIR => write!(
+                f,
+                "unexpected top-level entry '{e}': themes now ship in {}/, so rename the folder",
+                super::themes::THEMES_DIR
             ),
             Self::UnexpectedTopLevelEntry(e) => write!(
                 f,
-                "unexpected top-level entry '{}' (only manifest.toml + apps/knowhow/triggers/scripts/auth-modules allowed)",
-                e
+                "unexpected top-level entry '{}' (only manifest.toml + {} allowed)",
+                e,
+                CONTENT_DIRS.join("/")
             ),
             Self::UnsafePath(p) => write!(f, "unsafe path in archive: {}", p),
+            Self::InvalidTheme(path, reason) => write!(f, "{path} is not a valid theme: {reason}"),
+            Self::InvalidFont(path, reason) => {
+                write!(f, "{path} is not a valid workspace font: {reason}")
+            }
         }
     }
 }
@@ -268,8 +291,64 @@ pub fn validate_tree(root: &Path) -> Result<(PluginManifest, Vec<PlannedFile>), 
     if planned.is_empty() {
         return Err(ValidationError::EmptyTree);
     }
+    let fonts = validate_fonts(root, &planned)?;
+    validate_themes(&planned, &fonts)?;
 
     Ok((manifest, planned))
+}
+
+/// Every file a plugin installs under `fonts/` must belong to a valid
+/// workspace font. Checked here, so a broken font fails staging rather than
+/// dropping out of the list after install. Answers the plugin's fonts.
+fn validate_fonts(
+    root: &Path,
+    planned: &[PlannedFile],
+) -> Result<super::workspace_fonts::WorkspaceFonts, ValidationError> {
+    use super::workspace_fonts::{self, FONTS_DIR};
+    let prefix = format!("{FONTS_DIR}/");
+    for file in planned {
+        let Some(rel) = file.data_relative.strip_prefix(&prefix) else {
+            continue;
+        };
+        let invalid =
+            |reason: String| ValidationError::InvalidFont(file.data_relative.clone(), reason);
+        workspace_fonts::validate_staged(rel, &file.source).map_err(invalid)?;
+    }
+    let fonts = workspace_fonts::list_in(&root.join(FONTS_DIR));
+    if let Some(broken) = fonts.invalid.first() {
+        // Every listed id is the prefix and the directory name.
+        let dir = broken
+            .id
+            .strip_prefix(workspace_fonts::ID_PREFIX)
+            .unwrap_or(&broken.id);
+        return Err(ValidationError::InvalidFont(
+            format!("{prefix}{dir}"),
+            broken.reason.clone(),
+        ));
+    }
+    Ok(fonts)
+}
+
+/// Every file a plugin installs under `themes/` must be a valid theme with a
+/// fresh id. A theme may name a workspace font only if this plugin ships it.
+/// So a plugin never depends on a font the user happened to install. Checked
+/// here, so a broken theme fails staging rather than install.
+fn validate_themes(
+    planned: &[PlannedFile],
+    fonts: &super::workspace_fonts::WorkspaceFonts,
+) -> Result<(), ValidationError> {
+    let prefix = format!("{}/", super::themes::THEMES_DIR);
+    for file in planned {
+        let Some(file_name) = file.data_relative.strip_prefix(&prefix) else {
+            continue;
+        };
+        let invalid =
+            |reason: String| ValidationError::InvalidTheme(file.data_relative.clone(), reason);
+        let bytes = std::fs::read(&file.source).map_err(|e| invalid(e.to_string()))?;
+        super::themes::validate_workspace_write(file_name, &bytes, || fonts.clone())
+            .map_err(|e| invalid(e.to_string()))?;
+    }
+    Ok(())
 }
 
 /// Verify that no archive entry path uses `..` or absolute paths (zip-slip), and
@@ -356,6 +435,19 @@ pub fn detect_conflicts(planned: &[PlannedFile], data_dir: &Path) -> Vec<String>
         .filter(|p| data_dir.join(&p.data_relative).exists())
         .map(|p| p.data_relative.clone())
         .collect()
+}
+
+/// Refuse a plugin whose fonts would take the workspace past its font cap.
+/// Install copies files straight into `data_dir`, so the write-time check
+/// never sees them.
+pub fn check_font_room(planned: &[PlannedFile], data_dir: &Path) -> Result<(), String> {
+    use super::workspace_fonts::{self, FONTS_DIR, MANIFEST_FILE};
+    let prefix = format!("{FONTS_DIR}/");
+    let suffix = format!("/{MANIFEST_FILE}");
+    let slugs = planned
+        .iter()
+        .filter_map(|p| p.data_relative.strip_prefix(&prefix)?.strip_suffix(&suffix));
+    workspace_fonts::check_room(data_dir, slugs)
 }
 
 /// Decision returned when `update_plugin` compares installed vs remote.

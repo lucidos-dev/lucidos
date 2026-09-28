@@ -1,15 +1,16 @@
 import { blobPreviewUrl, continueThread, postCommandCheckpointUndo } from '../../api/client';
 import type { Change } from '../../api/client';
-import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { ensureChangeLoaded, revertChange } from '../../store/actions/chat-changes';
 import { HELD_UNTIL_REPLY } from '../../store/exchange-status';
 import { ensureEventTargetResolved, eventHasTarget, jumpableEventId, showEventWhereItLives } from '../../store/actions/event-navigation';
 import { viewChangeDiff } from '../../store/actions/repositories';
 import { checkpointDiffModal, contextViewer, eventConditionDoor, findChangeById, lazyChanges, openImagePopupFromGroup, showToast, stepDetailModal } from '../../store/store';
+import { prefetchStepDetail } from '../../store/stepDetailCache';
 import { LUCIDOS_AGENT_LABEL, eventWaitStoppedSummary, groupSubscriptions, isThinking, resumeEngineNote, stepStatus, subscriptionFilterNote, waitingFor } from '../../store/thread-events';
 import { LucidosGlyph } from '../shared/LucidosMark';
 import { BlobImage } from '../shared/BlobImage';
-import type { EventSubscription, EventWaitCancelCause, Exchange, SubscriptionGroup } from '../../store/thread-events';
+import { Disclosure } from '../shared/Disclosure';
+import type { ChangeLifecycleType, EventSubscription, EventWaitCancelCause, Exchange, SubscriptionGroup } from '../../store/thread-events';
 import type { Loadable, ResponseEvent, StepOutcome } from '../../store/types';
 import type { CodingAgent } from '../../api/types';
 import { HEARING_YOU } from '../../voice/callState';
@@ -18,7 +19,7 @@ import { formatFileCount } from '../../utils/formatFileCount';
 import { formatMessageTimestamp, formatShortDate, formatShortTime, isSameDayInUserTz } from '../../utils/formatTime';
 import { renderMarkdown } from '../../utils/renderMarkdown';
 import { eventNameChip, eventRowBody } from './EventRow';
-import type { EventRowChip, EventRowFact, EventRowMark, EventRowTone } from './EventRow';
+import type { EventRowChip, EventRowFact, EventRowTone } from './EventRow';
 import { followContinuedThread } from './scrollState';
 import { contextPercent, formatTokens } from '../../utils/formatTokens';
 import { CallIcon, ClaudeIcon, CodexIcon, CollapseTurnIcon, FullResponseIcon, StepLogIcon, StepOutcomeIcon } from '../shared/icons';
@@ -34,14 +35,23 @@ import { ROW_ATTR } from './scrollAnchor';
 // rendering). Extracted from ChatExchange.tsx; imported back there. The only
 // dependency on the parent is the InitiatorDescriptor type (erased at runtime).
 
-const CHANGE_ACCENT = {
-  ChangeApplied: 'change-applied',
-  ChangeDiscarded: 'change-discarded',
-  ChangeReverted: 'change-reverted',
-} as const;
+/** How each change resolution reads on its card. The accent is the initiator
+ *  panel's class, which the change deep link keys on (`scrollToChangeAndPulse`). */
+const CHANGE_STATE: Record<ChangeLifecycleType, { label: string; tone: EventRowTone; accent: string }> = {
+  ChangeApplied: { label: 'Applied', tone: 'good', accent: 'change-applied' },
+  ChangeDiscarded: { label: 'Discarded', tone: 'halted', accent: 'change-discarded' },
+  ChangeReverted: { label: 'Reverted', tone: 'none', accent: 'change-reverted' },
+  ChangeApplyFailed: { label: 'Failed', tone: 'bad', accent: 'change-failed' },
+};
 
-export function changeAccent(type: keyof typeof CHANGE_ACCENT): string {
-  return CHANGE_ACCENT[type];
+/** A change card's title: the first line of its description. The state badge
+ *  carries the resolution, so the title never repeats it. */
+export function changeSubject(description: string | undefined): string {
+  return description?.split('\n')[0].trim() || 'Change';
+}
+
+export function changeAccent(type: ChangeLifecycleType): string {
+  return CHANGE_STATE[type].accent;
 }
 
 export function MarkdownBlock({ html }: { html: string }) {
@@ -80,54 +90,80 @@ export function UserMessageBody({ html, imageHashes }: { html: string; imageHash
   );
 }
 
-/** Body for change lifecycle initiator panels — surfaces the change description,
- *  file count, and (when failed) the error message. The resolved timestamp is
- *  the panel header timestamp (the change-lifecycle event time IS resolved_at).
+/** A change resolution (applied, discarded, reverted, failed), as an **event
+ *  row**: the same card a child thread's return wears. The subject names the
+ *  change by the first line of its description, and Diff and Revert sit in the
+ *  card's action slot.
  *
  *  `seedDescription` / `seedFileCount` come from the in-thread `ChangeProposed`
- *  event, already loaded with the thread. They render the body at its FINAL
+ *  event, already loaded with the thread. They render the card at its FINAL
  *  height on first open, before the per-id `Change` lazy-fetch lands. So a
  *  thread ending with "Change applied" does not jump when the fetched row pops
  *  its description and file count in. The authoritative live row wins once
  *  loaded, and is normally identical to the seed. */
-export function ChangeBody({ changeId, error, seedDescription, seedFileCount }: { changeId?: string; error?: string; seedDescription?: string; seedFileCount?: number }) {
+export function ChangeEventRow({ type, changeId, error, seedDescription, seedFileCount }: {
+  type: ChangeLifecycleType;
+  changeId?: string;
+  error?: string;
+  seedDescription?: string;
+  seedFileCount?: number;
+}) {
   const change: Change | undefined = changeId ? findChangeById(changeId) : undefined;
   const lazy: Loadable<Change> = (changeId ? lazyChanges.value.get(changeId) : undefined) ?? { status: 'not-loaded' };
-  const showLoading = useDelayedLoading(lazy);
 
   useEffect(() => {
     if (changeId) void ensureChangeLoaded(changeId);
   }, [changeId]);
 
-  const desc = change ? change.description.split('\n')[0]
-    : seedDescription ? seedDescription.split('\n')[0]
-    : undefined;
+  const description = change?.description ?? seedDescription;
   const fileCount = change?.file_count ?? seedFileCount;
+  const seeded = !!description?.trim() || fileCount != null;
 
-  // A lifecycle error and any body content both win over the lazy-fetch state.
-  // A 404 for a row arriving via SSE moments later must not strand a stale
-  // "Failed to load" line. A seeded body is already complete, and the fetch
-  // failure only gates the footer's Diff and Revert.
-  const lazyFailedError = !error && !desc && fileCount == null && lazy.status === 'failed'
-    ? `Failed to load change details: ${lazy.error}`
-    : undefined;
-  // No "Loading..." line once the seed has painted the body. The fetch is still
-  // running for the footer's Diff and Revert. But the body is complete, so a
-  // Loading line would be a flicker and a shift.
-  const lazyLoading = !desc && fileCount == null && lazy.status === 'loading' && showLoading;
+  // A lifecycle error wins over the lazy-fetch state. A seeded card is already
+  // complete, so a fetch failure only costs it Diff and Revert. And a 404 for a
+  // row that SSE delivers moments later must not strand a stale error.
+  const shownError = error
+    ?? (!seeded && lazy.status === 'failed' ? `Failed to load change details: ${lazy.error}` : undefined);
+  const { label, tone } = CHANGE_STATE[type];
+  return changeEventRowBody({
+    type,
+    subject: changeSubject(description),
+    stateLabel: label,
+    tone,
+    fileCount,
+    error: shownError,
+    actions: changeActions(changeId, type === 'ChangeApplyFailed', type === 'ChangeApplied'),
+  });
+}
 
-  if (!desc && fileCount == null && !error && !lazyFailedError && !lazyLoading) return null;
-  return (
-    <div class="change-body">
-      {desc && <div class="change-body-desc">{desc}</div>}
-      {fileCount != null && (
-        <div class="change-body-meta">{formatFileCount(fileCount)}</div>
-      )}
-      {error && <div class="change-body-error">{error}</div>}
-      {lazyFailedError && <div class="change-body-error">{lazyFailedError}</div>}
-      {lazyLoading && <div class="change-body-meta">Loading...</div>}
-    </div>
-  );
+/** The card's markup, hookless for the same reason `eventWaitRowBody` is: the
+ *  tests drive this, since there is no jsdom to render the wrapper. */
+export function changeEventRowBody({ type, subject, stateLabel, tone, fileCount, error, actions }: {
+  type: ChangeLifecycleType;
+  subject: string;
+  stateLabel: string;
+  tone: EventRowTone;
+  fileCount?: number;
+  error?: string;
+  actions?: ComponentChildren;
+}) {
+  return eventRowBody({
+    kind: 'change',
+    state: type,
+    role: 'change-event-row',
+    subject,
+    stateLabel,
+    tone,
+    // The file count is a single value inside a real card, so an unseeded
+    // card leaves its slot empty until the lazy read fills it.
+    facts: [
+      fileCount != null ? { kind: 'text' as const, text: formatFileCount(fileCount) } : null,
+    ],
+    // Open, because the reason an apply failed is the one thing the reader
+    // came for.
+    fold: error ? { label: 'Error', open: true, body: error } : undefined,
+    actions,
+  });
 }
 
 /** "Continue" button rendered on the abort exchange the user may resume from
@@ -284,7 +320,6 @@ export function eventDeliveryBody({
 }) {
   return eventRowBody({
     kind: 'delivery',
-    mark: 'arrived',
     role: 'event-delivery',
     // The matched event usually lives somewhere ELSE: a `CodingAgentIdled` or a
     // `ChangeProposed` from the coding-agent thread this one watched. So the
@@ -300,7 +335,7 @@ export function eventDeliveryBody({
       pending: opening,
       role: 'event-delivery-jump',
     }),
-    stateLabel: 'arrived',
+    stateLabel: 'Arrived',
     tone: 'arrived',
     fold: payloadJson ? { label: 'Details', pre: true, body: payloadJson } : undefined,
   });
@@ -361,13 +396,12 @@ export function triggerFiredBody({
   const name = event.trigger_name?.trim();
   return eventRowBody({
     kind: 'trigger',
-    mark: 'arrived',
     role: 'trigger-fired',
     // A trigger with no recorded name says only that one fired. It never falls
     // back to `trigger_id`: that is a uuid, and no screen in Lucidos is
     // labelled with one.
     subject: name ? `Trigger fired: ${name}` : 'Trigger fired',
-    stateLabel: 'fired',
+    stateLabel: 'Fired',
     tone: 'arrived',
     facts: [
       invocation?.kind === 'Schedule' ? { kind: 'text' as const, text: 'scheduled' } : null,
@@ -387,16 +421,16 @@ export function triggerFiredBody({
   });
 }
 
-/** Diff/Revert action buttons rendered in the initiator panel's action slot
- *  for ChangeApplied/Discarded/Reverted exchanges. Returns null when the
+/** Diff/Revert action buttons rendered in a change card's action slot for
+ *  ChangeApplied/Discarded/Reverted exchanges. Returns null when the
  *  change has no relevant actions (e.g. ChangeApplyFailed leaves the change
  *  pending — user reads the error, doesn't diff/revert).
  *
  *  `reserveWhileLoading` renders a hidden button placeholder while the per-id
  *  `Change` row is being fetched. The real Diff and Revert buttons then slot
- *  into an already-reserved footer row, with no vertical shift on first open.
- *  It is set for ChangeApplied panels, which always get at least a Revert
- *  button. Mirrors the body's `seed*` props in <ChangeBody>. */
+ *  into an already-reserved action row, with no vertical shift on first open.
+ *  It is set for ChangeApplied cards, which always get at least a Revert
+ *  button. Mirrors the body's `seed*` props in <ChangeEventRow>. */
 export function changeActions(changeId?: string, suppress?: boolean, reserveWhileLoading?: boolean): ComponentChildren {
   if (suppress || !changeId) return null;
   const change = findChangeById(changeId);
@@ -416,25 +450,15 @@ export function changeActions(changeId?: string, suppress?: boolean, reserveWhil
   );
 }
 
-/** Shown in place of a collapsed panel's body, so a folded turn never reads as
- *  an empty row. A muted "⋯" on the turn's own left column, whichever panel is
- *  folded. Clicking it expands that panel. */
-function CollapsedIndicator({ onToggle }: { onToggle?: (e: MouseEvent) => void }) {
-  return (
-    <div class="turn-collapsed" onClick={onToggle}>
-      <span class="turn-collapsed-dots" aria-label="Collapsed. Click to expand">⋯</span>
-    </div>
-  );
-}
-
 /** The turn's fold, as an icon button. Both headers render this one control, so
  *  a reader folds a user message the way they fold the reply under it.
  *
  *  It is the third of the response header's three `turnControls`, and the
  *  initiator header's only one. Everything a reader keys off is therefore
  *  shared: the minus/plus glyph, the label naming the turn, and the
- *  `.turn-control-collapse` class the brightness rule excludes by name
- *  (styles/chat/input-messages.css).
+ *  `.turn-control-collapse` class the pressed-chip rule excludes by name
+ *  (styles/chat/input-messages.css). A fold draws nothing below the header, so
+ *  this control is the only mark of it: folded, its plus is lit.
  *
  *  `collapsible` is false on a panel with no body to fold. Disabling it matters
  *  on the response header, whose panel is often only a status line while the
@@ -480,8 +504,8 @@ interface InitiatorPanelProps {
   /** User message → render the body as a right-aligned gray bubble. */
   bubble?: boolean;
   /** Drop the actor chip (icon + name) entirely — used for user messages and
-   *  change-lifecycle turns. Attribution is reached via the clickable timestamp
-   *  (and, for change turns, the summary line), which open the route popover. */
+   *  change-lifecycle turns. Attribution is reached via the clickable timestamp,
+   *  which opens the route popover. */
   chromeless?: boolean;
 }
 
@@ -501,9 +525,6 @@ function ActorChipBody({ initiator }: { initiator: InitiatorDescriptor }) {
 export function InitiatorPanel({ initiator, timestamp, onActorClick, actions, collapsible, collapsed, onToggle, onBodyClick, bubble = false, chromeless = false }: InitiatorPanelProps) {
   const accentClass = initiator.accent ? ` initiator-panel-${initiator.accent}` : '';
   const hasBody = !!initiator.summary || !!initiator.details;
-  // A chromeless turn whose summary opens the popover renders that summary as a
-  // button ("Change applied" → origin info). Plain summaries stay a <div>.
-  const summaryLinks = chromeless && !!onActorClick;
 
   // The turn's fold. Rendered only where there is a body to fold, which is the
   // one way it departs from the response header's run of three: this panel's
@@ -560,20 +581,17 @@ export function InitiatorPanel({ initiator, timestamp, onActorClick, actions, co
           )}
         </span>
       </div>
-      {hasBody && !collapsed && (
-        <div class="initiator-body" onClick={onBodyClick}>
-          {initiator.summary && (summaryLinks ? (
-            <button type="button" class="initiator-summary initiator-summary-link" onClick={onActorClick}>
-              {initiator.summary}
-            </button>
-          ) : (
-            <div class="initiator-summary">{initiator.summary}</div>
-          ))}
-          {bubble ? <div class="user-bubble">{initiator.details}</div> : initiator.details}
-        </div>
+      {(hasBody || actions) && (
+        <Disclosure open={!collapsed}>
+          {hasBody && (
+            <div class="initiator-body" onClick={onBodyClick}>
+              {initiator.summary && <div class="initiator-summary">{initiator.summary}</div>}
+              {bubble ? <div class="user-bubble">{initiator.details}</div> : initiator.details}
+            </div>
+          )}
+          {actions && <div class="initiator-footer">{actions}</div>}
+        </Disclosure>
       )}
-      {hasBody && collapsed && <CollapsedIndicator onToggle={onToggle} />}
-      {actions && !collapsed && <div class="initiator-footer">{actions}</div>}
     </div>
   );
 }
@@ -608,7 +626,7 @@ interface TurnControlsProps {
   /** Current state of each toggle, which is what the icon and `aria-pressed` say. */
   detailsOn: boolean;
   stepsOn: boolean;
-  /** This turn folded to its `⋯` stub. Unlike the two above, per-turn state. */
+  /** This turn folded down to its header. Unlike the two above, per-turn state. */
   collapsed: boolean;
   /** Whether this turn HAS a body to fold (`canCollapse`). False on a panel
    *  that is only a status line so far, where the collapse control is disabled.
@@ -636,8 +654,8 @@ interface TurnControlsProps {
  *  carries, and the only one whose effect stops at the turn it sits on. Its
  *  LABEL is what says so. The run stays evenly spaced
  *  (`.turn-controls`, styles/chat/input-messages.css): a 2+1 break reads as
- *  "two things and a stray" rather than as a scope split. It is also the only
- *  one stating its state in its GLYPH rather than its brightness.
+ *  "two things and a stray" rather than as a scope split. The pair sit on a
+ *  pressed chip when on; the collapse control swaps minus for plus instead.
  *  `CollapseTurnIcon` and `FullResponseIcon` carry the long form. */
 export function turnControls({
   detailsOn, stepsOn, collapsed, collapsible, onToggleDetails, onToggleSteps, onToggleCollapsed,
@@ -688,7 +706,6 @@ interface ResponsePanelProps {
   status: ComponentChildren;
   timestamp: string;
   collapsed: boolean;
-  onToggle?: (e: MouseEvent) => void;
   hasBody: boolean;
   /** Drop the header row entirely, for a *speech-only turn*. Its body is the
    *  reply the caller heard, and the initiator above it is what they said. A
@@ -707,7 +724,7 @@ interface ResponsePanelProps {
  *  nothing, and it sat under three buttons that each mean something else. Both
  *  turn headers read that way now. */
 export function ResponsePanel({
-  executor, onExecutorClick, controls, status, timestamp, collapsed, onToggle, hasBody, headerless = false, children,
+  executor, onExecutorClick, controls, status, timestamp, collapsed, hasBody, headerless = false, children,
 }: ResponsePanelProps) {
   const folded = collapsed && !headerless;
   return (
@@ -730,12 +747,13 @@ export function ResponsePanel({
           </span>
         </div>
       )}
-      {hasBody && !folded && (
+      {/* Mounted even with no body, so a body that stops drawing rolls away.
+          Hiding steps on a step-only turn takes the whole body with it. */}
+      <Disclosure open={hasBody && !folded}>
         <div class="response-body">
           {children}
         </div>
-      )}
-      {hasBody && folded && <CollapsedIndicator onToggle={onToggle} />}
+      </Disclosure>
     </div>
   );
 }
@@ -893,6 +911,8 @@ export function InlineStep(
         type="button"
         class="step-main"
         data-role="step-main"
+        /* Starts the fetch the modal will need, so it opens at its size. */
+        onPointerDown={() => prefetchStepDetail(event)}
         onClick={() => { stepDetailModal.value = event; }}
       >
         {/* A running step draws no mark, but the span still renders: the slot
@@ -924,7 +944,7 @@ export function InlineStep(
 
 type EventWaitState = Extract<ResponseEvent, { type: 'event_wait' }>['state'];
 
-/** How each state reads on the row: the mark, and the state WORD with its tone.
+/** How each state reads on the row: the state WORD's tone.
  *
  *  None of these is a step outcome, and that is the point. `stepStatus` takes a
  *  `StepOutcome`, which has no `waiting`. Routing this row through it would
@@ -943,29 +963,29 @@ type EventWaitState = Extract<ResponseEvent, { type: 'event_wait' }>['state'];
  *  frames it to the model as arriving "while you were working". The row cannot
  *  tell the two lanes apart (its anchor records no such flag), so it says the
  *  thing that is true of both. Same reason `eventDeliveryBody` says "arrived". */
-const EVENT_WAIT_ROW_STATE: Record<EventWaitState, { mark: EventRowMark; tone: EventRowTone }> = {
-  waiting: { mark: 'pending', tone: 'live' },
-  matched: { mark: 'arrived', tone: 'arrived' },
-  timed_out: { mark: 'pending', tone: 'lapsed' },
-  canceled: { mark: 'pending', tone: 'halted' },
+const EVENT_WAIT_ROW_TONE: Record<EventWaitState, EventRowTone> = {
+  waiting: 'live',
+  matched: 'arrived',
+  timed_out: 'lapsed',
+  canceled: 'halted',
 };
 
-/** The state pill, which says the outcome once. The headline already says
- *  "Waiting", so a live pill gives the deadline instead of repeating it, and a
- *  delivered one gives a check and when it was done. */
+/** The state word, which says the outcome once. The headline already says
+ *  "Waiting", so a live state gives the deadline instead. A delivered one
+ *  gives a check and when it was done. */
 function eventWaitStateLabel(state: EventWaitState, expiresAt: string, matchedAt?: string): string {
   const deadline = waitMoment(expiresAt);
   switch (state) {
     case 'waiting':
-      return deadline ? `until ${deadline}` : 'waiting';
+      return deadline ? `Until ${deadline}` : 'Waiting';
     case 'matched': {
       const done = waitMoment(matchedAt);
       return done ? `✓ ${done}` : '✓';
     }
     case 'timed_out':
-      return deadline ? `gave up at ${deadline}` : 'gave up';
+      return deadline ? `Gave up at ${deadline}` : 'Gave up';
     case 'canceled':
-      return 'stopped';
+      return 'Stopped';
   }
 }
 
@@ -977,7 +997,7 @@ function eventWaitStateLabel(state: EventWaitState, expiresAt: string, matchedAt
  *  The `canceled` identifiers underneath keep their names: they are on disk in
  *  persisted rows.
  *
- *  An unknown cause gets no note, since the pill already says it stopped. */
+ *  An unknown cause gets no note, since the state already says it stopped. */
 const EVENT_WAIT_STOP_NOTE: Record<EventWaitCancelCause, string | null> = {
   user_stop: 'you stopped it',
   agent_stand_down: 'the agent stopped it',
@@ -1147,7 +1167,7 @@ export function eventWaitRowBody({
 }: {
   event: Extract<ResponseEvent, { type: 'event_wait' }>;
 }) {
-  const { mark, tone } = EVENT_WAIT_ROW_STATE[event.state];
+  const tone = EVENT_WAIT_ROW_TONE[event.state];
   const stopped = event.state === 'canceled';
   // One phrasing for every label about a wait: "<verb> for <subject>". A stop
   // takes it from `eventWaitStoppedSummary`, because the user's own stop renders
@@ -1159,7 +1179,6 @@ export function eventWaitRowBody({
   const stopNote = stopped && event.cause ? EVENT_WAIT_STOP_NOTE[event.cause] : null;
   return eventRowBody({
     kind: 'wait',
-    mark,
     state: event.state,
     role: 'event-wait-row',
     subject,
@@ -1197,7 +1216,6 @@ export function eventWaitRowBody({
 export function HeldMessageRow({ event }: { event: Extract<ResponseEvent, { type: 'held_message' }> }) {
   return eventRowBody({
     kind: 'held',
-    mark: event.released ? 'arrived' : 'pending',
     state: event.released ? 'released' : 'held',
     role: 'held-message-row',
     subject: `Message from ${event.sender}`,
@@ -1245,7 +1263,7 @@ function eventWaitTime(created: string | undefined): { label: string; iso: strin
   return { label: formatMessageTimestamp(created), iso: created };
 }
 
-/** A moment on the pill: when an unresolved wait gives up, or when a delivered
+/** A moment in the state word: when an unresolved wait gives up, or when a delivered
  *  one was done. A fact rather than a countdown.
  *
  *  Deliberately not ticking. ADR 0047 puts the live countdown on the

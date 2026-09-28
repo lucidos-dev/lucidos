@@ -154,7 +154,7 @@ pub(crate) fn paint_title_bars(app: &tauri::AppHandle, color: tauri::utils::conf
     }
 }
 
-/// Frontend-driven window-background tint. `applyTheme` calls this with the
+/// Frontend-driven window-background tint. `applyThemeMode` calls this with the
 /// header-top blue for the active theme, so the behind-the-webview fallback
 /// tracks the in-app header across theme switches. `color` is a CSS hex string.
 #[tauri::command]
@@ -1227,7 +1227,7 @@ pub fn run() {
             }
 
             // The color the frontend last asked for, so a light-theme user does
-            // not launch into the dark-theme blue. `applyTheme` refines it once
+            // not launch into the dark-theme blue. `applyThemeMode` refines it once
             // this launch's theme is known.
             if let Some(color) = pre_paint_title_bar_color(app.handle()) {
                 paint_title_bars(app.handle(), color);

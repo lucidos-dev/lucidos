@@ -510,7 +510,6 @@ fn a_redirect_armed_inside_the_result_arm_does_not_outlive_its_turn() {
     let mut sessions = HashMap::from([(thread_id, session)]);
     let origin = Some(crate::engine::thread_events::MessageOrigin::Device {
         device_id: "d-1".into(),
-        label: "My iPhone".into(),
     });
 
     assert!(arm_followup_redirect(&mut sessions, thread_id, true, false, &origin).is_some());

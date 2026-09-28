@@ -215,13 +215,32 @@ export function browserHandlesHref(href: string): boolean {
   return BROWSER_NAVIGABLE_SCHEMES.has(href.slice(0, href.indexOf(':')).toLowerCase());
 }
 
-/** The `data/` sub-trees a workspace file can live in. Single source of truth
- *  for both the href recognizer below and `normalizeDataPath` in
- *  `store/actions/artifacts.ts`, which prefixes anything unprefixed with
- *  `artifacts/`. `system-knowhow/` is engine-shipped and read-only, but it is
- *  served by the same `/data/*` mount and previews the same way, so a link to
- *  it must route in-app like any other. */
+/** The `data/` sub-trees the `/data/*` mount serves: the engine's
+ *  `MUTABLE_PREFIXES` in `core/data_prefixes.rs`, plus the read-only
+ *  `system-knowhow/`. `every_data_prefix_list_matches_the_engine` in the CLI
+ *  crate pins it to the engine's list.
+ *
+ *  It drives the href recognizer below, relative image sources, and
+ *  `normalizeDataPath`, which prefixes anything else with `artifacts/`. A tree
+ *  missing here opens the wrong file, and a link to it reloads the workspace. */
 export const DATA_PATH_PREFIXES: readonly string[] = [
+  'artifacts/',
+  'apps/',
+  'knowhow/',
+  'triggers/',
+  'config/',
+  'auth-modules/',
+  'scripts/',
+  'themes/',
+  'fonts/',
+  'system-knowhow/',
+];
+
+/** The trees a bare path in PROSE links into. Narrower than
+ *  `DATA_PATH_PREFIXES`, because prose is not a deliberate anchor. A coding
+ *  agent writes repo paths such as `scripts/e2e.sh` in passing, and those must
+ *  stay plain text rather than become data links that 404. */
+export const PROSE_DATA_PATH_PREFIXES: readonly string[] = [
   'artifacts/',
   'knowhow/',
   'apps/',
@@ -254,7 +273,7 @@ const DATA_PATH_IN_PROSE = new RegExp(
   + '(\\/?(?:data\\/)?'
   // Escaped like every other interpolated path in this file: a future prefix
   // carrying a regex metacharacter would otherwise change what this matches.
-  + `(?:${DATA_PATH_PREFIXES.map((p) => p.slice(0, -1).replace(REGEX_ESCAPE, '\\$&')).join('|')})`
+  + `(?:${PROSE_DATA_PATH_PREFIXES.map((p) => p.slice(0, -1).replace(REGEX_ESCAPE, '\\$&')).join('|')})`
   + '(?:\\/[^\\s<>"\'&/]+)*'
   + '\\/[^\\s<>"\'&/]*[^\\s<>"\'&/.]\\.[A-Za-z0-9]+)',
   'g',

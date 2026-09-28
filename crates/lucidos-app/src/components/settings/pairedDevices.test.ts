@@ -135,7 +135,7 @@ describe('where the list sits', () => {
  */
 describe('the pairing half as a Loadable', () => {
   it('is a loaded list when the gateway answers', async () => {
-    const { pairedRows, pairingIsKnown } = await import('./pairedDevices');
+    const { pairedRows, pairingIsKnown } = await import('../../store/actions/pairedDevices');
     const loaded = {
       status: 'loaded' as const,
       data: [{ id: 'a', label: 'My iPhone', paired_at: '2026-08-01T00:00:00Z' }],
@@ -147,7 +147,7 @@ describe('the pairing half as a Loadable', () => {
   it('knows nothing while the fetch is in flight', async () => {
     // Rendering "Not paired" here would be a guess, and it would flip a moment
     // later when the real answer lands.
-    const { pairedRows, pairingIsKnown } = await import('./pairedDevices');
+    const { pairedRows, pairingIsKnown } = await import('../../store/actions/pairedDevices');
     expect(pairedRows({ status: 'loading' })).toBe(null);
     expect(pairingIsKnown({ status: 'loading' })).toBe(false);
     expect(pairedRows({ status: 'not-loaded' })).toBe(null);
@@ -155,7 +155,7 @@ describe('the pairing half as a Loadable', () => {
   });
 
   it('knows nothing when the gateway failed, and says nothing about pairing', async () => {
-    const { pairedRows, pairingIsKnown } = await import('./pairedDevices');
+    const { pairedRows, pairingIsKnown } = await import('../../store/actions/pairedDevices');
     const failed = { status: 'failed' as const, error: 'gateway exploded' };
     expect(pairedRows(failed)).toBe(null);
     expect(pairingIsKnown(failed)).toBe(false);
@@ -164,7 +164,7 @@ describe('the pairing half as a Loadable', () => {
   it('treats "no gateway serves this page" as a loaded fact, not a failure', async () => {
     // A direct engine port answers 404 for `/~/`. There is nothing wrong, and
     // there is also no pairing to report.
-    const { pairedRows, pairingIsKnown, NO_GATEWAY } = await import('./pairedDevices');
+    const { pairedRows, pairingIsKnown, NO_GATEWAY } = await import('../../store/actions/pairedDevices');
     const absent = { status: 'loaded' as const, data: NO_GATEWAY };
     expect(pairedRows(absent)).toBe(null);
     expect(pairingIsKnown(absent)).toBe(false);

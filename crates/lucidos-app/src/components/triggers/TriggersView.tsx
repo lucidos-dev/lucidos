@@ -1,7 +1,8 @@
 import { useState, useRef, useEffect } from 'preact/hooks';
 import { triggers, triggerGroups, collapsedTriggerGroupIds, expandTriggerGroup, triggerScrollTarget, showToast } from '../../store/store';
-import { openAddTrigger } from '../../store/actions/triggers';
-import { createTriggerGroup } from '../../store/actions/triggerGroups';
+import { loadTriggers, openAddTrigger } from '../../store/actions/triggers';
+import { createTriggerGroup, loadTriggerGroups } from '../../store/actions/triggerGroups';
+import { usePanelRefresh } from '../../hooks/usePanelRefresh';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { hasNoMoreRuns, loadedOr } from '../../store/types';
 import type { TriggerInfo } from '../../store/types';
@@ -11,6 +12,7 @@ import { LoadableError } from '../shared/LoadableError';
 import { ListRowAddCard } from '../shared/ListRowAddCard';
 import { ListSkeletonOf } from '../shared/Skeleton';
 import { LoadingFade } from '../shared/LoadingFade';
+import { Disclosure } from '../shared/Disclosure';
 import { applyNavFocus } from '../shared/focusMarker';
 import { resolveTriggerScrollStep } from './triggerScrollStep';
 import { PROSE_TEXT_ATTRS } from '../../utils/noAutofill';
@@ -27,7 +29,15 @@ function sortByCompletion(a: TriggerInfo, b: TriggerInfo): number {
   return 0;
 }
 
+function refreshTriggersPanel(): Promise<unknown> {
+  return Promise.all([
+    loadTriggers(),
+    loadTriggerGroups(),
+  ]);
+}
+
 export function TriggersView() {
+  usePanelRefresh('triggers', refreshTriggersPanel);
   const triggersLoadable = triggers.value;
   const groupsLoadable = triggerGroups.value;
   const showTriggersLoading = useDelayedLoading(triggersLoadable);
@@ -170,9 +180,15 @@ function TriggersLoaded({
         return (
           <div class="trigger-group-section" key={group.id}>
             <TriggerGroupHeader group={group} />
-            {!isCollapsed && members.map(trigger => (
-              <TriggerItem key={trigger.id} trigger={trigger} />
-            ))}
+            <Disclosure
+              open={!isCollapsed}
+              instant={triggerScrollTarget.value !== null}
+              bodyClass="trigger-group-members"
+            >
+              {members.map(trigger => (
+                <TriggerItem key={trigger.id} trigger={trigger} />
+              ))}
+            </Disclosure>
           </div>
         );
       })}

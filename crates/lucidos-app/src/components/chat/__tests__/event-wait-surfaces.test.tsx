@@ -26,6 +26,7 @@ import type { ComponentChildren, VNode } from 'preact';
 import { eventDeliveryBody, eventWaitRowBody, triggerFiredBody } from '../chat-exchange-parts';
 import { formatDeliveredPayload } from '../CreateThreadView';
 import { EventConditionModal } from '../EventConditionModal';
+import { EventRowFoldView } from '../EventRow';
 import { waitingIndicatorBody } from '../WaitingPanel';
 import * as promptInputHelpers from '../prompt-input-helpers';
 import {
@@ -35,9 +36,13 @@ import {
 } from '../prompt-input-helpers';
 import { eventConditionModal } from '../../../store/store';
 import { isExchangeStartEvent } from '../../../store/thread-events';
+import { responseBody } from '../../../store/event-rendering';
 import type { EventWaitSummary, Exchange } from '../../../store/thread-events';
 import type { ResponseEvent } from '../../../store/types';
 import { formatMessageTimestamp } from '../../../utils/formatTime';
+
+// The suite calls components as bare functions, where a hook has no instance.
+vi.mock('../../../hooks/usePaneCentre', () => ({ usePaneCentre: () => undefined }));
 
 type TriggerStarted = Extract<Exchange['userEvent'], { type: 'TriggerStarted' }>;
 
@@ -78,6 +83,22 @@ function findByClass(node: ComponentChildren, cls: string): AnyVNode | null {
   const v = node as AnyVNode;
   if (String(v.props?.class ?? '').split(/\s+/).includes(cls)) return v;
   return findByClass(v.props?.children, cls);
+}
+
+/** The row's fold, which is a component: its label and body are props. */
+function findFold(node: ComponentChildren): AnyVNode | null {
+  if (node === null || node === undefined || typeof node === 'boolean') return null;
+  if (typeof node === 'string' || typeof node === 'number') return null;
+  if (Array.isArray(node)) {
+    for (const c of node) {
+      const m = findFold(c);
+      if (m) return m;
+    }
+    return null;
+  }
+  const v = node as AnyVNode;
+  if ((v.type as unknown) === EventRowFoldView) return v;
+  return findFold(v.props?.children);
 }
 
 type Wait = Extract<ResponseEvent, { type: 'event_wait' }>;
@@ -152,10 +173,10 @@ describe('EventWaitRow', () => {
    *  **The pill says the outcome once.** The headline already says "Waiting",
    *  so a live pill carries the deadline instead of repeating the verb. */
   it.each([
-    ['waiting', /^until /, 'live'],
+    ['waiting', /^Until /, 'live'],
     ['matched', /^✓$/, 'arrived'],
-    ['timed_out', /^gave up at /, 'lapsed'],
-    ['canceled', /^stopped$/, 'halted'],
+    ['timed_out', /^Gave up at /, 'lapsed'],
+    ['canceled', /^Stopped$/, 'halted'],
   ] as const)('reports the %s state as %s', (state, words, tone) => {
     const tree = step(wait_({ state }));
     const pill = findByClass(tree, 'event-row-state');
@@ -166,8 +187,8 @@ describe('EventWaitRow', () => {
   /** Without a deadline the pill falls back to the bare word, never to an
    *  "until" with nothing after it. */
   it.each([
-    ['waiting', 'waiting'],
-    ['timed_out', 'gave up'],
+    ['waiting', 'Waiting'],
+    ['timed_out', 'Gave up'],
   ] as const)('falls back to "%s" words with no deadline', (state, word) => {
     const pill = findByClass(step(wait_({ state, expires_at: '' })), 'event-row-state');
     expect(vnodeText(pill)).toBe(word);
@@ -191,12 +212,24 @@ describe('EventWaitRow', () => {
     }
   });
 
-  /** The header says when the wait started, in the message-header format. The
+  /** The row says when the wait started, in the message-header format. The
    *  response header above shows when the turn ENDED, so nothing else does. */
-  it('stamps the header with when the wait started', () => {
+  it('stamps the row with when the wait started', () => {
     const time = findByClass(step(wait_()), 'event-row-time');
     expect(time?.props.dateTime).toBe('2026-08-06T11:00:00Z');
     expect(vnodeText(time)).toBe(formatMessageTimestamp('2026-08-06T11:00:00Z'));
+  });
+
+  /** The stamp sits ABOVE the card, the way a user bubble carries its own. */
+  it('puts the start time above the card, not inside it', () => {
+    const tree = step(wait_());
+    const card = findByRole(tree, 'event-wait-row');
+    expect(findByClass(card, 'event-row-time')).toBeNull();
+    const siblings = (tree as AnyVNode).props.children as AnyVNode[];
+    expect(siblings.map((c) => c.props['data-role'] ?? c.props.class)).toEqual([
+      'event-row-time',
+      'event-wait-row',
+    ]);
   });
 
   /** An unparseable time draws nothing, never an "Invalid Date". */
@@ -207,8 +240,8 @@ describe('EventWaitRow', () => {
   /** **The deadline appears once**, on the pill, never again on the facts line. */
   it('states the deadline in the pill and nowhere else', () => {
     const tree = step(wait_());
-    expect(vnodeText(findByClass(tree, 'event-row-state'))).toMatch(/^until /);
-    expect(vnodeText(findByClass(tree, 'event-row-meta'))).not.toContain('until');
+    expect(vnodeText(findByClass(tree, 'event-row-state'))).toMatch(/^Until /);
+    expect(vnodeText(findByClass(tree, 'event-row-meta'))).not.toMatch(/until/i);
   });
 
   /** A wait that resolved on its own keeps the same subject line, so the eye
@@ -221,7 +254,7 @@ describe('EventWaitRow', () => {
    *  states the thing that is true of the subscription in both lanes. */
   it.each([
     ['matched', 'change proposed'],
-    ['timed_out', 'gave up'],
+    ['timed_out', 'Gave up'],
   ] as const)('keeps the subject, in the past tense, in the %s state', (state, note) => {
     const tree = step(
       wait_({ state, matched_event_type: state === 'matched' ? 'ChangeProposed' : undefined }),
@@ -317,6 +350,15 @@ describe('EventWaitRow', () => {
     );
   });
 
+  /** A long condition must scroll inside the modal rather than run off the
+   *  screen, which only the family's overlay class gives it: the height cap
+   *  reads gap variables that class declares. */
+  it('opens top-aligned and height-capped, like the rest of its family', () => {
+    eventConditionModal.value = { eventType: 'CodingAgentIdled', conditions: [{ thread_id: 't1' }] };
+    const modal = EventConditionModal() as AnyVNode;
+    expect(modal.props.overlayClass).toBe('step-detail-overlay');
+  });
+
   /** A chip with no condition promises nothing, so it must offer no door: a
    *  pressable chip opening an empty modal is the same lie in reverse. */
   it('leaves an unfiltered chip inert', () => {
@@ -329,9 +371,9 @@ describe('EventWaitRow', () => {
    *  live countdown on the indicator, and a ticking span here would re-render
    *  inside `ChatExchange` once a second for as long as the thread sleeps. */
   it('states an unresolved wait deadline without ticking', () => {
-    expect(vnodeText(step(wait_()))).toContain('until ');
+    expect(vnodeText(step(wait_()))).toContain('Until ');
     // A resolved wait has no deadline left to state.
-    expect(vnodeText(step(wait_({ state: 'matched' })))).not.toContain('until ');
+    expect(vnodeText(step(wait_({ state: 'matched' })))).not.toMatch(/until /i);
   });
 
   /** **An `await_event` timeout runs up to 24 hours**, so a deadline is
@@ -353,8 +395,8 @@ describe('EventWaitRow', () => {
       const stamp = (e: string) =>
         vnodeText(findByClass(step(wait_({ expires_at: e })), 'event-row-state'));
 
-      expect(stamp(at(60 * 1000))).toMatch(/^until \d{2}:\d{2}$/);
-      expect(stamp(at(36 * 60 * 60 * 1000))).toMatch(/^until \w{3} \d{1,2} \d{2}:\d{2}$/);
+      expect(stamp(at(60 * 1000))).toMatch(/^Until \d{2}:\d{2}$/);
+      expect(stamp(at(36 * 60 * 60 * 1000))).toMatch(/^Until \w{3} \d{1,2} \d{2}:\d{2}$/);
     } finally {
       vi.useRealTimers();
     }
@@ -365,7 +407,7 @@ describe('EventWaitRow', () => {
   it.each([['', 'absent'], ['not-a-date', 'unparseable']])(
     'omits a %s deadline (%s)',
     (expires) => {
-      expect(vnodeText(step(wait_({ expires_at: expires })))).not.toContain('until');
+      expect(vnodeText(step(wait_({ expires_at: expires })))).not.toMatch(/until/i);
     },
   );
 
@@ -433,7 +475,7 @@ describe('EventWaitRow', () => {
       state: 'canceled', reason: '', subscriptions: [], expires_at: '', cause: undefined,
     }));
     expect(vnodeText(tree)).toContain('Stopped waiting for an event');
-    expect(vnodeText(tree)).toContain('stopped');
+    expect(vnodeText(findByClass(tree, 'event-row-state'))).toBe('Stopped');
     // Nothing invented to fill the gaps, and no dangling separator either.
     expect(findByClass(tree, 'event-name')).toBeNull();
     expect(findByClass(tree, 'event-row-sep')).toBeNull();
@@ -487,26 +529,30 @@ describe('EventWaitRow', () => {
     expect(isExchangeStartEvent({ type: 'EventWaitCanceled', cause })).toBe(starts);
   });
 
-  /** **Source-scan tripwire for the bug this file's transcript half exists for.**
-   *
-   *  The row was gated on the "Show steps" toggle, which was off until a user
-   *  turned it on, so a parked thread rendered no `[data-role="event-wait-row"]`
-   *  at all: the event was in the stream and the class was in the bundle with
-   *  nothing on screen. The toggle defaults ON since 2026-08-11, which changes
-   *  nothing here: it is the reader's, so it can still be off. There is no jsdom here, so the render gate cannot be
-   *  driven; the line itself is what gets pinned. `'step'` is read alongside it
-   *  so a scan that stopped matching anything would fail rather than pass. */
+  /** The bug this file's transcript half exists for. The row was gated on the
+   *  "Show steps" toggle, which was off until a user turned it on. So a parked
+   *  thread rendered no `[data-role="event-wait-row"]` at all. The toggle is
+   *  the reader's, so it can still be off. The body now decides what each row
+   *  is (`responseBody`), and a wait must be a marker, which no toggle hides. */
   it('renders the row without consulting the Show steps toggle', () => {
-    const here: string = dirname(fileURLToPath(import.meta.url));
-    const src: string = readFileSync(resolve(here, '../ChatExchange.tsx'), 'utf8');
-    const arm = (kind: string) =>
-      src
-        .split('\n')
-        .find((l: string) => l.includes(`evt.type === '${kind}'`) && l.includes('return <'));
-
-    expect(arm('event_wait')).toBeDefined();
-    expect(arm('event_wait')).not.toContain('showSteps');
-    expect(arm('step')).toContain('showSteps');
+    const wait: ResponseEvent = {
+      type: 'event_wait',
+      wait_id: 'w1',
+      subscriptions: [{ event_type: 'ChangeApplied' }],
+      reason: 'waiting for the apply',
+      created: '2026-08-10T11:00:00Z',
+      expires_at: '2026-08-10T12:00:00Z',
+      state: 'waiting',
+    };
+    const events: ResponseEvent[] = [{ type: 'step', description: 'Read file', outcome: 'success' }, wait];
+    for (const showSteps of [true, false]) {
+      for (const showDetails of [true, false]) {
+        const rows = responseBody(events, { showSteps, showDetails, rowsHidden: 0 }).flatMap(s => s.rows);
+        expect(rows.find(r => r.kind === 'marker'), `${showSteps}/${showDetails}`).toMatchObject({ event: wait });
+      }
+    }
+    const [steps] = responseBody(events, { showSteps: false, showDetails: true, rowsHidden: 0 })[0].rows;
+    expect(steps).toMatchObject({ kind: 'steps', open: false });
   });
 });
 
@@ -525,18 +571,18 @@ describe('eventDeliveryBody', () => {
   it('leads with the event name and keeps the payload folded', () => {
     const tree = delivery({ payloadJson: '{\n  "has_changes": true\n}' });
     expect(vnodeText(tree)).toContain('Coding agent stopped working');
-    // A <details> with no `open` prop: the payload is there, not shown.
-    const disclosure = findByClass(tree, 'event-row-fold');
-    expect(disclosure).not.toBeNull();
-    expect(disclosure?.props.open).toBeUndefined();
-    expect(vnodeText(tree)).toContain('Details');
-    expect(vnodeText(tree)).toContain('has_changes');
+    // A fold with no `open` prop: the payload is there, not shown.
+    const fold = findFold(tree);
+    expect(fold).not.toBeNull();
+    expect(fold?.props.open).toBeUndefined();
+    expect(fold?.props.label).toBe('Details');
+    expect(vnodeText(fold?.props.body as ComponentChildren)).toContain('has_changes');
   });
 
   it('drops the disclosure when there is nothing to expand', () => {
     const tree = delivery({ eventType: 'ReleaseTagged' });
     expect(vnodeText(tree)).toContain('Release tagged');
-    expect(findByClass(tree, 'event-row-fold')).toBeNull();
+    expect(findFold(tree)).toBeNull();
   });
 
   /** Same marker as the wait, the child callback and the trigger: that shared
@@ -550,7 +596,7 @@ describe('eventDeliveryBody', () => {
     expect(el?.props['data-kind']).toBe('delivery');
     expect(vnodeText(findByClass(tree, 'event-name'))).toBe('Change proposed');
     expect(findByClass(tree, 'event-name')?.props['data-tooltip']).toBe('ChangeProposed');
-    expect(vnodeText(findByClass(tree, 'event-row-state'))).toBe('arrived');
+    expect(vnodeText(findByClass(tree, 'event-row-state'))).toBe('Arrived');
   });
 
   /** The arming reason lives on the `EventWaitStarted`, which is routinely
@@ -577,7 +623,7 @@ describe('eventDeliveryBody', () => {
    *  quietly reintroduce it. See
    *  `docs/plans/2026-08-13-a-delivery-does-not-know-the-thread-was-asleep.md`. */
   it('says the event arrived, never that the thread woke', () => {
-    expect(vnodeText(delivery({ eventType: 'ChangeProposed' }))).toBe('↓Change proposedarrived');
+    expect(vnodeText(delivery({ eventType: 'ChangeProposed' }))).toBe('Change proposedArrived');
     const surfaces = [
       delivery(),
       linked(),
@@ -706,10 +752,10 @@ describe('triggerFiredBody', () => {
     expect(String(el?.props.class)).toContain('event-row');
     expect(el?.props['data-kind']).toBe('trigger');
     expect(vnodeText(tree)).toContain('Trigger fired: Nightly release check');
-    expect(vnodeText(findByClass(tree, 'event-row-state'))).toBe('fired');
-    const fold = findByClass(tree, 'event-row-fold');
+    expect(vnodeText(findByClass(tree, 'event-row-state'))).toBe('Fired');
+    const fold = findFold(tree);
     expect(fold?.props.open).toBeUndefined();
-    expect(vnodeText(fold)).toContain('Prompt');
+    expect(fold?.props.label).toBe('Prompt');
   });
 
   /** **`TriggerStarted` carries no cron expression**, only
@@ -770,7 +816,7 @@ describe('triggerFiredBody', () => {
     expect(vnodeText(tree)).toContain('Trigger fired');
     expect(vnodeText(tree)).not.toContain('t1');
     expect(vnodeText(tree)).not.toContain(':');
-    expect(findByClass(tree, 'event-row-fold')).toBeNull();
+    expect(findFold(tree)).toBeNull();
   });
 });
 

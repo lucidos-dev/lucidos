@@ -19,6 +19,8 @@ import { pairLabelOf } from '../../store/modelSelection';
 import { LUCIDOS_AGENT_LABEL } from '../../store/thread-events';
 import { LucidosMarkIcon } from '../shared/icons';
 import { Overlay } from '../shared/Overlay';
+import { anchoredPanelStyle, useAnchoredPosition } from '../../hooks/useAnchoredPopover';
+import { viewportIsMobile } from '../../utils/viewport';
 import { ModelSelectionPicker } from '../shared/ModelSelectionPicker';
 
 /** The Lucidos Agent's model + reasoning picker — the chat-agent sibling of
@@ -46,7 +48,15 @@ import { ModelSelectionPicker } from '../shared/ModelSelectionPicker';
 export function LucidosControlMenu({ threadId, composeContext }: { threadId?: string; composeContext?: boolean }) {
   const perDraft = !!composeContext;
   const menuRef = useRef<HTMLDivElement>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
   const open = useSignal(false);
+  // Placed like CodingAgentControlMenu, whose `.control-dropdown` box it shares.
+  const pos = useAnchoredPosition(
+    open.value ? menuRef.current : null,
+    panelRef,
+    '.thread-pane',
+    viewportIsMobile.value ? 'container-center' : 'start',
+  );
 
   // Idempotent render-path kick-off so the picker shows the live DB-backed
   // registry; `chatModelOptions()` falls back to the static MODELS list until
@@ -57,7 +67,7 @@ export function LucidosControlMenu({ threadId, composeContext }: { threadId?: st
     // Blur before DOM removal so any focusout-driven header restore fires while
     // the element is still connected (same convention as CodingAgentControlMenu).
     const active = document.activeElement as HTMLElement | null;
-    if (active && menuRef.current?.contains(active)) active.blur();
+    if (active && (menuRef.current?.contains(active) || panelRef.current?.contains(active))) active.blur();
     open.value = false;
   }
 
@@ -134,7 +144,11 @@ export function LucidosControlMenu({ threadId, composeContext }: { threadId?: st
         onClose={close}
         anchor={menuRef.current}
         backdrop={false}
-        panelClass="control-dropdown control-dropdown-auto"
+        // Portaled for the same reason as the coding-agent menu's panel.
+        portal
+        panelClass="surface-box control-dropdown control-dropdown-auto"
+        panelRef={panelRef}
+        panelStyle={anchoredPanelStyle(pos)}
       >
         <ModelSelectionPicker
           label={LUCIDOS_AGENT_LABEL}

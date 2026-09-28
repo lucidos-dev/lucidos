@@ -2635,7 +2635,7 @@ export function legacyOrigin(
       : undefined;
   }
   if (event.device_id) {
-    return { kind: 'device', device_id: event.device_id, label: event.device ?? 'Unknown device' };
+    return { kind: 'device', device_id: event.device_id };
   }
   return undefined;
 }

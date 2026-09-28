@@ -1,4 +1,4 @@
-.PHONY: build build-local check lint lint-eval lint-fmt lint-rust lint-rust-clippy lint-shell fix fmt test test-eval test-gateway test-full test-scripts clean clean-all run run-local start stop restart status logs fresh
+.PHONY: build-local check lint lint-eval lint-fmt lint-rust lint-rust-clippy lint-shell fix fmt test test-eval test-gateway test-full test-scripts clean clean-all run-local stop restart status
 
 # Run a heavy build under a *build slot*, so parallel coding-agent worktrees
 # cannot pile N full compiles onto one host. Degrades to a plain run when the
@@ -26,10 +26,6 @@ WORKSPACE ?= ./test-workspace
 # lint uses a separate target dir (no cache sharing with cargo check/test), and
 # debug lints MORE code because cfg(debug_assertions) blocks compile.
 CLIPPY_FLAGS := --locked --workspace --all-targets
-
-# Build the Docker image
-build:
-	docker-compose build
 
 # Build locally (for development)
 build-local:
@@ -131,9 +127,10 @@ fix:
 fmt:
 	cargo fmt --all
 
-# Run tests
+# Run tests. ENGINE_TEST_ARGS reaches test-engine.sh verbatim; the early suite
+# run of `/harden` passes its driver-module skips through it (ADR 0292).
 test: test-eval test-gateway
-	./scripts/test-engine.sh
+	./scripts/test-engine.sh $(ENGINE_TEST_ARGS)
 
 # Full test suite
 test-full: test-eval test-gateway
@@ -190,17 +187,12 @@ clean-all:
 	cargo clean
 	rm -rf .launch
 	rm -rf test-workspace
-	docker-compose down --volumes --remove-orphans
 
-# Start Lucidos in Docker (background)
-start:
-	LUCIDOS_WORKSPACE=$(WORKSPACE) ./scripts/start.sh
-
-# Stop Lucidos Docker container
+# Stop the workspace's engine
 stop:
 	./scripts/stop.sh -w $(WORKSPACE)
 
-# Restart Lucidos Docker container
+# Restart the workspace's engine
 restart:
 	./scripts/restart.sh -w $(WORKSPACE)
 
@@ -208,22 +200,7 @@ restart:
 status:
 	./scripts/status.sh
 
-# View logs
-logs:
-	docker-compose logs -f
-
-# Run in foreground (for development)
-run:
-	LUCIDOS_WORKSPACE=$(WORKSPACE) ./scripts/start.sh -f
-
-# Run locally without Docker (for development)
+# Run the engine against a fresh test workspace (for development)
 run-local:
 	rm -rf test-workspace/data test-workspace/.lucidos
 	LUCIDOS_WORKSPACE=./test-workspace cargo run --locked -p lucidos-engine
-
-# Build and run fresh
-fresh: build
-	@test -n "$(WORKSPACE)" || { echo "ERROR: WORKSPACE is empty; refusing to rm -rf /data"; exit 1; }
-	./scripts/stop.sh -w "$(WORKSPACE)" || true
-	rm -rf "$(WORKSPACE)/data" "$(WORKSPACE)/.lucidos"
-	LUCIDOS_WORKSPACE="$(WORKSPACE)" ./scripts/start.sh

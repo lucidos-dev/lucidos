@@ -51,7 +51,7 @@ Each agent prompt must be **self-contained** (agents have no conversation contex
    - **Dead code** — unused functions, imports, types, exports, variables → delete entirely (don't comment out or `_` prefix)
    - **Bug patterns** — code that will crash or produce wrong results
    - **DRY violations** — duplicated logic within the module → extract into shared function
-   - **Code quality** — unclear names, unnecessary complexity, stale/wrong comments → fix
+   - **Code quality**: unclear names, unnecessary complexity, stale or wrong comments → fix. Also a comment that defends a workaround or known-wrong behaviour → fix per `.claude/rules/prose.md` § "What a comment is for"
    - **Private data** — per `.claude/rules/no-private-data.md`, any real personal/family/company-internal data or machine path in a shipping file (test fixtures and comments included) → replace with the approved generic placeholder; leave legitimate attribution (the carve-out) alone
 5. **How to work**:
    - Use Glob to list all source files in your directories
@@ -79,7 +79,8 @@ Each agent prompt must be **self-contained** (agents have no conversation contex
 
 After all 8 module agents complete, launch ONE agent to find cross-module issues:
 
-- **Dead exports**: `pub` (Rust) or `export` (TypeScript) items only referenced at their definition, never imported elsewhere
+- **Dead exports**: `pub` (Rust) or `export` (TypeScript) items only referenced at their definition, never imported elsewhere. **A test is not a caller.** An item that only its own tests reach is dead: delete it, and retarget or delete those tests. Two exceptions stay: a deliberate test oracle, and a seam an integration test needs because it can only use the public API
+- **Unreachable files and build paths**: a tracked script or build file that nothing reaches. Check Makefile targets, scripts, workflows, skills, hooks and usage lines. Also a build path nothing builds, such as a Dockerfile whose toolchain disagrees with `rust-toolchain.toml`. Delete it with its references. A manual tool with a usage line in a rule stays
 - **Broken imports**: references to items that module agents may have deleted
 - **Duplicate definitions**: same type or function defined in multiple modules
 
@@ -90,8 +91,8 @@ Use Grep across `crates/` to verify each item. Be conservative — only fix item
 The whole-tree face of the **temporary-measures & marker-hygiene** check (the
 per-change face lives in `/harden` Phase 2 Agent 2 — same registry, same markers,
 same inclusion test, same "register it" escape valve; this one just sweeps the
-whole tree instead of a diff). It is a **reporting** pass — surface findings in the
-final summary; don't silently delete impermanent code or registry rows.
+whole tree instead of a diff). It is a **reporting** pass for anything that needs judgment. The one exception
+is below: a condition the tree proves met is a fix, not a report.
 
 Read `docs/temporary-measures.md` (governed by `.claude/rules/temporary-measures.md`),
 then check **both directions**:
@@ -100,10 +101,12 @@ then check **both directions**:
    each `active` / `open` entry, read its removal/resolution condition and check the
    tree for whether it's now satisfiable: the upstream bug it worked around is
    fixed, the feature flag's cleanup is done, the model reliably emits the canonical
-   form, the investigation looks closeable. Flag any entry that reads as ready to
-   retire — with the evidence — so a human can flip its status to `removed` /
-   `resolved` (kept as history, never deleted) and do the paired cleanup the entry
-   names. Closing an investigation flags every measure tagged with its id.
+   form, the investigation looks closeable. **Did the tree, the tags or a live check
+   prove the condition met? Then do the paired cleanup the entry names.** Flip
+   its status to `removed` / `resolved` (kept as history, never deleted).
+   When proving it needs user data, an upstream fix you cannot verify, or a
+   judgment call, flag it with the evidence instead. Closing an investigation
+   flags every measure tagged with its id.
 
 2. **Impermanent code missing a row.** Grep the tree for impermanent-looking things
    NOT in the registry: `TODO` / `FIXME` / `HACK` / `XXX` markers, and

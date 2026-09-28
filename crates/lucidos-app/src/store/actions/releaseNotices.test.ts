@@ -23,6 +23,7 @@ const {
 // halves are exercised together here: they are one behaviour, and the split is
 // about the import graph rather than about what a notice does.
 const {
+  modalActionLabel,
   owedReleaseNotice,
   owedReleaseNoticeCount,
   releaseNoticeDismissed,
@@ -30,13 +31,14 @@ const {
 } = await import('../releaseNotices');
 const { releaseNoticeView } = await import('../store');
 
-function notice(id: string, resolved: boolean, action = false): ReleaseNotice {
+function notice(id: string, resolved: boolean, action = false, action_deferred = false): ReleaseNotice {
   return {
     id,
     since: '2.0.0',
     title: `Notice ${id}`,
     body: 'Do the thing.',
     resolved,
+    action_deferred,
     ...(action ? { action_label: 'Do it', action_prompt: 'Do the thing for me.' } : {}),
   };
 }
@@ -181,5 +183,21 @@ describe('dismissing without answering', () => {
     expect(releaseNoticeModalOpen()).toBe(false);
     // Still owed. A reload asks again, which is what "not now" means.
     expect(owedReleaseNotice()?.id).toBe('a');
+  });
+});
+
+describe('the action the modal draws', () => {
+  it('is the notice\'s own label', () => {
+    expect(modalActionLabel(notice('a', false, true))).toBe('Do it');
+  });
+
+  it('is nothing for a notice with no action', () => {
+    expect(modalActionLabel(notice('a', false))).toBeNull();
+  });
+
+  // A workspace that skipped releases owes several audit notices. The engine
+  // marks all but the last as deferred, so the reader runs one audit.
+  it('is nothing when a later owed notice carries the same action', () => {
+    expect(modalActionLabel(notice('a', false, true, true))).toBeNull();
   });
 });

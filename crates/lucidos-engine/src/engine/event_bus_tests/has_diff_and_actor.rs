@@ -274,7 +274,6 @@ async fn domain_event_persisted_payload_carries_actor_when_provided() {
 
     let actor = MessageOrigin::Device {
         device_id: "test-dev-42".to_string(),
-        label: "My MacBook".to_string(),
     };
     let result = bus
         .emit(BusEvent::System(SystemEvent::DomainEvent {
@@ -299,7 +298,10 @@ async fn domain_event_persisted_payload_carries_actor_when_provided() {
         .expect("actor must be persisted as a top-level payload key");
     assert_eq!(payload_actor["kind"], "device");
     assert_eq!(payload_actor["device_id"], "test-dev-42");
-    assert_eq!(payload_actor["label"], "My MacBook");
+    assert!(
+        payload_actor.get("label").is_none(),
+        "a device actor stores its id, never its name"
+    );
 
     pool.close().await;
     teardown_test_db(&db_name).await;
@@ -353,7 +355,6 @@ async fn wave4_mutating_endpoint_events_persist_with_actor() {
 
     let actor = MessageOrigin::Device {
         device_id: "dev-wave4".to_string(),
-        label: "Wave 4 Test Device".to_string(),
     };
 
     // Construct one of every new variant. Exhaustive enum match below
@@ -468,7 +469,10 @@ async fn wave4_mutating_endpoint_events_persist_with_actor() {
             "{event_type} actor must be the device variant"
         );
         assert_eq!(payload_actor["device_id"], "dev-wave4");
-        assert_eq!(payload_actor["label"], "Wave 4 Test Device");
+        assert!(
+            payload_actor.get("label").is_none(),
+            "a device actor stores its id, never its name"
+        );
     }
 
     pool.close().await;
@@ -605,7 +609,6 @@ async fn startup_clears_orphan_proposed_chip_without_pending_change() {
              status = CASE WHEN ts.status = 'waiting' THEN 'idle' ELSE ts.status END \
          WHERE ts.coding_agent_proposed = TRUE \
            AND ts.coding_agent_is_external_repo = FALSE \
-           AND ts.coding_agent_applying = FALSE \
            AND NOT EXISTS ( \
              SELECT 1 FROM changes c \
              WHERE c.thread_id = ts.thread_id AND c.status = 'pending' \

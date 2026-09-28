@@ -1,7 +1,7 @@
 import { useEffect } from 'preact/hooks';
 import { unfocusThread } from '../store/actions/threads';
 import { focusPromptNow } from '../components/chat/promptFocus';
-import { searchEverywhereOpen, focusedPane, toggleExchangeCollapsed, toggleInitiatorCollapsed } from '../store/store';
+import { searchEverywhereOpen, searchEverywhereAnchor, focusedPane, toggleExchangeCollapsed, toggleInitiatorCollapsed } from '../store/store';
 import { isTextInput, isThreadTranscript } from '../utils/dom';
 import { dismissTopOverlay, overlayStack } from '../store/overlayStack';
 import { nativeFullscreenElement } from '../store/appFullscreenHost';
@@ -62,6 +62,13 @@ function toggleNavigatedTurnCollapsed(): boolean {
   return true;
 }
 
+/** A shortcut opens the palette with no button behind it. So it drops the
+ *  anchor a past button open left, and the palette follows the focused pane. */
+function toggleSearchEverywhere(): void {
+  if (!searchEverywhereOpen.value) searchEverywhereAnchor.value = null;
+  searchEverywhereOpen.value = !searchEverywhereOpen.value;
+}
+
 /** What each registry shortcut does when its (current, possibly-customized)
  *  binding fires. The registry (`utils/shortcuts.ts`) owns the keys; this map
  *  owns the behavior — so rebinding a shortcut in Settings takes effect here
@@ -69,7 +76,7 @@ function toggleNavigatedTurnCollapsed(): boolean {
 const SHORTCUT_ACTIONS: Record<ShortcutId, () => void> = {
   newThread: startNewThread,
   closeThread: () => void runCloseCascade(),
-  searchEverywhere: () => { searchEverywhereOpen.value = !searchEverywhereOpen.value; },
+  searchEverywhere: toggleSearchEverywhere,
   // Context-gated: no-ops unless the thread drawer is focused with a thread row
   // highlighted, then opens that row's ⋯ menu (the keyboard route to per-row
   // actions, since the drawer is a single tab stop).

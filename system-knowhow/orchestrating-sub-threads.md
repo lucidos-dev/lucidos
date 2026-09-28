@@ -182,8 +182,8 @@ A finished child is not gone. `follow_up_child_thread` into an idle or completed
 child starts a fresh turn with its context intact, so a ruling still lands after
 the child reported done. Four things to expect:
 
-- **A finished child stays where it ran**, in the inbox, because nothing
-  archived it. A family routes as one unit, so it stays listed under its
+- **A finished child stays where it ran**, in the inbox, until you or the user
+  archive it (see below). A family routes as one unit, so it stays listed under its
   parent and reads as ordinary finished work. Only a real archive dims it,
   through the *archived sub-thread cue*, and archiving the parent cascades
   one onto every descendant.
@@ -193,6 +193,37 @@ the child reported done. Four things to expect:
   cards as superseded.
 - A follow-up into an **archived** coding-agent child resurfaces it in the
   user's Inbox at its next idle.
+
+## Archiving a child when it is done
+
+Nothing archives a thread on its own, not even after its change is applied.
+That call is yours (ADR 0310). Use the `threads` tool's `archive` action with
+the child's id (or `lucidos threads archive --thread <id>`).
+
+**Archive a child once its change is applied and you expect no follow-up.**
+Leave it open while any of these remains:
+
+- a follow-up you still mean to send, or a review round still to come;
+- a question card, or a permission card, waiting on the user;
+- a pending change, not yet applied or discarded;
+- a live event wait of its own.
+
+What to expect:
+
+- **It runs the Archive button's cascade.** The child's own sub-threads go
+  with it, and the same states refuse it: a running child, one waiting on the
+  user (`parent_not_archivable`), one holding a pending change, or one with a
+  blocking sub-thread.
+- **You reach only your own direct children.** A grandchild is its own
+  parent's to archive. Anything else is refused with `not_your_thread`.
+- **A pinned thread is the user's to archive, never yours.** A pinned child,
+  or your own pinned thread, is refused with `thread_pinned`. A pinned
+  sub-thread of the child stays open while the rest of the family goes.
+- **Archiving frees the child's worktree.** A merged, clean worktree is
+  reclaimed about an hour after the child goes idle. A follow-up after that
+  rebuilds it from scratch, which is why you archive only when none is coming.
+- **Your own thread** takes `thread_id: 'current'`. It is archived once this
+  turn ends and it has settled, and a new message before then keeps it open.
 
 ## Moving a child to top level
 

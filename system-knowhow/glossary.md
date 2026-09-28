@@ -26,6 +26,11 @@ A *thread* that is currently doing work — the system's turn — surfaced by th
 
 As a **query filter** (`--active` on `lucidos threads list` / `count`, `active` on `GET /api/v1/threads/{list,count}`, the `threads` tool and `lucidos.threads`), "active" is the wider **union** of the `running` and `waiting_for_user_answer` statuses: the agentic loop is mid-flow in either direction. Those two are opposites in the sense that matters to a caller, so the union answers "is anything busy?" wrongly, because a thread parked on an unanswered question is blocked on the human, not working. Ask that question with the *status filter* instead.
 
+### Agent archive
+An agent archiving a *thread* itself, through the `threads` tool's `archive` action or `lucidos threads archive`. It reaches only its own thread and its own direct *child threads*. It runs the same *cascading archive* as the Archive button, so the same states refuse it. A *pinned thread* is the one difference: an agent is refused one (`thread_pinned`), and a pinned sub-thread stays open while the rest goes (ADR 0312). A child is archived at once.
+
+An agent's own thread is archived once its turn ends and it has settled, and a new message before then keeps it open. The agent decides when: Lucidos never archives a thread by itself, not even after its change is applied (ADR 0310). The rule agents follow is to archive once the change is applied and no follow-up is expected.
+
 <!--gloss-app-start-->
 ### App
 A user-installed mini-application with its own UI (HTML/CSS/JS) at `data/apps/<id>/`, plus optional *knowhow* / *intents* / *scripts* / *triggers*. Chat is not per-app: every conversation is a regular *chat thread*. When an app is open in the panel-overlay slot, its `manifest.json` and discovered context flow into the *Lucidos Agent*'s prompt, so the agent can answer in-context. Quick edits to an app happen through the agent's file tools on the chat path; heavier edits spawn an *app coding-agent thread*. The *app manifest* is user-facing metadata shown in the UI; `knowhow/` and `intents/` are engine-facing context loaded into the LLM when the app is active. The app's interactive surface is the *app UI* — see entry.
@@ -73,8 +78,10 @@ Over the limit a build waits rather than failing: `lucidos build-slot -- <comman
 
 A granted slot also governs the build's CPU share, not just whether it may start. The holder runs at `nice +10`, which the whole compile tree inherits, and gets `CARGO_BUILD_JOBS` set to the cores divided by the slots held. The share never falls below the fixed `cores / capacity` share, so a solo build keeps the machine and full contention divides it evenly. An explicit `CARGO_BUILD_JOBS` from the caller always wins, and `LUCIDOS_BUILD_SLOT_NICE` overrides the increment (`0` opts out).
 
+One build jumps the line: the engine's own Apply rebuild waits as a **priority waiter**. While it waits, ordinary builds leave a freed slot to it, and it runs un-niced. It never takes a slot beyond the count and never stops a running build. While it waits, its line in the Lucidos menu calls it a **queued build** ("New version queued") instead of "Building new version". A still hourglass stands in for the spinner.
+
 Exists because every *coding-agent thread* gets its own *worktree* with its own `target/`, so parallel agent sessions are N full compiles resident at once. Distinct from the engine build lock, which serialises engine-triggered builds inside one checkout's shared `target/`. Also distinct from the e2e lock, which hard-fails a second run rather than waiting.
-See also: ADR 0070, ADR 0210, `system-knowhow/lucidos-cli.md` § `lucidos build-slot`.
+See also: ADR 0070, ADR 0210, ADR 0304, `system-knowhow/lucidos-cli.md` § `lucidos build-slot`.
 
 ### Capacity policy
 The configurable caps governing the *Thread Queue*. The fields:
@@ -89,6 +96,8 @@ Concurrency caps of 0 mean "hold": admission pauses and the queue accumulates un
 
 ### Cascading archive
 Archiving a parent *thread* also archives every *sub-thread* under it, in one atomic operation. Disabled when any descendant is a *blocking descendant*. **A thread waiting on your answer is never archived**, by any path: answer the question or press Stop first. A question asked in an archived thread moves it back to *Current*. **An archived thread stays fully searchable**, and what Lucidos learned from it stays in memory: Archive moves a thread to the Archive section of the *thread drawer* and changes nothing else. *Delete (a thread)* is the action that removes it.
+
+An agent can archive its own thread and its own child threads (*agent archive*). Nothing archives a thread on its own.
 
 ### Chat thread
 A *thread* whose `source = 'chat'` — the user typed the opening message in the Lucidos chat UI. Answered by the *Lucidos Agent*. Contrast with *trigger thread* and *coding-agent thread*.
@@ -305,6 +314,11 @@ A past-tense fact about something that happened in the workspace. Always past-te
 A read-only view of one file, rendered by Lucidos over whatever the *content pane* is showing, without navigating there. Opened by an *app* through `lucidos.ui.previewFile` so a reader following a citation in a report glances at the file and carries on, instead of losing their place. It takes the same locators and the same `line` / `line_end` as the `file` navigation target (a workspace data path or a `repo:<repoId>:file:<path>` one), shows the same highlight and line numbers the *content pane*'s preview shows, and carries a link that escalates the glance into that full preview. Dismissed by Esc, a click outside it, or its close control. Distinct from the *content pane*'s file preview, which IS a navigation: that one replaces what the pane was showing and lands in the Back history.
 See also: `system-knowhow/js-sdk.md` § lucidos.ui.
 
+### Font catalog
+Every font Lucidos offers, one entry each: its id, label, CSS stack, kind (`ui` for proportional, `both` for monospaced, `mono` for code only), group, source and license. The group is `sans`, `serif` or `mono`, read from the generic family the stack ends in, and Settings lists fonts by it. The source is one of two. `vendored` is served by the engine and works offline. `device` is the device's own fonts. No font loads from the internet.
+
+The `font-family` *preference* takes a font id or `theme`, which follows the *theme*'s suggestion. A theme may name any catalog font. The engine serves the catalog at `GET /api/v1/fonts`, followed by any *workspace font*. See `system-knowhow/themes.md` § Fonts.
+
 ### Form request
 Something the agent put in front of the user to fill in or confirm: a credential form, a plugin install or uninstall panel, an email confirmation, or an OAuth authorization page. It is persisted, so it survives a reload or a dropped connection. It stays open until the user answers it, cancels it, or something newer replaces it, and one `FormRequestResolved` records which. An open one shows in its thread with an Open button. It does not change the thread's status.
 See also: `system-knowhow/thread-events.md` § Form requests.
@@ -317,6 +331,9 @@ Its point is that the agent can note where something lives before a sweep drops 
 ### Image handle
 The stable address of an image already in a thread, written `img-<hex>`. Derived from the image's content, so it names the same picture for as long as that picture exists. The counterpart to `thread:N`, which is a *position* and therefore renumbers whenever an earlier image turns up. Every tool taking an image reference (`view_image`, `save_thread_image`, `generate_image`'s `input_images`) accepts both. Shown beside `thread:N` in the conversation history's image note, so the agent can note one and dereference it in a later turn.
 See also: `system-knowhow/best-practices.md` § Images posted in a thread.
+
+### Image size hint
+A trailing `#<width>x<height>` on a markdown image's source, in image pixels: `![mockup](artifacts/x.png#1600x1200)`. The thread uses it to hold the picture's box before the picture loads, so a card or reply does not jump. `lucidos data write` prints it on the picture line, and the engine adds it to every workspace picture on a question card. Keep it when you paste the line. Any other fragment is left as written.
 
 ### Imported
 The `data/imported/` directory where imported external repositories land (via `RepositoryImported` events). Treated as *artifacts* — content is flattened into the workspace's git tree, not kept as nested git repositories. Distinct from the *external-repo coding-agent thread* surface, which runs against a *repository* (a separately registered external git repo path).
@@ -420,6 +437,30 @@ How an answer comes back, chosen in **Settings → Models → Response style**. 
 
 The style applies to chat and to every *trigger*, from the next message onward, and changes nothing about a *coding-agent thread*. **Standard** is the default style and adds nothing at all, so answers come back the way they always have. Whatever a style asks for, Lucidos still keeps every warning, every caveat that changes the answer, and every step the user has to take: that rule sits outside the editable text and cannot be written away.
 
+### Theme
+A named set of design-token values that retunes how Lucidos looks: its colours, the header bar, how focus shows, radii and shadows. It can also suggest a UI font and a code font from the *font catalog*; the user's own font pick wins over the suggestion. A theme styles one *theme mode* or both, and the device-scoped `theme` *preference* picks it (**Settings → Appearance → Theme**). Tokens and *theme parts*, never CSS, and only the tokens the theme token catalog lists: a theme can recolour a control but never move or hide one. It sits under the *style overrides*, which still win, and never repaints a *protected surface* past its clamped palette.
+
+Built-in themes ship with the engine. A workspace theme is a file at `data/themes/<id>.json`, which a *plugin* can ship in its `themes/` folder. The engine validates a theme and derives what its three seed colours imply (background, text, accent). Every surface, app frames included, paints the result. See `system-knowhow/themes.md`.
+
+### Theme effects
+Whether a *theme*'s part shadows, filters and scanlines show on one device. The user sets it under **Settings → Appearance → Theme → Effects**, stored as the device-scoped `theme-effects` *preference*. **Reduce** drops every part `text-shadow`, `box-shadow` and `filter` and the screen's scanlines. It keeps part colours, letter-spacing, the caret shape and borders.
+
+**System**, the default, drops them when the device asks for more contrast or less transparency, and **Full** always shows them. It lands on the page as `data-theme-effects` before first paint, where apps read it too; battery state plays no part. See `system-knowhow/themes.md` § Theme parts.
+
+### Theme family
+The group a *theme* belongs to in the picker: `blue`, `violet`, `warm` or `neutral`. The picker labels `blue` "Cool". A theme names it in its own file, so similar themes sit together whatever their order. A theme with no family shows last, under "Other". See `system-knowhow/themes.md`.
+
+### Theme part
+A named region of the UI that a *theme* may style with capped paint-only properties. Shell parts include chat text, the actor icons, header titles, the composer, step cards, floating surfaces and the screen. Three more paint inside app frames.
+
+A theme names the part and the property, such as `"parts": {"chat-text": {"text-shadow": "0 0 0.3em var(--accent)"}}`, and never writes a selector: Lucidos owns every selector. Each property has a grammar and caps, so no part can cover, hide or fake anything. A theme may set parts for both modes and for one mode, and no part reaches a *protected surface*. `GET /api/v1/themes/parts` lists every part, and each part property compiles to a *part token*. See `system-knowhow/themes.md` § Theme parts.
+
+### Theme token catalog
+Every token a *theme* can tune, with its group, a description, its default in each *theme mode*, and the seeds it derives from. The engine serves it at `GET /api/v1/themes/tokens`, which is how a theme-building app lists every tunable element. A test pins it to the stylesheet, so a token the stylesheet declares is never missing from it. See `system-knowhow/themes.md` § The theme token catalog.
+
+### Theme mode
+Light, dark, or system (follow the OS): the `theme-mode` *preference*, per device. The shell and every app frame paint the resolved value as `data-theme-mode` on `<html>`. Distinct from a *theme*, which picks the colours a mode paints.
+
 ### Technical literacy
 How technical the user is, and so how technical the words are in every answer. Three levels, shown on every card as **Keep it plain** (non-technical), **Technical** and **I write software** (developer). It is the *response style*'s second part. The first chat asks for it, as part of first-run setup. It can also be set in the *setup interview*, by telling the agent, or in Settings, where the row is labelled **How technical**. It reaches chat and *triggers* from the next message, and a *coding-agent thread* or a voice call from its next start.
 
@@ -511,6 +552,8 @@ See also: `system-knowhow/orchestrating-sub-threads.md`.
 ### Device
 One browser storage container that has met Lucidos. Listed in **Settings → Devices**, one row each, whichever way it arrived. A device is what a push notification is sent to, what a device-scoped *preference* applies to, and who an actor chip credits.
 
+A device has one name everywhere: the name you typed on its row, else its *pairing label*, else `device-` and the start of its id. See `system-knowhow/remote-access.md` § What a device is called.
+
 **Per browser means per browser, and on iOS that includes the home-screen app.** iOS gives it a storage container of its own, so it is a separate device from Safari on the same phone.
 
 Two facts hang off one row, and they have different reach. Whether it may reach the machine at all is its *pairing*, which is machine-wide: **Revoke** cuts it off every *workspace* at once. Everything else is per workspace: where push goes, which preferences apply, and the name you typed. **Remove** forgets only that, here, and leaves the device paired.
@@ -519,6 +562,10 @@ Either half can be missing, and neither is an error. A device paired from anothe
 
 **One device is one row.** The id comes from the *workspace gateway* when there is one, and both halves key on it. Reaching an engine port directly, the browser mints its own and keeps it. That is safe: no pairing list exists on that route to disagree with it.
 See also: *paired device*, *pairing code*, *preference*, *active device*.
+
+### Pairing label
+The name a device got when it paired, such as "Safari on iPhone". The pairing screen suggests it from the browser, and the person at the device may type their own. It is fixed until you revoke the device and pair it again. Every *workspace* knows it: the *workspace gateway* passes it along with each request. A device has one name everywhere, the name typed on its **Devices** row, else its pairing label, else `device-` and the start of its id.
+See also: *device*, *paired device*, `system-knowhow/remote-access.md` § What a device is called.
 
 ### Paired device
 A *device* you have allowed to reach Lucidos over the network. The *workspace gateway* answers no network caller that is not paired, so joining the tailnet is no longer enough by itself. Pairing is per device and per browser, and it survives restarts until you revoke it. A *paired device* reaches every *workspace* that gateway serves: workspaces are not a boundary against each other, because a *coding agent* in one can already read another through the shell.
@@ -544,6 +591,9 @@ See also: *paired device*, `system-knowhow/lucidos-cli.md` § `lucidos pair`, `s
 ### Parent thread
 The direct ancestor of a *child thread*. Resolved via the child's `parent_thread_id` column. A thread can have at most one parent; a parent can have many children. The edge carries traffic both ways: each child reports its outcome upward when it terminates, and the parent can send a *child follow-up* downward to any child it spawned itself. A child a user Stop paused sends a note instead of a report; see *stopped child*.
 
+### Part token
+The custom property one *theme part* property compiles to, named `--part-<part>-<property>`, such as `--part-chat-text-text-shadow`. The engine emits it in the *theme*'s resolved map in a canonical form, never the author's string. A stylesheet Lucidos ships reads it under the part's selector, with a fallback to what the element paints without a theme. An app that loads the SDK stylesheet may read one by name. `--part-` is reserved: a theme's token maps cannot set one, and a part token in the *style overrides* must pass the same grammar.
+
 ### Paused (thread status)
 A *thread* whose turn the user's own *Switch to new version* interrupted, and which the engine has promised to resume. Its own status indicator, and the one that is not a dot: the standard pause glyph, in a neutral tone and deliberately not the red *failed* dot. The word "Paused" appears in the row's Info card, and the interrupted turn is labelled "Paused by restart" in the transcript. There is exactly one way in, and that is the point of the status: the engine auto-resumes the turn by itself, usually within seconds, so no **Continue** button is offered and nothing is being asked of you. Every OTHER interruption is *failed* instead, with the red dot, a place in the *attention* count, and the Continue button: a crash, an engine shutdown the user did not ask for, and a switch whose resume the next boot turned out not to be able to deliver (the boot says so explicitly, by replacing the pause with the error). So the pause glyph is a promise, and it is never shown for a turn nothing is coming back for. Paused is a *verdict* about the interrupted turn, not a resting state, so the events that merely close the turn out cannot walk it back to idle; sending a follow-up message clears it like any other new work. Distinct from *failed* as above, from `waiting` (a *change* is sitting in review) and from `waiting_for_user_answer` (the agent is parked on a question the user must answer). A paused thread does not count toward *attention*, because it resumes on its own.
 
@@ -551,8 +601,14 @@ A *thread* whose turn the user's own *Switch to new version* interrupted, and wh
 
 **A pending change does not change the verdict.** A thread interrupted mid-turn reads Paused (or *failed*) whether or not it is carrying a *change* to review. It used to read `waiting` in that case, and nothing writes `waiting` now: the change is carried by the thread's own change state, not by its status. So the change is not lost. It is still in the thread and in the review list, and the dot tells you what happened to the turn first.
 
+### Pinned thread
+A *thread* the user pinned to keep it at hand. It sits in the Pinned section of the *thread drawer*, whatever else is going on in it. A pinned thread is never archived: pinning an archived thread brings it back out, and archiving a pinned thread unpins it. So a settled pinned thread always offers Archive beside Unpin. Only the user's own Archive unpins. Automatic archiving (a finished trigger run nobody is watching) and an agent's archive both leave a pinned thread alone.
+
+Internally the pin is still called "saved": the `saved` section key, `is_saved`, and the `ThreadSaved` / `ThreadUnsaved` events.
+See also: *Current section*, *thread drawer*.
+
 ### Plugin
-A bundle of installable workspace content shipped as a single unit. Contains any of `apps/`, `knowhow/`, `triggers/`, `scripts/`, `auth-modules/` — mirroring the top-level `data/` directories. Defined by a *plugin manifest* at the root. At install time the contents merge into the target workspace's `data/`. Use a plugin when the pieces only make sense together (e.g. an app + its knowhow + its trigger); ship single files individually otherwise.
+A bundle of installable workspace content shipped as a single unit. Contains any of `apps/`, `knowhow/`, `triggers/`, `scripts/`, `auth-modules/`, `themes/`, `fonts/`, mirroring the top-level `data/` directories. Defined by a *plugin manifest* at the root. At install time the contents merge into the target workspace's `data/`. Use a plugin when the pieces only make sense together (e.g. an app + its knowhow + its trigger); ship single files individually otherwise.
 See also: `system-knowhow/plugins.md`.
 
 ### Plugin category
@@ -577,6 +633,11 @@ A single key→value user setting stored in the `preferences` table — theme, l
 The *app UI* filling the whole viewport as a CSS overlay, used where the browser's native Fullscreen API is unavailable or refused. That is the iOS path, so it is the usual shape on a phone. Both modes are entered from the same content-header control, and the user sees no difference between them.
 
 What differs is what the host can paint. A natively fullscreen element is painted alone, so the browser supplies Escape and nothing else is drawn. A pseudo-fullscreen panel sits in the normal layer, so the host draws its own chrome over the app iframe. That chrome is an exit button in the top-right corner, plus a transparent guard strip down each screen edge on mobile. Those regions belong to the host, and an app must keep them clear (`system-knowhow/building-an-app.md` § Responsive by default). Source: `.app-ui-fullscreen` in `crates/lucidos-app/src/styles/panels/previews.css`, gated by `isPseudo` in `components/apps/AppUiInline.tsx`.
+
+### Pull to refresh
+Dragging down past the top of a *content pane* view on a touch screen to re-read what it shows. A scroll up that reaches the top and keeps going counts too. An arrow drops with the finger and blends into the accent colour, fully there once letting go would refresh. There it stops dropping but keeps turning while the finger pulls. A refresh icon then spins beside the header's menu button until the new data replaces the old, then turns into a check. On desktop the same refresh is the header's Refresh button.
+
+What a refresh re-reads is the view's own business. Disk Usage re-measures its worktrees, the Plugins panel checks every marketplace again, and an *app* reloads as its header Refresh does. Views that update live, such as the thread list, have nothing to pull. Inside an app the SDK sees the pull, and an app can opt out (`system-knowhow/js-sdk.md` § Pull to refresh).
 
 ### PresenceCheck
 The transient SSE event the *Lucidos Engine* broadcasts on every `NotificationCreated` to ask every connected page for its live presence. A **pure pong trigger** — it carries `notification_id`, `event_id` (so the pong can report `event_in_viewport`), a `deadline_ms` the page reads off the payload (set by `scheduler::push::DEADLINE_MS`, currently 2 s — sized to cover an iOS PWA's first packet after Tailscale wake-from-idle, where Tailscale's userspace WireGuard renegotiation pushes the round-trip into the 1100–1800 ms band), and `sent_at_ms`. It carries NO toast content: the in-app toast is driven separately by *NotificationToastRequested*, so it can no longer race the push decision. Each page answers with a *PresencePong*. The engine collects pongs up to the deadline and uses them to decide whether to send an *OS surface* push. Skipped entirely only when nobody is reachable — no page holds an open SSE connection AND no device has pinged visible within `PRESENCE_STALE_AFTER` (120 s, `core::device_presence`). The live SSE-connection count is the primary gate (`engine.sse_connections`); the heartbeat candidates are secondary (`expected_pong_count` in `scheduler::push`). The SSE count is what makes this robust — iOS suspends the 30 s heartbeat while a PWA is foregrounded, so the heartbeat row goes stale even though the page is connected and would pong; gating on the open connection lets the active page still suppress the push. See `system-knowhow/notifications.md` §3.
@@ -628,6 +689,8 @@ A *Lucidos Agent* *thread* the engine spawns when a *plugin* shipping a `setup` 
 
 Its first message is a short user-facing line naming the occasion. A first install seeds `Set up the newly installed <name> plugin.`, and an update seeds `Set up <name> again: its setup instructions changed since version <prior>.` under the title `Update <name> setup`. A legacy record naming no version drops the `since version` clause, and says `this update changed its setup instructions` instead. The distinct title is what stops the thread list showing the same name twice.
 
+The engine wrote that line, so it is attributed to the *Lucidos Engine* with the reason `plugin_setup`, never to the user. It records the plugin, both versions and the occasion. The message route popover shows it as "Plugin install" or "Plugin update", with the device that confirmed as "Confirmed on". See `system-knowhow/thread-events.md` § Engine origins.
+
 The "how to run a plugin setup" guidance lives in `system-knowhow/plugin-setup`, which the agent loads to plan the steps as a todo list. It finds the author's setup instructions there too, referenced from the `PluginInstalled` event rather than embedded in the thread. It then walks the user through completing them, asking for credentials and choices, and doing the wiring it can.
 
 On an update that knowhow starts from the last run rather than from scratch. It diffs the two versions' `setup` texts, and reads the `PluginSetupCompleted` *domain event* the previous run wrote. That record holds the user's choices and what was skipped, and the earlier setup thread is the fallback when there is none. A record is never enough on its own. The agent first checks that trigger, webhook, credential or config entry is in place, since a record cannot see a deletion or an uninstall.
@@ -647,12 +710,14 @@ The grant does not govern everything an unattended session is denied. A command 
 The `<name>.manifest.json` sidecar next to a `<name>.wasm` signer artifact in `data/auth-modules/`. Carries WASM-host metadata (`secret_handles`, `body_mode`, `capabilities`). The engine never auto-loads provider config from it — `data/config/apis.json` is the single source of truth for proxy entries.
 
 ### Slowness warning
-An amber bar at the top of a workspace window that says Lucidos is slow, and why when it can tell. It has two reasons.
+An amber bar at the top of a workspace window that says Lucidos is slow, and why when it can tell. It picks the first reason that holds, in this order.
 
-- **Short on memory.** The computer running Lucidos is short on memory. The bar lists the biggest memory users, summed by app, with Lucidos (its engines, coding agents and database) counted as one. It shows in every workspace, because memory belongs to the whole computer.
-- **Responding slowly.** Lucidos is slow and memory is not the clear cause. The bar lists the apps using the most processor time, grouped the same way. It shows only in windows of the workspace that was slow.
+- **Almost out of disk space.** Less than 2 GB is free where Lucidos keeps its workspaces or its database. The bar says how much is free and to free up space. It shows in every workspace, because the disk belongs to the whole computer.
+- **Database not responding.** A workspace answers, but its database does not. The bar says to restart Docker, or Lucidos on an installed app. When the database answers but every connection is busy, the bar says Lucidos is waiting for a free database connection instead. It shows only in windows of the workspaces that reported it.
+- **Short on memory.** The computer running Lucidos is short on memory. The bar lists the biggest memory users, summed by app, with Lucidos (its engines, coding agents and database) counted as one. It shows in every workspace.
+- **Responding slowly.** Lucidos is slow and none of the above holds. The bar lists the apps using the most processor time, grouped the same way. It shows only in windows of the workspace that was slow.
 
-Either way it recommends one thing: quit or restart the busiest app, or stop idle coding-agent threads when Lucidos is itself the biggest. When nothing stands out, it suggests restarting the computer if the slowness lasts.
+For memory and slow responses it recommends one thing: quit or restart the busiest app, or stop idle coding-agent threads when Lucidos is itself the biggest. Only when nothing stands out either does it suggest restarting the computer if the slowness lasts.
 
 One stretch of slowness is an *episode*. An episode opens when, for most of the last five minutes, a workspace answered slowly or lost its database. Sustained memory pressure opens one too; on a Mac, real swap use must come with it. The bar names memory when the operating system reported memory pressure for at least half of that time. The episode closes after five quiet minutes.
 
@@ -683,8 +748,15 @@ A *question card* the engine resolved because a follow-up arrived that could not
 Coding-agent lane only, because it exists to break a deadlock that only that lane has. The agent is parked inside the call that asked, so nothing but an answer releases it. Meanwhile the follow-up's own prompt event has already killed the card. A chat thread keeps its question live instead, queuing such a follow-up as an injection and processing it once the user answers.
 See also: `system-knowhow/coding-agent-events.md` § `UserQuestionAsked`.
 
+### Protected surface
+A surface where the user grants, denies, answers or confirms. It covers permission and question cards, the credential and email forms, the Apply controls, plugin install panels, and the confirm, prompt and progress dialogs. For text, fills and confirm or deny colours it reads only the `--protected-*` palette. So no *theme*, *theme part* or *style override* can make it unreadable or misleading. The engine derives that palette from the active theme and clamps it: text and button labels reach WCAG AA, confirm stays green, deny stays red, and a blocking dialog's scrim always dims. See `system-knowhow/themes.md` § Protected surfaces.
+
 ### Style override
-One entry in the `style_overrides` *preference*: a CSS custom property name and the value to paint it with, applied straight onto the app's root element. Writing one repaints every connected client live, over the same `PreferencesChanged` fan-out that carries theme, font and UI scale, so a design value can be retuned on a running Lucidos with no rebuild. Device-scoped like the other appearance preferences, so tuning on a phone leaves a desktop alone. Values only: an override can retune a colour, a size, a duration, never move a control or change what a screen does. Two ways back out if a value makes the UI unusable, **Settings → Appearance → Style overrides → Clear all**, and `?style-reset` on the URL, which clears them before the first pixel is painted and so works when nothing on screen is readable.
+One entry in the `style_overrides` *preference*: a CSS custom property name and the value to paint it with, applied straight onto the app's root element. Writing one repaints every connected client live, over the `PreferencesChanged` fan-out that carries theme, font and UI scale. So a design value can be retuned on a running Lucidos with no rebuild. Device-scoped like the other appearance preferences, so tuning on a phone leaves a desktop alone. Values only: an override can retune a colour, a size, a duration, never move a control or change what a screen does.
+
+An override never sets a `--protected-*` token, a `--z-*` stacking token, the UI font tokens, `--user-ui-scale` or the scanlines. It cannot reach inside a *protected surface*. A shadow override stays within 2rem of its box, as a theme's must.
+
+There are two ways back out if a value makes the UI unusable. One is **Settings → Appearance → Style overrides → Clear all**. The other is `?style-reset` on the URL, which clears them before the first pixel is painted, so it works when nothing on screen is readable. `?style-reset` also resets the *theme* to the default, the other way to make the UI unreadable.
 
 ### Style remote
 The app that writes *style overrides*: sliders and colour pickers over the design tokens, one knob per custom property. Being an *app* it is workspace data rather than product code, so its knob list is edited in place and never goes through *Apply*.
@@ -727,7 +799,7 @@ On desktop the toggle rests in the header's top-left corner whether the thread d
 
 Filter shows as pressed only while the thread filter is open. Its icon says what the list shows: a status's own icon, an outline funnel for all threads, and a filled funnel while thread types narrow it. Filter draws a funnel shape, never lines, so on a phone you cannot mistake it for the list icon.
 
-Filter, its badge, the header title and the thread filter change together with one quick fade. Whichever view arrives, the thread filter or the thread list, fades in, and the one leaving goes at once. With motion reduced, every change is instant.
+Switching between the thread list and the thread filter dips through the background: the leaving view fades out, then the arriving one fades in. The header title switches word at once, and Filter's icon and badge fade quickly. With motion reduced, every change is instant.
 See also: *Conversation*, *thread pane*, *content pane*, *Current section*.
 
 ### Thread pane
@@ -958,6 +1030,8 @@ It arrives as a card over the workspace, with the instruction and, where there i
 
 **One at a time, oldest first.** Skip several releases and you get them in order, "1 of 3", each replacing the last as you answer it. A later notice is not drawn until the one before it is answered, so they cannot be worked through out of order. **Got it** answers the one you are reading. Escape and the X close the card and answer nothing, so an unanswered notice comes back next time you open the workspace.
 
+**A shared button comes once.** When several notices you owe offer the same button, such as "Audit my workspace", only the last of them draws it. The earlier ones say it comes later, so one audit covers them all.
+
 Every notice this workspace has met lives at **Settings > System > Release Notices**, its own page. Go there if you closed the card on the way to doing something else, or tapped one action and want the others. It is apart from *What's New* on purpose: that panel says what CHANGED, and a notice says what to do about it.
 
 Anything still owed leads the page. Answered notices fold away below, behind a shut **Already answered** row. Open that and each one is ticked and struck through: a record of what the release asked, not something still asking.
@@ -1048,7 +1122,7 @@ See also: *webhook*, *ingress probe*, *trigger*.
 ### Workspace
 A user's complete Lucidos instance: one PostgreSQL database inside the shared
 Lucidos Postgres cluster, plus a `data/` directory (artifacts, apps, knowhow,
-triggers, intents, config, auth-modules, scripts). Multiple workspaces run
+triggers, intents, config, auth-modules, scripts, themes). Multiple workspaces run
 concurrently, each its own isolated engine and database. A single *workspace
 gateway* (dev term) fronts them and addresses each by its *workspace address*,
 the path prefix `/<slug>/`.
@@ -1081,6 +1155,11 @@ ways in side by side: name your first workspace (suggesting "personal" or
 ### Workspace address
 The path a *workspace* is served at (`/personal/`), also the name of its folder and of its database. It is derived from the workspace's name when the workspace is created (lower-cased, with anything that is not a letter or digit turned into `-`) and then **fixed forever**: renaming a workspace changes its label, never its address, so the two can end up different. The picker shows a workspace's address only when it would otherwise surprise you, which is exactly when a rename has moved the label off the address, or when two workspaces share a label and the address is the only thing telling them apart. **No two workspaces can share an address, and no two can share a name either**: creating or renaming to a name another workspace already has is refused, naming the one that has it (a name a running restore is about to give its workspace counts as taken too, and you can wait for it instead) (matched ignoring case and surrounding spaces, since "Work" and "work" are no more tellable apart in a list than two identical names). Where only the *address* is taken, because the workspace holding it goes by a different name now, a create simply gets the next free address, `/personal-2/`, and the picker says so before you create it; a restore is refused instead, since restoring into a suffixed address would quietly leave you with a second copy of the same workspace. Workspaces that already shared a name before this rule keep working untouched, and the picker shows their addresses so you can still tell them apart.
 
+### Workspace font
+A font installed into the *workspace*, by you, the agent or a *plugin*, rather than shipped in the *font catalog*. It lives in `data/fonts/<slug>/`: a `font.json` naming its label, group and font files, beside the files. Its id is `ws-<slug>`.
+
+The group decides where it fits: a `sans` or `serif` font can be the UI font, and a `mono` font can be the UI font or the code font. The engine serves it from the workspace, never from the internet, and lists it after the catalog fonts in `GET /api/v1/fonts`. The `font-family` *preference* and a *theme* name it like any catalog font. See `system-knowhow/workspace-fonts.md`.
+
 ### Workspace audit
 A read-only sweep of what your *workspace* holds, against how Lucidos expects it to look today: *app*s, *trigger*s, *knowhow*, intents, scripts and *artifact*s. It writes a report and changes nothing. Ask for it by name, or take the button on the *release notice* that offers it. Drift is mostly silent, which is the point of sweeping for it: a trigger on a renamed event simply stops firing, and an app that lost a browser capability keeps opening and quietly forgets your settings.
 
@@ -1107,7 +1186,9 @@ The affordance for moving the *engine* onto a newer version. Lucidos surfaces **
 
 **The gateway detects the packaged half now** (ADR 0108), not the app updater named above. One poll per machine finds a published release, for every install shape rather than the macOS app alone. The client still performs the install, so everything above about narration, cancelling and failure is unchanged. A headless install has no client, so it gets the `install.sh` command to re-run instead. Settings > System > Overview carries the off switch, and `PRIVACY.md` says what the poll sends.
 
-**Taking the offer opens a confirm that says what the switch brings**, rather than restarting on the spot (ADR 0229). It names the version and counts only the commits the switch brings, listed under *New*, *Fixed* and *Improved*. **Switch to new version** commits; **Later** just closes it, which is not a dismissal, so the toast stays where it was. The same confirm opens from the Lucidos menu's **Restart** row while it wears the *New version* pill, and from Settings → System. A packaged build reports no commits, so its confirm lists the applied *changes* the restart activates, grouped by the *thread* that proposed them. That is also what a plain restart shows, under the shorter question it has always asked.
+**Taking the offer opens a confirm that says what the switch brings**, rather than restarting on the spot (ADR 0229). It names the version and counts only the commits the switch brings, listed under *New*, *Fixed* and *Improved*. **Switch** commits; **Later** just closes it, which is not a dismissal, so the toast stays where it was. The same confirm opens from the Lucidos menu's **Restart** row while it wears the *New version* pill, and from Settings → System. A packaged build reports no commits, so its confirm lists the applied *changes* the restart activates, grouped by the *thread* that proposed them. That is also what a plain restart shows, under the shorter question it has always asked.
+
+The button for *Switch to new version* reads **Switch**, on the toast and in the confirm.
 
 **A version that is not built yet is its own, quieter signal** (dev only). When new engine code exists in source with nothing built behind it, there is nothing to switch onto, so instead of the switch badge the brand mark carries a small dot, and the toast offers *Rebuild* rather than *Switch to new version*. It defers on dismiss exactly like the one above, keyed on the checkout's commit instead of an on-disk build id (there is no on-disk build to name, which is what makes it pending), and tapping the dot brings it back. Where a rebuild has already been tried for that commit and produced nothing to switch onto, rebuilding cannot help: the button is withheld and the toast names what does resolve it.
 
@@ -1118,16 +1199,29 @@ The user-clicked action that triggers an *Apply* on every pending *change* in on
 
 The batch skips exactly what a per-row *Apply* refuses: changes whose thread has not settled, and changes with no file changes left. So the bulk path can't do what the button won't. Discard All skips neither.
 
-The engine emits `ApplyAllBatchStarted` with the full change-id list and the actor. It advances the batch as each member's `ChangeApplied` / `ChangeApplyFailed` event lands. Once every member has resolved, it emits `ApplyAllBatchCompleted` with `applied: Vec<Uuid>` and `failed: Vec<ApplyFailure>`. Member status is first-write-wins, so one failure does not abandon the rest of the batch. Each member goes through the same *hardening* and restart-derivation rules as a single *Apply*. Persisted under aggregate `apply_all_batch`, `aggregate_id` = `batch_id` (UUID).
+Changes apply one at a time, with one exception. A change that hits a merge conflict hands it to its thread to resolve. The batch moves on to the next change while that runs. The parked change lands whenever its resolution finishes. If a change the batch applied meanwhile collides with that resolution, the parked change goes back in the queue once for a fresh try.
 
-While the batch runs, a sticky toast with a spinner shows progress and offers **Cancel** (`POST /api/v1/changes/apply-all/cancel`). The engine then stops advancing to further members and interrupts the in-flight *hardening* or merge session. It marks the remaining members `failed` with "Apply All canceled", so the batch resolves and `ApplyAllBatchCompleted` still fires. Already-applied members stay applied. The rest return to pending (best-effort for an in-progress merge that already landed). A single *Apply* that woke a *hardening* or merge session can likewise be canceled from its *coding-agent thread* (the thread's Cancel button).
+While it runs, its progress shows only in the Lucidos menu, on one line: "Applying 5 changes" and "2 of 5". Tapping the line unfolds it: "Change 2 of 5", a progress bar, what the thread in flight is doing (Merging, Resolving merge conflict, or Hardening) and its title, and **Cancel**. The thread is a link to the event where the hardening or conflict began (or to the change itself). No notice pops up while it runs, except a member's failure. When the batch ends, a summary notice reports it.
 
-**The checkbox beside it is the sweep.** *Keep going as the rest settle* adds a *standing apply* to every *settling* thread whose change Lucidos applies. Each one then applies as it lands, rather than waiting for you. An *external-repo coding-agent thread* is passed over, having no change to apply. With nothing appliable now, arming IS the action and the button reads **Apply as they settle**. The batch toast's **Cancel** takes the whole sweep back with it.
+A single *Apply* shows the same way, on its own line, and ends with an Applied or Failed notice. Each parked change also gets its own line, "Resolving merge conflict" and its title.
+
+The unfolded line also says how long things take, from the *apply estimate*: how long a hardening or conflict has run, how long one usually takes here, and roughly how long until all its changes are applied. Its bar fills for each finished thread and pulses on the ones in flight, parked ones included.
+
+### Apply estimate
+How long a hardening and a merge conflict resolution usually take in this workspace, worked out from its own past applies. Recent applies count most, since the process gets faster. With fewer than five past runs there is no estimate, and the Lucidos menu shows only the time so far. It is a typical time, never a countdown: the slowest runs take two to three times as long.
+
+Each pending change also carries a conflict prediction: whether merging it into `main` right now would conflict. Its Changes panel row then says "Likely merge conflict", and the batch estimate counts a resolution for it.
+
+The engine emits `ApplyAllBatchStarted` with the full change-id list and the actor. It advances the batch as each member's `ChangeApplied` / `ChangeApplyFailed` event lands, and parks a member on its `MergeConflictDetected`. Once every member has resolved, it emits `ApplyAllBatchCompleted` with `applied: Vec<Uuid>` and `failed: Vec<ApplyFailure>`. Member status is first-write-wins, so one failure does not abandon the rest of the batch. Each member goes through the same *hardening* and restart-derivation rules as a single *Apply*. Persisted under aggregate `apply_all_batch`, `aggregate_id` = `batch_id` (UUID).
+
+While the batch runs, its line in the Lucidos menu offers **Cancel** (`POST /api/v1/changes/apply-all/cancel`). The engine then stops advancing to further members and interrupts the in-flight *hardening* or merge session, and every parked resolution. It marks the remaining members `failed` with "Apply All canceled", so the batch resolves and `ApplyAllBatchCompleted` still fires. Already-applied members stay applied. The rest return to pending (best-effort for an in-progress merge that already landed). A single *Apply* that woke a *hardening* or merge session can likewise be canceled from its *coding-agent thread* (the thread's Cancel button).
+
+**The checkbox beside it is the sweep.** *Keep going as the rest settle* adds a *standing apply* to every *settling* thread whose change Lucidos applies. Each one then applies as it lands, rather than waiting for you. An *external-repo coding-agent thread* is passed over, having no change to apply. With nothing appliable now, arming IS the action and the button reads **Apply all on settle**. The batch's **Cancel**, in the Lucidos menu, takes the whole sweep back with it.
 
 ### Standing apply
 The owner's instruction to *Apply* a *change* once its thread finishes. Pressed while the thread is still settling, carried out by the engine later (ADR 0168 clause 5). It is what the Apply button becomes on a thread that has not settled: a control that cannot act is replaced by the one that can, so nothing on either surface renders disabled.
 
-Two forms. **Apply as it settles** arms one change, from the thread's own prompt row or its row in the Changes panel. **Apply as they settle**, the *Apply All* checkbox, arms every *settling* thread. Both read the same rule and both are one-shot.
+Two forms. **Apply on settle** arms one change, from the thread's own prompt row or its row in the Changes panel. **Apply all on settle**, the *Apply All* checkbox, arms every *settling* thread. Both read the same rule and both are one-shot.
 
 It goes wherever *Apply* goes, and nowhere else. An *external-repo coding-agent thread* is never offered one: Lucidos does not merge into that repo, and the thread proposes no *change* to arm. So its prompt row draws no flag, the sweep passes it over, and the engine refuses an arm anything else asks for.
 
@@ -1135,9 +1229,9 @@ A change whose *Apply* hit merge conflicts is not offered one either. Its thread
 
 It always ends. The change applies the moment the thread finishes, once the agent has saved its last edits. A thread waiting on an *event wait* keeps the instruction, because the wait ends by itself and the thread finishes after it wakes. A thread parked on a question, whose turn failed, or whose session stopped before the turn finished settling never settles by itself. The instruction is then dropped and reported, rather than left waiting. It acts only on the change it was armed for, so a second change the thread proposes afterwards is untouched.
 
-Cancel it from the same control you armed it with. Every control is a toggle, and they all show one state. In the **Changes panel** a change's row reads **✓ Applying as it settles** once armed. The bulk control above it reads **✓ Applying as they settle**, and cancels every standing apply here. On the **thread's own prompt row** it is a flag icon, filled once armed; its tooltip says the same thing.
+Cancel it from the same control you armed it with. Every control is a toggle, and they all show one state. In the **Changes panel** a change's row reads **✓ Applying on settle** once armed. The bulk control above it reads **✓ Applying all on settle**, and cancels every standing apply here. On the **thread's own prompt row** it is a flag icon, filled once armed; its tooltip says the same thing.
 
-Cancelling stops what has not started. A change already merging or hardening finishes, and nothing already applied is undone. Stopping a running *Apply All* is its own Cancel, on the "Applying changes" notice.
+Cancelling stops what has not started. A change already merging or hardening finishes, and nothing already applied is undone. Stopping a running *Apply All* is its own Cancel, on its line in the Lucidos menu.
 
 ### Settling thread
 A *coding-agent thread* that has not finished but will by itself: it is running, paused, or waiting on an *event wait*. A *standing apply* waits through these, and through the moment after a turn ends while the agent saves its last edits. A thread parked on a question is not settling, because only you can end that. While it runs or watches an event, its *Apply* is withheld, and the standing apply takes its place.

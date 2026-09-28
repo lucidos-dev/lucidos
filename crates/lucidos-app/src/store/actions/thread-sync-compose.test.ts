@@ -42,7 +42,6 @@ function makeActiveThread(overrides: MakeThreadOpts = {}): ThreadState {
       codingAgentProposed: false,
       codingAgentRequiresRestart: false,
       codingAgentIsExternalRepo: false,
-      codingAgentApplying: false,
       codingAgentHasDiff: false,
       lastRevivedAt: '',
       messageCount: 0,
@@ -211,7 +210,7 @@ describe('SSE MessageReceived preserves user-typed compose text', () => {
       created: '2026-05-04T10:00:00Z',
       event: {
         type: 'ThreadDiscarded',
-        actor: { kind: 'device', device_id: 'me-device', label: 'Me' },
+        actor: { kind: 'device', device_id: 'me-device' },
       },
     });
 
@@ -229,7 +228,7 @@ describe('SSE MessageReceived preserves user-typed compose text', () => {
       created: '2026-05-04T10:00:00Z',
       event: {
         type: 'ThreadDiscarded',
-        actor: { kind: 'device', device_id: 'peer-device', label: 'Peer' },
+        actor: { kind: 'device', device_id: 'peer-device' },
       },
     });
 
@@ -265,7 +264,7 @@ describe('SSE ThreadDiscarded from peer returns this device to compose view', ()
       created: '2026-05-04T10:00:00Z',
       event: {
         type: 'ThreadDiscarded',
-        actor: { kind: 'device', device_id: 'peer-device', label: 'Peer' },
+        actor: { kind: 'device', device_id: 'peer-device' },
       },
     });
 
@@ -281,7 +280,7 @@ describe('SSE ThreadDiscarded from peer returns this device to compose view', ()
       created: '2026-05-04T10:00:00Z',
       event: {
         type: 'ThreadDiscarded',
-        actor: { kind: 'device', device_id: 'peer-device', label: 'Peer' },
+        actor: { kind: 'device', device_id: 'peer-device' },
       },
     });
 
@@ -298,7 +297,7 @@ describe('SSE ThreadDiscarded from peer returns this device to compose view', ()
       created: '2026-05-04T10:00:00Z',
       event: {
         type: 'ThreadDiscarded',
-        actor: { kind: 'device', device_id: 'me-device', label: 'Me' },
+        actor: { kind: 'device', device_id: 'me-device' },
       },
     });
 
@@ -316,7 +315,7 @@ describe('SSE ThreadDiscarded from peer returns this device to compose view', ()
       created: '2026-05-04T10:00:00Z',
       event: {
         type: 'ThreadDiscarded',
-        actor: { kind: 'device', device_id: 'peer-device', label: 'Peer' },
+        actor: { kind: 'device', device_id: 'peer-device' },
       },
     });
 
@@ -332,7 +331,7 @@ describe('SSE ThreadDiscarded from peer returns this device to compose view', ()
       created: '2026-05-04T10:00:00Z',
       event: {
         type: 'ThreadDiscarded',
-        actor: { kind: 'device', device_id: 'peer-device', label: 'Peer' },
+        actor: { kind: 'device', device_id: 'peer-device' },
       },
     });
 

@@ -12,7 +12,7 @@ use super::{BusEvent, EmittedEvent, EventBus, ParentCallback};
 use crate::engine::thread_events::{
     CancelCause, ChildCompletionStatus, EventMeta, EventWaitCancelCause, ThreadEvent,
 };
-use crate::engine::thread_lifecycle::ArchiveState;
+use crate::engine::thread_lifecycle::{ArchiveState, ThreadStatus};
 
 /// What the fan-in reads about a child, in one self-joined query.
 ///
@@ -28,7 +28,7 @@ struct ChildRow {
     parent_callback_pending: bool,
     is_stopped_child: bool,
     holds_live_wait: bool,
-    status: String,
+    status: ThreadStatus,
     coding_agent_proposed: bool,
     parent_is_coding_agent: Option<bool>,
 }
@@ -59,8 +59,8 @@ fn cap_summary(summary: String, cap: usize) -> String {
 
 /// Whether a child is mid-turn, by the one in-flight definition the counters
 /// use. A child mid-turn is not owed a settle: its own terminal will report.
-fn in_flight(status: &str) -> bool {
-    crate::core::store::active_thread_statuses().contains(&status)
+fn in_flight(status: ThreadStatus) -> bool {
+    crate::core::store::active_thread_statuses().contains(&status.as_str())
 }
 
 /// The name a completion card gives the child: its title, else the start of
@@ -579,7 +579,7 @@ impl EventBus {
         else {
             return;
         };
-        if status != "idle" {
+        if status != ThreadStatus::Idle {
             return;
         }
         crate::log!(
@@ -664,7 +664,7 @@ impl EventBus {
         else {
             return None;
         };
-        if in_flight(&status) || (holds_live_wait && !settled_by.ends_waits()) {
+        if in_flight(status) || (holds_live_wait && !settled_by.ends_waits()) {
             return None;
         }
         Some(OwedChildCard(ChildCompletion {
@@ -939,18 +939,20 @@ impl EventBus {
             Option<chrono::DateTime<Utc>>,
             chrono::DateTime<Utc>,
         );
-        let row: Option<WakeRow> = match sqlx::query_as(
+        let row: Option<WakeRow> = match sqlx::query_as(&format!(
             "UPDATE thread_summaries t \
              SET archive_state = $2, \
-                 status = CASE WHEN t.status = 'waiting_for_user_answer' \
-                               THEN t.status ELSE 'running' END, \
+                 status = CASE WHEN t.status = {waiting_for_user_answer} \
+                               THEN t.status ELSE {running} END, \
                  last_revived_at = NOW() \
              FROM (SELECT thread_id, status, last_revived_at \
                    FROM thread_summaries WHERE thread_id = $1 FOR UPDATE) prev \
              WHERE t.thread_id = prev.thread_id \
              RETURNING t.active_children_count::bigint, t.total_children_count::bigint, \
                        prev.status, prev.last_revived_at, t.last_revived_at",
-        )
+            waiting_for_user_answer = ThreadStatus::WaitingForUserAnswer.sql_literal(),
+            running = ThreadStatus::Running.sql_literal(),
+        ))
         .bind(parent_id)
         .bind(ArchiveState::Inbox.as_str())
         .fetch_optional(&self.pool)

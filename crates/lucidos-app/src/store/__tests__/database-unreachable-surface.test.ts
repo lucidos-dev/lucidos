@@ -60,19 +60,34 @@ beforeEach(() => {
 
 describe('databaseUnreachableMessage', () => {
   it('names Docker on a dev install, where the database really is a container', () => {
-    expect(databaseUnreachableMessage(false)).toContain('Docker');
+    expect(databaseUnreachableMessage(false, false)).toContain('Docker');
   });
 
   it('does NOT name Docker on a packaged install, which runs its own Postgres', () => {
     // Naming a remedy that cannot apply is worse than naming none: it sends the
     // user to install something the outage has nothing to do with.
-    const msg = databaseUnreachableMessage(true);
+    const msg = databaseUnreachableMessage(true, false);
     expect(msg).not.toContain('Docker');
     expect(msg).toContain("can't reach its database");
+  });
+
+  it('points at Lucidos, never at Docker, when the database answers but the pool is used up', () => {
+    for (const packaged of [false, true]) {
+      const msg = databaseUnreachableMessage(packaged, true);
+      expect(msg).not.toContain('Docker');
+      expect(msg).toContain('database connections are busy');
+      expect(msg).toContain('restart Lucidos');
+    }
   });
 });
 
 describe('syncDatabaseReachability', () => {
+  it('names a used-up pool in the toast when the engine reports one', () => {
+    syncDatabaseReachability(health({ database_reachable: false, database_pool_exhausted: true }));
+    expect(databaseReachable.value).toBe(false);
+    expect(toasts.value.map(t => t.message).join(' ')).toContain('database connections are busy');
+  });
+
   it('treats an absent field as reachable, so an older engine is unaffected', () => {
     syncDatabaseReachability(health());
     expect(databaseReachable.value).toBe(true);

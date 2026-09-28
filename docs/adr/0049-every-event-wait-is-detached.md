@@ -114,6 +114,8 @@ recomputes the blocking counters with the current predicate; a boot sweep
 (`settle_legacy_attached_event_waits`) closes the unpaired calls, and
 `ThreadStatus::parse` maps the legacy string to `Idle` explicitly so an older
 engine sharing the database cannot write a value that reads as unknown.
+The boot sweep was removed on 2026-09-28, once its own query found no unpaired
+call left. See the resolved row in `docs/temporary-measures.md`.
 
 **Two frontend defects fixed alongside**, because both are latent for any path
 that folds a turn into an abort boundary rather than only for this one: such a

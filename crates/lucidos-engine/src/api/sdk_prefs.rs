@@ -8,7 +8,8 @@
 //! <link rel="stylesheet" href="/api/v1/sdk-iframe.css">
 //! ```
 //!
-//! The script sets `data-theme`, `--bg-primary`, `--font-ui` (and
+//! The script sets `data-theme-mode` (and, for app styles written before the
+//! rename, the legacy `data-theme`), `--bg-primary`, `--font-ui` (and
 //! `--user-ui-scale` when set) on `<html>` synchronously, so first paint
 //! matches the user's preferences before any subsequent stylesheet evaluates.
 //! The seed it carries also holds the device's `autocorrect` switch, which the
@@ -60,17 +61,32 @@ const SDK_PREFS_JS: &str =
 /// so this script and the live `ui.applyPreferences` pick the same scale.
 /// `autocorrect` is read by the SDK's field stamp, which must answer before a
 /// field's first focus (ADR 0262). `motion` resolves `data-motion` before the
-/// first frame can animate.
-const SEED_KEYS: [&str; 8] = [
-    "theme",
+/// first frame can animate. `theme-effects` sets `data-theme-effects` before a
+/// theme's glow can paint. [`THEME_RESOLVED_SEED_KEY`] carries the active
+/// theme's resolved token maps, which the engine alone can compute.
+/// [`WORKSPACE_FONT_SEED_KEY`] carries the workspace font `font-family` names.
+const SEED_KEYS: [&str; 11] = [
+    "theme-mode",
     "font-family",
     "ui-scale",
     "text-size",
     "font-size",
-    "style_overrides",
+    crate::core::themes::STYLE_OVERRIDES_KEY,
     "autocorrect",
     "motion",
+    "theme-effects",
+    THEME_RESOLVED_SEED_KEY,
+    WORKSPACE_FONT_SEED_KEY,
 ];
+
+/// Not a preference: the resolved maps of the device's `theme`, as JSON. The
+/// boot script reads it under this name (`boot/appearanceBoot.ts`).
+const THEME_RESOLVED_SEED_KEY: &str = "theme_resolved";
+
+/// Not a preference: the workspace font the device's `font-family` names, as
+/// JSON, so the boot script can register its faces (ADR 0308). The theme's own
+/// workspace fonts ride inside [`THEME_RESOLVED_SEED_KEY`].
+const WORKSPACE_FONT_SEED_KEY: &str = "workspace_font";
 
 /// The global the seed lands on, read by `boot/appearanceBoot.ts` and the SDK's
 /// `autocorrectStamp.ts`.
@@ -107,13 +123,16 @@ pub(super) async fn serve_sdk_prefs_js(
     // Answering 500 would leave the app with no appearance script at all, where
     // returning nothing costs one frame at the default that
     // `ui.applyPreferences` then corrects. The engine log names it either way.
-    let prefs = match PreferenceStore::get_all_for_device(&state.pool, device).await {
+    let mut prefs = match PreferenceStore::get_all_for_device(&state.pool, device).await {
         Ok(prefs) => prefs,
         Err(e) => {
             log!("[SdkPrefs] first-paint seed unavailable, the app corrects itself: {e}");
             Default::default()
         }
     };
+    let data_dir = state.workspace_path.join(crate::core::DATA_DIR);
+    with_resolved_theme(&mut prefs, &data_dir);
+    with_workspace_font(&mut prefs, &data_dir);
 
     (
         [
@@ -129,6 +148,45 @@ pub(super) async fn serve_sdk_prefs_js(
         format!("{}{}", seed_line(&prefs), SDK_PREFS_JS),
     )
         .into_response()
+}
+
+/// Replace whatever sits under [`THEME_RESOLVED_SEED_KEY`] with the resolved
+/// maps of the `theme` preference, or nothing for the default theme. Replaced
+/// rather than trusted, because any caller can write a preference by that name.
+fn with_resolved_theme(
+    prefs: &mut std::collections::HashMap<String, String>,
+    data_dir: &std::path::Path,
+) {
+    prefs.remove(THEME_RESOLVED_SEED_KEY);
+    let resolved = prefs
+        .get("theme")
+        .and_then(|id| crate::core::themes::resolved_json_for_preference(data_dir, id));
+    if let Some(json) = resolved {
+        prefs.insert(THEME_RESOLVED_SEED_KEY.to_string(), json);
+    }
+}
+
+/// Replace whatever sits under [`WORKSPACE_FONT_SEED_KEY`] with the workspace
+/// font the `font-family` preference names. A catalog font or a font that is
+/// not installed seeds nothing.
+fn with_workspace_font(
+    prefs: &mut std::collections::HashMap<String, String>,
+    data_dir: &std::path::Path,
+) {
+    use crate::core::workspace_fonts;
+    prefs.remove(WORKSPACE_FONT_SEED_KEY);
+    let Some(id) = prefs
+        .get("font-family")
+        .filter(|id| workspace_fonts::is_workspace_id(id))
+    else {
+        return;
+    };
+    let entry = workspace_fonts::list(data_dir)
+        .find(id)
+        .and_then(|font| serde_json::to_string(font).ok());
+    if let Some(json) = entry {
+        prefs.insert(WORKSPACE_FONT_SEED_KEY.to_string(), json);
+    }
 }
 
 /// The `window.__lucidosPrefs = {…};` line prepended to the bundle, or an empty
@@ -212,19 +270,17 @@ mod tests {
     }
 
     #[test]
-    fn script_reads_theme_font_and_scale_from_the_seed_then_storage() {
+    fn script_reads_theme_mode_font_and_scale_from_the_seed_then_storage() {
         // Two sources, in that order. The seed is what an ISOLATED app frame
         // has, since it can read none of the shell's storage. Storage is the
         // shell's own path, and the fallback behind the seed everywhere else.
-        for (served, stored) in [
-            ("theme", "lucidos-theme"),
-            ("font-family", "lucidos-font-family"),
-        ] {
-            assert!(
-                SDK_PREFS_JS.contains(&format!("seeded(served, \"{served}\", \"{stored}\")")),
-                "sdk-prefs.js must read {served} from the seed, then {stored}"
-            );
-        }
+        assert!(SDK_PREFS_JS.contains(r#"THEME_MODE_KEY = "theme-mode""#));
+        assert!(SDK_PREFS_JS.contains(r#"THEME_MODE_STORAGE_KEY = "lucidos-theme-mode""#));
+        assert!(SDK_PREFS_JS.contains("seeded(served, THEME_MODE_KEY, THEME_MODE_STORAGE_KEY)"));
+        assert!(
+            SDK_PREFS_JS.contains(r#"seeded(served, "font-family", "lucidos-font-family")"#),
+            "sdk-prefs.js must read font-family from the seed, then storage"
+        );
         // Scale reads the seed inline rather than through `seeded`, because it
         // carries the two pre-grid aliases as well. Same order, same fallback.
         assert!(SDK_PREFS_JS.contains(r#"served["ui-scale"]"#));
@@ -246,7 +302,7 @@ mod tests {
     fn script_namespaces_keys_per_workspace() {
         // The iframe realm has no access to the parent's Storage.prototype
         // override, so it must derive the workspace slug and namespace the keys
-        // itself, or a parent `ws:<slug>:lucidos-theme` write would never match
+        // itself, or a parent `ws:<slug>:lucidos-theme-mode` write would never match
         // the iframe read and every app would FOUC. Direct to an engine the
         // slug is the path before `/app/`. Behind a gateway the engine stamps a
         // frame capability base, and the slug is everything before that segment
@@ -261,7 +317,7 @@ mod tests {
         // Guard against a regression that drops the wsKey() wrapper. No raw,
         // string-literal read of a per-workspace appearance key may remain.
         for key in [
-            "lucidos-theme",
+            "lucidos-theme-mode",
             "lucidos-font-family",
             "lucidos-ui-scale",
             "lucidos-style-overrides",
@@ -275,15 +331,20 @@ mod tests {
     }
 
     #[test]
-    fn script_resolves_system_theme_via_matchmedia() {
+    fn script_resolves_system_theme_mode_via_matchmedia() {
         // `system` must defer to matchMedia at execution time so light-OS
         // browsers don't FOUC dark-then-light.
         assert!(SDK_PREFS_JS.contains("matchMedia(\"(prefers-color-scheme: light)\")"));
     }
 
     #[test]
-    fn script_sets_data_theme_and_bg_primary() {
-        assert!(SDK_PREFS_JS.contains("setAttribute(\"data-theme\""));
+    fn script_sets_data_theme_mode_and_bg_primary() {
+        assert!(SDK_PREFS_JS.contains(r#"THEME_MODE_ATTRIBUTE = "data-theme-mode""#));
+        assert!(SDK_PREFS_JS.contains("setAttribute(THEME_MODE_ATTRIBUTE, resolved)"));
+        // App styles written before the rename still key on `data-theme`
+        // (docs/temporary-measures.md § Legacy `data-theme` in app frames).
+        assert!(SDK_PREFS_JS.contains(r#"LEGACY_THEME_MODE_ATTRIBUTE = "data-theme""#));
+        assert!(SDK_PREFS_JS.contains("legacyThemeModeAttribute: true"));
         assert!(SDK_PREFS_JS.contains("setProperty(\"--bg-primary\""));
         assert!(SDK_PREFS_JS.contains("setProperty(\"--font-ui\""));
         assert!(SDK_PREFS_JS.contains("setProperty(\"--font-features-text\""));
@@ -321,8 +382,8 @@ mod tests {
     #[test]
     fn the_seed_line_carries_the_appearance_keys() {
         assert_eq!(
-            seed_line(&prefs(&[("theme", "dark"), ("ui-scale", "150")])),
-            "window.__lucidosPrefs={\"theme\":\"dark\",\"ui-scale\":\"150\"};\n"
+            seed_line(&prefs(&[("theme-mode", "dark"), ("ui-scale", "150")])),
+            "window.__lucidosPrefs={\"theme-mode\":\"dark\",\"ui-scale\":\"150\"};\n"
         );
     }
 
@@ -333,6 +394,14 @@ mod tests {
         assert_eq!(
             seed_line(&prefs(&[("autocorrect", "true")])),
             "window.__lucidosPrefs={\"autocorrect\":\"true\"};\n"
+        );
+    }
+
+    #[test]
+    fn the_seed_line_carries_theme_effects() {
+        assert_eq!(
+            seed_line(&prefs(&[("theme-effects", "reduce")])),
+            "window.__lucidosPrefs={\"theme-effects\":\"reduce\"};\n"
         );
     }
 
@@ -349,14 +418,56 @@ mod tests {
     #[test]
     fn the_seed_line_carries_nothing_else() {
         let line = seed_line(&prefs(&[
-            ("theme", "light"),
+            ("theme-mode", "light"),
             ("chat_model", "claude-opus-5"),
         ]));
-        assert!(line.contains(r#""theme":"light""#));
+        assert!(line.contains(r#""theme-mode":"light""#));
         assert!(
             !line.contains("chat_model"),
             "an unrelated preference must not reach an app: {line}"
         );
+    }
+
+    #[test]
+    fn the_seed_carries_the_active_theme_resolved() {
+        let data = std::path::Path::new("/nonexistent");
+        let mut seeded = prefs(&[("theme", "nord")]);
+        with_resolved_theme(&mut seeded, data);
+        let line = seed_line(&seeded);
+        assert!(line.contains("theme_resolved"), "{line}");
+        assert!(line.contains("--bg-primary"), "{line}");
+
+        // A forged value under the seed key never survives, and the default
+        // theme seeds nothing to apply.
+        let mut forged = prefs(&[("theme", "lucidos"), ("theme_resolved", "{\"dark\":{}}")]);
+        with_resolved_theme(&mut forged, data);
+        assert!(!forged.contains_key("theme_resolved"));
+    }
+
+    #[test]
+    fn the_seed_carries_the_picked_workspace_font() {
+        let dir = tempfile::tempdir().unwrap();
+        let font = dir.path().join("fonts/brand");
+        std::fs::create_dir_all(&font).unwrap();
+        std::fs::write(
+            font.join("font.json"),
+            r#"{"label":"Brand","group":"sans","faces":[{"file":"a.woff2"}]}"#,
+        )
+        .unwrap();
+        std::fs::write(font.join("a.woff2"), b"wOF2 bytes").unwrap();
+
+        let mut seeded = prefs(&[("font-family", "ws-brand")]);
+        with_workspace_font(&mut seeded, dir.path());
+        let line = seed_line(&seeded);
+        assert!(line.contains("workspace_font"), "{line}");
+        assert!(line.contains("fonts/brand/a.woff2"), "{line}");
+
+        // A forged entry never survives, and a font that is gone seeds nothing.
+        for pick in ["ws-gone", "fira-code"] {
+            let mut forged = prefs(&[("font-family", pick), ("workspace_font", "{}")]);
+            with_workspace_font(&mut forged, dir.path());
+            assert!(!forged.contains_key("workspace_font"), "{pick}");
+        }
     }
 
     #[test]
@@ -385,7 +496,7 @@ mod tests {
     fn the_seed_precedes_the_bundle_it_feeds() {
         let body = format!(
             "{}{}",
-            seed_line(&prefs(&[("theme", "dark")])),
+            seed_line(&prefs(&[("theme-mode", "dark")])),
             SDK_PREFS_JS
         );
         let seed_at = body.find("__lucidosPrefs").expect("seed present");

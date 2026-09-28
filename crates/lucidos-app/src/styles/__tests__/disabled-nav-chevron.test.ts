@@ -40,8 +40,8 @@ describe('a disabled nav chevron keeps its tooltip', () => {
 
 describe('a disabled icon button gets no hover wash', () => {
   it.each([
-    ['shared-components.css', sharedCss, '.icon-btn:hover:where(:not(:disabled))'],
-    ['panels/shell.css', shellCss, '.app-header .icon-btn:hover:where(:not(:disabled))'],
+    ['shared-components.css', sharedCss, '.icon-btn:hover:where(:not(:disabled, [aria-disabled="true"]))'],
+    ['panels/shell.css', shellCss, '.app-header .icon-btn:hover:where(:not(:disabled, [aria-disabled="true"]))'],
   ])('%s skips disabled buttons, at unchanged specificity', (_file, css, selector) => {
     const wash = cssRules(css).find(r => r.selector === selector);
     expect(wash?.props.has('background'), `${selector} is gone or paints nothing`).toBe(true);

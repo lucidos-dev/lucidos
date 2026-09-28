@@ -1,5 +1,6 @@
 use super::common::*;
 use crate::engine::event_bus::EventBus;
+use crate::engine::git_ops::git_cmd;
 use crate::test_support::{setup_test_db, teardown_test_db};
 use std::path::Path;
 use std::sync::Arc;
@@ -66,7 +67,9 @@ async fn prune_build_artifacts_strips_target_node_modules_cache() {
     assert!(worktree.join("node_modules").exists());
     assert!(worktree.join(".lucidos/cache").exists());
 
-    let freed = prune_build_artifacts(&worktree).expect("expected non-zero prune");
+    let freed = prune_build_artifacts(&worktree)
+        .await
+        .expect("expected non-zero prune");
     assert!(freed > 0, "expected non-zero freed bytes, got {}", freed);
 
     // Post: artifacts gone, worktree itself stays.
@@ -77,9 +80,38 @@ async fn prune_build_artifacts_strips_target_node_modules_cache() {
 
     // Second run is a no-op (returns None) — nothing left to prune.
     assert!(
-        prune_build_artifacts(&worktree).is_none(),
+        prune_build_artifacts(&worktree).await.is_none(),
         "second prune must be a no-op when there's nothing left"
     );
+}
+
+/// A repo can commit a directory named like a build output. Its edits are
+/// source, so the prune leaves it and still strips the untracked ones.
+#[tokio::test]
+async fn prune_build_artifacts_keeps_a_directory_holding_tracked_files() {
+    use super::prune_build_artifacts;
+
+    let (_tmp, root) = fresh_workspace().await;
+    let worktree = add_worktree_for_thread(&root, Uuid::new_v4(), true).await;
+    tokio::fs::write(worktree.join("target/source.txt"), b"committed")
+        .await
+        .unwrap();
+    git_cmd(&["add", "-f", "target/source.txt"], &worktree)
+        .await
+        .unwrap();
+    git_cmd(&["commit", "-m", "track a file under target"], &worktree)
+        .await
+        .unwrap();
+    tokio::fs::write(worktree.join("target/source.txt"), b"uncommitted edit")
+        .await
+        .unwrap();
+
+    assert!(prune_build_artifacts(&worktree).await.is_some());
+    assert_eq!(
+        std::fs::read(worktree.join("target/source.txt")).unwrap(),
+        b"uncommitted edit"
+    );
+    assert!(!worktree.join("node_modules").exists());
 }
 
 #[tokio::test]
@@ -104,7 +136,24 @@ async fn inventory_worktrees_returns_thread_metadata_sorted_by_size() {
     insert_thread_summary(&pool, small_id, true /* saved */).await;
     insert_old_event(&pool, small_id, 60).await;
 
-    let rows = inventory_worktrees(&pool, &root).await;
+    // Two worktrees at main: one idle and finished, one whose thread is live.
+    let done_id = Uuid::new_v4();
+    let _done_wt = add_worktree_at_main_for_thread(&root, done_id).await;
+    insert_thread_summary(&pool, done_id, false).await;
+    insert_old_event(&pool, done_id, 60).await;
+    let live_id = Uuid::new_v4();
+    let _live_wt = add_worktree_at_main_for_thread(&root, live_id).await;
+    insert_thread_summary(&pool, live_id, false).await;
+    insert_old_event(&pool, live_id, 60).await;
+
+    // A stranded tree: git cannot say what it tracks, so a strip frees nothing.
+    let stranded_id = Uuid::new_v4();
+    let stranded_wt = add_worktree_for_thread(&root, stranded_id, true).await;
+    strand_worktree(&stranded_wt).await;
+    insert_thread_summary(&pool, stranded_id, false).await;
+    insert_old_event(&pool, stranded_id, 60).await;
+
+    let rows = inventory_worktrees(&pool, &root, active_threads(&[live_id]).as_ref()).await;
     assert!(
         rows.len() >= 2,
         "expected at least 2 rows, got {}",
@@ -133,11 +182,151 @@ async fn inventory_worktrees_returns_thread_metadata_sorted_by_size() {
     let big = &rows[big_idx];
     assert!(!big.is_saved, "unsaved flag must be carried through");
     assert!(big.size_bytes > small.size_bytes);
+    assert!(
+        big.artifact_bytes >= 32 * 1024 && big.artifact_bytes < big.size_bytes,
+        "artifact share must be measured apart from the source"
+    );
+    assert!(!big.is_finished, "a branch ahead of main is not finished");
+    assert!(!big.is_active);
     assert!(big.last_activity.is_some());
+
+    let live = rows
+        .iter()
+        .find(|r| r.thread_id == live_id)
+        .expect("live thread inventory row");
+    assert!(live.is_active);
+    assert!(!live.is_finished, "a live tree is never reported finished");
+    let done = rows
+        .iter()
+        .find(|r| r.thread_id == done_id)
+        .expect("finished thread inventory row");
+    assert!(done.is_finished);
+    assert!(!done.is_active);
+    let stranded = rows
+        .iter()
+        .find(|r| r.thread_id == stranded_id)
+        .expect("stranded thread inventory row");
+    assert_eq!(stranded.artifact_bytes, 0);
+    assert!(!stranded.is_finished);
     assert!(
         big.thread_title.is_some(),
         "thread_title must be carried through"
     );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+#[test]
+fn prefix_upper_bound_sorts_above_every_id_with_the_prefix() {
+    use super::prefix_upper_bound;
+    assert_eq!(prefix_upper_bound("4d4839e7"), "4d4839e8");
+    assert_eq!(prefix_upper_bound("0123456f"), "0123456g");
+    assert_eq!(prefix_upper_bound("01234569"), "0123456:");
+    let id = "0123456f-ffff-ffff-ffff-ffffffffffff";
+    assert!(id < prefix_upper_bound("0123456f").as_str());
+}
+
+/// The plan Postgres picks for `sql`, with sequential scans priced out so a
+/// near-empty test table still shows which index the query can use. A
+/// generic plan is what a prepared statement gets after its first few runs.
+async fn plan_for(pool: &sqlx::PgPool, sql: &str, param_types: &str, args: &str) -> String {
+    let mut tx = pool.begin().await.unwrap();
+    for setup in [
+        "SET LOCAL enable_seqscan = off",
+        "SET LOCAL plan_cache_mode = force_generic_plan",
+    ] {
+        sqlx::query(setup).execute(&mut *tx).await.unwrap();
+    }
+    sqlx::query(&format!("PREPARE planned({param_types}) AS {sql}"))
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let lines: Vec<(String,)> = sqlx::query_as(&format!("EXPLAIN EXECUTE planned({args})"))
+        .fetch_all(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("DEALLOCATE planned")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    lines
+        .into_iter()
+        .map(|(l,)| l)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Every Disk Usage open and every cleanup tick runs one lookup per worktree.
+/// Each must be an index probe, even under a generic plan.
+#[tokio::test]
+async fn short_thread_lookup_is_served_by_the_prefix_index() {
+    use super::SHORT_THREAD_LOOKUP_SQL;
+    let (pool, db_name) = setup_test_db().await;
+    let plan = plan_for(
+        &pool,
+        SHORT_THREAD_LOOKUP_SQL,
+        "text, text, text",
+        "'4d4839e7%', '4d4839e7', '4d4839e8'",
+    )
+    .await;
+    assert!(
+        plan.contains("idx_events_thread_aggregate_id_pattern"),
+        "the short-id lookup must use the prefix index, got:\n{plan}"
+    );
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// Unfenced, `MAX(created)` walks `idx_events_created` backwards over every
+/// event in the workspace.
+#[tokio::test]
+async fn last_activity_reads_only_the_threads_own_events() {
+    use super::THREAD_EVENT_CREATED_FENCED;
+    let (pool, db_name) = setup_test_db().await;
+    let plan = plan_for(
+        &pool,
+        &format!("SELECT MAX(created) {THREAD_EVENT_CREATED_FENCED}"),
+        "uuid",
+        "'4d4839e7-0000-0000-0000-000000000000'",
+    )
+    .await;
+    assert!(
+        plan.contains("Index Cond: (aggregate_id =") && !plan.contains("idx_events_created"),
+        "last activity must read the thread's rows by aggregate id, got:\n{plan}"
+    );
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// Newest by timestamp, not by insertion: a backfill writes old-dated rows
+/// late, and reading one as the newest would make a live thread look idle.
+#[tokio::test]
+async fn last_activity_is_the_newest_timestamp_not_the_last_insert() {
+    use super::{last_activity_age, lookup_last_activity};
+    let (pool, db_name) = setup_test_db().await;
+    let thread_id = Uuid::new_v4();
+    insert_old_event(&pool, thread_id, 60).await;
+    insert_old_event(&pool, thread_id, 10 * 24 * 3600).await;
+
+    let age = last_activity_age(&pool, thread_id)
+        .await
+        .expect("a thread with events has an age");
+    assert!(
+        age < Duration::from_secs(3600),
+        "age must come from the 60 s old event, got {age:?}"
+    );
+    let (newest,): (chrono::DateTime<chrono::Utc>,) = sqlx::query_as(
+        "SELECT created FROM events WHERE aggregate_id = $1::text ORDER BY created DESC LIMIT 1",
+    )
+    .bind(thread_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(lookup_last_activity(&pool, thread_id).await, Some(newest));
+
+    assert!(last_activity_age(&pool, Uuid::new_v4()).await.is_none());
+    assert!(lookup_last_activity(&pool, Uuid::new_v4()).await.is_none());
 
     pool.close().await;
     teardown_test_db(&db_name).await;
@@ -165,82 +354,95 @@ fn available_disk_bytes_returns_none_for_missing_path() {
     assert!(available_disk_bytes(bogus).is_none());
 }
 
-#[tokio::test]
-async fn soft_threshold_does_not_re_emit_on_subsequent_ticks() {
-    // Crossing into "low disk" should fire the heads-up notification once.
-    // While the user stays below soft (multiple ticks), no spam.
-    let (pool, db_name) = setup_test_db().await;
-    let (bus, _rx) = EventBus::new(pool.clone());
-    let bus = Arc::new(bus);
-
-    let (_tmp, root) = fresh_workspace().await;
-    let mut worker = make_worker(pool.clone(), bus.clone(), root.clone());
-    worker.free_soft_bytes = u64::MAX; // force "below soft"
-    worker.free_hard_bytes = 0;
-
-    let rx = bus.subscribe();
-    worker.run_once().await;
-    worker.run_once().await;
-    worker.run_once().await;
-
-    let notifications = drain_notifications(rx, Duration::from_millis(200)).await;
-    let lows: Vec<_> = notifications
-        .into_iter()
-        .filter(|n| n.title == "Low disk space on your machine")
-        .collect();
-    assert_eq!(
-        lows.len(),
-        1,
-        "expected exactly one low-disk notification across 3 ticks, got: {:?}",
-        lows
-    );
-
-    pool.close().await;
-    teardown_test_db(&db_name).await;
+/// An empty session map with nothing registered anywhere.
+fn idle_engine_probe() -> (
+    super::EngineActiveThreads,
+    Arc<crate::engine::agent_session::SpawnsInFlight>,
+    crate::engine::tools::bash_background::BackgroundBashRegistry,
+) {
+    let sessions = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    let spawns = Arc::new(crate::engine::agent_session::SpawnsInFlight::default());
+    let registry = crate::engine::tools::bash_background::BackgroundBashRegistry::new();
+    let probe = super::EngineActiveThreads::new(sessions, spawns.clone(), registry.clone());
+    (probe, spawns, registry)
 }
 
+/// A spawn sets up the worktree, hardlinks included, well before its session
+/// registers. The spawn registry covers that window.
 #[tokio::test]
-async fn soft_threshold_re_arms_after_recovery() {
-    // After disk recovers above soft, sinking below should notify again.
-    let (pool, db_name) = setup_test_db().await;
-    let (bus, _rx) = EventBus::new(pool.clone());
-    let bus = Arc::new(bus);
+async fn a_spawn_in_flight_makes_its_thread_active() {
+    use super::ActiveThreads;
 
-    let (_tmp, root) = fresh_workspace().await;
-    let mut worker = make_worker(pool.clone(), bus.clone(), root.clone());
-    worker.free_soft_bytes = u64::MAX; // below soft
-    worker.free_hard_bytes = 0;
+    let (probe, spawns, _registry) = idle_engine_probe();
+    let thread_id = Uuid::new_v4();
+    assert!(!probe.is_active(thread_id).await, "nothing running yet");
+    {
+        let _slot = spawns.enter(thread_id);
+        assert!(probe.is_active(thread_id).await, "the spawn is in flight");
+        assert!(
+            !probe.is_active(Uuid::new_v4()).await,
+            "another thread's spawn does not count"
+        );
+    }
+    assert!(
+        !probe.is_active(thread_id).await,
+        "a returned spawn does not count"
+    );
+}
 
-    let rx = bus.subscribe();
-    worker.run_once().await;
+/// A background task builds in the worktree after its session ended the turn,
+/// so the session map alone cannot see it.
+#[tokio::test]
+async fn a_running_background_task_makes_its_thread_active() {
+    use super::ActiveThreads;
 
-    worker.free_soft_bytes = 0; // recovered above soft
-    worker.run_once().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let (probe, _spawns, registry) = idle_engine_probe();
+    let thread_id = Uuid::new_v4();
+    assert!(!probe.is_active(thread_id).await, "nothing running yet");
 
-    worker.free_soft_bytes = u64::MAX; // sinking again
-    worker.run_once().await;
-
-    let notifications = drain_notifications(rx, Duration::from_millis(200)).await;
-    let lows: Vec<_> = notifications
-        .into_iter()
-        .filter(|n| n.title == "Low disk space on your machine")
-        .collect();
-    assert_eq!(
-        lows.len(),
-        2,
-        "expected one notif per crossing into below-soft, got: {:?}",
-        lows
+    let (task_id, _finished) = registry
+        .spawn("sleep 30", 60, tmp.path(), &[], Some(thread_id), None)
+        .await
+        .expect("spawn");
+    assert!(probe.is_active(thread_id).await, "the task is running");
+    assert!(
+        !probe.is_active(Uuid::new_v4()).await,
+        "another thread's task does not count"
     );
 
-    pool.close().await;
-    teardown_test_db(&db_name).await;
+    assert!(registry.kill(&task_id).await);
+    assert!(
+        registry
+            .wait_for_finish(&task_id, Duration::from_secs(10))
+            .await
+    );
+    assert!(
+        !probe.is_active(thread_id).await,
+        "a finished task does not count"
+    );
+}
+
+#[test]
+fn the_tier_1_idle_window_shrinks_with_each_pressure_level() {
+    use super::{DiskPressure, TIER_1_IDLE};
+    let forced = Duration::from_secs(60 * 60);
+    let window = |free| DiskPressure::classify(Some(free), 20 * GB, 5 * GB).tier1_idle(forced);
+    assert_eq!(window(50 * GB), TIER_1_IDLE, "comfortable");
+    assert_eq!(window(10 * GB), forced, "soft");
+    assert_eq!(window(GB), Duration::ZERO, "hard");
+    assert_eq!(
+        DiskPressure::classify(None, 20 * GB, 5 * GB).tier1_idle(forced),
+        TIER_1_IDLE,
+        "a failed probe reads as comfortable"
+    );
 }
 
 #[tokio::test]
 async fn hard_threshold_emits_auto_cleanup_when_bytes_freed() {
-    // Below hard pressure, when forced Tier 1 actually reclaims space, the
-    // user gets a distinct "auto-cleanup running" notification reporting
-    // the freed bytes.
+    // Below hard pressure, when Tier 1 actually reclaims space, the user gets
+    // a distinct "auto-cleanup running" notification reporting the freed
+    // bytes.
     let (pool, db_name) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
     let bus = Arc::new(bus);
@@ -279,8 +481,7 @@ async fn hard_threshold_emits_auto_cleanup_when_bytes_freed() {
 #[tokio::test]
 async fn hard_threshold_no_auto_cleanup_when_nothing_freed() {
     // Below hard pressure but no idle worktrees to reclaim → no auto-cleanup
-    // notification (the soft-low heads-up still fires, but the action notif
-    // shouldn't claim "running" when nothing actually ran).
+    // notification: the action notif must not claim a reclaim that never ran.
     let (pool, db_name) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
     let bus = Arc::new(bus);
@@ -312,12 +513,11 @@ async fn hard_threshold_no_auto_cleanup_when_nothing_freed() {
 // Disk notifications: where a tap lands, and the route the body names.
 // ---------------------------------------------------------------------------
 
-const GB: u64 = 1024 * 1024 * 1024;
-
 /// Every body this module can produce, so a rule about the copy covers all of
 /// them rather than the one branch a test remembered.
 fn every_disk_body() -> Vec<String> {
-    use super::{auto_cleanup_body, disk_low_body};
+    use super::auto_cleanup_body;
+    use super::disk_monitor::disk_low_body;
     vec![
         disk_low_body(3 * GB, 40 * GB, 5 * GB), // large Lucidos footprint
         disk_low_body(3 * GB, GB, 5 * GB),      // pressure is elsewhere
@@ -341,7 +541,7 @@ fn every_disk_body_names_the_page_the_tap_opens() {
 /// Lucidos is the one holding it.
 #[test]
 fn the_two_low_disk_branches_keep_their_own_remedy() {
-    use super::disk_low_body;
+    use super::disk_monitor::disk_low_body;
     let large = disk_low_body(3 * GB, 40 * GB, 5 * GB);
     let small = disk_low_body(3 * GB, GB, 5 * GB);
     assert!(large.contains("clean idle ones"), "{large}");

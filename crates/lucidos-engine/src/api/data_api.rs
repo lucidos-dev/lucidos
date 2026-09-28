@@ -1,46 +1,11 @@
 use super::*;
+use crate::core::data_prefixes::MUTABLE_PREFIXES;
 use std::sync::LazyLock;
-
-/// Mutable workspace-data prefixes: user-owned trees the API may write and
-/// delete.
-///
-/// The write side cannot tell an app from the shell. So each of these is
-/// guarded at the point of USE instead (ADR 0156 decision 2). A new prefix
-/// states its answer in this table, and the test below fails if it does not.
-///
-/// | Prefix | Guard at use |
-/// |---|---|
-/// | `artifacts/`, `apps/`, `knowhow/`, `triggers/` | none: content the user owns |
-/// | `config/` | credential scope, so `apis.json` cannot send a secret off-scope |
-/// | `auth-modules/` | the wasmtime sandbox, plus credential scope per handle |
-/// | `scripts/` | the handshake approval record: path plus content hash |
-///
-/// `config/` and `auth-modules/` are coupled: `config/apis.json` references
-/// signers by name from `auth-modules/`, so deleting one without the other
-/// leaves a dangling reference.
-const MUTABLE_PREFIXES: &[&str] = &[
-    "artifacts/",
-    "apps/",
-    "knowhow/",
-    "triggers/",
-    "config/",
-    "auth-modules/",
-    "scripts/",
-];
-
-/// Read-only prefix for engine-shipped reference knowhow served from `<repo>/system-knowhow/`.
-/// Allowed for GET so the trigger UI's knowhow links resolve; rejected for PUT/DELETE/edit.
-const READ_ONLY_PREFIXES: &[&str] = &["system-knowhow/"];
 
 static READ_PREFIX_ERR: LazyLock<String> = LazyLock::new(|| {
     format!(
         "Path must start with one of: {}",
-        MUTABLE_PREFIXES
-            .iter()
-            .chain(READ_ONLY_PREFIXES.iter())
-            .copied()
-            .collect::<Vec<_>>()
-            .join(", ")
+        crate::core::known_data_prefixes_text()
     )
 });
 static MUTATE_PREFIX_ERR: LazyLock<String> = LazyLock::new(|| {
@@ -84,11 +49,7 @@ fn validate_path_basics(path: &str) -> Result<(), (StatusCode, String)> {
 
 fn validate_data_path_read(path: &str) -> Result<(), (StatusCode, String)> {
     validate_path_basics(path)?;
-    if !MUTABLE_PREFIXES
-        .iter()
-        .chain(READ_ONLY_PREFIXES.iter())
-        .any(|p| path.starts_with(p))
-    {
+    if !crate::core::is_known_data_prefix(path) {
         return Err((StatusCode::BAD_REQUEST, READ_PREFIX_ERR.to_string()));
     }
     Ok(())
@@ -354,6 +315,10 @@ pub(super) async fn write_data(
     if let Err((code, msg)) = validate_data_path_mutate(&path) {
         return (code, Json(serde_json::json!({ "error": msg }))).into_response();
     }
+    let data_dir = state.workspace_path.join(crate::core::DATA_DIR);
+    if let Err(msg) = crate::core::data_prefixes::validate_data_write(&data_dir, &path, &body) {
+        return ApiError::with_code(422, msg).into_response();
+    }
 
     // Before the write, not before the emit. A refusal after the bytes reach
     // disk would be a mutation nobody is recorded as making.
@@ -561,6 +526,20 @@ pub(super) async fn edit_data(
 ) -> Response {
     if let Err((code, msg)) = validate_data_path_mutate(&body.path) {
         return (code, Json(serde_json::json!({ "error": msg }))).into_response();
+    }
+    // A theme is validated whole, which an operation-by-operation edit cannot
+    // honour, so a theme is saved with `PUT` instead.
+    if crate::core::themes::is_theme_path(&body.path) {
+        return ApiError::bad_request(
+            "a theme is written whole: PUT /api/v1/data/themes/<id>.json with the full theme",
+        )
+        .into_response();
+    }
+    if crate::core::workspace_fonts::is_font_path(&body.path) {
+        return ApiError::bad_request(
+            "a workspace font file is written whole: PUT /api/v1/data/fonts/<slug>/<file>",
+        )
+        .into_response();
     }
 
     if body.operations.is_empty() {
@@ -864,47 +843,6 @@ mod tests {
         assert_eq!(result, vec!["artifacts/x.md"]);
     }
 
-    /// Every mutable prefix names what stops it at the point of use.
-    ///
-    /// No header tells an app from the shell (ADR 0156 decision 1). So a
-    /// prefix is safe because of what refuses it downstream, never because of
-    /// who wrote it. `scripts/` and `config/` sat here for a long time with
-    /// that answer written down nowhere, and a write-then-execute chain grew
-    /// in the gap. Adding a prefix now costs one table row.
-    #[test]
-    fn every_mutable_prefix_states_what_guards_it_at_use() {
-        // The doc block immediately above the const, read out of this file's
-        // own source. A table in a comment nothing checks is a table that goes
-        // stale the first time someone is in a hurry.
-        let source = include_str!("data_api.rs");
-        let (before, _) = source
-            .split_once("const MUTABLE_PREFIXES")
-            .expect("the const this test is about");
-        let doc: String = before
-            .lines()
-            .rev()
-            .take_while(|l| l.trim_start().starts_with("///"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            doc.contains("Guard at use"),
-            "the doc block above MUTABLE_PREFIXES must carry the guard table"
-        );
-        for prefix in MUTABLE_PREFIXES {
-            assert!(
-                doc.contains(&format!("`{prefix}`")),
-                "{prefix} is writable over the API and the table does not say \
-                 what refuses it at the point of use"
-            );
-        }
-        // The check can say no. Without this, a long table would pass the
-        // loop above whatever it actually listed.
-        assert!(
-            !doc.contains("`postgres/`"),
-            "a prefix absent from the table must not read as present"
-        );
-    }
-
     #[test]
     fn validate_rejects_traversal() {
         assert!(validate_data_path_read("../etc/passwd").is_err());
@@ -964,6 +902,7 @@ mod tests {
             "auth-modules/binance-hmac.wasm",
             "auth-modules/binance-hmac.manifest.json",
             "scripts/foo.py",
+            "themes/mine.json",
         ] {
             assert!(validate_data_path_read(p).is_ok());
             assert!(validate_data_path_mutate(p).is_ok());

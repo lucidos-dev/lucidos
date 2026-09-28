@@ -512,13 +512,6 @@ impl ArtifactManager {
         .unwrap()
     }
 
-    pub fn read_artifact(&self, relative_path: &str) -> Result<String, std::io::Error> {
-        reject_path_traversal(relative_path)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
-        let full_path = self.workspace_path.join(ARTIFACTS_DIR).join(relative_path);
-        fs::read_to_string(full_path)
-    }
-
     pub fn artifact_exists(&self, relative_path: &str) -> bool {
         if reject_path_traversal(relative_path).is_err() {
             return false;
@@ -799,15 +792,24 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    fn read_back(manager: &ArtifactManager, relative_path: &str) -> String {
+        fs::read_to_string(
+            manager
+                .workspace_path
+                .join(ARTIFACTS_DIR)
+                .join(relative_path),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn test_write_and_read_artifact() {
         let dir = tempdir().unwrap();
         let manager = ArtifactManager::new(dir.path().to_path_buf()).unwrap();
 
         manager.write_artifact("test.txt", "hello world").unwrap();
-        let content = manager.read_artifact("test.txt").unwrap();
 
-        assert_eq!(content, "hello world");
+        assert_eq!(read_back(&manager, "test.txt"), "hello world");
     }
 
     #[tokio::test]
@@ -1008,15 +1010,9 @@ mod tests {
         manager.write_artifact(&dest3, "third").unwrap();
 
         // All three exist; earlier files were never overwritten.
-        assert_eq!(manager.read_artifact("imported/Brev.pdf").unwrap(), "first");
-        assert_eq!(
-            manager.read_artifact("imported/Brev (1).pdf").unwrap(),
-            "second"
-        );
-        assert_eq!(
-            manager.read_artifact("imported/Brev (2).pdf").unwrap(),
-            "third"
-        );
+        assert_eq!(read_back(&manager, "imported/Brev.pdf"), "first");
+        assert_eq!(read_back(&manager, "imported/Brev (1).pdf"), "second");
+        assert_eq!(read_back(&manager, "imported/Brev (2).pdf"), "third");
     }
 
     #[tokio::test]

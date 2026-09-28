@@ -146,15 +146,10 @@ test.describe('Lucidos menu from the desktop mark', () => {
       'the panel landed on the window axis, so pane centring is not in force',
     ).toBeGreaterThan(1);
 
-    // The dim is up, and it is click-through so the outside-click contract can
-    // resolve its target against the app underneath.
-    await expect(page.locator('.brand-menu-scrim')).toHaveCount(1);
-
     // Re-activating the toggle closes via its own handler. With the anchor
     // exemption broken this reopens instead, which is the documented bug shape.
     await toggle.click();
     await expect(menu).toHaveCount(0);
-    await expect(page.locator('.brand-menu-scrim')).toHaveCount(0);
   });
 
   test('says why the mark is dim, and stops saying it on reconnect', async ({ page }) => {

@@ -13,10 +13,10 @@
        changes count. Semantic status badges (git add/modify/delete) keep their
        own colors. */
     background: var(--accent);
-    color: white;
+    color: var(--text-on-accent);
     font-size: var(--font-size-3xs);
     font-weight: bold;
-    border-radius: 0.5625rem;
+    border-radius: calc(var(--radius-control) * 1.125);
     /* The design height. styles/badges.css rounds it to whole pixels, which
        is what keeps the glyph centred, and the width follows that box. */
     --badge-height: 0.875rem;

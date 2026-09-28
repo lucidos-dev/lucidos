@@ -67,10 +67,21 @@ pub(crate) enum ScanCause {
     /// The registry just changed. The running scan may have read it before the
     /// write, so this one leaves a trailing pass behind rather than joining.
     RegistryChanged,
+    /// A user asked for a scan: the Plugins panel's refresh. It leaves a
+    /// trailing pass for the same reason, since the running scan may predate
+    /// the ask. That pass also answers the stamp the request left.
+    Requested,
 }
 
-/// A scan is owed because the registry changed. Set BEFORE reaching for the
-/// slot, and cleared by whichever pass takes it.
+impl ScanCause {
+    /// Whether a scan already running must go round again for this caller.
+    pub(crate) fn leaves_trailing_pass(self) -> bool {
+        matches!(self, Self::RegistryChanged | Self::Requested)
+    }
+}
+
+/// A scan is owed because the registry changed or a user asked for one. Set
+/// BEFORE reaching for the slot, and cleared by whichever pass takes it.
 ///
 /// Claim-then-clear-on-acquire is what makes it race-free. The pass that clears
 /// the claim is a pass that reads the registry afterwards, so it sees the
@@ -143,7 +154,7 @@ pub(crate) async fn run_plugin_marketplace_update_check(
     pool: sqlx::PgPool,
     cause: ScanCause,
 ) -> PluginUpdateCheckReport {
-    if cause == ScanCause::RegistryChanged {
+    if cause.leaves_trailing_pass() {
         // Claimed before reaching for the slot, so it cannot matter whether we
         // get it. Whoever does clears the claim and then reads the registry.
         SCAN_REQUEUE.store(true, Ordering::SeqCst);

@@ -34,6 +34,10 @@ const EVERY_VERB: &[ThreadReachVerb] = &[
 /// Hand-written, which is its weakness: a route added elsewhere is invisible
 /// here until somebody adds the row, and that is how arming an apply shipped
 /// ungated. Review a new change route against this list.
+///
+/// Deliberately absent: an agent's archive (`archive_thread_as_caller`'s token
+/// branch, `execute_archive_thread`). It applies a narrower ladder, the caller
+/// or its direct child, which no standing instruction widens (ADR 0310).
 const GATED_HANDLERS: &[(&str, &str, &str)] = &[
     ("changes.rs", CHANGES_RS, "apply_change"),
     ("changes.rs", CHANGES_RS, "discard_change"),
@@ -257,7 +261,6 @@ async fn seed_thread_opened_by(
             text: "work".into(),
             user_image_hashes: vec![],
             device_id: None,
-            device: None,
             image_description: None,
             parent_thread_id: parent,
             spawning_event_id: None,
@@ -278,7 +281,6 @@ async fn seed_thread_opened_by(
 fn owner_device() -> MessageOrigin {
     MessageOrigin::Device {
         device_id: "device-abc".into(),
-        label: "My MacBook".into(),
     }
 }
 

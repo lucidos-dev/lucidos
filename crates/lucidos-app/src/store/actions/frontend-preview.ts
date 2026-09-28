@@ -18,25 +18,26 @@ import {
   type FrontendPreviewStatus,
 } from '../../api/client';
 import { showToast } from '../store';
+import { failedIfFresh, setLoadingIfFresh, type Loadable } from '../types';
 import { errorDetail } from '../../utils/errorDetail';
 import { DEVICE_ID_PARAM } from '../../utils/deviceIdSeed';
 
-/** The one preview slot, or `null` before the first load has answered. */
-export const frontendPreview = signal<FrontendPreviewStatus | null>(null);
+/** The one preview slot. */
+export const frontendPreview = signal<Loadable<FrontendPreviewStatus>>({ status: 'not-loaded' });
 
 /** True while a start/stop is in flight, so the buttons can say so. Starting a
  *  cold Vite takes about a second, and the request does not answer until the
  *  server is actually serving. */
 export const frontendPreviewBusy = signal(false);
 
+/** Read the slot when the control menu opens. A reopen keeps the last answer
+ *  on screen while it re-reads; a failed read shows in the menu section. */
 export async function loadFrontendPreview(): Promise<void> {
+  setLoadingIfFresh(frontendPreview);
   try {
-    frontendPreview.value = await getFrontendPreview();
-  } catch {
-    // Telemetry carve-out (.claude/rules/frontend.md): runs at startup with no
-    // user intent, and the only cost of a miss is that the row shows "not
-    // running" until the user taps it, which then reports the real error.
-    console.warn('[FrontendPreview] could not read the preview status');
+    frontendPreview.value = { status: 'loaded', data: await getFrontendPreview() };
+  } catch (err) {
+    frontendPreview.value = failedIfFresh(frontendPreview.value, err);
   }
 }
 
@@ -45,7 +46,7 @@ export async function startPreviewForThread(threadId: string): Promise<void> {
   if (frontendPreviewBusy.value) return;
   frontendPreviewBusy.value = true;
   try {
-    frontendPreview.value = await startFrontendPreview(threadId);
+    frontendPreview.value = { status: 'loaded', data: await startFrontendPreview(threadId) };
   } catch (err) {
     // The engine's refusals name the worktree or the missing file, so the
     // detail is the whole value of the toast.
@@ -59,7 +60,7 @@ export async function stopPreview(): Promise<void> {
   if (frontendPreviewBusy.value) return;
   frontendPreviewBusy.value = true;
   try {
-    frontendPreview.value = await stopFrontendPreview();
+    frontendPreview.value = { status: 'loaded', data: await stopFrontendPreview() };
   } catch (err) {
     showToast(`Could not stop the frontend preview: ${errorDetail(err)}`, 'error');
   } finally {
@@ -110,9 +111,8 @@ export function handleFrontendPreviewStarted(payload: {
   port?: number;
 }): void {
   frontendPreview.value = {
-    running: true,
-    thread_id: payload.thread_id,
-    port: payload.port,
+    status: 'loaded',
+    data: { running: true, thread_id: payload.thread_id, port: payload.port },
   };
 }
 
@@ -130,9 +130,9 @@ export function handleFrontendPreviewStarted(payload: {
  * as noise, since the alternative is a Stop button for a process that is gone.
  */
 export function handleFrontendPreviewStopped(payload: { thread_id?: string }): void {
-  const current = frontendPreview.value;
+  const current = frontendPreview.value.status === 'loaded' ? frontendPreview.value.data : null;
   const namesAnother =
     !!payload.thread_id && !!current?.thread_id && current.thread_id !== payload.thread_id;
   if (current?.running && namesAnother) return;
-  frontendPreview.value = { running: false };
+  frontendPreview.value = { status: 'loaded', data: { running: false } };
 }

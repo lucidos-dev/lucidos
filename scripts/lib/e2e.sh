@@ -548,6 +548,22 @@ playwright_file_filter() {
     printf '/%s$' "$escaped"
 }
 
+# ── project_runs_spec ────────────────────────────────────────────────
+# Succeed when a browser project runs the given spec, fail when it ignores it.
+#
+#   project_runs_spec mobile header-desktop.spec.ts   # → fails
+#
+# Mirrors each project's `testIgnore` in crates/lucidos-app/playwright.config.ts.
+# A targeted `-f` run asks every project for the spec. A project that ignores
+# it finds no tests and exits 1, which fails a run that passed.
+project_runs_spec() {
+    case "$1:$2" in
+        chromium:*-mobile.spec.ts) return 1 ;;
+        mobile:*-desktop.spec.ts | mobile-webkit:*-desktop.spec.ts) return 1 ;;
+    esac
+    return 0
+}
+
 # ── report_project_exit_codes ────────────────────────────────────────
 # Print the per-project exit-code table for a multi-project browser run and
 # RETURN the umbrella exit code the caller must exit with.

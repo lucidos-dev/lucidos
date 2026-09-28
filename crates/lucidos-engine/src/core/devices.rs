@@ -9,7 +9,11 @@ use crate::engine::thread_events::MessageOrigin;
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Device {
     pub id: String,
+    /// The name someone typed on the Devices row.
     pub name: Option<String>,
+    /// The name the device was given when it paired, as the workspace gateway
+    /// forwards it. `None` for a client that never came through a gateway.
+    pub pairing_label: Option<String>,
     pub user_agent: Option<String>,
     pub push_enabled: bool,
     pub last_seen_at: DateTime<Utc>,
@@ -32,7 +36,7 @@ pub struct SeenDevice {
 /// "Seen" is the newer of the last page load (`last_seen_at`) and the last
 /// visible heartbeat (`device_presence.visible_at`). `$1` is the presence
 /// window in seconds. Ages use the database clock (ADR 0053).
-const SEEN_DEVICE_SELECT: &str = "SELECT d.id, d.name, d.user_agent, \
+const SEEN_DEVICE_SELECT: &str = "SELECT d.id, d.name, d.pairing_label, d.user_agent, \
         EXTRACT(EPOCH FROM now() - s.seen)::bigint AS seen_secs_ago, \
         COALESCE(p.visible_at > now() - make_interval(secs => $1), false) AS visible_now \
      FROM devices d \
@@ -47,6 +51,7 @@ fn presence_window_secs() -> f64 {
 struct SeenDeviceRow {
     id: String,
     name: Option<String>,
+    pairing_label: Option<String>,
     user_agent: Option<String>,
     seen_secs_ago: i64,
     visible_now: bool,
@@ -55,7 +60,7 @@ struct SeenDeviceRow {
 impl From<SeenDeviceRow> for SeenDevice {
     fn from(row: SeenDeviceRow) -> Self {
         Self {
-            label: resolve_device_name(row.name.as_deref(), &row.id),
+            label: friendly_device_name(row.name.as_deref(), row.pairing_label.as_deref(), &row.id),
             details: row.user_agent.as_deref().map(parse_user_agent),
             id: row.id,
             seen_secs_ago: row.seen_secs_ago,
@@ -129,6 +134,7 @@ impl DeviceStore {
         pool: &PgPool,
         id: &str,
         user_agent: Option<&str>,
+        pairing_label: Option<&str>,
     ) -> Result<(Device, bool), Box<dyn std::error::Error + Send + Sync>> {
         #[derive(sqlx::FromRow)]
         struct DeviceWithInsertFlag {
@@ -138,15 +144,17 @@ impl DeviceStore {
         }
 
         let row: DeviceWithInsertFlag = sqlx::query_as(
-            "INSERT INTO devices (id, user_agent, last_seen_at)
-             VALUES ($1, $2, NOW())
+            "INSERT INTO devices (id, user_agent, pairing_label, last_seen_at)
+             VALUES ($1, $2, $3, NOW())
              ON CONFLICT (id) DO UPDATE SET
                 user_agent = COALESCE($2, devices.user_agent),
+                pairing_label = COALESCE($3, devices.pairing_label),
                 last_seen_at = NOW()
-             RETURNING id, name, user_agent, push_enabled, last_seen_at, created_at, (xmax = 0) AS inserted",
+             RETURNING id, name, pairing_label, user_agent, push_enabled, last_seen_at, created_at, (xmax = 0) AS inserted",
         )
         .bind(id)
         .bind(user_agent)
+        .bind(pairing_label)
         .fetch_one(pool)
         .await?;
         Ok((row.device, row.inserted))
@@ -154,8 +162,8 @@ impl DeviceStore {
 
     /// Does a row exist for this device id?
     ///
-    /// The *attribution* probe, distinct from [`Self::display_name`] on purpose.
-    /// `display_name` collapses "no such device" and "the database is down"
+    /// The *attribution* probe, distinct from [`Self::friendly_name`] on purpose.
+    /// `friendly_name` collapses "no such device" and "the database is down"
     /// into the same `None`, which is fine when the answer only picks a label
     /// but wrong when it decides whether to accept a request: a transient
     /// outage would then refuse the user's own chat sends. This returns the
@@ -173,23 +181,25 @@ impl DeviceStore {
             .await
     }
 
-    /// Get the display name for a device (falls back to truncated ID if no name set).
-    /// DB errors are logged and treated as "device not found" — caller falls back to None.
-    pub async fn display_name(pool: &PgPool, id: &str) -> Option<String> {
-        let row: Option<(Option<String>,)> =
-            match sqlx::query_as("SELECT name FROM devices WHERE id = $1")
+    /// What to call a device, read from its row. See [`friendly_device_name`].
+    ///
+    /// Always answers. A device with no row, or a failed read, gets the short-id
+    /// name, since a label is display metadata and must never fail an action.
+    pub async fn friendly_name(pool: &PgPool, id: &str) -> String {
+        let row: Option<(Option<String>, Option<String>)> =
+            match sqlx::query_as("SELECT name, pairing_label FROM devices WHERE id = $1")
                 .bind(id)
                 .fetch_optional(pool)
                 .await
             {
                 Ok(r) => r,
                 Err(e) => {
-                    log!("[Devices] display_name({}) failed: {}", id, e);
-                    return None;
+                    log!("[Devices] friendly_name({}) failed: {}", id, e);
+                    None
                 }
             };
-        let (name,) = row?;
-        Some(resolve_device_name(name.as_deref(), id))
+        let (name, pairing_label) = row.unwrap_or_default();
+        friendly_device_name(name.as_deref(), pairing_label.as_deref(), id)
     }
 
     /// Build a rich tooltip string for a device: name + user agent summary.
@@ -207,7 +217,8 @@ impl DeviceStore {
             }
         };
         let device = device?;
-        let name = resolve_device_name(device.name.as_deref(), id);
+        let name =
+            friendly_device_name(device.name.as_deref(), device.pairing_label.as_deref(), id);
         let ua = device.user_agent.as_deref().map(parse_user_agent);
         match ua {
             Some(parsed) => Some(format!("{}\n{}", name, parsed)),
@@ -342,6 +353,9 @@ impl DeviceStore {
 
     /// Register a device and announce it. The only way to add one.
     ///
+    /// `pairing_label` is stored when present and kept when absent, so a
+    /// request that did not come through the gateway never erases it.
+    ///
     /// `DeviceRegistered` fires only on a genuinely new device, never on the
     /// last-seen-at refresh every page load performs.
     pub async fn register(
@@ -349,9 +363,10 @@ impl DeviceStore {
         event_bus: &EventBus,
         id: &str,
         user_agent: Option<&str>,
+        pairing_label: Option<&str>,
         actor: Option<MessageOrigin>,
     ) -> Result<(Device, bool), Box<dyn std::error::Error + Send + Sync>> {
-        let (device, inserted) = Self::upsert_row(pool, id, user_agent).await?;
+        let (device, inserted) = Self::upsert_row(pool, id, user_agent, pairing_label).await?;
         if inserted {
             event_bus
                 .emit_or_log(
@@ -487,8 +502,8 @@ impl DeviceStore {
             return Ok(HandOver::AlreadyDone);
         }
         let copied = sqlx::query(
-            "INSERT INTO devices (id, name, user_agent, push_enabled, last_seen_at, created_at)
-             SELECT $2, name, user_agent, push_enabled, last_seen_at, created_at
+            "INSERT INTO devices (id, name, pairing_label, user_agent, push_enabled, last_seen_at, created_at)
+             SELECT $2, name, pairing_label, user_agent, push_enabled, last_seen_at, created_at
              FROM devices WHERE id = $1",
         )
         .bind(old_id)
@@ -571,13 +586,23 @@ impl DeviceStore {
     }
 }
 
-/// Resolve a display name for a device: prefer the stored name, fall back to
-/// `device-<short id>` derived from the first 8 chars of the device ID.
-pub(crate) fn resolve_device_name(stored: Option<&str>, id: &str) -> String {
-    if let Some(n) = stored {
-        if !n.is_empty() {
-            return n.to_string();
-        }
+/// What to call a device: the one rule every engine surface names it by.
+///
+/// The typed name wins, then the pairing label, then `device-` and the first
+/// eight characters of the id. The frontend's `deviceFriendlyName` applies the
+/// same order, so a device is called one thing on every screen. Never build a
+/// device name anywhere else.
+pub(crate) fn friendly_device_name(
+    name: Option<&str>,
+    pairing_label: Option<&str>,
+    id: &str,
+) -> String {
+    if let Some(n) = [name, pairing_label]
+        .into_iter()
+        .flatten()
+        .find(|n| !n.trim().is_empty())
+    {
+        return n.to_string();
     }
     let short = &id[..id.floor_char_boundary(8)];
     format!("device-{}", short)
@@ -671,6 +696,86 @@ mod tests {
             ),
             "Safari/604.1 on iOS"
         );
+    }
+
+    #[test]
+    fn friendly_device_name_prefers_the_typed_name_then_the_pairing_label() {
+        let id = "ab2c03f77d715bce";
+        assert_eq!(
+            friendly_device_name(Some("My iPhone"), Some("Safari on iPhone"), id),
+            "My iPhone"
+        );
+        assert_eq!(
+            friendly_device_name(None, Some("Safari on iPhone"), id),
+            "Safari on iPhone"
+        );
+        assert_eq!(
+            friendly_device_name(Some("  "), Some("Safari on iPhone"), id),
+            "Safari on iPhone",
+            "a blank typed name is no name"
+        );
+        assert_eq!(friendly_device_name(None, None, id), "device-ab2c03f7");
+        assert_eq!(friendly_device_name(None, Some(""), id), "device-ab2c03f7");
+    }
+
+    /// A paired device nobody renamed is called by its pairing label, and a
+    /// typed name still wins over it.
+    #[tokio::test]
+    async fn friendly_name_uses_the_pairing_label_and_keeps_it_and_the_typed_name() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let (bus, _callback_rx) = EventBus::new(pool.clone());
+
+        DeviceStore::register(
+            &pool,
+            &bus,
+            "phone-1",
+            Some("UA"),
+            Some("Safari on iPhone"),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            DeviceStore::friendly_name(&pool, "phone-1").await,
+            "Safari on iPhone"
+        );
+
+        // A later request that did not come through the gateway carries no label.
+        DeviceStore::register(&pool, &bus, "phone-1", Some("UA"), None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            DeviceStore::friendly_name(&pool, "phone-1").await,
+            "Safari on iPhone",
+            "a request without the label must not erase it"
+        );
+
+        DeviceStore::rename(&pool, &bus, "phone-1", Some("Work phone"), None)
+            .await
+            .unwrap();
+        DeviceStore::register(
+            &pool,
+            &bus,
+            "phone-1",
+            Some("UA"),
+            Some("Safari on iPhone"),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            DeviceStore::friendly_name(&pool, "phone-1").await,
+            "Work phone",
+            "the typed name wins over the pairing label"
+        );
+
+        assert_eq!(
+            DeviceStore::friendly_name(&pool, "no-such-device").await,
+            "device-no-such-",
+            "an unknown device still gets a name"
+        );
+
+        crate::test_support::teardown_test_db(&db_name).await;
     }
 
     async fn backdate_last_seen(pool: &PgPool, id: &str, days_ago: i64) {
@@ -787,13 +892,13 @@ mod tests {
                 .unwrap()
         }
 
-        let (_, inserted) = DeviceStore::register(&pool, &bus, "d1", Some("UA"), None)
+        let (_, inserted) = DeviceStore::register(&pool, &bus, "d1", Some("UA"), None, None)
             .await
             .unwrap();
         assert!(inserted);
         assert_eq!(emitted(&pool, "DeviceRegistered").await, 1);
 
-        let (_, inserted) = DeviceStore::register(&pool, &bus, "d1", Some("UA"), None)
+        let (_, inserted) = DeviceStore::register(&pool, &bus, "d1", Some("UA"), None, None)
             .await
             .unwrap();
         assert!(!inserted);
@@ -845,7 +950,7 @@ mod tests {
         let (pool, db_name) = crate::test_support::setup_test_db().await;
         let (bus, _callback_rx) = EventBus::new(pool.clone());
 
-        DeviceStore::register(&pool, &bus, "d1", Some("UA"), None)
+        DeviceStore::register(&pool, &bus, "d1", Some("UA"), None, None)
             .await
             .unwrap();
         PinnedAppStore::pin(&pool, &bus, "habit-tracker", "main", "d1", None)
@@ -878,7 +983,7 @@ mod tests {
     /// Seed one row in every table the hand-over must move. A table added to
     /// the schema and forgotten here shows up as a surviving old-id row.
     async fn seed_device_state(pool: &PgPool, bus: &EventBus, id: &str) {
-        DeviceStore::register(pool, bus, id, Some("UA"), None)
+        DeviceStore::register(pool, bus, id, Some("UA"), Some("Safari on iPhone"), None)
             .await
             .unwrap();
         DeviceStore::set_push_enabled(pool, bus, id, true, None)
@@ -963,6 +1068,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(device.name.as_deref(), Some("My iPhone"));
+        assert_eq!(device.pairing_label.as_deref(), Some("Safari on iPhone"));
         assert!(device.push_enabled, "the push flag rides across");
 
         crate::test_support::teardown_test_db(&db_name).await;
@@ -1005,7 +1111,7 @@ mod tests {
         let (pool, db_name) = crate::test_support::setup_test_db().await;
         let (bus, _callback_rx) = EventBus::new(pool.clone());
         seed_device_state(&pool, &bus, "old").await;
-        DeviceStore::register(&pool, &bus, "new", Some("UA"), None)
+        DeviceStore::register(&pool, &bus, "new", Some("UA"), None, None)
             .await
             .unwrap();
 
@@ -1095,7 +1201,7 @@ mod tests {
         let (bus, _callback_rx) = EventBus::new(pool.clone());
 
         // Push-enabled + old → returned
-        DeviceStore::register(&pool, &bus, "old-on", Some("UA"), None)
+        DeviceStore::register(&pool, &bus, "old-on", Some("UA"), None, None)
             .await
             .unwrap();
         DeviceStore::set_push_enabled(&pool, &bus, "old-on", true, None)
@@ -1104,7 +1210,7 @@ mod tests {
         backdate_last_seen(&pool, "old-on", 45).await;
 
         // Push-enabled + recent → excluded (last_seen is today)
-        DeviceStore::register(&pool, &bus, "fresh-on", Some("UA"), None)
+        DeviceStore::register(&pool, &bus, "fresh-on", Some("UA"), None, None)
             .await
             .unwrap();
         DeviceStore::set_push_enabled(&pool, &bus, "fresh-on", true, None)
@@ -1112,13 +1218,13 @@ mod tests {
             .unwrap();
 
         // Push-disabled + old → excluded (filtered at SELECT to avoid no-op events)
-        DeviceStore::register(&pool, &bus, "old-off", Some("UA"), None)
+        DeviceStore::register(&pool, &bus, "old-off", Some("UA"), None, None)
             .await
             .unwrap();
         backdate_last_seen(&pool, "old-off", 45).await;
 
         // One day short of the 30-day cutoff (29 days) → excluded
-        DeviceStore::register(&pool, &bus, "almost-on", Some("UA"), None)
+        DeviceStore::register(&pool, &bus, "almost-on", Some("UA"), None, None)
             .await
             .unwrap();
         DeviceStore::set_push_enabled(&pool, &bus, "almost-on", true, None)
@@ -1138,7 +1244,7 @@ mod tests {
     async fn list_stale_push_enabled_returns_empty_when_nothing_stale() {
         let (pool, db_name) = crate::test_support::setup_test_db().await;
         let (bus, _callback_rx) = EventBus::new(pool.clone());
-        DeviceStore::register(&pool, &bus, "fresh", Some("UA"), None)
+        DeviceStore::register(&pool, &bus, "fresh", Some("UA"), None, None)
             .await
             .unwrap();
         DeviceStore::set_push_enabled(&pool, &bus, "fresh", true, None)

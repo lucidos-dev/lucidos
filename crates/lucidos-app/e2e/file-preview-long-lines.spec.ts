@@ -283,7 +283,7 @@ test.describe('a source line wider than the file preview', () => {
         return { row: bg(el), gutter: bg(el.querySelector('.line-number')!) };
       };
       return {
-        theme: document.documentElement.getAttribute('data-theme'),
+        theme: document.documentElement.getAttribute('data-theme-mode'),
         surface: bg(document.querySelector(opts.sel)!),
         cited: of(opts.line),
         plain: of(1),

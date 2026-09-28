@@ -15,6 +15,43 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 
 ## Rust engine
 
+- **The archive request resolver hears a descendant settle through its
+  ancestor's own events.** A reviewer reports a request stuck on
+  `blocking_descendants`, since the resolver only resolves the event's own
+  thread and skips unwatched ones. But when a descendant's blocking state
+  flips, the bus rebroadcasts each affected ancestor's aggregate. It arrives as
+  a `ChildrenCountChanged` thread event on that ancestor (`affected_ancestors`
+  in `event_bus/mod.rs`). A watched ancestor re-takes its verdict on it. Re-flag only with a
+  blocking change that reaches no ancestor rebroadcast (ADR 0310).
+
+- **`POST /api/v1/threads/:thread_id/archive` gives a caller with no origin
+  token the user's reach, as every thread route does.** A reviewer reports an
+  agent unsetting its token to escape the self-or-direct-child ladder. That is
+  the residual `api/thread_reach.rs` documents under "A caller presenting no
+  token keeps its reach": the mutating gate refuses a caller with no credential
+  at all (ADR 0169), and the detach and archive routes answer the rest the same
+  way. The new route adds no reach the existing archive route did not have.
+  Re-flag only with a way to present the token-less credential that the other
+  thread routes refuse.
+
+- **`ThreadQueue::submit` `debug_assert!`s that a spawn is attributed, and that
+  panic is the point.** A reviewer reads it as crashing on "supported" shapes,
+  since `origin` and `parent_thread_id` are optional on the wire. They are
+  optional so an old queued row still deserializes, and boot requeue never goes
+  through `submit`. Every live producer stamps an origin or a parent, so the
+  assert fires only on a new engine seed that would render Origin "Unknown". A
+  release build logs and still spawns. Re-flag only with a live producer that
+  legitimately submits neither (ADR 0300).
+
+- **Apply Now's parked-question refusal is a preflight read with no lock, and
+  that is enough.** A reviewer reports a race: a question asked between the
+  check and the session claim is still overtaken. That window exists only on a
+  mid-turn thread. There the UI offers no Apply, and ADR 0233 keeps Apply Now
+  for the agent's own use. An apply prompt queued into a running session can
+  overtake a later question wherever the check sits, so a lock closes nothing.
+  Re-flag only with a path that reaches Apply Now on a non-running thread in
+  that window (ADR 0293).
+
 - **An explicit JSON `null` for an optional tool argument means ABSENT, not a
   type error, and that is deliberate.** A reviewer sees
   `None | Some(Value::Null) => <default>` beside a `Some(_) => Err(...)` arm and
@@ -135,6 +172,18 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   kills it. That is the stale-holder failure the whole design avoids. Re-flag
   only if the child gains its own process group, or if the wrapper starts
   outliving the build. (ADR 0070 § Consequences.)
+
+- **The recommended cleanup's check-then-remove window is Tier 0's, not a new
+  race.** `run_recommended_cleanup` (`worktree_cleanup_recommended.rs`) asks
+  `is_finished_worktree`, re-checks only liveness, then removes. Codex flagged
+  this as P1: a commit or edit landing in between is force-removed.
+
+  The window is one `git log` long, and Tier 0 has the same one with a DB query
+  added. The only writers into a thread worktree are its agent session, a spawn
+  and a background task, and `ActiveThreads` is asked right before the removal.
+  A branch with a new commit survives anyway, since `BranchDisposal::WhenMerged`
+  asks again. Re-flag only if a new writer appears that `ActiveThreads` cannot
+  see.
 
 - **`kill_on_drop(true)` releasing the worktree admin lock without awaiting the
   child is bounded to one syscall, not a live race.** A reviewer reading
@@ -1127,6 +1176,18 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   exits 0. Re-flag only with a use that needs a value of the type, such as a
   constructor outside the gated platform modules.
 
+- **Every stored `MemoryCorrected` row carries `deleted_summaries` or
+  `removed`, so "old `wrong_fact` rows replay nothing" is wrong about the
+  data.** A reviewer sees the replay ignore `wrong_fact` and `search_query`,
+  and concludes an older row with only those fields finds nothing to delete.
+
+  No such row exists. Both versions of the retired `Event::memory_corrected`
+  factory wrote `deleted_summaries`: the first had no `wrong_fact` at all, the
+  second added it beside the list. Current rows carry `removed`. The replay
+  matches on those lists only, because keyword matching on `wrong_fact` deleted
+  facts the user never corrected. Re-flag only with a real row that has neither
+  list. (`engine/memory/correction.rs`.)
+
 ## Desktop client (Tauri, macOS)
 
 - **`unread_targets` returning `(Option<String>, String)` is a deliberate
@@ -1205,6 +1266,33 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   evidence the fallthrough cannot reach a browser.
 
 ## Frontend
+
+- **The refresh indicator's holds ignore the animation speed scale, even
+  where a scaled transition outlasts them.** A reviewer reports that at a slow
+  diagnostic speed the check's grow-in (`--duration-slow`) is cut short by
+  `REFRESH_DONE_HOLD_MS`, then reverses into the fade. The holds in
+  `components/layout/RefreshIndicator.tsx` set how long each state stays
+  legible. They are not timers that wait out a transition, so
+  `scaledDurationMs` does not apply, and the file says so. Only the slider's
+  slow end reaches the overlap, which is a diagnostic setting. Re-flag only
+  when a hold starts gating something beyond the icon's own look.
+
+- **An `export` in an SDK source file is not the app-facing SDK surface.** A
+  reviewer reports that removing or renaming one breaks apps that import it.
+  Apps load the IIFE `sdk.js` and reach only `window.lucidos.*`. That is
+  what `src/index.ts` re-exports and `browser.ts` installs. A module like
+  `pullToRefresh.ts` is reached only by the host, through its
+  `@lucidos/<name>` alias. Re-flag only when `index.ts` re-exports the symbol,
+  or `system-knowhow/js-sdk.md` documents it.
+
+- **The arrival hold ignores every `loading="lazy"` image, and that is
+  enough.** A reviewer reports that a lazy image already loading above the
+  target is not waited for (`imageAboveStillLoading` in
+  `components/chat/scrollState.ts`). The only lazy transcript image is
+  `GeneratedImage`, whose source is an inline base64 `data:` URI. Nothing is
+  fetched, so once in view it decodes in milliseconds, well inside the quiet
+  window. A dormant lazy image far above would pin the hold to its cap. Re-flag
+  only when a lazy transcript image with a network source appears.
 
 - **`whenLoaded`'s document `pointerdown` listener is not a hand-rolled
   dismiss.** `utils/lazyComponent.tsx` adds a capture listener while a surface
@@ -2942,7 +3030,7 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   preference.
 
   A device-scoped value can be absent from a served object for harmless reasons,
-  such as a device id that changed. `resolveThemePreference` documents the same
+  such as a device id that changed. `resolveThemeModePreference` documents the same
   precedence for the same reason: a missing server value must not clobber what
   the device last settled on. The shell also clears the mirror whenever the
   engine serves no value (`cacheServedValue` in `store/actions/preferences.ts`),
@@ -2950,7 +3038,32 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 
   Re-flag only if the shell stops clearing the mirror on an absent served value.
 
+- **A LEADING mark at the start of a line needs no word joiner.** The disk
+  usage page's worktree swatch opens its title, inside the link button. A
+  reviewer applies `frontend-css.md`'s "an icon never wraps away from its
+  label" rule and asks for the `.explainer-slot` joiner after it.
+
+  The joiner cannot help there. Nothing precedes the mark, so a break after it
+  happens only when the mark plus the first word is wider than the whole line.
+  Chromium and WebKit then break at the joiner anyway, which a render at a
+  narrow width confirms, trailing direction included. The joiner guards a
+  TRAILING icon, where earlier text can wrap in front of it.
+
+  Re-flag only with a render where the mark drops while the mark plus the
+  first word fits on one line.
+
 ## Scripts (bash)
+
+- **Several positional test filters after `--` are valid libtest input.** A
+  reviewer sees `./scripts/test-engine.sh -- -- runtime::codex::driver_tests
+  runtime::codex_app_server::driver_tests` in `scripts/lib/harden_suites.sh`
+  and claims the harness takes only one filter. It takes any number and runs
+  the union: that exact command reported `running 16 tests`, all passing.
+  `CLAUDE.md` documents the same form. Re-flagging needs a failing run.
+
+  The same goes for the early run's `ENGINE_TEST_ARGS='-- -- --skip …'`.
+  `test-engine.sh` consumes the first `--`, so cargo sees one, and that run
+  reported `16 filtered out`: the two driver modules.
 
 - **`record_instance_port`'s `2>/dev/null || true` is deliberate, even though
   the marker it writes is load-bearing.** `install.sh`'s helper carries a long
@@ -3326,13 +3439,13 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   "archived-with-pending-changes routes to Current" invariant
   (`display_section`, test `archived_with_pending_changes_routes_to_current`), but
   archived + `coding_agent_proposed=TRUE` is an UNREACHABLE state: `ChangeProposed`
-  (the event that sets `coding_agent_proposed`) and `CodingAgentIdled` both
+  (the event whose pending `changes` row the flag follows) and `CodingAgentIdled` both
   transition the thread `to_inbox` (`thread_lifecycle.rs` transition table), so a
   proposed CC thread is always inbox; `is_blocking` removes the Archive action
   while an in-workspace change is pending; and the external-repo archive cascade
   emits `ChangeApplied` (clearing proposed) before `ThreadArchived`. The
   `display_section` arm is a defensive property, not proof of reachability.
-  Re-flag only if a path is added that sets `coding_agent_proposed` WITHOUT a
+  Re-flag only if a path is added that writes a pending `changes` row WITHOUT a
   `ChangeProposed`/`to_inbox` transition. (`core/store/threads/summaries.rs`,
   `engine/thread_lifecycle.rs`.)
 
@@ -3341,7 +3454,7 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   (`crates/lucidos-engine/src/api/sdk.rs`): the engine's own `sdk_iframe.css`
   (which carries its OWN "keep in sync with base.css" token mirror) plus
   `shared-components.css`. A reviewer may flag a new host-chrome token in
-  `base.css`'s `html`/`html[data-theme]` blocks (e.g. `--focus-pill-*`) as
+  `base.css`'s `html`/`html[data-theme-mode]` blocks (e.g. `--focus-pill-*`) as
   "ships to every app iframe" or "belongs in `host-components.css`" — both wrong:
   base.css never reaches apps, and `.claude/rules/frontend.md` explicitly keeps
   ":root/theme token blocks" in `base.css` (`host-components.css` is for component
@@ -3638,8 +3751,8 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   `SettingsView.tsx` `repositoriesSection`.)
 
 - **`hasRenderableResponseContent` counts a `step` as drawn even though
-  `renderResponseEvents` gates it on `showSteps`.** Reviews read that as an
-  incomplete mirror: with steps collapsed the renderer returns `null` for them,
+  `responseBody` closes it when `showSteps` is off.** Reviews read that as an
+  incomplete mirror: with steps collapsed the renderer draws no row for them,
   so a boundary holding only a step would supposedly still open an empty panel.
   It does not. `getEventToggleState`'s `showStepsToggle` is the same predicate
   (`some(isStepMechanics)`), so a step present means the body always renders the
@@ -3766,7 +3879,7 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   `canCollapse && has(key)`, so a step-only turn with the steps control off
   reads as unfolded while it is drawing nothing, and folds again when a row
   becomes drawable. That is the fold being honoured, and the two states are
-  visually identical anyway (folded shows `⋯`, unfolded shows an empty body),
+  visually identical anyway (the control is unlit and the body is empty),
   which is what makes the transition invisible in practice. Pruning the key on
   the `canCollapse` false edge would silently discard the user's fold on every
   steps toggle; gating `expandExchange` on `canCollapse` would reintroduce the
@@ -4049,27 +4162,13 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   (`crates/lucidos-app/src/store/actions/preferences.ts`,
   `crates/lucidos-engine/src/llm/reasoning.rs`.)
 
-- **The Devices list and an actor chip may call one device different things,
-  and the list's name is the better one.** A reviewer reads
-  `deviceDisplayName` (`components/settings/deviceList.ts`) beside the engine's
-  `resolve_device_name` (`core/devices.rs`) and sees them diverge: for a device
-  with no typed name but a gateway pairing, the list shows the pairing label
-  and a chip shows `device-<first 8>`. Read as drift, that argues for dropping
-  the label so both surfaces agree.
-
-  Dropping it makes both surfaces worse. The pairing label is a name a person
-  chose on the device itself. The short id is a fallback for having no name at
-  all. The engine cannot reach the label: the paired-device store is a
-  machine-global file the *workspace gateway* owns, and the engine has no
-  handle on it. So agreement is only purchasable by showing the worse name
-  twice. The bottom rung DOES match, so an unnamed and unpaired device reads
-  the same everywhere.
-
-  Re-flag if the engine gains a way to read the pairing label, which would make
-  agreement free. Re-flag too if an engine row starts adopting that label as
-  its name at registration.
-  (`crates/lucidos-app/src/components/settings/deviceList.ts`,
-  `crates/lucidos-engine/src/core/devices.rs`.)
+- **`pairing_label_for` drops the gateway's label when the header's device id
+  differs from the body's.** It looks like a needless refusal. It covers the
+  hand-over window, where a client still registers its old `localStorage` id
+  while the gateway names the new one. Taking the label there would name two
+  rows alike, on the Devices page and in the agent context. Re-flag if register
+  stops taking the device id from the body.
+  (`crates/lucidos-engine/src/api/actor.rs`.)
 
 - **The three underline affordances are not one class waiting to be extracted,
   and the audience split is why.** `.accent-link`

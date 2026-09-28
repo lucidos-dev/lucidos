@@ -1101,8 +1101,8 @@ async fn a_stale_caller_content_length_does_not_frame_the_body() {
 const UNSENDABLE_SECRET: &str = "tok-abc";
 
 /// A layer whose produced value the header codec refuses. It stands in for
-/// every source of one: a stored credential saved with a trailing newline, an
-/// HMAC key header, a WASM signer's `add_headers` value.
+/// every source of one: a stored credential saved with a trailing newline, or
+/// an HMAC key header. A WASM signer's value is refused earlier, in its layer.
 struct UnsendableHeaderLayer;
 
 #[async_trait::async_trait]

@@ -11,7 +11,7 @@
 
 import { effect, untracked } from '@preact/signals';
 import type { Tap } from '@lucidos/sdk';
-import type { Loadable, Notification, ToastAction } from '../types';
+import type { Loadable, Notification } from '../types';
 import { markReadOptimistic, viewNotification } from './notifications';
 import { switchMenuItem } from './menu';
 // Imported from the module that DEFINES it, not from `thread-sync` (which only
@@ -24,7 +24,6 @@ import {
   resolveDeepLink,
   type DeepLinkTarget,
 } from './notification-deeplink';
-import { composeToastMessage } from '../../components/shared/toastMessage';
 import { currentNotificationToasts } from './preferences';
 import {
   dismissToast,
@@ -181,57 +180,45 @@ export function showInAppNotificationToast({ title, body, target }: InAppNotific
   }
 
   const safeTitle = title.length > 0 ? title : 'Lucidos';
-  // The title is the toast's HEADING, never glued onto the body's first line —
-  // see composeToastMessage for why a structured body has to start on line 2.
-  const message = composeToastMessage(safeTitle, body);
   const toastKey = notifId ? notificationToastKey(notifId) : undefined;
 
-  // A `modal` or `navigate` notification gets a single [Open] button (rendered
-  // right / primary via the Toast component's `action`) plus the toast's built-in
-  // X (close). [Open] runs the deep link — opening the notification detail in the
-  // content pane for `modal`, navigating to the destination for `navigate` — and
-  // marks the notification read, so a toast the user has acted on never has to be
-  // re-read in the Notifications panel. The X dismisses WITHOUT marking read,
-  // deferring the row to the bell badge + panel for later. There is deliberately
-  // no separate "OK / acknowledge" button: on a toast that HAS somewhere to go,
-  // marking read without opening is a footgun (it would bury an unanswered
-  // question), so the two meaningful outcomes are act-now ([Open]) or defer (X).
-  // The `acted` guard: Toast.tsx fires onClick raw and the DOM lingers across the
-  // async dismiss render, so a quick double-tap must not re-run a non-idempotent
-  // open/navigate (dispatchDeepLink → openAppById / focusThreadOrBootstrap).
-  // Dismiss-first, then act.
-  let action: ToastAction | undefined;
+  // A `modal` or `navigate` notification opens on a tap anywhere on the card,
+  // beside the toast's built-in X. The tap runs the deep link (the detail in the
+  // content pane for `modal`, the destination for `navigate`) and marks the
+  // notification read. The X dismisses WITHOUT marking read, leaving the row on
+  // the bell badge and in the panel. There is deliberately no "OK" button:
+  // marking read without opening would bury an unanswered question.
+  // The `acted` guard: the DOM lingers across the async dismiss render, so a
+  // quick double-tap must not re-run a non-idempotent open or navigate.
+  // Dismiss first, then act.
+  let onClick: (() => void) | undefined;
   if (resolved.type === 'view-notification' || resolved.type === 'navigate') {
     let acted = false;
-    action = {
-      label: 'Open',
-      onClick: () => {
-        if (acted) return;
-        acted = true;
-        if (toastKey) dismissToast(toastKey);
-        if (resolved.type === 'view-notification') {
-          // modal: viewNotification marks read only AFTER the detail fetch
-          // succeeds. An explicit [Open] must mark read even if that fetch fails
-          // (else a dismissed toast leaves the row unread). Mark AFTER
-          // viewNotification settles so we never race its own cold-open
-          // load-before-mark ordering; markReadOptimistic is idempotent, so the
-          // happy-path double is a no-op beyond one extra (idempotent) read POST.
-          const id = resolved.id;
-          const ensureRead = () => markReadOptimistic(id);
-          void viewNotification(id).then(ensureRead, ensureRead);
-        } else {
-          dispatchDeepLink(target);
-        }
-      },
+    onClick = () => {
+      if (acted) return;
+      acted = true;
+      if (toastKey) dismissToast(toastKey);
+      if (resolved.type === 'view-notification') {
+        // modal: viewNotification marks read only AFTER the detail fetch
+        // succeeds. A tap must mark read even if that fetch fails, or a
+        // dismissed toast leaves the row unread. Marking after it settles never
+        // races its own load-before-mark ordering. markReadOptimistic is
+        // idempotent, so the happy path costs one extra read POST.
+        const id = resolved.id;
+        const ensureRead = () => markReadOptimistic(id);
+        void viewNotification(id).then(ensureRead, ensureRead);
+      } else {
+        dispatchDeepLink(target);
+      }
     };
   }
 
-  // Notification toasts persist (no auto-dismiss) so their [Open] button (and the
-  // X) stay usable; the user drives dismissal. There is no passive/button-less
-  // kind anymore — every notification is openable. noAutofocus: these pop
-  // unsolicited, so they must not steal keyboard focus (a reflexive Enter on
-  // [Open] would navigate/open a notification the user never chose to act on).
-  showToast(message, 'info', { key: toastKey, action, noAutofocus: true });
+  // Notification toasts persist (no auto-dismiss); the user drives dismissal.
+  // noAutofocus: these pop unsolicited, so they must not steal keyboard focus.
+  // The notification's title and body map straight onto the toast's. A
+  // body-less one is its title alone.
+  const [toastTitle, message] = body ? [safeTitle, body] : [undefined, safeTitle];
+  showToast(message, 'info', { title: toastTitle, key: toastKey, onClick, noAutofocus: true });
 }
 
 /** Wall-clock budget after which a `NotificationToastRequested` is too stale

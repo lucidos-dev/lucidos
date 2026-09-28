@@ -1,19 +1,29 @@
 import { useLayoutEffect, useRef, useState } from 'preact/hooks';
 import { scaledDurationMs } from '../../utils/motion';
 
-/** The arrival animations at 1x (`--duration-normal`). The fuse is this,
- *  scaled by the Animation speed slider, plus a fixed slack. So an arrival
- *  outlives its own fade at any speed. The fuse also ends an arrival under
- *  reduced motion, where the CSS drops the animation. An `animationend`-driven
- *  end would then never fire. */
-const NAV_COVER_ANIM_MS = 200;
+/** The two motions a navigation cover plays, each with its 1x length:
+ *  - `arrive` clears off the arriving view (`--duration-normal`). The leaving
+ *    view has already gone, since a content pane unmounts it.
+ *  - `dip` rises over the leaving view, holds, and clears off the arriving one
+ *    (`--duration-slow`). It needs both views mounted, and the host swaps them
+ *    at its midpoint, as the drawer does.
+ *
+ *  The fuse is the length, scaled by the Animation speed slider, plus a fixed
+ *  slack. So a cover outlives its own animation at any speed. The fuse also
+ *  ends a cover under reduced motion, where the CSS drops the animation. An
+ *  `animationend`-driven end would then never fire. */
+export const NAV_COVER_MOTIONS = {
+  arrive: { class: 'nav-cover', animMs: 200 },
+  dip: { class: 'nav-cover nav-cover-dip', animMs: 300 },
+} as const;
+export type NavCoverMotion = keyof typeof NAV_COVER_MOTIONS;
 const NAV_COVER_SLACK_MS = 50;
 
-/** The view that just arrived in a pane, for as long as its arrival fades, or
+/** The view that just arrived in a pane, for as long as its cover lasts, or
  *  null. `viewKey` identifies what the pane shows, and each change to a
  *  non-null key is one arrival. The first render is not a navigation, and a
  *  pane navigating to nothing has nothing arriving. */
-export function useArrivingView(viewKey: string | null): string | null {
+function useArrivingView(viewKey: string | null, motion: NavCoverMotion): string | null {
   const [arriving, setArriving] = useState<string | null>(null);
   const seenKeyRef = useRef(viewKey);
   useLayoutEffect(() => {
@@ -21,16 +31,20 @@ export function useArrivingView(viewKey: string | null): string | null {
     seenKeyRef.current = viewKey;
     if (viewKey === null) { setArriving(null); return; }
     setArriving(viewKey);
-    const fuse = setTimeout(() => setArriving(null), scaledDurationMs(NAV_COVER_ANIM_MS) + NAV_COVER_SLACK_MS);
+    const fuse = setTimeout(
+      () => setArriving(null),
+      scaledDurationMs(NAV_COVER_MOTIONS[motion].animMs) + NAV_COVER_SLACK_MS,
+    );
     return () => clearTimeout(fuse);
+    // A host never changes its motion, so only a new view arms a fuse.
   }, [viewKey]);
   return arriving;
 }
 
-/** The navigation cover: every arriving view of a pane fades in from behind an
- *  opaque theme surface (`.nav-cover`, global/host-components.css). So a view
- *  switch never shows its swap frame. Render it as the last child of the pane's
- *  positioned box, which sets its z-index.
+/** The navigation cover: an opaque theme surface that hides a pane's view swap
+ *  (`.nav-cover`, global/host-components.css). So a view switch never shows its
+ *  swap frame. Render it as the last child of the pane's positioned box, which
+ *  sets its z-index.
  *
  *  A cover, not a fade on the content: a frame WebKit re-composites up from
  *  transparent is the shape of the iOS paint-loss bugs. The cover is a sibling
@@ -40,16 +54,8 @@ export function useArrivingView(viewKey: string | null): string | null {
  *  A transition needs its opaque start on screen before the clearing class
  *  lands, and silently hard-cuts when it loses that race. A fresh element's
  *  animation starts from its own first frame. Keyed on the view it covers, so a
- *  navigation arriving mid-fade restarts from opaque. */
-export function NavigationCover({ viewKey }: { viewKey: string | null }) {
-  const arriving = useArrivingView(viewKey);
-  return arriving === null ? null : <div key={arriving} class="nav-cover" aria-hidden="true" />;
-}
-
-/** The class a pane's header title appends so it fades in with the pane's
- *  arriving view: `.nav-arrive`, the cover's mirror, on the same curve. Key the
- *  title element on the same `viewKey`, so each arrival is a fresh element
- *  whose animation starts in the same frame as the cover's. */
-export function useArrivalFade(viewKey: string | null): string {
-  return useArrivingView(viewKey) === null ? '' : ' nav-arrive';
+ *  navigation arriving mid-fade restarts the animation. */
+export function NavigationCover({ viewKey, motion = 'arrive' }: { viewKey: string | null; motion?: NavCoverMotion }) {
+  const arriving = useArrivingView(viewKey, motion);
+  return arriving === null ? null : <div key={arriving} class={NAV_COVER_MOTIONS[motion].class} aria-hidden="true" />;
 }

@@ -32,7 +32,8 @@ import { readFileSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 // @ts-expect-error: same
 import { dirname, resolve, join } from 'node:path';
-import { DEFAULT_FONT_FAMILY } from '@lucidos/appearance';
+import { DEFAULT_FONT_PREFERENCE, FOLLOW_THEME, FONT_CATALOG } from '@lucidos/appearance';
+import { fontOptions } from '../fontOptions';
 import { SETTINGS_NAV_ITEMS, SETTINGS_SYSTEM_SUBPANEL_ITEMS } from '../../../store/store';
 import { findSettingsEntry, settingsSearchEntryIds } from '../../search/searchIndex';
 
@@ -40,6 +41,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const SETTINGS_VIEW = readFileSync(resolve(here, '..', 'SettingsView.tsx'), 'utf8');
 const SYSTEM_SUBMENU = readFileSync(resolve(here, '..', 'SystemSubmenu.tsx'), 'utf8');
 const NAV_ROW = readFileSync(resolve(here, '..', 'SettingsNavRow.tsx'), 'utf8');
+const SETTINGS_HOME = readFileSync(resolve(here, '..', 'SettingsHome.tsx'), 'utf8');
 const COMPONENTS_DIR = resolve(here, '..', '..');
 
 /** Strip comments so the prose explaining a call can never stand in for it. */
@@ -108,16 +110,15 @@ function expectRowGatedOnNothing(src: string, mapCall: string): void {
 }
 
 describe('Settings nav structure', () => {
-  const stripped = stripComments(SETTINGS_VIEW);
-
   it('renders every nav item on every platform: no category is platform-gated', () => {
     // The home list maps SETTINGS_NAV_ITEMS directly. A `.filter(...)` over it,
     // or a predicate deciding whether the ROW renders, is the regression: it
     // gives the app a different nav shape per device and hides a whole page
     // from the platform that needs it.
-    expect(stripped).toMatch(/SETTINGS_NAV_ITEMS\.map\(/);
-    expect(stripped).not.toMatch(/SETTINGS_NAV_ITEMS\.filter\(/);
-    expectRowGatedOnNothing(stripped, 'SETTINGS_NAV_ITEMS.map(');
+    const home = stripComments(SETTINGS_HOME);
+    expect(home).toMatch(/SETTINGS_NAV_ITEMS\.map\(/);
+    expect(home).not.toMatch(/SETTINGS_NAV_ITEMS\.filter\(/);
+    expectRowGatedOnNothing(home, 'SETTINGS_NAV_ITEMS.map(');
   });
 
   it('lists every System sub-page in the submenu, gated on nothing', () => {
@@ -185,15 +186,15 @@ describe('Settings nav structure', () => {
   });
 });
 
-describe('the Motion row', () => {
-  it('sits beside Theme in Appearance, on every client, and writes the preference', () => {
+describe('the Motion section', () => {
+  it('follows the Theme section, on every client, and writes the preference', () => {
     const iface = functionBody(SETTINGS_VIEW, 'function appearanceSection()');
     // Unconditional: reduced motion matters on every client, not one platform.
-    expect(iface).toMatch(/<div class="settings-row" data-search-anchor="appearance:motion">/);
-    expect(iface).not.toMatch(/&&\s*\(\s*<div class="settings-row" data-search-anchor="appearance:motion"/);
-    // After the theme row, inside the Theme section, before Typography.
+    expect(iface).toMatch(/<div class="settings-section-title" data-search-anchor="appearance:motion">Motion<\/div>/);
+    expect(iface).not.toMatch(/&&\s*\(\s*<div class="settings-section">\s*<div class="settings-section-title" data-search-anchor="appearance:motion"/);
+    // A section of its own, after Theme and its effects, before Typography.
     const motionAt = iface.indexOf('appearance:motion');
-    expect(motionAt).toBeGreaterThan(iface.indexOf('appearance:mode'));
+    expect(motionAt).toBeGreaterThan(iface.indexOf('appearance:theme-effects'));
     expect(motionAt).toBeLessThan(iface.indexOf('appearance:typography'));
     // Each option writes through setMotion, and the active one reads the signal.
     expect(iface).toContain('{MOTION_PREFS.map((m) => (');
@@ -202,10 +203,44 @@ describe('the Motion row', () => {
   });
 });
 
+describe('the Effects row', () => {
+  it('sits in the Theme section under the picker, on every client, and writes the preference', () => {
+    const iface = functionBody(SETTINGS_VIEW, 'function appearanceSection()');
+    expect(iface).toMatch(/<div class="settings-row" data-search-anchor="appearance:theme-effects">/);
+    expect(iface).not.toMatch(/&&\s*\(\s*<div class="settings-row" data-search-anchor="appearance:theme-effects"/);
+    const at = iface.indexOf('appearance:theme-effects');
+    const pickerAt = iface.indexOf('<ThemePicker />');
+    expect(pickerAt).toBeGreaterThan(iface.indexOf('appearance:mode'));
+    expect(at).toBeGreaterThan(pickerAt);
+    expect(at).toBeLessThan(iface.indexOf('appearance:motion'));
+    expect(iface).toContain('{THEME_EFFECTS_PREFS.map((e) => (');
+    expect(iface).toContain('onClick={() => void setThemeEffects(e)}');
+    expect(iface).toContain('const themeEffects = themeEffectsPreference.value;');
+  });
+});
+
 describe('the Font dropdown', () => {
-  it('lists the default font first, as Theme and Motion list theirs', () => {
-    const options = SETTINGS_VIEW.slice(SETTINGS_VIEW.indexOf('const FONT_OPTIONS'));
-    expect(options.match(/value: '([^']+)'/)?.[1]).toBe(DEFAULT_FONT_FAMILY);
+  const options = fontOptions([]);
+
+  it('lists the default first, as Mode and Motion list theirs', () => {
+    expect(options[0]).toEqual({ value: FOLLOW_THEME, label: 'Follow the theme' });
+    expect(DEFAULT_FONT_PREFERENCE).toBe(FOLLOW_THEME);
+    expect(SETTINGS_VIEW).toContain('? fontOptions(workspaceFontList.value.data.fonts, font)');
+  });
+
+  it('builds every catalog option from the font catalog', () => {
+    const values = options.filter(o => !o.disabled).map(o => o.value).slice(1);
+    expect(values).toEqual(FONT_CATALOG.filter(f => f.kind !== 'mono').map(f => f.id));
+  });
+
+  it('groups the fonts under Sans, Serif and Mono headers, in that order', () => {
+    const headers = options.filter(o => o.disabled);
+    // A header must never be selectable, or it would save as a font value.
+    expect(headers.map(o => o.label)).toEqual(['Sans', 'Serif', 'Mono']);
+    // Every group has fonts to list, so no header stands alone.
+    for (const group of ['sans', 'serif', 'mono'] as const) {
+      expect(FONT_CATALOG.some(f => f.group === group && f.kind !== 'mono')).toBe(true);
+    }
   });
 });
 

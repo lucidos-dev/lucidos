@@ -41,12 +41,12 @@ fn is_hop_by_hop(name: &HeaderName) -> bool {
 
 /// Does the gateway own this request header, rather than forwarding it?
 ///
-/// The trust boundary, and one definition for both paths. Five names are the
-/// gateway's: `x-forwarded-prefix`, `x-forwarded-host`, `x-lucidos-device-id`
+/// The trust boundary, and one definition for both paths. Six names are the
+/// gateway's: `x-forwarded-prefix`, `x-forwarded-host`, the device id and label,
 /// and the two engine credentials. A client-supplied one must never reach the
-/// engine. The caller re-injects the prefix, the device id and the local token
-/// with its own values, and whoever sends the upstream request re-frames `HOST`
-/// and `CONTENT_LENGTH`.
+/// engine. The caller re-injects the prefix, the device headers and the local
+/// token with its own values. Whoever sends the upstream request re-frames
+/// `HOST` and `CONTENT_LENGTH`.
 ///
 /// The two credentials are here for the reason the device id is, one step
 /// sharper. A wide-bound engine reads them as authorization
@@ -65,6 +65,7 @@ fn gateway_owns_header(name: &HeaderName, keep_handover: bool) -> bool {
         || n.eq_ignore_ascii_case("x-forwarded-prefix")
         || n.eq_ignore_ascii_case("x-forwarded-host")
         || n.eq_ignore_ascii_case(crate::stack::HEADER_DEVICE_ID)
+        || n.eq_ignore_ascii_case(crate::stack::HEADER_DEVICE_LABEL)
         || n.eq_ignore_ascii_case(crate::auth::HEADER_LOCAL_TOKEN)
         || n.eq_ignore_ascii_case(crate::auth::HEADER_WEBHOOK_TOKEN)
     {
@@ -254,10 +255,11 @@ pub async fn proxy(
     //     guard uses `Sec-Fetch-Site`, not a reconstructed host — but it is still
     //     stripped so a forged value can't pass through to an upstream that trusts
     //     it for URL generation / host-based authz.
-    //   - `x-lucidos-device-id` is re-injected from the AUTHENTICATED device, and
-    //     only when there is one. The engine keys push, preferences and actor
-    //     attribution on it, so a forged value would let a caller act as any
-    //     device. `enforce` stamps the extension; a client cannot.
+    //   - `x-lucidos-device-id` and `x-lucidos-device-label` are re-injected
+    //     from the AUTHENTICATED device, and only when there is one. The engine
+    //     keys push, preferences and actor attribution on the id, so a forged
+    //     value would let a caller act as any device. `enforce` stamps the
+    //     extension; a client cannot.
     let authenticated_device = req
         .extensions()
         .get::<crate::auth::AuthenticatedDevice>()
@@ -271,8 +273,10 @@ pub async fn proxy(
     }
     let forwarded_prefix = format!("/{slug}/");
     builder = builder.header("x-forwarded-prefix", &forwarded_prefix);
-    if let Some(crate::auth::AuthenticatedDevice(id)) = authenticated_device {
-        builder = builder.header(crate::stack::HEADER_DEVICE_ID, id);
+    if let Some(device) = authenticated_device {
+        for (name, value) in device.forwarded_headers() {
+            builder = builder.header(name, value);
+        }
     }
     // Prove to the engine that this hop is the gateway. An engine on a wide
     // bind requires it; a loopback one ignores it. Sent unconditionally so the
@@ -411,10 +415,10 @@ async fn proxy_upgrade(
         }
     }
     upstream = upstream.header("x-forwarded-prefix", format!("/{slug}/"));
-    if let Some(crate::auth::AuthenticatedDevice(id)) =
-        req.extensions().get::<crate::auth::AuthenticatedDevice>()
-    {
-        upstream = upstream.header(crate::stack::HEADER_DEVICE_ID, id);
+    if let Some(device) = req.extensions().get::<crate::auth::AuthenticatedDevice>() {
+        for (name, value) in device.forwarded_headers() {
+            upstream = upstream.header(name, value);
+        }
     }
     // The upgrade is a second way in, so it meets the same door (ADR 0151).
     // Omitting it here would let a wide-bound engine refuse the socket while
@@ -527,9 +531,10 @@ async fn proxy_upgrade(
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
-/// A lightweight "workspace starting…" page that auto-reloads, served while a
+/// A lightweight "workspace starting…" page that refreshes itself, served while a
 /// workspace engine is still booting (ADR 0014 §11). 503 so caches/bots don't
-/// treat it as the real page; `Retry-After` + a meta-refresh drive the reload.
+/// treat it as the real page. It polls its own url every 2s (see
+/// [`splash_page_html`]) and reloads once the engine answers.
 /// Used by the proxy on a connect failure (engine cold boot) and by the gateway
 /// `fallback` when a document navigation lazy-starts a stopped workspace.
 ///
@@ -538,7 +543,7 @@ async fn proxy_upgrade(
 /// [`crate::boot_phase`]), or a RETRYING boot failure's message when an attempt
 /// failed on something that can still clear, such as a Docker daemon that has
 /// not finished starting. The proxy's own connect-failure path passes the
-/// neutral default. It advances across the 2s meta-refresh reloads as the boot
+/// neutral default. Each poll crossfades in the current label as the boot
 /// progresses.
 ///
 /// A retrying failure belongs on THIS page rather than [`failed_page`] precisely
@@ -553,7 +558,7 @@ async fn proxy_upgrade(
 /// engine, so the splash never shows for an installed PWA. The marker tells the SW
 /// to SHOW this response; it is never cached (still a 503 + `no-store`).
 pub fn starting_page(label: &str) -> Response {
-    // 2s meta-refresh, no escape link — the happy-path boot window.
+    // 2s poll, no escape link: the happy-path boot window.
     boot_splash_response(splash_page_html(label, Some(2), false), "2")
 }
 
@@ -563,8 +568,8 @@ pub fn starting_page(label: &str) -> Response {
 /// app downgrade produces. `message` is the engine's own user-facing sentence.
 ///
 /// Differs from [`stalled_page`] in the two ways that matter: it states the actual
-/// cause instead of "taking longer than expected", and it carries **no
-/// meta-refresh** at all. Reloading cannot fix a boot that is definitionally
+/// cause instead of "taking longer than expected", and it carries **no poll and
+/// no meta-refresh** at all. Reloading cannot fix a boot that is definitionally
 /// unachievable, and the gateway has already stopped respawning the engine, so a
 /// refresh loop would only re-render the same page forever. The escape link to the
 /// picker is the one action left. Same 503 + boot-splash marker as its siblings, so
@@ -584,8 +589,8 @@ pub fn failed_page(message: &str) -> Response {
 /// window past the gateway's budget (`server::BOOT_ESCAPE_BUDGET`, private to
 /// that module, so this is a plain reference rather than a doc link). An
 /// alive-but-unreachable engine (misconfigured bind, network partition) is never
-/// marked `Unhealthy`, so without this the splash would meta-refresh forever with
-/// no way out. It keeps a SLOWER (10s) refresh so a late-but-real recovery still
+/// marked `Unhealthy`, so without this the splash would poll forever with no way
+/// out. It keeps a SLOWER (10s) poll so a late-but-real recovery still
 /// lands on the workspace, AND shows a manual "Back to workspaces" link to the
 /// picker (`/~/?pick`, which stands down the cold-start auto-open so there is no
 /// picker↔workspace loop). Same 503 + boot-splash marker as [`starting_page`].
@@ -625,7 +630,7 @@ fn boot_splash_response(html: String, retry_after: &'static str) -> Response {
 /// app document mid-boot, on the same url, and nothing about the mark or the
 /// status can move because nothing about them is defined twice. What this page
 /// adds is its own canvas plus three documented deviations (a wrapping status
-/// line, no breathe under the meta-refresh, its own label), and one difference
+/// line, no breathe across a reload, its own label), and one difference
 /// in timing rather than style: it renders the shared escape link outright,
 /// where the app document keeps the same link hidden until its boot gives up.
 /// It is also self-contained by necessity: it renders when no engine is
@@ -642,8 +647,8 @@ fn boot_splash_response(html: String, retry_after: &'static str) -> Response {
 /// trusted-static once it crosses a wire. Escaping here rather than at that one
 /// call site keeps every present and future caller safe by construction.
 ///
-/// `refresh_secs` sets the meta-refresh interval (2s on the happy-path
-/// [`starting_page`], slower on [`stalled_page`]); `None` omits the refresh tag
+/// `refresh_secs` sets the poll interval (2s on the happy-path [`starting_page`],
+/// slower on [`stalled_page`]). `None` omits the poll and the no-script refresh
 /// entirely, for [`failed_page`], where reloading can never change the outcome.
 /// When `escape` is set a manual "Back to workspaces" link to the picker is shown
 /// below the label.
@@ -653,7 +658,6 @@ fn splash_page_html(label: &str, refresh_secs: Option<u32>, escape: bool) -> Str
     const HEAD_A: &str = r##"<!doctype html><html><head><meta charset="utf-8">
 "##;
     const HEAD_B: &str = r##"
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#0a4ea8">
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><defs><radialGradient id='g' gradientUnits='userSpaceOnUse' cx='30' cy='22' r='125'><stop offset='0' stop-color='%232d83e0'/><stop offset='1' stop-color='%230a4ea8'/></radialGradient></defs><rect width='100' height='100' rx='22' fill='url(%23g)'/><g transform='translate(13 13) scale(0.74)' fill='%23fff'><rect x='17' y='17' width='29' height='29' rx='7'/><rect x='17' y='54' width='29' height='29' rx='7'/><rect x='54' y='54' width='29' height='29' rx='7'/><path d='M68.5 12 C71 25 74 28.5 87 31 C74 33.5 71 37 68.5 50 C66 37 63 33.5 50 31 C63 28.5 66 25 68.5 12 Z'/></g></svg>">
 <title>"##;
@@ -680,12 +684,12 @@ html{background:#145eb9 radial-gradient(125% 125% at 30% 22%,#2d83e0 0%,#0a4ea8 
 Every size, color, font and animation comes from there. */
 /* 1. The app's status is always one short line (nowrap + ellipsis). These labels
 are sentences (a boot phase, or the reason a workspace cannot open), so let them
-wrap rather than truncate. A one-line label still fills exactly the 1.4em box the
-app reserves, so the mark sits in the same place on both surfaces. */
-.boot-splash-status{height:auto;white-space:normal;overflow:visible;text-align:center}
-/* 2. This page reloads every couple of seconds (the meta-refresh polls for the
-booted engine) and every reload restarts its animations, so a breathe would snap
-back to full opacity each time. Overriding animation-NAME alone reuses the shared
+wrap rather than truncate. The status hangs below the mark, out of flow, so a
+wrapped label grows downward and the mark stays where the app document puts it. */
+.boot-splash-status{height:auto;white-space:normal;overflow:visible}
+/* 2. This page can still be replaced by a reload (the no-script refresh, a new
+kind of page, the swap to the app) and every reload restarts its animations, so
+a breathe would snap back to full opacity. Overriding animation-NAME alone reuses the shared
 timing: the reveal on first paint, then the mark simply stands there. The
 workspace document, which does not reload, picks the breathe up when it takes
 over. Scoped away from reduced motion because these rules sit after the shared
@@ -701,14 +705,14 @@ stalled/failed pages, where there is nothing else left to offer). */
 <script>try{var s=location.pathname.split('/')[1],k='lucidos-motion',v=null;try{v=localStorage.getItem(s&&s!=='~'?'ws:'+s+':'+k:k)}catch(e){}var r=v==='reduce'||(v!=='full'&&matchMedia('(prefers-reduced-motion: reduce)').matches);document.documentElement.setAttribute('data-motion',r?'reduce':'full')}catch(e){}</script>
 </head>
 <body>
-<div class="boot-splash">
 "##;
     // 3. The last deviation, in markup rather than CSS: the app bakes its own
     // status text ("Opening your workspace…"), ours is per-page.
     const MARK_TO_LABEL: &str = r##"
+<div class="boot-splash-foot">
 <div class="boot-splash-status boot-splash-status-shown">"##;
     // Keep the mark built for as long as this tab is showing one. This page and
-    // the app shell are the SAME url (the meta-refresh reloads this until the
+    // the app shell are the SAME url (the poller below reloads this once the
     // engine answers, then the engine serves index.html), so with no handover
     // every reload, and the final swap to the app, would re-play the reveal: a
     // mark that is already standing there drops to opacity 0 and rebuilds. Read
@@ -723,10 +727,15 @@ stalled/failed pages, where there is nothing else left to offer). */
     const ESCAPE_LINK: &str =
         r##"<a class="boot-splash-escape" href="/~/?pick">Back to workspaces</a>"##;
     let escape_html = if escape { ESCAPE_LINK } else { "" };
-    // Omitted entirely (not `content="0"`) when there is nothing to wait for.
-    let refresh_html = match refresh_secs {
-        Some(secs) => format!(r#"<meta http-equiv="refresh" content="{secs}">"#),
-        None => String::new(),
+    // The meta-refresh survives only for a browser with scripting off, where the
+    // poller cannot run. Omitted entirely (not `content="0"`) when there is
+    // nothing to wait for.
+    let (refresh_html, poll_attr) = match refresh_secs {
+        Some(secs) => (
+            format!(r#"<noscript><meta http-equiv="refresh" content="{secs}"></noscript>"#),
+            format!(r#" data-poll-secs="{secs}""#),
+        ),
+        None => (String::new(), String::new()),
     };
     // A page with nothing to wait for is not "Starting…".
     let title = if refresh_secs.is_some() {
@@ -737,11 +746,22 @@ stalled/failed pages, where there is nothing else left to offer). */
     let label = escape_html_text(label);
     let css = app_splash_css();
     let mark = app_mark_svg();
+    let viewport = app_viewport_meta();
     format!(
-        "{HEAD_A}{refresh_html}{HEAD_B}{title}{STYLE_OPEN}{css}{GATEWAY_CSS_AND_BODY}{mark}\
-         {MARK_TO_LABEL}{label}</div>\n{escape_html}\n</div>\n{HANDOVER}\n</body></html>"
+        "{HEAD_A}{refresh_html}\n{viewport}{HEAD_B}{title}{STYLE_OPEN}{css}{GATEWAY_CSS_AND_BODY}\
+         <div class=\"boot-splash\"{poll_attr}>\n{mark}\
+         {MARK_TO_LABEL}{label}</div>\n{escape_html}\n</div>\n</div>\n{HANDOVER}\n{SPLASH_POLLER}\n</body></html>"
     )
 }
+
+/// Advance the page IN PLACE. A reload per label repaints the whole splash
+/// and swaps the status with no transition. So fetch this same url instead,
+/// crossfade in the new label while the page is the same kind, and reload
+/// only when it is not: the engine answered, or the page became the stalled
+/// or failed one. `data-poll-secs` is the interval, and its absence (the
+/// failed page) means there is nothing to wait for. The 150ms before a swap
+/// waits out the `.boot-splash-status-swap` fade in index.html.
+const SPLASH_POLLER: &str = r##"<script>(function(){var splash=document.querySelector('.boot-splash'),secs=Number(splash&&splash.getAttribute('data-poll-secs'));if(!secs)return;var every=secs*1000;if(!window.fetch||!window.DOMParser){setTimeout(function(){location.reload()},every);return}var status=splash.querySelector('.boot-splash-status'),swap;function kind(doc){var s=doc.querySelector('.boot-splash');return s?s.getAttribute('data-poll-secs')+(s.querySelector('.boot-splash-escape')?'+escape':''):''}var mine=kind(document);function show(text){if(!status||text===status.textContent)return;clearTimeout(swap);status.classList.add('boot-splash-status-swap');swap=setTimeout(function(){status.textContent=text;status.classList.remove('boot-splash-status-swap')},document.documentElement.getAttribute('data-motion')==='reduce'?0:150)}function poll(){fetch(location.href,{headers:{Accept:'text/html'},cache:'no-store'}).then(function(r){if(!r.headers.get('x-lucidos-boot-splash'))return location.reload();return r.text().then(function(html){var doc=new DOMParser().parseFromString(html,'text/html');if(kind(doc)!==mine)return location.reload();var next=doc.querySelector('.boot-splash-status');if(next)show(next.textContent);setTimeout(poll,every)})}).catch(function(){setTimeout(poll,every)})}setTimeout(poll,every)})()</script>"##;
 
 /// The app document, embedded at COMPILE time. The splash must render with no
 /// engine reachable, so it cannot link the app's stylesheet; embedding the file
@@ -773,6 +793,23 @@ fn app_splash_css() -> &'static str {
 /// contract as [`app_splash_css`].
 fn app_mark_svg() -> &'static str {
     slice_between(APP_INDEX_HTML, MARK_START, MARK_END).unwrap_or("")
+}
+
+/// The app document's viewport and iOS home-screen `<meta>` tags, verbatim.
+/// They decide how tall the viewport is in an installed PWA, and the splash
+/// centres its mark in that viewport. A page with a different set lays out in
+/// a different viewport, so its mark sits higher and drops at the hand-over.
+/// Lifted rather than copied, like the stylesheet, so the two cannot differ.
+fn app_viewport_meta() -> String {
+    APP_INDEX_HTML
+        .lines()
+        .map(str::trim)
+        .filter(|line| {
+            line.starts_with(r#"<meta name="viewport""#)
+                || line.starts_with(r#"<meta name="apple-mobile-web-app-"#)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// The text between `open` and the first following `close`, excluding both.
@@ -871,11 +908,19 @@ mod tests {
         let html = splash_page_html("Starting engine", Some(2), true);
         assert!(html.contains(app_splash_css()), "{html}");
         assert!(html.contains(app_mark_svg()), "{html}");
-        assert!(html.contains(r#"<div class="boot-splash">"#), "{html}");
+        assert!(html.contains(r#"<div class="boot-splash""#), "{html}");
+        // The status and the escape link hang from the mark in the shared foot,
+        // so neither can move the mark (index.html `.boot-splash-foot`).
+        assert!(app_splash_css().contains(".boot-splash-foot"));
+        let foot = html
+            .split(r#"<div class="boot-splash-foot">"#)
+            .nth(1)
+            .expect("the page must carry the shared foot");
         assert!(
-            html.contains(r#"<div class="boot-splash-status boot-splash-status-shown">"#),
+            foot.starts_with("\n<div class=\"boot-splash-status boot-splash-status-shown\">"),
             "{html}"
         );
+        assert!(foot.contains("Back to workspaces"), "{html}");
         // Everything below is about this page's OWN css (the tail after the
         // shared sheet); the sheet itself is the app's to police.
         let tail = html.split("</style>").next().unwrap_or_default();
@@ -891,6 +936,32 @@ mod tests {
         // the old `body{font-family:…}` without inheriting is what once left the
         // escape link rendering in the UA serif.
         assert!(!tail.contains("font-"), "{tail}");
+    }
+
+    /// The installed PWA sizes its viewport from these tags, and the splash
+    /// centres its mark in it. So this page must carry the app document's own
+    /// tags, or the mark drops when the app document takes over.
+    #[test]
+    fn splash_page_lays_out_in_the_app_documents_viewport() {
+        let viewport = APP_INDEX_HTML
+            .lines()
+            .map(str::trim)
+            .find(|line| line.starts_with(r#"<meta name="viewport""#))
+            .expect("index.html must declare a viewport");
+        assert!(viewport.contains("viewport-fit=cover"), "{viewport}");
+        let html = splash_page_html("Starting engine…", Some(2), false);
+        assert!(html.contains(viewport), "{html}");
+        assert_eq!(
+            html.matches(r#"<meta name="viewport""#).count(),
+            1,
+            "{html}"
+        );
+        assert!(
+            html.contains(
+                r#"<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">"#
+            ),
+            "{html}"
+        );
     }
 
     /// The shared sheet keys reduced motion on `data-motion`, which the app sets
@@ -917,7 +988,7 @@ mod tests {
         let set = html
             .find("setAttribute('data-motion'")
             .expect("the page must set data-motion");
-        let splash = html.find(r#"<div class="boot-splash">"#).unwrap();
+        let splash = html.find(r#"<div class="boot-splash""#).unwrap();
         assert!(
             set < splash,
             "data-motion must be set before the splash markup"
@@ -986,10 +1057,10 @@ mod tests {
         out
     }
 
-    /// Every document in a boot shows the SAME standing mark: this page reloads
-    /// itself every couple of seconds and is then replaced by the app document at
-    /// the same url, so without a handover each of those would re-play the reveal
-    /// and rebuild a mark that is already on screen. The flag is set for the next
+    /// Every document in a boot shows the SAME standing mark. This page can be
+    /// reloaded into another kind of splash, and the app document then replaces
+    /// it at the same url. Without a handover each would re-play the reveal and
+    /// rebuild a mark that is already on screen. The flag is set for the next
     /// document and read to suppress our own reveal; index.html consumes it
     /// (removing it), so it can never suppress a reveal that was not a rebuild.
     #[test]
@@ -1010,8 +1081,8 @@ mod tests {
                 html.contains("classList.add('boot-splash-formed')"),
                 "{html}"
             );
-            // Once formed, the mark stands still: the meta-refresh restarts every
-            // animation, so a breathe would snap back to full opacity each reload.
+            // Once formed, the mark stands still: a reload restarts every
+            // animation, so a breathe would snap back to full opacity.
             assert!(
                 html.contains(".boot-splash-formed .boot-splash-mark{animation-name:none}"),
                 "{html}"
@@ -1024,9 +1095,9 @@ mod tests {
         let html = splash_page_html("Running migrations…", Some(2), false);
         // The current boot-phase label is shown beneath the mark.
         assert!(html.contains("Running migrations…"));
-        // The 2s auto-refresh that advances the label / drives the happy-path
+        // The 2s poll that advances the label and drives the happy-path
         // transition is preserved.
-        assert!(html.contains(r#"http-equiv="refresh" content="2""#));
+        assert!(html.contains(r#"data-poll-secs="2""#));
         // The happy-path splash has NO escape link (no anchor, no picker href) and
         // none of the removed auto-redirect machinery.
         assert!(!html.contains("<a "));
@@ -1035,6 +1106,27 @@ mod tests {
         assert!(!html.contains("boot-escape"));
         assert!(!html.contains("show-escape"));
         assert!(!html.contains("lucidos-boot-since"));
+    }
+
+    /// A new boot phase must not reload the page. A reload repaints the whole
+    /// splash and swaps the status with no transition, which read as the
+    /// splash jumping. The poller crossfades the label in place instead, and
+    /// the meta-refresh is only the fallback for a browser with scripting off.
+    /// The poller's behaviour is pinned in `src/utils/gatewaySplashPoller.test.ts`.
+    #[test]
+    fn a_new_phase_crossfades_in_place_rather_than_reloading() {
+        let html = splash_page_html("Recovering sessions…", Some(2), false);
+        assert!(
+            html.contains(r#"<noscript><meta http-equiv="refresh" content="2"></noscript>"#),
+            "{html}"
+        );
+        assert_eq!(html.matches("http-equiv=\"refresh\"").count(), 1, "{html}");
+        assert!(html.contains(r#"data-poll-secs="2""#), "{html}");
+        assert!(html.contains(SPLASH_POLLER), "{html}");
+        // The fade the poller runs is the shared one, so the app document's
+        // status changes look identical.
+        assert!(SPLASH_POLLER.contains("boot-splash-status-swap"));
+        assert!(app_splash_css().contains(".boot-splash-status.boot-splash-status-swap"));
     }
 
     /// A gateway-observed failure the supervisor is still retrying rides the
@@ -1063,10 +1155,7 @@ mod tests {
         );
         assert!(html.contains("Retrying… (attempt 2 of 5)"), "{html}");
         // The refresh is the whole point: this state clears by itself.
-        assert!(
-            html.contains(r#"http-equiv="refresh" content="2""#),
-            "{html}"
-        );
+        assert!(html.contains(r#"data-poll-secs="2""#), "{html}");
         assert!(html.contains("<title>Starting…</title>"), "{html}");
     }
 
@@ -1074,9 +1163,10 @@ mod tests {
     fn stalled_splash_has_manual_escape_link_and_slower_refresh() {
         let html = splash_page_html("This is taking longer than expected.", Some(10), true);
         assert!(html.contains("This is taking longer than expected."));
-        // A slower (10s) refresh so a late-but-real recovery still lands on the
+        // A slower (10s) poll so a late-but-real recovery still lands on the
         // workspace, rather than the happy-path 2s.
-        assert!(html.contains(r#"http-equiv="refresh" content="10""#));
+        assert!(html.contains(r#"data-poll-secs="10""#));
+        assert!(html.contains(r#"<noscript><meta http-equiv="refresh" content="10"></noscript>"#));
         // A MANUAL "Back to workspaces" link to the picker. `?pick` stands down the
         // cold-start auto-open, so tapping it cannot loop back into the workspace.
         assert!(html.contains(r##"href="/~/?pick""##));
@@ -1114,6 +1204,8 @@ mod tests {
         );
         // No meta-refresh AT ALL — not `content="0"`, not a long interval.
         assert!(!html.contains("http-equiv=\"refresh\""), "{html}");
+        // And no poll either, which would reload it just the same.
+        assert!(!html.contains(r#"data-poll-secs=""#), "{html}");
         // ...and the tab must not claim the workspace is still starting.
         assert!(
             html.contains("<title>Cannot open workspace</title>"),
@@ -1130,13 +1222,13 @@ mod tests {
     #[test]
     fn splash_escapes_html_in_the_label() {
         let html = splash_page_html(r#"<script>alert("x")</script> & 'quoted'"#, None, false);
-        // The page ships exactly TWO scripts of its own: the motion resolver
-        // and the mark handover. So a raw tag out of the label would show up as
-        // a third. Counting beats a bare "contains no <script>": that only held
-        // while the page had none.
+        // The page ships exactly THREE scripts of its own: the motion resolver,
+        // the mark handover and the poller. So a raw tag out of the label would
+        // show up as a fourth. Counting beats a bare "contains no <script>":
+        // that only held while the page had none.
         assert_eq!(
             html.matches("<script>").count(),
-            2,
+            3,
             "raw tag survived: {html}"
         );
         assert!(html.contains("&lt;script&gt;"), "{html}");
@@ -1178,6 +1270,20 @@ mod proxy_tests {
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    /// A non-ASCII pairing label, so every test that forwards it also proves
+    /// the percent-encoding.
+    const TEST_DEVICE_LABEL: &str = "Café iPhone";
+    /// [`TEST_DEVICE_LABEL`] as it reaches the engine, lowercased like the
+    /// captured request heads the tests search.
+    pub(super) const TEST_DEVICE_LABEL_HEADER: &str = "x-lucidos-device-label: caf%c3%a9%20iphone";
+
+    pub(super) fn test_device(id: &str) -> crate::auth::AuthenticatedDevice {
+        crate::auth::AuthenticatedDevice {
+            id: id.into(),
+            label: TEST_DEVICE_LABEL.into(),
+        }
+    }
 
     /// Capturing upstream: records the raw request bytes it receives, then 200s.
     async fn capturing_upstream() -> (u16, Arc<tokio::sync::Mutex<String>>) {
@@ -1471,8 +1577,7 @@ mod proxy_tests {
         let (port, captured) = capturing_upstream().await;
         let target = format!("http://127.0.0.1:{port}");
         let mut req = request("GET", "/dev/", Body::empty());
-        req.extensions_mut()
-            .insert(crate::auth::AuthenticatedDevice("device-1".into()));
+        req.extensions_mut().insert(test_device("device-1"));
         let resp = proxy(
             &build_client(),
             &target,
@@ -1488,6 +1593,10 @@ mod proxy_tests {
             got.contains("x-lucidos-device-id: device-1"),
             "the authenticated device id must reach the engine; upstream saw:\n{got}"
         );
+        assert!(
+            got.contains(TEST_DEVICE_LABEL_HEADER),
+            "the pairing label must reach the engine, percent-encoded; upstream saw:\n{got}"
+        );
     }
 
     #[tokio::test]
@@ -1500,10 +1609,10 @@ mod proxy_tests {
             .method("GET")
             .uri("/dev/")
             .header("x-lucidos-device-id", "someone-elses-device")
+            .header("x-lucidos-device-label", "someone-elses-label")
             .body(Body::empty())
             .unwrap();
-        req.extensions_mut()
-            .insert(crate::auth::AuthenticatedDevice("device-1".into()));
+        req.extensions_mut().insert(test_device("device-1"));
         let resp = proxy(
             &build_client(),
             &target,
@@ -1523,6 +1632,10 @@ mod proxy_tests {
             !got.contains("someone-elses-device"),
             "a client-spoofed device id must be stripped; upstream saw:\n{got}"
         );
+        assert!(
+            !got.contains("someone-elses-label") && got.contains(TEST_DEVICE_LABEL_HEADER),
+            "a client-spoofed label must be replaced by the gateway's; upstream saw:\n{got}"
+        );
     }
 
     #[tokio::test]
@@ -1535,6 +1648,7 @@ mod proxy_tests {
             .method("GET")
             .uri("/dev/")
             .header("x-lucidos-device-id", "unproven-device")
+            .header("x-lucidos-device-label", "unproven-label")
             .body(Body::empty())
             .unwrap();
         let resp = proxy(
@@ -1549,8 +1663,8 @@ mod proxy_tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let got = captured.lock().await.to_lowercase();
         assert!(
-            !got.contains("x-lucidos-device-id"),
-            "no authenticated device means no forwarded id; upstream saw:\n{got}"
+            !got.contains("x-lucidos-device-id") && !got.contains("x-lucidos-device-label"),
+            "no authenticated device means no forwarded id or label; upstream saw:\n{got}"
         );
     }
 
@@ -1571,14 +1685,11 @@ mod proxy_tests {
 
     #[tokio::test]
     async fn unreachable_engine_serves_starting_page_with_boot_label() {
-        // Bind then drop to get a definitely-closed loopback port (connect →
-        // ECONNREFUSED). The boot-window page (503 + auto-refresh) replaces the
-        // raw 502 from 0013.
-        let port = {
-            let l = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-            l.local_addr().unwrap().port()
-        };
-        let target = format!("http://127.0.0.1:{port}");
+        // Port 1 is privileged and nothing listens there, so the connect is
+        // refused at once. A port bound and dropped can be taken by another
+        // process on a busy host. The boot-window page (503 + auto-refresh)
+        // replaces the raw 502 from 0013.
+        let target = "http://127.0.0.1:1".to_string();
         // The route is set while the engine is still Booting, so a cold-open
         // navigation reaches the proxy (not fallback's no-route branch) during
         // the engine-reported phases — the connect-failure splash MUST render the
@@ -1613,6 +1724,7 @@ mod proxy_tests {
 /// trust boundary is the same one.
 #[cfg(test)]
 mod upgrade_tests {
+    use super::proxy_tests::{test_device, TEST_DEVICE_LABEL_HEADER};
     use super::*;
     use crate::boot_phase::DEFAULT_LABEL;
     use std::sync::Arc;
@@ -1691,8 +1803,7 @@ mod upgrade_tests {
             let target = target.clone();
             async move {
                 if let Some(id) = device {
-                    req.extensions_mut()
-                        .insert(crate::auth::AuthenticatedDevice(id.into()));
+                    req.extensions_mut().insert(test_device(id));
                 }
                 proxy(
                     &build_client(),
@@ -1783,6 +1894,7 @@ mod upgrade_tests {
         assert!(head.starts_with("HTTP/1.1 101"), "{head}");
         let got = captured.lock().await.clone();
         assert!(got.contains("x-lucidos-device-id: device-1"), "{got}");
+        assert!(got.contains(TEST_DEVICE_LABEL_HEADER), "{got}");
     }
 
     /// A second path through the gateway is a second place to forget the trust
@@ -1799,6 +1911,7 @@ mod upgrade_tests {
         let (head, _client) = upgrade_through(
             gw,
             "x-lucidos-device-id: someone-elses-device\r\n\
+             x-lucidos-device-label: someone-elses-label\r\n\
              x-forwarded-prefix: /evil/\r\n\
              x-forwarded-host: evil.example\r\n",
         )
@@ -1807,6 +1920,8 @@ mod upgrade_tests {
         let got = captured.lock().await.clone();
         assert!(got.contains("x-lucidos-device-id: device-1"), "{got}");
         assert!(!got.contains("someone-elses-device"), "{got}");
+        assert!(!got.contains("someone-elses-label"), "{got}");
+        assert!(got.contains(TEST_DEVICE_LABEL_HEADER), "{got}");
         assert!(got.contains("x-forwarded-prefix: /dev/"), "{got}");
         assert!(!got.contains("/evil/"), "{got}");
         assert!(!got.contains("evil.example"), "{got}");
@@ -1818,10 +1933,16 @@ mod upgrade_tests {
     async fn an_upgrade_with_no_authenticated_device_forwards_none() {
         let (upstream_port, captured) = upgrading_upstream().await;
         let gw = gateway_serving(format!("http://127.0.0.1:{upstream_port}"), None).await;
-        let (head, _client) = upgrade_through(gw, "x-lucidos-device-id: unproven-device\r\n").await;
+        let (head, _client) = upgrade_through(
+            gw,
+            "x-lucidos-device-id: unproven-device\r\n\
+             x-lucidos-device-label: unproven-label\r\n",
+        )
+        .await;
         assert!(head.starts_with("HTTP/1.1 101"), "{head}");
         let got = captured.lock().await.clone();
         assert!(!got.contains("x-lucidos-device-id"), "{got}");
+        assert!(!got.contains("x-lucidos-device-label"), "{got}");
     }
 
     /// A browser handshake carries an `Origin` and no fetch metadata, because
@@ -1937,11 +2058,8 @@ mod upgrade_tests {
     /// condition clears by itself, where 502 would read as a dead end.
     #[tokio::test]
     async fn an_unreachable_engine_answers_503_rather_than_a_boot_splash() {
-        let dead = {
-            let l = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-            l.local_addr().unwrap().port()
-        };
-        let gw = gateway_serving(format!("http://127.0.0.1:{dead}"), None).await;
+        // Port 1 refuses at once, as in `unreachable_engine_serves_starting_page_with_boot_label`.
+        let gw = gateway_serving("http://127.0.0.1:1".to_string(), None).await;
         let (head, _client) = upgrade_through(gw, "").await;
         assert!(head.starts_with("HTTP/1.1 503"), "{head}");
         // An HTML boot splash is meaningless to a socket, so it is not served.

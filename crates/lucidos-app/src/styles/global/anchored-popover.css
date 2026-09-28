@@ -1,0 +1,71 @@
+/* ── Anchored popover: the shell every popover at its trigger shares ───────
+   Used by the Waits and Todos panels (styles/chat/) and the explainer
+   (host-components.css). Each opens through `<Overlay anchor backdrop={false}
+   portal>` and `useAnchoredPosition` (ADR 0299), and keeps only its own caps.
+
+   Imported by global.css BEFORE every surface built on it. Shell and surface
+   classes land on one element at one specificity, so source order decides the
+   cascade. A surface loaded first would lose its own caps to the shell's.
+
+   Placement is the hook's: the panel is `position: fixed`, and the hook writes
+   a `top`/`left` it already clamped into the pane, flipping above the anchor
+   when there is no room below. The clamp only helps a panel that FITS, hence
+   the fit cap below.
+   ─────────────────────────────────────────────────────────────────────────── */
+
+.anchored-popover {
+    /* Widest a panel may get before its container is the binding constraint.
+       Each surface caps its own width against this rather than a bare rem, so
+       a panel too wide for the space is narrowed instead of overflowing.
+
+       The container is the box the hook clamped the position into, the pane
+       holding the trigger. Each surface publishes the live value per open as
+       an inline `--anchored-popover-fit`, from `pos.maxWidth`.
+       The viewport-based value here is only the pre-measurement fallback: on a
+       phone the pane IS the viewport so the two agree, but on desktop the pane
+       is a fraction of it, and a popover capped against the viewport sits half
+       in the content pane. */
+    --anchored-popover-fit: calc(100vw - 1rem);
+
+    position: fixed;
+    max-width: var(--anchored-popover-fit);
+    /* Height caps against the VIEWPORT for the same reason the width does.
+       Waits and Todos open upward off a bottom-docked bar. On a short viewport
+       (landscape, or the keyboard open) a fixed 18rem is taller than the room
+       above the anchor, and the panel's head lands off-screen. The hook
+       clamps `top` as the guarantee; this is what keeps the clamp from having
+       to overlap the anchor in the first place. `--app-height` is the
+       visualViewport measurement MobileSwipeContainer writes to <html>, which
+       is the only thing that shrinks with the iOS keyboard. */
+    max-height: min(18rem, calc(var(--app-height, 100dvh) - 8rem));
+    /* The SHELL never scrolls, the body does. A classic (space-taking)
+       scrollbar is laid out INSIDE its scroll container's content box, so while
+       the shell was the scroller every child was narrowed by the scrollbar's
+       width, the head included: its background and bottom border stopped short
+       of the panel's edge and the scrollbar column ran the full height past it,
+       through the title bar. Scrolling the body instead keeps the title bar
+       full-bleed and leaves the scrollbar in the content pane where the
+       content it scrolls actually is. Invisible wherever scrollbars are overlay
+       (a default-setting Mac, a phone), which is why it needs a source-scan
+       tripwire rather than a browser test. `hidden` still clips both children
+       to the rounded corners, which is what the head relies on for its top
+       two. */
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    /* The box (fill, hairline, radius, shadow) is `.surface`, and so is the
+       head, a `SurfaceHead` that sits outside the scrolling body. No padding on
+       the shell: the head and the body carry their own. */
+    z-index: var(--z-control-panel);
+}
+
+/* The scrolling pane. `min-height: 0` is load-bearing: a flex item's automatic
+   minimum size is its content, so without it a long list would push the shell
+   past its `max-height` instead of scrolling in here, and the panel's foot would
+   run off the bottom of a short viewport. */
+.anchored-popover-body {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 0 var(--surface-inset) var(--surface-inset);
+}

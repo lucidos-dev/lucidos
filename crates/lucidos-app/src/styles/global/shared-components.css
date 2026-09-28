@@ -19,7 +19,7 @@
  *   - HOST-CHROME component (the custom <Dropdown>/nav-history, the send→cancel
  *     morph, header/filter icon-button variants, list-row FLIP helper) →
  *     `host-components.css` (host bundle only, NOT served to apps).
- *   - IFRAME-ONLY (e.g. `.action-btn-secondary`, which the host has no use for)
+ *   - IFRAME-ONLY (e.g. the `lucidos.ui.Select` `.lucidos-select` styles)
  *     → the engine's `sdk_iframe.css` (avoids dead code in the host bundle).
  *
  * Rules here reference design tokens defined in `base.css` (`:root` + theme
@@ -57,7 +57,9 @@ input[type="checkbox"] {
     padding: 0;
     vertical-align: middle;
     border: 1px solid var(--text-muted);
-    border-radius: 0.25em;
+    /* In em, with the box. The corner keeps its size and squares only when the
+       theme zeroes the token. */
+    border-radius: min(0.25em, var(--radius-control) * 99);
     background: transparent;
     cursor: pointer;
     transition:
@@ -81,8 +83,10 @@ input[type="checkbox"]::before {
         clip-path 0s var(--duration-fast);
 }
 
-input[type="checkbox"]:hover:not(:disabled, :checked, :indeterminate) {
-    border-color: var(--text-secondary);
+@media (hover: hover) {
+    input[type="checkbox"]:hover:not(:disabled, :checked, :indeterminate) {
+        border-color: var(--text-secondary);
+    }
 }
 
 input[type="checkbox"]:checked,
@@ -144,7 +148,7 @@ input[type="checkbox"]:disabled {
     flex-wrap: wrap;
     gap: 0.125rem;
     background: var(--bg-tertiary);
-    border-radius: 0.25rem;
+    border-radius: calc(var(--radius-control) * 0.5);
     padding: 0.1875rem;
 }
 
@@ -161,7 +165,7 @@ input[type="checkbox"]:disabled {
     font-family: var(--font-ui);
     font-weight: 400;
     padding: 0.3125rem 0.75rem;
-    border-radius: 0.1875rem;
+    border-radius: calc(var(--radius-control) * 0.375);
     transition: background-color var(--duration-fast), color var(--duration-fast);
 }
 
@@ -224,7 +228,7 @@ input[type="checkbox"]:disabled {
     text-transform: uppercase;
     letter-spacing: 0.03125rem;
     padding: 0.0625rem 0.3125rem;
-    border-radius: 0.1875rem;
+    border-radius: calc(var(--radius-control) * 0.375);
     background: color-mix(in srgb, var(--accent) 15%, transparent);
     color: var(--accent);
     white-space: nowrap;
@@ -254,7 +258,7 @@ input[type="checkbox"]:disabled {
     display: flex;
     align-items: center;
     flex-shrink: 0;
-    border-radius: 0.375rem;
+    border-radius: calc(var(--radius-control) * 0.75);
     text-decoration: none;
     transition: color var(--duration-normal), background var(--duration-normal);
 }
@@ -266,9 +270,10 @@ input[type="checkbox"]:disabled {
 }
 
 /* `:where()` keeps the specificity at (0,2,0), so overrides still win. A
-   disabled button that takes the pointer back for its tooltip gets no wash. */
+   disabled button that takes the pointer back for its tooltip gets no wash, and
+   neither does an aria-disabled one, which keeps the pointer all along. */
 @media (hover: hover) {
-    .icon-btn:hover:where(:not(:disabled)) {
+    .icon-btn:hover:where(:not(:disabled, [aria-disabled="true"])) {
         background: var(--bg-hover);
         color: var(--text-primary);
     }
@@ -296,7 +301,7 @@ input[type="checkbox"]:disabled {
     cursor: pointer;
     min-width: 3.5rem;
     padding: 0.25rem 0.625rem;
-    border-radius: 0.25rem;
+    border-radius: calc(var(--radius-control) * 0.5);
     font-size: var(--font-size-xs);
     font-family: var(--font-ui);
     font-weight: 500;
@@ -341,9 +346,9 @@ input[type="checkbox"]:disabled {
 /* Dark mode tones the confirm green down a step — the bright --accent-green reads
    too vivid as a filled CTA against the near-black app (and darker lifts the white
    label's contrast). Only the button shifts; other green UI keeps --accent-green.
-   :not([data-theme="light"]) matches the dark default + explicit dark; "system" is
-   always resolved to an explicit data-theme, so light mode never matches. */
-html:not([data-theme="light"]) .action-btn-confirm {
+   :not([data-theme-mode="light"]) matches the dark default + explicit dark; "system" is
+   always resolved to an explicit data-theme-mode, so light mode never matches. */
+html:not([data-theme-mode="light"]) .action-btn-confirm {
     --confirm-bg: #2ea043;
 }
 
@@ -354,6 +359,23 @@ html:not([data-theme="light"]) .action-btn-confirm {
 @media (hover: hover) {
     .action-btn-danger:hover {
         background-color: color-mix(in srgb, var(--accent-red) 80%, #fff);
+    }
+}
+
+/* The outlined, lower-emphasis sibling beside a primary button: Cancel, Later.
+   Compound, because an app's sdk_iframe.css loads before this file. The padding
+   gives back the border's 1px, so it stands as tall as the borderless primary. */
+.action-btn.action-btn-secondary {
+    background-color: transparent;
+    border: 1px solid var(--border-color);
+    padding: calc(0.25rem - 1px) calc(0.625rem - 1px);
+    color: var(--text-primary);
+}
+
+@media (hover: hover) {
+    .action-btn.action-btn-secondary:hover {
+        background-color: var(--bg-hover);
+        border-color: var(--text-muted);
     }
 }
 
@@ -620,6 +642,13 @@ html:not([data-theme="light"]) .action-btn-confirm {
     font-weight: 600;
 }
 
+/* A UI font with no bold face paints bold with its regular outlines, so bold
+   prose steps up in colour instead. `data-font-bold` is set with the font.
+   Prose only: a label's bold word keeps the colour its own rule gives it. */
+html[data-font-bold="none"] .markdown-content :is(strong, b) {
+    color: var(--text-strong);
+}
+
 .markdown-content ul,
 .markdown-content ol {
     margin: 0.5rem 0;
@@ -688,9 +717,14 @@ html:not([data-theme="light"]) .action-btn-confirm {
  * untouched by all of this: the wrapper has no minimum, no padding and no
  * background, so it shows the image at its natural size with no scrollbar.
  *
- * This file is `include_str!`d into /api/v1/sdk-iframe.css, so both rules are
- * scoped to the wrapper class. An app's own hand-written <img> has no wrapper
- * around it and keeps whatever sizing the app gave it. */
+ * This file is `include_str!`d into /api/v1/sdk-iframe.css, so every rule here
+ * is scoped to the wrapper class. An app's own hand-written <img> has no wrapper
+ * around it and keeps whatever sizing the app gave it. The cap is one custom
+ * property, which the host's size-hint rule in host-components.css reads too. */
+.image-scroll-wrapper {
+    --image-max-height: 24rem;
+}
+
 .markdown-content .image-scroll-wrapper {
     display: block;
     max-width: 100%;
@@ -706,7 +740,7 @@ html:not([data-theme="light"]) .action-btn-confirm {
      * still one short scroll away. In rem so it tracks the user's UI scale, and
      * paired with `height: auto` so a tall capture narrows proportionally
      * instead of squashing. */
-    max-height: 24rem;
+    max-height: var(--image-max-height);
     height: auto;
 }
 
@@ -875,13 +909,13 @@ html:not([data-theme="light"]) .action-btn-confirm {
     margin: 0.75rem 0;
     padding: 0.625rem;
     background: var(--bg-tertiary);
-    border-radius: 0.25rem;
+    border-radius: calc(var(--radius-control) * 0.5);
 }
 
 .markdown-content code {
     background: var(--bg-tertiary);
     padding: 0.125rem 0.375rem;
-    border-radius: 0.1875rem;
+    border-radius: calc(var(--radius-control) * 0.375);
     /* Named, because a `<code>` carries a UA `font-family: monospace` of its
        own and therefore inherits nothing: with no declaration here it painted
        in the browser's generic mono face rather than the app's declared stack,
@@ -926,14 +960,14 @@ html:not([data-theme="light"]) .action-btn-confirm {
     height: 0.375rem;
     background: var(--bg-secondary);
     border: 1px solid var(--border-color);
-    border-radius: 0.1875rem;
+    border-radius: calc(var(--radius-control) * 0.375);
     overflow: hidden;
 }
 
 .progress-bar-fill {
     height: 100%;
     background: var(--accent);
-    border-radius: 0.1875rem;
+    border-radius: calc(var(--radius-control) * 0.375);
     transition: width var(--duration-slow) ease;
 }
 
@@ -973,7 +1007,7 @@ html:not([data-theme="light"]) .action-btn-confirm {
     background: var(--bg-secondary);
     color: var(--text-secondary);
     border: 1px solid var(--border-color);
-    border-radius: 0.625rem;
+    border-radius: calc(var(--radius-control) * 1.25);
     font-family: var(--font-ui);
     font-size: var(--font-size-xs);
     font-weight: 400;
@@ -1060,7 +1094,7 @@ html:not([data-theme="light"]) .action-btn-confirm {
     flex: none;
     width: 0.4rem;
     height: 0.4rem;
-    border-radius: 50%;
+    border-radius: var(--radius-round);
     background: var(--text-muted);
 }
 

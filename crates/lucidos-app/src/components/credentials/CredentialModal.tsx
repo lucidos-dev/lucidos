@@ -16,6 +16,8 @@ import {
 } from './oauthClientForm';
 import { ConsoleLink } from './providerConsoleHint';
 import { FieldLabel } from '../shared/Explainer';
+import { FormSkeleton } from '../shared/FormSkeleton';
+import { LoadingFade } from '../shared/LoadingFade';
 import { loadedOr, toFailed } from '../../store/types';
 import type { AuthType, CredentialInfo, CredentialRequest, EmailAccountInfo, Loadable } from '../../store/types';
 import { getCredentialValue, getEmailAccount } from '../../api/client';
@@ -111,6 +113,10 @@ interface EditData {
   emailInfo: EmailAccountInfo | null;
 }
 
+/** The fields every stored credential's form opens with. Only the secret's
+ *  own label depends on the type, so it shimmers. */
+const CREDENTIAL_FORM_FIELDS = [{ label: 'Service Name' }, { label: 'Base URLs' }, { label: 'Auth Type' }, {}];
+
 /** Loads a credential's stored secret (+ email settings), then renders the form
  *  pre-filled. The secret is fetched via the same endpoint the copy buttons use,
  *  so this is no new exposure.
@@ -187,7 +193,7 @@ function CredentialStoredLoader({
 
   if (credLoadable.status === 'failed') {
     return (
-      <div class="inline-form">
+      <div class="inline-form protected-surface">
         <LoadableError
           error={credLoadable.error}
           noun="credentials"
@@ -198,7 +204,7 @@ function CredentialStoredLoader({
   }
   if (data.status === 'failed') {
     return (
-      <div class="inline-form">
+      <div class="inline-form protected-surface">
         <LoadableError
           error={data.error}
           noun="credential"
@@ -207,27 +213,19 @@ function CredentialStoredLoader({
       </div>
     );
   }
-  if (showLoading) {
-    return (
-      <div class="inline-form">
-        <div class="loading-spinner" />
-      </div>
-    );
-  }
-  if (credLoadable.status !== 'loaded' || data.status !== 'loaded' || !existingCred) {
-    // Pre-delay window — keep the container mounted but show nothing yet.
-    return <div class="inline-form" />;
-  }
-
   return (
-    <CredentialFormInner
-      key={credentialId}
-      editing={request ? undefined : credentialId}
-      request={request}
-      existingCred={existingCred}
-      initialFields={data.data.fields}
-      emailInfo={data.data.emailInfo}
-    />
+    <LoadingFade showSkeleton={showLoading} skeleton={<FormSkeleton fields={CREDENTIAL_FORM_FIELDS} />}>
+      {credLoadable.status === 'loaded' && data.status === 'loaded' && existingCred && (
+        <CredentialFormInner
+          key={credentialId}
+          editing={request ? undefined : credentialId}
+          request={request}
+          existingCred={existingCred}
+          initialFields={data.data.fields}
+          emailInfo={data.data.emailInfo}
+        />
+      )}
+    </LoadingFade>
   );
 }
 
@@ -520,7 +518,7 @@ function CredentialFormInner({
   }
 
   return (
-    <div class="inline-form">
+    <div class="inline-form protected-surface">
       {instructions && <CredentialInstructions text={instructions} />}
       <form onSubmit={handleSubmit}>
         {!isEmailPassword && (

@@ -176,20 +176,12 @@ and the packaged `.app`.
 > removes its service, and only your **data** survives (it prints where it left
 > it). The one command that changes nothing is `--list`, so start there.
 
-Installed via the one-liner, so you have no checkout? Both are the repo's own
-scripts and the runtime lays no copy down (nothing under `~/.lucidos/` is an
-uninstaller), so download
-[`uninstall.sh`](https://github.com/lucidos-dev/lucidos/blob/main/uninstall.sh)
-and run it with the same flags:
+Installed via the one-liner, so you have no checkout? The front door serves the
+uninstaller beside the installer. Pass the same flags after `sh -s --`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/lucidos-dev/lucidos/main/uninstall.sh -o uninstall.sh
-sh uninstall.sh --list
+curl -fsSL https://lucidos.dev/uninstall.sh | sh -s -- --list
 ```
-
-The matching `https://lucidos.dev/uninstall.sh` front door is not served yet, so
-piping *that* URL would feed you the landing page instead of a script. Tracked in
-[`docs/temporary-measures.md`](https://github.com/lucidos-dev/lucidos/blob/main/docs/temporary-measures.md).
 
 **Pick your LLM provider** (optional). With no credentials the runtime boots into
 a clear no-provider onboarding state (`--dev` boots in `mock` mode); configure a

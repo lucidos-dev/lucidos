@@ -106,8 +106,7 @@ describe('no transcript toggle scrolls the reader', () => {
     .map((f) => ({ file: f, src: stripComments(readFileSync(join(CHAT_DIR, f), 'utf-8') as string) }));
 
   /** A pass-through, i.e. a handler slot filled with a bare identifier
-   *  (`onToggle={onToggle}`) rather than a body. `chat-exchange-parts.tsx`
-   *  forwards its panels' toggle prop that way in four places; a forward defines
+   *  (`onToggle={onToggle}`) rather than a body. A forward defines
    *  no behaviour, so counting it would inflate the site total and hide a real
    *  site being eaten by a bad strip. The behaviour lives where the arrow is
    *  written, which is what the counts below pin. */
@@ -127,7 +126,7 @@ describe('no transcript toggle scrolls the reader', () => {
    *  place) but not one that eats a single site, which is the same silent pass
    *  wearing a smaller hat. Adding or removing a toggle means changing these
    *  numbers deliberately, in the same commit. */
-  const EXPECTED_PANEL_TOGGLES = 2;    // ChatExchange: the initiator panel, the response panel
+  const EXPECTED_PANEL_TOGGLES = 1;    // ChatExchange: the initiator panel
   // The four turn controls, each wrapped by `heldOnThePress`: the full
   // response, the steps, this turn's fold, and its user message's fold.
   //

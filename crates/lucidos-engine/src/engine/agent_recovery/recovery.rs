@@ -10,6 +10,7 @@ use super::super::git_ops::{
     main_worktree, proposal_files_for_branch, worktrees_dir, WorktreeLookup,
 };
 use super::super::thread_events::{EngineReason, EventChannel, MessageOrigin, QuestionOption};
+use super::super::thread_lifecycle::ThreadStatus;
 use super::super::LucidosEngine;
 use super::*;
 use std::path::{Path, PathBuf};
@@ -1115,12 +1116,7 @@ pub(crate) fn branch_awaits_recovery(
 /// apart: a `ResponseAborted` is park-ending, so a teardown that emitted one
 /// would defeat the guard on the very next boot.
 pub(crate) async fn thread_has_unanswered_question(pool: &sqlx::PgPool, thread_id: Uuid) -> bool {
-    // `$1` is bound as the thread id (text). The shared fragment keeps this
-    // per-thread check and every set-based sweep on one definition.
-    let sql = format!("SELECT {}", unanswered_question_exists_sql("$1"));
-    sqlx::query_scalar::<_, bool>(&sql)
-        .bind(thread_id.to_string())
-        .fetch_one(pool)
+    thread_parked_on_question(pool, thread_id)
         .await
         .unwrap_or_else(|e| {
             log!(
@@ -1130,6 +1126,22 @@ pub(crate) async fn thread_has_unanswered_question(pool: &sqlx::PgPool, thread_i
             );
             false
         })
+}
+
+/// [`thread_has_unanswered_question`] for a caller that must not read a failed
+/// lookup as "not parked". Apply Now refuses on an `Err`, because applying over
+/// a live question card is the direction that loses the user's answer.
+pub(crate) async fn thread_parked_on_question(
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    // `$1` is bound as the thread id (text). The shared fragment keeps this
+    // per-thread check and every set-based sweep on one definition.
+    let sql = format!("SELECT {}", unanswered_question_exists_sql("$1"));
+    sqlx::query_scalar::<_, bool>(&sql)
+        .bind(thread_id.to_string())
+        .fetch_one(pool)
+        .await
 }
 
 /// True when an engine teardown must leave this thread exactly as it is because
@@ -1599,7 +1611,7 @@ fn unresumed_switch_threads_sql() -> String {
          JOIN thread_summaries t ON t.thread_id = e.aggregate_id::uuid \
          WHERE e.aggregate = 'thread' \
            AND t.state = 'active' \
-           AND t.status = 'paused' \
+           AND t.status = {paused} \
            AND {abort} \
            AND e.sequence = ( \
                SELECT MAX(a.sequence) FROM events a \
@@ -1608,6 +1620,7 @@ fn unresumed_switch_threads_sql() -> String {
            ) \
            AND {unsuperseded} \
          ORDER BY e.sequence ASC",
+        paused = ThreadStatus::Paused.sql_literal(),
         abort = SWITCH_TEARDOWN_ABORT_SQL,
         unsuperseded = switch_abort_unsuperseded_sql("e.aggregate_id", "e.sequence"),
     )
@@ -1725,10 +1738,11 @@ pub(crate) async fn settle_orphaned_running_coding_agent_threads(
     bus: &crate::engine::event_bus::EventBus,
     recovering: &std::collections::HashSet<Uuid>,
 ) {
-    let running: Vec<Uuid> = match sqlx::query_scalar::<_, Uuid>(
+    let running: Vec<Uuid> = match sqlx::query_scalar::<_, Uuid>(&format!(
         "SELECT thread_id FROM thread_summaries \
-         WHERE is_coding_agent = true AND status = 'running'",
-    )
+         WHERE is_coding_agent = true AND status = {}",
+        ThreadStatus::Running.sql_literal(),
+    ))
     .fetch_all(pool)
     .await
     {

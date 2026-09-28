@@ -1,5 +1,6 @@
 import { API, ApiError, json, mutatingFetch, throwIfNotOk } from './client';
-import type { ThreadSection, ThreadInitiator, ThreadAggregate, EventWaitSummary } from '../store/thread-events';
+import type { ThreadSection, ThreadInitiator, ThreadAggregate, EventWaitSummary, ThreadComposeState } from '../store/thread-events';
+import type { ThreadStatus } from '../generated/thread-lifecycle';
 import type { ComposeSelectionOverride } from '../store/composeSelections';
 
 export interface ThreadSummary {
@@ -61,8 +62,9 @@ export interface ThreadSummary {
    *  `upsertThread` leaves an existing list alone when the field is missing and
    *  clears it only on an explicit `[]`. */
   live_event_waits?: EventWaitSummary[];
-  /** Thread status computed by the backend: 'idle', 'running', or 'waiting'. */
-  status: string;
+  /** Thread status computed by the backend. One of the generated `ThreadStatus`
+   *  values. Nothing writes 'waiting' any more; historical rows may hold it. */
+  status: ThreadStatus;
   /** Whether the coding-agent branch has any diff against main on disk — pure git
    *  truth. Backs the WaitingBanner Diff button independently of the
    *  proposal lifecycle. */
@@ -75,8 +77,6 @@ export interface ThreadSummary {
   coding_agent_requires_restart: boolean;
   /** Whether the coding-agent thread is working on an external repo. */
   coding_agent_is_external_repo: boolean;
-  /** Whether a merge conflict is being resolved. */
-  coding_agent_applying: boolean;
   /** When the thread last entered 'running' state (ISO string or null). */
   last_revived_at: string | null;
   /** Parent thread that spawned this one (null for user-initiated threads). */
@@ -107,7 +107,7 @@ export interface ThreadSummary {
   /** Compose state machine: 'composing' (draft) | 'active' | 'discarded'. The
    *  archive flag lives on the separate `archive_state` field — an archived
    *  thread carries `state='active'` plus `archive_state='archived'`. */
-  state: 'composing' | 'active' | 'discarded';
+  state: ThreadComposeState;
   /** In-progress compose text. Empty when nothing typed. */
   compose_text: string;
   /** Currently-attached compose image URLs. Empty array when none. */

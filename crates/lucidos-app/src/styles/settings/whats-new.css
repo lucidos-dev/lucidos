@@ -74,8 +74,10 @@
     cursor: pointer;
 }
 
-.whats-new-release-header:hover .whats-new-version {
-    color: var(--accent);
+@media (hover: hover) {
+    .whats-new-release-header:hover .whats-new-version {
+        color: var(--accent);
+    }
 }
 
 /* Sized by its ink rather than its box, so it sits on the text's baseline run
@@ -110,7 +112,7 @@
     margin-left: auto;
     flex: 0 0 auto;
     padding: 0.125rem 0.375rem;
-    border-radius: 0.25rem;
+    border-radius: calc(var(--radius-control) * 0.5);
     background: var(--bg-tertiary);
     color: var(--text-primary);
     font-size: var(--font-size-2xs);
@@ -130,8 +132,8 @@
     margin-bottom: 1rem;
 }
 
-/* The notes are a card's contents, indented past the chevron so a release's
-   prose lines up under its own version rather than under the toggle.
+/* The notes are a card's contents, inset the same step from both edges of the
+   release row, so the prose has room on the right as well as the left.
 
    The size is here because `.markdown-content` deliberately sets none: it is the
    shared rule served to app iframes as well as the host, so every surface that
@@ -143,7 +145,7 @@
    under. --font-size-sm with 1.5 leading is what the app's other prose surfaces
    read at. */
 .whats-new-notes {
-    padding: 0 0 0.75rem 1.5rem;
+    padding: 0 var(--space-md) var(--space-md);
     font-size: var(--font-size-sm);
     line-height: 1.5;
 }
@@ -166,7 +168,7 @@
 
 .release-notice-row {
     background: var(--bg-tertiary);
-    border-radius: 0.5rem;
+    border-radius: calc(var(--radius-surface) * 2 / 3);
     padding: 0.75rem;
 }
 
@@ -197,7 +199,8 @@
 }
 
 /* The fold's body, clear of the toggle that opened it. */
-.release-notice-answered-toggle + .release-notice-list {
+/* Inside the disclosure's box, so the gap rolls in with the list. */
+.release-notice-answered-toggle + .disclosure .release-notice-list {
     margin-top: var(--space-sm);
 }
 
@@ -224,7 +227,7 @@
 
 .release-notice-row-mark {
     padding: 0.125rem 0.375rem;
-    border-radius: 0.25rem;
+    border-radius: calc(var(--radius-control) * 0.5);
     background: var(--accent);
     color: var(--text-on-accent);
     font-size: var(--font-size-2xs);

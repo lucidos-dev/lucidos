@@ -39,7 +39,6 @@ pub(super) struct ChatContextInputs<'a> {
     pub turn_anchor: Uuid,
     /// The device the turn's own event came from. `None` on a resume.
     pub device_id: Option<&'a str>,
-    pub event_device: Option<&'a str>,
     pub app_context: Option<&'a AppContext>,
     pub file_context: Option<&'a str>,
     pub url_context: Option<&'a crate::api::UrlContext>,
@@ -59,7 +58,6 @@ impl LucidosEngine {
             thread_id,
             turn_anchor,
             device_id,
-            event_device,
             app_context,
             file_context,
             url_context,
@@ -97,7 +95,6 @@ impl LucidosEngine {
                 thread_id,
                 Some(turn_anchor),
                 device_id,
-                event_device,
             )
             .await;
 

@@ -1,7 +1,7 @@
 import { threadMap, awaitedThreadId, focusedThreadId, setFocusedThread, showToast, removeToast, connectionStatus, threadsLoaded, generatedTitleIds, threadHasMore, threadLoadingMore, archiveThreadCount, ALL_CHANNELS, filterFacets, codingAgentSessionVersion, engineRestarting, archivingThreadIds, CODING_AGENT_CHANNEL, toasts, THREAD_EVENTS_LOAD_TOAST_KEY, THREAD_EVENTS_REFRESH_TOAST_KEY, THREAD_EVENTS_FETCH_CONCURRENCY, THREAD_EVENTS_PREFETCH_LIMIT, threadChannelToFilterSource, type ThreadFilterSource } from '../store';
 import { appliedThreadFilter, type ThreadFilterSelection } from '../appliedThreadFilter';
 import { threadPassesChannelFilter } from '../threadFilter';
-import { handleEvent, isCallerUtterance, isChannelDefiningEvent, offerCallerUtterance, PENDING_TITLE_PLACEHOLDER, applyAggregateToMeta, createdKey, isExcludedFromSections, type ThreadAggregate, type ThreadState, type ThreadEvent, type StoredEvent, type ThreadMeta, type ThreadStatus } from '../thread-events';
+import { handleEvent, isCallerUtterance, isChannelDefiningEvent, offerCallerUtterance, PENDING_TITLE_PLACEHOLDER, applyAggregateToMeta, createdKey, isExcludedFromSections, type ThreadAggregate, type ThreadState, type ThreadEvent, type StoredEvent, type ThreadMeta } from '../thread-events';
 import { bumpThreadEvents } from '../threadActivity';
 import { recordPerfSample } from '../../utils/perfQueue';
 import { runWithConcurrency } from '../../utils/concurrentPool';
@@ -23,16 +23,19 @@ import { pendingComposePuts, composeEditedAt, composePutSettledAt, hasUnsentLoca
  *  means clear the entry. The caller flushes via `applyDraftBatch`. */
 type DraftBatch = Map<string, ComposeDraft | null>;
 
-/** Per-thread timestamp of the last local archive-flip. Mirrors
+/** Per-thread timestamp of the last local archive or pin flip. Mirrors
  *  `composeEditedAt`: `upsertThread` consults it and skips overwriting
- *  `section` and `codingAgentProposed` when the GET went out before the flip.
+ *  `section`, `saved` and `codingAgentProposed` when the GET went out before
+ *  the flip. The pin rides with the section because a pinned thread is never
+ *  archived (ADR 0312), so the two flip together.
  *  Without it, a stale GET landing after the optimistic flip overwrites
  *  section back to 'inbox'. The row then flickers into Review until the SSE
  *  event confirms the move.
  *
  *  Stays set forever, with no expiry: a legitimate fresh GET captures
  *  `requestStartedAt` after the last flip, so the guard lets it through.
- *  `handleArchiveThread` (threads.ts) stamps it per cascade member. */
+ *  `handleArchiveThread` (threads.ts) stamps it per cascade member, and
+ *  `handleSaveThread` for the thread it pins. */
 export const sectionMutatedAt = new Map<string, number>();
 
 function makeThreadState(info: ThreadSummary, saved: boolean, batch?: DraftBatch): ThreadState {
@@ -51,7 +54,7 @@ function makeThreadState(info: ThreadSummary, saved: boolean, batch?: DraftBatch
       // coherent. Archive sorts and pages by createdAt rather than this.
       lastUserAction: info.last_user_action || info.last_activity || info.created_at || new Date().toISOString(),
       lastAgentAction: info.last_agent_action || info.last_activity || info.created_at || new Date().toISOString(),
-      status: (info.status as ThreadStatus) || 'idle',
+      status: info.status || 'idle',
       messageCount: info.message_count || 0,
       section: (info.section as ThreadMeta['section']) || 'archived',
       activeChildrenCount: info.active_children_count || 0,
@@ -65,7 +68,6 @@ function makeThreadState(info: ThreadSummary, saved: boolean, batch?: DraftBatch
       codingAgentProposed: info.coding_agent_proposed || false,
       codingAgentRequiresRestart: info.coding_agent_requires_restart || false,
       codingAgentIsExternalRepo: info.coding_agent_is_external_repo || false,
-      codingAgentApplying: info.coding_agent_applying || false,
       lastRevivedAt: info.last_revived_at || '',
       parentThreadId: info.parent_thread_id || undefined,
       parentThreadTitle: info.parent_thread_title || undefined,
@@ -169,7 +171,6 @@ export function upsertThread(
     map.set(info.thread_id, makeThreadState(info, saved, draftBatch));
   } else {
     const existing = map.get(info.thread_id)!;
-    if (saved) existing.meta.saved = true;
     if (info.title && info.title !== PENDING_TITLE_PLACEHOLDER && !generatedTitleIds.has(info.thread_id)) existing.meta.title = info.title;
     if (info.created_at) existing.meta.createdAt = info.created_at;
     // Snapshot the live, pre-overlay last_activity so the status guard below
@@ -196,13 +197,14 @@ export function upsertThread(
     // sticking the dot until a reload. `apiTime < liveUpdatedAt` means exactly
     // that. Mirrors the monotonic stale-GET guards above.
     const statusSnapshotStale = !!apiTime && !!liveUpdatedAt && apiTime < liveUpdatedAt;
-    if (info.status && !statusSnapshotStale) existing.meta.status = info.status as ThreadStatus;
+    if (info.status && !statusSnapshotStale) existing.meta.status = info.status;
     if (info.message_count) existing.meta.messageCount = info.message_count;
-    // Skip section and codingAgentProposed when a local archive-flip happened
-    // AT OR AFTER this GET went out, since the snapshot is then stale by
-    // definition. See `sectionMutatedAt`.
+    // A local archive or pin flip AT OR AFTER this GET went out makes its
+    // section, pin and codingAgentProposed stale, so skip them. See
+    // `sectionMutatedAt`.
     const sectionEditedSinceRequest = (sectionMutatedAt.get(info.thread_id) ?? 0) >= requestStartedAt;
     if (!sectionEditedSinceRequest) {
+      if (saved) existing.meta.saved = true;
       if (info.section) existing.meta.section = info.section as ThreadMeta['section'];
       existing.meta.codingAgentProposed = info.coding_agent_proposed || false;
     }
@@ -230,7 +232,6 @@ export function upsertThread(
     existing.meta.codingAgentHasDiff = info.coding_agent_has_diff || false;
     existing.meta.codingAgentRequiresRestart = info.coding_agent_requires_restart || false;
     existing.meta.codingAgentIsExternalRepo = info.coding_agent_is_external_repo || false;
-    existing.meta.codingAgentApplying = info.coding_agent_applying || false;
     if (info.last_revived_at) existing.meta.lastRevivedAt = info.last_revived_at;
     // A null clears: a thread moved to top level has no parent any more, and a
     // truthiness guard would re-nest it on every refresh (ADR 0278). Absent

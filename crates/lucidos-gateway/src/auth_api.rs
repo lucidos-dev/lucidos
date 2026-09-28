@@ -129,10 +129,11 @@ const APP_ASSET_TREES: [&str; 2] = ["/fonts/", "/static/"];
 ///
 /// An app frame runs at an OPAQUE origin (ADR 0227). Its site-for-cookies is
 /// null, so the browser withholds our `SameSite=Lax` device credential from
-/// every subresource the frame's document asks for. Those are `<script>`,
-/// `<link>` and `<font>` tags on the app's own document, and a bridge cannot
-/// carry a tag. Refuse them and every app renders unstyled, with no `lucidos`
-/// global.
+/// every subresource the frame's document asks for. Those are `<script>` and
+/// `<link>` tags on the app's own document, and the font a stylesheet names. A
+/// bridge cannot carry any of them. Refuse them and every app renders unstyled,
+/// with no `lucidos` global. The font's CORS header is the engine's to send
+/// (ADR 0289), and we relay it.
 ///
 /// Exempt because they carry nothing to protect. Four are the same bytes for
 /// every caller, and `sdk-prefs.js` answers one device's appearance. Everything
@@ -297,7 +298,7 @@ pub async fn enforce(State(state): State<GatewayState>, mut req: Request, next: 
     // stamp the device, and re-issue the credential it presented.
     let (decision, matched) = state.authorize_with_match(req.headers());
     match decision {
-        Authorization::Device { id, .. } => {
+        Authorization::Device { id, label } => {
             // Three reasons to hand this device a cookie. All are decided here,
             // before the request moves into the handler.
             //
@@ -325,7 +326,8 @@ pub async fn enforce(State(state): State<GatewayState>, mut req: Request, next: 
             // Tell the proxy who this is. The engine keys push, preferences and
             // actor attribution on the same id. So the device the gateway let
             // in and the device the workspace knows are one row, not two.
-            req.extensions_mut().insert(auth::AuthenticatedDevice(id));
+            req.extensions_mut()
+                .insert(auth::AuthenticatedDevice { id, label });
             let cookie_name = state.device_cookie_name().to_string();
             let mut response = next.run(req).await;
             if let Some(cookie) = refresh {

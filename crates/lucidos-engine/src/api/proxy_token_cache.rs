@@ -24,6 +24,11 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{watch, RwLock};
 
+/// The longest a cached token is trusted. A handshake script may report
+/// `expires_in` as a "never" sentinel such as Python's `sys.maxsize`, and
+/// `Instant + Duration` panics past the clock's range.
+const MAX_TOKEN_TTL: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+
 #[derive(Clone, Debug)]
 pub struct CachedToken {
     pub headers: Vec<(HeaderName, HeaderValue)>,
@@ -94,7 +99,7 @@ impl ProxyTokenCache {
     ) -> CachedToken {
         let token = CachedToken {
             headers,
-            expires_at: Instant::now() + ttl,
+            expires_at: Instant::now() + ttl.min(MAX_TOKEN_TTL),
         };
         self.entries
             .write()
@@ -305,6 +310,18 @@ mod tests {
             .await;
         tokio::time::sleep(Duration::from_millis(5)).await;
         assert!(c.get("x").await.is_none());
+    }
+
+    /// Regression: `expires_in = sys.maxsize` from a handshake script panicked
+    /// the request with "overflow when adding duration to instant".
+    #[tokio::test]
+    async fn a_never_expiring_ttl_is_capped_instead_of_panicking() {
+        let c = ProxyTokenCache::new();
+        let token = c
+            .insert("x", ok_headers(), Duration::from_secs(i64::MAX as u64))
+            .await;
+        assert!(token.expires_at <= Instant::now() + MAX_TOKEN_TTL);
+        assert!(c.get("x").await.is_some(), "a capped token is still fresh");
     }
 
     #[tokio::test]

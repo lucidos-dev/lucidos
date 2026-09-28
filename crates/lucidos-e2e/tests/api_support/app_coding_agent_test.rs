@@ -52,23 +52,13 @@ async fn seed_change(
     );
 }
 
-/// Serialises the workspace add/diff/commit sequence in
-/// `ensure_app_committed`. Two `#[tokio::test]`s on the same workspace race
-/// on a shared git index: T1's `git add` stages T1's files, T2's `git add`
-/// stages T2's files into the SAME index, T1 commits BOTH, and T2's commit
-/// then fails with "nothing to commit". A process-wide mutex around the
-/// stage-and-commit critical section eliminates the race without slowing
-/// the rest of the test (worktree add, branch ops, file edits) at all.
-static WORKSPACE_INDEX_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 /// Ensure the e2e workspace has an app folder named `app_id` with at least
 /// one file committed on `main`. Idempotent: skips when the folder already
 /// exists. The folder lives under `<ws>/data/apps/<app_id>/`.
-/// Async only so it can take the shared-tree read guard: the manifest and
-/// index it creates appear in the working tree, which a command checkpoint
-/// images whole (see `workspace_tree_lock`).
+/// Takes the tree guard exclusively, because it commits in the workspace
+/// itself (see `workspace_tree_lock`).
 async fn ensure_app_committed(app_id: &str, marker: &str) -> PathBuf {
-    let _tree = crate::support::workspace_tree_lock().read().await;
+    let _tree = crate::support::workspace_tree_lock().write().await;
     let ws = workspace_path();
     let app_dir = ws.join("data/apps").join(app_id);
     if !app_dir.exists() {
@@ -93,12 +83,7 @@ async fn ensure_app_committed(app_id: &str, marker: &str) -> PathBuf {
         )
         .unwrap();
     }
-    // Stage + commit anything new. Quiet about empty-commit cases. The mutex
-    // keeps two parallel test runs from interleaving add/diff/commit on the
-    // shared workspace index.
-    let _index_guard = WORKSPACE_INDEX_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Stage + commit anything new. Quiet about empty-commit cases.
     let rel_app = format!("data/apps/{}", app_id);
     git(&["add", &rel_app]);
     let status = std::process::Command::new("git")

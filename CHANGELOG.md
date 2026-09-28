@@ -1,5 +1,60 @@
 # Changelog
 
+## v0.41.0 — 2026-09-28
+
+### Added
+
+- Themes. Pick one in Settings > Appearance, where each card previews its own theme. The built-in themes are grouped by family and include Nord, Catppuccin, Gruvbox, Everforest, Rosé Pine, Solarized, Tokyo Night, Amethyst, Paper, Minimal and Mono.
+- A theme can set colours, the header, the focus marker, a suggested font, square corners, a text glow and retro parts: a block caret, scanlines and double frames. The active theme paints before the first frame and follows live in app frames. Plugins can ship themes.
+- A theme made for only light or only dark offers to switch the theme mode when you pick it.
+- After a pick, the theme picker folds to the active theme's card. Click it to open the gallery again.
+- Permission cards, credential requests and plugin confirmations stay readable under every theme. The engine refuses a theme that would hide them.
+- Workspace fonts. Install your own font in Settings and apps load it too. Plugins can ship fonts. VT323 and eight more fonts are now bundled.
+- Pull to refresh on the content pane on a phone, and a Refresh button at the start of the desktop content row. It works in Files, Settings, Disk Usage, Changes, Notifications, Apps, Plugins and Triggers.
+- Disk Usage has a Free up space card. It cleans every finished worktree in one step and shows how much it will free. Each worktree title links to its thread.
+- Idle threads with nothing pending release their build artifacts, and cleanup starts at once when the disk runs low.
+- Agents can archive threads. They never archive a pinned thread.
+- The Lucidos menu lists work in flight, one row per job. Tap a row to unfold its detail.
+- Apply All sets a conflicting change aside and keeps going.
+- Apply toasts name the thread and the step, and show the time so far, the typical time and the time left.
+- A thread's change actions are in its overflow menu.
+- `lucidos.ui.toast` takes an optional title.
+- A picture with a size hint reserves its space before it loads. Question cards and `lucidos data write` add the hint.
+- Lists and panels draw skeleton rows while they load.
+- The slowness bar says when a stuck database or a full disk is the cause.
+- The drawer's status filter headers show a thread count.
+
+### Changed
+
+- "Look" is now "theme", and the light and dark setting is "theme mode". Your choices carry over on upgrade.
+- Dialogs, toasts and menus share one layout: a head with an X, a body and a foot. Red means destructive and nothing else.
+- Toasts are one line, with the tone in the icon. A toast with one action is a tap on the whole card.
+- Turn folds and inline disclosures roll open like drawer sections.
+- Drawer rows start the title with the status mark, put the pin on the title line and the chips on the date line.
+- The Plugins panel has a simpler layout, and its install and uninstall panels fold their file lists.
+- The permission card leads with what the agent asks, and coding agents say what a command does and why.
+- A deep link holds its target on screen until you scroll or act.
+- A device has the same name on every screen, taken from its pairing label when nobody typed one.
+- The new-version button reads Switch, and the standing apply reads Apply on settle.
+
+### Fixed
+
+- A chat request that names another workspace can no longer skip the subprocess gate.
+- Undo, discard and apply no longer destroy unrelated work, and undo removes files the command created.
+- A restart no longer commits an agent's half-finished edits.
+- Apply refuses a thread that waits on a question and a worktree with uncommitted changes.
+- A thread with an open question or an event wait stays out of Review.
+- A WASM signer's output, trap backtrace and secrets stay out of error bodies and logs, and a looping signer can no longer hold the engine's workers.
+- A stored email secret cannot be pointed at a new server or port.
+- A memory correction survives a memory rebuild, and the Memory Inspector refreshes when you correct a memory.
+- A backup tells you when it creates an encryption key.
+- A thread that arrives by live update shows its title, not "Untitled".
+- A markdown image that fails to load says so, and a broken image body is fetched again.
+- The boot splash stays still while its status changes.
+- The Disk Usage worktree list loads in seconds.
+- A chatty command no longer floods the agent's context.
+- An OAuth token that never expires no longer breaks refresh, and an empty refresh token no longer replaces a good one.
+- Git still runs when the resolved git binary has gone.
 ## v0.40.1 — 2026-09-26
 
 ### Changed

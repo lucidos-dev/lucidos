@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   buildDeviceRows,
-  deviceDisplayName,
+  deviceRowName,
   deviceRowSummary,
   submittedDeviceName,
 } from '../deviceList';
@@ -12,6 +12,7 @@ function device(id: string, over: Partial<DeviceInfo> = {}): DeviceInfo {
   return {
     id,
     name: null,
+    pairing_label: null,
     user_agent: 'UA',
     push_enabled: false,
     last_seen_at: '2026-08-01T00:00:00Z',
@@ -117,28 +118,39 @@ describe('deviceRowSummary', () => {
   });
 });
 
-describe('deviceDisplayName', () => {
+describe('deviceRowName', () => {
   it('uses the name the user gave it', () => {
     const [row] = buildDeviceRows([device('a', { name: 'My MacBook' })], [], 'a');
-    expect(deviceDisplayName(row)).toBe('My MacBook');
+    expect(deviceRowName(row)).toBe('My MacBook');
   });
 
   it('shortens an unnamed device rather than titling it with a uuid', () => {
-    // A 36-character uuid wraps onto two lines as a row heading. This is the
-    // engine's own `resolve_device_name` shape, so the list and an actor chip
-    // call the same device the same thing.
     const [row] = buildDeviceRows([device('0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9')], [], 'x');
-    expect(deviceDisplayName(row)).toBe('device-0a1b2c3d');
+    expect(deviceRowName(row)).toBe('device-0a1b2c3d');
   });
 
   it('falls back to the gateway label when there is no engine row to name', () => {
     const [row] = buildDeviceRows([], [paired('a', { label: 'Chrome localhost' })], 'x');
-    expect(deviceDisplayName(row)).toBe('Chrome localhost');
+    expect(deviceRowName(row)).toBe('Chrome localhost');
+  });
+
+  it("uses the engine's copy of the pairing label when the gateway did not answer", () => {
+    const [row] = buildDeviceRows([device('a', { pairing_label: 'Safari on iPhone' })], null, 'a');
+    expect(deviceRowName(row)).toBe('Safari on iPhone');
+  });
+
+  it("does not let an empty gateway label hide the engine's copy", () => {
+    const [row] = buildDeviceRows(
+      [device('a', { pairing_label: 'Safari on iPhone' })],
+      [paired('a', { label: '' })],
+      'x',
+    );
+    expect(deviceRowName(row)).toBe('Safari on iPhone');
   });
 
   it('prefers the name over the gateway label, so a rename sticks', () => {
     const [row] = buildDeviceRows([device('a', { name: 'Work laptop' })], [paired('a')], 'x');
-    expect(deviceDisplayName(row)).toBe('Work laptop');
+    expect(deviceRowName(row)).toBe('Work laptop');
   });
 });
 

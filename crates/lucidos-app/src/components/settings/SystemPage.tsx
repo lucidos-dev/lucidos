@@ -24,6 +24,7 @@ import {
   canCheckForUpdatesHere,
   canInstallUpdateHere,
   followUpdateRoute,
+  refreshReleaseCheck,
   sessionCanInstall,
   shadowedEngine,
   updateControlLabel,
@@ -37,6 +38,7 @@ import { appUpdateNarration } from '../../store/progressDialogCopy';
 import { cancelAppUpdate } from '../../utils/tauri';
 import { openWhatsNew } from '../../store/actions/menu';
 import { requestServiceWorkerBuildId, refreshClient } from '../../hooks/sw-update';
+import { usePanelRefresh } from '../../hooks/usePanelRefresh';
 import { formatBuildId } from '../../utils/buildId';
 import { clientVersionLabel } from '../../utils/clientVersion';
 import { isNewerVersion } from '../../utils/version';
@@ -66,7 +68,14 @@ function getApiUrl(): string {
  *  and `SettingsView.renderSubview` maps each subview key onto one of these. */
 export type SystemPanel = 'overview' | 'release-notices' | 'whats-new' | 'thread-queue' | 'backup' | 'memory' | 'disk-usage' | 'environment-variables' | 'debugging' | 'communication-surfaces';
 
+/** A pull asks now, as the Check button does. Forced, so a failed check is
+ *  recorded on the page rather than only logged: the user asked for it. */
+function checkForUpdateNow(): Promise<unknown> {
+  return refreshReleaseCheck(true);
+}
+
 export function SystemPage({ panel }: { panel: SystemPanel }) {
+  usePanelRefresh('the update check', panel === 'overview' ? checkForUpdateNow : null);
   const status = connectionStatus.value;
   const name = visibleWorkspaceName.value;
   // Non-null for exactly the states that are not `connected`, which is what the

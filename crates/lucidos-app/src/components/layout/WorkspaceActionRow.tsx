@@ -22,18 +22,39 @@
 import type { WorkspaceOpenMode } from '../../utils/workspaceWindow';
 import { openModeLabel } from '../../utils/workspaceWindow';
 import { PopInIcon, PopOutIcon } from '../shared/icons';
+import { Disclosure } from '../shared/Disclosure';
 
-export function workspaceActionRow({ id, name, mode, indentClass, onActivate }: {
+/** Emitted under EVERY workspace row, folded unless `open`, so a right-click
+ *  unfolds it with the disclosure roll and a second one folds it away. */
+export function workspaceActionRow({ open, id, name, mode, indentClass, onActivate }: {
+  /** A right-click unfolded it. */
+  open: boolean;
   /** The workspace this action belongs to. Its row sits directly above. */
   id: string;
   /** What to call that workspace out loud, since the label cannot name it. */
   name: string;
-  mode: WorkspaceOpenMode;
+  /** Null for a row no alternate mode applies to, which never unfolds. */
+  mode: WorkspaceOpenMode | null;
   /** The host's own indent, putting this row's glyph on the name column of the
    *  row above it. See the two rules in styles/header-mark.css. */
   indentClass: string;
   onActivate: (mode: WorkspaceOpenMode) => void;
 }) {
+  return (
+    // A colon, because a slug cannot contain one and a workspace row's key is
+    // a bare slug. `${id}-window` could not promise that: it collides with
+    // the row of a workspace actually named `<id>-window`, and two siblings
+    // sharing a key is how keyed diffing reuses the wrong node.
+    <Disclosure key={`fold:${id}`} open={open && mode !== null}>
+      {mode !== null && actionButton(id, name, mode, indentClass, onActivate)}
+    </Disclosure>
+  );
+}
+
+function actionButton(
+  id: string, name: string, mode: WorkspaceOpenMode, indentClass: string,
+  onActivate: (mode: WorkspaceOpenMode) => void,
+) {
   const label = openModeLabel(mode);
   return (
     <button
@@ -44,10 +65,6 @@ export function workspaceActionRow({ id, name, mode, indentClass, onActivate }: 
       // it, and an `aria-label` replaces the content a screen reader would read.
       aria-label={`${label}: ${name}`}
       onClick={() => onActivate(mode)}
-      // A colon, because a slug cannot contain one and a workspace row's key is
-      // a bare slug. `${id}-window` could not promise that: it collides with
-      // the row of a workspace actually named `<id>-window`, and two siblings
-      // sharing a key is how keyed diffing reuses the wrong node.
       key={`window:${id}`}
     >
       {mode === 'separate' ? <PopOutIcon /> : <PopInIcon />}

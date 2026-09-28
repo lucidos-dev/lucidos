@@ -41,7 +41,6 @@ async fn emit_message_received(bus: &EventBus, thread_id: Uuid, text: &str) -> U
             text: text.into(),
             user_image_hashes: vec![],
             device_id: None,
-            device: None,
             image_description: None,
             parent_thread_id: None,
             spawning_event_id: None,

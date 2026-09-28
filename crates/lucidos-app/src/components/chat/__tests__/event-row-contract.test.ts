@@ -64,15 +64,11 @@ describe('event row contract', () => {
     expect(meta).not.toContain('text-overflow');
   });
 
-  /** **The green-check half.** The mark reports that something happened, never
-   *  that it succeeded. The moment it can carry a verdict colour it is a step
-   *  icon again, so the only colour it may name is the muted one. */
-  it('keeps the mark column muted', () => {
-    const mark = block('.event-row-mark');
-    expect(mark).toContain('color: var(--text-muted)');
-    for (const verdict of ['--accent-green', '--accent-red', '--accent-yellow']) {
-      expect(mark).not.toContain(verdict);
-    }
+  /** **No leading glyph.** The subject and the state word say what happened,
+   *  and a glyph carrying a verdict colour would be a step icon. */
+  it('draws no mark column', () => {
+    expect(code(row)).not.toContain('event-row-mark');
+    expect(code(css)).not.toContain('event-row-mark');
   });
 
   /** No module in the family may reach for the step list's outcome helper or
@@ -97,7 +93,7 @@ describe('event row contract', () => {
   });
 
   /** Every tint is a `color-mix` over a token, so both themes resolve from one
-   *  rule and no state pill hardcodes a hex. */
+   *  rule and no state word hardcodes a hex. */
   it('tints every state from a token', () => {
     const tones = [...css.matchAll(/\.event-row-state\[data-tone="[a-z]+"\]\s*\{([^}]*)\}/g)];
     expect(tones.length).toBeGreaterThanOrEqual(6);
@@ -130,35 +126,54 @@ describe('event row contract', () => {
   });
 
   /** The subject and the state share the top line, which is what stops the card
-   *  spending a whole line on one word. The pill pins to the FIRST line, so a
-   *  subject wrapping to three lines still reports its verdict where the reading
-   *  starts rather than trailing the last line. */
-  it('puts the state on the subject line, pinned to the top', () => {
-    expect(block('.event-row-head')).toContain('display: flex');
+   *  spending a whole line on one word. Flex baseline alignment uses the FIRST
+   *  baseline. So a subject wrapping to three lines still reports its verdict
+   *  level with the line where the reading starts. */
+  it('puts the state on the subject line, on its first baseline', () => {
+    const head = block('.event-row-head');
+    expect(head).toContain('display: flex');
+    expect(head).toContain('align-items: baseline');
     const state = block('.event-row-state');
-    expect(state).toContain('align-self: flex-start');
+    expect(state).not.toContain('align-self');
     expect(state).toContain('flex: 0 0 auto');
     // The subject is the only child that may give, so a long one wraps instead
-    // of pushing the pill off the card's right edge.
+    // of pushing the state off the card's right edge.
     expect(block('.event-row-subject')).toContain('min-width: 0');
   });
 
+  /** The state is tinted text, never a pill. A lowercase word in a filled
+   *  capsule read as a code token rather than a status. */
+  it('draws the state as plain text, with no pill behind it', () => {
+    const rules = [...css.matchAll(/\.event-row-state(\[data-tone="[a-z]+"\])?\s*\{([^}]*)\}/g)];
+    expect(rules.length).toBeGreaterThanOrEqual(7);
+    for (const [, , body] of rules) {
+      expect(body).not.toMatch(/background|border-radius|padding/);
+    }
+  });
+
   /** **The phone half.** The subject may break anywhere, so its min-content is
-   *  one letter. With the time and the pill fixed beside it, a phone-width pane
-   *  squeezed it to one letter per line. The head wraps instead, and the subject
-   *  keeps a basis, so the time and the pill drop to a line of their own. They
-   *  travel as one group, so neither is stranded alone. */
-  it('wraps the time and state below a subject that has no room', () => {
+   *  one letter. With the state fixed beside it, a phone-width pane squeezed it
+   *  to one letter per line. The head wraps instead, and the subject keeps a
+   *  basis, so the state drops to a line of its own at the far edge. */
+  it('wraps the state below a subject that has no room', () => {
     const head = block('.event-row-head');
     expect(head).toContain('flex-wrap: wrap');
     expect(block('.event-row-subject')).toMatch(/flex:\s*1 1 \d+(\.\d+)?rem/);
-    expect(block('.event-row-aside')).toContain('margin-left: auto');
-    expect(code(row)).toMatch(/class="event-row-aside"[\s\S]*event-row-time[\s\S]*event-row-state/);
+    expect(block('.event-row-state')).toContain('margin-left: auto');
+  });
+
+  /** The time is a line of its own ABOVE the card, right-aligned, where a user
+   *  bubble carries its stamp. */
+  it('draws the time above the card, right-aligned', () => {
+    const time = block('.event-row-time');
+    expect(time).toContain('display: block');
+    expect(time).toContain('text-align: right');
+    expect(code(row)).toMatch(/event-row-time[\s\S]*\{card\}/);
   });
 
   /** A fold on the card's own fill would open onto an invisible panel. */
   it('lifts the fold body off the card fill', () => {
-    const fold = block('.event-row-fold > pre,\n.event-row-fold > .event-row-fold-body');
+    const fold = block('.event-row-fold-pre,\n.event-row-fold-body');
     expect(fold).toContain('background: var(--bg-tertiary)');
   });
 });

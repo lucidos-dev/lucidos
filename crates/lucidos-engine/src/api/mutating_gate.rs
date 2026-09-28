@@ -106,7 +106,7 @@ fn is_exempt(route: &str) -> bool {
 /// the wrong thing.
 ///
 /// The layer does not hand the handler its actor. Each keeps calling
-/// `actor::user_actor_resolved` and, past here, always gets a `Some`.
+/// `actor::user_actor` and, past here, always gets a `Some`.
 pub(crate) async fn enforce_caller_identified(
     State(state): State<AppState>,
     request: Request,

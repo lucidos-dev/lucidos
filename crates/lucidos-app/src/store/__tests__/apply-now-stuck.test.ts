@@ -60,7 +60,7 @@ describe('endClaudeCodeAndApply 409 safety timeout', () => {
     expect(applyingNowThreadIds.value.has('thread-1')).toBe(false);
   });
 
-  it('shows the engine\'s own words when an apply holds the session, and keeps the spinner', async () => {
+  it('shows the engine\'s own words when an apply holds the session, and keeps it applying', async () => {
     const message = 'An apply is already in progress for this thread. It finishes on its own';
     mockedApplyNow.mockRejectedValueOnce(
       new ApiError(409, message, { error: message, reason: 'apply_in_progress' }),
@@ -69,7 +69,8 @@ describe('endClaudeCodeAndApply 409 safety timeout', () => {
 
     const toast = toasts.value.find((t) => t.key === 'applying-thread-1');
     expect(toast?.message).toContain(message);
-    expect(toast?.spinning).toBe(true);
+    // Its progress is the activity group's to show, so the notice does not spin.
+    expect(toast?.spinning).toBeFalsy();
     expect(applyingNowThreadIds.value.has('thread-1')).toBe(true);
   });
 
@@ -83,6 +84,22 @@ describe('endClaudeCodeAndApply 409 safety timeout', () => {
     const toast = toasts.value.find((t) => t.key === 'applying-thread-1');
     expect(toast?.message).toContain(message);
     expect(toast?.message).not.toMatch(/applying/i);
+    expect(toast?.spinning).toBeFalsy();
+    expect(applyingNowThreadIds.value.has('thread-1')).toBe(false);
+  });
+
+  it.each([
+    ['question_open', 'This thread is waiting for your answer to its question. Answer it first, then apply'],
+    ['question_unknown', 'Could not check whether this thread is waiting for your answer. Try again'],
+  ])('says Not applied for a %s refusal', async (reason, message) => {
+    mockedApplyNow.mockRejectedValueOnce(
+      new ApiError(409, message, { error: message, reason }),
+    );
+    await endClaudeCodeAndApply('thread-1');
+
+    const toast = toasts.value.find((t) => t.key === 'applying-thread-1');
+    expect(toast?.message).toContain(message);
+    expect(toast?.message).toMatch(/not applied/i);
     expect(toast?.spinning).toBeFalsy();
     expect(applyingNowThreadIds.value.has('thread-1')).toBe(false);
   });

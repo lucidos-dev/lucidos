@@ -23,9 +23,10 @@ export interface HeaderActionSpec {
   tooltip?: string;
   /** Renders an `<a target="_blank">` instead of a button (open-in-tab). */
   href?: string | null;
-  /** Extra class(es) naming the ACTION, e.g. `app-fullscreen`. Carries no CSS:
-   *  it is how the rest of the app (and the e2e suite) addresses one action, so
-   *  it is stamped on BOTH renderings. Progressive collapse decides placement,
+  /** Extra class(es) naming the ACTION, e.g. `app-fullscreen`. It is how the
+   *  rest of the app (and the e2e suite) addresses one action, so it is stamped
+   *  on BOTH renderings. A spec with its own `render` stamps its button there.
+   *  One class also styles the row: `protected-surface` (ADR 0309). Progressive collapse decides placement,
    *  and an action must stay findable by the same selector wherever it landed.
    *  A class only on the header button silently disappears the moment a long
    *  title folds the action into the overflow menu. */

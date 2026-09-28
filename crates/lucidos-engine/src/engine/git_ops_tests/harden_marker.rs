@@ -188,6 +188,48 @@ async fn harden_marker_state_distinguishes_missing_stale_fresh() {
     teardown_test_db(&db_name).await;
 }
 
+/// `/harden`'s merge-only mode reads the recorded SHA to find what the last
+/// hardening covered, so a stale marker must still report it.
+#[tokio::test]
+async fn harden_marker_reports_the_recorded_sha() {
+    use crate::test_support::{setup_test_db, teardown_test_db};
+    let (pool, db_name) = setup_test_db().await;
+    let (_tmp, repo_path) = make_test_repo().await;
+
+    assert_eq!(
+        harden_marker(&pool, &repo_path, "feature").await,
+        HardenMarker::Missing,
+    );
+
+    let _ = git_cmd(&["checkout", "-b", "feature"], &repo_path).await;
+    let hardened_sha = current_head_sha(&repo_path).await.unwrap();
+    record_hardened(&pool, &repo_path, "feature", &hardened_sha)
+        .await
+        .unwrap();
+    assert_eq!(
+        harden_marker(&pool, &repo_path, "feature").await,
+        HardenMarker::Recorded {
+            head_sha: hardened_sha.clone(),
+            fresh: true
+        },
+    );
+
+    tokio::fs::write(repo_path.join("b.txt"), "b")
+        .await
+        .unwrap();
+    let _ = git_cmd(&["add", "."], &repo_path).await;
+    let _ = git_cmd(&["commit", "-m", "new commit after harden"], &repo_path).await;
+    assert_eq!(
+        harden_marker(&pool, &repo_path, "feature").await,
+        HardenMarker::Recorded {
+            head_sha: hardened_sha,
+            fresh: false
+        },
+    );
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
 /// Regression: marker must be findable via (repo_root, branch_name) even
 /// after the worktree directory is gone. Stale-session recovery removes the
 /// worktree before propose-change runs, and apply needs to trust the marker

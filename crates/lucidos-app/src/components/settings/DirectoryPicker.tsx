@@ -4,15 +4,42 @@ import { browseDirectories, type BrowseResult } from '../../api/client';
 import { toFailed, type Loadable } from '../../store/types';
 import { Overlay } from '../shared/Overlay';
 import { FolderIcon, FolderUpIcon } from '../shared/icons';
+import { SurfaceHead } from '../shared/Surface';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
+import { LoadingFade } from '../shared/LoadingFade';
+import { ListSkeletonOf, SkBlock, SkText } from '../shared/Skeleton';
 
 interface DirectoryPickerProps {
   onSelect: (path: string) => void;
   onCancel: () => void;
 }
 
-/** Inner children of `.dir-picker-list` — branches on all four Loadable
- *  states so loading / failed are visually distinct from loaded-empty. */
+/** One directory. With no `name`, inside a `SkeletonProvider`, it is the
+ *  list's loading placeholder. */
+function DirRow({ name, up = false, selected = false, onClick, onMouseEnter }: {
+  name?: string;
+  up?: boolean;
+  selected?: boolean;
+  onClick?: () => void;
+  onMouseEnter?: () => void;
+}) {
+  return (
+    <button
+      class={`dir-picker-row${selected ? ' selected' : ''}`}
+      onClick={onClick}
+      onMouseEnter={onMouseEnter}
+      tabIndex={name === undefined ? -1 : undefined}
+    >
+      <SkBlock w="var(--icon-size-lg)" h="var(--icon-size-lg)" round>
+        <span class="dir-picker-icon">{up ? <FolderUpIcon /> : <FolderIcon />}</span>
+      </SkBlock>
+      <SkText class="dir-picker-name" w="9rem">{name}</SkText>
+    </button>
+  );
+}
+
+/** Inner children of `.dir-picker-list`. Branches on all four Loadable states
+ *  so loading and failed are visually distinct from loaded-empty. */
 export function directoryPickerBody({
   data,
   showLoading,
@@ -37,54 +64,40 @@ export function directoryPickerBody({
       </div>
     );
   }
-  // Delay (300ms) — only show the skeleton once the browse has been pending past
-  // the delay, so a fast browse doesn't flash "Loading…".
-  if (showLoading) {
+  return (
+    <LoadingFade showSkeleton={showLoading} skeleton={<ListSkeletonOf count={6} row={() => <DirRow />} />}>
+      {data.status === 'loaded' && loadedRows(data.data)}
+    </LoadingFade>
+  );
+
+  function loadedRows({ directories: dirs }: BrowseResult) {
+  const showParent = currentPath !== '/';
+    if (dirs.length === 0 && !showParent) {
+      return <div class="dir-picker-empty" data-state="empty">No subdirectories</div>;
+    }
     return (
-      <div class="dir-picker-empty loading-skeleton" data-state="loading">
-        Loading...
-      </div>
+      <>
+        {showParent && (
+          <DirRow name=".." up selected={selectedIndex === 0} onClick={onGoUp} onMouseEnter={() => onHoverIndex(0)} />
+        )}
+        {dirs.length === 0 && (
+          <div class="dir-picker-empty" data-state="empty">No subdirectories</div>
+        )}
+        {dirs.map((dir, i) => {
+          const idx = showParent ? i + 1 : i;
+          return (
+            <DirRow
+              key={dir}
+              name={dir}
+              selected={idx === selectedIndex}
+              onClick={() => onSelectDir(dir)}
+              onMouseEnter={() => onHoverIndex(idx)}
+            />
+          );
+        })}
+      </>
     );
   }
-  if (data.status !== 'loaded') {
-    return null; // pre-delay window — show nothing yet
-  }
-  const dirs = data.data.directories;
-  const showParent = currentPath !== '/';
-  if (dirs.length === 0 && !showParent) {
-    return <div class="dir-picker-empty" data-state="empty">No subdirectories</div>;
-  }
-  return (
-    <>
-      {showParent && (
-        <button
-          class={`dir-picker-row${selectedIndex === 0 ? ' selected' : ''}`}
-          onClick={onGoUp}
-          onMouseEnter={() => onHoverIndex(0)}
-        >
-          <span class="dir-picker-icon"><FolderUpIcon /></span>
-          <span class="dir-picker-name">..</span>
-        </button>
-      )}
-      {dirs.length === 0 && (
-        <div class="dir-picker-empty" data-state="empty">No subdirectories</div>
-      )}
-      {dirs.map((dir, i) => {
-        const idx = showParent ? i + 1 : i;
-        return (
-          <button
-            key={dir}
-            class={`dir-picker-row${idx === selectedIndex ? ' selected' : ''}`}
-            onClick={() => onSelectDir(dir)}
-            onMouseEnter={() => onHoverIndex(idx)}
-          >
-            <span class="dir-picker-icon"><FolderIcon /></span>
-            <span class="dir-picker-name">{dir}</span>
-          </button>
-        );
-      })}
-    </>
-  );
 }
 
 export function DirectoryPicker({ onSelect, onCancel }: DirectoryPickerProps) {
@@ -142,15 +155,8 @@ export function DirectoryPicker({ onSelect, onCancel }: DirectoryPickerProps) {
     // A centered modal, so it takes `<Overlay>`'s own `.modal-overlay`
     // container. `.dir-picker` places nothing itself, so a wrapper of its own
     // would leave the panel unscrimmed and in flow.
-    <Overlay open onClose={onCancel} panelClass="dir-picker" panelRole="dialog" ariaModal>
-      <div class="dir-picker-header">
-        <span class="dir-picker-title">Select Directory</span>
-        <button class="icon-btn header-icon" onClick={onCancel} aria-label="Close">
-          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
-            <path d="M4 4l8 8M12 4l-8 8" />
-          </svg>
-        </button>
-      </div>
+    <Overlay open onClose={onCancel} panelClass="surface surface-raised dir-picker" panelRole="dialog" ariaModal>
+      <SurfaceHead title="Select Directory" onClose={onCancel} closeLabel="Close directory picker" />
 
       <div class="dir-picker-breadcrumb">
         {editingPath ? (
@@ -212,7 +218,7 @@ export function DirectoryPicker({ onSelect, onCancel }: DirectoryPickerProps) {
           {isGitRepo && <span class="dir-picker-git-badge">git repo</span>}
         </div>
         <div class="dir-picker-actions">
-          <button class="action-btn" onClick={onCancel}>Cancel</button>
+          <button class="action-btn action-btn-secondary" onClick={onCancel}>Cancel</button>
           <button
             class="action-btn action-btn-confirm"
             disabled={data.status !== 'loaded'}

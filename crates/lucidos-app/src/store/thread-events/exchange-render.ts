@@ -1186,7 +1186,7 @@ export function exchangeResponseEvents(exchange: Exchange, isLast = true, thread
 
 /** Will rendering these response events actually DRAW anything?
  *
- *  The mirror of `renderResponseEvents` in `ChatExchange.tsx`, which draws a
+ *  The mirror of `responseBody` (`store/event-rendering.ts`), which draws a
  *  `text` event only when it is `isMeaningfulText` and every other kind
  *  unconditionally. So the one non-drawing shape is a blank `text`, and it is
  *  not hypothetical: `exchangeResponseEvents` pushes one for EVERY
@@ -1512,8 +1512,8 @@ export function isSpeechOnlyTurn(exchange: Exchange): boolean {
 
 /** Is this turn's response body folded away, given the reader's folded keys?
  *
- *  A speech-only turn draws no header, so it has no `⋯` stub and keeps its
- *  body whatever the store holds. `ChatExchange` renders by this, and the
+ *  A speech-only turn draws no header, so it has no collapse control and keeps
+ *  its body whatever the store holds. `ChatExchange` renders by this, and the
  *  render window budgets by it, so the two cannot disagree. */
 export function turnBodyFolded(folded: ReadonlySet<string>, threadId: string, exchange: Exchange): boolean {
   return folded.has(`${threadId}:${exchange.userSeq}`) && !isSpeechOnlyTurn(exchange);

@@ -2,9 +2,7 @@
  *  dropdowns, pseudo-fullscreen). Replaces the per-instance `document` Escape
  *  listeners that each overlay used to register independently — those raced
  *  each other and any future global key handler. Now ONE capture-phase Escape
- *  dispatcher (see `useKeyboardShortcuts`) pops the top entry, and
- *  `resolveGlobalActions` surfaces a top-priority `dismiss_overlay` action when
- *  the stack is non-empty.
+ *  dispatcher (see `useKeyboardShortcuts`) pops the top entry.
  *
  *  An overlay registers its dismiss handler on mount and removes it on unmount.
  *  Calling `dismiss()` closes the overlay (it flips whatever signal renders it),

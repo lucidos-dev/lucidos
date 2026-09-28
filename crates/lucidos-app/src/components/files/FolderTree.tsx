@@ -5,6 +5,7 @@ import type { FolderNode } from '../../store/actions/artifacts';
 import { FileTypeIcon, FolderIcon } from '../../utils/fileIcons';
 import { loadedOr } from '../../store/types';
 import { SkText, SkBlock } from '../shared/Skeleton';
+import { Disclosure } from '../shared/Disclosure';
 
 type FileEntry = { name: string; path: string };
 
@@ -81,7 +82,6 @@ export function TreeNode({
   onFileClick,
   folderExtra,
   fileExtra,
-  fileClass,
 }: {
   node: FolderNode;
   isExpanded: (path: string) => boolean;
@@ -89,7 +89,6 @@ export function TreeNode({
   onFileClick: (path: string) => void;
   folderExtra?: (folder: FolderNode) => ComponentChildren;
   fileExtra?: (file: FileEntry) => ComponentChildren;
-  fileClass?: (file: FileEntry) => string;
 }) {
   const folderNames = Object.keys(node.children).sort();
   const files = [...node.files].sort((a, b) => a.name.localeCompare(b.name));
@@ -112,7 +111,7 @@ export function TreeNode({
               <span class="folder-count">({childCount})</span>
               {folderExtra?.(folder)}
             </div>
-            {expanded && (
+            <Disclosure open={expanded}>
               <div class="folder-contents">
                 <TreeNode
                   node={folder}
@@ -121,10 +120,9 @@ export function TreeNode({
                   onFileClick={onFileClick}
                   folderExtra={folderExtra}
                   fileExtra={fileExtra}
-                  fileClass={fileClass}
                 />
               </div>
-            )}
+            </Disclosure>
           </div>
         );
       })}
@@ -132,7 +130,7 @@ export function TreeNode({
       {files.map((file) => (
         <div
           key={file.path}
-          class={`file-item tree-file-item ${fileClass?.(file) ?? ''}`}
+          class="file-item tree-file-item"
           onClick={() => onFileClick(file.path)}
         >
           <FileTypeIcon path={file.path} className="file-icon" />

@@ -70,6 +70,13 @@ pub enum PrefValue {
     IanaTimezone,
     /// Free-form non-empty text (e.g. a model id, a URL, a language name).
     Text,
+    /// A theme id: well formed, and never a theme mode value. An unknown id
+    /// is accepted and paints the default theme.
+    ThemeId,
+    /// `theme`, a font catalog id, or a well-formed workspace font id. Whether
+    /// the workspace font exists is asked where it is used, which falls back
+    /// when it does not (ADR 0308).
+    FontFamily,
 }
 
 /// One agent-settable preference.
@@ -103,18 +110,13 @@ const IMAGE_MODELS: &[&str] = &[
 /// `crates/lucidos-app/src/store/actions/preferences.ts`, which is also where
 /// the routing lives (`utils/openExternalUrl.ts`).
 const EXTERNAL_LINK_TARGETS: &[&str] = &["safari", "ask", "in-app"];
-/// Mirrors `Theme` / `FontFamily` in the same frontend file.
-const THEMES: &[&str] = &["light", "dark", "system"];
+/// Mirrors `THEME_MODES` in `packages/lucidos-sdk/src/appearance.ts`.
+const THEME_MODES: &[&str] = &["light", "dark", "system"];
 /// Mirrors `MOTION_PREFS` in `packages/lucidos-sdk/src/appearance.ts`.
 const MOTION_PREFS: &[&str] = &["system", "reduce", "full"];
-const FONT_FAMILIES: &[&str] = &[
-    "monospace",
-    "system",
-    "inter",
-    "jetbrains-mono",
-    "ibm-plex-mono",
-    "fira-code",
-];
+
+/// Mirrors `THEME_EFFECTS_PREFS` in `packages/lucidos-sdk/src/appearance.ts`.
+const THEME_EFFECTS_PREFS: &[&str] = &["system", "reduce", "full"];
 
 /// The catalog. Keep this in lockstep with `system-knowhow/preferences.md`
 /// (the sync test in this module's tests pins the doc's key table to these
@@ -485,21 +487,21 @@ pub const CATALOG: &[PrefSpec] = &[
     },
     // ---- Appearance (device-scoped) ----
     PrefSpec {
-        key: "theme",
-        label: "Theme",
+        key: "theme-mode",
+        label: "Theme mode",
         scope: PrefScope::Device,
-        value: PrefValue::Enum(THEMES),
+        value: PrefValue::Enum(THEME_MODES),
         default: "system",
-        description: "Color theme for THIS device. Defaults to 'system', which follows the OS light/dark setting; 'light' and 'dark' pin it. Device-scoped, so it overrides the global value on the device that set it.",
+        description: "Light or dark for THIS device. Defaults to 'system', which follows the OS light/dark setting; 'light' and 'dark' pin it. Device-scoped, so it overrides the global value on the device that set it.",
         side_effect: PrefSideEffect::None,
     },
     PrefSpec {
         key: "font-family",
         label: "Font family",
         scope: PrefScope::Device,
-        value: PrefValue::Enum(FONT_FAMILIES),
-        default: "fira-code",
-        description: "UI font for THIS device. Device-scoped. The default 'fira-code' is served by this engine, so it needs no internet; 'inter', 'jetbrains-mono' and 'ibm-plex-mono' are fetched from Google Fonts on first use, and 'monospace' / 'system' use the device's own fonts.",
+        value: PrefValue::FontFamily,
+        default: crate::core::fonts::FOLLOW_THEME,
+        description: "UI font for THIS device. The default 'theme' paints the active theme's font, else 'fira-code'. A font id wins over the theme. Every font is bundled, on the device, or a workspace font ('ws-<slug>') (GET /api/v1/fonts), so none loads from the internet.",
         side_effect: PrefSideEffect::None,
     },
     PrefSpec {
@@ -518,6 +520,24 @@ pub const CATALOG: &[PrefSpec] = &[
         value: PrefValue::Enum(MOTION_PREFS),
         default: "system",
         description: "Whether animations are reduced on THIS device. Defaults to 'system', which follows the OS reduce-motion setting. 'reduce' calms the app (no slides, pulses or spinners) whatever the OS says; 'full' keeps every animation even when the OS asks to reduce. Device-scoped.",
+        side_effect: PrefSideEffect::None,
+    },
+    PrefSpec {
+        key: "theme-effects",
+        label: "Theme effects",
+        scope: PrefScope::Device,
+        value: PrefValue::Enum(THEME_EFFECTS_PREFS),
+        default: "system",
+        description: "Whether the shadows, filters and scanlines a theme puts on its parts show on THIS device. 'system' drops them when the OS asks for more contrast or less transparency. 'reduce' always drops them and keeps part colours, letter-spacing, the caret shape and borders; 'full' always shows them. Device-scoped.",
+        side_effect: PrefSideEffect::None,
+    },
+    PrefSpec {
+        key: crate::core::themes::THEME_KEY,
+        label: "Theme",
+        scope: PrefScope::Device,
+        value: PrefValue::ThemeId,
+        default: crate::core::themes::DEFAULT_THEME_ID,
+        description: "The theme (colours, header and focus styles) on THIS device, by id: a built-in like 'nord' or a workspace theme at data/themes/<id>.json. Device-scoped. See the `themes` knowhow.",
         side_effect: PrefSideEffect::None,
     },
     // ---- Typing (device-scoped) ----
@@ -744,6 +764,23 @@ pub fn validate(spec: &PrefSpec, value: &str) -> Result<(), String> {
                 Ok(())
             }
         }
+        PrefValue::ThemeId => {
+            crate::core::themes::validate_id(value).map_err(|e| format!("'{}': {}", spec.key, e))
+        }
+        PrefValue::FontFamily => {
+            if crate::core::fonts::FONT_PREFERENCE_VALUES.contains(&value)
+                || crate::core::workspace_fonts::is_workspace_id(value)
+            {
+                Ok(())
+            } else {
+                Err(format!(
+                    "'{}' must be one of [{}] (got '{}')",
+                    spec.key,
+                    allowed_values_hint(spec),
+                    value
+                ))
+            }
+        }
     }
 }
 
@@ -756,6 +793,11 @@ pub fn allowed_values_hint(spec: &PrefSpec) -> String {
         PrefValue::Number { min, max } => format!("number {}–{}", min, max),
         PrefValue::IanaTimezone => "IANA timezone name".to_string(),
         PrefValue::Text => "text".to_string(),
+        PrefValue::ThemeId => "a theme id".to_string(),
+        PrefValue::FontFamily => format!(
+            "{} | ws-<slug> (a workspace font)",
+            crate::core::fonts::FONT_PREFERENCE_VALUES.join(" | ")
+        ),
     }
 }
 
@@ -813,7 +855,7 @@ mod tests {
 
     #[test]
     fn enum_validation() {
-        let spec = lookup("theme").unwrap();
+        let spec = lookup("theme-mode").unwrap();
         assert!(validate(spec, "dark").is_ok());
         assert!(validate(spec, "system").is_ok());
         assert!(validate(spec, "blue").is_err());
@@ -873,19 +915,30 @@ mod tests {
         };
 
         assert_eq!(
-            lookup("theme").unwrap().default,
-            declared("DEFAULT_THEME"),
-            "the catalog's theme default has drifted from the client contract"
+            lookup("theme-mode").unwrap().default,
+            declared("DEFAULT_THEME_MODE"),
+            "the catalog's theme mode default has drifted from the client contract"
         );
+        // Both sides name the font catalog's constant, which the generated
+        // `font-catalog.ts` carries (its staleness test pins the value).
         assert_eq!(
             lookup("font-family").unwrap().default,
-            declared("DEFAULT_FONT_FAMILY"),
-            "the catalog's font default has drifted from the client contract"
+            crate::core::fonts::FOLLOW_THEME
+        );
+        assert_eq!(
+            declared("DEFAULT_FONT_PREFERENCE: FontPreference"),
+            "FOLLOW_THEME",
+            "the client's font default no longer follows the theme"
         );
         assert_eq!(
             lookup("motion").unwrap().default,
             declared("DEFAULT_MOTION"),
             "the catalog's motion default has drifted from the client contract"
+        );
+        assert_eq!(
+            lookup("theme-effects").unwrap().default,
+            declared("DEFAULT_THEME_EFFECTS"),
+            "the catalog's theme-effects default has drifted from the client contract"
         );
     }
 
@@ -909,6 +962,17 @@ mod tests {
             crate::engine::DEFAULT_SWEEP_EVERY_ROUNDS.to_string(),
             "Settings advertises a sweep interval the sweep does not use"
         );
+    }
+
+    #[test]
+    fn font_family_takes_a_catalog_font_theme_or_a_workspace_font() {
+        let spec = lookup("font-family").unwrap();
+        for value in ["theme", "fira-code", "inter", "ws-brand-sans", spec.default] {
+            assert!(validate(spec, value).is_ok(), "{value}");
+        }
+        for value in ["", "comic-sans", "ws-", "ws-Brand", "ws-a/b", "url(x)"] {
+            assert!(validate(spec, value).is_err(), "{value}");
+        }
     }
 
     /// A default the enum does not allow is a default nothing can ever hold: the
@@ -1084,13 +1148,13 @@ mod tests {
     }
 
     #[test]
-    fn theme_is_device_scoped_and_language_is_global() {
-        assert_eq!(lookup("theme").unwrap().scope, PrefScope::Device);
+    fn theme_mode_is_device_scoped_and_language_is_global() {
+        assert_eq!(lookup("theme-mode").unwrap().scope, PrefScope::Device);
         assert_eq!(lookup("language").unwrap().scope, PrefScope::Global);
     }
 
     /// Motion is a comfort setting for one screen, so it must not reach another
-    /// device. Unset follows the OS, like theme.
+    /// device. Unset follows the OS, like the theme mode.
     #[test]
     fn motion_is_a_device_scoped_three_way_choice() {
         let spec = lookup("motion").expect("the agent can set motion");
@@ -1100,6 +1164,19 @@ mod tests {
         }
         assert!(validate(spec, "off").is_err());
         assert!(validate(spec, "true").is_err());
+        assert_eq!(spec.default, "system", "unset follows the OS");
+    }
+
+    /// Theme effects are a comfort and battery setting for one screen, like
+    /// motion. Unset follows the OS (ADR 0307).
+    #[test]
+    fn theme_effects_is_a_device_scoped_three_way_choice() {
+        let spec = lookup("theme-effects").expect("the agent can set theme-effects");
+        assert_eq!(spec.scope, PrefScope::Device);
+        for value in ["system", "reduce", "full"] {
+            assert!(validate(spec, value).is_ok(), "{value} must be accepted");
+        }
+        assert!(validate(spec, "off").is_err());
         assert_eq!(spec.default, "system", "unset follows the OS");
     }
 

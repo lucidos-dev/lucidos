@@ -261,7 +261,7 @@ describe('no floating promises in components/', () => {
     expect(ASYNC_EXPORTS.has('loadApps')).toBe(true);
     expect(ASYNC_EXPORTS.has('uploadFiles')).toBe(true);
     expect(ASYNC_EXPORTS.has('applySingleChange')).toBe(true);
-    expect(ASYNC_EXPORTS.has('setTheme')).toBe(true);
+    expect(ASYNC_EXPORTS.has('setThemeMode')).toBe(true);
     expect(ASYNC_EXPORTS.has('setUiScale')).toBe(true);
     // `listen` in utils/tauri.ts has a callback-typed parameter
     // (`handler: (e: { payload: T }) => void`) — verifies the paren-matching

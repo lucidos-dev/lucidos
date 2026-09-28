@@ -7,8 +7,10 @@ import {
   confirmDeleteApp,
   openEditApp,
   closeAppSearch,
+  refreshApps,
 } from '../../store/actions/apps';
-import { loadPluginCatalog } from '../../store/actions/plugin-marketplaces';
+import { loadPluginCatalog, refreshPluginCatalog } from '../../store/actions/plugin-marketplaces';
+import { usePanelRefresh } from '../../hooks/usePanelRefresh';
 import { installMarketplacePlugin } from '../../store/actions/plugin-install';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { LoadableError } from '../shared/LoadableError';
@@ -50,7 +52,16 @@ function AppSearchBar() {
   );
 }
 
+/** The apps list, and the catalog its rows read their plugin labels from. */
+function refreshAppsPanel(): Promise<unknown> {
+  return Promise.all([
+    refreshApps(),
+    refreshPluginCatalog(),
+  ]);
+}
+
 export function AppsView() {
+  usePanelRefresh('apps', refreshAppsPanel);
   const loadable = appsList.value;
   const showLoading = useDelayedLoading(loadable);
 

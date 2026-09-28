@@ -44,6 +44,7 @@ import { reportDraftClobbered } from './deadKeystrokeProbe';
 import { effectiveCodingAgentBackend, effectiveSendMode } from './promptToggleMode';
 import { resizeTextarea, remeasureTextarea, isTextareaHeightAnimating, useFontMetricsResize, useWidthRemeasure, animateTextareaHeightFrom } from './promptResize';
 import { isMobile } from '../../utils/viewport';
+import { cameraIsAvailable } from '../../utils/platform';
 import { isReducedMotion } from '../../utils/motion';
 import { createTapGate } from '../../utils/tapGesture';
 import { useTouchActivated } from '../../hooks/useTouchActivated';
@@ -118,6 +119,14 @@ export function isImeComposingKey(e: Pick<KeyboardEvent, 'isComposing' | 'keyCod
   return e.isComposing || e.keyCode === IME_HANDLED_KEYCODE;
 }
 
+/** Whether an input event opens the Claude Code slash-command menu. Opening it
+ *  clears the box, so only a box holding a lone `/` qualifies. A value that
+ *  merely starts with `/` is the user's text: a pasted path or log line, or a
+ *  slash typed in front of a draft. Pure, and exported for testing. */
+export function opensSlashMenu(value: string, claudeCodeMode: boolean): boolean {
+  return claudeCodeMode && value === '/';
+}
+
 function addImageFile(file: File) {
   attachImageToActiveDraft(file).catch((err) => {
     showToast('Failed to attach image: ' + errorDetail(err), 'error');
@@ -125,13 +134,24 @@ function addImageFile(file: File) {
 }
 
 
+/** Said when this page has no camera API at all, as over plain http on a LAN. */
+export const NO_CAMERA_API = 'This page cannot open a camera. The camera needs a secure connection.';
+
+/** Open the rear camera. Rejects, and never throws, where this page has no
+ *  camera API: `navigator.mediaDevices` is undefined outside a secure context,
+ *  and a synchronous throw would escape the caller's `.catch`. */
+export function openRearCamera(): Promise<MediaStream> {
+  if (!cameraIsAvailable()) return Promise.reject(new Error(NO_CAMERA_API));
+  return navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
+}
+
 function CameraCapture() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
 
   useEffect(() => {
     let canceled = false;
-    navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } })
+    openRearCamera()
       .then((stream) => {
         if (canceled) { stream.getTracks().forEach((t) => t.stop()); return; }
         streamRef.current = stream;
@@ -139,8 +159,8 @@ function CameraCapture() {
           videoRef.current.srcObject = stream;
         }
       })
-      .catch(() => {
-        showToast('Could not access camera', 'error');
+      .catch((err: unknown) => {
+        showToast(`Could not access camera: ${errorDetail(err)}`, 'error');
         cameraOpen.value = false;
       });
     return () => {
@@ -187,13 +207,13 @@ function CameraCapture() {
   // Backdrop-only modal (the attach menu that opened it is gone by now, so
   // there is no anchor toggle) — <Overlay> owns dismiss/swallow/Escape/inert.
   return (
-    <Overlay open onClose={close} overlayClass="camera-overlay" panelClass="camera-container" panelRole="dialog">
+    <Overlay open onClose={close} overlayClass="camera-overlay" panelClass="surface surface-raised camera-container" panelRole="dialog">
       <video ref={videoRef} autoPlay playsInline muted class="camera-video" />
       <div class="camera-controls">
         <button class="camera-capture-btn" onClick={capture} aria-label="Take photo" data-tooltip="Take photo">
           <CaptureIcon />
         </button>
-        <button class="action-btn action-btn-danger" onClick={close}>Cancel</button>
+        <button class="action-btn action-btn-secondary" onClick={close}>Cancel</button>
       </div>
     </Overlay>
   );
@@ -698,16 +718,15 @@ export function PromptInput() {
     // `resolveEmptyDraftSync`.
     typedSinceComposerWroteRef.current = true;
     const val = el.value;
-    // "/" prefix opens Claude Code slash commands. Codex shares the legacy
-    // claude_code channel but has no slash-command surface, so Codex prompts
-    // keep the slash as normal message text.
+    // Codex shares the legacy claude_code channel but has no slash-command
+    // surface, so Codex prompts keep the slash as normal message text.
     const tid = focusedThreadId.value;
     const thread = tid ? threadMap.value.get(tid) : undefined;
     const isClaudeCodeMode = effectiveCodingAgentBackend(thread, resolveCodingAgent(tid)) === 'claude-code';
-    if (isClaudeCodeMode && val.startsWith('/')) {
+    if (opensSlashMenu(val, isClaudeCodeMode)) {
       writeComposerValue(el, '');
       autoResize();
-      codingAgentMenuOpenRequest.value = val.slice(1);
+      codingAgentMenuOpenRequest.value = '';
       if (tid) updateCompose(tid, { text: '' });
       return;
     }
@@ -1336,7 +1355,7 @@ export function PromptInput() {
           onClose={() => { attachMenuOpen.value = false; }}
           anchor={menuRef.current}
           backdrop={false}
-          panelClass="image-attach-menu"
+          panelClass="surface-box image-attach-menu"
         >
           <button onClick={() => { attachMenuOpen.value = false; cameraOpen.value = true; }}>
             <CameraIcon />

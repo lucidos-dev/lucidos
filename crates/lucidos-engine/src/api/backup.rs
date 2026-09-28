@@ -298,8 +298,9 @@ pub async fn get_backup_key(
 }
 
 /// POST /api/v1/backup/key — generate the key if absent, then return it. This is
-/// the only user-facing path that mints a key (the backup paths also mint via
-/// `ensure_key`). Idempotent: if a key already exists it's returned unchanged
+/// the only path that mints a key onto the user's screen. The backup paths mint
+/// through `scheduler::ensure_backup_key`, which notifies the user instead.
+/// Idempotent: if a key already exists it's returned unchanged
 /// with `is_new: false`, so a double-click — or a race with a scheduled backup —
 /// can never overwrite the key that protects existing backups.
 ///
@@ -346,7 +347,8 @@ pub async fn create_backup(
 
     // Validate sync — guard drops on early return so the flag is released.
     let provider = resolve_provider(&req.provider, &state.pool)?;
-    let (key, _) = crypto::ensure_key(&state.workspace_path)
+    let key = crate::scheduler::ensure_backup_key(&state.engine, &state.workspace_path)
+        .await
         .map_err(|e| ApiError::internal(format!("Failed to get backup key: {e}")))?;
 
     let engine = state.engine.clone();
@@ -585,7 +587,8 @@ pub async fn set_schedule(
 
     // Ensure a backup key exists before enabling a schedule
     if backup::is_schedule_active(&req.schedule) {
-        crypto::ensure_key(&state.workspace_path)
+        crate::scheduler::ensure_backup_key(&state.engine, &state.workspace_path)
+            .await
             .map_err(|e| ApiError::internal(format!("Failed to ensure backup key: {e}")))?;
     }
 
@@ -600,7 +603,7 @@ pub async fn set_schedule(
     // announces each key it touches. The handler used to hand-roll those emits
     // afterwards; moving them into the write path is what makes a second caller
     // of `set_backup_schedule` impossible to get wrong.
-    let actor = crate::api::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    let actor = crate::api::actor::user_actor(&headers, None);
     {
         let mut scheduler = state.scheduler.lock().await;
         scheduler
@@ -650,7 +653,7 @@ pub async fn set_retention(
         return Err(ApiError::bad_request("Must keep at least 1 backup"));
     }
     let value = req.keep.to_string();
-    let actor = crate::api::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    let actor = crate::api::actor::user_actor(&headers, None);
     PreferenceStore::set(
         &state.pool,
         &state.engine.event_bus,
@@ -876,7 +879,6 @@ mod tests {
             minted: false,
             actor: Some(MessageOrigin::Device {
                 device_id: "device-1".to_string(),
-                label: "My MacBook".to_string(),
             }),
         };
         assert_eq!(

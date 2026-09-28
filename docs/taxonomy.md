@@ -100,6 +100,12 @@ data/
   scripts/                  ← Shared scripts NOT tied to one consumer
     <name>/run.py           ← Invoked by intents, knowhow, or proxy auth handshakes across apps/triggers
 
+  themes/                    ← Themes: named sets of design-token values (system-knowhow/themes.md)
+    <id>.json               ← One theme; the device-scoped `theme` preference picks it
+
+  fonts/                    ← Workspace fonts, beside the bundled catalog (system-knowhow/workspace-fonts.md)
+    <slug>/font.json        ← One font's label, group and faces; its id is `ws-<slug>`
+
   postgres/                 ← Event store — gitignored
 ```
 

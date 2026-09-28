@@ -73,7 +73,6 @@ async fn emit_orphan_turn(bus: &EventBus, thread_id: Uuid) {
             text: "stuck request".into(),
             user_image_hashes: vec![],
             device_id: None,
-            device: None,
             image_description: None,
             parent_thread_id: None,
             spawning_event_id: None,
@@ -110,7 +109,6 @@ async fn emit_orphan_tool_call(bus: &EventBus, thread_id: Uuid) {
             text: "trigger a tool".into(),
             user_image_hashes: vec![],
             device_id: None,
-            device: None,
             image_description: None,
             parent_thread_id: None,
             spawning_event_id: None,
@@ -482,7 +480,6 @@ mod switch_resume {
     fn device_actor() -> MessageOrigin {
         MessageOrigin::Device {
             device_id: "dev-1".into(),
-            label: "My MacBook".into(),
         }
     }
 
@@ -497,7 +494,6 @@ mod switch_resume {
                 text: "do the thing".into(),
                 user_image_hashes: vec![],
                 device_id: None,
-                device: None,
                 image_description: None,
                 parent_thread_id: None,
                 spawning_event_id: None,
@@ -638,7 +634,7 @@ mod switch_resume {
             crate::api::actor::HEADER_DEVICE_ID,
             axum::http::HeaderValue::from_static("picker-device"),
         );
-        let actor = crate::api::actor::user_actor(&headers, None, None);
+        let actor = crate::api::actor::user_actor(&headers, None);
         assert!(
             matches!(actor, Some(MessageOrigin::Device { .. })),
             "the picker's device-id header must resolve to a Device actor"

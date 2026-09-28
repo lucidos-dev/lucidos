@@ -12,7 +12,9 @@ impl LucidosEngine {
     ) {
         let cc_session_id = {
             let guard = self.agent_sessions.lock().await;
-            guard.get(&thread_id).and_then(|s| s.cc_session_id.clone())
+            guard
+                .get(&thread_id)
+                .and_then(|s| s.backend_session_id.clone())
         };
         // Phase 8.1: snapshot the worktree's HEAD SHA so that the next spawn
         // can detect external user edits made between turns. `git rev-parse`

@@ -1,10 +1,11 @@
 use std::ffi::OsStr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 mod branch_name;
 mod checkpoint;
 mod commits;
+mod conflict_probe;
 mod harden_marker;
 mod merge;
 mod plan_marker;
@@ -14,6 +15,7 @@ mod worktree;
 pub(crate) use branch_name::*;
 pub(crate) use checkpoint::*;
 pub(crate) use commits::*;
+pub(crate) use conflict_probe::*;
 pub(crate) use harden_marker::*;
 pub(crate) use merge::*;
 pub(crate) use plan_marker::*;
@@ -44,6 +46,56 @@ pub(crate) fn canonical_repo_root(repo_root: &Path) -> String {
 /// while the e2e suite runs, ordinary `rev-parse` calls have been observed
 /// taking tens of seconds.
 pub(crate) const GIT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The git binary the engine launches, resolved once per process.
+///
+/// On macOS `/usr/bin/git` is the `xcrun` shim, which launches the real git as
+/// a second process. Every launch costs tens of milliseconds there, so the shim
+/// doubles the price of each call. The shim's git names its exec path, whose
+/// `git` is the binary behind it.
+///
+/// Lazy, so it resolves after `core::user_path::augment_process_path` has set
+/// the PATH it reads.
+pub(crate) async fn git_program() -> &'static Path {
+    static PROGRAM: tokio::sync::OnceCell<PathBuf> = tokio::sync::OnceCell::const_new();
+    PROGRAM
+        .get_or_init(|| async {
+            let path_git = std::env::var_os("PATH").and_then(|path| {
+                std::env::split_paths(&path)
+                    .map(|dir| dir.join("git"))
+                    .find(|git| git.is_file())
+            });
+            if !is_xcrun_git_shim(path_git.as_deref(), cfg!(target_os = "macos")) {
+                return PathBuf::from("git");
+            }
+            let probe = tokio::process::Command::new("git")
+                .arg("--exec-path")
+                .output();
+            let exec_path = match tokio::time::timeout(GIT_TIMEOUT, probe).await {
+                Ok(Ok(o)) if o.status.success() => Some(o.stdout),
+                _ => None,
+            };
+            git_program_from_exec_path(exec_path.as_deref())
+        })
+        .await
+}
+
+/// Only the `xcrun` shim is bypassed. Another `git` on PATH may be a wrapper
+/// that injects config, credentials or auditing. Launching the binary behind
+/// it would skip all of that.
+fn is_xcrun_git_shim(path_git: Option<&Path>, macos: bool) -> bool {
+    macos && path_git == Some(Path::new("/usr/bin/git"))
+}
+
+/// `<exec-path>/git` when `git --exec-path` answered with a directory holding
+/// one, else bare `git`. A failed probe costs the shortcut, never a git call.
+fn git_program_from_exec_path(stdout: Option<&[u8]>) -> PathBuf {
+    let dir = stdout.map(|s| String::from_utf8_lossy(s).trim().to_string());
+    match dir.filter(|d| !d.is_empty()) {
+        Some(dir) if Path::new(&dir).join("git").is_file() => Path::new(&dir).join("git"),
+        _ => PathBuf::from("git"),
+    }
+}
 
 /// Run a git command with the [`GIT_TIMEOUT`] ceiling. Always prepends
 /// `-c core.quotepath=false` so non-ASCII paths come back as raw UTF-8 instead
@@ -110,8 +162,37 @@ pub(crate) async fn git_cmd_kill_on_timeout(
     git_cmd_spawn(args, dir, &[], GIT_TIMEOUT, true).await
 }
 
-/// The one place a git subprocess is spawned. `kill_on_timeout` decides whether
-/// giving up on the wait also kills the process.
+/// Run `program`, falling back to PATH's `git` when `program` is gone.
+///
+/// The resolved binary can vanish under a running engine: a Homebrew upgrade
+/// deletes the versioned keg its exec path named, while PATH's `git` follows
+/// the upgrade.
+async fn run_git(
+    program: &Path,
+    args: &[&str],
+    dir: &Path,
+    envs: &[(&str, &OsStr)],
+    kill_on_drop: bool,
+) -> std::io::Result<std::process::Output> {
+    let output = |program: &Path| {
+        let mut cmd = tokio::process::Command::new(program);
+        cmd.args(args).current_dir(dir).kill_on_drop(kill_on_drop);
+        for (key, value) in envs {
+            cmd.env(key, value);
+        }
+        async move { cmd.output().await }
+    };
+    match output(program).await {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && program != Path::new("git") => {
+            output(Path::new("git")).await
+        }
+        result => result,
+    }
+}
+
+/// The one place a git command is spawned, through [`run_git`]. The only other
+/// launch is [`git_program`]'s one-time probe, which finds the binary this runs.
+/// `kill_on_timeout` decides whether giving up on the wait also kills the process.
 async fn git_cmd_spawn(
     args: &[&str],
     dir: &Path,
@@ -123,14 +204,8 @@ async fn git_cmd_spawn(
     full_args.push("-c");
     full_args.push("core.quotepath=false");
     full_args.extend_from_slice(args);
-    let mut cmd = tokio::process::Command::new("git");
-    cmd.args(&full_args)
-        .current_dir(dir)
-        .kill_on_drop(kill_on_timeout);
-    for (key, value) in envs {
-        cmd.env(key, value);
-    }
-    match tokio::time::timeout(timeout, cmd.output()).await {
+    let run = run_git(git_program().await, &full_args, dir, envs, kill_on_timeout);
+    match tokio::time::timeout(timeout, run).await {
         Ok(Ok(output)) => Ok(output),
         Ok(Err(e)) => Err(format!("git {} failed: {}", args.join(" "), e)),
         Err(_) => Err(format!(
@@ -381,6 +456,10 @@ mod common;
 #[cfg(test)]
 #[path = "../git_ops_tests/answer.rs"]
 mod answer_tests;
+
+#[cfg(test)]
+#[path = "../git_ops_tests/program.rs"]
+mod program_tests;
 
 #[cfg(test)]
 #[path = "../git_ops_tests/app_worktree.rs"]

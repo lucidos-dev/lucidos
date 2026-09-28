@@ -81,7 +81,7 @@ pub enum PreferencesCmd {
     },
     /// Change one preference. Call 'get' first if unsure of the key or its allowed values.
     Set {
-        /// e.g. 'theme', 'language', 'timezone', 'chat_model'.
+        /// e.g. 'theme-mode', 'language', 'timezone', 'chat_model'.
         #[arg(long)]
         key: String,
         /// A string: 'true'/'false', '125', or an allowed enum value.

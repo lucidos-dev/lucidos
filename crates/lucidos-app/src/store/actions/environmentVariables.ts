@@ -46,7 +46,7 @@ export async function submitEnvVar(
 }
 
 export async function deleteEnvironmentVariable(name: string): Promise<void> {
-  if (!(await showConfirm(`Delete environment variable "${name}"?`, 'Delete'))) {
+  if (!(await showConfirm(`Delete environment variable "${name}"?`, 'Delete', { variant: 'danger' }))) {
     return;
   }
   try {

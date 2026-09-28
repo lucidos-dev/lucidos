@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { preferences, toasts } from '../store';
-import { applyTheme, applyFontFamily, applyUiScale, currentTheme, currentFontFamily, loadPreferences, welcomeSuggestionsDismissed, dismissWelcomeSuggestions, currentInAppBrowser, setInAppBrowser, inAppBrowserAvailable, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, savePreference, flushPendingPreferenceWrites, _pendingPreferenceKeysForTesting, _resetPendingPreferenceWritesForTesting, currentMaxToolCalls, estimateTurnDuration, MAX_TOOL_CALLS_DEFAULT, MAX_TOOL_CALLS_MIN, isBackupScheduleActive, backupIsActive, backupReminderHiddenByDismissal, backupReminderNextDismissal, backupReminderVisibleIn, backupReminderVisible, dismissBackupReminder, BACKUP_REMINDER_FOREVER, BACKUP_REMINDER_SNOOZE_MS, currentNotificationToasts, setNotificationToasts, VOICE_RESIDENT_SECTIONS, voiceSectionEnabled, setVoiceSectionEnabled, currentBackgroundModel, currentBackgroundReasoning, currentAutocorrect, setAutocorrect, currentMotion, setMotion } from './preferences';
+import { applyThemeMode, applyFontFamily, applyUiScale, currentThemeMode, currentFontFamily, refreshActiveTheme, loadPreferences, welcomeSuggestionsDismissed, dismissWelcomeSuggestions, currentInAppBrowser, setInAppBrowser, inAppBrowserAvailable, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, savePreference, flushPendingPreferenceWrites, _pendingPreferenceKeysForTesting, _resetPendingPreferenceWritesForTesting, currentMaxToolCalls, estimateTurnDuration, MAX_TOOL_CALLS_DEFAULT, MAX_TOOL_CALLS_MIN, isBackupScheduleActive, backupIsActive, backupReminderHiddenByDismissal, backupReminderNextDismissal, backupReminderVisibleIn, backupReminderVisible, dismissBackupReminder, BACKUP_REMINDER_FOREVER, BACKUP_REMINDER_SNOOZE_MS, currentNotificationToasts, setNotificationToasts, VOICE_RESIDENT_SECTIONS, voiceSectionEnabled, setVoiceSectionEnabled, currentBackgroundModel, currentBackgroundReasoning, currentAutocorrect, setAutocorrect, currentMotion, setMotion } from './preferences';
 import { motionPreference } from '../../utils/motion';
 import * as apiClient from '../../api/client';
 import { ApiError } from '../../api/client';
@@ -18,7 +18,7 @@ vi.mock('../../utils/platform', () => ({
 const setProseAutocorrectMock = vi.hoisted(() => vi.fn());
 vi.mock('../../utils/noAutofill', () => ({ setProseAutocorrect: setProseAutocorrectMock }));
 
-// applyTheme tints the native title bar via this when isTauri(); mock it so the
+// applyThemeMode tints the native title bar via this when isTauri(); mock it so the
 // web-path tests don't need a Tauri IPC bridge and the Tauri-path test can
 // assert the per-theme color.
 const setTitlebarColorMock = vi.hoisted(() => vi.fn(() => Promise.resolve()));
@@ -32,7 +32,7 @@ vi.mock('../../utils/tauri', () => ({
   windowReadyToShow: windowReadyToShowMock,
 }));
 
-describe('currentTheme — localStorage fallback', () => {
+describe('currentThemeMode: localStorage fallback', () => {
   beforeEach(() => {
     localStorage.clear();
     preferences.value = { status: 'not-loaded' };
@@ -41,71 +41,71 @@ describe('currentTheme — localStorage fallback', () => {
   it('returns localStorage theme when backend has no theme preference', () => {
     // User set light mode → saved in localStorage + backend
     // Backend lost the preference (device_id change, save failure, etc.)
-    localStorage.setItem('lucidos-theme', 'light');
+    localStorage.setItem('lucidos-theme-mode', 'light');
     preferences.value = { status: 'loaded', data: { 'font-family': 'monospace' } };
 
-    // currentTheme() must respect localStorage, not default to 'dark'
-    expect(currentTheme()).toBe('light');
+    // currentThemeMode() must respect localStorage, not default to 'dark'
+    expect(currentThemeMode()).toBe('light');
   });
 
   it('returns backend theme when backend has theme preference', () => {
-    localStorage.setItem('lucidos-theme', 'light');
-    preferences.value = { status: 'loaded', data: { theme: 'dark' } };
+    localStorage.setItem('lucidos-theme-mode', 'light');
+    preferences.value = { status: 'loaded', data: { 'theme-mode': 'dark' } };
 
     // Backend is source of truth when it has a value
-    expect(currentTheme()).toBe('dark');
+    expect(currentThemeMode()).toBe('dark');
   });
 
   it('returns localStorage theme when preferences not yet loaded', () => {
-    localStorage.setItem('lucidos-theme', 'light');
+    localStorage.setItem('lucidos-theme-mode', 'light');
     preferences.value = { status: 'loading' };
 
-    expect(currentTheme()).toBe('light');
+    expect(currentThemeMode()).toBe('light');
   });
 
   it('follows the OS as final fallback when nothing is set', () => {
     preferences.value = { status: 'loaded', data: {} };
 
-    expect(currentTheme()).toBe('system');
+    expect(currentThemeMode()).toBe('system');
   });
 
   it('returns system from localStorage when backend has no theme', () => {
-    localStorage.setItem('lucidos-theme', 'system');
+    localStorage.setItem('lucidos-theme-mode', 'system');
     preferences.value = { status: 'loaded', data: {} };
 
-    expect(currentTheme()).toBe('system');
+    expect(currentThemeMode()).toBe('system');
   });
 
   it('returns localStorage theme when preferences failed to load', () => {
-    localStorage.setItem('lucidos-theme', 'light');
+    localStorage.setItem('lucidos-theme-mode', 'light');
     preferences.value = { status: 'failed', error: 'network error' };
 
-    expect(currentTheme()).toBe('light');
+    expect(currentThemeMode()).toBe('light');
   });
 
   it('skips invalid backend value and falls back to localStorage', () => {
-    localStorage.setItem('lucidos-theme', 'light');
-    preferences.value = { status: 'loaded', data: { theme: 'garbage' } };
+    localStorage.setItem('lucidos-theme-mode', 'light');
+    preferences.value = { status: 'loaded', data: { 'theme-mode': 'garbage' } };
 
-    expect(currentTheme()).toBe('light');
+    expect(currentThemeMode()).toBe('light');
   });
 
   it('ignores invalid localStorage values', () => {
-    localStorage.setItem('lucidos-theme', 'purple');
+    localStorage.setItem('lucidos-theme-mode', 'purple');
     preferences.value = { status: 'loaded', data: {} };
 
-    expect(currentTheme()).toBe('system');
+    expect(currentThemeMode()).toBe('system');
   });
 
   // The defaults apply where nothing is stored, which is most existing devices:
   // no first run seeds either row, so a device that never opened Settings picks
   // them up. A device that DID pick keeps its pick, and the two cases above
   // ('returns backend theme…', 'skips invalid backend value…') pin that half.
-  it('defaults an untouched device to system theme and Fira Code', () => {
+  it('defaults an untouched device to system theme and following the theme', () => {
     preferences.value = { status: 'loaded', data: {} };
 
-    expect(currentTheme()).toBe('system');
-    expect(currentFontFamily()).toBe('fira-code');
+    expect(currentThemeMode()).toBe('system');
+    expect(currentFontFamily()).toBe('theme');
   });
 
   it('a stored font pick survives the default', () => {
@@ -164,26 +164,26 @@ describe('apply* functions mirror to localStorage for FOUC inline script', () =>
     (document as any).head = originalHead;
   });
 
-  it('applyTheme writes lucidos-theme to localStorage', () => {
-    applyTheme('light');
-    expect(localStorage.getItem('lucidos-theme')).toBe('light');
-    expect(attrs['data-theme']).toBe('light');
+  it('applyThemeMode writes lucidos-theme-mode to localStorage', () => {
+    applyThemeMode('light');
+    expect(localStorage.getItem('lucidos-theme-mode')).toBe('light');
+    expect(attrs['data-theme-mode']).toBe('light');
     expect(inlineProps['--bg-primary']).toBe('#ffffff');
   });
 
-  it('applyTheme keeps inline --bg-primary in sync on toggle', () => {
-    applyTheme('light');
+  it('applyThemeMode keeps inline --bg-primary in sync on toggle', () => {
+    applyThemeMode('light');
     expect(inlineProps['--bg-primary']).toBe('#ffffff');
-    applyTheme('dark');
+    applyThemeMode('dark');
     expect(inlineProps['--bg-primary']).toBe('#07172e');
   });
 
-  it('applyTheme sets html.style.background inline so the WebView has a paintable bg before global.css loads', () => {
-    // See preferences.ts:applyTheme for why — iOS PWA cold-restart flash.
+  it('applyThemeMode sets html.style.background inline so the WebView has a paintable bg before global.css loads', () => {
+    // See preferences.ts:applyThemeMode for why: the iOS PWA cold-restart flash.
     const el = (document as any).documentElement;
-    applyTheme('dark');
+    applyThemeMode('dark');
     expect(el.style.background).toBe('#07172e');
-    applyTheme('light');
+    applyThemeMode('light');
     expect(el.style.background).toBe('#ffffff');
   });
 
@@ -194,6 +194,51 @@ describe('apply* functions mirror to localStorage for FOUC inline script', () =>
     applyFontFamily('monospace');
     expect(localStorage.getItem('lucidos-font-family')).toBe('monospace');
     expect(inlineProps['--font-ui']).toContain('SF Mono');
+  });
+
+  describe('the font a theme suggests (theme suggests, user wins)', () => {
+    const FIRA = "'Fira Code', ui-monospace,";
+
+    async function activateTheme(fonts: Record<string, string>): Promise<void> {
+      vi.spyOn(apiClient, 'getTheme').mockResolvedValue({
+        id: 'harbour', source: 'workspace', name: 'Harbour', modes: [],
+        resolved: { dark: {}, light: {}, fonts },
+      } as any);
+      await refreshActiveTheme('harbour');
+    }
+
+    afterEach(async () => {
+      await refreshActiveTheme('lucidos');
+      vi.restoreAllMocks();
+    });
+
+    it('a device that follows the theme paints the theme font', async () => {
+      preferences.value = { status: 'loaded', data: {} };
+      await activateTheme({ ui: 'geist' });
+      expect(inlineProps['--font-ui']).toMatch(/^'Geist',/);
+      // The RAW preference is cached, so the boot script resolves the same way.
+      expect(localStorage.getItem('lucidos-font-family')).toBe('theme');
+    });
+
+    it('an explicit pick wins over the theme font', async () => {
+      preferences.value = { status: 'loaded', data: { 'font-family': 'ibm-plex-mono' } };
+      await activateTheme({ ui: 'geist' });
+      expect(inlineProps['--font-ui']).toMatch(/^'IBM Plex Mono', /);
+      expect(localStorage.getItem('lucidos-font-family')).toBe('ibm-plex-mono');
+    });
+
+    it('a theme with no font falls back to Fira Code', async () => {
+      preferences.value = { status: 'loaded', data: {} };
+      await activateTheme({});
+      expect(inlineProps['--font-ui'].startsWith(FIRA)).toBe(true);
+    });
+
+    it('switching back to the default theme drops the theme font', async () => {
+      preferences.value = { status: 'loaded', data: {} };
+      await activateTheme({ ui: 'geist' });
+      await refreshActiveTheme('lucidos');
+      expect(inlineProps['--font-ui'].startsWith(FIRA)).toBe(true);
+    });
   });
 
   it('applyFontFamily turns Fira Code ligatures OFF for text with explicit zeros, not `normal`', () => {
@@ -228,6 +273,13 @@ describe('apply* functions mirror to localStorage for FOUC inline script', () =>
     expect(inlineProps['--font-features-code']).toBe('normal');
   });
 
+  it('applyFontFamily says on <html> whether the UI font has a bold face', () => {
+    applyFontFamily('vt323');
+    expect(document.documentElement.getAttribute('data-font-bold')).toBe('none');
+    applyFontFamily('fira-code');
+    expect(document.documentElement.getAttribute('data-font-bold')).toBe('face');
+  });
+
   it('applyUiScale writes lucidos-ui-scale to localStorage', () => {
     applyUiScale(125);
     expect(localStorage.getItem('lucidos-ui-scale')).toBe('125');
@@ -260,7 +312,7 @@ describe('loadPreferences — no flash when refetching after PreferencesChanged'
   it('does not wipe loaded state to "loading" on a refetch', async () => {
     // First load → goes through 'loading' to 'loaded' as expected.
     vi.spyOn(apiClient, 'getPreferences').mockResolvedValue({
-      preferences: { theme: 'dark', 'font-family': 'monospace' },
+      preferences: { 'theme-mode': 'dark', 'font-family': 'monospace' },
     });
     await loadPreferences();
     expect(preferences.value.status).toBe('loaded');
@@ -287,7 +339,7 @@ describe('loadPreferences — no flash when refetching after PreferencesChanged'
   it('still flips to "loading" on the very first call', async () => {
     vi.spyOn(apiClient, 'getPreferences').mockImplementation(async () => {
       // Capture the synchronous state after invocation.
-      return { preferences: { theme: 'dark' } };
+      return { preferences: { 'theme-mode': 'dark' } };
     });
 
     const promise = loadPreferences();
@@ -318,12 +370,12 @@ describe('loadPreferences: transient failures retry, real ones surface', () => {
   it('retries once when the browser cancels the fetch mid-flight', async () => {
     vi.spyOn(apiClient, 'getPreferences')
       .mockRejectedValueOnce(new DOMException('Fetch is aborted', 'AbortError'))
-      .mockResolvedValueOnce({ preferences: { theme: 'dark' } });
+      .mockResolvedValueOnce({ preferences: { 'theme-mode': 'dark' } });
 
     await loadPreferences();
 
     expect(apiClient.getPreferences).toHaveBeenCalledTimes(2);
-    expect(preferences.value).toEqual({ status: 'loaded', data: { theme: 'dark' } });
+    expect(preferences.value).toEqual({ status: 'loaded', data: { 'theme-mode': 'dark' } });
   });
 
   it('retries once when our own deadline fires (engine still booting)', async () => {
@@ -393,17 +445,17 @@ describe('loadPreferences: a stale response cannot overwrite a fresher one', () 
     const older = new Promise<{ preferences: Record<string, string> }>(r => { resolveOlder = r; });
     vi.spyOn(apiClient, 'getPreferences')
       .mockReturnValueOnce(older)
-      .mockResolvedValueOnce({ preferences: { theme: 'dark' } });
+      .mockResolvedValueOnce({ preferences: { 'theme-mode': 'dark' } });
 
     const first = loadPreferences();
     const second = loadPreferences();
     // The newer call settles FIRST; the older one resolves after it, which
     // is the exact reordering that would overwrite fresh data unguarded.
     await second;
-    resolveOlder({ preferences: { theme: 'light' } });
+    resolveOlder({ preferences: { 'theme-mode': 'light' } });
     await first;
 
-    expect(preferences.value).toEqual({ status: 'loaded', data: { theme: 'dark' } });
+    expect(preferences.value).toEqual({ status: 'loaded', data: { 'theme-mode': 'dark' } });
   });
 
   it('a stale failure does not regress an already-loaded newer result', async () => {
@@ -411,7 +463,7 @@ describe('loadPreferences: a stale response cannot overwrite a fresher one', () 
     const older = new Promise<{ preferences: Record<string, string> }>((_r, rej) => { rejectOlder = rej; });
     vi.spyOn(apiClient, 'getPreferences')
       .mockReturnValueOnce(older)
-      .mockResolvedValueOnce({ preferences: { theme: 'dark' } });
+      .mockResolvedValueOnce({ preferences: { 'theme-mode': 'dark' } });
 
     const first = loadPreferences();
     const second = loadPreferences();
@@ -419,7 +471,7 @@ describe('loadPreferences: a stale response cannot overwrite a fresher one', () 
     rejectOlder(new ApiError(500, 'stale failure'));
     await first;
 
-    expect(preferences.value).toEqual({ status: 'loaded', data: { theme: 'dark' } });
+    expect(preferences.value).toEqual({ status: 'loaded', data: { 'theme-mode': 'dark' } });
   });
 
   it('a later call still starts a fresh fetch once the first has settled', async () => {
@@ -446,38 +498,38 @@ describe('loadPreferences — skip re-apply when theme unchanged (iOS matchMedia
     vi.restoreAllMocks();
   });
 
-  it('does not rewrite data-theme on a refetch when the theme value matches the previously applied value', async () => {
-    // Pin the "previously applied" value via a direct applyTheme so this test
+  it('does not rewrite data-theme-mode on a refetch when the theme value matches the previously applied value', async () => {
+    // Pin the "previously applied" value via a direct applyThemeMode so this test
     // is independent of any state left by earlier tests in the file.
-    applyTheme('light');
+    applyThemeMode('light');
 
     vi.spyOn(apiClient, 'getPreferences').mockResolvedValue({
-      preferences: { theme: 'light' },
+      preferences: { 'theme-mode': 'light' },
     });
 
     const setAttrSpy = vi.spyOn(document.documentElement, 'setAttribute');
     await loadPreferences();
 
-    const themeWrites = setAttrSpy.mock.calls.filter((c) => c[0] === 'data-theme');
+    const themeWrites = setAttrSpy.mock.calls.filter((c) => c[0] === 'data-theme-mode');
     expect(themeWrites).toHaveLength(0);
   });
 
-  it('still rewrites data-theme when the value differs from the previously applied value', async () => {
-    applyTheme('light');
+  it('still rewrites data-theme-mode when the value differs from the previously applied value', async () => {
+    applyThemeMode('light');
 
     vi.spyOn(apiClient, 'getPreferences').mockResolvedValue({
-      preferences: { theme: 'dark' },
+      preferences: { 'theme-mode': 'dark' },
     });
 
     const setAttrSpy = vi.spyOn(document.documentElement, 'setAttribute');
     await loadPreferences();
 
-    const themeWrites = setAttrSpy.mock.calls.filter((c) => c[0] === 'data-theme');
+    const themeWrites = setAttrSpy.mock.calls.filter((c) => c[0] === 'data-theme-mode');
     expect(themeWrites.length).toBeGreaterThan(0);
   });
 });
 
-describe("applyTheme('system'): following the OS", () => {
+describe("applyThemeMode('system'): following the OS", () => {
   // Three guards decide whether a re-resolve paints: the preference still
   // follows the OS, the document is visible, and the value actually changed.
   // The visibility guard is what makes the media-query listener safe on iOS.
@@ -488,7 +540,7 @@ describe("applyTheme('system'): following the OS", () => {
   let originalGetAttribute: unknown;
   let mqListeners: Array<() => void>;
   let mqLight: boolean;
-  /** Every `data-theme` value written since this case started. The guard being
+  /** Every `data-theme-mode` value written since this case started. The guard being
    *  tested reads the attribute back, so the stub has to round-trip it. */
   let painted: string[];
   let attrs: Record<string, string>;
@@ -505,7 +557,7 @@ describe("applyTheme('system'): following the OS", () => {
   beforeEach(() => {
     vi.useFakeTimers();
     localStorage.clear();
-    preferences.value = { status: 'loaded', data: { theme: 'system' } };
+    preferences.value = { status: 'loaded', data: { 'theme-mode': 'system' } };
     setVisibility('visible');
     mqListeners = [];
     mqLight = false;
@@ -516,7 +568,7 @@ describe("applyTheme('system'): following the OS", () => {
     originalGetAttribute = el.getAttribute;
     el.setAttribute = (k: string, v: string) => {
       attrs[k] = v;
-      if (k === 'data-theme') painted.push(v);
+      if (k === 'data-theme-mode') painted.push(v);
     };
     el.getAttribute = (k: string) => attrs[k] ?? null;
     originalMatchMedia = window.matchMedia;
@@ -533,7 +585,7 @@ describe("applyTheme('system'): following the OS", () => {
   afterEach(() => {
     setVisibility('visible');
     // Leave no listener behind pointing at this block's mocked media query.
-    applyTheme('dark');
+    applyThemeMode('dark');
     (window as any).matchMedia = originalMatchMedia;
     const el = document.documentElement as unknown as Record<string, unknown>;
     el.setAttribute = originalSetAttribute;
@@ -542,12 +594,12 @@ describe("applyTheme('system'): following the OS", () => {
   });
 
   it('subscribes on every platform, iOS included', () => {
-    applyTheme('system');
+    applyThemeMode('system');
     expect(mqListeners).toHaveLength(1);
   });
 
   it('applies an OS flip announced while the page is visible', () => {
-    applyTheme('system');
+    applyThemeMode('system');
     painted = [];
 
     mqLight = true;
@@ -558,7 +610,7 @@ describe("applyTheme('system'): following the OS", () => {
   });
 
   it('ignores a flip announced while the page is hidden', () => {
-    applyTheme('system');
+    applyThemeMode('system');
     painted = [];
 
     setVisibility('hidden');
@@ -572,7 +624,7 @@ describe("applyTheme('system'): following the OS", () => {
   it('re-reads at settle time rather than trusting the event that woke it', () => {
     // The snapshot pass flips the trait collection and flips it straight back.
     // A flip that raced the visibility guard must not survive to paint.
-    applyTheme('system');
+    applyThemeMode('system');
     painted = [];
 
     mqLight = true;
@@ -584,7 +636,7 @@ describe("applyTheme('system'): following the OS", () => {
   });
 
   it('repairs on resume a flip that arrived while the page was hidden', () => {
-    applyTheme('system');
+    applyThemeMode('system');
     painted = [];
 
     setVisibility('hidden');
@@ -601,7 +653,7 @@ describe("applyTheme('system'): following the OS", () => {
   });
 
   it('costs one apply per wake, however many resume events it delivers', () => {
-    applyTheme('system');
+    applyThemeMode('system');
     painted = [];
 
     mqLight = true;
@@ -614,7 +666,7 @@ describe("applyTheme('system'): following the OS", () => {
   });
 
   it('writes nothing when the OS still says what is already painted', () => {
-    applyTheme('system');
+    applyThemeMode('system');
     painted = [];
 
     document.dispatchEvent(new Event('visibilitychange'));
@@ -624,8 +676,8 @@ describe("applyTheme('system'): following the OS", () => {
   });
 
   it('leaves an explicit light or dark preference alone', () => {
-    preferences.value = { status: 'loaded', data: { theme: 'dark' } };
-    applyTheme('dark');
+    preferences.value = { status: 'loaded', data: { 'theme-mode': 'dark' } };
+    applyThemeMode('dark');
     expect(mqListeners).toHaveLength(0);
     painted = [];
 
@@ -638,12 +690,12 @@ describe("applyTheme('system'): following the OS", () => {
   });
 
   it('drops a pending refresh when the user picks an explicit theme', () => {
-    applyTheme('system');
+    applyThemeMode('system');
     mqLight = true;
     fireMediaQueryChange();
 
-    preferences.value = { status: 'loaded', data: { theme: 'dark' } };
-    applyTheme('dark');
+    preferences.value = { status: 'loaded', data: { 'theme-mode': 'dark' } };
+    applyThemeMode('dark');
     painted = [];
     vi.advanceTimersByTime(500);
 
@@ -651,7 +703,7 @@ describe("applyTheme('system'): following the OS", () => {
   });
 });
 
-describe('applyTheme — native title-bar tint (Tauri)', () => {
+describe('applyThemeMode: native title-bar tint (Tauri)', () => {
   beforeEach(() => {
     setTitlebarColorMock.mockClear();
     windowReadyToShowMock.mockClear();
@@ -663,29 +715,29 @@ describe('applyTheme — native title-bar tint (Tauri)', () => {
   });
 
   it('does not tint the title bar outside Tauri (web / PWA)', () => {
-    applyTheme('light');
+    applyThemeMode('light');
     expect(setTitlebarColorMock).not.toHaveBeenCalled();
   });
 
   it('tints the title bar the header-top blue per theme inside Tauri', () => {
     platformMocks.isTauri = true;
     // Mirrors --header-gradient's top stop in styles/global/base.css.
-    applyTheme('light');
+    applyThemeMode('light');
     expect(setTitlebarColorMock).toHaveBeenLastCalledWith('#1a6fd0');
-    applyTheme('dark');
+    applyThemeMode('dark');
     expect(setTitlebarColorMock).toHaveBeenLastCalledWith('#15549e');
   });
 
   it('tells the shell the page is ready to show, Tauri only', () => {
     // Nothing is waiting on a hidden window in a browser, and there is no IPC
     // bridge to carry the signal.
-    applyTheme('light');
+    applyThemeMode('light');
     expect(windowReadyToShowMock).not.toHaveBeenCalled();
 
     // Under Tauri the theme is now resolved and on the document, which is the
     // moment a window can come on screen showing a page instead of bare tint.
     platformMocks.isTauri = true;
-    applyTheme('light');
+    applyThemeMode('light');
     expect(windowReadyToShowMock).toHaveBeenCalled();
   });
 });
@@ -1068,7 +1120,7 @@ describe('preference writes survive an iOS PWA suspend', () => {
       .mockRejectedValueOnce(cancelled())
       .mockResolvedValueOnce({ success: true });
 
-    await savePreference('theme', 'light');
+    await savePreference('theme-mode', 'light');
 
     expect(spy).toHaveBeenCalledTimes(2);
     expect(toasts.value).toHaveLength(0);
@@ -1147,7 +1199,7 @@ describe('preference writes survive an iOS PWA suspend', () => {
   it('collapses repeated rejections into one card instead of stacking', async () => {
     vi.spyOn(apiClient, 'setPreference').mockRejectedValue(new ApiError(500, 'db down'));
 
-    await savePreference('theme', 'light');
+    await savePreference('theme-mode', 'light');
     await savePreference('font-family', 'inter');
     await savePreference('ui-scale', '125', undefined, true);
 
@@ -1157,19 +1209,19 @@ describe('preference writes survive an iOS PWA suspend', () => {
   it('speaks once when writes keep failing to arrive, naming what is stuck', async () => {
     vi.spyOn(apiClient, 'setPreference').mockRejectedValue(cancelled());
 
-    await savePreference('theme', 'light');
+    await savePreference('theme-mode', 'light');
     expect(toasts.value).toHaveLength(0);
     await savePreference('font-family', 'inter');
     expect(toasts.value).toHaveLength(0);
 
     await savePreference('ui-scale', '125', undefined, true);
     expect(toasts.value).toHaveLength(1);
-    expect(toasts.value[0].message).toContain('font-family, theme, ui-scale');
+    expect(toasts.value[0].message).toContain('font-family, theme-mode, ui-scale');
   });
 
   it('retracts the unreachable banner once the queue drains', async () => {
     const spy = vi.spyOn(apiClient, 'setPreference').mockRejectedValue(cancelled());
-    await savePreference('theme', 'light');
+    await savePreference('theme-mode', 'light');
     await savePreference('font-family', 'inter');
     await savePreference('ui-scale', '125', undefined, true);
     expect(toasts.value).toHaveLength(1);
@@ -1185,10 +1237,10 @@ describe('preference writes survive an iOS PWA suspend', () => {
     vi.spyOn(apiClient, 'setPreference').mockRejectedValue(cancelled());
     const applied = vi.fn();
 
-    await savePreference('theme', 'light', applied);
+    await savePreference('theme-mode', 'light', applied);
 
     expect(applied).toHaveBeenCalledTimes(1);
-    expect(preferences.value).toMatchObject({ data: { theme: 'light' } });
+    expect(preferences.value).toMatchObject({ data: { 'theme-mode': 'light' } });
   });
 });
 
@@ -1309,7 +1361,7 @@ describe('concurrent writes to one preference key', () => {
     });
 
     await Promise.all([
-      savePreference('theme', 'light'),
+      savePreference('theme-mode', 'light'),
       savePreference('font-family', 'inter'),
       savePreference('ui-scale', '125', undefined, true),
     ]);
@@ -1343,7 +1395,7 @@ describe('unreachable banner tracks the queue, not just the happy path', () => {
   /** Park three writes so the escalation threshold trips. */
   async function stallThreeWrites() {
     const spy = vi.spyOn(apiClient, 'setPreference').mockRejectedValue(cancelled());
-    await savePreference('theme', 'light');
+    await savePreference('theme-mode', 'light');
     await savePreference('font-family', 'inter');
     await savePreference('ui-scale', '125', undefined, true);
     expect(toasts.value.some(t => t.key === UNREACHABLE)).toBe(true);
@@ -1365,7 +1417,7 @@ describe('unreachable banner tracks the queue, not just the happy path', () => {
   it('treats a rejection as proof the engine is reachable, resetting the count', async () => {
     const spy = vi.spyOn(apiClient, 'setPreference');
     spy.mockRejectedValue(cancelled());
-    await savePreference('theme', 'light');
+    await savePreference('theme-mode', 'light');
     await savePreference('font-family', 'inter');
 
     // An answer, even a refusal, breaks the "nothing is getting through" streak.
@@ -1383,7 +1435,7 @@ describe('unreachable banner tracks the queue, not just the happy path', () => {
     vi.spyOn(apiClient, 'setPreference').mockResolvedValue({ success: true });
     const before = toasts.value;
 
-    await savePreference('theme', 'light');
+    await savePreference('theme-mode', 'light');
 
     // Same array identity: retracting an absent banner must not notify
     // subscribers, or every preference save re-renders the toast container.

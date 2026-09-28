@@ -23,7 +23,7 @@ use axum::{
 use serde::Serialize;
 use uuid::Uuid;
 
-use crate::api::actor::user_actor_resolved;
+use crate::api::actor::user_actor;
 use crate::api::{ApiError, AppState};
 use crate::core::blobs::{
     get_or_create_preview, resolve_blob, write_blob, BlobError, PREVIEW_MAX_EDGE,
@@ -104,7 +104,7 @@ pub(super) async fn post_blob(
         Err(BlobError::BadEncoding(_)) => unreachable!(),
     };
 
-    let actor = user_actor_resolved(&headers, state.engine.pool(), None).await;
+    let actor = user_actor(&headers, None);
     let event = BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ImageUploaded {

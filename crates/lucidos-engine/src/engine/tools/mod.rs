@@ -301,6 +301,7 @@ impl LucidosEngine {
             tn::COUNT_THREADS => self.execute_count_threads(args, thread_id).await,
             tn::SEARCH_THREADS => to_outcome(self.execute_search_threads(args).await),
             tn::DETACH_CHILD_THREAD => self.execute_detach_child_thread(args, thread_id).await,
+            tn::ARCHIVE_THREAD => self.execute_archive_thread(args, thread_id).await,
             tn::LIST_CHANGES => self.execute_list_changes(args, thread_id).await,
             tn::APPLY_CHANGE => self.execute_apply_change(args, thread_id).await,
             tn::APPLY_WHEN_SETTLED => self.execute_apply_when_settled(args, thread_id).await,
@@ -508,28 +509,11 @@ impl LucidosEngine {
     }
 
     async fn execute_emit_event(&self, args: &serde_json::Value) -> ToolOutcome {
-        let event_type = match args.get("event_type").and_then(|v| v.as_str()) {
-            Some(t) if !t.is_empty() => t,
-            _ => return Err("Error: event_type is required".to_string()),
-        };
-        let payload = args
-            .get("payload")
-            .cloned()
-            .unwrap_or(serde_json::json!({}));
-        // The agent itself is the actor; attribution flows via the
-        // surrounding `MessageReceived` / `ToolCalled` events.
-        //
         // The tool call runs on the fire's own task, so the ambient marker is
         // this fire. Passing it keeps what `EventBus::emit` used to read for
         // free, now that the emit states its owner (ADR 0137).
         let emitting_trigger_id = crate::scheduler::user_tasks::current_trigger_id();
-        match self
-            .emit_domain_event(event_type, payload, None, emitting_trigger_id)
-            .await
-        {
-            Ok(id) => Ok(format!("Event {} emitted (id: {})", event_type, id)),
-            Err(e) => Err(format!("Error: failed to emit event: {}", e)),
-        }
+        emit_event_impl(&self.event_bus, args, emitting_trigger_id).await
     }
 
     /// Thin wrapper over [`repositories::manage_repositories_impl`], which owns
@@ -775,6 +759,44 @@ impl LucidosEngine {
         }
     }
 
+    /// LLM tool: archive the calling thread or one of its direct children
+    /// (ADR 0310). The caller is `execute_tool`'s ambient thread, as for
+    /// detach, so the model picks the target but never who it is.
+    async fn execute_archive_thread(
+        &self,
+        args: &serde_json::Value,
+        caller_thread_id: uuid::Uuid,
+    ) -> ToolOutcome {
+        use crate::engine::{AgentArchiveAck, AgentArchiveError};
+
+        let raw_id = args
+            .get("thread_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                "Error: archive needs a thread_id: 'current' for this thread, or a direct \
+                 child's uuid from the threads tool's 'list' action with my_children: true."
+                    .to_string()
+            })?;
+        let target = crate::api::resolve_thread_id_arg(raw_id, Some(caller_thread_id))
+            .map_err(|e| format!("Error: {e}"))?;
+
+        match self.archive_as_agent(Some(caller_thread_id), target).await {
+            Ok(AgentArchiveAck::Requested { .. }) => Ok(
+                "This thread will be archived once this turn ends and it has settled. A new \
+                 message into it before then keeps it open."
+                    .to_string(),
+            ),
+            Ok(AgentArchiveAck::Archived(outcome)) => describe_agent_archive(target, outcome),
+            Err(
+                e @ (AgentArchiveError::NotYourThread(_) | AgentArchiveError::UnknownThread(_)),
+            ) => Err(format!(
+                "Error: {e} List your own children with the threads tool's 'list' action \
+                     and my_children: true."
+            )),
+            Err(e) => Err(format!("Error: {e}")),
+        }
+    }
+
     /// LLM tool: list thread summaries for the workspace. Mirrors
     /// `GET /api/v1/threads/list` and `lucidos threads list`.
     ///
@@ -924,7 +946,7 @@ impl LucidosEngine {
 
     /// LLM tool: arm a *standing apply* on one thread, so its change applies
     /// once the thread settles. The prompt-side twin of the Apply control's
-    /// "Apply as it settles" face, calling the same engine state (ADR 0168
+    /// "Apply on settle" face, calling the same engine state (ADR 0168
     /// clause 5, philosophy rule 2).
     async fn execute_apply_when_settled(
         &self,
@@ -1189,6 +1211,37 @@ fn is_thread_queue_policy_field(field: &str) -> bool {
             | "max_event_trigger_depth"
             | "overflow"
     )
+}
+
+/// What an agent's archive tells the model. A member the cascade left open is
+/// named, and a pinned sub-thread is one (ADR 0312). Only a target left open
+/// is an error: an already-archived target is not.
+pub(crate) fn describe_agent_archive(
+    target: uuid::Uuid,
+    outcome: crate::api::threads::archive::ArchiveOutcome,
+) -> ToolOutcome {
+    let target_skipped = outcome
+        .skipped
+        .iter()
+        .any(|m| m["thread_id"] == serde_json::json!(target));
+    let left_open = if outcome.skipped.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " Left open: {}",
+            serde_json::Value::Array(outcome.skipped.clone())
+        )
+    };
+    if target_skipped {
+        return Err(format!("Error: thread {target} was left open.{left_open}"));
+    }
+    if outcome.archived.contains(&target) {
+        let sub_threads = outcome.archived.len() - 1;
+        return Ok(format!(
+            "Archived thread {target} and {sub_threads} of its sub-threads.{left_open}"
+        ));
+    }
+    Ok(format!("Thread {target} was already archived.{left_open}"))
 }
 
 /// The `changes` tool's wording for a refused Apply. Pure, so every branch is
@@ -1670,6 +1723,48 @@ fn bad_event_address(got: impl std::fmt::Display) -> String {
         "event_id '{got}' is not an event address. Pass the `evt-<32 hex>` \
          form a tool result states, or a bare uuid."
     )
+}
+
+/// Write core for the `events` tool's `emit` action, on the bus alone so a test
+/// can drive it without booting the engine.
+///
+/// **The actor is the Lucidos Agent, always.** `execute_tool` runs only on that
+/// agent's own loop (ADR 0150). The model cannot name another actor: an `actor`
+/// in its payload is dropped, and the result says so, so the model never
+/// believes a forged one took.
+pub(crate) async fn emit_event_impl(
+    bus: &crate::engine::event_bus::EventBus,
+    args: &serde_json::Value,
+    emitting_trigger_id: Option<String>,
+) -> ToolOutcome {
+    use crate::engine::event_bus::SystemEvent;
+    use crate::engine::thread_events::{AgentParticipant, MessageOrigin};
+
+    let event_type = match args.get("event_type").and_then(|v| v.as_str()) {
+        Some(t) if !t.is_empty() => t,
+        _ => return Err("Error: event_type is required".to_string()),
+    };
+    let payload = args
+        .get("payload")
+        .cloned()
+        .unwrap_or(serde_json::json!({}));
+    let dropped_actor = payload.get(SystemEvent::ACTOR_KEY).is_some();
+    let actor = MessageOrigin::Agent {
+        agent: AgentParticipant::LucidosAgent,
+    };
+    let emitted = bus
+        .emit_domain_event(event_type, payload, false, actor, emitting_trigger_id)
+        .await
+        .map_err(|e| format!("Error: failed to emit event: {}", e))?
+        .expect("a durable domain event always returns its row");
+    let mut text = format!("Event {} emitted (id: {})", event_type, emitted.event_id);
+    if dropped_actor {
+        text.push_str(
+            ". Its payload's `actor` was dropped: the engine records who emitted an event, \
+             and this one reads as you, the Lucidos Agent.",
+        );
+    }
+    Ok(text)
 }
 
 /// Read core for the `events` tool's `query` action. Factored out of the

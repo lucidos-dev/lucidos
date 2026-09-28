@@ -681,7 +681,7 @@ pub(super) async fn update_trigger(
     // very next request. `POST /api/v1/triggers/run` reads the registry to
     // decide whether to refuse, so a subscriber-only apply lets a trigger the
     // user just paused take a real off-schedule fire.
-    let actor = crate::api::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    let actor = crate::api::actor::user_actor(&headers, None);
     state
         .engine
         .emit_trigger_write_or_log(
@@ -720,7 +720,7 @@ pub(super) async fn delete_trigger(
         return ApiResult::err(format!("Trigger '{}' not found", task_id));
     }
 
-    let actor = crate::api::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    let actor = crate::api::actor::user_actor(&headers, None);
     state
         .engine
         .emit_trigger_write_or_log(

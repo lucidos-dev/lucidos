@@ -15,7 +15,9 @@ pub use model_download::{
     apply_default_cache_dir, ensure_model_cached, CacheOutcome, DownloadFrame,
     ModelDownloadObserver,
 };
-pub use pgvector::{MemoryEntry, MemorySource, MemoryStats, PgVectorIndex, SearchResult};
+pub use pgvector::{
+    CorrectedMemory, MemoryEntry, MemorySource, MemoryStats, PgVectorIndex, SearchResult,
+};
 pub use provider::EmbeddingProvider;
 
 /// Drop memory entries below this importance before semantic ranking.

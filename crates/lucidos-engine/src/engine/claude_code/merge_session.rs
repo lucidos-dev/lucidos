@@ -1,6 +1,7 @@
 use super::*;
 use crate::engine::agent_session::probe_merge_conflicts;
 use crate::engine::change_ops::{CodingAgentChangeOps, LiveSessionInfo};
+use crate::engine::thread_events::EngineReason;
 
 impl CodingAgentChangeOps for LucidosEngine {
     fn spawn_hardening(
@@ -72,7 +73,10 @@ impl CodingAgentChangeOps for LucidosEngine {
                 )
                 .await;
 
-            let origin_id = match engine.emit_automated_prompt(thread_id, &prompt, None).await {
+            let origin_id = match engine
+                .emit_automated_prompt(thread_id, &prompt, EngineReason::MergeConflict)
+                .await
+            {
                 Ok(id) => id,
                 Err(e) => {
                     log!(
@@ -184,7 +188,7 @@ impl CodingAgentChangeOps for LucidosEngine {
             )
             .await;
         let origin_id = self
-            .emit_automated_prompt(thread_id, &merge_prompt, None)
+            .emit_automated_prompt(thread_id, &merge_prompt, EngineReason::MergeConflict)
             .await?;
         let request_id = Uuid::new_v4();
         let cancel_token = tokio_util::sync::CancellationToken::new();

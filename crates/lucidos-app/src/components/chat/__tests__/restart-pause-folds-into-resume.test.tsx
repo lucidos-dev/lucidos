@@ -3,6 +3,8 @@ import type { ComponentChildren, VNode } from 'preact';
 import { renderExchanges } from '../CreateThreadView';
 import { renderOriginSection } from '../MessageRoutePanel';
 import { cancelingThreadIds, removingQueuedMessageIds, threadMap } from '../../../store/store';
+import { devices } from '../../../store/actions/devices';
+import { pairedDevices } from '../../../store/actions/pairedDevices';
 import type { Exchange, StoredEvent, ThreadState } from '../../../store/thread-events';
 
 // A restart the user asked for writes two boundaries: "Paused by restart" and,
@@ -32,7 +34,6 @@ function makeThread(id: string): ThreadState {
       codingAgentProposed: false,
       codingAgentRequiresRestart: false,
       codingAgentIsExternalRepo: false,
-      codingAgentApplying: false,
       codingAgentHasDiff: false,
       lastRevivedAt: '',
       state: 'active',
@@ -49,7 +50,7 @@ function makeThread(id: string): ThreadState {
   };
 }
 
-const DEVICE = { kind: 'device', device_id: 'd-1', label: 'My iPhone' } as const;
+const DEVICE = { kind: 'device', device_id: 'd-1' } as const;
 
 function turn(seq: number): Exchange {
   return {
@@ -137,6 +138,11 @@ describe('a restart pause folds into the resume that answers it', () => {
 
 describe('the resume popover carries the folded pause', () => {
   it('says why it paused and which device restarted', () => {
+    pairedDevices.value = { status: 'loaded', data: [] };
+    devices.value = {
+      status: 'loaded',
+      data: [{ id: 'd-1', name: 'My iPhone', pairing_label: null, user_agent: null, push_enabled: false, last_seen_at: '', created_at: '' }],
+    };
     const exchanges = [pause(2), resume(3)];
     const s = JSON.stringify(renderOriginSection(exchanges[1], undefined, () => undefined, exchanges[0].userEvent));
     expect(s).toContain('Why this resumed');

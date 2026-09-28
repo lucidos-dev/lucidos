@@ -30,7 +30,11 @@ When you suggest a fix, point at the file — don't quote it.
 
 ## What to walk
 
-Window: last **N days** (default 7; user may say "last 30 days" or "since last release"). From chat use `query_events` / `count_events`; from a script use `lucidos events query` / `lucidos events count`.
+Window: a recurring run (a trigger fire) covers everything since its previous run. Read that time from this trigger's `Last run:` line in `list_triggers`, which is UTC. The engine stamps it when a fire finishes, pass or fail, so the current fire never shows there. A failed fire writes no report. A successful fire emits `WorkspaceLearningCompleted` minutes before `Last run:`. If the newest one is more than an hour older, that fire failed, so start from the event.
+
+Cap the window at 30 days. After a longer gap, such as a paused trigger, start 30 days back and say so in the report Summary. Friction older than that is almost always fixed or stale.
+
+Fall back to the last **N days** (default 7) when `Last run:` reads `never`, or for a one-off chat run. A window the user names ("last 30 days", "since last release") wins. From chat use `query_events` / `count_events`; from a script use `lucidos events query` / `lucidos events count`.
 
 **Count first, then drill** — this is mandatory, not advisory. A busy week can easily produce 2 MB+ of `ToolResult` payloads, and chaining many `query_events` calls in a single turn will blow the LLM's prompt budget on the next turn (the recipe and trigger that owns this file did exactly that on 2026-05-25 — 8 calls × 256 KB tool results → 1.54 M tokens to a 1 M-cap API → `prompt is too long` failure). The workflow is:
 

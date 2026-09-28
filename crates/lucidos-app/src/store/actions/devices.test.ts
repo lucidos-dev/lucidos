@@ -45,6 +45,7 @@ function makeDevice(id: string, push_enabled: boolean) {
   return {
     id,
     name: null,
+    pairing_label: null,
     user_agent: null,
     push_enabled,
     last_seen_at: '2026-06-26T00:00:00Z',
@@ -474,5 +475,62 @@ describe('boot order', () => {
     );
     expect(main).toContain('await adoptGatewayDeviceId(');
     expect(main).not.toContain('registerCurrentDevice');
+  });
+});
+
+/** A turn's Origin names its device from the id alone, from the same two lists
+ *  the Devices page reads. */
+describe('turnDeviceName', () => {
+  beforeEach(() => vi.resetModules());
+
+  async function load() {
+    const mod = await import('./devices');
+    const paired = await import('./pairedDevices');
+    paired.pairedDevices.value = { status: 'loaded', data: [] };
+    return { mod, paired };
+  }
+
+  it('names the device the way its Devices row does, and marks the reader', async () => {
+    const { mod } = await load();
+    const me = mod.getDeviceId();
+    mod.devices.value = {
+      status: 'loaded',
+      data: [{ ...makeDevice(me, true), pairing_label: 'Safari on iPhone' }],
+    };
+    expect(mod.turnDeviceName(me)).toBe('Safari on iPhone (this device)');
+  });
+
+  it("uses the gateway's pairing label when the engine has no copy yet", async () => {
+    const { mod, paired } = await load();
+    mod.devices.value = { status: 'loaded', data: [makeDevice('phone-1', true)] };
+    paired.pairedDevices.value = {
+      status: 'loaded',
+      data: [{ id: 'phone-1', label: 'Safari on iPhone', paired_at: '2026-08-01T00:00:00Z' }],
+    };
+    expect(mod.turnDeviceName('phone-1')).toBe('Safari on iPhone');
+  });
+
+  it('shows a rename on every turn, since no turn stores the name', async () => {
+    const { mod } = await load();
+    mod.devices.value = {
+      status: 'loaded',
+      data: [{ ...makeDevice('laptop-1', false), name: 'Work laptop', pairing_label: 'Chrome on Mac' }],
+    };
+    expect(mod.turnDeviceName('laptop-1')).toBe('Work laptop');
+  });
+
+  it('stays empty while either list loads, rather than flashing a lesser name', async () => {
+    const { mod, paired } = await load();
+    mod.devices.value = { status: 'loading' };
+    expect(mod.turnDeviceName('phone-1')).toBe('');
+    mod.devices.value = { status: 'loaded', data: [] };
+    paired.pairedDevices.value = { status: 'loading' };
+    expect(mod.turnDeviceName('phone-1')).toBe('');
+  });
+
+  it('gives a device neither list holds its short-id name', async () => {
+    const { mod } = await load();
+    mod.devices.value = { status: 'loaded', data: [] };
+    expect(mod.turnDeviceName('0a1b2c3d-gone')).toBe('device-0a1b2c3d');
   });
 });

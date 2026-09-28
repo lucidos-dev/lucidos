@@ -193,6 +193,25 @@ fn thread_archived_clears_inbox_both_types() {
     assert_eq!(cc.new_section, Some(ArchiveState::Archived));
 }
 
+/// A pinned thread is never archived (ADR 0312), so the pin brings an archived
+/// thread back to the inbox, for both thread types.
+#[test]
+fn thread_saved_moves_an_archived_thread_to_the_inbox() {
+    for thread_type in [ThreadType::Chat, ThreadType::CodingAgent] {
+        let result =
+            resolve_transition("ThreadSaved", thread_type, ArchiveState::Archived, false).unwrap();
+        assert_eq!(result.new_section, Some(ArchiveState::Inbox));
+    }
+}
+
+#[test]
+fn only_the_pinned_archived_pair_is_illegal() {
+    assert!(is_retention_legal(ArchiveState::Inbox, false));
+    assert!(is_retention_legal(ArchiveState::Inbox, true));
+    assert!(is_retention_legal(ArchiveState::Archived, false));
+    assert!(!is_retention_legal(ArchiveState::Archived, true));
+}
+
 // 13. thread_archived_is_terminal
 #[test]
 fn thread_archived_is_terminal() {

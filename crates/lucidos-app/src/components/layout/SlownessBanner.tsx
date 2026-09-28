@@ -7,9 +7,12 @@ import {
   visibleSlownessEpisode,
   type SlownessEpisode,
 } from '../../store/actions/slowness';
+import { enginePackaged } from '../../store/store';
 import { WORKSPACE_ID } from '../../utils/basePath';
 import {
   busyEnoughToName,
+  databaseRecommendation,
+  diskRecommendation,
   memoryRecommendation,
   memoryUsersPhrase,
   processorRecommendation,
@@ -17,6 +20,7 @@ import {
 } from '../../utils/slownessNotice';
 import { viewportIsMobile } from '../../utils/viewport';
 import { CloseIcon } from '../shared/icons';
+import { SurfaceToneIcon } from '../shared/Surface';
 import { bannerBelongsToLayout, useBannerHeightVar, type BannerLayout } from './appBanner';
 
 /** The CSS custom property this banner publishes its measured height into. Its
@@ -37,22 +41,41 @@ export function shouldRenderSlownessBanner(opts: {
  *
  *  "The computer running Lucidos", never "this Mac": a phone reaching the
  *  workspace remotely reads the same bar about a machine it is not. The
- *  unclear reason names no cause at all, because none was measured. */
-function slownessSentence(episode: SlownessEpisode): ComponentChildren {
-  if (episode.reason === 'memory') {
-    const users = episode.top_users;
-    return [
-      <b>The computer running Lucidos is short on memory, so Lucidos is slow.</b>,
-      users.length > 0 ? ` Biggest users: ${memoryUsersPhrase(users)}.` : '',
-      ` ${memoryRecommendation(users)}`,
-    ];
+ *  unclear reason names no cause at all, because none was measured.
+ *  `packaged` picks who restarts the database: Docker, or Lucidos itself. */
+function slownessSentence(episode: SlownessEpisode, packaged: boolean): ComponentChildren {
+  switch (episode.reason) {
+    case 'disk':
+      return [
+        <b>The computer running Lucidos is almost out of disk space, so Lucidos is slow.</b>,
+        ` ${diskRecommendation(episode.free_bytes, packaged)}`,
+      ];
+    case 'database':
+      return [
+        <b>
+          {episode.problem === 'pool_exhausted'
+            ? 'Lucidos is waiting for a free database connection, so it is slow.'
+            : "Lucidos's database is not responding, so Lucidos is slow."}
+        </b>,
+        ` ${databaseRecommendation(episode.problem, packaged)}`,
+      ];
+    case 'memory': {
+      const users = episode.top_users;
+      return [
+        <b>The computer running Lucidos is short on memory, so Lucidos is slow.</b>,
+        users.length > 0 ? ` Biggest users: ${memoryUsersPhrase(users)}.` : '',
+        ` ${memoryRecommendation(users)}`,
+      ];
+    }
+    case 'unclear': {
+      const busiest = busyEnoughToName(episode.busiest_apps);
+      return [
+        <b>Lucidos is responding slowly.</b>,
+        busiest.length > 0 ? ` Busiest apps: ${processorUsersPhrase(busiest)}.` : '',
+        ` ${processorRecommendation(episode.busiest_apps)}`,
+      ];
+    }
   }
-  const busiest = busyEnoughToName(episode.busiest_apps);
-  return [
-    <b>Lucidos is responding slowly.</b>,
-    busiest.length > 0 ? ` Busiest apps: ${processorUsersPhrase(busiest)}.` : '',
-    ` ${processorRecommendation(episode.busiest_apps)}`,
-  ];
 }
 
 /** Pure markup for the bar. `elRef` lands on the bar itself, so the box the
@@ -60,16 +83,19 @@ function slownessSentence(episode: SlownessEpisode): ComponentChildren {
 export function slownessBannerBody(props: {
   layout: BannerLayout;
   episode: SlownessEpisode;
+  packaged: boolean;
   onDismiss: () => void;
   elRef?: Ref<HTMLDivElement>;
 }): VNode {
   return (
     <div ref={props.elRef} class="slowness-banner" data-layout={props.layout} role="status">
-      <span class="slowness-banner-text">{slownessSentence(props.episode)}</span>
+      <SurfaceToneIcon tone="warning" />
+      <span class="slowness-banner-text">{slownessSentence(props.episode, props.packaged)}</span>
       <button
-        class="icon-btn slowness-banner-close"
+        class="icon-btn surface-close slowness-banner-close"
         onClick={props.onDismiss}
         aria-label="Dismiss slowness warning"
+        data-tooltip="Dismiss slowness warning"
       >
         <CloseIcon />
       </button>
@@ -78,7 +104,7 @@ export function slownessBannerBody(props: {
 }
 
 /**
- * The slowness warning (ADRs 0274, 0283). The gateway opens an episode only
+ * The slowness warning (ADRs 0274, 0283, 0301). The gateway opens an episode only
  * when slowness or memory pressure has held for five minutes, so the bar is
  * news rather than noise.
  *
@@ -108,6 +134,7 @@ export function SlownessBanner({ layout }: { layout: BannerLayout }) {
   return slownessBannerBody({
     layout,
     episode,
+    packaged: enginePackaged.value,
     elRef: ref,
     onDismiss: () => dismissSlownessEpisode(episode.episode_id),
   });

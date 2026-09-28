@@ -175,7 +175,7 @@ EOF
 }
 
 # ── parse_dev_args ──────────────────────────────────────────────────────
-# Parse -w, -b, -r, -h flags. Sets WORKSPACE, BUILD, RELEASE, BUILT.
+# Parse -w, -b, -r, -h flags. Sets WORKSPACE, BUILD, RELEASE.
 parse_dev_args() {
     WORKSPACE="${LUCIDOS_WORKSPACE:-}"
     BUILD=""
@@ -190,12 +190,6 @@ parse_dev_args() {
     ENGINE_BUILD_ONLY=""
     # shellcheck disable=SC2034 # read by scripts/web-dev.sh after it calls this parser
     FOLLOW_LOG=""
-    # The engine serves the built dist/ DIRECTLY (ADR 0014) — `vite build --watch`
-    # rebuilds it on source change; the SW caches bundled /assets/* so an iOS PWA
-    # resumes instantly. BUILT stays set for back-compat with callers that read it
-    # (the old `--hmr` live-dev-server path was removed — there is no Vite proxy).
-    # shellcheck disable=SC2034 # documented output of this parser, kept for back-compat callers
-    BUILT="1"
     while [[ $# -gt 0 ]]; do
         # A directive cannot sit on an individual case branch, so it goes here:
         # FOLLOW_LOG is set below and read by scripts/web-dev.sh after this parser
@@ -206,7 +200,7 @@ parse_dev_args() {
             -b|--build) BUILD="1"; shift ;;
             -r|--release) RELEASE="1"; shift ;;
             -f|--follow) FOLLOW_LOG="1"; shift ;;
-            --built) shift ;;   # accepted for back-compat; BUILT is already 1 (always built now)
+            --built) shift ;;   # accepted for back-compat: the frontend is always built now
             --engine-only) ENGINE_ONLY="1"; BUILD="1"; shift ;;
             --engine-build) ENGINE_BUILD_ONLY="1"; BUILD="1"; shift ;;
             -h|--help)
@@ -1368,8 +1362,7 @@ wait_for_engine_shutdown() {
 # history inside a roughly 22 KB `--append-system-prompt` argument. Any thread
 # quoting a dev script and then this workspace path became a kill candidate,
 # and the caller sends `pkill -P` plus a SIGTERM, so it takes the session's
-# children with it. Same class as ADR 0025's webkit reaper, and as
-# `select_cargo_lock_holders` below.
+# children with it. Same class as ADR 0025's webkit reaper.
 #
 # A shell script's argv[0] is the interpreter, so the script path is argv[1].
 # Testing that ONE token keeps `bash -c '<text naming web-dev.sh>'` out of
@@ -1557,35 +1550,6 @@ kill_stale_processes() {
     elif [ -n "$killed" ]; then
         sleep 1
     fi
-}
-
-# ── select_cargo_lock_holders ───────────────────────────────────────────
-# Print the PIDs of real `cargo` processes whose command line includes
-# `check` — the IDE / rust-analyzer processes that hold the shared `target/`
-# build lock and must be cleared before a fresh `cargo build`.
-#
-# CRITICAL — filter by the process's EXECUTABLE, not a substring of its whole
-# command line. `pgrep -f 'cargo check'` matches the phrase ANYWHERE in a
-# process's argv, which also snares coding-agent subprocesses (claude / codex)
-# whose injected prompt or args merely CONTAIN "cargo check" (a CC session
-# working on a build does). Killing those by PID bypasses their process-group
-# isolation and SIGTERMs a live coding-agent session — in THIS workspace or,
-# because `target/` is shared across workspaces launched from one checkout, in
-# ANOTHER workspace entirely. That is the exit=143 cross-workspace kill that
-# silently terminated a parked CC session during an unrelated workspace's
-# rebuild. Matching on the executable basename (`cargo`) keeps the
-# lock-release intent while making it impossible to target a CC subprocess.
-select_cargo_lock_holders() {
-    local p comm
-    for p in $(pgrep -f 'cargo check' 2>/dev/null || true); do
-        # `ps -o comm=` is the executable path (macOS) or a bare name; compare
-        # the basename so a rustup/homebrew `cargo` shim still matches and a
-        # `claude` / `node` / `codex` subprocess never does.
-        comm="$(ps -p "$p" -o comm= 2>/dev/null || true)"
-        # `if`, never `&&`: the caller assigns this output under `set -e`. A
-        # false `&&` as the loop's last command returns 1 and ends the caller.
-        if [ "${comm##*/}" = "cargo" ]; then printf '%s\n' "$p"; fi
-    done
 }
 
 # ── select_tauri_dev_watchers ───────────────────────────────────────────
@@ -1810,7 +1774,8 @@ publish_launch_binaries() {
 # `stale` means the build did NOT produce a binary for the source that is on
 # disk now — `build.rs` stamps the id when the build script RUNS, so a build
 # that starts at commit N and finishes after an Apply moved main to N+1
-# publishes an N binary. `unknown` (no git, unreadable/empty id, a no-git
+# publishes an N binary. It is stale only if N..N+1 touched a file that needs a
+# restart: a CSS-only move keeps it current. `unknown` (no git, unreadable/empty id, a no-git
 # `src-…` id) is deliberately NOT a mismatch: the same asymmetry the engine's
 # direction guard uses, so an unresolvable id never costs a rebuild.
 published_build_state() {
@@ -1830,6 +1795,13 @@ published_build_state() {
     # and a plain `=` would then report a false mismatch and rebuild forever.
     case "$head" in "$commit"*) echo "current"; return 0 ;; esac
     case "$commit" in "$head"*) echo "current"; return 0 ;; esac
+    # HEAD moved. The binary still serves it unless a file that needs a restart
+    # changed, and the binary answers that with the engine's own classifier. A
+    # binary that predates the flag prints its id instead, which stays stale.
+    if [ "$("$bin" --build-id --source-state 2>/dev/null || true)" = "current" ]; then
+        echo "current"
+        return 0
+    fi
     echo "stale"
 }
 
@@ -1926,19 +1898,9 @@ build_or_find_engine() {
     launch_dir="$(launch_bin_dir)"
     uplift_dir="$PROJECT_DIR/target/$(engine_build_profile)"
 
-    # Clear IDE/rust-analyzer `cargo check` processes holding the shared
-    # target/ build lock. Scoped to real cargo processes — see
-    # select_cargo_lock_holders for why a raw `pgrep -f` is unsafe.
-    local check_pids
-    check_pids=$(select_cargo_lock_holders)
-    if [ -n "$check_pids" ]; then
-        echo "Killing cargo check processes to release build lock..."
-        echo "$check_pids" | xargs kill 2>/dev/null || true
-    fi
-
-    # Remove stale lock files (can linger after sleep/wake with no holding process)
-    rm -f "$PROJECT_DIR/target/.cargo-lock" "$PROJECT_DIR/target/debug/.cargo-lock" "$PROJECT_DIR/target/release/.cargo-lock" "$PROJECT_DIR/target/.package-cache"
-
+    # The build waits on cargo's own lock for any cargo holding target/. Never
+    # signal it or delete its lock file: it may be another worktree's build
+    # (ADR 0294).
     echo ""
     echo "Building engine..."
     run_engine_cargo_build

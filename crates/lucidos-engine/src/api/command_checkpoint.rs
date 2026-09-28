@@ -20,7 +20,7 @@ pub(super) async fn undo_command_checkpoint(
     headers: HeaderMap,
     Json(body): Json<CommandCheckpointUndoRequest>,
 ) -> impl IntoResponse {
-    let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    let actor = super::actor::user_actor(&headers, None);
     match state
         .engine
         .undo_command_checkpoint(&body.checkpoint_id, actor)

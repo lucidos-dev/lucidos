@@ -2,8 +2,8 @@ import { useRef } from 'preact/hooks';
 import { useAnchoredPosition } from '../../hooks/useAnchoredPopover';
 import { focusedThreadId, threadMap } from '../../store/store';
 import type { TodoItem, TodoStatus } from '../../store/thread-events';
-import { CloseIcon } from '../shared/icons';
 import { Overlay } from '../shared/Overlay';
+import { SurfaceHead } from '../shared/Surface';
 import { closeTodoPanel, todoPanelAnchor } from './todoIndicator';
 
 /** One marker glyph per status, all from the same geometric-circle family so
@@ -41,18 +41,8 @@ export function todoListPanelBody({
 }) {
   return (
     <>
-      <div class="prompt-bar-popover-head">
-        <span class="prompt-bar-popover-title">Todo list</span>
-        <button
-          type="button"
-          class="icon-btn prompt-bar-popover-close"
-          aria-label="Close todo list"
-          onClick={onClose}
-        >
-          <CloseIcon />
-        </button>
-      </div>
-      <div class="prompt-bar-popover-body">
+      <SurfaceHead title="Todo list" onClose={onClose} closeLabel="Close todo list" />
+      <div class="anchored-popover-body">
         {/* The agent's own *todo notes*, above the list because they are what
             it kept rather than what it planned. Rendered only when there are
             any, which under ADR 0085's context mode is most lists and
@@ -129,14 +119,14 @@ export function TodoPanelHost() {
       anchor={anchor}
       backdrop={false}
       portal
-      panelClass="prompt-bar-popover todo-panel"
-      // `--prompt-bar-popover-fit` is the thread pane's usable width, the box
+      panelClass="surface anchored-popover todo-panel"
+      // `--anchored-popover-fit` is the thread pane's usable width, the box
       // the hook clamped this panel's position into (see WaitingPanel).
       panelStyle={pos
         ? {
             top: `${pos.top}px`,
             left: `${pos.left}px`,
-            '--prompt-bar-popover-fit': `${pos.maxWidth}px`,
+            '--anchored-popover-fit': `${pos.maxWidth}px`,
           }
         : { visibility: 'hidden' }}
       panelRole="dialog"

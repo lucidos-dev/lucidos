@@ -50,8 +50,6 @@ pub enum ResponseEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         tool_called_event_id: Option<String>,
     },
-    #[serde(rename = "section_break")]
-    SectionBreak { channel: String },
 }
 
 /// A message in a session (for history time travel)

@@ -28,7 +28,6 @@ use uuid::Uuid;
 fn device_actor() -> Option<MessageOrigin> {
     Some(MessageOrigin::Device {
         device_id: "dev-1".into(),
-        label: "Test Device".into(),
     })
 }
 
@@ -36,7 +35,7 @@ fn device_actor() -> Option<MessageOrigin> {
 /// restart-intent handler builds it: out of an `x-lucidos-device-id` header and
 /// nothing else. The picker's Restart / Stop sends that header on its control
 /// request, the gateway forwards it to `/api/v1/internal/restart-intent`, and
-/// `user_actor_resolved` turns it into this.
+/// `user_actor` turns it into this.
 ///
 /// Deliberately NOT the hand-built [`device_actor`] literal: the whole feature
 /// hangs on the header actually resolving to a `Device`, so the test derives it
@@ -47,7 +46,7 @@ fn gateway_restart_actor(device_id: &str) -> Option<MessageOrigin> {
         crate::api::actor::HEADER_DEVICE_ID,
         axum::http::HeaderValue::from_str(device_id).expect("valid header value"),
     );
-    crate::api::actor::user_actor(&headers, None, None)
+    crate::api::actor::user_actor(&headers, None)
 }
 
 /// This thread's `thread_summaries.status` verdict.
@@ -122,7 +121,6 @@ async fn teardown_skips_abort_for_question_parked_chat_thread() {
             text: "make a story".into(),
             user_image_hashes: vec![],
             device_id: None,
-            device: None,
             image_description: None,
             parent_thread_id: None,
             spawning_event_id: None,

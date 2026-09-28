@@ -295,7 +295,7 @@ impl super::LucidosEngine {
     }
 
     /// The durable half: `Some(open)`, or `None` when the query could not run.
-    async fn conflict_pairing_open_or_unknown(
+    pub(crate) async fn conflict_pairing_open_or_unknown(
         &self,
         thread_id: Uuid,
         change_id: Uuid,

@@ -345,6 +345,21 @@ Don't use `condition` for logic that depends on external state (e.g. "only if th
 
 A persisted **system event** is the same case. `BackupFailed` belongs to no thread, so a `thread_id` condition never matches it. Condition on the variant's own fields instead, such as `filename` on `BackupCompleted`. The stored row wraps the event in a `type` / `data` envelope, and the matcher unwraps it for you, so never name those two keys.
 
+### Who emitted a domain event: `actor`
+
+**A domain event's `actor` is written by the engine, never by the emitter.** The engine records who called, and it drops any `actor` the emitter put in its own payload. So a condition on `actor.kind` reads who really emitted the event:
+
+| Emitted by | `actor.kind` | Also carries |
+|---|---|---|
+| An app, through `lucidos.events.emit` | `device` | `device_id` only, never a name (see `thread-events.md`) |
+| The `emit_event` tool (the Lucidos Agent) | `agent` | `agent.kind` = `lucidos_agent` |
+| `lucidos events emit` from a coding agent, a script trigger or a `run_bash` script | `api` | `mode` = `agent`, and `source_thread_id` when a thread ran it |
+| A webhook delivery | `webhook` | `webhook_id`, `name` |
+
+So `{ "actor.kind": "device" }` fires only on an emit from a device, and no agent can satisfy it by writing an `actor` field. That makes it the right condition for a button that must be pressed by the user.
+
+It is attribution, not proof of a tap. A device id is a header, and the engine does not authenticate it. So pair the condition with the payload fields the button itself sends.
+
 ### What a condition can say
 
 A key is a **field path**. A bare name reads a top-level field, and dots read downwards: `{ "payload.workflow_run.event": "schedule" }` reads `event` inside the `workflow_run` object of a GitHub delivery. The leading `payload.` is not decoration; see § "The envelope" below.
@@ -502,7 +517,7 @@ Three independent fields control the notification:
 - **`tap`** — *what happens on tap*. Discriminated union: `{ kind: 'modal' }` (default — opens the inbox detail showing the body; use it for informational pushes too, every notification is openable) or `{ kind: 'navigate', to: NavigateUi }` (delegates to the same router `navigate_ui` uses; `to` is its arg shape). Both mark the source notification read on tap. (The passive `{ kind: 'none' }` kind was retired — `docs/plans/2026-07-02-remove-notification-tap-none.md`.)
 - **`event_id`** — *which specific event inside the linked thread* raised the notification. Optional UUID. Used by the §4 in-app matrix to silently mark-read when the user is already looking at the source event. Distinct from `tap.to.event_id` (which is the scroll-and-pulse target when the tap navigates to a thread — typically the same value).
 
-Write the **`message` as content only — never restate the `title` in it.** Every surface renders the title in its own right (the in-app toast promotes it to the heading, the inbox detail to its `<h2>`, the OS push to the banner title), so a body that opens by repeating the title shows it twice. Use a bare sentence for a single item and `"• "`-prefixed lines for a list; the toast renderer picks those up as bullets under the title. See `system-knowhow/notifications.md` §4.
+Write the **`message` as content only, and never restate the `title` in it.** The in-app toast, the inbox detail and the OS push each show the title in their own right. So a body that opens by repeating the title shows it twice. Use a bare sentence for a single item and `"• "`-prefixed lines for a list. The toast shows each line as written, under the bold title. See `system-knowhow/notifications.md` §4.
 
 | Trigger says | `app_id` | `tap` | `event_id` |
 |---|---|---|---|
@@ -723,6 +738,7 @@ Three answers other than "started", each of which you must relay as-is rather th
 `events(action="emit", …)`, or `lucidos events emit <Type> --summary "…" --payload '{…}'` from a script. The emit goes through the same matcher, the same admission, and the same run as a real event, so this is the faithful reproduction.
 
 - **Per-entry `condition` filters still apply.** A payload that fails the condition matches nothing and you get silence, not an error. Read the `on` array from `list_triggers` and build a payload that passes.
+- **A condition on `actor` is not yours to pass.** The engine records you as the emitter, whatever the payload says (§ "Who emitted a domain event"). A trigger gated on `actor.kind` = `device` waits for the user. Ask them to press the button.
 - Shape the payload like the real emitter's, not just enough to match: the run reads it (`## Triggering Event` for an intent, `TRIGGER_EVENT_PAYLOAD` for a script).
 - The event is real and persisted, so every *other* subscriber fires too.
 - **Event fires do NOT coalesce.** Unlike the run action (cron fires collapse to at most one pending run per trigger), event fires keep strict FIFO because each carries its own payload. Emit twice and the trigger runs twice, the second surfacing as an unexplained extra run minutes later. Check `list_threads` (rows carry `trigger_id` and `status`) before re-emitting.

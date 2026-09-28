@@ -55,7 +55,8 @@ describe('content pane navigation cover', () => {
     // makes the CSS animation replay at all: a class-toggled transition needs
     // the opaque state to reach the screen before the clearing class lands,
     // which from a Preact commit is a double-rAF race it can lose silently.
-    expect(cover).toMatch(/<div key=\{arriving\} class="nav-cover"/);
+    expect(cover).toMatch(/<div key=\{arriving\} class=\{NAV_COVER_MOTIONS\[motion\]\.class\}/);
+    expect(cover).toMatch(/arrive: \{ class: 'nav-cover', animMs: 200 \}/);
     expect(css).toMatch(/\.nav-cover\s*\{[^}]*animation:\s*nav-cover-clear/);
   });
 
@@ -63,7 +64,7 @@ describe('content pane navigation cover', () => {
     // Reduced motion drops the animation, so an `animationend`-driven unmount
     // would never fire and the pane would stay covered forever.
     expect(cover).toMatch(
-      /setTimeout\(\(\) => setArriving\(null\), scaledDurationMs\(NAV_COVER_ANIM_MS\) \+ NAV_COVER_SLACK_MS\)/,
+      /setTimeout\(\s*\(\) => setArriving\(null\),\s*scaledDurationMs\(NAV_COVER_MOTIONS\[motion\]\.animMs\) \+ NAV_COVER_SLACK_MS,\s*\)/,
     );
     expect(cover).not.toMatch(/onAnimationEnd/);
   });
@@ -73,11 +74,10 @@ describe('content pane navigation cover', () => {
     // is scaled by the slider, so a fixed 250ms fuse would unmount the cover a
     // tenth of the way into its own fade at 0.1x. The slack is a fixed safety
     // margin rather than animation, so it stays outside the scaled term.
-    expect(cover).toMatch(/const NAV_COVER_ANIM_MS = 200;/);
+    expect(cover).toMatch(/arrive: \{ class: 'nav-cover', animMs: 200 \}/);
     expect(cover).toMatch(/const NAV_COVER_SLACK_MS = 50;/);
     // The base must be the 1x value of the token the CSS actually uses.
     expect(css).toMatch(/\.nav-cover\s*\{[^}]*animation:\s*nav-cover-clear var\(--duration-normal\)/);
-    expect(css).toMatch(/\.nav-arrive\s*\{[^}]*animation:\s*nav-arrive var\(--duration-normal\)/);
   });
 
   it('does not cover a pane that is navigating to nothing', () => {
@@ -125,28 +125,23 @@ describe('content pane navigation cover', () => {
   });
 });
 
-describe('the content pane title arrives with its view', () => {
-  const helpers = readFileSync(resolve(here, '../headerHelpers.ts'), 'utf-8');
+// The user asked for both pane titles to switch at once: only the view moves.
+describe('the pane titles switch word at once, with no fade of their own', () => {
   const desktop = readFileSync(resolve(here, '../AppHeader.tsx'), 'utf-8');
   const mobile = readFileSync(resolve(here, '../MobileAppHeader.tsx'), 'utf-8');
+  const filterButton = readFileSync(resolve(here, '../ThreadFilterButton.tsx'), 'utf-8');
 
-  it('keys the title on the pane\'s own view key', () => {
-    expect(helpers).toMatch(/const titleKey = contentViewKey\(activeMenuItem\.value, panelOverlay\.value, settingsSubview\.value\)/);
-    expect(helpers).toMatch(/useArrivalFade\(titleKey\)/);
+  it('no rule animates a title in', () => {
+    expect(css).not.toMatch(/nav-arrive|crossfade-dip/);
   });
 
-  it.each([['desktop', desktop], ['mobile', mobile]])('%s: the title element is keyed and fades on arrival', (_what, header) => {
-    expect(header).toMatch(/const \{ titleKey, titleFade \} = useContentTitleArrival\(\);/);
-    expect(header).toMatch(/key=\{titleKey\}/);
-    expect(header).toMatch(/\$\{titleFade\}`\}/);
+  it.each([['desktop', desktop], ['mobile', mobile]])('%s: the content title is a plain span', (_what, header) => {
+    expect(header).not.toMatch(/useContentTitleArrival|titleFade|key=\{titleKey\}/);
   });
 
-  it('rests transparent while it fades, and shows at once under reduced motion', () => {
-    const arrive = hostRules.find(r => r.selector === '.nav-arrive');
-    expect(arrive?.props.get('opacity')).toBe('0');
-    expect(css).toMatch(/@keyframes nav-arrive\s*\{\s*from\s*\{[^}]*\}\s*to\s*\{\s*opacity:\s*1/);
-    const reduce = hostRules.find(r => selectorList(r.selector).includes(`${REDUCED_MOTION_ROOT} .nav-arrive`));
-    expect(reduce?.props.get('animation')).toBe('none');
-    expect(reduce?.props.get('opacity')).toBe('1');
+  it('the drawer title is one plain word, not a stack', () => {
+    const title = filterButton.slice(filterButton.indexOf('export function ThreadsPaneTitle'));
+    expect(title).toMatch(/return <span class=\{className\}>\{THREADS_TITLES\[/);
+    expect(title).not.toMatch(/CrossfadeStack/);
   });
 });

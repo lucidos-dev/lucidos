@@ -13,7 +13,16 @@
        var(--bg-primary) only AFTER the splash node is removed at the end of its
        fade-out (bootSplash.ts / index.html), so without this the panels flash
        blue for the ~0.65s the splash spends fading. */
-    background: var(--bg-primary);
+    background-color: var(--bg-primary);
+}
+
+/* The screen part (ADR 0313). A theme's scanlines paint on the base fills, the
+   shell and each mobile pane, under everything they contain. So no protected
+   surface can ever sit beneath them. Both fills set background-color, never
+   the shorthand, which would reset this image by source order. */
+.app-shell,
+.mobile-swipe-pane {
+    background-image: var(--part-screen-background-image, none);
 }
 
 /* Reclaimed macOS title-bar band. Under the packaged macOS Tauri build
@@ -28,9 +37,13 @@
    byte-for-byte identical to before. The header and everything below it are
    untouched — only this band is added on top.
 
-   This background is the BASE color only: the focused pane's .header-focus-wash
-   rises out of the header and tints its own segment of this band too (see that
-   rule), so the focused pane reads as painted to the very top of the window. */
+   The focused pane's .header-focus-wash rises out of the header and tints its
+   own segment of this band too (see that rule), so the focused pane reads as
+   painted to the very top of the window.
+
+   This background is the solid base, and the native window colour reads it
+   (applyThemeMode). On desktop the header's fill paints from this strip too: see
+   .titlebar-strip::before. */
 .titlebar-strip {
     flex: none;
     height: var(--titlebar-inset, 0px);
@@ -67,6 +80,18 @@
     border-bottom: 1px solid var(--border-color);
     font-size: var(--font-size-sm);
     color: var(--text-primary);
+}
+
+/* A banner's buttons share one size, a step under a surface's, because a bar is
+   a single line of chrome. The tone icon at the start is `.surface-icon`. */
+:is(.backup-reminder, .slowness-banner, .ingress-banner, .refusal-banner) .action-btn {
+    display: inline-flex;
+    align-items: center;
+    min-height: 1.75rem;
+    padding: 0 0.75rem;
+    border-radius: var(--radius-control);
+    font-size: var(--font-size-sm);
+    font-weight: 600;
 }
 
 .backup-reminder {
@@ -324,36 +349,15 @@
        pulls itself up over this gap (see .mobile-dot-indicator in mobile.css).
        A literal there would silently stop cancelling the moment this moves. */
     --pane-header-gap: 0.25rem;
-    /* Brand-blue bar (both themes) with a LIGHT foreground scale. Every glyph,
-       label, and badge in the bar consumes these --header-* tokens so the
-       inversion lives in one place. A popout ANCHORED in the bar needs no
-       reset back to dark-on-light, because it is never IN this subtree: the
-       menus portal their panel to <body> and inherit the document's own
-       defaults. One that ever rendered inline would need the reset restored;
-       see the note where it used to live, at the end of this file. */
-    --header-fg: #ffffff;
-    /* An alpha of its own, because the Filter glyph paints the muted tone as
-       an opaque shape under a group opacity (.filter-glyph below). */
-    --header-fg-muted-alpha: 0.72;
-    --header-fg-muted: rgba(255, 255, 255, var(--header-fg-muted-alpha));
-    /* The white veil a header control wears: nothing at rest, one step under
-       the pointer, a stronger one while it is toggled on. An ALPHA, plus the
-       CURRENT one, because two things wash the same veil over two different
-       backdrops. The control washes it over the bar. A badge riding that
-       control washes it over the ring colour below. So the ring matches the
-       lighter square its own button drew, instead of notching a dark hole in
-       it. The state rules at the end of this file raise it. */
+    /* Every glyph, label and badge in the bar consumes the --header-* tokens,
+       which live in the theme blocks of global/base.css so a theme can retune
+       them. Never redeclare one here: a value on this element beats the theme's
+       value on <html>. A popout anchored in the bar portals to <body>, so it
+       inherits the document's own colours rather than these.
+       The CURRENT veil stays here because it is per-control state: at rest it is
+       0%, and the state rules at the end of this file raise it to one of the
+       theme's veil steps. */
     --header-control-veil: 0%;
-    --header-control-veil-hover: 12%;
-    --header-control-veil-active: 22%;
-    --header-control-veil-active-hover: 30%;
-    /* Header divider: currently disabled (transparent) so the brand-blue bar
-       reads as one seamless header across the drawer/chat/content splits. The
-       full-height ::before/::after geometry is kept (matching the pane
-       .split-divider below) so re-enabling is just a color change here. */
-    --header-divider: transparent;
-    --header-badge-bg: #ffffff;
-    --header-badge-fg: var(--brand-blue-deep);
     /* The gap that stops a badge FUSING with the glyph it rides. The badge is
        painted white above and the bar's glyphs are white too, so a badge
        overlapping one merged into a single shape: the Lucidos mark's count and
@@ -572,6 +576,48 @@
     z-index: 1;
 }
 
+/* The pull-to-refresh arrow (PullRefreshAffordance). It rests just above the
+   pane's top edge and drops with the finger until a release would refresh.
+   `--pull-travel` is a measured touch distance, so it is px rather than a rem
+   length. `--pull-refresh-top` is the pane's visible top: 0 here, below the
+   overlaid header on a phone. */
+.content-pane > .pull-refresh-affordance {
+    position: absolute;
+    top: var(--pull-refresh-top, 0px);
+    left: 50%;
+    z-index: 2;
+    width: 2rem;
+    height: 2rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: var(--radius-round);
+    background: var(--bg-secondary);
+    /* Blends toward the accent with the pull, and is fully the accent at the
+       threshold. The colour says how close a release is to refreshing. */
+    --pull-accent-mix: calc(var(--pull-progress, 0) * 100%);
+    border: 1px solid color-mix(in srgb, var(--accent) var(--pull-accent-mix), var(--border-color));
+    box-shadow: var(--shadow-sm);
+    color: color-mix(in srgb, var(--accent) var(--pull-accent-mix), var(--text-muted));
+    pointer-events: none;
+    opacity: var(--pull-progress, 0);
+    transform: translate(-50%, calc(var(--pull-travel, 0px) - 100%));
+    transition: transform var(--duration-normal) ease, opacity var(--duration-normal) ease;
+}
+
+/* Tracks the finger with no lag. The transition above is the spring-back. */
+.content-pane > .pull-refresh-affordance.is-pulling {
+    transition: none;
+}
+
+/* Turns with the whole pull, so it keeps turning after the arrow stops
+   dropping, more slowly, for as long as the finger keeps pulling. */
+.content-pane > .pull-refresh-affordance svg {
+    width: var(--icon-size-md);
+    height: var(--icon-size-md);
+    transform: rotate(calc(var(--pull-turn, 0) * 270deg));
+}
+
 
 /* --- Hamburger toggle (panel menu) --- */
 
@@ -729,10 +775,10 @@
            what keeps the two from disagreeing, which would show as the ⋯
            appearing at a width the stylesheet says has room to spare.
 
-           Sized to the trailing end on both sides, deliberately: the leading end
-           is a box and a half narrower, and spending that difference on the
-           title is exactly what would stop the title being centred on the pane,
-           which is the whole point of the arrangement.
+           Sized to the trailing end on both sides, deliberately. The leading
+           end (the hamburger and Refresh) is a box and a gap narrower.
+           Spending that difference on the title would stop it being centred on
+           the pane, which is the whole point of the arrangement.
 
            The gap term is a literal rather than --pane-header-gap because a
            custom property is substituted on the element that DECLARES it, and
@@ -910,8 +956,32 @@
         --ddo: var(--divider-width); /* account for drawer divider element */
     }
 
+    /* The header's fill, painted as ONE box. At --titlebar-strip-continues 0
+       the box is exactly the header's. At 1 it also covers the band above, so
+       a striped fill lines up across the join: a pattern restarts at each
+       box's top edge, so two boxes never could. The theme's value is used
+       verbatim, its own tile size and colour layers included.
+
+       It hangs off the strip, which sits before the header, so the header's
+       dividers, focus wash and controls all paint above it. */
+    .titlebar-strip {
+        position: relative;
+    }
+
+    .titlebar-strip::before {
+        content: '';
+        position: absolute;
+        left: 0;
+        right: 0;
+        top: calc((1 - var(--titlebar-strip-continues)) * var(--titlebar-inset, 0px));
+        height: calc(var(--app-header-height) + var(--titlebar-strip-continues) * var(--titlebar-inset, 0px));
+        background: var(--header-gradient);
+        pointer-events: none;
+    }
+
     .app-header {
         position: relative;
+        background: none;
     }
 
     /* Divider between chat and panel header areas — centered on the split bar.
@@ -1036,6 +1106,61 @@
     .app-header .content-header-elements > .hamburger-panel,
     .app-header .content-header-actions {
         flex-shrink: 0;
+    }
+
+    /* Refresh (ContentRefreshButton) joins the hamburger at the leading end.
+       The auto margin takes the free space, so `space-between` still pins the
+       actions to the trailing end. Two boxes and a gap fit inside
+       --content-side-reserve, so the centred title does not move. */
+    .app-header .content-refresh-btn {
+        display: inline-grid;
+        place-items: center;
+        flex-shrink: 0;
+        margin-inline-end: auto;
+    }
+
+    /* The arrow and the check share one cell and crossfade, as on the phone
+       row (.mobile-refresh-indicator). `scale` rather than `transform`, which
+       the spin animation owns. */
+    .app-header .content-refresh-btn svg {
+        grid-area: 1 / 1;
+        transition: opacity var(--duration-slow) ease, scale var(--duration-slow) ease;
+    }
+
+    /* An activity indicator, so a literal duration. It runs through the
+       crossfade to the check, since stopping would snap the arrow upright
+       mid-fade. It stops back at idle, where the arrow is still transparent. */
+    .app-header .content-refresh-btn:not([data-state="idle"]) svg:not(.refresh-check) {
+        animation: spin 1s linear infinite;
+    }
+
+    :root[data-motion="reduce"] .app-header .content-refresh-btn:not([data-state="idle"]) svg:not(.refresh-check) {
+        animation: none;
+    }
+
+    .app-header .content-refresh-btn[data-state="done"] svg:not(.refresh-check),
+    .app-header .content-refresh-btn .refresh-check {
+        opacity: 0;
+        scale: 0.6;
+    }
+
+    /* The check grows in, then fades out at full size, as on the phone row.
+       Its `scale` resets only once it is invisible. */
+    .app-header .content-refresh-btn .refresh-check {
+        color: var(--header-fg);
+        transition: opacity var(--duration-emphasis) ease-in-out, scale 0s var(--duration-emphasis);
+    }
+
+    .app-header .content-refresh-btn[data-state="done"] .refresh-check {
+        opacity: 1;
+        scale: 1;
+        transition: opacity var(--duration-slow) ease, scale var(--duration-slow) ease;
+    }
+
+    /* The arrow waits for the check to finish fading. Keyed on `idle` alone,
+       so a new refresh still brings it straight back. */
+    .app-header .content-refresh-btn[data-state="idle"] svg:not(.refresh-check) {
+        transition-delay: var(--duration-emphasis);
     }
 
     /* The chevrons bracketing the title hold their size; only the title gives
@@ -1354,9 +1479,8 @@
        widths: content that can't shrink further (the mark) clips at the box
        edges, which sit inside the side reserves, instead of spilling over the
        clusters. overflow-y stays visible (matching the parent .pane-header-brand
-       above) so the brand badge's oversized touch target
-       (.brand-badge-action::after) keeps its full height where an engine honours
-       the pairing. NOTHING VISIBLE MAY RELY ON IT: the packaged macOS webview
+       above) where an engine honours the pairing. NOTHING VISIBLE MAY RELY ON
+       IT: the packaged macOS webview
        clips both axes as soon as one of them is `clip`, so anything that has to
        be seen stays inside this box. The badge does: it rides the mark's own
        corner, inside the mark's tap target, rather than lifting out of the flex
@@ -1619,11 +1743,16 @@
         left: 0;
         right: 0;
         background-color: transparent;
+        /* The underline cue (--focus-header-underline), drawn as an inset
+           shadow so it adds no layout. At rest its colour is transparent. */
+        box-shadow: inset 0 calc(-1 * var(--focus-header-underline-width)) 0 0 transparent;
         /* Slower than --duration-slow on purpose, so the wash blooms up like a
            light turning on rather than popping in. Scaled like every token in
            global/base.css, or it would be the one animation in the app that
-           ignores the animation-speed slider. */
-        transition: background-color calc(0.33s * var(--duration-scale)) ease-out;
+           ignores the animation-speed slider. A shadow is painted, not
+           composited, so fading it conjures no layer either. */
+        transition: background-color calc(0.33s * var(--duration-scale)) ease-out,
+                    box-shadow calc(0.33s * var(--duration-scale)) ease-out;
     }
     /* Drawer: extend the RIGHT edge over the drawer divider (--ddo wide when open,
        0 when closed). Left is the window edge. */
@@ -1649,6 +1778,7 @@
     :root[data-focused-pane="thread"]:not([data-thread-collapsed]) .header-focus-wash[data-pane="thread"]::before,
     :root[data-focused-pane="content"]:not([data-content-collapsed]) .header-focus-wash[data-pane="content"]::before {
         background-color: var(--focus-header-tint);
+        box-shadow: inset 0 calc(-1 * var(--focus-header-underline-width)) 0 0 var(--focus-header-underline);
     }
 
     /* While a divider drag is live (data-pane-resizing, set by
@@ -1748,7 +1878,7 @@
    panel is where the state is spelled and this is the dot that leads it.
    Size is the host's, since the two draw it at different scales. */
 .status-dot {
-    border-radius: 50%;
+    border-radius: var(--radius-round);
     background: var(--text-muted);
     flex-shrink: 0;
 }
@@ -1779,42 +1909,13 @@
     position: relative;
 }
 
-/* Background-activity badge: a spinning refresh glyph in place of the "!",
-   rendered as a real <button> because tapping it opens the status toast naming
-   what is running. Strip the UA button chrome so it stays visually identical to
-   the non-interactive "!" span, and widen the touch target past the ~0.875rem
-   glyph without moving it (the badge is out of flow on the mark's corner, so
-   padding would resize the badge itself). */
-.brand-badge-action {
-    -webkit-appearance: none;
-    appearance: none;
-    border: 0;
-    font: inherit;
-    /* `font` resets font-feature-settings to initial; keep inheriting it
-       so a Fira Code user does not get ligatures back here. */
-    font-feature-settings: inherit;
-    color: inherit;
-    cursor: pointer;
-}
-
-.brand-badge-action::after {
-    content: '';
-    position: absolute;
-    /* ~2.75rem square around a 0.875rem badge, centred, so a finger lands on it
-       without the glyph growing. */
-    inset: -0.9375rem;
-}
-
 /* The PENDING badge: new code exists in source with no version built behind it.
    A bare dot, deliberately quieter than the ready "!" and the spinner, because
    it reports a fact rather than an action that is waiting: it is smaller than
    the base .badge box, and it draws no glyph (the box IS the dot), so it reads
    as a mark on the brand rather than as a second attention mark competing with
-   the one that means "you can switch right now".
-
-   It is still a .brand-badge-action button, so it keeps the finger-sized hit
-   area above: tapping it re-opens the pending toast, which is the only way back
-   to a toast the user dismissed. */
+   the one that means "you can switch right now". The Lucidos menu's pending
+   row is the way back to its toast. */
 .brand-badge-dot {
     min-width: 0.5rem;
     min-height: 0.5rem;
@@ -1822,7 +1923,7 @@
        applies to an empty box, and both would stretch the dot out of round. */
     padding: 0;
     line-height: 0;
-    border-radius: 50%;
+    border-radius: var(--radius-round);
 }
 
 /* Rebuilding has been proved unable to deliver the pending version, so this one
@@ -1834,7 +1935,7 @@
     background: var(--accent-yellow);
 }
 
-/* Inherits the badge's white-on-accent color via currentColor. */
+/* Inherits the badge's ink via currentColor. */
 .brand-badge-spinner {
     display: inline-flex;
     animation: spin 1s linear infinite;
@@ -1844,10 +1945,16 @@
     animation: none;
 }
 
-.brand-badge-spinner svg {
+.brand-badge-spinner svg,
+.brand-badge-queued svg {
     display: block;
     width: 0.625rem;
     height: 0.625rem;
+}
+
+/* The still glyph a queued build shows in the spinner's place. */
+.brand-badge-queued {
+    display: inline-flex;
 }
 
 /* Slightly smaller on mobile — the badge rides a tighter header bar there, so
@@ -1857,10 +1964,11 @@
     .brand-badge {
         font-size: var(--font-size-3xs);
         --badge-height: 0.75rem;
-        border-radius: 0.5rem;
+        border-radius: var(--radius-control);
     }
 
-    .brand-badge-spinner svg {
+    .brand-badge-spinner svg,
+    .brand-badge-queued svg {
         width: 0.5625rem;
         height: 0.5625rem;
     }
@@ -1908,8 +2016,14 @@
     --focus-ring: 0 0 0 0.1875rem color-mix(in srgb, var(--header-fg) 55%, transparent);
 }
 
+/* An aria-disabled button keeps the pointer for its tooltip, and takes no
+   press: the busy Refresh (ContentRefreshButton). */
+.app-header .icon-btn[aria-disabled="true"] {
+    cursor: default;
+}
+
 @media (hover: hover) {
-    .app-header .icon-btn:hover:where(:not(:disabled)) {
+    .app-header .icon-btn:hover:where(:not(:disabled, [aria-disabled="true"])) {
         --header-control-veil: var(--header-control-veil-hover);
         color: var(--header-fg);
         background: color-mix(in srgb, var(--header-fg) var(--header-control-veil), transparent);
@@ -1982,7 +2096,13 @@
 
 /* ─── The threads Filter button's fades ─────────────────────────────────────
    Its glyph, badge and pressed highlight, the pane title and the filter panel
-   (drawer.css) all change on --duration-fast, so they land together. */
+   (drawer.css) all change on --duration-fast, so they land together.
+
+   Each element that fades holds `will-change: opacity` at rest. A running fade
+   puts its element on a compositing layer, and a layer snaps to whole pixels.
+   The button sits at a fractional y, so on a GPU-composited renderer the glyph
+   and badge can hop as a fade starts and drop back as it ends. Emulators paint
+   without that compositing and never show it: check on a real iPhone. */
 
 .app-header .icon-btn.filter-btn {
     transition-duration: var(--duration-fast);
@@ -1997,10 +2117,12 @@
     color: var(--header-fg);
     opacity: var(--header-fg-muted-alpha);
     transition: opacity var(--duration-fast) ease;
+    will-change: opacity;
 }
 
 .app-header .filter-glyph > .crossfade-layer {
     display: flex;
+    will-change: opacity;
 }
 
 .app-header .icon-btn.view-selector-active .filter-glyph {
@@ -2019,6 +2141,7 @@
 .app-header .badge.filter-badge {
     opacity: 0;
     visibility: hidden;
+    will-change: opacity;
     transition:
         box-shadow var(--duration-fast),
         opacity var(--duration-fast) ease,

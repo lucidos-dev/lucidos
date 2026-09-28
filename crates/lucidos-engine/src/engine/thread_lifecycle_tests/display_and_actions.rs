@@ -37,7 +37,7 @@ fn inbox_maps_to_current() {
 fn saved_default_idle_maps_to_saved() {
     assert_eq!(
         display_section(
-            ArchiveState::Archived,
+            ArchiveState::Inbox,
             ThreadStatus::Idle,
             true,
             false,
@@ -53,7 +53,7 @@ fn saved_default_idle_maps_to_saved() {
 fn saved_overrides_running_to_saved() {
     assert_eq!(
         display_section(
-            ArchiveState::Archived,
+            ArchiveState::Inbox,
             ThreadStatus::Running,
             true,
             false,
@@ -101,7 +101,7 @@ fn active_children_idle_maps_to_current() {
 fn active_children_saved_still_saved() {
     assert_eq!(
         display_section(
-            ArchiveState::Archived,
+            ArchiveState::Inbox,
             ThreadStatus::Idle,
             true,
             true,
@@ -186,7 +186,7 @@ fn archived_with_pending_changes_routes_to_current() {
 fn saved_overrides_pending() {
     assert_eq!(
         display_section(
-            ArchiveState::Archived,
+            ArchiveState::Inbox,
             ThreadStatus::Idle,
             true,
             false,
@@ -721,6 +721,8 @@ fn full_cascade_draft_change_then_save() {
     );
 }
 
+/// A pinned thread always sits in the inbox (ADR 0312). So a settled one is
+/// offered Archive beside Unpin, and the user is never left with Unpin alone.
 #[test]
 fn saved_thread_shows_unsave_not_save() {
     let actions = available_thread_actions(

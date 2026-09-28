@@ -22,6 +22,7 @@ import {
   followSeedFromStored,
   followingLiveEdge,
   honourAnchoredMutation,
+  DRAWN_ROW_SELECTOR,
   followSurvivesScroll,
   isNavigationScroll,
   markAnchorScroll,
@@ -276,11 +277,11 @@ function makeEl(opts: {
           : sel === '.queued-message-remove' ? (turn.queued ? { isConnected: true } : null)
             : null
       ),
-      // `.response-content > *` and not `.response-body > *`: the body's own
-      // children are the SECTION wrappers, and a resuming agent appends inside
-      // the wrapper already there. The fake must read at the row level for the
-      // same reason the code does.
-      querySelectorAll: (sel: string) => (sel === '.response-content > *' ? turn.drawn : []),
+      // Rows, not `.response-body > *`: the body's own children are the
+      // SECTION wrappers, and a resuming agent appends inside the wrapper
+      // already there. The fake must read at the row level for the same reason
+      // the code does.
+      querySelectorAll: (sel: string) => (sel === DRAWN_ROW_SELECTOR ? turn.drawn : []),
       getBoundingClientRect: () => ({
         width: 800, height, top: top - el.scrollTop, bottom: top + height - el.scrollTop, left: 0, right: 800,
       }),
@@ -1206,6 +1207,50 @@ describe('a carrying ride verifies its own landing', () => {
     expect(el.scrollTop).toBe(2500);
   });
 
+  it('an anchor write\'s own scroll event during the ride\'s glide keeps the ride', () => {
+    // THE REPORTED CASE. A question deep link lands and the ride glides to the
+    // edge. The rest of the history folds in above, and the fold's hold writes
+    // an anchor correction mid-glide. Read as a placement, its scroll event
+    // would park the ride, stop the glide, and leave the reader in older turns.
+    setTranscriptLive(false);  // a thread waiting on a question
+    const el = makeEl({ scrollTop: 100, scrollHeight: 3000, clientHeight: 500 });
+    const { onScroll } = makeScrollObservers(el);
+    setActiveScrollElement(el);
+    setFollowLiveEdge(true);   // the glide starts, and has moved nobody yet
+
+    el.scrollHeight = 5000;    // the history folds in above the reader
+    markAnchorScroll(el, 2100);
+    onScroll();
+    expect(followingLiveEdge.value).toBe(true);
+
+    vi.advanceTimersByTime(1500);
+    expect(el.scrollTop).toBe(4500);
+  });
+
+  it('a glide carries an anchor write\'s shift instead of dropping it', () => {
+    // The fold lands a frame or two into the glide. The hold moves the reader
+    // down by exactly what folded in above, so the glide goes on from there.
+    // Easing on from its old start would show the reader older turns for a
+    // frame, then sweep them back down.
+    setTranscriptLive(false);
+    const el = makeEl({ scrollTop: 100, scrollHeight: 3000, clientHeight: 500 });
+    const { onScroll } = makeScrollObservers(el);
+    setActiveScrollElement(el);
+    setFollowLiveEdge(true);
+    vi.advanceTimersByTime(50);          // a frame or two into the glide
+    const before = el.scrollTop;
+    expect(before).toBeGreaterThan(100);
+
+    el.scrollHeight = 5000;
+    markAnchorScroll(el, before + 2000);
+    onScroll();
+    vi.advanceTimersByTime(17);          // the glide's next frame
+
+    expect(el.scrollTop).toBeGreaterThanOrEqual(before + 2000);
+    vi.advanceTimersByTime(1500);
+    expect(el.scrollTop).toBe(4500);
+  });
+
   it('a TURN CONTROL press that leaves the reader on the edge keeps the ride', () => {
     const { el } = riding();
 
@@ -1297,8 +1342,8 @@ describe('a carrying ride verifies its own landing', () => {
     // The hole this used to be. An anchor write moves the reader and the
     // correction stands down for it, correctly. The ride kept its flag, and no
     // later round could put it right, so the toggle stayed lit over a
-    // transcript nothing was following. An anchor write is a placement, so it
-    // retires the ride instead.
+    // transcript nothing was following. Outside the ride's own glide, an
+    // anchor write is a placement, so it retires the ride instead.
     const { el, onScroll } = riding();
 
     markAnchorScroll(el, 900);

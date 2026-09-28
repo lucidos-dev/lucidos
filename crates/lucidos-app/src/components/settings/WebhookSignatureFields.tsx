@@ -7,7 +7,9 @@
  * the pure helpers in `webhookSignature.ts`.
  */
 
-import { Dropdown } from '../shared/Dropdown';
+import { Dropdown, DropdownSkeleton } from '../shared/Dropdown';
+import { LoadingFade } from '../shared/LoadingFade';
+import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { LoadableError } from '../shared/LoadableError';
 import type { CredentialInfo, Loadable } from '../../store/types';
 import type { WebhookHmac, WebhookSigningSecret } from '../../api/client';
@@ -154,33 +156,34 @@ const SOURCE_LABELS: Record<SecretSource, string> = {
  *
  *  All four `Loadable` states get their own answer. Collapsing them read as
  *  "you have none saved" while the list was merely in flight, and stayed on
- *  screen for good when the fetch failed. */
-function savedCredentialControl(
-  credentials: Loadable<CredentialInfo[]>,
-  saved: CredentialInfo[] | null,
-  draft: SignatureDraft,
-  patch: (change: Partial<SignatureDraft>) => void,
-) {
+ *  screen for good when the fetch failed. In flight, past the delay gate, it
+ *  wears the picker's own box. */
+function SavedCredentialControl({ credentials, draft, patch }: {
+  credentials: Loadable<CredentialInfo[]>;
+  draft: SignatureDraft;
+  patch: (change: Partial<SignatureDraft>) => void;
+}) {
+  const showLoading = useDelayedLoading(credentials);
   if (credentials.status === 'failed') {
     return <LoadableError noun="credentials" error={credentials.error} />;
   }
-  if (saved === null) {
-    return <div class="settings-section-desc">Loading credentials...</div>;
-  }
-  if (saved.length === 0) {
-    return (
-      <div class="settings-section-desc">
-        No saved credentials yet. Generate one here, or add it in Accounts.
-      </div>
-    );
-  }
+  const saved = signableCredentials(credentials);
   return (
-    <Dropdown
-      options={saved.map((c) => ({ value: c.service_name, label: c.service_name }))}
-      value={draft.credential}
-      onChange={(v) => patch({ credential: v })}
-      placeholder="Pick a credential"
-    />
+    <LoadingFade showSkeleton={showLoading} skeleton={<DropdownSkeleton w="8rem" />}>
+      {saved?.length === 0 && (
+        <div class="settings-section-desc">
+          No saved credentials yet. Generate one here, or add it in Accounts.
+        </div>
+      )}
+      {!!saved?.length && (
+        <Dropdown
+          options={saved.map((c) => ({ value: c.service_name, label: c.service_name }))}
+          value={draft.credential}
+          onChange={(v) => patch({ credential: v })}
+          placeholder="Pick a credential"
+        />
+      )}
+    </LoadingFade>
   );
 }
 
@@ -194,7 +197,6 @@ interface Props {
 
 export function WebhookSignatureFields({ draft, credentials, onChange }: Props) {
   const preset = presetFor(draft.scheme);
-  const saved = signableCredentials(credentials);
 
   function patch(change: Partial<SignatureDraft>) {
     onChange({ ...draft, ...change });
@@ -237,7 +239,7 @@ export function WebhookSignatureFields({ draft, credentials, onChange }: Props) 
       {draft.source === 'saved' ? (
         <div class="webhook-signature-row">
           <label>Credential</label>
-          {savedCredentialControl(credentials, saved, draft, patch)}
+          <SavedCredentialControl credentials={credentials} draft={draft} patch={patch} />
         </div>
       ) : (
         <div class="webhook-signature-row">

@@ -24,6 +24,9 @@ export const OFFICIAL_MARKETPLACE = {
 // refresh — each cloning every registered marketplace repo.
 let catalogLoadInFlight: Promise<void> | null = null;
 
+/** Counts catalog reads as they start, so a waiter can tell which came after its request. */
+let catalogReadSeq = 0;
+
 // A flaky link fails this GET at the transport layer, or times it out
 // client-side. Safari surfaces the first as `TypeError: "Load failed"`,
 // typically on an iOS PWA resuming over Tailscale. Both recover on their own
@@ -97,6 +100,7 @@ function scanRanBehindAMutation(scanned: PluginMarketplace[]): boolean {
 export function loadPluginCatalog(force = false): Promise<void> {
   if (!force && marketplaceCatalog.value.status === 'loaded') return Promise.resolve();
   if (catalogLoadInFlight) return catalogLoadInFlight;
+  const readSeq = ++catalogReadSeq;
   catalogLoadInFlight = (async () => {
     setLoadingIfFresh(marketplaceCatalog);
     try {
@@ -113,11 +117,13 @@ export function loadPluginCatalog(force = false): Promise<void> {
         return;
       }
       marketplaceCatalog.value = { status: 'loaded', data: catalog };
+      if (!catalog.scanning) settleScanWaitersReadAfter(readSeq);
     } catch (e) {
       // The applied list goes with the catalog it lived in, so there is nothing
       // left for a later scan to be checked against.
       expectedMarketplaces = null;
       marketplaceCatalog.value = toFailed(e);
+      settleScanWaitersReadAfter(readSeq);
     }
   })().finally(() => {
     catalogLoadInFlight = null;
@@ -136,18 +142,12 @@ export async function refreshPluginCatalog(): Promise<void> {
   await loadPluginCatalog(true);
 }
 
-/** The Plugins panel's refresh control. Asks the engine for a fresh scan.
- *
- *  Raises the cue here rather than waiting for the `PluginCatalogScanStarted`
- *  frame, so the button responds to the click that pressed it. The frame and
- *  the next fetch both agree with it moments later. A failed request lowers the
- *  cue again, or it would claim a scan that never started. */
+/** The Plugins panel's "Updated …" control: the panel refresh, from a click.
+ *  A failed request is toasted here, since no panel refresh names it. */
 export async function rescanPluginCatalogAction(): Promise<void> {
-  marketplaceScanning.value = true;
   try {
-    await rescanPluginCatalog();
+    await rescanPluginCatalogAndSettle();
   } catch (e) {
-    marketplaceScanning.value = false;
     showToast(`Failed to start a marketplace scan: ${errorDetail(e)}`, 'error');
   }
 }
@@ -171,9 +171,77 @@ export async function refreshPluginCatalogAfterMutation(): Promise<void> {
   if (catalogLoadInFlight) {
     catalogRefreshQueued = true;
     await catalogLoadInFlight;
+    // The in-flight read's `finally` started the trailing one. Settle on that,
+    // since the read just awaited predates what this caller is fresher than.
+    await catalogLoadInFlight;
     return;
   }
   await loadPluginCatalog(true);
+}
+
+/** A refresh waiting on the scan it asked for. */
+interface ScanWaiter {
+  settle: () => void;
+  /** The last read started before the scan request returned. Null while it is in flight. */
+  afterRead: number | null;
+  /** A scan landed while the request was in flight. It may predate the request, so it cannot settle it. */
+  landedEarly: boolean;
+}
+
+let scanWaiters: ScanWaiter[] = [];
+
+/** The one way a refresh settles. A read that started after its scan request
+ *  returned holds that scan's result once it finds no scan running, or it
+ *  failed visibly. A scan frame alone cannot settle it: SSE and HTTP arrive in
+ *  no fixed order, so the frame may belong to an earlier scan. */
+function settleScanWaitersReadAfter(readSeq: number): void {
+  const done = scanWaiters.filter((w) => w.afterRead !== null && readSeq > w.afterRead);
+  if (done.length === 0) return;
+  scanWaiters = scanWaiters.filter((w) => !done.includes(w));
+  for (const w of done) w.settle();
+}
+
+/** A scan ended, whoever started it: the engine's `PluginCatalogScanned`.
+ *  Lowers the "Updating…" cue, then re-reads. */
+export function pluginCatalogScanned(): void {
+  marketplaceScanning.value = false;
+  for (const w of scanWaiters) if (w.afterRead === null) w.landedEarly = true;
+  resyncPluginCatalog();
+}
+
+/** Re-read an open catalog, or one a refresh waits on. `AfterMutation`, not
+ *  the plain refresh: a fetch already in flight may predate what just
+ *  happened. A reconnect calls this too, since SSE replays no scan frame. */
+export function resyncPluginCatalog(): void {
+  if (marketplaceCatalog.value.status === 'loaded' || scanWaiters.length > 0) {
+    void refreshPluginCatalogAfterMutation();
+  }
+}
+
+/** The Plugins panel refresh: a fresh scan, settled once its result is on
+ *  screen. A re-read alone returns the engine's cached scan, so the list and
+ *  its "Updated …" age would never move. A failed request rejects, so the
+ *  panel refresh names it. */
+export async function rescanPluginCatalogAndSettle(): Promise<void> {
+  let settle!: () => void;
+  const landed = new Promise<void>((resolve) => { settle = resolve; });
+  const waiter: ScanWaiter = { settle, afterRead: null, landedEarly: false };
+  scanWaiters.push(waiter);
+  // Raised now, not on `PluginCatalogScanStarted`, so the cue answers the press.
+  // A failed request lowers it again: no scan started.
+  marketplaceScanning.value = true;
+  try {
+    await rescanPluginCatalog();
+  } catch (e) {
+    scanWaiters = scanWaiters.filter((w) => w !== waiter);
+    marketplaceScanning.value = false;
+    throw e;
+  }
+  waiter.afterRead = catalogReadSeq;
+  // Neither a scan that landed during the request nor a read begun before it
+  // returned can say whether the requested scan has run. A read begun now can.
+  if (waiter.landedEarly || catalogLoadInFlight) void refreshPluginCatalogAfterMutation();
+  await landed;
 }
 
 /** Show the marketplace list an add/remove response carried, then fill in the

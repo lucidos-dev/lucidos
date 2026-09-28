@@ -1,15 +1,11 @@
 /**
- * The prompt-bar popover shell must load BEFORE the surfaces that override it.
+ * The anchored popover shell must load BEFORE the surfaces that override it.
  *
- * `.prompt-bar-popover` and a surface class (`.waiting-panel`,
- * `.todo-panel`) land on the SAME element, one via `panelClass`, at the same
- * specificity (one class each). Nothing but source order decides which
- * `max-width` wins. While the shell lived inside `todo-list.css` it therefore
- * beat every rule in `waiting-indicator.css`, which `chat.css` imports first: the
- * waiting panel's own `max-width` cap lost to the shell's bare
- * fit cap and the panel grew to the full viewport width, running out of the
- * thread pane and leaving its description on one unbroken line. `.todo-panel`
- * hid the bug, being declared after the shell inside one file.
+ * `.anchored-popover` and a surface class (`.waiting-panel`, `.todo-panel`,
+ * `.explainer-popover`) land on the SAME element at the same specificity. So
+ * only source order decides which `max-width` wins. A shell loaded after a
+ * surface beat its caps: the waiting panel once grew to the full viewport
+ * width that way, running out of the thread pane.
  *
  * Neither `tsc` nor `vite build` can see this: the stylesheet is valid CSS and
  * builds clean. Only the rendered result is wrong, so the ordering gets a
@@ -26,40 +22,43 @@ import { dirname, resolve, join } from 'node:path';
 const here = dirname(fileURLToPath(import.meta.url));
 /** `crates/lucidos-app/src/styles/`, from `src/styles/__tests__/`. */
 const STYLES = resolve(here, '..');
-const SHELL = 'prompt-bar-popover.css';
+const SRC = resolve(STYLES, '..');
+const SHELL = 'anchored-popover.css';
 
-/** Import specifiers in `chat.css`, in source order. */
-function chatImports(): string[] {
-  const css = readFileSync(join(STYLES, 'chat.css'), 'utf8');
-  return [...css.matchAll(/@import\s+'\.\/chat\/([^']+)'/g)].map((m) => m[1]);
+/** Import specifiers of a stylesheet, in source order. */
+function imports(file: string): string[] {
+  const css = readFileSync(join(STYLES, file), 'utf8');
+  return [...css.matchAll(/@import\s+'\.\/([^']+)'/g)].map((m) => m[1]);
 }
 
-describe('prompt-bar popover shell cascade', () => {
-  it('is imported before every stylesheet that overrides it', () => {
-    const imports = chatImports();
-    const shellAt = imports.indexOf(SHELL);
-    expect(shellAt, `chat.css must import chat/${SHELL}`).toBeGreaterThanOrEqual(0);
+/** Every stylesheet under `styles/`, as a path relative to it. */
+function sheets(dir = STYLES, prefix = ''): string[] {
+  return readdirSync(dir, { withFileTypes: true }).flatMap((e: { name: string; isDirectory(): boolean }) =>
+    e.isDirectory()
+      ? e.name === '__tests__' ? [] : sheets(join(dir, e.name), `${prefix}${e.name}/`)
+      : e.name.endsWith('.css') ? [`${prefix}${e.name}`] : []);
+}
 
-    // Any chat stylesheet mentioning the shell class is a surface that may
-    // override it, so it has to come later. Discovered from disk rather than
-    // listed, so a third popover surface is covered the day it is added.
-    const overriders = readdirSync(join(STYLES, 'chat'))
-      .filter((f: string) => f.endsWith('.css') && f !== SHELL)
-      .filter((f: string) => readFileSync(join(STYLES, 'chat', f), 'utf8').includes('prompt-bar-popover'));
-    expect(overriders.length).toBeGreaterThan(0);
-    for (const f of overriders) {
-      const at = imports.indexOf(f);
-      expect(at, `chat.css must import chat/${f}`).toBeGreaterThanOrEqual(0);
-      expect(at, `chat/${f} must be imported after the shell`).toBeGreaterThan(shellAt);
+describe('anchored popover shell cascade', () => {
+  it('loads before the explainer, in global.css', () => {
+    const order = imports('global.css');
+    const shellAt = order.indexOf(`global/${SHELL}`);
+    expect(shellAt, `global.css must import global/${SHELL}`).toBeGreaterThanOrEqual(0);
+    expect(order.indexOf('global/host-components.css')).toBeGreaterThan(shellAt);
+  });
+
+  it('loads before the chat surfaces, since main.tsx imports global.css first', () => {
+    const main = readFileSync(join(SRC, 'main.tsx'), 'utf8');
+    expect(main.indexOf("'./styles/global.css'")).toBeGreaterThanOrEqual(0);
+    expect(main.indexOf("'./styles/global.css'")).toBeLessThan(main.indexOf("'./styles/chat.css'"));
+    for (const f of ['chat/waiting-indicator.css', 'chat/todo-list.css']) {
+      expect(imports('chat.css'), `chat.css must import ${f}`).toContain(f);
     }
   });
 
   it('declares the shell rules in exactly one file', () => {
-    const declaring = readdirSync(join(STYLES, 'chat'))
-      .filter((f: string) => f.endsWith('.css'))
-      .filter((f: string) =>
-        /^\.prompt-bar-popover[\w-]*[\s,{]/m.test(readFileSync(join(STYLES, 'chat', f), 'utf8')),
-      );
-    expect(declaring).toEqual([SHELL]);
+    const declaring = sheets().filter((f) =>
+      /^\.anchored-popover[\w-]*[\s,{]/m.test(readFileSync(join(STYLES, f), 'utf8')));
+    expect(declaring).toEqual([`global/${SHELL}`]);
   });
 });

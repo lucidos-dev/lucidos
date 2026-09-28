@@ -40,10 +40,11 @@ const BASE_CLASS = /list-row-details(?!-prose)/g;
 const INLINE_ELEMENT = /<(?:code|strong|em)[\s>]/;
 
 /** Where the element opened at `start` ends, as far as this scan cares. A
- *  details slot never nests a block, so the first close of either kind ends it;
- *  stopping early can only under-report, never flag a well-formed row. */
+ *  details slot never nests a block, so the first close of any kind ends it;
+ *  stopping early can only under-report, never flag a well-formed row. A
+ *  self-skeletonizing row writes its slot as an `<SkText>`. */
 function bodyEnd(src: string, from: number): number {
-  const ends = ['</div>', '</span>'].map((t) => src.indexOf(t, from)).filter((i) => i >= 0);
+  const ends = ['</div>', '</span>', '</SkText>'].map((t) => src.indexOf(t, from)).filter((i) => i >= 0);
   return ends.length ? Math.min(...ends) : src.length;
 }
 

@@ -25,6 +25,8 @@ vi.mock('../../utils/platform', () => ({
   },
 }));
 
+vi.mock('../shared/Disclosure', () => import('../shared/__tests__/disclosureStub'));
+
 const {
   notifyRows,
   countLabel,

@@ -8,6 +8,7 @@ import { previewAuthGate, previewGatewayFromEnv, previewProxy } from './vite/fro
 import { askGatewaySession } from './vite/gatewaySession';
 import { entryChunkBudget } from './vite/entryChunkBudget';
 import { shellChunkPreload } from './vite/shellChunkPreload';
+import { inlineBootScript } from './vite/inlineBootScript';
 
 const VITE_PORT = parseInt(process.env.VITE_PORT || '5173');
 
@@ -193,20 +194,7 @@ function inlineAppearanceBoot(): Plugin {
           `${bundlePath} is missing. Run: cd packages/lucidos-sdk && npm run build`,
         );
       }
-      const bundle = fs.readFileSync(bundlePath, 'utf-8');
-      // An HTML parser ends a <script> at the first `</script`, inside a string
-      // or a regex literal alike, so a bundle carrying that sequence would close
-      // its own tag and spill the remainder into the document as markup. Nothing
-      // in the boot source does today; this is here because inlining arbitrary
-      // built text is exactly where that stops being true quietly.
-      if (/<\/script/i.test(bundle)) {
-        throw new Error(
-          'The appearance boot bundle contains `</script`, which would terminate the '
-          + 'inline tag early. Rewrite the source so the sequence cannot appear '
-          + '(e.g. split the string).',
-        );
-      }
-      return html.replace(APPEARANCE_BOOT_MARKER, `<script>\n${bundle}</script>`);
+      return inlineBootScript(html, APPEARANCE_BOOT_MARKER, fs.readFileSync(bundlePath, 'utf-8'));
     },
   };
 }
@@ -358,6 +346,10 @@ export default defineConfig({
       // import time, so widening that graph reorders side effects.
       // Mirrored in tsconfig.json `paths` so tsc resolves it too.
       '@lucidos/appearance': resolve(__dirname, '../../packages/lucidos-sdk/src/appearance.ts'),
+      // Registers a workspace font's faces. Imports only types, so it is reached
+      // WITHOUT the barrel for the same reason as the line above.
+      // Mirrored in tsconfig.json `paths` so tsc resolves it too.
+      '@lucidos/font-faces': resolve(__dirname, '../../packages/lucidos-sdk/src/fontFaces.ts'),
       // The tooltip, and the viewport clamps it shares with the host's anchored
       // popover. Both are reached WITHOUT the barrel, for the same reason.
       // Mirrored in tsconfig.json `paths` so tsc resolves them too.
@@ -373,6 +365,11 @@ export default defineConfig({
       // barrel, for the same reason as the four above.
       // Mirrored in tsconfig.json `paths` so tsc resolves it too.
       '@lucidos/text-entry': resolve(__dirname, '../../packages/lucidos-sdk/src/textEntry.ts'),
+      // The pull-to-refresh gesture, shared so a pull on the content pane and
+      // a pull inside an app frame follow one model. Reached WITHOUT the barrel,
+      // for the same reason as the five above.
+      // Mirrored in tsconfig.json `paths` so tsc resolves it too.
+      '@lucidos/pull-to-refresh': resolve(__dirname, '../../packages/lucidos-sdk/src/pullToRefresh.ts'),
     },
   },
   server: {

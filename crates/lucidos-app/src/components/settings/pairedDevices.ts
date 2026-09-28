@@ -1,10 +1,9 @@
 /**
  * The pairing half of a device row: who may reach this machine at all.
  *
- * Read from the gateway's own `/~/api/v1/auth/devices`, so it answers nothing
- * at all when there is no gateway to ask, exactly as the workspace switcher
- * does. That absence is a real state and not an error: see `deviceList.ts`,
- * which joins this half onto the engine's per-workspace rows.
+ * The list itself is shared state (`store/actions/pairedDevices.ts`). This
+ * module is the Devices page's side of it: the revoke flow and how a row
+ * describes its pairing. `deviceList.ts` joins it onto the engine's rows.
  *
  * This was a whole section under Settings -> Access. That is how Settings ended
  * up with a *device* in two places that were not the same device. It is now the
@@ -12,14 +11,12 @@
  */
 
 import { useEffect, useState } from 'preact/hooks';
+import { revokePairedDevice, type PairedDevice } from '../../api/client/control';
 import {
-  GatewayError,
-  listPairedDevices,
-  revokePairedDevice,
-  type PairedDevice,
-} from '../../api/client/control';
-import type { Loadable } from '../../store/types';
-import { toFailed } from '../../store/types';
+  loadPairedDevices,
+  pairedDevices,
+  type PairedDevicesLoadable,
+} from '../../store/actions/pairedDevices';
 import { pairingSession } from '../../api/client/pairing';
 import { showConfirm, showToast } from '../../store/store';
 
@@ -95,22 +92,6 @@ export function deviceDetails(
   return clauses.join(', ');
 }
 
-/** What this deployment has instead of a pairing list.
- *
- *  A LOADED value, not a failure: reaching an engine's own port answers 404 for
- *  `/~/`, and that is a settled fact about the deployment rather than something
- *  going wrong. A gateway that answers anything else IS a failure and takes the
- *  `failed` arm, so a broken one can never read as an absent one. */
-export const NO_GATEWAY = 'no-gateway' as const;
-
-/** The gateway's half of the device list.
- *
- *  `Loadable` because it is async-fetched (`.claude/rules/frontend.md`), and
- *  all four of its states are distinct here: in flight, loaded with a list,
- *  loaded with [`NO_GATEWAY`], and failed. Collapsing any two would let a
- *  gateway outage render as a deployment that never had one. */
-export type PairedDevicesLoadable = Loadable<PairedDevice[] | typeof NO_GATEWAY>;
-
 export interface PairedDevicesState {
   paired: PairedDevicesLoadable;
   /** Which row is this browser. `null` while unknown, and for a local process,
@@ -119,48 +100,19 @@ export interface PairedDevicesState {
   reload: () => void;
 }
 
+/** The Devices page's view of the shared list. Opening the page refetches, so
+ *  it shows what the gateway holds now. */
 export function usePairedDevices(): PairedDevicesState {
-  const [paired, setPaired] = useState<PairedDevicesLoadable>({ status: 'not-loaded' });
   const [selfId, setSelfId] = useState<string | null>(null);
 
-  function reload() {
-    setPaired({ status: 'loading' });
-    listPairedDevices()
-      .then((rows) => setPaired({ status: 'loaded', data: rows }))
-      .catch((e: unknown) => {
-        if (e instanceof GatewayError && e.isAbsent) {
-          setPaired({ status: 'loaded', data: NO_GATEWAY });
-          return;
-        }
-        setPaired(toFailed(e));
-      });
-  }
-
   useEffect(() => {
-    reload();
+    void loadPairedDevices();
     pairingSession()
       .then((s) => setSelfId(s.device_id ?? null))
       .catch(() => setSelfId(null));
   }, []);
 
-  return { paired, selfId, reload };
-}
-
-/** The rows to join onto the engine's, or `null` when there are none to join.
- *
- *  `null` for every state but a loaded list, so an in-flight or failed fetch
- *  never renders as "nothing is paired". */
-export function pairedRows(paired: PairedDevicesLoadable): PairedDevice[] | null {
-  if (paired.status !== 'loaded' || paired.data === NO_GATEWAY) return null;
-  return paired.data;
-}
-
-/** Has a gateway told us, one way or the other, which devices are paired?
- *
- *  Gates the pairing clause on a row. False while loading, on a failure, and
- *  where no gateway serves the page, because none of the three knows. */
-export function pairingIsKnown(paired: PairedDevicesLoadable): boolean {
-  return paired.status === 'loaded' && paired.data !== NO_GATEWAY;
+  return { paired: pairedDevices.value, selfId, reload: () => void loadPairedDevices() };
 }
 
 /**
@@ -173,11 +125,11 @@ export function pairingIsKnown(paired: PairedDevicesLoadable): boolean {
  */
 export async function revokePaired(
   device: PairedDevice,
-  state: { selfId: string | null; count: number; reload: () => void },
+  state: { name: string; selfId: string | null; count: number; reload: () => void },
 ): Promise<void> {
   const isSelf = state.selfId !== null && device.id === state.selfId;
   const confirmed = await showConfirm(
-    revokeConfirmMessage({ label: device.label, isSelf, isLast: state.count === 1 }),
+    revokeConfirmMessage({ label: state.name, isSelf, isLast: state.count === 1 }),
     'Revoke',
     { title: 'Revoke this device', variant: 'danger' },
   );
@@ -189,7 +141,7 @@ export async function revokePaired(
       window.location.reload();
       return;
     }
-    showToast(`${device.label} can no longer reach this machine`, 'success');
+    showToast(`${state.name} can no longer reach this machine`, 'success');
     state.reload();
   } catch (e) {
     showToast(e instanceof Error ? e.message : 'Could not revoke that device', 'error');

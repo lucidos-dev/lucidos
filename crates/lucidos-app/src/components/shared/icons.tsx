@@ -1,4 +1,4 @@
-import type { StepOutcome } from '../../store/types';
+import type { StepOutcome, ToastType } from '../../store/types';
 
 export function ClaudeIcon() {
   return (
@@ -14,6 +14,18 @@ export function ReloadIcon() {
       <polyline points="20.8 5.6 20.8 10.4 16 10.4"/>
       <polyline points="3.2 18.4 3.2 13.6 8 13.6"/>
       <path d="M5.21 9.6A7.2 7.2 0 0 1 14.28 5.09L20.8 10.4M3.2 13.6l6.52 5.31A7.2 7.2 0 0 0 18.79 14.4"/>
+    </svg>
+  );
+}
+
+// Hourglass: work that is waiting its turn rather than running, the still
+// counterpart of the spinning ReloadIcon on the brand badge. The glass has
+// straight walls under each cap, so at badge size it cannot read as an "X".
+export function HourglassIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M5 2.5h14M5 21.5h14"/>
+      <path d="M7 2.5v3.5l5 6 5-6V2.5M7 21.5V18l5-6 5 6v3.5"/>
     </svg>
   );
 }
@@ -250,11 +262,9 @@ export function ChevronDownIcon({ size = '1.25rem' }: { size?: string }) {
 }
 
 /** A horseshoe MAGNET over the LIVE EDGE: the *standing follow*'s toggle, in the
- *  prompt area. It says stick to the live edge, where the chevron beside it
- *  says go there once. NOT `DownloadIcon`, worn one row above, and NOT
- *  `ChevronDownIcon`, which the scroll button keeps: that one NAVIGATES to
- *  the bottom, this one STAYS there. A labelled menu item can share a mark.
- *  An icon-only toggle cannot.
+ *  prompt area. It says STAY at the live edge; the chevron beside it says go
+ *  there once. NOT `DownloadIcon` (one row up) and NOT `ChevronDownIcon` (the
+ *  scroll button's), because an icon-only toggle cannot share a mark.
  *
  *  POLES DOWN, over a line, after both free-floating orientations failed at
  *  this size. A horseshoe is read from its inner void and its two pole bands,
@@ -265,13 +275,15 @@ export function ChevronDownIcon({ size = '1.25rem' }: { size?: string }) {
  *  apart from rainbow bands. Widen the 2-unit gap, or reopen the poles, and
  *  the glyph goes back there.
  *
- *  INK IS 0.750 OF THE BOX on both axes, the fraction this row's other glyphs
- *  land. That is the GEOMETRIC extent, stroke excluded. With the stroke it is
- *  0.833, and so is every neighbour. No inline size either: `.icon-btn` sizes
- *  the svg, and an inline size would override it. */
-export function FollowLiveEdgeIcon() {
+ *  ON AND OFF BY FILL, like `StandingApplyIcon`. A theme without a hue sets the
+ *  accent to the text colour, so colour alone cannot show the state.
+ *
+ *  INK IS 0.750 OF THE BOX on both axes, as for this row's other glyphs. That
+ *  is the GEOMETRIC extent, stroke excluded (0.833 with it, for every glyph).
+ *  No inline size either: `.icon-btn` sizes the svg. */
+export function FollowLiveEdgeIcon({ armed = false }: { armed?: boolean }) {
   return (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <svg viewBox="0 0 24 24" fill={armed ? 'currentColor' : 'none'} stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
       <path d="M4 17v-6a8 8 0 0 1 16 0v6h-5v-6a3 3 0 0 0-6 0v6z"/>
       <path d="M3 21h18"/>
     </svg>
@@ -305,11 +317,10 @@ export function StandingApplyIcon({ armed = false }: { armed?: boolean }) {
  *  turn, not only the latest. Worn by the response header's full-response
  *  toggle.
  *
- *  It does NOT change with the toggle's state. An unfold/fold pair was tried
- *  and visibly changed size on every click while the body under it moved,
- *  which read as the layout dancing. Brightness answers "is it on" instead
- *  (`.turn-controls` in styles/chat/input-messages.css), as it does for the
- *  steps control beside it.
+ *  The glyph never changes with the toggle: a swapped glyph changes the mark's
+ *  size on every click while the body under it moves. The pressed chip says
+ *  "on" instead (`.turn-controls` in styles/chat/input-messages.css), as it
+ *  does for the steps control beside it.
  *
  *  The back bubble draws only the edge the front one leaves showing, so the
  *  two never cross strokes at the 0.875rem this renders at. */
@@ -325,14 +336,14 @@ export function FullResponseIcon() {
 /** A circled minus to fold this turn, a circled plus to unfold it. Worn by both
  *  turn headers: the third of the response header's controls, the initiator
  *  header's only one. The other two flip a transcript-wide setting; this one
- *  folds THIS turn to its `⋯` stub.
+ *  folds THIS turn down to its header.
  *
  *  **It is the one turn control whose glyph changes with its state.** The pair
- *  beside it keeps a fixed glyph and brightens (see `FullResponseIcon`). This
- *  one is exempt from that brightness rule (`.turn-controls` in
- *  styles/chat/input-messages.css): bright meaning FOLDED would invert what
- *  bright means on its neighbours. So the glyph is its only visible state cue,
- *  and it names the next click, agreeing with the tooltip.
+ *  beside it keeps a fixed glyph and sits on a pressed chip when on (see
+ *  `FullResponseIcon`). This one is exempt from that chip (`.turn-controls` in
+ *  styles/chat/input-messages.css): a chip meaning FOLDED would invert what it
+ *  means on its neighbours. So the glyph carries the state, lit in the accent
+ *  while folded, and it names the next click, agreeing with the tooltip.
  *
  *  The circle is the same in both forms, so the flip adds one stroke inside it
  *  and the mark never changes size. `__tests__/turn-controls.test.tsx` pins
@@ -354,12 +365,12 @@ export function CollapseTurnIcon({ collapsed = false }: { collapsed?: boolean })
 export function StepLogIcon() {
   return (
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-      <circle cx="4.5" cy="7" r="1.15" fill="currentColor" stroke="none"/>
-      <line x1="8.5" y1="7" x2="20" y2="7"/>
+      <circle cx="4.5" cy="6" r="1.15" fill="currentColor" stroke="none"/>
+      <line x1="8.5" y1="6" x2="20" y2="6"/>
       <circle cx="4.5" cy="12" r="1.15" fill="currentColor" stroke="none"/>
       <line x1="8.5" y1="12" x2="20" y2="12"/>
-      <circle cx="4.5" cy="17" r="1.15" fill="currentColor" stroke="none"/>
-      <line x1="8.5" y1="17" x2="20" y2="17"/>
+      <circle cx="4.5" cy="18" r="1.15" fill="currentColor" stroke="none"/>
+      <line x1="8.5" y1="18" x2="20" y2="18"/>
     </svg>
   );
 }
@@ -405,6 +416,37 @@ export function SideBySideColumnsIcon() {
       <rect x="13.5" y="4" width="7.5" height="16" rx="1" />
     </svg>
   );
+}
+
+/** The glyph that carries a surface's tone: success, info, warning or error.
+ *  The frame around it stays neutral, so this is the only place tone shows. */
+export function ToneIcon({ tone }: { tone: ToastType }) {
+  switch (tone) {
+    case 'success':
+      return (
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="10" /><path d="M8 12l2.5 2.5L16 9" />
+        </svg>
+      );
+    case 'info':
+      return (
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+          <circle cx="12" cy="12" r="10" /><line x1="12" y1="16" x2="12" y2="11" /><line x1="12" y1="7.5" x2="12" y2="7.6" />
+        </svg>
+      );
+    case 'warning':
+      return (
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 2.5 1.5 21h21z" /><line x1="12" y1="10" x2="12" y2="14" /><line x1="12" y1="17.5" x2="12" y2="17.6" />
+        </svg>
+      );
+    case 'error':
+      return (
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+          <circle cx="12" cy="12" r="10" /><line x1="12" y1="7" x2="12" y2="13" /><line x1="12" y1="16.5" x2="12" y2="16.6" />
+        </svg>
+      );
+  }
 }
 
 export function BackIcon() {
@@ -607,9 +649,11 @@ export function WrapTextIcon() {
   );
 }
 
+// The stroke stays a presentation attribute: `.commands-btn .codex-icon`
+// repaints it with an author rule, which an inline style would beat.
 export function CodexIcon() {
   return (
-    <svg class="codex-icon" viewBox="0 0 24 24" fill="none" stroke="var(--accent-light)" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round">
+    <svg class="codex-icon" viewBox="0 0 24 24" fill="none" stroke="var(--codex-mark, var(--accent-light))" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round">
       <g transform="translate(-1.2 -1.2) scale(1.1)">
         <path d="M9.6 5.5c1.4-2 4.7-1.9 6 .2.9.2 1.7.8 2.2 1.7.5.8.6 1.7.4 2.6 2 .5 3.3 2.1 3.3 4.1 0 1.3-.6 2.5-1.6 3.3.1 2.3-1.8 4.1-4.2 4.1-1 0-1.9-.3-2.6-.9-.8.8-1.9 1.2-3.1 1.2-2 0-3.6-1.2-4.2-2.8-2-.3-3.5-1.9-3.5-3.8 0-1.7 1-3.2 2.6-3.8-.3-2.4 1.6-4.5 4-4.5.3 0 .5 0 .7.1Z" />
         <path d="M8.4 10.2 10.4 12l-2 1.8" />

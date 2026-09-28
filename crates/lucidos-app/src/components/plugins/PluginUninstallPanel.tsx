@@ -5,8 +5,8 @@ import {
   cancelPluginUninstallAction,
   confirmPluginUninstallAction,
 } from '../../store/actions/plugin-uninstall';
-import { formatMessageTimestamp } from '../../utils/formatTime';
 import { PluginFileList } from './PluginFileList';
+import { pluginPanelHeader } from './PluginSection';
 
 export function PluginUninstallPanel() {
   const form = activeInlineForm.value;
@@ -46,16 +46,16 @@ function PluginUninstallConfirm({ form }: { form: PluginUninstallForm }) {
     }
   }
 
-  const totalKnown = req.files_present.length + req.files_missing.length;
+  const present = req.files_present.length;
+  const description = present === 0
+    ? 'Its files are already gone. Uninstalling only clears its install record.'
+    : `This deletes ${present} file${present === 1 ? '' : 's'} from your workspace.`;
 
-  // Rendered twice — once top-right in the header, once at the bottom — so the
-  // Cancel/Confirm pair is reachable without scrolling past a long file list.
-  // A function (not a shared vnode) so each mount is a fresh element.
-  const renderActions = (extraClass = '') => (
-    <div class={`plugin-install-actions${extraClass ? ` ${extraClass}` : ''}`}>
+  const actions = (
+    <div class="plugin-install-actions">
       <button
         type="button"
-        class="action-btn"
+        class="action-btn action-btn-secondary"
         onClick={handleCancel}
         disabled={busy}
       >
@@ -67,48 +67,34 @@ function PluginUninstallConfirm({ form }: { form: PluginUninstallForm }) {
         onClick={handleConfirm}
         disabled={busy}
       >
-        {req.files_present.length === 0 ? 'Clear install record' : 'Confirm uninstall'}
+        {present === 0 ? 'Clear record' : 'Uninstall'}
       </button>
     </div>
   );
 
   return (
-    <div class="inline-form">
+    <div class="inline-form protected-surface">
       <div class="plugin-install-panel">
-        <header class="plugin-install-header plugin-install-header-row">
-          <div class="plugin-install-header-text">
-            <h2>Uninstall plugin</h2>
-            <div class="plugin-install-title-row">
-              <span class="plugin-install-name">{req.plugin_name}</span>
-              <span class="plugin-install-version">v{req.plugin_version}</span>
-            </div>
-            <p class="plugin-install-description">
-              {req.files_present.length === 0
-                ? `All ${totalKnown} recorded files are already gone — this just clears the install record.`
-                : `Removes ${req.files_present.length} file${req.files_present.length === 1 ? '' : 's'} from your workspace.`}
-            </p>
-          </div>
-          {renderActions('plugin-install-actions-top')}
-        </header>
+        {pluginPanelHeader({
+          status: 'Uninstall plugin',
+          name: req.plugin_name,
+          version: req.plugin_version,
+          description,
+          actions,
+        })}
 
-        {req.files_present.length > 0 && (
+        {present > 0 && (
           <PluginFileList
-            label={`Will be deleted (${req.files_present.length})`}
+            label="Files to delete"
             files={req.files_present}
-            sectionClass="plugin-install-overwrites"
-            fileClass="plugin-install-file-overwrite"
-            note={<>Local edits to these files since install will be lost. Empty parent directories under <code>data/</code> are pruned.</>}
+            tone="danger"
+            note="Any edits you made to these files are lost. Folders left empty are removed too."
           />
         )}
 
         {req.files_missing.length > 0 && (
-          <PluginFileList
-            label={`Already gone (${req.files_missing.length})`}
-            files={req.files_missing}
-          />
+          <PluginFileList label="Already gone" files={req.files_missing} />
         )}
-
-        {renderActions()}
       </div>
     </div>
   );
@@ -121,11 +107,8 @@ function PluginUninstallConfirm({ form }: { form: PluginUninstallForm }) {
  *
  *  Deliberately offers NO buttons at all. Confirm and Cancel are gone because
  *  the files are gone and the staged `uninstall_id` is popped. Close is gone
- *  because it broke the nav history the receipt exists to hold:
- *  `closeInlineForm()` blanks `panelOverlay` without touching the nav stack, so
- *  the cursor was left pointing at an entry describing a panel no longer on
- *  screen, and Back/Forward walked from that stale position. The header's back
- *  arrow is how you leave a receipt, same as any other panel page.
+ *  because a receipt is a page in the nav history. The header's back arrow is
+ *  how you leave it, same as any other panel page.
  *
  *  Exported for its unit test, which renders it directly: the suite's VNode walk
  *  stops at function components (the confirm branch's hooks would throw), so it
@@ -134,32 +117,22 @@ export function PluginUninstallReceiptPanel({ form }: { form: PluginUninstallFor
   const req = form.request;
   const removed = form.removed!;
   return (
-    <div class="inline-form">
+    <div class="inline-form protected-surface">
       <div class="plugin-install-panel">
-        <header class="plugin-install-header">
-          <div class="panel-receipt-status">
-            <span class="panel-receipt-badge">Uninstalled</span>
-            <span class="panel-receipt-time">{formatMessageTimestamp(removed.at)}</span>
-          </div>
-          <div class="plugin-install-title-row">
-            <span class="plugin-install-name">{req.plugin_name}</span>
-            <span class="plugin-install-version">v{req.plugin_version}</span>
-          </div>
-          <p class="plugin-install-description">{removed.summary}</p>
-        </header>
+        {pluginPanelHeader({
+          status: 'Uninstalled',
+          receiptAt: removed.at,
+          name: req.plugin_name,
+          version: req.plugin_version,
+          description: removed.summary,
+        })}
 
         {removed.files_deleted.length > 0 && (
-          <PluginFileList
-            label={`Deleted (${removed.files_deleted.length})`}
-            files={removed.files_deleted}
-          />
+          <PluginFileList label="Deleted" files={removed.files_deleted} />
         )}
 
         {removed.files_missing.length > 0 && (
-          <PluginFileList
-            label={`Already gone (${removed.files_missing.length})`}
-            files={removed.files_missing}
-          />
+          <PluginFileList label="Already gone" files={removed.files_missing} />
         )}
       </div>
     </div>

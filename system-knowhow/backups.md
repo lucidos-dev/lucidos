@@ -155,10 +155,10 @@ safe?" at a glance and nothing more; `get_backup_status` is where the detail is.
 
 ## Encryption key
 
-Backups are encrypted with a per-workspace key. The first scheduled backup
-auto-generates one if none exists and notifies the user to store it — it **cannot
-be recovered** and is **required to restore**. The user can view/copy it in
-Settings → System → Backup.
+Backups are encrypted with a per-workspace key. The first backup that needs one
+creates it: a manual backup, turning a schedule on, or a scheduled run. Lucidos
+then notifies the user to store it. It **cannot be recovered** and is **required
+to restore**. The user can view and copy it in Settings → System → Backup.
 
 ## Restore
 

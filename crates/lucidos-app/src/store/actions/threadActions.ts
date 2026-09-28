@@ -11,11 +11,9 @@
  *    core's `has_unsent_draft` from the live `composeDrafts` signal (fresh,
  *    ahead of the 250 ms compose-debounce), and applies the external-repo
  *    carve-out (Apply can't merge into a foreign repo → Archive instead).
- *  - `resolveGlobalActions()` — composes the top overlay-dismiss action with
- *    the focused thread's actions.
  */
 
-import { threadMap, focusedThreadId, changes, showConfirm, effectiveThreadStatus, applyingNowThreadIds, discardingCCThreadIds, archivingThreadIds, standingApplyThreadIds } from '../store';
+import { threadMap, focusedThreadId, changes, showConfirm, effectiveThreadStatus, applyingNowThreadIds, applyingChangeThreadIds, discardingCCThreadIds, archivingThreadIds, standingApplyThreadIds, armingStandingApplyThreadIds } from '../store';
 import { getCodingAgentWaitingInfo } from '../thread-events';
 import { availableThreadActions, type Action } from '../../generated/thread-lifecycle';
 import { getDraft, draftIsEmpty } from '../composeDrafts';
@@ -23,16 +21,11 @@ import { handleArchiveThread, handleSaveThread, handleUnsaveThread } from './thr
 import { endClaudeCodeAndApply, handleDiscardCCChanges } from './chat-claude-code';
 import { armStandingApply, disarmStandingApply, APPLY_NEW_VERSION_TOOLTIP } from './chat-changes';
 import { discardCompose, updateCompose } from './compose';
-import { topOverlay, dismissTopOverlay } from '../overlayStack';
 
-export type ActionCategory = 'close' | 'primary' | 'save' | 'dismiss';
-
-/** The kind discriminator: every `Action` from the core, plus the global-only
- *  overlay-dismiss pseudo-action that `resolveGlobalActions` prepends. */
-export type ActionKind = Action | 'dismiss_overlay';
+export type ActionCategory = 'close' | 'primary' | 'save';
 
 export interface TaggedAction {
-  kind: ActionKind;
+  kind: Action;
   category: ActionCategory;
   label: string;
   /** Optional hover tooltip (e.g. the Apply restart / partial-work hint). */
@@ -61,7 +54,7 @@ const APPLY_INCOMPLETE_CONFIRM =
  *  for cross-device draft sync, so emptying them flows through updateCompose).
  *  Composing throwaway → drop it wholesale via discardCompose. */
 export async function discardDraft(threadId: string): Promise<boolean> {
-  if (!(await showConfirm(DISCARD_DRAFT_CONFIRM, 'Discard'))) return false;
+  if (!(await showConfirm(DISCARD_DRAFT_CONFIRM, 'Discard', { variant: 'danger' }))) return false;
   const thread = threadMap.value.get(threadId);
   if (thread?.meta.state === 'active') {
     updateCompose(threadId, { text: '', image_hashes: [] });
@@ -168,6 +161,30 @@ export function resolveThreadActions(threadId: string): TaggedAction[] {
   );
 }
 
+/** Menu order for the change layer: the positive actions before Discard. */
+const CHANGE_MENU_ORDER: readonly Action[] = ['apply', 'apply_when_settled', 'discard'];
+
+/**
+ * The thread's change actions (Apply, Apply on settle, Discard) for the
+ * thread ⋯ menu, positive first. The menu hides an action it cannot run
+ * rather than disabling it (ADR 0168), and the thread's banner shows the
+ * progress. So it drops every action while an apply or a discard is in
+ * flight, and the standing apply while its own request is.
+ */
+export function resolveChangeMenuActions(threadId: string): TaggedAction[] {
+  if (
+    applyingNowThreadIds.value.has(threadId) ||
+    applyingChangeThreadIds.value.has(threadId) ||
+    discardingCCThreadIds.value.has(threadId)
+  ) {
+    return [];
+  }
+  const arming = armingStandingApplyThreadIds.value.has(threadId);
+  const actions = resolveThreadActions(threadId)
+    .filter((a) => !(arming && a.kind === 'apply_when_settled'));
+  return CHANGE_MENU_ORDER.flatMap((kind) => actions.filter((a) => a.kind === kind));
+}
+
 function tagAction(
   kind: Action,
   threadId: string,
@@ -195,7 +212,7 @@ function tagAction(
         category: 'close',
         label: 'Discard',
         invoke: async () => {
-          if (await showConfirm(DISCARD_CHANGE_CONFIRM, 'Discard')) void handleDiscardCCChanges(threadId);
+          if (await showConfirm(DISCARD_CHANGE_CONFIRM, 'Discard', { variant: 'danger' })) void handleDiscardCCChanges(threadId);
         },
       };
     case 'apply':
@@ -218,7 +235,7 @@ function tagAction(
             ? APPLY_NEW_VERSION_TOOLTIP
             : undefined,
         invoke: async () => {
-          if (opts.incomplete && !(await showConfirm(APPLY_INCOMPLETE_CONFIRM, 'Apply'))) return;
+          if (opts.incomplete && !(await showConfirm(APPLY_INCOMPLETE_CONFIRM, 'Apply', { variant: 'default' }))) return;
           void endClaudeCodeAndApply(threadId);
         },
       };
@@ -229,7 +246,7 @@ function tagAction(
         // A checked state that toggles off on click, the shape `unsave` already
         // uses. Never a disabled Apply: ADR 0168 replaces a control that cannot
         // act with the one that can.
-        label: opts.armed ? '✓ Applying as it settles' : 'Apply as it settles',
+        label: opts.armed ? '✓ Applying on settle' : 'Apply on settle',
         tooltip: opts.armed
           ? 'Armed. The change applies when this thread finishes, and drops with a report if the thread stops on a question or fails. Click to cancel.'
           : 'The thread has not finished. Apply its change the moment it does.',
@@ -340,27 +357,4 @@ export async function runCloseCascade(): Promise<void> {
     default:
       return; // nothing closeable — no-op
   }
-}
-
-/**
- * Global action availability: the top overlay-dismiss action (when any overlay
- * is open) followed by the focused thread's actions. The centralized Escape
- * dispatcher consults the dismiss action; the close cascade consults the
- * focused thread's `close`-category layers.
- */
-export function resolveGlobalActions(): TaggedAction[] {
-  const out: TaggedAction[] = [];
-  if (topOverlay()) {
-    out.push({
-      kind: 'dismiss_overlay',
-      category: 'dismiss',
-      label: 'Dismiss',
-      invoke: () => {
-        dismissTopOverlay();
-      },
-    });
-  }
-  const focused = focusedThreadId.value;
-  if (focused) out.push(...resolveThreadActions(focused));
-  return out;
 }

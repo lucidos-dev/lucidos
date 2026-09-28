@@ -21,6 +21,7 @@
 import type { DeviceInfo } from '../../api/types';
 import type { PairedDevice } from '../../api/client/control';
 import { deviceDetails } from './pairedDevices';
+import { deviceName } from '../../utils/deviceFriendlyName';
 
 /** One device, as the list shows it. */
 export interface DeviceRowModel {
@@ -79,33 +80,16 @@ export function buildDeviceRows(
  */
 const NO_ENGINE_ROW = 'Not set up in this workspace';
 
-/**
- * What to call a device: the most human name available, in that order.
- *
- * The name someone typed wins. Failing that the gateway's pairing label, which
- * a person also chose, on the device itself. Only with neither does this fall
- * back to `device-<first 8>`, and never to the whole id: a 36-character uuid is
- * unreadable, and as a row heading it wraps onto two lines.
- *
- * That last rung is the engine's `resolve_device_name`, so an unnamed, unpaired
- * device is called the same thing here and on an actor chip. The middle rung is
- * deliberately NOT: the engine cannot see the pairing label, so an unnamed but
- * paired device reads as its label here and as `device-<first 8>` on a chip.
- * That is the better name winning where it is available, not a drift to fix by
- * showing the worse one in both places.
- */
-export function deviceDisplayName(row: DeviceRowModel): string {
-  const stored = row.device?.name;
-  if (stored) return stored;
-  if (row.paired?.label) return row.paired.label;
-  return `device-${row.id.slice(0, 8)}`;
+/** What to call a row's device, by [`deviceName`]. */
+export function deviceRowName(row: DeviceRowModel): string {
+  return deviceName(row.id, row.device, row.paired);
 }
 
 /**
  * What a submitted rename field means: the name to store, or `undefined` for
  * "nothing changed, write nothing".
  *
- * The field is prefilled with [`deviceDisplayName`], which is the stored name
+ * The field is prefilled with [`deviceRowName`], which is the stored name
  * when there is one and a DERIVED name when there is not. Submitting that
  * prefill untouched is not a rename either way. Check the raw id instead and a
  * click-and-blur stores `device-<8>` as a real name. That name then outlives

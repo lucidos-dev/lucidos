@@ -1,4 +1,4 @@
-import { apiUrl, getBaseUrl, request, requestText, requestVoid } from './_fetch';
+import { apiUrl, dataMountUrl, getBaseUrl, request, requestText, requestVoid } from './_fetch';
 import { assertArray } from './_validate';
 import { capabilityCarrier } from './frameCapability';
 import { parseAppId } from './scroll';
@@ -94,7 +94,7 @@ export const data = {
       );
       if (appUrl !== null) return appUrl;
     }
-    return `${getBaseUrl()}${carrier}/data/${encodePathSegments(path)}`;
+    return dataMountUrl(encodePathSegments(path));
   },
 
   edit(path: string, operations: EditOperation[]): Promise<void> {

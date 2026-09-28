@@ -14,6 +14,7 @@ const mockListAppsApi = vi.fn().mockResolvedValue([]);
 vi.mock('../../api/client', () => ({
   postAppCapture: (...args: unknown[]) => mockPostAppCapture(...args),
   listAppsApi: (...args: unknown[]) => mockListAppsApi(...args),
+  retryTransientRead: <T>(read: () => Promise<T>) => read(),
   appUrl: vi.fn((id: string, tid?: string, fragment?: string) =>
     `/app/${id}/${tid ? `?thread_id=${tid}` : ''}${fragment ? `#${fragment}` : ''}`),
 }));
@@ -96,6 +97,28 @@ describe('captureAppUI', () => {
       '',
       expect.stringContaining('Error'),
     );
+  });
+});
+
+describe('refreshApps', () => {
+  // The panel refresh contract: a pull shows data at least as new as the pull.
+  // A list read already in flight began before it, so it may not answer it.
+  it('waits out a read already in flight, then sends its own', async () => {
+    const { loadApps, refreshApps } = await import('./apps');
+    let releaseFirst!: (apps: App[]) => void;
+    mockListAppsApi.mockReset()
+      .mockImplementationOnce(() => new Promise<App[]>((res) => { releaseFirst = res; }))
+      .mockResolvedValue([notesApp, tripPlanner]);
+
+    const first = loadApps();
+    const refresh = refreshApps();
+    await vi.waitFor(() => expect(mockListAppsApi).toHaveBeenCalledTimes(1));
+    releaseFirst([notesApp]);
+    await first;
+    await refresh;
+
+    expect(mockListAppsApi).toHaveBeenCalledTimes(2);
+    expect(appsList.value).toEqual({ status: 'loaded', data: [notesApp, tripPlanner] });
   });
 });
 
@@ -325,6 +348,7 @@ describe('openAppById', () => {
 
   it('toasts when the app id is unknown — stale link should not silently no-op', async () => {
     appsList.value = { status: 'loaded', data: [notesApp] };
+    mockListAppsApi.mockResolvedValue([notesApp]);
 
     const { openAppById } = await import('./apps');
     await openAppById('trip-planner-2026');

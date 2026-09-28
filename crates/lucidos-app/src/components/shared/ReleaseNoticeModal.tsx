@@ -1,4 +1,5 @@
 import { Overlay } from './Overlay';
+import { SurfaceHead } from './Surface';
 import { renderMarkdown } from '../../utils/renderMarkdown';
 import {
   acknowledgeReleaseNotice,
@@ -6,6 +7,7 @@ import {
   takeReleaseNoticeAction,
 } from '../../store/actions/releaseNotices';
 import {
+  modalActionLabel,
   owedReleaseNotice,
   owedReleaseNoticeCount,
   releaseNoticeDismissed,
@@ -27,43 +29,56 @@ export function ReleaseNoticeModal() {
   if (!notice || releaseNoticeDismissed.value) return null;
 
   const remaining = owedReleaseNoticeCount();
+  const actionLabel = modalActionLabel(notice);
 
   return (
     <Overlay
       open
       onClose={dismissReleaseNoticeModal}
-      panelClass="confirm-dialog release-notice"
+      overlayClass="protected-surface"
+      panelClass="surface surface-raised confirm-dialog release-notice protected-surface"
       panelRole="dialog"
       ariaModal
     >
-      <div class="release-notice-meta">
-        <span>Since Lucidos {notice.since}</span>
-        {/* Only worth saying when there is a queue behind this one. "1 of 1"
-            invents a sequence the reader is not in. */}
-        {remaining > 1 && <span class="release-notice-step">1 of {remaining}</span>}
-      </div>
-      <h2 class="confirm-title">{notice.title}</h2>
-      <div
-        class="markdown-content release-notice-body"
-        dangerouslySetInnerHTML={{ __html: renderMarkdown(notice.body) }}
+      <SurfaceHead
+        title={notice.title}
+        onClose={dismissReleaseNoticeModal}
+        closeLabel="Close, and show this notice again later"
       />
-      <div class="confirm-actions">
-        <div class="confirm-actions-right">
-          <button
-            class="confirm-btn confirm-btn-cancel"
-            onClick={() => void acknowledgeReleaseNotice(notice)}
-          >
-            Got it
-          </button>
-          {notice.action_label && (
-            <button
-              class="confirm-btn confirm-btn-ok"
-              onClick={() => void takeReleaseNoticeAction(notice)}
-            >
-              {notice.action_label}
-            </button>
-          )}
+      <div class="surface-body dialog-body" tabIndex={-1}>
+        <div class="release-notice-meta">
+          <span>Since Lucidos {notice.since}</span>
+          {/* Only worth saying when there is a queue behind this one. "1 of 1"
+              invents a sequence the reader is not in. */}
+          {remaining > 1 && <span class="release-notice-step">1 of {remaining}</span>}
         </div>
+        <div
+          class="markdown-content release-notice-body"
+          dangerouslySetInnerHTML={{ __html: renderMarkdown(notice.body) }}
+        />
+        {notice.action_deferred && notice.action_label && (
+          <p class="release-notice-deferred">
+            {notice.action_label} comes with a later notice, so you do it once.
+          </p>
+        )}
+      </div>
+      <div class="surface-foot">
+        <button
+          class={`action-btn${actionLabel ? ' action-btn-secondary' : ''}`}
+          data-role="release-notice-ack"
+          onClick={() => void acknowledgeReleaseNotice(notice)}
+        >
+          Got it
+        </button>
+        {actionLabel && (
+          <button
+            class="action-btn"
+            data-role="release-notice-action"
+            onClick={() => void takeReleaseNoticeAction(notice)}
+          >
+            {actionLabel}
+          </button>
+        )}
       </div>
     </Overlay>
   );

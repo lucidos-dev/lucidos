@@ -44,6 +44,14 @@ pub const MOCK_RUN_PYTHON_SENTINEL: &str = "MOCK_RUN_PYTHON:";
 /// and only a real multi-call response reaches that path.
 pub const MOCK_READ_FILES_SENTINEL: &str = "MOCK_READ_FILES:";
 
+/// Sentinel that makes the mock issue one call to any tool:
+/// `MOCK_TOOL_CALL: <tool name> <JSON arguments>`, to the end of the line.
+///
+/// For a test whose subject is what one tool does when a real model calls
+/// it, such as where `write_file` lands a path. The sentinels above stay
+/// because each also shapes the turn around its call.
+pub const MOCK_TOOL_CALL_SENTINEL: &str = "MOCK_TOOL_CALL:";
+
 /// What the mock says on any turn whose message array already carries the
 /// `await_event` call: the iteration right after it subscribes, and the
 /// re-entered turn later. Distinct from [`MOCK_RESPONSE`] so a test can tell those from a
@@ -57,8 +65,9 @@ pub const MOCK_REENTRY_RESPONSE: &str = "Picked the watch back up and finished t
 ///
 /// It issues a tool call only when scripted to, behind
 /// [`MOCK_AWAIT_EVENT_SENTINEL`] (see [`scripted_await_event`]),
-/// [`MOCK_RUN_PYTHON_SENTINEL`] (see [`scripted_run_python`]) and
-/// [`MOCK_READ_FILES_SENTINEL`] (see [`scripted_read_files`]).
+/// [`MOCK_RUN_PYTHON_SENTINEL`] (see [`scripted_run_python`]),
+/// [`MOCK_READ_FILES_SENTINEL`] (see [`scripted_read_files`]) and
+/// [`MOCK_TOOL_CALL_SENTINEL`] (see [`scripted_tool_call`]).
 pub struct MockProvider {
     default_model: String,
 }
@@ -141,6 +150,19 @@ pub fn scripted_read_files(messages: &[Message]) -> Option<Vec<String>> {
     }
     let line = sentinel_line(messages, MOCK_READ_FILES_SENTINEL)?;
     Some(line.split_whitespace().map(str::to_string).collect())
+}
+
+/// Decide whether this turn should call a named tool, and with what arguments.
+/// Same two halves as [`scripted_await_event`]: the request line only, and
+/// never twice. A line whose arguments are not a JSON object scripts nothing.
+pub fn scripted_tool_call(messages: &[Message]) -> Option<(String, serde_json::Value)> {
+    let line = sentinel_line(messages, MOCK_TOOL_CALL_SENTINEL)?;
+    let (name, args) = line.split_once(char::is_whitespace)?;
+    if already_called(messages, name) {
+        return None;
+    }
+    let args: serde_json::Value = serde_json::from_str(args.trim()).ok()?;
+    args.is_object().then(|| (name.to_string(), args))
 }
 
 /// The rest of the request line after `sentinel`, read from this turn's
@@ -259,6 +281,28 @@ impl LlmProvider for MockProvider {
                         thought_signature: None,
                     })
                     .collect(),
+                stop_reason: Some("tool_use".to_string()),
+                output_tokens: None,
+                input_tokens: None,
+                cache_creation_tokens: None,
+                cache_read_tokens: None,
+                thinking_chars: None,
+                thinking_blocks: None,
+                unknown_sse_dropped: 0,
+                model_only_text: None,
+                content_is_progress_notes: false,
+            });
+        }
+
+        if let Some((name, arguments)) = scripted_tool_call(&messages) {
+            return Ok(LlmResponse {
+                content: None,
+                tool_calls: vec![ToolCall {
+                    id: format!("toolu_mock_{name}"),
+                    name,
+                    arguments,
+                    thought_signature: None,
+                }],
                 stop_reason: Some("tool_use".to_string()),
                 output_tokens: None,
                 input_tokens: None,
@@ -445,6 +489,40 @@ mod tests {
             }]),
         });
         assert_eq!(scripted_read_files(&msgs), None);
+    }
+
+    #[test]
+    fn a_scripted_tool_call_carries_its_name_and_arguments_once() {
+        let mut msgs = assembled(
+            "earlier: MOCK_TOOL_CALL: delete_file {\"path\":\"artifacts/x.md\"}",
+            r#"MOCK_TOOL_CALL: write_file {"path":"themes/a.json","content":"{\"name\":\"A\"}"}"#,
+        );
+        let (name, args) = scripted_tool_call(&msgs).expect("scripted");
+        assert_eq!(name, "write_file");
+        assert_eq!(args["path"], "themes/a.json");
+        assert_eq!(args["content"], r#"{"name":"A"}"#);
+
+        msgs.push(Message {
+            role: "assistant".to_string(),
+            content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                id: "toolu_mock_write_file".to_string(),
+                name: "write_file".to_string(),
+                input: args,
+                thought_signature: None,
+            }]),
+        });
+        assert_eq!(scripted_tool_call(&msgs), None, "never twice");
+    }
+
+    #[test]
+    fn a_tool_call_line_without_object_arguments_scripts_nothing() {
+        for line in [
+            "MOCK_TOOL_CALL: write_file",
+            "MOCK_TOOL_CALL: write_file not json",
+            "MOCK_TOOL_CALL: write_file [1, 2]",
+        ] {
+            assert_eq!(scripted_tool_call(&assembled("", line)), None, "{line}");
+        }
     }
 
     #[tokio::test]

@@ -162,11 +162,9 @@ async fn cleanup_fired_trigger(client: &reqwest::Client, id: &str, slug: &str) {
     {
         // Removing the dir is a working-tree change, so it takes the same guard
         // the creation did; see `workspace_tree_lock`. Scoped to the removal
-        // alone, deliberately: that guard's own contract is that only the moment
-        // a file appears or disappears needs it, and a commit changes HEAD and
-        // the index rather than the worktree the snapshot images. Holding it
-        // across the poll below would pin every other tree writer behind a
-        // fifteen-second read guard (tokio's RwLock is write-preferring, so one
+        // alone: each commit below takes its own exclusive guard. Holding one
+        // across the poll would pin every other tree writer behind a
+        // fifteen-second guard (tokio's RwLock is write-preferring, so one
         // queued snapshot would stall them all) to protect nothing.
         let _tree = crate::support::workspace_tree_lock().read().await;
         let _ = std::fs::remove_dir_all(workspace_path().join("data/triggers").join(slug));
@@ -188,7 +186,9 @@ async fn cleanup_fired_trigger(client: &reqwest::Client, id: &str, slug: &str) {
             // The failure this retries past is an unlucky one: the command
             // exits non-zero for a lost `index.lock` and for "nothing to
             // commit" alike, so the exit code cannot tell them apart and the
-            // next poll is what settles it.
+            // next poll is what settles it. The commit itself takes the guard
+            // exclusively, like every commit a test runs in the workspace.
+            let _tree = crate::support::workspace_tree_lock().write().await;
             let _ = std::process::Command::new("git")
                 .current_dir(workspace_path())
                 .args([

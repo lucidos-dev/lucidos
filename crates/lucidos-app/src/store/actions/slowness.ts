@@ -27,10 +27,11 @@ function readDismissed(): string | null {
 
 /** The episode this window shows: an open one the user has not dismissed.
  *
- *  Memory belongs to the whole computer, so every workspace shows it. An
- *  unclear slowdown is only true of the workspaces that were slow, so a fast
- *  one never claims it. `workspaceId` is `null` outside a workspace. A reason
- *  this build does not know shows nothing. */
+ *  Disk and memory belong to the whole computer, so every workspace shows
+ *  them. A stuck database or an unclear slowdown is only true of the
+ *  workspaces that were slow, so a fast one never claims it. `workspaceId` is
+ *  `null` outside a workspace. A reason this build does not know shows
+ *  nothing. */
 export function visibleSlownessEpisode(
   status: SlownessStatus | null,
   dismissed: string | null,
@@ -38,8 +39,10 @@ export function visibleSlownessEpisode(
 ): SlownessEpisode | null {
   if (status?.state !== 'slow' || status.episode_id === dismissed) return null;
   switch (status.reason) {
+    case 'disk':
     case 'memory':
       return status;
+    case 'database':
     case 'unclear':
       return workspaceId !== null && status.slow_workspaces.includes(workspaceId) ? status : null;
     default:
@@ -68,8 +71,9 @@ export async function refreshSlowness(): Promise<void> {
     lastRefreshFailed = false;
   } catch (e) {
     slownessStatus.value = null;
-    // No toast: the user did not ask for this, and a warning that cannot be
-    // measured is simply absent (ADR 0274). The next poll retries on its own.
+    // Best-effort carve-out (frontend.md), so no toast: the user did not ask
+    // for this, and a warning that cannot be measured is simply absent
+    // (ADR 0274). The next poll retries on its own.
     // Warn once per failing streak, not once a minute.
     if (!lastRefreshFailed) {
       console.warn('[slowness] gateway status unavailable; retrying each poll', e);

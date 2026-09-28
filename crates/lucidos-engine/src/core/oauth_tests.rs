@@ -612,6 +612,85 @@ async fn an_empty_refresh_token_is_no_refresh_token() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
+/// An empty refresh token must not erase a working one. The `COALESCE` in each
+/// write keeps the stored token only for NULL, so `""` used to replace it.
+#[tokio::test]
+async fn an_empty_refresh_token_keeps_the_stored_one() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let (bus, _callback_rx) = crate::engine::event_bus::EventBus::new(pool.clone());
+
+    async fn connect(
+        pool: &sqlx::PgPool,
+        bus: &crate::engine::event_bus::EventBus,
+        refresh_token: Option<&str>,
+    ) -> ConnectedAccount {
+        OAuthStore::connect(
+            pool,
+            bus,
+            "acme",
+            Some("user@example.com"),
+            None,
+            "access",
+            refresh_token,
+            None,
+            "read",
+            "read offline_access",
+            None,
+        )
+        .await
+        .unwrap()
+    }
+
+    let first = connect(&pool, &bus, Some("refresh-1")).await;
+    let second = connect(&pool, &bus, Some("")).await;
+    assert!(
+        second.has_refresh_token,
+        "a reconnect answering \"\" keeps it"
+    );
+
+    OAuthStore::update_tokens(&pool, first.id, "rotated", None, Some(""))
+        .await
+        .unwrap();
+    let stored = OAuthStore::get_by_id(&pool, first.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.refresh_token.as_deref(), Some("refresh-1"));
+
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+fn token_response(expires_in: Option<u64>) -> TokenResponse {
+    TokenResponse {
+        access_token: "access".to_string(),
+        refresh_token: None,
+        expires_in,
+        token_type: None,
+        scope: None,
+    }
+}
+
+#[test]
+fn expiry_counts_the_lifetime_from_now() {
+    let now = Utc::now();
+    assert_eq!(
+        token_response(Some(3600)).expiry_from(now),
+        Some(now + chrono::Duration::seconds(3600))
+    );
+    assert_eq!(token_response(None).expiry_from(now), None);
+}
+
+/// A "never expires" sentinel from a token endpoint panicked the date
+/// arithmetic, which lost the account the user had just authorized.
+#[test]
+fn an_out_of_range_lifetime_is_clamped_not_a_panic() {
+    let now = Utc::now();
+    let cap = Some(now + chrono::Duration::seconds(MAX_TOKEN_LIFETIME_SECS));
+    for huge in [u64::MAX, i64::MAX as u64, 9_999_999_999_999] {
+        assert_eq!(token_response(Some(huge)).expiry_from(now), cap);
+    }
+}
+
 #[tokio::test]
 async fn insert_upserts_no_email_account_in_place() {
     // The no-email path (provider yields no userinfo) collapses to a single

@@ -7,6 +7,7 @@ use uuid::Uuid;
 const SAFE_PREFERENCE_KEYS: &[&str] = &[
     "timezone",
     "language",
+    "theme-mode",
     "theme",
     "font-family",
     "ui-scale",
@@ -23,12 +24,8 @@ const SAFE_PREFERENCE_KEYS: &[&str] = &[
 /// sessions, for an already resolved device. It is intentionally compact and
 /// allowlisted: `preferences` also stores operational values such as VAPID
 /// keys. Callers go through [`build_user_device_preferences_context_for_turn`].
-async fn build_user_device_preferences_context(
-    pool: &PgPool,
-    device_id: Option<&str>,
-    event_device: Option<&str>,
-) -> String {
-    let device_section = build_device_lines(pool, device_id, event_device).await;
+async fn build_user_device_preferences_context(pool: &PgPool, device_id: Option<&str>) -> String {
+    let device_section = build_device_lines(pool, device_id).await;
     let known_device_lines = build_known_device_lines(pool).await;
     let preference_lines = build_preference_lines(pool, device_id).await;
 
@@ -94,21 +91,16 @@ pub(crate) async fn last_used_device(
     }
 }
 
-/// The block for one turn, about its last used device.
-///
-/// `turn_device` and `turn_device_label` are what the turn's own event says.
-/// The label only describes that device, so it is dropped when a later action
-/// moved the last used device elsewhere.
+/// The block for one turn, about its last used device. `turn_device` is the
+/// device the turn's own event names.
 pub(crate) async fn build_user_device_preferences_context_for_turn(
     pool: &PgPool,
     thread_id: Uuid,
     turn_anchor: Option<Uuid>,
     turn_device: Option<&str>,
-    turn_device_label: Option<&str>,
 ) -> String {
     let device = last_used_device(pool, thread_id, turn_anchor, turn_device).await;
-    let label = turn_device_label.filter(|_| device.as_deref() == turn_device);
-    build_user_device_preferences_context(pool, device.as_deref(), label).await
+    build_user_device_preferences_context(pool, device.as_deref()).await
 }
 
 /// At most this many devices are listed, most recently seen first.
@@ -157,8 +149,9 @@ fn render_user_device_preferences_context(
 
     out.push_str(
         "Use these facts when interpreting user-facing UI/UX requests. \
-         Apps should respect theme, font, UI scale and motion (key animations on \
-         `data-motion`), and use rem/em-sized layout where user scale should apply.\n",
+         Apps should respect the theme mode, theme, font, UI scale and motion (key animations on \
+         `data-motion`). Style with the theme variables, never hardcoded colours, so \
+         the theme applies. Use rem/em-sized layout where user scale should apply.\n",
     );
     out.push_str("[END USER DEVICE & PREFERENCES]");
     out
@@ -172,16 +165,16 @@ pub(crate) async fn build_user_device_preferences_context_for_origin(
     thread_id: Uuid,
     origin_id: Uuid,
 ) -> String {
-    let (device_id, event_device) = match event_store.get_event_by_id(origin_id).await {
+    let device_id = match event_store.get_event_by_id(origin_id).await {
         Ok(Some(row)) => device_from_event_row(&row),
-        Ok(None) => (None, None),
+        Ok(None) => None,
         Err(e) => {
             log!(
                 "[AgentContext] Failed to load origin event {} for device/preferences context: {}",
                 origin_id,
                 e
             );
-            (None, None)
+            None
         }
     };
     build_user_device_preferences_context_for_turn(
@@ -189,7 +182,6 @@ pub(crate) async fn build_user_device_preferences_context_for_origin(
         thread_id,
         Some(origin_id),
         device_id.as_deref(),
-        event_device.as_deref(),
     )
     .await
 }
@@ -204,12 +196,11 @@ pub(crate) fn prepend_user_device_preferences_context(context: &str, text: &str)
     format!("{context}\n\n{text}")
 }
 
-fn device_from_event_row(row: &EventRow) -> (Option<String>, Option<String>) {
+fn device_from_event_row(row: &EventRow) -> Option<String> {
     if row.event_type != "MessageReceived" && row.event_type != "UserPromptInjected" {
-        return (None, None);
+        return None;
     }
-    let device_id = row
-        .payload
+    row.payload
         .get("device_id")
         .and_then(|v| v.as_str())
         .map(str::to_string)
@@ -219,43 +210,20 @@ fn device_from_event_row(row: &EventRow) -> (Option<String>, Option<String>) {
                 .and_then(|origin| origin.get("device_id"))
                 .and_then(|v| v.as_str())
                 .map(str::to_string)
-        });
-    let event_device = row
-        .payload
-        .get("device")
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .or_else(|| {
-            row.payload
-                .get("origin")
-                .and_then(|origin| origin.get("label"))
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-        });
-    (device_id, event_device)
+        })
 }
 
-async fn build_device_lines(
-    pool: &PgPool,
-    device_id: Option<&str>,
-    event_device: Option<&str>,
-) -> Vec<String> {
+/// The last used device's lines, read from its `devices` row. A device with no
+/// row still gets its short-id name.
+async fn build_device_lines(pool: &PgPool, device_id: Option<&str>) -> Vec<String> {
     let Some(device_id) = device_id else {
-        return event_device
-            .map(split_device_label_details)
-            .map(|(label, details)| {
-                let mut lines = vec![format!("- label: {label}")];
-                if let Some(details) = details {
-                    lines.push(format!("- details: {details}"));
-                }
-                lines
-            })
-            .unwrap_or_default();
+        return Vec::new();
     };
-
-    let tooltip = DeviceStore::tooltip_info(pool, device_id).await;
-    let raw = tooltip.as_deref().or(event_device).unwrap_or(device_id);
-    let (label, details) = split_device_label_details(raw);
+    let raw = match DeviceStore::tooltip_info(pool, device_id).await {
+        Some(tooltip) => tooltip,
+        None => DeviceStore::friendly_name(pool, device_id).await,
+    };
+    let (label, details) = split_device_label_details(&raw);
     let mut lines = vec![format!("- id: {device_id}"), format!("- label: {label}")];
     if let Some(details) = details {
         lines.push(format!("- details: {details}"));
@@ -350,6 +318,16 @@ mod tests {
     use super::*;
     use crate::test_support::{setup_test_db, teardown_test_db};
 
+    /// A device the table does not hold still gets a line, named by its id:
+    /// no event carries a name to fall back on.
+    #[tokio::test]
+    async fn a_device_with_no_row_is_named_by_its_short_id() {
+        let (pool, db_name) = setup_test_db().await;
+        let lines = build_device_lines(&pool, Some("0a1b2c3d-gone")).await;
+        assert_eq!(lines, ["- id: 0a1b2c3d-gone", "- label: device-0a1b2c3d"]);
+        teardown_test_db(&db_name).await;
+    }
+
     #[tokio::test]
     async fn context_loads_registered_device_and_effective_user_preferences() {
         let (pool, db_name) = setup_test_db().await;
@@ -360,10 +338,10 @@ mod tests {
             Some("Ios pwa"),
         )
         .await;
-        crate::test_support::seed_preference(&pool, "theme", "dark")
+        crate::test_support::seed_preference(&pool, "theme-mode", "dark")
             .await
             .unwrap();
-        crate::test_support::seed_preference_for_device(&pool, "theme", "light", "device-ios")
+        crate::test_support::seed_preference_for_device(&pool, "theme-mode", "light", "device-ios")
             .await
             .unwrap();
         crate::test_support::seed_preference_for_device(&pool, "ui-scale", "125", "device-ios")
@@ -375,11 +353,11 @@ mod tests {
             .await
             .unwrap();
 
-        let context = build_user_device_preferences_context(&pool, Some("device-ios"), None).await;
+        let context = build_user_device_preferences_context(&pool, Some("device-ios")).await;
 
         assert!(context.contains("- id: device-ios"));
         assert!(context.contains("- label: Ios pwa"));
-        assert!(context.contains("- theme: light"));
+        assert!(context.contains("- theme-mode: light"));
         assert!(context.contains("- ui-scale: 125"));
         assert!(context.contains("Safari") || context.contains("iOS"));
         assert!(!context.contains("vapid"));
@@ -391,6 +369,61 @@ mod tests {
 
         pool.close().await;
         teardown_test_db(&db_name).await;
+    }
+
+    /// An agent debugging a UI report needs the theme the user actually sees.
+    /// So a device's own `theme` wins over the global one, like every entry.
+    #[tokio::test]
+    async fn context_names_the_effective_theme_with_the_device_override_winning() {
+        let (pool, db_name) = setup_test_db().await;
+        crate::test_support::seed_preference(&pool, "theme", "minimal")
+            .await
+            .unwrap();
+        crate::test_support::seed_preference_for_device(&pool, "theme", "mono", "device-ios")
+            .await
+            .unwrap();
+
+        let on_device = build_user_device_preferences_context(&pool, Some("device-ios")).await;
+        assert!(on_device.contains("- theme: mono"), "{on_device}");
+        assert!(!on_device.contains("- theme: minimal"), "{on_device}");
+
+        let global = build_user_device_preferences_context(&pool, None).await;
+        assert!(global.contains("- theme: minimal"), "{global}");
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    #[test]
+    fn the_theme_line_sits_beside_the_theme_mode_line() {
+        let prefs = HashMap::from([
+            ("theme-mode".to_string(), "dark".to_string()),
+            ("theme".to_string(), "nord".to_string()),
+            ("font-family".to_string(), "theme".to_string()),
+        ]);
+        assert_eq!(
+            format_preference_lines(&prefs),
+            [
+                "- theme-mode: dark",
+                "- theme: nord",
+                "- font-family: theme"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_closing_guidance_tells_apps_to_respect_the_theme() {
+        let context = render_user_device_preferences_context(
+            vec![],
+            vec![],
+            vec!["- theme: nord".to_string()],
+            false,
+        );
+        assert!(
+            context
+                .contains("Apps should respect the theme mode, theme, font, UI scale and motion"),
+            "{context}"
+        );
     }
 
     /// A coding agent lives across many user messages. Each one the user sent
@@ -506,14 +539,17 @@ mod tests {
                 "- details: Safari/604.1 on iOS".to_string(),
             ],
             vec![],
-            vec!["- theme: light".to_string(), "- ui-scale: 125".to_string()],
+            vec![
+                "- theme-mode: light".to_string(),
+                "- ui-scale: 125".to_string(),
+            ],
             true,
         );
 
         assert!(context.contains("[USER DEVICE & PREFERENCES]"));
         assert!(context.contains("- id: device-ios"));
         assert!(context.contains("- label: Ios pwa"));
-        assert!(context.contains("- theme: light"));
+        assert!(context.contains("- theme-mode: light"));
         assert!(context.contains("- ui-scale: 125"));
         assert!(context.contains("Safari"));
         assert!(context.contains("Effective preferences for this device"));
@@ -522,7 +558,7 @@ mod tests {
     #[test]
     fn preference_lines_filter_non_allowlisted_preferences() {
         let prefs = HashMap::from([
-            ("theme".to_string(), "light".to_string()),
+            ("theme-mode".to_string(), "light".to_string()),
             ("ui-scale".to_string(), "125".to_string()),
             ("language".to_string(), "".to_string()),
             (
@@ -534,7 +570,7 @@ mod tests {
         let lines = format_preference_lines(&prefs);
         let context = lines.join("\n");
 
-        assert!(context.contains("- theme: light"));
+        assert!(context.contains("- theme-mode: light"));
         assert!(context.contains("- ui-scale: 125"));
         assert!(!context.contains("language"));
         assert!(!context.contains("vapid"));
@@ -568,16 +604,17 @@ mod tests {
             }),
         );
 
-        let (device_id, event_device) = device_from_event_row(&row);
-
-        assert_eq!(device_id.as_deref(), Some("device-ios"));
-        assert_eq!(event_device.as_deref(), Some("Ios pwa"));
+        assert_eq!(
+            device_from_event_row(&row).as_deref(),
+            Some("device-ios"),
+            "an older row's stored name is ignored; the id is what counts"
+        );
     }
 
     #[test]
     fn prefix_helper_adds_context_before_user_text() {
         let text = prepend_user_device_preferences_context(
-            "[USER DEVICE & PREFERENCES]\n- theme: light\n[END USER DEVICE & PREFERENCES]",
+            "[USER DEVICE & PREFERENCES]\n- theme-mode: light\n[END USER DEVICE & PREFERENCES]",
             "Build the app.",
         );
 

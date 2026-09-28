@@ -5,16 +5,19 @@
  * Wired at the SSE dispatch level in thread-sync.ts, NOT as a side-effect of
  * handleThreadEvent or handleGlobalEvent.
  */
-import { panelOverlay, appsList, installedPlugins, marketplaceCatalog, marketplaceScanning, triggers, credentials, environmentVariables, chatModels, oauthAccounts, repositories, llmConfigured, configuredProviders, mcpServersVersion, webhooksVersion, permissionGrantsVersion, handshakeScriptsVersion } from '../store';
+import { panelOverlay, appsList, installedPlugins, marketplaceCatalog, marketplaceScanning, triggers, credentials, environmentVariables, chatModels, oauthAccounts, repositories, llmConfigured, configuredProviders, mcpServersVersion, webhooksVersion, permissionGrantsVersion, handshakeScriptsVersion, memoryEntriesVersion } from '../store';
 import { checkHealth } from '../../api/client';
 import { loadApps } from './apps';
 import { loadInstalledPlugins } from './plugins';
-import { refreshPluginCatalogAfterMutation } from './plugin-marketplaces';
+import { pluginCatalogScanned, refreshPluginCatalogAfterMutation } from './plugin-marketplaces';
 import { loadChatModels } from './models';
 import { loadTriggers, loadHistoricalTriggers } from './triggers';
 import { loadThreadQueue } from './threadQueue';
 import { loadTriggerGroups } from './triggerGroups';
 import { loadArtifacts, refreshArtifacts, invalidateFilePreview } from './artifacts';
+import { refreshThemesIfLoaded } from './themes';
+import { isActiveThemePath, refreshActiveTheme } from './preferences';
+import { refreshWorkspaceFontsIfLoaded } from './workspaceFonts';
 import { removePinnedAppLocal, loadPinnedApps } from './pinnedApps';
 import { loadCredentials } from './credentials';
 import { loadEnvironmentVariables } from './environmentVariables';
@@ -23,9 +26,9 @@ import { loadRepositories } from './repositoriesLoader';
 import { loadDevices, devices, getDeviceId } from './devices';
 import { loadWebhookIngress } from './webhookIngress';
 import { loadWebhookRefusals } from './webhookRefusals';
+import { pruneNavHistory, type NavEntry } from './navigation';
 
 export const RECENTS_KEY = 'lucidos-search-recents';
-export const NAV_KEY = 'lucidos-nav-history';
 
 /** Re-probe `/health` and update `llmConfigured` after a provider credential
  *  change. The backend hot-swaps the active LLM provider in an in-process
@@ -180,7 +183,7 @@ export function processSSEForReferences(type: string, data: Record<string, unkno
       const triggerId = data.trigger_id as string;
       if (triggerId) {
         pruneRecents(triggerId, 'triggers');
-        pruneNavStack('trigger', triggerId);
+        pruneNavHistory((entry) => isNavEntryStale(entry, 'trigger', triggerId));
         closeOverlayIfStale('trigger', triggerId);
       }
       void loadTriggers();
@@ -215,7 +218,7 @@ export function processSSEForReferences(type: string, data: Record<string, unkno
       const appId = data.app_id as string;
       if (appId) {
         pruneRecents(appId, 'apps');
-        pruneNavStack('app', appId);
+        pruneNavHistory((entry) => isNavEntryStale(entry, 'app', appId));
         removePinnedAppLocal(appId);
         closeOverlayIfStale('app', appId);
       }
@@ -256,7 +259,7 @@ export function processSSEForReferences(type: string, data: Record<string, unkno
       refreshArtifacts();
       break;
     // Data-file mutations via the HTTP `/data/*` API (SDK `lucidos.data.*`,
-    // `lucidos` CLI). These are the API-origin AUDIT events; the paired
+    // `lucidos` CLI), and the agent's file tools under `themes/`. These are the AUDIT events; the paired
     // `Artifact*` entity event now fires alongside them, emitted from inside
     // `ArtifactManager`'s write path. This arm used to be the workaround for
     // its absence, and is kept because a data-API write to a non-artifact
@@ -273,10 +276,18 @@ export function processSSEForReferences(type: string, data: Record<string, unkno
       // write changes no artifact list, but it may well be the file on screen.
       if (dataPath) invalidateFilePreview(dataPath);
       if (dataPath?.startsWith('artifacts/')) refreshArtifacts();
+      if (dataPath?.startsWith('themes/')) refreshThemesIfLoaded();
+      // A workspace font changed: the list, and any theme naming it, repaint.
+      if (dataPath?.startsWith('fonts/')) {
+        refreshWorkspaceFontsIfLoaded();
+        void refreshActiveTheme();
+      }
+      // Editing the active theme repaints it on every device.
+      if (isActiveThemePath(dataPath)) void refreshActiveTheme();
       break;
     }
     // Plugin install/uninstall lands files under apps/, knowhow/, triggers/,
-    // scripts/, auth-modules/. Only refresh lists the user has already
+    // scripts/, auth-modules/, themes/, fonts/. Only refresh lists the user has already
     // loaded — eagerly populating caches the user hasn't asked for is pure
     // network + render waste. Knowhow has no list view; scripts/auth-modules
     // don't surface.
@@ -285,6 +296,12 @@ export function processSSEForReferences(type: string, data: Record<string, unkno
       if (appsList.value.status === 'loaded') void loadApps();
       if (triggers.value.status === 'loaded') void loadTriggers();
       if (installedPlugins.value.status === 'loaded') void loadInstalledPlugins();
+      refreshThemesIfLoaded();
+      refreshWorkspaceFontsIfLoaded();
+      // Unlike the lists above, the active theme is always on screen, and the
+      // plugin may have shipped, changed or taken it away. The default theme
+      // costs no request.
+      void refreshActiveTheme();
       closeResolvedPluginPanel(type, pluginIdOf(data), actorOf(data));
       break;
     // A peer resolved the pending entry this device's panel is offering, so
@@ -319,13 +336,8 @@ export function processSSEForReferences(type: string, data: Record<string, unkno
     case 'PluginCatalogScanStarted':
       marketplaceScanning.value = true;
       break;
-    // `AfterMutation`, not the plain refresh. A fetch already in flight was
-    // issued BEFORE the scan landed. Joining it would settle on pre-scan
-    // plugins, and on the `scanning: true` that came with them. Queue a
-    // trailing fetch instead, which is now one file read on the engine.
     case 'PluginCatalogScanned':
-      marketplaceScanning.value = false;
-      if (marketplaceCatalog.value.status === 'loaded') void refreshPluginCatalogAfterMutation();
+      pluginCatalogScanned();
       break;
     // Settings-page caches — gated on `status === 'loaded'` (same as Plugin*
     // above) so cross-device events don't warm caches the user hasn't asked
@@ -362,6 +374,9 @@ export function processSSEForReferences(type: string, data: Record<string, unkno
     case 'McpServerRemoved':
     case 'McpServerDisabledToolsChanged':
       mcpServersVersion.value++;
+      break;
+    case 'MemoryCorrected':
+      memoryEntriesVersion.value++;
       break;
     case 'WebhookCreated':
     case 'WebhookUpdated':
@@ -506,50 +521,14 @@ function patchRecentsMetadata(id: string, category: string, name: string): void 
   } catch { /* corrupted localStorage */ }
 }
 
-function pruneNavStack(entity: string, id: string): void {
-  try {
-    const raw = localStorage.getItem(NAV_KEY);
-    if (!raw) return;
-    const { stack, cursor }: { stack: Array<Record<string, unknown>>; cursor: number } = JSON.parse(raw);
-    if (!Array.isArray(stack)) return;
-
-    let removed = 0;
-    const filtered = stack.filter((entry, i) => {
-      if (isNavEntryStale(entry, entity, id)) {
-        if (i <= cursor) removed++;
-        return false;
-      }
-      return true;
-    });
-
-    if (filtered.length < stack.length) {
-      const newCursor = Math.max(0, Math.min(cursor - removed, filtered.length - 1));
-      localStorage.setItem(NAV_KEY, JSON.stringify({ stack: filtered, cursor: newCursor }));
-    }
-  } catch { /* corrupted localStorage */ }
-}
-
-function isNavEntryStale(entry: Record<string, unknown>, entity: string, id: string): boolean {
-  const overlay = entry.overlay as Record<string, unknown> | null;
-  if (!overlay) return false;
-
+function isNavEntryStale(entry: NavEntry, entity: string, id: string): boolean {
+  const overlay = entry.overlay;
   switch (entity) {
     case 'app':
-      if (overlay.type === 'app-ui') {
-        const app = overlay.app as Record<string, unknown> | undefined;
-        return app?.id === id;
-      }
-      if (overlay.type === 'form') {
-        const form = overlay.form as Record<string, unknown> | undefined;
-        return form?.type === 'app-edit' && form?.appId === id;
-      }
-      return false;
+      return (overlay?.type === 'app-ui' && overlay.app.id === id)
+        || (overlay?.type === 'form' && overlay.form.type === 'app-edit' && overlay.form.appId === id);
     case 'trigger':
-      if (overlay.type === 'form') {
-        const form = overlay.form as Record<string, unknown> | undefined;
-        return form?.type === 'trigger' && form?.triggerId === id;
-      }
-      return false;
+      return overlay?.type === 'form' && overlay.form.type === 'trigger' && overlay.form.triggerId === id;
     default:
       return false;
   }

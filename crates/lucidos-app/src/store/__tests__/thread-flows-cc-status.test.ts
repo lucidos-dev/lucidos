@@ -476,8 +476,8 @@ describe('CC idle session — getCodingAgentWaitingInfo state transitions', () =
     const info = getCodingAgentWaitingInfo(thread.meta);
     expect(info).toBeNull();
 
-    // Thread should be in waiting state — pending changes need resolution
-    expect(thread.meta.status).toBe('waiting');
+    // Status is idle; the pending change still needs resolution
+    expect(thread.meta.status).toBe('idle');
   });
 
   it('Discard without ChangeDiscarded: CodingAgentIdled { has_changes: false } clears stale flags', () => {

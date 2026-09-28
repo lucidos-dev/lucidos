@@ -12,6 +12,8 @@ import type { Loadable } from '../../store/types';
 import { toFailed } from '../../store/types';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { LoadableError } from '../shared/LoadableError';
+import { LoadingFade } from '../shared/LoadingFade';
+import { ProseSkeleton } from './previewSkeletons';
 
 interface Props {
   file: DiffFile;
@@ -357,25 +359,28 @@ export function RenderedDiff({ file, changeId, repoId, gitRef }: Props) {
   if (content.status === 'failed') {
     return <LoadableError noun="diff" error={content.error} />;
   }
-  if (content.status !== 'loaded') {
-    if (!showLoading) return null;
-    return <div class="loading-spinner" />;
-  }
-
   return (
-    <div class="rendered-diff" ref={containerRef}>
-      <div class="diff-strip-layer" aria-hidden="true">
-        {strips.map((s, i) => {
-          const style = `top:${s.top}px;height:${s.height}px`;
-          return (
-            <Fragment key={i}>
-              <div class={`diff-bg diff-bg-${s.variant}`} style={style} />
-              <div class={`diff-strip diff-strip-${s.variant}`} style={style} />
-            </Fragment>
-          );
-        })}
-      </div>
-      <div class="response-content markdown-content" ref={contentRef} dangerouslySetInnerHTML={{ __html: html ?? '' }} />
-    </div>
+    <LoadingFade
+      class="repo-preview-fade"
+      showSkeleton={showLoading}
+      skeleton={<div class="rendered-diff"><ProseSkeleton /></div>}
+    >
+      {content.status === 'loaded' && (
+        <div class="rendered-diff" ref={containerRef}>
+          <div class="diff-strip-layer" aria-hidden="true">
+            {strips.map((s, i) => {
+              const style = `top:${s.top}px;height:${s.height}px`;
+              return (
+                <Fragment key={i}>
+                  <div class={`diff-bg diff-bg-${s.variant}`} style={style} />
+                  <div class={`diff-strip diff-strip-${s.variant}`} style={style} />
+                </Fragment>
+              );
+            })}
+          </div>
+          <div class="response-content markdown-content" ref={contentRef} dangerouslySetInnerHTML={{ __html: html ?? '' }} />
+        </div>
+      )}
+    </LoadingFade>
   );
 }

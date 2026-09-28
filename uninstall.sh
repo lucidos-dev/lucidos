@@ -9,13 +9,7 @@
 #   ./uninstall.sh --list           # list instances + ports (no changes)
 #   ./uninstall.sh --name test --purge   # also delete that instance's data
 #   ./uninstall.sh --all --purge         # also delete every instance's data + the shared runtime
-#   curl -fsSL https://lucidos.dev/uninstall.sh | sh   # NOT PUBLISHED YET (see below)
-#
-# The one-liner above is the intended front door, but the site publisher does not
-# upload uninstall.sh beside install.sh yet, so that URL currently returns the
-# landing page at status 200. Until it does, run this script from a checkout (or
-# a downloaded copy). Tracked in docs/temporary-measures.md § "'not published
-# yet' hedge on the front-door uninstall one-liner".
+#   curl -fsSL https://lucidos.dev/uninstall.sh | sh   # the front door; flags after `sh -s --`
 #
 # This is step 4 of docs/plans/2026-06-30-installer-step4-service-mode.md. It is
 # DATA-SAFE by default: it stops the service, gracefully stops the engines +

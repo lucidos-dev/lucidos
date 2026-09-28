@@ -32,10 +32,7 @@ impl EventStore {
             "btrim(regexp_replace(COALESCE(s.title, s.first_message, ''), '\\s+', ' ', 'g'))";
 
         // Search query joins `best_scores b` against `thread_summaries s`, so
-        // the FROM alias is `s` instead of the default `t`. SearchRow below
-        // reads `is_saved` but ignores `has_response`, the one column the shared
-        // helper emits that a search result has no use for: the extra DB byte
-        // per row is cheaper than a parallel copy of the column list.
+        // the FROM alias is `s` instead of the default `t`.
         let thread_cols_prefixed = thread_cols("s");
 
         let sql = format!(
@@ -85,51 +82,10 @@ impl EventStore {
             thread_cols_prefixed,
         );
 
-        // Row type: ThreadRow fields + score. Struct needed because >16 columns exceeds sqlx tuple limit.
         #[derive(sqlx::FromRow)]
         struct SearchRow {
-            thread_id: String,
-            title: Option<String>,
-            first_message: Option<String>,
-            source: String,
-            initiator: String,
-            created_at: chrono::DateTime<chrono::Utc>,
-            last_activity: chrono::DateTime<chrono::Utc>,
-            last_user_action: chrono::DateTime<chrono::Utc>,
-            last_agent_action: chrono::DateTime<chrono::Utc>,
-            message_count: i64,
-            is_saved: bool,
-            section: String,
-            active_children_count: i64,
-            waiting_children_count: i64,
-            total_children_count: i64,
-            blocking_descendant_count: i64,
-            attention_descendant_count: i64,
-            is_stopped_child: bool,
-            live_event_wait_count: i64,
-            live_event_waits: sqlx::types::Json<Vec<EventWaitSummary>>,
-            status: String,
-            coding_agent_has_diff: bool,
-            coding_agent_proposed: bool,
-            coding_agent_requires_restart: bool,
-            coding_agent_is_external_repo: bool,
-            coding_agent_applying: bool,
-            last_revived_at: Option<chrono::DateTime<chrono::Utc>>,
-            parent_thread_id: Option<String>,
-            parent_thread_title: Option<String>,
-            trigger_id: Option<String>,
-            trigger_name: Option<String>,
-            cc_repo_id: Option<String>,
-            cc_repo_name: Option<String>,
-            coding_agent_kind: Option<String>,
-            coding_agent_folder: Option<String>,
-            coding_agent: Option<String>,
-            state: String,
-            compose_text: String,
-            compose_images: serde_json::Value,
-            compose_mode: Option<String>,
-            compose_selection: Option<serde_json::Value>,
-            compose_epoch: i64,
+            #[sqlx(flatten)]
+            row: ThreadRow,
             score: f64,
         }
 
@@ -145,50 +101,7 @@ impl EventStore {
         rows.into_iter()
             .map(|r| {
                 Ok(ThreadSearchResult {
-                    info: ThreadSummary {
-                        thread_id: r.thread_id,
-                        title: format_display_title(r.title, r.first_message),
-                        channel: r.source,
-                        initiator: LegacyInitiator::from_db_str(r.initiator.as_str())?,
-                        created_at: r.created_at,
-                        last_activity: r.last_activity,
-                        last_user_action: r.last_user_action,
-                        last_agent_action: r.last_agent_action,
-                        message_count: r.message_count,
-                        saved: r.is_saved,
-                        section: r.section,
-                        active_children_count: r.active_children_count,
-                        waiting_children_count: r.waiting_children_count,
-                        total_children_count: r.total_children_count,
-                        blocking_descendant_count: r.blocking_descendant_count,
-                        attention_descendant_count: r.attention_descendant_count,
-                        is_stopped_child: r.is_stopped_child,
-                        live_event_wait_count: r.live_event_wait_count,
-                        live_event_waits: r.live_event_waits.0,
-                        status: r.status,
-                        coding_agent_has_diff: r.coding_agent_has_diff,
-                        coding_agent_proposed: r.coding_agent_proposed,
-                        coding_agent_requires_restart: r.coding_agent_requires_restart,
-                        coding_agent_is_external_repo: r.coding_agent_is_external_repo,
-                        coding_agent_applying: r.coding_agent_applying,
-                        last_revived_at: r.last_revived_at,
-                        parent_thread_id: r.parent_thread_id,
-                        parent_thread_title: r.parent_thread_title,
-                        trigger_id: r.trigger_id,
-                        trigger_name: r.trigger_name,
-                        cc_repo_id: r.cc_repo_id,
-                        cc_repo_name: r.cc_repo_name,
-                        coding_agent_kind: r.coding_agent_kind,
-                        coding_agent_folder: r.coding_agent_folder,
-                        coding_agent: r.coding_agent,
-                        state: r.state,
-                        compose_text: r.compose_text,
-                        compose_images: r.compose_images,
-                        compose_mode: r.compose_mode,
-                        compose_selection: r.compose_selection,
-                        compose_epoch: r.compose_epoch,
-                        pending_sub_thread_change_count: None,
-                    },
+                    info: row_to_thread_summary(r.row)?,
                     score: r.score,
                 })
             })

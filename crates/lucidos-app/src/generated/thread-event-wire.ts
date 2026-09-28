@@ -245,6 +245,33 @@ export type EngineReason =
       marketplace_id: string;
       marketplace_name: string;
     }
+  /** The engine seeded a thread to finish a plugin's setup, after the user
+   *  confirmed an install or update whose setup instructions were new.
+   *  Full reasoning is on the Rust variant. */
+  | {
+      kind: 'plugin_setup';
+      plugin_id: string;
+      plugin_name: string;
+      /** The version just installed. */
+      version: string;
+      occasion: PluginSetupOccasion;
+      /** The device that confirmed, when a device did. The id only; a display
+       *  resolves the name, so a rename reaches every event. */
+      confirmed_on_device_id?: string;
+    }
+  /** The engine seeded a thread to offer the user's local plugin edits to
+   *  the plugin's author, after the user asked for it. Attribution follows
+   *  `PluginSetup`. */
+  | {
+      kind: 'plugin_upstream_proposal';
+      plugin_id: string;
+      plugin_name: string;
+      /** The installed version the patch is diffed against. */
+      version: string;
+      /** `data/`-relative path of the patch the thread proposes. */
+      patch_path: string;
+      confirmed_on_device_id?: string;
+    }
   /** The pre-rename name for `continuation_started`, carried by rows written before the rename. */
   | { kind: 'session_recovered' };
 
@@ -283,11 +310,11 @@ export type FormRequestOutcome =
  *  Full reasoning is on the Rust variant. */
 export type MessageOrigin =
   /** Mode = Human. Human at a known device. `device_id` is the TEXT primary
-   *  key from the `devices` table (not necessarily a UUID). */
+   *  key from the `devices` table (not necessarily a UUID).
+   *  Full reasoning is on the Rust variant. */
   | {
       kind: 'device';
       device_id: string;
-      label: string;
     }
   /** HTTP request without a `device_id` and without a `caller_workspace`
    *  body field. Mode is carried explicitly so SDK callers can declare
@@ -387,6 +414,18 @@ export interface ModalityUsage {
   output_audio_tokens: number;
 }
 
+/** Why a plugin setup thread runs: a first install, or an update that changed
+ *  the setup instructions.
+ *  Full reasoning is on the Rust variant. */
+export type PluginSetupOccasion =
+  | { kind: 'fresh_install' }
+  /** The plugin was already installed. `from_version` is the version it was
+   *  on, when the prior record names one. */
+  | {
+      kind: 'update';
+      from_version?: string;
+    };
+
 /** One option offered by CC's AskUserQuestion tool. Persisted inside
  *  `UserQuestionAsked` and looked up when the user picks one to send the
  *  matching `tool_result` back to CC. */
@@ -479,8 +518,9 @@ export type ThreadEvent =
        *  migrate from `images: [{base64, mime_type}, ...]` via the
        *  startup migration in `core::image_migration`. */
       user_image_hashes?: string[];
+      /** The device the message came from, by id only. A display resolves
+       *  its name; older rows also carry a `device` name, which is ignored. */
       device_id?: string;
-      device?: string;
       image_description?: string;
       /** Set when this thread was spawned by another thread. Required when
        *  `mode != Human` and the spawn originated from a parent thread. */
@@ -939,7 +979,11 @@ export type ThreadEvent =
     }
   | {
       type: 'CodingAgentToolResult';
+      /** The tool of the call this answers. Empty on older rows and for a
+       *  call the session never saw. */
       name: string;
+      /** The agent's whole output. Older rows kept only its first 200 chars.
+       *  The snapshot and the live stream both drop it; fetch it by event id. */
       result?: string;
       coding_agent?: CodingAgent;
       /** Matches the originating `CodingAgentToolCalled.tool_use_id`.
@@ -1129,6 +1173,18 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
+  /** The thread's own agent asked to be archived once its turn ends (ADR 0310).
+   *  The actor names the agent thread. The archive request resolver runs the
+   *  Archive button's cascade after the settle; a newer message closes it. */
+  | {
+      type: 'ThreadArchiveRequested';
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
   /** A thread was created in `composing` state. Emitted by the first
    *  successful POST /threads (debounced first user input: keystroke,
    *  image attach, or mode toggle on a fresh compose). The thread can
@@ -1138,7 +1194,7 @@ export type ThreadEvent =
       /** Initial mode the user opened compose with. Mutable while the
        *  thread is `Composing`; locked on first `MessageReceived`. */
       mode: string;
-      /** Stamped by `api::actor::user_actor_resolved` so the timeline
+      /** Stamped by `api::actor::user_actor` so the timeline
        *  shows which device started the draft thread. */
       actor?: MessageOrigin;
       /** Links this event back to the request that opened the turn. */
@@ -2225,6 +2281,7 @@ const THREAD_EVENT_TYPE_FLAGS = {
   ThreadSaved: true,
   ThreadUnsaved: true,
   ThreadArchived: true,
+  ThreadArchiveRequested: true,
   ThreadStarted: true,
   ThreadDiscarded: true,
   ImageUploaded: true,

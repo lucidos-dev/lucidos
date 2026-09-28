@@ -499,7 +499,6 @@ async fn seed_cc_thread(bus: &crate::engine::event_bus::EventBus, thread_id: Uui
             text: "implement the ticket".into(),
             user_image_hashes: vec![],
             device_id: None,
-            device: None,
             image_description: None,
             parent_thread_id: None,
             spawning_event_id: None,

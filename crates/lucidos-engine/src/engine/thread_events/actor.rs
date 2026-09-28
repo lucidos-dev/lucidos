@@ -65,6 +65,54 @@ pub enum EngineReason {
         marketplace_id: String,
         marketplace_name: String,
     },
+    /// The engine seeded a thread to finish a plugin's setup, after the user
+    /// confirmed an install or update whose setup instructions were new.
+    ///
+    /// The engine wrote the seed, so the engine is the origin. The user's
+    /// confirm is the authorization, carried as `confirmed_on_device_id`: a
+    /// device origin would claim the user typed words they never typed.
+    PluginSetup {
+        plugin_id: String,
+        plugin_name: String,
+        /// The version just installed.
+        version: String,
+        occasion: PluginSetupOccasion,
+        /// The device that confirmed, when a device did. The id only; a display
+        /// resolves the name, so a rename reaches every event.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        confirmed_on_device_id: Option<String>,
+    },
+    /// The engine seeded a thread to offer the user's local plugin edits to
+    /// the plugin's author, after the user asked for it. Attribution follows
+    /// `PluginSetup`.
+    PluginUpstreamProposal {
+        plugin_id: String,
+        plugin_name: String,
+        /// The installed version the patch is diffed against.
+        version: String,
+        /// `data/`-relative path of the patch the thread proposes.
+        patch_path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        confirmed_on_device_id: Option<String>,
+    },
+}
+
+/// Why a plugin setup thread runs: a first install, or an update that changed
+/// the setup instructions.
+///
+/// A separate fact from the version, because a legacy install record can name
+/// no version at all. Folding the two would seed such an update as a first
+/// install, and the agent would then re-ask everything instead of reusing it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PluginSetupOccasion {
+    FreshInstall,
+    /// The plugin was already installed. `from_version` is the version it was
+    /// on, when the prior record names one.
+    Update {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_version: Option<String>,
+    },
 }
 
 /// Which agent authored a thread event, when a thread carries more than one.
@@ -146,7 +194,11 @@ fn default_thread_direction_parent() -> ThreadDirection {
 pub enum MessageOrigin {
     /// Mode = Human. Human at a known device. `device_id` is the TEXT primary
     /// key from the `devices` table (not necessarily a UUID).
-    Device { device_id: String, label: String },
+    ///
+    /// The id only, never the device's name: a display resolves the name from
+    /// the id (`DeviceStore::friendly_name`), so a rename reaches every event.
+    /// Older rows carry a `label` key, which deserialization ignores.
+    Device { device_id: String },
     /// HTTP request without a `device_id` and without a `caller_workspace`
     /// body field. Mode is carried explicitly so SDK callers can declare
     /// themselves as agent/engine; defaults to Human for back-compat.
@@ -265,6 +317,12 @@ impl MessageOrigin {
             Self::Agent { .. } => ActorMode::Agent,
             Self::Webhook { .. } | Self::Engine { .. } | Self::System => ActorMode::Engine,
         }
+    }
+
+    /// The mode an emit site stamps beside `origin`, or `fallback` when there
+    /// is none. Deriving it is what keeps the pair from ever mismatching.
+    pub fn mode_or(origin: Option<&Self>, fallback: ActorMode) -> ActorMode {
+        origin.map_or(fallback, Self::mode)
     }
 
     /// The agent that authored this event, when an agent did.

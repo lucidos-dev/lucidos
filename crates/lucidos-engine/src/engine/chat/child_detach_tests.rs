@@ -17,7 +17,6 @@ async fn emit_message(bus: &EventBus, thread_id: Uuid, parent: Option<Uuid>, tex
             text: text.into(),
             user_image_hashes: vec![],
             device_id: None,
-            device: None,
             image_description: None,
             parent_thread_id: parent,
             spawning_event_id: None,

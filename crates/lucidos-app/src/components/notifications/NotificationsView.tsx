@@ -11,6 +11,7 @@ import {
   markAllRead,
   loadMoreNotifications,
   setNotificationsFilter,
+  refreshActiveNotificationsTab,
 } from '../../store/actions/notifications';
 import { dispatchDeepLink } from '../../store/actions/in-app-notification-toast';
 import { parseDeepLinkFromInboxRow } from '../../store/actions/notification-deeplink';
@@ -19,6 +20,7 @@ import { formatTimeAgo, formatNotificationDate } from '../../utils/formatTime';
 import { loadedOr, type Loadable, type Notification } from '../../store/types';
 import { renderMarkdown } from '../../utils/renderMarkdown';
 import { useDelayedFlag } from '../../hooks/useDelayedLoading';
+import { usePanelRefresh } from '../../hooks/usePanelRefresh';
 import { LoadableError } from '../shared/LoadableError';
 import { ChevronRightIcon } from '../shared/icons';
 import { ListSkeletonOf, useSkeleton, SkText } from '../shared/Skeleton';
@@ -58,6 +60,7 @@ export function notificationsTabIsLoading(loadable: Loadable<Notification[]>): b
 
 export function NotificationsView() {
   const sentinelRef = useRef<HTMLDivElement>(null);
+  usePanelRefresh('notifications', refreshActiveNotificationsTab);
 
   const filter = notificationsFilter.value;
   const loadable = notificationsTabSource(filter, unreadNotifications.value, notifications.value);
@@ -68,6 +71,7 @@ export function NotificationsView() {
   // "99+" on the badge), so there is no "load more" on the "Unread" tab.
   const hasMore = filter === 'all' && notificationsHasMore.value;
   const loadingMore = notificationsLoadingMore.value;
+  const showLoadingMore = useDelayedFlag(loadingMore);
 
   // Infinite scroll: observe a sentinel at the bottom of the list. The real
   // scroll container is the ancestor `.content-pane-body` (overflow-y: auto in
@@ -133,13 +137,13 @@ export function NotificationsView() {
                 {items.map((n) => (
                   <NotificationRow key={n.id} n={n} />
                 ))}
+                {/* The next page's rows, drawn above the sentinel that asked for them. */}
+                <LoadingFade showSkeleton={showLoadingMore} skeleton={<ListSkeletonOf count={2} row={() => <NotificationRow />} />}>
+                  {null}
+                </LoadingFade>
                 {hasMore && (
-                  <div
-                    ref={sentinelRef}
-                    class="dropdown-panel-loading-more"
-                    style={loadingMore ? undefined : 'opacity: 0.4'}
-                  >
-                    {loadingMore ? 'Loading more...' : 'Scroll for more'}
+                  <div ref={sentinelRef} class="dropdown-panel-loading-more" style="opacity: 0.4">
+                    {!loadingMore && 'Scroll for more'}
                   </div>
                 )}
               </>

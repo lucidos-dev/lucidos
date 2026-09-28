@@ -82,7 +82,7 @@
     min-width: 0;
     padding: 0.25rem 0.625rem;
     background: var(--bg-secondary);
-    border-radius: 0.75rem;
+    border-radius: var(--radius-surface);
     color: var(--text-primary);
     overflow-wrap: break-word;
 }
@@ -129,7 +129,7 @@
 .live-speech-bar {
     width: 0.1875rem;
     height: 0.375rem;
-    border-radius: 0.09375rem;
+    border-radius: calc(var(--radius-control) * 0.1875);
     background: currentColor;
     opacity: 0.75;
     animation: live-speech-pulse 1s ease-in-out infinite;

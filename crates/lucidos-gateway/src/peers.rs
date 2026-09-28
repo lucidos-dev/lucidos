@@ -113,8 +113,7 @@ pub fn locate(inventory: &Inventory, own_gateway_port: u16, name: &str) -> Locat
 ///
 /// A contended port addresses nobody. Only one install bound it, and nothing
 /// on disk says which, so the URL may reach a stranger's picker under the
-/// matched install's name. Dropping the hit says "cannot tell", which is the
-/// answer `Inventory::serving_port` gives for the same question over rows.
+/// matched install's name. Dropping the hit says "cannot tell".
 ///
 /// Counted over distinct data dirs rather than over rows. Two bundles in two
 /// application directories share one data dir and one port. That is one

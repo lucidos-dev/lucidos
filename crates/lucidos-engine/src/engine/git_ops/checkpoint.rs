@@ -18,9 +18,10 @@
 //! later cannot be in that set, which is what makes removing the created files
 //! safe where the blanket `git clean` ADR 0002 rejected was not.
 //!
-//! **Undo** restores the working tree from the pre image (re-creating deleted
-//! files, reverting overwritten ones) and then removes the files the command
-//! created, each only if it is still byte-identical to the post image. The refs
+//! **Undo** ([`revert_command_effects`]) removes the files the command
+//! created, then restores from the pre image the files it deleted or
+//! overwrote. Each path is touched only if the working tree still holds what
+//! the command left there. The refs
 //! survive the undo, because they are also what the card's diff viewer reads;
 //! they are reclaimed by [`prune_expired_checkpoints`] once they age out.
 //!
@@ -188,12 +189,48 @@ pub(crate) async fn create_command_post_image(
     .await
 }
 
-/// Restore `repo_root`'s working tree from the checkpoint's pre image:
-/// re-create files the command deleted and revert ones it overwrote. Removing
-/// what the command *created* is a separate step ([`remove_created_files`]),
-/// because it needs the post image too. Non-invasive: reads into a throwaway
-/// index, never the repo's real one. `Err` if the ref is gone or any git step
-/// fails.
+/// Undo a checkpointed command's effect on the working tree. Returns how many
+/// created files it removed.
+///
+/// It runs in the reverse of the command's own order: remove what the command
+/// created, then put back what it deleted or overwrote. The order matters when
+/// the command swapped a file for a directory, or the reverse. The created
+/// path then stands where the deleted one was. A restore run first would take
+/// it for the user's work and skip the deleted path.
+///
+/// A checkpoint with no post image removes nothing and restores only. A diff
+/// that fails touches nothing and returns `Err`.
+pub(crate) async fn revert_command_effects(
+    repo_root: &Path,
+    checkpoint_id: &str,
+) -> Result<u32, String> {
+    let removed = match diff_checkpoint_effects(repo_root, checkpoint_id).await {
+        Ok(Some(effects)) => {
+            let removed = remove_created_files(repo_root, checkpoint_id, &effects.created).await;
+            crate::log!(
+                "[CommandGuard] undo {checkpoint_id}: removed {removed} of {} created",
+                effects.removes()
+            );
+            removed
+        }
+        Ok(None) => {
+            crate::log!("[CommandGuard] undo {checkpoint_id}: no post image, restoring only");
+            0
+        }
+        Err(e) => return Err(format!("could not diff checkpoint {checkpoint_id}: {e}")),
+    };
+    restore_command_checkpoint(repo_root, checkpoint_id).await?;
+    Ok(removed)
+}
+
+/// Restore from the checkpoint's pre image what the command deleted,
+/// overwrote or retyped. [`revert_command_effects`] runs it after removing
+/// what the command created. Non-invasive: reads into a throwaway index,
+/// never the repo's real one. `Err` if the ref is gone or any git step fails.
+///
+/// Only the command's own paths are written, and only those the working tree
+/// has not moved on from since (see [`restore_targets`]). The pre image holds
+/// the WHOLE tree. Writing all of it would revert every later edit.
 pub(crate) async fn restore_command_checkpoint(
     repo_root: &Path,
     checkpoint_id: &str,
@@ -210,6 +247,12 @@ pub(crate) async fn restore_command_checkpoint(
         ));
     }
 
+    let targets = restore_targets(repo_root, checkpoint_id).await?;
+    if targets.as_ref().is_some_and(Vec::is_empty) {
+        crate::log!("[CommandGuard] undo {checkpoint_id}: nothing left to restore");
+        return Ok(());
+    }
+
     let tmp_index = temp_index_path(checkpoint_id, "restore");
     let _ = std::fs::remove_file(&tmp_index);
     let envs: &[(&str, &OsStr)] = &[("GIT_INDEX_FILE", tmp_index.as_os_str())];
@@ -223,22 +266,126 @@ pub(crate) async fn restore_command_checkpoint(
                 String::from_utf8_lossy(&read.stderr).trim()
             ));
         }
-        // … and force-write every entry from it to the working tree. `-f`
-        // overwrites existing files; `-a` writes all entries (re-creating
-        // deleted ones). Files NOT in the snapshot are left alone here; the
-        // ones this command created are handled by `remove_created_files`.
-        let checkout = git_cmd_env(&["checkout-index", "-a", "-f"], repo_root, envs).await?;
-        if !checkout.status.success() {
-            return Err(format!(
-                "git checkout-index (restore): {}",
-                String::from_utf8_lossy(&checkout.stderr).trim()
-            ));
+        // … and force-write the chosen entries to the working tree. `-f`
+        // overwrites an existing file and re-creates a deleted one. The batches
+        // keep a command that deleted thousands of files inside argv limits.
+        let batches: Vec<Vec<&str>> = match &targets {
+            None => vec![vec!["checkout-index", "-a", "-f"]],
+            Some(paths) => paths
+                .chunks(RESTORE_BATCH)
+                .map(|chunk| {
+                    let mut args = vec!["checkout-index", "-f", "--"];
+                    args.extend(chunk.iter().map(String::as_str));
+                    args
+                })
+                .collect(),
+        };
+        for args in &batches {
+            let checkout = git_cmd_env(args, repo_root, envs).await?;
+            if !checkout.status.success() {
+                return Err(format!(
+                    "git checkout-index (restore): {}",
+                    String::from_utf8_lossy(&checkout.stderr).trim()
+                ));
+            }
+        }
+        match &targets {
+            None => crate::log!("[CommandGuard] undo {checkpoint_id}: restored the pre image"),
+            Some(paths) => crate::log!(
+                "[CommandGuard] undo {checkpoint_id}: restored {} file(s)",
+                paths.len()
+            ),
         }
         Ok(())
     }
     .await;
     let _ = std::fs::remove_file(&tmp_index);
     result
+}
+
+/// How many paths one `checkout-index` call names.
+const RESTORE_BATCH: usize = 200;
+
+/// The paths undo writes back from the pre image, or `None` to write all of it.
+///
+/// A path qualifies when the command deleted, overwrote or retyped it, and the
+/// working tree still holds what the command left:
+///
+/// - Overwritten or retyped: still matches the post image.
+/// - Deleted: still absent. A file recreated since is the user's, and kept.
+///
+/// `None` means the post image is provably missing, so nothing says what the
+/// command touched. That is the restore-only shape of a pre-image-only
+/// checkpoint. A probe or comparison that could not run is `Err`. An unknown
+/// never authorizes overwriting a file.
+async fn restore_targets(
+    repo_root: &Path,
+    checkpoint_id: &str,
+) -> Result<Option<Vec<String>>, String> {
+    let Some(stdout) = checkpoint_diff_tree(repo_root, checkpoint_id).await? else {
+        // `checkpoint_pair_available` folds an unanswered probe into "gone".
+        // Writing the whole pre image needs a definite "no post image".
+        let post_ref = command_post_image_ref(checkpoint_id);
+        let post = git_answer(&["rev-parse", "--verify", "--quiet", &post_ref], repo_root).await;
+        if post.or_unknown(true) {
+            return Err(format!(
+                "could not read the checkpoint's before-and-after pair ({post_ref}); \
+                 restoring nothing"
+            ));
+        }
+        return Ok(None);
+    };
+    let mut deleted = Vec::new();
+    let mut changed = Vec::new();
+    for (status, path) in diff_tree_records(&stdout) {
+        let bucket = match status {
+            b'D' => &mut deleted,
+            b'M' | b'T' => &mut changed,
+            _ => continue,
+        };
+        match std::str::from_utf8(path) {
+            Ok(path) => bucket.push(path.to_string()),
+            Err(_) => crate::log!("[CommandGuard] skipping non-UTF-8 path in checkpoint restore"),
+        }
+    }
+
+    let unchanged = if changed.is_empty() {
+        BTreeSet::new()
+    } else {
+        unchanged_since_post_image(repo_root, checkpoint_id, &changed)
+            .await
+            .ok_or_else(|| {
+                format!(
+                    "could not compare {} overwritten file(s) against the post image; \
+                     restoring nothing",
+                    changed.len()
+                )
+            })?
+    };
+
+    let mut targets: Vec<String> = deleted
+        .into_iter()
+        .filter(|path| {
+            let absent = matches!(
+                std::fs::symlink_metadata(repo_root.join(path)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound
+            );
+            if !absent {
+                crate::log!(
+                    "[CommandGuard] {path} was recreated since the command ran; keeping it"
+                );
+            }
+            absent
+        })
+        .collect();
+    for path in changed {
+        if unchanged.contains(&path) {
+            targets.push(path);
+        } else {
+            crate::log!("[CommandGuard] {path} changed since the command ran; keeping it");
+        }
+    }
+    Ok(Some(targets))
 }
 
 /// What one checkpointed command did to the git-visible working tree.
@@ -304,6 +451,18 @@ pub(crate) async fn diff_checkpoint_effects(
     repo_root: &Path,
     checkpoint_id: &str,
 ) -> Result<Option<CheckpointEffects>, String> {
+    Ok(checkpoint_diff_tree(repo_root, checkpoint_id)
+        .await?
+        .map(|stdout| parse_diff_tree_z(&stdout)))
+}
+
+/// Raw `git diff-tree -r -z --no-renames` output from the pre image to the
+/// post image. `Ok(None)` when the pair is not available, as for
+/// [`diff_checkpoint_effects`].
+async fn checkpoint_diff_tree(
+    repo_root: &Path,
+    checkpoint_id: &str,
+) -> Result<Option<Vec<u8>>, String> {
     if !checkpoint_pair_available(repo_root, checkpoint_id).await {
         return Ok(None);
     }
@@ -321,24 +480,23 @@ pub(crate) async fn diff_checkpoint_effects(
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    Ok(Some(parse_diff_tree_z(&out.stdout)))
+    Ok(Some(out.stdout))
 }
 
-/// Parse `git diff-tree -r -z --no-renames` output into [`CheckpointEffects`].
+/// Each `(status letter, raw path)` record of `git diff-tree -r -z
+/// --no-renames` output.
 ///
-/// Each record is `:<srcmode> <dstmode> <srcsha> <dstsha> <status>` followed by
-/// a NUL, the path, and another NUL. `-z` means the path is raw bytes rather
-/// than git's C-quoted form, so a path that is not valid UTF-8 is skipped
-/// rather than lossily decoded into a path that would not resolve. Split out as
-/// a pure function so the classification is testable without a repo.
-fn parse_diff_tree_z(stdout: &[u8]) -> CheckpointEffects {
-    let mut effects = CheckpointEffects::default();
+/// A record is `:<srcmode> <dstmode> <srcsha> <dstsha> <status>` followed by a
+/// NUL, the path, and another NUL. `-z` means the path is raw bytes rather than
+/// git's C-quoted form. A malformed record is skipped.
+fn diff_tree_records(stdout: &[u8]) -> impl Iterator<Item = (u8, &[u8])> + '_ {
     let mut fields = stdout.split(|b| *b == 0);
-    while let Some(meta) = fields.next() {
+    std::iter::from_fn(move || loop {
+        let meta = fields.next()?;
         if meta.is_empty() {
             continue;
         }
-        let Some(path) = fields.next() else { break };
+        let path = fields.next()?;
         let Ok(meta) = std::str::from_utf8(meta) else {
             continue;
         };
@@ -346,8 +504,22 @@ fn parse_diff_tree_z(stdout: &[u8]) -> CheckpointEffects {
         let [_src_mode, _dst_mode, _src_sha, _dst_sha, status] = parts[..] else {
             continue;
         };
-        match status.as_bytes().first() {
-            Some(b'A') => {
+        if let Some(&letter) = status.as_bytes().first() {
+            return Some((letter, path));
+        }
+    })
+}
+
+/// Parse `git diff-tree -r -z --no-renames` output into [`CheckpointEffects`].
+///
+/// A path that is not valid UTF-8 is skipped rather than lossily decoded into a
+/// path that would not resolve. Split out as a pure function so the
+/// classification is testable without a repo.
+fn parse_diff_tree_z(stdout: &[u8]) -> CheckpointEffects {
+    let mut effects = CheckpointEffects::default();
+    for (status, path) in diff_tree_records(stdout) {
+        match status {
+            b'A' => {
                 let Ok(path) = std::str::from_utf8(path) else {
                     crate::log!(
                         "[CommandGuard] skipping non-UTF-8 created path in checkpoint diff"
@@ -358,7 +530,7 @@ fn parse_diff_tree_z(stdout: &[u8]) -> CheckpointEffects {
             }
             // Deleted, overwritten, or type-changed: all three are put back by
             // restoring the pre image.
-            Some(b'D') | Some(b'M') | Some(b'T') => effects.restores += 1,
+            b'D' | b'M' | b'T' => effects.restores += 1,
             _ => {}
         }
     }
@@ -397,8 +569,8 @@ fn safe_repo_path(repo_root: &Path, rel: &str) -> Option<PathBuf> {
     Some(joined)
 }
 
-/// Which of `created` still matches the post image, and may therefore be
-/// removed.
+/// Which of `paths` still match the post image. Undo removes a created file
+/// only when it does, and restores an overwritten one only when it does.
 ///
 /// Asked as one `git diff-files` against a throwaway index loaded from the post
 /// tree, rather than one `git hash-object` per file. That is fewer subprocesses,
@@ -409,11 +581,11 @@ fn safe_repo_path(repo_root: &Path, rel: &str) -> Option<PathBuf> {
 /// the two never agree; a dangling symlink does not even open. Mode changes and
 /// clean filters land the same way.
 ///
-/// `None` on any git failure, which the caller reads as "remove nothing".
+/// `None` on any git failure, which each caller reads as "touch nothing".
 async fn unchanged_since_post_image(
     repo_root: &Path,
     checkpoint_id: &str,
-    created: &[String],
+    paths: &[String],
 ) -> Option<BTreeSet<String>> {
     let tmp_index = temp_index_path(checkpoint_id, "verify");
     let _ = std::fs::remove_file(&tmp_index);
@@ -435,7 +607,7 @@ async fn unchanged_since_post_image(
         // updating, which is the answer we are asking for rather than a
         // failure, so only a spawn/timeout error bails out here.
         //
-        // **No pathspec**, deliberately, even though only `created` interests
+        // **No pathspec**, deliberately, even though only `paths` interest
         // us. `git update-index <path>` RE-REGISTERS that path from the working
         // tree, and it keeps doing so when `--refresh` is also passed, so the
         // narrower-looking form silently rewrites each entry to the current
@@ -466,7 +638,7 @@ async fn unchanged_since_post_image(
         // empty deletes nothing; inverted, the same mistake would delete
         // everything the command created.
         Some(
-            created
+            paths
                 .iter()
                 .filter(|p| !changed.contains(p.as_bytes()))
                 .cloned()

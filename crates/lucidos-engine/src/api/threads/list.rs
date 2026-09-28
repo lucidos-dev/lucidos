@@ -71,7 +71,7 @@ pub(in crate::api) async fn list_threads(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     // Active thread IDs — only threads with a live processing task (chat loop running).
     // Coding-agent session existence no longer makes a thread "active" — the status column in
-    // thread_summaries handles that (set by CodingAgentIdled → 'waiting').
+    // thread_summaries handles that.
     let active_id_strings: Vec<String> = state
         .engine
         .processing_thread_ids()

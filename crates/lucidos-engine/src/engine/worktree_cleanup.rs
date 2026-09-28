@@ -7,19 +7,22 @@
 //!
 //! Cleanup runs on [`CLEANUP_INTERVAL`] (15 minutes) and applies three tiers
 //! per thread (Tier 0, Tier 1, Tier 2), plus sweeps for stranded, orphan-path
-//! and temporary worktrees, plus one global threshold alert.
+//! and temporary worktrees. The low-disk alert runs apart, in [`DiskMonitor`].
 //!
 //! **Retention gate (the load-bearing policy).** A worktree is the user's warm
 //! working copy of a thread — reopening a thread with its worktree still on disk
 //! is instant, while reclaiming it forces a cold ~15 GB rebuild and (if it races
 //! a resume) can strand the tree so the next session lands in the workspace data
-//! repo. So all reclamation tiers are **gated**: a thread's worktree is touched
-//! only when the user has **archived** the thread (the explicit "I'm done"
-//! signal) OR free disk has dropped below [`FREE_DISK_SOFT_BYTES`]. While disk is
-//! comfortable and the thread is non-archived, the worktree is kept fully warm
-//! regardless of idle age — no stripping, no removal. The gate is applied in
-//! `run_once`; the tier descriptions below state the additional per-tier
-//! conditions that apply *once the gate opens*. Always-exempt regardless of the
+//! repo. So all reclamation tiers are **gated**. A worktree is removed only
+//! once its thread is **archived** or free disk drops below
+//! [`FREE_DISK_SOFT_BYTES`]. Archiving is the explicit "I'm done" signal, from
+//! the user or the thread's agent (ADR 0310).
+//!
+//! While disk is comfortable and the thread is non-archived, the worktree is
+//! never removed. Its build artifacts stay too, unless the thread has nothing
+//! pending (Tier 1 below). The gate is `WorktreeCleanup::reclaim_pressure`; the
+//! tier descriptions below state the additional per-tier conditions that apply
+//! *once the gate opens*. Always-exempt regardless of the
 //! gate: live sessions and *stranded* worktrees (broken git admin dir — removed
 //! immediately because they hold nothing recoverable).
 //!
@@ -29,7 +32,7 @@
 //! `ChildThreadCompleted` as its latest persisted event (a child completed but
 //! the parent hasn't processed it yet). Reclaiming such a worktree would leave
 //! the parent with nothing to resume into when it reacts to the completion (the
-//! `276f5580` incident). See [`WorktreeCleanup::has_pending_fan_in`]. Tier 1 is
+//! `276f5580` incident). See [`has_pending_fan_in`]. Tier 1 is
 //! exempt — it strips only regenerable build artifacts, leaving the worktree and
 //! the parent's ability to resume intact.
 //!
@@ -41,11 +44,17 @@
 //!   per ADR 0035 it is why no session teardown needs to reclaim anything.
 //!   Emits `WorktreeCleaned { tier: 0, freed_bytes, branch_deleted }`.
 //!
-//! - **Tier 1 — strip regenerable build artifacts.** When a thread has been idle longer than
-//!   [`TIER_1_IDLE`] AND its worktree contains a `target/`, `node_modules/`,
-//!   or `.lucidos/cache/` directory, those directories are stripped. The
-//!   worktree itself stays so the next CC turn re-installs only the missing
-//!   bits. Emits `WorktreeCleaned { tier: 1, freed_bytes }`.
+//! - **Tier 1: strip regenerable build artifacts.** Strips `target/`,
+//!   `node_modules/` and `.lucidos/cache/`. The worktree, its source and its
+//!   branch stay, so the next turn rebuilds only what is missing. It runs in
+//!   two cases:
+//!   - through the gate, once idle longer than [`TIER_1_IDLE`],
+//!     [`FORCE_TIER_1_IDLE`] under soft pressure, or at once under hard;
+//!   - outside the gate, once idle longer than [`RELEASE_ARTIFACTS_IDLE`], when
+//!     the thread has nothing pending: no pending change, no owed fan-in, not
+//!     saved (ADR 0311).
+//!
+//!   Emits `WorktreeCleaned { tier: 1, freed_bytes }`.
 //!
 //! - **Tier 2 — auto, safe when nothing depends on the working tree.** When
 //!   a thread has been idle longer than [`TIER_2_IDLE`], `git status` is
@@ -56,29 +65,34 @@
 //!   ahead of main (fully merged), the branch is also deleted (Phase 10.3).
 //!   Emits `WorktreeCleaned { tier: 2, freed_bytes, branch_deleted }`.
 //!
-//! - **Free-disk monitoring.** Each cycle the worker probes available space
-//!   on the volume hosting the worktrees dir. On the transition from
-//!   above-soft to below [`FREE_DISK_SOFT_BYTES`] (20 GB) it emits a one-shot
-//!   "Low disk space on your machine" `NotificationCreated`; the alert re-arms
-//!   once disk recovers above soft. The body is deliberately framed around
-//!   the volume (not Lucidos) and branches on Lucidos's own footprint vs.
-//!   [`LARGE_FOOTPRINT_BYTES`] so the suggestion matches reality: a small
-//!   footprint says "look elsewhere on your machine", a large one says clean
-//!   up here. Every disk notification taps through to
-//!   [`DISK_USAGE_PAGE_PATH`], and names it. Below [`FREE_DISK_HARD_BYTES`] (5 GB) it
-//!   ALSO widens its Tier 1 idle window from 24 h to [`FORCE_TIER_1_IDLE`]
-//!   (1 h) so build artifacts from recently-idle worktrees get reclaimed
-//!   aggressively, and emits "Lucidos reclaimed disk space" with the bytes
-//!   reclaimed each cycle that actually freed space. Active and saved
-//!   worktrees are always exempt. Routine 24h Tier 1 / 30d Tier 2 sweeps
-//!   stay silent — only disk-pressure cleanup notifies.
+//! - **Free-disk pressure.** The worker reads free space on the volume hosting
+//!   the worktrees dir at each decision, never once per cycle: a cycle can
+//!   wait minutes on the database while free space changes by hundreds of GB.
+//!   Below [`FREE_DISK_SOFT_BYTES`] (20 GB) the retention gate opens and the
+//!   Tier 1 idle window shrinks from 24 h to [`FORCE_TIER_1_IDLE`] (1 h).
+//!   Below [`FREE_DISK_HARD_BYTES`] (5 GB) the Tier 0 grace and the Tier 1
+//!   window drop to zero. Each cycle that frees space then emits "Lucidos
+//!   reclaimed disk space". The
+//!   disk monitor wakes the worker when pressure worsens, so a cycle starts
+//!   within a minute instead of at the next [`CLEANUP_INTERVAL`].
+//!
+//!   Active worktrees are always exempt. Routine Tier 1 and Tier 2 sweeps
+//!   stay silent: only cleanup under hard pressure notifies.
+//!
+//! - **The low-disk alert** belongs to [`DiskMonitor`], a separate task that
+//!   never waits on the database. Each crossing below the soft threshold emits
+//!   one "Low disk space on your machine" `NotificationCreated`. Its body is
+//!   framed around the volume and branches on Lucidos's footprint vs.
+//!   [`LARGE_FOOTPRINT_BYTES`]. Every disk notification taps through to
+//!   [`DISK_USAGE_PAGE_PATH`], and names it.
 //!
 //! ## What we *do not* touch
 //!
-//! - Active worktrees. A live agent session skips every tier, checked through
-//!   [`ActiveThreads`], because a session parked on a question emits no
-//!   events. Past that, activity comes from the events table: a thread event
-//!   newer than a tier's idle window keeps the worktree out of that tier.
+//! - Active worktrees. A live agent session or a running background task skips
+//!   every tier, checked through [`ActiveThreads`]: a session parked on a
+//!   question emits no events, and a task builds after its session's turn.
+//!   Past that, activity comes from the events table: a thread event newer
+//!   than a tier's idle window keeps the worktree out of that tier.
 //! - Legacy random-suffix worktrees (anything in `.lucidos/worktrees/` whose
 //!   directory name doesn't match `thread-<8-hex>`). We can't safely map them
 //!   back to a thread, so we leave them for manual pruning.
@@ -87,51 +101,78 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
 use sqlx::PgPool;
+use tokio::sync::Notify;
 use uuid::Uuid;
 
+use crate::engine::agent_session::SpawnsInFlight;
 use crate::engine::event_bus::{BusEvent, EventBus, SystemEvent};
 use crate::engine::git_ops::{git_cmd, has_branch_commits, worktrees_dir, SHORT_THREAD_ID_LEN};
 use crate::engine::thread_events::{EventMeta, ThreadEvent};
+use crate::engine::tools::bash_background::BackgroundBashRegistry;
 use crate::engine::types::AgentSession;
 use crate::scheduler::notifications::settings_tap;
 
-/// `last_activity_age` lies across long `AskUserQuestion` waits — CC is alive
-/// on stdin but emits no events. Probing `agent_sessions` is the only reliable
-/// liveness signal. Trait-erased so tests can fake without building a real
-/// `AgentSession`.
+/// Is something working in this thread's worktree right now? Event age cannot
+/// say, because three kinds of work emit nothing while they use the tree:
+/// - a session parked on `AskUserQuestion`;
+/// - a spawn setting up the worktree before its session registers;
+/// - a background task building after its session ended the turn.
+///
+/// Trait-erased so tests can fake it.
 #[async_trait::async_trait]
 pub trait ActiveThreads: Send + Sync {
     async fn is_active(&self, thread_id: Uuid) -> bool;
 }
 
-pub struct AgentSessionsActiveThreads {
+/// Asks the engine's three in-memory sources of work in a worktree: live agent
+/// sessions, coding-agent spawns still starting, and running background tasks.
+/// All die with the engine, so memory is the whole truth, and the probe never
+/// waits on the database.
+pub struct EngineActiveThreads {
     sessions: Arc<tokio::sync::Mutex<HashMap<Uuid, AgentSession>>>,
+    spawns_in_flight: Arc<SpawnsInFlight>,
+    background_tasks: BackgroundBashRegistry,
 }
 
-impl AgentSessionsActiveThreads {
-    pub fn new(sessions: Arc<tokio::sync::Mutex<HashMap<Uuid, AgentSession>>>) -> Self {
-        Self { sessions }
+impl EngineActiveThreads {
+    pub(crate) fn new(
+        sessions: Arc<tokio::sync::Mutex<HashMap<Uuid, AgentSession>>>,
+        spawns_in_flight: Arc<SpawnsInFlight>,
+        background_tasks: BackgroundBashRegistry,
+    ) -> Self {
+        Self {
+            sessions,
+            spawns_in_flight,
+            background_tasks,
+        }
     }
 }
 
 #[async_trait::async_trait]
-impl ActiveThreads for AgentSessionsActiveThreads {
+impl ActiveThreads for EngineActiveThreads {
     async fn is_active(&self, thread_id: Uuid) -> bool {
-        // Presence in the map is not liveness — `AgentSession::is_live` is.
-        // A phantom left by a dropped run future used to hold this `true`
-        // forever, so cleanup logged "skipping thread … — live agent session
-        // active" on every cycle for a thread whose subprocess was long gone
-        // (thread 293f96d5, 2026-07-28) and its worktree was never reclaimed.
-        self.sessions
+        if self.spawns_in_flight.contains(thread_id) {
+            return true;
+        }
+        // Presence in the map is not liveness, `AgentSession::is_live` is. A
+        // phantom left by a dropped run future would otherwise hold this
+        // `true` forever and block reclamation of a long-dead tree.
+        let session_live = self
+            .sessions
             .lock()
             .await
             .get(&thread_id)
-            .is_some_and(|s| s.is_live())
+            .is_some_and(|s| s.is_live());
+        session_live
+            || self
+                .background_tasks
+                .has_running_for_thread(thread_id)
+                .await
     }
 }
 
@@ -147,20 +188,18 @@ pub const TIER_1_IDLE: Duration = Duration::from_secs(24 * 60 * 60);
 /// Idle threshold for Tier 2 (full worktree removal). 30 days.
 pub const TIER_2_IDLE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
-/// Soft free-disk threshold. When the volume hosting the workspace falls
-/// below this, the worker emits one `NotificationCreated` per pressure episode
-/// so the user knows worktrees are competing for space. It also opens the
-/// retention gate for non-archived threads.
+/// Soft free-disk threshold. Below it the disk monitor sends one low-disk
+/// notification per pressure episode. The worker opens the retention gate for
+/// non-archived threads and shrinks the Tier 1 idle window to
+/// [`FORCE_TIER_1_IDLE`].
 pub const FREE_DISK_SOFT_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 
-/// Hard free-disk threshold. When free space drops below this, the worker
-/// widens its Tier 1 idle window from `TIER_1_IDLE` (24 h) to
-/// `FORCE_TIER_1_IDLE` (1 h) so build artifacts get reclaimed aggressively.
-/// Active and saved worktrees are still untouched. Also emits a stronger
-/// notification telling the user what we just did.
+/// Hard free-disk threshold. Below it the Tier 0 grace and the Tier 1 idle
+/// window drop to zero, and the worker tells the user what it reclaimed.
+/// Active worktrees stay untouched.
 pub const FREE_DISK_HARD_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 
-/// Tier 1 idle window when disk pressure forces aggressive cleanup. 1 hour.
+/// Tier 1 idle window under soft disk pressure. 1 hour.
 pub const FORCE_TIER_1_IDLE: Duration = Duration::from_secs(60 * 60);
 
 /// How often the cleanup loop fires. 15 minutes — fast enough that
@@ -172,9 +211,13 @@ pub const CLEANUP_INTERVAL: Duration = Duration::from_secs(15 * 60);
 /// removal). Long enough that the user can apply a change, read the diff,
 /// and send a follow-up message that reuses the worktree before deletion;
 /// short enough that the Disk Usage panel stays accurate. Drops to 0 under
-/// disk pressure (`free_bytes < FREE_DISK_HARD_BYTES`), matching how Tier 1
-/// already accelerates from 24h to 1h under the same condition.
+/// hard disk pressure (`free_bytes < FREE_DISK_HARD_BYTES`).
 pub const TIER_0_GRACE: Duration = Duration::from_secs(60 * 60);
+
+/// Idle time after which a thread with nothing pending releases its build
+/// artifacts through Tier 1, whatever the free disk (ADR 0311). The same
+/// "applied, then idle an hour" window as [`TIER_0_GRACE`].
+pub const RELEASE_ARTIFACTS_IDLE: Duration = TIER_0_GRACE;
 
 /// Grace window before a *stranded* worktree (its git admin dir under
 /// `.git/worktrees/<name>` is gone, so every git call fails) is removed.
@@ -202,14 +245,6 @@ pub const TEMP_WORKTREE_GRACE: Duration = Duration::from_secs(2 * 60 * 60);
 /// are treated as legacy and skipped, same as any non-`thread-<8hex>` name.
 const TEMP_WORKTREE_PREFIXES: &[&str] = &["harden-", "apply-", "merge-"];
 
-/// Threshold above which Lucidos's own worktree footprint is "meaningful"
-/// in the disk-low notification. Below this, the heads-up message tells the
-/// user the pressure is from their machine overall (other apps), not Lucidos
-/// — so the framing matches reality. 5 GB is roughly the size of one CC
-/// session's `target/` after a Cargo build, so anything noticeably above
-/// "one fresh worktree" gets the cleanup-suggestion variant.
-pub const LARGE_FOOTPRINT_BYTES: u64 = 5 * 1024 * 1024 * 1024;
-
 const BYTES_PER_GB: f64 = 1024.0 * 1024.0 * 1024.0;
 
 /// The `settings_view` every disk notification's tap deep-links to. Must be a
@@ -223,44 +258,19 @@ const DISK_USAGE_SETTINGS_VIEW: &str = "disk-usage";
 /// bodies said "Settings → Disk Usage", a page with no Disk Usage on it.
 const DISK_USAGE_PAGE_PATH: &str = "Settings → System → Disk Usage";
 
-/// Body for the soft-threshold heads-up.
-///
-/// The body frames the pressure around the user's machine, not Lucidos: the
-/// trigger is system-wide free space, and Lucidos's own footprint is usually a
-/// small slice of it. The two branches differ in the REMEDY, never in the
-/// destination. A large footprint means cleaning here reclaims real space; a
-/// small one means the page is where you confirm the pressure is elsewhere.
-fn disk_low_body(free_bytes: u64, lucidos_bytes: u64, large_footprint_bytes: u64) -> String {
-    let free_gb = free_bytes as f64 / BYTES_PER_GB;
-    let lucidos_gb = lucidos_bytes as f64 / BYTES_PER_GB;
-    let volume = format!("Only {free_gb:.1} GB free on the volume hosting your Lucidos workspace.");
-    if lucidos_bytes >= large_footprint_bytes {
-        format!(
-            "{volume} Lucidos worktrees use {lucidos_gb:.1} GB: clean idle ones from \
-             {DISK_USAGE_PAGE_PATH} to reclaim space. New coding-agent sessions may fail \
-             to spawn until disk is freed."
-        )
-    } else {
-        format!(
-            "{volume} Lucidos itself uses just {lucidos_gb:.1} GB, so most of the pressure \
-             is from other apps on your machine. {DISK_USAGE_PAGE_PATH} has the breakdown. \
-             New coding-agent sessions may fail to spawn until you free space elsewhere."
-        )
-    }
-}
-
 /// Body for the hard-threshold auto-cleanup report.
 ///
-/// The title attributes the action to Lucidos. The body names the system-wide
-/// free space first, so the reader sees the trigger was the volume rather than
-/// Lucidos eating disk.
+/// The title attributes the action to Lucidos. The body names the volume as
+/// the trigger, so the reader does not read it as Lucidos eating disk. It does
+/// not claim the volume is still critical: `free_bytes` is read after the
+/// reclamation, which may have lifted it above the hard threshold.
 fn auto_cleanup_body(free_bytes: u64, freed_bytes: u64) -> String {
     let free_gb = free_bytes as f64 / BYTES_PER_GB;
     let freed_gb = freed_bytes as f64 / BYTES_PER_GB;
     format!(
-        "Your machine is critically low on disk ({free_gb:.1} GB free). Lucidos reclaimed \
-         {freed_gb:.1} GB from idle coding-agent worktrees. Close saved threads or remove \
-         unused worktrees from {DISK_USAGE_PAGE_PATH} to reclaim more."
+        "Your machine ran critically low on disk, so Lucidos reclaimed {freed_gb:.1} GB \
+         from idle coding-agent worktrees. {free_gb:.1} GB is free now. Close saved threads \
+         or remove unused worktrees from {DISK_USAGE_PAGE_PATH} to reclaim more."
     )
 }
 
@@ -268,16 +278,23 @@ fn auto_cleanup_body(free_bytes: u64, freed_bytes: u64) -> String {
 /// regenerable build artifacts. Order matters only for logging.
 const TIER_1_PRUNE_DIRS: &[&str] = &["target", "node_modules", ".lucidos/cache"];
 
-/// In-memory state used to dedupe disk-pressure notifications across cycles.
-/// Lives only on the worker handle: on engine restart the state resets, which
-/// at worst causes one extra "getting low" notification — acceptable per the
-/// engine-statelessness rules.
-#[derive(Default)]
-struct AlertState {
-    /// Whether the previous tick observed `free_bytes < free_soft_bytes`.
-    /// Used to fire the "low" notification only on the above_soft → below_soft
-    /// transition, not on every tick we remain below.
-    was_below_soft: bool,
+/// One worktree's inputs to [`WorktreeCleanup::reclaim_pressure`], which
+/// every tier asks at the moment it would act.
+struct ReclaimGate {
+    thread_id: Uuid,
+    age: Duration,
+    /// The archive lookup, cached across the tiers of one worktree.
+    archived: Option<bool>,
+}
+
+impl ReclaimGate {
+    fn new(thread_id: Uuid, age: Duration) -> Self {
+        Self {
+            thread_id,
+            age,
+            archived: None,
+        }
+    }
 }
 
 /// Worker handle returned by [`WorktreeCleanup::spawn`].
@@ -296,14 +313,14 @@ pub struct WorktreeCleanup {
     /// Grace before an orphaned temp worktree is removed. Defaults to
     /// [`TEMP_WORKTREE_GRACE`]; overridable in tests for the same reason.
     temp_worktree_grace: Duration,
-    /// Boundary used by [`emit_disk_low_alert`] to pick the
-    /// look-elsewhere vs. clean-from-Settings body variant.
-    large_footprint_bytes: u64,
-    alerts: Mutex<AlertState>,
+    free_disk: FreeDiskProbe,
     /// Tier 0 needs `pending_for_thread`; constructed per-worker so the
     /// `spawn` signature stays pool-only.
     changes: crate::core::changes_projection::ChangesProjection,
     active_threads: Arc<dyn ActiveThreads>,
+    /// Starts a cycle before the interval ends. The disk monitor holds the
+    /// other end.
+    cleanup_wake: Arc<Notify>,
 }
 
 impl WorktreeCleanup {
@@ -313,11 +330,13 @@ impl WorktreeCleanup {
         bus: Arc<EventBus>,
         workspace_root: PathBuf,
         active_threads: Arc<dyn ActiveThreads>,
+        cleanup_wake: Arc<Notify>,
     ) -> Self {
         let changes = crate::core::changes_projection::ChangesProjection::new(pool.clone());
         Self {
             pool,
             bus,
+            free_disk: os_free_disk_probe(workspace_root.clone()),
             workspace_root,
             interval: CLEANUP_INTERVAL,
             free_soft_bytes: FREE_DISK_SOFT_BYTES,
@@ -325,10 +344,9 @@ impl WorktreeCleanup {
             force_tier1_idle: FORCE_TIER_1_IDLE,
             stranded_grace: STRANDED_GRACE,
             temp_worktree_grace: TEMP_WORKTREE_GRACE,
-            large_footprint_bytes: LARGE_FOOTPRINT_BYTES,
-            alerts: Mutex::new(AlertState::default()),
             changes,
             active_threads,
+            cleanup_wake,
         }
     }
 
@@ -340,12 +358,16 @@ impl WorktreeCleanup {
         bus: Arc<EventBus>,
         workspace_root: PathBuf,
         active_threads: Arc<dyn ActiveThreads>,
+        cleanup_wake: Arc<Notify>,
     ) -> tokio::task::JoinHandle<()> {
-        let worker = Self::new(pool, bus, workspace_root, active_threads);
+        let worker = Self::new(pool, bus, workspace_root, active_threads, cleanup_wake);
         tokio::spawn(async move { worker.run_loop().await })
     }
 
-    /// Loop forever, sleeping [`Self::interval`] between passes.
+    /// Loop forever, waiting [`Self::interval`] or a wake between passes. The
+    /// wait starts only when a pass returns, so passes never overlap: a pass
+    /// stalled on the database just delays the next one. A wake during a pass
+    /// is kept, and starts the next pass as soon as this one returns.
     async fn run_loop(self) {
         log!(
             "[WorktreeCleanup] starting (interval={:?}, tier1_idle={:?}, tier2_idle={:?}, free_soft={} bytes, free_hard={} bytes)",
@@ -357,7 +379,10 @@ impl WorktreeCleanup {
         );
         loop {
             self.run_once().await;
-            tokio::time::sleep(self.interval).await;
+            tokio::select! {
+                _ = tokio::time::sleep(self.interval) => {}
+                _ = self.cleanup_wake.notified() => {}
+            }
         }
     }
 
@@ -378,31 +403,10 @@ impl WorktreeCleanup {
             }
         };
 
-        let free_bytes =
-            available_disk_bytes(&dir).or_else(|| available_disk_bytes(&self.workspace_root));
-        let under_hard = free_bytes.is_some_and(|b| b < self.free_hard_bytes);
-        let under_soft = free_bytes.is_some_and(|b| b < self.free_soft_bytes);
-        let tier1_idle = if under_hard {
-            self.force_tier1_idle
-        } else {
-            TIER_1_IDLE
-        };
-
+        // Every pressure decision below reads `self.disk_pressure()` after the
+        // database calls it depends on have returned. A reading taken before a
+        // stalled query is stale by the time the query answers.
         let mut total_freed_under_hard: u64 = 0;
-        // Sum of every recognised worktree's on-disk size — the "Lucidos
-        // worktree footprint" we put in the disk-low notification so the
-        // user can see how much of the volume is actually Lucidos vs. the
-        // rest of their machine.
-        let mut lucidos_footprint_bytes: u64 = 0;
-
-        // Tier 0 / orphan-path grace: 1h normally, 0 under disk pressure.
-        // Same threshold for both since the safety story is identical
-        // (provably zero information on disk).
-        let zero_info_grace = if under_hard {
-            Duration::ZERO
-        } else {
-            TIER_0_GRACE
-        };
 
         for entry in entries.flatten() {
             let path = entry.path();
@@ -416,10 +420,11 @@ impl WorktreeCleanup {
             // so `cc-<uuid>` and other non-`thread-` names still fall through to
             // the legacy skip below.
             if TEMP_WORKTREE_PREFIXES.iter().any(|p| name.starts_with(p)) {
-                if let Some(freed) = self.try_temp_worktree(&dir, name, &path, pre_size).await {
-                    if under_hard {
-                        total_freed_under_hard = total_freed_under_hard.saturating_add(freed);
-                    }
+                if let Some((freed, pressure)) =
+                    self.try_temp_worktree(&dir, name, &path, pre_size).await
+                {
+                    total_freed_under_hard =
+                        total_freed_under_hard.saturating_add(pressure.hard_reclaimed(Some(freed)));
                 }
                 continue;
             }
@@ -445,12 +450,6 @@ impl WorktreeCleanup {
                 // a live session's worktree.
                 ShortThreadLookup::Unknown => continue,
                 ShortThreadLookup::Found(thread_id) => {
-                    // Footprint accounting MUST stay above the active-session
-                    // skip below — `inventory_worktrees` counts active worktrees
-                    // too, and the disk-low alert's "Lucidos uses X GB" framing
-                    // breaks if a live session's bytes silently disappear.
-                    lucidos_footprint_bytes = lucidos_footprint_bytes.saturating_add(pre_size);
-
                     // A live Claude Code subprocess parked on `AskUserQuestion` emits
                     // no events while the user thinks, so `last_activity_age`
                     // crosses the tier-0 grace and we'd `git branch -D` the
@@ -472,140 +471,129 @@ impl WorktreeCleanup {
                         // checks all fail, and a stranded tree is broken whether
                         // or not disk is tight — remove it before the ladder and
                         // outside the retention gate below.
+                        let pressure = self.disk_pressure();
                         if let Some(freed) = self
                             .try_stranded(thread_id, &dir, &path, pre_size, age)
                             .await
                         {
-                            if under_hard {
-                                total_freed_under_hard =
-                                    total_freed_under_hard.saturating_add(freed);
-                            }
+                            total_freed_under_hard = total_freed_under_hard
+                                .saturating_add(pressure.hard_reclaimed(Some(freed)));
                             continue;
                         }
 
-                        // Retention gate: keep a non-archived thread's worktree
-                        // fully warm while free disk is comfortable, so reopening
-                        // the thread reuses the worktree instead of paying a cold
-                        // ~15 GB rebuild (and never races a resume into a torn-down
-                        // tree). Reclaim — Tier 0/1/2 — only once the user has
-                        // ARCHIVED the thread (the explicit "done" signal) or free
-                        // disk drops below the soft threshold. `||` short-circuits,
-                        // so the archive lookup is skipped entirely under pressure.
-                        let may_reclaim = under_soft || self.is_archived(thread_id).await;
-                        if may_reclaim {
-                            if age >= zero_info_grace {
-                                if let Some(freed) =
-                                    self.try_tier_0(thread_id, &path, pre_size).await
-                                {
-                                    if under_hard {
-                                        total_freed_under_hard =
-                                            total_freed_under_hard.saturating_add(freed);
-                                    }
-                                    continue;
-                                }
+                        // Each tier asks the gate before its checks, as a cheap
+                        // filter, and again right before it deletes anything.
+                        let mut gate = ReclaimGate::new(thread_id, age);
+                        if self
+                            .reclaim_pressure(&mut gate, DiskPressure::zero_info_grace)
+                            .await
+                            .is_some()
+                        {
+                            if let Some((freed, pressure)) =
+                                self.try_tier_0(&mut gate, &path, pre_size).await
+                            {
+                                total_freed_under_hard = total_freed_under_hard
+                                    .saturating_add(pressure.hard_reclaimed(Some(freed)));
+                                continue;
                             }
-                            if age >= TIER_2_IDLE {
-                                if let Some(freed) =
-                                    self.try_tier_2(thread_id, &path, pre_size).await
-                                {
-                                    if under_hard {
-                                        total_freed_under_hard =
-                                            total_freed_under_hard.saturating_add(freed);
-                                    }
-                                    continue;
-                                }
+                        }
+                        if self
+                            .reclaim_pressure(&mut gate, |_| TIER_2_IDLE)
+                            .await
+                            .is_some()
+                        {
+                            if let Some((freed, pressure)) =
+                                self.try_tier_2(&mut gate, &path, pre_size).await
+                            {
+                                total_freed_under_hard = total_freed_under_hard
+                                    .saturating_add(pressure.hard_reclaimed(Some(freed)));
+                                continue;
                             }
-                            if age >= tier1_idle {
-                                if let Some(freed) = self.try_tier_1(thread_id, &path).await {
-                                    if under_hard {
-                                        total_freed_under_hard =
-                                            total_freed_under_hard.saturating_add(freed);
-                                    }
-                                }
-                            }
+                        }
+                        if let Some((freed, pressure)) = self.try_tier_1(&mut gate, &path).await {
+                            total_freed_under_hard = total_freed_under_hard
+                                .saturating_add(pressure.hard_reclaimed(Some(freed)));
                         }
                     }
                 }
                 ShortThreadLookup::NotFound => {
-                    // Orphan worktrees are excluded from the footprint to
-                    // match `inventory_worktrees`, which feeds the same page.
-                    if let Some(freed) = self
-                        .try_orphan_path(&dir, &path, pre_size, zero_info_grace)
-                        .await
+                    if let Some((freed, pressure)) =
+                        self.try_orphan_path(&dir, &path, pre_size).await
                     {
-                        if under_hard {
-                            total_freed_under_hard = total_freed_under_hard.saturating_add(freed);
-                        }
+                        total_freed_under_hard = total_freed_under_hard
+                            .saturating_add(pressure.hard_reclaimed(Some(freed)));
                     }
                 }
             }
         }
 
-        if let Some(free) = free_bytes {
-            // Heads-up notification fires only on the transition into the
-            // below-soft state — not every tick — so the user isn't pinged
-            // hourly while the disk stays low. Probe failures (`free_bytes`
-            // is `None`) skip this whole block, intentionally freezing
-            // `was_below_soft` so a transient probe failure doesn't reset
-            // the dedup state.
-            let just_crossed_soft = {
-                let mut state = self.alerts.lock().unwrap();
-                let crossed = under_soft && !state.was_below_soft;
-                state.was_below_soft = under_soft;
-                crossed
-            };
-            if just_crossed_soft {
-                self.emit_disk_low_alert(free, lucidos_footprint_bytes)
-                    .await;
-            }
-            // Action notification: only when forced cleanup actually ran AND
-            // reclaimed something. Routine 24h Tier 1 / 30d Tier 2 sweeps stay
-            // silent.
-            if under_hard && total_freed_under_hard > 0 {
+        // Only forced cleanup that actually reclaimed something reports.
+        // Routine 24h Tier 1 / 30d Tier 2 sweeps stay silent.
+        if total_freed_under_hard > 0 {
+            if let Some(free) = self.disk_pressure().free_bytes {
                 self.emit_auto_cleanup_alert(free, total_freed_under_hard)
                     .await;
             }
         }
     }
 
+    /// Free disk right now, classified against this worker's thresholds.
+    fn disk_pressure(&self) -> DiskPressure {
+        DiskPressure::classify(
+            (self.free_disk)(),
+            self.free_soft_bytes,
+            self.free_hard_bytes,
+        )
+    }
+
+    /// The retention gate: `Some(pressure)` when this thread's worktree may be
+    /// reclaimed now. A non-archived thread keeps its worktree while free disk
+    /// is comfortable, so a resume never races a torn-down tree. Only Tier 1
+    /// acts outside this gate, for a thread with nothing pending.
+    /// Reclaim opens once the user ARCHIVED the thread (the explicit "done"
+    /// signal) or free disk is below the soft threshold.
+    ///
+    /// On top of the gate, the worktree must have been idle for `min_age`,
+    /// which some tiers derive from the same pressure reading. Under soft
+    /// pressure the archive lookup is skipped entirely.
+    async fn reclaim_pressure(
+        &self,
+        gate: &mut ReclaimGate,
+        min_age: impl Fn(&DiskPressure) -> Duration,
+    ) -> Option<DiskPressure> {
+        let mut pressure = self.disk_pressure();
+        if !pressure.under_soft {
+            let archived = match gate.archived {
+                Some(known) => known,
+                None => *gate.archived.insert(self.is_archived(gate.thread_id).await),
+            };
+            if !archived {
+                return None;
+            }
+            // Read again: the archive lookup may have waited on the database.
+            pressure = self.disk_pressure();
+        }
+        (gate.age >= min_age(&pressure)).then_some(pressure)
+    }
+
     /// Tier 0: full removal of zero-information worktrees (clean + branch at
     /// main HEAD + no pending change), typically after Apply merged the work.
     /// No saved-thread exemption: events stay in Postgres regardless, and the
     /// worktree itself carries nothing not in main.
-    async fn try_tier_0(&self, thread_id: Uuid, worktree: &Path, pre_size: u64) -> Option<u64> {
-        // Don't reclaim a parent that still owes a child fan-in resume — it would
-        // have nothing to resume into (ADR 0011, B2).
-        if self.has_pending_fan_in(thread_id).await {
-            log!(
-                "[WorktreeCleanup] tier-0 skipped for thread {} — outstanding child fan-in obligation",
-                thread_id
-            );
+    async fn try_tier_0(
+        &self,
+        gate: &mut ReclaimGate,
+        worktree: &Path,
+        pre_size: u64,
+    ) -> Option<(u64, DiskPressure)> {
+        let thread_id = gate.thread_id;
+        if !is_finished_worktree(&self.pool, &self.changes, thread_id, worktree).await {
             return None;
         }
-        // On DB error, treat as if pending changes exist — skipping tier-0 cleanup
-        // is safer than deleting a worktree whose pending-state we can't verify.
-        match self.changes.pending_for_thread(thread_id).await {
-            Ok(v) if v.is_empty() => {}
-            Ok(_) => return None,
-            Err(e) => {
-                crate::log!(
-                    "[WorktreeCleanup] tier-0 pending_for_thread({}): {} — \
-                     skipping cleanup defensively",
-                    thread_id,
-                    e
-                );
-                return None;
-            }
-        }
-        if is_worktree_dirty(worktree).await {
-            return None;
-        }
-        let branch = crate::engine::git_ops::worktree_current_branch(worktree).await;
-        let branch_name = branch.as_deref()?;
-        let repo_root = resolve_repo_root_from_worktree(worktree).await?;
-        if has_branch_commits(&repo_root, branch_name).await {
-            return None;
-        }
+        // The checks above may have waited minutes on the database or git.
+        let pressure = self
+            .reclaim_pressure(gate, DiskPressure::zero_info_grace)
+            .await?;
 
         let outcome = remove_worktree_and_optionally_delete_branch(
             worktree,
@@ -621,7 +609,7 @@ impl WorktreeCleanup {
         );
         self.emit_cleaned(thread_id, 0, outcome.freed_bytes, outcome.branch_deleted)
             .await;
-        Some(outcome.freed_bytes)
+        Some((outcome.freed_bytes, pressure))
     }
 
     /// Orphan-path sweep: same destructive call as Tier 0 for `thread-<8hex>`
@@ -634,8 +622,7 @@ impl WorktreeCleanup {
         worktrees_dir: &Path,
         worktree: &Path,
         pre_size: u64,
-        mtime_grace: Duration,
-    ) -> Option<u64> {
+    ) -> Option<(u64, DiskPressure)> {
         // Stranded orphan: the git admin dir is gone, so every git check below
         // fails (and `remove_worktree_and_optionally_delete_branch` can't
         // resolve a repo root). Remove the directory directly after the fixed
@@ -644,16 +631,20 @@ impl WorktreeCleanup {
             if directory_age(worktree).unwrap_or(Duration::ZERO) < self.stranded_grace {
                 return None;
             }
+            let pressure = self.disk_pressure();
             let freed = remove_stranded_worktree(worktrees_dir, worktree, pre_size)?;
             log!(
                 "[WorktreeCleanup] stranded orphan-path freed {} bytes at {} (git admin dir missing)",
                 freed,
                 worktree.display()
             );
-            return Some(freed);
+            return Some((freed, pressure));
         }
 
-        if directory_age(worktree).unwrap_or(Duration::ZERO) < mtime_grace {
+        let past_grace = |pressure: &DiskPressure| {
+            directory_age(worktree).unwrap_or(Duration::ZERO) >= pressure.zero_info_grace()
+        };
+        if !past_grace(&self.disk_pressure()) {
             return None;
         }
         if is_worktree_dirty(worktree).await {
@@ -665,6 +656,12 @@ impl WorktreeCleanup {
             if has_branch_commits(&repo_root, branch_name).await {
                 return None;
             }
+        }
+
+        // The git checks above may have waited, and the grace depends on pressure.
+        let pressure = self.disk_pressure();
+        if !past_grace(&pressure) {
+            return None;
         }
 
         let outcome = remove_worktree_and_optionally_delete_branch(
@@ -679,7 +676,7 @@ impl WorktreeCleanup {
             worktree.display(),
             outcome.branch_deleted
         );
-        Some(outcome.freed_bytes)
+        Some((outcome.freed_bytes, pressure))
     }
 
     /// Stranded-worktree removal for a `thread-<8hex>` dir that resolves to a
@@ -736,7 +733,7 @@ impl WorktreeCleanup {
         name: &str,
         worktree: &Path,
         pre_size: u64,
-    ) -> Option<u64> {
+    ) -> Option<(u64, DiskPressure)> {
         if !is_safe_subpath(worktrees_dir, worktree) {
             log!(
                 "[WorktreeCleanup] refusing to act on temp path outside worktrees dir: {}",
@@ -773,6 +770,8 @@ impl WorktreeCleanup {
             return None;
         }
 
+        // Pressure plays no part in this sweep, only in the report.
+        let pressure = self.disk_pressure();
         let outcome = remove_worktree_and_optionally_delete_branch(
             worktree,
             Some(pre_size),
@@ -785,22 +784,73 @@ impl WorktreeCleanup {
             worktree.display(),
             outcome.branch_deleted
         );
-        Some(outcome.freed_bytes)
+        Some((outcome.freed_bytes, pressure))
     }
 
-    /// Tier 1: strip regenerable build artifacts. Safe even when the thread
-    /// is still considered "active enough" to keep the worktree around.
-    /// Returns the total bytes freed (best-effort), or `None` if nothing was
-    /// pruned (so the caller knows not to count it against the threshold).
-    async fn try_tier_1(&self, thread_id: Uuid, worktree: &Path) -> Option<u64> {
-        let freed = prune_build_artifacts(worktree)?;
+    /// Tier 1: strip regenerable build artifacts, leaving the worktree, its
+    /// source and its branch. Runs through the retention gate, or outside it
+    /// for a thread with nothing pending idle past [`RELEASE_ARTIFACTS_IDLE`].
+    /// Returns the bytes freed, or `None` if nothing was pruned.
+    async fn try_tier_1(
+        &self,
+        gate: &mut ReclaimGate,
+        worktree: &Path,
+    ) -> Option<(u64, DiskPressure)> {
+        let thread_id = gate.thread_id;
+        let pressure = match self
+            .reclaim_pressure(gate, |p| p.tier1_idle(self.force_tier1_idle))
+            .await
+        {
+            Some(pressure) => pressure,
+            None if gate.age >= RELEASE_ARTIFACTS_IDLE && self.nothing_pending(thread_id).await => {
+                self.disk_pressure()
+            }
+            None => return None,
+        };
+        // The lookups above can wait minutes, and a session may start meanwhile.
+        if self.active_threads.is_active(thread_id).await {
+            return None;
+        }
+        let freed = prune_build_artifacts(worktree).await?;
         log!(
             "[WorktreeCleanup] tier-1 freed {} bytes for thread {}",
             freed,
             thread_id
         );
         self.emit_cleaned(thread_id, 1, freed, false).await;
-        Some(freed)
+        Some((freed, pressure))
+    }
+
+    /// True when nothing waits on this thread's working copy: no pending
+    /// change, no owed fan-in, and not saved. An unanswered lookup counts as
+    /// pending, because this answer authorizes a delete.
+    async fn nothing_pending(&self, thread_id: Uuid) -> bool {
+        match self.changes.pending_for_thread(thread_id).await {
+            Ok(pending) if pending.is_empty() => {}
+            Ok(_) => return false,
+            Err(e) => {
+                log!(
+                    "[WorktreeCleanup] pending_for_thread({}) failed: {}; keeping build artifacts",
+                    thread_id,
+                    e
+                );
+                return false;
+            }
+        }
+        if has_pending_fan_in(&self.pool, thread_id).await {
+            return false;
+        }
+        match thread_is_saved(&self.pool, thread_id).await {
+            Ok(saved) => !saved,
+            Err(e) => {
+                log!(
+                    "[WorktreeCleanup] is_saved lookup failed for thread {}: {}; keeping build artifacts",
+                    thread_id,
+                    e
+                );
+                false
+            }
+        }
     }
 
     /// Tier 2: remove the entire worktree directory if it's safe — clean
@@ -810,10 +860,16 @@ impl WorktreeCleanup {
     /// `pre_size` is the directory size measured at the top of `run_once`;
     /// passing it through avoids walking the same tree twice (worktrees can
     /// be tens of GB).
-    async fn try_tier_2(&self, thread_id: Uuid, worktree: &Path, pre_size: u64) -> Option<u64> {
+    async fn try_tier_2(
+        &self,
+        gate: &mut ReclaimGate,
+        worktree: &Path,
+        pre_size: u64,
+    ) -> Option<(u64, DiskPressure)> {
+        let thread_id = gate.thread_id;
         // Don't reclaim a parent that still owes a child fan-in resume — it would
         // have nothing to resume into (ADR 0011, B2).
-        if self.has_pending_fan_in(thread_id).await {
+        if has_pending_fan_in(&self.pool, thread_id).await {
             log!(
                 "[WorktreeCleanup] tier-2 skipped for thread {} — outstanding child fan-in obligation",
                 thread_id
@@ -822,7 +878,7 @@ impl WorktreeCleanup {
         }
         // Pinned threads are exempt — the user has indicated they care about
         // this thread and may come back to it.
-        match self.is_saved(thread_id).await {
+        match thread_is_saved(&self.pool, thread_id).await {
             Ok(true) => {
                 return None;
             }
@@ -848,6 +904,9 @@ impl WorktreeCleanup {
             return None;
         }
 
+        // The checks above may have waited minutes on the database or git.
+        let pressure = self.reclaim_pressure(gate, |_| TIER_2_IDLE).await?;
+
         let outcome = remove_worktree_and_optionally_delete_branch(
             worktree,
             Some(pre_size),
@@ -864,19 +923,11 @@ impl WorktreeCleanup {
 
         self.emit_cleaned(thread_id, 2, outcome.freed_bytes, outcome.branch_deleted)
             .await;
-        Some(outcome.freed_bytes)
+        Some((outcome.freed_bytes, pressure))
     }
 
-    async fn is_saved(&self, thread_id: Uuid) -> Result<bool, sqlx::Error> {
-        let row: Option<(bool,)> =
-            sqlx::query_as("SELECT is_saved FROM thread_summaries WHERE thread_id = $1")
-                .bind(thread_id)
-                .fetch_optional(&self.pool)
-                .await?;
-        Ok(row.map(|(p,)| p).unwrap_or(false))
-    }
-
-    /// Whether the user has archived this thread (`archive_state = 'archived'`).
+    /// Whether the thread is archived (`archive_state = 'archived'`), by the
+    /// user or by an agent (ADR 0310).
     /// Archiving is the explicit "I'm done with this" signal that lets the
     /// retention gate reclaim the worktree even while free disk is comfortable.
     /// On a DB error (or unknown thread) returns `false` — keep the worktree, as
@@ -897,77 +948,6 @@ impl WorktreeCleanup {
                     e
                 );
                 false
-            }
-        }
-    }
-
-    /// True iff `thread_id` has an outstanding parent↔child fan-in obligation
-    /// that requires keeping its worktree alive (ADR 0011, weakness B2):
-    ///   (a) `active_children_count > 0` — a direct child is still running; the
-    ///       parent will resume when it finishes, so it needs its worktree. A
-    ///       *stopped child* counts the same way: the parent is still owed its
-    ///       card and will resume when it lands (ADR 0252).
-    ///   (b) the thread's latest persisted event, `ChildThreadStopped` and
-    ///       `ChildThreadDetached` notes aside, is a `ChildThreadCompleted`:
-    ///       a child has completed but the parent hasn't processed it yet (the
-    ///       exact incident window); this is the same predicate B1's boot sweep
-    ///       (`refire_unprocessed_child_completions`) selects on.
-    ///
-    /// Removing the worktree in either window would leave the parent with nothing
-    /// to resume into. The count guards the "children still running" window; the
-    /// card guards the "completed-but-not-processed" window — both are needed
-    /// because the child's terminal event decrements `active_children_count` in
-    /// the same transaction that persists `ChildThreadCompleted`, so the count is
-    /// already 0 by the time the parent owes a resume. On a DB error returns
-    /// `true` (keep the worktree) — reclaiming on unverifiable state is the
-    /// unsafe direction, matching `try_tier_0`'s pending-change stance.
-    async fn has_pending_fan_in(&self, thread_id: Uuid) -> bool {
-        // (a) direct children still running, or stopped and still owed.
-        match sqlx::query_scalar::<_, bool>(
-            "SELECT t.active_children_count > 0 OR EXISTS ( \
-                 SELECT 1 FROM thread_summaries c \
-                 WHERE c.parent_thread_id = t.thread_id AND c.is_stopped_child \
-                   AND c.archive_state <> 'archived') \
-             FROM thread_summaries t WHERE t.thread_id = $1",
-        )
-        .bind(thread_id)
-        .fetch_optional(&self.pool)
-        .await
-        {
-            Ok(Some(true)) => return true,
-            Ok(_) => {}
-            Err(e) => {
-                log!(
-                    "[WorktreeCleanup] children lookup failed for thread {}: {}; keeping worktree",
-                    thread_id,
-                    e
-                );
-                return true;
-            }
-        }
-        // (b) a completed-but-unprocessed child completion is the thread's last
-        // persisted word (no resume emitted a later event). A sibling's
-        // `ChildThreadStopped` or `ChildThreadDetached` note wakes nothing, so
-        // it cannot have processed the card, and it must not hide it.
-        match sqlx::query_scalar::<_, String>(
-            "SELECT event_type FROM events \
-             WHERE aggregate = 'thread' AND aggregate_id = $1::text \
-               AND event_type NOT IN ('ChildThreadStopped', 'ChildThreadDetached') \
-             ORDER BY sequence DESC LIMIT 1",
-        )
-        .bind(thread_id)
-        .fetch_optional(&self.pool)
-        .await
-        {
-            Ok(Some(event_type)) => event_type == "ChildThreadCompleted",
-            Ok(None) => false,
-            Err(e) => {
-                log!(
-                    "[WorktreeCleanup] latest-event lookup failed for thread {}: {} — keeping worktree",
-                    thread_id,
-                    e
-                );
-                true
             }
         }
     }
@@ -996,60 +976,55 @@ impl WorktreeCleanup {
             .await;
     }
 
-    /// Heads-up that free disk has crossed the soft threshold. Fires once per
-    /// pressure episode (re-armed on recovery above soft).
-    async fn emit_disk_low_alert(&self, free_bytes: u64, lucidos_bytes: u64) {
-        let title = "Low disk space on your machine".to_string();
-        let message = disk_low_body(free_bytes, lucidos_bytes, self.large_footprint_bytes);
-        log!(
-            "[WorktreeCleanup] crossed below soft threshold ({:.1} GB free, Lucidos {:.1} GB), emitting disk-low NotificationCreated",
-            free_bytes as f64 / BYTES_PER_GB,
-            lucidos_bytes as f64 / BYTES_PER_GB,
-        );
-        self.emit_notification(title, message, "disk-low").await;
-    }
-
     /// Auto-cleanup action notification: hard pressure forced reclamation and
     /// we actually freed bytes. Fires per cycle that does work, so the user
     /// sees ongoing progress while disk recovers.
     async fn emit_auto_cleanup_alert(&self, free_bytes: u64, freed_bytes: u64) {
-        let title = "Lucidos reclaimed disk space".to_string();
-        let message = auto_cleanup_body(free_bytes, freed_bytes);
         log!(
             "[WorktreeCleanup] auto-cleanup reclaimed {:.1} GB (free now {:.1} GB), emitting NotificationCreated",
             freed_bytes as f64 / BYTES_PER_GB,
             free_bytes as f64 / BYTES_PER_GB,
         );
-        self.emit_notification(title, message, "auto-cleanup").await;
-    }
-
-    /// Both disk notifications land on the same page, because that page answers
-    /// the question each of them raises: how much room is left on the volume,
-    /// and how much of it Lucidos holds.
-    async fn emit_notification(&self, title: String, message: String, log_tag: &str) {
-        let id = Uuid::new_v4().to_string();
         self.bus
             .emit_or_log(
-                BusEvent::System(SystemEvent::NotificationCreated {
-                    id,
-                    title,
-                    message,
-                    task_id: None,
-                    app_id: None,
-                    thread_id: None,
-                    event_id: None,
-                    tap: settings_tap(DISK_USAGE_SETTINGS_VIEW),
-                    actor: None,
-                }),
-                &format!("[WorktreeCleanup] {} NotificationCreated", log_tag),
+                disk_notification(
+                    "Lucidos reclaimed disk space",
+                    auto_cleanup_body(free_bytes, freed_bytes),
+                ),
+                "[WorktreeCleanup] auto-cleanup NotificationCreated",
             )
             .await;
     }
 }
 
+/// A disk notification. Both kinds land on the same page, because that page
+/// answers the question each of them raises: how much room is left on the
+/// volume, and how much of it Lucidos holds.
+fn disk_notification(title: &str, message: String) -> BusEvent {
+    BusEvent::System(SystemEvent::NotificationCreated {
+        id: Uuid::new_v4().to_string(),
+        title: title.to_string(),
+        message,
+        task_id: None,
+        app_id: None,
+        thread_id: None,
+        event_id: None,
+        tap: settings_tap(DISK_USAGE_SETTINGS_VIEW),
+        actor: None,
+    })
+}
+
+#[path = "worktree_cleanup_disk_monitor.rs"]
+mod disk_monitor;
+pub use disk_monitor::{DiskMonitor, LARGE_FOOTPRINT_BYTES};
+
 #[path = "worktree_cleanup_ops.rs"]
 mod ops;
 pub(crate) use ops::*;
+
+#[path = "worktree_cleanup_recommended.rs"]
+mod recommended;
+pub(crate) use recommended::{run_recommended_cleanup, RecommendedCleanupOutcome};
 
 #[cfg(test)]
 #[path = "worktree_cleanup_tests/common.rs"]
@@ -1066,3 +1041,15 @@ mod parsers_tests;
 #[cfg(test)]
 #[path = "worktree_cleanup_tests/stranded.rs"]
 mod stranded_tests;
+
+#[cfg(test)]
+#[path = "worktree_cleanup_tests/disk_monitor.rs"]
+mod disk_monitor_tests;
+
+#[cfg(test)]
+#[path = "worktree_cleanup_tests/release_artifacts.rs"]
+mod release_artifacts_tests;
+
+#[cfg(test)]
+#[path = "worktree_cleanup_tests/recommended.rs"]
+mod recommended_tests;

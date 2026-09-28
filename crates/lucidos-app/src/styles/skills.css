@@ -152,7 +152,7 @@
     font-weight: 600;
     text-transform: uppercase;
     padding: 0.0625rem 0.3125rem;
-    border-radius: 0.1875rem;
+    border-radius: calc(var(--radius-control) * 0.375);
 }
 
 .trigger-type-schedule {
@@ -210,28 +210,25 @@
 
 /* ===== Trigger groups (panel sections) ===== */
 
-.trigger-group-section {
+.trigger-group-section,
+.trigger-group-members {
     display: flex;
     flex-direction: column;
     gap: 0.125rem;
 }
 
+/* A group heading is a bold title over a hairline, on the shared 1rem gutter:
+   its chevron lines up with the trigger text below it, and the space above it
+   sets one section off from the next. No fill, so the triggers stay the
+   loudest thing on the panel. */
 .trigger-group-header {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    gap: 0.5rem;
-    /* Right padding matches `.pane-header`'s `--header-padding-x` (which is
-       scoped to that subtree, so this mirrors the value the way
-       `.mobile-thread-title-row` does), and the actions are as wide as the
-       title bar's icons, so both centre their glyph 1.5rem off the edge: on a
-       phone these sit directly under the thread title bar's pin and overflow,
-       and the old 0.5rem around a narrower button put them 0.3125rem further
-       out than the column they hang from. */
-    padding: 0.375rem 0.625rem 0.375rem 0.5rem;
-    margin-top: 0.5rem;
-    background: var(--bg-tertiary);
-    border-radius: 0.25rem;
+    gap: var(--space-sm);
+    margin: var(--space-xl) var(--space-lg) var(--space-xs);
+    padding-bottom: var(--space-xs);
+    border-bottom: 1px solid var(--border-color);
     user-select: none;
     /* Sets the size the name and the inline rename input inherit. Without it
        they fell through to the root (18px on mobile, 16px on desktop), making a
@@ -244,14 +241,15 @@
     margin-top: 0;
 }
 
+/* The synthetic Ungrouped heading has no chevron and no actions. Its name
+   starts where a group's name does, past the chevron (`.trigger-group-chevron`'s
+   width plus the toggle's gap), with the count beside it as in a real heading. */
 .trigger-group-header-ungrouped {
-    /* The synthetic Ungrouped header is informational only — no chevron, no
-       per-section actions. Give it a quieter background so it visually
-       reads as a separator rather than a real group. */
-    background: transparent;
-    border-radius: 0;
-    padding-left: 0.25rem;
-    margin-top: 0.75rem;
+    justify-content: flex-start;
+    gap: 0.375rem;
+    padding-left: calc(0.75rem + 0.375rem);
+    /* The height the icon buttons give a real heading, so both headings match. */
+    min-height: calc(2.25rem + var(--space-xs));
 }
 
 .trigger-group-toggle {
@@ -310,7 +308,7 @@
     color: var(--text-primary);
     background: var(--bg-primary);
     border: 1px solid var(--accent);
-    border-radius: 0.1875rem;
+    border-radius: calc(var(--radius-control) * 0.375);
     padding: 0.125rem 0.25rem;
     /* Same text size and weight as the .trigger-group-name span it replaces (the
        input's own border and padding still make the header a few px taller while
@@ -340,12 +338,14 @@
 }
 
 /* The idle create field, same bargain a row down: clipped to nothing so the
-   panel looks unchanged, while the input inside keeps a real box to focus. */
-.trigger-group-create-idle {
+   panel looks unchanged, while the input inside keeps a real box to focus.
+   Both classes, so it outranks the open row's margin declared further down. */
+.trigger-group-create-row.trigger-group-create-idle {
     height: 0;
     margin-top: 0;
     padding-top: 0;
     padding-bottom: 0;
+    border-bottom-width: 0;
     overflow: hidden;
     opacity: 0;
     pointer-events: none;
@@ -361,6 +361,21 @@
     display: flex;
     gap: 0.25rem;
     flex-shrink: 0;
+}
+
+/* With a pointer, rename and delete wait until the heading is hovered or holds
+   focus, so a list of groups reads as titles rather than a column of icons.
+   Touch has no hover to reveal them, so there they always show. */
+@media (hover: hover) {
+    .trigger-group-actions {
+        opacity: 0;
+        transition: opacity var(--duration-fast);
+    }
+
+    .trigger-group-header:hover .trigger-group-actions,
+    .trigger-group-header:focus-within .trigger-group-actions {
+        opacity: 1;
+    }
 }
 
 /* Rename and delete are .icon-btn, not filled .action-btn pills: every section
@@ -403,14 +418,12 @@
 
 .trigger-group-create-row {
     display: flex;
-    margin-top: 0.5rem;
-    /* The same band box as `.trigger-group-header` above, down to the derived
-       right padding: this is that heading with a name field in it and nothing
-       yet to head, and the two stack in one panel on one background, so an
-       edge that differs between them reads as a box that moved. */
-    padding: 0.375rem 0.625rem 0.375rem 0.5rem;
-    background: var(--bg-tertiary);
-    border-radius: 0.25rem;
+    /* The same box as `.trigger-group-header` above: this is that heading with
+       a name field in it and nothing yet to head, so an edge that differs
+       reads as a box that moved. */
+    margin: var(--space-xl) var(--space-lg) 0;
+    padding-bottom: var(--space-xs);
+    border-bottom: 1px solid var(--border-color);
 }
 
 .trigger-group-create-row > .trigger-group-name-input {
@@ -444,7 +457,7 @@
     margin-bottom: 0.5rem;
     background: var(--bg-tertiary);
     border: 1px solid var(--border-color);
-    border-radius: 0.25rem;
+    border-radius: calc(var(--radius-control) * 0.5);
 }
 
 .inline-form-body {
@@ -458,7 +471,7 @@
     /* Matches .form-group input — crisp border-defined field, not a gray block. */
     background: var(--bg-secondary);
     border: 1px solid var(--border-color);
-    border-radius: 0.25rem;
+    border-radius: calc(var(--radius-control) * 0.5);
     color: var(--text-primary);
     font-family: var(--font-ui);
     font-size: var(--font-size-md);
@@ -519,7 +532,7 @@
     padding: 0.25rem 0.5rem;
     background: var(--bg-primary);
     border: 1px solid var(--border-color);
-    border-radius: 0.25rem;
+    border-radius: calc(var(--radius-control) * 0.5);
 }
 
 .removable-list-item-info {
@@ -560,7 +573,7 @@
     padding-right: 0.375rem;
     background: var(--bg-secondary);
     border: 1px solid var(--border-color);
-    border-radius: 0.25rem;
+    border-radius: calc(var(--radius-control) * 0.5);
     transition: border-color var(--duration-normal), box-shadow var(--duration-normal);
 }
 

@@ -285,3 +285,27 @@ describe('startClient runs before the shell renders', () => {
     expect(preloadAt).toBeLessThan(main.indexOf('async function boot('));
   });
 });
+
+/**
+ * Events store a device's id, never its name, so every screen that names a
+ * device reads the devices list. It must load on every boot, not only when the
+ * restored tab is Settings.
+ */
+describe('startClient device lists', () => {
+  const src = stripComments(readFileSync(SOURCE, 'utf8'));
+
+  it('loads the devices list whatever tab the app restores to', () => {
+    const settingsBranch = src.indexOf("if (tab === 'settings')");
+    const load = src.indexOf('loadDevices();');
+    expect(load, 'startup must load the devices list').toBeGreaterThan(-1);
+    expect(settingsBranch).toBeGreaterThan(-1);
+    expect(load, 'the load must not sit inside the Settings-only branch').toBeLessThan(settingsBranch);
+  });
+
+  it('loads the pairing list too, since a pairing label is part of a name', () => {
+    const settingsBranch = src.indexOf("if (tab === 'settings')");
+    const load = src.indexOf('void loadPairedDevices();');
+    expect(load, 'startup must load the pairing list').toBeGreaterThan(-1);
+    expect(load).toBeLessThan(settingsBranch);
+  });
+});

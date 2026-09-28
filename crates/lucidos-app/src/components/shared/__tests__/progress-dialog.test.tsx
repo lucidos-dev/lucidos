@@ -24,8 +24,9 @@ function walk(node: ComponentChildren, out: VNode[] = []): VNode[] {
     for (const child of node) walk(child, out);
     return out;
   }
-  const v = node as VNode<{ children?: ComponentChildren }>;
+  const v = node as VNode<{ children?: ComponentChildren; icon?: ComponentChildren }>;
   out.push(v);
+  walk(v.props?.icon, out);
   walk(v.props?.children, out);
   return out;
 }
@@ -57,6 +58,14 @@ describe('progressDialogBody', () => {
     expect(byClass(indeterminate, 'mini-spinner')).toHaveLength(1);
   });
 
+  it('leads the title with the spinner, not the body', () => {
+    const indeterminate = progressDialogBody({ state: base });
+    const body = byClass(indeterminate, 'surface-body')[0];
+    expect(byClass(body, 'mini-spinner')).toHaveLength(0);
+    const head = walk(indeterminate).find((v) => (v.props as { title?: unknown }).title === base.title);
+    expect(byClass((head?.props as { icon?: ComponentChildren }).icon, 'mini-spinner')).toHaveLength(1);
+  });
+
   it('clamps the fill rather than painting past its track', () => {
     const over = progressDialogBody({ state: { ...base, progress: 4 } });
     const fill = byClass(over, 'progress-bar-fill')[0];
@@ -64,11 +73,11 @@ describe('progressDialogBody', () => {
   });
 
   it('offers Cancel only while cancelling is still possible', () => {
-    expect(byClass(progressDialogBody({ state: base }), 'confirm-btn-cancel')).toHaveLength(0);
+    expect(byClass(progressDialogBody({ state: base }), 'action-btn-secondary')).toHaveLength(0);
     const cancellable = progressDialogBody({
       state: { ...base, cancel: { label: 'Cancel', onClick: () => {} } },
     });
-    expect(byClass(cancellable, 'confirm-btn-cancel')).toHaveLength(1);
+    expect(byClass(cancellable, 'action-btn-secondary')).toHaveLength(1);
   });
 
   it('never renders a dismiss X: the operation runs whatever the user presses', () => {
@@ -90,7 +99,7 @@ describe('the flows that own the dialog', () => {
     const body = progressDialogBody({ state: restartDialogState(true) });
     expect(byClass(body, 'mini-spinner')).toHaveLength(1);
     expect(byClass(body, 'progress-bar-fill')).toHaveLength(0);
-    expect(byClass(body, 'confirm-btn-cancel')).toHaveLength(0);
+    expect(byClass(body, 'action-btn-secondary')).toHaveLength(0);
   });
 
   it('gives a sized download a bar and a Cancel', () => {
@@ -100,13 +109,13 @@ describe('the flows that own the dialog', () => {
     );
     const body = progressDialogBody({ state });
     expect(byClass(body, 'progress-bar-fill')).toHaveLength(1);
-    expect(byClass(body, 'confirm-btn-cancel')).toHaveLength(1);
+    expect(byClass(body, 'action-btn-secondary')).toHaveLength(1);
   });
 
   it('takes the Cancel away once the install has committed', () => {
     const state = appUpdateDialogState({ version: '9.9.9', phase: 'installing' }, () => {});
     const body = progressDialogBody({ state });
-    expect(byClass(body, 'confirm-btn-cancel')).toHaveLength(0);
+    expect(byClass(body, 'action-btn-secondary')).toHaveLength(0);
     expect(byClass(body, 'mini-spinner')).toHaveLength(1);
   });
 });

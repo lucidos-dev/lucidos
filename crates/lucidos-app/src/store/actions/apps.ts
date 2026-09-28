@@ -72,6 +72,13 @@ export function loadApps(): Promise<void> {
   return appsLoadInFlight;
 }
 
+/** Load the list with a request sent after this call. A load already in flight
+ *  may predate what the caller just saw, so wait it out and send another. */
+export async function refreshApps(): Promise<void> {
+  if (appsLoadInFlight) await appsLoadInFlight;
+  return loadApps();
+}
+
 async function loadAppsInner(): Promise<void> {
   setLoadingIfFresh(appsList);
   try {
@@ -224,7 +231,7 @@ export async function confirmDeleteApp(
   appId: string,
   appName: string
 ): Promise<void> {
-  if (!(await showConfirm(`Delete app "${appName}"? This cannot be undone.`))) {
+  if (!(await showConfirm(`Delete app "${appName}"? This cannot be undone.`, 'Delete', { variant: 'danger' }))) {
     return;
   }
 

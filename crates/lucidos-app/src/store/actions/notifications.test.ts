@@ -54,6 +54,7 @@ vi.mock('./app-badge', () => ({
 }));
 
 const {
+  refreshActiveNotificationsTab,
   handleNotificationSSE,
   loadUnreadNotifications,
   markAllRead,
@@ -1092,5 +1093,27 @@ describe('loadMoreNotifications: a reload that lands mid-request', () => {
 
     expect((getNotifications as Mock).mock.calls.length).toBeLessThanOrEqual(3);
     expect(notificationsLoadingMore.value).toBe(false);
+  });
+});
+
+// The panel refresh contract: a pull on Notifications keeps the list on screen
+// while it re-reads, and its promise waits for the new rows.
+describe('refreshActiveNotificationsTab', () => {
+  it('keeps the list on screen and settles once the new rows land', async () => {
+    notificationsFilter.value = 'all';
+    notifications.value = { status: 'loaded', data: [makeNotification('old', true)] };
+    const pending = deferred<NotifResponse>();
+    (getNotifications as Mock).mockReturnValueOnce(pending.promise);
+
+    let settled = false;
+    const refresh = refreshActiveNotificationsTab().then(() => { settled = true; });
+    await Promise.resolve();
+    expect(notifications.value.status).toBe('loaded');
+    expect(settled).toBe(false);
+
+    const fresh = makeNotification('new', false);
+    pending.resolve({ notifications: [fresh], unread_count: 1, has_more: false });
+    await refresh;
+    expect(notifications.value).toEqual({ status: 'loaded', data: [fresh] });
   });
 });

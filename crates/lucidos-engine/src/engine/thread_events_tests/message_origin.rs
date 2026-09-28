@@ -207,7 +207,6 @@ fn message_origin_thread_link_child_round_trips() {
 fn message_origin_mode_derives_human_for_device_and_api() {
     let device = MessageOrigin::Device {
         device_id: "d".into(),
-        label: "l".into(),
     };
     let api = MessageOrigin::Api {
         user_agent: None,
@@ -307,7 +306,6 @@ fn only_an_agent_origin_names_an_authoring_agent() {
     assert_eq!(
         MessageOrigin::Device {
             device_id: "dev-1".into(),
-            label: "My MacBook".into(),
         }
         .agent(),
         None
@@ -326,4 +324,41 @@ fn a_guest_speaks_under_its_own_name_and_our_agent_stays_assistant() {
         .speaker_label(),
         "Voice"
     );
+}
+
+/// A device actor stores the id alone. Older rows also stored the device's name
+/// as `label`; they must still load, and the name is dropped rather than read.
+#[test]
+fn a_device_origin_stores_the_id_only_and_old_rows_with_a_name_still_load() {
+    let origin = MessageOrigin::Device {
+        device_id: "phone-1".into(),
+    };
+    assert_eq!(
+        serde_json::to_value(&origin).unwrap(),
+        serde_json::json!({ "kind": "device", "device_id": "phone-1" })
+    );
+    let old: MessageOrigin =
+        serde_json::from_str(r#"{"kind":"device","device_id":"phone-1","label":"device-phone-1"}"#)
+            .unwrap();
+    assert_eq!(old, origin);
+}
+
+/// A stored `MessageReceived` carrying a legacy `device` name still loads,
+/// keeping the id.
+#[test]
+fn an_old_message_received_with_a_stored_device_name_still_loads() {
+    let event: ThreadEvent = serde_json::from_value(serde_json::json!({
+        "type": "MessageReceived",
+        "text": "hello",
+        "device_id": "phone-1",
+        "device": "My iPhone\nSafari/604.1 on iOS",
+        "mode": "human"
+    }))
+    .unwrap();
+    match event {
+        ThreadEvent::MessageReceived { device_id, .. } => {
+            assert_eq!(device_id.as_deref(), Some("phone-1"));
+        }
+        other => panic!("expected MessageReceived, got {other:?}"),
+    }
 }

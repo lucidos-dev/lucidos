@@ -97,7 +97,9 @@ describe('Mobile Access reachability', () => {
     expect(page).toContain(
       'return shell(<LoadableError noun="connect info" error={connectReadsError} />);',
     );
-    expect(page).toContain("return shell(showLoading ? <div class=\"empty-state\">Loading…</div> : null);");
+    // A settled body goes through `settled`, which is the shell around a fade.
+    expect(page).toContain('const settled = (body: ComponentChildren) => shell(');
+    expect(page).toContain('return settled(null);');
   });
 
   it('scopes every printed URL to this workspace', () => {
@@ -127,7 +129,7 @@ describe('Mobile Access reachability', () => {
     // the guard first is the regression: it leaves a browser with no way to know
     // the machine is on a tailnet, which is what made the page offer the install
     // to a working setup.
-    const guard = page.indexOf('if (!showMachineHalf) return;');
+    const guard = page.indexOf('if (!showMachineHalf) return');
     const httpFetch = page.indexOf('getNetworkConfig()');
     // Same rule for the tailnet probe: the MagicDNS name is the browser's only
     // way to learn the address it is meant to hand another device.

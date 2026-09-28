@@ -87,14 +87,14 @@ report that distinctly.
 
 ## Documented #[ignore] exceptions
 
-Expect **`13 ignored` in the lib run and `0 ignored` in the doctest run**,
+Expect **`15 ignored` in the lib run and `0 ignored` in the doctest run**,
 and nothing else. Any other ignored test is a real skip and must be
 fixed. (`crates/lucidos-engine/tests/`, the integration binaries, has
-no `#[ignore]` at all.) The thirteen are three different things: **eight
+no `#[ignore]` at all.) The fifteen are three different things: **ten
 codegen writers**, **three diagnostic printers**, and **two
 live-provider checks**.
 
-### The eight codegen writers
+### The ten codegen writers
 
 Every one of them is paired with a *non-ignored* staleness guard that
 fails `cargo test` when the generated file on disk no longer matches
@@ -117,6 +117,8 @@ and "regenerate" (run on demand). Don't re-litigate it, and don't
 | `llm::tools::misc::navigate_targets_codegen::generate_navigate_targets_file` | `generated_navigate_targets_is_up_to_date` |
 | `engine::thread_events::ts_codegen::generate_thread_event_wire_file` | `generated_thread_event_wire_is_up_to_date` |
 | `core::store::messages::spoken_merge::tests::generate_spoken_merge_fixture_file` | `spoken_merge_fixture_is_up_to_date` |
+| `core::fonts::tests::generate_font_catalog_files` | `generated_font_catalog_is_up_to_date` and `generated_font_faces_are_up_to_date` |
+| `core::themes::parts::tests::generate_theme_parts_files` | `generated_theme_parts_ts_is_up_to_date` and `generated_theme_parts_css_is_up_to_date` |
 | `api::app_reach::tests::generate_app_reach_file` | `generated_app_reach_is_up_to_date` |
 
 When a guard fails it prints the exact regeneration command; run that,

@@ -19,9 +19,6 @@
    ─────────────────────────────────────────────────────────────────────── */
 
 .event-row {
-    /* Published so the indent under the subject cannot drift from the mark it
-       is clearing: the two are one measurement, declared once. */
-    --event-row-mark-width: 0.75rem;
     display: flex;
     flex-direction: column;
     gap: 0.375rem;
@@ -29,7 +26,7 @@
     padding: 0.625rem var(--space-md);
     background: var(--bg-secondary);
     border: 1px solid color-mix(in srgb, var(--border-color) 30%, transparent);
-    border-radius: 0.625rem;
+    border-radius: calc(var(--radius-surface) * 5 / 6);
     font-size: var(--font-size-md);
     /* Pinned rather than inherited, for the same reason `.inline-step` pins
        its own: these render inside `.response-content`, whose 1.6 is prose
@@ -45,14 +42,13 @@
     -webkit-user-select: text;
 }
 
-/* Mark, subject and state on ONE line. The state is pushed to the far edge and
-   pinned to the first line (`align-self: flex-start`), so a subject that wraps
-   to three lines still reports its verdict where the reading starts.
+/* Subject and state on ONE line. The state is pushed to the far edge and sits
+   on the subject's first baseline, so a subject that wraps to three lines
+   still reports its verdict where the reading starts.
 
-   On a pane too narrow for the subject's basis beside the time and the pill
-   (a phone), the aside wraps onto a line of its own instead. Without the wrap
-   the subject, which may break between any two letters, shrank to one letter
-   per line. */
+   On a pane too narrow for the subject's basis beside the state (a phone), the
+   state wraps onto a line of its own instead. Without the wrap the subject,
+   which may break between any two letters, shrank to one letter per line. */
 .event-row-head {
     display: flex;
     flex-wrap: wrap;
@@ -60,64 +56,30 @@
     gap: var(--space-xs) var(--space-sm);
 }
 
-/* The time and the state as one group, so they wrap together and neither is
-   left alone on a line. Pushed to the far edge on either line. It wraps
-   internally only when even a line of its own is too narrow for both. */
-.event-row-aside {
-    display: flex;
-    flex-wrap: wrap;
-    justify-content: flex-end;
-    align-items: flex-start;
-    align-self: flex-start;
-    gap: var(--space-xs) var(--space-sm);
+/* Pushed to the far edge, on the subject's line or on its own. It rides the
+   head's baseline alignment, which in flex is the FIRST baseline. So it stays
+   level with the subject's opening line, however far the subject wraps. */
+.event-row-state {
+    flex: 0 0 auto;
     margin-left: auto;
 }
 
-/* One mark column, shared by all four kinds, so a column of these is scannable.
-   ALWAYS muted: the mark reports that something happened, never that it
-   succeeded, and the moment it can carry a verdict colour it is a step icon
-   again. */
-.event-row-mark {
-    flex: 0 0 auto;
-    width: var(--event-row-mark-width);
-    text-align: center;
-    color: var(--text-muted);
-    font-size: var(--font-size-sm);
-}
-
-.event-row-state {
-    flex: 0 0 auto;
-    /* Baseline alignment would drop the pill onto the subject's LAST line once
-       it wraps. Pin it to the top instead, and nudge it back onto the first
-       line's optical centre. */
-    align-self: flex-start;
-    margin-top: 0.03125rem;
-}
-
-/* The same muted stamp a message header carries. Pinned like the pill, with
-   the pill's vertical padding, so the two texts share one baseline. */
+/* ABOVE the card, right-aligned, in the muted stamp a user bubble carries
+   (`.initiator-timestamp`). The card's own top margin is the gap under it,
+   the same 0.5rem a turn header leaves above its body. */
 .event-row-time {
-    flex: 0 0 auto;
-    align-self: flex-start;
-    margin-top: 0.03125rem;
-    padding-block: 0.0625rem;
+    display: block;
+    margin-top: var(--space-sm);
+    text-align: right;
     font-size: var(--font-size-xs);
     color: var(--text-muted);
     white-space: nowrap;
 }
 
-/* The facts and the fold hang under the subject rather than under the mark, so
-   the card has one text column instead of a ragged two. Clears exactly the mark
-   plus the head's gap, both taken from their own declarations. */
-.event-row-meta,
-.event-row-fold,
-.event-row-actions {
-    padding-left: calc(var(--event-row-mark-width) + var(--space-sm));
-}
-
-/* An open form request's Open, on the subject's column. */
+/* An open form request's Open, or a change's Diff and Revert. */
 .event-row-actions {
     display: flex;
+    justify-content: flex-end;
     gap: var(--space-sm);
     margin-top: var(--space-xs);
 }
@@ -128,10 +90,10 @@
    is answering. `overflow-wrap` rather than `word-break`, so an ordinary
    sentence still breaks at its spaces and only an unbroken token is split. */
 .event-row-subject {
-    /* The only child that gives: the mark and the state pill are fixed-size, so
-       a long subject shrinks itself and wraps rather than pushing the pill off
+    /* The only child that gives: the state word is fixed-size, so
+       a long subject shrinks itself and wraps rather than pushing the state off
        the card's right edge. The basis is the floor it shrinks to before the
-       head wraps the aside below it instead. */
+       head wraps the state below it instead. */
     flex: 1 1 12rem;
     min-width: 0;
     color: var(--text-primary);
@@ -165,66 +127,75 @@
     font-size: var(--font-size-2xs);
 }
 
-/* The state as a WORD. The tint only groups it: every state stays legible as
-   text, so a colourblind reader and a screen reader get the same fact the
-   colour carries. One vocabulary across all four kinds, which is what makes a
-   matched wait, a delivered event and a child's verdict comparable at a
-   glance. */
+/* The state as a WORD in plain tinted text, with no pill behind it. The tint
+   only groups it: every state stays legible as text, so a colourblind reader
+   and a screen reader get the same fact the colour carries. One vocabulary
+   across all kinds, which is what makes a matched wait, a delivered event and
+   a child's verdict comparable at a glance. */
 .event-row-state {
-    display: inline-flex;
-    align-items: center;
-    padding: 0.0625rem var(--space-sm);
-    border-radius: 999rem;
     font-size: var(--font-size-xs);
     font-weight: 500;
-    letter-spacing: 0.02em;
-    background: var(--bg-tertiary);
     color: var(--text-secondary);
+}
+
+/* The tick or cross before a verdict word. A word joiner after it glues it to
+   that word (.claude/rules/frontend-css.md, icon glue), so the label itself
+   stays free to wrap. */
+.event-row-state-glyph {
+    display: inline;
+    line-height: 0;
+}
+
+.event-row-state-glyph::after {
+    content: '\2060';
+}
+
+/* Sized to the word's cap band. The rem pair is the fallback for an engine
+   without `cap`: an unsized inline svg draws at 300 by 150. */
+.event-row-state-glyph svg {
+    width: 0.5rem;
+    height: 0.5rem;
+    width: 1cap;
+    height: 1cap;
+    margin-right: var(--space-xs);
+    vertical-align: baseline;
 }
 
 /* Still watching: cool and quiet, since nothing has happened yet and the row
    must not read as a result. */
 .event-row-state[data-tone="live"] {
-    background: color-mix(in srgb, var(--accent-notable) 16%, transparent);
     color: var(--accent-notable);
 }
 
 /* Something arrived (a delivery, a matched wait, a trigger fire). */
 .event-row-state[data-tone="arrived"] {
-    background: color-mix(in srgb, var(--accent) 16%, transparent);
     color: var(--accent);
 }
 
-/* A child thread's own verdict, the one place a marker legitimately reports a
-   pass or a fail: it is reporting the CHILD's outcome, not this row's. */
+/* A verdict: a child thread's outcome, an applied change, a finished form.
+   It reports what the row points at, never the row's own success. */
 .event-row-state[data-tone="good"] {
-    background: color-mix(in srgb, var(--accent-green) 18%, transparent);
-    color: var(--accent-green);
+    color: var(--accent-green-soft);
 }
 
 .event-row-state[data-tone="bad"] {
-    background: color-mix(in srgb, var(--accent-red) 18%, transparent);
     color: var(--accent-red);
 }
 
 /* A deadline passed with no match. Not red: nothing failed, the watch simply
    ended without its event. */
 .event-row-state[data-tone="lapsed"] {
-    background: color-mix(in srgb, var(--accent-yellow) 18%, transparent);
     color: var(--accent-yellow);
 }
 
 /* Somebody ended it early (a stand-down, an archive, a discard). Warm and
-   deliberately NOT the cool grey-blue neutral, so it cannot be mistaken for
-   the untinted `none` pill sitting beside it in the same stream. Same
-   reasoning as the child-completion pills it replaces. */
+   deliberately NOT the neutral, so it cannot be mistaken for the untinted
+   `none` word beside it in the same stream. */
 .event-row-state[data-tone="halted"] {
-    background: color-mix(in srgb, var(--accent-orange) 18%, transparent);
     color: var(--accent-orange);
 }
 
 .event-row-state[data-tone="none"] {
-    background: var(--bg-tertiary);
     color: var(--text-muted);
 }
 
@@ -241,7 +212,7 @@
     padding: 0.0625rem 0.375rem;
     /* Transparent, so the link variant's outline costs no layout shift. */
     border: 1px solid transparent;
-    border-radius: 0.3125rem;
+    border-radius: calc(var(--radius-control) * 0.625);
     background: color-mix(in srgb, var(--text-primary) 7%, transparent);
     color: var(--text-secondary);
     font-family: var(--font-mono);
@@ -295,13 +266,30 @@
     color: var(--text-muted);
 }
 
-.event-row-fold > summary {
+.event-row-fold-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.25rem;
+    padding: 0;
+    border: none;
+    background: none;
+    color: inherit;
     cursor: pointer;
     user-select: none;
+    transition: color var(--duration-fast) ease;
+}
+
+.event-row-fold-chevron {
+    display: inline-flex;
+    transition: transform var(--duration-fast) ease;
+}
+
+.event-row-fold-toggle[aria-expanded="true"] > .event-row-fold-chevron {
+    transform: rotate(90deg);
 }
 
 @media (hover: hover) {
-    .event-row-fold > summary:hover {
+    .event-row-fold-toggle:hover {
         color: var(--text-primary);
     }
 }
@@ -310,24 +298,24 @@
    body on the same fill would open onto an invisible panel. Tertiary lifts in
    both themes, which keeps the direction consistent rather than recessing on
    one and lifting on the other. */
-.event-row-fold > pre,
-.event-row-fold > .event-row-fold-body {
+.event-row-fold-pre,
+.event-row-fold-body {
     margin: 0.375rem 0 0;
     padding: var(--space-sm) 0.625rem;
-    border-radius: 0.375rem;
+    border-radius: calc(var(--radius-surface) * 0.5);
     background: var(--bg-tertiary);
     color: var(--text-secondary);
 }
 
 /* Machine data of unknown width (a path, a sha). Scrolls rather than wraps: a
    wrapped sha reads as two shas. */
-.event-row-fold > pre {
+.event-row-fold-pre {
     overflow-x: auto;
     font-family: var(--font-mono);
     font-size: var(--font-size-xs);
     line-height: 1.4;
 }
 
-.event-row-fold > .event-row-fold-body {
+.event-row-fold-body {
     font-size: var(--font-size-sm);
 }

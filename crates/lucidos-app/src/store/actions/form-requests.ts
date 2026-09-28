@@ -97,8 +97,9 @@ export async function syncPendingFormRequests(): Promise<void> {
   try {
     pending = await listPendingFormRequests();
   } catch (e) {
-    // Runs on every stream open with no user action behind it. The next open
-    // retries, and each open request stays reachable from its transcript row.
+    // Best-effort carve-out (frontend.md): runs on every stream open with no
+    // user action behind it. The next open retries, and each open request
+    // stays reachable from its transcript row.
     // A toast here would only repeat itself on a flaky connection.
     console.warn('[FormRequests] reading the open form requests failed:', e);
     return;

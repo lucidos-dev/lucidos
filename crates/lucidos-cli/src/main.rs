@@ -613,6 +613,23 @@ enum ThreadsCmd {
         #[arg(long)]
         thread: String,
     },
+    /// Archive this thread, or one of its own direct children.
+    ///
+    /// `--thread current` archives THIS thread once its turn ends and it has
+    /// settled; a new message into it before then keeps it open. A child's
+    /// uuid archives that child now, with its own sub-threads. Refused while
+    /// the target runs, waits on the user, or holds a pending change.
+    ///
+    /// From inside a Lucidos thread you can only archive yourself and your
+    /// own DIRECT children: the engine reads the calling thread from the
+    /// origin token this subprocess was spawned with. Outside a thread, it
+    /// archives any thread, as the Archive button does.
+    Archive {
+        /// `current`, or a direct child's uuid from
+        /// `threads list --my-children`.
+        #[arg(long)]
+        thread: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -936,11 +953,8 @@ pub(crate) struct SpawnThreadArgs {
     #[arg(long, value_enum)]
     pub(crate) coding_agent: Option<CliCodingAgent>,
     /// Coding-agent model override, for either backend (e.g. "sonnet",
-    /// "opus", "gpt-5.6-sol"). `--cc-model` is the old name, still accepted.
-    ///
-    /// That alias is a sunset deprecation, not permanent back-compat. Its
-    /// removal condition is in `docs/temporary-measures.md`.
-    #[arg(long = "coding-agent-model", alias = "cc-model")]
+    /// "opus", "gpt-5.6-sol").
+    #[arg(long = "coding-agent-model")]
     pub(crate) coding_agent_model: Option<String>,
     /// Chat model override.
     #[arg(long)]
@@ -1004,6 +1018,10 @@ enum HardenedCmd {
     /// the `harden.md` skill (skip `/harden` iff `FRESH`) and the
     /// `pre-push.sh` hook (allow push iff `FRESH`).
     Query,
+    /// Print the HEAD SHA the last `/harden` recorded for the current branch
+    /// (in $PWD), fresh or stale. Exits non-zero when there is no marker.
+    /// `/harden`'s merge-only check reads it.
+    Sha,
 }
 
 #[derive(Subcommand)]
@@ -1261,6 +1279,7 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
             match action {
                 HardenedCmd::Mark => hardened::cmd_mark(&ws)?,
                 HardenedCmd::Query => hardened::cmd_query(&ws)?,
+                HardenedCmd::Sha => hardened::cmd_sha(&ws)?,
             }
             Ok(0)
         }
@@ -1518,6 +1537,7 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
                     urgent,
                 )?,
                 ThreadsCmd::Detach { thread } => threads::cmd_detach(&ws, &thread)?,
+                ThreadsCmd::Archive { thread } => threads::cmd_archive(&ws, &thread)?,
             }
             Ok(0)
         }
@@ -1665,6 +1685,20 @@ mod tests {
             assert!(
                 !flags.iter().any(|f| f == forbidden),
                 "{forbidden} must not exist on detach: the caller is authenticated, not stated"
+            );
+        }
+    }
+
+    /// `threads archive` states no caller either: the origin token decides
+    /// whether it may archive only this thread and its own children.
+    #[test]
+    fn archive_exposes_no_caller_identity_flag() {
+        let flags = subcommand_flags(&["threads", "archive"]);
+        assert!(flags.contains(&"--thread".to_string()), "{flags:?}");
+        for forbidden in ["--from", "--caller", "--caller-thread", "--parent"] {
+            assert!(
+                !flags.iter().any(|f| f == forbidden),
+                "{forbidden} must not exist on archive: the caller is authenticated, not stated"
             );
         }
     }

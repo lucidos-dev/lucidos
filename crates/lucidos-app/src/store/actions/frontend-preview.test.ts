@@ -11,7 +11,7 @@ const THREAD = '2951200f-0652-4ee2-baa3-433d608983d8';
 const OTHER = '11111111-1111-1111-1111-111111111111';
 
 beforeEach(() => {
-  frontendPreview.value = null;
+  frontendPreview.value = { status: 'not-loaded' };
 });
 
 describe('previewHref', () => {
@@ -83,13 +83,13 @@ describe('previewHref', () => {
 describe('the SSE handlers', () => {
   it('a start records the thread and the port', () => {
     handleFrontendPreviewStarted({ thread_id: THREAD, port: 6173 });
-    expect(frontendPreview.value).toEqual({ running: true, thread_id: THREAD, port: 6173 });
+    expect(frontendPreview.value).toEqual({ status: 'loaded', data: { running: true, thread_id: THREAD, port: 6173 } });
   });
 
   it('a stop for the running thread clears the slot', () => {
     handleFrontendPreviewStarted({ thread_id: THREAD, port: 6173 });
     handleFrontendPreviewStopped({ thread_id: THREAD });
-    expect(frontendPreview.value).toEqual({ running: false });
+    expect(frontendPreview.value).toEqual({ status: 'loaded', data: { running: false } });
   });
 
   it('a late stop for the PREVIOUS thread does not erase the preview just moved', () => {
@@ -99,12 +99,12 @@ describe('the SSE handlers', () => {
     // Vite server is serving.
     handleFrontendPreviewStarted({ thread_id: THREAD, port: 6173 });
     handleFrontendPreviewStopped({ thread_id: OTHER });
-    expect(frontendPreview.value).toEqual({ running: true, thread_id: THREAD, port: 6173 });
+    expect(frontendPreview.value).toEqual({ status: 'loaded', data: { running: true, thread_id: THREAD, port: 6173 } });
   });
 
   it('a stop with no thread named still clears, since it names no survivor', () => {
     handleFrontendPreviewStarted({ thread_id: THREAD, port: 6173 });
     handleFrontendPreviewStopped({});
-    expect(frontendPreview.value).toEqual({ running: false });
+    expect(frontendPreview.value).toEqual({ status: 'loaded', data: { running: false } });
   });
 });

@@ -1,56 +1,43 @@
 import { eventConditionModal } from '../../store/store';
+import { usePaneCentre } from '../../hooks/usePaneCentre';
 import { Overlay } from '../shared/Overlay';
-import { plainEventName } from '../../store/thread-events/event-waits';
+import { SurfaceHead } from '../shared/Surface';
+import { eventConditionBody, eventConditionTitle } from './eventConditionBody';
 
 function close() {
   eventConditionModal.value = null;
 }
 
-/** The `condition` on one *event subscription*, opened from either PRESSABLE
- *  place saying "matching only": the transcript row's chip, and the waiting
- *  indicator's subscription line. Both ask `eventConditionDoor`, so neither can
- *  open something different or call it something different.
+/** The `condition` on one *event subscription*, opened from the transcript
+ *  row's "matching only" chip through `eventConditionDoor`.
  *
- *  Those doors exist because the note they carry states that a filter is in play
- *  and nothing about what the filter says. That was deliberate: the raw operator
- *  JSON is developer-facing and does not belong on a line read by whoever is
- *  waiting. It belongs one tap away, which is here.
- *
- *  Each condition renders as a `type:` / `payload:` block: the event it waits
- *  for, and what that event's payload must match. The type is the RAW event
- *  name, and its plain name moves to the tooltip. */
+ *  That door exists because the note it carries states that a filter is in
+ *  play and nothing about what the filter says. That was deliberate: the raw
+ *  operator JSON is developer-facing and does not belong on a line read by
+ *  whoever is waiting. It belongs one tap away, which is here. The waiting
+ *  panel asks the same door but drills in instead, since a popover never opens
+ *  a second layer. */
 export function EventConditionModal() {
   const open = eventConditionModal.value;
+  const paneCentre = usePaneCentre('conversation');
   if (!open) return null;
-  const several = open.conditions.length > 1;
-  const typeTooltip = plainEventName(open.eventType);
 
   return (
     <Overlay
       open
       onClose={close}
       overlayClass="step-detail-overlay"
-      panelClass="step-detail-modal"
+      panelClass="surface surface-raised surface-pane-centred step-detail-modal"
+      panelStyle={paneCentre}
       panelRole="dialog"
       ariaModal
       dataRole="event-condition-modal"
       panelProps={{ 'aria-label': `Condition on ${open.eventType}` }}
     >
-      <div class="step-detail-header">
-        <span class="step-detail-status">{several ? 'Conditions' : 'Condition'}</span>
+      <SurfaceHead title={eventConditionTitle(open)} onClose={close} closeLabel="Close condition" />
+      <div class="surface-body step-detail-body" tabIndex={-1}>
+        {eventConditionBody(open)}
       </div>
-      {/* Pretty JSON, since a one-line dump is unreadable for the nested
-          shapes a real filter takes (`$or` over several field paths). */}
-      {open.conditions.map((condition, i) => (
-        <pre key={i} class="step-detail-full" data-role="event-condition-json">
-          <span class="event-condition-key">type:</span>{' '}
-          <span data-role="event-condition-type" data-tooltip={typeTooltip}>{open.eventType}</span>
-          {'\n'}
-          <span class="event-condition-key">payload:</span>{' '}
-          {JSON.stringify(condition, null, 2)}
-        </pre>
-      ))}
-      <button class="action-btn step-detail-close" onClick={close}>Close</button>
     </Overlay>
   );
 }

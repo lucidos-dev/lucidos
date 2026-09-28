@@ -66,11 +66,28 @@ pub(crate) async fn unreleased_held_messages(
                 .unwrap_or_default()
                 .to_string(),
             images: super::queued_recovery::images_for_row(workspace, &payload),
-            origin: payload
-                .get("origin")
-                .and_then(|v| serde_json::from_value::<MessageOrigin>(v.clone()).ok()),
+            origin: held_origin(id, &payload),
         })
         .collect())
+}
+
+/// The origin a `MessageHeld` recorded. A value that no longer decodes is
+/// logged: the released message then goes out unattributed, and the route
+/// popover falls back to its engine-seeded explanation.
+fn held_origin(id: Uuid, payload: &serde_json::Value) -> Option<MessageOrigin> {
+    let raw = payload.get("origin").filter(|v| !v.is_null())?;
+    match serde_json::from_value::<MessageOrigin>(raw.clone()) {
+        Ok(origin) => Some(origin),
+        Err(e) => {
+            crate::log!(
+                "[HeldMessages] held message {} has an origin that no longer decodes, \
+                 releasing it unattributed: {}",
+                id,
+                e
+            );
+            None
+        }
+    }
 }
 
 /// Whether an incoming message on a coding-agent thread must be held.
@@ -246,7 +263,6 @@ impl LucidosEngine {
             &self.workspace_path,
             &message.text,
             message.images.as_deref(),
-            None,
             None,
             None,
             None,

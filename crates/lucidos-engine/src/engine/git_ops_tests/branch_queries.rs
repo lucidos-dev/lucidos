@@ -465,22 +465,77 @@ async fn proposal_files_for_branch_rejects_already_applied_after_criss_cross_bac
 }
 
 #[test]
-fn files_have_client_update_detects_frontend_files() {
-    assert!(files_have_client_update(&["src/App.tsx".into()]));
-    assert!(files_have_client_update(&["store/store.ts".into()]));
-    assert!(files_have_client_update(&["styles/global.css".into()]));
-    assert!(files_have_client_update(&["index.html".into()]));
-    assert!(files_have_client_update(&["utils/helper.js".into()]));
-    assert!(files_have_client_update(&["component.jsx".into()]));
+fn files_have_client_update_detects_bundle_inputs() {
+    for f in [
+        "crates/lucidos-app/src/App.tsx",
+        "crates/lucidos-app/src/styles/global/base.css",
+        "crates/lucidos-app/public/sw.js",
+        "crates/lucidos-app/vite/gatewaySession.ts",
+        "crates/lucidos-app/index.html",
+        "crates/lucidos-app/vite.config.ts",
+        "crates/lucidos-app/package.json",
+        "packages/lucidos-sdk/src/index.ts",
+        "package.json",
+        "package-lock.json",
+    ] {
+        assert!(
+            files_have_client_update(&[f.into()]),
+            "{f} feeds the bundle"
+        );
+    }
 }
 
+/// An Apply touching only an e2e spec must not wait for a rebuild. The
+/// build-watch never runs one, so the wait ends in a false warning.
 #[test]
-fn files_have_client_update_ignores_non_frontend_files() {
-    assert!(!files_have_client_update(&["src/engine.rs".into()]));
-    assert!(!files_have_client_update(&["Cargo.toml".into()]));
-    assert!(!files_have_client_update(&["README.md".into()]));
-    assert!(!files_have_client_update(&["migrations/001.sql".into()]));
+fn files_have_client_update_ignores_files_outside_the_bundle() {
+    for f in [
+        "crates/lucidos-app/e2e/transcript-window-fills-the-pane.spec.ts",
+        "crates/lucidos-app/e2e/fixture.html",
+        "crates/lucidos-app/dev-build-watch.mjs",
+        "crates/lucidos-engine/src/api/sdk_iframe_audio.js",
+        "packages/lucidos-sdk/tests/preferences.test.ts",
+        "scripts/lib/e2e.ts",
+        "crates/lucidos-engine/src/main.rs",
+        "Cargo.toml",
+        "README.md",
+    ] {
+        assert!(
+            !files_have_client_update(&[f.into()]),
+            "{f} is not a bundle input"
+        );
+    }
     assert!(!files_have_client_update(&[]));
+}
+
+/// The classifier must agree with what the build-watch watches, or an Apply
+/// either waits for a build that never runs or skips one that does.
+#[test]
+fn files_have_client_update_matches_the_build_watch_inputs() {
+    let watcher = include_str!("../../../../lucidos-app/dev-build-watch.mjs");
+    let mut watched: Vec<String> = watcher
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("resolve("))
+        .filter_map(|l| Some((l.split(',').next()?, l.split('\'').nth(1)?)))
+        .map(|(base, rel)| match (base, rel.strip_prefix("../../")) {
+            ("PROJECT_DIR", _) => rel.to_string(),
+            ("APP_DIR", Some(up)) => up.to_string(),
+            ("APP_DIR", None) => format!("crates/lucidos-app/{rel}"),
+            _ => panic!("unknown base {base} in dev-build-watch.mjs"),
+        })
+        .collect();
+    let mut classified: Vec<String> = restart_detection::CLIENT_BUNDLE_DIRS
+        .iter()
+        .map(|dir| dir.trim_end_matches('/'))
+        .chain(restart_detection::CLIENT_BUNDLE_FILES.iter().copied())
+        .map(str::to_string)
+        .collect();
+    watched.sort();
+    classified.sort();
+    assert_eq!(
+        watched, classified,
+        "dev-build-watch.mjs and files_have_client_update disagree"
+    );
 }
 
 /// External repos with non-`main`/`master` default branches must be detected
@@ -819,10 +874,9 @@ async fn default_diff_base_in_linked_worktree_never_uses_own_head() {
 
 #[test]
 fn files_have_client_update_mixed_files() {
-    // If any frontend file is present, returns true
     assert!(files_have_client_update(&[
-        "src/engine.rs".into(),
-        "src/App.tsx".into()
+        "crates/lucidos-engine/src/main.rs".into(),
+        "crates/lucidos-app/src/App.tsx".into()
     ]));
 }
 
@@ -893,24 +947,149 @@ fn files_require_restart_for_engine_bundled_iframe_assets() {
     ]));
 }
 
-/// The vendored default font is the sharpest case of "an engine-bundled asset
-/// is not always an engine FILE". `FiraCode-VF.woff2` lives in the app crate,
-/// because the host's `@font-face` resolves it through Vite, so by path alone it
-/// reads as a frontend-only change. But `api/sdk_fonts.rs` `include_bytes!`s that
-/// same file to serve app iframes, so a running engine serves the copy it was
-/// BUILT with. One copy in the tree, two consumers, and only one of them picks up
-/// an edit without a rebuild.
+/// The vendored fonts are the sharpest case of "an engine-bundled asset is not
+/// always an engine FILE". They live in the app crate, because the host's
+/// `@font-face` resolves them through Vite, so by path alone they read as a
+/// frontend-only change. But `core::fonts` `include_bytes!`s the same files to
+/// serve app iframes, so a running engine serves the copy it was BUILT with.
 #[test]
-fn files_require_restart_for_the_engine_bundled_font() {
+fn files_require_restart_for_the_engine_bundled_fonts() {
     assert!(files_require_restart(&[
         "crates/lucidos-app/src/assets/fonts/FiraCode-VF.woff2".into()
     ]));
     assert!(files_require_restart(&[
-        "crates/lucidos-engine/src/api/sdk_fonts_fira_code.css".into()
+        "crates/lucidos-app/src/assets/fonts/Geist-latin.woff2".into()
     ]));
     // The license text beside the font is not served by anything.
     assert!(!files_require_restart(&[
         "crates/lucidos-app/src/assets/fonts/LICENSE-FiraCode.txt".into()
+    ]));
+}
+
+/// Every file a binary embeds needs a restart. Otherwise an Apply that edits
+/// one offers no restart, and the running process keeps the old copy.
+#[test]
+fn a_file_a_binary_embeds_requires_a_restart() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .unwrap();
+    // Built into none of the binaries an Apply rebuilds and restarts onto.
+    const NOT_IN_A_RESTARTED_BINARY: &[&str] = &["lucidos-app", "lucidos-e2e", "lucidos-eval"];
+    let include = regex::Regex::new(r#"include_(?:str|bytes)!\(\s*"([^"]+)"\s*\)"#).unwrap();
+    let mut embedded = Vec::new();
+    for crate_dir in std::fs::read_dir(root.join("crates")).unwrap() {
+        let crate_dir = crate_dir.unwrap().path();
+        let name = crate_dir.file_name().unwrap().to_string_lossy().to_string();
+        if NOT_IN_A_RESTARTED_BINARY.contains(&name.as_str()) {
+            continue;
+        }
+        let mut dirs = vec![crate_dir.join("src")];
+        while let Some(dir) = dirs.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries {
+                let path = entry.unwrap().path();
+                let file_name = path.file_name().unwrap().to_string_lossy().to_string();
+                // A whole file or directory of tests, mounted under `#[cfg(test)]`.
+                if file_name.ends_with("tests") || file_name.ends_with("tests.rs") {
+                    continue;
+                }
+                if path.is_dir() {
+                    dirs.push(path);
+                    continue;
+                }
+                if !file_name.ends_with(".rs") {
+                    continue;
+                }
+                let source = std::fs::read_to_string(&path).unwrap();
+                for literal in include.captures_iter(&production_source(&source)) {
+                    let target = path.parent().unwrap().join(&literal[1]);
+                    let target = target
+                        .canonicalize()
+                        .unwrap_or_else(|e| panic!("{} embeds {target:?}: {e}", path.display()));
+                    let relative = target.strip_prefix(&root).unwrap();
+                    embedded.push(relative.to_string_lossy().replace('\\', "/"));
+                }
+            }
+        }
+    }
+    assert!(
+        embedded.len() > 20,
+        "the scan found only {embedded:?}, so it no longer reads the sources"
+    );
+    let missed: Vec<&String> = embedded
+        .iter()
+        .filter(|f| !files_require_restart(&[f.to_string()]))
+        .collect();
+    assert!(
+        missed.is_empty(),
+        "a binary embeds these, but an Apply that edits one offers no restart: {missed:?}. \
+         Add each to EMBEDDED_FILES in restart_detection.rs."
+    );
+}
+
+/// A Rust file's source without its inline test modules. Each one is a
+/// column-0 `#[cfg(test)]` over `mod <name> {`, closed by the next column-0
+/// `}`, which rustfmt guarantees. A bodiless `mod x;` is only a declaration.
+fn production_source(source: &str) -> String {
+    let mut production = String::new();
+    let mut rest = source;
+    while let Some(at) = rest.find("\n#[cfg(test)]\n") {
+        let (before, from) = rest.split_at(at);
+        let item = from
+            .lines()
+            .skip(2)
+            .find(|line| !line.starts_with("#["))
+            .unwrap_or("");
+        let names_a_module = item.starts_with("mod ") || item.starts_with("pub mod ");
+        let body_end = from.find("\n}\n").map(|end| end + "\n}\n".len());
+        match body_end {
+            Some(end) if names_a_module && item.trim_end().ends_with('{') => {
+                production.push_str(before);
+                rest = from.split_at(end).1;
+            }
+            _ => {
+                let (kept, after) = from.split_at("\n#[cfg(test)]\n".len());
+                production.push_str(before);
+                production.push_str(kept);
+                rest = after;
+            }
+        }
+    }
+    production.push_str(rest);
+    production
+}
+
+#[test]
+fn production_source_drops_test_bodies_and_keeps_what_follows() {
+    let source = "#[cfg(test)]\nmod a;\n\n#[cfg(test)]\nmod b;\nconst X: &str = \"x\";\n\
+                  \n#[cfg(test)]\n#[allow(dead_code)]\nmod tests {\n    fn t() {}\n}\n\
+                  const Y: &str = \"y\";\n\n#[cfg(test)]\nmod more {\n    fn u() {}\n}\n";
+    let production = production_source(source);
+    assert!(production.contains("mod b;"));
+    assert!(production.contains("const X"));
+    assert!(production.contains("const Y"));
+    assert!(!production.contains("fn t()"));
+    assert!(!production.contains("fn u()"));
+}
+
+/// The two shapes the embed guard exists for: a built-in theme is an engine data
+/// file, and the app-iframe stylesheet lives in the frontend tree.
+#[test]
+fn files_require_restart_for_embedded_data_and_the_iframe_stylesheet() {
+    assert!(files_require_restart(&[
+        "crates/lucidos-engine/src/core/themes/builtin/nord.json".into()
+    ]));
+    assert!(files_require_restart(&[
+        "crates/lucidos-app/src/styles/global/shared-components.css".into()
+    ]));
+    assert!(files_require_restart(&[
+        "crates/lucidos-gateway/Cargo.toml".into()
+    ]));
+    assert!(!files_require_restart(&[
+        "crates/lucidos-engine/src/core/themes/README.md".into()
     ]));
 }
 
@@ -1067,4 +1246,125 @@ async fn worktree_add_waits_for_a_prune_holding_the_admin_lock() {
         "worktree_add failed once the lock was free: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+/// `for-each-ref` output in the shape [`RefFacts::read`] asks for.
+fn ref_facts(refs: &[(&str, &str, &str)]) -> RefFacts {
+    let stdout: String = refs
+        .iter()
+        .map(|(name, sha, symref)| format!("{name}\0{sha}\0{symref}\n"))
+        .collect();
+    RefFacts::parse(&stdout)
+}
+
+#[test]
+fn diff_base_skips_the_ancestry_check_when_local_and_origin_agree() {
+    let facts = ref_facts(&[
+        ("refs/heads/main", "aaa", ""),
+        (
+            "refs/remotes/origin/HEAD",
+            "aaa",
+            "refs/remotes/origin/main",
+        ),
+        ("refs/remotes/origin/main", "aaa", ""),
+    ]);
+    assert_eq!(diff_base_from(&facts), DiffBase::Settled("main".into()));
+}
+
+#[test]
+fn diff_base_asks_about_ancestry_when_local_and_origin_differ() {
+    let facts = ref_facts(&[
+        ("refs/heads/main", "aaa", ""),
+        ("refs/remotes/origin/main", "bbb", ""),
+    ]);
+    assert_eq!(
+        diff_base_from(&facts),
+        DiffBase::LocalUnlessDiverged {
+            local: "main".into(),
+            remote_tracking: "origin/main".into(),
+        }
+    );
+}
+
+#[test]
+fn diff_base_follows_origin_head_to_a_local_default() {
+    let facts = ref_facts(&[
+        ("refs/heads/develop", "aaa", ""),
+        ("refs/heads/main", "ccc", ""),
+        (
+            "refs/remotes/origin/HEAD",
+            "aaa",
+            "refs/remotes/origin/develop",
+        ),
+    ]);
+    assert_eq!(diff_base_from(&facts), DiffBase::Settled("develop".into()));
+}
+
+#[test]
+fn diff_base_uses_master_when_there_is_no_main() {
+    let facts = ref_facts(&[("refs/heads/master", "aaa", "")]);
+    assert_eq!(diff_base_from(&facts), DiffBase::Settled("master".into()));
+}
+
+#[test]
+fn diff_base_falls_back_to_origin_head_when_no_local_default_exists() {
+    let facts = ref_facts(&[
+        ("refs/heads/lucidos-thread-branch", "ddd", ""),
+        (
+            "refs/remotes/origin/HEAD",
+            "aaa",
+            "refs/remotes/origin/develop",
+        ),
+        ("refs/remotes/origin/develop", "aaa", ""),
+    ]);
+    assert_eq!(
+        diff_base_from(&facts),
+        DiffBase::Settled("origin/develop".into())
+    );
+}
+
+#[test]
+fn diff_base_uses_origin_main_when_local_main_is_missing() {
+    let facts = ref_facts(&[("refs/remotes/origin/main", "aaa", "")]);
+    assert_eq!(
+        diff_base_from(&facts),
+        DiffBase::Settled("origin/main".into())
+    );
+}
+
+/// A `for-each-ref` that could not run reads as no refs at all, which lands
+/// on the primary worktree's tip rather than a phantom branch name.
+#[test]
+fn diff_base_with_no_ref_facts_asks_the_primary_worktree() {
+    assert_eq!(
+        diff_base_from(&RefFacts::default()),
+        DiffBase::PrimaryWorktreeHead
+    );
+}
+
+#[tokio::test]
+async fn ref_facts_read_parses_real_for_each_ref_output() {
+    let (_tmp, repo) = make_test_repo().await;
+    let facts = RefFacts::read(&repo).await;
+    assert_eq!(diff_base_from(&facts), DiffBase::Settled("main".into()));
+}
+
+/// An `origin/HEAD` naming a branch the remote deleted names no default. A
+/// local branch left behind by that name must not become the merge target.
+#[tokio::test]
+async fn a_dangling_origin_head_names_no_default() {
+    let (_tmp, repo) = make_test_repo().await;
+    for args in [
+        &["branch", "develop"][..],
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/develop",
+        ],
+    ] {
+        let o = git_cmd(args, &repo).await.unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    }
+    assert_eq!(default_local_branch(&repo).await, "main");
+    assert_eq!(default_diff_base(&repo).await, "main");
 }

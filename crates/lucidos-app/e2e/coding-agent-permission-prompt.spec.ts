@@ -167,7 +167,7 @@ test.describe('CC permission prompt — Allow / Deny flow', () => {
         .first();
       await expect(panel).toBeVisible({ timeout: 15_000 });
       const body = panel.locator('.initiator-body .permission-body').first();
-      await expect(body).toContainText(/Bash/);
+      await expect(body.locator('.permission-command')).toHaveText('rm -rf /tmp/lucidos-deny-test');
 
       await body.locator('button', { hasText: /^Deny$/ }).click();
 
@@ -340,7 +340,7 @@ test.describe('CC permission prompt — Allow / Deny flow', () => {
         .first();
       await expect(body).toBeVisible({ timeout: 15_000 });
 
-      // Click the narrow "Always allow Skill(plugin:*)" button — second-row button.
+      // Click the narrow "Always allow Skill(plugin:*)" button.
       await body.locator('button', { hasText: new RegExp(`Always allow.*${plugin}`) }).click();
 
       const resolved = await promptResponse;

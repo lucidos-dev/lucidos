@@ -10,6 +10,7 @@ import { describe, it, expect } from 'vitest';
 import {
   releaseRowIsOpen,
   releaseNotesBody,
+  ReleaseNotes,
   leadAheadVersion,
   offeredRelease,
   releaseRowMark,
@@ -19,6 +20,7 @@ import {
   defaultOpenRelease,
 } from '../WhatsNewPage';
 import type { ChangelogRelease } from '../../../api/client';
+import type { VNode } from 'preact';
 
 const RELEASE: ChangelogRelease = {
   version: '0.26.3',
@@ -104,16 +106,22 @@ describe('defaultOpenRelease', () => {
 });
 
 describe('releaseNotesBody', () => {
-  it('renders nothing at all while the row is shut', () => {
+  type Body = { open: boolean; children: VNode<{ release: ChangelogRelease }> };
+
+  it('parses no markdown while the row is shut', () => {
     // Not a hidden element: 43 sections of markdown are parsed only as asked
-    // for, which is the whole reason the list is collapsible.
-    expect(releaseNotesBody(RELEASE, false)).toBe(null);
+    // for, which is the whole reason the list is collapsible. The notes are
+    // an unrendered component, which a shut disclosure never renders.
+    const body = releaseNotesBody(RELEASE, false).props as Body;
+    expect(body.open).toBe(false);
+    expect(body.children.type).toBe(ReleaseNotes);
   });
 
   it('renders the notes as markdown once the row is open', () => {
-    const body = releaseNotesBody(RELEASE, true);
-    expect(body).not.toBe(null);
-    const props = body!.props as unknown as { dangerouslySetInnerHTML: { __html: string } };
+    const body = releaseNotesBody(RELEASE, true).props as Body;
+    expect(body.open).toBe(true);
+    const notes = ReleaseNotes(body.children.props);
+    const props = notes.props as unknown as { dangerouslySetInnerHTML: { __html: string } };
     const html = props.dangerouslySetInnerHTML.__html;
     expect(html).toContain('Fixed');
     expect(html).toContain('a thing');

@@ -1,6 +1,7 @@
 use super::super::*;
 use super::*;
 use crate::core::changes::ChangeStatus;
+use crate::engine::thread_lifecycle::ThreadStatus;
 
 /// Locks in the boolean-cluster split: `CodingAgentIdled` no longer sets
 /// `coding_agent_proposed`, even when its `has_changes` payload is true.
@@ -145,7 +146,11 @@ async fn sse_thread_event_carries_aggregate() {
         agg.section, "inbox",
         "ResponseCanceled puts CC thread in inbox"
     );
-    assert_eq!(agg.status, "idle", "after cancel, status returns to idle");
+    assert_eq!(
+        agg.status,
+        ThreadStatus::Idle,
+        "after cancel, status returns to idle"
+    );
     assert_eq!(agg.thread_id, thread_id.to_string());
 
     // Verify SSE JSON serialization carries the aggregate too.
@@ -358,14 +363,9 @@ async fn full_apply_cycle_ends_idle_not_waiting() {
         .unwrap();
     }
 
-    let (status, has_changes, requires_restart, is_external, applying): (
-        String,
-        bool,
-        bool,
-        bool,
-        bool,
-    ) = sqlx::query_as(
-        "SELECT status, coding_agent_proposed, coding_agent_requires_restart, coding_agent_is_external_repo, coding_agent_applying \
+    let (status, has_changes, requires_restart, is_external): (String, bool, bool, bool) =
+        sqlx::query_as(
+            "SELECT status, coding_agent_proposed, coding_agent_requires_restart, coding_agent_is_external_repo \
              FROM thread_summaries WHERE thread_id = $1",
     )
     .bind(thread_id)
@@ -382,7 +382,6 @@ async fn full_apply_cycle_ends_idle_not_waiting() {
     );
     assert!(!requires_restart);
     assert!(!is_external);
-    assert!(!applying);
 
     let sid: Option<String> = sqlx::query_scalar(
         "SELECT payload->>'cc_session_id' FROM events \
@@ -405,7 +404,7 @@ async fn full_apply_cycle_ends_idle_not_waiting() {
 
 /// Regression: a `ChangeApplied` emitted with `actor: Some(MessageOrigin::Device)`
 /// must persist that actor verbatim into the events table. The frontend reads
-/// `payload->'actor'` to render the chip ("You" / "<device label>") — when the
+/// `payload->'actor'` to render the chip ("You" / the device's name). When the
 /// stored payload is missing the actor or has it as `null`, the
 /// `actorInitiator` fallback in `thread-events.ts` collapses to "Lucidos
 /// Engine", which is the user-visible bug behind Task 4 of the
@@ -422,7 +421,6 @@ async fn change_applied_persists_device_actor_in_payload() {
 
     let device = MessageOrigin::Device {
         device_id: "dev-actor-test".into(),
-        label: "Test MacBook".into(),
     };
 
     bus.emit(BusEvent::Thread {
@@ -467,11 +465,9 @@ async fn change_applied_persists_device_actor_in_payload() {
         Some("dev-actor-test"),
         "actor.device_id must round-trip, got: {actor_json:?}"
     );
-    assert_eq!(
-        actor_json.get("label").and_then(|v| v.as_str()),
-        Some("Test MacBook"),
-        "actor.label must round-trip so the chip renders the user's device name, \
-         got: {actor_json:?}"
+    assert!(
+        actor_json.get("label").is_none(),
+        "a device actor stores its id, never its name, got: {actor_json:?}"
     );
 
     pool.close().await;
@@ -676,7 +672,6 @@ async fn slow_path_change_applied_carries_stashed_apply_actor() {
 
     let device = MessageOrigin::Device {
         device_id: "iphone-slow-path".into(),
-        label: "iOS Safari PWA".into(),
     };
 
     // Apply call site stashes the actor by change_id before spawning CC for the merge.
@@ -745,9 +740,8 @@ async fn slow_path_change_applied_carries_stashed_apply_actor() {
 /// locks the two guarantees:
 ///   1. Only branch B's change is left pending — the orphan is gone, so the
 ///      frontend's `hasPendingChanges` no longer suppresses Archive.
-///   2. `coding_agent_proposed` is TRUE afterwards — the discard's `ClearAll`
-///      runs BEFORE the propose's `SetChanges`, so the flag reflects the new
-///      change (the ordering the source guard below pins in `propose_change`).
+///   2. `coding_agent_proposed` is TRUE afterwards, because branch B's change
+///      is still pending and the flag follows the pending rows.
 ///
 /// This is the exact stuck state from thread `a4d52fd0` — two pending change
 /// rows across branches, one applied, one orphaned pending — reduced to its
@@ -841,8 +835,8 @@ async fn propose_time_reconcile_keeps_single_pending_and_proposed_flag() {
     .unwrap();
     assert!(
         proposed,
-        "coding_agent_proposed must be TRUE after a cross-branch propose — the sibling \
-         discard's ClearAll must run BEFORE the new ChangeProposed's SetChanges"
+        "coding_agent_proposed must be TRUE after a cross-branch propose: the new \
+         change is still pending"
     );
 
     pool.close().await;
@@ -856,8 +850,7 @@ async fn propose_time_reconcile_keeps_single_pending_and_proposed_flag() {
 /// signature test — we pin the load-bearing property structurally: the sibling
 /// reconcile call must appear BEFORE the `ChangeProposed` emit. If a refactor
 /// reorders them, `ChangeDiscarded`'s `ClearAll` would wipe the
-/// `coding_agent_proposed` flag the proposal just set, re-introducing the
-/// "applied but no Apply button / no Archive" class of bug.
+/// `coding_agent_has_diff` flag the proposal just set, and the Diff button with it.
 #[test]
 fn propose_change_reconciles_stale_branches_before_change_proposed_emit() {
     let src = include_str!("../change_ops/propose.rs");
@@ -869,8 +862,8 @@ fn propose_change_reconciles_stale_branches_before_change_proposed_emit() {
         .expect("propose_change must still emit ChangeProposed");
     assert!(
         discard_pos < proposed_pos,
-        "the sibling reconcile must run BEFORE the ChangeProposed emit — otherwise \
-         ChangeDiscarded's ClearAll wipes the coding_agent_proposed flag this proposal sets. \
+        "the sibling reconcile must run BEFORE the ChangeProposed emit: otherwise \
+         ChangeDiscarded's ClearAll wipes the coding_agent_has_diff flag this proposal sets. \
          See docs/plans/2026-07-01-orphaned-pending-change-blocks-archive.md"
     );
 }

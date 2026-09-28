@@ -1083,6 +1083,54 @@ describe('renderMarkdown images', () => {
     expect(imgSrc(html)).toBe('/myws/data/artifacts/chart.svg#detail');
   });
 
+  /** A size hint lets the browser reserve the picture's box before its bytes
+   *  arrive, so a card or reply does not grow when it loads. */
+  describe('size hint', () => {
+    const imgOf = (html: string) =>
+      new DOMParser().parseFromString(html, 'text/html').querySelector('img')!;
+
+    it('stamps the size and strips the hint from the served source', () => {
+      const img = imgOf(renderMarkdown('![alt](artifacts/x.png#1600x1200)', { cache: false }));
+      expect(img.getAttribute('src')).toBe('/myws/data/artifacts/x.png');
+      expect(img.getAttribute('data-size-hint')).toBe('');
+      expect(img.getAttribute('style')).toBe('--hint-w: 1600; --hint-h: 1200;');
+    });
+
+    it('stamps a hinted absolute URL too', () => {
+      const img = imgOf(renderMarkdown('![alt](https://example.com/x.png#40x30)', { cache: false }));
+      expect(img.getAttribute('src')).toBe('https://example.com/x.png');
+      expect(img.hasAttribute('data-size-hint')).toBe(true);
+    });
+
+    it('stamps the inline variants a question card renders', () => {
+      for (const render of [renderMarkdownInline, renderMarkdownInlineWithLinks]) {
+        const img = imgOf(render('![alt](artifacts/x.png#800x600)'));
+        expect(img.getAttribute('src')).toBe('/myws/data/artifacts/x.png');
+        expect(img.getAttribute('style')).toBe('--hint-w: 800; --hint-h: 600;');
+      }
+    });
+
+    it('keeps an inline style the author gave a raw image', () => {
+      const img = imgOf(renderMarkdown('<img style="opacity: 0.5" src="artifacts/x.png#40x30">', { cache: false }));
+      expect(img.style.getPropertyValue('opacity')).toBe('0.5');
+      expect(img.style.getPropertyValue('--hint-w')).toBe('40');
+    });
+
+    it('leaves an unhinted image unstamped', () => {
+      const img = imgOf(renderMarkdown('![alt](artifacts/x.png)', { cache: false }));
+      expect(img.hasAttribute('data-size-hint')).toBe(false);
+      expect(img.hasAttribute('style')).toBe(false);
+    });
+
+    it('treats any other fragment as the author\'s own', () => {
+      for (const src of ['artifacts/x.svg#detail', 'artifacts/x.png#0x10', 'artifacts/x.png#10x']) {
+        const img = imgOf(renderMarkdown(`![alt](${src})`, { cache: false }));
+        expect(img.hasAttribute('data-size-hint'), src).toBe(false);
+        expect(img.getAttribute('src'), src).toBe(`/myws/data/${src}`);
+      }
+    });
+  });
+
   it('still strips a data: image URI, exactly as before the rewrite existed', () => {
     const html = renderMarkdown('![alt](data:image/png;base64,AAAA)', { cache: false });
     expect(html).not.toContain('data:image/png');
@@ -1281,20 +1329,16 @@ describe('renderMarkdown tables', () => {
     expect(labels(html)).toEqual([HEADER_PAYLOAD, HEADER_PAYLOAD, 'B', 'C', 'D']);
   });
 
-  /** `linkifyPaths` re-scans this output with a tag regex that is not
-   *  quote-aware, and the serializer writes `<` and `>` raw inside a value.
-   *  A `>` in the label therefore ends that scanner's idea of the tag. What
-   *  follows lands in attribute-name position once it splices a link in.
-   *  See `docs/temporary-measures.md` § "Angle brackets kept out of
-   *  `data-label`" for the real fix and for when this goes away. */
-  it("a header's angle brackets never reach the stacked-card label", () => {
+  /** The serializer writes `<` and `>` raw inside a value, and `linkifyPaths`
+   *  re-scans this output. Its `splitTags` must keep a `>` in the label from
+   *  ending the tag, or a spliced link puts the rest in attribute-name
+   *  position. */
+  it("a header's angle brackets stay in the label and never become a handler", () => {
     const html = renderMarkdown(
       mdTable(['q>https://e.com/onmouseover=x;//', 'B', 'C', 'D'], ['w', 'x', 'y', 'z']),
       { cache: false },
     );
-    for (const label of labels(html)) expect(label).not.toMatch(/[<>]/);
-    // The rest of the header survives, and so does the real column text.
-    expect(labels(html)).toEqual(['qhttps://e.com/onmouseover=x;//', 'B', 'C', 'D']);
+    expect(labels(html)).toEqual(['q>https://e.com/onmouseover=x;//', 'B', 'C', 'D']);
     const linked = linkifyPaths(html, [], []);
     const doc = new DOMParser().parseFromString(linked, 'text/html');
     const handlers = [...doc.querySelectorAll('*')]

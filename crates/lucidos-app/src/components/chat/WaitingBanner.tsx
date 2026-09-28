@@ -9,6 +9,7 @@ import type { HeaderActionSpec } from '../layout/headerActions';
 import type { OverflowMenuContext } from '../shared/OverflowMenu';
 import { useTouchActivated } from '../../hooks/useTouchActivated';
 import { blurPromptInputIfFocused } from './promptFocus';
+import { PROTECTED_SURFACE } from '../shared/protectedSurface';
 
 /** The close-set kinds the banner renders. Two other kinds come from the same
  *  selector and live elsewhere, so both are excluded. Discard-draft is a
@@ -61,8 +62,8 @@ export function getWaitingState(): WaitingState | null {
   // Excludes 'waiting' (CC has changes — needs Apply/Discard, not Cancel).
   //
   // This now also covers an apply that woke a live Claude Code session — a
-  // `/harden` run (codingAgentApplying false, status running) or a merge-conflict
-  // resolution (codingAgentApplying true, status running). Both run as a real CC
+  // `/harden` run or a merge-conflict resolution, both with status running.
+  // Both run as a real CC
   // turn, so the user can interrupt them. Cancel is best-effort for a merge: if
   // the merge already landed before the interrupt processes, the engine still
   // emits ChangeApplied; otherwise the change returns to pending. (Previously a
@@ -107,7 +108,7 @@ function actionMenuRow(action: TaggedAction, ctx: OverflowMenuContext) {
     <button
       key={action.kind}
       type="button"
-      class="thread-overflow-item"
+      class={`thread-overflow-item ${PROTECTED_SURFACE}`}
       role="menuitem"
       onClick={ctx.run(() => void action.invoke())}
     >
@@ -160,7 +161,7 @@ export function getBannerActions(state: BannerState): HeaderActionSpec[] {
         <ChangeActionSplitButton
           primary={applyAction}
           menuActions={menuActions}
-          attrs={attrs}
+          attrs={{ ...attrs, 'data-thread-action': '' }}
         />
       ),
       menuRows: (ctx) => [applyAction, ...menuActions].map((a) => actionMenuRow(a, ctx)),
@@ -227,6 +228,13 @@ function diffAction(threadId: string): HeaderActionSpec {
   };
 }
 
+/** A change action is an approval, so each button, and each row it folds into,
+ *  is a protected surface of its own (ADR 0309). `variant` is empty for a
+ *  neutral button. */
+function protectedButtonClass(variant: string): string {
+  return ['action-btn', variant, PROTECTED_SURFACE].filter(Boolean).join(' ');
+}
+
 /** A request in flight. Disabled on both sides: `disabledTooltip` is what makes
  *  the folded row `aria-disabled` rather than a live action. */
 function busyAction(key: string, variant: string, label: string): HeaderActionSpec {
@@ -235,8 +243,9 @@ function busyAction(key: string, variant: string, label: string): HeaderActionSp
     label,
     disabledTooltip: label,
     icon: () => null,
+    extraClass: PROTECTED_SURFACE,
     render: (attrs) => (
-      <button {...attrs} class={`action-btn ${variant}`.trim()} disabled aria-label={label}>
+      <button {...attrs} class={protectedButtonClass(variant)} disabled aria-label={label}>
         {label}
       </button>
     ),
@@ -247,21 +256,24 @@ function busyAction(key: string, variant: string, label: string): HeaderActionSp
  *  the kind; label, tooltip and the (confirm-wrapped) handler come from the
  *  selector. */
 function closeSetAction(action: TaggedAction): HeaderActionSpec {
-  const cls =
+  const variant =
     action.kind === 'discard'
-      ? 'action-btn action-btn-danger'
+      ? 'action-btn-danger'
       : action.kind === 'apply'
-        ? 'action-btn action-btn-confirm'
-        : 'action-btn';
+        ? 'action-btn-confirm'
+        : '';
+  const cls = protectedButtonClass(variant);
   const label = action.kind === 'archive' ? 'Archive thread' : action.label;
   return {
     key: action.kind,
     label,
     tooltip: action.tooltip,
     icon: () => ACTION_ICON[action.kind]?.() ?? null,
+    extraClass: PROTECTED_SURFACE,
     render: (attrs) => (
       <button
         {...attrs}
+        data-thread-action=""
         class={cls}
         aria-label={action.kind === 'archive' ? label : undefined}
         data-tooltip={action.tooltip}
@@ -407,20 +419,4 @@ export function StandingApplyButton({
       <StandingApplyIcon armed={armed} />
     </button>
   );
-}
-
-/** The change action for the focused thread's own prompt row, when the banner
- *  is suppressed because the thread has not settled (working, or watching an
- *  event).
- *
- *  That row used to lift the Diff button and nothing else, so a working
- *  coding-agent thread offered no way to arm an apply at all. Availability
- *  comes from the same lifecycle selector the banner reads, so the two cannot
- *  drift on when the action exists. */
-export function getStandingApplyControl(): ComponentChildren | null {
-  const focused = focusedThreadId.value;
-  if (!focused) return null;
-  const action = resolveThreadActions(focused).find((a) => a.kind === 'apply_when_settled');
-  if (!action) return null;
-  return <StandingApplyButton key="standing-apply" threadId={focused} action={action} />;
 }

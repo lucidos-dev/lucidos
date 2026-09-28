@@ -1,0 +1,1063 @@
+{
+  "seeds": [
+    "--bg-primary",
+    "--text-primary",
+    "--accent"
+  ],
+  "groups": [
+    {
+      "id": "surface",
+      "label": "Surfaces",
+      "description": "The backgrounds everything sits on, from the page to raised panels."
+    },
+    {
+      "id": "text",
+      "label": "Text",
+      "description": "Foreground colours for prose, labels and anything drawn on the accent."
+    },
+    {
+      "id": "accent",
+      "label": "Accent",
+      "description": "The brand and action colours: links, active states, filled buttons."
+    },
+    {
+      "id": "marks",
+      "label": "Brand marks",
+      "description": "The Lucidos tile, the Claude logo and the Codex logo, on the chat's actor chips and wherever else they draw in their own colours. They keep their brand colours until a theme sets them."
+    },
+    {
+      "id": "status",
+      "label": "Status",
+      "description": "Colours that carry meaning: success, caution, error, and neutral notable state."
+    },
+    {
+      "id": "header",
+      "label": "Header",
+      "description": "The bar across the top of every pane: its fill, its foreground, badges and control veils."
+    },
+    {
+      "id": "focus",
+      "label": "Focus",
+      "description": "How Lucidos shows where you are: the focused pane's header, the mobile pane dot, the navigation spotlight and the keyboard focus ring."
+    },
+    {
+      "id": "shape",
+      "label": "Shape",
+      "description": "Corner radii of controls, surfaces, and circles and pills."
+    },
+    {
+      "id": "shadow",
+      "label": "Shadows",
+      "description": "Elevation of floating surfaces."
+    },
+    {
+      "id": "syntax",
+      "label": "Syntax",
+      "description": "Code highlighting in previews and tool output."
+    },
+    {
+      "id": "typography",
+      "label": "Typography",
+      "description": "The code font. A theme suggests the UI font with `fonts.ui`, and the user's own font pick wins over it."
+    }
+  ],
+  "tokens": [
+    {
+      "name": "--bg-primary",
+      "group": "surface",
+      "kind": "color",
+      "label": "Background",
+      "description": "The page background. A seed: set it and the other surfaces, the text greys and the header follow.",
+      "frames": true,
+      "default": {
+        "dark": "#07172e",
+        "light": "#ffffff"
+      }
+    },
+    {
+      "name": "--bg-secondary",
+      "group": "surface",
+      "kind": "color",
+      "label": "Surface",
+      "description": "Panels, cards and the default floating surface.",
+      "frames": true,
+      "default": {
+        "dark": "#0d2244",
+        "light": "#f6f8fa"
+      },
+      "derive": {
+        "value": "color-mix(in oklab, var(--bg-primary) 94%, var(--text-primary))",
+        "seeds": [
+          "--bg-primary",
+          "--text-primary"
+        ]
+      }
+    },
+    {
+      "name": "--bg-tertiary",
+      "group": "surface",
+      "kind": "color",
+      "label": "Raised surface",
+      "description": "Chips, question options and controls on a surface.",
+      "frames": true,
+      "default": {
+        "dark": "#163052",
+        "light": "#e1e4e8"
+      },
+      "derive": {
+        "value": "color-mix(in oklab, var(--bg-primary) 87%, var(--text-primary))",
+        "seeds": [
+          "--bg-primary",
+          "--text-primary"
+        ]
+      }
+    },
+    {
+      "name": "--bg-quaternary",
+      "group": "surface",
+      "kind": "color",
+      "label": "Highest surface",
+      "description": "The strongest fill, for pressed and nested controls.",
+      "frames": true,
+      "default": {
+        "dark": "#21406c",
+        "light": "#d0d7de"
+      },
+      "derive": {
+        "value": "color-mix(in oklab, var(--bg-primary) 79%, var(--text-primary))",
+        "seeds": [
+          "--bg-primary",
+          "--text-primary"
+        ]
+      }
+    },
+    {
+      "name": "--bg-hover",
+      "group": "surface",
+      "kind": "color",
+      "label": "Hover",
+      "description": "The fill a row or control takes under the pointer.",
+      "frames": true,
+      "default": {
+        "dark": "#122a4a",
+        "light": "#eaeef2"
+      },
+      "derive": {
+        "value": "color-mix(in oklab, var(--bg-primary) 91%, var(--text-primary))",
+        "seeds": [
+          "--bg-primary",
+          "--text-primary"
+        ]
+      }
+    },
+    {
+      "name": "--bg-selected",
+      "group": "surface",
+      "kind": "color",
+      "label": "Selected",
+      "description": "The fill of the selected row.",
+      "frames": true,
+      "default": {
+        "dark": "#163356",
+        "light": "#eff2f5"
+      },
+      "derive": {
+        "value": "color-mix(in oklab, var(--bg-primary) 88%, var(--text-primary))",
+        "seeds": [
+          "--bg-primary",
+          "--text-primary"
+        ]
+      }
+    },
+    {
+      "name": "--border-color",
+      "group": "surface",
+      "kind": "color",
+      "label": "Border",
+      "description": "Hairlines between rows and around surfaces.",
+      "frames": true,
+      "default": {
+        "dark": "#2c456a",
+        "light": "#d0d7de"
+      },
+      "derive": {
+        "value": "color-mix(in oklab, var(--bg-primary) 81%, var(--text-primary))",
+        "seeds": [
+          "--bg-primary",
+          "--text-primary"
+        ]
+      }
+    },
+    {
+      "name": "--surface-bg",
+      "group": "surface",
+      "kind": "color",
+      "label": "Floating surface",
+      "description": "Toasts, menus, popovers and dialogs.",
+      "frames": false,
+      "default": {
+        "dark": "var(--bg-secondary)",
+        "light": "var(--bg-primary)"
+      }
+    },
+    {
+      "name": "--picked-surface",
+      "group": "surface",
+      "kind": "color",
+      "label": "Picked surface",
+      "description": "The user's own message bubble and a chosen answer.",
+      "frames": false,
+      "default": {
+        "dark": "color-mix(in srgb, var(--accent) 12%, var(--bg-tertiary))",
+        "light": "color-mix(in srgb, var(--accent) 10%, var(--bg-secondary))"
+      }
+    },
+    {
+      "name": "--scrim",
+      "group": "surface",
+      "kind": "color",
+      "label": "Scrim",
+      "description": "The dimming layer behind a blocking dialog.",
+      "frames": false,
+      "default": {
+        "dark": "rgba(0, 0, 0, 0.5)",
+        "light": "rgba(0, 0, 0, 0.5)"
+      }
+    },
+    {
+      "name": "--text-primary",
+      "group": "text",
+      "kind": "color",
+      "label": "Text",
+      "description": "Body text. A seed: set it and the secondary and muted greys follow.",
+      "frames": true,
+      "default": {
+        "dark": "#e6edf3",
+        "light": "#1f2328"
+      }
+    },
+    {
+      "name": "--text-secondary",
+      "group": "text",
+      "kind": "color",
+      "label": "Secondary text",
+      "description": "Labels and supporting text.",
+      "frames": true,
+      "default": {
+        "dark": "#8b949e",
+        "light": "#656d76"
+      },
+      "derive": {
+        "value": "color-mix(in oklab, var(--text-primary) 66%, var(--bg-primary))",
+        "seeds": [
+          "--bg-primary",
+          "--text-primary"
+        ]
+      }
+    },
+    {
+      "name": "--text-muted",
+      "group": "text",
+      "kind": "color",
+      "label": "Muted text",
+      "description": "Hints, timestamps and placeholders.",
+      "frames": true,
+      "default": {
+        "dark": "#6e7681",
+        "light": "#8b949e"
+      },
+      "derive": {
+        "value": "color-mix(in oklab, var(--text-primary) 50%, var(--bg-primary))",
+        "seeds": [
+          "--bg-primary",
+          "--text-primary"
+        ]
+      }
+    },
+    {
+      "name": "--text-on-accent",
+      "group": "text",
+      "kind": "color",
+      "label": "Text on accent",
+      "description": "Labels on filled accent buttons and badges.",
+      "frames": true,
+      "default": {
+        "dark": "#fff",
+        "light": "#fff"
+      },
+      "derive": {
+        "value": "var(--bg-primary)",
+        "seeds": [
+          "--accent"
+        ]
+      }
+    },
+    {
+      "name": "--text-strong",
+      "group": "text",
+      "kind": "color",
+      "label": "Strong text",
+      "description": "Bold text, where the UI font has no bold face and draws bold with its regular strokes. A step brighter than the text by default.",
+      "frames": true,
+      "default": {
+        "dark": "color-mix(in oklab, var(--text-primary) 60%, white)",
+        "light": "color-mix(in oklab, var(--text-primary) 60%, black)"
+      }
+    },
+    {
+      "name": "--text-glow",
+      "group": "text",
+      "kind": "shadow",
+      "label": "Text glow",
+      "description": "Kept for themes written before parts: the text-shadow of the chat-text, actor-label, header-title and composer-text parts. None by default.",
+      "frames": false,
+      "default": {
+        "dark": "none",
+        "light": "none"
+      }
+    },
+    {
+      "name": "--accent",
+      "group": "accent",
+      "kind": "color",
+      "label": "Accent",
+      "description": "Links, active states and highlights. A seed: set it and the action colour, the header tint and the focus cues follow.",
+      "frames": true,
+      "default": {
+        "dark": "#58a6ff",
+        "light": "#0969da"
+      }
+    },
+    {
+      "name": "--accent-light",
+      "group": "accent",
+      "kind": "color",
+      "label": "Light accent",
+      "description": "A lighter step of the accent, for hover and emphasis.",
+      "frames": true,
+      "default": {
+        "dark": "#7ab8ff",
+        "light": "#218bff"
+      },
+      "derive": {
+        "value": "color-mix(in oklab, var(--accent) 78%, var(--text-primary))",
+        "seeds": [
+          "--accent"
+        ]
+      }
+    },
+    {
+      "name": "--accent-action",
+      "group": "accent",
+      "kind": "color",
+      "label": "Action",
+      "description": "The fill of primary buttons.",
+      "frames": true,
+      "default": {
+        "dark": "color-mix(in srgb, var(--brand-blue) 82%, var(--accent))",
+        "light": "var(--brand-blue)"
+      },
+      "derive": {
+        "value": "var(--accent)",
+        "seeds": [
+          "--accent"
+        ]
+      }
+    },
+    {
+      "name": "--brand-blue",
+      "group": "accent",
+      "kind": "color",
+      "label": "Brand blue",
+      "description": "The Lucidos brand blue, behind the default action colour and light header.",
+      "frames": true,
+      "default": {
+        "dark": "#1a6fd0",
+        "light": "#1a6fd0"
+      }
+    },
+    {
+      "name": "--brand-blue-deep",
+      "group": "accent",
+      "kind": "color",
+      "label": "Deep brand blue",
+      "description": "The deeper brand blue, the light header's lower stop and the header badge text.",
+      "frames": true,
+      "default": {
+        "dark": "#0a4ea8",
+        "light": "#0a4ea8"
+      }
+    },
+    {
+      "name": "--initiator-coding-agent",
+      "group": "accent",
+      "kind": "color",
+      "label": "Coding agent",
+      "description": "The coding-agent brand orange. The Claude mark takes it unless a theme sets --claude-mark.",
+      "frames": false,
+      "default": {
+        "dark": "#fb923c",
+        "light": "#ea7c2a"
+      }
+    },
+    {
+      "name": "--lucidos-mark-bg-top",
+      "group": "marks",
+      "kind": "color",
+      "label": "Lucidos tile, top",
+      "description": "The Lucidos tile's gradient at its upper-left light source.",
+      "frames": false,
+      "default": {
+        "dark": "#2d83e0",
+        "light": "#2d83e0"
+      }
+    },
+    {
+      "name": "--lucidos-mark-bg-bottom",
+      "group": "marks",
+      "kind": "color",
+      "label": "Lucidos tile, bottom",
+      "description": "The Lucidos tile's gradient at the far corner. Set both stops to one colour for a flat tile.",
+      "frames": false,
+      "default": {
+        "dark": "#0a4ea8",
+        "light": "#0a4ea8"
+      }
+    },
+    {
+      "name": "--lucidos-mark-fg",
+      "group": "marks",
+      "kind": "color",
+      "label": "Lucidos glyph",
+      "description": "The three squares and the spark on the Lucidos tile.",
+      "frames": false,
+      "default": {
+        "dark": "#ffffff",
+        "light": "#ffffff"
+      }
+    },
+    {
+      "name": "--claude-mark",
+      "group": "marks",
+      "kind": "color",
+      "label": "Claude mark",
+      "description": "The Claude logo on the chat's actor chips and in navigation history. Follows --initiator-coding-agent by default.",
+      "frames": false,
+      "default": {
+        "dark": "var(--initiator-coding-agent)",
+        "light": "var(--initiator-coding-agent)"
+      }
+    },
+    {
+      "name": "--codex-mark",
+      "group": "marks",
+      "kind": "color",
+      "label": "Codex mark",
+      "description": "The Codex logo's stroke. Follows the light accent by default.",
+      "frames": false,
+      "default": {
+        "dark": "var(--accent-light)",
+        "light": "var(--accent-light)"
+      }
+    },
+    {
+      "name": "--accent-green",
+      "group": "status",
+      "kind": "color",
+      "label": "Success",
+      "description": "Success, applied, confirm.",
+      "frames": true,
+      "default": {
+        "dark": "#3fb950",
+        "light": "#1a7f37"
+      }
+    },
+    {
+      "name": "--accent-green-soft",
+      "group": "status",
+      "kind": "color",
+      "label": "Success word",
+      "description": "A status word in a pill, such as Installed or applied: the success green pulled toward secondary text.",
+      "frames": false,
+      "default": {
+        "dark": "color-mix(in srgb, var(--accent-green) 60%, var(--text-secondary))",
+        "light": "color-mix(in srgb, var(--accent-green) 60%, var(--text-secondary))"
+      }
+    },
+    {
+      "name": "--accent-yellow",
+      "group": "status",
+      "kind": "color",
+      "label": "Caution",
+      "description": "Caution only. Never a neutral marker.",
+      "frames": true,
+      "default": {
+        "dark": "#d9c48f",
+        "light": "#8a6d2f"
+      }
+    },
+    {
+      "name": "--accent-red",
+      "group": "status",
+      "kind": "color",
+      "label": "Error",
+      "description": "Errors and destructive actions.",
+      "frames": true,
+      "default": {
+        "dark": "#f85149",
+        "light": "#cf222e"
+      }
+    },
+    {
+      "name": "--accent-orange",
+      "group": "status",
+      "kind": "color",
+      "label": "Orange",
+      "description": "A warm step between caution and error.",
+      "frames": false,
+      "default": {
+        "dark": "#D97757",
+        "light": "#c26a4a"
+      }
+    },
+    {
+      "name": "--accent-notable",
+      "group": "status",
+      "kind": "color",
+      "label": "Notable",
+      "description": "A neutral state worth marking that is not a caution: waiting, trimmed, changed.",
+      "frames": false,
+      "default": {
+        "dark": "#9db4d0",
+        "light": "#5a7492"
+      }
+    },
+    {
+      "name": "--header-bar-top",
+      "group": "header",
+      "kind": "color",
+      "label": "Header top",
+      "description": "The header gradient's top stop. The macOS title-bar band takes it too.",
+      "frames": false,
+      "default": {
+        "dark": "#15549e",
+        "light": "var(--brand-blue)"
+      },
+      "derive": {
+        "value": "color-mix(in oklab, var(--accent) 22%, var(--bg-secondary))",
+        "seeds": [
+          "--accent",
+          "--bg-primary"
+        ]
+      }
+    },
+    {
+      "name": "--header-bar-bottom",
+      "group": "header",
+      "kind": "color",
+      "label": "Header bottom",
+      "description": "The header gradient's bottom stop.",
+      "frames": false,
+      "default": {
+        "dark": "#0b3868",
+        "light": "var(--brand-blue-deep)"
+      },
+      "derive": {
+        "value": "color-mix(in oklab, var(--accent) 12%, var(--bg-secondary))",
+        "seeds": [
+          "--accent",
+          "--bg-primary"
+        ]
+      }
+    },
+    {
+      "name": "--header-gradient",
+      "group": "header",
+      "kind": "gradient",
+      "label": "Header fill",
+      "description": "The header's whole fill. Built from the two stops by default; set it to a flat colour for a flat bar.",
+      "frames": false,
+      "default": {
+        "dark": "linear-gradient(180deg, var(--header-bar-top) 0%, var(--header-bar-bottom) 100%)",
+        "light": "linear-gradient(180deg, var(--header-bar-top) 0%, var(--header-bar-bottom) 100%)"
+      }
+    },
+    {
+      "name": "--titlebar-strip-bg",
+      "group": "header",
+      "kind": "color",
+      "label": "Title-bar band",
+      "description": "The reclaimed macOS title-bar band above the header.",
+      "frames": false,
+      "default": {
+        "dark": "var(--header-bar-top)",
+        "light": "var(--header-bar-top)"
+      }
+    },
+    {
+      "name": "--titlebar-strip-continues",
+      "group": "header",
+      "kind": "number",
+      "label": "Title-bar band continues header",
+      "description": "1 paints the header fill up through the macOS title-bar band, lined up with the header. 0 keeps the band solid.",
+      "frames": false,
+      "default": {
+        "dark": "0",
+        "light": "0"
+      },
+      "derive": {
+        "value": "1",
+        "seeds": [
+          "--header-gradient"
+        ]
+      }
+    },
+    {
+      "name": "--header-fg",
+      "group": "header",
+      "kind": "color",
+      "label": "Header text",
+      "description": "Every glyph and label on the header.",
+      "frames": false,
+      "default": {
+        "dark": "#ffffff",
+        "light": "#ffffff"
+      },
+      "derive": {
+        "value": "var(--text-primary)",
+        "seeds": [
+          "--accent",
+          "--bg-primary",
+          "--text-primary"
+        ]
+      }
+    },
+    {
+      "name": "--header-fg-muted-alpha",
+      "group": "header",
+      "kind": "number",
+      "label": "Header muted strength",
+      "description": "How strong muted header glyphs are, from 0 to 1.",
+      "frames": false,
+      "default": {
+        "dark": "0.72",
+        "light": "0.72"
+      }
+    },
+    {
+      "name": "--header-fg-muted",
+      "group": "header",
+      "kind": "color",
+      "label": "Header muted text",
+      "description": "Muted header glyphs. Built from the header text and its strength by default.",
+      "frames": false,
+      "default": {
+        "dark": "color-mix(in srgb, var(--header-fg) calc(var(--header-fg-muted-alpha) * 100%), transparent)",
+        "light": "color-mix(in srgb, var(--header-fg) calc(var(--header-fg-muted-alpha) * 100%), transparent)"
+      }
+    },
+    {
+      "name": "--header-control-veil-hover",
+      "group": "header",
+      "kind": "alpha",
+      "label": "Control hover veil",
+      "description": "How much header text colour a control mixes in under the pointer.",
+      "frames": false,
+      "default": {
+        "dark": "12%",
+        "light": "12%"
+      }
+    },
+    {
+      "name": "--header-control-veil-active",
+      "group": "header",
+      "kind": "alpha",
+      "label": "Control on veil",
+      "description": "The veil of a header control that is toggled on.",
+      "frames": false,
+      "default": {
+        "dark": "22%",
+        "light": "22%"
+      }
+    },
+    {
+      "name": "--header-control-veil-active-hover",
+      "group": "header",
+      "kind": "alpha",
+      "label": "Control on, hover veil",
+      "description": "The veil of a toggled-on control under the pointer.",
+      "frames": false,
+      "default": {
+        "dark": "30%",
+        "light": "30%"
+      }
+    },
+    {
+      "name": "--header-divider",
+      "group": "header",
+      "kind": "color",
+      "label": "Header divider",
+      "description": "The line between pane headers. Transparent by default, for one seamless bar.",
+      "frames": false,
+      "default": {
+        "dark": "transparent",
+        "light": "transparent"
+      }
+    },
+    {
+      "name": "--header-badge-bg",
+      "group": "header",
+      "kind": "color",
+      "label": "Header badge",
+      "description": "The fill of a count badge on the header.",
+      "frames": false,
+      "default": {
+        "dark": "#ffffff",
+        "light": "#ffffff"
+      },
+      "derive": {
+        "value": "var(--accent)",
+        "seeds": [
+          "--accent",
+          "--bg-primary",
+          "--text-primary"
+        ]
+      }
+    },
+    {
+      "name": "--header-badge-fg",
+      "group": "header",
+      "kind": "color",
+      "label": "Header badge text",
+      "description": "The text of a count badge on the header.",
+      "frames": false,
+      "default": {
+        "dark": "var(--brand-blue-deep)",
+        "light": "var(--brand-blue-deep)"
+      },
+      "derive": {
+        "value": "var(--text-on-accent)",
+        "seeds": [
+          "--accent",
+          "--bg-primary",
+          "--text-primary"
+        ]
+      }
+    },
+    {
+      "name": "--focus-header-tint",
+      "group": "focus",
+      "kind": "color",
+      "label": "Focused header wash",
+      "description": "The wash over the focused pane's header segment. Set it transparent to turn the wash off.",
+      "frames": false,
+      "default": {
+        "dark": "rgba(169, 197, 232, 0.12)",
+        "light": "rgba(191, 213, 243, 0.16)"
+      },
+      "derive": {
+        "value": "color-mix(in srgb, var(--text-primary) 7%, transparent)",
+        "seeds": [
+          "--accent",
+          "--bg-primary",
+          "--text-primary"
+        ]
+      }
+    },
+    {
+      "name": "--focus-header-underline",
+      "group": "focus",
+      "kind": "color",
+      "label": "Focused header underline",
+      "description": "A line under the focused pane's header segment. Transparent (off) by default.",
+      "frames": false,
+      "default": {
+        "dark": "transparent",
+        "light": "transparent"
+      }
+    },
+    {
+      "name": "--focus-header-underline-width",
+      "group": "focus",
+      "kind": "length",
+      "label": "Underline width",
+      "description": "The thickness of the focused header underline, in px.",
+      "frames": false,
+      "default": {
+        "dark": "2px",
+        "light": "2px"
+      }
+    },
+    {
+      "name": "--focus-pill-bg",
+      "group": "focus",
+      "kind": "color",
+      "label": "Mobile pane dot",
+      "description": "The active pane dot on the phone header.",
+      "frames": false,
+      "default": {
+        "dark": "rgba(169, 197, 232, 0.87)",
+        "light": "rgba(191, 213, 243, 0.93)"
+      },
+      "derive": {
+        "value": "var(--accent)",
+        "seeds": [
+          "--accent"
+        ]
+      }
+    },
+    {
+      "name": "--focus-pill-glow",
+      "group": "focus",
+      "kind": "shadow",
+      "label": "Mobile pane dot glow",
+      "description": "The bloom around the active pane dot.",
+      "frames": false,
+      "default": {
+        "dark": "0 0 0.25rem rgba(178, 206, 240, 0.42), 0 0 0.625rem rgba(158, 190, 232, 0.28)",
+        "light": "0 0 0.25rem rgba(198, 220, 248, 0.5), 0 0 0.625rem rgba(186, 212, 244, 0.34)"
+      },
+      "derive": {
+        "value": "0 0 0.5rem color-mix(in srgb, var(--accent) 45%, transparent)",
+        "seeds": [
+          "--accent"
+        ]
+      }
+    },
+    {
+      "name": "--nav-focus-glow",
+      "group": "focus",
+      "kind": "color",
+      "label": "Navigation spotlight",
+      "description": "The neutral spotlight on the item you navigated to. Keep it hue-free: it marks a place, not a state.",
+      "frames": false,
+      "default": {
+        "dark": "#ffffff",
+        "light": "#a8a8a8"
+      },
+      "derive": {
+        "value": "color-mix(in oklab, var(--text-primary) 60%, var(--bg-primary))",
+        "seeds": [
+          "--bg-primary",
+          "--text-primary"
+        ]
+      }
+    },
+    {
+      "name": "--nav-focus-border-alpha",
+      "group": "focus",
+      "kind": "alpha",
+      "label": "Spotlight border",
+      "description": "How strong the spotlight's hairline border is.",
+      "frames": false,
+      "default": {
+        "dark": "0%",
+        "light": "60%"
+      }
+    },
+    {
+      "name": "--focus-ring",
+      "group": "focus",
+      "kind": "shadow",
+      "label": "Keyboard focus ring",
+      "description": "The ring around the control that has keyboard focus.",
+      "frames": true,
+      "default": {
+        "dark": "0 0 0 0.1875rem color-mix(in srgb, var(--accent) 55%, transparent)",
+        "light": "0 0 0 0.1875rem color-mix(in srgb, var(--accent) 55%, transparent)"
+      }
+    },
+    {
+      "name": "--radius-control",
+      "group": "shape",
+      "kind": "length",
+      "label": "Control radius",
+      "description": "Corner radius of buttons, inputs and rows.",
+      "frames": true,
+      "default": {
+        "dark": "0.5rem",
+        "light": "0.5rem"
+      }
+    },
+    {
+      "name": "--radius-surface",
+      "group": "shape",
+      "kind": "length",
+      "label": "Surface radius",
+      "description": "Corner radius of toasts, menus, popovers and dialogs.",
+      "frames": true,
+      "default": {
+        "dark": "0.75rem",
+        "light": "0.75rem"
+      }
+    },
+    {
+      "name": "--radius-round",
+      "group": "shape",
+      "kind": "length",
+      "label": "Round radius",
+      "description": "Corner radius of circles and pills: round buttons, dots, badges and chips. Set it to 0 to square them.",
+      "frames": true,
+      "default": {
+        "dark": "999px",
+        "light": "999px"
+      }
+    },
+    {
+      "name": "--shadow-sm",
+      "group": "shadow",
+      "kind": "shadow",
+      "label": "Small shadow",
+      "description": "Low elevation.",
+      "frames": true,
+      "default": {
+        "dark": "0 4px 12px rgba(0, 0, 0, 0.3)",
+        "light": "0 4px 12px rgba(0, 0, 0, 0.08)"
+      }
+    },
+    {
+      "name": "--shadow-md",
+      "group": "shadow",
+      "kind": "shadow",
+      "label": "Medium shadow",
+      "description": "Menus and popovers.",
+      "frames": true,
+      "default": {
+        "dark": "0 8px 24px rgba(0, 0, 0, 0.4)",
+        "light": "0 8px 24px rgba(0, 0, 0, 0.1)"
+      }
+    },
+    {
+      "name": "--shadow-lg",
+      "group": "shadow",
+      "kind": "shadow",
+      "label": "Large shadow",
+      "description": "Dialogs.",
+      "frames": true,
+      "default": {
+        "dark": "0 8px 32px rgba(0, 0, 0, 0.4)",
+        "light": "0 8px 32px rgba(0, 0, 0, 0.1)"
+      }
+    },
+    {
+      "name": "--shadow-up",
+      "group": "shadow",
+      "kind": "shadow",
+      "label": "Upward shadow",
+      "description": "A surface docked under the content it lifts off.",
+      "frames": false,
+      "default": {
+        "dark": "0 -0.5rem 1.5rem -0.25rem rgba(0, 0, 0, 0.1)",
+        "light": "0 -0.5rem 1.5rem -0.25rem rgba(0, 0, 0, 0.1)"
+      }
+    },
+    {
+      "name": "--syntax-key",
+      "group": "syntax",
+      "kind": "color",
+      "label": "Key",
+      "description": "Code highlighting: keys.",
+      "frames": false,
+      "default": {
+        "dark": "#9cdcfe",
+        "light": "#0550ae"
+      }
+    },
+    {
+      "name": "--syntax-string",
+      "group": "syntax",
+      "kind": "color",
+      "label": "String",
+      "description": "Code highlighting: strings.",
+      "frames": false,
+      "default": {
+        "dark": "#ce9178",
+        "light": "#0a3069"
+      }
+    },
+    {
+      "name": "--syntax-number",
+      "group": "syntax",
+      "kind": "color",
+      "label": "Number",
+      "description": "Code highlighting: numbers.",
+      "frames": false,
+      "default": {
+        "dark": "#b5cea8",
+        "light": "#0550ae"
+      }
+    },
+    {
+      "name": "--syntax-keyword",
+      "group": "syntax",
+      "kind": "color",
+      "label": "Keyword",
+      "description": "Code highlighting: keywords.",
+      "frames": false,
+      "default": {
+        "dark": "#569cd6",
+        "light": "#cf222e"
+      }
+    },
+    {
+      "name": "--syntax-comment",
+      "group": "syntax",
+      "kind": "color",
+      "label": "Comment",
+      "description": "Code highlighting: comments.",
+      "frames": false,
+      "default": {
+        "dark": "#6a9955",
+        "light": "#6e7781"
+      }
+    },
+    {
+      "name": "--syntax-control",
+      "group": "syntax",
+      "kind": "color",
+      "label": "Control flow",
+      "description": "Code highlighting: control flows.",
+      "frames": false,
+      "default": {
+        "dark": "#c586c0",
+        "light": "#8250df"
+      }
+    },
+    {
+      "name": "--syntax-type",
+      "group": "syntax",
+      "kind": "color",
+      "label": "Type",
+      "description": "Code highlighting: types.",
+      "frames": false,
+      "default": {
+        "dark": "#4ec9b0",
+        "light": "#953800"
+      }
+    },
+    {
+      "name": "--syntax-function",
+      "group": "syntax",
+      "kind": "color",
+      "label": "Function",
+      "description": "Code highlighting: functions.",
+      "frames": false,
+      "default": {
+        "dark": "#dcdcaa",
+        "light": "#8250df"
+      }
+    },
+    {
+      "name": "--font-mono",
+      "group": "typography",
+      "kind": "font",
+      "label": "Code font",
+      "description": "The font for code, paths and tool output.",
+      "frames": true,
+      "default": {
+        "dark": "ui-monospace, SFMono-Regular, 'SF Mono', Menlo, 'Fira Code', 'JetBrains Mono', Monaco, Consolas, monospace",
+        "light": "ui-monospace, SFMono-Regular, 'SF Mono', Menlo, 'Fira Code', 'JetBrains Mono', Monaco, Consolas, monospace"
+      }
+    }
+  ]
+}

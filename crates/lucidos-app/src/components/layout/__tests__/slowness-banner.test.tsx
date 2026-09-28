@@ -30,6 +30,21 @@ const unclear: SlownessEpisode = {
   slow_workspaces: ['dev'],
 };
 
+const stalledDatabase: SlownessEpisode = {
+  state: 'slow',
+  episode_id: 'e3',
+  reason: 'database',
+  problem: 'not_answering',
+  slow_workspaces: ['dev'],
+};
+
+const fullDisk: SlownessEpisode = {
+  state: 'slow',
+  episode_id: 'e4',
+  reason: 'disk',
+  free_bytes: 4e8,
+};
+
 describe('shouldRenderSlownessBanner renders exactly one instance per layout', () => {
   it('renders only the desktop instance on a desktop viewport', () => {
     const args = { mobileViewport: false, episode };
@@ -54,7 +69,7 @@ describe('shouldRenderSlownessBanner renders exactly one instance per layout', (
 
 describe('slownessBannerBody renders the bar', () => {
   const body = (onDismiss = () => {}) =>
-    slownessBannerBody({ layout: 'desktop', episode, onDismiss });
+    slownessBannerBody({ layout: 'desktop', episode, packaged: false, onDismiss });
 
   it('says what is wrong, who holds the memory, and what to do', () => {
     const text = textOf(body());
@@ -67,6 +82,7 @@ describe('slownessBannerBody renders the bar', () => {
     const text = textOf(slownessBannerBody({
       layout: 'desktop',
       episode: { ...episode, top_users: [] },
+      packaged: false,
       onDismiss: () => {},
     }));
     expect(text).not.toContain('Biggest users');
@@ -74,7 +90,7 @@ describe('slownessBannerBody renders the bar', () => {
   });
 
   it('says only that Lucidos is slow when memory is not the cause, and names the busiest apps', () => {
-    const text = textOf(slownessBannerBody({ layout: 'desktop', episode: unclear, onDismiss: () => {} }));
+    const text = textOf(slownessBannerBody({ layout: 'desktop', episode: unclear, packaged: false, onDismiss: () => {} }));
     expect(text).toContain('Lucidos is responding slowly.');
     expect(text).toContain('Busiest apps: Xcode 40%, Lucidos 12%.');
     expect(text).toContain('Quit or restart Xcode.');
@@ -85,10 +101,49 @@ describe('slownessBannerBody renders the bar', () => {
     const text = textOf(slownessBannerBody({
       layout: 'desktop',
       episode: { ...unclear, busiest_apps: [{ name: 'Google Chrome', percent: 3, kind: 'app' }] },
+      packaged: false,
       onDismiss: () => {},
     }));
     expect(text).not.toContain('Busiest apps');
-    expect(text).toContain('Nothing on this computer stands out as busy.');
+    expect(text).toContain('Lucidos found no database or disk problem, and nothing on this computer stands out as busy.');
+  });
+
+  const say = (episode: SlownessEpisode, packaged = false) =>
+    textOf(slownessBannerBody({ layout: 'desktop', episode, packaged, onDismiss: () => {} }));
+
+  it('names a database that does not answer, and tells a dev install to restart Docker', () => {
+    const text = say(stalledDatabase);
+    expect(text).toContain("Lucidos's database is not responding, so Lucidos is slow.");
+    expect(text).toContain('Restart Docker.');
+    expect(text).not.toMatch(/computer|busy/i);
+  });
+
+  it('tells a packaged install to restart Lucidos for a stalled database', () => {
+    const text = say(stalledDatabase, true);
+    expect(text).toContain('Restart Lucidos.');
+    expect(text).not.toContain('Docker');
+  });
+
+  it('names a used-up pool and points at coding agents', () => {
+    const text = say({ ...stalledDatabase, problem: 'pool_exhausted' });
+    expect(text).toContain('Lucidos is waiting for a free database connection, so it is slow.');
+    expect(text).toContain('Stop coding-agent threads you are not using.');
+    expect(text).not.toContain('Docker');
+  });
+
+  it('names a nearly full disk with how much is free', () => {
+    const text = say(fullDisk);
+    expect(text).toContain('The computer running Lucidos is almost out of disk space, so Lucidos is slow.');
+    expect(text).toContain('0.4 GB free. Free up disk space.');
+    expect(text).not.toMatch(/restart the computer/);
+  });
+
+  it('suggests restarting the computer only when no known cause holds and nothing is busy', () => {
+    const idle = { ...unclear, busiest_apps: [] };
+    for (const e of [episode, unclear, stalledDatabase, fullDisk]) {
+      expect(say(e)).not.toMatch(/restart the computer/);
+    }
+    expect(say(idle)).toContain('If it lasts, restart the computer.');
   });
 
   it('dismisses through its close button', () => {

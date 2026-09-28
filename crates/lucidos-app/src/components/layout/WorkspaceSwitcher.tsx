@@ -44,6 +44,7 @@ import { useEffect, useRef } from 'preact/hooks';
 import type { Loadable } from '../../store/types';
 import { toFailed } from '../../store/types';
 import { LoadingFade } from '../shared/LoadingFade';
+import { Disclosure } from '../shared/Disclosure';
 import { SkeletonProvider, SkText, SkBlock } from '../shared/Skeleton';
 import { useDelayedFlag } from '../../hooks/useDelayedLoading';
 import { CheckIcon, ChevronDownIcon } from '../shared/icons';
@@ -156,7 +157,7 @@ export function workspacesMenuRow({
 }) {
   // The expander's affordance rides IN the pill, taking the check's slot rather
   // than a slot of its own. The panel's width is a budget tuned so an ordinary
-  // workspace name is spelled whole (see --brand-menu-width), and a chevron
+  // workspace name is spelled whole (see --header-surface-width), and a chevron
   // added beside the pill spends ~15px of it, which is a character and a half:
   // "development" ellipsised the moment one was added. Swapping the marker
   // spends nothing, and it says the more useful thing now that the row leads
@@ -417,15 +418,14 @@ export function workspaceSwitcherList(props: SwitcherListProps) {
             const mode = alternateOpenMode(workspaceState(w), currentId, w.id);
             return [
               switcherRow(w, props),
-              w.id === contextId && mode !== null
-                ? workspaceActionRow({
-                    id: w.id,
-                    name: w.name,
-                    mode,
-                    indentClass: SWITCHER_ACTION_INDENT,
-                    onActivate: (m) => onAlternate(w, m),
-                  })
-                : null,
+              workspaceActionRow({
+                open: w.id === contextId,
+                id: w.id,
+                name: w.name,
+                mode,
+                indentClass: SWITCHER_ACTION_INDENT,
+                onActivate: (m) => onAlternate(w, m),
+              }),
             ];
           })}
       </div>
@@ -570,7 +570,7 @@ export function WorkspacesMenuRow({ onClose }: { onClose: () => void }) {
         },
         onNavigate: onClose,
       })}
-      {expanded.value && (
+      <Disclosure open={expanded.value}>
         <LoadingFade
           showSkeleton={showSkeleton}
           skeleton={placeholder}
@@ -594,7 +594,7 @@ export function WorkspacesMenuRow({ onClose }: { onClose: () => void }) {
             onAlternate: open,
           })}
         </LoadingFade>
-      )}
+      </Disclosure>
     </>
   );
 }

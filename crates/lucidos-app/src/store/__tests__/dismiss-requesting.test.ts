@@ -63,7 +63,6 @@ function makeCCThread(id: string, status: 'idle' | 'running' | 'waiting' | 'wait
       codingAgentProposed: false,
       codingAgentRequiresRestart: false,
       codingAgentIsExternalRepo: false,
-      codingAgentApplying: false,
       codingAgentHasDiff: false,
       lastRevivedAt: '',
       state: 'active',
@@ -507,10 +506,10 @@ describe('Apply Now — SessionEnded must not clear applying state', () => {
 });
 
 describe('merge-via-CC apply is cancelable (best-effort) from the thread', () => {
-  it('returns canceling when status=running and codingAgentApplying=true', () => {
+  it('returns canceling when status=running during a merge', () => {
     // Scenario: user clicked Apply on the Changes panel for a thread with a
-    // live Claude Code session. Tier 1 slow-path emits MergeConflictDetected (sets
-    // codingAgentApplying=true), then sends a merge prompt to CC. CC processes the
+    // live Claude Code session. Tier 1 slow-path emits MergeConflictDetected,
+    // then sends a merge prompt to CC. CC processes the
     // prompt → CodingAgentPromptSent flips status to 'running'.
     //
     // The user must be able to stop a long-running merge: Cancel interrupts the
@@ -519,7 +518,6 @@ describe('merge-via-CC apply is cancelable (best-effort) from the thread', () =>
     // change returns to pending. (This used to be suppressed to a disabled
     // "Apply...", leaving no way out of a stuck merge.)
     const thread = makeCCThread('t1', 'running', 'inbox');
-    thread.meta.codingAgentApplying = true;
     threadMap.value = new Map([['t1', thread]]);
     focusedThreadId.value = 't1';
 
@@ -528,22 +526,9 @@ describe('merge-via-CC apply is cancelable (best-effort) from the thread', () =>
     expect(state!.type).toBe('canceling');
   });
 
-  it('returns canceling when status=waiting_for_user_answer and codingAgentApplying=true', () => {
+  it('returns canceling when status=waiting_for_user_answer during a merge', () => {
     // Symmetric: a merge paused on a CC question is still mid-turn and cancelable.
     const thread = makeCCThread('t1', 'waiting_for_user_answer', 'inbox');
-    thread.meta.codingAgentApplying = true;
-    threadMap.value = new Map([['t1', thread]]);
-    focusedThreadId.value = 't1';
-
-    const state = getWaitingState();
-    expect(state).not.toBeNull();
-    expect(state!.type).toBe('canceling');
-  });
-
-  it('still shows Cancel for normal CC running with codingAgentApplying=false', () => {
-    // Regression guard: ordinary CC turns are cancelable too.
-    const thread = makeCCThread('t1', 'running', 'inbox');
-    thread.meta.codingAgentApplying = false;
     threadMap.value = new Map([['t1', thread]]);
     focusedThreadId.value = 't1';
 

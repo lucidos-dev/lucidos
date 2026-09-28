@@ -13,7 +13,7 @@
 
 use super::LucidosEngine;
 use serde::Serialize;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -552,6 +552,11 @@ pub struct VersionStatus {
     /// number.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub build_elapsed_ms: Option<u64>,
+    /// Present while THIS engine's rebuild waits for a *build slot* rather
+    /// than compiling, naming what holds the slots. Absent otherwise, and
+    /// always absent for a co-located peer's build. See [`queued_behind`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub build_queued: Option<QueuedBuild>,
     /// The commits the switch would bring, or absent when git could not say
     /// (see [`PendingCommits`]). Read only when a surface
     /// will show it, so an idle workspace forks no git: see
@@ -561,6 +566,53 @@ pub struct VersionStatus {
     /// only way to say there is nothing to bring.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pending_commits: Option<PendingCommits>,
+    /// How long THIS engine has been waiting for the build-watch to republish
+    /// `dist/` after a frontend-only Apply, in ms, or absent when it is not.
+    /// Elapsed rather than a timestamp, for the reason `build_elapsed_ms` gives.
+    /// Always absent packaged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frontend_refresh_elapsed_ms: Option<u64>,
+}
+
+/// A rebuild that is waiting for a *build slot*, as the version-status wire
+/// carries it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct QueuedBuild {
+    /// What holds each slot, by the label its wrapper recorded.
+    pub holders: Vec<String>,
+}
+
+/// Stands in for a holder that recorded no label.
+const UNLABELLED_HOLDER: &str = "a build";
+
+/// Is the build running in process group `our_group` queued for a slot?
+///
+/// Queued means every slot is held and no holder is in our group. A slot's
+/// holder is the `lucidos build-slot` wrapper, which stays in the build's group
+/// on purpose (ADR 0070). So a holder in our group means we compile.
+/// Pure over the probe results, so each case is testable without a pool.
+fn queued_behind(
+    our_group: Option<u32>,
+    slots: &[lucidos_build_slot::SlotState],
+    group_of: impl Fn(u32) -> Option<u32>,
+) -> Option<QueuedBuild> {
+    let our_group = our_group?;
+    if slots.is_empty() {
+        return None;
+    }
+    let mut holders = Vec::with_capacity(slots.len());
+    for slot in slots {
+        let holder = slot.holder.as_ref()?;
+        if holder.pid.and_then(&group_of) == Some(our_group) {
+            return None;
+        }
+        holders.push(if holder.label.is_empty() {
+            UNLABELLED_HOLDER.to_string()
+        } else {
+            holder.label.clone()
+        });
+    }
+    Some(QueuedBuild { holders })
 }
 
 /// The stash rule, extracted from [`LucidosEngine::stash_restart_actor`] so it
@@ -683,6 +735,16 @@ impl LucidosEngine {
     /// Enqueue a thread for auto-resume after a user-initiated switch (recovery).
     pub(crate) fn enqueue_switch_resume(&self, thread_id: uuid::Uuid) {
         self.pending_switch_resumes.lock().unwrap().push(thread_id);
+    }
+
+    /// Whether recovery queued this thread for auto-resume. Only answers before
+    /// [`resume_pending_switches`](Self::resume_pending_switches) drains the
+    /// queue, so a caller must run between agent recovery and that drain.
+    pub(crate) fn switch_resume_queued(&self, thread_id: uuid::Uuid) -> bool {
+        self.pending_switch_resumes
+            .lock()
+            .unwrap()
+            .contains(&thread_id)
     }
 
     /// Emit `ContinuationRequested` for every thread recovery queued for
@@ -1009,8 +1071,37 @@ impl LucidosEngine {
             build_elapsed_ms: build_state
                 .elapsed()
                 .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
+            build_queued: self.build_queued(),
             pending_commits,
+            frontend_refresh_elapsed_ms: self
+                .frontend_refresh_elapsed()
+                .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
         }
+    }
+
+    /// Whether this engine's own rebuild is waiting for a build slot. Reads
+    /// the pool only while a build of ours runs, so an idle engine probes
+    /// nothing. An unreadable pool is not a queue.
+    ///
+    /// The build also runs steps that hold no slot, such as publishing and the
+    /// SDK build. A priority waiter must be up, or those would read as queued.
+    fn build_queued(&self) -> Option<QueuedBuild> {
+        if crate::runtime::is_packaged() {
+            return None;
+        }
+        let group = self.build_process_group.load(Ordering::SeqCst);
+        if group == 0 {
+            return None;
+        }
+        let pool = lucidos_build_slot::BuildSlotPool::open().ok()?;
+        if !pool.priority_waiting() {
+            return None;
+        }
+        queued_behind(
+            Some(group),
+            &pool.status(),
+            crate::runtime::spawn_env::process_group_of,
+        )
     }
 
     /// The [`PendingCommits`] a switch would bring, or `None` when git could
@@ -1202,7 +1293,12 @@ impl LucidosEngine {
             // wrong forever, and the wedge for that HEAD is missed. One fork per
             // build, against a build running for tens of seconds, is cheap.
             let built_head = current_head_sha().await;
-            let outcome = run_engine_build(&workspace, previous_failure.as_deref()).await;
+            let outcome = run_engine_build(
+                &workspace,
+                previous_failure.as_deref(),
+                &engine.build_process_group,
+            )
+            .await;
             // Only the latest generation updates state. A superseded build's
             // completion is ignored, since a newer build is already `Building`.
             if engine.build_generation.load(Ordering::SeqCst) == generation {
@@ -1315,22 +1411,35 @@ async fn acquire_engine_build_lock_waiting(
 /// the group id, can be recycled, and signalling a recycled group would hit
 /// unrelated processes (see `spawn_env::signal_child_process_group`).
 ///
+/// It also PUBLISHES the group while armed, for the queued probe. Clearing it
+/// at the same moment keeps the probe from reading a recycled group too.
+///
 /// SIGKILL is untrappable, so a kill landing inside the launch-binary publish
 /// leaves its `*.tmp.<pid>` behind. That is disk only, never a corrupt binary:
 /// the publish copies and signs a temp and reaches the launch path solely
 /// through `mv -f`. `prune_dead_launch_temps` (`scripts/lib/workspace.sh`)
 /// collects the residue on the next publish.
-struct BuildProcessGroupGuard(Option<u32>);
+struct BuildProcessGroupGuard<'a> {
+    pid: Option<u32>,
+    published: &'a AtomicU32,
+}
 
-impl BuildProcessGroupGuard {
+impl<'a> BuildProcessGroupGuard<'a> {
+    fn arm(pid: Option<u32>, published: &'a AtomicU32) -> Self {
+        published.store(pid.unwrap_or(0), Ordering::SeqCst);
+        BuildProcessGroupGuard { pid, published }
+    }
+
     fn disarm(&mut self) {
-        self.0 = None;
+        self.pid = None;
+        self.published.store(0, Ordering::SeqCst);
     }
 }
 
-impl Drop for BuildProcessGroupGuard {
+impl Drop for BuildProcessGroupGuard<'_> {
     fn drop(&mut self) {
-        if let Some(pid) = self.0 {
+        if let Some(pid) = self.pid {
+            self.published.store(0, Ordering::SeqCst);
             crate::runtime::spawn_env::kill_child_process_group_now(pid);
         }
     }
@@ -1541,6 +1650,32 @@ pub(crate) async fn no_restart_between(
     Some(!crate::engine::git_ops::files_require_restart(&files))
 }
 
+/// Whether this binary still serves the engine source at HEAD: no file
+/// `files_require_restart` flags differs between its build commit and HEAD.
+/// `None` for an unstamped id, no checkout, or a git probe that could not run.
+pub(crate) async fn own_source_matches_head() -> Option<bool> {
+    let commit = build_id_commit(crate::ENGINE_BUILD_ID)?;
+    let root = crate::paths::repo_root().ok()?;
+    no_restart_between(commit, "HEAD", &root).await
+}
+
+/// What `lucidos-engine --build-id --source-state` prints.
+///
+/// The dev build script reads it to decide whether HEAD moving during a build
+/// needs a second build (`published_build_state`, `scripts/lib/workspace.sh`).
+/// It treats every answer but `current` as a mismatch.
+pub async fn own_source_state() -> &'static str {
+    source_state_word(own_source_matches_head().await)
+}
+
+fn source_state_word(no_restart: Option<bool>) -> &'static str {
+    match no_restart {
+        Some(true) => "current",
+        Some(false) => "stale",
+        None => "unknown",
+    }
+}
+
 /// Classify a [`pending_commits_since`] run into the grouped commit list the
 /// status toast shows, keeping "git could not answer" apart from "git answered
 /// none".
@@ -1745,6 +1880,7 @@ async fn current_head_sha() -> Option<String> {
 async fn run_engine_build(
     workspace: &std::path::Path,
     previous_failure: Option<&str>,
+    published_group: &AtomicU32,
 ) -> EngineBuildOutcome {
     // Elect a single builder across co-located engines. With no resolvable
     // checkout there is no shared `target/` to coordinate on, so proceed
@@ -1774,14 +1910,9 @@ async fn run_engine_build(
             )));
         }
     };
-    let ws = workspace.to_string_lossy().to_string();
-    let mut cmd = tokio::process::Command::new(&script);
-    cmd.args(["-w", &ws, "--engine-build"]).kill_on_drop(true);
-    // Own process group, so a coalescing abort can reach the `cargo` grandchild
-    // and not just this script. See `BuildProcessGroupGuard`.
-    crate::runtime::spawn_env::isolate_in_process_group(&mut cmd);
+    let cmd = engine_build_command(&script, workspace);
     let log_path = workspace.join(".lucidos/engine.log");
-    match run_capturing_output(cmd, &log_path, BUILD_OUTPUT_DRAIN_GRACE).await {
+    match run_capturing_output(cmd, &log_path, BUILD_OUTPUT_DRAIN_GRACE, published_group).await {
         Ok((status, _)) if status.success() => EngineBuildOutcome::Succeeded,
         Ok((status, output)) => {
             crate::log!("[Rebuild] engine build exited {status}");
@@ -1797,6 +1928,26 @@ async fn run_engine_build(
             EngineBuildOutcome::Failed(BuildFailure::plain(e))
         }
     }
+}
+
+/// The `web-dev.sh --engine-build` command, before its output is wired.
+///
+/// It waits for a build slot as a priority waiter, because the user is
+/// watching this build (ADR 0304). Nothing else in the tree asks for that.
+fn engine_build_command(
+    script: &std::path::Path,
+    workspace: &std::path::Path,
+) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(script);
+    cmd.arg("-w")
+        .arg(workspace)
+        .arg("--engine-build")
+        .env(lucidos_build_slot::ENV_PRIORITY, "1")
+        .kill_on_drop(true);
+    // Own process group, so a coalescing abort can reach the `cargo` grandchild
+    // and not just this script. See `BuildProcessGroupGuard`.
+    crate::runtime::spawn_env::isolate_in_process_group(&mut cmd);
+    cmd
 }
 
 /// How long to wait for a build's output to end after the build exits. A
@@ -1820,6 +1971,7 @@ async fn run_capturing_output(
     mut cmd: tokio::process::Command,
     log_path: &std::path::Path,
     drain_grace: Duration,
+    published_group: &AtomicU32,
 ) -> Result<(std::process::ExitStatus, BuildOutput), String> {
     use tokio::io::AsyncReadExt;
     let capture_failed = |e: std::io::Error| format!("could not capture the build output: {e}");
@@ -1834,7 +1986,7 @@ async fn run_capturing_output(
         .map_err(|e| format!("could not start the build: {e}"))?;
     // Our copies of the write end must go, or end-of-file never arrives.
     drop(cmd);
-    let mut group_guard = BuildProcessGroupGuard(child.id());
+    let mut group_guard = BuildProcessGroupGuard::arm(child.id(), published_group);
     let mut output = BuildOutput::new(log_path);
     let mut buf = vec![0u8; 8192];
     let mut open = true;
@@ -1967,15 +2119,17 @@ mod tests {
     use super::{
         acquire_engine_build_lock_waiting, build_id_commit, classify_build_failure,
         classify_commit_subject, classify_pending_commits, commit_is_strict_ancestor,
-        compatible_served_commit, disk_upgrade_verdict, engine_build_lock_path,
-        group_commit_subjects, lock_held_at, open_teardown, pending_commits_since,
-        rebuild_is_wedged, run_capturing_output, self_heal_is_wedged, stash_first_restart_actor,
+        compatible_served_commit, disk_upgrade_verdict, engine_build_command,
+        engine_build_lock_path, group_commit_subjects, lock_held_at, no_restart_between,
+        open_teardown, pending_commits_since, queued_behind, rebuild_is_wedged,
+        run_capturing_output, self_heal_is_wedged, source_state_word, stash_first_restart_actor,
         try_lock_file, unrecognized_build_failure, wants_pending_commits, BuildFailure,
-        BuildOutput, BuildProcessGroupGuard, BuildState, CommitGroupKind,
+        BuildOutput, BuildProcessGroupGuard, BuildState, CommitGroupKind, QueuedBuild,
         BUILD_FAILURE_SUMMARY_CAP, BUILD_OUTPUT_HEAD_CAP, BUILD_OUTPUT_TAIL_CAP,
-        COMMIT_GROUP_ORDER, PENDING_COMMIT_DESCRIPTION_CAP,
+        COMMIT_GROUP_ORDER, PENDING_COMMIT_DESCRIPTION_CAP, UNLABELLED_HOLDER,
     };
     use crate::engine::thread_events::MessageOrigin;
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Duration;
 
     // ── Why a build failed ───────────────────────────────────────────────────
@@ -2255,6 +2409,7 @@ ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 51
             shell("echo first; echo second >&2; echo third; exit 3"),
             &log,
             Duration::from_secs(2),
+            &AtomicU32::new(0),
         )
         .await
         .expect("the build must run");
@@ -2282,6 +2437,7 @@ ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 51
             shell("set -e; echo Building engine...; echo done"),
             &log,
             Duration::from_secs(2),
+            &AtomicU32::new(0),
         )
         .await
         .expect("the build must run");
@@ -2300,6 +2456,7 @@ ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 51
             shell("sleep 5 & echo done"),
             &dir.join("engine.log"),
             Duration::from_millis(200),
+            &AtomicU32::new(0),
         )
         .await
         .expect("the build must run");
@@ -2335,7 +2492,6 @@ ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 51
     fn device(id: &str) -> Option<MessageOrigin> {
         Some(MessageOrigin::Device {
             device_id: id.to_string(),
-            label: format!("device {id}"),
         })
     }
 
@@ -2441,7 +2597,7 @@ ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 51
     fn a_non_device_actor_is_still_stashable_by_this_rule() {
         // The device-only requirement is enforced at the HTTP boundary (the
         // restart-intent handler 400s a non-device caller), NOT here: the
-        // in-workspace Switch legitimately stashes whatever `user_actor_resolved`
+        // in-workspace Switch legitimately stashes whatever `user_actor`
         // gave it, and downstream reads the actor's kind for itself. Pinned so a
         // later "tighten the stash" edit has to notice it would change that path.
         let mut slot = None;
@@ -2548,9 +2704,15 @@ ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 51
 
         // Exactly what a cancelled build future does: guard first (declared
         // last), then the child.
-        drop(BuildProcessGroupGuard(child.id()));
+        let published = AtomicU32::new(0);
+        drop(BuildProcessGroupGuard::arm(child.id(), &published));
         child.start_kill().ok();
         child.wait().await.ok();
+        assert_eq!(
+            published.load(Ordering::SeqCst),
+            0,
+            "a dead build names no group"
+        );
 
         assert!(
             eventually(|| !pid_is_alive(grandchild)),
@@ -2558,6 +2720,124 @@ ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 51
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The queued probe reads the group while the build runs. It must never
+    /// read it once the leader is reaped and its pid can be recycled.
+    #[tokio::test]
+    async fn the_build_group_is_published_while_it_runs_and_cleared_once_reaped() {
+        let dir = scratch_dir("published-group");
+        let log = dir.join("engine.log");
+        let published = AtomicU32::new(0);
+        let mut cmd = shell("sleep 0.5");
+        crate::runtime::spawn_env::isolate_in_process_group(&mut cmd);
+        let (result, seen) = tokio::join!(
+            run_capturing_output(cmd, &log, Duration::from_secs(2), &published),
+            async {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                published.load(Ordering::SeqCst)
+            },
+        );
+        assert!(result.expect("the build must run").0.success());
+        assert_ne!(seen, 0, "a running build publishes its group");
+        assert_eq!(
+            published.load(Ordering::SeqCst),
+            0,
+            "a reaped build does not"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_engine_rebuild_waits_as_a_priority_build() {
+        let cmd = engine_build_command(
+            std::path::Path::new("/repo/scripts/web-dev.sh"),
+            std::path::Path::new("/ws"),
+        );
+        let priority = cmd
+            .as_std()
+            .get_envs()
+            .find(|(k, _)| *k == lucidos_build_slot::ENV_PRIORITY)
+            .and_then(|(_, v)| v);
+        assert_eq!(priority, Some(std::ffi::OsStr::new("1")));
+        let args: Vec<_> = cmd.as_std().get_args().collect();
+        assert_eq!(args, ["-w", "/ws", "--engine-build"]);
+    }
+
+    fn held(pid: u32, label: &str) -> lucidos_build_slot::SlotState {
+        lucidos_build_slot::SlotState {
+            index: 0,
+            holder: Some(lucidos_build_slot::SlotHolder {
+                pid: Some(pid),
+                label: label.to_string(),
+                ..Default::default()
+            }),
+        }
+    }
+
+    fn free() -> lucidos_build_slot::SlotState {
+        lucidos_build_slot::SlotState {
+            index: 0,
+            holder: None,
+        }
+    }
+
+    /// Pids 1xx are in group 100 (ours), 2xx in group 200.
+    fn group_of(pid: u32) -> Option<u32> {
+        Some(pid / 100 * 100)
+    }
+
+    #[test]
+    fn a_build_is_queued_when_every_slot_is_held_by_someone_else() {
+        let slots = [
+            held(201, "make lint"),
+            held(202, ""),
+            held(203, "engine tests"),
+        ];
+        assert_eq!(
+            queued_behind(Some(100), &slots, group_of),
+            Some(QueuedBuild {
+                holders: vec![
+                    "make lint".into(),
+                    UNLABELLED_HOLDER.into(),
+                    "engine tests".into()
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn a_build_is_not_queued_while_it_holds_a_slot_or_one_is_free() {
+        let ours = [held(201, "make lint"), held(101, "engine build")];
+        assert_eq!(
+            queued_behind(Some(100), &ours, group_of),
+            None,
+            "it compiles"
+        );
+        let room = [held(201, "make lint"), free()];
+        assert_eq!(
+            queued_behind(Some(100), &room, group_of),
+            None,
+            "a slot is free"
+        );
+    }
+
+    #[test]
+    fn no_build_of_ours_or_no_pool_is_never_queued() {
+        let full = [held(201, "make lint")];
+        assert_eq!(queued_behind(None, &full, group_of), None, "idle");
+        assert_eq!(queued_behind(Some(100), &[], group_of), None, "no pool");
+    }
+
+    #[test]
+    fn a_holder_whose_group_cannot_be_read_is_someone_else() {
+        let slots = [held(101, "engine build")];
+        assert_eq!(
+            queued_behind(Some(100), &slots, |_| None),
+            Some(QueuedBuild {
+                holders: vec!["engine build".into()]
+            })
+        );
     }
 
     /// Poll for the pid the shell writes once it has backgrounded its child.
@@ -2699,6 +2979,55 @@ ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 51
         assert_eq!(build_id_commit("src-0123456789abcdef"), None);
         assert_eq!(build_id_commit(""), None);
         assert_eq!(build_id_commit("-abc"), None);
+    }
+
+    /// The build script matches these words exactly, so a rename strands it on
+    /// the old behaviour of rebuilding after every move of HEAD.
+    #[test]
+    fn source_state_word_keeps_the_three_words_the_build_script_reads() {
+        assert_eq!(source_state_word(Some(true)), "current");
+        assert_eq!(source_state_word(Some(false)), "stale");
+        assert_eq!(source_state_word(None), "unknown");
+    }
+
+    /// End to end over a real repo: a move by a stylesheet keeps a binary
+    /// current, and a move by engine source makes it stale.
+    #[tokio::test]
+    async fn no_restart_between_passes_a_css_move_and_stops_a_rust_move() {
+        let dir = std::env::temp_dir().join(format!(
+            "lucidos-source-state-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        let commit_file = |path: &str| {
+            let full = dir.join(path);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(&full, uuid::Uuid::new_v4().to_string()).unwrap();
+            git(&["add", "."]);
+            git(&["commit", "-qm", path]);
+            git(&["rev-parse", "--short", "HEAD"])
+        };
+        let built = commit_file("README.md");
+        commit_file("crates/lucidos-app/src/styles/header-mark.css");
+        assert_eq!(no_restart_between(&built, "HEAD", &dir).await, Some(true));
+        commit_file("crates/lucidos-engine/src/lib.rs");
+        assert_eq!(no_restart_between(&built, "HEAD", &dir).await, Some(false));
+        assert_eq!(no_restart_between("0123456789ab", "HEAD", &dir).await, None);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A DIFFERENT on-disk binary is an update only when it is not provably

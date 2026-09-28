@@ -67,6 +67,7 @@ function makeDevice(id: string, userAgent: string, pushEnabled: boolean): Device
   return {
     id,
     name: null,
+    pairing_label: null,
     user_agent: userAgent,
     push_enabled: pushEnabled,
     last_seen_at: '2026-08-08T00:00:00Z',

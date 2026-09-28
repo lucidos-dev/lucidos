@@ -208,15 +208,53 @@ export function openFilePreview(path: string, opts?: { preserveSource?: boolean 
 let previewBumpDebounce: ReturnType<typeof setTimeout> | null = null;
 const PREVIEW_BUMP_DEBOUNCE_MS = 150;
 
-function bumpOpenPreview(path: string): void {
+/** Mounted preview bodies that re-read text on a bump, and the refreshes
+ *  waiting for that re-read to land. A media body reloads inside the browser's
+ *  own element, which reports nothing. So with no text body mounted, a refresh
+ *  settles as soon as its bump is applied. */
+let previewTextBodies = 0;
+
+/** Each waits for a read of revision `rev` or newer. An older read can still
+ *  land after a bump, and it does not answer a refresh asked after it. */
+let previewSettleWaiters: Array<{ rev: number; settle: () => void }> = [];
+
+function settlePreviewRefreshes(upTo: number): void {
+  const waiting = previewSettleWaiters;
+  previewSettleWaiters = waiting.filter((w) => w.rev > upTo);
+  for (const w of waiting) if (w.rev <= upTo) w.settle();
+}
+
+/** A text body calls this as it mounts. Returns the unmount half. */
+export function registerPreviewTextBody(): () => void {
+  previewTextBodies++;
+  return () => {
+    previewTextBodies--;
+    if (previewTextBodies === 0) settlePreviewRefreshes(Infinity);
+  };
+}
+
+/** A text body calls this when its read of `revision` lands, loaded or
+ *  failed. */
+export function reportPreviewTextSettled(revision: number): void {
+  settlePreviewRefreshes(revision);
+}
+
+/** Refreshes whose bump is still inside the debounce. A later bump replaces
+ *  the timer but inherits these, so no refresh is left waiting forever. */
+let pendingBumpSettles: Array<() => void> = [];
+
+function bumpOpenPreview(path: string, onSettled?: () => void): void {
   if (previewBumpDebounce) clearTimeout(previewBumpDebounce);
+  if (onSettled) pendingBumpSettles.push(onSettled);
   previewBumpDebounce = setTimeout(() => {
     previewBumpDebounce = null;
+    const settles = pendingBumpSettles;
+    pendingBumpSettles = [];
     const current = filePreviewRevision.peek();
-    filePreviewRevision.value = {
-      path,
-      rev: current?.path === path ? current.rev + 1 : 1,
-    };
+    const rev = current?.path === path ? current.rev + 1 : 1;
+    if (previewTextBodies > 0) previewSettleWaiters.push(...settles.map((settle) => ({ rev, settle })));
+    else for (const settle of settles) settle();
+    filePreviewRevision.value = { path, rev };
   }, PREVIEW_BUMP_DEBOUNCE_MS);
 }
 
@@ -241,12 +279,13 @@ export function invalidateFilePreview(path: string): void {
   bumpOpenPreview(path);
 }
 
-/** Re-fetch whatever the preview shows, because the user asked: the header
- *  Refresh button, and the inline editor once a save has landed. */
-export function refreshFilePreview(): void {
+/** Re-fetch whatever the preview shows, because the user asked: the panel's
+ *  refresh, and the inline editor once a save has landed. Settles once the
+ *  re-read is on screen (the panel refresh contract). */
+export function refreshFilePreview(): Promise<void> {
   const overlay = panelOverlay.peek();
-  if (overlay?.type !== 'file-preview') return;
-  bumpOpenPreview(overlay.path);
+  if (overlay?.type !== 'file-preview') return Promise.resolve();
+  return new Promise((resolve) => bumpOpenPreview(overlay.path, resolve));
 }
 
 // --- URL preview in panel ---
@@ -325,7 +364,8 @@ export function openLocalFile(target: string): void {
 }
 
 /** Update panelUrl display from in-webview navigation (link clicks, history back/forward).
- *  Does NOT push to the panel nav stack — the webview maintains its own history internally.
+ *  Adds no nav row, because the webview keeps its own history. The row at the
+ *  cursor follows the new URL, like any change made without a push.
  *  Only openUrl/closeUrl push to panel nav (panel-level actions). */
 export function updatePanelUrl(url: string): void {
   const o = panelOverlay.value;

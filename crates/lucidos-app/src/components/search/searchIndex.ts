@@ -152,10 +152,11 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
 
   // Appearance & Behavior subview (Links absorbed the retired Links and
   // Experimental categories, so its two rows keep their own platform flags)
-  { id: 'appearance:theme', label: 'Theme', subview: 'appearance', path: 'Settings → Appearance & Behavior', anchor: 'appearance:theme' },
+  { id: 'appearance:theme', label: 'Theme', subview: 'appearance', path: 'Settings → Appearance & Behavior', anchor: 'appearance:theme', keywords: 'theme themes look looks colour color scheme palette nord catppuccin gruvbox solarized minimal header focus accent customize' },
+  { id: 'appearance:mode', label: 'Mode', subview: 'appearance', path: 'Settings → Appearance & Behavior → Theme', anchor: 'appearance:mode', keywords: 'theme mode dark mode light mode dark light system appearance night' },
+  { id: 'appearance:theme-effects', label: 'Effects', subview: 'appearance', path: 'Settings → Appearance & Behavior → Theme', anchor: 'appearance:theme-effects', keywords: 'glow shadow scanlines effects theme reduce contrast transparency battery sharp text' },
+  { id: 'appearance:motion', label: 'Motion', subview: 'appearance', path: 'Settings → Appearance & Behavior', anchor: 'appearance:motion', keywords: 'reduce motion reduced animation animations calm still accessibility vestibular dizzy spinner pulse slide' },
   { id: 'appearance:typography', label: 'Typography', subview: 'appearance', path: 'Settings → Appearance & Behavior', anchor: 'appearance:typography' },
-  { id: 'appearance:mode', label: 'Mode', subview: 'appearance', path: 'Settings → Appearance & Behavior → Theme', anchor: 'appearance:mode' },
-  { id: 'appearance:motion', label: 'Motion', subview: 'appearance', path: 'Settings → Appearance & Behavior → Theme', anchor: 'appearance:motion', keywords: 'reduce motion reduced animation animations calm still accessibility vestibular dizzy spinner pulse slide' },
   { id: 'appearance:font', label: 'Font', subview: 'appearance', path: 'Settings → Appearance & Behavior → Typography', anchor: 'appearance:font' },
   { id: 'appearance:ui-scale', label: 'UI scale', subview: 'appearance', path: 'Settings → Appearance & Behavior → Typography', anchor: 'appearance:ui-scale' },
   { id: 'appearance:mobile', label: 'Mobile', subview: 'appearance', path: 'Settings → Appearance & Behavior', anchor: 'appearance:mobile', mobileOnly: true },

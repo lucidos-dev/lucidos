@@ -469,7 +469,9 @@ test.describe('Threads-header unified Filter control — desktop layout', () => 
       const listColumn = px(row, 'padding-left');
       row.remove();
       // Where the words sit inside their heading row. A list heading is built
-      // here rather than found, since a cleared workspace may render none.
+      // here rather than found, since a cleared workspace may render none. It
+      // carries the count a real one always draws, since the count sets the
+      // heading's line height.
       const wordsOffset = (title: Element) => {
         const range = document.createRange();
         range.selectNodeContents(title.querySelector('.drawer-section-label')!);
@@ -478,7 +480,9 @@ test.describe('Threads-header unified Filter control — desktop layout', () => 
       const listHeading = document.createElement('div');
       listHeading.className = 'list-section-title list-section-title-collapsible';
       listHeading.innerHTML = '<span class="drawer-section-icon"></span>'
-        + '<span class="drawer-section-label">Pinned</span>';
+        + '<span class="drawer-section-label">Pinned</span>'
+        + '<span class="section-count"><span class="section-count-badge">3</span>'
+        + '<span class="section-count-open">3</span></span>';
       list.prepend(listHeading);
       const listWords = wordsOffset(listHeading);
       listHeading.remove();

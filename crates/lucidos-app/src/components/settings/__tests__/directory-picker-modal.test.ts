@@ -48,7 +48,7 @@ function dirPickerRule(): string {
 
 describe('DirectoryPicker is a modal', () => {
   it('renders its panel through <Overlay> with the shared backdrop container', () => {
-    expect(markup).toMatch(/<Overlay\b[\s\S]{0,200}?panelClass="dir-picker"/);
+    expect(markup).toMatch(/<Overlay\b[\s\S]{0,200}?panelClass="[^"]*\bdir-picker"/);
     expect(markup).not.toMatch(/backdrop=\{false\}/);
   });
 

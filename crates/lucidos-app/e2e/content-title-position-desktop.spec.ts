@@ -15,11 +15,15 @@
  * edge (`.pane-header-content-title` in styles/panels/shell.css). This spec is
  * the rendered proof, over three views whose clusters differ:
  *
- * | View            | Trailing cluster        | ⋯   |
- * |-----------------|-------------------------|-----|
- * | Settings        | the bell alone          | no  |
- * | Apps            | search + the bell       | no  |
- * | An app's UI     | ⋯ + the bell            | yes |
+ * | View            | Trailing cluster                    |
+ * |-----------------|-------------------------------------|
+ * | Settings        | the bell alone                      |
+ * | Apps            | search + the bell                   |
+ * | An app's UI     | open in tab + fullscreen + the bell |
+ *
+ * The app's UI is the widest cluster the fold leaves standing: two context
+ * actions and the bell. Its Refresh leads the row beside the hamburger, so the
+ * back chevron must clear that too.
  *
  * The mirror case has its own test: two app views whose CLUSTERS are identical
  * and whose TITLES are not, one of them long enough to ellipsize. That is the
@@ -56,7 +60,8 @@ interface HeaderMetrics {
   boxWidth: number;
   rowCentre: number;
   rowWidth: number;     // the box's containing block, which its 100% resolves against
-  navRight: number;     // the hamburger's inner edge
+  navRight: number;     // the leading cluster's inner edge: the hamburger, or Refresh beside it
+  hasRefresh: boolean;  // Refresh leads the row beside the hamburger
   actionsLeft: number;  // the trailing cluster's inner edge
   minSpan: number;      // --desktop-nav-min-span, resolved to px
   sideReserve: number;  // --content-side-reserve, resolved to px
@@ -79,6 +84,7 @@ async function measure(page: Page): Promise<HeaderMetrics | null> {
     const forward = row.querySelector('.content-forward-btn') as HTMLElement | null;
     const nav = row.querySelector('.hamburger-panel') as HTMLElement | null;
     const actions = row.querySelector('.content-header-actions') as HTMLElement | null;
+    const refresh = row.querySelector('.content-refresh-btn') as HTMLElement | null;
     if (!box || !back || !forward || !nav || !actions) return null;
     const b = box.getBoundingClientRect();
     const r = row.getBoundingClientRect();
@@ -106,7 +112,8 @@ async function measure(page: Page): Promise<HeaderMetrics | null> {
       boxWidth: b.width,
       rowCentre: r.left + r.width / 2,
       rowWidth: r.width,
-      navRight: nav.getBoundingClientRect().right,
+      navRight: (refresh ?? nav).getBoundingClientRect().right,
+      hasRefresh: refresh !== null,
       actionsLeft: a.left,
       minSpan,
       sideReserve,
@@ -144,7 +151,7 @@ function expectCentredAndClear(m: HeaderMetrics, view: string): void {
   ).toBeLessThanOrEqual(m.actionsLeft + 0.6);
   expect(
     m.backX,
-    `${view}: the back chevron reaches the hamburger at ${m.navRight.toFixed(1)}`,
+    `${view}: the back chevron reaches the leading cluster at ${m.navRight.toFixed(1)}`,
   ).toBeGreaterThanOrEqual(m.navRight - 0.6);
 }
 
@@ -177,8 +184,8 @@ test.describe('the desktop content title holds its position across views', () =>
     // the same)". The case below it holds the TITLE roughly constant and varies
     // the action cluster; this one is its mirror, and it is the sharper
     // isolation of the two: both loads are the same view TYPE (an app's UI, so
-    // the same three context actions folded to the same ⋯ + bell) at the same
-    // split, so the title is the only thing that differs.
+    // the same trailing cluster) at the same split, so the title is the only
+    // thing that differs.
     //
     // What makes the chevrons immune to it is that the box is a FIXED SPAN with
     // `space-between`: the title is its one shrinking member, so a title too
@@ -188,10 +195,15 @@ test.describe('the desktop content title holds its position across views', () =>
     const titled: Partial<Record<'short' | 'long', HeaderMetrics>> = {};
     // One load first, purely to put the page on the app's origin: the restore
     // key is written with `evaluate` rather than `addInitScript` so the second
-    // pass can overwrite it, and localStorage is per-origin.
+    // pass can overwrite it, and localStorage is per-origin. The saved nav
+    // history is the other restore record: the first pass folds its app into
+    // it, and it wins at load. Dropping it leaves the seed as the only record.
     await gotoWithRetry(page, '/');
     for (const [label, id] of [['short', APP_ID], ['long', APP_ID_LONG]] as const) {
-      await page.evaluate((appId) => localStorage.setItem('app-window-open', appId), id);
+      await page.evaluate((appId) => {
+        localStorage.removeItem('lucidos-nav-history');
+        localStorage.setItem('app-window-open', appId);
+      }, id);
       await gotoWithRetry(page, '/');
       await expect(page.locator('iframe[data-role="app-ui-frame"]:visible')).toBeVisible({ timeout: 15_000 });
       titled[label] = await settled(page);
@@ -202,7 +214,7 @@ test.describe('the desktop content title holds its position across views', () =>
       titled.long!.titleText.length,
       `the long fixture rendered "${titled.long!.titleText}", no longer than the short one`,
     ).toBeGreaterThan(titled.short!.titleText.length + 20);
-    expect(titled.long!.hasOverflow && titled.short!.hasOverflow, 'both views carry the ⋯').toBe(true);
+    expect(titled.long!.trailingIcons, 'both views carry the same cluster').toBe(titled.short!.trailingIcons);
     expect(titled.long!.actionsLeft, 'the clusters differ, so this is not a title-only comparison')
       .toBeCloseTo(titled.short!.actionsLeft, 0);
 
@@ -216,21 +228,20 @@ test.describe('the desktop content title holds its position across views', () =>
     expectCentredAndClear(titled.long!, 'long title');
   });
 
-  test('the chevrons land on the same x whether the ⋯ is present or not', async ({ page }) => {
+  test('the chevrons land on the same x whatever the trailing cluster holds', async ({ page }) => {
     // Restore-on-load opens the app in the content pane (the same hook
-    // sdk-iframe-mount uses): panelOverlay = {type:'app-ui'}, whose three
-    // context actions fold whole, so this view carries the ⋯.
+    // sdk-iframe-mount uses): panelOverlay = {type:'app-ui'}, whose two
+    // context actions ride the row beside the bell, the widest cluster.
     await page.addInitScript((id) => localStorage.setItem('app-window-open', id), APP_ID);
     await gotoWithRetry(page, '/');
     await expect(page.locator('iframe[data-role="app-ui-frame"]:visible')).toBeVisible({ timeout: 15_000 });
-    const withOverflow = await settled(page);
-    expect(withOverflow.hasOverflow, 'the app view should carry the ⋯ trigger').toBe(true);
-    expect(withOverflow.trailingIcons, 'the app view: ⋯ + the bell').toBe(2);
-    expectCentredAndClear(withOverflow, 'app UI');
+    const widest = await settled(page);
+    expect(widest.hasOverflow, 'two actions fit the reserve, so nothing folds').toBe(false);
+    expect(widest.trailingIcons, 'the app view: open in tab + fullscreen + the bell').toBe(3);
+    expect(widest.hasRefresh, 'the app view leads its row with Refresh').toBe(true);
+    expectCentredAndClear(widest, 'app UI');
 
-    // Apps: one context action (search) riding the row beside the bell. Same
-    // icon count as the app view, no ⋯, and a different total width once the
-    // gap between the two is counted.
+    // Apps: one context action (search) riding the row beside the bell.
     await clickVisibleElement(page, '.hamburger-panel');
     await expect.poll(() => clickVisibleElement(page, '.drawer-item', 'Apps'), { timeout: 10_000 }).toBe(true);
     const oneAction = await settled(page);
@@ -251,24 +262,23 @@ test.describe('the desktop content title holds its position across views', () =>
     expect(
       noActions.actionsLeft,
       'the three views produced the same trailing cluster, so this proves nothing',
-    ).toBeGreaterThan(withOverflow.actionsLeft + 1);
+    ).toBeGreaterThan(widest.actionsLeft + 1);
     for (const [view, m] of [['apps', oneAction], ['settings', noActions]] as const) {
       expect(
         m.backX,
-        `${view}: the back chevron moved to ${m.backX.toFixed(1)} from ${withOverflow.backX.toFixed(1)}`,
-      ).toBeCloseTo(withOverflow.backX, 0);
+        `${view}: the back chevron moved to ${m.backX.toFixed(1)} from ${widest.backX.toFixed(1)}`,
+      ).toBeCloseTo(widest.backX, 0);
       expect(
         m.forwardX,
-        `${view}: the forward chevron moved to ${m.forwardX.toFixed(1)} from ${withOverflow.forwardX.toFixed(1)}`,
-      ).toBeCloseTo(withOverflow.forwardX, 0);
+        `${view}: the forward chevron moved to ${m.forwardX.toFixed(1)} from ${widest.forwardX.toFixed(1)}`,
+      ).toBeCloseTo(widest.forwardX, 0);
     }
   });
 
   test('the box still clears the cluster with the Canvas pane near its floor', async ({ page }) => {
     // The narrowest this pane legally gets, where the box has given up the most
-    // width to the two side reserves. The collapse measurement is the other
-    // half here, folding the actions into ⋯: the reason the centring survives
-    // at all.
+    // width to the two side reserves. The reserve is sized for the widest
+    // cluster the fold leaves standing, so the clearance holds here too.
     //
     // The pane width is SEEDED, not dragged. `splitRatio` is read straight out
     // of localStorage with no load-time clamp (store/store.ts), so a ratio IS a
@@ -312,10 +322,10 @@ test.describe('the desktop content title holds its position across views', () =>
       narrow.boxWidth,
       `the box fell to its ${narrow.minSpan} min-span floor above the pane's own floor`,
     ).toBeGreaterThan(narrow.minSpan);
-    // And the fold is what keeps them apart there: the app view's three context
-    // actions are in the ⋯ menu, leaving ⋯ + the bell.
-    expect(narrow.hasOverflow, 'the app view folds its three actions whole').toBe(true);
-    expect(narrow.trailingIcons, 'the narrow app view: ⋯ + the bell').toBe(2);
+    // The cluster is at most the two actions and the bell, folded or not: that
+    // is what the reserve is sized for.
+    expect(narrow.trailingIcons, 'the narrow app view outgrew the reserve').toBeLessThanOrEqual(3);
+    expect(narrow.hasRefresh, 'Refresh still leads the narrow row').toBe(true);
     expectCentredAndClear(narrow, 'canvas pane near its floor');
   });
 });

@@ -263,7 +263,7 @@ export function OverflowMenu({ ariaLabel, stopPropagation, extraClass, triggerAt
         anchor={overlayAnchor}
         backdrop={false}
         portal
-        panelClass="thread-overflow-menu"
+        panelClass="surface-box thread-overflow-menu"
         panelRole="menu"
         panelRef={menuRef}
         panelProps={{ onKeyDown: handleMenuKeyDown }}
@@ -289,7 +289,7 @@ export function OverflowMenu({ ariaLabel, stopPropagation, extraClass, triggerAt
         anchor={overlayAnchor}
         backdrop={false}
         portal
-        panelClass="thread-info-popover"
+        panelClass="surface thread-info-popover"
         panelRef={infoRef}
         panelStyle={infoPos
           ? { position: 'fixed', top: `${infoPos.top}px`, left: `${infoPos.left}px` }

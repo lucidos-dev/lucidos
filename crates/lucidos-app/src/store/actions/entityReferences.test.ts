@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { panelOverlay, pinnedApps, credentials, environmentVariables, oauthAccounts, repositories, artifacts, marketplaceCatalog, marketplaceScanning, mcpServersVersion, webhooksVersion, permissionGrantsVersion } from '../store';
+import { panelOverlay, pinnedApps, credentials, environmentVariables, oauthAccounts, repositories, artifacts, marketplaceCatalog, marketplaceScanning, mcpServersVersion, webhooksVersion, permissionGrantsVersion, memoryEntriesVersion } from '../store';
 import type { App, PluginInstallRequest, PluginInstallReceipt } from '../types';
 
 // Mock loader functions to prevent API calls
@@ -10,7 +10,7 @@ vi.mock('./credentials', () => ({ loadCredentials: vi.fn() }));
 vi.mock('./environmentVariables', () => ({ loadEnvironmentVariables: vi.fn() }));
 vi.mock('./oauth', () => ({ loadOAuthAccounts: vi.fn(), handleOAuthAccountConnected: vi.fn() }));
 vi.mock('./repositoriesLoader', () => ({ loadRepositories: vi.fn() }));
-vi.mock('./plugin-marketplaces', () => ({ refreshPluginCatalogAfterMutation: vi.fn() }));
+vi.mock('./plugin-marketplaces', () => ({ pluginCatalogScanned: vi.fn(), refreshPluginCatalogAfterMutation: vi.fn() }));
 // Partial-mock the HTTP client so the credential-event /health re-probe is
 // observable without a real network call (keeps every other export real for the
 // modules below that legitimately use them, e.g. pinnedApps).
@@ -42,7 +42,7 @@ import { loadCredentials } from './credentials';
 import { loadEnvironmentVariables } from './environmentVariables';
 import { loadOAuthAccounts, handleOAuthAccountConnected } from './oauth';
 import { loadRepositories } from './repositoriesLoader';
-import { refreshPluginCatalogAfterMutation } from './plugin-marketplaces';
+import { pluginCatalogScanned, refreshPluginCatalogAfterMutation } from './plugin-marketplaces';
 import { loadDevices, devices } from './devices';
 import { loadPinnedApps } from './pinnedApps';
 
@@ -336,18 +336,6 @@ describe('processSSEForReferences', () => {
   // engine's scheduler now. So these are the only way a client learns one is
   // under way, including one another device started.
   describe('PluginCatalogScan* events', () => {
-    const loadedCatalog = {
-      status: 'loaded' as const,
-      data: {
-        marketplaces: [],
-        plugins: [],
-        errors: [],
-        scanned_at: '2026-09-22T10:00:00Z',
-        scanning: false,
-        scan_error: null,
-      },
-    };
-
     beforeEach(() => {
       marketplaceScanning.value = false;
     });
@@ -357,33 +345,11 @@ describe('processSSEForReferences', () => {
       expect(marketplaceScanning.value).toBe(true);
     });
 
-    it('lowers the cue and re-reads when a scan lands', () => {
-      marketplaceScanning.value = true;
-      marketplaceCatalog.value = loadedCatalog;
-
+    // What a landing scan does is `pluginCatalogScanned`'s, tested beside it.
+    it('hands a landed scan to the catalog store, failed or not', () => {
       processSSEForReferences('PluginCatalogScanned', { failed: false });
-
-      expect(marketplaceScanning.value).toBe(false);
-      expect(refreshPluginCatalogAfterMutation).toHaveBeenCalledTimes(1);
-    });
-
-    // A failed scan still ends. Leaving the cue up would claim the data is
-    // about to move when nothing is coming.
-    it('lowers the cue for a scan that failed', () => {
-      marketplaceScanning.value = true;
-      marketplaceCatalog.value = loadedCatalog;
-
       processSSEForReferences('PluginCatalogScanned', { failed: true });
-
-      expect(marketplaceScanning.value).toBe(false);
-    });
-
-    // Same rule as the marketplace arms above: a device that never opened the
-    // panel is not made to fetch a catalog it is not showing.
-    it('does not re-read when the catalog was never loaded', () => {
-      marketplaceCatalog.value = { status: 'not-loaded' };
-      processSSEForReferences('PluginCatalogScanned', { failed: false });
-      expect(refreshPluginCatalogAfterMutation).not.toHaveBeenCalled();
+      expect(pluginCatalogScanned).toHaveBeenCalledTimes(2);
     });
   });
 
@@ -491,6 +457,12 @@ describe('processSSEForReferences', () => {
       expect(webhooksVersion.value).toBe(before + 3);
     });
 
+    it('bumps memoryEntriesVersion when a memory is corrected', () => {
+      const before = memoryEntriesVersion.value;
+      processSSEForReferences('MemoryCorrected', { wrong_fact: 'x', removed: [] });
+      expect(memoryEntriesVersion.value).toBe(before + 1);
+    });
+
     it('bumps permissionGrantsVersion when a grant file changes', () => {
       const before = permissionGrantsVersion.value;
       processSSEForReferences('PermissionGrantsChanged', { grant_file: 'cc-allowed-tools' });
@@ -498,10 +470,13 @@ describe('processSSEForReferences', () => {
     });
 
     it('leaves the counters alone for an unrelated frame', () => {
-      const before = [mcpServersVersion.value, webhooksVersion.value, permissionGrantsVersion.value];
+      const counters = () => [
+        mcpServersVersion.value, webhooksVersion.value, permissionGrantsVersion.value,
+        memoryEntriesVersion.value,
+      ];
+      const before = counters();
       processSSEForReferences('AppCreated', { app_id: 'x' });
-      expect([mcpServersVersion.value, webhooksVersion.value, permissionGrantsVersion.value])
-        .toEqual(before);
+      expect(counters()).toEqual(before);
     });
   });
 

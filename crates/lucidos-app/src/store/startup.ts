@@ -9,8 +9,11 @@ import {
 } from './actions/notifications';
 import { syncWorkspaceAppBadge, refreshOtherWorkspacesUnread } from './actions/app-badge';
 import { loadApps } from './actions/apps';
+import { loadInstalledPlugins } from './actions/plugins';
+import { loadPluginCatalog } from './actions/plugin-marketplaces';
 import { loadCredentials } from './actions/credentials';
 import { loadDevices, registerCurrentDevice } from './actions/devices';
+import { loadPairedDevices } from './actions/pairedDevices';
 import { loadTriggers, loadHistoricalTriggers } from './actions/triggers';
 import { loadTriggerGroups } from './actions/triggerGroups';
 import { loadThreadQueue } from './actions/threadQueue';
@@ -41,6 +44,7 @@ import { restoreRepoSelectionFromStorage } from './actions/repositories';
 import { openThreadAcrossWorkspaces } from './actions/cross-workspace';
 import { inlineMarkdownImage, openImagePopupFromGroup } from './imagePopup';
 import { installMarkdownImageRetry } from '../utils/markdownImageRetry';
+import { installMarkdownImageFallback } from '../utils/markdownImageFallback';
 import { CHECK_ICON, COPY_ICON } from '../utils/markedConfig';
 import { clipboardOrReport } from '../utils/clipboard';
 import { activeMenuItem, notificationsFilter, settingsSubview, serviceWorkerBuildId, threadsLoaded, showToast, showConfirm, showPrompt, CONNECTION_POLL_INTERVAL_MS, FOCUSED_THREAD_KEY, setFocusedThread } from './store';
@@ -63,6 +67,7 @@ import {
   stopFrameCapabilityRenewal,
 } from './actions/app-frame-capability';
 import { handleAppToastMessage } from './actions/app-toast-bridge';
+import { handleAppPullMessage } from './actions/app-pull-bridge';
 import { withBase, SCOPE_PATH } from '../utils/basePath';
 import { isDevServerBundle, DEV_SERVER_SW_REASON } from '../utils/devServerBundle';
 
@@ -175,7 +180,7 @@ export function startClient(): () => void {
       activeMenuItem.value === 'notifications' &&
       notificationsFilter.value !== filterBeforePreferences
     ) {
-      refreshActiveNotificationsTab();
+      void refreshActiveNotificationsTab();
     }
     // The version-update dismissals are GLOBAL preferences. The update surfaces
     // skip while preferences load, since they can't yet know if this build was
@@ -310,6 +315,8 @@ export function startClient(): () => void {
   // and would stay half-drawn after a truncated load. One delegated listener
   // gives every markdown surface the same self-healing retry.
   const stopMarkdownImageRetry = installMarkdownImageRetry();
+  // While it is failing, a notice says so in place of the broken-image glyph.
+  const stopMarkdownImageFallback = installMarkdownImageFallback();
 
   // Cold-start, warm hashchange, AND resume (visibilitychange / focus /
   // pageshow) all dispatch through one shared router. While its JS is
@@ -320,6 +327,11 @@ export function startClient(): () => void {
 
   loadArtifacts();
   loadApps();
+  // The Plugins panel paints only once both of these have settled. Both read
+  // an engine-side cache, so they are cheap. Without this, the first open of a
+  // session waits for the panel's chunk, its mount, then two round trips.
+  void loadPluginCatalog();
+  void loadInstalledPlugins();
   // Triggers are global (thread filter dropdown + form titles), not tab-scoped.
   // Without this eager load, the dropdown lies on cold start to a non-triggers
   // tab: every trigger in the registry shows as "(deleted)" because the
@@ -340,11 +352,14 @@ export function startClient(): () => void {
   // loadAllThreads also refreshes these, but call it eagerly
   // in case the thread fetch is slow or fails.
   void loadFilterFacets();
+  // Events store a device's id, never its name, so every screen that names a
+  // device reads these two lists.
+  loadDevices();
+  void loadPairedDevices();
 
   // Load data for the restored active menu item (switchMenuItem isn't called on reload)
   const tab = activeMenuItem.value;
   if (tab === 'settings') {
-    loadDevices();
     if (settingsSubview.value === 'accounts') loadCredentials();
   }
   if (tab === 'files') {
@@ -621,6 +636,7 @@ export function startClient(): () => void {
     }).catch(() => { /* showConfirm rejection: drop, modal already closed */ });
   }
   window.addEventListener('message', onAppFrameMessage);
+  window.addEventListener('message', handleAppPullMessage);
 
   // On iOS PWA, the page doesn't reload when returning from background.
   // Reconnect SSE and check for SW updates. Notification deep-links arrive
@@ -821,6 +837,7 @@ export function startClient(): () => void {
     stopSlownessChecks();
     clearTimeout(initialHealthCheck);
     window.removeEventListener('message', onAppFrameMessage);
+    window.removeEventListener('message', handleAppPullMessage);
     stopHashRouting();
     navigator.serviceWorker?.removeEventListener('message', onServiceWorkerMessage);
     navigator.serviceWorker?.removeEventListener('controllerchange', requestServiceWorkerBuildId);
@@ -833,6 +850,7 @@ export function startClient(): () => void {
     stopNativeTap?.();
     document.removeEventListener('click', onGlobalClick);
     stopMarkdownImageRetry();
+    stopMarkdownImageFallback();
     document.removeEventListener('visibilitychange', handleVisibilityChange);
     window.removeEventListener('focus', onResumeCoalesced);
     window.removeEventListener('pageshow', onResumeCoalesced);

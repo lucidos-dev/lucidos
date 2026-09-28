@@ -23,11 +23,12 @@ use uuid::Uuid;
 use crate::core::changes::ChangeStatus;
 use crate::engine::event_bus::{BusEvent, EventBus, SystemEvent};
 use crate::engine::thread_events::{MessageOrigin, ThreadEvent};
+use crate::engine::thread_lifecycle::ThreadStatus;
 use crate::engine::types::AgentSession;
 use crate::engine::LucidosEngine;
 
 /// The engine's in-memory agent sessions, keyed by thread.
-type AgentSessions = tokio::sync::Mutex<HashMap<Uuid, AgentSession>>;
+pub(crate) type AgentSessions = tokio::sync::Mutex<HashMap<Uuid, AgentSession>>;
 
 /// One armed standing apply, as stored.
 #[derive(Debug, Clone)]
@@ -59,6 +60,9 @@ pub(crate) enum ArmedChange {
 pub(crate) struct SettleFacts {
     /// `thread_summaries.status`.
     pub status: String,
+    /// The thread is parked on an unanswered question, read from the events.
+    /// A row can read `idle` with its question still open (ADR 0293).
+    pub parked_on_question: bool,
     pub live_event_waits: bool,
     /// `thread_summaries.coding_agent_has_diff`: the branch holds commits the
     /// projection has seen. A settled thread with a diff and no pending change
@@ -132,8 +136,16 @@ pub const DISARMED_BY_OWNER: &str = "Canceled.";
 ///
 /// Unqualified, like [`LUCIDOS_APPLIES_SQL`], so `thread_summaries` must be the
 /// only source of these columns in the query using it.
-const SETTLING_THREAD_SQL: &str = "(status IN ('running', 'paused') \
-     OR (live_event_wait_count > 0 AND status NOT IN ('waiting_for_user_answer', 'failed')))";
+static SETTLING_THREAD_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        "(status IN ({running}, {paused}) \
+         OR (live_event_wait_count > 0 AND status NOT IN ({waiting_for_user_answer}, {failed})))",
+        running = ThreadStatus::Running.sql_literal(),
+        paused = ThreadStatus::Paused.sql_literal(),
+        waiting_for_user_answer = ThreadStatus::WaitingForUserAnswer.sql_literal(),
+        failed = ThreadStatus::Failed.sql_literal(),
+    )
+});
 
 /// A `thread_summaries` row whose change Lucidos would apply. The standing
 /// apply IS an Apply, one settle later, so it is offered exactly where Apply
@@ -200,6 +212,8 @@ pub(crate) fn standing_verdict(facts: &SettleFacts) -> StandingVerdict {
         "paused" => StandingVerdict::Wait,
         "waiting_for_user_answer" => StandingVerdict::Drop(PARKED_ON_QUESTION),
         "failed" => StandingVerdict::Drop(TURN_FAILED),
+        // A row can read `idle` with its question still open (ADR 0293).
+        _ if facts.parked_on_question => StandingVerdict::Drop(PARKED_ON_QUESTION),
         // Watching an event: it wakes and may commit again, so it has not
         // settled (ADR 0106). A running sub-thread does not count (ADR 0249).
         _ if facts.live_event_waits => StandingVerdict::Wait,
@@ -220,7 +234,8 @@ pub(crate) fn standing_verdict(facts: &SettleFacts) -> StandingVerdict {
     }
 }
 
-/// The thread whose arm this bus event re-resolves, if any. Pure.
+/// The thread whose arm this bus event re-resolves, if any. Pure. The
+/// archive request resolver shares it, for the same settle reason.
 ///
 /// **A wait's delivery or expiry never re-takes a verdict.** Each clears the
 /// live-wait count while the status still reads `idle`. The `UserPromptInjected`
@@ -230,7 +245,7 @@ pub(crate) fn standing_verdict(facts: &SettleFacts) -> StandingVerdict {
 ///
 /// An agent session's settle needs no skip here. [`TurnSettle`] holds the arm
 /// until the idle, on this path and on every resolve with no event behind it.
-fn thread_to_resolve(event: &BusEvent) -> Option<Uuid> {
+pub(crate) fn thread_to_resolve(event: &BusEvent) -> Option<Uuid> {
     match event {
         BusEvent::Thread {
             event: ThreadEvent::EventWaitDelivered { .. } | ThreadEvent::EventWaitExpired { .. },
@@ -460,6 +475,24 @@ async fn read_settle_facts(
             return FactsProbe::Unknown;
         }
     };
+    // Resolves run on every event of an armed thread, streaming included. The
+    // verdict waits on `running` and `paused` before it reads the question,
+    // so those skip the events scan.
+    let parked_on_question = if matches!(status.as_str(), "running" | "paused") {
+        false
+    } else {
+        match crate::engine::agent_recovery::thread_parked_on_question(pool, arm.thread_id).await {
+            Ok(parked) => parked,
+            Err(e) => {
+                log!(
+                    "[StandingApply] question lookup for {} failed: {}",
+                    arm.thread_id,
+                    e
+                );
+                return FactsProbe::Unknown;
+            }
+        }
+    };
     let Some(armed_change) = read_armed_change(pool, arm).await else {
         return FactsProbe::Unknown;
     };
@@ -474,6 +507,7 @@ async fn read_settle_facts(
     };
     FactsProbe::Ready(SettleFacts {
         status,
+        parked_on_question,
         live_event_waits: live_waits > 0,
         has_diff,
         armed_change,
@@ -497,7 +531,7 @@ const AGENT_TURN_CLOSER_SQL: &str = "(event_type = 'CodingAgentIdled' \
 /// before it broadcasts it, so a resolve that the idle triggered already sees
 /// the idle. The session map is read only when the terminal is newest, so a
 /// settled thread never takes the lock.
-async fn read_turn_settle(
+pub(crate) async fn read_turn_settle(
     pool: &sqlx::PgPool,
     thread_id: Uuid,
     sessions: &AgentSessions,
@@ -554,10 +588,11 @@ async fn read_armed_change(pool: &sqlx::PgPool, arm: &StandingApply) -> Option<A
         None => {
             sqlx::query_as(
                 "SELECT id, status, file_count FROM changes \
-                 WHERE thread_id = $1 AND status = 'pending' \
+                 WHERE thread_id = $1 AND status = $2 \
                  ORDER BY created_at LIMIT 1",
             )
             .bind(arm.thread_id)
+            .bind(ChangeStatus::Pending)
             .fetch_optional(pool)
             .await
         }
@@ -584,7 +619,8 @@ async fn read_armed_change(pool: &sqlx::PgPool, arm: &StandingApply) -> Option<A
 pub(crate) async fn count_sweep_candidates(pool: &sqlx::PgPool) -> Result<i64, sqlx::Error> {
     sqlx::query_scalar(&format!(
         "SELECT count(*) FROM thread_summaries \
-          WHERE is_coding_agent = TRUE AND {SETTLING_THREAD_SQL} AND {LUCIDOS_APPLIES_SQL}"
+          WHERE is_coding_agent = TRUE AND {settling} AND {LUCIDOS_APPLIES_SQL}",
+        settling = &*SETTLING_THREAD_SQL,
     ))
     .fetch_one(pool)
     .await
@@ -675,7 +711,8 @@ pub async fn settling_thread_ids(
     }
     let rows: Vec<(Uuid,)> = sqlx::query_as(&format!(
         "SELECT thread_id FROM thread_summaries \
-          WHERE thread_id = ANY($1) AND is_coding_agent = TRUE AND {SETTLING_THREAD_SQL}"
+          WHERE thread_id = ANY($1) AND is_coding_agent = TRUE AND {settling}",
+        settling = &*SETTLING_THREAD_SQL,
     ))
     .bind(&ids)
     .fetch_all(pool)
@@ -707,12 +744,14 @@ async fn read_sweep_candidates(
     sqlx::query_as(&format!(
         "SELECT t.thread_id, \
                 (SELECT c.id FROM changes c \
-                  WHERE c.thread_id = t.thread_id AND c.status = 'pending' \
+                  WHERE c.thread_id = t.thread_id AND c.status = $1 \
                   ORDER BY c.created_at LIMIT 1) \
            FROM thread_summaries t \
-          WHERE t.is_coding_agent = TRUE AND {SETTLING_THREAD_SQL} \
-            AND {LUCIDOS_APPLIES_SQL}"
+          WHERE t.is_coding_agent = TRUE AND {settling} \
+            AND {LUCIDOS_APPLIES_SQL}",
+        settling = &*SETTLING_THREAD_SQL,
     ))
+    .bind(ChangeStatus::Pending)
     .fetch_all(pool)
     .await
 }
@@ -2021,10 +2060,31 @@ mod tests {
     fn facts(status: &str, armed_change: ArmedChange) -> SettleFacts {
         SettleFacts {
             status: status.to_string(),
+            parked_on_question: false,
             live_event_waits: false,
             has_diff: false,
             armed_change,
             turn_settle: TurnSettle::Settled,
+        }
+    }
+
+    /// A row that reads `idle` while its question is still open drops the
+    /// arm like a `waiting_for_user_answer` row does. Firing would prompt the
+    /// agent over the question card.
+    #[test]
+    fn an_open_question_drops_the_arm_on_an_idle_row() {
+        let id = Uuid::new_v4();
+        for (status, waits) in [("idle", false), ("idle", true)] {
+            let parked = SettleFacts {
+                parked_on_question: true,
+                live_event_waits: waits,
+                ..facts(status, ArmedChange::Ready(id))
+            };
+            assert_eq!(
+                standing_verdict(&parked),
+                StandingVerdict::Drop(PARKED_ON_QUESTION),
+                "{status}, waits={waits}"
+            );
         }
     }
 

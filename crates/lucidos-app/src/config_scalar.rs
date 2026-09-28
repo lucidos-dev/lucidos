@@ -48,7 +48,7 @@ pub(crate) fn read(path: &std::path::Path) -> Option<String> {
 /// trimmed, because [`read`] trims what it returns. Writing a padded string
 /// would leave a value that never compares equal to what is read back, so the
 /// skip below would never hit and every apply would rewrite the file. Both
-/// callers re-fire far more often than their value changes (`applyTheme` runs on
+/// callers re-fire far more often than their value changes (`applyThemeMode` runs on
 /// every system-appearance change, the traffic-light push on every preferences
 /// load), so agreeing with disk is the common case and the skip is what keeps
 /// this off the disk entirely.

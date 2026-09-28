@@ -1,13 +1,15 @@
 import { useState, useEffect, useRef } from 'preact/hooks';
 import { NotificationsBell } from '../notifications/NotificationsBell';
 import { lucidos } from '@lucidos/sdk';
-import { activeMenuItem, panelOverlay, panelUrl, filePreviewSource, filePreviewWrap, diffWholeFile, diffWholeFileEffective, diffSideBySide, filePreviewEditing, appPseudoFullscreen, parseRepoPath, appSearchOpen, repositories, workspacePath } from '../../store/store';
+import { activeMenuItem, panelOverlay, panelUrl, filePreviewSource, filePreviewWrap, diffWholeFile, diffWholeFileEffective, diffSideBySide, filePreviewEditing, appPseudoFullscreen, parseRepoPath, appSearchOpen, repositories, workspacePath, type PanelOverlay } from '../../store/store';
 import { loadedOr } from '../../store/types';
 import { sideBySideDiffAvailable } from '../../store/diffBody';
 import { wrapToggleAvailable } from '../../store/previewWrap';
-import { closeUrl, openLocalFile, openUrlOutsideApp, refreshFilePreview } from '../../store/actions/artifacts';
+import { closeUrl, openLocalFile, openUrlOutsideApp } from '../../store/actions/artifacts';
 import { previewDiskPath } from '../../utils/previewPath';
-import { getAppFrameSrc, getVisibleAppFrame, getVisibleAppPanel, exitAppFullscreen, exitPseudoFullscreen, refreshAppUI, toggleAppSearch, popOutApp } from '../../store/actions/apps';
+import { getAppFrameSrc, getVisibleAppFrame, getVisibleAppPanel, exitAppFullscreen, exitPseudoFullscreen, toggleAppSearch, popOutApp } from '../../store/actions/apps';
+import { panelRefreshAvailable, runPanelRefresh } from '../../store/panelRefresh';
+import { DIFF_REFRESH_PINNED, panelRefreshLive } from './RefreshIndicator';
 import { nativeFullscreenElement } from '../../store/appFullscreenHost';
 import { CloseIcon, ReloadIcon, SearchIcon, PopOutIcon, FullscreenIcon, ExitFullscreenIcon, CodeIcon, EyeIcon, EditIcon, FileIcon, DiffIcon, SideBySideColumnsIcon, WrapTextIcon } from '../shared/icons';
 import { RENDERABLE_EXTS, REPO_RENDERABLE_EXTS, isEditableDataFile } from '../files/previewExts';
@@ -19,11 +21,10 @@ import { CollapsingActions, type HeaderActionSpec } from './headerActions';
 import { useHeaderActionCollapse, type HeaderCollapseTargets } from '../../hooks/useHeaderActionCollapse';
 
 /** The boxes the content row's collapse is measured against: the row, and the
- *  title cluster centred on it. No leading entry, because there is nothing to
- *  measure there: the cluster is centred, so the room these actions get is half
- *  of what it leaves rather than the row's leftover, and the hamburger leading
- *  the row is inside that half by a box and a half. Stable identity so the
- *  collapse effect's deps do not re-fire every render. */
+ *  title cluster centred on it. No leading entry: there is nothing to measure
+ *  there. The cluster is centred, so these actions get half of what it leaves,
+ *  not the row's leftover. The hamburger and Refresh fit inside the other half.
+ *  Stable identity so the collapse effect's deps do not re-fire every render. */
 const COLLAPSE_TARGETS: HeaderCollapseTargets = {
   container: '.content-header-elements',
   centre: '.pane-header-content-title',
@@ -114,6 +115,18 @@ export function filePreviewPopoutAction(encoded: string): HeaderActionSpec | nul
     return popoutSpec('file-open-in-tab', OPEN_ON_DESKTOP, { onClick: () => openUrlOutsideApp(absoluteUrl(url)) });
   }
   return null;
+}
+
+/** Whether a phone's actions carry the open panel's Refresh.
+ *
+ *  A phone refreshes by pulling. So Refresh shows only where it predates the
+ *  pull (an app, a file preview). Its spinner is not an action at all, see
+ *  `MobileRefreshIndicator`. A diff draws a disabled Refresh instead, and
+ *  claiming both would throw on the duplicate key. Desktop leads the row with
+ *  `ContentRefreshButton` and carries no Refresh here. */
+export function mobileRefreshActionShown(overlay: PanelOverlay, available: boolean): boolean {
+  const predatesPull = overlay?.type === 'app-ui' || overlay?.type === 'file-preview';
+  return predatesPull && panelRefreshLive(overlay, available);
 }
 
 interface Props {
@@ -230,13 +243,15 @@ export function ContentHeaderActions({ layout }: Props) {
     return { key, label, icon: () => <ReloadIcon />, onClick, disabledTooltip };
   }
 
+  // The open panel's refresh (the panel refresh contract), first so it folds
+  // first. A phone spins the leading slot instead, which no action can fold.
+  const mobile = layout === 'mobile';
+  if (mobile && mobileRefreshActionShown(overlay, panelRefreshAvailable.value)) {
+    addAction(reloadSpec('refresh', () => void runPanelRefresh()));
+  }
+
   // Context-specific actions — mutually exclusive via if/else
   if (overlay?.type === 'app-ui') {
-    // preserveWip: the header refresh re-fetches whatever the iframe is
-    // currently pointed at, including WIP. Apply landing on disk and direct
-    // file-source edits still drop WIP — those paths call refreshAppUI()
-    // with the default options.
-    addAction(reloadSpec('refresh', () => void refreshAppUI(undefined, { preserveWip: true })));
     const popout = appPopoutAction();
     if (popout) addAction(popout);
     addAction({
@@ -270,14 +285,10 @@ export function ContentHeaderActions({ layout }: Props) {
 
     // While editing, Save/Cancel live in the editor body (FilePreviewInline) and
     // refresh/source-toggle would fight the draft — so the header drops them and
-    // keeps only the global actions.
+    // keeps only the global actions. The preview registers no refresh then, nor
+    // for a diff, which is pinned to its change and says so on its Refresh.
     if (!editing) {
-      addAction(reloadSpec(
-        'refresh',
-        refreshFilePreview,
-        'Refresh',
-        isDiff ? 'Diff is fixed to this change' : undefined,
-      ));
+      if (isDiff && mobile) addAction(reloadSpec('refresh', () => {}, 'Refresh', DIFF_REFRESH_PINNED));
       // Second, mirroring where the app header puts its own popout, so the two
       // content views agree about where "take this out of the shell" lives.
       const popout = filePreviewPopoutAction(overlay.path);

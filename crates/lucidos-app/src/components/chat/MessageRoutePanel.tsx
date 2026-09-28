@@ -4,6 +4,7 @@ import type { CodingAgent } from '../../api/types';
 import { AppsIcon } from '../shared/icons';
 import { messageRoutePanel, closeMessageRoutePanel, triggers, threadMap, repositories, appsList, workspaceName } from '../../store/store';
 import { loadApps } from '../../store/actions/apps';
+import { turnDeviceName } from '../../store/actions/devices';
 import { focusThreadOrBootstrap } from '../../store/actions/threads';
 import {
   openThreadAcrossWorkspaces,
@@ -29,6 +30,7 @@ import {
   findQuestionAnswer,
   isChangeLifecycleEvent,
   legacyOrigin,
+  modeToInitiator,
   PENDING_TITLE_PLACEHOLDER,
   sortEventsChronologically,
   SYSTEM_LABEL,
@@ -43,6 +45,9 @@ import {
   describeCancelCause,
   describeContinuationReason,
   describeEngineReason,
+  engineReasonConfirmingDevice,
+  engineReasonHeadline,
+  UNRECORDED_ENGINE_SEED_EXPLAINER,
 } from '../../utils/engineEventExplainers';
 
 /** Boundary events the engine is the ONLY possible issuer of, mapped to the
@@ -229,7 +234,7 @@ export function MessageRoutePanel() {
       onClose={closeMessageRoutePanel}
       anchor={state.anchor}
       backdrop={false}
-      panelClass={`message-route-panel ${pos?.placement ?? ''}`}
+      panelClass={`surface message-route-panel ${pos?.placement ?? ''}`}
       panelStyle={pos ? { top: `${pos.top}px`, left: `${pos.left}px` } : { visibility: 'hidden' }}
       panelRole="dialog"
       panelProps={{ 'aria-label': section === 'origin' ? 'Initiator info' : 'Executor info' }}
@@ -272,13 +277,15 @@ export function renderOriginSection(
   const origin = resolveOrigin(exchange);
   const channel = origin ? renderChannelSection(origin, parentTitle, getLiveTitle) : null;
   const audit = origin ? renderAuditSection(origin) : null;
+  const unrecordedSeed = !origin && isUnrecordedEngineSeed(userEvent);
   // Engine and system origins have no channel to disclose (they ARE the
   // channel, which is why `renderChannelSection` returns null for both), so
   // name the issuer here or the panel is an explainer paragraph with no "who"
   // above it, out of step with every other origin kind.
-  const issuer = origin?.kind === 'engine' ? renderIssuedByRow(ENGINE_LABEL)
+  const issuer = origin?.kind === 'engine' || unrecordedSeed ? renderIssuedByRow(ENGINE_LABEL)
     : origin?.kind === 'system' ? renderIssuedByRow(SYSTEM_LABEL)
       : null;
+  const engineRows = origin?.kind === 'engine' ? renderEngineReasonRows(origin.reason) : null;
   // A resume boundary prefers its own `reason` field, which is finer-grained
   // than the `continuation_started` EngineReason (that one would claim an
   // engine restart even for a local hang recovery). It falls through to the
@@ -288,7 +295,9 @@ export function renderOriginSection(
     ? renderExplainer('Why this resumed', describeContinuationReason(userEvent.reason))
     : null;
   const explainer = continuationWhy
-    ?? (origin?.kind === 'engine' ? renderEngineExplainerSection(origin.reason) : null);
+    ?? (origin?.kind === 'engine' ? renderEngineExplainerSection(origin.reason)
+      : unrecordedSeed ? renderExplainer('Why the engine acted', UNRECORDED_ENGINE_SEED_EXPLAINER)
+        : null);
   const paused = pausedBy ? renderFoldedPause(pausedBy) : null;
 
   // System-driven `ResponseAborted` (safety_net, engine_shutdown, …): the
@@ -340,6 +349,7 @@ export function renderOriginSection(
       <h4>Origin</h4>
       {initiatorRow}
       {issuer}
+      {engineRows}
       {channel}
       {audit}
       {explainer}
@@ -366,7 +376,41 @@ function renderFoldedPause(pause: StoredEvent): preact.JSX.Element {
       {actor?.kind === 'device' && (
         <div class="route-row">
           <strong>Restarted from</strong>
-          <span>{actor.label}</span>
+          <span>{turnDeviceName(actor.device_id)}</span>
+        </div>
+      )}
+    </>
+  );
+}
+
+/** A `MessageReceived` the engine or an agent sent, with nothing recorded to
+ *  say which: no origin, no parent, no device. `legacyOrigin` has nothing to
+ *  synthesize from, and the chip already reads "Lucidos Engine" for it. So
+ *  the panel names the engine too, rather than a bare "Unknown". A human-mode
+ *  row with nothing recorded stays unknown: that one genuinely is. */
+function isUnrecordedEngineSeed(userEvent: StoredEvent): boolean {
+  return userEvent.type === 'MessageReceived' && modeToInitiator(userEvent.mode) === 'system';
+}
+
+/** The rows an engine reason adds under "Issued by": the thing it acted on
+ *  (a plugin install or update, a patch) and the device that confirmed it.
+ *  Null for a reason that names neither, so most engine origins add nothing. */
+function renderEngineReasonRows(reason: EngineReason): preact.JSX.Element | null {
+  const headline = engineReasonHeadline(reason);
+  const deviceId = engineReasonConfirmingDevice(reason);
+  if (!headline && !deviceId) return null;
+  return (
+    <>
+      {headline && (
+        <div class="route-row">
+          <strong>{headline.label}</strong>
+          <span>{headline.value}</span>
+        </div>
+      )}
+      {deviceId && (
+        <div class="route-row">
+          <strong>Confirmed on</strong>
+          <span>{turnDeviceName(deviceId)}</span>
         </div>
       )}
     </>
@@ -444,7 +488,7 @@ export function renderChannelSection(
       return (
         <div class="route-row">
           <strong>Device</strong>
-          <span>{origin.label}</span>
+          <span>{turnDeviceName(origin.device_id)}</span>
         </div>
       );
     case 'api': {

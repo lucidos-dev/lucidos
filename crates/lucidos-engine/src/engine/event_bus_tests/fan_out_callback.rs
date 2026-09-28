@@ -19,7 +19,6 @@ async fn test_fan_out_parent_callback() {
             text: "do three things".into(),
             user_image_hashes: vec![],
             device_id: None,
-            device: None,
             image_description: None,
             parent_thread_id: None,
             spawning_event_id: None,
@@ -46,7 +45,6 @@ async fn test_fan_out_parent_callback() {
                 text: format!("task {}", i + 1),
                 user_image_hashes: vec![],
                 device_id: None,
-                device: None,
                 image_description: None,
                 parent_thread_id: Some(parent_id),
                 spawning_event_id: None,
@@ -289,7 +287,6 @@ async fn test_fan_out_chat_children_all_report_back() {
             text: "research crypto sectors".into(),
             user_image_hashes: vec![],
             device_id: None,
-            device: None,
             image_description: None,
             parent_thread_id: None,
             spawning_event_id: None,
@@ -316,7 +313,6 @@ async fn test_fan_out_chat_children_all_report_back() {
                 text: format!("research sector {}", i + 1),
                 user_image_hashes: vec![],
                 device_id: None,
-                device: None,
                 image_description: None,
                 parent_thread_id: Some(parent_id),
                 spawning_event_id: None,
@@ -415,7 +411,6 @@ async fn test_top_relation_thread_does_not_callback_or_increment_count() {
             text: "kick off some research".into(),
             user_image_hashes: vec![],
             device_id: None,
-            device: None,
             image_description: None,
             parent_thread_id: None,
             spawning_event_id: None,
@@ -441,7 +436,6 @@ async fn test_top_relation_thread_does_not_callback_or_increment_count() {
             text: "do the research independently".into(),
             user_image_hashes: vec![],
             device_id: None,
-            device: None,
             image_description: None,
             parent_thread_id: None,
             spawning_event_id: None,
@@ -524,7 +518,6 @@ async fn test_cc_child_session_ended_without_idle_sends_callback() {
             text: "research something".into(),
             user_image_hashes: vec![],
             device_id: None,
-            device: None,
             image_description: None,
             parent_thread_id: None,
             spawning_event_id: None,
@@ -550,7 +543,6 @@ async fn test_cc_child_session_ended_without_idle_sends_callback() {
             text: "do subtask".into(),
             user_image_hashes: vec![],
             device_id: None,
-            device: None,
             image_description: None,
             parent_thread_id: Some(parent_id),
             spawning_event_id: None,
@@ -652,7 +644,6 @@ async fn test_cc_child_no_duplicate_callback_after_idle_then_session_ended() {
             text: "research something".into(),
             user_image_hashes: vec![],
             device_id: None,
-            device: None,
             image_description: None,
             parent_thread_id: None,
             spawning_event_id: None,
@@ -678,7 +669,6 @@ async fn test_cc_child_no_duplicate_callback_after_idle_then_session_ended() {
             text: "do subtask".into(),
             user_image_hashes: vec![],
             device_id: None,
-            device: None,
             image_description: None,
             parent_thread_id: Some(parent_id),
             spawning_event_id: None,
@@ -814,7 +804,6 @@ async fn refire_reinjects_unprocessed_child_completion_after_restart() {
             text: "do subtask".into(),
             user_image_hashes: vec![],
             device_id: None,
-            device: None,
             image_description: None,
             parent_thread_id: Some(parent_id),
             spawning_event_id: None,
@@ -921,7 +910,6 @@ async fn refire_skips_parent_that_already_resumed() {
             text: "do subtask".into(),
             user_image_hashes: vec![],
             device_id: None,
-            device: None,
             image_description: None,
             parent_thread_id: Some(parent_id),
             spawning_event_id: None,
@@ -2077,7 +2065,6 @@ async fn spawn_cc_grandchild_with_change(bus: &EventBus, parent_id: Uuid) -> (Uu
             text: "a milestone".into(),
             user_image_hashes: vec![],
             device_id: None,
-            device: None,
             image_description: None,
             parent_thread_id: Some(parent_id),
             spawning_event_id: None,
@@ -2094,7 +2081,7 @@ async fn spawn_cc_grandchild_with_change(bus: &EventBus, parent_id: Uuid) -> (Uu
     .await
     .unwrap();
     emit_cc_session_started(bus, thread_id).await;
-    emit_cc_idle(bus, thread_id, true, None).await;
+    emit_cc_idled(bus, thread_id, true, None).await;
     emit_pending_change(bus, thread_id, change_id).await;
     (thread_id, change_id)
 }

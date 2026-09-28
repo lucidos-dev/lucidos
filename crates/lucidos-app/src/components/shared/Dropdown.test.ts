@@ -42,17 +42,22 @@ describe('dropdownMenuClass (the portaled menu carries its own context)', () => 
   });
 
   it('is the plain menu class for a trigger outside any form group', () => {
-    expect(dropdownMenuClass(trigger())).toBe('dropdown-menu');
+    expect(dropdownMenuClass(trigger())).toBe('surface-box dropdown-menu');
   });
 
   it('adds the field class for a trigger inside a .form-group', () => {
     // The menu is portaled to <body>, so `.form-group .dropdown-option` can no
     // longer reach it through the DOM: the context has to ride on the panel.
-    expect(dropdownMenuClass(trigger('.form-group'))).toBe('dropdown-menu dropdown-menu-field');
+    expect(dropdownMenuClass(trigger('.form-group'))).toBe('surface-box dropdown-menu dropdown-menu-field');
+  });
+
+  it('takes the protected-surface class from a trigger inside a protected surface (ADR 0309)', () => {
+    expect(dropdownMenuClass(trigger('.form-group', '.protected-surface')))
+      .toBe('surface-box dropdown-menu dropdown-menu-field protected-surface');
   });
 
   it('is the plain menu class before the wrapper has mounted (no trigger yet)', () => {
-    expect(dropdownMenuClass(null)).toBe('dropdown-menu');
+    expect(dropdownMenuClass(null)).toBe('surface-box dropdown-menu');
   });
 });
 

@@ -1,5 +1,5 @@
 /**
- * A sectioned toast keeps its heading, and scrolls the rest against its own
+ * A titled toast keeps its title, and scrolls its message against its own
  * right edge.
  *
  * The report (a build toast listing a dozen commits) was two things at once.
@@ -19,8 +19,8 @@
 import { test, expect } from './fixtures';
 import { assertHealthy, gotoWithRetry } from './helpers';
 
-/** The parsed shape of a build toast: a count line, a group title, and enough
- *  bullets to overflow the 14rem cap. */
+/** The shape of a build toast: a count for the title, and enough bullet lines
+ *  in the message to overflow the 14rem cap. */
 const HEADING = '12 commits come with the new version';
 const BULLETS = [
   'header: the unread total rides the brand and the menu says where it lives',
@@ -44,60 +44,52 @@ test.describe('toast scroll shape', () => {
 
     const geom = await page.evaluate(
       ({ heading, bullets }: { heading: string; bullets: string[] }) => {
-        // Mirrors the markup `renderToast` emits (Toast.tsx) for a message with
-        // sections: the icon and the close X are the body's siblings, line 1 is
-        // the heading, and everything else is in the box that scrolls.
+        // Mirrors the markup `renderToast` emits (Toast.tsx) for a titled toast:
+        // the icon and the close X are the body's siblings, the title is the
+        // heading, and the message is in the box that scrolls.
         const container = document.createElement('div');
         container.className = 'toast-container';
         const column = document.createElement('div');
         column.className = 'toast-column';
         const toast = document.createElement('div');
-        toast.className = 'toast toast-info';
+        toast.className = 'toast surface toast-info';
         toast.innerHTML =
           '<svg class="toast-icon" viewBox="0 0 24 24"></svg>' +
           '<div class="toast-body">' +
-          '<div class="toast-heading"></div>' +
-          '<div class="toast-sections">' +
-          '<div class="toast-section">' +
-          '<div class="toast-section-title">New</div>' +
-          '<ul class="toast-bullets"></ul>' +
-          '</div>' +
-          '</div>' +
+          '<div class="toast-heading"><span class="toast-title"></span></div>' +
+          '<div class="toast-text"></div>' +
           '</div>' +
           '<button class="icon-btn toast-close" aria-label="Dismiss"></button>';
-        (toast.querySelector('.toast-heading') as HTMLElement).textContent = heading;
-        const list = toast.querySelector('.toast-bullets') as HTMLElement;
-        for (const b of bullets) {
-          const li = document.createElement('li');
-          li.textContent = b;
-          list.appendChild(li);
-        }
+        (toast.querySelector('.toast-title') as HTMLElement).textContent = heading;
+        (toast.querySelector('.toast-text') as HTMLElement).textContent =
+          bullets.map((b) => `• ${b}`).join('\n');
         column.appendChild(toast);
         container.appendChild(column);
         document.body.appendChild(container);
 
         const headingEl = toast.querySelector('.toast-heading') as HTMLElement;
-        const sections = toast.querySelector('.toast-sections') as HTMLElement;
+        const text = toast.querySelector('.toast-text') as HTMLElement;
         const close = toast.querySelector('.toast-close') as HTMLElement;
         const style = getComputedStyle(toast);
         const toastRect = toast.getBoundingClientRect();
         const headingBefore = headingEl.getBoundingClientRect();
 
-        sections.scrollTop = sections.scrollHeight;
+        text.scrollTop = text.scrollHeight;
         const headingAfter = headingEl.getBoundingClientRect();
 
-        const sectionsRect = sections.getBoundingClientRect();
+        const textRect = text.getBoundingClientRect();
         const closeRect = close.getBoundingClientRect();
         const result = {
           // Proves there was something to scroll, so the rest asserts anything
           // at all.
-          sectionsOverflow: sections.scrollHeight > sections.clientHeight + 1,
-          scrolled: sections.scrollTop > 1,
+          textOverflow: text.scrollHeight > text.clientHeight + 1,
+          scrolled: text.scrollTop > 1,
           headingHeld: Math.abs(headingAfter.top - headingBefore.top) < 1,
-          headingLeft: headingBefore.left,
+          headingTextLeft: headingBefore.left + parseFloat(getComputedStyle(headingEl).paddingLeft),
           headingRight: headingBefore.right,
-          sectionsTop: sectionsRect.top,
-          sectionsRight: sectionsRect.right,
+          textTop: textRect.top,
+          textLeft: textRect.left,
+          textRight: textRect.right,
           // The toast's content-box edges: where the card's own rail is.
           contentRight:
             toastRect.right - parseFloat(style.borderRightWidth) - parseFloat(style.paddingRight),
@@ -113,25 +105,28 @@ test.describe('toast scroll shape', () => {
       { heading: HEADING, bullets: BULLETS },
     );
 
-    expect(geom.sectionsOverflow, 'the probe did not overflow, so nothing here is under test').toBe(true);
+    expect(geom.textOverflow, 'the probe did not overflow, so nothing here is under test').toBe(true);
     expect(geom.scrolled, 'the probe box did not scroll, so the heading test proves nothing').toBe(true);
 
     // 1. The heading holds. It names what the toast is about, so a scroll to
     //    the last bullet must not take it off the top.
-    expect(geom.headingHeld, 'the heading moved when the sections scrolled').toBe(true);
+    expect(geom.headingHeld, 'the heading moved when the text scrolled').toBe(true);
 
     // 2. The scroll box runs to the card's own content edge, which is where its
     //    scrollbar is drawn. Inside that edge is the text column, where the bar
     //    used to sit.
-    expect(Math.abs(geom.sectionsRight - geom.contentRight)).toBeLessThan(1);
+    expect(Math.abs(geom.textRight - geom.contentRight)).toBeLessThan(1);
 
     // 3. And it starts below the close X, so the bar never runs under the
     //    glyph. The heading's floor is what guarantees the clearance.
-    expect(geom.sectionsTop).toBeGreaterThanOrEqual(geom.closeBottom - 1);
+    expect(geom.textTop).toBeGreaterThanOrEqual(geom.closeBottom - 1);
 
-    // 4. The text column has not moved: the heading still starts past the icon
-    //    gutter, and still stops short of the button.
-    expect(geom.headingLeft).toBeGreaterThan(geom.contentLeft + geom.iconWidth - 1);
+    // 4. The heading text starts past the icon gutter and stops short of the
+    //    button, since it is the one line beside both.
+    expect(geom.headingTextLeft).toBeGreaterThan(geom.contentLeft + geom.iconWidth - 1);
     expect(geom.headingRight).toBeLessThanOrEqual(geom.closeLeft + 1);
+
+    // 5. The text sits below the icon, so it pays no gutter for it.
+    expect(Math.abs(geom.textLeft - geom.contentLeft)).toBeLessThan(1);
   });
 });

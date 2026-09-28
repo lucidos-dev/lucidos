@@ -1,34 +1,9 @@
-/* Fira Code, the DEFAULT UI font: vendored, never fetched from a CDN.
-   Inter / JetBrains Mono / IBM Plex Mono are still loaded on demand from Google
-   Fonts (GOOGLE_FONT_URLS in store/actions/preferences.ts), and that is fine for
-   an OPT-IN font. The default is different in kind: a Lucidos workspace is a
-   self-contained local install, so its ordinary appearance must not depend on a
-   third-party origin being reachable. Fetched from the CDN, an offline or
-   air-gapped workspace would render its whole UI in the browser's generic
-   `monospace`, and every boot would announce itself to Google.
-
-   One variable file covers the 300-700 range the four static weights used to ask
-   the CDN for. The `url()` is relative so Vite hashes it into `assets/`, which
-   is also the prefix the service worker's SHELL_CACHE covers, so a warm client
-   keeps the font offline. App iframes are outside this bundle and get the same
-   bytes from the engine instead: `crates/lucidos-engine/src/api/sdk_fonts.rs`
-   `include_bytes!`s THIS file, so there is one copy in the tree.
-
-   `format('woff2')`, NOT `format('woff2-variations')`. The `-variations` form
-   is a non-standard Safari-10-era string that CSS Fonts 4 replaced with
-   `tech(variations)`, and a UA that does not recognise a format() value SKIPS
-   the source outright, so the whole face would silently fail to load. Plain
-   `woff2` is what every browser with variable-font support reads.
-
-   Provenance: Fira Code 6.2 (github.com/tonsky/FiraCode), SIL Open Font License
-   1.1, license text in the same directory. */
-@font-face {
-    font-family: 'Fira Code';
-    src: url('../../assets/fonts/FiraCode-VF.woff2') format('woff2');
-    font-weight: 300 700;
-    font-style: normal;
-    font-display: swap;
-}
+/* Every vendored font's faces, generated from the font catalog
+   (`crates/lucidos-engine/src/core/fonts.rs`). Each `url()` is relative, so Vite
+   hashes the file into `assets/`, which the service worker's SHELL_CACHE covers
+   once fetched. A face downloads only when text uses it. App iframes get the
+   same bytes from the engine (ADR 0077, ADR 0298). */
+@import '../generated/font-faces.css';
 
 * {
     margin: 0;
@@ -41,17 +16,20 @@ html {
     -webkit-text-size-adjust: 100%;
     background: var(--bg-primary);
     color-scheme: dark;
+    /* A tap paints no background, anywhere. It inherits, so no rule below
+       restates it. Guarded by touch-paints-no-press.test.ts. */
+    -webkit-tap-highlight-color: transparent;
 }
 
 :root {
     /* Font stacks */
     --font-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, 'Fira Code', 'JetBrains Mono', Monaco, Consolas, monospace;
-    /* NOT the default UI font, which is Fira Code. This is the pre-JS floor,
-       and it is deliberately the local system stack: the inline FOUC script in
-       index.html overwrites --font-ui on <html> before this sheet is even
-       parsed, so this value only paints if that script somehow did not run, and
-       at that instant no web font can be assumed decoded either. The default
-       itself is `fira-code` in currentFontFamily() and its three mirrors. */
+    /* NOT the UI font. This is the pre-JS floor, and it is deliberately the
+       local system stack: the inline FOUC script in index.html overwrites
+       --font-ui on <html> before this sheet is even parsed, so this value only
+       paints if that script somehow did not run, and at that instant no web
+       font can be assumed decoded either. What paints is `resolveFontKey` in
+       the appearance contract. */
     --font-ui: var(--font-mono);
     /* Neutral system sans-serif — the gateway workspace picker opts out of the
        app's monospace --font-ui for a calmer, brand-neutral surface. Native
@@ -91,6 +69,22 @@ html {
        inlined in index.html (it must paint before this bundle's CSS loads), so it
        hardcodes 2500 there rather than referencing a token defined here. */
     --z-tooltip: 10000;
+
+    /* Surfaces: every toast, popover, menu and dialog (styles/global/surface.css).
+       A control sits inside a surface, so its corner is the smaller step. */
+    --radius-control: 0.5rem;
+    --radius-surface: 0.75rem;
+    /* Circles and pills. On a square box 999px clamps to half the side, the
+       same circle as 50%. Every other corner in the shell is a multiple of
+       the two steps above, so a theme can square the whole UI. */
+    --radius-round: 999px;
+    /* Light mode inverts the background ladder, so it overrides this fill. */
+    --surface-bg: var(--bg-secondary);
+    /* The one dimming wash behind a blocking surface. Only the image viewer and
+       the camera go darker, because they are lightboxes. */
+    --scrim: rgba(0, 0, 0, 0.5);
+    /* Casts upward, for a surface docked under the content it lifts off. */
+    --shadow-up: 0 -0.5rem 1.5rem -0.25rem rgba(0, 0, 0, 0.1);
 
     /* Transitions.
      *
@@ -155,11 +149,15 @@ html {
        so it reads as coming out of the row it was opened from rather than as
        welded to it. The other half of the anchor above, and it lives beside it
        for the same reason: a surface that picks its own gap starts on a
-       different line from every other one. Two users today, the Lucidos menu
-       (.brand-menu, styles/header-mark.css) and the Search everywhere palette
-       (components/search/SearchEverywhere.css). It was --brand-menu-gap while
-       the menu was the only one. */
+       different line from every other one. Its users are the Lucidos menu
+       (.brand-menu, styles/header-mark.css), the Search everywhere palette
+       (components/search/SearchEverywhere.css) and file search. */
     --header-surface-gap: 0.5rem;
+    /* The one width every surface hung from the header shares: the Lucidos
+       menu, Search everywhere and file search. Its size is a budget: the
+       menu's Workspaces row must spell an ordinary workspace name whole. On a
+       phone the `min()` keeps a 1rem margin to each screen edge. */
+    --header-surface-width: min(22rem, calc(100vw - 2 * var(--space-lg)));
     /* Height of the app-shell banner that sits between the desktop header and
        the panes (Settings-less chrome such as the backup reminder), published
        live by the banner's own ResizeObserver and absent when no banner is up.
@@ -215,6 +213,12 @@ html {
        .chat-exchange scroll-margin-top (chat/response.css) so a navigated turn
        lands clear of it. Mobile's desktop-mask analog; kept a touch shorter. */
     --mobile-title-fade: 0.75rem;
+    /* How deep rows dissolve as a disclosure rolls them under the header or
+       parent row above (host-components.css). The transcript's own depth. */
+    --disclosure-fade: var(--thread-top-fade);
+    /* The band below the mobile header where content dissolves on its way
+       under the bar (.app-header::after in mobile.css). */
+    --mobile-header-fade: 0.5rem;
     /* How far the navigation focus marker (.nav-focus-stuck, host-components.css)
        reaches beyond a turn's box. The marker is a background wash whose visible
        edge IS the box, plus a glow blooming past it; this is the reach the
@@ -364,11 +368,16 @@ html {
 @media (pointer: coarse) {
     :root {
         --scroll-chevron-size: var(--mobile-header-icon-box);
+        /* How far a chevron's tap target reaches past its circle, on every
+           side (chat/input-messages.css). It equals the 0.75rem gap each
+           chevron keeps to the title bar and the composer, so it never takes
+           their taps. */
+        --scroll-chevron-reach: 0.75rem;
     }
 }
 
 /* Dark theme (default) */
-html, html[data-theme="dark"] {
+html, html[data-theme-mode="dark"] {
     /* Very dark blue, anchored on the brand/logo blue (--brand-blue-deep
        #0a4ea8) but much darker — the app's near-black surfaces retinted toward
        navy so the whole dark theme reads as "logo blue, dark" rather than grey.
@@ -384,13 +393,19 @@ html, html[data-theme="dark"] {
     --bg-hover: #122a4a;
     --bg-selected: #163356;
     /* Accent-tinted "picked" surface: user message bubble, selected/answered
-       question option, freetext resolution, collapsed-turn stub. One recipe so
+       question option, freetext resolution. One recipe so
        the whole picked family stays in lockstep (overridden per theme below). */
     --picked-surface: color-mix(in srgb, var(--accent) 12%, var(--bg-tertiary));
     --text-primary: #e6edf3;
     --text-secondary: #8b949e;
     --text-muted: #6e7681;
     --text-on-accent: #fff;
+    /* Bold text, where the UI font has no bold face ([data-font-bold]): a step
+       brighter than the text, like a terminal's bright attribute. */
+    --text-strong: color-mix(in oklab, var(--text-primary) 60%, white);
+    /* A theme's text glow, off by default. The engine compiles a theme's value
+       into the text-shadow part tokens, so no rule reads this token. */
+    --text-glow: none;
     --accent: #58a6ff;
     --accent-light: #7ab8ff;
     /* Action-button blue — darker than the bright sky-blue --accent (which stays
@@ -399,6 +414,12 @@ html, html[data-theme="dark"] {
        good contrast either way. */
     --accent-action: color-mix(in srgb, var(--brand-blue) 82%, var(--accent));
     --accent-green: #3fb950;
+    /* Green for a status WORD in a pill ("Installed", "applied"). The full
+       --accent-green shouts at pill size, so this pulls it toward the grey of
+       secondary text. One declaration serves both themes: it resolves against
+       whichever --accent-green and --text-secondary the theme sets. Host-only,
+       like --accent-notable below. */
+    --accent-green-soft: color-mix(in srgb, var(--accent-green) 60%, var(--text-secondary));
     /* Caution ONLY — see the --accent-notable note below for the other half of
        what this token used to carry. A muted sand rather than a saturated gold:
        the previous #d29922 was GitHub's attention-yellow, tuned for GitHub's
@@ -430,16 +451,16 @@ html, html[data-theme="dark"] {
        rather than a preference. The marker used to wash the landed element in
        --accent at 16%, which is the same hue at nearly the same alpha as
        --picked-surface (--accent at 12%, worn by the user bubble, the selected
-       question option and the collapsed-turn stub), so a spotlit turn read as a
+       question option), so a spotlit turn read as a
        PICKED surface rather than as a marker. Blue could not have carried the
        signal anyway: the header, the links and the badges are all already blue,
        so nothing about an accent wash says "look here".
 
-       The light theme carries a mid GREY rather than white, which looks like an
+       The light theme carries a GREY rather than white, which looks like an
        oversight and is not: the two themes have opposite problems, so one value
        cannot serve both. Over a near-black navy a wash can only lift toward its
        own colour, so dark needs the brightest neutral there is; over white nothing
-       can be added, so light needs a DARK neutral to sink the surface instead.
+       can be added, so light needs a DARKER neutral to sink the surface instead.
        Same absence of hue, driven from opposite ends of the scale.
 
        Do not reuse a SEMANTIC token for either value. A marker must not assert a
@@ -452,15 +473,21 @@ html, html[data-theme="dark"] {
        and never renders in an app iframe, so this is absent from the engine's
        sdk_iframe.css and must never be referenced from shared-components.css. */
     --nav-focus-glow: #ffffff;
-    /* Sole survivor of the --initiator-* family: the coding-agent brand orange,
-       worn by the chat executor chip and the Claude mark. The you / agent /
-       engine members were never referenced and have been removed. */
+    /* The marker's hairline border, off here: the white wash already stands out
+       on navy. Keep it defined, since a missing value drops the whole marker. */
+    --nav-focus-border-alpha: 0%;
+    /* Sole survivor of the --initiator-* family: the coding-agent brand orange.
+       Its one reader is --claude-mark below. */
     --initiator-coding-agent: #fb923c;
-    /* Reason hues — only ever paint the summary line of an engine panel. */
-    --reason-trigger: #f59e0b;
-    --reason-applied: #10b981;
-    --reason-failed: #ef4444;
-    --reason-muted: #888888;
+    /* The actor icons' brand colours, one value for both modes. Each var() that
+       reads them repeats the default as its fallback, so a mark painted before
+       this sheet loads looks the same. --claude-mark resolves here on <html>,
+       so a theme that sets only --initiator-coding-agent still recolours it. */
+    --lucidos-mark-bg-top: #2d83e0;
+    --lucidos-mark-bg-bottom: #0a4ea8;
+    --lucidos-mark-fg: #ffffff;
+    --claude-mark: var(--initiator-coding-agent);
+    --codex-mark: var(--accent-light);
     --shadow-sm: 0 4px 12px rgba(0, 0, 0, 0.3);
     --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.4);
     --shadow-lg: 0 8px 32px rgba(0, 0, 0, 0.4);
@@ -501,9 +528,62 @@ html, html[data-theme="dark"] {
        alpha so it lightens without flattening the brand blue; it crossfades in/out
        as focus moves between panes. */
     --focus-header-tint: rgba(169, 197, 232, 0.12);
+    /* A second focus cue: a line along the bottom of the focused pane's header
+       segment. Off by default, so the wash above carries focus alone. A theme
+       that wants an underline instead sets a colour here and clears the tint.
+       A px width, like a border: a rem would round at a scaled root. */
+    --focus-header-underline: transparent;
+    --focus-header-underline-width: 2px;
     /* Reclaimed macOS title-bar band (.titlebar-strip) — solid = the gradient's
        TOP stop above, so the strip is seamless with the header's top edge. */
     --titlebar-strip-bg: var(--header-bar-top);
+    /* 1 carries --header-gradient up through that band as one fill with the
+       header (panels/shell.css). Off here, so the band stays solid. A theme
+       that sets its own header fill gets 1 (theme-tokens.json). */
+    --titlebar-strip-continues: 0;
+    /* The header bar's foreground scale, the same in both modes because the
+       bar is brand blue in both. Declared here, on <html>, rather than on
+       .pane-header, so a theme can retune it (panels/shell.css). */
+    --header-fg: #ffffff;
+    /* An alpha of its own, because the Filter glyph paints the muted tone as
+       an opaque shape under a group opacity (.filter-glyph in shell.css). */
+    --header-fg-muted-alpha: 0.72;
+    --header-fg-muted: color-mix(in srgb, var(--header-fg) calc(var(--header-fg-muted-alpha) * 100%), transparent);
+    /* The veil steps a header control wears, as alphas of --header-fg: one step
+       under the pointer, a stronger one while toggled on. Alphas rather than
+       colours, because a badge riding a control washes the same veil over the
+       ring colour, so the ring matches the square its button drew. */
+    --header-control-veil-hover: 12%;
+    --header-control-veil-active: 22%;
+    --header-control-veil-active-hover: 30%;
+    /* Off, so the bar reads as one seamless header across the pane splits. The
+       divider geometry is kept (panels/shell.css), so a theme can turn it on. */
+    --header-divider: transparent;
+    --header-badge-bg: #ffffff;
+    --header-badge-fg: var(--brand-blue-deep);
+
+    /* The protected palette of the default theme, which paints nothing inline.
+       Engine-derived and literal, so no override flows through (ADR 0309).
+       core/themes tests fail on drift and print the block to paste. */
+    --protected-bg: #07172e;
+    --protected-surface: #0d2244;
+    --protected-inset: #0d2244;
+    --protected-raised: #163052;
+    --protected-picked: #1e3e67;
+    --protected-text: #e6edf3;
+    --protected-text-muted: #a0aab4;
+    --protected-accent: #62abff;
+    --protected-caution: #d9c48f;
+    --protected-confirm-text: #45be55;
+    --protected-danger-text: #ff8579;
+    --protected-confirm: #008a28;
+    --protected-on-confirm: #ffffff;
+    --protected-danger: #dd3532;
+    --protected-on-danger: #ffffff;
+    --protected-action: #2176d5;
+    --protected-on-action: #ffffff;
+    --protected-scrim: rgba(0, 0, 0, 0.5);
+    --protected-font-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, 'Fira Code', 'JetBrains Mono', Monaco, Consolas, monospace;
 }
 
 /* iOS PWA dark-mode brand-blue correction (iPhone OLED).
@@ -518,8 +598,8 @@ html, html[data-theme="dark"] {
    `--accent` is intentionally NOT overridden — the lighter sky-blue accent does
    not pick up the OLED violet, and nudging it shifted accent-derived chrome
    (the --focus-ring band and the info-toast border) off the app's standard blue.
-   Higher specificity than the `html, html[data-theme="dark"]` block above. */
-html.ios-pwa[data-theme="dark"] {
+   Higher specificity than the `html, html[data-theme-mode="dark"]` block above. */
+html.ios-pwa[data-theme-mode="dark"] {
     --header-bar-top: #15579c;
     --header-bar-bottom: #0b3a66;
     --header-gradient: linear-gradient(180deg, var(--header-bar-top) 0%, var(--header-bar-bottom) 100%);
@@ -527,7 +607,7 @@ html.ios-pwa[data-theme="dark"] {
 }
 
 /* Light theme */
-html[data-theme="light"] {
+html[data-theme-mode="light"] {
     color-scheme: light;
     --bg-primary: #ffffff;
     --bg-secondary: #f6f8fa;
@@ -536,6 +616,9 @@ html[data-theme="light"] {
     --border-color: #d0d7de;
     --bg-hover: #eaeef2;
     --bg-selected: #eff2f5;
+    /* Elevation runs toward white here, so a floating surface sits on the
+       brightest fill and floats on its shadow and hairline. */
+    --surface-bg: var(--bg-primary);
     /* Lighter in light mode — a softer tint over the near-white secondary surface
        instead of the heavier grey tertiary, so the bubble reads gentler. */
     --picked-surface: color-mix(in srgb, var(--accent) 10%, var(--bg-secondary));
@@ -543,6 +626,7 @@ html[data-theme="light"] {
     --text-secondary: #656d76;
     --text-muted: #8b949e;
     --text-on-accent: #fff;
+    --text-strong: color-mix(in oklab, var(--text-primary) 60%, black);
     --accent: #0969da;
     --accent-light: #218bff;
     /* Action-button blue — light mode uses the brand blue instead of the much
@@ -558,18 +642,20 @@ html[data-theme="light"] {
     --accent-orange: #c26a4a;
     /* Neutral notable state — see the dark-theme note. Host-only. */
     --accent-notable: #5a7492;
-    /* Marker spotlight, a mid grey. See the dark-theme note for why it carries no
+    /* Marker spotlight, a light grey. See the dark-theme note for why it carries no
        hue, why it is not the accent, and why the two themes sit at opposite ends
        of the neutral scale rather than sharing one value: the marker's alphas are
        low and nothing can be added to white, so on this theme the wash has to
-       darken the surface where the dark one brightens it. Host-only. */
-    --nav-focus-glow: #454545;
+       darken the surface where the dark one brightens it. Host-only.
+       Keep the wash LIGHTER than --bg-tertiary. The question option cards wear
+       that grey, so a wash at the same shade makes a landed card's options
+       vanish into it. At 16% this lands near #f1f1f1, between white and the card. */
+    --nav-focus-glow: #a8a8a8;
+    /* The marker's hairline border. The light wash is faint over white, so the
+       border is what outlines the landed turn. 60% reads as a hairline, not a frame. */
+    --nav-focus-border-alpha: 60%;
     /* Light-theme variants — darkened so each hue passes contrast on the white surface. */
     --initiator-coding-agent: #ea7c2a;
-    --reason-trigger: #b45309;
-    --reason-applied: #047857;
-    --reason-failed: #b91c1c;
-    --reason-muted: #6e7781;
     --shadow-sm: 0 4px 12px rgba(0, 0, 0, 0.08);
     --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.1);
     --shadow-lg: 0 8px 32px rgba(0, 0, 0, 0.1);
@@ -598,6 +684,28 @@ html[data-theme="light"] {
     /* Reclaimed macOS title-bar band (.titlebar-strip) — solid = the gradient's
        TOP stop above, so the strip is seamless with the header. */
     --titlebar-strip-bg: var(--header-bar-top);
+    --titlebar-strip-continues: 0;
+
+    /* The default theme's protected palette, light mode (see the dark block). */
+    --protected-bg: #ffffff;
+    --protected-surface: #ffffff;
+    --protected-inset: #f6f8fa;
+    --protected-raised: #e1e4e8;
+    --protected-picked: #c7d5e6;
+    --protected-text: #1f2328;
+    --protected-text-muted: #545c65;
+    --protected-accent: #0058bd;
+    --protected-caution: #745716;
+    --protected-confirm-text: #006927;
+    --protected-danger-text: #ba001f;
+    --protected-confirm: #1a7f37;
+    --protected-on-confirm: #ffffff;
+    --protected-danger: #cf222e;
+    --protected-on-danger: #ffffff;
+    --protected-action: #1a6fd0;
+    --protected-on-action: #ffffff;
+    --protected-scrim: rgba(0, 0, 0, 0.5);
+    --protected-font-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, 'Fira Code', 'JetBrains Mono', Monaco, Consolas, monospace;
 }
 
 button,
@@ -611,9 +719,9 @@ label {
 /* Programming ligatures belong to CODE, never to prose. The font preference
    (store/actions/preferences.ts, mirrored by the index.html FOUC IIFE)
    publishes two values on <html>: --font-features-text and
-   --font-features-code. For Fira Code they are '"liga" 0, "calt" 0' and
-   '"liga" 1, "calt" 1'; for every other font both are `normal`, so nothing but
-   Fira Code changes. These two rules are their ONLY consumers in the host,
+   --font-features-code. For a font with programming ligatures (`ligatures` in
+   the font catalog) they are '"liga" 0, "calt" 0' and '"liga" 1, "calt" 1'. For
+   every other font both are `normal`, so its rendering is unchanged. These two rules are their ONLY consumers in the host,
    because a custom property inherits as a value and renders nothing until
    something applies it: the scope of the feature is decided right here.
 

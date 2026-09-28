@@ -110,8 +110,10 @@ for calling a category clean.
 | `media-capture` | the camera or the microphone, from an app frame | 2 |
 | `web-share` | the OS share sheet, from an app frame | 2 |
 | `url-mutation` | the frame writing its own session-history URL | 2 |
+| `theme-rename` | names from before *look* became *theme* | 2 |
 | `tap-strings` | the retired `tap` string forms | 1 |
 | `removed-flags` | CLI flags and tool args that were removed | 7 |
+| `removed-fields` | thread-summary fields the engine no longer sends | 7 |
 | `cred-env` | a credential read from the environment | 7 |
 | `auth-header` | an auth header built in app UI code | 7 |
 | `machine-path` | a hardcoded home or machine path | 5 |
@@ -147,9 +149,13 @@ scan web-share "navigator\.share" $inc apps
 
 scan url-mutation "history\.(replaceState|pushState)|location\.(href|assign|replace)[[:space:]]*=|window\.location[[:space:]]*=" $inc apps
 
+scan theme-rename "data-theme([^-]|\$)|data-look-|look-effects|lucidos-look|/looks?[/?'\"\`]|preferences\.(set|get)\(['\"](look|theme)['\"]" $inc --include=*.css apps
+
 scan tap-strings "\"tap\"[[:space:]]*:[[:space:]]*\"(modal|none|open_app|open_thread)\"|tap:[[:space:]]*'(modal|none|open_app|open_thread)'|kind:[[:space:]]*'none'" $all
 
-scan removed-flags "spawn-thread[^|]*--parent|run_coding_agent\([^)]*repo[[:space:]]*=" $all
+scan removed-flags "spawn-thread[^|]*--(parent|cc-model)|run_coding_agent\([^)]*repo[[:space:]]*=" $all
+
+scan removed-fields "coding_agent_applying" $all
 
 scan cred-env "CRED_[A-Z0-9_]+" --exclude-dir=auth $all
 
@@ -281,9 +287,23 @@ Per `system-knowhow/js-sdk.md`:
     The remedy is `lucidos.data.read('apps/<app-id>/<path>')`, which travels the bridge. **`lucidos.data.url()` is not a remedy.** It builds a URL for a `src` or an `href`, and fetching one is refused identically.
   - **A `<base href>` the app declares itself.** The first base in a document wins. So it replaces the pass the engine stamps for the app's own files, and behind a gateway every relative `src` / `href` then answers **401**. Severity: **broken**. The remedy is to delete it: relative refs already resolve against the app's own directory. Reference: `system-knowhow/js-sdk.md` § Setup, and [ADR 0238](https://github.com/lucidos-dev/lucidos/blob/main/docs/adr/0238-app-frame-carries-a-capability-to-its-own-files.md).
 
-  **A separate `app.js`, `style.css` or image is NOT a finding.** It was one while the frame had no way to prove itself. The engine now gives each framed document a short-lived pass to its own files. Do not flag one, and do not recommend inlining.
+  **A separate `app.js`, `style.css` or image is NOT a finding.** The engine gives each framed document a short-lived pass to its own files. Do not flag one, and do not recommend inlining. The same holds for the app's own `@font-face` and its own `<script type="module">`: the engine grants both across the frame's opaque origin, the module behind the gateway every install runs ([ADR 0289](https://github.com/lucidos-dev/lucidos/blob/main/docs/adr/0289-app-frames-load-fonts-and-modules-across-origins.md)).
 
   An app opened in its own browser tab is a top-level document and keeps all of this. Never report one as unaffected on that basis: the same app is reachable both ways, and the frame is the usual one.
+
+- **Names from before the theme rename.** *Look* became *theme*, and the
+  light/dark `theme` preference became `theme-mode` (ADR 0316). The `theme-rename`
+  scan finds the old names. Judge each hit:
+  - **stale**: `data-theme` in a selector or an attribute read. An app frame
+    still carries it for now, and it goes when its temporary measure ends
+    (`docs/temporary-measures.md` § Legacy `data-theme` in app frames).
+    Recommend `data-theme-mode`.
+  - **broken**: `data-look-effects`, `data-look-parts`, the `look` or
+    `look-effects` preference, or a `/looks` or `/look?id=` route. None of
+    them exists any more. Recommend `data-theme-effects`, `data-theme-parts`,
+    the `theme` and `theme-effects` preferences, and `/themes` or `/theme?id=`.
+  - **broken**: `theme` set to `light`, `dark` or `system`. The engine refuses
+    it. Recommend `theme-mode`. A `theme` set to a theme id is correct.
 
 Per `system-knowhow/best-practices.md`:
 
@@ -334,6 +354,9 @@ Per `system-knowhow/best-practices.md`:
 Don't enumerate user content. Per `system-knowhow/best-practices.md`:
 
 - No `data/artifacts/artifacts/`.
+- No `data/artifacts/themes/` (or `data/artifacts/looks/`, its name before the rename), `data/artifacts/config/`, `data/artifacts/auth-modules/` or `data/artifacts/scripts/`. `lucidos data write` once filed those trees under `artifacts/`, and the agent's file tools did the same for themes, so nothing reads them there: a theme never shows, and an `apis.json` never loads. Severity: **broken**. Owns the rule: `system-knowhow/lucidos-cli.md` § `lucidos data path`.
+  - Flag a file only when its content fits the tree: a theme JSON, `apis.json`, a signer `.wasm`, or a handshake script. An artifact project that happens to share the name is not a finding.
+  - Recommend writing each file again at its real path with `lucidos data write`, without the `artifacts/` segment. That also runs the engine's checks. Then delete the copy under `artifacts/`.
 - No bulk imports under `data/artifacts/imported/<service>/` that match the "dumped repo / archive" anti-pattern (file count + size are the tell). Suggest moving bulk to `.lucidos/tmp/` or `~/.lucidos/data/`.
 - No orphaned `imported/<service>/` directories — flag for review (don't auto-delete).
 - App data sits under `data/artifacts/<app-id>/`, not at the artifacts root.
@@ -361,9 +384,18 @@ Don't enumerate user content. Per `system-knowhow/best-practices.md`:
   - `lucidos spawn-thread --parent` → `--relation child` (a same-workspace
     parent-with-callback spawn). Do NOT flag `threads list --parent <uuid>` or
     `threads count --parent <uuid>`, which are current, unrelated filters.
+  - `lucidos spawn-thread --cc-model` → `--coding-agent-model` (same value).
   - `repo` passed to the `run_coding_agent` tool → `folder` (which also accepts a
     registered repo name). Do NOT flag the current `lucidos spawn-thread --repo`
     flag, which is a different, live argument.
+- **Removed thread-summary fields still read by workspace code.** A thread
+  summary comes from `lucidos.threads.list`, `lucidos threads list` or the
+  `list_threads` tool. A removed field reads as `undefined` in JS, so the code
+  quietly takes its falsy branch. Grep each one across the same four surfaces as
+  the flags above. Severity: **stale**, or **broken** for a Python `row["field"]`,
+  which raises on the missing key. Currently removed:
+  - `coding_agent_applying`. There is no replacement: it never tracked a live
+    merge reliably. Delete the read and whatever branches on it.
 
 ## Output
 

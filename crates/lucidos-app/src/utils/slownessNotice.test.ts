@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest';
 import type { MemoryUser, ProcessorUser } from '../api/client/control';
 import {
   busyEnoughToName,
+  databaseRecommendation,
+  diskRecommendation,
   formatGigabytes,
   memoryRecommendation,
   memoryUsersPhrase,
@@ -68,8 +70,9 @@ describe('processorRecommendation names one thing to do', () => {
     expect(processorRecommendation([rustc, xcode])).toBe('Quit apps you are not using.');
   });
 
-  it('says so honestly when nothing stands out, or nothing was measured', () => {
-    const nothing = 'Nothing on this computer stands out as busy. If it lasts, restart the computer.';
+  it('says what was ruled out when nothing stands out, or nothing was measured', () => {
+    const nothing = 'Lucidos found no database or disk problem, and nothing on this computer stands out as busy. '
+      + 'If it lasts, restart the computer.';
     expect(processorRecommendation([idleChrome])).toBe(nothing);
     expect(processorRecommendation([])).toBe(nothing);
   });
@@ -89,5 +92,43 @@ describe('busyEnoughToName', () => {
 describe('processorUsersPhrase', () => {
   it('lists each group with its share of the computer', () => {
     expect(processorUsersPhrase([xcode, busyLucidos])).toBe('Xcode 40%, Lucidos 30%');
+  });
+});
+
+describe('databaseRecommendation names the fix for the database', () => {
+  it('restarts Docker on a dev install, where Postgres is a container', () => {
+    expect(databaseRecommendation('not_answering', false)).toBe('Restart Docker.');
+  });
+
+  it('restarts Lucidos on a packaged install, whose gateway replaces a wedged cluster', () => {
+    expect(databaseRecommendation('not_answering', true)).toBe('Restart Lucidos.');
+  });
+
+  it('points at coding agents, then Lucidos, when the pool is used up', () => {
+    for (const packaged of [false, true]) {
+      const text = databaseRecommendation('pool_exhausted', packaged);
+      expect(text).toContain('Stop coding-agent threads you are not using.');
+      expect(text).toContain('restart Lucidos');
+      expect(text).not.toContain('Docker');
+    }
+  });
+
+  it('never suggests restarting the computer', () => {
+    for (const problem of ['not_answering', 'pool_exhausted'] as const) {
+      for (const packaged of [false, true]) {
+        expect(databaseRecommendation(problem, packaged)).not.toMatch(/computer/);
+      }
+    }
+  });
+});
+
+describe('diskRecommendation', () => {
+  it('says how much is free, to free space first, and who restarts the database after', () => {
+    expect(diskRecommendation(4e8, false)).toBe(
+      '0.4 GB free. Free up disk space. If Lucidos stays slow after that, restart Docker.',
+    );
+    expect(diskRecommendation(4e8, true)).toBe(
+      '0.4 GB free. Free up disk space. If Lucidos stays slow after that, restart Lucidos.',
+    );
   });
 });

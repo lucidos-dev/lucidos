@@ -24,10 +24,7 @@ async fn tier_1_strips_build_artifacts_after_24h_idle() {
     assert!(worktree.join(".lucidos/cache").exists());
 
     let rx = bus.subscribe();
-    // Cleanup is now disk-gated: with ample disk and a non-archived thread the
-    // worktree is kept fully warm. Put the worker under soft pressure so the
-    // routine 24 h Tier 1 strip is eligible (soft only — hard stays 0 so the
-    // 24 h window doesn't widen to 1 h).
+    // Soft pressure opens the retention gate for this non-archived thread.
     let mut worker = make_worker(pool.clone(), bus.clone(), root.clone());
     worker.free_soft_bytes = u64::MAX;
     worker.run_once().await;
@@ -169,141 +166,11 @@ async fn dirty_threads_are_exempt_from_tier_2_auto() {
     teardown_test_db(&db_name).await;
 }
 
+/// Below the hard threshold a thread with nothing live loses its build
+/// artifacts at once. A burst of just-finished sessions fills the last few GB
+/// well inside any idle window, and a full disk takes Postgres down.
 #[tokio::test]
-async fn soft_threshold_breach_emits_low_disk_notification() {
-    let (pool, db_name) = setup_test_db().await;
-    let (bus, _rx) = EventBus::new(pool.clone());
-    let bus = Arc::new(bus);
-
-    let (_tmp, root) = fresh_workspace().await;
-    let thread_id = Uuid::new_v4();
-    let _wt = add_worktree_for_thread(&root, thread_id, true).await;
-    insert_thread_summary(&pool, thread_id, false).await;
-    insert_old_event(&pool, thread_id, 5).await; // recent — Tier 1/2 won't fire
-
-    let mut worker = make_worker(pool.clone(), bus.clone(), root.clone());
-    // Force "we are under the soft threshold" by pretending the soft threshold
-    // is the entire disk size. Hard stays at 0 so we don't trigger forced
-    // Tier 1 in this test.
-    worker.free_soft_bytes = u64::MAX;
-    worker.free_hard_bytes = 0;
-
-    let rx = bus.subscribe();
-    worker.run_once().await;
-
-    let notifications = drain_notifications(rx, Duration::from_millis(200)).await;
-    let alerts: Vec<_> = notifications
-        .into_iter()
-        .filter(|n| n.title == "Low disk space on your machine")
-        .collect();
-    assert_eq!(
-        alerts.len(),
-        1,
-        "expected exactly one low-disk notification, got: {:?}",
-        alerts
-    );
-    let body = &alerts[0].message;
-    assert!(
-        !body.contains("Lucidos disk space"),
-        "body must not lead with the old 'Lucidos disk space' framing: {}",
-        body,
-    );
-    assert!(
-        body.contains("volume hosting"),
-        "body must explicitly call out the volume, not Lucidos itself: {}",
-        body,
-    );
-    // A tap has to land on the page that answers the alert. `Tap::Modal` made
-    // the notification a dead end.
-    assert_eq!(alerts[0].settings_view(), Some("disk-usage"));
-
-    pool.close().await;
-    teardown_test_db(&db_name).await;
-}
-
-/// Small Lucidos footprint + low volume → message must steer the user to look
-/// elsewhere on their machine, not at Lucidos.
-#[tokio::test]
-async fn soft_threshold_with_tiny_lucidos_footprint_blames_the_machine() {
-    let (pool, db_name) = setup_test_db().await;
-    let (bus, _rx) = EventBus::new(pool.clone());
-    let bus = Arc::new(bus);
-
-    let (_tmp, root) = fresh_workspace().await;
-    // No worktrees on disk → Lucidos footprint is 0.
-    let mut worker = make_worker(pool.clone(), bus.clone(), root.clone());
-    worker.free_soft_bytes = u64::MAX;
-    worker.free_hard_bytes = 0;
-
-    let rx = bus.subscribe();
-    worker.run_once().await;
-
-    let notifications = drain_notifications(rx, Duration::from_millis(200)).await;
-    let alerts: Vec<_> = notifications
-        .into_iter()
-        .filter(|n| n.title == "Low disk space on your machine")
-        .collect();
-    assert_eq!(alerts.len(), 1);
-    let body = &alerts[0].message;
-    assert!(
-        body.contains("other apps")
-            || body.contains("not Lucidos")
-            || body.contains("isn't Lucidos"),
-        "tiny-footprint body must point at the user's machine, not Lucidos: {}",
-        body,
-    );
-
-    pool.close().await;
-    teardown_test_db(&db_name).await;
-}
-
-/// Large Lucidos footprint + low volume: the message steers to the Disk Usage
-/// page, and names the route to it.
-#[tokio::test]
-async fn soft_threshold_with_large_lucidos_footprint_suggests_cleanup() {
-    let (pool, db_name) = setup_test_db().await;
-    let (bus, _rx) = EventBus::new(pool.clone());
-    let bus = Arc::new(bus);
-
-    let (_tmp, root) = fresh_workspace().await;
-    let thread_id = Uuid::new_v4();
-    let _wt = add_worktree_for_thread(&root, thread_id, true).await;
-    insert_thread_summary(&pool, thread_id, false).await;
-    insert_old_event(&pool, thread_id, 5).await;
-
-    let mut worker = make_worker(pool.clone(), bus.clone(), root.clone());
-    worker.free_soft_bytes = u64::MAX;
-    worker.free_hard_bytes = 0;
-    // Boundary at 1 byte forces the "large footprint" branch — the planted
-    // worktree's artifacts comfortably exceed that without us having to write
-    // gigabytes to disk.
-    worker.large_footprint_bytes = 1;
-
-    let rx = bus.subscribe();
-    worker.run_once().await;
-
-    let notifications = drain_notifications(rx, Duration::from_millis(200)).await;
-    let alerts: Vec<_> = notifications
-        .into_iter()
-        .filter(|n| n.title == "Low disk space on your machine")
-        .collect();
-    assert_eq!(alerts.len(), 1);
-    let body = &alerts[0].message;
-    assert!(
-        body.contains("Settings → System → Disk Usage"),
-        "large-footprint body must point at the Disk Usage page: {}",
-        body,
-    );
-
-    pool.close().await;
-    teardown_test_db(&db_name).await;
-}
-
-#[tokio::test]
-async fn hard_threshold_breach_forces_tier_1_on_recently_idle_worktrees() {
-    // Below the hard threshold, Tier 1 widens from 24 h to 1 h. A worktree
-    // idle for 90 minutes should get its build artifacts stripped despite
-    // not crossing the normal 24 h Tier 1 line.
+async fn hard_pressure_strips_the_target_of_a_thread_idle_minutes() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
     let bus = Arc::new(bus);
@@ -312,50 +179,7 @@ async fn hard_threshold_breach_forces_tier_1_on_recently_idle_worktrees() {
     let thread_id = Uuid::new_v4();
     let worktree = add_worktree_for_thread(&root, thread_id, true).await;
     insert_thread_summary(&pool, thread_id, false).await;
-    insert_old_event(&pool, thread_id, 90 * 60).await; // 90 minutes idle
-
-    assert!(worktree.join("target").exists());
-
-    let mut worker = make_worker(pool.clone(), bus.clone(), root.clone());
-    worker.free_hard_bytes = u64::MAX; // force hard-threshold path
-    worker.free_soft_bytes = u64::MAX; // also under soft (which is implicit)
-
-    let rx = bus.subscribe();
-    worker.run_once().await;
-
-    let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;
-    let cleaned: Vec<_> = events
-        .into_iter()
-        .filter(|(t, ..)| *t == thread_id)
-        .collect();
-    assert_eq!(
-        cleaned.len(),
-        1,
-        "Tier 1 should have fired under hard pressure"
-    );
-    assert_eq!(cleaned[0].1, 1, "must be Tier 1, not Tier 2");
-    assert!(
-        !worktree.join("target").exists(),
-        "target/ should be stripped"
-    );
-
-    pool.close().await;
-    teardown_test_db(&db_name).await;
-}
-
-#[tokio::test]
-async fn hard_threshold_does_not_force_tier_1_on_active_worktrees() {
-    // Even with hard pressure, a worktree active in the last hour stays
-    // untouched (FORCE_TIER_1_IDLE = 1 h floor).
-    let (pool, db_name) = setup_test_db().await;
-    let (bus, _rx) = EventBus::new(pool.clone());
-    let bus = Arc::new(bus);
-
-    let (_tmp, root) = fresh_workspace().await;
-    let thread_id = Uuid::new_v4();
-    let worktree = add_worktree_for_thread(&root, thread_id, true).await;
-    insert_thread_summary(&pool, thread_id, false).await;
-    insert_old_event(&pool, thread_id, 5 * 60).await; // 5 minutes idle — active
+    insert_old_event(&pool, thread_id, 5 * 60).await;
 
     let mut worker = make_worker(pool.clone(), bus.clone(), root.clone());
     worker.free_hard_bytes = u64::MAX;
@@ -369,50 +193,59 @@ async fn hard_threshold_does_not_force_tier_1_on_active_worktrees() {
         .into_iter()
         .filter(|(t, ..)| *t == thread_id)
         .collect();
+    assert_eq!(cleaned.len(), 1, "Tier 1 fires under hard pressure");
+    assert_eq!(cleaned[0].1, 1, "must be Tier 1, not a removal tier");
+    assert!(!worktree.join("target").exists(), "target/ is stripped");
+    assert!(worktree.exists(), "the worktree itself stays");
+    let short = &thread_id.simple().to_string()[..8];
     assert!(
-        cleaned.is_empty(),
-        "active worktree must not be touched: {:?}",
-        cleaned
-    );
-    assert!(
-        worktree.join("target").exists(),
-        "target/ must survive: only 5 min idle"
+        branch_exists(&root, &format!("test/{short}")).await,
+        "the branch stays"
     );
 
     pool.close().await;
     teardown_test_db(&db_name).await;
 }
 
+/// Liveness, not a recent event, is what protects a tree under hard pressure.
+/// The fixture is Tier 0 eligible too, whose grace is also zero here.
 #[tokio::test]
-async fn ample_free_disk_emits_no_notification() {
+async fn hard_pressure_keeps_the_tree_of_a_live_thread() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
     let bus = Arc::new(bus);
 
     let (_tmp, root) = fresh_workspace().await;
     let thread_id = Uuid::new_v4();
-    let _wt = add_worktree_for_thread(&root, thread_id, true).await;
+    let worktree = add_worktree_at_main_for_thread(&root, thread_id).await;
+    tokio::fs::create_dir_all(worktree.join("target"))
+        .await
+        .unwrap();
     insert_thread_summary(&pool, thread_id, false).await;
-    insert_old_event(&pool, thread_id, 5).await;
+    insert_old_event(&pool, thread_id, 0).await;
 
-    // make_worker defaults: free_soft/hard = 0 → never trigger
-    let worker = make_worker(pool.clone(), bus.clone(), root.clone());
+    let mut worker = make_worker_with_active(
+        pool.clone(),
+        bus.clone(),
+        root.clone(),
+        active_threads(&[thread_id]),
+    );
+    worker.free_hard_bytes = u64::MAX;
+    worker.free_soft_bytes = u64::MAX;
 
     let rx = bus.subscribe();
     worker.run_once().await;
 
-    let notifications = drain_notifications(rx, Duration::from_millis(200)).await;
-    let alerts: Vec<_> = notifications
+    let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;
+    let cleaned: Vec<_> = events
         .into_iter()
-        .filter(|n| {
-            n.title.contains("disk") || n.title.contains("Disk") || n.title.contains("auto-cleanup")
-        })
+        .filter(|(t, ..)| *t == thread_id)
         .collect();
     assert!(
-        alerts.is_empty(),
-        "no disk-related notifications when free disk is ample, got: {:?}",
-        alerts
+        cleaned.is_empty(),
+        "a live thread is untouched: {cleaned:?}"
     );
+    assert!(worktree.join("target").exists(), "target/ survives");
 
     pool.close().await;
     teardown_test_db(&db_name).await;
@@ -883,11 +716,10 @@ async fn fan_in_card_behind_a_stopped_note_keeps_archived_worktree() {
     teardown_test_db(&db_name).await;
 }
 
-/// Even build-artifact stripping (Tier 1) waits for disk pressure now: with
-/// comfortable disk and a non-archived thread, a day-idle worktree keeps its
-/// `target/`/`node_modules/` so the next reopen is fully warm.
+/// With comfortable disk and a non-archived thread, a day-idle worktree whose
+/// change is still pending keeps its `target/` and `node_modules/`.
 #[tokio::test]
-async fn ample_disk_keeps_non_archived_worktree_artifacts() {
+async fn ample_disk_keeps_artifacts_of_a_thread_with_a_pending_change() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
     let bus = Arc::new(bus);
@@ -896,6 +728,7 @@ async fn ample_disk_keeps_non_archived_worktree_artifacts() {
     let thread_id = Uuid::new_v4();
     let worktree = add_worktree_for_thread(&root, thread_id, true).await;
     insert_thread_summary(&pool, thread_id, false).await;
+    insert_pending_change_for_thread(&pool, thread_id, &root).await;
     insert_old_event(&pool, thread_id, TIER_1_AGE).await; // > 24h idle
 
     let rx = bus.subscribe();
@@ -1008,4 +841,92 @@ async fn branch_exists(repo_root: &std::path::Path, branch: &str) -> bool {
     .await
     .map(|o| o.status.success())
     .unwrap_or(false)
+}
+
+// ---------------------------------------------------------------------------
+// Pressure is read at the decision, not at the start of the cycle.
+// ---------------------------------------------------------------------------
+
+/// Reports "no live session", and on that call sets the free-disk probe to
+/// `recovered`: disk recovering while the cycle waits on the database.
+struct DiskRecoversDuringLookup {
+    reading: Arc<std::sync::Mutex<Option<u64>>>,
+    recovered: Option<u64>,
+}
+
+#[async_trait::async_trait]
+impl super::ActiveThreads for DiskRecoversDuringLookup {
+    async fn is_active(&self, _thread_id: Uuid) -> bool {
+        if self.recovered.is_some() {
+            *self.reading.lock().unwrap() = self.recovered;
+        }
+        false
+    }
+}
+
+/// Runs one cycle over a non-archived, Tier-0-eligible worktree, with the
+/// given free-disk probe. Returns whether the worktree survived.
+async fn tier_0_worktree_survives(
+    probe: super::FreeDiskProbe,
+    active: Arc<dyn super::ActiveThreads>,
+) -> bool {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let bus = Arc::new(bus);
+    let (_tmp, root) = fresh_workspace().await;
+    let thread_id = Uuid::new_v4();
+    let worktree = add_worktree_at_main_for_thread(&root, thread_id).await;
+    insert_thread_summary(&pool, thread_id, false).await;
+    insert_old_event(&pool, thread_id, TIER_0_AGE_SECS).await;
+
+    let mut worker = make_worker_with_active(pool.clone(), bus, root.clone(), active);
+    worker.free_disk = probe;
+    worker.free_soft_bytes = super::FREE_DISK_SOFT_BYTES;
+    worker.free_hard_bytes = super::FREE_DISK_HARD_BYTES;
+    worker.run_once().await;
+
+    let survived = worktree.exists();
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+    survived
+}
+
+/// Free disk reads 12 GB until the thread lookup answers, then `recovered`.
+async fn tier_0_survives_recovery_during_lookup(recovered: Option<u64>) -> bool {
+    let (probe, reading) = settable_probe(Some(12 * GB));
+    let active = Arc::new(DiskRecoversDuringLookup { reading, recovered });
+    tier_0_worktree_survives(probe, active).await
+}
+
+/// The incident: the cycle probed 12 GB, waited ten minutes on Postgres, then
+/// opened the retention gate on that reading with 232 GB free.
+#[tokio::test]
+async fn disk_that_recovers_while_the_cycle_waits_keeps_the_retention_gate_closed() {
+    assert!(
+        tier_0_survives_recovery_during_lookup(Some(232 * GB)).await,
+        "a non-archived worktree must stay warm once free disk is back above soft"
+    );
+}
+
+/// Control for the tests around it: with no recovery, 12 GB opens the gate
+/// and Tier 0 reclaims the same worktree.
+#[tokio::test]
+async fn disk_still_low_at_the_decision_opens_the_retention_gate() {
+    assert!(
+        !tier_0_survives_recovery_during_lookup(None).await,
+        "12 GB is below soft, so the gate opens and Tier 0 reclaims"
+    );
+}
+
+/// Tier 0's own checks (fan-in, pending change, git) can wait on the database
+/// after the gate opened. The gate is asked again right before the removal.
+/// The stranded check and the first gate read 12 GB; the read before the
+/// removal sees 232 GB.
+#[tokio::test]
+async fn disk_that_recovers_during_tier_0_checks_keeps_the_worktree() {
+    let probe = scripted_probe(&[12 * GB, 12 * GB, 232 * GB]);
+    assert!(
+        tier_0_worktree_survives(probe, no_active_threads()).await,
+        "the removal must re-check the gate after Tier 0's own checks"
+    );
 }
