@@ -199,6 +199,10 @@ impl ThreadEvent {
             Self::SpokenReplyGenerated { .. } => "SpokenReplyGenerated",
             Self::SpokenMessageReceived { .. } => "SpokenMessageReceived",
             Self::WorkDelegated { .. } => "WorkDelegated",
+            Self::SideQuestionAsked { .. } => "SideQuestionAsked",
+            Self::SideQuestionAnswered { .. } => "SideQuestionAnswered",
+            Self::SideQuestionFailed { .. } => "SideQuestionFailed",
+            Self::SideQuestionDismissed { .. } => "SideQuestionDismissed",
             // Transient
             Self::CumulativeTextUpdated { .. } => "CumulativeTextUpdated",
             Self::LlmCallRetried { .. } => "LlmCallRetried",
@@ -325,6 +329,10 @@ impl ThreadEvent {
         "SpokenMessageReceived",
         "WorkDelegated",
         "SpokenReplyGenerated",
+        "SideQuestionAsked",
+        "SideQuestionAnswered",
+        "SideQuestionFailed",
+        "SideQuestionDismissed",
     ];
 
     /// The `#[serde(alias = ...)]` spellings, kept for rows written before a
@@ -366,6 +374,31 @@ impl ThreadEvent {
     /// Whether `name` is a `ThreadEvent` wire name, current or legacy.
     pub fn is_reserved_type_name(name: &str) -> bool {
         Self::RESERVED_TYPE_NAMES.contains(&name) || Self::LEGACY_TYPE_NAME_ALIASES.contains(&name)
+    }
+
+    /// The `event_type` names of the four side-question events, for readers
+    /// that filter in SQL. `is_side_question_event` is the typed twin.
+    ///
+    /// No agent may see these rows, and none may count as thread activity.
+    /// Every reader that walks a thread's events generically excludes them,
+    /// each pinned by a test that feeds it these rows.
+    pub const SIDE_QUESTION_EVENT_TYPES: &'static [&'static str] = &[
+        "SideQuestionAsked",
+        "SideQuestionAnswered",
+        "SideQuestionFailed",
+        "SideQuestionDismissed",
+    ];
+
+    /// Whether this is one of the four side-question events, which no agent,
+    /// trigger or event wait may ever see.
+    pub fn is_side_question_event(&self) -> bool {
+        matches!(
+            self,
+            Self::SideQuestionAsked { .. }
+                | Self::SideQuestionAnswered { .. }
+                | Self::SideQuestionFailed { .. }
+                | Self::SideQuestionDismissed { .. }
+        )
     }
 
     /// Whether this variant fires once per streamed text chunk (many fires per

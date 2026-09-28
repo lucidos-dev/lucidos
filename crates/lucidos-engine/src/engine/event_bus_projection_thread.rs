@@ -1668,6 +1668,12 @@ impl EventBus {
             // renderer/agentic loop consult this row without changing the
             // thread summary projection.
             | ThreadEvent::QueuedMessageRemoved { .. }
+            // A side question is a card beside the thread, never a turn, so
+            // it moves no column (ADR 0320).
+            | ThreadEvent::SideQuestionAsked { .. }
+            | ThreadEvent::SideQuestionAnswered { .. }
+            | ThreadEvent::SideQuestionFailed { .. }
+            | ThreadEvent::SideQuestionDismissed { .. }
             // Markers over a held message. The release's own
             // `MessageReceived` is what moves the projection.
             | ThreadEvent::MessageHeld { .. }

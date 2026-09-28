@@ -21,6 +21,7 @@ import { LucidosMarkIcon } from '../shared/icons';
 import { Overlay } from '../shared/Overlay';
 import { anchoredPanelStyle, useAnchoredPosition } from '../../hooks/useAnchoredPopover';
 import { viewportIsMobile } from '../../utils/viewport';
+import { keepFocusOnPress } from '../../utils/dom';
 import { ModelSelectionPicker } from '../shared/ModelSelectionPicker';
 
 /** The Lucidos Agent's model + reasoning picker — the chat-agent sibling of
@@ -129,6 +130,7 @@ export function LucidosControlMenu({ threadId, composeContext }: { threadId?: st
         class="icon-btn header-icon commands-btn lucidos-commands-btn"
         data-tooltip={`${LUCIDOS_AGENT_LABEL} model`}
         aria-label={`${LUCIDOS_AGENT_LABEL} model`}
+        onMouseDown={keepFocusOnPress}
         onClick={() => {
           if (open.value) close();
           else open.value = true;

@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from 'preact/hooks';
 import type { JSX } from 'preact';
 import { hasCoarsePointer, isMobile } from '../../utils/viewport';
+import { keepFocusOnPress } from '../../utils/dom';
 import { useAnchoredPosition, type AnchorPosition } from '../../hooks/useAnchoredPopover';
 import { useHidePanelWebviewWhile } from '../../hooks/useHidePanelWebviewWhile';
 import { Overlay } from './Overlay';
@@ -395,11 +396,8 @@ export function Dropdown({
           disabled={disabled}
           aria-haspopup="listbox"
           aria-expanded={open}
-          // Focus stays where it is. On iOS a mousedown on a button blurs the
-          // focused field, and a keyboard sliding away mid-open moves the menu
-          // under the reader. The open effect still focuses the trigger on
-          // desktop.
-          onMouseDown={(e) => e.preventDefault()}
+          // The open effect still focuses the trigger on desktop.
+          onMouseDown={keepFocusOnPress}
           onClick={() => {
             if (disabled) return;
             if (open) closeDropdown(); else openDropdown();

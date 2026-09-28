@@ -803,7 +803,7 @@ html[data-theme-mode="dark"] .thread-row .message-channel-tag.channel-error {
 }
 
 /* The title text, then the row's actions at the line's right end. The bottom
- * margin adds to the column gap, so the title has 0.875rem below it. The font
+ * margin adds to the column gap, so the title has 0.75rem below it. The font
  * size sits here rather than on the title, so the status mark's `ex` and `cap`
  * units measure the title's own letters.
  *
@@ -815,7 +815,7 @@ html[data-theme-mode="dark"] .thread-row .message-channel-tag.channel-error {
     align-items: flex-start;
     gap: 0.5rem;
     min-height: calc(var(--thread-row-title-line) + var(--space-xs));
-    margin-bottom: var(--space-sm);
+    margin-bottom: 0.375rem;
     font-size: var(--font-size-md);
     line-height: var(--thread-row-title-line);
 }
@@ -836,8 +836,8 @@ html[data-theme-mode="dark"] .thread-row .message-channel-tag.channel-error {
  * still right-aligned; nothing shrinks, so the date never truncates. The gap
  * is the only spacing. `.message-channel-tag` brings a margin from its
  * chat-header use, and that margin would push the chips off the shared line.
- * Items align on their first baseline, so a name chip that wraps grows
- * downward. The chips keep one top edge and the date reads with their first line.
+ * Items align on their last baseline, so a name chip that wraps grows
+ * upward. The chips keep one bottom edge and the date reads with their last line.
  *
  * A row with sub-threads moves its chips down to the sub-thread line. There
  * they wrap inside their own box, laid out the same way. */
@@ -846,7 +846,7 @@ html[data-theme-mode="dark"] .thread-row .message-channel-tag.channel-error {
     display: flex;
     flex-wrap: wrap;
     justify-content: flex-end;
-    align-items: baseline;
+    align-items: last baseline;
     gap: 0.25rem 0.375rem;
 }
 

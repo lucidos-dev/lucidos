@@ -11,9 +11,9 @@ describe('ChangeApplied does NOT eagerly light the update badge', () => {
   // truth — the build-id check (syncClientUpdateFromBuild), covered in
   // actions/client-update.test.ts. ChangeApplied must NOT light it: at apply time
   // the rebuilt bundle isn't served yet, so an eager badge would lead the real
-  // update and could appear before (or without) the toast. The ChangeApplied
-  // handler instead nudges the service worker; the badge+toast surface together
-  // once the new /sw.js is genuinely served.
+  // update and could appear before (or without) the toast. The badge and toast
+  // surface together on the engine's ServedFrontendAdvanced, once the new
+  // /sw.js is genuinely served.
   beforeEach(() => {
     vi.useFakeTimers();
     updateAvailable.value = false;
@@ -58,8 +58,8 @@ describe('Applied toast has no premature Refresh button', () => {
   it('carries NO Refresh action even when client_update=true', () => {
     // At ChangeApplied time the rebuilt frontend isn't ready (the build-watch
     // rebuilds over the next few seconds), so a Refresh now would reload the OLD
-    // build. The genuine affordance is the SW-driven "New version available →
-    // Refresh" toast, which fires only once the rebuild is actually activated.
+    // build. The genuine affordance is the "New version available → Refresh"
+    // toast, which fires only once the rebuild is actually served.
     const threadId = 't-no-refresh';
     const applyKey = `applying-${threadId}`;
 

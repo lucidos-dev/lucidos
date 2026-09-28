@@ -42,7 +42,7 @@ What each piece does — include only what you need:
 |---|---|---|
 | `<title>` | Tab title | (always include — browsers require it) |
 | `<script src="/api/v1/sdk-prefs.js"></script>` | Synchronous prefs script. Sets `data-theme-mode`, `--bg-primary`, and `--font-ui` on `<html>` (plus `--user-ui-scale` when the user has set one) *before* any subsequent stylesheet evaluates. The engine resolves this device's theme mode, theme, font and scale and serves them inside the script, so an app frame needs no access to the shell's storage. It stamps `?device=` onto this one `src` to know whose to serve, and adds nothing to your document. The same script carries the device's Autocorrect switch, so `sdk.js` knows it before any field can take focus, and sets `data-motion` (§ Reduced motion), `data-theme-effects` (§ Theme parts) and `data-font-bold` (§ Theme variables). Eliminates the flash-of-default-theme between iframe load and `applyPreferences()`. **Place as early in `<head>` as possible: before `sdk-iframe.css`, before any other `<link rel="stylesheet">`, and before any inline `<style>` that reads theme vars.** Inlining `--bg-primary` directly (not just `data-theme-mode`) is what makes the body's `background: var(--bg-primary, …)` paint correctly even when stylesheets are loaded asynchronously (JS-injected, dynamic `import()`, dev-mode bundlers like Vite that ship CSS as JS modules). | App doesn't use `sdk-iframe.css` (no FOUC to fix) |
-| `<link rel="stylesheet" href="/api/v1/sdk-iframe.css">` | Theme tokens (`--bg-primary`, `--accent`, etc.), dark/light variables, default body/input/scrollbar styling, **and Lucidos's shared component classes** (`.action-btn` + `.action-btn-confirm`/`.action-btn-danger`, `.button-group`, `.icon-btn`, `.label`, `.title`, `.segmented-control`/`.segmented-btn`, `.list-row*`, `.markdown-content`, `.progress-bar`, `.empty-state`, `.accent-link`). Use these class names and the app's buttons/lists/etc. render identically to the host shell. The body is set to `--font-size-md`, the type scale's body step, and inputs and buttons are set to `--font-ui` at the same step, so text and controls you do not size yourself land where the host shell's body text lands. Note that the body step is NOT the root font-size: the root is the user's UI scale, and `1rem` is `--font-size-xl`, a section heading. Text that names no size at all therefore comes out a step and a half larger than body, which is why the defaults above exist. | App ships its own complete stylesheet and doesn't want Lucidos theming |
+| `<link rel="stylesheet" href="/api/v1/sdk-iframe.css">` | Theme tokens (`--bg-primary`, `--accent`, etc.), dark/light variables, default body/input/scrollbar styling, **and Lucidos's shared component classes** (`.action-btn` + `.action-btn-confirm`/`.action-btn-danger`, `.button-group`, `.icon-btn`, `.label`, `.title`, `.segmented-control`/`.segmented-btn`, `.list-row*`, `.markdown-content`, `.progress-bar`, `.empty-state`, `.accent-link`). Use these class names and the app's buttons/lists/etc. render identically to the host shell. The body is set to `--font-size-sm`, the step chat prose renders at, so text you do not size yourself reads at the size of the chat beside it. Inputs and buttons are set to `--font-ui` at `--font-size-md`, the host's step for labels and controls. Neither is the root font-size: the root is the user's UI scale, and `1rem` is `--font-size-xl`, a section heading. Text that names no size at all would come out two steps larger than body, which is why the defaults exist. | App ships its own complete stylesheet and doesn't want Lucidos theming |
 | `<script src="/api/v1/sdk-iframe-audio.js"></script>` | Monkey-patches `AudioContext` so app code reuses a gesture-unlocked instance, survives iOS PWA background cycles. **Must be in `<head>` before any code that creates an `AudioContext`.** | App doesn't play audio |
 | `<script src="/api/v1/sdk.js"></script>` | The `lucidos.*` API. Also installs iframe-only side effects, none of which needs a call from you: a link interceptor (`target="_blank"` links resolve in-frame; external `http(s)://` links route through `lucidos.ui.openExternal()`); a keyboard-shortcut forwarder (host shortcuts like focus/hide a pane, narrow/widen, new thread, search, and Escape keep working while the app has focus, because iframe keydowns otherwise never reach the host); per-app scroll memory (the app returns to where the user left it after an app switch or a reload); pull to refresh (a pull past the top reloads the app, see § Pull to refresh); the Lucidos **tooltip** on any `data-tooltip` element (see § Tooltips, under lucidos.ui); and the device's **Autocorrect switch** plus a key-code guard on your text fields (see § Text fields and autocorrect). Only modifier-bearing chords and Escape are forwarded; plain typing stays in the app. | App doesn't use `lucidos.*` |
 | `lucidos.ui.applyPreferences()` | Reads the user's theme mode/theme/font/scale (resolving a `system` preference to the live OS light/dark) and sets `data-theme-mode`, `data-font-bold` and CSS vars on `<html>`. Pairs with `sdk-iframe.css` to apply the right palette. | **Don't skip if you include `sdk-iframe.css`**: without it the app ignores the user's light/system setting and stays on the default dark palette. Skip only when opting out of Lucidos theming entirely. |
@@ -345,8 +345,8 @@ this SDK stylesheet both size text from these, so use the token instead of a raw
 | `--font-size-3xs` | `0.5625rem` (9px) | micro-label / tiny badge | | `--font-size-lg` | `0.875rem` (14px) | emphasis |
 | `--font-size-2xs` | `0.625rem` (10px) | dots, micro-meta | | `--font-size-xl` | `1rem` (16px) | section heading |
 | `--font-size-xs` | `0.6875rem` (11px) | dense metadata | | `--font-size-2xl` | `1.125rem` (18px) | larger heading |
-| `--font-size-sm` | `0.75rem` (12px) | labels, secondary | | `--font-size-3xl` | `1.25rem` (20px) | large heading |
-| `--font-size-md` | `0.8125rem` (13px) | body default | | `--font-size-display` | `2.25rem` (36px) | hero |
+| `--font-size-sm` | `0.75rem` (12px) | body text, the chat prose step | | `--font-size-3xl` | `1.25rem` (20px) | large heading |
+| `--font-size-md` | `0.8125rem` (13px) | labels, controls, row titles | | `--font-size-display` | `2.25rem` (36px) | hero |
 
 ```css
 .card {
@@ -368,20 +368,20 @@ renders at a fixed size and silently ignores the user's font-size setting — th
 single most common "the app doesn't respect my font size" bug. Size everything
 in `rem` (divide px by 16: 14px → `0.875rem`, 24px → `1.5rem`), and prefer the
 `--space-*` / `--radius-*` tokens above for spacing and corners. For text, prefer
-the `--font-size-*` type-scale tokens over a raw `rem` — body text is
-`--font-size-md` (13px), small/meta `--font-size-xs` (11px), emphasis
-`--font-size-lg` (14px), headings `--font-size-xl`+ (or the `h1`–`h6` defaults
-`sdk-iframe.css` already ships). (`1px` borders are the one acceptable `px`
-exception, same as the host shell.)
+the `--font-size-*` type-scale tokens over a raw `rem`. Body text and
+paragraphs are `--font-size-sm` (12px), the size chat renders at. Labels,
+controls and row titles are `--font-size-md` (13px). Small/meta is
+`--font-size-xs` (11px), emphasis `--font-size-lg` (14px), and headings use the
+`h1`–`h6` defaults `sdk-iframe.css` already ships. (`1px` borders are the one
+acceptable `px` exception, same as the host shell.)
 
 **The body step is already the default.** `sdk-iframe.css` sets
-`body { font-size: var(--font-size-md) }`, so a paragraph you never size
-explicitly still lands on Lucidos's body text size instead of the raw root
-(`1rem`), which is a size nothing in the host shell renders at. So you don't
-need to declare it, and if you do (a text-heavy report might want
-`--font-size-lg`), it takes another type-scale step. Never reset it to `1rem` or
-a `px` value: that is exactly what makes an app read a whole scale step larger
-than the rest of Lucidos, with looser line spacing to match.
+`body { font-size: var(--font-size-sm) }`, so a paragraph you never size
+explicitly reads at the size of the chat beside it, not at the raw root
+(`1rem`). So you don't need to declare it. Don't raise it for a report either:
+an app sits next to the chat that made it, and a larger body reads as too big.
+Never reset it to `1rem` or a `px` value: that makes an app read two steps
+larger than the rest of Lucidos, with looser line spacing to match.
 
 ### Component classes
 

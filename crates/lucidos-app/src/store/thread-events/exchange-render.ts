@@ -671,6 +671,7 @@ export function exchangeResponseEvents(exchange: Exchange, isLast = true, thread
 
   for (const { seq, event } of exchange.steps) {
     const created = event.created;
+    const pushedBefore = events.length;
     switch (event.type) {
       // Legacy name kept alongside the current one, as in `exchangeSteps`.
       case 'MemoryRecalled':
@@ -766,6 +767,9 @@ export function exchangeResponseEvents(exchange: Exchange, isLast = true, thread
           full: fullCommandForEngineTool(e.name, e.args),
           outcome: callOutcome(exchange, seq),
           created,
+          // A Thinking row renamed to this call reads as the call, so it takes
+          // the call's place on the thread's clock too.
+          seq,
           ...(event._eventId ? { call_event_id: event._eventId } : {}),
           ...(e.args_stripped ? { args_stripped: true, tool_channel: 'chat' as const } : {}),
         };
@@ -834,6 +838,8 @@ export function exchangeResponseEvents(exchange: Exchange, isLast = true, thread
           full: fullCommandForCCTool(e.name, e.args),
           outcome: callOutcome(exchange, seq),
           created,
+          // See the engine arm above: a renamed Thinking row takes the call's seq.
+          seq,
           ...(event._eventId ? { call_event_id: event._eventId } : {}),
           ...(e.args_stripped ? { args_stripped: true, tool_channel: 'coding_agent' as const } : {}),
         };
@@ -1018,7 +1024,7 @@ export function exchangeResponseEvents(exchange: Exchange, isLast = true, thread
           state: 'waiting',
         };
         const parked = lastPendingStepIndex(events, isAwaitEventStep);
-        if (parked >= 0) events[parked] = row;
+        if (parked >= 0) events[parked] = { ...row, seq: events[parked].seq };
         else events.push(row);
         // Registering the wait is the whole of the turn's last action, and
         // `await_event` is terminal, so the engine emits no terminator here by
@@ -1126,6 +1132,8 @@ export function exchangeResponseEvents(exchange: Exchange, isLast = true, thread
       case 'SessionEnded':
         break;
     }
+    // Every row this event pushed sits at its seq on the thread's clock.
+    for (let i = pushedBefore; i < events.length; i++) events[i].seq ??= seq;
   }
   // Resolve pending spinners on finished exchanges: a missing ToolResult from
   // a killed session, parallel calls with lost results, or a non-last exchange

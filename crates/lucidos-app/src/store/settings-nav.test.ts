@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { SETTINGS_NAV_ITEMS, SETTINGS_SYSTEM_SUBPANEL_ITEMS, settingsSubviewLabel, settingsSubviewShortLabel, migrateSettingsSubview } from './store';
+import { SETTINGS_NAV_ITEMS, SETTINGS_SYSTEM_SUBPANEL_ITEMS, SETTINGS_SUBVIEW_ITEMS, settingsSubviewLabel, settingsSubviewShortLabel, migrateSettingsSubview } from './store';
 
 describe('settings navigation', () => {
   it("keeps System last in the Workspace group and owns What's New, Thread Queue, Backup, Memory, Disk Usage, Environment Variables, and Debugging as subpanels", () => {
@@ -106,7 +106,7 @@ describe('the header bar’s short category names', () => {
   // font instead would make the bar's type jitter from screen to screen, which
   // is what both the iOS and Material top-bar conventions warn against.
   const HEADER_TITLE_MAX_CHARS = 12;
-  const allItems = [...SETTINGS_NAV_ITEMS, ...SETTINGS_SYSTEM_SUBPANEL_ITEMS];
+  const allItems = SETTINGS_SUBVIEW_ITEMS;
 
   it('every category fits the bar without an ellipsis', () => {
     for (const { key, label } of allItems) {
@@ -162,10 +162,11 @@ describe('migrateSettingsSubview', () => {
     expect(migrateSettingsSubview('repositories')).toBe('coding-agents');
     expect(migrateSettingsSubview('mobile-access')).toBe('access');
     expect(migrateSettingsSubview('network-access')).toBe('access');
+    expect(migrateSettingsSubview('themes')).toBe('appearance');
   });
 
   it('passes every live key through untouched', () => {
-    for (const { key } of [...SETTINGS_NAV_ITEMS, ...SETTINGS_SYSTEM_SUBPANEL_ITEMS]) {
+    for (const { key } of SETTINGS_SUBVIEW_ITEMS) {
       expect(migrateSettingsSubview(key)).toBe(key);
     }
     expect(migrateSettingsSubview('main')).toBe('main');

@@ -1,4 +1,5 @@
 import type { RefObject } from 'preact';
+import { keepFocusOnPress } from '../../utils/dom';
 
 /** One row in a control menu's option list. */
 export interface ControlOption {
@@ -87,7 +88,7 @@ export function ControlOptionList({
         </div>
       )}
       {back && (
-        <button class="control-item control-back" onClick={back.onBack}>
+        <button class="control-item control-back" onMouseDown={keepFocusOnPress} onClick={back.onBack}>
           <span class="control-back-glyph" aria-hidden="true">&#8249;</span>
           {back.label}
         </button>
@@ -105,6 +106,7 @@ export function ControlOptionList({
             data-value={opt.value}
             class={`control-item control-option${index === highlightIndex ? ' control-item-active' : ''}${isCurrent ? ' control-option-current' : ''}`}
             disabled={disabled}
+            onMouseDown={keepFocusOnPress}
             onClick={() => onPick(opt)}
             onMouseEnter={() => onHighlight(index)}
           >

@@ -4,6 +4,7 @@ mod threads;
 pub mod types;
 
 use crate::core::EventRow;
+use crate::engine::thread_events::ThreadEvent;
 use chrono::{DateTime, Utc};
 pub use messages::format_child_thread_completed_block;
 pub(crate) use messages::{
@@ -345,6 +346,9 @@ impl EventStore {
         // `None`, and a filter that narrowed by default would silently change
         // all of them. It rides the `idx_events_thread_id_created_seq` index.
         // `event_id` follows the same rule and hits the primary key.
+        //
+        // Side-question rows never come back, in any mode: this reader backs
+        // the agent's `query_events` tool, and no agent may see one (ADR 0320).
         sqlx::query_as::<_, EventRow>(
             "SELECT id, event_type, payload, created, thread_id, sequence FROM events \
              WHERE ($1::text IS NULL OR event_type = $1) \
@@ -354,6 +358,7 @@ impl EventStore {
              AND ($7::timestamptz IS NULL OR created > $7 OR (created = $7 AND id > $8)) \
              AND ($9::uuid IS NULL OR thread_id = $9) \
              AND ($10::uuid IS NULL OR id = $10) \
+             AND event_type <> ALL($11) \
              ORDER BY created DESC, id DESC LIMIT $4",
         )
         .bind(filters.event_type)
@@ -366,12 +371,14 @@ impl EventStore {
         .bind(after_cursor.map(|(_, i)| i))
         .bind(filters.thread_id)
         .bind(filters.event_id)
+        .bind(ThreadEvent::SIDE_QUESTION_EVENT_TYPES)
         .fetch_all(&self.pool)
         .await
     }
 
     /// Count events matching the same filters as [`Self::query_events`],
-    /// without materialising the payloads.
+    /// without materialising the payloads. Side-question rows are excluded
+    /// here too, as in every generic reader.
     ///
     /// Returns `(count, byte_total)` for the single-type filter; when
     /// `event_type` is `None`, the caller should use
@@ -391,11 +398,13 @@ impl EventStore {
             "SELECT COUNT(*)::bigint, SUM(octet_length(payload::text))::bigint FROM events \
              WHERE ($1::text IS NULL OR event_type = $1) \
              AND ($2::timestamptz IS NULL OR created > $2) \
-             AND ($3::timestamptz IS NULL OR created < $3)",
+             AND ($3::timestamptz IS NULL OR created < $3) \
+             AND event_type <> ALL($4)",
         )
         .bind(event_type)
         .bind(since)
         .bind(until)
+        .bind(ThreadEvent::SIDE_QUESTION_EVENT_TYPES)
         .fetch_one(&self.pool)
         .await?;
         Ok((count, bytes.unwrap_or(0)))
@@ -416,11 +425,13 @@ impl EventStore {
              FROM events \
              WHERE ($1::timestamptz IS NULL OR created > $1) \
              AND ($2::timestamptz IS NULL OR created < $2) \
+             AND event_type <> ALL($3) \
              GROUP BY event_type \
              ORDER BY COUNT(*) DESC, event_type ASC",
         )
         .bind(since)
         .bind(until)
+        .bind(ThreadEvent::SIDE_QUESTION_EVENT_TYPES)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows
@@ -429,7 +440,8 @@ impl EventStore {
             .collect())
     }
 
-    /// Return all distinct event_type values, ordered alphabetically.
+    /// Return all distinct event_type values, ordered alphabetically, less
+    /// the side-question names no agent may see.
     ///
     /// A loose index scan, NOT `SELECT DISTINCT`, and the difference is the
     /// point. Postgres has no skip scan, so `SELECT DISTINCT` reads every row.
@@ -452,8 +464,11 @@ impl EventStore {
                          ORDER BY e.event_type LIMIT 1) \
                  FROM t WHERE t.event_type IS NOT NULL \
              ) \
-             SELECT event_type FROM t WHERE event_type IS NOT NULL ORDER BY event_type",
+             SELECT event_type FROM t \
+             WHERE event_type IS NOT NULL AND event_type <> ALL($1) \
+             ORDER BY event_type",
         )
+        .bind(ThreadEvent::SIDE_QUESTION_EVENT_TYPES)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(|r| r.0).collect())

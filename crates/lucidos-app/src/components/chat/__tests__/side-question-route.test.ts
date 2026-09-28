@@ -38,6 +38,9 @@ describe('PromptInput submit routes /btw before any send', () => {
     const branch = submit.match(/if \(sideQuestion\.kind === 'ask'[\s\S]*?\n {4}\}/)?.[0] ?? '';
     expect(branch, 'ask branch not found').not.toBe('');
     expect(branch).toContain('askSideQuestion(threadId, sideQuestion.question)');
+    // Before the ask, so it can tell the new card from the ones on screen.
+    expect(branch.indexOf('followSideQuestion()')).toBeGreaterThan(-1);
+    expect(branch.indexOf('followSideQuestion()')).toBeLessThan(branch.indexOf('askSideQuestion('));
     expect(branch).toMatch(/return;\s*\}$/);
     expect(branch).not.toMatch(/sendFollowup|sendMessage|sendCompose|beginSend/);
   });

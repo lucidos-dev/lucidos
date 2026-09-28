@@ -127,43 +127,6 @@ export function wasEngineVersionDismissed(versionId: string): boolean {
   return dismissedBuild(ENGINE_SWITCH_DISMISSED_KEY) === versionId;
 }
 
-/** Spread of delays (ms) over which we re-check the service worker for a new
- *  build after a frontend-affecting apply. Covers a typical `vite build`
- *  rebuild window without hammering. */
-const SW_UPDATE_CHECK_DELAYS_MS = [3_000, 8_000, 15_000, 30_000];
-
-/** Nudge the service worker to re-check for a new build after a
- *  frontend-affecting apply.
- *
- *  In `web-dev.sh --built` mode the build-watch republishes `dist/` (a fresh
- *  `vite build`) over the next few seconds after a change is applied, stamping a
- *  new BUILD_ID into sw.js (see vite.config.ts `lucidos-sw-stamp`). The engine
- *  serves a boot-pinned snapshot, so the served sw.js advances once the engine
- *  re-snapshots: for a **frontend-only** Apply the engine does that in-process
- *  (`engine::frontend_refresh`), and a mixed change advances it via a Switch.
- *  Either way `registration.update()` then detects the new worker and fires the
- *  "New version available → Refresh" toast (`surfaceUpdateToast` in
- *  store/actions/client-update.ts, reached through `syncClientUpdateFromBuild`;
- *  startup.ts routes to it rather than deciding). Without this
- *  nudge the toast would only appear on the next resume or the 5-min SW health
- *  probe — this makes "push Apply → get told when it's ready" prompt and hands-free.
- *
- *  Best-effort and self-recovering: a failed `update()` is ignored because the
- *  next scheduled check, the resume-time `reg.update()`, or a manual reload all
- *  re-surface the new build. A no-op when the served sw.js genuinely doesn't
- *  change (an engine-only apply with no client delta) and where service workers
- *  are unavailable. */
-export function scheduleServiceWorkerUpdateChecks(): void {
-  if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) return;
-  for (const delay of SW_UPDATE_CHECK_DELAYS_MS) {
-    setTimeout(() => {
-      navigator.serviceWorker.getRegistration()
-        .then((reg) => reg?.update())
-        .catch(() => { /* best-effort; next check / resume / manual reload covers it */ });
-    }, delay);
-  }
-}
-
 /** Safety net (ms): if a new worker is detected but never claims the page
  *  (delayed/dropped `controllerchange`, e.g. a wedged SW), stop waiting, bust
  *  the cached shell, and reload anyway so the click can't hang on a stale build.

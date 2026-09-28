@@ -899,7 +899,8 @@ pub const DEADLINE_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::fr
 /// against a real database without standing up an engine.
 ///
 /// A resolution's re-entry **never ran** when the very next event on its thread
-/// is that resolution's own anchor and nothing follows it. `emit_resolution`
+/// is that resolution's own anchor and nothing follows it. Side-question events
+/// are skipped both ways, since none of them is a turn. `emit_resolution`
 /// writes exactly one anchor shape, so that is the whole exclusion list.
 /// Anything else after the resolution means the re-entry WAS consumed, and
 /// re-driving it would double-run a turn.
@@ -921,6 +922,7 @@ pub async fn lost_wait_reentries(
              WHERE a.aggregate = 'thread' \
                AND a.aggregate_id = e.aggregate_id \
                AND a.sequence > e.sequence \
+               AND a.event_type <> ALL($1) \
              ORDER BY a.sequence LIMIT 1 \
          ) anchor ON TRUE \
          WHERE e.aggregate = 'thread' \
@@ -932,9 +934,11 @@ pub async fn lost_wait_reentries(
                WHERE later.aggregate = 'thread' \
                  AND later.aggregate_id = e.aggregate_id \
                  AND later.sequence > anchor.sequence \
+                 AND later.event_type <> ALL($1) \
            ) \
          ORDER BY e.sequence",
     )
+    .bind(crate::engine::thread_events::ThreadEvent::SIDE_QUESTION_EVENT_TYPES)
     .fetch_all(pool)
     .await?;
 

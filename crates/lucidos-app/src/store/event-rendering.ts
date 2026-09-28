@@ -177,7 +177,9 @@ export type BodyRow =
    *  `elided` is a closed run between two drawn chunks. It draws the hairline
    *  that says steps were hidden there, as a row of its own that rolls. */
   | { kind: 'steps'; key: number; steps: { event: StepEvent; index: number }[]; open: boolean; elided: boolean }
-  | { kind: 'text'; key: number; event: TextEvent; open: boolean }
+  /** A chunk's tail split off at a side question is keyed `<key>@<offset>`,
+   *  which holds while the chunk keeps growing. */
+  | { kind: 'text'; key: number | string; event: TextEvent; open: boolean }
   /** A transcript marker. Neither toggle ever hides one. */
   | { kind: 'marker'; key: number; event: ResponseEvent };
 
@@ -296,19 +298,25 @@ export function liveStepInBody(sections: BodySection[]): number {
 export function mergeAdjacentTextEvents(events: ResponseEvent[]): ResponseEvent[] {
   const merged: ResponseEvent[] = [];
   let textBuf = '';
+  // A merged chunk sits where its first piece did on the thread's clock. It
+  // remembers where each later piece begins, so a side question can split it.
+  let pieces: { at: number; seq?: number }[] = [];
+  const flushText = () => {
+    if (textBuf) {
+      merged.push({ type: 'text', md: textBuf, seq: pieces[0]?.seq, ...(pieces.length > 1 ? { pieces } : {}) });
+    }
+    textBuf = '';
+    pieces = [];
+  };
   for (const evt of events) {
     if (evt.type === 'text') {
+      if (evt.md) pieces.push({ at: textBuf.length, seq: evt.seq });
       textBuf += evt.md;
     } else {
-      if (textBuf) {
-        merged.push({ type: 'text', md: textBuf });
-        textBuf = '';
-      }
+      flushText();
       merged.push(evt);
     }
   }
-  if (textBuf) {
-    merged.push({ type: 'text', md: textBuf });
-  }
+  flushText();
   return merged;
 }

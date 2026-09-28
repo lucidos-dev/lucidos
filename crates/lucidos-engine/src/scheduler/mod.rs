@@ -96,7 +96,7 @@ pub(crate) struct TriggerDispatch {
 /// not a trigger carrier.
 ///
 /// Thread events are gated by a **blocklist**
-/// (`ThreadEvent::is_per_token_streaming`): a workspace can `on_event:` any
+/// (`core::event_subscription::is_subscribable`): a workspace can `on_event:` any
 /// persisted `ThreadEvent` by default, and new lifecycle and per-action
 /// variants are triggerable automatically. High-cardinality per-action
 /// variants flow through, scoped by `condition:` filters.
@@ -120,7 +120,8 @@ pub(crate) fn trigger_dispatch(
     emitted: &crate::engine::event_bus::EmittedEvent,
 ) -> Option<TriggerDispatch> {
     use crate::core::event_subscription::{
-        is_subscribable_system_event, matchable_system_payload, matchable_thread_payload,
+        is_subscribable, is_subscribable_system_event, matchable_system_payload,
+        matchable_thread_payload,
     };
     use crate::engine::event_bus::{BusEvent, SystemEvent};
 
@@ -128,7 +129,7 @@ pub(crate) fn trigger_dispatch(
         BusEvent::Thread {
             thread_id, event, ..
         } => {
-            if event.is_per_token_streaming() {
+            if !is_subscribable(event) {
                 return None;
             }
             Some(TriggerDispatch {
@@ -1520,6 +1521,18 @@ mod tests {
             None,
             "the blocklist still gates the thread carrier"
         );
+    }
+
+    #[test]
+    fn a_side_question_never_reaches_the_matcher() {
+        for event in crate::test_support::every_side_question_event() {
+            let name = event.event_type();
+            assert_eq!(
+                trigger_dispatch(&thread_frame(uuid::Uuid::new_v4(), event, 0)),
+                None,
+                "{name} reached the trigger matcher"
+            );
+        }
     }
 
     #[test]

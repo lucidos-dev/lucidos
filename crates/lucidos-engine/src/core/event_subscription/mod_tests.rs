@@ -340,6 +340,32 @@ fn the_gate_admits_ordinary_lifecycle_and_per_action_events() {
     assert!(is_subscribable(&ThreadEvent::ThreadArchived));
 }
 
+/// No agent, trigger or event wait may see a side question (ADR 0320): the
+/// gate drops each one, both surfaces refuse the name, and no list offers it.
+#[test]
+fn side_questions_are_never_subscribable() {
+    let events = crate::test_support::every_side_question_event();
+    let mut names: Vec<&str> = events.iter().map(ThreadEvent::event_type).collect();
+    names.sort_unstable();
+    let mut listed = ThreadEvent::SIDE_QUESTION_EVENT_TYPES.to_vec();
+    listed.sort_unstable();
+    assert_eq!(names, listed, "the const and the predicate disagree");
+    for event in &events {
+        let name = event.event_type();
+        assert!(event.is_side_question_event(), "{name} fails the predicate");
+        assert!(!is_subscribable(event), "the gate admitted {name}");
+        for err in [awaitable(name).unwrap_err(), triggerable(name).unwrap_err()] {
+            assert!(err.contains(name) && err.contains("side question"), "{err}");
+        }
+        for surface in [SubscriptionSurface::Wait, SubscriptionSurface::Trigger] {
+            assert!(
+                !known_names::subscribable_event_type_names(surface).contains(&name),
+                "{name} is offered as subscribable"
+            );
+        }
+    }
+}
+
 /// Dropped before any subscriber sees it, so neither surface may take it.
 #[test]
 fn streaming_variants_are_refused_at_both_surfaces() {

@@ -23,7 +23,7 @@ import { pushNavState } from '../../store/actions/navigation';
 import { getDraft } from '../../store/composeDrafts';
 import { askSideQuestion, routeSideQuestion, withSideQuestionPrefix } from '../../store/sideQuestions';
 import { ComposeDestinationRow } from './ComposeDestinationRow';
-import { followAnsweredQuestion, followCanceledTurn, followSentMessage } from './scrollState';
+import { followAnsweredQuestion, followCanceledTurn, followSentMessage, followSideQuestion } from './scrollState';
 import { CaptureIcon, ImageIcon, CameraIcon, FileIcon, CloseIcon, ClearIcon, GlobeIcon, SendArrowIcon, StopIcon } from '../shared/icons';
 import { BlobImage } from '../shared/BlobImage';
 import { codingAgentMenuComposerText, codingAgentMenuOpenRequest } from './CodingAgentControlMenu';
@@ -645,6 +645,7 @@ export function PromptInput() {
         el.style.height = 'auto';
       }
       updateCompose(threadId, { text: '' });
+      followSideQuestion();
       void askSideQuestion(threadId, sideQuestion.question);
       restoreComposerFocus();
       return;

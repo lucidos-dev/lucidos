@@ -666,6 +666,49 @@ async fn orphan_pass_settles_a_running_thread_with_no_live_session() {
     teardown_test_db(&db_name).await;
 }
 
+/// A side question after the agent's last output is a card, not agent output.
+/// The orphan pass reads past it, so the wedge still settles (ADR 0320).
+#[tokio::test]
+async fn orphan_pass_reads_past_a_side_question_to_the_agents_last_output() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let bus = Arc::new(bus);
+
+    let thread_id = Uuid::new_v4();
+    seed_cc_thread(&bus, thread_id).await;
+    emit_agent_output(&bus, thread_id).await;
+    for event in crate::test_support::every_side_question_event() {
+        bus.emit(BusEvent::Thread {
+            thread_id,
+            event,
+            meta: EventMeta::NONE,
+        })
+        .await
+        .expect("side-question emit");
+    }
+    backdate_activity(&pool, thread_id, TWO_HOURS_SECS).await;
+
+    let sessions = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    ExternalWatchdog::new(
+        sessions,
+        bus.clone(),
+        pool.clone(),
+        ORPHAN_LIMIT_MS,
+        CEILING_MS,
+    )
+    .tick()
+    .await;
+
+    assert_eq!(
+        aborted_count(&pool, thread_id).await,
+        1,
+        "a side question hid the agent's last output from the orphan pass"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
 #[tokio::test]
 async fn orphan_pass_leaves_a_thread_with_a_live_session_alone() {
     let (pool, db_name) = setup_test_db().await;

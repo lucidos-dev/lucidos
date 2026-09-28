@@ -6,6 +6,7 @@ import {
   stopPreview,
 } from '../../store/actions/frontend-preview';
 import { readDeviceId } from '../../utils/deviceIdHeader';
+import { keepFocusOnPress } from '../../utils/dom';
 
 /**
  * The frontend preview's controls, rendered as a section of the coding-agent
@@ -61,7 +62,12 @@ export function FrontendPreviewSection({ threadId }: { threadId: string }) {
                 Open
               </a>
             )}
-            <button class="action-btn action-btn-danger" disabled={busy} onClick={() => void stopPreview()}>
+            <button
+              class="action-btn action-btn-danger"
+              disabled={busy}
+              onMouseDown={keepFocusOnPress}
+              onClick={() => void stopPreview()}
+            >
               {busy ? 'Stopping...' : 'Stop'}
             </button>
           </>
@@ -69,6 +75,7 @@ export function FrontendPreviewSection({ threadId }: { threadId: string }) {
           <button
             class="action-btn"
             disabled={busy || !known}
+            onMouseDown={keepFocusOnPress}
             onClick={() => void startPreviewForThread(threadId)}
           >
             {busy ? 'Starting...' : running ? 'Move here' : 'Start'}

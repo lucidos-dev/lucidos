@@ -328,8 +328,14 @@ export const SETTINGS_NAV_ITEMS: SettingsHomeNavItem[] = [
   { key: 'keyboard-shortcuts', label: 'Keyboard Shortcuts', short: 'Shortcuts', group: 'This device' },
 ];
 
+/** Every subview but the home list: the categories and the pages below them. */
+export const SETTINGS_SUBVIEW_ITEMS: SettingsNavItem[] = [
+  ...SETTINGS_NAV_ITEMS,
+  ...SETTINGS_SYSTEM_SUBPANEL_ITEMS,
+];
+
 function settingsNavItem(key: Exclude<SettingsSubview, 'main'>): SettingsNavItem | undefined {
-  return [...SETTINGS_NAV_ITEMS, ...SETTINGS_SYSTEM_SUBPANEL_ITEMS].find(item => item.key === key);
+  return SETTINGS_SUBVIEW_ITEMS.find(item => item.key === key);
 }
 
 /** The category's full name, for every surface with room for it. */
@@ -359,6 +365,8 @@ const RETIRED_SETTINGS_SUBVIEWS = new Map<string, SettingsSubview>([
   ['repositories', 'coding-agents'],
   ['mobile-access', 'access'],
   ['network-access', 'access'],
+  // The theme gallery's own page, back inline on Appearance as a carousel.
+  ['themes', 'appearance'],
 ]);
 
 /** Resolve a subview name that came from OUTSIDE this build into a renderable
@@ -374,7 +382,7 @@ export function migrateSettingsSubview(raw: unknown): SettingsSubview {
   if (typeof raw !== 'string') return 'main';
   if (raw === 'main') return 'main';
   const moved = aliasRetiredSettingsSubview(raw);
-  const live = [...SETTINGS_NAV_ITEMS, ...SETTINGS_SYSTEM_SUBPANEL_ITEMS].some(i => i.key === moved);
+  const live = SETTINGS_SUBVIEW_ITEMS.some(i => i.key === moved);
   return live ? (moved as SettingsSubview) : 'main';
 }
 

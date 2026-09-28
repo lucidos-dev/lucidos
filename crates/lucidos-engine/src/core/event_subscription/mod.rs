@@ -271,12 +271,14 @@ pub enum SubscriptionSurface {
 ///
 /// Blocklist semantics on purpose: any persisted `ThreadEvent` is subscribable
 /// by default, so a new lifecycle or per-action variant becomes watchable
-/// without touching this function. Only the per-token firehose is dropped, and
-/// only because running the matcher per token would be pure waste. Subscribers
-/// scope high-cardinality per-action variants (`ToolCalled`, and friends) with
-/// a `condition:` instead.
+/// without touching this function. Subscribers scope high-cardinality
+/// per-action variants (`ToolCalled`, and friends) with a `condition:` instead.
+///
+/// Two families are dropped. The per-token firehose, because running the
+/// matcher per token would be pure waste. The side-question events, because no
+/// agent may ever see one (ADR 0320).
 pub fn is_subscribable(event: &ThreadEvent) -> bool {
-    !event.is_per_token_streaming()
+    !event.is_per_token_streaming() && !event.is_side_question_event()
 }
 
 /// **The system-side gate.** A live `SystemEvent` reaches the trigger matcher
@@ -355,6 +357,13 @@ pub fn validate_subscribable_event_type(
              can never match. Subscribe to the turn's outcome instead \
              (ResponseGenerated), or to a specific tool call (ToolCalled with a \
              condition on `name`)."
+        ));
+    }
+    if ThreadEvent::SIDE_QUESTION_EVENT_TYPES.contains(&name) {
+        return Err(format!(
+            "'{name}' records a /btw side question, which no agent, trigger or \
+             event wait ever sees. It is dropped before any subscriber, so a \
+             subscription on it can never match."
         ));
     }
     // The one case the two surfaces disagree about. A trigger falls through to

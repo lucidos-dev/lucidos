@@ -13,7 +13,7 @@ import { ensureFocusedComposeThread, updateCompose } from './compose';
 import { openEncodedRepoFilePreview } from './repositories';
 import { focusPromptNow } from '../../components/chat/promptFocus';
 import { isMobile } from '../../utils/viewport';
-import { showToast, dismissToast, focusedThreadId, panelOverlay, pluginScrollTarget, setPluginsInstalledOnly, parseRepoPath, normalizeLineRange, selectedLines, lineScrollTarget, filePreviewSource, SETTINGS_NAV_ITEMS, SETTINGS_SYSTEM_SUBPANEL_ITEMS, settingsSubviewLabel, aliasRetiredSettingsSubview } from '../store';
+import { showToast, dismissToast, focusedThreadId, panelOverlay, pluginScrollTarget, setPluginsInstalledOnly, parseRepoPath, normalizeLineRange, selectedLines, lineScrollTarget, filePreviewSource, SETTINGS_SUBVIEW_ITEMS, settingsSubviewLabel, aliasRetiredSettingsSubview } from '../store';
 import type { SettingsNavKey } from '../store';
 import type { MenuItem } from '../types';
 
@@ -28,10 +28,7 @@ import type { MenuItem } from '../types';
 let settingsViewKeys: ReadonlySet<string> | null = null;
 function isRenderableSettingsView(view: string): boolean {
   if (settingsViewKeys === null) {
-    settingsViewKeys = new Set<string>([
-      ...SETTINGS_NAV_ITEMS.map((i) => i.key),
-      ...SETTINGS_SYSTEM_SUBPANEL_ITEMS.map((i) => i.key),
-    ]);
+    settingsViewKeys = new Set<string>(SETTINGS_SUBVIEW_ITEMS.map((i) => i.key));
   }
   return settingsViewKeys.has(view);
 }

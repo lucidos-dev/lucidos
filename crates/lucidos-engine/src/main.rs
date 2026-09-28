@@ -1020,6 +1020,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         &shared_engine.event_bus,
     )
     .await;
+    // A side question's answer was on its way to the previous process, so an
+    // ask it left unsettled can never be answered now.
+    shared_engine.recover_unsettled_side_questions().await;
     // Plugin staging and OAuth listeners lived in the previous engine's memory,
     // so a form request resting on one can no longer be answered.
     lucidos_engine::engine::form_requests::expire_memory_backed_requests(

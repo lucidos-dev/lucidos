@@ -88,13 +88,13 @@ describe('ENGINE-LIMIT banner', () => {
     // inside the !hasEvents branch — the cap always fires with 100+ tool steps,
     // so hasEvents is always true when isEngineLimit is true.
     //
-    // Asserted by locating the banner JSX and confirming the closing `</div>` +
-    // closing `)}` of the response-content ternary appears immediately before it
-    // — i.e. the banner is at the same nesting depth as the ternary, not inside.
+    // Asserted by locating the banner JSX and confirming the body expression
+    // closes (`)}` or `]}`) immediately before it. The banner then sits at the
+    // same depth as the body, not inside one of its branches.
     const bannerIdx = source.indexOf('{isEngineLimit && (');
     expect(bannerIdx, 'banner JSX not found').toBeGreaterThan(0);
     const before = source.slice(0, bannerIdx).trimEnd();
-    expect(before.endsWith(')}')).toBe(true);
+    expect(/[)\]]\}$/.test(before)).toBe(true);
   });
 
   it('preserves the response panel even when there is no streamed text', () => {

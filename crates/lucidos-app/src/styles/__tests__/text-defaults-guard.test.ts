@@ -126,8 +126,15 @@ describe('the text defaults that make an omission harmless', () => {
     );
     expect(fields!.props.get('font-family')).toBe('var(--font-ui)');
 
+    // App body text is the chat prose step, while controls stay on the host's
+    // UI step (ADR 0319).
     const body = cssRules(iframeCss).find(r => r.selector === 'body' && !r.atRules);
-    expect(body!.props.get('font-size')).toBe('var(--font-size-md)');
+    expect(body!.props.get('font-size')).toBe('var(--font-size-sm)');
+    expect(fields!.props.get('font-size')).toBe('var(--font-size-md)');
+    expect(button!.props.get('font-size')).toBe('var(--font-size-md)');
+    // A shared row title inherits, so its container restores the host's step.
+    const rowInfo = cssRules(iframeCss).find(r => r.selector === '.list-row-info' && !r.atRules);
+    expect(rowInfo?.props.get('font-size')).toBe('var(--font-size-md)');
   });
 
   it('names the mono face on rendered code, which inherits none from body', () => {
@@ -181,6 +188,19 @@ describe('the type scale itself', () => {
     ]) {
       const quoted = scaleSteps(readFileSync(resolve(repoRoot, doc), 'utf-8'));
       expect(quoted, `${doc} no longer quotes the type scale`).toEqual(steps);
+    }
+  });
+
+  it('hands artifact authors the chat prose step as their body size', () => {
+    // An HTML artifact sits beside the chat that wrote it, so its body text
+    // takes the chat's step, not the host's UI step (ADR 0319).
+    for (const doc of [
+      'system-knowhow/best-practices.md',
+      '.claude/skills/lucidos-cli/SKILL.md',
+    ]) {
+      const text = readFileSync(resolve(repoRoot, doc), 'utf-8');
+      expect(text, `${doc} no longer pastes the chat prose step on body`)
+        .toContain('body { font-size: var(--font-size-sm); line-height: 1.5; }');
     }
   });
 

@@ -326,3 +326,5 @@ Create an entry with `./scripts/adr-new.sh`, never by hand. See
 - [0316: The palette is a theme and light/dark is the theme mode, renamed in every layer](0316-look-becomes-theme.md)
 - [0317: A drawn caret where the browser has no caret-shape: a layout copy of the textarea places a real inline caret, which steps aside for IME; amends 0313](0317-drawn-caret.md)
 - [0318: A /btw side question and its answer are never recorded as thread events: ephemeral by construction, so no context builder can read them, at the cost of no card after reload or on another device](0318-side-questions-are-never-recorded.md)
+- [0319: App and HTML-artifact running text uses the chat prose step, sm; md is for labels and controls](0319-app-and-artifact-running-text-is-the-chat-step.md)
+- [0320: A /btw side question and its answer are recorded as four quiet thread events that no agent, trigger, event wait or query_events reader ever sees; supersedes 0318](0320-side-questions-are-thread-events.md)

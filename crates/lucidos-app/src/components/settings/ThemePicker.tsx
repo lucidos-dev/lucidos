@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'preact/hooks';
+import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
 import {
   DEFAULT_THEME_ID,
   FOLLOW_THEME,
@@ -12,10 +12,11 @@ import { registerWorkspaceFont } from '@lucidos/font-faces';
 import { THEME_FAMILIES, dataMountUrl, type Theme, type ThemeFamily } from '../../api/client';
 import { themeGallery, loadThemeGallery, pickTheme } from '../../store/actions/themes';
 import { currentThemeId, paintedThemeMode } from '../../store/actions/preferences';
+import { preferences } from '../../store/store';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
-import { TOUCH_CLICK_WINDOW_MS, createTapGate, notePressOutcome } from '../../utils/tapGesture';
-import { Disclosure } from '../shared/Disclosure';
-import { ChevronRightIcon } from '../shared/icons';
+import { isReducedMotion } from '../../utils/motion';
+import { viewportIsMobile } from '../../utils/viewport';
+import { ChevronLeftIcon, ChevronRightIcon } from '../shared/icons';
 import { LoadingFade } from '../shared/LoadingFade';
 import { LoadableError } from '../shared/LoadableError';
 import { ListSkeletonOf, SkBlock, SkText, useSkeleton } from '../shared/Skeleton';
@@ -61,176 +62,290 @@ function themeFontStyle(theme: Theme): Record<string, string> {
   };
 }
 
+/** Which ends of the strip already show. */
+interface StripEnds {
+  atStart: boolean;
+  atEnd: boolean;
+}
+
+/** The narrowest a card may get before the strip drops a column. */
+const THEME_CARD_MIN_REM = 9;
+
+/** A phone card previews a portrait phone screen, so it is narrower than a
+ *  desktop card. */
+const PEEK_CARD_REM = 7;
+
+/** On a phone, the centred card's widest share of the strip. Even a narrow
+ *  strip then leaves its neighbours room to peek in at both sides. */
+const PEEK_CARD_MAX_SHARE = 0.62;
+
+/** Marks a phone's strip, the skeleton's included. */
+const PEEK_CLASS = 'theme-carousel-peek';
+
+function peekCardWidth(el: HTMLElement): number {
+  const rootPx = parseFloat(getComputedStyle(document.documentElement).fontSize);
+  return Math.min(PEEK_CARD_REM * rootPx, el.clientWidth * PEEK_CARD_MAX_SHARE);
+}
+
+interface StripGeometry {
+  columns: number;
+  /** How far one page moves the strip, its gap included. */
+  page: number;
+  /** How far left of a page's start the strip stops, so a phone's card sits
+   *  centred. The browser clamps the first and last stop to the strip's ends,
+   *  so the end cards sit at the edges and leave no side empty. */
+  offset: number;
+}
+
+/** The strip's layout from its own box. A PEEK_CLASS strip (a phone) centres
+ *  one card with its neighbours peeking in. Any other fits as many whole
+ *  columns as it can, and a page is all of them. */
+function stripGeometry(el: HTMLElement): StripGeometry {
+  const style = getComputedStyle(el);
+  const gap = parseFloat(style.columnGap) || 0;
+  if (el.classList.contains(PEEK_CLASS)) {
+    const card = peekCardWidth(el);
+    const offset = (el.clientWidth - card) / 2 - parseFloat(style.paddingLeft);
+    return { columns: 1, page: card + gap, offset };
+  }
+  const content = el.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
+  const rootPx = parseFloat(getComputedStyle(document.documentElement).fontSize);
+  const columns = Math.max(1, Math.floor((content + gap) / (THEME_CARD_MIN_REM * rootPx + gap)));
+  const page = content + gap;
+  return { columns, page, offset: 0 };
+}
+
+/** Sizes the columns to the strip: whole columns filling it exactly, or on a
+ *  phone a card narrow enough for its neighbours to peek in. */
+function fitColumns(el: HTMLElement): void {
+  if (el.classList.contains(PEEK_CLASS)) {
+    el.style.setProperty('--theme-card-width', `${peekCardWidth(el)}px`);
+    return;
+  }
+  el.style.setProperty('--theme-columns', String(stripGeometry(el).columns));
+}
+
+interface FamilyPlacement {
+  group: ThemeFamilyGroup;
+  /** First grid column, 1-based. */
+  column: number;
+  span: number;
+}
+
+/** Lays families side by side, each starting on a fresh column and filling
+ *  `rows` rows, so a page boundary always falls between whole cards. */
+function placeFamilies(groups: ThemeFamilyGroup[], rows: number): FamilyPlacement[] {
+  let column = 1;
+  return groups.map(group => {
+    const span = Math.ceil(group.themes.length / rows);
+    const placed = { group, column, span };
+    column += span;
+    return placed;
+  });
+}
+
+function stripEnds(el: HTMLElement): StripEnds {
+  return { atStart: el.scrollLeft <= 1, atEnd: el.scrollLeft + el.clientWidth >= el.scrollWidth - 1 };
+}
+
 /**
- * The active theme's card alone, unfolding into every theme grouped by family.
+ * Every theme as a radio card in a strip that scrolls sideways, a page of
+ * whole columns at a time. A chevron floats over each side and pages it, and
+ * the cards fade out at a side with more past it. The strip is two cards
+ * tall. On a phone it is one row that centres a card at a time, with its
+ * neighbours peeking in. Above it, filter chips pick All or one family. All
+ * names each family above its first card.
+ *
+ * A pick paints at once and the strip stays, so themes can be compared.
  * Each card previews itself: it sets every catalog token at its default, then
- * the theme's own resolved map, as custom properties on the preview element. So
- * the preview resolves each `var()` against that theme alone and never inherits
- * the page's active theme.
+ * the theme's own resolved map, as custom properties on the preview element.
+ * So the preview resolves each `var()` against that theme alone and never
+ * inherits the page's active theme.
  */
 export function ThemePicker() {
   useEffect(() => {
     if (themeGallery.value.status === 'not-loaded') void loadThemeGallery();
   }, []);
-  // Shut on arrival, page-local like every other settings disclosure: the
-  // grid is a dozen previews, and most visits to Appearance are not for it.
-  const [open, setOpen] = useState(false);
-  const root = useRef<HTMLDivElement>(null);
-  // Whether focus was inside when the grid toggled, so it follows the swap
-  // rather than dropping to the body with the card it was on.
-  const refocus = useRef(false);
-  const toggleOpen = (next: boolean) => {
-    refocus.current = root.current?.contains(document.activeElement) ?? false;
-    setOpen(next);
-  };
-  useEffect(() => {
-    if (!refocus.current) return;
-    refocus.current = false;
-    const target = open ? '.theme-card[aria-checked="true"]' : '.theme-toggle';
-    root.current?.querySelector<HTMLElement>(target)?.focus({ preventScroll: true });
-  }, [open]);
-  useEffect(() => {
-    if (!open) return;
-    // Any tap but one on a theme folds the grid and is spent doing so, as an
-    // overlay's outside tap is: the control under it does not fire. A theme
-    // card answers its own tap: another theme is picked, and the active one
-    // folds or offers its mode switch. A tap while an overlay is open belongs
-    // to that overlay, such as the mode-switch confirm a pick raises. A toast
-    // stays live, as it does over an overlay: its tap folds and still presses.
-    // So does a keyboard press, which is no tap: its click has `detail` 0.
-    //
-    // Capture phase, so the swallow precedes the target's own handler. The
-    // `touchend` arm covers a button that acts there and cancels its click. A
-    // touch that scrolled the page is no tap, and leaves the grid open. The
-    // `touchend` rules for its gesture, so the click iOS may still send after
-    // a scroll is ignored rather than folding.
-    //
-    // An overlay's own dismiss closes it at `pointerdown`, before the paired
-    // lift. So the press remembers whether an overlay was open when it began.
-    const press = createTapGate();
-    let folded = false;
-    let lastTouchAt: number | null = null;
-    let overlayAtPress = false;
-    const overlayOpen = () => document.documentElement.hasAttribute('data-overlay-open');
-    const fold = (e: Event, tapped: boolean) => {
-      const overlayOwnsPress = overlayAtPress || overlayOpen();
-      overlayAtPress = false;
-      if (folded || overlayOwnsPress) return;
-      const target = e.target instanceof Element ? e.target : null;
-      if (target?.closest('.theme-card[role="radio"]')) return;
-      folded = true;
-      toggleOpen(false);
-      if (!tapped || target?.closest('.toast-container')) return;
-      notePressOutcome('swallowed');
-      e.stopPropagation();
-      e.preventDefault();
-    };
-    const onPointerDown = (e: PointerEvent) => {
-      if (!e.isPrimary) return;
-      press.down(e);
-      overlayAtPress = overlayOpen();
-    };
-    const onPointerMove = (e: PointerEvent) => { if (e.isPrimary) press.move(e); };
-    const onPointerCancel = (e: PointerEvent) => { if (e.isPrimary) press.cancel(); };
-    const onTouchEnd = (e: TouchEvent) => {
-      lastTouchAt = Date.now();
-      const aborted = press.wasAborted();
-      if (press.isTap() && !aborted) fold(e, true);
-      overlayAtPress = false;
-    };
-    const onClick = (e: MouseEvent) => {
-      if (lastTouchAt !== null && Date.now() - lastTouchAt < TOUCH_CLICK_WINDOW_MS) {
-        lastTouchAt = null;
-        return;
-      }
-      fold(e, e.detail > 0);
-    };
-    document.addEventListener('pointerdown', onPointerDown, true);
-    document.addEventListener('pointermove', onPointerMove, { capture: true, passive: true });
-    document.addEventListener('pointercancel', onPointerCancel, true);
-    document.addEventListener('touchend', onTouchEnd, { capture: true, passive: false });
-    document.addEventListener('click', onClick, true);
-    return () => {
-      document.removeEventListener('pointerdown', onPointerDown, true);
-      document.removeEventListener('pointermove', onPointerMove, true);
-      document.removeEventListener('pointercancel', onPointerCancel, true);
-      document.removeEventListener('touchend', onTouchEnd, true);
-      document.removeEventListener('click', onClick, true);
-    };
-  }, [open]);
   const gallery = themeGallery.value;
   const showSkeleton = useDelayedLoading(gallery);
+  const strip = useRef<HTMLDivElement>(null);
+  const phone = viewportIsMobile.value;
+  const rows = phone ? 1 : 2;
+  // The family chip picked, or null for All.
+  const [filter, setFilter] = useState<string | null>(null);
+  const groups = gallery.status === 'loaded' ? groupThemesByFamily(gallery.data.themes) : [];
+  // A family a reload dropped falls back to All rather than an empty strip.
+  const picked = groups.some(group => group.name === filter) ? filter : null;
+  const shown = picked === null ? groups : groups.filter(group => group.name === picked);
+  // All names each family above its first card, on a row of its own.
+  const labelRows = picked === null ? 1 : 0;
+  const families = placeFamilies(shown, rows);
+  const [ends, setEnds] = useState<StripEnds>({ atStart: true, atEnd: true });
+  // Runs on every scroll, so it keeps the old state when neither end moved:
+  // a fresh object would re-render every card each frame.
+  const measure = () => {
+    if (!strip.current) return;
+    const next = stripEnds(strip.current);
+    setEnds(prev => (prev.atStart === next.atStart && prev.atEnd === next.atEnd ? prev : next));
+  };
+  const loaded = gallery.status === 'loaded';
+  useLayoutEffect(() => {
+    if (strip.current) fitColumns(strip.current);
+    measure();
+  }, [loaded, phone]);
+  // Opens on the page holding the active theme, once the gallery and the
+  // preference naming the active theme are both in. Earlier would open on the
+  // default, and a later pick must not move the strip under the reader.
+  const ready = loaded && preferences.value.status === 'loaded';
+  useLayoutEffect(() => {
+    if (!ready) return;
+    const scroller = strip.current;
+    const card = scroller?.querySelector<HTMLElement>('.theme-card[aria-checked="true"]');
+    if (!scroller || !card) return;
+    const { columns, page, offset } = stripGeometry(scroller);
+    const column = parseInt(card.style.gridColumnStart, 10) - 1;
+    scroller.scrollLeft = Math.max(0, Math.floor(column / columns) * page - offset);
+    measure();
+  }, [ready]);
+  // A wider or narrower column changes how many cards fit, and moves the ends
+  // without a scroll event.
+  useEffect(() => {
+    const scroller = strip.current;
+    if (!scroller || typeof ResizeObserver === 'undefined') return;
+    const observer = new ResizeObserver(() => {
+      fitColumns(scroller);
+      measure();
+    });
+    observer.observe(scroller);
+    return () => observer.disconnect();
+  }, [loaded]);
+  const scrollTo = (left: number) => {
+    strip.current?.scrollTo({ left: Math.max(0, left), behavior: isReducedMotion() ? 'auto' : 'smooth' });
+  };
+  // Moves one page on, so every stop shows whole pages. Whole columns round
+  // toward the direction of travel: after a clamp at an end or a swipe the
+  // strip rests between stops, and rounding to the nearest would skip cards.
+  // A phone steps on from the card nearest the centre instead: at an end that
+  // is the second card, so a press centres the third.
+  const pageBy = (direction: 1 | -1) => {
+    const scroller = strip.current;
+    if (!scroller) return;
+    const { page, offset } = stripGeometry(scroller);
+    const at = (scroller.scrollLeft + offset) / page;
+    const from = offset !== 0 ? Math.round(at) : direction > 0 ? Math.floor(at + 0.01) : Math.ceil(at - 0.01);
+    scrollTo((from + direction) * page - offset);
+  };
+  // A new filter shows a new set of cards, so the ends move with no scroll.
+  useLayoutEffect(measure, [picked]);
+  const pickFilter = (name: string | null) => {
+    if (strip.current) strip.current.scrollLeft = 0;
+    setFilter(name);
+  };
   if (gallery.status === 'failed') return <LoadableError noun="themes" error={gallery.error} />;
 
   const mode = paintedThemeMode.value;
+  const stripClass = phone ? `theme-carousel ${PEEK_CLASS}` : 'theme-carousel';
   const active = currentThemeId();
   const themes = gallery.status === 'loaded' ? gallery.data.themes : null;
   // A preference naming a theme that is gone paints the default
-  // (refreshActiveTheme), so the picker shows and checks the default too.
+  // (refreshActiveTheme), so the picker checks the default too.
   const painted = themes?.find(theme => theme.id === active) ?? themes?.find(theme => theme.id === DEFAULT_THEME_ID);
   return (
-    <div ref={root}>
-      <LoadingFade
-        showSkeleton={showSkeleton}
-        skeleton={<ListSkeletonOf containerClass="theme-grid" count={1} row={() => <ThemeCard mode={mode} />} />}
-      >
-        {gallery.status === 'loaded' && (
-          <>
-            <Disclosure open={!open}>
-              {painted && (
-                <div class="theme-grid">
-                  <ThemeCard
-                    theme={painted}
-                    defaults={gallery.data.defaults}
-                    mode={mode}
-                    themeCount={gallery.data.themes.length}
-                    onClick={() => toggleOpen(true)}
-                  />
+    <LoadingFade
+      showSkeleton={showSkeleton}
+      skeleton={
+        // The loaded frame's rows: a chip line, the names row, then the cards.
+        <div class="theme-carousel-frame">
+          <div class="theme-family-chips" aria-hidden="true">
+            <span class="theme-family-chip">{'\u00a0'}</span>
+          </div>
+          <ListSkeletonOf
+            containerClass={stripClass}
+            count={6}
+            row={i => (
+              <>
+                {i === 0 && <span class="theme-family-name">{'\u00a0'}</span>}
+                <ThemeCard mode={mode} column={1 + Math.floor(i / rows)} row={2 + (i % rows)} />
+              </>
+            )}
+          />
+        </div>
+      }
+    >
+      {gallery.status === 'loaded' && (
+        <div class="theme-carousel-frame">
+          <div class="theme-family-chips" role="group" aria-label="Theme family">
+            {[null, ...groups.map(group => group.name)].map(name => (
+              <button
+                key={name ?? 'all'}
+                type="button"
+                class={`theme-family-chip${picked === name ? ' active' : ''}`}
+                aria-pressed={picked === name}
+                onClick={() => pickFilter(name)}
+              >
+                {name ?? 'All'}
+              </button>
+            ))}
+          </div>
+          <div class="theme-carousel-body">
+            <button type="button" class="icon-btn theme-carousel-step theme-carousel-prev" aria-label="Previous themes" disabled={ends.atStart} onClick={() => pageBy(-1)}>
+              <ChevronLeftIcon />
+            </button>
+            <div
+              ref={strip}
+              class={stripClass}
+              role="radiogroup"
+              aria-label="Theme"
+              data-more-before={ends.atStart ? undefined : ''}
+              data-more-after={ends.atEnd ? undefined : ''}
+              onScroll={measure}
+            >
+              {families.map(({ group, column, span }) => (
+                <div key={group.name} class="theme-family" role="group" aria-label={group.name}>
+                  {labelRows > 0 && (
+                    <span class="theme-family-name" aria-hidden="true" style={{ gridColumn: `${column} / span ${span}` }}>
+                      {group.name}
+                    </span>
+                  )}
+                  {group.themes.map((theme, i) => {
+                    const selected = theme.id === painted?.id;
+                    // The active theme needs no pick, unless it lacks this mode:
+                    // then pickTheme offers the mode switch.
+                    const settled = selected && theme.modes.includes(mode);
+                    return (
+                      <ThemeCard
+                        key={theme.id}
+                        theme={theme}
+                        defaults={gallery.data.defaults}
+                        mode={mode}
+                        selected={selected}
+                        column={column + Math.floor(i / rows)}
+                        row={labelRows + 1 + (i % rows)}
+                        onClick={settled ? undefined : () => void pickTheme(theme)}
+                      />
+                    );
+                  })}
                 </div>
-              )}
-            </Disclosure>
-            <Disclosure open={open}>
-              <div class="theme-families" role="radiogroup" aria-label="Theme">
-                {groupThemesByFamily(gallery.data.themes).map(group => (
-                  <div key={group.name} class="theme-family" role="group" aria-label={group.name}>
-                    <span class="theme-family-name" aria-hidden="true">{group.name}</span>
-                    <div class="theme-grid">
-                      {group.themes.map(theme => {
-                        const selected = theme.id === painted?.id;
-                        // An active theme that has this mode needs no pick, so its tap folds
-                        // the grid. One without it still offers pickTheme's mode switch.
-                        const folds = selected && theme.modes.includes(mode);
-                        return (
-                          <ThemeCard
-                            key={theme.id}
-                            theme={theme}
-                            defaults={gallery.data.defaults}
-                            mode={mode}
-                            selected={selected}
-                            onClick={folds ? () => toggleOpen(false) : () => void pickTheme(theme)}
-                          />
-                        );
-                      })}
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </Disclosure>
-          </>
-        )}
-      </LoadingFade>
-    </div>
+              ))}
+            </div>
+            <button type="button" class="icon-btn theme-carousel-step theme-carousel-next" aria-label="Next themes" disabled={ends.atEnd} onClick={() => pageBy(1)}>
+              <ChevronRightIcon />
+            </button>
+          </div>
+        </div>
+      )}
+    </LoadingFade>
   );
 }
 
-/** A radio in the unfolded grid, or, given `themeCount`, the folded summary
- *  that unfolds it. */
-function ThemeCard({ theme, defaults, mode, selected = false, themeCount, onClick }: {
+/** One theme's radio in the carousel, at its grid cell. */
+function ThemeCard({ theme, defaults, mode, selected = false, column, row, onClick }: {
   theme?: Theme;
   defaults?: ThemeModeMaps;
   mode: ResolvedThemeMode;
   selected?: boolean;
-  themeCount?: number;
+  column: number;
+  row: number;
   onClick?: () => void;
 }) {
   const sk = useSkeleton();
@@ -244,20 +359,20 @@ function ThemeCard({ theme, defaults, mode, selected = false, themeCount, onClic
   const style = defaults ? { ...defaults[previewMode], ...tokens } : undefined;
   const label = theme ? modesLabel(theme) : null;
   const tooltip = theme ? [theme.description, theme.credit].filter(Boolean).join(' ') : undefined;
-  const summary = themeCount !== undefined;
 
   return (
     <button
       type="button"
-      role={summary ? undefined : 'radio'}
-      aria-checked={summary ? undefined : selected}
-      aria-expanded={summary ? false : undefined}
-      class={`theme-card${selected ? ' selected' : ''}${summary ? ' theme-toggle' : ''}`}
+      role="radio"
+      aria-checked={selected}
+      class={`theme-card${selected ? ' selected' : ''}`}
+      style={{ gridColumn: String(column), gridRow: String(row) }}
       data-tooltip={tooltip || undefined}
       disabled={sk}
       onClick={onClick}
     >
-      <SkBlock w="100%" h="5rem" round>
+      {/* The preview's height in themes.css: portrait on a phone. */}
+      <SkBlock w="100%" h={viewportIsMobile.value ? '11rem' : '5rem'} round>
         <div class="theme-preview" style={style} aria-hidden="true">
           <div class="theme-preview-header">
             <span class="theme-preview-dot" />
@@ -283,12 +398,7 @@ function ThemeCard({ theme, defaults, mode, selected = false, themeCount, onClic
       </SkBlock>
       <span class="theme-card-meta" style={theme ? themeFontStyle(theme) : undefined}>
         <SkText class="theme-card-name" w="50%">{theme?.name}</SkText>
-        {summary
-          ? <>
-              <span class="theme-toggle-count">{themeCount} themes</span>
-              <span class="theme-toggle-chevron"><ChevronRightIcon size="1em" /></span>
-            </>
-          : label && <span class="theme-card-modes">{label}</span>}
+        {label && <span class="theme-card-modes">{label}</span>}
       </span>
     </button>
   );

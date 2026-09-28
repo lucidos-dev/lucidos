@@ -1488,7 +1488,9 @@ The entry survives its removal because the idea is the obvious one to reach for 
 ### Type scale
 The closed set of ten `--font-size-*` steps (`3xs` through `display`, 9px to 36px) that every `font-size` in the app reads, declared in `styles/global/base.css` and mirrored value-for-value into the engine's `api/sdk_iframe.css` so app iframes get the same rungs. Not a palette to pick freely from: the rule is snap to the nearest step, never a hand-dialed `rem` (`.claude/rules/frontend-css.md`).
 
-**Its anchor is offset from the platform's, and that offset is why the recurring bug is always "too big".** `--font-size-xl` is exactly `1rem` and is a *section heading*; body text is `--font-size-md` at `0.8125rem`. On the rest of the web `1rem` is body, so every instinct, snippet and reconstructed-from-memory scale lands about a step and a half high. The root font-size is deliberately not a step at all: it is `var(--user-ui-scale)`, the multiplier every `rem` in the app rides, geometry included, which is also why the anchor cannot be moved without rescaling the whole app.
+**Its anchor is offset from the platform's, and that offset is why the recurring bug is always "too big".** `--font-size-xl` is exactly `1rem` and is a *section heading*. The host's body is `--font-size-md` at `0.8125rem`. Running text in chat, apps and HTML artifacts is `--font-size-sm` at `0.75rem`, the *chat prose step* (ADR 0319).
+
+On the rest of the web `1rem` is body, so every instinct, snippet and reconstructed-from-memory scale lands high. The root font-size is deliberately not a step at all. It is `var(--user-ui-scale)`, the multiplier every `rem` in the app rides, geometry included. That is also why the anchor cannot move without rescaling the whole app.
 
 The consequence is the **text defaults layer**, the two `base.css` declarations that make an omitted `font-size` harmless: `body` carries `--font-size-md`, and `input, textarea, select, button` carry `font-family: inherit; font-size: inherit` (a control inherits nothing on its own, because the UA stylesheet applies the `font` shorthand to it, and the shorthand must never be used to hand it back, since it also resets `font-weight` and `font-feature-settings`). Before those existed, text that named no size fell through to the root and rendered as a heading, which is what shipped in Settings > System > What's New on 2026-08-12. Pinned by `styles/__tests__/text-defaults-guard.test.ts` and, in the only check that resolves the cascade, `e2e/type-scale.spec.ts`.
 
@@ -3206,7 +3208,7 @@ source-scan test holds that line. Sibling of `trigger_group_writes.rs`, which
 does the same for *trigger groups*.
 
 ### Scheduler blocklist
-The `ThreadEvent::is_per_token_streaming` predicate (`crates/lucidos-engine/src/engine/thread_events.rs`) consumed by the scheduler subscriber's `BusEvent::Thread` arm in `crates/lucidos-engine/src/scheduler/mod.rs`. Filters out per-token streaming variants — today: `TextStreamed`, `Thinking`, `CodingAgentTextStreamed` — before they reach the trigger matcher. Every other persisted `ThreadEvent` flows through and is subscribable via `on_event:`. Triggers wired to a blocked variant validate and persist but **never fire**.
+The `core::event_subscription::is_subscribable` predicate, consumed by the scheduler subscriber's `BusEvent::Thread` arm in `crates/lucidos-engine/src/scheduler/mod.rs`. It filters out the per-token streaming variants (`ThreadEvent::is_per_token_streaming`) and the four side-question events (`ThreadEvent::is_side_question_event`) before they reach the trigger matcher. Every other persisted `ThreadEvent` flows through and is subscribable via `on_event:`. A trigger on a streaming variant validates and persists but **never fires**. A subscription on a side-question event is refused (ADR 0320).
 See also: `system-knowhow/thread-events.md` § "Today the scheduler uses a blocklist", `.claude/rules/system-knowhow.md`.
 
 ### System subscribability gate
@@ -3492,7 +3494,7 @@ Wider than the *child follow-up* edge, which stops at direct children, and delib
 
 Enforced on all fourteen routes carrying seven of clause 4's eight verbs, per verb rather than per route: Apply, Discard, answering a question card, restarting a turn (Continue), creating a top-thread, archiving and cancelling. Three of them arrive by more than one path, and gating the first path of each is how the ungated set grew. Three LLM tools press Apply in-process (`apply_change`, `apply_when_settled`, `apply_as_they_settle`). They carry no headers, so they name their own thread and ask the same rule through `refuse_thread_without_authority`. The eighth verb, resolving a permission card, is still ungated and recorded as such in the plan. See ADR 0083's amendment for the archive and cancel half, and ADR 0168 for the rest.
 
-Two more verbs aim at a live coding-agent session rather than at the tree's shape: controlling it (`POST /api/v1/claude-code/control`) and asking it a *side question* (`POST /api/v1/coding-agents/side-question`), which reads the session's whole context.
+Three more verbs aim at a live coding-agent session rather than at the tree's shape: controlling it (`POST /api/v1/claude-code/control`), asking it a *side question* (`POST /api/v1/coding-agents/side-question`), which reads the session's whole context, and dismissing that question's card (`POST /api/v1/coding-agents/side-question/dismiss`).
 
 **Deleting a thread is deliberately NOT one of these verbs.** It has no place on the ladder and no `ThreadReachVerb`, because the ladder's second question admits a thread carrying the *standing instruction*. It takes the *owner-device gate* instead, which refuses every agent outright (ADR 0192).
 

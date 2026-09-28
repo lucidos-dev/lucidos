@@ -293,14 +293,17 @@ pub(crate) async fn has_pending_fan_in(pool: &PgPool, thread_id: Uuid) -> bool {
     // (b) a completed-but-unprocessed child completion is the thread's last
     // persisted word (no resume emitted a later event). A sibling's
     // `ChildThreadStopped` or `ChildThreadDetached` note wakes nothing, so
-    // it cannot have processed the card, and it must not hide it.
+    // it cannot have processed the card, and it must not hide it. Nor can a
+    // side question, which no agent reads.
     match sqlx::query_scalar::<_, String>(
         "SELECT event_type FROM events \
          WHERE aggregate = 'thread' AND aggregate_id = $1::text \
            AND event_type NOT IN ('ChildThreadStopped', 'ChildThreadDetached') \
+           AND event_type <> ALL($2) \
          ORDER BY sequence DESC LIMIT 1",
     )
     .bind(thread_id)
+    .bind(crate::engine::thread_events::ThreadEvent::SIDE_QUESTION_EVENT_TYPES)
     .fetch_optional(pool)
     .await
     {

@@ -70,6 +70,16 @@ export async function setDevicePreference(page: Page, key: string, value: string
   expect((await res.json()).success, `${key}=${value}`).toBe(true);
 }
 
+/** Open a Settings page through the navigate API, as the agent does.
+ *  `view` is a `settings_view` value such as `appearance` or `system`. */
+export async function openSettingsView(page: Page, view: string): Promise<void> {
+  const nav = await apiRequest(page).post('/api/v1/ui/navigate', {
+    headers: { 'content-type': 'application/json' },
+    data: { target: 'settings', params: { settings_view: view } },
+  });
+  expect(nav.ok(), `POST /api/v1/ui/navigate -> ${nav.status()}`).toBeTruthy();
+}
+
 /** CSS selector for the body of a rendered user message (initiator panel).
  *  Centralized so a UI rename only requires changing this one constant. */
 export const USER_MSG_SELECTOR = '.initiator-panel-user .initiator-body';

@@ -515,3 +515,45 @@ fn a_delegation_starts_a_turn_exactly_as_the_message_it_replaced() {
         }
     }
 }
+
+// 17. a_side_question_moves_nothing
+//
+// A side question is a card beside the thread, never a turn (ADR 0320). Its
+// four events are persisted so the card survives reload. None of them may
+// move a status, a section, recency or the message count.
+#[test]
+fn a_side_question_moves_nothing() {
+    use crate::engine::thread_events::ThreadEvent;
+    let status_rules: std::collections::BTreeMap<&str, StatusTransition> =
+        status_transitions().into_iter().collect();
+    for &event_type in ThreadEvent::SIDE_QUESTION_EVENT_TYPES {
+        assert_eq!(
+            classify_event(event_type),
+            Some(EventClass::Metadata),
+            "'{event_type}' must be a quiet class"
+        );
+        assert!(
+            all_persisted_event_types().contains(&event_type),
+            "'{event_type}' must be persisted so the card survives reload"
+        );
+        assert!(
+            !status_rules.contains_key(event_type),
+            "'{event_type}' must not write a status"
+        );
+        assert!(!LAST_ACTIVITY_EVENTS.contains(&event_type));
+        assert!(!MESSAGE_COUNT_EVENTS.contains(&event_type));
+        assert!(!WAITING_FOR_USER_ANSWER_EVENTS.contains(&event_type));
+        for thread_type in [ThreadType::Chat, ThreadType::CodingAgent] {
+            for section in [ArchiveState::Archived, ArchiveState::Inbox] {
+                for unattended in [false, true] {
+                    let result = resolve_transition(event_type, thread_type, section, unattended)
+                        .unwrap_or_else(|e| panic!("'{event_type}' was rejected: {e:?}"));
+                    assert_eq!(
+                        result.new_section, None,
+                        "'{event_type}' moved a {thread_type:?} thread out of {section:?}"
+                    );
+                }
+            }
+        }
+    }
+}

@@ -6,7 +6,7 @@ import {
 import type { ModelSelection } from '../../hooks/useModelSelection';
 import { useEscapeStep } from '../../hooks/useEscapeStep';
 import { focusIfNeeded, isTextInput } from '../../utils/dom';
-import { isTouchDevice } from '../../utils/viewport';
+import { hasCoarsePointer, isTouchDevice } from '../../utils/viewport';
 import {
   ControlOptionList, selectedOptionIndex, wrapHighlight, type ControlOption,
 } from './ControlOptionList';
@@ -103,10 +103,14 @@ export function pickerShowsFilter(opts: { searching: boolean; touch: boolean }):
  *  what turns that key into the query. The tier step has no filter, so it is
  *  always the list there.
  *
- *  So the box a touch device always shows OPENS unfocused, and that is the
- *  point: the panel would otherwise be half covered by the on-screen keyboard
- *  before the user has asked to search. A tap on the box is the asking. */
-export function pickerFocusTarget(opts: { tierStep: boolean; searching: boolean }): 'filter' | 'list' {
+ *  `null` on a touch device leaves focus where it is. The box it always shows
+ *  opens unfocused, so the keyboard cannot cover the panel before the user
+ *  asks to search. A tap on the box is the asking. Nor does the list take
+ *  focus: that blurs the prompt, and the keyboard slides away under the panel. */
+export function pickerFocusTarget(
+  opts: { tierStep: boolean; searching: boolean; touch: boolean },
+): 'filter' | 'list' | null {
+  if (opts.touch) return null;
   return opts.searching && !opts.tierStep ? 'filter' : 'list';
 }
 
@@ -169,9 +173,7 @@ export function ModelSelectionPicker({
     ? []
     : openStep.step === 'tiers' ? tierStepOptions(openRow) : providerStepOptions(openRow);
   const rows = openStep ? stepOptions : modelOptions;
-  const showsFilter = pickerShowsFilter({
-    searching: searching.value, touch: isTouchDevice(),
-  });
+  const showsFilter = pickerShowsFilter({ searching: searching.value, touch: isTouchDevice() });
 
   // Land on the model in force, so a long registry opens where the user is.
   useEffect(() => {
@@ -187,7 +189,12 @@ export function ModelSelectionPicker({
   // already on screen, which is every reveal, and there the next keystroke is
   // already on its way.
   useEffect(() => {
-    const target = pickerFocusTarget({ tierStep: !!openStep, searching: searching.value });
+    // A coarse pointer, not any touch capability: a touchscreen laptop driven
+    // by its trackpad still wants the arrow keys in the list.
+    const target = pickerFocusTarget({
+      tierStep: !!openStep, searching: searching.value, touch: hasCoarsePointer(),
+    });
+    if (target === null) return;
     const ref = target === 'filter' ? filterRef : listRef;
     focusIfNeeded(ref.current);
     requestAnimationFrame(() => focusIfNeeded(ref.current));

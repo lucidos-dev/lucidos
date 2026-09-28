@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'preact/hooks';
+import { useEffect, useId, useState } from 'preact/hooks';
 import { WORKSPACE_FONT_LIMITS, type FontGroup, type WorkspaceFont } from '@lucidos/appearance';
 import { registerWorkspaceFont } from '@lucidos/font-faces';
 import { dataMountUrl, type InvalidWorkspaceFont } from '../../api/client';
@@ -18,6 +18,7 @@ import { errorDetail } from '../../utils/errorDetail';
 import { Disclosure } from '../shared/Disclosure';
 import { Dropdown } from '../shared/Dropdown';
 import { Explainer } from '../shared/Explainer';
+import { HiddenFileInput } from '../shared/HiddenFileInput';
 import { LoadableError } from '../shared/LoadableError';
 import { LoadingFade } from '../shared/LoadingFade';
 import { ListSkeletonOf, SkBlock, SkText } from '../shared/Skeleton';
@@ -152,12 +153,20 @@ function labelFromFileName(name: string): string {
   return name.replace(/\.[^.]+$/, '').split(/[-_]/)[0] ?? '';
 }
 
+/** What the picker holds, in the words the native input would use. */
+export function chosenFilesSummary(files: FontFileChoice[]): string {
+  if (files.length === 0) return 'No file chosen';
+  if (files.length === 1) return files[0]!.file.name;
+  return `${files.length} files`;
+}
+
 function InstallFontForm({ onInstalled }: { onInstalled: () => void }) {
   const [label, setLabel] = useState('');
   const [group, setGroup] = useState<FontGroup>('sans');
   const [ligatures, setLigatures] = useState(false);
   const [files, setFiles] = useState<FontFileChoice[]>([]);
   const [busy, setBusy] = useState(false);
+  const statusId = useId();
 
   const chooseFiles = (list: FileList | null) => {
     const chosen = Array.from(list ?? []).map(file => ({ file, ...guessFace(file.name) }));
@@ -191,12 +200,21 @@ function InstallFontForm({ onInstalled }: { onInstalled: () => void }) {
     <div class="workspace-font-form">
       <div class="settings-row settings-row-child">
         <span class="settings-row-label">Files</span>
-        <input
-          type="file"
-          multiple
-          accept={FONT_FILE_TYPES}
-          onChange={e => chooseFiles((e.currentTarget as HTMLInputElement).files)}
-        />
+        <div class="workspace-font-picker">
+          <span class="workspace-font-picker-status" id={statusId}>
+            {chosenFilesSummary(files)}
+          </span>
+          <label class="settings-option">
+            <HiddenFileInput
+              multiple
+              accept={FONT_FILE_TYPES}
+              name="Choose font files"
+              describedBy={statusId}
+              onChange={e => chooseFiles((e.currentTarget as HTMLInputElement).files)}
+            />
+            Choose files
+          </label>
+        </div>
       </div>
       {files.map((choice, i) => (
         <div class="settings-row settings-row-child workspace-font-file" key={`${choice.file.name}-${i}`}>

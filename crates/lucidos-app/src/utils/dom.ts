@@ -7,6 +7,13 @@ export function focusIfNeeded(el: HTMLElement | null | undefined): void {
   }
 }
 
+/** The `onMouseDown` of a menu trigger or menu row: the press leaves focus
+ *  where it is. On iOS a mousedown on a button blurs the focused field, and a
+ *  keyboard sliding away under an open menu moves it under the reader. */
+export function keepFocusOnPress(e: Event): void {
+  e.preventDefault();
+}
+
 /** Returns true if the element is a text input (input, textarea, select, or contentEditable). */
 export function isTextInput(el: EventTarget | Element | null): boolean {
   if (!(el instanceof HTMLElement)) return false;

@@ -63,7 +63,7 @@ For trigger config syntax (cron vs the `on` subscription list, per-entry `condit
 
 ## Triggerability: blocklist semantics
 
-The scheduler forwards persisted ThreadEvents to the trigger matcher, unless they sit on a small **per-token streaming blocklist**. That is `ThreadEvent::is_per_token_streaming` in `crates/lucidos-engine/src/engine/thread_events/event_impl.rs`, gated at the `BusEvent::Thread` arm of the scheduler subscriber in `crates/lucidos-engine/src/scheduler/mod.rs`. Two coding-agent entries sit on it, `CodingAgentTextStreamed` and `CodingAgentThoughtStreamed`. Those are the two coding-agent variants a workspace cannot subscribe to today.
+The scheduler forwards persisted ThreadEvents to the trigger matcher, unless they sit on a small **blocklist**. That is `core::event_subscription::is_subscribable`, called at the `BusEvent::Thread` arm of the scheduler subscriber in `crates/lucidos-engine/src/scheduler/mod.rs`. It drops the per-token streaming variants (`ThreadEvent::is_per_token_streaming`) and the side-question events (`ThreadEvent::is_side_question_event`). Two coding-agent streaming entries sit on it, `CodingAgentTextStreamed` and `CodingAgentThoughtStreamed`, beside the four side-question events.
 
 That means right now (each line is one entry inside a trigger's `on` list, see `system-knowhow/triggers.md` for the full subscription shape):
 
@@ -71,7 +71,8 @@ That means right now (each line is one entry inside a trigger's `on` list, see `
 - `event_type: CodingAgentIdled` — **works**. Pair with the entry's `condition: { has_changes: true }` to scope to "the coding agent finished and left work to review."
 - `event_type: CodingAgentPermissionRequest` — **works**. Lets a workspace react to "the coding agent is asking permission for a tool call."
 - `event_type: CodingAgentToolCalled` / `CodingAgentToolResult` / `CodingAgentPromptSent`: **works**, but these are per-action and chatty. Always pair with the entry's `condition:` (e.g. `name: "Bash"`) or the trigger fires many times per turn. A condition key is a field path, so the command text inside `args` is filterable too: `{ "args.command": { "$regex": "cargo test" } }`.
-- `event_type: CodingAgentTextStreamed` / `CodingAgentThoughtStreamed`: does not fire. Per-token streaming is the only `ThreadEvent` the scheduler blocks, so subscribing to either is a no-op.
+- `event_type: CodingAgentTextStreamed` / `CodingAgentThoughtStreamed`: does not fire. The scheduler blocks per-token streaming, so subscribing to either is a no-op.
+- `event_type: SideQuestionAsked` (or any side-question event): refused. No agent, trigger or event wait may see a side question (ADR 0320).
 - `event_type: <any chat-side lifecycle event>` (`ResponseGenerated`, `ResponseFailed`, `ChangeApplied`, …) — works; same blocklist semantics. See `system-knowhow/thread-events.md` for the full set.
 
 The blocklist is not the only gate. A trigger is never woken by an event its own fire emitted, so an *intent* trigger subscribed to `ResponseGenerated` does not see its own. The split that matters here is what the fire hands off. A coding-agent session the fire STARTS runs on its own thread, so its `CodingAgentIdled` still wakes the trigger. That is what makes "wait for the session I started" work.
@@ -168,9 +169,16 @@ All fields except `coding_agent` are `#[serde(skip_serializing_if = ...)]`-gated
 
 **Cancel = Esc (resumable):** the `Cancel` button is a real *interrupt*, not a kill. `POST /api/v1/claude-code/stop` (default, `StopReason::UserStop`) routes through `interrupt_agent`, which forwards CC's native interrupt (the equivalent of pressing `Esc` in the CLI). CC winds down the current turn, emits a `Result`, and the engine emits `ResponseCanceled(UserStop)` **+** `CodingAgentIdled` carrying the `cc_session_id`. The branch is **kept** even with zero commits (`SessionEndAction::KeepCanceledBranch` in `finalize`), so the next message `--resume`s the *same* conversation on the *same* branch — no fresh session, no re-asking. (Apply / Discard / Archive still hard-stop via `stop_agent`; each carries its own terminator.) A bounded fallback escalates to the hard stop only if CC fails to honor the interrupt within ~8s (hung socket, control request ignored while a long tool runs — the watchdog skips while a tool is in flight); even then the turn is stamped `Canceled(UserStop)` so the branch is kept and the session stays best-effort resumable. Before this, the `Cancel` button hard-killed CC and `git branch -D`'d the branch, so the follow-up spawned a brand-new, amnesiac session.
 
-### Side questions record nothing
+### Side questions are recorded, and hidden from every agent
 
-A *side question* (`/btw <question>` in a Claude Code thread) emits **no event of any kind**, so no trigger, query or recap can see one. `POST /api/v1/coding-agents/side-question` with `{thread_id, question}` returns `{answer}` and nothing else. The running turn is untouched: the engine writes only Claude Code's `side_question` control request, never a user message or an interrupt. A Codex thread gets a 400 naming the limit. The normal chat route refuses `/btw` in any coding-agent thread with a 400 (reason `side-question`), so it can never become a main-session turn. Claude Code reports no usage for a side question, so Token Cost does not count it (ADR 0318).
+A *side question* (`/btw <question>` in a Claude Code thread) is answered by Claude Code from its own session, beside any running turn, with no tools. The engine writes only Claude Code's `side_question` control request, never a user message or an interrupt.
+
+- **Ask:** `POST /api/v1/coding-agents/side-question` with `{thread_id, side_question_id, question}` returns `{answer}`. The client names `side_question_id` (a UUID). A 400 refuses a Codex thread, a thread with no Claude Code session yet, or an empty question. A 409 refuses a repeated id. A refusal records nothing.
+- **Dismiss:** `POST /api/v1/coding-agents/side-question/dismiss` with `{thread_id, side_question_id}` returns `{ok: true}`, or 404 when no such ask exists on the thread.
+- **Recorded:** `SideQuestionAsked`, then `SideQuestionAnswered` or `SideQuestionFailed`, and `SideQuestionDismissed`. So a card survives reload and shows on every device. Startup fails every ask a restart left unanswered.
+- **Hidden:** no agent ever reads them. `query_events`, triggers, event waits and every context builder leave them out, and they move no thread state.
+
+The normal chat route refuses `/btw` in any coding-agent thread with a 400 (reason `side-question`), so it can never become a main-session turn. Claude Code reports no usage for a side question, so Token Cost does not count it (ADR 0320).
 
 ### `UserQuestionAsked`
 

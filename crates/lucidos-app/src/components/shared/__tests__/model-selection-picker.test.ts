@@ -140,15 +140,22 @@ describe('pickerFocusTarget', () => {
   it('gives the list the keystrokes before the search starts', () => {
     // The list's own handler turns a printable key into the query, so it holds
     // focus while there is no box to type into.
-    expect(pickerFocusTarget({ tierStep: false, searching: false })).toBe('list');
+    expect(pickerFocusTarget({ tierStep: false, searching: false, touch: false })).toBe('list');
   });
 
   it('hands over to the box once the search has started', () => {
-    expect(pickerFocusTarget({ tierStep: false, searching: true })).toBe('filter');
+    expect(pickerFocusTarget({ tierStep: false, searching: true, touch: false })).toBe('filter');
   });
 
   it('keeps the tier step on the list, which has no filter to focus', () => {
-    expect(pickerFocusTarget({ tierStep: true, searching: true })).toBe('list');
+    expect(pickerFocusTarget({ tierStep: true, searching: true, touch: false })).toBe('list');
+  });
+
+  it('leaves focus alone on a touch device, on every step', () => {
+    // Focusing the list takes focus from the prompt, and on iOS the keyboard
+    // then slides away under the open panel.
+    expect(pickerFocusTarget({ tierStep: false, searching: false, touch: true })).toBeNull();
+    expect(pickerFocusTarget({ tierStep: true, searching: false, touch: true })).toBeNull();
   });
 });
 

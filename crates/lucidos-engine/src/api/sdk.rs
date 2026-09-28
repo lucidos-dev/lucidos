@@ -280,21 +280,18 @@ mod tests {
         }
     }
 
-    /// An app's `<body>` must carry the type scale's body step. Two ways to get
-    /// this wrong, and the assert below covers both: leave the declaration off
-    /// and unstyled app text falls to the raw root font-size (`1rem`, 18px at a
-    /// 112.5% UI scale), which is exactly `--font-size-xl`, a SECTION HEADING,
-    /// so every app reads a scale step larger than Lucidos with proportionally
-    /// looser line spacing on top (2026-08-05); write a raw `rem` and it ships
-    /// an off-scale size to every app, against the closed-set rule the host
-    /// shell follows (`.claude/rules/frontend-css.md`).
+    /// An app's `<body>` must carry the chat prose step, `--font-size-sm`, so
+    /// unsized app text reads at the size of the chat beside it (ADR 0319).
+    /// Two ways to get this wrong, and the assert below covers both. Leave the
+    /// declaration off and unstyled app text falls to the raw root font-size
+    /// (`1rem`), which is `--font-size-xl`, a SECTION HEADING. Write a raw `rem`
+    /// and it ships an off-scale size to every app, against the closed-set rule
+    /// the host shell follows (`.claude/rules/frontend-css.md`).
     ///
-    /// The host's `body` in `styles/global/base.css` carries the same
-    /// declaration since 2026-08-13. It used to be deliberately absent, on the
-    /// theory that every host surface names its own token; What's New disproved
-    /// it. See `docs/code-review-priors.md` for the full history of all three
-    /// deletions, and `styles/__tests__/text-defaults-guard.test.ts` for the
-    /// host-side twin of this assert.
+    /// The host's `body` in `styles/global/base.css` stays on `--font-size-md`,
+    /// the host's step for single-line UI. See `docs/code-review-priors.md` for
+    /// the history, and `styles/__tests__/text-defaults-guard.test.ts` for the
+    /// frontend twin of this assert.
     #[test]
     fn iframe_body_is_sized_from_the_type_scale() {
         let rule = SDK_IFRAME_BASE_CSS
@@ -303,8 +300,8 @@ mod tests {
             .and_then(|rest| rest.split('}').next())
             .expect("sdk_iframe.css must carry a top-level `body {` rule");
         assert!(
-            rule.contains("font-size: var(--font-size-md);"),
-            "app <body> must default to the type scale's body step, not the raw \
+            rule.contains("font-size: var(--font-size-sm);"),
+            "app <body> must default to the chat prose step, not the raw \
              root font-size and not an off-scale rem. Found:\n{rule}"
         );
     }

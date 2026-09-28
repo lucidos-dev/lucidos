@@ -163,3 +163,13 @@ signal, which is simpler to reason about. It has no right length: short enough
 not to hold through a fast stream is too short for a slow first token, and the
 gap between those is seconds. Reading what the turn has DRAWN answers for both
 without a guess.
+
+## Amendment: a side question rests on its card
+
+A `/btw` side question takes the submit path too, but it asks the agent for
+nothing. No reply streams under the reader, so the live edge has nothing to
+offer them. It rests once on the card's start instead, clamped to the live edge,
+and holds nothing (`followSideQuestion`, `landOnStart`). Every submit to the
+agent still rests on the live edge. The reader chose this for side questions:
+"scroll down to the message start". Plan:
+`docs/plans/2026-09-28-side-question-sits-inside-its-turn.md`.

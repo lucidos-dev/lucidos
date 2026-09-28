@@ -3,30 +3,199 @@
    (components/settings/ThemePicker.tsx), so every var() inside it resolves to
    that theme, not to the page's. */
 
-.theme-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(9rem, 1fr));
-    gap: var(--space-sm);
-    padding: var(--space-sm) 0;
-}
-
-.theme-families {
+.theme-carousel-frame {
     display: flex;
     flex-direction: column;
+    gap: var(--space-xs);
+}
+
+/* Filter chips over the strip: All, then one per family. The one picked is
+   marked. They stay on one line and scroll sideways when they do not fit. */
+.theme-family-chips {
+    display: flex;
+    gap: var(--space-xs);
+    overflow-x: auto;
+    overscroll-behavior-x: contain;
+    scrollbar-width: none;
+}
+
+.theme-family-chips::-webkit-scrollbar {
+    display: none;
+}
+
+.theme-family-chip {
+    flex-shrink: 0;
+    min-height: 2.25rem;
+    padding: 0.25rem 0.75rem;
+    border: none;
+    border-radius: var(--radius-round);
+    background: none;
+    color: var(--text-muted);
+    font-size: var(--font-size-xs);
+    cursor: pointer;
+    transition: background var(--duration-normal), color var(--duration-normal);
+}
+
+.theme-family-chip.active {
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+}
+
+@media (hover: hover) {
+    .theme-family-chip:not(.active):hover {
+        color: var(--text-primary);
+    }
+}
+
+.theme-family-chip:focus-visible {
+    outline: none;
+    box-shadow: var(--focus-ring);
+}
+
+/* Two half-transparent chevrons float over the strip's sides and page it.
+   The one at a reached end hides. */
+.theme-carousel-body {
+    position: relative;
+}
+
+.theme-carousel-step {
+    position: absolute;
+    top: 50%;
+    z-index: 1;
+    justify-content: center;
+    width: 2.25rem;
+    height: 2.25rem;
+    padding: 0;
+    border: 1px solid color-mix(in srgb, var(--border-color) 50%, transparent);
+    border-radius: var(--radius-round);
+    background: color-mix(in srgb, var(--surface-bg) 60%, transparent);
+    backdrop-filter: blur(0.25rem);
+    color: var(--text-primary);
+    box-shadow: var(--shadow-sm);
+    transform: translateY(-50%);
+    transition: opacity var(--duration-fast);
+}
+
+.theme-carousel-step svg {
+    width: var(--icon-size-lg);
+    height: var(--icon-size-lg);
+}
+
+.theme-carousel-prev {
+    left: var(--space-xs);
+}
+
+.theme-carousel-next {
+    right: var(--space-xs);
+}
+
+.theme-carousel-step:disabled {
+    opacity: 0;
+}
+
+/* On a phone the panes lay a touch strip over each screen edge, above the
+   content (.edge-swipe-zone in mobile.css), to reach an app iframe's touches
+   first. The carousel is lifted over it, as .trigger-group-actions is, or the
+   strip takes the first chip's taps, the left chevron's, and a swipe that
+   starts at the edge. */
+@media (max-width: 768px) {
+    .theme-carousel-frame {
+        position: relative;
+        z-index: 2;
+    }
+}
+
+/* One grid that scrolls sideways a page at a time, with no scrollbar: a swipe
+   or a trackpad scrolls it, and the chevrons page it. ThemePicker sets
+   --theme-columns to the whole number of columns that fit, and the width below
+   fills the strip with exactly that many. Snapping on each column keeps a
+   swipe on whole cards. The inset padding keeps the selected outline and the
+   focus ring clear of the clip. */
+.theme-carousel {
+    --theme-fade: 2.5rem;
+    display: grid;
+    grid-auto-rows: auto;
+    grid-auto-columns: calc((100% - (var(--theme-columns, 3) - 1) * var(--space-sm)) / var(--theme-columns, 3));
     gap: var(--space-sm);
-    padding: var(--space-sm) 0;
+    padding: var(--space-xs);
+    overflow-x: auto;
+    overscroll-behavior-x: contain;
+    scroll-snap-type: x mandatory;
+    scroll-padding-inline: var(--space-xs);
+    scrollbar-width: none;
 }
 
-.theme-family .theme-grid {
-    padding: var(--space-xs) 0 0;
+.theme-carousel::-webkit-scrollbar {
+    display: none;
 }
 
+/* A phone: a card centred, its neighbours peeking in at both sides. The
+   first and the last card snap to their edge instead, so the strip opens and
+   ends with no empty side. ThemePicker sets the card width. */
+.theme-carousel-peek {
+    grid-auto-columns: var(--theme-card-width, 7rem);
+}
+
+.theme-carousel-peek .theme-card {
+    scroll-snap-align: center;
+}
+
+.theme-carousel-peek .theme-family:first-child .theme-card:first-of-type {
+    scroll-snap-align: start;
+}
+
+.theme-carousel-peek .theme-family:last-child .theme-card:last-of-type {
+    scroll-snap-align: end;
+}
+
+/* A phone previews a portrait phone screen: the header on top, the panel
+   filling the middle, and the button and status dots along the bottom. */
+.theme-carousel-peek .theme-preview {
+    height: 11rem;
+}
+
+.theme-carousel-peek .theme-preview-body {
+    flex-direction: column;
+    align-items: stretch;
+}
+
+.theme-carousel-peek .theme-preview-panel {
+    flex: 1;
+}
+
+.theme-carousel-peek .theme-preview-side {
+    flex-direction: row;
+    justify-content: space-between;
+    align-items: center;
+}
+
+/* Fades the cards out at a side only where more of the strip waits past it.
+   The mask reads alpha alone, so black here is opacity, not a colour. */
+.theme-carousel[data-more-before] {
+    mask-image: linear-gradient(to right, transparent, black var(--theme-fade));
+}
+
+.theme-carousel[data-more-after] {
+    mask-image: linear-gradient(to left, transparent, black var(--theme-fade));
+}
+
+.theme-carousel[data-more-before][data-more-after] {
+    mask-image: linear-gradient(to right, transparent, black var(--theme-fade), black calc(100% - var(--theme-fade)), transparent);
+}
+
+.theme-family {
+    display: contents;
+}
+
+/* All names each family above its first card, on the strip's first row. */
 .theme-family-name {
+    grid-row: 1;
     font-size: var(--font-size-xs);
     color: var(--text-muted);
 }
 
 .theme-card {
+    scroll-snap-align: start;
     display: flex;
     flex-direction: column;
     gap: var(--space-xs);
@@ -81,30 +250,6 @@
 
 .theme-card-modes {
     flex-shrink: 0;
-    font-size: var(--font-size-2xs);
-    color: var(--text-muted);
-}
-
-/* The folded summary stacks the name over the count, with a chevron pinned
-   right across both: the hint that the card unfolds the whole gallery. */
-.theme-toggle .theme-card-meta {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) auto;
-    align-items: center;
-    row-gap: 0.125rem;
-}
-
-.theme-toggle-count {
-    grid-column: 1;
-    white-space: nowrap;
-    font-size: var(--font-size-2xs);
-    color: var(--text-muted);
-}
-
-.theme-toggle-chevron {
-    display: inline-flex;
-    grid-column: 2;
-    grid-row: 1 / span 2;
     font-size: var(--font-size-2xs);
     color: var(--text-muted);
 }

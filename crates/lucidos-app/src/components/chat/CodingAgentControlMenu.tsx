@@ -9,8 +9,8 @@ import { sendMessage } from '../../store/actions/chat';
 import { fetchCodingAgentCommands, type CodingAgentCommandDef, type CodingAgentCommandsResponse, type CodingAgentModelValue, type CodingAgentReasoningEffort } from '../../api/client';
 import type { CodingAgent } from '../../api/types';
 import { ClaudeIcon, CodexIcon } from '../shared/icons';
-import { focusIfNeeded, isTextInput } from '../../utils/dom';
-import { viewportIsMobile } from '../../utils/viewport';
+import { focusIfNeeded, isTextInput, keepFocusOnPress } from '../../utils/dom';
+import { hasCoarsePointer, viewportIsMobile } from '../../utils/viewport';
 import { errorDetail } from '../../utils/errorDetail';
 import { Overlay } from '../shared/Overlay';
 import { anchoredPanelStyle, useAnchoredPosition } from '../../hooks/useAnchoredPopover';
@@ -32,6 +32,13 @@ export const codingAgentMenuOpenRequest = signal<string | null>(null);
 /** Text the menu hands back to the composer, which consumes it: a side
  *  question is typed in the composer, never sent from the menu. */
 export const codingAgentMenuComposerText = signal<string | null>(null);
+
+/** Whether the open menu moves focus into itself. Under a finger it leaves
+ *  focus in the prompt: moving it drops the keyboard and the panel jumps. A
+ *  typed "/" is the exception, since the typing continues in the filter. */
+export function menuTakesFocus(opts: { coarsePointer: boolean; typed: boolean }): boolean {
+  return opts.typed || !opts.coarsePointer;
+}
 
 /** The builtin commands to list. A live Claude Code thread also offers `/btw`,
  *  which headless Claude Code does not register as a command. */
@@ -103,6 +110,7 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
   const optionsListRef = useRef<HTMLDivElement>(null);
   const retryTimerRef = useRef<number | null>(null);
   const retryCountRef = useRef(0);
+  const openedByTypingRef = useRef(false);
   // Only the newest `loadCommands` may apply its response. A scope or backend
   // switch fires a second fetch, and the first can land after it.
   const loadSeqRef = useRef(0);
@@ -286,9 +294,11 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
       });
   }
 
-  /** Open the command menu with an optional filter (from "/" prefix). */
-  function openMenu(filterText = '') {
+  /** Open the command menu with an optional filter. `typed` is true when a
+   *  typed "/" opened it, so the typing continues in the filter. */
+  function openMenu(filterText = '', typed = false) {
     if (!hasAnyCommands(controlCommands.value, effectiveBuiltinCommands, effectiveSkillCommands)) return;
+    openedByTypingRef.current = typed;
     open.value = true;
     filter.value = filterText;
     highlightIndex.value = 0;
@@ -375,13 +385,13 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
         if (el) requestAnimationFrame(() => {
           if (codingAgentMenuOpenRequest.value !== null && el.getBoundingClientRect().width > 0) {
             codingAgentMenuOpenRequest.value = null;
-            openMenu(req);
+            openMenu(req, true);
           }
         });
         return;
       }
       codingAgentMenuOpenRequest.value = null;
-      openMenu(req);
+      openMenu(req, true);
     }
   });
 
@@ -397,7 +407,7 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
       if (isTextInput(e.target)) return;
       if (e.key === '/') {
         e.preventDefault();
-        openMenuRef.current();
+        openMenuRef.current('', true);
       }
     }
     document.addEventListener('keydown', handleSlash);
@@ -420,9 +430,13 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
     viewportIsMobile.value ? 'container-center' : 'start',
   );
 
+  const takesFocus = () => menuTakesFocus({
+    coarsePointer: hasCoarsePointer(), typed: openedByTypingRef.current,
+  });
+
   // Focus filter input when dropdown opens (autoFocus is unreliable for conditional rendering)
   useEffect(() => {
-    if (open.value && !activeCommand.value) {
+    if (open.value && !activeCommand.value && takesFocus()) {
       requestAnimationFrame(() => focusIfNeeded(filterRef.current));
     }
   }, [open.value, activeCommand.value]);
@@ -430,7 +444,7 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
   // Focus the options view on entry, so its arrow keys are live. The model
   // picker focuses whichever of its own two steps is showing.
   useEffect(() => {
-    if (activeCommand.value !== null && activeCommand.value !== 'set_model') {
+    if (activeCommand.value !== null && activeCommand.value !== 'set_model' && takesFocus()) {
       focusIfNeeded(optionsListRef.current);
     }
   }, [activeCommand.value]);
@@ -690,6 +704,7 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
         class={`icon-btn header-icon commands-btn${hasAnyCommands(controlCommands.value, effectiveBuiltinCommands, effectiveSkillCommands) ? ' commands-btn-active' : ''}`}
         data-tooltip={`${menuLabel} controls`}
         aria-label={`${menuLabel} controls`}
+        onMouseDown={keepFocusOnPress}
         onClick={() => {
           if (open.value) { close(); return; }
           openMenu();
@@ -744,6 +759,7 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
                       <button
                         key={label}
                         class={`control-item${idx === highlightIndex.value ? ' control-item-active' : ''}`}
+                        onMouseDown={keepFocusOnPress}
                         onClick={action}
                         onMouseEnter={() => { highlightIndex.value = idx; }}
                       >

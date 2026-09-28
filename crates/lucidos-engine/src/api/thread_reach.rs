@@ -52,6 +52,9 @@ pub(crate) enum ThreadReachVerb {
     /// Asking a side question of a coding-agent session, which reads the
     /// session's whole context (`POST /api/v1/coding-agents/side-question`).
     AskSideQuestion,
+    /// Dismissing a side question's card
+    /// (`POST /api/v1/coding-agents/side-question/dismiss`).
+    DismissSideQuestion,
     Apply,
     Discard,
     Revert,
@@ -75,6 +78,7 @@ impl ThreadReachVerb {
             Self::Cancel => "cancel",
             Self::Control => "control the session on",
             Self::AskSideQuestion => "ask a side question of",
+            Self::DismissSideQuestion => "dismiss a side question on",
             Self::Apply => "apply a change from",
             Self::Discard => "discard a change from",
             Self::Revert => "revert a change from",
@@ -94,6 +98,7 @@ impl ThreadReachVerb {
             Self::Cancel => "cancelling a turn",
             Self::Control => "controlling a session",
             Self::AskSideQuestion => "asking a side question",
+            Self::DismissSideQuestion => "dismissing a side question",
             Self::Apply => "applying a change",
             Self::Discard => "discarding a change",
             Self::Revert => "reverting a change",

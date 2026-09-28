@@ -112,7 +112,7 @@ export function createTapGate() {
 /** How long after a `touchend` a `click` counts as that touch's synthetic twin.
  *  Only the click path reads it, so a real second tap is never suppressed: the
  *  touch path serves every `touchend` it is given. */
-export const TOUCH_CLICK_WINDOW_MS = 500;
+const TOUCH_CLICK_WINDOW_MS = 500;
 
 /** Who took a touch press, said by whoever took it.
  *

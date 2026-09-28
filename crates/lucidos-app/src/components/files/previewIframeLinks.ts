@@ -492,12 +492,18 @@ export function withPreviewBase(html: string, baseHref: string): string {
 }
 
 /** Stamp the user's UI scale into an artifact as `zoom` on its root, so the
- *  previewed document grows with the shell around it.
+ *  previewed document grows with the shell around it. Also stamp a body text
+ *  default at the chat prose step. Text the artifact never sized then reads at
+ *  chat size, not at the browser's 16px (ADR 0319).
  *
  *  A srcdoc document is its own realm and inherits nothing from the host, whose
  *  root font-size is `var(--user-ui-scale)`. An artifact is sized in px against
  *  the browser's 16px default, so at any scale but 100% it reads visibly smaller
  *  than everything framing it.
+ *
+ *  The body default has zero specificity, so any author rule on `body` wins. It
+ *  never touches the root: that would move every `rem` in an artifact that
+ *  already follows the type scale.
  *
  *  `zoom` INSIDE the document rather than on the iframe element, which is the
  *  obvious form and is wrong. WebKit leaves the inner viewport unzoomed and
@@ -506,16 +512,23 @@ export function withPreviewBase(html: string, baseHref: string): string {
  *  form instead. See ADR 0217 for the measurements.
  *
  *  `scalePercent` is the preference's own unit (`currentUiScale`), so 100 is the
- *  identity and stamps nothing at all. A non-finite or non-positive value is one
- *  too, rather than an error: an unreadable preference must never cost the
+ *  identity and stamps no zoom. A non-finite or non-positive value stamps none
+ *  either, rather than an error: an unreadable preference must never cost the
  *  reader the document. */
-export function withPreviewScale(html: string, scalePercent: number): string {
-  if (!Number.isFinite(scalePercent) || scalePercent <= 0) return html;
+export function withPreviewSizing(html: string, scalePercent: number): string {
+  return injectAtHeadStart(html, `<style>${previewZoomRule(scalePercent)}${PREVIEW_BODY_TEXT_RULE}</style>`);
+}
+
+/** `--font-size-sm`, the step chat prose renders at, before the zoom scales it. */
+const PREVIEW_BODY_TEXT_RULE = ':where(body){font-size:0.75rem}';
+
+function previewZoomRule(scalePercent: number): string {
+  if (!Number.isFinite(scalePercent) || scalePercent <= 0) return '';
   // One decimal covers the 12.5% preference grid, and rounding here is what
   // keeps a stray float out of the stylesheet in exponent notation.
   const pct = Math.round(scalePercent * 10) / 10;
-  if (pct === 100) return html;
+  if (pct === 100) return '';
   // `:root` rather than `html`, so an artifact's own `html { … }` rule does not
   // outrank it on specificity.
-  return injectAtHeadStart(html, `<style>:root{zoom:${pct}%}</style>`);
+  return `:root{zoom:${pct}%}`;
 }

@@ -17,10 +17,11 @@ hide a card, write a selector, or load anything from a third-party origin.
 ## Switch themes
 
 Set the device-scoped `theme` preference to a theme's id with `set_preference`.
-The user finds the same choice under **Settings → Appearance → Theme**.
+The user finds the same choice under **Settings → Appearance → Theme**, a
+carousel of every theme grouped by family.
 
 A theme with a map for one mode only is *light only* or *dark only*. Picked in
-the picker from the other mode, it asks first, then switches the device's
+the carousel from the other mode, it asks first, then switches the device's
 `theme-mode` to the theme's mode. `set_preference` does not ask: set `theme-mode` too when
 the user wants to see the theme now.
 

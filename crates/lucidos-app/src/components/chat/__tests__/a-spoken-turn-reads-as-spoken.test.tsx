@@ -145,6 +145,7 @@ describe('what was said out loud is in the transcript', () => {
       type: 'spoken_reply',
       text: 'Both of them answered.',
       interrupted: false,
+      seq: 1,
     });
   });
 

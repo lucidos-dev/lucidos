@@ -14,7 +14,7 @@ vi.mock('../api/client', () => ({ setPreference: vi.fn(() => Promise.resolve({})
 import {
   markSwUpdateDismissed, wasSwUpdateDismissed, noteUpdateBuildId,
   markEngineVersionDismissed, wasEngineVersionDismissed, noteAnnouncedEngineVersion,
-  scheduleServiceWorkerUpdateChecks, requestServiceWorkerBuildId,
+  requestServiceWorkerBuildId,
   refreshClient, clientRefreshing, getServedBuildId, shouldReloadForStaleChunk,
 } from './sw-update';
 import { preferences } from '../store/store';
@@ -110,53 +110,6 @@ describe('shouldReloadForStaleChunk loop guard', () => {
     } finally {
       spy.mockRestore();
     }
-  });
-});
-
-describe('scheduleServiceWorkerUpdateChecks', () => {
-  const originalNavigator = globalThis.navigator;
-
-  beforeEach(() => {
-    vi.useFakeTimers();
-  });
-  afterEach(() => {
-    vi.useRealTimers();
-    Object.defineProperty(globalThis, 'navigator', { value: originalNavigator, configurable: true });
-  });
-
-  function stubNavigator(sw: unknown): void {
-    Object.defineProperty(globalThis, 'navigator', {
-      value: sw === undefined ? {} : { serviceWorker: sw },
-      configurable: true,
-    });
-  }
-
-  it('calls registration.update() multiple times across the rebuild window', async () => {
-    const update = vi.fn(() => Promise.resolve());
-    const getRegistration = vi.fn(() => Promise.resolve({ update }));
-    stubNavigator({ getRegistration });
-
-    scheduleServiceWorkerUpdateChecks();
-    expect(getRegistration).not.toHaveBeenCalled(); // all deferred
-
-    await vi.advanceTimersByTimeAsync(30_000);
-    expect(getRegistration.mock.calls.length).toBeGreaterThanOrEqual(4);
-    expect(update.mock.calls.length).toBeGreaterThanOrEqual(4);
-  });
-
-  it('is a no-op when service workers are unavailable', () => {
-    stubNavigator(undefined); // navigator without serviceWorker
-    expect(() => {
-      scheduleServiceWorkerUpdateChecks();
-      vi.advanceTimersByTime(30_000);
-    }).not.toThrow();
-  });
-
-  it('swallows a failing update() (best-effort, self-recovering)', async () => {
-    const getRegistration = vi.fn(() => Promise.reject(new Error('no SW')));
-    stubNavigator({ getRegistration });
-    scheduleServiceWorkerUpdateChecks();
-    await expect(vi.advanceTimersByTimeAsync(30_000)).resolves.not.toThrow();
   });
 });
 

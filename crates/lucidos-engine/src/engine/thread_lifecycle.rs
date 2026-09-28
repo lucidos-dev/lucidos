@@ -319,6 +319,12 @@ pub fn classify_event(event_type: &str) -> Option<EventClass> {
         // talker decides whether the doer is wanted, and Start here would
         // leave the thread waiting on a turn that never runs.
         "SpokenMessageReceived" => EventClass::Metadata,
+        // A side question is a card beside the thread, never a turn: it moves
+        // no status, section, recency or count (ADR 0320).
+        "SideQuestionAsked"
+        | "SideQuestionAnswered"
+        | "SideQuestionFailed"
+        | "SideQuestionDismissed" => EventClass::Metadata,
         // The talker asking for the doer, which is what STARTS a delegated
         // call's turn (ADR 0201). No `MessageReceived` is written beside it,
         // so this is the turn's only starter and its anchor.
@@ -550,6 +556,12 @@ pub fn all_persisted_event_types() -> Vec<&'static str> {
         // for the same reason, since neither has a row anywhere else.
         "SpokenMessageReceived",
         "WorkDelegated",
+        // Side questions. Persisted so a card survives reload and shows on
+        // every device (ADR 0320).
+        "SideQuestionAsked",
+        "SideQuestionAnswered",
+        "SideQuestionFailed",
+        "SideQuestionDismissed",
     ]
 }
 
@@ -867,7 +879,14 @@ pub fn resolve_transition(
         // request for the doer. Same caller, same call, same reason.
         | "SpokenReplyGenerated"
         | "SpokenMessageReceived"
-        | "WorkDelegated" => no_change,
+        | "WorkDelegated"
+        // A side question is a card beside the thread (ADR 0320). Surfacing
+        // the thread for one would ask for attention the user is already
+        // giving.
+        | "SideQuestionAsked"
+        | "SideQuestionAnswered"
+        | "SideQuestionFailed"
+        | "SideQuestionDismissed" => no_change,
         _ => violation("Unknown event type"),
     }?;
 

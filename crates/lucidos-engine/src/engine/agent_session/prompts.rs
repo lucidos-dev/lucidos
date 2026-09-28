@@ -646,6 +646,15 @@ const REASONING_NOT_VISIBLE_RULE: &str = "\n\n\
     must read in full goes on the question card itself, in the question or the option \
     descriptions.";
 
+/// Backend-independent: any session can write an HTML file for the user. The
+/// type scale lived only in the `lucidos-cli` skill, and a session that never
+/// loaded it wrote a 16px scale with `4rem` headings (ADR 0319).
+const HTML_ARTIFACT_TYPE_SCALE_RULE: &str = "\n\n\
+    HTML ARTIFACT TYPE SCALE: Size an HTML file under `artifacts/` like the chat: body \
+    `0.75rem`, labels `0.8125rem`; `1rem` is a heading. Use `rem` and never size the root, \
+    since the preview applies the UI scale. Full scale: `lucidos knowhow read \
+    system-knowhow/best-practices`, § Standalone HTML.";
+
 /// Sibling of [`REASONING_NOT_VISIBLE_RULE`], riding the same
 /// [`append_backend_rules`] chokepoint, and the same shape of mistake: the
 /// agent believes the user can see what only it can see.
@@ -797,7 +806,8 @@ pub(super) fn append_backend_rules(
     // backend-specific teaching below.
     let prompt = format!(
         "{prompt}{REASONING_NOT_VISIBLE_RULE}{SHOWING_AN_IMAGE_RULE}\
-         {NAMES_NOT_IDS_RULE}{NO_IMPERSONATION_RULE}{PERMISSION_ASK_RULE}"
+         {HTML_ARTIFACT_TYPE_SCALE_RULE}{NAMES_NOT_IDS_RULE}{NO_IMPERSONATION_RULE}\
+         {PERMISSION_ASK_RULE}"
     );
     match coding_agent {
         crate::runtime::CodingAgent::ClaudeCode => format!("{prompt}{PERMISSION_CONFIG_RULE}"),
@@ -1668,6 +1678,10 @@ mod tests {
     /// screenshot read into the agent's own context reaches the user on no
     /// backend and in no worktree shape.
     const PROMPT_FLAVOR_CEILINGS: &[(&str, &str, usize)] = &[
+        // EVERY row rose by 234 to 297 bytes for `HTML_ARTIFACT_TYPE_SCALE_RULE`
+        // (ADR 0319). It rides the shared chokepoint: a session that never
+        // loaded the skill wrote HTML at a 16px scale.
+        //
         // The twelve chat-style rows rose for the DANGLING ITEM paragraph in
         // the ask rule: Claude Code by 758 bytes, Codex by 422. The two
         // conflict_resolution rows stay put, because they carry no ASKING
@@ -1688,29 +1702,29 @@ mod tests {
         // The same four rose by 185 more when `APPLY_RESTART_RULE` learned
         // that every file a binary embeds requires a restart. An agent that
         // misses it promises an Apply the running engine never picks up.
-        ("worktree", "claude-code", 26519),
-        ("worktree", "codex", 24659),
+        ("worktree", "claude-code", 26816),
+        ("worktree", "codex", 24956),
         // The four external-repo rows are 569 bytes higher than they were, for
         // `BUILD_SLOT_RULE` (ADR 0070). Only these flavors carry it. A
         // Lucidos-source session is already covered, because `make lint` and
         // `make test` take a slot themselves. Carrying it there would pay for
         // an instruction the session cannot use.
-        ("external_repo", "claude-code", 18948),
-        ("external_repo", "codex", 17071),
-        ("recovery", "claude-code", 25114),
-        ("recovery", "codex", 23254),
-        ("external_repo_recovery", "claude-code", 18824),
-        ("external_repo_recovery", "codex", 16947),
-        ("app_worktree", "claude-code", 21590),
-        ("app_worktree", "codex", 19713),
-        ("app_worktree_recovery", "claude-code", 20154),
-        ("app_worktree_recovery", "codex", 18277),
+        ("external_repo", "claude-code", 19222),
+        ("external_repo", "codex", 17362),
+        ("recovery", "claude-code", 25411),
+        ("recovery", "codex", 23551),
+        ("external_repo_recovery", "claude-code", 19098),
+        ("external_repo_recovery", "codex", 17238),
+        ("app_worktree", "claude-code", 21824),
+        ("app_worktree", "codex", 19964),
+        ("app_worktree_recovery", "claude-code", 20388),
+        ("app_worktree_recovery", "codex", 18528),
         // Both conflict_resolution rows rose by about 115 bytes when
         // `SHOWING_AN_IMAGE_RULE` learned that saving a picture shows nothing
         // either. The other rows had the slack to absorb it. Both rose again,
         // by 384, for its visual-choice clause: a real picture per option.
-        ("conflict_resolution", "claude-code", 6567),
-        ("conflict_resolution", "codex", 7837),
+        ("conflict_resolution", "claude-code", 6864),
+        ("conflict_resolution", "codex", 8134),
     ];
 
     /// Both backends, paired with the label used in `PROMPT_FLAVOR_CEILINGS`.
@@ -2018,6 +2032,35 @@ mod tests {
             codex.contains("ask_user_question` tool (on the `lucidos` MCP"),
             "Codex prompt must still swap in the MCP ask_user_question rule",
         );
+    }
+
+    /// A Claude Code session asked for "a showcase html" wrote its own 16px
+    /// scale with headings up to `4rem`. The type scale lived only in a skill
+    /// it never loaded (ADR 0319). Every flavor on both backends must
+    /// carry the three facts that decide it, and where the full scale lives.
+    #[test]
+    fn coding_agent_prompts_carry_the_html_artifact_type_scale() {
+        let flavors = all_prompt_flavors();
+        for agent in [
+            crate::runtime::CodingAgent::ClaudeCode,
+            crate::runtime::CodingAgent::Codex,
+        ] {
+            for (label, base) in &flavors {
+                let full = append_backend_rules(base.clone(), agent);
+                for needle in [
+                    "HTML ARTIFACT TYPE SCALE",
+                    "body `0.75rem`",
+                    "`1rem` is a heading",
+                    "never size the root",
+                    "`lucidos knowhow read system-knowhow/best-practices`, § Standalone HTML",
+                ] {
+                    assert!(
+                        full.contains(needle),
+                        "{label} ({agent:?}) must carry the HTML artifact type scale (`{needle}`)",
+                    );
+                }
+            }
+        }
     }
 
     /// Regression guard for the session that screenshotted a docs page, called

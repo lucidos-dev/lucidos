@@ -6,7 +6,7 @@ import { dirname, resolve } from 'node:path';
 // @ts-expect-error: same
 import { fileURLToPath } from 'node:url';
 import { MENU_ITEMS, type MenuItem } from '../types';
-import { SETTINGS_NAV_ITEMS, SETTINGS_SYSTEM_SUBPANEL_ITEMS, type PanelOverlay, type SettingsSubview } from '../store';
+import { SETTINGS_SUBVIEW_ITEMS, type PanelOverlay, type SettingsSubview } from '../store';
 import { SETTINGS_SECTION_REFRESH } from '../../components/settings/settingsSectionRefresh';
 
 /** How one content view takes part in the panel refresh contract. */
@@ -91,7 +91,7 @@ describe('every content panel is refreshable or listed static', () => {
   });
 
   it('covers every settings subview', () => {
-    const subviews = ['main', ...[...SETTINGS_NAV_ITEMS, ...SETTINGS_SYSTEM_SUBPANEL_ITEMS].map((item) => item.key)];
+    const subviews = ['main', ...SETTINGS_SUBVIEW_ITEMS.map((item) => item.key)];
     expect(Object.keys(SETTINGS).sort()).toEqual([...new Set(subviews)].sort());
     for (const [view, coverage] of Object.entries(SETTINGS)) check(view, coverage);
   });

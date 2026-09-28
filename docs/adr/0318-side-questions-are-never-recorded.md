@@ -1,6 +1,6 @@
 # 0318: Side questions are never recorded
 
-- **Status**: Accepted
+- **Status**: Superseded by 0320
 - **Date**: 2026-09-28
 
 ## Context

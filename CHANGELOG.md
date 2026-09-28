@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.42.1
+
+### Changed
+- Settings > Appearance shows every theme in a carousel. Chips filter it by family, and chevrons page through it. On a phone it shows one card at a time, with its neighbours peeking in.
+- Side questions stay in the thread. A card survives a reload and shows on your other devices. A chevron folds it to a row, and the same chevron opens it again.
+- A side question card sits in the turn where you asked it and shows your question as a message bubble.
+- The Refresh notice appears as soon as a new client build is served, and a reconnect checks for one again.
+- Coding agents know the type scale for HTML artifacts, so the reports they build match your chat text.
+
+### Fixed
+- Text in apps and HTML artifacts that sets no size of its own reads at the chat text size, not larger.
+- On an iPhone, opening the agent menu or the model picker keeps the keyboard up.
+- Thread rows in the drawer line up when one label wraps to two lines, with less space under the title.
+- The file picker for installing a workspace font follows your theme.
 ## v0.42.0
 
 ### Added

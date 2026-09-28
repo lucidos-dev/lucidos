@@ -1,9 +1,9 @@
 //! Side questions (`/btw`) in Claude Code threads: a quick question answered
 //! from the session's context, beside any running turn, with no tools.
 //!
-//! Nothing here emits an event or writes to the thread. The answer goes back to
-//! the asker and nowhere else, so it never enters a context builder
-//! (ADR 0318).
+//! Each ask is recorded as side-question thread events, so its card survives a
+//! reload and shows on every device. No agent ever reads them: every generic
+//! event reader excludes them (ADR 0320).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -11,6 +11,8 @@ use std::path::PathBuf;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+use crate::engine::event_bus::{BusEvent, EventBus};
+use crate::engine::thread_events::{EventMeta, MessageOrigin, ThreadEvent};
 use crate::engine::types::AgentSession;
 use crate::engine::LucidosEngine;
 use crate::runtime::{CodingAgent, SideQuestionRequest};
@@ -20,9 +22,16 @@ use crate::runtime::{CodingAgent, SideQuestionRequest};
 pub(crate) enum SideQuestionFailure {
     /// The thread cannot take side questions. The text tells the user why.
     Refused(&'static str),
+    /// A side question with this id was already asked. The first ask stands.
+    AlreadyAsked,
+    /// Nothing asked with this id on the thread, so there is nothing to dismiss.
+    NotAsked,
     /// Claude Code could not answer. The text says what went wrong.
     Failed(String),
 }
+
+/// What startup recovery records for an ask a restart left unanswered.
+pub(crate) const INTERRUPTED_BY_RESTART: &str = "Interrupted by a restart. Ask again.";
 
 pub(crate) const EMPTY_QUESTION: &str = "Type a question after /btw.";
 pub(crate) const NOT_CODING_AGENT_THREAD: &str = "Side questions work only in Claude Code threads.";
@@ -35,6 +44,10 @@ const NO_SESSION_YET: &str =
 /// thread. Sent there, it would become a real turn in the main session.
 pub(crate) const SIDE_QUESTION_ON_CHAT_ROUTE: &str =
     "A /btw side question is never sent to the main session. Ask it through POST /api/v1/coding-agents/side-question.";
+
+/// Serializes the duplicate-id check with the ask's record. Held only for
+/// those two quick writes, never across the answer.
+static ASK_ADMISSION: Mutex<()> = Mutex::const_new(());
 
 /// Whether `message` is a side question: `/btw` as its first word.
 pub(crate) fn is_side_question(message: &str) -> bool {
@@ -119,19 +132,224 @@ struct ColdSession {
     permission_mode: Option<String>,
 }
 
+/// Whether a side question with this id was already asked on the thread.
+async fn was_asked(
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+    side_question_id: Uuid,
+) -> Result<bool, SideQuestionFailure> {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (
+            SELECT 1 FROM events
+             WHERE aggregate = 'thread'
+               AND aggregate_id = $1
+               AND event_type = 'SideQuestionAsked'
+               AND payload->>'side_question_id' = $2
+        )",
+    )
+    .bind(thread_id.to_string())
+    .bind(side_question_id.to_string())
+    .fetch_one(pool)
+    .await
+    .map_err(|e| SideQuestionFailure::Failed(format!("Could not read the thread: {e}")))
+}
+
+/// Record one side-question event on its thread.
+async fn record(
+    bus: &EventBus,
+    thread_id: Uuid,
+    event: ThreadEvent,
+    meta: EventMeta,
+) -> Result<(), SideQuestionFailure> {
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event,
+        meta,
+    })
+    .await
+    .map(|_| ())
+    .map_err(|e| SideQuestionFailure::Failed(format!("Could not record the side question: {e}")))
+}
+
+/// The event that settles an ask, from how it ended.
+fn settled_event(
+    side_question_id: Uuid,
+    outcome: &Result<String, SideQuestionFailure>,
+) -> ThreadEvent {
+    match outcome {
+        Ok(answer) => ThreadEvent::SideQuestionAnswered {
+            side_question_id,
+            answer: answer.clone(),
+        },
+        Err(failure) => ThreadEvent::SideQuestionFailed {
+            side_question_id,
+            error: match failure {
+                SideQuestionFailure::Refused(text) => text.to_string(),
+                SideQuestionFailure::Failed(text) => text.clone(),
+                SideQuestionFailure::AlreadyAsked | SideQuestionFailure::NotAsked => {
+                    "The side question could not be asked.".to_string()
+                }
+            },
+        },
+    }
+}
+
+/// Record a failure for every ask no answer or failure settled. Run once at
+/// startup, since the process that would have settled them is gone.
+pub(crate) async fn fail_unsettled_side_questions(
+    pool: &sqlx::PgPool,
+    bus: &EventBus,
+) -> Result<usize, sqlx::Error> {
+    let unsettled: Vec<(String, String)> = sqlx::query_as(
+        "SELECT a.aggregate_id, a.payload->>'side_question_id'
+           FROM events a
+          WHERE a.aggregate = 'thread'
+            AND a.event_type = 'SideQuestionAsked'
+            AND NOT EXISTS (
+                SELECT 1 FROM events s
+                 WHERE s.aggregate = 'thread'
+                   AND s.aggregate_id = a.aggregate_id
+                   AND s.event_type IN ('SideQuestionAnswered', 'SideQuestionFailed')
+                   AND s.payload->>'side_question_id' = a.payload->>'side_question_id'
+            )",
+    )
+    .fetch_all(pool)
+    .await?;
+    let mut failed = 0;
+    for (thread_id, side_question_id) in unsettled {
+        let (Ok(thread_id), Ok(side_question_id)) = (
+            Uuid::parse_str(&thread_id),
+            Uuid::parse_str(&side_question_id),
+        ) else {
+            crate::log!(
+                "[SideQuestion] Skipping an unsettled side question with a malformed id: thread {thread_id:?}, id {side_question_id:?}"
+            );
+            continue;
+        };
+        let event = ThreadEvent::SideQuestionFailed {
+            side_question_id,
+            error: INTERRUPTED_BY_RESTART.to_string(),
+        };
+        match record(bus, thread_id, event, EventMeta::NONE).await {
+            Ok(()) => failed += 1,
+            Err(e) => crate::log!(
+                "[SideQuestion] Could not fail interrupted side question {side_question_id} on thread {thread_id}: {e:?}"
+            ),
+        }
+    }
+    Ok(failed)
+}
+
 impl LucidosEngine {
-    /// Answer a side question in a Claude Code thread, from its live process
-    /// when it has one and from a short-lived resumed process otherwise.
+    /// Ask a side question and record it: the ask, then its answer or
+    /// failure. A refused thread, an empty question or a repeated id records
+    /// nothing, since no card is owed for them.
     pub(crate) async fn ask_side_question(
         &self,
         thread_id: Uuid,
+        side_question_id: Uuid,
         question: &str,
+        actor: MessageOrigin,
     ) -> Result<String, SideQuestionFailure> {
         let question = question.trim();
         if question.is_empty() {
             return Err(SideQuestionFailure::Refused(EMPTY_QUESTION));
         }
         check_thread(self.pool(), thread_id).await?;
+        if !self.has_session(thread_id).await? {
+            return Err(SideQuestionFailure::Refused(NO_SESSION_YET));
+        }
+        {
+            // Held from the check to the record, so two requests with one id
+            // cannot both pass `was_asked`.
+            let _admission = ASK_ADMISSION.lock().await;
+            if was_asked(self.pool(), thread_id, side_question_id).await? {
+                return Err(SideQuestionFailure::AlreadyAsked);
+            }
+            let asked = ThreadEvent::SideQuestionAsked {
+                side_question_id,
+                question: question.to_string(),
+            };
+            record(
+                &self.event_bus,
+                thread_id,
+                asked,
+                EventMeta::with_actor(Some(actor)),
+            )
+            .await?;
+        }
+        let outcome = self.answer_side_question(thread_id, question).await;
+        let settled = settled_event(side_question_id, &outcome);
+        record(&self.event_bus, thread_id, settled, EventMeta::NONE).await?;
+        outcome
+    }
+
+    /// Whether the thread has a Claude Code session to ask: a live process,
+    /// or a session a cold process can resume.
+    async fn has_session(&self, thread_id: Uuid) -> Result<bool, SideQuestionFailure> {
+        let live = self
+            .agent_sessions
+            .lock()
+            .await
+            .get(&thread_id)
+            .is_some_and(|session| !session.process_exited && session.side_question_tx.is_some());
+        if live {
+            return Ok(true);
+        }
+        let pool = self.pool();
+        let config_dir = super::lookup_pinned_cc_config_dir(pool, thread_id)
+            .await
+            .map_err(|e| SideQuestionFailure::Failed(format!("Could not read the thread: {e}")))?;
+        Ok(
+            super::resume::resume_sid_for_account(pool, thread_id, config_dir.as_deref())
+                .await
+                .is_some(),
+        )
+    }
+
+    /// Startup recovery: fail every ask the previous process left unanswered,
+    /// so no card waits forever.
+    pub async fn recover_unsettled_side_questions(&self) {
+        match fail_unsettled_side_questions(self.pool(), &self.event_bus).await {
+            Ok(0) => {}
+            Ok(failed) => log!(
+                "[SideQuestion] Failed {} side questions a restart interrupted",
+                failed
+            ),
+            Err(e) => log!(
+                "[SideQuestion] Could not recover unsettled side questions: {}",
+                e
+            ),
+        }
+    }
+
+    /// Record that the user dismissed a side question's card.
+    pub(crate) async fn dismiss_side_question(
+        &self,
+        thread_id: Uuid,
+        side_question_id: Uuid,
+        actor: MessageOrigin,
+    ) -> Result<(), SideQuestionFailure> {
+        if !was_asked(self.pool(), thread_id, side_question_id).await? {
+            return Err(SideQuestionFailure::NotAsked);
+        }
+        let dismissed = ThreadEvent::SideQuestionDismissed { side_question_id };
+        record(
+            &self.event_bus,
+            thread_id,
+            dismissed,
+            EventMeta::with_actor(Some(actor)),
+        )
+        .await
+    }
+
+    /// Answer a side question in a Claude Code thread, from its live process
+    /// when it has one and from a short-lived resumed process otherwise.
+    async fn answer_side_question(
+        &self,
+        thread_id: Uuid,
+        question: &str,
+    ) -> Result<String, SideQuestionFailure> {
         // One budget for both paths, so a cold retry cannot outlast the browser's wait.
         let deadline =
             tokio::time::Instant::now() + crate::runtime::claude_code::SIDE_QUESTION_TIMEOUT;

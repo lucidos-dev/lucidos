@@ -189,16 +189,126 @@ async fn a_codex_thread_is_refused_and_nothing_is_recorded() {
     teardown_test_db(&db_name).await;
 }
 
-/// The side Q&A must never become a thread event: a recorded event feeds the
-/// next session's context (ADR 0318). This module holds no event bus at all.
+/// The side-question event types recorded on a thread, oldest first.
+async fn recorded_types(pool: &sqlx::PgPool, thread_id: Uuid) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT event_type FROM events WHERE thread_id = $1 \
+         AND event_type LIKE 'SideQuestion%' ORDER BY sequence",
+    )
+    .bind(thread_id)
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
+/// An ask is recorded, and its id then counts as asked on that thread only.
+#[tokio::test]
+async fn a_recorded_ask_is_known_by_its_id_on_its_thread() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    let side_question_id = Uuid::new_v4();
+    assert_eq!(
+        was_asked(&pool, thread_id, side_question_id).await,
+        Ok(false)
+    );
+
+    let asked = ThreadEvent::SideQuestionAsked {
+        side_question_id,
+        question: "what does it return?".into(),
+    };
+    record(&bus, thread_id, asked, EventMeta::NONE)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        was_asked(&pool, thread_id, side_question_id).await,
+        Ok(true)
+    );
+    assert_eq!(
+        was_asked(&pool, Uuid::new_v4(), side_question_id).await,
+        Ok(false)
+    );
+    assert_eq!(
+        recorded_types(&pool, thread_id).await,
+        ["SideQuestionAsked"]
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
 #[test]
-fn the_side_question_module_never_emits_an_event() {
-    use crate::test_support::source_scan::{read_production_source, src_root};
-    let source = read_production_source(&src_root().join("engine/agent_session/side_question.rs"));
-    for forbidden in ["event_bus", ".emit(", "BusEvent", "ThreadEvent"] {
-        assert!(
-            !source.contains(forbidden),
-            "side_question.rs must not touch events, found `{forbidden}`"
-        );
+fn an_ask_settles_as_its_answer_or_its_failure() {
+    let id = Uuid::new_v4();
+    let json = |event: ThreadEvent| serde_json::to_value(event).unwrap();
+    assert_eq!(
+        json(settled_event(id, &Ok("A string.".into()))),
+        json(ThreadEvent::SideQuestionAnswered {
+            side_question_id: id,
+            answer: "A string.".into()
+        })
+    );
+    assert_eq!(
+        json(settled_event(
+            id,
+            &Err(SideQuestionFailure::Failed("busy".into()))
+        )),
+        json(ThreadEvent::SideQuestionFailed {
+            side_question_id: id,
+            error: "busy".into()
+        })
+    );
+    assert_eq!(
+        json(settled_event(
+            id,
+            &Err(SideQuestionFailure::Refused(NO_SESSION_YET))
+        )),
+        json(ThreadEvent::SideQuestionFailed {
+            side_question_id: id,
+            error: NO_SESSION_YET.into()
+        })
+    );
+}
+
+/// A restart kills the process an answer was on its way to. Recovery fails
+/// every unsettled ask once, and leaves settled ones alone.
+#[tokio::test]
+async fn recovery_fails_only_the_asks_nothing_settled() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    let (open, answered) = (Uuid::new_v4(), Uuid::new_v4());
+    for side_question_id in [open, answered] {
+        let asked = ThreadEvent::SideQuestionAsked {
+            side_question_id,
+            question: "q".into(),
+        };
+        record(&bus, thread_id, asked, EventMeta::NONE)
+            .await
+            .unwrap();
     }
+    let answer = ThreadEvent::SideQuestionAnswered {
+        side_question_id: answered,
+        answer: "a".into(),
+    };
+    record(&bus, thread_id, answer, EventMeta::NONE)
+        .await
+        .unwrap();
+
+    assert_eq!(fail_unsettled_side_questions(&pool, &bus).await.unwrap(), 1);
+    assert_eq!(fail_unsettled_side_questions(&pool, &bus).await.unwrap(), 0);
+
+    let failed_id: String = sqlx::query_scalar(
+        "SELECT payload->>'side_question_id' FROM events \
+         WHERE thread_id = $1 AND event_type = 'SideQuestionFailed'",
+    )
+    .bind(thread_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(failed_id, open.to_string());
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
 }

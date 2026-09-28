@@ -215,15 +215,35 @@ pub async fn seed_thread_event(bus: &EventBus, thread_id: Uuid, event: ThreadEve
     .event_id
 }
 
+/// One of each side-question event, for the tests pinning that no agent,
+/// trigger or event wait ever sees one (ADR 0320).
+pub fn every_side_question_event() -> Vec<ThreadEvent> {
+    let side_question_id = Uuid::new_v4();
+    vec![
+        ThreadEvent::SideQuestionAsked {
+            side_question_id,
+            question: "what does this return?".into(),
+        },
+        ThreadEvent::SideQuestionAnswered {
+            side_question_id,
+            answer: "A string.".into(),
+        },
+        ThreadEvent::SideQuestionFailed {
+            side_question_id,
+            error: "no answer".into(),
+        },
+        ThreadEvent::SideQuestionDismissed { side_question_id },
+    ]
+}
+
 /// Build a tiny git repo with `main` + initial commit and a worktree on
 /// `branch`. Returns `(tmpdir, repo_root, worktree_path)`. Caller must keep
-/// `tmpdir` in scope for the test duration — dropping it `rm -rf`'s the repo.
+/// `tmpdir` in scope for the test duration: dropping it `rm -rf`'s the repo.
 ///
 /// Shared by tests that need a real on-disk git repo + worktree pair (the
 /// `seed_coding_agent_has_diff` tests in `session_seed_tests.rs` and the startup
 /// sweep tests in `agent_recovery_tests.rs`). The same boilerplate also lives
-/// in git_ops_tests.rs / worktree_cleanup_tests.rs — those older copies are out
-/// of scope for this helper, follow-up DRY sweep.
+/// in git_ops_tests.rs / worktree_cleanup_tests.rs.
 pub async fn make_repo_and_worktree(branch: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("repo");

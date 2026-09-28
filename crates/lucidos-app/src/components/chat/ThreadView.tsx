@@ -9,7 +9,7 @@ import { replaceDocument } from '../../utils/documentNavigation';
 import { rebuildCorruptedThreadEvents } from '../../store/actions/thread-sync';
 import { useScrollObservers, renderExchanges, ScrollControls } from './CreateThreadView';
 import { StoppedChildNotice } from './StoppedChildNotice';
-import { SideQuestionCards } from './SideQuestionCard';
+import { sideQuestionsFor } from '../../store/sideQuestions';
 import { ThreadStatusIcon, threadVisualStatus } from '../shared/ThreadStatusIcon';
 import { ThreadTitleEditor } from './ThreadTitleEditor';
 import { PinThreadButton } from '../shared/PinThreadButton';
@@ -1988,11 +1988,13 @@ export function ThreadView() {
                         // It carries no alignment and no floor, and
                         // `.thread-feed` in chat/input-messages.css says why.
                         <div class="thread-feed" key="feed">
-                            {renderExchanges(exchanges, threadId!, streamingBuffer, renderFromIndex, edge.rowsHidden)}
-                            {/* Last, and boxed, as `readScrollAnchor` requires of
-                                every non-turn child in the feed. */}
+                            {/* Every non-turn child is boxed, as `readScrollAnchor`
+                                requires: a side question sits between turns. */}
+                            {renderExchanges(
+                                exchanges, threadId!, streamingBuffer, renderFromIndex, edge.rowsHidden,
+                                sideQuestionsFor(threadId!),
+                            )}
                             <StoppedChildNotice meta={eventThread.meta} />
-                            <SideQuestionCards threadId={threadId!} />
                         </div>
                     ) : (
                         <ThreadEmptyState key={threadId} reason={emptyReason(animating, eventsLoaded, eventsLoadFailed, hasContentEvents(eventThread.events), threadId!, connectionStatus.value === 'disconnected', isMidTurn(effectiveThreadStatus(eventThread)))} />

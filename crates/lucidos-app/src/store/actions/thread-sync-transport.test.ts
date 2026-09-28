@@ -114,6 +114,9 @@ vi.mock('./form-requests', () => ({
   closeResolvedFormRequest: vi.fn(),
 }));
 
+const syncClientUpdateFromBuild = vi.fn(async () => {});
+vi.mock('./client-update', () => ({ syncClientUpdateFromBuild }));
+
 const processSSEForReferences = vi.fn();
 vi.mock('./entityReferences', () => ({
   processSSEForReferences,
@@ -192,6 +195,19 @@ describe('the shell attaching to a transport', () => {
     await vi.runAllTimersAsync();
 
     expect(refreshThreadList).toHaveBeenCalledTimes(1);
+  });
+
+  it('re-checks the served client build on the open that follows an error', () => {
+    // A served-snapshot swap during the gap sent a transient
+    // ServedFrontendAdvanced that nobody replays. The first open is covered by
+    // startClient's own check.
+    connectThreadEvents();
+    opened?.handlers.onOpen();
+    expect(syncClientUpdateFromBuild).not.toHaveBeenCalled();
+
+    opened?.handlers.onError();
+    opened?.handlers.onOpen();
+    expect(syncClientUpdateFromBuild).toHaveBeenCalledTimes(1);
   });
 
   it('refreshes the Files list on EVERY open, the first one included', () => {

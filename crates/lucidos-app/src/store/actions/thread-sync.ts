@@ -40,7 +40,6 @@ import {
 } from './frontend-preview';
 import { changeToastMessage } from './changeToast';
 import { batchSummary, clearApplyPhase, isBatchMember, openApplyPhase, setApplyPhase } from './applyProgress';
-import { scheduleServiceWorkerUpdateChecks } from '../../hooks/sw-update';
 import { syncClientUpdateFromBuild } from './client-update';
 import { loadPreferences, refreshActiveTheme } from './preferences';
 import { loadReleaseNotices } from './releaseNotices';
@@ -291,6 +290,9 @@ export function connectThreadEvents(): void {
         // `resyncLoadedThreads` coalesces and surfaces its own failures, so
         // `void` here only acknowledges that the promise is not needed back.
         void resyncLoadedThreads();
+        // `ServedFrontendAdvanced` is transient too. A swap during the gap
+        // announced a newer client to nobody, so re-run the build-id check.
+        void syncClientUpdateFromBuild();
       }
     },
 
@@ -656,15 +658,13 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
     resolveBatchMember(event.change_id);
     const desc = event.change_id ? findChangeDescription(threadId, event.change_id) : undefined;
     const requiresRestart = !!event.requires_restart;
-    const clientUpdate = !!event.client_update;
     const applyKey = `applying-${threadId}`;
-    // No Refresh button here. At ChangeApplied time the rebuilt frontend is not
-    // ready, the build-watch still running `vite build`, so a Refresh now would
-    // reload the OLD build. The genuine affordance is the New-version toast
-    // `surfaceUpdateToast` surfaces (store/actions/client-update.ts). The
-    // build-id check drives it once the rebuilt sw.js is served, fired on the
-    // new worker's activation and nudged by
-    // scheduleServiceWorkerUpdateChecks().
+    // No Refresh button and no update badge here. At ChangeApplied time the
+    // rebuilt frontend is not served yet, the build-watch still running `vite
+    // build`, so a Refresh now would reload the OLD build. The genuine
+    // affordance is the New-version toast (store/actions/client-update.ts).
+    // The engine's `ServedFrontendAdvanced` fires it the moment the rebuilt
+    // client is served, and a mixed change reaches it through the Switch.
     // The Applied toast lands where the apply's thread link did: at the event
     // that started its last phase.
     if (inBatch) {
@@ -684,19 +684,6 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
       const commits = event.commits ?? [];
       const threadTitle = event.thread_title ?? threadMap.value.get(threadId)?.meta.title ?? 'Untitled thread';
       addRestartGroup({ threadId, threadTitle, commits });
-    }
-    if (clientUpdate) {
-      // Do not light the badge here. It shares the toast's single source of
-      // truth, the build-id check in `syncClientUpdateFromBuild`, so badge and
-      // toast cannot disagree or appear out of order. At ChangeApplied time the
-      // rebuilt bundle is not served yet, so an eager badge would lead the real
-      // update. Nudge the SW to pick up the rebuilt /sw.js instead, its
-      // activation re-running the build-id check and lighting BOTH together.
-      //
-      // For a frontend-only Apply the engine re-snapshots its served dist
-      // in-process (engine::frontend_refresh). The served sw.js then advances
-      // without a respawn, and this nudge is what surfaces it.
-      scheduleServiceWorkerUpdateChecks();
     }
   } else if (event.type === 'ChangeDiscarded') {
     clearApplyPhase(threadId);
@@ -968,11 +955,10 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
       break;
 
     case 'ServedFrontendAdvanced':
-      // Dev-only transient signal: THIS engine advanced its served-frontend
-      // snapshot to the checkout-shared dist/ after a PEER workspace's
-      // frontend-only Apply. Re-run the build-id check, so the Refresh badge
-      // and toast surface without a manual restart. Idempotent and
-      // self-correcting, so no payload is needed.
+      // Dev-only transient signal: THIS engine swapped its served-frontend
+      // snapshot to the rebuilt dist/, after a frontend-only Apply here or in a
+      // peer workspace. Re-run the build-id check, so the Refresh badge and
+      // toast surface at once. Idempotent and self-correcting, so no payload.
       void syncClientUpdateFromBuild();
       break;
 

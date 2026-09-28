@@ -392,18 +392,15 @@ pub enum SystemEvent {
         sent_at_ms: i64,
     },
     /// A dev engine advanced its boot-pinned served-frontend snapshot to the
-    /// checkout-shared `dist/` after ANOTHER workspace's *frontend-only* Apply
-    /// moved it — the applying engine advances only its OWN snapshot, so a peer
-    /// workspace would otherwise silently serve a stale client with no badge (see
-    /// `engine::frontend_refresh::spawn_served_frontend_sync`,
+    /// checkout-shared `dist/`. Emitted on every swap, by the engine that applied
+    /// a *frontend-only* change and by a peer workspace's periodic sync
+    /// (`engine::frontend_refresh`,
     /// `docs/plans/2026-07-03-cross-workspace-frontend-only-refresh.md`).
-    /// INV-A-gated: only emitted when the running engine's source still matches
-    /// HEAD (no engine version change pending), so the newer client is compatible
-    /// with the running binary. Transient (never persisted — a pure UI signal like
-    /// `FrontendUpdateDeferred`) and dev-only by construction
-    /// (`spawn_served_frontend_sync` no-ops packaged / headless). The connected
-    /// client re-runs `syncClientUpdateFromBuild` to surface the Refresh
-    /// badge/toast. `sent_at_ms` is informational — the handler is idempotent and
+    /// INV-A-gated: only emitted when no engine version change is pending, so the
+    /// newer client is compatible with the running binary. Transient and dev-only
+    /// by construction (both paths no-op packaged / headless). The connected
+    /// client re-runs `syncClientUpdateFromBuild` to surface the Refresh badge and
+    /// toast. `sent_at_ms` is informational: the handler is idempotent and
     /// self-correcting, so no page-side freshness gate is needed.
     ServedFrontendAdvanced {
         sent_at_ms: i64,

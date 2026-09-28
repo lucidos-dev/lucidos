@@ -1463,33 +1463,87 @@ html[data-theme-mode="dark"] .thread-status-question-badge::after {
     padding: var(--turn-feed-pad-y) var(--turn-body-inset) 0 0;
 }
 
-/* `/btw` answers (ADR 0318) close the feed on the same edge as the notice.
-   Each is a raised neutral box, never an accent stripe, and stacks. */
+/* `/btw` answers (ADR 0318) sit where they were asked. Each is a nested
+   surface on the turn body edge, like a question card, so its text shares
+   their column. */
 .side-questions {
     display: flex;
     flex-direction: column;
     gap: var(--space-sm);
-    padding: var(--turn-feed-pad-y) var(--turn-body-inset) 0 0;
+    padding: var(--turn-feed-pad-y) var(--turn-body-inset) 0;
+}
+
+/* Inside a turn's body, between its rows. The panel already pads the right
+   edge, so the box keeps only the left inset, and air on both sides. */
+.response-body > .side-questions {
+    padding: var(--space-sm) 0 var(--space-sm) var(--turn-body-inset);
 }
 
 .side-question-card {
-    padding: var(--space-sm) var(--space-md) var(--space-md);
-    background: var(--bg-tertiary);
+    padding: calc(var(--turn-surface-inset) - 1px);
+    background: var(--bg-secondary);
     border: 1px solid var(--border-color);
     border-radius: var(--radius-surface);
     min-width: 0;
 }
 
+/* A dismissed card: one line on the card's own edges, the question cut off
+   with an ellipsis. */
+.side-question-dismissed {
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-sm);
+    width: 100%;
+    min-width: 0;
+    padding: calc(var(--space-sm) - 1px) calc(var(--turn-surface-inset) - 1px);
+    background: none;
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-surface);
+    color: var(--text-muted);
+    text-align: left;
+    cursor: pointer;
+}
+
+@media (hover: hover) {
+    .side-question-dismissed:hover {
+        background: var(--bg-secondary);
+    }
+}
+
+.side-question-dismissed-text {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* The open card's collapse chevron at the same size and colour, so the two
+   sit on one right edge. */
+.side-question-dismissed-chevron {
+    display: flex;
+    align-self: center;
+    color: var(--text-secondary);
+}
+
+.side-question-dismissed-chevron svg {
+    width: var(--icon-size-sm);
+    height: var(--icon-size-sm);
+}
+
+/* Top-aligned: a note wrapped onto two lines keeps the label on its first. */
 .side-question-head {
     display: flex;
-    align-items: center;
+    align-items: baseline;
     gap: var(--space-sm);
 }
 
 .side-question-label {
-    font-size: var(--font-size-sm);
+    font-size: var(--font-size-xs);
     font-weight: 600;
-    color: var(--text-strong);
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--text-secondary);
 }
 
 .side-question-note {
@@ -1499,20 +1553,38 @@ html[data-theme-mode="dark"] .thread-status-question-badge::after {
     color: var(--text-muted);
 }
 
-/* 44px at the 16px root: the platform's minimum touch target. */
+/* The negative margin hands the chip padding back, so the glyph sits on the
+   card's text edge and the head stays one text line tall. */
 .side-question-dismiss {
-    flex: none;
-    min-width: 2.75rem;
-    min-height: 2.75rem;
-    margin-right: calc(-1 * var(--space-sm));
-    border-radius: var(--radius-control);
+    position: relative;
+    align-self: flex-start;
+    margin: -0.25rem;
 }
 
+/* A transparent 44px touch target, 2.75rem at the 16px root. */
+.side-question-dismiss::before {
+    content: '';
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: 2.75rem;
+    height: 2.75rem;
+    transform: translate(-50%, -50%);
+}
+
+/* Surface, radius, padding and leading come from `.user-bubble`, so the card
+   reads as the thread's own question-then-answer shape. This adds the right
+   alignment and a typed question's own line breaks. */
 .side-question-question {
-    margin-bottom: var(--space-sm);
-    color: var(--text-secondary);
+    width: fit-content;
+    margin: var(--space-sm) 0 var(--space-md) auto;
+    color: var(--text-primary);
     white-space: pre-wrap;
     overflow-wrap: anywhere;
+}
+
+.side-question-card .markdown-content > :last-child {
+    margin-bottom: 0;
 }
 
 .side-question-thinking {

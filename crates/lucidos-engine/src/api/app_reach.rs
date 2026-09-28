@@ -97,6 +97,7 @@ pub const ROUTE_REACH: &[(&str, Reach, &[&str])] = &[
     ("/claude-code/stop", Host, &[]),
     ("/coding-agents/binaries", Host, &[]),
     ("/coding-agents/side-question", Host, &[]),
+    ("/coding-agents/side-question/dismiss", Host, &[]),
     ("/command-checkpoint/diff", Host, &[]),
     ("/command-checkpoint/undo", Host, &[]),
     ("/command-permission/consent", Host, &[]),

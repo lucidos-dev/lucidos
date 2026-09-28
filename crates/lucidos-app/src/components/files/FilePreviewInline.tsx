@@ -29,7 +29,7 @@ import {
   handlePreviewLinkClick,
   previewBaseHref,
   withPreviewBase,
-  withPreviewScale,
+  withPreviewSizing,
 } from './previewIframeLinks';
 import { currentUiScale } from '../../store/actions/preferences';
 
@@ -412,14 +412,14 @@ function TextContent({ body, url, path, revision, servesPanel }: {
     // artifact's folder; `bridgePreviewIframeLinks` routes the clicks the browser
     // would otherwise use to navigate this iframe. See previewIframeLinks.ts.
     //
-    // `withPreviewScale` is the other half of that isolation: the document
-    // inherits no root font-size either, so it is stamped with the UI scale.
-    // Reading `currentUiScale()` here is what re-stamps it when the user moves the
-    // slider, since the read subscribes this component to the preference.
+    // `withPreviewSizing` is the other half of that isolation: the document
+    // inherits no root font-size either, so it is stamped with the UI scale and a
+    // body text default. Reading `currentUiScale()` here is what re-stamps it when
+    // the user moves the slider, since the read subscribes this component to it.
     if (body === 'html') {
       return (
         <iframe
-          srcDoc={withPreviewBase(withPreviewScale(content, currentUiScale()), previewBaseHref(url))}
+          srcDoc={withPreviewBase(withPreviewSizing(content, currentUiScale()), previewBaseHref(url))}
           // `#fff` is functional rather than thematic, the token rule's second
           // carve-out. An artifact is authored against a white page and usually
           // sets no background. A themed canvas would put its black text on the

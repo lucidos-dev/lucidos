@@ -284,7 +284,7 @@ Distinct from discarding a draft, which throws away a thread that was never sent
 See also: `docs/adr/0192-thread-delete-is-the-one-sanctioned-removal.md`.
 
 ### Domain event
-An *event* the workspace itself emits via the `emit_event` LLM tool or `lucidos events emit` CLI — anything observable about the user's world (`MorningRoutineCompleted`, `JobListingFound`, `PanasonicHeatpumpAdjusted`). Persisted with the inner event type (not the literal string `"DomainEvent"`). Flows through the trigger matcher unconditionally, so a *trigger*'s `on_event:` can subscribe to any domain event name. Persisted `ThreadEvent` variants are also subscribable except per-token streaming ones — see *scheduler blocklist* (dev).
+An *event* the workspace itself emits via the `emit_event` LLM tool or `lucidos events emit` CLI: anything observable about the user's world (`MorningRoutineCompleted`, `JobListingFound`, `PanasonicHeatpumpAdjusted`). Persisted with the inner event type (not the literal string `"DomainEvent"`). Flows through the trigger matcher unconditionally, so a *trigger*'s `on_event:` can subscribe to any domain event name. Persisted `ThreadEvent` variants are also subscribable, except the per-token streaming ones and the side-question events. See *scheduler blocklist* (dev).
 **The name must be your own.** Every engine event name is refused, both the `SystemEvent` ones and the `ThreadEvent` ones (including legacy spellings like `Thinking`). A domain event's `aggregate_id` is its event TYPE, where a thread event's is a thread uuid. So a borrowed name writes a permanent row that breaks any query reading the name as an id.
 See also: `system-knowhow/thread-events.md` § "Today the scheduler uses a blocklist", `.claude/rules/rust.md` § "Apps — Event APIs".
 
@@ -1293,8 +1293,8 @@ A *thread* driven by a *coding agent* (Claude Code or Codex) inside an isolated 
 See also: `system-knowhow/coding-agent-events.md`.
 
 ### Side question
-A quick question put to a Claude Code *coding-agent thread* by typing `/btw <question>` in its composer. Claude Code answers from the session's full context, beside any running turn, with no tools. The answer shows on a dismissible card at the end of the thread and is **never recorded**: it is not a message, not an event, and never part of the conversation, so it is gone after a reload (ADR 0318). An idle thread is answered by a short-lived resumed process that writes nothing. Codex threads cannot take side questions and say so.
-See also: `system-knowhow/coding-agent-events.md` § Side questions record nothing.
+A quick question put to a Claude Code *coding-agent thread* by typing `/btw <question>` in its composer. Claude Code answers from the session's full context, beside any running turn, with no tools. The answer shows on a card at the moment it was asked, even mid-turn, and later output draws below it. Kept as events **no agent ever sees** (ADR 0320), the card survives reloads and shows on every device. Its chevron collapses it to a one-line row, which expands again on a tap. Codex threads refuse side questions.
+See also: `system-knowhow/coding-agent-events.md` § Side questions are recorded, and hidden from every agent.
 
 ### External-repo coding-agent thread
 A *coding-agent thread* (see) running against a user-registered external git *repository* rather than the Lucidos workspace itself. No Apply / Discard surface — the user reviews diffs via the external-repo diff viewer. Worktree creation and system prompt differ from the Lucidos-internal variant; documented in `docs/plans/2026-03-17-external-repos-plan.md`.

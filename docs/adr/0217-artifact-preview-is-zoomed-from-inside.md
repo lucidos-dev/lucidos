@@ -14,7 +14,7 @@ which is what a user reported.
 ## Decision
 
 The preview stamps `:root { zoom: <scale>% }` into the artifact's own head,
-beside the `<base href>` it already stamps (`withPreviewScale` in
+beside the `<base href>` it already stamps (`withPreviewSizing` in
 `components/files/previewIframeLinks.ts`). It does NOT set `zoom` on the iframe
 element.
 
@@ -39,8 +39,8 @@ gets read on.
 - The srcdoc carries the scale, so changing the UI scale re-stamps the document
   and the iframe reloads. A preview loses its scroll position when the slider
   moves, which is rare and cheap.
-- 100% stamps nothing, so the default case is byte-identical to the artifact on
-  disk.
+- 100% stamps no zoom. ADR 0319 later added a body text default to the same
+  stamp, so no scale leaves the document byte-identical to the file on disk.
 - `100vw` and media queries inside the artifact still resolve against the
   UNZOOMED viewport, in both engines. An artifact sized in viewport units
   therefore overflows horizontally by the scale factor. That is a scrollbar

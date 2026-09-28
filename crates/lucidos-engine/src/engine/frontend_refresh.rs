@@ -601,26 +601,29 @@ impl LucidosEngine {
         }
 
         // Pin a fresh snapshot of the rebuilt `dist/` and swap the served dir.
-        let _ = self
-            .advance_served_snapshot(&handle, &source, &workspace, generation)
+        self.advance_served_snapshot(&handle, &source, &workspace, generation)
             .await;
     }
 
-    /// Pin a fresh snapshot of `source` and atomically swap the served handle to
-    /// it, grace-cleaning the previous snapshot. Returns `true` if the swap
-    /// happened. Shared by the applying-engine refresh
+    /// Pin a fresh snapshot of `source`, atomically swap the served handle to it,
+    /// and announce the swap with `ServedFrontendAdvanced`. Grace-cleans the
+    /// previous snapshot. Shared by the applying-engine refresh
     /// ([`run_served_frontend_refresh`]) and the periodic peer sync
     /// ([`sync_served_frontend_if_safe`]); both honor the generation guard (a newer
     /// refresh supersedes this one) and the cleanup guard (only ever removes a dir
     /// UNDER the snapshot parent, never the live `dist/`). The caller is
     /// responsible for the INV-A gate before calling.
+    ///
+    /// The announcement is the client's only prompt signal that a newer client
+    /// is served. Every swap must emit it, or the Refresh toast waits for the
+    /// next page resume.
     async fn advance_served_snapshot(
         &self,
         handle: &Arc<RwLock<PathBuf>>,
         source: &Path,
         workspace: &Path,
         generation: u64,
-    ) -> bool {
+    ) {
         // Read BEFORE the copy: `dist/` can only hold this commit or an older
         // one. An unreadable or incompatible HEAD records `None`, which lists
         // everything since the running commit.
@@ -636,7 +639,7 @@ impl LucidosEngine {
                 if self.frontend_refresh_superseded(generation) {
                     // A newer refresh won while we were copying; drop our snapshot.
                     frontend_snapshot::remove_snapshot_dir(&new_dir);
-                    return false;
+                    return;
                 }
                 let prev = {
                     let mut guard = handle.write().unwrap();
@@ -657,21 +660,18 @@ impl LucidosEngine {
                         frontend_snapshot::remove_snapshot_dir(&prev);
                     });
                 }
-                true
+                self.emit_served_frontend_advanced().await;
             }
             Err(e) => {
                 // Fail-safe: leave the current served dir in place (never a 404).
                 crate::log!("[Frontend] re-snapshot failed ({e}); served snapshot unchanged");
-                false
             }
         }
     }
 
-    /// Emit the transient `ServedFrontendAdvanced` UI signal — tells the connected
-    /// client this engine just advanced its served snapshot to the shared `dist/`
-    /// (a peer workspace's frontend-only Apply), so it re-runs
-    /// `syncClientUpdateFromBuild` and surfaces the Refresh badge/toast. Mirrors
-    /// [`Self::emit_frontend_update_deferred`].
+    /// Emit the transient `ServedFrontendAdvanced` UI signal: this engine just
+    /// swapped its served snapshot, so the client re-runs
+    /// `syncClientUpdateFromBuild` and surfaces the Refresh badge and toast.
     async fn emit_served_frontend_advanced(&self) {
         self.event_bus
             .emit_or_log(
@@ -772,12 +772,8 @@ impl LucidosEngine {
             self.emit_frontend_refresh_state_changed().await;
         }
         let workspace = self.workspace_path().to_path_buf();
-        if self
-            .advance_served_snapshot(&handle, &source, &workspace, generation)
-            .await
-        {
-            self.emit_served_frontend_advanced().await;
-        }
+        self.advance_served_snapshot(&handle, &source, &workspace, generation)
+            .await;
     }
 
     /// Dev-only: spawn the periodic dev-maintenance loop (every
@@ -825,6 +821,26 @@ mod tests {
         BuildState, BuildWatchState,
     };
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn every_served_snapshot_swap_announces_itself() {
+        let src = include_str!("frontend_refresh.rs");
+        // Split so this test's own source is not a match.
+        let emit = concat!("self.emit_served_frontend", "_advanced()");
+        let start = src
+            .find("async fn advance_served_snapshot(")
+            .expect("advance_served_snapshot exists");
+        let swap = &src[start..start + src[start..].find("\n    }\n").expect("method end")];
+        assert!(
+            swap.contains(emit),
+            "the swap itself must emit ServedFrontendAdvanced, so no caller can forget"
+        );
+        assert_eq!(
+            src.matches(emit).count(),
+            1,
+            "ServedFrontendAdvanced is emitted in one place, the swap"
+        );
+    }
 
     #[test]
     fn a_refresh_is_live_only_while_its_generation_is_current() {

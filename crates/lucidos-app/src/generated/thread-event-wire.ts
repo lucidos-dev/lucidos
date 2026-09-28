@@ -2104,6 +2104,56 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
+  /** The user asked a `/btw` side question in a Claude Code thread.
+   *  Full reasoning is on the Rust variant. */
+  | {
+      type: 'SideQuestionAsked';
+      side_question_id: string;
+      question: string;
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
+  /** Claude Code answered the side question with this id. */
+  | {
+      type: 'SideQuestionAnswered';
+      side_question_id: string;
+      answer: string;
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
+  /** The side question with this id got no answer. Startup recovery writes
+   *  one for every ask a restart left unsettled. */
+  | {
+      type: 'SideQuestionFailed';
+      side_question_id: string;
+      error: string;
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
+  /** The user dismissed the card for this side question. The card collapses
+   *  to a row and can be reopened, so the ask stays recorded. */
+  | {
+      type: 'SideQuestionDismissed';
+      side_question_id: string;
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
   /** Retired. The pre-`ContextCaptured` token measurement. */
   | {
       type: 'ContextTokensMeasured';
@@ -2337,6 +2387,10 @@ const THREAD_EVENT_TYPE_FLAGS = {
   SpokenReplyGenerated: true,
   SpokenMessageReceived: true,
   WorkDelegated: true,
+  SideQuestionAsked: true,
+  SideQuestionAnswered: true,
+  SideQuestionFailed: true,
+  SideQuestionDismissed: true,
   ContextTokensMeasured: true,
   ContextAssembled: true,
   MemorySearched: true,

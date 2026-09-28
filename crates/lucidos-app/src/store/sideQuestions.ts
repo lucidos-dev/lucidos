@@ -1,20 +1,47 @@
 import { signal } from '@preact/signals';
-import { askSideQuestion as postSideQuestion, ApiError } from '../api/client';
+import {
+  askSideQuestion as postSideQuestion,
+  dismissSideQuestion as postDismissal,
+  ApiError,
+} from '../api/client';
 import { errorDetail } from '../utils/errorDetail';
+import { showToast, threadMap } from './store';
+import { isSideQuestionEvent } from './thread-events/thread-event-types';
+import type { ThreadState } from './thread-events/thread-meta';
 
-/** A `/btw` side question and where its answer stands. Held in memory only:
- *  the engine records nothing, so a reload or another device shows no card
- *  (ADR 0318). */
-export type SideQuestion =
-  | { id: string; threadId: string; question: string; status: 'pending' }
-  | { id: string; threadId: string; question: string; status: 'answered'; answer: string }
-  | { id: string; threadId: string; question: string; status: 'failed'; error: string };
+/** A `/btw` side question and where its answer stands.
+ *
+ *  Recorded as side-question thread events no agent ever reads (ADR 0320), so
+ *  a card survives a reload and shows on every device. */
+export type SideQuestion = {
+  id: string;
+  threadId: string;
+  question: string;
+  /** The card's moment on the thread's clock: its `SideQuestionAsked` seq,
+   *  or the newest seq the thread held while the ask is still on its way.
+   *  Rows later than it draw below the card. Null when no event had loaded. */
+  afterSeq: number | null;
+  /** Dismissed cards collapse to a row that reopens. */
+  dismissed: boolean;
+} & (
+  | { status: 'pending' }
+  | { status: 'answered'; answer: string }
+  | { status: 'failed'; error: string }
+);
 
 /** The menu entry and composer prefix for a side question. */
 export const SIDE_QUESTION_COMMAND = 'btw';
 
-/** Every side question on screen, oldest first. */
-export const sideQuestions = signal<readonly SideQuestion[]>([]);
+/** Asks not yet recorded, keyed by id: a pending card before its event lands,
+ *  and an ask whose request failed before the engine recorded anything. */
+export const localSideQuestions = signal<ReadonlyMap<string, SideQuestion>>(new Map());
+
+/** Ids this device dismissed, drawn dismissed before the event lands. */
+export const dismissingSideQuestions = signal<ReadonlySet<string>>(new Set());
+
+/** Dismissed cards this device opened again. Local only: reopening records
+ *  nothing, so another device keeps its own view. */
+export const reopenedSideQuestions = signal<ReadonlySet<string>>(new Set());
 
 /** The question in `message` when it is a side question (`/btw` as its first
  *  word), else `null`. An empty string is a bare `/btw`. Mirrors the engine's
@@ -66,28 +93,155 @@ export function routeSideQuestion(
   return { kind: 'ask', question };
 }
 
-export function sideQuestionsFor(all: readonly SideQuestion[], threadId: string): SideQuestion[] {
-  return all.filter((q) => q.threadId === threadId);
+/** The highest persisted seq the thread holds, or null before any has
+ *  loaded. An unsent message is not in `events`, so it always sorts after. */
+export function latestEventSeq(thread: ThreadState | undefined): number | null {
+  let latest: number | null = null;
+  for (const seq of thread?.events.keys() ?? []) latest = Math.max(latest ?? seq, seq);
+  return latest;
 }
 
-let nextId = 0;
+/** The thread's recorded side questions, in asking order. Rebuilt only when
+ *  its append-only event map grows, so each card keeps its identity and a
+ *  memoised turn re-renders only when its own card changes. */
+const recordedCache = new WeakMap<ThreadState['events'], { size: number; cards: SideQuestion[] }>();
 
-/** Ask a side question and show its card. Never throws: a failure lands on
- *  the card. A card dismissed while pending drops its answer. */
+export function recordedSideQuestions(thread: ThreadState | undefined): SideQuestion[] {
+  if (!thread) return [];
+  const cached = recordedCache.get(thread.events);
+  if (cached && cached.size === thread.events.size) return cached.cards;
+  const previous = new Map((cached?.cards ?? []).map((card) => [card.id, card]));
+  const byId = new Map<string, SideQuestion>();
+  const inOrder = [...thread.events].filter(([, event]) => isSideQuestionEvent(event)).sort(([a], [b]) => a - b);
+  for (const [seq, event] of inOrder) {
+    if (!isSideQuestionEvent(event)) continue;
+    const id = event.side_question_id;
+    const card = byId.get(id);
+    if (event.type === 'SideQuestionAsked') {
+      byId.set(id, {
+        id, threadId: thread.meta.id, question: event.question, afterSeq: seq, dismissed: false, status: 'pending',
+      });
+    } else if (!card) {
+      continue;
+    } else if (event.type === 'SideQuestionAnswered') {
+      byId.set(id, { ...card, status: 'answered', answer: event.answer });
+    } else if (event.type === 'SideQuestionFailed') {
+      byId.set(id, { ...card, status: 'failed', error: event.error });
+    } else {
+      byId.set(id, { ...card, dismissed: true });
+    }
+  }
+  const cards = [...byId.values()].map((card) => {
+    const old = previous.get(card.id);
+    return old && sameCard(old, card) ? old : card;
+  });
+  recordedCache.set(thread.events, { size: thread.events.size, cards });
+  return cards;
+}
+
+function sameCard(a: SideQuestion, b: SideQuestion): boolean {
+  return a.status === b.status && a.dismissed === b.dismissed && a.afterSeq === b.afterSeq
+    && (a.status !== 'answered' || (b.status === 'answered' && a.answer === b.answer))
+    && (a.status !== 'failed' || (b.status === 'failed' && a.error === b.error));
+}
+
+/** The dismissed flag a card is drawn with, from this device's own layer. */
+const drawnCache = new WeakMap<SideQuestion, SideQuestion>();
+
+function drawn(card: SideQuestion, dismissed: boolean): SideQuestion {
+  if (card.dismissed === dismissed) return card;
+  const hit = drawnCache.get(card);
+  if (hit) return hit;
+  const flipped = { ...card, dismissed };
+  drawnCache.set(card, flipped);
+  return flipped;
+}
+
+/** A recorded card still pending while this device already holds the
+ *  answer, drawn with that answer at the recorded moment. */
+const settledCache = new WeakMap<SideQuestion, SideQuestion>();
+
+function settledEarly(recorded: SideQuestion, local: SideQuestion | undefined): SideQuestion {
+  if (recorded.status !== 'pending' || !local || local.status === 'pending') return recorded;
+  const hit = settledCache.get(local);
+  if (hit && hit.afterSeq === recorded.afterSeq && hit.dismissed === recorded.dismissed) return hit;
+  const merged = { ...local, afterSeq: recorded.afterSeq, dismissed: recorded.dismissed };
+  settledCache.set(local, merged);
+  return merged;
+}
+
+/** Every side question on a thread, as this device draws it: the recorded
+ *  cards, then asks still on their way. */
+export function sideQuestionsFor(threadId: string): SideQuestion[] {
+  const localCards = localSideQuestions.value;
+  const recorded = recordedSideQuestions(threadMap.value.get(threadId))
+    .map((card) => settledEarly(card, localCards.get(card.id)));
+  const recordedIds = new Set(recorded.map((card) => card.id));
+  const local = [...localCards.values()]
+    .filter((card) => card.threadId === threadId && !recordedIds.has(card.id));
+  const dismissing = dismissingSideQuestions.value;
+  const reopened = reopenedSideQuestions.value;
+  return [...recorded, ...local].map((card) => {
+    const dismissed = (card.dismissed || dismissing.has(card.id)) && !reopened.has(card.id);
+    return drawn(card, dismissed);
+  });
+}
+
+function setLocal(card: SideQuestion): void {
+  const next = new Map(localSideQuestions.value);
+  next.set(card.id, card);
+  localSideQuestions.value = next;
+}
+
+function withId(set: ReadonlySet<string>, id: string, present: boolean): ReadonlySet<string> {
+  const next = new Set(set);
+  if (present) next.add(id);
+  else next.delete(id);
+  return next;
+}
+
+/** Ask a side question and show its card at once. Never throws: a failure
+ *  lands on the card. The recorded events take over when they arrive. */
 export async function askSideQuestion(threadId: string, question: string): Promise<void> {
-  const id = `side-question-${++nextId}`;
-  sideQuestions.value = [...sideQuestions.value, { id, threadId, question, status: 'pending' }];
-  let settled: SideQuestion;
+  const id = crypto.randomUUID();
+  const asked = {
+    id, threadId, question, afterSeq: latestEventSeq(threadMap.value.get(threadId)), dismissed: false,
+  };
+  setLocal({ ...asked, status: 'pending' });
   try {
-    const answer = await postSideQuestion(threadId, question);
-    settled = { id, threadId, question, status: 'answered', answer };
+    const answer = await postSideQuestion(threadId, id, question);
+    setLocal({ ...asked, status: 'answered', answer });
   } catch (err) {
     const error = err instanceof ApiError ? err.reason : errorDetail(err);
-    settled = { id, threadId, question, status: 'failed', error };
+    setLocal({ ...asked, status: 'failed', error });
   }
-  sideQuestions.value = sideQuestions.value.map((q) => (q.id === id ? settled : q));
 }
 
-export function dismissSideQuestion(id: string): void {
-  sideQuestions.value = sideQuestions.value.filter((q) => q.id !== id);
+/** Dismiss a card and record the dismissal. A 404 means the engine never
+ *  recorded the ask (it refused it), so the card just leaves this device. */
+export async function dismissSideQuestion(card: SideQuestion): Promise<void> {
+  if (reopenedSideQuestions.value.has(card.id)) {
+    reopenedSideQuestions.value = withId(reopenedSideQuestions.value, card.id, false);
+    return;
+  }
+  dismissingSideQuestions.value = withId(dismissingSideQuestions.value, card.id, true);
+  try {
+    await postDismissal(card.threadId, card.id);
+  } catch (err) {
+    dismissingSideQuestions.value = withId(dismissingSideQuestions.value, card.id, false);
+    if (err instanceof ApiError && err.httpCode === 404 && card.status !== 'pending') {
+      const next = new Map(localSideQuestions.value);
+      next.delete(card.id);
+      localSideQuestions.value = next;
+      return;
+    }
+    reopenedSideQuestions.value = withId(reopenedSideQuestions.value, card.id, false);
+    const reason = err instanceof ApiError ? err.reason : errorDetail(err);
+    showToast(`Could not dismiss the side question "${card.question}": ${reason}`, 'error');
+  }
+}
+
+/** Open a dismissed card again, on this device. */
+export function reopenSideQuestion(id: string): void {
+  reopenedSideQuestions.value = withId(reopenedSideQuestions.value, id, true);
 }

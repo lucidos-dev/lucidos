@@ -159,18 +159,23 @@ body {
     background: var(--bg-primary);
     color: var(--text-primary);
     font-family: var(--font-ui);
-    /* The type scale's body step, so text an app doesn't size explicitly lands
-       where the host shell's body text does. It is a `rem`, so it still tracks
-       the user's UI-scale preference through the root font-size above. An
-       earlier removal of this declaration assumed otherwise, and left unstyled
-       app text falling to the raw root (`1rem`, 18px at a 112.5% scale), a size
-       nothing in the host renders at: every app came out a scale step larger
-       than Lucidos, with proportionally looser line spacing on top. */
-    font-size: var(--font-size-md);
+    /* The chat prose step, so text an app doesn't size explicitly reads at the
+       size of the chat beside it (ADR 0319). Controls keep `md`, as in the host.
+       It is a `rem`, so it still tracks the user's UI-scale preference through
+       the root font-size above. Without it, unstyled app text falls to the raw
+       root (`1rem`), a size nothing in the host renders body text at. */
+    font-size: var(--font-size-sm);
     line-height: 1.5;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
     text-rendering: optimizeLegibility;
+}
+
+/* A shared row title names no size and inherits the body's. The host body is
+   `md`, so the row keeps the host's UI step here rather than the prose step.
+   On the container, so a `.title list-row-name` still wins with its own. */
+.list-row-info {
+    font-size: var(--font-size-md);
 }
 
 /* Programming ligatures belong to CODE, never to prose. sdk-prefs.js

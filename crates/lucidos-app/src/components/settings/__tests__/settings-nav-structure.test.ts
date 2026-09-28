@@ -34,7 +34,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, resolve, join } from 'node:path';
 import { DEFAULT_FONT_PREFERENCE, FOLLOW_THEME, FONT_CATALOG } from '@lucidos/appearance';
 import { fontOptions } from '../fontOptions';
-import { SETTINGS_NAV_ITEMS, SETTINGS_SYSTEM_SUBPANEL_ITEMS } from '../../../store/store';
+import { SETTINGS_SUBVIEW_ITEMS } from '../../../store/store';
 import { findSettingsEntry, settingsSearchEntryIds } from '../../search/searchIndex';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -145,7 +145,7 @@ describe('Settings nav structure', () => {
 
   it('has a renderSubview case for every nav key, so no row opens onto nothing', () => {
     const body = functionBody(SETTINGS_VIEW, 'function renderSubview()');
-    for (const { key } of [...SETTINGS_NAV_ITEMS, ...SETTINGS_SYSTEM_SUBPANEL_ITEMS]) {
+    for (const { key } of SETTINGS_SUBVIEW_ITEMS) {
       expect(body, `renderSubview has no case for '${key}'`).toContain(`case '${key}':`);
     }
   });
@@ -278,7 +278,7 @@ describe('Settings leaf-setting reachability', () => {
   it('resolves every search entry to a live subview and a rendered anchor', () => {
     for (const id of settingsSearchEntryIds()) {
       const entry = findSettingsEntry(id)!;
-      const navKeys = [...SETTINGS_NAV_ITEMS, ...SETTINGS_SYSTEM_SUBPANEL_ITEMS].map((i) => i.key);
+      const navKeys = SETTINGS_SUBVIEW_ITEMS.map((i) => i.key);
       expect(navKeys, `search entry "${id}" points at a dead subview`).toContain(entry.subview);
       if (entry.anchor) {
         expect(anchors.has(entry.anchor), `search entry "${id}" has no rendered anchor`).toBe(true);

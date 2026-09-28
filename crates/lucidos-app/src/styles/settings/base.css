@@ -438,7 +438,7 @@
 }
 
 /* A bare text button carrying a chevron, opening a group of rows below it:
-   an MCP row's tool list, the switched-off models, the theme grid. Lives here
+   an MCP row's tool list, the switched-off models. Lives here
    rather than beside any one of them, because this file is where the
    settings-wide classes are (.settings-section-title, .settings-text-input,
    .model-provider-badge). */

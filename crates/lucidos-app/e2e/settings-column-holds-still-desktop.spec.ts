@@ -1,49 +1,43 @@
 /**
- * The settings column holds still as the theme gallery unfolds and folds. The
- * page grows past the pane and shrinks back. A classic scrollbar coming and
- * going would slide the whole column sideways as the roll lands. The pane
- * reserves the scroll gutter for a column view (panels/shell.css).
+ * The settings column holds still between a page that fits the pane and one
+ * that outgrows it. A classic scrollbar coming and going would slide the whole
+ * column sideways. The pane reserves the scroll gutter for a column view
+ * (panels/shell.css).
  */
 import { test, expect } from './fixtures';
-import { apiRequest, assertHealthy, navigateToApp, waitForEventStream } from './helpers';
+import { assertHealthy, navigateToApp, openSettingsView, waitForEventStream } from './helpers';
 
 // Headless Chromium launches with `--hide-scrollbars`, which removes the
-// scrollbar whose arrival this spec measures.
+// scrollbar whose arrival this spec measures. The height puts the System list
+// inside the pane and Appearance past it.
 test.use({
-  viewport: { width: 1280, height: 900 },
+  viewport: { width: 1280, height: 600 },
   launchOptions: { ignoreDefaultArgs: ['--hide-scrollbars'] },
 });
 
-test('the settings column holds still as the theme gallery unfolds and folds', async ({ page }) => {
+test('the settings column holds still as the page grows past the pane', async ({ page }) => {
   await assertHealthy(page);
   await navigateToApp(page);
   await waitForEventStream(page);
-  const nav = await apiRequest(page).post('/api/v1/ui/navigate', {
-    headers: { 'content-type': 'application/json' },
-    data: { target: 'settings', params: { settings_view: 'appearance' } },
-  });
-  expect(nav.ok(), `POST /api/v1/ui/navigate -> ${nav.status()}`).toBeTruthy();
 
+  const body = page.locator('.content-pane-body');
   const column = page.locator('.content-pane-body > .settings-panel');
+  const overflows = () => body.evaluate(el => el.scrollHeight > el.clientHeight);
   const rightEdge = async () => {
     const box = await column.boundingBox();
     return box ? box.x + box.width : null;
   };
-  const rolling = page.locator('.disclosure.is-rolling');
-  const radios = page.locator('.theme-card[role="radio"]');
-  await expect(page.locator('.theme-toggle')).toBeVisible();
-  const shut = await rightEdge();
 
-  await page.locator('.theme-toggle').click();
-  await expect(radios.first()).toBeVisible();
-  await expect(rolling).toHaveCount(0);
+  // The System list is a column of ten rows, inside the pane.
+  await openSettingsView(page, 'system');
+  await expect(page.locator('.settings-nav-row').first()).toBeVisible();
+  await expect.poll(overflows, { message: 'the System list outgrew the pane' }).toBe(false);
+  const fits = await rightEdge();
+
+  // Appearance is several sections deep, past the pane.
+  await openSettingsView(page, 'appearance');
+  await expect(page.locator('.theme-carousel')).toBeVisible();
   // Proves the page outgrew the pane, or the check below proves nothing.
-  const overflows = await page.locator('.content-pane-body').evaluate(el => el.scrollHeight > el.clientHeight);
-  expect(overflows, 'the unfolded gallery never outgrew the pane').toBe(true);
-  expect(await rightEdge(), 'the column moved as the gallery unfolded').toBe(shut);
-
-  await page.locator('.settings-section-title', { hasText: 'Typography' }).click();
-  await expect(radios).toHaveCount(0);
-  await expect(rolling).toHaveCount(0);
-  expect(await rightEdge(), 'the column moved as the gallery folded').toBe(shut);
+  await expect.poll(overflows, { message: 'Appearance never outgrew the pane' }).toBe(true);
+  expect(await rightEdge(), 'the column moved as the page outgrew the pane').toBe(fits);
 });

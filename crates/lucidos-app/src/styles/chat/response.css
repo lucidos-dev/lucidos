@@ -260,6 +260,12 @@
     --deep-link-focus-gap: 0.5rem;
 }
 
+/* A side question lands on the same line as a turn (`followSideQuestion`),
+   and one in the feed sits outside any exchange to inherit the gap from. */
+.side-questions {
+    --deep-link-focus-gap: 0.5rem;
+}
+
 /* The deep-link landing clearance, shared by the turn AND by any addressable
    card INSIDE it. A step-level event carries its OWN `data-event-id` (today the
    `ResponseFailed` failure card, see ChatExchange.tsx), so the deep-link lands on
@@ -268,9 +274,10 @@
    which is exactly what the `.chat-exchange` values below exist to prevent.
    `--deep-link-focus-gap` inherits from the enclosing exchange, so the descendant
    arm needs no second declaration. The desktop and mobile rules below carry the
-   same selector pair, so all three stay in lockstep. */
+   same selector list, so all three stay in lockstep. */
 .chat-exchange,
-.chat-exchange [data-event-id] {
+.chat-exchange [data-event-id],
+[data-side-question-id] {
     scroll-margin-top: var(--deep-link-focus-gap);
 }
 
@@ -296,7 +303,8 @@
    Matches the mask's min-width breakpoint. */
 @media (min-width: 769px) {
     .chat-exchange,
-    .chat-exchange [data-event-id] {
+    .chat-exchange [data-event-id],
+    [data-side-question-id] {
         scroll-margin-top: max(
             calc(var(--thread-top-fade) + var(--deep-link-focus-gap) + 0.5rem),
             calc(env(safe-area-inset-top, 0px) + var(--scroll-chevron-top) + var(--scroll-chevron-size) + var(--nav-focus-reach) + 0.5rem)
@@ -344,7 +352,8 @@
    title header with its whole highlight visible. */
 @media (max-width: 768px) {
     .chat-exchange,
-    .chat-exchange [data-event-id] {
+    .chat-exchange [data-event-id],
+    [data-side-question-id] {
         scroll-margin-top: calc(
             var(--mobile-header-height, 3rem)
             + var(--mobile-thread-title-height, 2.75rem)

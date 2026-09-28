@@ -3464,9 +3464,11 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   Re-flag only if the token is added to one of those two served files without the
   doc row. (`styles/global/base.css`, `crates/lucidos-engine/src/api/sdk.rs`.)
 
-- **BOTH bodies carry an explicit `font-size: var(--font-size-md)` now, and so do
-  form controls. Deleting either one to "let it inherit" is a bug that has
-  shipped three times.** This entry used to say the opposite for the host, on
+- **BOTH bodies carry an explicit `font-size` now, and so do form controls.
+  Deleting either one to "let it inherit" is a bug that has shipped three
+  times.** The host body is `--font-size-md`. The app iframe body is
+  `--font-size-sm`, the chat prose step (ADR 0319), so do not "restore" it to
+  `md` to match the host. This entry used to say the opposite for the host, on
   the theory that every host text element names its own token, so the host
   body's computed size was a value nothing rendered at. It carried a re-flag
   clause, *"re-flag only if the host shell starts rendering real body text at the
@@ -3478,8 +3480,9 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 
   **Why the failure is always "too big".** The root is
   `var(--user-ui-scale)`, which is exactly `--font-size-xl` (`1rem`, labelled
-  "section headings"), while body is `--font-size-md` (`0.8125rem`). Text that
-  reaches the root is therefore a step and a half ABOVE prose, not "unstyled".
+  "section headings"), while the host body is `--font-size-md` (`0.8125rem`)
+  and chat prose is `--font-size-sm`. Text that reaches the root is therefore
+  well ABOVE prose, not "unstyled".
   Reviewers reading a too-large surface should look for a MISSING declaration
   before looking for a wrong one.
 

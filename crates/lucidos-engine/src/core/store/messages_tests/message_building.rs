@@ -941,3 +941,56 @@ fn a_delegation_takes_nothing_from_the_turn_it_started() {
     assert_eq!(answer.steps.len(), 1, "the tool call went missing");
     assert_eq!(answer.steps[0].tool_name.as_deref(), Some("list_files"));
 }
+
+/// Session history is an allowlist, so the four side-question events never
+/// reach the main agent (ADR 0320). Interleaving them, even mid-turn, must
+/// leave the built messages identical.
+#[test]
+fn side_questions_never_enter_session_history() {
+    let turn = |with_side_questions: bool| {
+        let mut events = vec![make_event(
+            "MessageReceived",
+            json!({"text": "fix the bug", "request_id": "r1"}),
+            0,
+        )];
+        if with_side_questions {
+            events.push(make_event(
+                "SideQuestionAsked",
+                json!({"side_question_id": Uuid::new_v4(), "question": "what is x?"}),
+                1,
+            ));
+            events.push(make_event(
+                "SideQuestionAnswered",
+                json!({"side_question_id": Uuid::new_v4(), "answer": "x is 3"}),
+                2,
+            ));
+            events.push(make_event(
+                "SideQuestionFailed",
+                json!({"side_question_id": Uuid::new_v4(), "error": "no answer"}),
+                3,
+            ));
+            events.push(make_event(
+                "SideQuestionDismissed",
+                json!({"side_question_id": Uuid::new_v4()}),
+                4,
+            ));
+        }
+        events.push(make_event(
+            "ResponseGenerated",
+            json!({"text": "fixed", "request_id": "r1"}),
+            5,
+        ));
+        // Each built event gets a fresh id, so the two builds differ there.
+        let mut messages = serde_json::to_value(build_session_messages(&events)).unwrap();
+        for message in messages.as_array_mut().unwrap() {
+            let fields = message.as_object_mut().unwrap();
+            fields.remove("event_id");
+            fields.remove("request_event_id");
+        }
+        messages
+    };
+    let with = turn(true);
+    assert_eq!(with, turn(false));
+    let text = with.to_string();
+    assert!(!text.contains("what is x?") && !text.contains("x is 3"));
+}

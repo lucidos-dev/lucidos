@@ -1535,6 +1535,36 @@ pub enum ThreadEvent {
         reason: String,
     },
 
+    /// The user asked a `/btw` side question in a Claude Code thread.
+    ///
+    /// The four side-question events record a card, never a turn. No agent
+    /// ever reads them: every generic reader excludes them through
+    /// [`ThreadEvent::is_side_question_event`], and no allowlist names them. They
+    /// move no thread state (ADR 0320).
+    ///
+    /// The client names `side_question_id`, so its pending card and these
+    /// rows reconcile by id.
+    SideQuestionAsked {
+        side_question_id: uuid::Uuid,
+        question: String,
+    },
+    /// Claude Code answered the side question with this id.
+    SideQuestionAnswered {
+        side_question_id: uuid::Uuid,
+        answer: String,
+    },
+    /// The side question with this id got no answer. Startup recovery writes
+    /// one for every ask a restart left unsettled.
+    SideQuestionFailed {
+        side_question_id: uuid::Uuid,
+        error: String,
+    },
+    /// The user dismissed the card for this side question. The card collapses
+    /// to a row and can be reopened, so the ask stays recorded.
+    SideQuestionDismissed {
+        side_question_id: uuid::Uuid,
+    },
+
     // ---- Transient — never persisted ----
     // Every transient variant is past-tense (events-only model — no command
     // concept). Aliases preserve replay of any legacy persisted rows that

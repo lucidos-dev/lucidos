@@ -16,6 +16,8 @@ import { welcomeSuggestionsDismissed } from '../../store/actions/preferences';
 import { anchorSpacer, setAnchorSpacer, splitAnchorCorrection } from './anchorCorrection';
 import { awayFromBottom, notAtTop, scrollToBottom, scrollToTop, setActiveScrollElement, getActiveScrollElement, isElementVisible, makeScrollObservers, honourAnchoredMutation, isOtherNavigationScroll, markAnchorScroll, readerGestureSince } from './scrollState';
 import { ChatExchange } from './ChatExchange';
+import { NO_SIDE_QUESTIONS, placeSideQuestions, sideQuestionOwners } from './SideQuestionCard';
+import type { SideQuestion } from '../../store/sideQuestions';
 import { ChevronUpIcon, ChevronDownIcon } from '../shared/icons';
 import { WelcomeMessage } from './WelcomeMessage';
 import type { Exchange, StoredEvent } from '../../store/thread-events';
@@ -131,6 +133,9 @@ export function renderExchanges(
    *  gating whole exchanges is not enough on its own. Zero for every other
    *  exchange, which is what keeps the window a contiguous tail. */
   floorRowsHidden = 0,
+  /** The thread's side questions. Each is drawn inside the turn it was asked
+   *  in, or in the feed when no turn owns it (`sideQuestionOwners`). */
+  sideQuestions: readonly SideQuestion[] = NO_SIDE_QUESTIONS,
 ): VNode[] {
   // Compute once which abort exchange (if any) gets the Continue button: the
   // most recent ResponseAborted the user may actually resume from. See
@@ -172,6 +177,11 @@ export function renderExchanges(
   const queuedOrder = queuedRun.queuedOrder.filter(i => !removedQueuedIndices.has(i));
   const queuedIndices = new Set<number>(queuedOrder);
   const queuedCount = queuedOrder.length;
+  const sideQuestionPlaces = sideQuestionOwners(
+    exchanges,
+    sideQuestions,
+    (i) => queuedRun.queuedIndices.has(i) || restartPauseFoldsInto(exchanges[i], exchanges[i + 1]),
+  );
   const markers = readMarkers(exchanges, threadIsCC);
   const nodes: VNode[] = [];
   let lastModel: string | undefined;
@@ -257,6 +267,7 @@ export function renderExchanges(
         matchedEventId={matchedEvent?.eventId}
         matchedPayloadJson={matchedEvent?.payloadJson}
         pausedBy={pausedBy}
+        sideQuestions={sideQuestionPlaces.owned.get(i) ?? NO_SIDE_QUESTIONS}
       />
     );
   };
@@ -359,7 +370,7 @@ export function renderExchanges(
     i++;
   }
 
-  return nodes;
+  return placeSideQuestions(nodes, exchanges, sideQuestionPlaces.unowned, renderFromIndex > 0);
 }
 
 // --- Scroll anchoring for turn-control changes (full response, steps) ---

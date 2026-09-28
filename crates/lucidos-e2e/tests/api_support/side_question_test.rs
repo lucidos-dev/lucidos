@@ -1,5 +1,5 @@
 //! E2E coverage for `POST /api/v1/coding-agents/side-question` and the chat
-//! route's `/btw` guard (ADR 0318).
+//! route's `/btw` guard (ADR 0320).
 //!
 //! Every case here is a refusal the engine gives before any Claude Code runs,
 //! so it needs no real session. The answered path runs against a real Claude
@@ -12,11 +12,11 @@ use crate::support::{
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-async fn ask(thread_id: &str, question: &str) -> (u16, Value) {
+async fn post(path: &str, body: Value) -> (u16, Value) {
     let resp = user_client()
         .await
-        .post(format!("{}/api/v1/coding-agents/side-question", base_url()))
-        .json(&json!({ "thread_id": thread_id, "question": question }))
+        .post(format!("{}/api/v1/coding-agents/{path}", base_url()))
+        .json(&body)
         .send()
         .await
         .expect("side-question request failed");
@@ -25,6 +25,15 @@ async fn ask(thread_id: &str, question: &str) -> (u16, Value) {
         status,
         resp.json().await.expect("side-question body is JSON"),
     )
+}
+
+async fn ask(thread_id: &str, question: &str) -> (u16, Value) {
+    let body = json!({
+        "thread_id": thread_id,
+        "side_question_id": Uuid::new_v4(),
+        "question": question,
+    });
+    post("side-question", body).await
 }
 
 async fn thread_event_count(pool: &sqlx::PgPool, thread_id: Uuid) -> i64 {
@@ -96,6 +105,24 @@ async fn a_claude_code_thread_with_no_session_yet_is_refused_without_spawning() 
     let (status, body) = ask(&thread_id.to_string(), "   ").await;
     assert_eq!(status, 400, "{body}");
     assert!(error_of(&body).contains("Type a question"), "{body}");
+    assert_eq!(thread_event_count(&pool, thread_id).await, 0);
+}
+
+/// Only a recorded ask can be dismissed, and a refused dismissal records
+/// nothing.
+#[tokio::test]
+async fn dismissing_a_side_question_nobody_asked_is_not_found() {
+    let pool = sqlx::PgPool::connect(&db_url()).await.unwrap();
+    let thread_id = Uuid::new_v4();
+    seed_cc_thread_summary(&pool, thread_id, "idle").await;
+
+    let body = json!({ "thread_id": thread_id, "side_question_id": Uuid::new_v4() });
+    let (status, body) = post("side-question/dismiss", body).await;
+    assert_eq!(status, 404, "{body}");
+    assert!(
+        error_of(&body).contains("No side question with this id"),
+        "{body}"
+    );
     assert_eq!(thread_event_count(&pool, thread_id).await, 0);
 }
 

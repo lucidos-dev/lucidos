@@ -169,6 +169,14 @@ fn the_event_wait_family_never_reaches_the_wait_matcher() {
     assert!(is_subscribable(&started));
 }
 
+/// No agent may see a side question (ADR 0320), so no wait delivers one.
+#[test]
+fn a_side_question_never_reaches_the_wait_matcher() {
+    for event in crate::test_support::every_side_question_event() {
+        assert!(!is_awaitable_event(&event), "{}", event.event_type());
+    }
+}
+
 #[test]
 fn ordinary_events_are_awaitable() {
     assert!(is_awaitable_event(&ThreadEvent::ThreadArchived));
@@ -2278,6 +2286,29 @@ async fn the_lost_reentry_sweep_skips_a_reentry_that_already_ran() {
     assert!(
         lost_wait_reentries(&pool).await.unwrap().is_empty(),
         "a consumed re-entry is not lost"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// A side question asked or settled after the anchor is no turn, and startup
+/// recovery writes one before the sweep runs.
+#[tokio::test]
+async fn the_lost_reentry_sweep_looks_past_side_questions() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+
+    let thread_id = Uuid::new_v4();
+    subscribe_and_resolve_without_waking(&bus, &pool, thread_id).await;
+    for event in crate::test_support::every_side_question_event() {
+        seed_thread_event(&bus, thread_id, event).await;
+    }
+
+    assert_eq!(
+        lost_wait_reentries(&pool).await.unwrap().len(),
+        1,
+        "a side question does not consume the re-entry"
     );
 
     pool.close().await;

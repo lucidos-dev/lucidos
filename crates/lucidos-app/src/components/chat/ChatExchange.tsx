@@ -22,6 +22,8 @@ import { renderMarkdown } from '../../utils/renderMarkdown';
 import { linkifyPaths } from '../../utils/linkifyPaths';
 import { handleMarkdownLinkClick } from '../shared/markdownLinkClick';
 import { FormRequestRow } from './FormRequestRow';
+import { NO_SIDE_QUESTIONS, SideQuestionGroup, placeInBody } from './SideQuestionCard';
+import type { SideQuestion } from '../../store/sideQuestions';
 import { ChangeEventRow, CheckpointCard, ContinueButton, EventDeliveryBody, EventWaitRow, FileList, HeldMessageRow, GeneratedImage, InitiatorPanel, InlineStep, LivePartialBody, LiveUtteranceBody, MarkdownBlock, ResponsePanel, ResumeNoteBody, SpokenChip, SpokenReply, TriggerFiredBody, UserMessageBody, changeAccent, describeExecutor, turnControls } from './chat-exchange-parts';
 import { TrashIcon, PowerIcon, PersonIcon, ApiPlugIcon, TriggerFiredIcon, WarningIcon, ContinuedIcon } from '../shared/icons';
 import { useOnScreenInTranscript } from '../../hooks/useOnScreenInTranscript';
@@ -131,6 +133,10 @@ interface Props {
    *  panel; the info popover discloses it. A persisted event is immutable, so
    *  the memo compares it by reference. */
   pausedBy?: StoredEvent;
+  /** The side questions asked while this turn was the thread's latest, drawn
+   *  at their moments in its body (`placeInBody`). Each card object is replaced
+   *  when it changes, so the memo compares them by reference. */
+  sideQuestions?: readonly SideQuestion[];
 }
 
 /**
@@ -192,7 +198,7 @@ function heldOnThePress(fn: () => void): (e: MouseEvent) => void {
   return (e) => withScrollAnchor(e.currentTarget as HTMLElement | null, fn);
 }
 
-function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMarker, threadId, hasPriorActive, priorModel, priorEffort, isContinuableAbort, threadIsCC, threadCodingAgent, threadIdle, threadAwaitingAnswer, threadCanceling, rowsHidden = 0, proposedChangeDesc, proposedChangeFileCount, matchedEventType, matchedEventId, matchedPayloadJson, pausedBy }: Props) {
+function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMarker, threadId, hasPriorActive, priorModel, priorEffort, isContinuableAbort, threadIsCC, threadCodingAgent, threadIdle, threadAwaitingAnswer, threadCanceling, rowsHidden = 0, proposedChangeDesc, proposedChangeFileCount, matchedEventType, matchedEventId, matchedPayloadJson, pausedBy, sideQuestions = NO_SIDE_QUESTIONS }: Props) {
   const showDetails = detailsExpanded.value;
   const showSteps = stepsExpanded.value;
   const artifactPaths = loadedOr(artifacts.value, NO_ARTIFACTS);
@@ -339,6 +345,13 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
     () => (hasEvents && !bodyFolded ? responseBody(events, { showSteps, showDetails, rowsHidden }) : []),
     [hasEvents, bodyFolded, events, showSteps, showDetails, rowsHidden],
   );
+  // A body the panel draws (`hasBody`, unfolded) takes its side questions at
+  // their moments, or after what it streamed when it has no rows yet. Any
+  // other turn draws them after the panel (`bodyTakesCards` below).
+  const bodyPieces = useMemo(
+    () => placeInBody(sections, canCollapse && !bodyFolded ? sideQuestions : NO_SIDE_QUESTIONS),
+    [sections, canCollapse, bodyFolded, sideQuestions],
+  );
 
   // Exactly one running-text shimmer at a time, and it has to be one the reader
   // can SEE. While the live step row is on screen its shimmer is the affordance,
@@ -377,15 +390,18 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
   // open, so it never reads this map.
   const chunkHtmls = useMemo(() => {
     const map = new Map<ResponseEvent, string>();
-    for (const { rows } of sections) {
-      for (const row of rows) {
+    // The placed pieces, not the raw sections: a side question can split a
+    // chunk into two rows, each drawn from its own markdown.
+    for (const piece of bodyPieces) {
+      if (piece.kind !== 'section') continue;
+      for (const row of piece.rows) {
         if (row.kind === 'text' && row.open) {
           map.set(row.event, linkifyPaths(renderMarkdown(row.event.md), artifactPaths, apps));
         }
       }
     }
     return map;
-  }, [sections, artifactPaths, apps]);
+  }, [bodyPieces, artifactPaths, apps]);
 
   const responseHtmlLinkified = useMemo(
     // The streaming buffer's html changes every token, so its linkify opts out
@@ -501,6 +517,9 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
   // an empty box under the caller's bubble.
   const speechOnlyHasWords = !isSpeechOnly || canCollapse;
   const showResponsePanel = (!isChangePanel || isChangeContinuation) && (!isAbortPanel || isTerminatedContinuation) && (!isCancelPanel || isTerminatedContinuation) && !isTurnlessPanel && !isUnansweredDivider && !isEmptyContinued && !isQueuedUserMessage && !isLiveRow && speechOnlyHasWords && (hasResponse || hasEvents || showStatus);
+  // The panel draws its body only when it has one and is unfolded, which is
+  // exactly when `bodyPieces` carries the cards.
+  const bodyTakesCards = showResponsePanel && canCollapse && !bodyFolded;
   // A change turn's Diff and Revert live inside its card (`ChangeEventRow`).
   const initiatorActions = isAbortPanel && isContinuableAbort
     ? <ContinueButton threadId={threadId} />
@@ -646,17 +665,22 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
           timestamp={formatMessageTimestamp(responseTimestamp || timestamp)}
           collapsed={isCollapsed}
         >
-          {hasEvents ? (
-            sections.map(({ key, rows }) => (
-              <div class="response-content markdown-content" key={`sec-${key}`} onClick={handleLinkClick}>
-                {rows.map(renderRow)}
-              </div>
-            ))
-          ) : (
-            <div class="response-content markdown-content" onClick={handleLinkClick}>
-              <div dangerouslySetInnerHTML={{ __html: responseHtmlLinkified }} />
-            </div>
-          )}
+          {/* One keyed list for both shapes, so a card under streamed text
+              stays mounted when the first row replaces that text. */}
+          {[
+            ...(hasEvents ? [] : [
+              <div class="response-content markdown-content" key="streamed" onClick={handleLinkClick}>
+                <div dangerouslySetInnerHTML={{ __html: responseHtmlLinkified }} />
+              </div>,
+            ]),
+            ...bodyPieces.map((piece) => (piece.kind === 'cards'
+              ? <SideQuestionGroup key={piece.key} items={piece.items} />
+              : (
+                <div class="response-content markdown-content" key={`sec-${piece.key}`} onClick={handleLinkClick}>
+                  {piece.rows.map(renderRow)}
+                </div>
+              ))),
+          ]}
           {isEngineLimit && (
             <div class="exchange-engine-limit" role="status">
               <strong>Per-turn cap reached</strong>
@@ -664,6 +688,10 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
             </div>
           )}
         </ResponsePanel>
+      )}
+
+      {!bodyTakesCards && sideQuestions.length > 0 && (
+        <SideQuestionGroup key="side-questions:after:turn" items={sideQuestions} />
       )}
 
       {error && (
@@ -699,6 +727,12 @@ function sameMarks<T>(a: Set<T> | undefined, b: Set<T> | undefined): boolean {
   if (a.size !== b.size) return false;
   for (const mark of a) if (!b.has(mark)) return false;
   return true;
+}
+
+/** The same cards, each unchanged. A card is replaced whenever its state
+ *  moves, so reference equality per card is exact. */
+function sameSideQuestions(a: readonly SideQuestion[] = NO_SIDE_QUESTIONS, b: readonly SideQuestion[] = NO_SIDE_QUESTIONS): boolean {
+  return a.length === b.length && a.every((card, i) => card === b[i]);
 }
 
 /** The words in the row's own bubble, for the fingerprint below.
@@ -764,6 +798,7 @@ export function chatExchangePropsEqual(prev: Props, next: Props): boolean {
   if (prev.matchedEventId !== next.matchedEventId) return false;
   if (prev.matchedPayloadJson !== next.matchedPayloadJson) return false;
   if (prev.pausedBy !== next.pausedBy) return false;
+  if (!sameSideQuestions(prev.sideQuestions, next.sideQuestions)) return false;
   const a = prev.exchange;
   const b = next.exchange;
   if (a.userSeq !== b.userSeq) return false;

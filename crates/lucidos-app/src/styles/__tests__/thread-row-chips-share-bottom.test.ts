@@ -1,10 +1,10 @@
 /**
- * A drawer row's chips share one top edge, also when the name chip wraps.
+ * A drawer row's chips share one bottom edge, also when the name chip wraps.
  *
  * A long trigger name wraps inside its chip, so that chip grows taller than
- * the type tag beside it. Centred items then put the short tag in the middle
- * of the tall chip, and the date with it. Baseline alignment keeps every
- * item on the first line of text, so the tall chip grows downward only.
+ * the type tag beside it. Last-baseline alignment puts the short tag and the
+ * date on the wrapped chip's last line. That is level with the sub-thread
+ * link, and the tall chip grows upward only.
  */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
@@ -31,9 +31,9 @@ describe('thread row meta line', () => {
   // A family row carries its chips in a box on the sub-thread line instead,
   // so that box needs the same alignment.
   it.each(['.thread-row-meta', '.thread-row-family-chips'])(
-    '%s aligns its items on the first baseline, not the centre',
+    '%s aligns its items on the last baseline',
     (selector) => {
-      expect(rule(selector).props.get('align-items')).toBe('baseline');
+      expect(rule(selector).props.get('align-items')).toBe('last baseline');
     },
   );
 

@@ -38,6 +38,8 @@ interface FrameProbe {
   fullWidth: number;
   viewportWidth: number;
   scrollWidth: number;
+  /** The computed size of text the artifact never sized. */
+  proseFontSize: string;
 }
 
 async function probeFrame(page: Page): Promise<FrameProbe> {
@@ -57,6 +59,7 @@ async function probeFrame(page: Page): Promise<FrameProbe> {
       fullWidth: width('#full'),
       viewportWidth: doc.documentElement.clientWidth,
       scrollWidth: doc.documentElement.scrollWidth,
+      proseFontSize: getComputedStyle(doc.querySelector('#prose')!).fontSize,
     };
   });
 }
@@ -107,6 +110,7 @@ test.describe('an HTML artifact preview', () => {
 <body style="margin:0">
 <div id="box" style="width:${BOX_PX}px;height:20px;background:#333"></div>
 <div id="full" style="width:100%;height:20px;background:#666"></div>
+<p id="prose">Unsized text</p>
 </body>
 </html>
 `);
@@ -129,9 +133,15 @@ test.describe('an HTML artifact preview', () => {
     const probe = await probeFrame(page);
 
     expect(probe.boxWidth).toBeCloseTo(BOX_PX, 0);
-    // The stamp is skipped entirely at 100%, so this is also the assertion that
-    // an unscaled artifact is the bytes on disk and nothing else.
+    // 100% stamps no zoom, so a full-width element fills the frame exactly.
     expect(probe.fullWidth).toBeCloseTo(probe.viewportWidth, 0);
+  });
+
+  // Text the artifact never sized takes the chat prose step, `0.75rem` against
+  // the artifact's own 16px root, rather than the browser's 16px (ADR 0319).
+  test('gives unsized text the chat prose step', async ({ page }) => {
+    await openArtifact(page);
+    expect((await probeFrame(page)).proseFontSize).toBe('12px');
   });
 
   test('grows with the UI scale, without overflowing its frame', async ({ page }) => {

@@ -59,6 +59,24 @@ export function isFormRequest(event: { type: string }): event is FormRequestEven
   return (FORM_REQUEST_TYPES as readonly string[]).includes(event.type);
 }
 
+/** The four side-question events (ADR 0320). Each records a card beside the
+ *  thread, never a step of a turn, and no agent ever reads one. */
+export const SIDE_QUESTION_TYPES = [
+  'SideQuestionAsked',
+  'SideQuestionAnswered',
+  'SideQuestionFailed',
+  'SideQuestionDismissed',
+] as const;
+
+export type SideQuestionEvent = Extract<
+  ThreadEvent,
+  { type: (typeof SIDE_QUESTION_TYPES)[number] }
+>;
+
+export function isSideQuestionEvent(event: { type: string }): event is SideQuestionEvent {
+  return (SIDE_QUESTION_TYPES as readonly string[]).includes(event.type);
+}
+
 export type ThreadInitiator = 'user' | 'system';
 
 /** The five actor labels below are the WHOLE of what this module says about the

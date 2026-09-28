@@ -1094,8 +1094,9 @@ impl EventBus {
         // a real fan-in. See the selection rationale above. A later
         // `ChildThreadStopped` or `ChildThreadDetached` is not a reaction: it
         // wakes nothing, so a card it follows is still unprocessed (ADR 0252,
-        // ADR 0278). No card was written after its child moved out, since the
-        // emit refuses one, so every card this finds was earned.
+        // ADR 0278). Nor is a side question, which no agent reads (ADR 0320).
+        // No card was written after its child moved out, since the emit
+        // refuses one, so every card this finds was earned.
         //
         // The OUTER `e.aggregate = 'thread'` is load-bearing for a second reason.
         // On a DOMAIN event `aggregate_id` holds the event TYPE NAME, not a uuid,
@@ -1119,8 +1120,10 @@ impl EventBus {
                    AND later.aggregate_id = e.aggregate_id \
                    AND later.sequence > e.sequence \
                    AND later.event_type NOT IN ('ChildThreadStopped', 'ChildThreadDetached') \
+                   AND later.event_type <> ALL($1) \
                )",
         )
+        .bind(crate::engine::thread_events::ThreadEvent::SIDE_QUESTION_EVENT_TYPES)
         .fetch_all(&self.pool)
         .await
         {

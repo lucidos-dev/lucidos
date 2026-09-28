@@ -652,9 +652,15 @@ let _pendingLanding: {
    *  it to FINISH: no first row is coming, so the landing aims once and lets
    *  go. */
   holds: boolean;
+  /** Where a one-shot landing aims once its element is there. Unset means the
+   *  live edge, which every submit to the agent uses (ADR 0080). */
+  aim?: LandingAim;
   on: ResolvedTurn | null;
   at: number;
 } | null = null;
+
+/** Takes the reader to what a one-shot submit resolved. */
+type LandingAim = (el: HTMLElement, target: HTMLElement) => void;
 
 /** TWO deadlines, because a landing can be waiting for two different things and
  *  they are not the same length.
@@ -1693,7 +1699,9 @@ function rideToLiveEdge(el: HTMLElement): void {
  *  them differ only in `resolveTurn` and in whether they HOLD. It ARMS
  *  NOTHING, per ADR 0064.
  *
- *  EVERY submit rests on the LIVE EDGE, armed or not (ADR 0080). The two
+ *  EVERY submit to the agent rests on the LIVE EDGE, armed or not (ADR 0080).
+ *  A side question is the one `aim` that differs: the agent is asked nothing,
+ *  so it rests on the card's start (ADR 0080 § Amendment). The two
  *  branches below differ only in WHEN. A rider goes at once, since the growth
  *  is about to take them there anyway. Everyone else waits for the turn they
  *  acted on to render. A glide started before it would aim at the bottom the
@@ -1707,7 +1715,7 @@ function rideToLiveEdge(el: HTMLElement): void {
  *  A landing that has not yet found its turn is KEPT rather than replaced,
  *  which makes the composer's two calls for one send one submit. See the guard
  *  itself for why the rule stops there. */
-function followSubmit(resolveTurn: TurnResolver, holds = true): void {
+function followSubmit(resolveTurn: TurnResolver, holds = true, aim?: LandingAim): void {
   // A submit sends the reader to the live edge, so an arrival hold would pull
   // them back to the event they have just acted on.
   _arrivalHold = null;
@@ -1748,7 +1756,7 @@ function followSubmit(resolveTurn: TurnResolver, holds = true): void {
   // is addressable the instant it is tapped. The try-first shape therefore spent
   // the landing before the answer had caused anything, and a reader at the
   // bottom got no write at all. Both paths are one function (`honourLanding`).
-  _pendingLanding = { resolveTurn, holds, on: null, at: nowMs() };
+  _pendingLanding = { resolveTurn, holds, aim, on: null, at: nowMs() };
   honourLanding(el);
 }
 
@@ -1894,6 +1902,44 @@ export function followCanceledTurn(toolUseId?: string): void {
   );
 }
 
+/** The reader is asking a side question. Called BEFORE the ask, like a send,
+ *  so it can tell the new card from the ones already on screen. Its card
+ *  renders a frame later, and this lands ONCE on its start and lets go.
+ *
+ *  No hold: the agent's turn is not asked for anything, so no first row is
+ *  coming. And not the live edge: a long answer growing under the card must
+ *  not carry the reader past the question. A rider still rides, through
+ *  `followSubmit`'s own branch. */
+export function followSideQuestion(): void {
+  const el = resolveTarget();
+  const before = new Set(el ? sideQuestionCards(el).map((card) => card.getAttribute('data-side-question-id')) : []);
+  followSubmit((c) => {
+    const card = sideQuestionCards(c).find((node) =>
+      !before.has(node.getAttribute('data-side-question-id')) && isElementVisible(node));
+    return card ? { turn: card, drawnAtSubmit: 0 } : null;
+  }, false, landOnStart);
+}
+
+function sideQuestionCards(el: HTMLElement): HTMLElement[] {
+  if (typeof el.querySelectorAll !== 'function') return [];
+  return Array.from(el.querySelectorAll<HTMLElement>('[data-side-question-id]'));
+}
+
+/** Glide `target`'s top onto the landing line, never past the live edge and
+ *  never back up. A reader who is already there is left alone. */
+function landOnStart(el: HTMLElement, target: HTMLElement): void {
+  const onLine = landingTargetOf(target);
+  const targetOf = (c: HTMLElement) => Math.min(liveEdgeTop(c), onLine(c));
+  if (targetOf(el) <= el.scrollTop + 1) return;
+  if (isReducedMotion()) {
+    cancelScrollAnim();
+    markNavigationScroll(el, targetOf(el));
+    syncAwayFromBottom();
+    return;
+  }
+  animateScroll(targetOf, syncAwayFromBottom);
+}
+
 /** THE SUBMIT'S LANDING: take the reader to the live edge, where a rider's own
  *  glide rests too (ADR 0080). Run once the turn the submit was made on has a
  *  box, so the edge being measured already includes it.
@@ -1957,7 +2003,12 @@ function honourLanding(el: HTMLElement): void {
     // A landing that never holds is done the moment its turn is there: aim
     // once, frozen, and let go. It has no use for the baseline, so `on` is only
     // ever populated for a real hold.
-    if (!landing.holds) { _pendingLanding = null; landAtLiveEdge(el, true); return; }
+    if (!landing.holds) {
+      _pendingLanding = null;
+      if (landing.aim) landing.aim(el, found.turn);
+      else landAtLiveEdge(el, true);
+      return;
+    }
     landing.on = found;
   }
   const { turn, drawnAtSubmit } = landing.on;

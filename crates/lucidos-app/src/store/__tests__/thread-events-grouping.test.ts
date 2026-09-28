@@ -96,6 +96,19 @@ describe('groupIntoExchanges', () => {
     expect(exchanges[1].steps).toHaveLength(2);
   });
 
+  it('leaves side questions out of the turn they were asked during', () => {
+    const events = new Map<number, ThreadEvent>([
+      [1, { type: 'MessageReceived', text: 'first' }],
+      [2, { type: 'SideQuestionAsked', side_question_id: 'a', question: 'what is X?' }],
+      [3, { type: 'TextStreamed', text: 'reply' }],
+      [4, { type: 'SideQuestionAnswered', side_question_id: 'a', answer: 'X' }],
+      [5, { type: 'SideQuestionDismissed', side_question_id: 'a' }],
+      [6, { type: 'ResponseGenerated' }],
+    ] as [number, ThreadEvent][]);
+    const [turn] = groupIntoExchanges(events);
+    expect(turn.steps.map((s) => s.seq)).toEqual([3, 6]);
+  });
+
   it('handles TriggerStarted as exchange boundary', () => {
     const events = new Map<number, ThreadEvent>([
       [1, { type: 'TriggerStarted', trigger_id: 'task-1' }],
@@ -904,6 +917,15 @@ describe('handleEvent', () => {
 
     handleEvent(threadMap, 'thread-1', 1, { type: 'TextStreamed', text: 'full text' }, TS);
     expect(thread.streamingBuffer).toBe('');
+  });
+
+  it('keeps the streaming buffer when a side question lands mid-reply', () => {
+    const thread = makeThreadState();
+    thread.streamingBuffer = 'partial text';
+    const threadMap = new Map([['thread-1', thread]]);
+
+    handleEvent(threadMap, 'thread-1', 1, { type: 'SideQuestionAsked', side_question_id: 'a', question: 'q' } as ThreadEvent, TS);
+    expect(thread.streamingBuffer).toBe('partial text');
   });
 
   it('ignores unknown threads', () => {

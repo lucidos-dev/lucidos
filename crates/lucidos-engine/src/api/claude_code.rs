@@ -345,39 +345,103 @@ pub(super) async fn claude_code_control(
 #[derive(Deserialize)]
 pub(super) struct SideQuestionBody {
     thread_id: String,
+    /// Named by the client, so its pending card and the recorded events
+    /// reconcile by id.
+    side_question_id: uuid::Uuid,
     question: String,
 }
 
+#[derive(Deserialize)]
+pub(super) struct SideQuestionDismissBody {
+    thread_id: String,
+    side_question_id: uuid::Uuid,
+}
+
+/// A side-question failure as its HTTP response.
+fn side_question_error(
+    failure: crate::engine::agent_session::side_question::SideQuestionFailure,
+) -> ApiError {
+    use crate::engine::agent_session::side_question::SideQuestionFailure;
+    match failure {
+        SideQuestionFailure::Refused(refusal) => ApiError::bad_request(refusal),
+        SideQuestionFailure::AlreadyAsked => ApiError::new(
+            StatusCode::CONFLICT,
+            "A side question with this id was already asked.",
+        ),
+        SideQuestionFailure::NotAsked => ApiError::new(
+            StatusCode::NOT_FOUND,
+            "No side question with this id was asked on this thread.",
+        ),
+        SideQuestionFailure::Failed(message) => ApiError::new(StatusCode::BAD_GATEWAY, message),
+    }
+}
+
+/// The thread a side-question request names, once the caller is identified
+/// and may reach it. Both steps run before anything is recorded.
+async fn side_question_target(
+    state: &AppState,
+    headers: &HeaderMap,
+    thread_id: &str,
+    verb: super::thread_reach::ThreadReachVerb,
+) -> Result<(uuid::Uuid, crate::engine::thread_events::MessageOrigin), ApiError> {
+    let thread_id =
+        uuid::Uuid::parse_str(thread_id).map_err(|_| ApiError::bad_request("Invalid thread_id"))?;
+    let actor = super::actor::require_user_actor(headers, &state.pool, None).await?;
+    super::thread_reach::refuse_without_authority(&state.pool, headers, Some(thread_id), verb)
+        .await
+        .map_err(|e| ApiError::new(e.status_code(), e.to_string()))?;
+    Ok((thread_id, actor))
+}
+
 /// `POST /api/v1/coding-agents/side-question`: answer a `/btw` side question
-/// in a Claude Code thread, beside any running turn. The answer is returned,
-/// never recorded (ADR 0318).
+/// in a Claude Code thread, beside any running turn. The ask and its outcome
+/// are recorded as side-question events no agent reads (ADR 0320).
 pub(super) async fn coding_agent_side_question(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<SideQuestionBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    use crate::engine::agent_session::side_question::SideQuestionFailure;
-    let thread_id = uuid::Uuid::parse_str(&body.thread_id)
-        .map_err(|_| ApiError::bad_request("Invalid thread_id"))?;
-    super::thread_reach::refuse_without_authority(
-        &state.pool,
+    let (thread_id, actor) = side_question_target(
+        &state,
         &headers,
-        Some(thread_id),
+        &body.thread_id,
         super::thread_reach::ThreadReachVerb::AskSideQuestion,
     )
-    .await
-    .map_err(|e| ApiError::new(e.status_code(), e.to_string()))?;
-    match state
+    .await?;
+    // Detached, so a reload mid-ask still records the answer: dropping this
+    // request would otherwise leave the card pending until a restart.
+    let engine = state.engine.clone();
+    let ask = tokio::spawn(async move {
+        engine
+            .ask_side_question(thread_id, body.side_question_id, &body.question, actor)
+            .await
+    });
+    ask.await
+        .map_err(|e| ApiError::internal(format!("The side question stopped: {e}")))?
+        .map(|answer| Json(serde_json::json!({ "answer": answer })))
+        .map_err(side_question_error)
+}
+
+/// `POST /api/v1/coding-agents/side-question/dismiss`: record that the user
+/// dismissed a side question's card. The ask stays, so the card can reopen.
+pub(super) async fn coding_agent_side_question_dismiss(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<SideQuestionDismissBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (thread_id, actor) = side_question_target(
+        &state,
+        &headers,
+        &body.thread_id,
+        super::thread_reach::ThreadReachVerb::DismissSideQuestion,
+    )
+    .await?;
+    state
         .engine
-        .ask_side_question(thread_id, &body.question)
+        .dismiss_side_question(thread_id, body.side_question_id, actor)
         .await
-    {
-        Ok(answer) => Ok(Json(serde_json::json!({ "answer": answer }))),
-        Err(SideQuestionFailure::Refused(refusal)) => Err(ApiError::bad_request(refusal)),
-        Err(SideQuestionFailure::Failed(message)) => {
-            Err(ApiError::new(StatusCode::BAD_GATEWAY, message))
-        }
-    }
+        .map(|()| Json(serde_json::json!({ "ok": true })))
+        .map_err(side_question_error)
 }
 
 #[derive(Deserialize)]
@@ -583,6 +647,10 @@ pub(super) fn router() -> Router<AppState> {
         .route(
             "/coding-agents/side-question",
             post(coding_agent_side_question),
+        )
+        .route(
+            "/coding-agents/side-question/dismiss",
+            post(coding_agent_side_question_dismiss),
         )
         .route("/claude-code/stop", post(claude_code_stop))
         .route("/claude-code/interrupt", post(claude_code_interrupt))

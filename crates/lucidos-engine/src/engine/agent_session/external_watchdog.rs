@@ -329,6 +329,7 @@ impl ExternalWatchdog {
     ///   (ADR 0053).
     /// * a NEWEST event in [`AGENT_PRODUCED_OUTPUT_EVENT_TYPES`], which is the
     ///   load-bearing one. It also spares an unactuated `ContinuationRequested`.
+    ///   Side-question rows are skipped: a card is not agent output.
     /// * no `queued` `thread_queue` row, kept as depth.
     /// * no live `agent_sessions` entry, re-read under the lock HERE, not from
     ///   the tick's opening snapshot, which is a round-trip stale (Codex).
@@ -341,6 +342,7 @@ impl ExternalWatchdog {
                AND ( \
                    SELECT e.event_type FROM events e \
                    WHERE e.aggregate_id = ts.thread_id::text \
+                     AND e.event_type <> ALL($3) \
                    ORDER BY e.sequence DESC LIMIT 1 \
                ) = ANY($2) \
                AND NOT EXISTS ( \
@@ -351,6 +353,7 @@ impl ExternalWatchdog {
         ))
         .bind(quiet_window_secs(self.limit_ms))
         .bind(AGENT_PRODUCED_OUTPUT_EVENT_TYPES)
+        .bind(crate::engine::thread_events::ThreadEvent::SIDE_QUESTION_EVENT_TYPES)
         .fetch_all(&self.pool)
         .await
         {

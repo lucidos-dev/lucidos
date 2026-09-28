@@ -3,7 +3,7 @@ import { instantMicros } from '../../utils/isoInstant';
 import { eventWaitProjection } from './event-waits';
 import { findQuestionAnswer, modeToInitiator } from './exchange';
 import { isOneUtterance, joinSpoken } from './spokenMerge';
-import { isFormRequest, isTurnlessBoundary, isUserStoppedWait } from './thread-event-types';
+import { SIDE_QUESTION_TYPES, isFormRequest, isSideQuestionEvent, isTurnlessBoundary, isUserStoppedWait } from './thread-event-types';
 import { applyAggregateToMeta, updatesLastActivity } from './thread-meta';
 import type { Exchange } from './exchange';
 import type { MessageOrigin, SequencedEvent, StoredEvent, ThreadEvent, TransientEvent } from './thread-event-types';
@@ -633,6 +633,9 @@ const NON_EXCHANGE_METADATA_EVENTS: ReadonlySet<string> = new Set([
   // Background worktree-cleanup bookkeeping: EventClass::Metadata in
   // worktree_cleanup.rs, but not `Thread`-prefixed and with no render case.
   'WorktreeCleaned',
+  // A side question is a card beside the thread (`store/sideQuestions.ts`),
+  // never a step of a turn (ADR 0320).
+  ...SIDE_QUESTION_TYPES,
 ]);
 
 /** True for a `ContextCaptured` recording an *auxiliary model call* rather
@@ -2515,7 +2518,8 @@ export function handleEvent(
     // signal. To rewrite a thread's events wholesale, replace the Map object
     // instead: a new Map misses the WeakMap and triggers a clean rebuild.
     thread.events.set(seq, stored);
-    thread.streamingBuffer = '';
+    // A side question lands beside a streaming reply and is no part of it.
+    if (!isSideQuestionEvent(event)) thread.streamingBuffer = '';
     // Update updatedAt only for events that the backend updates last_activity for.
     // Must stay in sync with update_thread_projection() in event_bus.rs.
     // Tick-only write — does not mark metaChanged (see `applyAggregateToMeta`).

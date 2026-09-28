@@ -30,9 +30,9 @@ const MAX_SUGGESTIONS: usize = 3;
 /// **Every name a subscription on `surface` can match**, derived from the two
 /// enumerations the engine already keeps.
 ///
-/// The per-token streaming family is dropped at both surfaces, because
-/// [`super::validate_subscribable_event_type`] refuses it with a message of its
-/// own. Suggesting one would trade a silent failure for a loud wrong answer.
+/// The per-token streaming and side-question families are dropped at both
+/// surfaces, because [`super::validate_subscribable_event_type`] refuses each
+/// with a message of its own. Suggesting one would trade a silent failure for a loud wrong answer.
 /// The `EventWait*` family is dropped at the wait surface only.
 ///
 /// **This is the one list.** It answers the near-match heuristic, it seeds the
@@ -46,6 +46,7 @@ pub fn subscribable_event_type_names(surface: SubscriptionSurface) -> Vec<&'stat
     names.extend_from_slice(crate::engine::event_bus::SystemEvent::PERSISTED_TYPE_NAMES);
     names.retain(|name| {
         !PER_TOKEN_STREAMING_EVENT_TYPES.contains(name)
+            && !crate::engine::thread_events::ThreadEvent::SIDE_QUESTION_EVENT_TYPES.contains(name)
             && (surface == SubscriptionSurface::Trigger || !EVENT_WAIT_EVENT_TYPES.contains(name))
     });
     names.sort_unstable();

@@ -60,6 +60,9 @@ impl EventStore {
     /// A window can start mid-exchange, so the fold over it may produce a
     /// partial leading message. Size the window well above what you keep, and
     /// take from the tail.
+    ///
+    /// Side-question rows are left out in SQL, so a burst of them can never
+    /// push real turns out of the window (ADR 0320).
     pub async fn get_recent_thread_events(
         &self,
         thread_id: uuid::Uuid,
@@ -70,12 +73,14 @@ impl EventStore {
             SELECT id, event_type, payload, created, thread_id, sequence
             FROM events
             WHERE thread_id = $1
+              AND event_type <> ALL($3)
             ORDER BY created DESC, sequence DESC
             LIMIT $2
             "#,
         )
         .bind(thread_id)
         .bind(limit)
+        .bind(crate::engine::thread_events::ThreadEvent::SIDE_QUESTION_EVENT_TYPES)
         .fetch_all(&self.pool)
         .await?;
 

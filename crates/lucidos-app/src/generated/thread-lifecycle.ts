@@ -106,6 +106,10 @@ export const EVENT_CLASSIFICATION: Readonly<Record<string, EventClass>> = {
   SpokenReplyGenerated: 'metadata',
   SpokenMessageReceived: 'metadata',
   WorkDelegated: 'start',
+  SideQuestionAsked: 'metadata',
+  SideQuestionAnswered: 'metadata',
+  SideQuestionFailed: 'metadata',
+  SideQuestionDismissed: 'metadata',
 } as const;
 
 export const CC_ONLY_EVENTS: ReadonlySet<string> = new Set([

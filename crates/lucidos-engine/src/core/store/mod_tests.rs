@@ -779,3 +779,134 @@ async fn thread_events_page_reports_no_max_sequence_for_an_empty_thread() {
 
     teardown_test_db(&db).await;
 }
+
+/// One thread holding a real event and all four side-question events. Returns
+/// the thread and the id of one side-question row.
+async fn a_thread_with_side_questions(pool: &PgPool) -> (Uuid, Uuid) {
+    let thread_id = Uuid::new_v4();
+    let ts = Utc.timestamp_opt(1_700_000_900, 0).unwrap();
+    insert_thread_event(pool, Uuid::new_v4(), "MessageReceived", ts, thread_id).await;
+    let side_row = Uuid::new_v4();
+    for (i, &name) in ThreadEvent::SIDE_QUESTION_EVENT_TYPES.iter().enumerate() {
+        let id = if i == 0 { side_row } else { Uuid::new_v4() };
+        insert_thread_event(pool, id, name, ts, thread_id).await;
+    }
+    (thread_id, side_row)
+}
+
+/// No agent may see a side question (ADR 0320). `query_events` backs the
+/// agent's tool, the HTTP route and the CLI, so every mode must drop them.
+#[tokio::test]
+async fn query_events_never_returns_a_side_question_in_any_mode() {
+    let (pool, db) = setup_test_db().await;
+    let store = EventStore::new(pool.clone());
+    let (thread_id, side_row) = a_thread_with_side_questions(&pool).await;
+
+    let everything = store
+        .query_events(EventQueryFilters::default(), 50)
+        .await
+        .unwrap();
+    assert_eq!(
+        everything
+            .iter()
+            .map(|e| e.event_type.as_str())
+            .collect::<Vec<_>>(),
+        vec!["MessageReceived"]
+    );
+    let by_thread = store
+        .query_events(
+            EventQueryFilters {
+                thread_id: Some(thread_id),
+                ..Default::default()
+            },
+            50,
+        )
+        .await
+        .unwrap();
+    assert_eq!(by_thread.len(), 1);
+    for &name in ThreadEvent::SIDE_QUESTION_EVENT_TYPES {
+        let by_type = store
+            .query_events(
+                EventQueryFilters {
+                    event_type: Some(name),
+                    ..Default::default()
+                },
+                50,
+            )
+            .await
+            .unwrap();
+        assert!(by_type.is_empty(), "{name} came back by type");
+    }
+    let by_id = store
+        .query_events(
+            EventQueryFilters {
+                event_id: Some(side_row),
+                ..Default::default()
+            },
+            50,
+        )
+        .await
+        .unwrap();
+    assert!(by_id.is_empty(), "a side question came back by id");
+    let paged = match store
+        .query_events_paged(EventQueryFilters::default(), 50)
+        .await
+        .unwrap()
+    {
+        QueryEventsResult::Events(e) => e,
+        QueryEventsResult::CursorNotFound => panic!("no cursor was passed"),
+    };
+    assert_eq!(paged.len(), 1);
+
+    teardown_test_db(&db).await;
+}
+
+#[tokio::test]
+async fn counts_and_distinct_types_never_include_a_side_question() {
+    let (pool, db) = setup_test_db().await;
+    let store = EventStore::new(pool.clone());
+    a_thread_with_side_questions(&pool).await;
+
+    assert_eq!(store.count_events(None, None, None).await.unwrap().0, 1);
+    for &name in ThreadEvent::SIDE_QUESTION_EVENT_TYPES {
+        assert_eq!(
+            store.count_events(Some(name), None, None).await.unwrap(),
+            (0, 0),
+            "{name} was counted"
+        );
+    }
+    let by_type = store.count_events_by_type(None, None).await.unwrap();
+    assert_eq!(
+        by_type
+            .iter()
+            .map(|(t, _, _)| t.as_str())
+            .collect::<Vec<_>>(),
+        vec!["MessageReceived"]
+    );
+    assert_eq!(
+        store.distinct_event_types().await.unwrap(),
+        vec!["MessageReceived"]
+    );
+
+    teardown_test_db(&db).await;
+}
+
+/// The voice resident block reads a window of the newest rows. Side questions
+/// are dropped in SQL, so a burst of them cannot push real turns out.
+#[tokio::test]
+async fn the_recent_thread_window_skips_side_questions() {
+    let (pool, db) = setup_test_db().await;
+    let store = EventStore::new(pool.clone());
+    let (thread_id, _) = a_thread_with_side_questions(&pool).await;
+
+    let window = store.get_recent_thread_events(thread_id, 1).await.unwrap();
+    assert_eq!(
+        window
+            .iter()
+            .map(|e| e.event_type.as_str())
+            .collect::<Vec<_>>(),
+        vec!["MessageReceived"]
+    );
+
+    teardown_test_db(&db).await;
+}

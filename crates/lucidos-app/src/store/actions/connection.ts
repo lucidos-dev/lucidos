@@ -642,10 +642,7 @@ async function runConnectionCheck(): Promise<boolean> {
         autoDismissMs: TOAST_AUTO_DISMISS_MS,
       });
       // Re-check client staleness now that the new engine serves its pinned
-      // client. The build-watch rebuild may land a few seconds later, so the
-      // scheduled SW nudges (scheduleServiceWorkerUpdateChecks, fired from the
-      // ChangeApplied arm) re-run this check too; this catches a rebuild that
-      // already completed.
+      // client.
       void syncClientUpdateFromBuild();
       // A release-notice dismissal means "not now, ask on the next open", and a
       // restart under a live page IS the next open: the notice list is a pure

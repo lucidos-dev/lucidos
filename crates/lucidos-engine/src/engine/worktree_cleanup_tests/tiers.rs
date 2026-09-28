@@ -716,6 +716,49 @@ async fn fan_in_card_behind_a_stopped_note_keeps_archived_worktree() {
     teardown_test_db(&db_name).await;
 }
 
+/// A side question after a completion card is a card beside the thread, not
+/// a reaction to the child (ADR 0320). The completion still guards the
+/// worktree.
+#[tokio::test]
+async fn fan_in_card_behind_a_side_question_keeps_archived_worktree() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let bus = Arc::new(bus);
+
+    let (_tmp, root) = fresh_workspace().await;
+    let parent_id = Uuid::new_v4();
+    let worktree = add_worktree_at_main_for_thread(&root, parent_id).await;
+
+    insert_thread_summary_with_archive(&pool, parent_id, false, "archived").await;
+    insert_old_event(&pool, parent_id, TIER_2_AGE).await;
+    insert_child_completed_event(&pool, parent_id, Uuid::new_v4(), TIER_2_AGE).await;
+    sqlx::query(
+        "INSERT INTO events (id, aggregate, aggregate_id, event_type, payload, created, thread_id) \
+         VALUES ($1, 'thread', $2::text, 'SideQuestionAsked', '{}'::jsonb, \
+                 NOW() - make_interval(secs => $3), $2::uuid)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(parent_id)
+    .bind(TIER_2_AGE as f64)
+    .execute(&pool)
+    .await
+    .expect("insert SideQuestionAsked event");
+
+    let rx = bus.subscribe();
+    let worker = make_worker(pool.clone(), bus.clone(), root.clone());
+    worker.run_once().await;
+
+    let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;
+    assert!(
+        !events.iter().any(|(t, ..)| *t == parent_id),
+        "a side question hid an unprocessed card from the cleanup guard"
+    );
+    assert!(worktree.exists());
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
 /// With comfortable disk and a non-archived thread, a day-idle worktree whose
 /// change is still pending keeps its `target/` and `node_modules/`.
 #[tokio::test]

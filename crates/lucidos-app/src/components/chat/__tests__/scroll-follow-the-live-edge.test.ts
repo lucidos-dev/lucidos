@@ -18,6 +18,7 @@ import {
   followContinuedThread,
   followResolvedPermission,
   followSentMessage,
+  followSideQuestion,
   followLiveEdgeSeed,
   followSeedFromStored,
   followingLiveEdge,
@@ -107,6 +108,7 @@ function makeEl(opts: {
   const panels: any[] = [];
   const questionCards: any[] = [];
   const permissionCards: any[] = [];
+  const sideQuestionCards: any[] = [];
   const turns: any[] = [];
   /** An inline style declaration the module may write to, kept so a test can
    *  assert that it does not. Nothing publishes a custom property onto the
@@ -139,8 +141,22 @@ function makeEl(opts: {
         : selector === '.question-body' ? questionCards
           : selector === '.permission-body' ? permissionCards
             : selector === '.chat-exchange' ? turns
-              : []
+              : selector === '[data-side-question-id]' ? sideQuestionCards
+                : []
     ),
+    /** Render a side-question card, which carries its id and nothing an agent
+     *  drew. */
+    addSideQuestionCard(p: { id: string; top: number; height: number }) {
+      const card: any = {
+        isConnected: true,
+        getAttribute: (name: string) => (name === 'data-side-question-id' ? p.id : null),
+        getBoundingClientRect: () => ({
+          width: 800, height: p.height, top: p.top - el.scrollTop, bottom: p.top + p.height - el.scrollTop, left: 0, right: 800,
+        }),
+      };
+      sideQuestionCards.push(card);
+      return card;
+    },
     /** Render one more user message, the way an optimistic send row arrives.
      *  `visible: false` models a panel with no box: a queued follow-up folded
      *  into its closed disclosure group.
@@ -4090,6 +4106,108 @@ describe.each(SUBMIT_SURFACES)('the submit matrix: $name', ({ arrange, submit })
     vi.advanceTimersByTime(1500);
 
     expect(el.scrollTop).toBe(700);
+  });
+});
+
+describe('a side question scrolls to its card start', () => {
+  beforeEach(() => { resetFollow(); vi.useFakeTimers(); });
+  afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); resetFollow(); });
+
+  it('waits for the new card, then rests its top on the landing line', () => {
+    const el = makeEl({ scrollTop: 500, scrollHeight: 6000 });
+    const { onResize } = makeScrollObservers(el);
+    setActiveScrollElement(el);
+
+    followSideQuestion();
+    vi.advanceTimersByTime(100);
+    expect(el.scrollTop).toBe(500);        // nothing to land on yet
+
+    el.addSideQuestionCard({ id: 'side-question-1', top: 3000, height: 200 });
+    onResize();
+    vi.advanceTimersByTime(1500);
+
+    expect(el.scrollTop).toBe(3000);
+  });
+
+  it('never goes past the live edge', () => {
+    const el = makeEl({ scrollTop: 500, scrollHeight: 6000 });
+    const { onResize } = makeScrollObservers(el);
+    setActiveScrollElement(el);
+
+    followSideQuestion();
+    el.addSideQuestionCard({ id: 'side-question-1', top: 5800, height: 200 });
+    onResize();
+    vi.advanceTimersByTime(1500);
+
+    expect(el.scrollTop).toBe(5500);       // 6000 - 500
+  });
+
+  it('lands on the card just asked, not one already on screen', () => {
+    const el = makeEl({ scrollTop: 500, scrollHeight: 6000 });
+    const { onResize } = makeScrollObservers(el);
+    setActiveScrollElement(el);
+    el.addSideQuestionCard({ id: 'side-question-1', top: 900, height: 200 });
+
+    followSideQuestion();
+    vi.advanceTimersByTime(100);
+    expect(el.scrollTop).toBe(500);
+
+    el.addSideQuestionCard({ id: 'side-question-2', top: 3000, height: 200 });
+    onResize();
+    vi.advanceTimersByTime(1500);
+
+    expect(el.scrollTop).toBe(3000);
+  });
+
+  it('does not chase the answer growing under the card', () => {
+    const el = makeEl({ scrollTop: 500, scrollHeight: 6000 });
+    const { onResize } = makeScrollObservers(el);
+    setActiveScrollElement(el);
+
+    followSideQuestion();
+    el.addSideQuestionCard({ id: 'side-question-1', top: 3000, height: 200 });
+    onResize();
+    vi.advanceTimersByTime(1500);
+    el.writes = 0;
+
+    el.scrollHeight = 9000;
+    onResize();
+    vi.advanceTimersByTime(1500);
+
+    expect(el.writes).toBe(0);
+    expect(el.scrollTop).toBe(3000);
+  });
+
+  it('leaves a reader riding the live edge riding', () => {
+    const el = makeEl({ scrollTop: 500, scrollHeight: 3000 });
+    const { onResize } = makeScrollObservers(el);
+    setActiveScrollElement(el);
+    setFollowLiveEdge(true);
+    vi.advanceTimersByTime(1500);
+
+    followSideQuestion();
+    el.addSideQuestionCard({ id: 'side-question-1', top: 2900, height: 200 });
+    el.scrollHeight = 3200;
+    onResize();
+    vi.advanceTimersByTime(1500);
+
+    expect(followingLiveEdge.value).toBe(true);
+    expect(el.scrollTop).toBe(2700);       // 3200 - 500, still on the edge
+  });
+
+  it('never scrolls a reader back up to it', () => {
+    const el = makeEl({ scrollTop: 4000, scrollHeight: 6000 });
+    const { onResize } = makeScrollObservers(el);
+    setActiveScrollElement(el);
+    el.writes = 0;
+
+    followSideQuestion();
+    el.addSideQuestionCard({ id: 'side-question-1', top: 3000, height: 200 });
+    onResize();
+    vi.advanceTimersByTime(1500);
+
+    expect(el.writes).toBe(0);
+    expect(el.scrollTop).toBe(4000);
   });
 });
 

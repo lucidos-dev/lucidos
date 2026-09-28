@@ -571,9 +571,12 @@ describe('Flow: Edge cases', () => {
    *  serde alias on the Rust variant cannot reach them: the snapshot endpoint
    *  serves the raw `event_type` column straight to the client. */
   it('legacy MemorySearched rows render as a recall step', () => {
+    // The two turns are separate threads, so their rows sit at different seqs.
+    const clockless = <T extends object>(rows: T[]) => rows.map((row) => ({ ...row, seq: undefined }));
     for (const n of [0, 1, 12]) {
       expect(recallTurn('MemorySearched', n).steps).toEqual(recallTurn('MemoryRecalled', n).steps);
-      expect(recallTurn('MemorySearched', n).stepEvents).toEqual(recallTurn('MemoryRecalled', n).stepEvents);
+      expect(clockless(recallTurn('MemorySearched', n).stepEvents))
+        .toEqual(clockless(recallTurn('MemoryRecalled', n).stepEvents));
     }
   });
 

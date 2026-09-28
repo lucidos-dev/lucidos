@@ -9,9 +9,9 @@ import {
 // changes nothing for this POST (see `answer-over-a-stale-connection.spec.ts`).
 test.use({ serviceWorkers: 'block' });
 
-/** `/btw` in a Claude Code thread (ADR 0318). The question goes to the
- *  side-question endpoint, the answer lands on a dismissible card, and the
- *  thread's own history is untouched. Runs on desktop and on the mobile
+/** `/btw` in a Claude Code thread (ADR 0320). The question goes to the
+ *  side-question endpoint, the answer lands on a card that survives a reload,
+ *  and no turn of the thread shows it. Runs on desktop and on the mobile
  *  projects, since the card must work on the iOS PWA too.
  *
  *  The thread is idle when asked, so this crosses the cold path against the
@@ -53,12 +53,28 @@ test.describe('side questions in a Claude Code thread', () => {
     await expect(page.locator('.chat-exchange:visible', { hasText: '/btw' })).toHaveCount(0);
     expect(chatPostsWithBtw).toEqual([]);
 
-    const dismiss = card.getByRole('button', { name: 'Dismiss side question' });
-    const box = await dismiss.boundingBox();
-    expect(box!.width).toBeGreaterThanOrEqual(44);
-    expect(box!.height).toBeGreaterThanOrEqual(44);
+    // The button draws a compact chip. Its transparent overlay carries the
+    // 44px touch target, so probe the hit area rather than the box.
+    const dismiss = card.getByRole('button', { name: 'Collapse side question' });
+    const box = (await dismiss.boundingBox())!;
+    const centre = { x: box.x + box.width / 2, y: box.y + box.height / 2 };
+    for (const [dx, dy] of [[-21, 0], [21, 0], [0, -21], [0, 21]]) {
+      const hit = await page.evaluate(({ x, y }) => document.elementFromPoint(x, y)
+        ?.closest('button')?.getAttribute('aria-label') ?? null, { x: centre.x + dx, y: centre.y + dy });
+      expect(hit).toBe('Collapse side question');
+    }
     await dismiss.click();
     await expect(page.locator('[data-role="side-question-card"]:visible')).toHaveCount(0);
+    const row = page.locator('[data-role="side-question-dismissed"]:visible').first();
+    await expect(row).toContainText('What codeword did you just say?');
+
+    // Recorded as events, so the folded row is still there after a reload,
+    // and a tap opens the answer again.
+    await page.reload();
+    await expect(row).toBeVisible({ timeout: 30_000 });
+    await row.click();
+    await expect(page.locator('[data-role="side-question-card"]:visible .markdown-content')).toContainText(token);
+    expect(await countExchanges(page)).toBe(exchangesBefore);
   });
 
   test('a failed side question says why on the card', async ({ page }) => {

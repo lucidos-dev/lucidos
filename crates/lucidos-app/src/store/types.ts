@@ -214,8 +214,14 @@ export interface ContextAssembledData {
 }
 
 // A response event — interleaved text blocks and steps (from backend ResponseEvent).
-export type ResponseEvent =
-  | { type: 'text'; md: string }
+type ResponseEventKind =
+  | {
+      type: 'text';
+      md: string;
+      /** Where each streamed piece of a merged chunk starts in `md`, with its
+       *  seq. Set only on a chunk merged from several pieces. */
+      pieces?: { at: number; seq?: number }[];
+    }
   | {
       type: 'step';
       description: string;
@@ -425,6 +431,14 @@ export type ResponseEvent =
        *  `exchangeResponseEvents`, never sent by the backend. */
       type: 'empty';
     };
+
+/** A response event, and where it sits on the thread's clock. */
+export type ResponseEvent = ResponseEventKind & {
+  /** Seq of the thread event that produced this row. Absent on a row the
+   *  render synthesises after the last event, such as the live Thinking row,
+   *  which therefore reads as the newest. */
+  seq?: number;
+};
 
 // A notification
 export interface Notification {

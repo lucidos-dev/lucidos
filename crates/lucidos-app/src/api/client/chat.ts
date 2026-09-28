@@ -159,14 +159,24 @@ export async function sendControlRequest(threadId: string, request: Record<strin
 export const SIDE_QUESTION_TIMEOUT_MS = 130_000;
 
 /** Ask a `/btw` side question in a coding-agent thread. The engine answers
- *  beside any running turn and records nothing (ADR 0318). */
-export async function askSideQuestion(threadId: string, question: string): Promise<string> {
+ *  beside any running turn and records the ask and its outcome as events no
+ *  agent reads (ADR 0320). `sideQuestionId` is ours, so the card reconciles. */
+export async function askSideQuestion(threadId: string, sideQuestionId: string, question: string): Promise<string> {
   const body = await json<{ answer: string }>(`${API}/coding-agents/side-question`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ thread_id: threadId, question }),
+    body: JSON.stringify({ thread_id: threadId, side_question_id: sideQuestionId, question }),
   }, SIDE_QUESTION_TIMEOUT_MS);
   return body.answer;
+}
+
+/** Record that the user dismissed a side question's card. */
+export async function dismissSideQuestion(threadId: string, sideQuestionId: string): Promise<void> {
+  await json(`${API}/coding-agents/side-question/dismiss`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ thread_id: threadId, side_question_id: sideQuestionId }),
+  });
 }
 
 export interface CodingAgentCommandOption {
