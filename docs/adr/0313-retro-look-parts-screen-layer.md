@@ -1,6 +1,7 @@
 # 0313: Retro look parts: a block caret, scanlines on the screen fill, capped double borders
 
 - **Status**: Accepted (amends [ADR 0307](0307-look-parts-paint-only.md))
+- **Amended by**: [0317: A drawn caret where the browser has no caret-shape](0317-drawn-caret.md)
 - **Date**: 2026-09-27
 
 ## Context

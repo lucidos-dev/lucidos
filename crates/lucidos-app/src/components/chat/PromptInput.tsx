@@ -51,6 +51,7 @@ import { useTouchActivated } from '../../hooks/useTouchActivated';
 import { errorDetail } from '../../utils/errorDetail';
 import { extractPasteUrl, escapeMarkdownLinkText } from '../../utils/extractPasteUrl';
 import { PROSE_TEXT_ATTRS } from '../../utils/noAutofill';
+import { attachDrawnCaret } from '../../utils/drawnCaret';
 import { attachedImagesForCurrentThread, getAttachedImages, removeAttachedImage, type AttachedImage } from './pastedImages';
 import { getPendingUploads, hasInFlightUploads, removePendingUpload, pendingUploads } from '../../store/pendingUploads';
 import { attachImageToActiveDraft } from './attachToDraft';
@@ -451,6 +452,11 @@ export function PromptInput() {
     if (el && !isTextareaHeightAnimating(el)) remeasureTextarea(el);
   });
   useWidthRemeasure(inputRef);
+
+  useEffect(() => {
+    const el = inputRef.current;
+    return el ? attachDrawnCaret(el) : undefined;
+  }, []);
 
   function autoResize() {
     const el = inputRef.current;

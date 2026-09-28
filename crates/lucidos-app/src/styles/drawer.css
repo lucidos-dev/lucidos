@@ -508,6 +508,9 @@
     padding-left: var(--thread-row-pad-left);
     /* Right padding gives the action icons breathing room inside the row. */
     padding-right: var(--thread-row-pad-right);
+    /* The space above the title must stay clearly larger than the gap under
+     * it, so each row reads as one group, not as loose lines. */
+    padding-top: var(--space-lg);
     /* No right MARGIN: the focused / hover / highlighted background runs full
      * width to the drawer's right edge (or up to the scrollbar when the list
      * overflows), so the selection reads flush with no `--bg-primary` gap strip.
@@ -1038,9 +1041,7 @@ html[data-theme-mode="dark"] .thread-row .message-channel-tag.channel-error {
         height: 1.25rem;
     }
 
-    /* Match the row's top padding (0.5rem, from base `.list-row`) so the title
-     * has symmetric breathing room above and below — the old 0.125rem crowded
-     * the title against the row's bottom divider. */
+    /* Keeps the last line off the row's bottom divider. */
     .thread-row {
         padding-bottom: 0.5rem;
     }
@@ -1052,11 +1053,9 @@ html[data-theme-mode="dark"] .thread-row .message-channel-tag.channel-error {
         height: 1.5rem;
     }
 
-    /* 1rem above the title and 1rem below the date (this bottom plus
-     * `.thread-row-left`'s descent room). It must stay clearly larger than the
-     * title-to-date gap, so each row reads as one group, not as loose lines. */
+    /* 1rem below the date (this bottom plus `.thread-row-left`'s descent
+     * room), matching the 1rem above the title. */
     .thread-row {
-        padding-top: var(--space-lg);
         padding-bottom: var(--space-md);
     }
 

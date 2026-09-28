@@ -1398,6 +1398,12 @@ select_stale_dev_script_pids() {
             *"$WORKSPACE"*) ;;
             *) continue ;;
         esac
+        # The engine's own background build is never stale: this launch does
+        # not replace it, and a SIGTERM fails the build the user is waiting on.
+        # Matched as a whole token, so a path containing the text still counts.
+        case " $argv1 $rest " in
+            *" --engine-build "*) continue ;;
+        esac
         # Backstop for a matcher that ever broadens again: never signal another
         # workspace's live engine or an ancestor of this process.
         if command -v is_protected_host_pid >/dev/null 2>&1 && is_protected_host_pid "$pid"; then

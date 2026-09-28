@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.41.1
+
+### Fixed
+- A theme with a block caret shows the block caret in the macOS app, Safari, Firefox and on iPhone. The caret follows the text, and it hides while you select text or type with an input method.
+- Search results wrap a long subtitle onto two lines, and a long unbroken path wraps too.
+- Thread rows in the desktop drawer have more room above the title.
+- A new engine version that builds while you start Lucidos from the dev scripts finishes its build. The toast no longer reports that the build failed.
 ## v0.41.0 — 2026-09-28
 
 ### Added
@@ -26,7 +33,6 @@
 
 ### Changed
 
-- "Look" is now "theme", and the light and dark setting is "theme mode". Your choices carry over on upgrade.
 - Dialogs, toasts and menus share one layout: a head with an X, a body and a foot. Red means destructive and nothing else.
 - Toasts are one line, with the tone in the icon. A toast with one action is a tap on the whole card.
 - Turn folds and inline disclosures roll open like drawer sections.

@@ -203,9 +203,12 @@
 .search-everywhere-result-subtitle {
     font-size: var(--font-size-xs);
     color: var(--text-muted);
-    white-space: nowrap;
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
     overflow: hidden;
-    text-overflow: ellipsis;
+    overflow-wrap: anywhere;
 }
 
 .search-everywhere-empty {

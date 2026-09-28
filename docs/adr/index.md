@@ -324,3 +324,4 @@ Create an entry with `./scripts/adr-new.sh`, never by hand. See
 - [0314: Apply All parks a change that hits a merge conflict and keeps applying the rest](0314-apply-all-parks-a-conflicting-change.md)
 - [0315: After a hardened branch gains commits, /harden reviews only what no hardening has reviewed](0315-incremental-hardening.md)
 - [0316: The palette is a theme and light/dark is the theme mode, renamed in every layer](0316-look-becomes-theme.md)
+- [0317: A drawn caret where the browser has no caret-shape: a layout copy of the textarea places a real inline caret, which steps aside for IME; amends 0313](0317-drawn-caret.md)

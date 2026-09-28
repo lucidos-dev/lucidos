@@ -2161,6 +2161,26 @@ test_another_workspaces_dev_script_is_not_selected() {
     fi
 }
 
+test_the_engines_background_build_is_not_selected() {
+    # The engine spawns this for Apply, self-heal and Retry build. A launch does
+    # not replace it, and the `pkill -P` SIGTERMed its build-slot broker, so the
+    # build reported exit 143 while cargo finished underneath it.
+    local got
+    got="$(selected_pids "4245 /bin/bash /repo/scripts/web-dev.sh -w /ws/mine --engine-build" "/ws/mine")"
+    if [ -z "$got" ]; then
+        pass "the engine's own --engine-build for this workspace is left alone"
+    else
+        fail "engine background build selected as stale dev script: '$got'"
+    fi
+
+    got="$(selected_pids "4246 /bin/bash /repo/scripts/web-dev.sh -w /ws/mine--engine-build -b" "/ws/mine--engine-build")"
+    if [ "$got" = "4246" ]; then
+        pass "a workspace path containing the flag's text is still selected"
+    else
+        fail "expected 4246, got '$got'"
+    fi
+}
+
 test_init_and_self_are_never_selected() {
     local got
     got="$(selected_pids "1 /bin/bash /repo/scripts/web-dev.sh -w /ws/mine" "/ws/mine")"
@@ -2187,6 +2207,7 @@ test_an_empty_feed_never_reaches_the_real_ps() {
 test_a_dev_script_for_this_workspace_is_selected
 test_a_coding_agent_merely_mentioning_a_dev_script_is_not_selected
 test_another_workspaces_dev_script_is_not_selected
+test_the_engines_background_build_is_not_selected
 test_init_and_self_are_never_selected
 test_an_empty_feed_never_reaches_the_real_ps
 

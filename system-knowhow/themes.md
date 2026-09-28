@@ -266,7 +266,7 @@ refusal names the field, the rule and the limit, for example
 | `header-icon` | The glyphs on the icon buttons in a pane's header. Their colour follows --header-fg-muted. | `filter` |
 | `header-title` | Pane, thread and workspace titles in the header. Their colour follows --header-fg. | `text-shadow`, `letter-spacing` |
 | `composer` | The box around the message you type in chat. It can overlap scrolled messages, so it takes inset shadows only. | `background-color`, `border-color`, `box-shadow` |
-| `composer-text` | The text you type in the composer. `caret-shape` draws in Chromium browsers only. | `color`, `caret-color`, `caret-shape`, `text-shadow`, `letter-spacing` |
+| `composer-text` | The text you type in the composer. `caret-shape` is native in Chromium and drawn by Lucidos elsewhere. | `color`, `caret-color`, `caret-shape`, `text-shadow`, `letter-spacing` |
 | `card` | The bordered blocks a step shows: tool output, its result and its reasoning. | `border-style`, `border-width`, `border-color` |
 | `surface` | Every toast, popover, menu and dialog. Protected dialogs keep their own frame. | `border-style`, `border-width`, `border-color` |
 | `screen` | The base fill behind every pane. Scanlines paint here, under all content. | `background-image` |
@@ -348,11 +348,15 @@ double-line boxes.
 }
 ```
 
-**The block caret.** `composer-text` takes `caret-shape: block`, and the caret
-blinks as the browser draws it. Only Chromium browsers draw a block today:
-Safari, the iPhone and the macOS app keep a thin caret in the theme's
-`caret-color`. Under reduced motion the caret stops blinking. Protected inputs,
-such as the credential form, keep the normal caret.
+**The block caret.** `composer-text` takes `caret-shape: block` or
+`underscore`. `caret-shape` is native in Chromium and drawn by Lucidos
+elsewhere: Safari, the iPhone, the macOS app and Firefox get the same shape. It
+paints in the part's `caret-color`, else the composer text colour, and a block
+shows the character under it.
+
+The shape hides while you select text, and the thin caret returns while an
+input method composes text. Under reduced motion the caret stops blinking.
+Protected inputs, such as the credential form, keep the normal caret.
 
 **Scanlines.** `screen` takes a `repeating-linear-gradient()` of faint stops.
 Lucidos paints it on the base fill behind every pane, so it shows through

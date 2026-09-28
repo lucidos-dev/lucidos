@@ -3870,6 +3870,16 @@ another, where one call carrying fifty questions is a single round trip.
 their own path when Jev errors. This caller has none, and inventing an answer
 would be a lie about a number.
 
+### Drawn caret
+The composer caret Lucidos paints itself when the `composer-text` *theme part*
+asks for `block` or `underscore` and the browser has no `caret-shape` (WebKit,
+Firefox). A layout copy of the textarea holds a real inline caret element, so
+the browser places it. The native caret turns transparent while it shows, and
+comes back during IME composition. Chromium draws the shape natively and gets
+no drawn caret. Code: `utils/drawnCaret.ts`.
+
+See also: ADR 0317, `docs/temporary-measures.md` § Drawn caret.
+
 ## When to add a term
 
 Add it here if it's dev-only — engine plumbing, DB schema, test infrastructure, build tooling, CC mechanics. If users (or the workspace LLM) would ever encounter it, add it to `system-knowhow/glossary.md` instead (under **Core** if it's general, or under **Advanced — coding agents** if it's only relevant to coding-agent workflows).

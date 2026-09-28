@@ -168,9 +168,12 @@ test.describe('retro theme parts', () => {
     await injectCards(page, 'thread');
     const composer = await ready(page);
 
-    expect(await composer.evaluate(el => getComputedStyle(el).caretColor)).toBe(GREEN);
     const drawsShape = await page.evaluate(() => CSS.supports('caret-shape', 'block'));
     expect(drawsShape, 'Chromium draws caret-shape; WebKit does not yet').toBe(browserName === 'chromium');
+    // WebKit gets the drawn caret instead (ADR 0317, theme-caret-fallback.spec.ts),
+    // which hides the native one.
+    await expect.poll(() => composer.evaluate(el => getComputedStyle(el).caretColor))
+      .toBe(drawsShape ? GREEN : 'rgba(0, 0, 0, 0)');
     if (drawsShape) {
       expect(await composer.evaluate(el => getComputedStyle(el).getPropertyValue('caret-shape'))).toBe('block');
       expect(await style(page, '#rt-protected-input', 'caret-shape'), 'a protected input keeps the normal caret').toBe('auto');

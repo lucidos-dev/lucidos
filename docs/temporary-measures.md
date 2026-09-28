@@ -1721,6 +1721,25 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
     `engine/git_ops_tests/recover_exclude.rs`.
 - **Status:** active
 
+### Drawn caret
+
+- **Added:** 2026-09-28. Decision: [ADR 0317](adr/0317-drawn-caret.md).
+- **Lives in:** `crates/lucidos-app/src/utils/drawnCaret.ts`, its effect in
+  `components/chat/PromptInput.tsx`, and the `.drawn-caret` rules in
+  `styles/global/host-components.css`. Tests: `utils/drawnCaret.test.ts` and
+  `e2e/theme-caret-fallback.spec.ts`.
+- **Impermanent because:** only Chromium draws `caret-shape`. WebKit and
+  Firefox ignore it, so Lucidos draws the `composer-text` caret shape itself
+  there. The native property is the right mechanism; the overlay stands in for
+  it.
+- **Removal / resolution condition:** every engine Lucidos ships on draws
+  `caret-shape`: WebKit (the macOS app, Safari, iOS) and Firefox (the PWA).
+  Verify in MDN browser-compat-data for `css.properties.caret-shape`, then
+  check `CSS.supports('caret-shape', 'block')` is true in Safari and in the
+  macOS app. Then delete the three sites and the two tests. The native-shape
+  check in `e2e/theme-parts-retro.spec.ts` then holds on every engine.
+- **Status:** active
+
 ---
 
 ## 2. Model-tolerance measures

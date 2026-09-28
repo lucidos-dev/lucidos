@@ -1864,3 +1864,53 @@ html[data-font-bold="none"] :is(.response-body .response-chunk, .response-body >
 :root[data-motion="reduce"] .prompt-area .prompt-row .prompt-textarea {
     caret-animation: manual;
 }
+
+/* The drawn caret: the composer's caret-shape where the browser has none
+   (utils/drawnCaret.ts, ADR 0317). The native caret hides only while it
+   shows. The overlay copies the textarea's box and text; only the caret
+   span paints. No `display` here, so the `hidden` attribute still hides it. */
+.prompt-area .prompt-row .prompt-textarea[data-drawn-caret] {
+    caret-color: transparent;
+}
+
+.prompt-row .drawn-caret {
+    position: absolute;
+    margin: 0;
+    overflow: hidden;
+    pointer-events: none;
+    border-style: solid;
+    border-color: transparent;
+    white-space: pre-wrap;
+    overflow-wrap: break-word;
+    -webkit-text-fill-color: transparent;
+    text-shadow: none;
+}
+
+.drawn-caret-cursor {
+    animation: drawn-caret-blink 1s steps(1) infinite;
+}
+
+/* The block shows the character under it in the composer's own fill. */
+.drawn-caret-cursor[data-shape="block"] {
+    background-color: var(--drawn-caret-color);
+    -webkit-text-fill-color: var(--drawn-caret-ink);
+}
+
+.drawn-caret-cursor[data-shape="underscore"] {
+    box-shadow: inset 0 -0.12em var(--drawn-caret-color);
+}
+
+/* At a line end there is no character to cover, so the caret takes a cell. */
+.drawn-caret-cursor:empty {
+    padding-inline-end: 1ch;
+}
+
+:root[data-motion="reduce"] .drawn-caret-cursor {
+    animation: none;
+}
+
+@keyframes drawn-caret-blink {
+    50% {
+        opacity: 0;
+    }
+}
