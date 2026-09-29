@@ -78,6 +78,23 @@ impl LucidosEngine {
         Some(oauth_account.access_token)
     }
 
+    /// The base provider whose token endpoint issues `provider`'s tokens, from
+    /// the `token_url` its stored client credential names. `None` when the
+    /// credential is missing, unreadable or points at an unknown issuer.
+    async fn oauth_token_issuer(&self, provider: &str) -> Option<&'static str> {
+        let service = oauth::client_provider_name(provider);
+        let credential =
+            match crate::core::CredentialStore::get_oauth_client(&self.pool, &service).await {
+                Ok(found) => found?,
+                Err(e) => {
+                    log!("[Email] Failed to read the {} OAuth client: {}", service, e);
+                    return None;
+                }
+            };
+        let config: serde_json::Value = serde_json::from_str(&credential.auth_value).ok()?;
+        oauth::provider_for_url(config["token_url"].as_str()?)
+    }
+
     pub(crate) async fn execute_email_tool(
         &self,
         name: &str,
@@ -175,6 +192,26 @@ impl LucidosEngine {
                             return Ok(format!("Error: Failed to look up OAuth account: {}", e))
                         }
                     };
+                    let already_linked = existing
+                        .as_ref()
+                        .is_some_and(|a| a.oauth_account_id == Some(oauth_account.id));
+                    if !already_linked {
+                        let issuer = self.oauth_token_issuer(oauth_provider).await;
+                        if let Some(refusal) = oauth_link_refusal(
+                            oauth_provider,
+                            issuer,
+                            &MailDestination {
+                                imap_host,
+                                imap_port,
+                                smtp_host,
+                                smtp_port,
+                                username,
+                                use_tls,
+                            },
+                        ) {
+                            return Ok(refusal);
+                        }
+                    }
 
                     EmailStore::upsert(
                         &self.pool,
@@ -640,9 +677,65 @@ fn secret_redirect_refusal(
     ))
 }
 
+/// The mail servers each OAuth provider's token is meant for. XOAUTH2 sends
+/// the bearer token itself to the server. A token linked to any other host
+/// gives the user's whole account to whoever runs that host.
+const OAUTH_MAIL_HOSTS: &[(&str, &[&str])] = &[
+    ("google", &["imap.gmail.com", "smtp.gmail.com"]),
+    (
+        "microsoft",
+        &[
+            "outlook.office365.com",
+            "imap-mail.outlook.com",
+            "smtp.office365.com",
+            "smtp-mail.outlook.com",
+        ],
+    ),
+];
+
+/// The refusal for a new OAuth link whose token would leave its issuer's own
+/// mail servers. `None` when both hosts are the issuer's and TLS is on.
+///
+/// `issuer` is the base provider whose token endpoint issued the token, read
+/// from the connection's stored `token_url`, never from its name. A dedicated
+/// connection such as `google-work` runs on Google's endpoints (the alias rule
+/// in `system-knowhow/oauth-providers.md`), so it shares Google's servers.
+///
+/// `secret_redirect_refusal` guards a secret already on the account. This
+/// guards the first link. There the model picks the hosts, and the text of a
+/// web page or an email can pick them for it.
+fn oauth_link_refusal(
+    provider: &str,
+    issuer: Option<&str>,
+    to: &MailDestination<'_>,
+) -> Option<String> {
+    let hosts = issuer.and_then(|issuer| {
+        OAUTH_MAIL_HOSTS
+            .iter()
+            .find(|(known, _)| *known == issuer)
+            .map(|(_, hosts)| *hosts)
+    });
+    let Some(hosts) = hosts else {
+        return Some(format!(
+            "Error: use_oauth '{provider}' is not a provider whose mail servers Lucidos knows, \
+             so its token is not linked to an email account. Use an app password instead \
+             (leave use_oauth out)."
+        ));
+    };
+    let is_provider_host = |host: &str| hosts.iter().any(|h| h.eq_ignore_ascii_case(host.trim()));
+    if to.use_tls && is_provider_host(to.imap_host) && is_provider_host(to.smtp_host) {
+        return None;
+    }
+    Some(format!(
+        "Error: use_oauth '{provider}' sends the user's {provider} token to the mail servers, \
+         so it links only to {} with TLS on. Not changed.",
+        hosts.join(", ")
+    ))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{secret_redirect_refusal, MailDestination};
+    use super::{oauth_link_refusal, secret_redirect_refusal, MailDestination};
     use crate::core::EmailAccount;
 
     fn account(password: &str, oauth: bool) -> EmailAccount {
@@ -744,5 +837,83 @@ mod tests {
             ..same()
         };
         assert!(secret_redirect_refusal(&acct, other).is_none());
+    }
+
+    fn gmail() -> MailDestination<'static> {
+        MailDestination {
+            imap_host: "imap.gmail.com",
+            smtp_host: "smtp.gmail.com",
+            ..same()
+        }
+    }
+
+    /// The reported attack on a NEW account: a prompt injection configures
+    /// `backup` at the attacker's hosts with `use_oauth: google`. The first
+    /// read would send the Google bearer token there as XOAUTH2.
+    #[test]
+    fn a_new_oauth_link_refuses_hosts_that_are_not_the_providers() {
+        let off_provider: [fn() -> MailDestination<'static>; 3] = [
+            || MailDestination {
+                imap_host: "imap.attacker.example",
+                ..gmail()
+            },
+            || MailDestination {
+                smtp_host: "smtp.attacker.example",
+                ..gmail()
+            },
+            || MailDestination {
+                use_tls: false,
+                ..gmail()
+            },
+        ];
+        for to in off_provider {
+            let refusal = oauth_link_refusal("google", Some("google"), &to())
+                .expect("an off-provider link was allowed");
+            assert!(refusal.starts_with("Error:"), "{refusal}");
+        }
+        let outlook_to_gmail = oauth_link_refusal("microsoft", Some("microsoft"), &gmail());
+        assert!(
+            outlook_to_gmail.is_some(),
+            "a Microsoft token reached Gmail"
+        );
+    }
+
+    /// A provider with no known mail servers gets no link at all, since any
+    /// host the model names would be a guess.
+    #[test]
+    fn a_provider_without_known_mail_hosts_is_refused() {
+        let refusal =
+            oauth_link_refusal("github", Some("github"), &gmail()).expect("github was linked");
+        assert!(refusal.contains("app password"), "{refusal}");
+    }
+
+    #[test]
+    fn the_providers_own_hosts_over_tls_link() {
+        assert!(oauth_link_refusal("google", Some("google"), &gmail()).is_none());
+        let recased = MailDestination {
+            imap_host: " IMAP.Gmail.com",
+            ..gmail()
+        };
+        assert!(oauth_link_refusal("Google", Some("google"), &recased).is_none());
+        let outlook = MailDestination {
+            imap_host: "outlook.office365.com",
+            smtp_host: "smtp-mail.outlook.com",
+            ..same()
+        };
+        assert!(oauth_link_refusal("microsoft", Some("microsoft"), &outlook).is_none());
+    }
+
+    /// A dedicated connection is judged by the issuer of its token, not by its
+    /// name. An issuer read from nowhere links nothing.
+    #[test]
+    fn an_alias_connection_uses_its_issuers_hosts() {
+        assert!(oauth_link_refusal("google-work", Some("google"), &gmail()).is_none());
+        assert!(oauth_link_refusal("health", Some("google"), &gmail()).is_none());
+        assert!(oauth_link_refusal("google-work", None, &gmail()).is_some());
+        let off = MailDestination {
+            imap_host: "imap.attacker.example",
+            ..gmail()
+        };
+        assert!(oauth_link_refusal("google-work", Some("google"), &off).is_some());
     }
 }

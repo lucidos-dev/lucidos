@@ -124,6 +124,34 @@ pub(super) async fn resolve_route_overrides(
     }
 }
 
+impl LucidosEngine {
+    /// The tools a chat turn offers. A side question sends the same array, so
+    /// the two share one prompt-cache prefix.
+    pub(super) async fn chat_turn_tools(
+        &self,
+        gates: &crate::llm::ToolCapabilities,
+    ) -> crate::engine::agentic_loop::TurnTools {
+        let mut tools = get_default_tools(gates);
+        tools.push(get_notification_tool());
+        // Grouped notification-inbox tool (list / mark_read / mark_all_read) +
+        // any other manifest-declared LLM tools, from one source of truth.
+        tools.extend(crate::capability_manifest::llm_tools());
+        // navigate_ui, save_thread_image, view_image and generate_image, each
+        // with its gate declared beside it in `llm::tools::CHAT_TAIL`.
+        tools.extend(chat_tail_tools(gates));
+        // MCP server management is the grouped `mcp` manifest tool (spliced via
+        // llm_tools() above). Tools discovered from running servers join here.
+        let mcp_surface = self.mcp_manager.tool_surface().await;
+        // The stamp rides with the tools so the loop can tell whether what it
+        // holds is still current. It is the only part of the array that can
+        // move mid-turn; see `TurnTools`.
+        crate::engine::agentic_loop::TurnTools::new(
+            tools.into_iter().chain(mcp_surface.tools).collect(),
+            mcp_surface.generation,
+        )
+    }
+}
+
 /// Whether a typed-instead-of-clicked message is eligible to answer a pending
 /// `UserQuestionAsked` via the FreeText fast-path.
 ///
@@ -149,11 +177,12 @@ pub(super) async fn resolve_route_overrides(
 pub(super) fn message_can_answer_pending_question(
     is_new_thread: bool,
     user_message: &str,
+    has_images: bool,
     mode: ActorMode,
     pre_emitted_origin: Option<PreEmittedOrigin>,
 ) -> bool {
     !is_new_thread
-        && !user_message.is_empty()
+        && (!user_message.is_empty() || has_images)
         && mode == ActorMode::Human
         && pre_emitted_origin.is_none()
 }
@@ -308,11 +337,106 @@ impl LucidosEngine {
                 .await;
         }
 
-        // Spawn Flash image description in background (don't block main LLM flow).
-        // Returns `(description, model)` so the agentic loop can emit
-        // `ImageDescribed { model, .. }` with the actual model that produced
-        // the description (the user's `model_image_description` preference, or
-        // the extractor's default when the preference is empty / "default").
+        // AskUserQuestion free-form path: if the thread is currently waiting
+        // on a `UserQuestionAsked` and the user typed instead of clicking an
+        // option, route the message to the answer-question handler with
+        // `FreeText` instead of creating a new exchange. Applies to BOTH chat
+        // and CC threads — the chat agent's `ask_user_question` tool blocks
+        // on the same wait registry as CC's hook, so without this routing the
+        // typed text would spawn a brand-new turn while the prior turn's tool
+        // stays blocked, leaving the thread stuck "Requesting" forever.
+        //
+        // Gated on `mode == Human` (see `message_can_answer_pending_question`):
+        // only a real human follow-up answers the question. An agent-driven
+        // child-completion wake (`ActorMode::Agent`) must fall through to the
+        // injection fast-path below instead of being persisted as a bogus
+        // FreeText answer.
+        //
+        // Uses `lookup_active_question_tool_use_id` (not `..pending..`) so a
+        // question orphaned by a prior `ResponseAborted`/`Canceled`/`Failed`/
+        // `CodingAgentIdled` doesn't intercept the follow-up — otherwise the
+        // typed text would be silently consumed as the dead question's answer
+        // and `MessageReceived` would never be emitted.
+        if message_can_answer_pending_question(
+            is_new_thread,
+            user_message,
+            user_images.is_some_and(|images| !images.is_empty()),
+            mode,
+            pre_emitted_origin,
+        ) {
+            if let Some(pending_tool_use_id) =
+                crate::engine::agent_question::lookup_active_question_tool_use_id(
+                    self.pool(),
+                    thread_id,
+                )
+                .await
+            {
+                use crate::engine::agent_question::{answer_pending_question, AnswerResult};
+                use crate::engine::thread_events::AnswerKind;
+                let engine_arc: std::sync::Arc<Self> = self.clone_arc();
+                let image_hashes =
+                    super::super::events::images_to_hashes(self.workspace_path(), user_images);
+                // An image that could not be stored would reach the agent as an
+                // answer without it, or as an empty one it reads as unanswered.
+                if image_hashes.len() != user_images.map_or(0, <[_]>::len) {
+                    emit_routing_failure(
+                        &self.event_bus,
+                        thread_id,
+                        "An image attached to this answer could not be stored, so the answer was not sent. Try attaching it again.",
+                    )
+                    .await?;
+                    return Ok(terminal_result(
+                        String::new(),
+                        vec![],
+                        request_id,
+                        thread_id,
+                        false,
+                    ));
+                }
+                let answer = AnswerKind::FreeText {
+                    text: user_message.to_string(),
+                    image_hashes,
+                };
+                match answer_pending_question(
+                    &engine_arc,
+                    thread_id,
+                    pending_tool_use_id,
+                    answer,
+                    origin.clone(),
+                )
+                .await
+                {
+                    AnswerResult::Resumed => {
+                        log!(
+                            "[Chat] Free-form answer routed to pending question for thread {}",
+                            thread_id
+                        );
+                    }
+                    AnswerResult::Conflict(msg) => {
+                        log!(
+                            "[Chat] Free-form answer conflict for thread {}: {}",
+                            thread_id,
+                            msg
+                        );
+                        emit_routing_failure(&self.event_bus, thread_id, &msg).await?;
+                    }
+                }
+                return Ok(terminal_result(
+                    String::new(),
+                    vec![],
+                    request_id,
+                    thread_id,
+                    false,
+                ));
+            }
+        }
+
+        // Spawn the image description in the background, so it never blocks
+        // the turn. It sits after the answer path above, which reads none.
+        // It returns `(description, model)`, and the agentic loop emits
+        // `ImageDescribed { model, .. }` naming the model that described it.
+        // That is the `model_image_description` preference, or the
+        // extractor's default when the preference is empty or "default".
         let mut description_handle = if let (Some(imgs), Some(ref extractor)) =
             (user_images, &self.extractor)
         {
@@ -321,10 +445,10 @@ impl LucidosEngine {
                 let call = crate::engine::aux_purpose::AuxCall::resolve(&self.pool, purpose).await;
                 match extractor.provider_for_model(call.model(), call.attempt_timeout()) {
                     Ok(provider) => {
-                        // Resolve the model name we'll record on the event. The
-                        // pref string wins when set; otherwise fall back to the
-                        // provider's default (which is the model the call actually
-                        // hits via `provider_for_model`'s "" / "default" branch).
+                        // Resolve the model name the event records. The pref
+                        // string wins when set. Otherwise it is the provider's
+                        // default, the model `provider_for_model`'s "" /
+                        // "default" branch actually calls.
                         let recorded_model =
                             if crate::engine::aux_purpose::is_extractor_default(call.model()) {
                                 provider.default_model().to_string()
@@ -373,79 +497,6 @@ impl LucidosEngine {
         } else {
             None
         };
-
-        // AskUserQuestion free-form path: if the thread is currently waiting
-        // on a `UserQuestionAsked` and the user typed instead of clicking an
-        // option, route the message to the answer-question handler with
-        // `FreeText` instead of creating a new exchange. Applies to BOTH chat
-        // and CC threads — the chat agent's `ask_user_question` tool blocks
-        // on the same wait registry as CC's hook, so without this routing the
-        // typed text would spawn a brand-new turn while the prior turn's tool
-        // stays blocked, leaving the thread stuck "Requesting" forever.
-        //
-        // Gated on `mode == Human` (see `message_can_answer_pending_question`):
-        // only a real human follow-up answers the question. An agent-driven
-        // child-completion wake (`ActorMode::Agent`) must fall through to the
-        // injection fast-path below instead of being persisted as a bogus
-        // FreeText answer.
-        //
-        // Uses `lookup_active_question_tool_use_id` (not `..pending..`) so a
-        // question orphaned by a prior `ResponseAborted`/`Canceled`/`Failed`/
-        // `CodingAgentIdled` doesn't intercept the follow-up — otherwise the
-        // typed text would be silently consumed as the dead question's answer
-        // and `MessageReceived` would never be emitted.
-        if message_can_answer_pending_question(
-            is_new_thread,
-            user_message,
-            mode,
-            pre_emitted_origin,
-        ) {
-            if let Some(pending_tool_use_id) =
-                crate::engine::agent_question::lookup_active_question_tool_use_id(
-                    self.pool(),
-                    thread_id,
-                )
-                .await
-            {
-                use crate::engine::agent_question::{answer_pending_question, AnswerResult};
-                use crate::engine::thread_events::AnswerKind;
-                let engine_arc: std::sync::Arc<Self> = self.clone_arc();
-                let answer = AnswerKind::FreeText {
-                    text: user_message.to_string(),
-                };
-                match answer_pending_question(
-                    &engine_arc,
-                    thread_id,
-                    pending_tool_use_id,
-                    answer,
-                    origin.clone(),
-                )
-                .await
-                {
-                    AnswerResult::Resumed => {
-                        log!(
-                            "[Chat] Free-form answer routed to pending question for thread {}",
-                            thread_id
-                        );
-                    }
-                    AnswerResult::Conflict(msg) => {
-                        log!(
-                            "[Chat] Free-form answer conflict for thread {}: {}",
-                            thread_id,
-                            msg
-                        );
-                        emit_routing_failure(&self.event_bus, thread_id, &msg).await?;
-                    }
-                }
-                return Ok(terminal_result(
-                    String::new(),
-                    vec![],
-                    request_id,
-                    thread_id,
-                    false,
-                ));
-            }
-        }
 
         // Held messages (ADR 0256). An agent-sent message waits while a human
         // owes this thread a reply, so it cannot supersede their question.
@@ -542,6 +593,33 @@ impl LucidosEngine {
             // supersedes, so the human is who resolved any open card.
             if mode == ActorMode::Human {
                 self.clone_arc().deliver_held_messages(thread_id).await;
+            }
+        }
+
+        // A delivery waits behind a question that outlived its turn (ADR 0321).
+        // With the turn live it injects below instead. The answer's resume
+        // carries it (`resume_chat_after_answer`).
+        if use_coding_agent != Some(true) && !is_new_thread {
+            let has_live_turn = self.active_threads.lock().unwrap().contains_key(&thread_id);
+            if super::super::held_deliveries::delivery_is_held(
+                self.pool(),
+                thread_id,
+                pre_emitted_origin,
+                has_live_turn,
+            )
+            .await
+            {
+                log!(
+                    "[Chat] Held a delivery behind the open question on thread {}",
+                    thread_id
+                );
+                return Ok(terminal_result(
+                    String::new(),
+                    vec![],
+                    request_id,
+                    thread_id,
+                    false,
+                ));
             }
         }
 
@@ -763,16 +841,15 @@ impl LucidosEngine {
 
                 let images = user_images.map(|imgs| imgs.to_vec());
                 let send_ok = {
-                    let sessions = self.agent_sessions.lock().await;
-                    if let Some(session) = sessions.get(&thread_id) {
+                    let mut sessions = self.agent_sessions.lock().await;
+                    if let Some(session) = sessions.get_mut(&thread_id) {
                         if session.is_live() {
-                            // Nothing to pre-count and nothing to roll back: the
-                            // message is visible to the session's idle decision the
+                            // The message is visible to the session's idle decision the
                             // moment it is in the channel (that decision reads
                             // `msg_rx` under this same lock), and the run loop records
-                            // it as owed when it forwards it to the driver. A send
-                            // that fails put nothing anywhere.
-                            session
+                            // it as owed when it forwards it to the driver. Only a
+                            // withdraw needs telling that it is still on its way.
+                            let sent = session
                                 .msg_tx
                                 .send(AgentUserInput {
                                     text: user_message.to_string(),
@@ -780,7 +857,11 @@ impl LucidosEngine {
                                     origin_event_id,
                                     kind: input_kind,
                                 })
-                                .is_ok()
+                                .is_ok();
+                            if let (true, Some(id)) = (sent, origin_event_id) {
+                                session.unforwarded_inputs.insert(id);
+                            }
+                            sent
                         } else {
                             false
                         }
@@ -1493,21 +1574,6 @@ impl LucidosEngine {
             thread_depth_context,
         } = context_sections;
 
-        let mut tools = get_default_tools(&capabilities.gates);
-        tools.push(get_notification_tool());
-        // Grouped notification-inbox tool (list / mark_read / mark_all_read) +
-        // any other manifest-declared LLM tools — single source of truth.
-        tools.extend(crate::capability_manifest::llm_tools());
-        // manage_models / manage_repositories are now manifest-built grouped tools
-        // contributed by llm_tools() above (no longer spliced here).
-        //
-        // navigate_ui, save_thread_image, view_image and generate_image, each
-        // with its gate declared beside it in `llm::tools::CHAT_TAIL`.
-        tools.extend(chat_tail_tools(&capabilities.gates));
-        // MCP server management is the grouped `mcp` manifest tool (spliced via
-        // llm_tools() above). Discovered tools from running MCP servers are added
-        // separately below.
-        //
         // The one setup await that is checkpointed rather than raced: it can be
         // mid-RPC to a running MCP server, and dropping it there is not the pure
         // read the other phases are. So the checkpoint goes AFTER it, where it
@@ -1516,14 +1582,7 @@ impl LucidosEngine {
         // have exited. The two remaining awaits (stopped-server summaries, the
         // capture preference) are in-memory / single-row and are followed
         // immediately by the loop's own pre-iteration check.
-        let mcp_surface = self.mcp_manager.tool_surface().await;
-        // The stamp rides with the tools so the loop can tell whether what it
-        // holds is still current. It is the only part of the array that can
-        // move mid-turn; see `TurnTools`.
-        let tools = crate::engine::agentic_loop::TurnTools::new(
-            tools.into_iter().chain(mcp_surface.tools).collect(),
-            mcp_surface.generation,
-        );
+        let tools = self.chat_turn_tools(&capabilities.gates).await;
         if cancel_token.is_cancelled() {
             return Ok(self
                 .cancel_during_setup(&cancel_exit, guard, &mut injection_rx)

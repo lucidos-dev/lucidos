@@ -98,7 +98,6 @@ describe('NotificationToastRequested (active page) → in-app toast', () => {
     expect(t.onClick).toBeTypeOf('function');
     expect(t.action).toBeUndefined();
     expect(t.secondaryAction).toBeUndefined();
-    expect(t.noAutofocus).toBe(true);
     // The X stays available so the user can defer.
     expect(t.dismissable).not.toBe(false);
     expect(markReadOptimistic).not.toHaveBeenCalled();
@@ -177,7 +176,6 @@ describe('NotificationToastRequested (active page) → in-app toast', () => {
     expect(t.onClick).toBeTypeOf('function');
     expect(t.action).toBeUndefined();
     expect(t.secondaryAction).toBeUndefined();
-    expect(t.noAutofocus).toBe(true);
   });
 
   it('a tap on a navigate (thread + event) notification deep-links to the source event', () => {

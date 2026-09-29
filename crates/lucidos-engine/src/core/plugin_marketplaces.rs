@@ -614,7 +614,7 @@ fn collect_manifest_roots(
             continue;
         }
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if name.starts_with('.') || name == "node_modules" || name == "target" {
+        if name.starts_with('.') || super::VENDORED_DIR_NAMES.contains(&name) {
             continue;
         }
         let is_content_dir = depth == 0 && plugins::CONTENT_DIRS.contains(&name);

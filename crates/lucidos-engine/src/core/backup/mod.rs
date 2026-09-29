@@ -1356,7 +1356,7 @@ fn pg_restore(database_url: &str, dump_path: &Path) -> Result<(), BoxError> {
     // Step 3: pipe filtered SQL to psql inside a single transaction
     let mut psql_cmd = pg_tool_command("psql", database_url)?;
     let mut psql = psql_cmd
-        .args(["--single-transaction", "--dbname", &dbname])
+        .args(psql_restore_args(&dbname))
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -1385,6 +1385,23 @@ fn pg_restore(database_url: &str, dump_path: &Path) -> Result<(), BoxError> {
     }
     write_result?;
     Ok(())
+}
+
+/// The psql arguments that replay a restore's SQL.
+///
+/// `ON_ERROR_STOP` is what makes a failed restore exit non-zero. Without it,
+/// one failing statement rolls the single transaction back, and psql still
+/// exits 0. The user is then told an empty database was restored.
+/// `--no-psqlrc` keeps a user's `~/.psqlrc` out of the replay.
+fn psql_restore_args(dbname: &str) -> [&str; 6] {
+    [
+        "--single-transaction",
+        "--no-psqlrc",
+        "--set",
+        "ON_ERROR_STOP=1",
+        "--dbname",
+        dbname,
+    ]
 }
 
 /// Terminate all other database connections to allow pg_restore --clean to drop objects.

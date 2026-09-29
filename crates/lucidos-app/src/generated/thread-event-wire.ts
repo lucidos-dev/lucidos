@@ -63,19 +63,23 @@ export type AnswerKind =
       kind: 'Selected';
       option_id: string;
     }
+  /** A reply typed in the composer. `image_hashes` names the blobs attached
+   *  to it, and `text` may be empty when the images are the answer. */
   | {
       kind: 'FreeText';
       text: string;
+      image_hashes?: string[];
     }
   /** Multi-select answer. `text` carries optional freetext typed alongside
    *  the toggled options. The prompt textarea folds into the answer when a
-   *  multi-select question is pending. Backend joins the resolved labels and
-   *  the freetext together when relaying to CC. Either side may be empty
-   *  (but not both: see `validate_answer`). */
+   *  multi-select question is pending, images included. Backend joins the
+   *  resolved labels and the freetext together when relaying to CC. Some
+   *  side must be present: see `validate_answer`. */
   | {
       kind: 'MultiSelected';
       option_ids: string[];
       text?: string;
+      image_hashes?: string[];
     }
   | { kind: 'Canceled' }
   /** A follow-up arrived that could not be the answer, so it replaced the
@@ -167,7 +171,9 @@ export type ContextPurpose =
   | 'judge_tool'
   | 'intent_loop'
   | 'memory_correction'
-  | 'artifact_summary';
+  | 'artifact_summary'
+  | 'side_question'
+  | 'change_summary';
 
 /** API role bucket a `ContextSection` belongs to. Mirrors the three buckets
  *  in the LLM API call: the system prompt, prior messages (verbatim resume
@@ -1453,6 +1459,22 @@ export type ThreadEvent =
       /** Source channel. Always set on an origin event. */
       channel?: EventChannel;
     }
+  /** A model wrote the *change summary*: one line saying what a change of
+   *  several commits does. `description` is the commit list it summarized.
+   *  The projection keeps the summary only while that still equals the
+   *  change's description, so a summary of an older commit set never lands. */
+  | {
+      type: 'ChangeSummarized';
+      change_id?: string;
+      summary?: string;
+      description?: string;
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
   /** Coding-agent session settings changed mid-session (model, reasoning effort,
    *  or permission mode). Persisted per-thread so settings survive idle exit
    *  and respawn.
@@ -1469,11 +1491,17 @@ export type ThreadEvent =
        *  session↔config-dir pairing. CC keys each session's transcript on this
        *  dir (`$CLAUDE_CONFIG_DIR/projects/<cwd>/<sid>.jsonl`). So a follow-up
        *  resume re-injects it (see `lookup_pinned_cc_config_dir` and
-       *  `SpawnArgs::claude_config_dir`), and a mid-flight user toggle of the
+       *  `SpawnArgs::account_pin`), and a mid-flight user toggle of the
        *  env var cannot strand the session. `None` on legacy rows,
        *  on the pre-Init settings emit, and on mid-session settings-only emits
        *  (model/effort/permission changes). The Init emit is the carrier. */
       claude_config_dir?: string;
+      /** Whether `CLAUDE_CONFIG_DIR` was actually set for that session, stamped
+       *  beside `claude_config_dir`. `false` means it was unset and the dir is
+       *  Claude Code's default. The two are different logins to Claude Code, so
+       *  a resume must replay which one it was (`AccountPin`). `None` wherever
+       *  `claude_config_dir` is, and on rows written before it existed. */
+      claude_config_dir_explicit?: boolean;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
       /** Source channel. Always set on an origin event. */
@@ -2104,12 +2132,14 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** The user asked a `/btw` side question in a Claude Code thread.
+  /** The user asked a `/btw` side question.
    *  Full reasoning is on the Rust variant. */
   | {
       type: 'SideQuestionAsked';
       side_question_id: string;
       question: string;
+      /** Blobs the user attached to the question. */
+      image_hashes?: string[];
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
       /** Source channel. Always set on an origin event. */
@@ -2117,7 +2147,7 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** Claude Code answered the side question with this id. */
+  /** The thread's agent answered the side question with this id. */
   | {
       type: 'SideQuestionAnswered';
       side_question_id: string;
@@ -2350,6 +2380,7 @@ const THREAD_EVENT_TYPE_FLAGS = {
   MergeResolutionStarted: true,
   MergeResolutionCleared: true,
   ChangeHardened: true,
+  ChangeSummarized: true,
   CodingAgentSettingsChanged: true,
   UserPromptInjected: true,
   CredentialRequested: true,

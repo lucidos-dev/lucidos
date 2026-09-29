@@ -1,10 +1,11 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { preferences, toasts } from '../store';
-import { applyThemeMode, applyFontFamily, applyUiScale, currentThemeMode, currentFontFamily, refreshActiveTheme, loadPreferences, welcomeSuggestionsDismissed, dismissWelcomeSuggestions, currentInAppBrowser, setInAppBrowser, inAppBrowserAvailable, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, savePreference, flushPendingPreferenceWrites, _pendingPreferenceKeysForTesting, _resetPendingPreferenceWritesForTesting, currentMaxToolCalls, estimateTurnDuration, MAX_TOOL_CALLS_DEFAULT, MAX_TOOL_CALLS_MIN, isBackupScheduleActive, backupIsActive, backupReminderHiddenByDismissal, backupReminderNextDismissal, backupReminderVisibleIn, backupReminderVisible, dismissBackupReminder, BACKUP_REMINDER_FOREVER, BACKUP_REMINDER_SNOOZE_MS, currentNotificationToasts, setNotificationToasts, VOICE_RESIDENT_SECTIONS, voiceSectionEnabled, setVoiceSectionEnabled, currentBackgroundModel, currentBackgroundReasoning, currentAutocorrect, setAutocorrect, currentMotion, setMotion } from './preferences';
+import { preferences, toasts, llmConfigured } from '../store';
+import { applyThemeMode, applyFontFamily, applyUiScale, currentThemeMode, currentFontFamily, refreshActiveTheme, loadPreferences, welcomeSuggestionsDismissed, dismissWelcomeSuggestions, retireWelcomeAfterUse, WELCOME_RETIRES_AFTER_THREADS, currentInAppBrowser, setInAppBrowser, inAppBrowserAvailable, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, savePreference, flushPendingPreferenceWrites, _pendingPreferenceKeysForTesting, _resetPendingPreferenceWritesForTesting, currentMaxToolCalls, estimateTurnDuration, MAX_TOOL_CALLS_DEFAULT, MAX_TOOL_CALLS_MIN, isBackupScheduleActive, backupIsActive, backupReminderHiddenByDismissal, backupReminderNextDismissal, backupReminderVisibleIn, backupReminderVisible, dismissBackupReminder, BACKUP_REMINDER_FOREVER, BACKUP_REMINDER_SNOOZE_MS, currentNotificationToasts, setNotificationToasts, VOICE_RESIDENT_SECTIONS, voiceSectionEnabled, setVoiceSectionEnabled, currentBackgroundModel, currentBackgroundReasoning, currentAutocorrect, setAutocorrect, currentMotion, setMotion } from './preferences';
 import { motionPreference } from '../../utils/motion';
 import * as apiClient from '../../api/client';
 import { ApiError } from '../../api/client';
 import type { ApiResult } from '../../api/types';
+import type { ThreadState } from '../thread-events';
 
 const platformMocks = vi.hoisted(() => ({ isTauri: false, isIOSPwa: false, isIOS: false }));
 vi.mock('../../utils/platform', () => ({
@@ -790,6 +791,73 @@ describe('welcomeSuggestionsDismissed — new-workspace welcome gate', () => {
   });
 });
 
+describe('retireWelcomeAfterUse: the welcome retires itself after enough threads', () => {
+  const thread = (meta: Partial<ThreadState['meta']> = {}): ThreadState => ({
+    meta: { initiator: 'user', state: 'active', ...meta },
+  }) as ThreadState;
+  const userThreads = (n: number) => Array.from({ length: n }, () => thread());
+
+  beforeEach(() => {
+    preferences.value = { status: 'loaded', data: {} };
+    llmConfigured.value = true;
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    llmConfigured.value = true;
+  });
+
+  it('keeps the provider-setup welcome while no provider is configured', async () => {
+    llmConfigured.value = false;
+    const spy = vi.spyOn(apiClient, 'setPreference').mockResolvedValue({ success: true });
+
+    await retireWelcomeAfterUse(userThreads(WELCOME_RETIRES_AFTER_THREADS));
+
+    expect(spy).not.toHaveBeenCalled();
+  });
+
+  it(`saves the dismissal once the user has started ${WELCOME_RETIRES_AFTER_THREADS} threads`, async () => {
+    const spy = vi.spyOn(apiClient, 'setPreference').mockResolvedValue({ success: true });
+
+    await retireWelcomeAfterUse(userThreads(WELCOME_RETIRES_AFTER_THREADS));
+
+    expect(spy).toHaveBeenCalledWith('welcome_suggestions_dismissed', 'true', undefined);
+    expect(welcomeSuggestionsDismissed()).toBe(true);
+  });
+
+  it('keeps the welcome while the user has started fewer threads', async () => {
+    const spy = vi.spyOn(apiClient, 'setPreference').mockResolvedValue({ success: true });
+
+    await retireWelcomeAfterUse(userThreads(WELCOME_RETIRES_AFTER_THREADS - 1));
+
+    expect(spy).not.toHaveBeenCalled();
+    expect(welcomeSuggestionsDismissed()).toBe(false);
+  });
+
+  it('counts only top-level threads the user sent, not drafts, trigger runs or sub-threads', async () => {
+    const spy = vi.spyOn(apiClient, 'setPreference').mockResolvedValue({ success: true });
+
+    await retireWelcomeAfterUse([
+      ...userThreads(WELCOME_RETIRES_AFTER_THREADS - 1),
+      thread({ state: 'composing' }),
+      thread({ state: 'discarded' }),
+      thread({ initiator: 'system' }),
+      thread({ parentThreadId: 'parent' }),
+    ]);
+
+    expect(spy).not.toHaveBeenCalled();
+  });
+
+  it('writes nothing while preferences are not loaded', async () => {
+    preferences.value = { status: 'not-loaded' };
+    const spy = vi.spyOn(apiClient, 'setPreference').mockResolvedValue({ success: true });
+
+    await retireWelcomeAfterUse(userThreads(WELCOME_RETIRES_AFTER_THREADS));
+
+    expect(spy).not.toHaveBeenCalled();
+  });
+});
+
 /**
  * The app-shell backup reminder's visibility rule.
  *
@@ -1519,6 +1587,32 @@ describe('currentMaxToolCalls: mirrors the engine resolution', () => {
  * The engine resolves the same fallback in `aux_purpose`; a Settings row that
  * resolved it differently would name a model the engine is not running.
  */
+/**
+ * The change summary follows the title pair while unset, mirroring
+ * `aux_purpose`'s fallback for `ContextPurpose::ChangeSummary`.
+ */
+describe('the change summary inherits the title pair', () => {
+  it('follows the title model and effort until its own keys are set', () => {
+    preferences.value = { status: 'loaded', data: { model_title: 'claude-haiku-4-5', reasoning_title: 'low' } };
+    expect(currentBackgroundModel('model_change_summary')).toBe('claude-haiku-4-5');
+    expect(currentBackgroundReasoning('reasoning_change_summary')).toBe('low');
+  });
+
+  it('prefers its own keys once set', () => {
+    preferences.value = {
+      status: 'loaded',
+      data: {
+        model_title: 'claude-haiku-4-5',
+        reasoning_title: 'low',
+        model_change_summary: 'gpt-5.4-mini',
+        reasoning_change_summary: 'medium',
+      },
+    };
+    expect(currentBackgroundModel('model_change_summary')).toBe('gpt-5.4-mini');
+    expect(currentBackgroundReasoning('reasoning_change_summary')).toBe('medium');
+  });
+});
+
 describe('the keys split out of model_memory inherit it', () => {
   beforeEach(() => {
     preferences.value = { status: 'loaded', data: {} };

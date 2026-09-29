@@ -181,7 +181,7 @@ describe('mcpServersBody (Loadable discipline)', () => {
 describe('the skeleton row is the real row', () => {
   it('draws the same structure with no data in it', () => {
     const text = vnodeToText(mcpServerRow({ sk: true }));
-    for (const cls of ['mcp-server-block', 'mcp-server-heading', 'mcp-state-chip', 'mcp-server-id', 'mcp-server-cost', 'mcp-switch', 'action-btn-danger']) {
+    for (const cls of ['mcp-server-block', 'mcp-server-heading', 'label label-neutral', 'mcp-server-id', 'mcp-server-cost', 'mcp-switch', 'action-btn-danger']) {
       expect(text, `the skeleton row dropped ${cls}`).toContain(cls);
     }
     expect(text).not.toContain('Slack');

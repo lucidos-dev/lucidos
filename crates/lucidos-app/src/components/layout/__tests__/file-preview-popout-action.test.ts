@@ -28,6 +28,12 @@ vi.mock('../../../store/actions/artifacts', async (importOriginal) => ({
   openUrlOutsideApp,
 }));
 
+const pass = vi.hoisted(() => ({ current: null as string | null }));
+vi.mock('../../../store/actions/frame-capability', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../../store/actions/frame-capability')>()),
+  currentArtifactPreviewCapability: () => pass.current,
+}));
+
 const { filePreviewPopoutAction } = await import('../ContentHeaderActions');
 const { repositories, workspacePath } = await import('../../../store/store');
 
@@ -43,6 +49,7 @@ describe('filePreviewPopoutAction', () => {
       { pathname: '/dev/', search: '', href: 'https://localhost:5251/dev/' };
     platform.isTauri = false;
     platform.isIOSPwa = false;
+    pass.current = null;
     openLocalFile.mockClear();
     openUrlOutsideApp.mockClear();
     workspacePath.value = '/home/user/workspaces/dev';
@@ -60,6 +67,15 @@ describe('filePreviewPopoutAction', () => {
     // onClick here would silently demote the control to a button.
     expect(action?.onClick).toBeUndefined();
     expect(action?.label).toBe('Open in new tab');
+  });
+
+  // Behind a gateway an HTML artifact opens sandboxed, so its tab sends no
+  // cookie with its images (ADR 0322). The pass in the URL is what loads them.
+  it('browser: an HTML artifact carries the preview pass, and a plain file does not', () => {
+    pass.current = 'tok';
+
+    expect(filePreviewPopoutAction(ARTIFACT)?.href).toBe(`/~cap/tok/data/${ARTIFACT}`);
+    expect(filePreviewPopoutAction('artifacts/reports/chart.png')?.href).toBe('/data/artifacts/reports/chart.png');
   });
 
   it('browser: nothing at all for a repo file, which has no URL to point at', () => {

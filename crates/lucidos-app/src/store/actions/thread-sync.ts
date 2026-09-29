@@ -4,7 +4,7 @@ import { eventStreamTargets, openEventStream, type EventStreamTargets } from '@l
 import { getEventStream, setEventStream } from './event-stream';
 import { fanOutEventFrame, fanOutEventStreamStatus } from './app-bridge';
 import { threadMap, focusedThreadId, changes, appliedChanges, applyingChangeIds, applyingNowThreadIds, applyAllInProgress, applyAllBatch, applyAllCanceling, APPLY_ALL_SUMMARY_TOAST_KEY, applyEstimates, applyPhases, standingApplyThreadIds, generatedTitleIds, codingAgentSessionVersion, setFocusedThread, archivingThreadIds, removingQueuedMessageIds, queuedMessageRemovalKey } from '../store';
-import { memoryRebuildProgress, backupProgress, backupStatusVersion, backupPreferencesVersion, responseStylesVersion, appSourceEpoch, recoveryProgress, showConfirm, showToast, dismissToast, repoSource, TOAST_AUTO_DISMISS_MS } from '../store';
+import { findChangeById, memoryRebuildProgress, backupProgress, backupStatusVersion, backupPreferencesVersion, responseStylesVersion, appSourceEpoch, recoveryProgress, showConfirm, showToast, dismissToast, repoSource, TOAST_AUTO_DISMISS_MS } from '../store';
 import { isFormRequest } from '../thread-events/thread-event-types';
 import { handleEvent, isChannelDefiningEvent, makeOptimisticThreadState, PENDING_TITLE_PLACEHOLDER, type ThreadAggregate, type ThreadMeta, type ThreadEvent, type TransientEvent } from '../thread-events';
 import { bumpThreadEvents } from '../threadActivity';
@@ -25,7 +25,7 @@ import {
   handleNativePushDismiss,
   type NativePushDismissRequestedPayload,
 } from './native-push';
-import { addRestartGroup, STANDING_APPLY_CANCELED } from './chat-changes';
+import { addRestartGroup, applyChangeSummarized, STANDING_APPLY_CANCELED } from './chat-changes';
 import {
   handleFrontendUpdateDeferred,
   handleFrontendUpdateStranded,
@@ -39,6 +39,7 @@ import {
   handleFrontendPreviewStopped,
 } from './frontend-preview';
 import { changeToastMessage } from './changeToast';
+import { changeHeadline, changeNamingFromEvents } from '../changeHeadline';
 import { batchSummary, clearApplyPhase, isBatchMember, openApplyPhase, setApplyPhase } from './applyProgress';
 import { syncClientUpdateFromBuild } from './client-update';
 import { loadPreferences, refreshActiveTheme } from './preferences';
@@ -198,16 +199,14 @@ export function rebuildCorruptedThreadEvents(threadId: string): void {
   void loadThreadEvents(threadId);
 }
 
-/** Find the description for a change by looking up the matching ChangeProposed event in the thread. */
-function findChangeDescription(threadId: string, changeId: string): string | undefined {
-  const thread = threadMap.value.get(threadId);
-  if (!thread) return undefined;
-  for (const event of thread.events.values()) {
-    if (event.type === 'ChangeProposed' && event.change_id === changeId) {
-      if (event.description) return event.description.split('\n')[0];
-    }
-  }
-  return undefined;
+/** The headline a change toast names the change by (`changeHeadline`).
+ *
+ *  The loaded row first, since it carries the stored summary. Else the thread's
+ *  own events: the latest proposal, and the summary of that commit list. */
+function findChangeHeadline(threadId: string, changeId: string): string | undefined {
+  const naming = findChangeById(changeId)
+    ?? changeNamingFromEvents(threadMap.value.get(threadId)?.events.values() ?? [], changeId);
+  return naming ? changeHeadline(naming) : undefined;
 }
 
 /** Route one frame's `data` payload into the store.
@@ -656,7 +655,7 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
     const lastPhase = clearApplyPhase(threadId);
     const inBatch = isBatchMember(applyAllBatch.value, event.change_id);
     resolveBatchMember(event.change_id);
-    const desc = event.change_id ? findChangeDescription(threadId, event.change_id) : undefined;
+    const desc = event.change_id ? findChangeHeadline(threadId, event.change_id) : undefined;
     const requiresRestart = !!event.requires_restart;
     const applyKey = `applying-${threadId}`;
     // No Refresh button and no update badge here. At ChangeApplied time the
@@ -687,14 +686,14 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
     }
   } else if (event.type === 'ChangeDiscarded') {
     clearApplyPhase(threadId);
-    const desc = event.change_id ? findChangeDescription(threadId, event.change_id) : undefined;
+    const desc = event.change_id ? findChangeHeadline(threadId, event.change_id) : undefined;
     showToast(changeToastMessage('Discarded', threadId, desc), 'success', {
       key: `discarding-${threadId}`,
       onClick: () => focusThread(threadId),
       autoDismissMs: TOAST_AUTO_DISMISS_MS,
     });
   } else if (event.type === 'ChangeReverted') {
-    const desc = event.change_id ? findChangeDescription(threadId, event.change_id) : undefined;
+    const desc = event.change_id ? findChangeHeadline(threadId, event.change_id) : undefined;
     showToast(changeToastMessage('Reverted', threadId, desc), 'success');
   } else if (event.type === 'ChangeApplyFailed') {
     clearApplyPhase(threadId);
@@ -730,6 +729,10 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
       next.delete(event.change_id);
       applyingChangeIds.value = next;
     }
+  }
+
+  if (event.type === 'ChangeSummarized' && event.change_id && event.summary) {
+    applyChangeSummarized(event.change_id, event.summary, event.description ?? '');
   }
 
   // Track change_id as "applying" when merge conflict resolution starts.

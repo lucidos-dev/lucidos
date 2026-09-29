@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 mod control;
 mod merge_session;
+mod model_discovery;
 mod spawn;
 
 /// Look up a repo's cached CC commands by its on-disk path.

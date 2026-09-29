@@ -96,11 +96,6 @@
     display: contents;
 }
 
-/* Reduced motion: disable non-essential transitions globally */
-@keyframes spin {
-    to { transform: rotate(360deg); }
-}
-
 /* AI running-text shimmer — the standard "actively working" affordance: a
  * highlight band sweeps across the text itself (clipped to the glyphs) instead
  * of a separate spinner. Applied to text that should read as "live" — the
@@ -152,21 +147,6 @@
     color: var(--text-primary);
 }
 
-/* Mini spinner — small inline spinning ring for "in progress" indicators */
-.mini-spinner {
-    --spinner-color: var(--text-secondary);
-    display: inline-block;
-    width: 0.75rem;
-    height: 0.75rem;
-    animation: spin 1.2s linear infinite;
-    vertical-align: middle;
-    flex-shrink: 0;
-    border: var(--spinner-weight) solid var(--spinner-color);
-    border-top-color: transparent;
-    border-radius: 50%;
-    box-sizing: border-box;
-}
-
 :root[data-motion="reduce"] .list-row,
 :root[data-motion="reduce"] .list-row-add-card,
 :root[data-motion="reduce"] .action-btn,
@@ -178,10 +158,6 @@
 
 :root[data-motion="reduce"] .progress-bar-fill {
     transition: none;
-}
-
-:root[data-motion="reduce"] .mini-spinner {
-    animation: none;
 }
 
 /* Drop the sweep AND the text-clip so the glyphs fall back to a solid,

@@ -157,6 +157,22 @@ printf '%s\n' system-knowhow/a.md > "$TMP/paths"
 expect_has "engine-filtered carries filters" "-- -- always_loaded" \
     "$(HS_STUB_CMD='' hs_suite_command engine-filtered normal "$TMP/paths")"
 
+echo "every workspace crate's tests run in a suite"
+# `make lint` compiles every crate's tests and runs none, so each crate needs a
+# suite that runs them. Reads the real Makefile through `make -n`.
+REAL_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+suite_cmds="$(make -s -n -C "$REAL_ROOT" test 2> /dev/null)
+$(HS_STUB_CMD='' hs_suite_command app-lib normal /dev/null)
+$(HS_STUB_CMD='' hs_suite_command cli normal /dev/null)"
+while read -r crate; do
+    case "$crate" in
+        lucidos-engine) needle="test-engine.sh" ;;
+        lucidos-e2e) continue ;; # the e2e scripts run it against a live engine
+        *) needle="-p $crate" ;;
+    esac
+    expect_has "$crate is tested" "$needle" "$suite_cmds"
+done < <(sed -n '/^members = \[/,/^\]/p' "$REAL_ROOT/Cargo.toml" | grep -o 'crates/[a-z0-9-]*' | sed 's|crates/||')
+
 # ---------------------------------------------------------------- fixture repo
 
 REPO="$TMP/repo"

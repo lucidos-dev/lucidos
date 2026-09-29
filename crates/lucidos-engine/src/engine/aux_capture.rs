@@ -263,6 +263,8 @@ mod tests {
             ContextPurpose::IntentLoop,
             ContextPurpose::MemoryCorrection,
             ContextPurpose::ArtifactSummary,
+            ContextPurpose::SideQuestion,
+            ContextPurpose::ChangeSummary,
         ] {
             let event = auxiliary_capture(purpose, "gemini-3-flash-preview", 100, None, false);
             let (producer, stamped) = capture_fields(&event);

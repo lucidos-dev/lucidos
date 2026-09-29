@@ -13,6 +13,7 @@ use crate::engine::git_ops::{
 use crate::engine::thread_events::{EventChannel, SessionEndReason};
 use crate::engine::{AgentSession, AgentUserInput, LucidosEngine, ProcessResult, StopReason};
 use crate::runtime::{AgentEvent, AgentInput, CodingAgent};
+use futures::StreamExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -29,9 +30,14 @@ use crate::engine::agent_session::lifecycle::{
     WATCHDOG_TICK_INTERVAL_SECS,
 };
 use crate::engine::agent_session::resume::{
-    change_description_fallback, default_claude_config_dir, resolve_resume_context,
+    change_description_fallback, default_claude_config_dir, live_claude_config_dir,
+    resolve_resume_context,
 };
 use crate::engine::agent_session::spawn::spawn_or_resume;
+use crate::engine::agent_session::withdraw::{
+    begin_withdraw, finish_withdraw, settle_answered_withdraws, PendingWithdraws,
+    WithdrawInputRequest,
+};
 
 /// Decrement the paired-tool counter, flooring at 0. An unpaired decrement going
 /// negative would permanently disarm the hang watchdog, since `watchdog_gate`
@@ -95,6 +101,29 @@ fn drain_startup_failure_reason(
         killed_by_signal
             .then(|| "coding agent process was killed by a signal during startup".to_string())
     })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum StartupFailure {
+    /// Claude Code refused the `--resume` because the session is gone. The run
+    /// loop recovers the same refusal when it lands after the first prompt, so
+    /// both routes end in one fresh-session retry.
+    StaleResume,
+    Failed(String),
+}
+
+fn classify_startup_failure(resumed: bool, cause: Option<String>) -> StartupFailure {
+    match cause {
+        Some(c) if resumed && is_definitive_session_not_found(Some(&c)) => {
+            StartupFailure::StaleResume
+        }
+        Some(c) => StartupFailure::Failed(format!(
+            "Coding agent exited during startup before the first prompt could be sent: {c}"
+        )),
+        None => StartupFailure::Failed(
+            "Coding agent exited during startup before the first prompt could be sent".to_string(),
+        ),
+    }
 }
 
 /// Where a Lucidos-**source** session roots when no `Lucidos` repository row
@@ -346,7 +375,7 @@ impl LucidosEngine {
         // another provider. It also scopes the auto-detected resume session id
         // to this account. Read before the debounce stamp, so a failed read
         // never makes the user's resend look like a double submit.
-        let pinned_config_dir =
+        let recorded_pin =
             crate::engine::agent_session::lookup_pinned_cc_config_dir(self.pool(), thread_id)
                 .await?;
 
@@ -380,7 +409,7 @@ impl LucidosEngine {
                     self.changes(),
                     thread_id,
                     resume_session_id,
-                    pinned_config_dir.as_deref(),
+                    recorded_pin.as_ref().map(|pin| pin.dir.as_str()),
                 )
                 .await
             } else {
@@ -539,39 +568,10 @@ impl LucidosEngine {
         // can see what was discussed/done previously.
         let system_prompt = {
             let thread_messages = self.event_store.get_thread_messages(&thread_id_str).await?;
-            if thread_messages.is_empty() {
-                system_prompt
-            } else {
-                let mut history = String::from("\n\nTHREAD HISTORY: This session continues an existing thread. Here is the conversation so far:\n\n");
-                for msg in &thread_messages {
-                    let content = msg.content.trim();
-                    if content.is_empty() {
-                        continue;
-                    }
-                    let label = match msg.role.as_str() {
-                        "user" => "User",
-                        "assistant" if msg.channel.as_deref() == Some("claude_code") => {
-                            "Coding agent"
-                        }
-                        "assistant" => "Assistant",
-                        other => other,
-                    };
-                    // Truncate very long messages to keep the prompt reasonable
-                    let truncated = if content.len() > 2000 {
-                        let end = content.floor_char_boundary(2000);
-                        format!(
-                            "{}…\n[truncated, {} chars total]",
-                            &content[..end],
-                            content.len()
-                        )
-                    } else {
-                        content.to_string()
-                    };
-                    history.push_str(&format!("**{}:** {}\n\n", label, truncated));
-                }
-                history.push_str("---\nEnd of thread history. The user's new message follows.\n");
-                format!("{}{}", system_prompt, history)
-            }
+            let lines = thread_messages
+                .iter()
+                .map(|m| (m.role.as_str(), m.channel.as_deref(), m.content.as_str()));
+            format!("{}{}", system_prompt, thread_history_block(lines))
         };
 
         // Resolve model/effort BEFORE spawning: explicit param > active session > thread events.
@@ -622,33 +622,22 @@ impl LucidosEngine {
         // first in `apply_lucidos_env`, so engine-owned vars still win.
         let user_env_vars =
             crate::core::EnvironmentVariableStore::spawn_pairs(&self.pool, "AgentSession").await;
-        // Resolve the CLAUDE_CONFIG_DIR (provider/account) this session runs under.
-        // A CC session's transcript lives at
-        // `$CLAUDE_CONFIG_DIR/projects/<cwd>/<sid>.jsonl`, and the thread is PINNED
-        // to the account of its FIRST session (`pinned_config_dir`, resolved above).
-        //   * `inject_config_dir` is the engine-owned override, injected on EVERY
-        //     spawn of an existing thread. That is what guarantees a thread never
-        //     switches provider after turn 1: a live `CLAUDE_CONFIG_DIR` toggle is
-        //     ignored for any thread that already has a pin. It is `None` only for
-        //     the truly-first turn, which reads the live env and sets the pin.
-        //     Injecting on resume also keeps `--resume` pointed at the dir CC
-        //     wrote the transcript to.
-        //   * `effective_config_dir` is the dir CC ACTUALLY runs under this spawn:
-        //     the injected pin, else the user's live value on turn 1, else CC's
-        //     default. Recorded at Init so the pin persists, including the case
-        //     where turn 1 ran on the default and the user set a dir later.
-        let inject_config_dir = pinned_config_dir.clone();
-        let effective_config_dir = inject_config_dir.clone().or_else(|| {
-            // Match CC's precedence for a fresh session, so the recorded dir
-            // never diverges from where CC writes the transcript. The
-            // user-managed env var wins, then what CC inherits from the
-            // engine's own env, then CC's default.
-            user_env_vars
-                .iter()
-                .find(|(k, _)| k == "CLAUDE_CONFIG_DIR")
-                .map(|(_, v)| v.clone())
-                .or_else(|| crate::core::inherited_env_var("CLAUDE_CONFIG_DIR"))
-                .or_else(default_claude_config_dir)
+        // The account pin this session runs under. A CC session's transcript
+        // lives at `$CLAUDE_CONFIG_DIR/projects/<cwd>/<sid>.jsonl`, and the
+        // thread is pinned to the profile of its FIRST session.
+        //   * `injected_pin` is replayed on EVERY spawn of an existing thread,
+        //     so a live `CLAUDE_CONFIG_DIR` toggle never moves it to another
+        //     account. `None` only on the first turn, which sets the pin.
+        //   * `effective_pin` is what CC ACTUALLY runs under this spawn, recorded
+        //     at Init: the replayed pin, else what turn 1 inherits.
+        let injected_pin = recorded_pin
+            .as_ref()
+            .map(|recorded| recorded.resolve(&user_env_vars));
+        let effective_pin = injected_pin.clone().or_else(|| {
+            crate::runtime::AccountPin::for_first_session(
+                live_claude_config_dir(&user_env_vars),
+                default_claude_config_dir(),
+            )
         });
         // CC's defaults, resolved as the spawned CC will resolve them. The
         // settings files are a CC-only fallback: their effort vocabulary must
@@ -657,7 +646,9 @@ impl LucidosEngine {
             crate::runtime::claude_code::CcSettingsScope {
                 env: &user_env_vars,
                 inherited: crate::core::inherited_env_var,
-                config_dir: effective_config_dir.as_deref().map(std::path::Path::new),
+                config_dir: effective_pin
+                    .as_ref()
+                    .map(|pin| std::path::Path::new(pin.dir())),
                 project_dir: &cwd,
             }
         });
@@ -706,6 +697,9 @@ impl LucidosEngine {
             }),
             crate::runtime::CodingAgent::Codex => None,
         };
+        if coding_agent == crate::runtime::CodingAgent::ClaudeCode {
+            self.remember_cc_system_prompt(thread_id, &system_prompt);
+        }
         let runtime = match spawn_or_resume(
             self,
             coding_agent,
@@ -725,10 +719,7 @@ impl LucidosEngine {
                 user_env_vars: &user_env_vars,
                 binary_override: binary_override.as_deref(),
                 permission_mode: permission_mode.as_deref(),
-                // Override CLAUDE_CONFIG_DIR only on an actual resume (see
-                // `inject_config_dir` above); a fresh session passes None so its
-                // env / CC default is untouched.
-                claude_config_dir: inject_config_dir.as_deref(),
+                account_pin: injected_pin.as_ref(),
             },
             agent_cancel.clone(),
         )
@@ -761,7 +752,7 @@ impl LucidosEngine {
             mut events_rx,
             input_tx: agent_input_tx,
             control_tx: agent_control_tx,
-            side_question_tx: agent_side_question_tx,
+            withdraw_tx: agent_withdraw_tx,
             kind: _,
             // In-band approval requests (Codex app-server). `None` for CC and
             // the Codex exec escape hatch, where the matching select arm below
@@ -815,6 +806,7 @@ impl LucidosEngine {
                 &final_text,
             ),
             images,
+            uuid: Uuid::new_v4(),
         };
         // The first prompt is the first owed input.
         let mut inputs = InputLedger::new();
@@ -840,20 +832,49 @@ impl LucidosEngine {
             // flushed onto `events_rx`. A bare "channel closed" hides what
             // actually failed.
             let cause = drain_startup_failure_reason(&mut events_rx);
-            return Err(match cause {
-                Some(c) => format!(
-                    "Coding agent exited during startup before the first prompt could be sent: {c}"
-                ),
-                None => "Coding agent exited during startup before the first prompt could be sent"
-                    .to_string(),
-            }
-            .into());
+            return Err(
+                match classify_startup_failure(resume_session_id.is_some(), cause) {
+                    StartupFailure::Failed(e) => e,
+                    StartupFailure::StaleResume => {
+                        log!(
+                            "[AgentSession] thread {} could not resume sid={}: the coding agent has no such session. Retrying with a fresh one.",
+                            thread_id,
+                            resume_session_id.as_deref().unwrap_or("")
+                        );
+                        // Same contract as the run loop's stale-resume arm:
+                        // shadow the dead id so the retry cannot pick it
+                        // again, and release the debounce so the retry is not
+                        // refused as a duplicate. The driver already exited,
+                        // so there is no process group to wait for.
+                        self.event_bus
+                            .emit_or_log(
+                                crate::engine::event_bus::BusEvent::Thread {
+                                    thread_id,
+                                    event: crate::engine::thread_events::ThreadEvent::SessionEnded {
+                                        reason: SessionEndReason::StaleResume,
+                                    },
+                                    meta: meta.clone(),
+                                },
+                                "[AgentSession] SessionEnded (stale resume at startup)",
+                            )
+                            .await;
+                        self.clear_spawn_debounce(thread_id);
+                        STALE_RESUME_ERROR.to_string()
+                    }
+                }
+                .into(),
+            );
         }
 
         let mut startup_permit = Some(startup_permit);
 
         // Create channel for user follow-up messages and register the session
         let (msg_tx, mut msg_rx) = tokio::sync::mpsc::unbounded_channel::<AgentUserInput>();
+        let (withdraw_tx, mut withdraw_rx) =
+            tokio::sync::mpsc::unbounded_channel::<WithdrawInputRequest>();
+        let mut pending_withdraws = PendingWithdraws::new();
+        // Withdraws for follow-ups still in `msg_rx`, answered once forwarded.
+        let mut withdraws_awaiting_forward: Vec<WithdrawInputRequest> = Vec::new();
         let stop = Arc::new(tokio::sync::Notify::new());
         let interrupt = Arc::new(tokio::sync::Notify::new());
         let idle_notify = Arc::new(tokio::sync::Notify::new());
@@ -896,7 +917,8 @@ impl LucidosEngine {
                 external_terminal_emitted: external_terminal_emitted.clone(),
                 external_continuation_requested: external_continuation_requested.clone(),
                 control_tx: agent_control_tx.clone(),
-                side_question_tx: agent_side_question_tx,
+                withdraw_tx,
+                unforwarded_inputs: Default::default(),
                 builtin_commands: prev_builtin,
                 skill_commands: prev_skill,
                 current_model: normalized_model.clone(),
@@ -1008,6 +1030,7 @@ impl LucidosEngine {
                         // carrying it and the config dir.
                         cc_session_id: None,
                         claude_config_dir: None,
+                        claude_config_dir_explicit: None,
                     },
                     meta: meta.clone(),
                 })
@@ -1129,6 +1152,7 @@ impl LucidosEngine {
                         break;
                     };
                     silent_grace_at = None;
+                    settle_answered_withdraws(&self.event_bus, thread_id, &mut inputs, &mut pending_withdraws).await;
                     // Only a read that settles an owed input can start a turn. A
                     // stray replay with nothing owed settles nothing.
                     let read_owed_input = matches!(ev, AgentEvent::InputRead(_)) && inputs.owed() > 0;
@@ -1296,7 +1320,7 @@ impl LucidosEngine {
                     )
                     .await;
                     match ev {
-                        AgentEvent::Init { session_id: cc_sid, model: init_model, slash_commands: cmds, skills } => {
+                        AgentEvent::Init { session_id: cc_sid, model: init_model, slash_commands: cmds, skills, agent_version } => {
                             log!("[AgentSession] [TIMING] Init event received: {:?}", cc_start.elapsed());
                             // Record what the backend actually attached to before
                             // anything else: the stale-resume veto reads it.
@@ -1330,6 +1354,9 @@ impl LucidosEngine {
                                     None
                                 }
                             };
+                            if coding_agent == CodingAgent::ClaudeCode {
+                                self.refresh_cc_models_if_stale(agent_version.as_deref());
+                            }
                             // Update per-repo cache outside sessions lock to avoid nested locks
                             if let Some(info) = cache_update {
                                 let repo_key = repo_root.to_string_lossy().to_string();
@@ -1354,7 +1381,8 @@ impl LucidosEngine {
                                     // Pin the session-to-config-dir pairing at
                                     // Init. A later resume must re-inject this
                                     // dir to find the transcript.
-                                    claude_config_dir: effective_config_dir.clone(),
+                                    claude_config_dir: effective_pin.as_ref().map(|pin| pin.dir().to_string()),
+                                    claude_config_dir_explicit: effective_pin.as_ref().map(|pin| pin.is_explicit()),
                                 },
                                 meta: meta.clone(),
                             }).await {
@@ -2288,7 +2316,12 @@ impl LucidosEngine {
                     );
                     {
                         let mut sessions = self.agent_sessions.lock().await;
-                        if let Some(s) = sessions.get_mut(&thread_id) { s.is_waiting = false; }
+                        if let Some(s) = sessions.get_mut(&thread_id) {
+                            s.is_waiting = false;
+                            if let Some(id) = user_input.origin_event_id {
+                                s.unforwarded_inputs.remove(&id);
+                            }
+                        }
                     }
                     // Flush any pending reasoning before the new user input opens a
                     // fresh turn, then reset so the next turn's thinking starts clean.
@@ -2326,6 +2359,7 @@ impl LucidosEngine {
                     let agent_input = AgentInput {
                         text: agent_text,
                         images,
+                        uuid: Uuid::new_v4(),
                     };
                     // A child wake owes its `ChildThreadCompleted`, so its read
                     // can say it started a turn. Only an engine-made prompt
@@ -2334,6 +2368,15 @@ impl LucidosEngine {
                     if agent_input_tx.send(agent_input).is_err() {
                         log!("[AgentSession] Failed to forward user input to agent runtime — channel closed");
                         break;
+                    }
+                    if let Some(id) = user_input.origin_event_id {
+                        let (now_forwarded, still_waiting) = std::mem::take(&mut withdraws_awaiting_forward)
+                            .into_iter()
+                            .partition(|w| w.input_event_id == id);
+                        withdraws_awaiting_forward = still_waiting;
+                        for withdraw in now_forwarded {
+                            begin_withdraw(&inputs, agent_withdraw_tx.as_ref(), withdraw, &mut pending_withdraws);
+                        }
                     }
                     // `ReentryFromEngine` suppresses our emit, see `AgentInputKind`
                     // docs; the parent's `ChildThreadCompleted` is the start.
@@ -2351,6 +2394,26 @@ impl LucidosEngine {
                             meta: meta.clone(),
                         }, "[AgentSession] CodingAgentPromptSent").await;
                     }
+                }
+
+                Some(withdraw) = withdraw_rx.recv() => {
+                    // Read under the lock the chat fast path writes under, so
+                    // a follow-up still in `msg_rx` is never mistaken for read.
+                    let on_its_way = self
+                        .agent_sessions
+                        .lock()
+                        .await
+                        .get(&thread_id)
+                        .is_some_and(|s| s.unforwarded_inputs.contains(&withdraw.input_event_id));
+                    if on_its_way {
+                        withdraws_awaiting_forward.push(withdraw);
+                    } else {
+                        begin_withdraw(&inputs, agent_withdraw_tx.as_ref(), withdraw, &mut pending_withdraws);
+                    }
+                }
+
+                Some(answered) = pending_withdraws.next() => {
+                    finish_withdraw(&self.event_bus, thread_id, &mut inputs, answered).await;
                 }
 
                 _ = interrupt.notified() => {
@@ -2767,6 +2830,114 @@ pub(super) async fn build_resume_prompt_text(
     format!("{block}\n{RESUME_NOTE_REFERENT_GUARD}\n\n{user_message}")
 }
 
+/// Longest a message may run inside the thread-history block.
+const HISTORY_MESSAGE_MAX_BYTES: usize = 2000;
+
+/// Budget for the whole thread-history block. It rides in one argv string
+/// with the system prompt, and Linux refuses to exec any single argument over
+/// 128 KiB. History only grows, so an uncapped block kills the thread for good.
+const HISTORY_BLOCK_MAX_BYTES: usize = 48 * 1024;
+
+/// The thread history a new coding-agent session sees, from `(role, channel,
+/// content)` lines. The newest messages are kept when the whole thread
+/// exceeds [`HISTORY_BLOCK_MAX_BYTES`]. Empty when no message has content.
+fn thread_history_block<'a>(
+    messages: impl IntoIterator<Item = (&'a str, Option<&'a str>, &'a str)>,
+) -> String {
+    let entries: Vec<String> = messages
+        .into_iter()
+        .filter_map(|(role, channel, content)| {
+            let content = content.trim();
+            if content.is_empty() {
+                return None;
+            }
+            let label = match role {
+                "user" => "User",
+                "assistant" if channel == Some("claude_code") => "Coding agent",
+                "assistant" => "Assistant",
+                other => other,
+            };
+            let body = if content.len() > HISTORY_MESSAGE_MAX_BYTES {
+                let end = content.floor_char_boundary(HISTORY_MESSAGE_MAX_BYTES);
+                format!(
+                    "{}…\n[truncated, {} chars total]",
+                    &content[..end],
+                    content.len()
+                )
+            } else {
+                content.to_string()
+            };
+            Some(format!("**{}:** {}\n\n", label, body))
+        })
+        .collect();
+    if entries.is_empty() {
+        return String::new();
+    }
+    let mut kept_bytes = 0;
+    let kept = entries
+        .iter()
+        .rev()
+        .take_while(|entry| {
+            kept_bytes += entry.len();
+            kept_bytes <= HISTORY_BLOCK_MAX_BYTES
+        })
+        .count();
+    let omitted = entries.len() - kept;
+    let mut history = String::from(
+        "\n\nTHREAD HISTORY: This session continues an existing thread. Here is the conversation so far:\n\n",
+    );
+    if omitted > 0 {
+        history.push_str(&format!("[{omitted} earlier messages omitted]\n\n"));
+    }
+    for entry in &entries[omitted..] {
+        history.push_str(entry);
+    }
+    history.push_str("---\nEnd of thread history. The user's new message follows.\n");
+    history
+}
+
+#[cfg(test)]
+mod thread_history_block_tests {
+    use super::*;
+
+    /// A long thread fit in one argv string only until it outgrew 128 KiB,
+    /// and then every later spawn failed with E2BIG. The block stays under
+    /// budget and keeps the newest messages.
+    #[test]
+    fn a_long_thread_keeps_the_newest_messages_within_budget() {
+        let contents: Vec<String> = (0..400)
+            .map(|i| format!("message {i:03} {}", "x".repeat(1500)))
+            .collect();
+        let block = thread_history_block(contents.iter().map(|c| ("user", None, c.as_str())));
+        assert!(
+            block.len() < HISTORY_BLOCK_MAX_BYTES + 1024,
+            "{} bytes",
+            block.len()
+        );
+        assert!(
+            block.contains("message 399"),
+            "the newest message was dropped"
+        );
+        assert!(
+            !block.contains("message 000"),
+            "the oldest message survived"
+        );
+        assert!(block.contains("earlier messages omitted"));
+    }
+
+    #[test]
+    fn a_short_thread_is_kept_whole() {
+        let block = thread_history_block([
+            ("user", None, "hello"),
+            ("assistant", Some("claude_code"), "hi there"),
+        ]);
+        assert!(block.contains("**User:** hello"));
+        assert!(block.contains("**Coding agent:** hi there"));
+        assert!(!block.contains("omitted"));
+        assert_eq!(thread_history_block([("user", None, "  ")]), "");
+    }
+}
+
 #[cfg(test)]
 mod unregistered_lucidos_root_tests {
     use super::*;
@@ -2868,6 +3039,36 @@ mod startup_failure_tests {
         drop(tx);
 
         assert_eq!(drain_startup_failure_reason(&mut rx), None);
+    }
+
+    const NOT_FOUND: &str = "No conversation found with session ID: 2f27ec90";
+
+    #[test]
+    fn a_refused_resume_is_a_stale_resume() {
+        assert_eq!(
+            classify_startup_failure(true, Some(NOT_FOUND.to_string())),
+            StartupFailure::StaleResume
+        );
+    }
+
+    #[test]
+    fn the_same_text_on_a_fresh_spawn_is_a_plain_failure() {
+        assert!(matches!(
+            classify_startup_failure(false, Some(NOT_FOUND.to_string())),
+            StartupFailure::Failed(e) if e.ends_with(NOT_FOUND)
+        ));
+    }
+
+    #[test]
+    fn any_other_resume_failure_stays_a_plain_failure() {
+        assert!(matches!(
+            classify_startup_failure(true, Some("API Error: 529 overloaded".to_string())),
+            StartupFailure::Failed(_)
+        ));
+        assert!(matches!(
+            classify_startup_failure(true, None),
+            StartupFailure::Failed(_)
+        ));
     }
 }
 

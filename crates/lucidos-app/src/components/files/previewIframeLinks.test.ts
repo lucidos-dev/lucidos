@@ -45,7 +45,6 @@ const {
   classifyPreviewLink,
   resolvePreviewRelativePath,
   handlePreviewLinkClick,
-  bridgePreviewIframeLinks,
   previewBaseHref,
   withPreviewBase,
   withPreviewSizing,
@@ -320,41 +319,8 @@ describe('resolvePreviewRelativePath', () => {
 });
 
 // ---------------------------------------------------------------------------
-// The DOM bridge
+// Markdown preview clicks (rendered in the host document)
 // ---------------------------------------------------------------------------
-
-/** A preview iframe's same-origin `contentDocument`, faked for the node test env
- *  (no jsdom): records click listeners, resolves fragment targets, and records
- *  what got scrolled. */
-function fakeContentDoc(ids: string[] = []) {
-  const handlers: { fn: (e: unknown) => void; capture: boolean }[] = [];
-  const scrolled: string[] = [];
-  let scrolledToTop = false;
-  return {
-    addEventListener: (type: string, fn: (e: unknown) => void, capture?: boolean) => {
-      if (type === 'click') handlers.push({ fn, capture: capture === true });
-    },
-    removeEventListener: () => {},
-    /** Resolves the `[id="…"]` / `[name="…"]` selectors the bridge builds. */
-    querySelector: (selector: string) => {
-      const m = /^\[(?:id|name)="(.*)"\]$/.exec(selector);
-      const id = m?.[1].replace(/\\(["\\])/g, '$1');
-      return id !== undefined && ids.includes(id)
-        ? ({ scrollIntoView: () => { scrolled.push(id); } } as unknown as HTMLElement)
-        : null;
-    },
-    defaultView: { scrollTo: () => { scrolledToTop = true; } },
-    /** test-only */
-    listenerCount: () => handlers.length,
-    allCapture: () => handlers.every((h) => h.capture),
-    scrolledIds: () => scrolled,
-    didScrollToTop: () => scrolledToTop,
-  };
-}
-type FakeDoc = ReturnType<typeof fakeContentDoc>;
-const iframeWith = (doc: FakeDoc | null) =>
-  ({ contentDocument: doc } as unknown as HTMLIFrameElement);
-const BRIDGE_OPTS = { artifactPath: 'artifacts/reports/pr-1573.html', declaresOwnBase: false };
 
 /** A click whose target resolves to an anchor with `href`. `href: null` models a
  *  click that hit no anchor at all; `attrs` adds the `data-thread-*` pair the
@@ -386,193 +352,20 @@ function clickOn(
   return e;
 }
 
-/** Run the bridge's click handling against a fake preview document, as the
- *  srcdoc iframe does (fragments claimed). */
-function click(
-  doc: FakeDoc,
+function clickInMarkdown(
   href: string | null,
-  artifactPath = 'artifacts/x.html',
-  extra: { attrs?: Record<string, string>; modifiers?: Parameters<typeof clickOn>[2]; documentBase?: string } = {},
+  artifactPath = 'artifacts/x.md',
+  extra: { attrs?: Record<string, string>; modifiers?: Parameters<typeof clickOn>[2] } = {},
 ) {
   const e = clickOn(href, extra.attrs, extra.modifiers);
-  handlePreviewLinkClick(e as unknown as MouseEvent, {
-    doc: doc as unknown as Document,
-    artifactPath,
-    documentBase: extra.documentBase,
-    claimFragments: true,
-  });
+  handlePreviewLinkClick(e as unknown as MouseEvent, artifactPath);
   return e;
 }
 
-/** Same, as the host-rendered markdown preview does (fragments left to the
- *  browser, since they are an ordinary same-document hash change there). */
-function clickInMarkdown(doc: FakeDoc, href: string | null, artifactPath = 'artifacts/x.md') {
-  const e = clickOn(href);
-  handlePreviewLinkClick(e as unknown as MouseEvent, {
-    doc: doc as unknown as Document,
-    artifactPath,
-    claimFragments: false,
-  });
-  return e;
-}
-
-describe('bridgePreviewIframeLinks', () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-    mocks.workspaceId = 'myws';
-    vi.stubGlobal('location', { origin: 'https://localhost:5251', pathname: '/myws/' });
-  });
-  afterEach(() => {
-    vi.unstubAllGlobals();
-  });
-
-  it('registers a single capture-phase click listener on the preview document', () => {
-    const doc = fakeContentDoc();
-    bridgePreviewIframeLinks(iframeWith(doc), BRIDGE_OPTS);
-    expect(doc.listenerCount()).toBe(1);
-    expect(doc.allCapture()).toBe(true);
-  });
-
-  it('attaches once per document, so a second bridge call does not stack listeners', () => {
-    const doc = fakeContentDoc();
-    bridgePreviewIframeLinks(iframeWith(doc), BRIDGE_OPTS);
-    bridgePreviewIframeLinks(iframeWith(doc), BRIDGE_OPTS);
-    expect(doc.listenerCount()).toBe(1);
-  });
-
-  it('no-ops on a cross-origin preview (contentDocument access throws)', () => {
-    const crossOrigin = {
-      get contentDocument(): Document {
-        throw new Error('cross-origin');
-      },
-    } as unknown as HTMLIFrameElement;
-    expect(() => bridgePreviewIframeLinks(crossOrigin, BRIDGE_OPTS)).not.toThrow();
-  });
-
-  it('no-ops on a null iframe', () => {
-    expect(() => bridgePreviewIframeLinks(null, BRIDGE_OPTS)).not.toThrow();
-  });
-
-  it('scrolls in-document for a fragment click and never navigates', () => {
-    const doc = fakeContentDoc(['section-two']);
-    const e = click(doc, '#section-two');
-    expect(e.defaultPrevented).toBe(true);
-    expect(doc.scrolledIds()).toEqual(['section-two']);
-    expect(mocks.openUrl).not.toHaveBeenCalled();
-    expect(mocks.openFilePreview).not.toHaveBeenCalled();
-  });
-
-  it('scrolls to the top for a bare `#`', () => {
-    const doc = fakeContentDoc();
-    expect(click(doc, '#').defaultPrevented).toBe(true);
-    expect(doc.didScrollToTop()).toBe(true);
-  });
-
-  it('reports a fragment the document does not contain instead of failing silently', () => {
-    const doc = fakeContentDoc();
-    const e = click(doc, '#nope');
-    expect(e.defaultPrevented).toBe(true); // still suppressed: navigating loads the app shell
-    expect(mocks.showToast).toHaveBeenCalledTimes(1);
-    expect(mocks.showToast.mock.calls[0][0]).toContain('nope');
-  });
-
-  it('routes a thread link through the host router', () => {
-    const e = click(fakeContentDoc(), `thread:dev/${TID}`);
-    expect(e.defaultPrevented).toBe(true);
-    expect(mocks.openThreadAcrossWorkspaces).toHaveBeenCalledWith('dev', TID);
-  });
-
-  it('routes a sibling file through openFilePreview, which is what gives it a nav-history entry', () => {
-    const e = click(fakeContentDoc(), 'pr-1573.md', 'artifacts/reports/pr-1573.html');
-    expect(e.defaultPrevented).toBe(true);
-    expect(mocks.openFilePreview).toHaveBeenCalledWith('artifacts/reports/pr-1573.md');
-  });
-
-  it('opens an external link in a new tab', () => {
-    const e = click(fakeContentDoc(), 'https://example.com/docs');
-    expect(e.defaultPrevented).toBe(true);
-    expect(mocks.openUrl).toHaveBeenCalledWith('https://example.com/docs');
-  });
-
-  // The whole point of the repo arm: a citation written in an artifact lands on
-  // the cited line, through the same navigate router the SDK call reaches.
-  it('routes a repo citation through the navigate router, lines and all', () => {
-    const e = click(fakeContentDoc(), 'repo:repo-1:file:src/main.rs#L510-L520');
-    expect(e.defaultPrevented).toBe(true);
-    expect(mocks.handleNavigationRequest).toHaveBeenCalledWith(
-      { target: 'file', file_path: 'repo:repo-1:file:src/main.rs', line: 510, line_end: 520 },
-      { source: 'a file preview' },
-    );
-    expect(mocks.openFilePreview).not.toHaveBeenCalled();
-  });
-
-  it('leaves an unclaimed href and a non-anchor click completely alone', () => {
-    const doc = fakeContentDoc();
-    expect(click(doc, 'mailto:someone@example.com').defaultPrevented).toBe(false);
-    expect(click(doc, null).defaultPrevented).toBe(false);
-  });
-
-  it('hands a modified or non-primary click back to the browser', () => {
-    // Command/ctrl/shift-click and a middle click all mean "browser, you take
-    // this". Intercepting them would break the one behavior every link has.
-    const doc = fakeContentDoc(['x']);
-    for (const modifiers of [
-      { metaKey: true },
-      { ctrlKey: true },
-      { shiftKey: true },
-      { altKey: true },
-      { button: 1 },
-    ]) {
-      expect(click(doc, 'pr-1573.md', 'artifacts/reports/pr.html', { modifiers }).defaultPrevented).toBe(false);
-    }
-    expect(mocks.openFilePreview).not.toHaveBeenCalled();
-  });
-
-  it('leaves a download link to the browser', () => {
-    const e = click(fakeContentDoc(), 'report.csv', 'artifacts/reports/pr.html', {
-      attrs: { download: '' },
-    });
-    expect(e.defaultPrevented).toBe(false);
-    expect(mocks.openFilePreview).not.toHaveBeenCalled();
-  });
-
-  it('resolves a relative link against a base the artifact declared itself', () => {
-    // `withPreviewBase` leaves an artifact-declared <base> alone, so the routing
-    // has to honour it too: this is an external page, not a workspace file.
-    const e = click(fakeContentDoc(), 'guide.html', 'artifacts/reports/pr.html', {
-      documentBase: 'https://example.com/docs/',
-    });
-    expect(e.defaultPrevented).toBe(true);
-    expect(mocks.openUrl).toHaveBeenCalledWith('https://example.com/docs/guide.html');
-    expect(mocks.openFilePreview).not.toHaveBeenCalled();
-  });
-
-  it('maps a declared base that points back into the workspace data mount to a file', () => {
-    const e = click(fakeContentDoc(), 'guide.md', 'artifacts/reports/pr.html', {
-      documentBase: 'https://localhost:5251/myws/data/artifacts/manuals/',
-    });
-    expect(e.defaultPrevented).toBe(true);
-    expect(mocks.openFilePreview).toHaveBeenCalledWith('artifacts/manuals/guide.md');
-  });
-
-  it('respects a click another handler already claimed', () => {
-    const doc = fakeContentDoc(['x']);
-    const e = clickOn('#x');
-    e.defaultPrevented = true;
-    handlePreviewLinkClick(e as unknown as MouseEvent, {
-      doc: doc as unknown as Document,
-      artifactPath: 'artifacts/x.html',
-      claimFragments: true,
-    });
-    expect(doc.scrolledIds()).toEqual([]);
-  });
-});
-
-// A markdown artifact renders into the HOST document, so its relative links
-// resolve against the engine-stamped `<base href="/<slug>/">` and reload the
-// whole workspace through the SPA fallback. Same routing, one difference:
-// fragments there are a harmless same-document hash change, so they stay with
-// the browser.
+// A markdown artifact renders into the HOST document. So its relative links
+// resolve against the engine-stamped `<base href="/<slug>/">`, and would reload
+// the whole workspace through the SPA fallback. Fragments there are a harmless
+// same-document hash change, so they stay with the browser.
 describe('markdown preview links (rendered in the host document)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -584,39 +377,67 @@ describe('markdown preview links (rendered in the host document)', () => {
   });
 
   it('routes a sibling link through the file preview instead of reloading the workspace', () => {
-    const e = clickInMarkdown(fakeContentDoc(), 'notes.md', 'artifacts/reports/pr-1573.md');
+    const e = clickInMarkdown('notes.md', 'artifacts/reports/pr-1573.md');
     expect(e.defaultPrevented).toBe(true);
     expect(mocks.openFilePreview).toHaveBeenCalledWith('artifacts/reports/notes.md');
   });
 
   it('routes a thread link', () => {
-    const e = clickInMarkdown(fakeContentDoc(), `thread:other-ws/${TID}`);
+    const e = clickInMarkdown(`thread:other-ws/${TID}`);
     expect(e.defaultPrevented).toBe(true);
     expect(mocks.openThreadAcrossWorkspaces).toHaveBeenCalledWith('other-ws', TID);
+  });
+
+  it('routes a repo citation through the navigate router, lines and all', () => {
+    const e = clickInMarkdown('repo:repo-1:file:src/main.rs#L510-L520');
+    expect(e.defaultPrevented).toBe(true);
+    expect(mocks.handleNavigationRequest).toHaveBeenCalledWith(
+      { target: 'file', file_path: 'repo:repo-1:file:src/main.rs', line: 510, line_end: 520 },
+      { source: 'a file preview' },
+    );
   });
 
   it('prefers a resolved thread link\'s data attributes over its slug-bearing href', () => {
     // The href carries the workspace SLUG; `data-thread-workspace` carries the
     // NAME the ref was written with, which is what the router compares against.
-    const e = clickOn(`https://localhost:5251/my-workspace/#thread=${TID}`, {
-      'data-thread-id': TID,
-      'data-thread-workspace': 'My Workspace',
-    });
-    handlePreviewLinkClick(e as unknown as MouseEvent, {
-      doc: fakeContentDoc() as unknown as Document,
-      artifactPath: 'artifacts/x.md',
-      claimFragments: false,
+    const e = clickInMarkdown(`https://localhost:5251/my-workspace/#thread=${TID}`, 'artifacts/x.md', {
+      attrs: { 'data-thread-id': TID, 'data-thread-workspace': 'My Workspace' },
     });
     expect(e.defaultPrevented).toBe(true);
     expect(mocks.openThreadAcrossWorkspaces).toHaveBeenCalledWith('My Workspace', TID);
   });
 
   it('leaves an in-page fragment to the browser', () => {
-    const doc = fakeContentDoc(['section-two']);
-    const e = clickInMarkdown(doc, '#section-two');
+    const e = clickInMarkdown('#section-two');
     expect(e.defaultPrevented).toBe(false);
-    expect(doc.scrolledIds()).toEqual([]);
     expect(mocks.showToast).not.toHaveBeenCalled();
+  });
+
+  it('leaves an unclaimed href and a non-anchor click completely alone', () => {
+    expect(clickInMarkdown('mailto:someone@example.com').defaultPrevented).toBe(false);
+    expect(clickInMarkdown(null).defaultPrevented).toBe(false);
+  });
+
+  it('hands a modified or non-primary click, or a download, back to the browser', () => {
+    for (const modifiers of [
+      { metaKey: true },
+      { ctrlKey: true },
+      { shiftKey: true },
+      { altKey: true },
+      { button: 1 },
+    ]) {
+      expect(clickInMarkdown('notes.md', 'artifacts/x.md', { modifiers }).defaultPrevented).toBe(false);
+    }
+    expect(clickInMarkdown('report.csv', 'artifacts/x.md', { attrs: { download: '' } }).defaultPrevented)
+      .toBe(false);
+    expect(mocks.openFilePreview).not.toHaveBeenCalled();
+  });
+
+  it('respects a click another handler already claimed', () => {
+    const e = clickOn('notes.md');
+    e.defaultPrevented = true;
+    handlePreviewLinkClick(e as unknown as MouseEvent, 'artifacts/x.md');
+    expect(mocks.openFilePreview).not.toHaveBeenCalled();
   });
 });
 

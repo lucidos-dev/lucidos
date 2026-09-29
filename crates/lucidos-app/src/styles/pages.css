@@ -681,26 +681,6 @@
     min-width: 0;
 }
 
-.app-marketplace-chip {
-    flex: 0 0 auto;
-    padding: 0.0625rem 0.375rem;
-    border-radius: var(--radius-round);
-    background: var(--bg-tertiary);
-    color: var(--text-secondary);
-    font-size: var(--font-size-xs);
-    font-weight: 600;
-}
-
-.app-update-chip {
-    flex: 0 0 auto;
-    padding: 0.0625rem 0.375rem;
-    border-radius: var(--radius-round);
-    color: var(--accent);
-    border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--border-color));
-    font-size: var(--font-size-xs);
-    font-weight: 700;
-}
-
 /* ===== Store tab (plugin catalog) + Marketplaces settings ===== */
 
 .app-store-marketplace-form {
@@ -966,19 +946,11 @@
     font-size: var(--font-size-2xs);
 }
 
-.app-store-content-chip,
-.app-store-category-chip {
-    padding: 0.0625rem 0.375rem;
-    border-radius: calc(var(--radius-control) * 0.5);
-    background: var(--bg-tertiary);
-    color: var(--text-secondary);
-}
 
-/* A filter pill bar above the catalog list. Categories are the only pills: a
-   category vocabulary is short and controlled, where marketplace names are
-   arbitrary repo names and take the dropdown in the filter bar instead. The name
-   stays filter-wide rather than category-specific, so a second pill bar would
-   reuse it rather than fork the style.
+/* The catalog's category filter: the shared .pill-bar, laid out for this list.
+   Categories are the only pills: a category vocabulary is short and
+   controlled, where marketplace names are arbitrary repo names and take the
+   dropdown in the filter bar instead.
 
    On touch, one line that scrolls sideways under a swipe, so the bar never
    grows taller than a pill. Its padding carries the --space-lg gutter, and the
@@ -988,20 +960,12 @@
    focus ring. A mouse wheel cannot scroll a line sideways, so a fine pointer
    gets the wrapping bar below instead. */
 .app-store-filter-pills {
-    display: flex;
-    gap: 0.375rem;
-    overflow-x: auto;
-    scrollbar-width: none;
     scroll-padding-inline: var(--space-lg);
     padding: 0.1875rem var(--space-lg) var(--space-sm);
     -webkit-mask: linear-gradient(to right, transparent, #000 var(--space-lg),
         #000 calc(100% - var(--space-lg)), transparent);
     mask: linear-gradient(to right, transparent, #000 var(--space-lg),
         #000 calc(100% - var(--space-lg)), transparent);
-}
-
-.app-store-filter-pills::-webkit-scrollbar {
-    display: none;
 }
 
 @media (hover: hover) and (pointer: fine) {
@@ -1011,37 +975,6 @@
         -webkit-mask: none;
         mask: none;
     }
-}
-
-.app-store-filter-pill {
-    flex: 0 0 auto;
-    padding: 0.3125rem 0.75rem;
-    border: none;
-    border-radius: var(--radius-round);
-    background: var(--bg-tertiary);
-    color: var(--text-secondary);
-    font-family: var(--font-ui);
-    font-size: var(--font-size-xs);
-    font-weight: 500;
-    white-space: nowrap;
-    cursor: pointer;
-    transition: background-color var(--duration-fast), color var(--duration-fast);
-}
-
-@media (hover: hover) {
-    .app-store-filter-pill:hover {
-        color: var(--text-primary);
-    }
-}
-
-.app-store-filter-pill.active {
-    background: var(--text-primary);
-    color: var(--bg-primary);
-}
-
-.app-store-filter-pill:focus-visible {
-    outline: 0.125rem solid transparent;
-    box-shadow: var(--focus-ring);
 }
 
 /* A plugin row deep-link (navigate_ui target `plugins`) scrolls to the row and

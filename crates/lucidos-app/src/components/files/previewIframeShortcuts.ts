@@ -1,18 +1,17 @@
-// Bridge the app shell's keyboard shortcuts into content-pane PREVIEW iframes
-// (file / HTML / diff / PDF previews). These iframes don't load the Lucidos SDK,
-// so — unlike app iframes (`AppUiInline` + `keyboardForward.ts`) — their keydowns
-// never reach the host. While DOM focus sits inside a preview iframe, every shell
-// shortcut silently dies and the chord falls through to Chrome's own default for
-// the combo (the reported bug: ⌘⇧↵ to maximize the content pane opened Chrome's
-// page context menu instead).
+// Bridge the app shell's keyboard shortcuts into a same-origin PDF preview
+// iframe. The frame runs no SDK, so unlike an app iframe (`AppUiInline` +
+// `keyboardForward.ts`) its keydowns never reach the host. While DOM focus sits
+// inside it, every shell shortcut would silently die. The chord would fall
+// through to the browser's own default instead (the reported bug: ⌘⇧↵ to
+// maximize the content pane opened Chrome's page context menu).
 //
-// Preview iframes are SAME-ORIGIN (`about:srcdoc` inherits the host origin;
-// engine-served files are same-origin), so the host can listen on the iframe's
-// own `contentDocument` and dispatch against its shortcut registry — and, having
-// the real event, `preventDefault()` the browser default (which the postMessage
-// forward path used for apps cannot do). A cross-origin preview (an external URL)
-// throws on `contentDocument` access; we swallow it and no-op — there's nothing
-// we can reach into.
+// An engine-served PDF is same-origin, so the host listens on the frame's own
+// `contentDocument` and dispatches against its shortcut registry. Having the
+// real event, it can `preventDefault()` the browser default too. A cross-origin
+// frame throws on `contentDocument` access; that is swallowed as a no-op.
+//
+// The HTML artifact preview is NOT bridged here. It runs at an opaque origin
+// (ADR 0322), and forwards its chords over `previewFrameBridge.ts` instead.
 
 import { dispatchPreviewIframeShortcut } from '../../hooks/useKeyboardShortcuts';
 

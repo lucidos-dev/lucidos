@@ -292,9 +292,29 @@ pub fn is_tmp_path(data_path: &str) -> bool {
         .is_some_and(|rest| rest.starts_with('/'))
 }
 
+/// Write `value` as pretty JSON through a temp file and a rename, creating the
+/// parent directory. A crash mid-write leaves the previous file whole.
+pub fn write_json_atomic(
+    path: &std::path::Path,
+    value: &impl serde::Serialize,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use std::io::Write;
+    let dir = path
+        .parent()
+        .ok_or_else(|| format!("no parent directory for {}", path.display()))?;
+    std::fs::create_dir_all(dir)?;
+    let mut temp = tempfile::NamedTempFile::new_in(dir)?;
+    serde_json::to_writer_pretty(&mut temp, value)?;
+    temp.write_all(b"\n")?;
+    temp.flush()?;
+    temp.persist(path)?;
+    Ok(())
+}
+
 pub use apps::{App, AppManager};
 pub use artifacts::{
-    is_vendored_path, list_searchable_data_files, ArtifactManager, WriteAnnouncement,
+    is_build_output_file, is_build_output_path, is_vendored_path, list_searchable_data_files,
+    ArtifactManager, WriteAnnouncement, VENDORED_DIR_NAMES,
 };
 pub use credentials::{
     credential_scope_covers, normalized_base_urls, AuthType, Credential, CredentialInfo,
@@ -486,17 +506,17 @@ pub use preferences::{
     DEFAULT_VERTEX_REGION, MIN_MAX_TOOL_CALLS, PREF_CHAT_MODEL, PREF_CHAT_REASONING_EFFORT,
     PREF_CODING_AGENT_CLAUDE_PATH, PREF_CODING_AGENT_CLAUDE_PERMISSION_MODE,
     PREF_CODING_AGENT_CODEX_PATH, PREF_IMAGE_MODEL, PREF_JUDGMENT_COMMAND_GUARD,
-    PREF_JUDGMENT_QUERY_CLASSIFICATION, PREF_LOCAL_BASE_URL, PREF_MODEL_COMMAND_JUDGE,
-    PREF_MODEL_CONVERSATION_SUMMARY, PREF_MODEL_IMAGE_DESCRIPTION, PREF_MODEL_MEMORY,
-    PREF_MODEL_QUERY_CLASSIFICATION, PREF_MODEL_TITLE, PREF_MODEL_VOICE_TALKER,
+    PREF_JUDGMENT_QUERY_CLASSIFICATION, PREF_LOCAL_BASE_URL, PREF_MODEL_CHANGE_SUMMARY,
+    PREF_MODEL_COMMAND_JUDGE, PREF_MODEL_CONVERSATION_SUMMARY, PREF_MODEL_IMAGE_DESCRIPTION,
+    PREF_MODEL_MEMORY, PREF_MODEL_QUERY_CLASSIFICATION, PREF_MODEL_TITLE, PREF_MODEL_VOICE_TALKER,
     PREF_MODEL_VOICE_TRANSCRIBER, PREF_OPENCODE_FREE_ENABLED, PREF_PROVIDER_ENABLED_ANTHROPIC,
     PREF_PROVIDER_ENABLED_LOCAL, PREF_PROVIDER_ENABLED_OPENAI, PREF_PROVIDER_ENABLED_OPENROUTER,
     PREF_PROVIDER_ENABLED_TYPESAFE, PREF_PROVIDER_ENABLED_VERTEX, PREF_PROVIDER_ENABLED_XAI,
-    PREF_PROXY_TIMEOUT_SECS, PREF_REASONING_COMMAND_JUDGE, PREF_REASONING_CONVERSATION_SUMMARY,
-    PREF_REASONING_IMAGE_DESCRIPTION, PREF_REASONING_MEMORY, PREF_REASONING_QUERY_CLASSIFICATION,
-    PREF_REASONING_TITLE, PREF_RESPONSE_STYLE, PREF_RESPONSE_STYLES,
-    PREF_SELF_CURATED_CONTEXT_MODE, PREF_TECHNICAL_LITERACY, PREF_VERTEX_REGION,
-    PREF_VOICE_RESIDENT_SECTIONS, PREF_VOICE_TALKER_VOICE,
+    PREF_PROXY_TIMEOUT_SECS, PREF_REASONING_CHANGE_SUMMARY, PREF_REASONING_COMMAND_JUDGE,
+    PREF_REASONING_CONVERSATION_SUMMARY, PREF_REASONING_IMAGE_DESCRIPTION, PREF_REASONING_MEMORY,
+    PREF_REASONING_QUERY_CLASSIFICATION, PREF_REASONING_TITLE, PREF_RESPONSE_STYLE,
+    PREF_RESPONSE_STYLES, PREF_SELF_CURATED_CONTEXT_MODE, PREF_TECHNICAL_LITERACY,
+    PREF_VERTEX_REGION, PREF_VOICE_RESIDENT_SECTIONS, PREF_VOICE_TALKER_VOICE,
 };
 pub use store::{
     ConversationMessage, ConversationSnapshot, EventStore, SessionMessage, Step, ThreadEventRow,

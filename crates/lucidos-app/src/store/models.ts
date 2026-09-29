@@ -20,6 +20,8 @@ export const MODELS = [
   { value: 'claude-fable-5[1m]', label: 'Fable 5 (1M)' },
   { value: 'claude-opus-5-5', label: 'Opus 5.5' },
   { value: 'claude-opus-5-5[1m]', label: 'Opus 5.5 (1M)' },
+  { value: 'claude-sonnet-5-5', label: 'Sonnet 5.5' },
+  { value: 'claude-sonnet-5-5[1m]', label: 'Sonnet 5.5 (1M)' },
   { value: 'claude-opus-5', label: 'Opus 5' },
   { value: 'claude-opus-5[1m]', label: 'Opus 5 (1M)' },
   { value: 'claude-sonnet-5', label: 'Sonnet 5' },
@@ -84,8 +86,9 @@ export const REASONING_LEVELS = [
  *    `llm::reasoning::supported_efforts` keeps the same per-family list, since
  *    a family that tops out at `xhigh` answers `max` with a 400.
  *  - Other OpenAI: drops `max` (their top tier is `xhigh`, so `max` would be a duplicate).
- *  - Opus 5.5 / Fable (5 and 5.1): every tier except `none`. They always think,
- *    so the engine snaps a stored `none` to `low`.
+ *  - Opus 5.5 / Sonnet 5.5 / Fable (5 and 5.1): every tier except `none`. They
+ *    always think, so the engine snaps a stored `none` to `low`. Sonnet 5.5 is
+ *    matched before the `claude-sonnet-5` prefix below, which would claim it.
  *  - Opus 4.7+ (incl. Opus 5) / Sonnet 5: full set (the adaptive Anthropic family that
  *    natively supports `xhigh`). Sonnet 5 is the first Sonnet-tier model with a distinct `xhigh`;
  *    Sonnet 4.6 and older stay on the filtered set below.
@@ -105,7 +108,11 @@ export function availableReasoningLevels(
     if (model.startsWith('gpt-5.6') || model === 'gpt-6-astra') return REASONING_LEVELS;
     return REASONING_LEVELS.filter(l => l.value !== 'max');
   }
-  if (model.startsWith('claude-opus-5-5') || model.startsWith('claude-fable-5')) {
+  if (
+    model.startsWith('claude-opus-5-5') ||
+    model.startsWith('claude-sonnet-5-5') ||
+    model.startsWith('claude-fable-5')
+  ) {
     return REASONING_LEVELS.filter(l => l.value !== 'none');
   }
   if (

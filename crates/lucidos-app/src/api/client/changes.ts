@@ -24,6 +24,10 @@ export interface Change {
   pre_merge_sha: string | null;
   post_merge_sha: string | null;
   commits: string[];
+  /** The *change summary*: one model-written line for a change of several
+   *  commits. Null for a single commit and until it lands. Read it through
+   *  `changeHeadline`, never on its own. */
+  summary: string | null;
   /** True when the originating CC turn ended in `ResponseFailed` — the
    * worktree state reflects partial work, not a deliberate completion.
    * `WaitingBanner` reads this to confirm before Apply so the user knows

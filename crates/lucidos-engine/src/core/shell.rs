@@ -1,5 +1,5 @@
-//! The interpreter every engine-spawned shell command runs under, and the
-//! typed outcome of a reaped child.
+//! The interpreter every engine-spawned shell command runs under, the typed
+//! outcome of a reaped child, and the cap on the output the model reads back.
 //!
 //! ## Why this module exists: the pipeline-masking trap
 //!
@@ -321,9 +321,86 @@ pub(crate) fn signal_name(sig: i32) -> Option<&'static str> {
     }
 }
 
+/// The most of one output stream the model reads back, for every tool that
+/// runs a child process.
+pub(crate) const MAX_OUTPUT_BYTES: usize = 100 * 1024;
+
+/// How much of one stream a pipe reader keeps. The model sees only the first
+/// `MAX_OUTPUT_BYTES`, and the slack covers what sanitizing strips. Past it
+/// the reader counts bytes and drops them, so a chatty command cannot grow the
+/// engine's memory without bound.
+pub(crate) const KEPT_BYTES_CAP: usize = 4 * MAX_OUTPUT_BYTES;
+
+/// Sanitize raw subprocess bytes for storage in a jsonb event payload and
+/// truncate to the model-facing cap, so every tool applies the same cut.
+///
+/// `total` is how many bytes the stream carried, which exceeds `bytes` when
+/// the reader hit `KEPT_BYTES_CAP`.
+pub(crate) fn finalize_stream(bytes: &[u8], total: u64) -> String {
+    let sanitized = super::sanitize_for_jsonb(&String::from_utf8_lossy(bytes));
+    let dropped = total > bytes.len() as u64;
+    let dropped_total = dropped.then(|| usize::try_from(total).unwrap_or(usize::MAX));
+    truncate_output(&sanitized, MAX_OUTPUT_BYTES, dropped_total)
+}
+
+/// The first `max` bytes of `s`, marked when anything is cut.
+///
+/// `dropped_total` is the stream's full size when the reader stopped keeping
+/// bytes. Its note is due even when `s` fits: sanitizing can shrink a mostly
+/// binary head below `max`.
+fn truncate_output(s: &str, max: usize, dropped_total: Option<usize>) -> String {
+    if s.len() <= max && dropped_total.is_none() {
+        return s.to_string();
+    }
+    let end = s.floor_char_boundary(max);
+    let total = dropped_total.unwrap_or(0).max(s.len());
+    format!("{}...\n[truncated: {} bytes total]", &s[..end], total)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A capped stream of NULs sanitizes to nothing. The note must still say
+    /// how much output there was.
+    #[test]
+    fn a_capped_stream_that_sanitizes_to_nothing_is_still_marked() {
+        let shown = finalize_stream(&[0u8; 16], 1_000_000);
+        assert!(
+            shown.ends_with("[truncated: 1000000 bytes total]"),
+            "{shown:?}"
+        );
+        assert_eq!(finalize_stream(b"ok", 2), "ok");
+    }
+
+    /// Sanitizing strips a NUL byte, which must not read as truncation.
+    #[test]
+    fn complete_output_with_a_nul_byte_carries_no_marker() {
+        assert_eq!(finalize_stream(b"a\0b", 3), "ab");
+        assert!(finalize_stream(b"ab", 5).ends_with("[truncated: 5 bytes total]"));
+    }
+
+    #[test]
+    fn truncate_output_short_string() {
+        let s = "hello world";
+        assert_eq!(truncate_output(s, 100, None), "hello world");
+    }
+
+    #[test]
+    fn truncate_output_long_string() {
+        let s = "a".repeat(200);
+        let result = truncate_output(&s, 50, None);
+        assert!(result.starts_with(&"a".repeat(50)));
+        assert!(result.contains("[truncated"));
+        assert!(result.contains("200 bytes total"));
+    }
+
+    #[test]
+    fn truncate_output_multibyte_boundary() {
+        let s = "ééééé"; // 10 bytes in UTF-8
+        let result = truncate_output(s, 5, None);
+        assert!(result.contains("[truncated"));
+    }
 
     #[test]
     fn resolved_shell_is_reused_and_self_consistent() {

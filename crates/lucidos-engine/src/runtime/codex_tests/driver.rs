@@ -68,7 +68,7 @@ fn stub_driver_running(script_tail: &str, resume: Option<&str>) -> StubSession {
             input_tx,
             control_tx,
             permission_rx: None,
-            side_question_tx: None,
+            withdraw_tx: None,
         },
         cancel,
     }
@@ -111,6 +111,7 @@ async fn one_turn_emits_init_message_usage_result_then_exited_on_close() {
         .send(AgentInput {
             text: "ping".into(),
             images: vec![],
+            uuid: uuid::Uuid::new_v4(),
         })
         .expect("send input");
 
@@ -178,6 +179,7 @@ async fn follow_up_turn_resumes_with_session_id_from_first_turn() {
         .send(AgentInput {
             text: "first".into(),
             images: vec![],
+            uuid: uuid::Uuid::new_v4(),
         })
         .unwrap();
     // Drain turn 1: InputRead, Init, Message, Usage, Result.
@@ -189,6 +191,7 @@ async fn follow_up_turn_resumes_with_session_id_from_first_turn() {
         .send(AgentInput {
             text: "second".into(),
             images: vec![],
+            uuid: uuid::Uuid::new_v4(),
         })
         .unwrap();
     // Turn 2: duplicate thread.started is suppressed → Message, Usage, Result.
@@ -233,6 +236,7 @@ async fn a_resumed_session_runs_the_engine_continuation_as_an_input() {
         .send(AgentInput {
             text: continuation.into(),
             images: vec![],
+            uuid: uuid::Uuid::new_v4(),
         })
         .expect("send input");
 
@@ -270,6 +274,7 @@ async fn child_death_without_terminal_synthesizes_failed_result() {
         .send(AgentInput {
             text: "ping".into(),
             images: vec![],
+            uuid: uuid::Uuid::new_v4(),
         })
         .unwrap();
 
@@ -307,6 +312,7 @@ async fn abandoned_tool_call_is_closed_at_synthesized_turn_end() {
         .send(AgentInput {
             text: "go".into(),
             images: vec![],
+            uuid: uuid::Uuid::new_v4(),
         })
         .unwrap();
 
@@ -395,6 +401,7 @@ async fn interrupt_kills_in_flight_turn_and_synthesizes_canceled_result() {
         .send(AgentInput {
             text: "go".into(),
             images: vec![],
+            uuid: uuid::Uuid::new_v4(),
         })
         .unwrap();
     async fn recv(rx: &mut mpsc::UnboundedReceiver<AgentEvent>) -> AgentEvent {
@@ -423,6 +430,7 @@ async fn interrupt_kills_in_flight_turn_and_synthesizes_canceled_result() {
         .send(AgentInput {
             text: "queued".into(),
             images: vec![],
+            uuid: uuid::Uuid::new_v4(),
         })
         .unwrap();
     control_tx.send(ControlRequest::Interrupt).unwrap();
@@ -486,6 +494,7 @@ async fn a_line_split_around_a_queued_input_still_arrives_whole() {
         .send(AgentInput {
             text: "ping".into(),
             images: vec![],
+            uuid: uuid::Uuid::new_v4(),
         })
         .expect("send input");
 
@@ -504,6 +513,7 @@ async fn a_line_split_around_a_queued_input_still_arrives_whole() {
         .send(AgentInput {
             text: "later".into(),
             images: vec![],
+            uuid: uuid::Uuid::new_v4(),
         })
         .expect("send input");
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;

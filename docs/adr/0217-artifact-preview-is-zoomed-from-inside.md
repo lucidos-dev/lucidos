@@ -62,4 +62,5 @@ gets read on.
 - **Applying the zoom from the host to the live `contentDocument` on load.** No
   reload and no scroll loss, but the frame paints once before `load` fires, so
   the reader sees the document re-scale. The srcdoc stamp is correct on the first
-  frame.
+  frame. Since ADR 0322 the preview runs at an opaque origin. The host cannot
+  reach its `contentDocument` at all, so the stamp is the only option.

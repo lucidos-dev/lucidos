@@ -7,6 +7,7 @@ import { autoResizeTextarea } from '../../utils/dom';
 import { PROSE_TEXT_ATTRS } from '../../utils/noAutofill';
 import { useDelayedFlag } from '../../hooks/useDelayedLoading';
 import { isImeComposingKey } from './PromptInput';
+import { isElementVisible } from './scrollState';
 
 interface Props {
   threadId: string;
@@ -26,6 +27,17 @@ export function normalizeRename(
   const trimmed = newValue.trim();
   if (!isDirty || !trimmed || trimmed === currentTitle) return null;
   return trimmed;
+}
+
+/** Start renaming the focused thread from the keyboard. Focus is what opens
+ *  the editor (`onFocus` runs `startEditing`), so this only has to land it on
+ *  the title field. It prefers a visible one, then any that is laid out: a
+ *  thread pane still animating open measures zero wide but can take focus. The
+ *  other layout's copy is `display: none` and cannot. A no-op with none. */
+export function focusThreadTitleEditor(): void {
+  const fields = Array.from(document.querySelectorAll<HTMLElement>('[data-role="thread-title-input"]'));
+  const target = fields.find(isElementVisible) ?? fields.find((el) => el.getClientRects().length > 0);
+  target?.focus({ preventScroll: true });
 }
 
 export function ThreadTitleEditor({ threadId, title }: Props) {
@@ -192,6 +204,7 @@ export function ThreadTitleEditor({ threadId, title }: Props) {
         <textarea
           ref={setInputEl}
           class="thread-title-input thread-title-edit-input"
+          data-role="thread-title-input"
           value={editValue}
           rows={1}
           onFocus={startEditing}
@@ -207,6 +220,7 @@ export function ThreadTitleEditor({ threadId, title }: Props) {
           ref={setInputEl}
           type="text"
           class="thread-title-input thread-title-edit-input"
+          data-role="thread-title-input"
           value={editValue}
           // Hug the value while editing (override the base width:100% with width:auto
           // in CSS). size is universal, unlike field-sizing which isn't everywhere yet.

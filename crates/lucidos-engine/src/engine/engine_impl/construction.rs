@@ -267,6 +267,7 @@ impl LucidosEngine {
                             let continue_input =
                                 crate::engine::agent_recovery::continue_input_for_reason(
                                     engine.pool(),
+                                    engine.workspace_path(),
                                     thread_id,
                                     continue_reason.as_deref(),
                                 )
@@ -317,6 +318,7 @@ impl LucidosEngine {
                                 let retry_text =
                                     crate::engine::agent_recovery::continue_retry_input(
                                         engine.pool(),
+                                        engine.workspace_path(),
                                         thread_id,
                                         continue_reason.as_deref(),
                                     )
@@ -1372,6 +1374,7 @@ impl LucidosEngine {
                 tx
             },
             last_spawn: std::sync::Mutex::new(HashMap::new()),
+            cc_system_prompts: std::sync::Mutex::new(HashMap::new()),
             spawns_in_flight: Arc::default(),
             pending_app_spawn: std::sync::Mutex::new(HashMap::new()),
             follow_up_order: Default::default(),

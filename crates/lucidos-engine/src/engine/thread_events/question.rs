@@ -23,18 +23,24 @@ pub enum AnswerKind {
     Selected {
         option_id: String,
     },
+    /// A reply typed in the composer. `image_hashes` names the blobs attached
+    /// to it, and `text` may be empty when the images are the answer.
     FreeText {
         text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        image_hashes: Vec<String>,
     },
     /// Multi-select answer. `text` carries optional freetext typed alongside
     /// the toggled options. The prompt textarea folds into the answer when a
-    /// multi-select question is pending. Backend joins the resolved labels and
-    /// the freetext together when relaying to CC. Either side may be empty
-    /// (but not both: see `validate_answer`).
+    /// multi-select question is pending, images included. Backend joins the
+    /// resolved labels and the freetext together when relaying to CC. Some
+    /// side must be present: see `validate_answer`.
     MultiSelected {
         option_ids: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         text: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        image_hashes: Vec<String>,
     },
     Canceled,
     /// A follow-up arrived that could not be the answer, so it replaced the
@@ -49,4 +55,15 @@ pub enum AnswerKind {
     /// nothing is coming. Here the user did reply, just not to this question,
     /// and the reply drives the very next turn.
     Superseded,
+}
+
+impl AnswerKind {
+    /// The blobs attached to this answer. Only a typed answer carries any.
+    pub fn image_hashes(&self) -> &[String] {
+        match self {
+            AnswerKind::FreeText { image_hashes, .. }
+            | AnswerKind::MultiSelected { image_hashes, .. } => image_hashes,
+            AnswerKind::Selected { .. } | AnswerKind::Canceled | AnswerKind::Superseded => &[],
+        }
+    }
 }

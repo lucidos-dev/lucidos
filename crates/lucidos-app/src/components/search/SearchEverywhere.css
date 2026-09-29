@@ -217,6 +217,26 @@
     overflow-wrap: anywhere;
 }
 
+/* Laid out like a result row, so the spinner sits in the icon column. */
+.search-everywhere-pending,
+.search-everywhere-note {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.375rem var(--surface-inset);
+    font-size: var(--font-size-xs);
+    font-family: var(--font-ui);
+}
+
+/* The note takes its colour from `.error-text`. */
+.search-everywhere-pending {
+    color: var(--text-muted);
+}
+
+.search-everywhere-pending .mini-spinner {
+    margin-inline: calc((var(--icon-size-md) - 0.75rem) / 2);
+}
+
 .search-everywhere-empty {
     padding: 1.5rem;
     text-align: center;

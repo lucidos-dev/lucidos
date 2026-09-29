@@ -276,13 +276,14 @@ const ANSWER_OUT_OF_BAND_TRAILER: &str =
 /// parks `claude --print --resume` forever and zombies the thread.
 pub(crate) async fn continue_input_for_reason(
     pool: &sqlx::PgPool,
+    workspace: &std::path::Path,
     thread_id: Uuid,
     reason: Option<&str>,
 ) -> String {
     if reason != Some(ANSWERED_AFTER_IDLE_REASON) {
         return CONTINUE_RESUME_USER_MESSAGE.to_string();
     }
-    match crate::engine::agent_question::answered_question_recap(pool, thread_id).await {
+    match crate::engine::agent_question::answered_question_recap(pool, workspace, thread_id).await {
         Some(recap) => {
             format!("{ANSWER_OUT_OF_BAND_NOTE}\n\n{recap}\n{ANSWER_OUT_OF_BAND_TRAILER}")
         }
@@ -322,10 +323,11 @@ pub(crate) async fn continue_input_for_reason(
 /// idle long enough for the transcript to age out.
 pub(crate) async fn continue_retry_input(
     pool: &sqlx::PgPool,
+    workspace: &std::path::Path,
     thread_id: Uuid,
     reason: Option<&str>,
 ) -> String {
-    let tail = continue_input_for_reason(pool, thread_id, reason).await;
+    let tail = continue_input_for_reason(pool, workspace, thread_id, reason).await;
     crate::engine::agent_session::prepend_reconstruction(pool, thread_id, &tail).await
 }
 

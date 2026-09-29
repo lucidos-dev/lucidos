@@ -221,11 +221,16 @@ pub fn parse_line(state: &mut CcStreamState, line: &str) -> Vec<AgentEvent> {
                         })
                         .unwrap_or_default();
                     let model = val.get("model").and_then(|v| v.as_str()).map(String::from);
+                    let agent_version = val
+                        .get("claude_code_version")
+                        .and_then(|v| v.as_str())
+                        .map(String::from);
                     vec![AgentEvent::Init {
                         session_id: sid.to_string(),
                         model,
                         slash_commands,
                         skills,
+                        agent_version,
                     }]
                 } else {
                     Vec::new()

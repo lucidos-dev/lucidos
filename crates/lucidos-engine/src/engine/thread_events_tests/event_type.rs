@@ -48,6 +48,29 @@ fn reserved_type_names_cover_every_variant() {
     }
 }
 
+/// Every name in `INDEXABLE_EVENT_TYPES` reaches an arm of `indexable_text`.
+/// The list gates that match, so a listed type with no arm would load rows
+/// into a memory rebuild only to index none of them.
+#[test]
+fn every_indexable_event_type_indexes_text() {
+    for name in ThreadEvent::INDEXABLE_EVENT_TYPES {
+        let event = serde_json::from_value::<ThreadEvent>(json!({
+            "type": name,
+            "text": "x",
+            "summary": "x",
+            "description": "x",
+            "session_id": "00000000-0000-0000-0000-000000000001",
+            "child_thread_id": "00000000-0000-0000-0000-000000000002",
+            "status": "success",
+            "source_event_id": "00000000-0000-0000-0000-000000000003",
+            "hash": "x",
+            "model": "x",
+        }))
+        .unwrap_or_else(|e| panic!("{name} needs a richer sample: {e}"));
+        assert!(event.indexable_text().is_some(), "{name} indexes nothing");
+    }
+}
+
 #[test]
 fn thread_event_serializes_with_type_tag() {
     let event = ThreadEvent::ToolCalled {

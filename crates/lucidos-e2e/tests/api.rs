@@ -35,6 +35,9 @@ mod workspace_fonts_test;
 #[path = "api_support/frame_file_cors_test.rs"]
 mod frame_file_cors_test;
 
+#[path = "api_support/served_document_sandbox_test.rs"]
+mod served_document_sandbox_test;
+
 #[path = "api_support/workspace_label_test.rs"]
 mod workspace_label_test;
 

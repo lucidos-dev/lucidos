@@ -12,6 +12,7 @@ import {
 } from '../store';
 import { PENDING_TITLE_PLACEHOLDER } from '../thread-events';
 import { changeToastMessage } from './changeToast';
+import { changeHeadline } from '../changeHeadline';
 import { focusThread } from './threads';
 
 /** What an apply is doing, as the activity group names it. */
@@ -274,7 +275,7 @@ export function reconcileApplyProgress(
     const appliedChange = changeId ? applied.find((c) => c.id === changeId) : undefined;
     // A batch member's result is the batch summary's to report.
     if (!appliedChange || isBatchMember(applyAllBatch.value, appliedChange.id)) continue;
-    showToast(changeToastMessage('Applied', threadId, appliedChange.description), 'success', {
+    showToast(changeToastMessage('Applied', threadId, changeHeadline(appliedChange)), 'success', {
       key: `applying-${threadId}`,
       onClick: () => openApplyPhase(threadId, appliedChange.id, reading),
       autoDismissMs: TOAST_AUTO_DISMISS_MS,

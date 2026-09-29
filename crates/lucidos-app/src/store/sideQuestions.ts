@@ -17,6 +17,8 @@ export type SideQuestion = {
   id: string;
   threadId: string;
   question: string;
+  /** Blobs the user attached to the question. */
+  imageHashes: readonly string[];
   /** The card's moment on the thread's clock: its `SideQuestionAsked` seq,
    *  or the newest seq the thread held while the ask is still on its way.
    *  Rows later than it draw below the card. Null when no event had loaded. */
@@ -31,6 +33,9 @@ export type SideQuestion = {
 
 /** The menu entry and composer prefix for a side question. */
 export const SIDE_QUESTION_COMMAND = 'btw';
+
+/** One shared empty list, so an imageless card keeps a stable prop. */
+const NO_IMAGES: readonly string[] = [];
 
 /** Asks not yet recorded, keyed by id: a pending card before its event lands,
  *  and an ask whose request failed before the engine recorded anything. */
@@ -67,7 +72,7 @@ export function withSideQuestionPrefix(handoff: string, draft: string): string {
 
 /** What the composer does with a submitted message. */
 export type SideQuestionRoute =
-  /** Not a side question, or not a coding-agent thread: send it as usual. */
+  /** Not a side question: send it as usual. */
   | { kind: 'message' }
   /** A side question that cannot be asked here. The draft stays. */
   | { kind: 'refuse'; toast: string }
@@ -75,20 +80,23 @@ export type SideQuestionRoute =
 
 export const SIDE_QUESTION_NOT_STARTED =
   'Side questions work once this thread has started. Send a normal message first.';
-export const SIDE_QUESTION_TEXT_ONLY = 'Side questions are text only. Remove the images to ask.';
 export const SIDE_QUESTION_EMPTY = 'Type a question after /btw.';
+export const SIDE_QUESTION_CODEX =
+  'Side questions are not available in Codex threads. Send it as a normal message instead.';
 
-/** Route a submit. In a coding-agent thread a side question never goes to the
- *  main session: it is asked, or refused with the draft kept. A Codex thread
- *  is asked too, and the engine's refusal lands on the card. */
+/** Route a submit. A side question never becomes a turn: it is asked, or
+ *  refused with the draft kept. `asked` is true when the user chose to ask
+ *  (the Send button's long press), so no `/btw` is needed. A Codex thread
+ *  takes none, and refusing here keeps the draft and its images. */
 export function routeSideQuestion(
   message: string,
-  thread: { codingAgent: boolean; started: boolean; hasImages: boolean },
+  thread: { started: boolean; codex: boolean },
+  asked = false,
 ): SideQuestionRoute {
-  const question = sideQuestionText(message);
-  if (question === null || !thread.codingAgent) return { kind: 'message' };
+  const question = sideQuestionText(message) ?? (asked ? message.trim() : null);
+  if (question === null) return { kind: 'message' };
   if (!thread.started) return { kind: 'refuse', toast: SIDE_QUESTION_NOT_STARTED };
-  if (thread.hasImages) return { kind: 'refuse', toast: SIDE_QUESTION_TEXT_ONLY };
+  if (thread.codex) return { kind: 'refuse', toast: SIDE_QUESTION_CODEX };
   if (question === '') return { kind: 'refuse', toast: SIDE_QUESTION_EMPTY };
   return { kind: 'ask', question };
 }
@@ -119,7 +127,13 @@ export function recordedSideQuestions(thread: ThreadState | undefined): SideQues
     const card = byId.get(id);
     if (event.type === 'SideQuestionAsked') {
       byId.set(id, {
-        id, threadId: thread.meta.id, question: event.question, afterSeq: seq, dismissed: false, status: 'pending',
+        id,
+        threadId: thread.meta.id,
+        question: event.question,
+        imageHashes: event.image_hashes ?? NO_IMAGES,
+        afterSeq: seq,
+        dismissed: false,
+        status: 'pending',
       });
     } else if (!card) {
       continue;
@@ -200,16 +214,26 @@ function withId(set: ReadonlySet<string>, id: string, present: boolean): Readonl
   return next;
 }
 
-/** Ask a side question and show its card at once. Never throws: a failure
- *  lands on the card. The recorded events take over when they arrive. */
-export async function askSideQuestion(threadId: string, question: string): Promise<void> {
+/** Ask a side question with any uploaded images and show its card at once.
+ *  Never throws: a failure lands on the card. The recorded events take over
+ *  when they arrive. */
+export async function askSideQuestion(
+  threadId: string,
+  question: string,
+  imageHashes: readonly string[] = NO_IMAGES,
+): Promise<void> {
   const id = crypto.randomUUID();
   const asked = {
-    id, threadId, question, afterSeq: latestEventSeq(threadMap.value.get(threadId)), dismissed: false,
+    id,
+    threadId,
+    question,
+    imageHashes,
+    afterSeq: latestEventSeq(threadMap.value.get(threadId)),
+    dismissed: false,
   };
   setLocal({ ...asked, status: 'pending' });
   try {
-    const answer = await postSideQuestion(threadId, id, question);
+    const answer = await postSideQuestion(threadId, id, question, imageHashes);
     setLocal({ ...asked, status: 'answered', answer });
   } catch (err) {
     const error = err instanceof ApiError ? err.reason : errorDetail(err);

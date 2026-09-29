@@ -585,6 +585,8 @@ _STATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "state")
 
 That resolves to the real `data/triggers/<slug>/state/` — the natural home for a script trigger's own state (a last-seen id, a per-version marker, a cursor). Prefer `__file__`-relative paths over paths relative to the working directory: they keep the script correct no matter who invokes it, and they keep its state beside the script that owns it, per the ownership rule in `docs/taxonomy.md`.
 
+A trigger that a plugin ships is the exception. Its folder belongs to the plugin, so its state goes under `data/artifacts/<plugin-id>/` instead. See `plugins.md` § "Where a plugin keeps its runtime state".
+
 ### Script trigger env vars
 
 When the engine fires a script trigger that subscribes to a domain event, it sets the following env vars before exec'ing the script. Schedule fires emit none of them — the script has no source event to point at.

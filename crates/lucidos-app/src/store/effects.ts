@@ -4,6 +4,7 @@ import { clientRefreshing } from '../hooks/sw-update';
 import { handleRestartTimeout } from './actions/connection';
 import { onNotificationDetailClosed } from './actions/notifications';
 import { installSeenTargetWatch } from './actions/notification-visit';
+import { installAppKeybindingsSync } from './actions/app-keybindings';
 import { installNotificationToastLifetime } from './actions/in-app-notification-toast';
 import { installUnregisteredRepoTargetReset } from './actions/compose';
 import { installLiveUtteranceRow } from './liveUtterance';
@@ -267,6 +268,7 @@ effect(() => {
 // rules they feed rather than spread across this file. See
 // actions/notification-visit.ts and system-knowhow/notifications.md §4.
 installSeenTargetWatch();
+installAppKeybindingsSync();
 
 // A toast is the third projection of the unread set, beside the bell badge and
 // the Unread tab. So a row that has been read can hold no toast. The rule the

@@ -1,8 +1,9 @@
 /*
  * Lucidos shared component layer — SINGLE SOURCE OF TRUTH.
  *
- * The REUSABLE component classes shared by the host shell and app iframes —
- * .action-btn family, .icon-btn, .label, .title, .segmented-control, .list-row*,
+ * The REUSABLE component classes shared by the host shell and app iframes:
+ * .action-btn family, .icon-btn, .label and its tones, .title,
+ * .segmented-control, .pill-bar, .toggle-switch, .mini-spinner, .list-row*,
  * .markdown-content, .progress-bar, .empty-state, .accent-link, headings. This
  * file is consumed by BOTH:
  *   1. the host shell — imported by `src/styles/global.css` (`@import './global/shared-components.css'`).
@@ -169,9 +170,15 @@ input[type="checkbox"]:disabled {
     transition: background-color var(--duration-fast), color var(--duration-fast);
 }
 
+/* The clear background restated, because an app frame's `button:hover`
+   (sdk_iframe.css) outranks the base rule and would fill the segment grey. */
 @media (hover: hover) {
     .segmented-btn:hover {
         color: var(--text-primary);
+    }
+
+    .segmented-btn:hover:not(.active) {
+        background: none;
     }
 }
 
@@ -187,6 +194,189 @@ input[type="checkbox"]:disabled {
     outline: 0.125rem solid transparent;
     box-shadow: var(--focus-ring);
     position: relative;
+}
+
+/* Pill bar: a row of filled pills with one picked, which inverts. Settings >
+   Theme and the app store filter with it, and an app switches views with it as
+   tabs. The markup carries the role: `role="group"` with `aria-pressed` for a
+   filter, and `role="tablist"` with `role="tab"` + `aria-selected` for tabs.
+   The host marks the picked pill with `.active` as well. It stays on one line
+   and scrolls sideways when it does not fit. */
+.pill-bar {
+    display: flex;
+    gap: 0.375rem;
+    overflow-x: auto;
+    overscroll-behavior-x: contain;
+    scrollbar-width: none;
+}
+
+.pill-bar::-webkit-scrollbar {
+    display: none;
+}
+
+.pill-bar-btn {
+    flex-shrink: 0;
+    padding: 0.3125rem 0.75rem;
+    border: none;
+    border-radius: var(--radius-round);
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+    font-family: var(--font-ui);
+    font-size: var(--font-size-xs);
+    font-weight: 500;
+    white-space: nowrap;
+    cursor: pointer;
+    transition: background-color var(--duration-fast), color var(--duration-fast);
+}
+
+.pill-bar-btn.active,
+.pill-bar-btn[aria-pressed="true"],
+.pill-bar-btn[aria-selected="true"] {
+    background: var(--text-primary);
+    color: var(--bg-primary);
+}
+
+/* The fill restated, for the same reason as the segmented control: an app
+   frame's `button:hover` would repaint an unpicked pill. */
+@media (hover: hover) {
+    .pill-bar-btn:hover:not(.active, [aria-pressed="true"], [aria-selected="true"]) {
+        background: var(--bg-tertiary);
+        color: var(--text-primary);
+    }
+}
+
+/* A finger needs a taller target than a pointer does. */
+@media (pointer: coarse) {
+    .pill-bar-btn {
+        min-height: 2.25rem;
+    }
+}
+
+/* Forced colors repaint every background, which would erase the only thing
+   marking the picked pill. System colours keep it marked. */
+@media (forced-colors: active) {
+    .pill-bar-btn.active,
+    .pill-bar-btn[aria-pressed="true"],
+    .pill-bar-btn[aria-selected="true"] {
+        forced-color-adjust: none;
+        background: SelectedItem;
+        color: SelectedItemText;
+    }
+}
+
+.pill-bar-btn:focus-visible {
+    /* Transparent outline is the forced-colors fallback (box-shadow is stripped). */
+    outline: 0.125rem solid transparent;
+    box-shadow: var(--focus-ring);
+}
+
+/* Toggle switch: a real checkbox, hidden, with the pill drawn beside it.
+
+   The three geometry values are named here because everything else derives from
+   them: the pill's height, and the knob's travel when checked. Write those two
+   as literals and they go wrong silently. A later change to any of the three
+   leaves the knob off centre, short of the far end, or over it.
+
+   `flex-shrink: 0` is what keeps the pill the width it declares. A settings row
+   is a flex box, and a flex item shrinks on its UNWRAPPED width. So a label long
+   enough to wrap squeezes the control beside it instead. Three toggles in one
+   column came out three different widths. The narrowest one had its knob
+   hanging past the end of its own pill. */
+.toggle-switch {
+    --toggle-width: 2.25rem;
+    --toggle-knob: 0.875rem;
+    --toggle-inset: 0.1875rem;
+    position: relative;
+    display: inline-block;
+    flex-shrink: 0;
+    width: var(--toggle-width);
+    height: calc(var(--toggle-knob) + 2 * var(--toggle-inset));
+    cursor: pointer;
+}
+
+/* The attribute matches the checkbox rule's `:disabled` specificity above, and
+   this rule comes after it, so a disabled switch keeps its input hidden too. */
+.toggle-switch input[type="checkbox"] {
+    opacity: 0;
+    width: 0;
+    height: 0;
+}
+
+.toggle-slider {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background-color: var(--bg-tertiary);
+    border-radius: calc(var(--radius-control) * 2.5);
+    transition: background-color var(--duration-normal);
+}
+
+.toggle-slider::before {
+    content: '';
+    position: absolute;
+    height: var(--toggle-knob);
+    width: var(--toggle-knob);
+    left: var(--toggle-inset);
+    bottom: var(--toggle-inset);
+    background-color: var(--text-muted);
+    border-radius: var(--radius-round);
+    transition: transform var(--duration-normal), background-color var(--duration-normal);
+}
+
+.toggle-switch input:checked + .toggle-slider {
+    background-color: color-mix(in srgb, var(--accent) 30%, transparent);
+}
+
+/* The knob lands on the far inset, mirroring where it rests when off. */
+.toggle-switch input:checked + .toggle-slider::before {
+    transform: translateX(calc(var(--toggle-width) - var(--toggle-knob) - 2 * var(--toggle-inset)));
+    background-color: var(--accent);
+}
+
+/* Keyboard focus shows the shared accent ring on the visible pill. The real
+   <input> is 0×0 and transparent, so a default outline would land on nothing. */
+.toggle-switch input:focus-visible + .toggle-slider {
+    /* Transparent outline is the forced-colors fallback (box-shadow is stripped). */
+    outline: 0.125rem solid transparent;
+    box-shadow: var(--focus-ring);
+}
+
+/* Disabled: dimmed and not interactive, but still showing on or off. */
+.toggle-switch-disabled {
+    cursor: not-allowed;
+}
+
+.toggle-switch input:disabled + .toggle-slider {
+    opacity: 0.4;
+}
+
+/* The spinning ring for a working state: a running step, a save in flight.
+   Data loading draws a skeleton instead. An indefinite animation keeps a
+   literal duration, so it ignores the animation-speed slider. */
+@keyframes spin {
+    to { transform: rotate(360deg); }
+}
+
+.mini-spinner {
+    --spinner-color: var(--text-secondary);
+    display: inline-block;
+    width: 0.75rem;
+    height: 0.75rem;
+    animation: spin 1.2s linear infinite;
+    vertical-align: middle;
+    flex-shrink: 0;
+    border: var(--spinner-weight) solid var(--spinner-color);
+    border-top-color: transparent;
+    border-radius: 50%;
+    box-sizing: border-box;
+}
+
+/* Reduced motion stops the ring. It stays drawn, so the working state still
+   shows. */
+:root[data-motion="reduce"] .mini-spinner {
+    animation: none;
 }
 
 /* Utility classes */
@@ -236,6 +426,30 @@ input[type="checkbox"]:disabled {
     overflow: hidden;
     text-overflow: ellipsis;
     vertical-align: baseline;
+}
+
+/* Status tones, additive: `class="label label-success"`. The bare label is the
+   accent tone. They share the toast's words, so a status reads the same in a
+   chip and in a toast. Neutral takes --text-secondary, since --text-muted on
+   --bg-tertiary reads as disabled. */
+.label-success {
+    background: color-mix(in srgb, var(--accent-green) 15%, transparent);
+    color: var(--accent-green);
+}
+
+.label-warning {
+    background: color-mix(in srgb, var(--accent-yellow) 15%, transparent);
+    color: var(--accent-yellow);
+}
+
+.label-error {
+    background: color-mix(in srgb, var(--accent-red) 15%, transparent);
+    color: var(--accent-red);
+}
+
+.label-neutral {
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
 }
 
 /* Shared title — used across modals, list rows, panels */

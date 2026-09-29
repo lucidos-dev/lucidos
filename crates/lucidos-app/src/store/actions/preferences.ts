@@ -1,6 +1,7 @@
 import { effect, signal, untracked } from '@preact/signals';
-import { preferences, showToast, removeToast, notificationsFilter, currentModel, reasoningEffort, selectedCodingAgent, clampThreadDrawerWidth } from '../store';
+import { preferences, showToast, removeToast, notificationsFilter, currentModel, reasoningEffort, selectedCodingAgent, clampThreadDrawerWidth, llmConfigured } from '../store';
 import type { CodingAgent } from '../../api/types';
+import type { ThreadState } from '../thread-events';
 import { failedIfFresh } from '../types';
 import { getPreferences, setPreference, isTransientFetchError, retryTransientRead, getTheme, ApiError } from '../../api/client';
 import { resolvedHexColor } from '../../utils/cssColor';
@@ -1407,6 +1408,7 @@ export function setMobileHeaderSticky(enabled: boolean): Promise<void> {
  *  `engine::aux_purpose`. */
 export type BackgroundModelKey =
   | 'model_title'
+  | 'model_change_summary'
   | 'model_image_description'
   | 'model_memory'
   | 'model_conversation_summary'
@@ -1416,6 +1418,7 @@ export type BackgroundModelKey =
 /** The reasoning half of each background *model selection*. */
 export type BackgroundReasoningKey =
   | 'reasoning_title'
+  | 'reasoning_change_summary'
   | 'reasoning_image_description'
   | 'reasoning_memory'
   | 'reasoning_conversation_summary'
@@ -1432,6 +1435,7 @@ export const DEFAULT_COMMAND_JUDGE_MODEL = 'claude-haiku-4-5';
  *  they are set, matching `aux_purpose`'s `model_fallback_key`. */
 const BACKGROUND_MODEL_DEFAULTS: Record<BackgroundModelKey, string> = {
   model_title: 'gemini-3-flash-preview',
+  model_change_summary: 'gemini-3-flash-preview',
   model_image_description: 'gemini-3-flash-preview',
   model_memory: 'gemini-3-flash-preview',
   model_conversation_summary: 'gemini-3-flash-preview',
@@ -1454,6 +1458,7 @@ const INHERITS_MEMORY_MODEL: readonly BackgroundModelKey[] = [
  *  does not track it), and the rest spend nothing on deliberation. */
 const BACKGROUND_REASONING_DEFAULTS: Record<BackgroundReasoningKey, string> = {
   reasoning_title: 'none',
+  reasoning_change_summary: 'none',
   reasoning_image_description: 'none',
   reasoning_memory: 'none',
   reasoning_conversation_summary: 'low',
@@ -1468,12 +1473,19 @@ const INHERITS_MEMORY_REASONING: readonly BackgroundReasoningKey[] = [
   'reasoning_query_classification',
 ];
 
+/** The change summary follows the title pair while unset, mirroring
+ *  `aux_purpose`'s fallbacks for `ContextPurpose::ChangeSummary`. */
+const INHERITS_TITLE_MODEL: readonly BackgroundModelKey[] = ['model_change_summary'];
+const INHERITS_TITLE_REASONING: readonly BackgroundReasoningKey[] = ['reasoning_change_summary'];
+
 export function currentBackgroundModel(key: BackgroundModelKey): string {
+  // Split out of another key, so an unset value follows whatever the user
+  // pinned there. The engine resolves the same fallback.
   const fallback = INHERITS_MEMORY_MODEL.includes(key)
-    // Split out of `model_memory`, so an unset value follows whatever the user
-    // pinned there. The engine resolves the same fallback.
     ? currentBackgroundModel('model_memory')
-    : BACKGROUND_MODEL_DEFAULTS[key];
+    : INHERITS_TITLE_MODEL.includes(key)
+      ? currentBackgroundModel('model_title')
+      : BACKGROUND_MODEL_DEFAULTS[key];
   if (preferences.value.status !== 'loaded') return fallback;
   return preferences.value.data[key] || fallback;
 }
@@ -1481,7 +1493,9 @@ export function currentBackgroundModel(key: BackgroundModelKey): string {
 export function currentBackgroundReasoning(key: BackgroundReasoningKey): string {
   const fallback = INHERITS_MEMORY_REASONING.includes(key)
     ? currentBackgroundReasoning('reasoning_memory')
-    : BACKGROUND_REASONING_DEFAULTS[key];
+    : INHERITS_TITLE_REASONING.includes(key)
+      ? currentBackgroundReasoning('reasoning_title')
+      : BACKGROUND_REASONING_DEFAULTS[key];
   if (preferences.value.status !== 'loaded') return fallback;
   return preferences.value.data[key] || fallback;
 }
@@ -1545,15 +1559,35 @@ export function welcomeSuggestionsDismissed(): boolean {
   return preferences.value.data['welcome_suggestions_dismissed'] === 'true';
 }
 
-/** One-way retire — the user clicked "Don't show this again" on the
- *  new-workspace welcome. Idempotent: skips the write only when the LOADED
- *  preference already says dismissed. */
+/** One-way retire: the user clicked "Don't show this again" on the
+ *  new-workspace welcome, or `retireWelcomeAfterUse` decided they no longer
+ *  need it. Idempotent: skips the write only when the LOADED preference
+ *  already says dismissed. */
 export function dismissWelcomeSuggestions(): Promise<void> {
   if (preferences.value.status === 'loaded'
     && preferences.value.data['welcome_suggestions_dismissed'] === 'true') {
     return Promise.resolve();
   }
   return savePreference('welcome_suggestions_dismissed', 'true');
+}
+
+/** How many threads a user starts before the welcome retires itself. */
+export const WELCOME_RETIRES_AFTER_THREADS = 3;
+
+/** Retires the welcome once the user has started enough threads to know the
+ *  composer, so nobody carries it for months. Runs after each send and saves
+ *  the same preference as "Don't show this again". It counts top-level threads
+ *  the user sent: drafts, trigger runs and sub-threads are not use of the
+ *  composer. Desktop keeps the header's ? button as the way back into the
+ *  setup interview. With no provider the welcome is the provider-setup call to
+ *  action, which the same preference hides, so it never retires then. */
+export function retireWelcomeAfterUse(threads: Iterable<ThreadState>): Promise<void> {
+  if (!llmConfigured.value || welcomeSuggestionsDismissed()) return Promise.resolve();
+  let started = 0;
+  for (const { meta } of threads) {
+    if (meta.initiator === 'user' && meta.state === 'active' && !meta.parentThreadId) started++;
+  }
+  return started >= WELCOME_RETIRES_AFTER_THREADS ? dismissWelcomeSuggestions() : Promise.resolve();
 }
 
 // --- Backup reminder banner ---

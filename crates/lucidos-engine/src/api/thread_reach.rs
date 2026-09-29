@@ -49,11 +49,10 @@ pub(crate) enum ThreadReachVerb {
     /// reasoning effort or permission mode (`POST /api/v1/claude-code/control`).
     /// Controlling another thread's session is as much a reach as cancelling it.
     Control,
-    /// Asking a side question of a coding-agent session, which reads the
-    /// session's whole context (`POST /api/v1/coding-agents/side-question`).
+    /// Asking a side question, which reads the thread's whole context
+    /// (`POST /api/v1/side-questions`).
     AskSideQuestion,
-    /// Dismissing a side question's card
-    /// (`POST /api/v1/coding-agents/side-question/dismiss`).
+    /// Dismissing a side question's card (`POST /api/v1/side-questions/dismiss`).
     DismissSideQuestion,
     Apply,
     Discard,

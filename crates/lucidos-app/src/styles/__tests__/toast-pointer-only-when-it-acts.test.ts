@@ -1,9 +1,9 @@
 /**
  * A toast card shows the pointer only when a click on it acts.
  *
- * A passive info or success toast still closes on a click (`toastTap` answers
- * `'dismiss'`), but the pointer promised a destination that did not exist. So
- * the pointer belongs to `click` and `action` cards, never to a dismiss.
+ * A passive toast does nothing on a click, so a pointer would promise a
+ * destination that does not exist. The pointer belongs to `click` and `action`
+ * cards only.
  */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
@@ -29,8 +29,7 @@ describe('toast card cursor', () => {
     expect(pointerSelectors).toContain('.toast[data-toast-tap="action"]');
   });
 
-  it('does not point on a card that only dismisses', () => {
+  it('does not point on every card', () => {
     expect(pointerSelectors).not.toContain('.toast[data-toast-tap]');
-    expect(pointerSelectors).not.toContain('.toast[data-toast-tap="dismiss"]');
   });
 });

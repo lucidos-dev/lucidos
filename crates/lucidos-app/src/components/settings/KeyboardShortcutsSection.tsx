@@ -16,8 +16,8 @@ export function KeyboardShortcutsSection() {
 
   useEffect(() => {
     if (!recordingId) return;
-    // Capture phase so the recorded chord is intercepted before the global
-    // shortcut dispatcher (which runs in the bubble phase) can fire its action.
+    // Window capture runs before every document listener, the global shortcut
+    // dispatcher's Escape capture included, so no recorded chord also acts.
     function onKey(e: KeyboardEvent) {
       const outcome = recordChord(e, recordingId!);
       if (outcome.kind === 'modifier') return; // bare Ctrl/Cmd/etc — keep waiting
@@ -40,8 +40,8 @@ export function KeyboardShortcutsSection() {
       }
       setRecordingId(null);
     }
-    document.addEventListener('keydown', onKey, true);
-    return () => document.removeEventListener('keydown', onKey, true);
+    window.addEventListener('keydown', onKey, true);
+    return () => window.removeEventListener('keydown', onKey, true);
   }, [recordingId]);
 
   return (

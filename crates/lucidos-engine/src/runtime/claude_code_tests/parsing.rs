@@ -49,6 +49,24 @@ fn parse_system_init() {
     }
 }
 
+/// The version rides the handshake, which is how the engine learns Claude Code
+/// updated and its model list may have moved.
+#[test]
+fn parse_system_init_carries_the_claude_code_version() {
+    let line =
+        r#"{"type":"system","subtype":"init","session_id":"s-1","claude_code_version":"2.1.281"}"#;
+    match &parse_one_line(line)[0] {
+        AgentEvent::Init { agent_version, .. } => {
+            assert_eq!(agent_version.as_deref(), Some("2.1.281"));
+        }
+        other => panic!("Expected Init, got {:?}", other),
+    }
+    match &parse_one_line(r#"{"type":"system","subtype":"init","session_id":"s-1"}"#)[0] {
+        AgentEvent::Init { agent_version, .. } => assert_eq!(agent_version, &None),
+        other => panic!("Expected Init, got {:?}", other),
+    }
+}
+
 #[test]
 fn parse_system_init_with_model() {
     let line = r#"{"type":"system","subtype":"init","session_id":"s-1","model":"claude-opus-4-6","tools":[]}"#;
@@ -1199,6 +1217,7 @@ fn parse_line_extracts_init_from_system_init_event() {
             model,
             slash_commands,
             skills,
+            ..
         } => {
             assert_eq!(session_id, "s1");
             assert_eq!(model.as_deref(), Some("opus"));

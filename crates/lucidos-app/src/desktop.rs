@@ -1870,16 +1870,8 @@ pub fn run_service() -> i32 {
     // start whatever the start goes on to do.
     eprintln!("{SERVICE_BOOT_MARKER} (pid {})", std::process::id());
 
-    // FIRST, before anything else in the process. Everything below inherits
-    // what we set here: the gateway, every workspace engine, every coding
-    // agent. See `shell_env` for what launchd leaves out and why.
-    //
-    // At the top rather than beside `spawn_gateway` because it sets process
-    // env, which is only sound while the process is single-threaded. `main`
-    // reaches here before any Tauri, AppKit or thread setup.
-    #[cfg(target_os = "macos")]
-    crate::shell_env::hydrate_login_shell_env();
-
+    // No login-shell hydration here: the gateway does it for both shipped
+    // installs, and doing it here too would run the profile twice (ADR 0326).
     install_stop_handlers();
 
     let app_data = match app_data_dir_from_env() {

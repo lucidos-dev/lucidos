@@ -233,6 +233,24 @@ pub const CATALOG: &[PrefSpec] = &[
         side_effect: PrefSideEffect::None,
     },
     PrefSpec {
+        key: "model_change_summary",
+        label: "Change-summary model",
+        scope: PrefScope::Global,
+        value: PrefValue::Text,
+        default: "(the model_title model)",
+        description: "Background model that writes a change summary: one line saying what a coding-agent change of several commits does. It heads the change card, the change toasts and the Changes panel. A single-commit change makes no call, since its commit subject is already the line. Inherits model_title until you set this one.",
+        side_effect: PrefSideEffect::None,
+    },
+    PrefSpec {
+        key: "reasoning_change_summary",
+        label: "Change-summary reasoning",
+        scope: PrefScope::Global,
+        value: PrefValue::Enum(REASONING_EFFORTS),
+        default: "(the reasoning_title value, else none)",
+        description: "Thinking budget for the change summary. It condenses a list of commit subjects into one line, so the default spends nothing. Inherits reasoning_title until you set this one.",
+        side_effect: PrefSideEffect::None,
+    },
+    PrefSpec {
         key: "model_memory",
         label: "Memory model",
         scope: PrefScope::Global,
@@ -414,7 +432,7 @@ pub const CATALOG: &[PrefSpec] = &[
         scope: PrefScope::Global,
         value: PrefValue::Bool,
         default: "false",
-        description: "Whether the new-workspace welcome message + starter suggestions are hidden. Set 'false' to SHOW the welcome message again, 'true' to hide it.",
+        description: "Whether the new-workspace welcome message + starter suggestions are hidden. Set 'false' to SHOW the welcome message again, 'true' to hide it. The app also sets it to 'true' by itself after a send once the user has started 3 threads.",
         side_effect: PrefSideEffect::None,
     },
     // The key is spelled out rather than reusing `PREF_SELF_CURATED_CONTEXT_MODE`

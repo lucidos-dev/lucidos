@@ -29,6 +29,7 @@ pub(crate) mod context_panel;
 mod context_sections;
 mod history;
 mod run;
+mod side_question;
 mod system_prompt;
 mod titles;
 mod turn_clock;

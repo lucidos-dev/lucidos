@@ -150,7 +150,7 @@ fn pinned_model_version(value: &str) -> Option<(u32, u32)> {
 /// trail, because there is no version to place them by.
 #[test]
 fn the_model_rows_run_newest_version_first() {
-    let values: Vec<&str> = cc_model_options()
+    let values: Vec<&str> = curated_cc_model_options()
         .iter()
         .map(|m| m.value.as_str())
         .collect();
@@ -404,26 +404,46 @@ fn every_fable_generation_round_trips_through_cc_model_helpers() {
 }
 
 #[test]
-fn sonnet_5_round_trips_through_cc_model_helpers() {
-    // Sonnet 5 is pinned as a full model id in cc_menu_options.json, so CC
-    // echoing `claude-sonnet-5` must normalize to itself rather than being
-    // rewritten to the `sonnet` alias by the `claude-sonnet-4` rule below it.
-    assert_eq!(normalize_cc_model_id("claude-sonnet-5"), "claude-sonnet-5");
+fn every_sonnet_5_generation_round_trips_through_cc_model_helpers() {
+    // Both are pinned full ids in cc_menu_options.json, so CC echoing either
+    // must normalize to itself. Neither is rewritten to the `sonnet` alias by
+    // the `claude-sonnet-4` rule, and neither folds onto the other.
+    for id in [
+        "claude-sonnet-5-5",
+        "claude-sonnet-5",
+        "claude-sonnet-5-5[1m]",
+    ] {
+        assert_eq!(normalize_cc_model_id(id), id);
+    }
     assert_eq!(
         reconcile_cc_model(Some("claude-sonnet-5"), "claude-sonnet-5"),
         "claude-sonnet-5"
     );
-    // Picking the `sonnet` alias also lands on Sonnet 5: CC resolves the alias
+    // CC strips the suffix when it echoes the model, so reconcile re-attaches it.
+    assert_eq!(
+        reconcile_cc_model(Some("claude-sonnet-5-5[1m]"), "claude-sonnet-5-5"),
+        "claude-sonnet-5-5[1m]"
+    );
+    // Picking the `sonnet` alias lands on Sonnet 5.5: CC resolves the alias
     // and reports the concrete id, which is a picker value.
     assert_eq!(
-        reconcile_cc_model(Some("sonnet"), "claude-sonnet-5"),
-        "claude-sonnet-5"
+        reconcile_cc_model(Some("sonnet"), "claude-sonnet-5-5"),
+        "claude-sonnet-5-5"
     );
     // Sonnet 4.6 still folds back to the alias (unchanged behaviour).
     assert_eq!(normalize_cc_model_id("claude-sonnet-4-6"), "sonnet");
-    // The /model picker offers Sonnet 5 alongside the alias.
     let defs = cc_command_definitions();
-    assert_command_options(&defs, "set_model", "model", &["claude-sonnet-5", "sonnet"]);
+    assert_command_options(
+        &defs,
+        "set_model",
+        "model",
+        &[
+            "claude-sonnet-5-5",
+            "claude-sonnet-5-5[1m]",
+            "claude-sonnet-5",
+            "sonnet",
+        ],
+    );
 }
 
 #[test]
@@ -517,4 +537,37 @@ fn reconcile_cc_model_passes_through_when_no_1m() {
         reconcile_cc_model(None, "claude-opus-4-7"),
         "claude-opus-4-7"
     );
+}
+
+/// The picker is Claude Code's own list once it has answered, and the curated
+/// rows before. Never a mix of the two.
+#[test]
+fn the_picker_is_the_discovered_list_or_the_curated_one() {
+    assert_eq!(&*pick_cc_model_options(None), curated_cc_model_options());
+    let discovered: std::sync::Arc<[CcMenuOption]> = vec![CcMenuOption {
+        value: "sonnet".to_string(),
+        label: "Sonnet 5".to_string(),
+        description: String::new(),
+        supported_models: None,
+        context_window: None,
+        reasoning_efforts: Some(vec!["low".to_string()]),
+    }]
+    .into();
+    assert_eq!(pick_cc_model_options(Some(discovered.clone())), discovered);
+}
+
+/// A discovered row carries its own tiers, and the wire serves those rather
+/// than the effort table's universal set.
+#[test]
+fn a_discovered_row_offers_its_own_tiers() {
+    let row = CcMenuOption {
+        value: "haiku".to_string(),
+        label: "Haiku 4.5".to_string(),
+        description: String::new(),
+        supported_models: None,
+        context_window: None,
+        reasoning_efforts: Some(Vec::new()),
+    };
+    let (models, _) = model_and_effort_options(&[row], cc_reasoning_effort_options());
+    assert_eq!(models[0]["reasoning_efforts"], serde_json::json!([]));
 }

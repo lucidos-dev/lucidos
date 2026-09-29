@@ -385,4 +385,20 @@ describe('the provider step', () => {
   it('names no backend on a surface that has none', () => {
     expect(formatPair('Opus 5.5', 'High', null)).toBe('Opus 5.5 · High');
   });
+
+  // Claude Code's picker is what Claude Code lists now, so a thread can stay
+  // pinned to a model the list has dropped. It keeps a name, not a bare id.
+  it('names a selected model no row offers through labelFor', () => {
+    const offered = { value: 'opus', label: 'Opus 5.5', description: '', reasoningEfforts: ['high'] };
+    const named = useModelSelection({
+      models: [offered], vocabulary: LUCIDOS, model: 'claude-opus-5@default', effort: null,
+      labelFor: (id) => (id === 'claude-opus-5@default' ? 'Opus 5' : id), onChange: () => {},
+    });
+    expect(named.label).toBe('Opus 5');
+    const bare = useModelSelection({
+      models: [offered], vocabulary: LUCIDOS, model: 'claude-opus-5@default', effort: null,
+      onChange: () => {},
+    });
+    expect(bare.label).toBe('claude-opus-5@default');
+  });
 });

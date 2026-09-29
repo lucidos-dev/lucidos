@@ -68,6 +68,22 @@ Four things that go wrong, in the order they actually happen:
 
 `--font-mono` for code, and the UI font is whatever the user picked, so a mockup meant to look like Lucidos should say `font-family: 'Fira Code', ui-monospace, SFMono-Regular, Menlo, monospace`.
 
+### What a standalone HTML document can do
+
+An HTML file under `artifacts/` is untrusted content: it may come from an upload or a fetched web page. So the preview runs it in a sandboxed frame at an opaque origin. The engine serves it the same way when it is opened on its own. Write for that:
+
+| Works | Does not work |
+|---|---|
+| Its own `<script>`: sortable tables, charts, tabs | Calling the engine: `fetch('/api/v1/…')`, `EventSource`. The engine refuses the request. |
+| Relative assets next to it, loaded as tags: `<img src="img/chart.png">`, `<link href="style.css">` | Reading a sibling file from script: `fetch('data.json')`. It is another origin, and CORS refuses it. |
+| Links a reader clicks: a sibling file, `#section`, `thread:…`, `app:…`, `repo:…:file:…` | A link the script follows on its own. Only a real click navigates. |
+| `<a href="results.csv" download>` in a browser, a Copy button, a video's fullscreen button | `localStorage`, `sessionStorage`, `IndexedDB`, cookies. An opaque origin has none. |
+| `mailto:` and `tel:` links | Reading or changing the Lucidos window around it (`parent.…`) |
+
+A document that needs live workspace data, or that must remember state between opens, is an **app**, not an artifact. An app reads the workspace through `lucidos.*` (`system-knowhow/js-sdk.md`). If a snapshot is enough, write the data into the report itself, as a JSON `<script>` block or inline in the markup.
+
+Relative assets load from `artifacts/` only. An HTML file stored elsewhere (`knowhow/`, an app folder) still renders, but behind the gateway its relative images and stylesheets do not load. Keep a report and its assets together under `artifacts/`.
+
 ## apps/ — App UIs & Logic
 
 Each app: `apps/{id}/`

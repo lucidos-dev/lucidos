@@ -8,6 +8,15 @@ export type ShortcutId =
   | 'newThread'
   | 'closeThread'
   | 'searchEverywhere'
+  | 'searchFiles'
+  | 'openSettings'
+  | 'showShortcuts'
+  | 'openNotifications'
+  | 'focusComposer'
+  | 'stopThread'
+  | 'copyLastResponse'
+  | 'renameThread'
+  | 'focusNewestToast'
   | 'openThreadActions'
   | 'toggleSubthreads'
   | 'historyBack'
@@ -27,7 +36,7 @@ export type ShortcutId =
   | 'zoomOut'
   | 'zoomReset';
 
-export type ShortcutCategory = 'Navigation' | 'Panes' | 'View';
+export type ShortcutCategory = 'Navigation' | 'Thread' | 'Panes' | 'View';
 
 /** A normalized key chord. `mod` means "the platform primary modifier" and
  *  matches either Cmd (meta) or Ctrl — the same lenient rule the handlers have
@@ -51,6 +60,8 @@ const B = (mod: boolean, shift: boolean, alt: boolean, key: string): Binding => 
 
 /** The full registry. Order is the cheat-sheet display order. All entries are
  *  rebindable; the single-key `c`/`t` shortcuts were intentionally dropped.
+ *  A default copies the chord well-known apps use for the same action, where
+ *  one exists (docs/plans/2026-09-29-familiar-keyboard-shortcuts.md).
  *  Labels render in Settings → Keyboard shortcuts (and in Search Everywhere via
  *  `searchIndex.ts`), so they use `system-knowhow/glossary.md`'s two layers: a
  *  shortcut acting on ONE pane names it mechanically — thread drawer, thread
@@ -60,13 +71,22 @@ const B = (mod: boolean, shift: boolean, alt: boolean, key: string): Binding => 
 export const SHORTCUT_DEFS: readonly ShortcutDef[] = [
   { id: 'newThread', label: 'New thread', category: 'Navigation', defaultBinding: B(true, true, false, 'o') },
   { id: 'closeThread', label: 'Close thread (cascade)', category: 'Navigation', defaultBinding: B(true, true, false, 'w') },
-  { id: 'searchEverywhere', label: 'Search everywhere', category: 'Navigation', defaultBinding: B(true, true, false, 's') },
+  { id: 'searchEverywhere', label: 'Search everywhere', category: 'Navigation', defaultBinding: B(true, false, false, 'k') },
+  { id: 'searchFiles', label: 'Search files', category: 'Navigation', defaultBinding: B(true, false, false, 'p') },
+  { id: 'openSettings', label: 'Open settings', category: 'Navigation', defaultBinding: B(true, false, false, ',') },
+  { id: 'showShortcuts', label: 'Show keyboard shortcuts', category: 'Navigation', defaultBinding: B(true, false, false, '/') },
+  { id: 'openNotifications', label: 'Open notifications', category: 'Navigation', defaultBinding: B(true, true, false, 'i') },
+  { id: 'focusNewestToast', label: 'Focus newest toast', category: 'Navigation', defaultBinding: B(true, true, false, 'n') },
   { id: 'openThreadActions', label: 'Open thread actions (highlighted drawer row)', category: 'Navigation', defaultBinding: B(true, true, false, 'm') },
   { id: 'toggleSubthreads', label: 'Expand or collapse sub-threads (focused thread)', category: 'Navigation', defaultBinding: B(true, true, false, 'e') },
   { id: 'historyBack', label: 'Back (focused pane)', category: 'Navigation', defaultBinding: B(true, false, true, 'ArrowDown') },
   { id: 'historyForward', label: 'Forward (focused pane)', category: 'Navigation', defaultBinding: B(true, false, true, 'ArrowUp') },
   { id: 'prevTurnOrNotification', label: 'Previous turn (thread) or newer notification', category: 'Navigation', defaultBinding: B(true, false, false, 'ArrowUp') },
   { id: 'nextTurnOrNotification', label: 'Next turn (thread) or older notification', category: 'Navigation', defaultBinding: B(true, false, false, 'ArrowDown') },
+  { id: 'focusComposer', label: 'Focus the composer', category: 'Thread', defaultBinding: B(false, true, false, 'Escape') },
+  { id: 'stopThread', label: 'Stop the running thread', category: 'Thread', defaultBinding: B(true, false, false, '.') },
+  { id: 'copyLastResponse', label: 'Copy last response', category: 'Thread', defaultBinding: B(true, true, false, 'c') },
+  { id: 'renameThread', label: 'Rename thread', category: 'Thread', defaultBinding: B(false, false, false, 'F2') },
   { id: 'toggleThreadDrawer', label: 'Show or hide thread drawer', category: 'Panes', defaultBinding: B(true, true, false, '1') },
   { id: 'toggleThreadPane', label: 'Focus or hide thread pane', category: 'Panes', defaultBinding: B(true, true, false, '2') },
   { id: 'toggleContentPane', label: 'Focus or hide content pane', category: 'Panes', defaultBinding: B(true, true, false, '3') },
@@ -188,6 +208,7 @@ const KEY_GLYPHS: Record<string, string> = {
   ArrowUp: '↑',
   ArrowDown: '↓',
   Enter: '↵',
+  Escape: 'Esc',
 };
 
 /** Platform-correct display string, e.g. Mac `⌘K` / `⌃⇧O`, Win/Linux

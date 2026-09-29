@@ -2,8 +2,9 @@ import { signal, useSignal } from '@preact/signals';
 import { useEffect, useMemo, useRef } from 'preact/hooks';
 import { answerThreadQuestion } from '../../store/actions/chat-claude-code';
 import { createTapGate } from '../../utils/tapGesture';
-import { renderMarkdownInline, renderMarkdownInlineWithLinks } from '../../utils/renderMarkdown';
+import { renderMarkdown, renderMarkdownInline } from '../../utils/renderMarkdown';
 import { CHOICE_CARD_ROLE, handleChoiceCardKeyDown, seedChoiceCardFocus } from './choiceCardNav';
+import { UserImages } from './chat-exchange-parts';
 import { followAnsweredQuestion } from './scrollState';
 import type { AnswerKind, QuestionOption } from '../../store/thread-events';
 
@@ -120,17 +121,18 @@ function OptionContent({
   );
 }
 
-/** The question prompt itself. Rendered as inline markdown with live links so
- *  a URL the LLM pastes into the question (e.g. a PR link) is clickable rather
- *  than dead text. It sits in a plain `<div>`, not a `<button>`, so real `<a>`
- *  elements are valid here — unlike the option label/desc inside OptionButton.
- *  Shared across the live, answered, and terminated bodies so all three render
- *  the question identically. */
+/** The question prompt itself, rendered as full markdown like a reply. A card
+ *  often carries findings before the decision, and only block markdown keeps
+ *  their paragraphs and lists apart. It sits in a plain `<div>`, not a
+ *  `<button>`, so links are valid here, unlike inside OptionButton. They route
+ *  like a reply's: workspace links through the initiator panel's body click,
+ *  web links through the global click handler. Shared across the live, answered
+ *  and terminated bodies so all three render the question identically. */
 function QuestionText({ question }: { question: string }) {
   return (
     <div
-      class="question-text"
-      dangerouslySetInnerHTML={{ __html: renderMarkdownInlineWithLinks(question) }}
+      class="question-text markdown-content"
+      dangerouslySetInnerHTML={{ __html: renderMarkdown(question) }}
     />
   );
 }
@@ -337,6 +339,8 @@ export function AnsweredBody({
     resolved.kind === 'FreeText' ? resolved.text
     : resolved.kind === 'MultiSelected' ? resolved.text
     : undefined;
+  const imageHashes =
+    resolved.kind === 'FreeText' || resolved.kind === 'MultiSelected' ? resolved.image_hashes ?? [] : [];
   return (
     <div class="question-body question-body-answered protected-surface" data-tool-use-id={toolUseId}>
       <QuestionText question={question} />
@@ -352,10 +356,13 @@ export function AnsweredBody({
           ))}
         </div>
       )}
-      {customText && customText.length > 0 && (
+      {((customText && customText.length > 0) || imageHashes.length > 0) && (
         <div class="question-freetext">
           <span class="question-freetext-label">Custom answer</span>
-          <div class="user-bubble question-freetext-text">{customText}</div>
+          <div class="user-bubble question-freetext-text">
+            {customText}
+            <UserImages imageHashes={imageHashes} />
+          </div>
         </div>
       )}
       {resolved.kind === 'Canceled' && (

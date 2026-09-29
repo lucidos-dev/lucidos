@@ -41,7 +41,10 @@ async fn answer(bus: &EventBus, thread_id: Uuid, tool_use_id: &str) {
         thread_id,
         ThreadEvent::UserQuestionAnswered {
             tool_use_id: tool_use_id.into(),
-            answer: AnswerKind::FreeText { text: "yes".into() },
+            answer: AnswerKind::FreeText {
+                text: "yes".into(),
+                image_hashes: vec![],
+            },
         },
     )
     .await;
@@ -223,7 +226,10 @@ async fn a_held_message_can_be_released_only_once() {
 fn only_a_cancel_keeps_the_hold() {
     assert!(!answer_releases_held_messages(&AnswerKind::Canceled));
     for kind in [
-        AnswerKind::FreeText { text: "yes".into() },
+        AnswerKind::FreeText {
+            text: "yes".into(),
+            image_hashes: vec![],
+        },
         AnswerKind::Selected {
             option_id: "opt-0".into(),
         },

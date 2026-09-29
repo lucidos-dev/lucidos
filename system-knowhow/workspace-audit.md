@@ -1,6 +1,6 @@
 ---
 name: Workspace Consistency Audit
-description: Audits the workspace apps, triggers, knowhow, intents, scripts and artifacts against current conventions and the SDK/CLI surface. Use to audit the workspace, check for drift, see what is stale, or migrate every app off one retired pattern.
+description: Audits the workspace apps, triggers, knowhow, intents, scripts and artifacts against current conventions and the SDK/CLI surface. Use to audit the workspace, check for drift, see what is stale, or move every app off a retired pattern or onto SDK UI helpers.
 ---
 
 # Workspace Consistency Audit
@@ -111,6 +111,7 @@ for calling a category clean.
 | `web-share` | the OS share sheet, from an app frame | 2 |
 | `url-mutation` | the frame writing its own session-history URL | 2 |
 | `theme-rename` | names from before *look* became *theme* | 2 |
+| `hand-rolled-ui` | a control the app draws itself that the SDK provides | 2 |
 | `tap-strings` | the retired `tap` string forms | 1 |
 | `removed-flags` | CLI flags and tool args that were removed | 7 |
 | `removed-fields` | thread-summary fields the engine no longer sends | 7 |
@@ -150,6 +151,8 @@ scan web-share "navigator\.share" $inc apps
 scan url-mutation "history\.(replaceState|pushState)|location\.(href|assign|replace)[[:space:]]*=|window\.location[[:space:]]*=" $inc apps
 
 scan theme-rename "data-theme([^-]|\$)|data-look-|look-effects|lucidos-look|/looks?[/?'\"\`]|preferences\.(set|get)\(['\"](look|theme)['\"]" $inc --include=*.css apps
+
+scan hand-rolled-ui "(^|[^.[:alnum:]_])(alert|confirm|prompt)\(|window\.(alert|confirm|prompt)\(|function[[:space:]]+(toast|showToast|snackbar)[[:space:]]*\(|class=[\"'][^\"']*(toast|snackbar)|^[[:space:]]*\.(toast|snackbar)[[:space:]{.,:]|<select[[:space:]>]|[[:space:]]title=[\"']|role=[\"']switch|(toggle|switch)[[:alnum:]_-]*(thumb|knob)|^[[:space:]]*\.[[:alnum:]_-]*(spinner|loader|badge|chip|pill|tabs?)[[:space:]{.,:]|role=[\"']tab[\"']" $inc --include=*.css --exclude-dir=tests apps
 
 scan tap-strings "\"tap\"[[:space:]]*:[[:space:]]*\"(modal|none|open_app|open_thread)\"|tap:[[:space:]]*'(modal|none|open_app|open_thread)'|kind:[[:space:]]*'none'" $all
 
@@ -305,6 +308,39 @@ Per `system-knowhow/js-sdk.md`:
   - **broken**: `theme` set to `light`, `dark` or `system`. The engine refuses
     it. Recommend `theme-mode`. A `theme` set to a theme id is correct.
 
+- **A control the app draws itself that the SDK provides.** The host draws the
+  SDK's helpers, so they pick up every later fix and theme change on their own.
+  A copy the app drew itself stays as it was the day someone wrote it. That is
+  why an app keeps needing updates. The `hand-rolled-ui` scan finds the copies.
+  Judge each hit:
+  - **drift**: the browser's own `alert()`, `confirm()` or `prompt()`. They
+    still work in the frame, unthemed.
+  - **drift**: the app's own toast or snackbar, meaning a `toast()` function or
+    a `.toast` element with its own CSS.
+  - **drift**: a `<select>` in an app that never calls `lucidos.ui.Select` or
+    `lucidos.ui.enhanceSelects`.
+  - **drift**: a `title="…"` attribute used as a tooltip. It never shows on a
+    touch device.
+  - **drift**: an on/off switch the app draws itself, such as a `role="switch"`
+    button with its own track and thumb. A `role="switch"` checkbox inside a
+    `.toggle-switch` label is the shared one and is correct.
+  - **drift**: a spinner the app draws itself, meaning a `.spinner` or
+    `.loader` rule of its own. Where it stands in for loaded data, say so: data
+    loading draws a skeleton, and only a working state takes the ring.
+  - **drift**: a badge, chip or pill the app draws itself to show a status or
+    a category. A pill the user taps to filter or switch views is the next case.
+  - **drift**: tabs or filter pills the app draws itself. A `role="tab"` button
+    with the `pill-bar-btn` class is the shared one and is correct.
+
+  Read the call site before you report a hit. An app can define its own
+  `confirm()` method, and a `title` on an `<iframe>` or `<abbr>` is an
+  accessible name, not a tooltip. Leave those.
+
+  **A pattern with no SDK counterpart is not a finding.** Cards and custom
+  modals have none yet, so an app that draws its own is correct. Owns the rule: `system-knowhow/js-sdk.md` § Toasts, § Confirmation
+  dialogs, § Prompts, § Tooltips, § lucidos.ui.Select and § Component classes.
+  § Remediation carries the replacements.
+
 Per `system-knowhow/best-practices.md`:
 
 - `manifest.json` carries only user-facing metadata; no operational knowledge has leaked in.
@@ -340,7 +376,7 @@ Scope is **every `.md` file the registry reads** (per `system-knowhow/intent-reg
 
 Per `system-knowhow/lucidos-cli.md`:
 
-- Writes to `data/` go through `lucidos data write`, not raw HTTP and not open-coded paths under `$LUCIDOS_WORKSPACE/data/`.
+- Writes to `data/` go through `lucidos data write`, not raw HTTP and not open-coded paths under `$LUCIDOS_WORKSPACE/data/`. Do not flag a script's own runtime state (a cursor, a last-seen id) written directly under `data/artifacts/<plugin-id>/` or `data/triggers/<slug>/state/`. Per `system-knowhow/plugins.md` § "Where a plugin keeps its runtime state", that is the intended pattern.
 - Domain events go through `lucidos events emit` / `lucidos events query`.
 - External API calls go through `lucidos proxy <name>` when the workspace owns a credential for the service. The patterns are check 7's; a script adds one consequence of its own, which is that a credential in argv also lands in shell history.
 - No hardcoded absolute paths to a specific workspace.
@@ -357,6 +393,10 @@ Don't enumerate user content. Per `system-knowhow/best-practices.md`:
 - No `data/artifacts/themes/` (or `data/artifacts/looks/`, its name before the rename), `data/artifacts/config/`, `data/artifacts/auth-modules/` or `data/artifacts/scripts/`. `lucidos data write` once filed those trees under `artifacts/`, and the agent's file tools did the same for themes, so nothing reads them there: a theme never shows, and an `apis.json` never loads. Severity: **broken**. Owns the rule: `system-knowhow/lucidos-cli.md` § `lucidos data path`.
   - Flag a file only when its content fits the tree: a theme JSON, `apis.json`, a signer `.wasm`, or a handshake script. An artifact project that happens to share the name is not a finding.
   - Recommend writing each file again at its real path with `lucidos data write`, without the `artifacts/` segment. That also runs the engine's checks. Then delete the copy under `artifacts/`.
+- No HTML artifact that expects the shell's authority. A previewed or served HTML file runs sandboxed at an opaque origin. So its own calls to the engine, its `fetch()` of sibling files and its browser storage all fail. Grep the artifact's own inline `<script>` blocks in `data/artifacts/**/*.html` for `/api/v1`, `new EventSource(`, `fetch(`, `localStorage`, `sessionStorage` and `parent.document`. Skip a vendored library file, which is not the artifact's code.
+  - An unguarded storage access throws and stops the script. Severity: **broken**. A `fetch` inside a `catch` that falls back leaves an empty or stale report. Severity: **stale**.
+  - Recommend writing the data into the file when it is written, or making it an app.
+  - Owns the rule: `system-knowhow/best-practices.md` § What a standalone HTML document can do.
 - No bulk imports under `data/artifacts/imported/<service>/` that match the "dumped repo / archive" anti-pattern (file count + size are the tell). Suggest moving bulk to `.lucidos/tmp/` or `~/.lucidos/data/`.
 - No orphaned `imported/<service>/` directories — flag for review (don't auto-delete).
 - App data sits under `data/artifacts/<app-id>/`, not at the artifacts root.
@@ -514,6 +554,33 @@ this table and the two rules under it:
   covers an uncovered route, and a route the engine denies has no remedy by
   design.
 
+### Replacing a control the app draws itself
+
+Hand a fix thread this table and the rules under it:
+
+| Old | New |
+|---|---|
+| `alert(message)` | `lucidos.ui.toast(message, 'error')` for a failure, else `'info'` |
+| the app's own `toast(message)` and its element | `lucidos.ui.toast(message, type)`, then delete the element and its CSS |
+| `if (confirm(message))` | `if (await lucidos.ui.confirm({ message }))`, with `danger: true` for a destructive action |
+| `const value = prompt(message)` | `const value = await lucidos.ui.prompt({ message })`. It also returns `null` on cancel |
+| a plain `<select>` | `lucidos.ui.enhanceSelects()` once the markup is on the page |
+| `title="…"` as a tooltip | `data-tooltip="…"` |
+| a switch the app draws itself | `<label class="toggle-switch"><input type="checkbox" role="switch"><span class="toggle-slider"></span></label>`, then delete the app's own switch CSS |
+| a spinner the app draws itself | `<span class="mini-spinner" aria-hidden="true"></span>` beside its text, then delete the app's own spinner CSS and keyframes |
+| a status or category chip the app draws itself | `<span class="label">`, plus `label-success`, `label-warning`, `label-error` or `label-neutral` for a status. Map the app's own colours onto those four and the bare accent, then delete its chip CSS |
+| tabs the app draws itself | `<div class="pill-bar" role="tablist">` with a `<button class="pill-bar-btn" role="tab" aria-selected>` per view, then delete the app's own tab CSS |
+| filter pills the app draws itself | the same `.pill-bar`, with `role="group"` and `aria-pressed` on each button |
+
+- **Confirm and prompt become asynchronous.** The browser's dialogs block, and
+  the SDK's return a promise. The calling function becomes `async`, and every
+  caller of it has to wait for it.
+- **Keep the message and its language.** Pick the toast type from what the
+  message says: success, a failure, or neutral information.
+- **Every helper needs `sdk.js`.** An app whose `index.html` does not load
+  `/api/v1/sdk.js` gets it first, per the boilerplate in `system-knowhow/js-sdk.md`
+  § Setup.
+
 ### Rewriting an old-form `tap`
 
 A fix thread needs the mapping, not just the finding, so hand it this table:
@@ -563,5 +630,10 @@ an app can no longer do for itself is the whole of that check. That check's
 `fetch` half now runs as two scan sections: `engine-fetch` for the engine
 address and `relative-fetch` for the app's own files, because one CORS refusal
 has two spellings in app code. A sandbox change reaches both.
+
+The hand-rolled-control check owns its list of what the SDK replaces. When the
+SDK or the shared component layer gains a control, its hand-drawn form becomes
+drift. Add it to the `hand-rolled-ui` scan, the check and the § Remediation
+table in the same change. Then drop it from the "no SDK counterpart" list.
 
 When a deprecated CLI flag or tool arg is fully removed, add it to check 7's "Removed CLI flags and tool args" list. Include its replacement and any live same-named flag to exclude. The source is `docs/temporary-measures.md` § sunset deprecations.

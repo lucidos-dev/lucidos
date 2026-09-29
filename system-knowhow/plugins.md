@@ -65,6 +65,8 @@ Validation rules enforced at install (`core/plugins.rs::validate_tree` and `vali
 - Every file under `themes/` is `<id>.json` and a valid theme, with an id no built-in theme uses (`InvalidTheme` otherwise). The rules are in `themes.md`, theme parts included: a part value past a cap, or a part on a protected surface, fails staging with the field, the rule and the limit (`dark.parts.chat-text.text-shadow: blur 2em is over the 0.6em cap.`).
 - Every file under `fonts/` belongs to a valid workspace font: `fonts/<slug>/font.json` plus the font files it names (`InvalidFont` otherwise). A theme in the plugin may name a workspace font only if the plugin ships it. Install is refused when the plugin's new fonts would take the workspace past 100. The rules are in `workspace-fonts.md`.
 - Hidden files (any path component starting with `.`) are silently skipped during the file walk -- `.DS_Store`, editor swap files, and friends do not get installed.
+- Build output is silently skipped during the file walk. The walk does not enter a directory named `node_modules`, `target`, `dist`, `build`, `out`, `__pycache__`, `venv`, `.venv`, `.next`, `.pytest_cache` or `.git`, at any depth. It also skips any `*.pyc` or `*.pyo` file. These files are machine-specific, so they never reach the install record or the uninstall list. A tree that holds only build output fails as `EmptyTree`.
+- An app, trigger or font folder with one of those names (`apps/dist/`, `triggers/build/`, `fonts/out/`) fails as `ItemNamedLikeBuildOutput`, so install never drops a whole item silently. Deeper down, install drops such a folder without a warning, so do not put real content in one.
 - Symbolic links are never followed. A file symlink is skipped and a dir symlink is not walked. A top-level symlink named as a content dir is rejected. This keeps a plugin from reaching a file outside its own tree.
 - No archive entry uses `..` or absolute paths (`/`, `\`) -- zip-slip protection.
 
@@ -189,10 +191,13 @@ looking for `manifest.toml`:
   Flat (`<plugin-id>/manifest.toml`) or one grouping level
   (`plugins/<plugin-id>/manifest.toml`) both work; flat is preferred because the
   generated install URL is shorter.
-- **At depth 0, the five content-dir names (`apps`, `knowhow`, `triggers`,
-  `scripts`, `auth-modules`) are skipped** -- that guard stops a single-plugin
-  repo (manifest at the root) from also reporting its own `apps/` as a
-  candidate.
+- **At depth 0, the seven content-dir names (`apps`, `knowhow`, `triggers`,
+  `scripts`, `auth-modules`, `themes`, `fonts`) are skipped.** That guard stops
+  a single-plugin repo (manifest at the root) from also reporting its own
+  `apps/` as a candidate.
+- **At every depth, the walk skips hidden directories and build-output
+  directories** (the same list as the install walk, see "Plugin layout"). So a
+  `manifest.toml` inside `node_modules/` or `dist/` is never a plugin root.
 - **Duplicate plugin `id`s are de-duplicated** -- first root wins, later ones are
   silently dropped. Keep directory name == manifest `id` to make collisions
   obvious.
@@ -201,7 +206,7 @@ looking for `manifest.toml`:
 
 **Root-level files that are not plugin directories are ignored.** A README,
 `CODEOWNERS`, `.github/`, `LICENSE`, `.gitignore` at the *marketplace* root are
-fine -- the strict "only `manifest.toml` + the five content dirs" validation
+fine -- the strict "only `manifest.toml` + the seven content dirs" validation
 applies **inside a plugin root**, not to the marketplace repo. Use the root
 README as the human discovery index (this is what `lucidos-dev/plugins` does).
 
@@ -377,7 +382,7 @@ confirming, so activation is never silent.
 
 ## What doesn't belong in a plugin
 
-The four content directories make almost anything technically packageable, but apply judgment to `triggers/`. Apps, knowhow, and **event-driven (`on_event`) triggers** belong in plugins -- they are reference material or part of the plugin's own mechanism. An `on_event` trigger that reacts to events the plugin's apps/knowhow emit ships as a `triggers/<slug>/trigger.toml` declaration: install **auto-registers** it (stamped with the plugin id) and uninstall removes it — see "Shipping triggers" above.
+The seven content directories make almost anything technically packageable, but apply judgment to `triggers/`. Apps, knowhow, and **event-driven (`on_event`) triggers** belong in plugins -- they are reference material or part of the plugin's own mechanism. An `on_event` trigger that reacts to events the plugin's apps/knowhow emit ships as a `triggers/<slug>/trigger.toml` declaration: install **auto-registers** it (stamped with the plugin id) and uninstall removes it. See "Shipping triggers" above.
 
 **Nothing user- or machine-specific ships in a plugin.** A plugin is one artifact many workspaces install identically. Anything that differs per installer is workspace state, not plugin content: an account, a schedule, a client id, a path on someone's disk. Ship the generic code, and use the `setup` field to have the agent ask each installer for their own value at install time. The test for a file: would it still be correct on a machine that is not yours?
 
@@ -401,6 +406,28 @@ Concretely:
 - If a plugin would benefit from a cron trigger, the manifest `description` should mention it so the install-time LLM can offer to set one up conversationally.
 
 The canonical example is `browser-learning` v0.2.0, which ships knowhow only and relies on the install-time prompt for the reflection (cron) trigger.
+
+## Where a plugin keeps its runtime state
+
+A plugin's scripts, triggers and apps often write state when they run: a cursor, a last-seen id, a cache, a log. Put that state under `data/artifacts/<plugin-id>/`. Never write it inside the plugin's own `triggers/`, `apps/`, `scripts/` or `knowhow/` folders.
+
+Those folders hold the shipped content, so two things go wrong with state there:
+
+- **Updates and uninstalls manage them.** An update replaces or merges the files the plugin shipped. Uninstall tells the user to delete them. State kept among them is easy to lose.
+- **The engine reads state there as a local edit.** The Modified badge counts any file added to the plugin's app folder, and any change to a file the plugin shipped. An update's three-way merge then treats that change as the user's edit. A plugin nobody touched looks modified.
+
+Build the path from `LUCIDOS_WORKSPACE`, the workspace root the engine sets for every process it spawns:
+
+```python
+import os
+
+STATE_DIR = os.path.join(os.environ["LUCIDOS_WORKSPACE"], "data", "artifacts", "my-plugin")
+os.makedirs(STATE_DIR, exist_ok=True)
+```
+
+Write state files directly, not with `lucidos data write`. That command commits and announces every write, which suits a finished report but not a cursor rewritten on every run.
+
+This overrides the `__file__`-relative state path in `triggers.md` § "Scripts run in place". A plugin's scripts also run in place, so that section still explains where `__file__` points. Its advice to keep state beside the script suits a trigger the user owns. For a plugin, beside the script is inside a folder the plugin manages.
 
 ## Three distribution shapes
 
@@ -537,7 +564,7 @@ This state is **derived on read, never stored**: there is no "PluginModified" ev
 
 What counts as a modification, per content type:
 
-- **Apps** (`apps/<id>/`): any edit, delete, or **added** file inside the plugin's app directory (a directory diff against the install commit).
+- **Apps** (`apps/<id>/`): any edit, delete, or **added** file inside the plugin's app directory (a directory diff against the install commit). Build output never counts: a file under one of the build-output directories listed in "Plugin layout", or a `*.pyc` / `*.pyo` file.
 - **Knowhow / scripts / auth-modules**: an edit or delete of a file the plugin *recorded*. A brand-new file you drop into `knowhow/` (etc.) is *not* attributed to a plugin — those roots are shared by the user and other content.
 - **Triggers** (`triggers/<slug>/trigger.toml`): a change to the trigger's *definition*. `trigger.toml` is a gitignored, re-serialized projection (ADR 0019), so it is compared semantically (ignoring `slug` / `plugin_id` / `group_id`), not byte-for-byte — re-serialization after install never counts as a modification.
 
@@ -678,7 +705,9 @@ Both events are useful trigger sources. Examples worth considering:
 - **Building the archive with `tar`, `tar -czf`, or `gzip`.** The `.lucidos-plugin` extension is a renamed PKZip file, not a tarball. The install path opens it with `zip::ZipArchive::new()` (`engine/tools/plugins.rs::extract_zip`), which fails on gzip/tar with an opaque parse error. Always run `zip -r ../foo.lucidos-plugin .` from inside the plugin tree -- if `zip` isn't installed, install it (`brew install zip`, `apt install zip`) instead of substituting another archiver. Verify before handing the file off: `unzip -l foo.lucidos-plugin` should list the entries; `file foo.lucidos-plugin` should say `Zip archive data`, not `gzip compressed data`.
 - **Calling the manifest `manifest.json`, `manifest.yaml`, or anything other than `manifest.toml`.** `validate_tree` looks for `manifest.toml` at the archive root and only parses TOML. Other names or formats reject the archive before any file is written. The required fields are `id`, `version`, `name`, `description` (optional: `source`, `engine`) -- see the schema table above.
 - **Silently dropping or rewriting external references.** When an app references a file outside the plugin tree (`<img src="../../artifacts/foo.png">`, `<script src="/data/scripts/bar.js">`, etc.), do not guess. List every external reference back to the user and ask whether to bundle the file into the plugin tree, leave the reference as-is (and document the external dependency), drop the reference + dependent feature, or abort packaging. Auto-bundling without asking risks shipping the user's private workspace artifacts; auto-dropping risks publishing a plugin with a broken feature the user did not realise was lost. See "Authoring loop" step 2 for the full handling rule.
-- **Putting a README at the plugin root.** Validation rejects any top-level entry that is not `manifest.toml` or one of the four content directories. Put your README inside `apps/<id>/` if it is app-specific, or only in the source repo (which is not part of what gets installed).
+- **Putting a README at the plugin root.** Validation rejects any top-level entry that is not `manifest.toml` or one of the seven content directories (`apps`, `knowhow`, `triggers`, `scripts`, `auth-modules`, `themes`, `fonts`). Put your README inside `apps/<id>/` if it is app-specific, or only in the source repo (which is not part of what gets installed).
+- **Committing `__pycache__/` or `*.pyc` files.** Install skips them (see "Plugin layout"), but they still bloat the repo and add noise to every PR. Give the plugin repo a `.gitignore` that lists `__pycache__/`, `*.pyc` and any other build output your scripts or apps create.
+- **Writing runtime state inside the plugin's own folders.** See "Where a plugin keeps its runtime state".
 - **Using underscores or capitals in `id`.** `browser_learning` and `Browser-Learning` both fail validation. Stick to `[a-z0-9-]+`.
 - **Setting `source` to a `.lucidos-plugin` path.** When `source` is present it must be a git URL -- a local archive path is not valid. If you're distributing as an archive only, just omit `source` entirely.
 - **Forgetting to bump `version` before publishing a fix.** Existing installers will see `"Already at latest"` and never pick up your change.

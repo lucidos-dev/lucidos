@@ -136,6 +136,7 @@ async fn handshake_turn_streams_deltas_and_results_then_exits_on_close() {
         .send(AgentInput {
             text: "ping".into(),
             images: vec![],
+            uuid: uuid::Uuid::new_v4(),
         })
         .expect("send input");
 
@@ -219,6 +220,7 @@ async fn resume_uses_thread_resume_with_stored_id() {
         .send(AgentInput {
             text: "follow up".into(),
             images: vec![],
+            uuid: uuid::Uuid::new_v4(),
         })
         .unwrap();
     // Drain: Init, Message x2, Usage, Result.
@@ -250,6 +252,7 @@ async fn approval_round_trip_accept_reaches_the_child() {
         .send(AgentInput {
             text: "go".into(),
             images: vec![],
+            uuid: uuid::Uuid::new_v4(),
         })
         .unwrap();
 
@@ -299,6 +302,7 @@ async fn approval_gated_item_started_does_not_emit_tool_use_until_acceptance() {
         .send(AgentInput {
             text: "go".into(),
             images: vec![],
+            uuid: uuid::Uuid::new_v4(),
         })
         .unwrap();
 
@@ -346,6 +350,7 @@ async fn approval_deny_sends_decline() {
         .send(AgentInput {
             text: "go".into(),
             images: vec![],
+            uuid: uuid::Uuid::new_v4(),
         })
         .unwrap();
     let _ = next_event(&mut s.events_rx).await; // Init
@@ -379,6 +384,7 @@ async fn interrupt_sends_turn_interrupt_and_turn_ends_canceled() {
         .send(AgentInput {
             text: "go".into(),
             images: vec![],
+            uuid: uuid::Uuid::new_v4(),
         })
         .unwrap();
     assert!(matches!(
@@ -427,6 +433,7 @@ async fn child_death_mid_turn_synthesizes_failed_result() {
         .send(AgentInput {
             text: "go".into(),
             images: vec![],
+            uuid: uuid::Uuid::new_v4(),
         })
         .unwrap();
     assert!(matches!(
@@ -542,6 +549,7 @@ done
         .send(AgentInput {
             text: "continue please".into(),
             images: vec![],
+            uuid: uuid::Uuid::new_v4(),
         })
         .unwrap();
 

@@ -149,3 +149,16 @@ steps.
 **Widen the gate for all unattended work, not just security.** It would fix the
 same symptom and give up the gate's actual purpose. The nightly's other steps
 already have their own commit postures, and none of them was deadlocked.
+
+## Addendum (2026-09-29): the blocked lane never rides on a branch with fixes
+
+On 2026-09-29 the nightly `/harden-project` step committed 11 critical and high
+fixes. On the same branch it then took the blocked lane for one design-level
+finding, and recorded a proposed marker. Apply refuses a branch with a proposed
+marker, so none of the fixes merged. The night's e2e ran on a main without them.
+
+The blocked lane is now for a branch with no fix commits only. A session that
+has committed a fix, or will commit one, writes no plan and records no marker.
+It lists the finding under `Decisions:` with the thorough and the narrow fix.
+The orchestrator then has the plan written in a separate session on its own
+branch. The bounded lane and `--simple` are unchanged.

@@ -223,6 +223,7 @@ pub fn every_side_question_event() -> Vec<ThreadEvent> {
         ThreadEvent::SideQuestionAsked {
             side_question_id,
             question: "what does this return?".into(),
+            image_hashes: vec![],
         },
         ThreadEvent::SideQuestionAnswered {
             side_question_id,

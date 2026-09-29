@@ -16,6 +16,7 @@ import { welcomeSuggestionsDismissed } from '../../store/actions/preferences';
 import { anchorSpacer, setAnchorSpacer, splitAnchorCorrection } from './anchorCorrection';
 import { awayFromBottom, notAtTop, scrollToBottom, scrollToTop, setActiveScrollElement, getActiveScrollElement, isElementVisible, makeScrollObservers, honourAnchoredMutation, isOtherNavigationScroll, markAnchorScroll, readerGestureSince } from './scrollState';
 import { ChatExchange } from './ChatExchange';
+import type { ProposedChangeSeed } from './ChatExchange';
 import { NO_SIDE_QUESTIONS, placeSideQuestions, sideQuestionOwners } from './SideQuestionCard';
 import type { SideQuestion } from '../../store/sideQuestions';
 import { ChevronUpIcon, ChevronDownIcon } from '../shared/icons';
@@ -29,30 +30,41 @@ import { nowMs } from '../../utils/scrollActivity';
 import { scaledDurationMs } from '../../utils/motion';
 import { DISCLOSURE_MAX_MS } from '../../utils/disclosureMotion';
 
-/** First line of a change's description and its file count, keyed by change_id.
- *  Harvested from the `ChangeProposed` events riding a thread's coding-agent
- *  turns as non-rendered steps. A later lifecycle card for the same change_id
- *  is a SEPARATE exchange carrying neither. It would otherwise fetch the
- *  `Change` row on open and pop the body in late. Seeding from this in-thread
- *  data paints the body at full height immediately. */
-type ProposedChangeInfo = { description?: string; fileCount?: number };
-
-function buildProposedChangeInfo(exchanges: Exchange[]): Map<string, ProposedChangeInfo> {
-  const map = new Map<string, ProposedChangeInfo>();
+/** A change's description, file count and summary, keyed by change_id.
+ *  Harvested from the `ChangeProposed` and `ChangeSummarized` events riding a
+ *  thread's coding-agent turns as non-rendered steps. A later lifecycle card
+ *  for the same change_id is a SEPARATE exchange carrying none of them. It
+ *  would otherwise fetch the `Change` row on open and pop the body in late.
+ *  Seeding from this in-thread data paints the body at full height at once.
+ *
+ *  The LATEST proposal wins, since that is the commit list the card resolves.
+ *  A summary counts only while it summarized that list, the same guard the
+ *  engine's projection applies. */
+export function buildProposedChangeInfo(exchanges: Exchange[]): Map<string, ProposedChangeSeed> {
+  const map = new Map<string, ProposedChangeSeed>();
+  // change_id → description summarized → summary. A later event overwrites.
+  const summaries = new Map<string, Map<string, string>>();
   for (const ex of exchanges) {
     for (const { event } of ex.steps) {
       // Per-commit ChangeProposed emits carry an empty change_id, which the
       // truthiness check skips. The aggregate proposal carries the real id and
       // the full file list.
-      if (event.type === 'ChangeProposed' && event.change_id && !map.has(event.change_id)) {
+      if (event.type === 'ChangeProposed' && event.change_id) {
         map.set(event.change_id, { description: event.description, fileCount: event.files?.length });
+      } else if (event.type === 'ChangeSummarized' && event.change_id && event.summary) {
+        const byDescription = summaries.get(event.change_id) ?? new Map<string, string>();
+        byDescription.set(event.description ?? '', event.summary);
+        summaries.set(event.change_id, byDescription);
       }
     }
+  }
+  for (const [changeId, seed] of map) {
+    seed.summary = summaries.get(changeId)?.get(seed.description ?? '');
   }
   return map;
 }
 
-const NO_PROPOSED_CHANGE_INFO = new Map<string, ProposedChangeInfo>();
+const NO_PROPOSED_CHANGE_INFO = new Map<string, ProposedChangeSeed>();
 
 /** The matched event of a delivery, keyed by the `EventWaitDelivered`'s own
  *  event id, which is what the anchor's `UserPromptInjected.delivered_event_id`
@@ -263,6 +275,7 @@ export function renderExchanges(
         rowsHidden={i === renderFromIndex && !pinnedIndices.has(i) ? floorRowsHidden : 0}
         proposedChangeDesc={proposedSeed?.description}
         proposedChangeFileCount={proposedSeed?.fileCount}
+        proposedChangeSummary={proposedSeed?.summary}
         matchedEventType={matchedEvent?.eventType}
         matchedEventId={matchedEvent?.eventId}
         matchedPayloadJson={matchedEvent?.payloadJson}
@@ -675,7 +688,8 @@ export function useScrollObservers(ref: preact.RefObject<HTMLDivElement>, ready:
 }
 
 /** Whether the welcome surface (`WelcomeMessage`) shows on the empty compose
- *  view. One rule: show it until the user dismisses it. The dismissal is stored
+ *  view. One rule: show it until it is dismissed, by the user or by
+ *  `retireWelcomeAfterUse` after their third thread. The dismissal is stored
  *  in the DB-backed `welcome_suggestions_dismissed` preference, so it sticks
  *  across reloads and devices. `WelcomeMessage` still adapts its body to whether
  *  an LLM provider is configured (provider-setup CTA vs. starter prompts), but

@@ -36,6 +36,7 @@ function change(id: string, threadId: string | null, overrides: Partial<Change> 
     pre_merge_sha: null,
     post_merge_sha: null,
     commits: [],
+    summary: null,
     incomplete: false,
     predicted_conflict: 'clean',
     ...overrides,

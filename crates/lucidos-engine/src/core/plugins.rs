@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
 
+use super::{is_build_output_file, VENDORED_DIR_NAMES};
+
 /// Plugin top-level directory (and `data/` subdirectory) that holds compiled
 /// WASM auth signers — `<name>.wasm` plus optional `<name>.manifest.json`
 /// sidecar. Naming a single source for the literal so a typo in one place
@@ -110,6 +112,9 @@ pub enum ValidationError {
     /// A file or directory under `fonts/` that is not a valid workspace font:
     /// `(path, reason)`.
     InvalidFont(String, String),
+    /// An item directory (`apps/<id>`, `triggers/<slug>`, `fonts/<slug>`)
+    /// named in [`VENDORED_DIR_NAMES`], which [`plan_files`] would skip.
+    ItemNamedLikeBuildOutput(String),
 }
 
 impl std::fmt::Display for ValidationError {
@@ -146,6 +151,10 @@ impl std::fmt::Display for ValidationError {
             Self::InvalidFont(path, reason) => {
                 write!(f, "{path} is not a valid workspace font: {reason}")
             }
+            Self::ItemNamedLikeBuildOutput(path) => write!(
+                f,
+                "{path}/ has a build-output folder name, so install would skip it: rename the folder"
+            ),
         }
     }
 }
@@ -286,6 +295,7 @@ pub fn validate_tree(root: &Path) -> Result<(PluginManifest, Vec<PlannedFile>), 
             return Err(ValidationError::UnexpectedTopLevelEntry(name_str.into()));
         }
     }
+    reject_items_named_like_build_output(root)?;
 
     let planned = plan_files(root);
     if planned.is_empty() {
@@ -295,6 +305,34 @@ pub fn validate_tree(root: &Path) -> Result<(PluginManifest, Vec<PlannedFile>), 
     validate_themes(&planned, &fonts)?;
 
     Ok((manifest, planned))
+}
+
+/// Content dirs that hold one directory per item.
+const ITEM_DIRS: [&str; 3] = ["apps", "triggers", super::workspace_fonts::FONTS_DIR];
+
+/// Refuse an item whose directory name [`plan_files`] skips as build output,
+/// so a real app, trigger or font is never dropped without a word. Hidden
+/// names stay out of scope: the walk skips every one of those anyway.
+fn reject_items_named_like_build_output(root: &Path) -> Result<(), ValidationError> {
+    for dir in ITEM_DIRS {
+        let Ok(entries) = std::fs::read_dir(root.join(dir)) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            let is_real_dir = entry.file_type().is_ok_and(|t| t.is_dir());
+            if is_real_dir
+                && !name_str.starts_with('.')
+                && VENDORED_DIR_NAMES.contains(&name_str.as_ref())
+            {
+                return Err(ValidationError::ItemNamedLikeBuildOutput(format!(
+                    "{dir}/{name_str}"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Every file a plugin installs under `fonts/` must belong to a valid
@@ -379,7 +417,9 @@ pub struct PlannedFile {
 }
 
 /// Walk the plugin tree under `root` and produce the install plan.
-/// Skips dotfiles and any directory not in `CONTENT_DIRS`.
+/// Skips dotfiles, any directory not in `CONTENT_DIRS`, and build output
+/// (a [`VENDORED_DIR_NAMES`] directory or a bytecode file). Build output is
+/// machine-specific, so it must never reach the install record.
 pub fn plan_files(root: &Path) -> Vec<PlannedFile> {
     let mut out = Vec::new();
     for dir in CONTENT_DIRS {
@@ -417,8 +457,10 @@ fn walk_into(dir: &Path, prefix: &str, out: &mut Vec<PlannedFile>) {
         let path = entry.path();
         let next_prefix = format!("{}/{}", prefix, name_str);
         if file_type.is_dir() {
-            walk_into(&path, &next_prefix, out);
-        } else if file_type.is_file() {
+            if !VENDORED_DIR_NAMES.contains(&name_str.as_ref()) {
+                walk_into(&path, &next_prefix, out);
+            }
+        } else if file_type.is_file() && !is_build_output_file(&name_str) {
             out.push(PlannedFile {
                 source: path,
                 data_relative: next_prefix,

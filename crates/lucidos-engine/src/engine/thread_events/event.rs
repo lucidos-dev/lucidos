@@ -880,6 +880,18 @@ pub enum ThreadEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
+    /// A model wrote the *change summary*: one line saying what a change of
+    /// several commits does. `description` is the commit list it summarized.
+    /// The projection keeps the summary only while that still equals the
+    /// change's description, so a summary of an older commit set never lands.
+    ChangeSummarized {
+        #[serde(default, skip_serializing_if = "is_empty_str")]
+        change_id: String,
+        #[serde(default, skip_serializing_if = "is_empty_str")]
+        summary: String,
+        #[serde(default, skip_serializing_if = "is_empty_str")]
+        description: String,
+    },
 
     /// Coding-agent session settings changed mid-session (model, reasoning effort,
     /// or permission mode). Persisted per-thread so settings survive idle exit
@@ -911,12 +923,19 @@ pub enum ThreadEvent {
         /// session↔config-dir pairing. CC keys each session's transcript on this
         /// dir (`$CLAUDE_CONFIG_DIR/projects/<cwd>/<sid>.jsonl`). So a follow-up
         /// resume re-injects it (see `lookup_pinned_cc_config_dir` and
-        /// `SpawnArgs::claude_config_dir`), and a mid-flight user toggle of the
+        /// `SpawnArgs::account_pin`), and a mid-flight user toggle of the
         /// env var cannot strand the session. `None` on legacy rows,
         /// on the pre-Init settings emit, and on mid-session settings-only emits
         /// (model/effort/permission changes). The Init emit is the carrier.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         claude_config_dir: Option<String>,
+        /// Whether `CLAUDE_CONFIG_DIR` was actually set for that session, stamped
+        /// beside `claude_config_dir`. `false` means it was unset and the dir is
+        /// Claude Code's default. The two are different logins to Claude Code, so
+        /// a resume must replay which one it was (`AccountPin`). `None` wherever
+        /// `claude_config_dir` is, and on rows written before it existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        claude_config_dir_explicit: Option<bool>,
     },
 
     // Mid-flight injection — a user correction OR a system message (e.g. parent
@@ -1535,7 +1554,7 @@ pub enum ThreadEvent {
         reason: String,
     },
 
-    /// The user asked a `/btw` side question in a Claude Code thread.
+    /// The user asked a `/btw` side question.
     ///
     /// The four side-question events record a card, never a turn. No agent
     /// ever reads them: every generic reader excludes them through
@@ -1547,8 +1566,11 @@ pub enum ThreadEvent {
     SideQuestionAsked {
         side_question_id: uuid::Uuid,
         question: String,
+        /// Blobs the user attached to the question.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        image_hashes: Vec<String>,
     },
-    /// Claude Code answered the side question with this id.
+    /// The thread's agent answered the side question with this id.
     SideQuestionAnswered {
         side_question_id: uuid::Uuid,
         answer: String,

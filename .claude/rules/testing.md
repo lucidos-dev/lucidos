@@ -303,8 +303,9 @@ Two rules follow:
 | Packaged macOS build boots | Packaged build smoke test |
 | Native Tauri (non-UI) logic | `cargo test -p lucidos-app` |
 
-**That last row is the one nothing else runs for you.** `make test` is
-`./scripts/test-engine.sh`, which tests `lucidos-engine` alone. Clippy compiles
+**That last row is the one nothing else runs for you.** `make test` runs the
+engine suite plus the eval, gateway and six library crates, never
+`lucidos-app`. Clippy compiles
 the client's test targets and never executes them, so a broken assertion there
 lands on `main` green. Touch a `.rs` file under `crates/lucidos-app/src/` and
 run `cargo test --locked -p lucidos-app --lib` yourself: seconds, and no

@@ -10,6 +10,9 @@ use crate::engine::thread_events::MessageOrigin;
 // per `ContextPurpose` in `engine::aux_purpose`.
 pub const PREF_MODEL_TITLE: &str = "model_title";
 pub const PREF_MODEL_IMAGE_DESCRIPTION: &str = "model_image_description";
+/// Model the *change summary* is written by. Falls back to [`PREF_MODEL_TITLE`]
+/// while unset: both write one line naming a piece of work.
+pub const PREF_MODEL_CHANGE_SUMMARY: &str = "model_change_summary";
 /// Model for fact extraction.
 ///
 /// It used to cover history summarisation and query classification too. Both
@@ -76,6 +79,8 @@ pub const PREF_VOICE_RESIDENT_SECTIONS: &str = "voice_resident_sections";
 // description: see `engine::aux_purpose`.
 pub const PREF_REASONING_TITLE: &str = "reasoning_title";
 pub const PREF_REASONING_IMAGE_DESCRIPTION: &str = "reasoning_image_description";
+/// Effort the *change summary* runs at. Falls back to [`PREF_REASONING_TITLE`].
+pub const PREF_REASONING_CHANGE_SUMMARY: &str = "reasoning_change_summary";
 pub const PREF_REASONING_MEMORY: &str = "reasoning_memory";
 pub const PREF_REASONING_CONVERSATION_SUMMARY: &str = "reasoning_conversation_summary";
 /// Effort *query classification* runs at, the other half of
@@ -307,9 +312,10 @@ impl ResolvedModelSelection {
 }
 
 impl PreferenceStore {
-    /// Defensive double-write — the migration owns this CREATE TABLE
-    /// (see `20260517160627_consolidate_init_schema_tables.sql`). Slated
-    /// for removal in `harden-init-schema-tables-vs-migrations-pattern-finish`.
+    /// Defensive double-write: the migration owns this CREATE TABLE (see
+    /// `20260517160627_consolidate_init_schema_tables.sql`). A temporary measure:
+    /// `docs/temporary-measures.md` § "Defensive double-write of tables into
+    /// `init_schema`".
     pub async fn init_schema(pool: &PgPool) -> Result<(), sqlx::Error> {
         sqlx::query(
             r#"
@@ -399,6 +405,20 @@ impl PreferenceStore {
         .await?;
 
         Ok(result)
+    }
+
+    /// A global preference trimmed, with a blank value read as unset. A failed
+    /// read is logged under `label` and also reads as unset, for a caller that
+    /// then falls back to its default.
+    pub async fn get_nonblank(pool: &PgPool, key: &str, label: &str) -> Option<String> {
+        Self::get(pool, key)
+            .await
+            .unwrap_or_else(|e| {
+                log!("[{}] Failed to load {} preference: {}", label, key, e);
+                None
+            })
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
     }
 
     /// Get a preference for a specific device, falling back to the global value

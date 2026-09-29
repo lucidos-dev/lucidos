@@ -21,6 +21,7 @@ mod spawns_in_flight;
 mod text_buffer;
 mod tool_output;
 mod turn_gap;
+pub(crate) mod withdraw;
 
 pub(crate) use spawns_in_flight::SpawnsInFlight;
 

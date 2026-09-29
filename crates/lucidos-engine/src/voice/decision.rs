@@ -190,6 +190,7 @@ impl OpenDecision {
                         AnswerKind::MultiSelected {
                             option_ids: vec![option.id.clone()],
                             text: None,
+                            image_hashes: vec![],
                         }
                     } else {
                         AnswerKind::Selected {
@@ -592,6 +593,7 @@ pub async fn resolve(
             // given (ADR 0149).
             let answer = AnswerKind::FreeText {
                 text: text.to_string(),
+                image_hashes: vec![],
             };
             match answered(engine, thread_id, &tool_use_id, answer, actor).await {
                 Resolution::Settled => Resolution::SettledWithTheirWords,

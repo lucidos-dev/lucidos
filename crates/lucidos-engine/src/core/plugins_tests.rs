@@ -264,6 +264,48 @@ fn rejects_empty_tree() {
 }
 
 #[test]
+fn rejects_a_tree_holding_only_build_output() {
+    let dir = tmpdir("only_build_output");
+    fs::write(dir.join("manifest.toml"), VALID_MANIFEST).unwrap();
+    fs::create_dir_all(dir.join("scripts/__pycache__")).unwrap();
+    fs::write(dir.join("scripts/__pycache__/run.cpython-314.pyc"), "x").unwrap();
+    fs::write(dir.join("scripts/run.pyc"), "x").unwrap();
+    fs::create_dir_all(dir.join("apps/a/node_modules")).unwrap();
+    fs::write(dir.join("apps/a/node_modules/y.js"), "x").unwrap();
+    assert_eq!(validate_tree(&dir), Err(ValidationError::EmptyTree));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn rejects_an_item_named_like_build_output() {
+    for item in ["apps/dist", "triggers/build", "fonts/out"] {
+        let dir = tmpdir("item_named_build_output");
+        write_valid_plugin(&dir);
+        fs::create_dir_all(dir.join(item)).unwrap();
+        fs::write(dir.join(item).join("index.html"), "x").unwrap();
+        assert_eq!(
+            validate_tree(&dir),
+            Err(ValidationError::ItemNamedLikeBuildOutput(item.into()))
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
+fn accepts_build_output_below_an_item_or_hidden() {
+    let dir = tmpdir("build_output_below_item");
+    write_valid_plugin(&dir);
+    fs::create_dir_all(dir.join("apps/a/dist")).unwrap();
+    fs::write(dir.join("apps/a/index.html"), "x").unwrap();
+    fs::write(dir.join("apps/a/dist/bundle.js"), "x").unwrap();
+    fs::create_dir_all(dir.join("apps/.venv")).unwrap();
+    let (_, planned) = validate_tree(&dir).unwrap();
+    let paths: Vec<&str> = planned.iter().map(|p| p.data_relative.as_str()).collect();
+    assert_eq!(paths, vec!["apps/a/index.html", "knowhow/a.md"]);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn validates_tree_with_only_auth_modules() {
     let dir = tmpdir("authonly");
     fs::write(dir.join("manifest.toml"), VALID_MANIFEST).unwrap();
@@ -500,6 +542,33 @@ fn plans_files_under_known_dirs_only() {
     let planned = plan_files(&dir);
     let paths: Vec<&str> = planned.iter().map(|p| p.data_relative.as_str()).collect();
     assert_eq!(paths, vec!["knowhow/a.md", "triggers/morning/morning.md"]);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn plan_files_skips_build_output() {
+    let dir = tmpdir("plan_build_output");
+    write_valid_plugin(&dir);
+    for (rel, body) in [
+        ("scripts/run.py", "print(1)"),
+        ("scripts/__pycache__/x.pyc", "x"),
+        ("scripts/.venv/lib/site.py", "x"),
+        ("apps/a/index.html", "<h1>a</h1>"),
+        ("apps/a/node_modules/y.js", "x"),
+        ("knowhow/foo.pyc", "x"),
+        ("knowhow/bar.pyo", "x"),
+    ] {
+        let path = dir.join(rel);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, body).unwrap();
+    }
+
+    let planned = plan_files(&dir);
+    let paths: Vec<&str> = planned.iter().map(|p| p.data_relative.as_str()).collect();
+    assert_eq!(
+        paths,
+        vec!["apps/a/index.html", "knowhow/a.md", "scripts/run.py"]
+    );
     let _ = fs::remove_dir_all(&dir);
 }
 

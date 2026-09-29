@@ -181,13 +181,10 @@ impl EventStore {
         Self { pool }
     }
 
-    /// Defensive double-write: the same CREATE TABLE / CREATE INDEX
-    /// statements now live in
-    /// `migrations/20260517160627_consolidate_init_schema_tables.sql`,
-    /// which is the canonical home per `.claude/rules/rust.md`. This body
-    /// is kept for one release cycle so existing installs that boot a
-    /// pre-migration build still come up; slated for removal in
-    /// `harden-init-schema-tables-vs-migrations-pattern-finish`.
+    /// Defensive double-write: the migration owns this CREATE TABLE (see
+    /// `20260517160627_consolidate_init_schema_tables.sql`). A temporary measure:
+    /// `docs/temporary-measures.md` § "Defensive double-write of tables into
+    /// `init_schema`".
     pub async fn init_schema(&self) -> Result<(), sqlx::Error> {
         sqlx::query(
             r#"
@@ -229,7 +226,7 @@ impl EventStore {
             .execute(&self.pool)
             .await?;
 
-        // Index on created for range queries (get_events_until, chronological loads)
+        // Index on created for range queries (get_conversation_events_until, chronological loads)
         sqlx::query(
             r#"
             CREATE INDEX IF NOT EXISTS idx_events_created
@@ -490,37 +487,45 @@ impl EventStore {
         Ok(event)
     }
 
-    /// Get all events up to and including the given timestamp, ordered chronologically
-    pub async fn get_events_until(
+    /// What a conversation snapshot at `until` reads, oldest first: one
+    /// thread's events, plus every artifact write, which the snapshot takes
+    /// its commit from. Artifact events belong to no thread. A `None` thread
+    /// reads the rows that belong to no thread.
+    pub async fn get_conversation_events_until(
         &self,
+        thread_id: Option<Uuid>,
         until: DateTime<Utc>,
     ) -> Result<Vec<EventRow>, sqlx::Error> {
-        let events = sqlx::query_as::<_, EventRow>(
+        sqlx::query_as::<_, EventRow>(
             r#"
             SELECT id, event_type, payload, created, thread_id, sequence
             FROM events
-            WHERE created <= $1
-            ORDER BY created ASC
+            WHERE created <= $2
+              AND (thread_id IS NOT DISTINCT FROM $1
+                   OR event_type IN ('ArtifactCreated', 'ArtifactUpdated'))
+            ORDER BY created ASC, sequence ASC
             "#,
         )
+        .bind(thread_id)
         .bind(until)
         .fetch_all(&self.pool)
-        .await?;
-
-        Ok(events)
+        .await
     }
 
-    /// Load all events in chronological order (oldest first).
-    /// Used by rebuild_memory to reprocess the entire event history.
-    pub async fn get_all_events_chronological(
+    /// Every event of the given types, oldest first. Memory rebuild reads only
+    /// the types it indexes, which keeps the streaming rows that fill most of
+    /// the table out of memory.
+    pub async fn events_of_types_chronological(
         &self,
-    ) -> Result<Vec<EventRow>, Box<dyn std::error::Error + Send + Sync>> {
-        let events = sqlx::query_as::<_, EventRow>(
-            "SELECT id, event_type, payload, created, thread_id, sequence FROM events ORDER BY created ASC"
+        event_types: &[&str],
+    ) -> Result<Vec<EventRow>, sqlx::Error> {
+        sqlx::query_as::<_, EventRow>(
+            "SELECT id, event_type, payload, created, thread_id, sequence FROM events \
+             WHERE event_type = ANY($1) ORDER BY created ASC, sequence ASC",
         )
+        .bind(event_types)
         .fetch_all(&self.pool)
-        .await?;
-        Ok(events)
+        .await
     }
 
     /// Every event of one type, oldest first. Ties on `created` fall back to
@@ -529,13 +534,7 @@ impl EventStore {
         &self,
         event_type: &str,
     ) -> Result<Vec<EventRow>, sqlx::Error> {
-        sqlx::query_as::<_, EventRow>(
-            "SELECT id, event_type, payload, created, thread_id, sequence FROM events \
-             WHERE event_type = $1 ORDER BY created ASC, sequence ASC",
-        )
-        .bind(event_type)
-        .fetch_all(&self.pool)
-        .await
+        self.events_of_types_chronological(&[event_type]).await
     }
 
     /// Get thread events after a given sequence number (or all if None).

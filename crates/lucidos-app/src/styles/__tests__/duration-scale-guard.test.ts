@@ -18,7 +18,7 @@
  * opposite property: it must keep the same literals (the two files' "keep in
  * sync" comments finally have teeth) while pinning the scale at 1, because a
  * custom property does not cross a document boundary and an app iframe is a
- * different document.
+ * different document. Reduced motion is the one thing that moves it there.
  */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
@@ -28,6 +28,7 @@ import { fileURLToPath } from 'node:url';
 // @ts-expect-error: same
 import { dirname, resolve } from 'node:path';
 import { block, decl } from './css-rule-helpers';
+import { REDUCED_MOTION_DURATION_SCALE } from '@lucidos/appearance';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(here, '../../../../..');
@@ -94,5 +95,12 @@ describe('the app-iframe mirror', () => {
     // plumbed on purpose: the slider is a host debugging aid for inspecting
     // host transitions, not a preference apps are expected to honour.
     expect(decl(root, '--duration-scale')).toBe('1');
+  });
+
+  it('collapses the scale under reduced motion, to the value the host uses', () => {
+    // The shared components transition on these tokens, and the switch's knob
+    // slides. Without this an app kept that motion under Reduce.
+    const reduce = block(iframeCss, ':root[data-motion="reduce"]');
+    expect(decl(reduce, '--duration-scale')).toBe(String(REDUCED_MOTION_DURATION_SCALE));
   });
 });

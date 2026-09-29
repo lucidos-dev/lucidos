@@ -33,6 +33,7 @@ fn sent(text: &str) -> AgentInput {
     AgentInput {
         text: text.into(),
         images: Vec::new(),
+        uuid: uuid::Uuid::new_v4(),
     }
 }
 
@@ -259,6 +260,7 @@ fn a_replay_with_an_image_reads_every_input_it_carries() {
         &AgentInput {
             text: "three".into(),
             images: vec![image.clone()],
+            uuid: uuid::Uuid::new_v4(),
         },
     );
     ledger.forwarded(
@@ -266,6 +268,7 @@ fn a_replay_with_an_image_reads_every_input_it_carries() {
         &AgentInput {
             text: String::new(),
             images: vec![image],
+            uuid: uuid::Uuid::new_v4(),
         },
     );
     ledger.forwarded(vec![four], &sent("four"));
@@ -299,4 +302,60 @@ fn a_replay_matching_no_input_reads_the_oldest() {
     let output = replay(&["<local-command-stdout>Compacted </local-command-stdout>"]);
     assert_eq!(ledger.observe(&output), vec![compact]);
     assert_eq!(ledger.owed(), 1);
+}
+
+/// A withdrawn input leaves the ledger, so a later replay reads the input it
+/// carries and never the withdrawn one.
+#[test]
+fn a_withdrawn_input_is_never_read_in_place_of_a_later_one() {
+    let [a, b, c] = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+    let mut ledger = InputLedger::new();
+    ledger.forwarded(vec![a], &sent("a"));
+    let b_input = sent("b");
+    ledger.forwarded(vec![b], &b_input);
+    ledger.forwarded(vec![c], &sent("c"));
+    assert_eq!(ledger.observe(&replay(&["a"])), vec![a]);
+
+    assert_eq!(ledger.withdrawable(b), Some(b_input.uuid));
+    ledger.withdrawn(b);
+    assert_eq!(ledger.owed(), 1);
+    assert_eq!(ledger.observe(&READ), vec![c], "the read is c's, not b's");
+}
+
+/// Only an owed input can be withdrawn, and only when its write carried that
+/// message alone: a coalesced write cannot be taken back one message at a time.
+#[test]
+fn only_an_owed_input_written_alone_is_withdrawable() {
+    let [read, leader, follower, never_sent] = [
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+    ];
+    let mut ledger = InputLedger::new();
+    ledger.forwarded(vec![read], &sent("read"));
+    ledger.observe(&READ);
+    ledger.forwarded(vec![leader, follower], &sent("coalesced"));
+    assert_eq!(ledger.withdrawable(read), None, "already read");
+    assert_eq!(ledger.withdrawable(leader), None, "coalesced");
+    assert_eq!(ledger.withdrawable(follower), None, "coalesced");
+    assert_eq!(ledger.withdrawable(never_sent), None, "never forwarded");
+}
+
+/// A withdrawal waits for its tombstone. Until it is recorded, a retry must be
+/// able to record it again, so the ledger keeps asking for it.
+#[test]
+fn a_withdrawal_awaits_its_tombstone_until_recorded() {
+    let id = Uuid::new_v4();
+    let mut ledger = InputLedger::new();
+    ledger.forwarded(vec![id], &sent("queued"));
+    ledger.withdrawn(id);
+    assert!(ledger.awaits_tombstone(id));
+    assert_eq!(
+        ledger.withdrawable(id),
+        None,
+        "the agent already dropped it"
+    );
+    ledger.tombstone_recorded(id);
+    assert!(!ledger.awaits_tombstone(id));
 }

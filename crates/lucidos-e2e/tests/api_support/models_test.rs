@@ -156,6 +156,10 @@ async fn every_model_declares_the_reasoning_tiers_its_provider_supports() {
             "claude-opus-5-5",
             vec!["low", "medium", "high", "xhigh", "max"],
         ),
+        (
+            "claude-sonnet-5-5",
+            vec!["low", "medium", "high", "xhigh", "max"],
+        ),
         // The Claude budget path deliberately omits xhigh.
         (
             "claude-sonnet-4-6",
@@ -424,6 +428,7 @@ async fn seeded_builtins_declare_the_window_the_prefix_map_gets_wrong() {
         "claude-fable-5-1[1m]",
         "claude-fable-5[1m]",
         "claude-opus-5-5[1m]",
+        "claude-sonnet-5-5[1m]",
         "claude-opus-5[1m]",
         "claude-opus-4-8[1m]",
         "claude-opus-4-7[1m]",
@@ -435,6 +440,7 @@ async fn seeded_builtins_declare_the_window_the_prefix_map_gets_wrong() {
         "claude-fable-5-1",
         "claude-fable-5",
         "claude-opus-5-5",
+        "claude-sonnet-5-5",
         "claude-opus-5",
     ] {
         let m = find_model(&client, &api, id)

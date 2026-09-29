@@ -1970,6 +1970,7 @@ impl LucidosEngine {
                         tool_use_id: tool_call.id.clone(),
                         text: read.llm_text,
                         event_id: read.tool_called_event_id,
+                        images: Vec::new(),
                     });
                     continue;
                 }
@@ -2029,6 +2030,7 @@ impl LucidosEngine {
                         tool_use_id: tool_call.id.clone(),
                         text: refusal,
                         event_id: tool_called_event_id,
+                        images: Vec::new(),
                     });
                     continue;
                 }
@@ -2065,6 +2067,7 @@ impl LucidosEngine {
                         tool_use_id: tool_call.id.clone(),
                         text: refusal.to_string(),
                         event_id: tool_called_event_id,
+                        images: Vec::new(),
                     });
                     continue;
                 }
@@ -2137,6 +2140,7 @@ impl LucidosEngine {
                         tool_use_id: tool_call.id.clone(),
                         text: result,
                         event_id: tool_called_event_id,
+                        images: Vec::new(),
                     });
                     continue;
                 }
@@ -2216,6 +2220,7 @@ impl LucidosEngine {
                         tool_use_id: tool_call.id.clone(),
                         text: result,
                         event_id: tool_called_event_id,
+                        images: Vec::new(),
                     });
                     continue;
                 }
@@ -2377,6 +2382,7 @@ impl LucidosEngine {
                 // stub instead of megabytes the frontend never reads. Reading
                 // both off one value blinded the model and bloated the events
                 // table at the same time.
+                let (result, answer_blobs) = take_answer_images(&tool_call.name, result);
                 let mut split = split_tool_result(&result);
 
                 // Form-request sentinels (credentials, plugin install, plugin
@@ -2455,6 +2461,7 @@ impl LucidosEngine {
 
                 tool_outputs.push(ToolOutput {
                     tool_use_id: tool_call.id.clone(),
+                    images: load_attached_images(self.workspace_path(), &answer_blobs),
                     text: split.llm_text,
                     event_id: tool_called_event_id,
                 });

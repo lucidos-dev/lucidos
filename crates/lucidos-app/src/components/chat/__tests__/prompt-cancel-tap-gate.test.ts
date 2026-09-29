@@ -51,12 +51,12 @@ describe('send-cancel-morph button has tap-gate scroll protection', () => {
 
   it('wires onPointerDown to gate.down(event)', () => {
     const btn = findMorphButton();
-    expect(btn).toMatch(/onPointerDown=\{\s*[a-zA-Z]+\s*=>\s*morphGate\.down\(\s*[a-zA-Z]+\s*\)/);
+    expect(btn).toMatch(/onPointerDown=\{\s*([a-zA-Z]+)\s*=>\s*\{?[^}]*?morphGate\.down\(\s*\1\s*\)/);
   });
 
   it('wires onPointerMove to gate.move(event)', () => {
     const btn = findMorphButton();
-    expect(btn).toMatch(/onPointerMove=\{\s*[a-zA-Z]+\s*=>\s*morphGate\.move\(\s*[a-zA-Z]+\s*\)/);
+    expect(btn).toMatch(/onPointerMove=\{\s*([a-zA-Z]+)\s*=>\s*\{?[^}]*?morphGate\.move\(\s*\1\s*\)/);
   });
 
   it('wires onPointerCancel to gate.cancel()', () => {
@@ -265,7 +265,7 @@ describe('the prompt row survives the iOS keyboard dropping a click', () => {
   it('blurs from inside each touch-activated action', () => {
     // The suppressed click never reaches `installActionBtnBlurListener`, which
     // listens on `click`. So each action has to drop the keyboard itself.
-    const submitFn = promptSource.match(/async function submit\(\)[\s\S]*?\n  \}/);
+    const submitFn = promptSource.match(/async function submit\(asSideQuestion = false\)[\s\S]*?\n  \}/);
     const multiFn = promptSource.match(/async function submitMultiAnswer\(\)[\s\S]*?\n  \}/);
     const diffFn = bannerSource.match(/function DiffButton\([\s\S]*?\n\}/);
     expect(submitFn, 'submit() not found').not.toBeNull();

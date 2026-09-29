@@ -1,4 +1,3 @@
-import { Fragment } from 'preact';
 import { useRef, useCallback, useEffect } from 'preact/hooks';
 import { useSignal } from '@preact/signals';
 import { changes, appliedChanges, changesHasMore, changesLoadingMore, busyChangeIds, applyAllInProgress, showConfirm, standingApplyThreadIds, armingStandingApplySweep, disarmingAllStandingApply, settlingThreadCount } from '../../store/store';
@@ -13,16 +12,24 @@ import { usePanelRefresh } from '../../hooks/usePanelRefresh';
 import { LoadableError } from '../shared/LoadableError';
 import { ListSkeletonOf, useSkeleton, SkText, SkBlock } from '../shared/Skeleton';
 import { LoadingFade } from '../shared/LoadingFade';
+import { CommitList } from '../shared/CommitList';
+import { EventRowFoldView } from '../chat/EventRow';
+import { changeCommitList, changeHeadline } from '../../store/changeHeadline';
 
-/** Render a change description, preserving line breaks. */
-function ChangeDescription({ description }: { description: string }) {
-  const lines = (description || 'Claude Code changes').split('\n');
+/** A change's headline, with its commits one fold away when there are
+ *  several. The same pair the change card draws. */
+function ChangeHeadline({ change }: { change: Change }) {
+  const commits = changeCommitList(change);
   return (
-    <span class="title change-description">
-      {lines.map((line, i) => (
-        <Fragment key={i}>{line}{i < lines.length - 1 && <br />}</Fragment>
-      ))}
-    </span>
+    <>
+      <span class="title change-description">{changeHeadline(change)}</span>
+      {commits.length > 1 && (
+        // The row opens its thread on click, so the fold keeps its own clicks.
+        <div class="change-row-commits" onClick={(e) => e.stopPropagation()}>
+          <EventRowFoldView label={`${commits.length} commits`} body={<CommitList commits={commits} />} />
+        </div>
+      )}
+    </>
   );
 }
 
@@ -129,7 +136,7 @@ function ChangeRow({ change, busy, armed, onOpen, onDiff, onDiscard, onApply, on
         {sk ? (
           <SkText class="title change-description" w="18rem" />
         ) : (
-          <ChangeDescription description={change!.description} />
+          <ChangeHeadline change={change!} />
         )}
         <SkText class="list-row-details" w="7rem">
           {change && (
@@ -453,7 +460,7 @@ export function ChangesView() {
                 >
                   <div class="list-row-info">
                     {change.thread_title && <span class="list-row-label">{change.thread_title}</span>}
-                    <ChangeDescription description={change.description} />
+                    <ChangeHeadline change={change} />
                     <span class="list-row-details">
                       {formatFileCount(change.file_count)}
                       {change.requires_restart && ' · Requires engine restart'}

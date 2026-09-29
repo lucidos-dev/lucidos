@@ -137,6 +137,24 @@ fn scan_catalog_discovers_root_plugin_from_git_marketplace() {
     assert_eq!(plugin.status, MarketplacePluginStatus::Available);
 }
 
+#[test]
+fn find_manifest_roots_skips_build_output_dirs() {
+    let repo_dir = tempfile::tempdir().unwrap();
+    write_plugin(&repo_dir.path().join("real"), "real", "0.1.0", "Real");
+    for vendored in ["node_modules", "dist", "__pycache__", "venv"] {
+        write_plugin(
+            &repo_dir.path().join(vendored).join("pkg"),
+            "vendored",
+            "0.1.0",
+            "Vendored",
+        );
+    }
+
+    let roots = find_manifest_roots(repo_dir.path()).unwrap();
+
+    assert_eq!(roots, vec![repo_dir.path().join("real")]);
+}
+
 fn catalog_plugin(
     id: &str,
     version: &str,

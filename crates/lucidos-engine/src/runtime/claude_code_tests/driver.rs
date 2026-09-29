@@ -17,7 +17,7 @@ async fn spawn_driver_for_test(program: &str, args: &[&str]) -> (RunningAgent, C
     let (events_tx, events_rx) = mpsc::unbounded_channel();
     let (input_tx, input_rx) = mpsc::unbounded_channel();
     let (control_tx, control_rx) = mpsc::unbounded_channel();
-    let (side_question_tx, side_question_rx) = mpsc::unbounded_channel();
+    let (withdraw_tx, withdraw_rx) = mpsc::unbounded_channel();
     let cancel = CancellationToken::new();
     tokio::spawn(driver_task(
         child,
@@ -27,7 +27,7 @@ async fn spawn_driver_for_test(program: &str, args: &[&str]) -> (RunningAgent, C
         events_tx,
         input_rx,
         control_rx,
-        side_question_rx,
+        withdraw_rx,
         cancel.clone(),
         None,
         CcStreamState::default(),
@@ -39,7 +39,7 @@ async fn spawn_driver_for_test(program: &str, args: &[&str]) -> (RunningAgent, C
             input_tx,
             control_tx,
             permission_rx: None,
-            side_question_tx: Some(side_question_tx),
+            withdraw_tx: Some(withdraw_tx),
         },
         cancel,
     )
@@ -152,7 +152,7 @@ async fn driver_task_flags_stray_signal_kill() {
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
     let (_input_tx, input_rx) = mpsc::unbounded_channel();
     let (_control_tx, control_rx) = mpsc::unbounded_channel();
-    let (_side_question_tx, side_question_rx) = mpsc::unbounded_channel();
+    let (_withdraw_tx, withdraw_rx) = mpsc::unbounded_channel();
     let cancel = CancellationToken::new();
     tokio::spawn(driver_task(
         child,
@@ -162,7 +162,7 @@ async fn driver_task_flags_stray_signal_kill() {
         events_tx,
         input_rx,
         control_rx,
-        side_question_rx,
+        withdraw_rx,
         cancel,
         None,
         CcStreamState::default(),
@@ -422,6 +422,7 @@ async fn a_line_split_around_an_input_still_arrives_whole() {
         .send(AgentInput {
             text: "go on".into(),
             images: vec![],
+            uuid: uuid::Uuid::new_v4(),
         })
         .expect("send input");
 
@@ -478,6 +479,7 @@ async fn a_split_last_line_ended_by_stdout_eof_still_arrives() {
             .send(AgentInput {
                 text: "go on".into(),
                 images: vec![],
+                uuid: uuid::Uuid::new_v4(),
             })
             .expect("send input");
     }
@@ -505,128 +507,166 @@ async fn a_split_last_line_ended_by_stdout_eof_still_arrives() {
 // ── side questions ───────────────────────────────────────────────────────
 
 #[test]
-fn side_question_reply_reads_success_and_error() {
-    let ok = r#"{"type":"control_response","response":{"subtype":"success","request_id":"r1","response":{"response":"forty-two","synthetic":false}}}"#;
+fn side_question_result_reads_the_answer_and_every_failure() {
+    let answer = |line: &str| side_question_result(line).map(|(answer, _)| answer);
+    let ok = r#"{"type":"result","subtype":"success","is_error":false,"result":" forty-two \n"}"#;
+    assert_eq!(answer(ok), Some(Ok("forty-two".to_string())));
+    let turns = r#"{"type":"result","subtype":"error_max_turns","is_error":true}"#;
+    let Some(Err(message)) = answer(turns) else {
+        panic!("a spent turn budget is a failure");
+    };
+    assert!(message.contains("reaching for tools"), "got {message}");
+    let empty = r#"{"type":"result","subtype":"success","is_error":false,"result":""}"#;
+    assert!(matches!(answer(empty), Some(Err(_))));
     assert_eq!(
-        side_question_reply(ok),
-        Some(("r1".to_string(), Ok("forty-two".to_string())))
-    );
-    let err = r#"{"type":"control_response","response":{"subtype":"error","request_id":"r2","error":"no context"}}"#;
-    assert_eq!(
-        side_question_reply(err),
-        Some(("r2".to_string(), Err("no context".to_string())))
-    );
-    assert_eq!(
-        side_question_reply(r#"{"type":"result","result":"x"}"#),
+        answer(r#"{"type":"assistant","message":{"content":"result"}}"#),
         None
     );
 }
 
-/// A shell stand-in for Claude Code that answers the first `side_question`
-/// on stdin with `answer`, echoing its request id. Lines it reads go to `log`.
+/// The copy is a real model call, so its result's usage is kept for the cost
+/// record. Claude Code reports the uncached input alone, and the recorded
+/// input is the total, as the main session's capture records it.
+#[test]
+fn side_question_result_keeps_the_usage_as_a_total() {
+    let line = r#"{"type":"result","subtype":"success","is_error":false,"result":"a","usage":{"input_tokens":2,"cache_read_input_tokens":17925,"cache_creation_input_tokens":625,"output_tokens":40}}"#;
+    let (_, usage) = side_question_result(line).unwrap();
+    let usage = usage.expect("usage reported");
+    assert_eq!(usage.input_tokens, 2 + 17925 + 625);
+    assert_eq!(usage.cache_read_tokens, 17925);
+    assert_eq!(usage.cache_creation_tokens, 625);
+    assert_eq!(usage.output_tokens, 40);
+}
+
+#[test]
+fn init_model_reads_only_the_init_line() {
+    assert_eq!(
+        init_model(r#"{"type":"system","subtype":"init","model":"claude-opus-5-5"}"#).as_deref(),
+        Some("claude-opus-5-5")
+    );
+    assert_eq!(init_model(r#"{"type":"result","result":"init"}"#), None);
+}
+
+/// The one line a side question writes: the framing and the question in one
+/// text block, then each image as a base64 block.
+#[test]
+fn side_question_message_carries_the_question_then_each_image() {
+    let image = crate::api::ChatImage {
+        base64: "iVBORw0KGgo=".to_string(),
+        mime_type: "image/png".to_string(),
+    };
+    let line = side_question_message("what is this?", std::slice::from_ref(&image));
+    assert!(line.ends_with('\n'));
+    let value: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+    assert_eq!(value["type"], "user");
+    let content = value["message"]["content"].as_array().unwrap();
+    assert_eq!(content.len(), 2);
+    let text = content[0]["text"].as_str().unwrap();
+    assert!(text.starts_with("<system-reminder>This is a side question"));
+    assert!(text.ends_with("what is this?"));
+    assert_eq!(content[1]["type"], "image");
+    assert_eq!(content[1]["source"]["type"], "base64");
+}
+
+/// A shell stand-in for Claude Code: it logs the line it reads to `log`, then
+/// answers with a `result` whose text is `answer`.
 fn answer_side_question_script(log: &Path, answer: &str) -> String {
     format!(
-        r#"read l; printf '%s\n' "$l" >> {log}; id=$(printf '%s' "$l" | sed 's/.*"request_id":"\([^"]*\)".*/\1/'); printf '{{"type":"control_response","response":{{"subtype":"success","request_id":"%s","response":{{"response":"{answer}","synthetic":false}}}}}}\n' "$id""#,
+        r#"read l; printf '%s\n' "$l" >> {log}; printf '{{"type":"result","subtype":"success","is_error":false,"result":"{answer}"}}\n'"#,
         log = log.display(),
     )
 }
 
-/// The running turn is never touched: a side question asked mid-turn writes
-/// exactly one `side_question` line, is answered before the turn's `Result`,
-/// and its answer reaches the asker only, never `events_rx`.
+// ── withdraws ────────────────────────────────────────────────────────────
+
+fn withdraw_reply(body: &str) -> InputWithdrawal {
+    let (_, body) = control_reply(body).expect("a control_response line");
+    withdrawal(body)
+}
+
+/// Only `cancelled: true` withdraws. Every other answer is a refusal to report.
+#[test]
+fn a_withdraw_reply_reads_each_answer() {
+    assert_eq!(
+        withdraw_reply(
+            r#"{"type":"control_response","response":{"subtype":"success","request_id":"r","response":{"cancelled":true}}}"#
+        ),
+        InputWithdrawal::Withdrawn
+    );
+    assert_eq!(
+        withdraw_reply(
+            r#"{"type":"control_response","response":{"subtype":"success","request_id":"r","response":{"cancelled":false}}}"#
+        ),
+        InputWithdrawal::AlreadyRead
+    );
+    assert!(matches!(
+        withdraw_reply(
+            r#"{"type":"control_response","response":{"subtype":"success","request_id":"r","response":{}}}"#
+        ),
+        InputWithdrawal::Refused(_)
+    ));
+    let InputWithdrawal::Refused(why) = withdraw_reply(
+        r#"{"type":"control_response","response":{"subtype":"error","request_id":"r","error":"Unsupported control request subtype"}}"#,
+    ) else {
+        panic!("an error reply is a refusal");
+    };
+    assert!(why.contains("Unsupported control request subtype"), "{why}");
+}
+
+/// The input sent right before its withdraw is written first, and the cancel
+/// names that input's uuid. The reply reaches the caller, never the session.
 #[tokio::test]
-async fn a_side_question_mid_turn_leaves_the_turn_alone() {
+async fn a_withdraw_never_overtakes_its_input() {
     let dir = tempfile::tempdir().unwrap();
     let log = dir.path().join("stdin.log");
     let script = format!(
-        r#"read l; printf '%s\n' "$l" >> {log}; printf '{init}\n'; {answer}; printf '{result}\n'"#,
+        r#"read a; printf '%s\n' "$a" >> {log}; read b; printf '%s\n' "$b" >> {log}; id=$(printf '%s' "$b" | sed 's/.*"request_id":"\([^"]*\)".*/\1/'); printf '{{"type":"control_response","response":{{"subtype":"success","request_id":"%s","response":{{"cancelled":true}}}}}}\n' "$id"; sleep 5"#,
         log = log.display(),
-        init = r#"{"type":"system","subtype":"init","session_id":"sess-1"}"#,
-        answer = answer_side_question_script(&log, "forty-two"),
-        result = r#"{"type":"result","result":"main done","duration_ms":5}"#,
     );
-    let (mut agent, _cancel) = spawn_driver_for_test("sh", &["-c", &script]).await;
+    let (mut agent, cancel) = spawn_driver_for_test("sh", &["-c", &script]).await;
+    let input_uuid = uuid::Uuid::new_v4();
+    let (reply, answer) = tokio::sync::oneshot::channel();
     agent
         .input_tx
         .send(AgentInput {
-            text: "do the main work".into(),
+            text: "never mind this".into(),
             images: vec![],
+            uuid: input_uuid,
         })
         .unwrap();
-    let init = tokio::time::timeout(std::time::Duration::from_secs(5), agent.events_rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(matches!(init, AgentEvent::Init { .. }), "got {init:?}");
-
-    let (reply, answer) = tokio::sync::oneshot::channel();
     agent
-        .side_question_tx
+        .withdraw_tx
         .as_ref()
-        .expect("Claude Code takes side questions")
-        .send(SideQuestionRequest {
-            question: "what is the codeword?".into(),
-            reply,
-        })
+        .expect("Claude Code takes withdraws")
+        .send(WithdrawRequest { input_uuid, reply })
         .unwrap();
-    let answer = tokio::time::timeout(std::time::Duration::from_secs(5), answer)
+    let answer = tokio::time::timeout(std::time::Duration::from_secs(10), answer)
         .await
-        .expect("answered within 5s")
+        .expect("answered within 10s")
         .expect("reply not dropped");
-    assert_eq!(answer, Ok("forty-two".to_string()));
-
-    let mut rest = Vec::new();
-    while let Some(ev) =
-        tokio::time::timeout(std::time::Duration::from_secs(5), agent.events_rx.recv())
-            .await
-            .expect("driver finishes")
-    {
-        rest.push(ev);
-    }
-    assert!(
-        matches!(&rest[0], AgentEvent::Result { text, error: None, .. } if text == "main done"),
-        "the turn's own Result follows unchanged, got {rest:?}"
-    );
-    assert!(
-        !format!("{rest:?}").contains("forty-two"),
-        "the side answer must never reach the session's events"
-    );
+    assert_eq!(answer, InputWithdrawal::Withdrawn);
+    cancel.cancel();
 
     let stdin_log = std::fs::read_to_string(&log).unwrap();
     let lines: Vec<&str> = stdin_log.lines().collect();
-    assert_eq!(
-        lines.len(),
-        2,
-        "one user line, one side question: {stdin_log}"
-    );
-    assert!(lines[0].contains(r#""type":"user""#));
-    assert!(lines[1].contains(r#""subtype":"side_question""#));
-    assert!(lines[1].contains("what is the codeword?"));
-    assert!(!stdin_log.contains("interrupt"));
-}
-
-/// A process that exits with a side question pending drops its reply, which
-/// tells the engine to fall back to a cold process.
-#[tokio::test]
-async fn a_pending_side_question_is_dropped_when_the_process_exits() {
-    let (agent, _cancel) = spawn_driver_for_test("sh", &["-c", "read l; exit 0"]).await;
-    let (reply, answer) = tokio::sync::oneshot::channel();
-    agent
-        .side_question_tx
-        .as_ref()
-        .unwrap()
-        .send(SideQuestionRequest {
-            question: "q".into(),
-            reply,
-        })
-        .unwrap();
-    let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), answer)
-        .await
-        .expect("resolves once the driver ends");
+    assert_eq!(lines.len(), 2, "the input, then the cancel: {stdin_log}");
+    assert!(lines[0].contains(r#""type":"user""#), "{stdin_log}");
+    assert!(lines[0].contains(&input_uuid.to_string()), "{stdin_log}");
     assert!(
-        outcome.is_err(),
-        "reply dropped unanswered, got {outcome:?}"
+        lines[1].contains(r#""subtype":"cancel_async_message""#),
+        "{stdin_log}"
     );
+    assert!(lines[1].contains(&input_uuid.to_string()), "{stdin_log}");
+    while let Some(ev) =
+        tokio::time::timeout(std::time::Duration::from_secs(15), agent.events_rx.recv())
+            .await
+            .expect("driver finishes")
+    {
+        assert!(
+            matches!(ev, AgentEvent::Exited { .. }),
+            "the withdraw reply must never reach the session: {ev:?}"
+        );
+    }
 }
 
 fn spawn_cold_fake(script: &str) -> Child {
@@ -641,6 +681,19 @@ fn spawn_cold_fake(script: &str) -> Child {
 
 fn deadline_in(wait: std::time::Duration) -> tokio::time::Instant {
     tokio::time::Instant::now() + wait
+}
+
+/// Wait until the stand-in has written `path`, pid and all. A short deadline
+/// that starts first can kill a shell still starting on a loaded host.
+async fn wait_for_file(path: &Path) {
+    let started = std::time::Instant::now();
+    while !std::fs::read_to_string(path).is_ok_and(|s| !s.trim().is_empty()) {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "the stand-in never wrote {path:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
 }
 
 /// True once `pid` names no process. Polls briefly: an orphan zombie lingers
@@ -658,37 +711,38 @@ async fn process_gone(pid: i32) -> bool {
 }
 
 #[tokio::test]
-async fn a_cold_side_question_is_answered_past_unrelated_lines() {
+async fn a_side_question_is_answered_past_unrelated_lines() {
     let dir = tempfile::tempdir().unwrap();
     let log = dir.path().join("stdin.log");
     let script = format!(
-        r#"printf '{{"type":"system","subtype":"init","session_id":"s"}}\n'; {}; sleep 30"#,
+        r#"printf '{{"type":"system","subtype":"init","session_id":"s","model":"m"}}\n'; {}; sleep 30"#,
         answer_side_question_script(&log, "from the transcript")
     );
     let child = spawn_cold_fake(&script);
     let pid = child.id().unwrap() as i32;
     let answer =
-        ask_side_question_of(child, "q", deadline_in(std::time::Duration::from_secs(5))).await;
-    assert_eq!(answer.unwrap(), "from the transcript");
+        ask_side_question_of(child, "q\n", deadline_in(std::time::Duration::from_secs(5))).await;
+    let reply = answer.unwrap();
+    assert_eq!(reply.answer.unwrap(), "from the transcript");
+    assert_eq!(reply.model.as_deref(), Some("m"));
     #[cfg(unix)]
     assert!(
         process_gone(pid).await,
-        "the cold process must not outlive the answer"
+        "the side-question process must not outlive the answer"
     );
     let stdin_log = std::fs::read_to_string(&log).unwrap();
     assert_eq!(
         stdin_log.lines().count(),
         1,
-        "only the control request: {stdin_log}"
+        "only the side question: {stdin_log}"
     );
-    assert!(!stdin_log.contains(r#""type":"user""#));
 }
 
-/// The cold process never outlives the request: a timeout kills its whole
+/// The side-question process never outlives the request: a timeout kills its whole
 /// process group, grandchildren included.
 #[cfg(unix)]
 #[tokio::test]
-async fn a_cold_side_question_that_never_answers_is_killed() {
+async fn a_side_question_that_never_answers_is_killed() {
     let dir = tempfile::tempdir().unwrap();
     let grandchild = dir.path().join("grandchild.pid");
     let script = format!(
@@ -697,15 +751,19 @@ async fn a_cold_side_question_that_never_answers_is_killed() {
     );
     let child = spawn_cold_fake(&script);
     let pid = child.id().unwrap() as i32;
+    wait_for_file(&grandchild).await;
     let outcome = ask_side_question_of(
         child,
-        "q",
+        "q\n",
         deadline_in(std::time::Duration::from_millis(500)),
     )
     .await;
     let err = outcome.expect_err("times out").to_string();
     assert!(err.contains("did not answer"), "got {err}");
-    assert!(process_gone(pid).await, "the cold process is reaped");
+    assert!(
+        process_gone(pid).await,
+        "the side-question process is reaped"
+    );
     let grandchild_pid: i32 = std::fs::read_to_string(&grandchild)
         .unwrap()
         .trim()
@@ -718,9 +776,9 @@ async fn a_cold_side_question_that_never_answers_is_killed() {
 }
 
 #[tokio::test]
-async fn a_cold_process_that_exits_first_reports_it() {
+async fn a_side_question_process_that_exits_first_reports_it() {
     let child = spawn_cold_fake("read l; exit 3");
-    let err = ask_side_question_of(child, "q", deadline_in(std::time::Duration::from_secs(5)))
+    let err = ask_side_question_of(child, "q\n", deadline_in(std::time::Duration::from_secs(5)))
         .await
         .expect_err("no answer")
         .to_string();
@@ -728,10 +786,10 @@ async fn a_cold_process_that_exits_first_reports_it() {
 }
 
 /// An asker that goes away mid-question, such as an HTTP request the browser
-/// abandoned, still takes the cold process group down with it.
+/// abandoned, still takes the side-question process group down with it.
 #[cfg(unix)]
 #[tokio::test]
-async fn an_abandoned_cold_side_question_kills_its_process_group() {
+async fn an_abandoned_side_question_kills_its_process_group() {
     let dir = tempfile::tempdir().unwrap();
     let grandchild = dir.path().join("grandchild.pid");
     let script = format!(
@@ -740,12 +798,17 @@ async fn an_abandoned_cold_side_question_kills_its_process_group() {
     );
     let child = spawn_cold_fake(&script);
     let pid = child.id().unwrap() as i32;
-    let asked = ask_side_question_of(child, "q", deadline_in(std::time::Duration::from_secs(60)));
+    wait_for_file(&grandchild).await;
+    let asked = ask_side_question_of(
+        child,
+        "q\n",
+        deadline_in(std::time::Duration::from_secs(60)),
+    );
     let abandoned = tokio::time::timeout(std::time::Duration::from_millis(500), asked).await;
     assert!(abandoned.is_err(), "the asker gave up before any answer");
     assert!(
         process_gone(pid).await,
-        "the cold process dies with its asker"
+        "the side-question process dies with its asker"
     );
     let grandchild_pid: i32 = std::fs::read_to_string(&grandchild)
         .unwrap()
@@ -756,4 +819,72 @@ async fn an_abandoned_cold_side_question_kills_its_process_group() {
         process_gone(grandchild_pid).await,
         "the group kill reaches the grandchild"
     );
+}
+
+// ── model probe ──────────────────────────────────────────────────────────
+
+/// A shell stand-in for Claude Code that answers the first line on stdin with
+/// an `initialize` reply carrying an account and two models. Lines it reads go
+/// to `log`.
+fn answer_initialize_script(log: &Path) -> String {
+    let reply = r#"{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"account":{"email":"someone@example.com"},"models":[{"value":"default","resolvedModel":"claude-opus-5-5[1m]","displayName":"Default","description":"d","supportsEffort":true,"supportedEffortLevels":["low","high"]},{"value":"haiku","displayName":"Haiku 4.5","description":"h"}]}}}"#;
+    format!(
+        r#"read l; printf '%s\n' "$l" >> {log}; id=$(printf '%s' "$l" | sed 's/.*"request_id":"\([^"]*\)".*/\1/'); printf '{reply}\n' "$id""#,
+        log = log.display(),
+    )
+}
+
+/// The probe writes exactly one line, an `initialize` request, and never a
+/// prompt, so it costs no tokens. Hook frames before the reply are skipped.
+#[tokio::test]
+async fn the_model_probe_sends_only_initialize_and_reads_the_list() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("stdin.log");
+    let script = format!(
+        r#"printf '{{"type":"system","subtype":"hook_started"}}\n'; {}; sleep 30"#,
+        answer_initialize_script(&log)
+    );
+    let child = spawn_cold_fake(&script);
+    let pid = child.id().unwrap() as i32;
+    let models = probe_models_of(child, deadline_in(std::time::Duration::from_secs(5)))
+        .await
+        .unwrap();
+    let values: Vec<&str> = models.iter().map(|m| m.value.as_str()).collect();
+    assert_eq!(values, ["default", "haiku"]);
+    #[cfg(unix)]
+    assert!(
+        process_gone(pid).await,
+        "the probe must not outlive the reply"
+    );
+    let stdin_log = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(stdin_log.lines().count(), 1, "one line only: {stdin_log}");
+    let sent: serde_json::Value = serde_json::from_str(stdin_log.trim()).unwrap();
+    assert_eq!(sent["type"], "control_request");
+    assert_eq!(
+        sent["request"],
+        serde_json::json!({ "subtype": "initialize" })
+    );
+}
+
+/// A Claude Code that never answers is killed at the deadline, and the error
+/// names what it was waiting for.
+#[tokio::test]
+async fn a_model_probe_that_never_answers_times_out() {
+    let child = spawn_cold_fake("cat > /dev/null");
+    let err = probe_models_of(child, deadline_in(std::time::Duration::from_millis(300)))
+        .await
+        .expect_err("times out")
+        .to_string();
+    assert!(err.contains("did not answer initialize"), "got {err}");
+}
+
+#[tokio::test]
+async fn a_refused_initialize_reports_claude_codes_error() {
+    let script = r#"read l; id=$(printf '%s' "$l" | sed 's/.*"request_id":"\([^"]*\)".*/\1/'); printf '{"type":"control_response","response":{"subtype":"error","request_id":"%s","error":"not now"}}\n' "$id"; sleep 30"#;
+    let child = spawn_cold_fake(script);
+    let err = probe_models_of(child, deadline_in(std::time::Duration::from_secs(5)))
+        .await
+        .expect_err("refused")
+        .to_string();
+    assert_eq!(err, "not now");
 }

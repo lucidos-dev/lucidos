@@ -11,7 +11,7 @@ How the chat agent runs Python in a workspace, and which mistakes are silent con
 
 | Tool | When | Ceiling |
 |------|------|---------|
-| `run_python` | Quick scripts: data prep, plotting, file conversion, one-off transforms. Returns stdout synchronously when the script finishes. | 300 s hard, not adjustable |
+| `run_python` | Quick scripts: data prep, plotting, file conversion, one-off transforms. Returns stdout synchronously when the script finishes: the first 100 KB, then a `[truncated: N bytes total]` marker. Write bigger output to a file. | 300 s hard, not adjustable |
 | `run_python_background` | Anything that may run longer than ~30 s: backtests, model training, large data sweeps, batch downloads. Returns a `task_id` immediately; drain with `bash_output(task_id, wait_secs=…)`. | watchdog `timeout_secs` (default 600 s, max 3600 s) |
 | `bash_output(task_id, wait_secs?)` | The drain tool for the two above AND for `run_bash_background`. Pass `wait_secs` to BLOCK server-side for that many seconds, or until the task finishes. | up to 120 s per call |
 | `bash_kill(task_id)` | Cancel a running background task. No-op if already finished. | — |

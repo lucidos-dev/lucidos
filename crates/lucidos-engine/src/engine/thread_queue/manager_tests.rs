@@ -1543,6 +1543,7 @@ fn user_question_answered() -> crate::engine::thread_events::ThreadEvent {
         tool_use_id: "tu-1".to_string(),
         answer: crate::engine::thread_events::AnswerKind::FreeText {
             text: "go".to_string(),
+            image_hashes: vec![],
         },
     }
 }

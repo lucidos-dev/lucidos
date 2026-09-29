@@ -78,7 +78,7 @@ export function TriggerItem({ trigger }: Partial<Props>) {
             )}
           </SkBlock>
           <SkBlock w="4rem" h="1.25rem" round>
-            <span class={`label trigger-type-${triggerType}`}>
+            <span class={triggerType === 'schedule' ? 'label label-neutral' : 'label'}>
               {triggerType === 'hybrid' ? 'Hybrid' : triggerType === 'event' ? 'Event' : 'Schedule'}
             </span>
           </SkBlock>
@@ -88,7 +88,7 @@ export function TriggerItem({ trigger }: Partial<Props>) {
             </span>
           </SkBlock>
           {trigger?.plugin_id && (
-            <span class="label trigger-plugin-chip" data-tooltip={`Installed by the "${trigger.plugin_id}" plugin`}>
+            <span class="label" data-tooltip={`Installed by the "${trigger.plugin_id}" plugin`}>
               from {trigger.plugin_id}
             </span>
           )}
@@ -134,7 +134,7 @@ export function TriggerItem({ trigger }: Partial<Props>) {
           <div class="list-row-date trigger-last-run">
             <SkText as="span" w="8rem">{lastRunStr && `Last run ${lastRunStr}`}</SkText>
             {trigger?.last_run_status && (
-              <span class={`label trigger-run-status trigger-run-status-${trigger.last_run_status}`}>
+              <span class={trigger.last_run_status === 'ok' ? 'label label-success' : 'label label-error'}>
                 {trigger.last_run_status === 'ok' ? 'OK' : 'Failed'}
               </span>
             )}

@@ -7,7 +7,7 @@
 //! call as a second turn, after the first turn's `Result`. Inputs that queued
 //! behind a busy turn share one replay, so one read can settle several.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::time::Duration;
 
 use uuid::Uuid;
@@ -25,6 +25,9 @@ pub(crate) const SILENT_GRACE: Duration = Duration::from_secs(10);
 #[derive(Debug, Default)]
 pub(crate) struct InputLedger {
     unread: VecDeque<OwedInput>,
+    /// Inputs the agent dropped whose `QueuedMessageRemoved` is not recorded
+    /// yet, by event id. A retry records it without asking the agent again.
+    awaiting_tombstone: HashSet<Uuid>,
 }
 
 /// One write to the agent.
@@ -36,6 +39,8 @@ struct OwedInput {
     /// What the agent was sent, to match against a replay.
     text: String,
     images: usize,
+    /// [`AgentInput::uuid`], the name a withdraw uses.
+    uuid: Uuid,
 }
 
 impl InputLedger {
@@ -50,7 +55,36 @@ impl InputLedger {
             event_ids: input_event_ids,
             text: input.text.clone(),
             images: input.images.len(),
+            uuid: input.uuid,
         });
+    }
+
+    /// The uuid the agent knows `input_event_id`'s message by, while it is owed
+    /// and its write carried that message alone. A coalesced write cannot be
+    /// taken back one message at a time.
+    pub(crate) fn withdrawable(&self, input_event_id: Uuid) -> Option<Uuid> {
+        self.unread
+            .iter()
+            .find(|input| input.event_ids == [input_event_id])
+            .map(|input| input.uuid)
+    }
+
+    /// The agent dropped the input carrying `input_event_id`. It will never be
+    /// read, so nothing owes it now but its tombstone.
+    pub(crate) fn withdrawn(&mut self, input_event_id: Uuid) {
+        self.unread
+            .retain(|input| input.event_ids != [input_event_id]);
+        self.awaiting_tombstone.insert(input_event_id);
+    }
+
+    /// Whether the agent dropped `input_event_id`'s input and its tombstone is
+    /// still unrecorded.
+    pub(crate) fn awaits_tombstone(&self, input_event_id: Uuid) -> bool {
+        self.awaiting_tombstone.contains(&input_event_id)
+    }
+
+    pub(crate) fn tombstone_recorded(&mut self, input_event_id: Uuid) {
+        self.awaiting_tombstone.remove(&input_event_id);
     }
 
     /// Account for one agent event. Returns the events of the inputs it marks

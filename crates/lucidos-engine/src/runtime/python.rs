@@ -1,4 +1,5 @@
 use crate::core::sanitize_for_jsonb;
+use crate::core::shell::{finalize_stream, KEPT_BYTES_CAP};
 use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -473,9 +474,9 @@ impl PythonRuntime {
             // a hung urlopen() / time.sleep() / spin loop keeps running in the
             // background while the engine logs nothing about it. With it, the
             // OS sends SIGKILL when the future drops, so each path reliably
-            // reaps the subprocess. `Command::output()` owns the spawned Child
-            // inside the future it returns, so dropping that future drops the
-            // Child, which is what triggers the kill.
+            // reaps the subprocess. The spawned Child is a local of this
+            // future, so dropping the future or returning drops the Child,
+            // which is what triggers the kill.
             //
             // Scope of that kill, stated because the ceiling below leans on
             // it: SIGKILL reaches the INTERPRETER, not a process tree the
@@ -490,14 +491,28 @@ impl PythonRuntime {
             // signals only the leader on cancel and shutdown.
             .kill_on_drop(true);
         crate::core::apply_to_subprocess_env(&mut cmd, &env_vars);
-        let output = match tokio::time::timeout(self.execution_timeout, cmd.output()).await {
-            Ok(Ok(output)) => output,
-            Ok(Err(e)) => return Err(format!("Failed to execute Python: {}", e)),
-            Err(_) => return Err(self.on_execution_timeout(run_dir)),
+        cmd.stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| format!("Failed to execute Python: {}", e))?;
+        let (stdout_pipe, stderr_pipe) = (child.stdout.take(), child.stderr.take());
+        let run = async {
+            tokio::join!(
+                read_capped(stdout_pipe, Keep::Head),
+                read_capped(stderr_pipe, Keep::Tail),
+                child.wait()
+            )
         };
+        let ((stdout, stdout_total), (stderr, _), status) =
+            match tokio::time::timeout(self.execution_timeout, run).await {
+                Ok((out, err, Ok(status))) => (out, err, status),
+                Ok((_, _, Err(e))) => return Err(format!("Failed to execute Python: {}", e)),
+                Err(_) => return Err(self.on_execution_timeout(run_dir)),
+            };
 
-        let stdout = sanitize_for_jsonb(&String::from_utf8_lossy(&output.stdout));
-        let stderr = sanitize_for_jsonb(&String::from_utf8_lossy(&output.stderr));
+        let stdout = finalize_stream(&stdout, stdout_total);
+        let stderr = sanitize_for_jsonb(&String::from_utf8_lossy(&stderr));
 
         if let Err(e) = fs::write(run_dir.join("stdout.txt"), &stdout) {
             log!("[Python] Failed to write stdout debug log: {}", e);
@@ -506,12 +521,12 @@ impl PythonRuntime {
             log!("[Python] Failed to write stderr debug log: {}", e);
         }
 
-        if output.status.success() {
+        if status.success() {
             Ok(stdout)
         } else {
             // Stripping middle frames + tail-clipping pre-traceback noise
-            // keeps the LLM context lean. The FULL stderr is still on
-            // disk at exhaust_path/<task_id>/stderr.txt for debugging.
+            // keeps the LLM context lean. The kept stderr tail is on disk
+            // at exhaust_path/<task_id>/stderr.txt for debugging.
             let trimmed = truncate_python_error(&stderr);
             Err(format!("Python error:\n{}", trimmed))
         }
@@ -520,14 +535,8 @@ impl PythonRuntime {
     /// Build the error a hard-ceiling expiry returns, and leave a note in the
     /// run's exhaust dir so the audit trail says why it holds no output.
     ///
-    /// The child is already being SIGKILLed by the time this runs (the
-    /// `Command::output()` future was dropped on the way in), and its stdout
-    /// and stderr went with it. Draining partial output would mean replacing
-    /// `output()` with piped handles plus reader tasks feeding shared buffers,
-    /// which is real restructuring for very little: CPython block-buffers
-    /// stdout when it is not a tty, so a script that hangs before filling the
-    /// 8 KB buffer has flushed nothing to capture. `run_bash` makes the same
-    /// trade at the same seam.
+    /// The child is SIGKILLed when `spawn_python` returns, and its partial
+    /// stdout and stderr go with the dropped readers.
     ///
     /// The message names the ceiling and the escape hatch, because the moment
     /// an agent hits this wall is exactly when it needs to know
@@ -691,10 +700,63 @@ impl PythonRuntime {
 /// the truncator kicks in. 30 lines + 4 KB is enough room for a full
 /// 5-frame traceback, the exception line, and a couple of pre-crash
 /// stderr prints — below that, the agent rarely benefits from more
-/// context (the full stderr is on disk at exhaust_path/<id>/stderr.txt
+/// context (the kept stderr tail is on disk at exhaust_path/<id>/stderr.txt
 /// either way).
 const PY_ERROR_LINE_BUDGET: usize = 30;
 const PY_ERROR_BYTE_BUDGET: usize = 4096;
+
+/// Which end of an oversized stream a reader keeps.
+#[derive(Clone, Copy)]
+enum Keep {
+    /// Stdout: the model reads from the start.
+    Head,
+    /// Stderr: a traceback always comes last.
+    Tail,
+}
+
+/// Read a pipe to EOF, keeping at most [`KEPT_BYTES_CAP`] bytes from the end
+/// `keep` names. Returns the kept bytes and how many the stream carried.
+async fn read_capped<R: tokio::io::AsyncRead + Unpin>(
+    pipe: Option<R>,
+    keep: Keep,
+) -> (Vec<u8>, u64) {
+    use tokio::io::AsyncReadExt;
+    let Some(mut pipe) = pipe else {
+        return (Vec::new(), 0);
+    };
+    let mut kept = Vec::new();
+    let mut total = 0u64;
+    let mut chunk = [0u8; 8192];
+    loop {
+        match pipe.read(&mut chunk).await {
+            Ok(0) => break,
+            Ok(n) => {
+                total += n as u64;
+                match keep {
+                    Keep::Head => {
+                        let room = KEPT_BYTES_CAP.saturating_sub(kept.len());
+                        kept.extend_from_slice(&chunk[..n.min(room)]);
+                    }
+                    Keep::Tail => {
+                        kept.extend_from_slice(&chunk[..n]);
+                        if kept.len() > 2 * KEPT_BYTES_CAP {
+                            kept.drain(..kept.len() - KEPT_BYTES_CAP);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                log!("[Python] Output pipe read failed: {}", e);
+                break;
+            }
+        }
+    }
+    if let Keep::Tail = keep {
+        let excess = kept.len().saturating_sub(KEPT_BYTES_CAP);
+        kept.drain(..excess);
+    }
+    (kept, total)
+}
 
 /// Strip middle frames out of a Python traceback and tail-clip
 /// pre-traceback stderr noise so the LLM-facing tool result stays
@@ -917,5 +979,57 @@ mod staging_seed_tests {
             .expect("r+ on an existing artifact must not raise");
 
         assert_eq!(out.trim(), "hello");
+    }
+
+    /// A script that prints far more than the model can read returns a capped,
+    /// marked head, never the whole stream.
+    #[tokio::test]
+    async fn a_huge_stdout_comes_back_capped_and_marked() {
+        let dir = tempdir().unwrap();
+        let ws = dir.path();
+        std::fs::create_dir_all(ws.join("data")).unwrap();
+        let runtime = PythonRuntime::new(ws.to_path_buf()).unwrap();
+
+        let staging = ws.join(".lucidos/staging/huge-run");
+        let out = runtime
+            .execute_staged(
+                "import sys\nsys.stdout.write('x' * 3_000_000)",
+                vec![],
+                &staging,
+            )
+            .await
+            .expect("a chatty script still succeeds");
+
+        assert!(out.len() < 200 * 1024, "returned {} bytes", out.len());
+        assert!(
+            out.ends_with("[truncated: 3000000 bytes total]"),
+            "{}",
+            &out[out.len() - 60..]
+        );
+    }
+
+    /// A traceback comes last on stderr. A script that floods stderr first
+    /// (warnings, progress bars) must still report the exception it died of.
+    #[tokio::test]
+    async fn a_traceback_after_a_stderr_flood_survives() {
+        let dir = tempdir().unwrap();
+        let ws = dir.path();
+        std::fs::create_dir_all(ws.join("data")).unwrap();
+        let runtime = PythonRuntime::new(ws.to_path_buf()).unwrap();
+
+        let staging = ws.join(".lucidos/staging/flood-run");
+        let err = runtime
+            .execute_staged(
+                "import sys\nsys.stderr.write('w' * 2_000_000)\nraise ValueError('the real cause')",
+                vec![],
+                &staging,
+            )
+            .await
+            .expect_err("the script raises");
+        assert!(
+            err.contains("the real cause"),
+            "{}",
+            &err[..err.len().min(300)]
+        );
     }
 }

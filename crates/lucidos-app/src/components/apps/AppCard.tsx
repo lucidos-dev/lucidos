@@ -43,12 +43,12 @@ export function AppRow({ app, onOpen, onEdit, onDelete, pluginInfo, onUpdate }: 
         <div class="app-row-title-line">
           <SkText class="title list-row-name" w="9rem">{app?.name}</SkText>
           {pluginInfo && (
-            <span class="app-marketplace-chip" data-tooltip={`Installed from ${pluginInfo.marketplaceName}`}>
+            <span class="label label-neutral" data-tooltip={`Installed from ${pluginInfo.marketplaceName}`}>
               {pluginInfo.marketplaceName}
             </span>
           )}
           {pluginInfo?.updateAvailable && (
-            <span class="app-update-chip">Update available</span>
+            <span class="label">Update available</span>
           )}
         </div>
         {(sk || app?.description) && (

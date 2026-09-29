@@ -246,3 +246,62 @@ describe('an unread coding-agent message', () => {
     expect(reply).toBe(exchanges.length - 1);
   });
 });
+
+describe('a withdrawn coding-agent message', () => {
+  // The session records the tombstone once Claude Code drops the message.
+  it('leaves the transcript on every device', () => {
+    const thread = makeOptimisticThreadState({
+      id: 't1',
+      title: 'A coding-agent thread',
+      channel: 'claude_code',
+      initiator: 'user',
+      eventsLoaded: true,
+    });
+    for (const [seq, event] of [
+      ev(1, message('start'), 'm1'),
+      ev(2, read('m1')),
+      ev(3, said('working on it')),
+      ev(4, message('also check the totals'), 'm2'),
+      ev(5, { type: 'QueuedMessageRemoved', removed_message_id: 'm2' }),
+    ]) thread.events.set(seq, event);
+    const exchanges = computeExchanges(thread);
+    expect(exchanges.map(ex => ex.userEvent.type === 'MessageReceived' && ex.userEvent.text))
+      .toEqual(['start']);
+  });
+
+  // Edit withdraws the message and the user resends it. A Stop then ends the
+  // turn, and the agent reads the resent copy. The withdrawn copy must stay
+  // gone: neither the read nor the idle turn may take it out of the queue.
+  it.each([
+    ['in one load', false],
+    ['as each event arrives', true],
+  ])('stays gone after an edit, a Stop and the read of the resent copy, %s', (_, live) => {
+    const thread = makeOptimisticThreadState({
+      id: 't1',
+      title: 'A coding-agent thread',
+      channel: 'claude_code',
+      initiator: 'user',
+      eventsLoaded: true,
+    });
+    for (const [seq, event] of [
+      ev(1, message('start'), 'm1'),
+      ev(2, read('m1')),
+      ev(3, said('working on it')),
+      ev(4, message('check the totals'), 'm2'),
+      ev(5, { type: 'QueuedMessageRemoved', removed_message_id: 'm2' }),
+      ev(6, message('check the totals'), 'm3'),
+      ev(7, { type: 'ResponseCanceled', cause: 'user_stop', channel: 'claude_code' }),
+      ev(8, idled),
+      ev(9, { type: 'CodingAgentSettingsChanged', model: 'opus', channel: 'claude_code' }),
+      ev(10, read('m3')),
+      ev(11, said('checking the totals')),
+    ]) {
+      thread.events.set(seq, event);
+      if (live) computeExchanges(thread);
+    }
+    const exchanges = computeExchanges(thread);
+    const resent = exchanges.filter(ex => ex.userEvent._eventId === 'm2' || ex.userEvent._eventId === 'm3');
+    expect(resent.map(ex => ex.userEvent._eventId)).toEqual(['m3']);
+    expect(texts(resent[0])).toEqual(['checking the totals']);
+  });
+});

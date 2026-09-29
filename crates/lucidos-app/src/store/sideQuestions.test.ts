@@ -1,13 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const post = vi.fn<(threadId: string, id: string, question: string) => Promise<string>>();
+const post = vi.fn<(threadId: string, id: string, question: string, images: readonly string[]) => Promise<string>>();
 const postDismissal = vi.fn<(threadId: string, id: string) => Promise<void>>();
 const toast = vi.fn();
 vi.mock('../api/client', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../api/client')>();
   return {
     ...actual,
-    askSideQuestion: (t: string, id: string, q: string) => post(t, id, q),
+    askSideQuestion: (t: string, id: string, q: string, images: readonly string[]) => post(t, id, q, images),
     dismissSideQuestion: (t: string, id: string) => postDismissal(t, id),
   };
 });
@@ -18,9 +18,9 @@ vi.mock('./store', async (importOriginal) => {
 
 import { ApiError } from '../api/client';
 import {
+  SIDE_QUESTION_CODEX,
   SIDE_QUESTION_EMPTY,
   SIDE_QUESTION_NOT_STARTED,
-  SIDE_QUESTION_TEXT_ONLY,
   askSideQuestion,
   dismissSideQuestion,
   isSideQuestionFilter,
@@ -38,7 +38,7 @@ import { threadMap } from './store';
 import type { StoredEvent } from './thread-events/thread-event-types';
 import type { ThreadState } from './thread-events/thread-meta';
 
-const STARTED_CC = { codingAgent: true, started: true, hasImages: false };
+const STARTED = { started: true, codex: false };
 
 describe('sideQuestionText', () => {
   it('reads /btw as the first word, like the engine', () => {
@@ -82,25 +82,28 @@ describe('withSideQuestionPrefix', () => {
 });
 
 describe('routeSideQuestion', () => {
-  it('asks a side question in a started coding-agent thread', () => {
-    expect(routeSideQuestion('/btw what is X?', STARTED_CC)).toEqual({ kind: 'ask', question: 'what is X?' });
+  it('asks a side question in any started thread', () => {
+    expect(routeSideQuestion('/btw what is X?', STARTED)).toEqual({ kind: 'ask', question: 'what is X?' });
   });
 
   it('sends a normal message and other slash commands as usual', () => {
-    expect(routeSideQuestion('please fix the tests', STARTED_CC)).toEqual({ kind: 'message' });
-    expect(routeSideQuestion('/compact', STARTED_CC)).toEqual({ kind: 'message' });
+    expect(routeSideQuestion('please fix the tests', STARTED)).toEqual({ kind: 'message' });
+    expect(routeSideQuestion('/compact', STARTED)).toEqual({ kind: 'message' });
   });
 
-  it('leaves /btw alone outside coding-agent threads', () => {
-    expect(routeSideQuestion('/btw q', { ...STARTED_CC, codingAgent: false })).toEqual({ kind: 'message' });
+  it('asks the whole draft when the user chose to ask, with no /btw typed', () => {
+    expect(routeSideQuestion('  what is X?  ', STARTED, true)).toEqual({ kind: 'ask', question: 'what is X?' });
+    expect(routeSideQuestion('/btw what is X?', STARTED, true)).toEqual({ kind: 'ask', question: 'what is X?' });
   });
 
   it('refuses, keeping the draft, where it cannot be asked', () => {
-    expect(routeSideQuestion('/btw q', { ...STARTED_CC, started: false }))
+    expect(routeSideQuestion('/btw q', { started: false, codex: false }))
       .toEqual({ kind: 'refuse', toast: SIDE_QUESTION_NOT_STARTED });
-    expect(routeSideQuestion('/btw q', { ...STARTED_CC, hasImages: true }))
-      .toEqual({ kind: 'refuse', toast: SIDE_QUESTION_TEXT_ONLY });
-    expect(routeSideQuestion('/btw', STARTED_CC)).toEqual({ kind: 'refuse', toast: SIDE_QUESTION_EMPTY });
+    expect(routeSideQuestion('/btw', STARTED)).toEqual({ kind: 'refuse', toast: SIDE_QUESTION_EMPTY });
+    expect(routeSideQuestion('   ', STARTED, true)).toEqual({ kind: 'refuse', toast: SIDE_QUESTION_EMPTY });
+    // A Codex thread takes none, and refusing here keeps the draft's images.
+    expect(routeSideQuestion('/btw q', { started: true, codex: true }))
+      .toEqual({ kind: 'refuse', toast: SIDE_QUESTION_CODEX });
   });
 });
 
@@ -129,10 +132,12 @@ describe('askSideQuestion', () => {
   it('shows a pending card, then the answer', async () => {
     let resolve!: (answer: string) => void;
     post.mockReturnValue(new Promise((r) => { resolve = r; }));
-    const asking = askSideQuestion('t1', 'what is X?');
+    const asking = askSideQuestion('t1', 'what is X?', ['h1']);
     const [card] = sideQuestionsFor('t1');
-    expect(post).toHaveBeenCalledWith('t1', card.id, 'what is X?');
-    expect(card).toMatchObject({ question: 'what is X?', status: 'pending', dismissed: false });
+    expect(post).toHaveBeenCalledWith('t1', card.id, 'what is X?', ['h1']);
+    expect(card).toMatchObject({
+      question: 'what is X?', imageHashes: ['h1'], status: 'pending', dismissed: false,
+    });
     resolve('X is a letter.');
     await asking;
     expect(sideQuestionsFor('t1')).toMatchObject([{ status: 'answered', answer: 'X is a letter.' }]);
@@ -181,16 +186,19 @@ describe('recorded side questions', () => {
 
   it('draws each card from its events, at its asked seq', () => {
     holdEvents('t1', [
-      [4, asked('a', 'first')],
+      [4, { ...asked('a', 'first'), image_hashes: ['h1'] }],
       [5, { type: 'MessageReceived' }],
       [6, asked('b', 'second')],
       [7, { type: 'SideQuestionAnswered', side_question_id: 'a', answer: 'one' }],
       [8, { type: 'SideQuestionFailed', side_question_id: 'b', error: 'Interrupted by a restart. Ask again.' }],
     ]);
     expect(sideQuestionsFor('t1')).toEqual([
-      { id: 'a', threadId: 't1', question: 'first', afterSeq: 4, dismissed: false, status: 'answered', answer: 'one' },
       {
-        id: 'b', threadId: 't1', question: 'second', afterSeq: 6, dismissed: false,
+        id: 'a', threadId: 't1', question: 'first', imageHashes: ['h1'], afterSeq: 4, dismissed: false,
+        status: 'answered', answer: 'one',
+      },
+      {
+        id: 'b', threadId: 't1', question: 'second', imageHashes: [], afterSeq: 6, dismissed: false,
         status: 'failed', error: 'Interrupted by a restart. Ask again.',
       },
     ]);

@@ -62,7 +62,7 @@ async function injectScene(page: Page): Promise<void> {
       <div style="display: flex; gap: 0.5rem; flex-wrap: wrap; padding: 0.5rem 0">
         <span class="section-count-badge">3</span>
         <span class="label">label</span>
-        <span class="app-store-filter-pill">pill</span>
+        <span class="pill-bar-btn active">pill</span>
         <button class="action-btn">Archive</button>
         <span class="status-dot" style="width: 0.5rem; height: 0.5rem; background: currentcolor"></span>
       </div>

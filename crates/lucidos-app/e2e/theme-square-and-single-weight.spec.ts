@@ -42,7 +42,7 @@ async function openScene(page: Page): Promise<void> {
       <div class="response-body"><div class="response-content"><div class="response-chunk markdown-content">
         <p id="sq-prose">Plain text and <strong id="sq-strong">bold text</strong>.</p>
       </div></div></div>
-      <span class="app-store-filter-pill" id="sq-pill">pill</span>
+      <span class="pill-bar-btn active" id="sq-pill">pill</span>
       <button class="action-btn" id="sq-button">Archive</button>
       <div style="position: relative; height: 6.5rem">
         <button class="scroll-to-top visible" style="top: 0.5rem" aria-label="Scroll to top">

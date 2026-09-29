@@ -24,7 +24,7 @@ const here: string = dirname(fileURLToPath(import.meta.url));
 const promptSource = readFileSync(resolve(here, '../PromptInput.tsx'), 'utf-8');
 
 describe('PromptInput submit routes /btw before any send', () => {
-  const submit = promptSource.match(/async function submit\(\)[\s\S]*?\n {2}\}/)?.[0] ?? '';
+  const submit = promptSource.match(/async function submit\(asSideQuestion = false\)[\s\S]*?\n {2}\}/)?.[0] ?? '';
 
   it('decides the route ahead of the upload queue and the send', () => {
     expect(submit, 'submit() not found').not.toBe('');
@@ -34,15 +34,29 @@ describe('PromptInput submit routes /btw before any send', () => {
     expect(submit.indexOf('beginSend')).toBeGreaterThan(routeIdx);
   });
 
-  it('the ask branch calls the side-question action and returns before beginSend', () => {
+  it('the ask branch asks with the images, or waits for them, and never sends', () => {
     const branch = submit.match(/if \(sideQuestion\.kind === 'ask'[\s\S]*?\n {4}\}/)?.[0] ?? '';
     expect(branch, 'ask branch not found').not.toBe('');
-    expect(branch).toContain('askSideQuestion(threadId, sideQuestion.question)');
-    // Before the ask, so it can tell the new card from the ones on screen.
-    expect(branch.indexOf('followSideQuestion()')).toBeGreaterThan(-1);
-    expect(branch.indexOf('followSideQuestion()')).toBeLessThan(branch.indexOf('askSideQuestion('));
+    expect(branch).toContain('askComposerSideQuestion(threadId, sideQuestion.question, currentImages)');
+    expect(branch).toMatch(/if \(uploadInFlight\) \{[\s\S]*?asSideQuestion: true[\s\S]*?return;/);
     expect(branch).toMatch(/return;\s*\}$/);
     expect(branch).not.toMatch(/sendFollowup|sendMessage|sendCompose|beginSend/);
+  });
+
+  it('asking empties the draft, images included, and follows the new card', () => {
+    const helper = promptSource.match(/function askComposerSideQuestion\([\s\S]*?\n {2}\}/)?.[0] ?? '';
+    expect(helper, 'askComposerSideQuestion not found').not.toBe('');
+    expect(helper).toContain("updateCompose(threadId, { text: '', image_hashes: [] })");
+    // Before the ask, so it can tell the new card from the ones on screen.
+    expect(helper.indexOf('followSideQuestion()')).toBeGreaterThan(-1);
+    expect(helper.indexOf('followSideQuestion()')).toBeLessThan(helper.indexOf('askSideQuestion('));
+    expect(helper).toContain('askSideQuestion(threadId, question, hashes)');
+  });
+
+  it('a queued ask routes as a side question once the upload lands', () => {
+    const queued = promptSource.match(/function sendQueuedAfterUpload\([\s\S]*?\n {2}\}/)?.[0] ?? '';
+    expect(queued).toMatch(/routeSideQuestion\(msg, \{\s*started: thread\.meta\.state !== 'composing',[\s\S]*?\}, intent\.asSideQuestion\)/);
+    expect(queued.indexOf('routeSideQuestion(')).toBeLessThan(queued.indexOf('beginSend('));
   });
 
   it('a refusal toasts and returns, keeping the draft', () => {

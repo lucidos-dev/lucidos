@@ -55,7 +55,7 @@ test('the theme carousel fits a phone and pages on a tap', async ({ page }) => {
   await expect.poll(centred, { message: 'the left chevron did not page back' }).toBe(1);
 
   // The first chip sits at the edge-swipe strip and still takes a tap.
-  const chips = page.locator('.theme-family-chip');
+  const chips = page.locator('.pill-bar-btn');
   await chips.nth(1).tap();
   await expect(chips.nth(1)).toHaveAttribute('aria-pressed', 'true');
   await chips.first().tap();

@@ -16,6 +16,7 @@ mod propose;
 
 #[path = "../change_ops_emitters.rs"]
 mod emitters;
+pub(crate) use emitters::APPLIED_IN_BROADCAST;
 
 // Test-only re-exports — `change_ops_tests.rs` reaches these via `use super::*`.
 // Non-test callers in the child modules import them directly.

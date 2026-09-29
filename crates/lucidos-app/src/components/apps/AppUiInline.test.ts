@@ -47,7 +47,11 @@ describe('app frame load cover', () => {
     // `load` is the only signal that the frame has a document to show. A fixed
     // delay would either uncover too early (back to the white flash) or hold a
     // blank pane over an app that was ready.
-    expect(src).toMatch(/onLoad=\{\(\) => setLoaded\(true\)\}/);
+    expect(src).toMatch(/onLoad=\{\(e\) => \{\s*setLoaded\(true\);/);
+  });
+
+  it('hands the loaded frame the shortcut bindings, so the SDK cancels their browser defaults', () => {
+    expect(src).toMatch(/pushKeybindingsToFrame\(e\.currentTarget as HTMLIFrameElement\)/);
   });
 
   it('keeps the cover mounted through its fade-out, at any animation speed', () => {

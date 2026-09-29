@@ -213,7 +213,12 @@ mod tests {
     /// The budget path keeps its pre-existing set.
     #[test]
     fn claude_tiers_split_on_the_adaptive_thinking_path() {
-        for always_on in ["claude-opus-5-5", "claude-opus-5-5[1m]"] {
+        for always_on in [
+            "claude-opus-5-5",
+            "claude-opus-5-5[1m]",
+            "claude-sonnet-5-5",
+            "claude-sonnet-5-5[1m]",
+        ] {
             assert_eq!(
                 supported_efforts(ProviderKind::Vertex, always_on),
                 LOW_THROUGH_MAX,
@@ -257,6 +262,7 @@ mod tests {
     fn none_snaps_to_low_on_a_model_that_cannot_stop_thinking() {
         for (provider, model) in [
             (ProviderKind::Vertex, "claude-opus-5-5"),
+            (ProviderKind::Anthropic, "claude-sonnet-5-5"),
             (ProviderKind::Anthropic, "claude-fable-5-1[1m]"),
         ] {
             assert_eq!(

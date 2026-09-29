@@ -15,10 +15,6 @@ describe('toastTap', () => {
     expect(toastTap({ type: 'success', action: OPEN })).toBe('action');
   });
 
-  it('turns a lone OK into the card tap even with no X', () => {
-    expect(toastTap({ type: 'info', action: { label: 'OK', onClick: noop }, dismissable: false })).toBe('action');
-  });
-
   it('keeps the button on a warning or an error, since a tap to read it must not act', () => {
     expect(toastTap({ type: 'warning', action: OPEN })).toBeNull();
     expect(toastTap({ type: 'error', action: { label: 'Retry build', onClick: noop } })).toBeNull();
@@ -33,19 +29,10 @@ describe('toastTap', () => {
     expect(toastTap({ type: 'info', action: { label: 'Update & restart', onClick: noop, variant: 'confirm' } })).toBeNull();
   });
 
-  it('closes a passive info or success toast', () => {
-    expect(toastTap({ type: 'info' })).toBe('dismiss');
-    expect(toastTap({ type: 'success' })).toBe('dismiss');
-  });
-
-  it('leaves a warning or an error up, since the reader may still be reading it', () => {
+  it('never closes a passive toast, since a reader may tap it looking for more', () => {
+    expect(toastTap({ type: 'info' })).toBeNull();
+    expect(toastTap({ type: 'success' })).toBeNull();
     expect(toastTap({ type: 'warning' })).toBeNull();
     expect(toastTap({ type: 'error' })).toBeNull();
-  });
-
-  it('never closes a non-dismissable toast, or one narrating work in flight', () => {
-    expect(toastTap({ type: 'info', dismissable: false })).toBeNull();
-    expect(toastTap({ type: 'info', spinning: true })).toBeNull();
-    expect(toastTap({ type: 'info', progress: 0.4 })).toBeNull();
   });
 });

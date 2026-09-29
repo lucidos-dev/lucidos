@@ -34,6 +34,7 @@ import {
   mcpServerState,
   mcpServerStateLabel,
   mcpToolCostLine,
+  type McpServerState,
   disabledWireNames,
   patchToolDisabled,
   sortToolsByCost,
@@ -103,6 +104,13 @@ function mcpToolRow(tool: McpToolStatus, props: McpServerRowProps): VNode {
   );
 }
 
+/** The shared label tone each server state wears. */
+const STATE_TONE: Record<McpServerState, string> = {
+  running: 'label-success',
+  stopped: 'label-neutral',
+  undispatchable: 'label-error',
+};
+
 /** One registered server, as a pure builder. `McpServersPage` calls it with
  *  real data. `ListSkeletonOf` calls it with `sk` inside a skeleton provider,
  *  so the placeholder IS this markup and cannot drift from it. */
@@ -126,7 +134,7 @@ export function mcpServerRow(props: McpServerRowProps): VNode {
         <div class="list-row-info">
           <div class="mcp-server-heading">
             <SkText class="title list-row-name" as="div" w="9rem">{server?.name}</SkText>
-            <SkText class="mcp-state-chip" w="6rem">
+            <SkText class={`label ${STATE_TONE[state]}`} w="6rem">
               {server ? mcpServerStateLabel(server) : null}
             </SkText>
           </div>

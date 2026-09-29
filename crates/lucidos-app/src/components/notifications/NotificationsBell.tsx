@@ -1,5 +1,6 @@
 import { unreadCount } from '../../store/store';
 import { switchMenuItem } from '../../store/actions/menu';
+import { tooltipWithShortcut } from '../../store/actions/keybindings';
 import { BellIcon } from '../shared/icons';
 
 export function NotificationsBell() {
@@ -9,7 +10,7 @@ export function NotificationsBell() {
     <button
       class="icon-btn header-icon notifications-bell"
       onClick={() => switchMenuItem('notifications')}
-      data-tooltip="View notifications"
+      data-tooltip={tooltipWithShortcut('View notifications', 'openNotifications')}
       aria-label="View notifications"
     >
       <BellIcon />

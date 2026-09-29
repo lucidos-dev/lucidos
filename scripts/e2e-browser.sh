@@ -99,6 +99,15 @@ cd "$PROJECT_DIR/crates/lucidos-app"
 # Playwright below).
 ( cd "$PROJECT_DIR" && npm ci )
 
+# Every Playwright on the host shares one browsers cache, and any `playwright
+# install` deletes the builds no live install still registers. Ours registers a
+# worktree path that is later removed, so a foreign install (a workspace Python
+# venv, say) can take our browsers with it. Installing here is a no-op when the
+# build is present, and restores it when it is not.
+PW_BROWSERS=(chromium)
+[ -n "$SKIP_WEBKIT" ] || PW_BROWSERS+=(webkit)
+npx playwright install "${PW_BROWSERS[@]}"
+
 export E2E_WORKSPACE
 [ -n "$HEADED" ] && export HEADED=1
 

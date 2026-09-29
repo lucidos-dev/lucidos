@@ -995,27 +995,21 @@
     gap: 0.75rem;
 }
 
+/* The question is markdown, often findings before the decision. The body
+   reads at normal weight, and the closing paragraph is the question itself,
+   so it alone is bold. A one-line question is its own closing paragraph. */
 .question-text {
     color: var(--text-primary);
-    font-weight: 600;
+    font-size: var(--font-size-md);
     line-height: 1.5;
 }
 
-/* Links the LLM pastes into a question (e.g. a PR URL) — styled like the
-   standard markdown-content anchor. word-break keeps a long URL from
-   overflowing the card. */
-.question-text a {
-    color: var(--accent);
-    text-decoration: underline;
-    text-decoration-color: color-mix(in srgb, var(--accent) 40%, transparent);
-    text-underline-offset: 0.125rem;
-    word-break: break-all;
+.question-text > p:last-child {
+    font-weight: 600;
 }
 
-@media (hover: hover) {
-    .question-text a:hover {
-        text-decoration-color: var(--accent);
-    }
+.question-text > :last-child {
+    margin-bottom: 0;
 }
 
 /* Option indicator — radio circle (single-select) or checkbox box (multi-
@@ -1702,3 +1696,44 @@ body:not(.is-touch) .code-block-copy-btn.copy-btn-copied {
     font-style: italic;
     font-size: var(--font-size-lg);
 }
+
+/* Error notice: the red-tinted surface and the red bold heading carry the
+   emphasis. No left accent bar (.claude/rules/frontend-css.md forbids it). */
+.exchange-error {
+    padding: 0.75rem 1rem;
+    background: color-mix(in srgb, var(--accent-red) 8%, transparent);
+    color: var(--accent-red);
+    font-size: var(--font-size-lg);
+}
+.exchange-error strong {
+    display: block;
+    margin-bottom: 0.25rem;
+}
+.exchange-error p {
+    margin: 0;
+    opacity: 0.85;
+}
+
+/* Engine-limit notice, under the same no-stripe rule as .exchange-error.
+   Unlike .exchange-error (a direct .chat-exchange child), this box lives INSIDE
+   a .response-panel, whose base padding-right insets turn content from the pane
+   edge (chat/input-messages.css). The notice is a full-bleed coloured surface
+   flush left, so it cancels that inset to stay full-bleed on the right too.
+   Otherwise it reads as a card that is shy of one edge. */
+.exchange-engine-limit {
+    padding: 0.75rem 1rem;
+    margin-right: calc(-1 * var(--turn-body-inset));
+    background: color-mix(in srgb, var(--accent-yellow) 8%, transparent);
+    color: var(--accent-yellow);
+    font-size: var(--font-size-lg);
+}
+.exchange-engine-limit strong {
+    display: block;
+    margin-bottom: 0.25rem;
+}
+.exchange-engine-limit p {
+    margin: 0;
+    opacity: 0.9;
+    color: var(--text-primary);
+}
+

@@ -365,6 +365,13 @@ pub enum ContextPurpose {
     /// The summary written for one file the `import_file` tool imported. Runs
     /// the agent's own chat model, once per imported file.
     ArtifactSummary,
+    /// One *side question*'s model call, on either agent: a Lucidos Agent round
+    /// on its own chat model, or a Claude Code session copy's summed usage.
+    /// It runs beside the thread and is never a turn.
+    SideQuestion,
+    /// The *change summary*: one line saying what a change of several commits
+    /// does. It owns `model_change_summary`, falling back to the title model.
+    ChangeSummary,
 }
 
 impl ContextPurpose {
@@ -391,6 +398,8 @@ impl ContextPurpose {
             Self::IntentLoop => "Intent Loop Request",
             Self::MemoryCorrection => "Memory Correction Request",
             Self::ArtifactSummary => "Artifact Summary Request",
+            Self::SideQuestion => "Side Question Request",
+            Self::ChangeSummary => "Change Summary Request",
         }
     }
 }
@@ -768,10 +777,16 @@ pub struct AgentSession {
     /// Channel for sending control requests (set_model, set_permission_mode, etc.)
     /// from outside the event loop. The event loop forwards them to the runtime.
     pub control_tx: tokio::sync::mpsc::UnboundedSender<crate::runtime::ControlRequest>,
-    /// Side questions for the live process (`RunningAgent::side_question_tx`).
-    /// `None` for Codex, which has no side-question call.
-    pub side_question_tx:
-        Option<tokio::sync::mpsc::UnboundedSender<crate::runtime::SideQuestionRequest>>,
+    /// Withdraws for this session's run loop, which owns the input ledger.
+    pub withdraw_tx: tokio::sync::mpsc::UnboundedSender<
+        crate::engine::agent_session::withdraw::WithdrawInputRequest,
+    >,
+    /// Follow-ups sent on `msg_tx` that the run loop has not forwarded yet,
+    /// by origin event id. The chat fast path adds one before its send and the
+    /// run loop removes it on receipt, both under the `agent_sessions` lock. A
+    /// withdraw for an id still here waits until the message is forwarded, so
+    /// it can never reach the agent ahead of it.
+    pub unforwarded_inputs: std::collections::HashSet<Uuid>,
     /// Built-in CC commands (compact, clear, cost, etc.) — slash_commands minus skills.
     pub builtin_commands: Vec<String>,
     /// Skill commands (from plugins and user .claude/skills/).
@@ -910,7 +925,8 @@ impl AgentSession {
             external_terminal_emitted: Arc::new(AtomicBool::new(false)),
             external_continuation_requested: Arc::new(AtomicBool::new(false)),
             control_tx: tokio::sync::mpsc::unbounded_channel().0,
-            side_question_tx: None,
+            withdraw_tx: tokio::sync::mpsc::unbounded_channel().0,
+            unforwarded_inputs: Default::default(),
             builtin_commands: vec![],
             skill_commands: vec![],
             current_model: None,

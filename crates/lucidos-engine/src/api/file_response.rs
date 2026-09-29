@@ -1,8 +1,8 @@
 //! Serve a file over HTTP with cache validators and byte-range support.
 //!
-//! The one caller today is `GET /api/v1/data/*path`, which serves everything
-//! from a 2 KB markdown note to an 80 MB video artifact. Three properties the
-//! callers depend on:
+//! The one caller of `serve_file` is `GET /api/v1/data/*path`, which serves
+//! everything from a 2 KB markdown note to an 80 MB video artifact. Three
+//! properties the callers depend on:
 //!
 //! - **Validators, because `Cache-Control: no-cache` needs something to
 //!   revalidate against.** The engine stamps `no-cache` on every response, which
@@ -139,6 +139,62 @@ pub(super) async fn serve_file(
             }
         }
     }
+}
+
+/// The CSP a served workspace document runs under: scripts yes, the workspace
+/// origin no.
+///
+/// `allow-same-origin` is absent, and that is the whole point. The file came
+/// from an upload, an agent's web fetch or an app, so it must not run as the
+/// shell. It runs at an opaque origin, exactly like the artifact preview frame
+/// (ADR 0322). A popup it opens inherits the sandbox, since
+/// `allow-popups-to-escape-sandbox` is absent too.
+pub(super) const DOCUMENT_SANDBOX_CSP: &str =
+    "sandbox allow-scripts allow-forms allow-modals allow-popups allow-downloads";
+
+/// Is this a type a browser renders as a document that can run script?
+///
+/// HTML, and every XML flavour. An XML document runs a `<script>` in the XHTML
+/// namespace, and SVG is XML. An image tag never runs one, so an `<img>` of an
+/// SVG is unaffected by the header either way.
+fn is_active_document(content_type: &str) -> bool {
+    let essence = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    essence == "text/html"
+        || essence == "text/xml"
+        || essence == "application/xml"
+        || essence.ends_with("+xml")
+}
+
+/// Sandbox a workspace file response when it is an active document.
+///
+/// Every mount that serves `data/` files inline passes its response through
+/// here: `/data/*`, `GET /api/v1/data/*path` and `/app/:id/artifacts/*path`.
+/// Anything else keeps its exact headers.
+///
+/// `path_type` is the type the file's name implies, read only when the response
+/// carries none. A `304` from `ServeDir` has no `Content-Type`, and a browser
+/// merges a `304`'s headers into the copy it cached. Without the fallback, a
+/// page cached before the sandbox existed would keep running unsandboxed.
+pub(super) fn sandbox_documents(mut response: Response, path_type: &str) -> Response {
+    let active = is_active_document(
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or(path_type),
+    );
+    if active {
+        response.headers_mut().insert(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static(DOCUMENT_SANDBOX_CSP),
+        );
+    }
+    response
 }
 
 fn read_failed(e: std::io::Error) -> Response {

@@ -127,6 +127,122 @@ async fn long_poll_returns_answer_when_user_responds() {
         .ok();
 }
 
+/// Upload the suite's PNG to `thread_id` and return its blob hash.
+async fn upload_png(client: &reqwest::Client, thread_id: Uuid) -> String {
+    let form = reqwest::multipart::Form::new().part(
+        "file",
+        reqwest::multipart::Part::bytes(crate::support::png_bytes())
+            .file_name("answer.png")
+            .mime_str("image/png")
+            .unwrap(),
+    );
+    let resp = client
+        .post(format!("{}/api/v1/threads/{}/blobs", base_url(), thread_id))
+        .multipart(form)
+        .send()
+        .await
+        .expect("blob upload");
+    assert!(resp.status().is_success(), "upload: {}", resp.status());
+    let body: serde_json::Value = resp.json().await.unwrap();
+    body["hash"].as_str().expect("hash").to_string()
+}
+
+/// A typed answer's image reaches the coding agent as its blob path, which a
+/// Claude Code session may open because it is granted `data/`. An answer
+/// naming an image the workspace never received is refused outright.
+#[tokio::test]
+async fn an_answer_image_reaches_the_hook_as_its_blob_path() {
+    let client = user_client().await;
+    let pool = PgPool::connect(&db_url()).await.expect("db connect");
+    let thread_id = Uuid::new_v4();
+    let tool_use_id = format!("toolu_e2e_{}", thread_id.simple());
+    let q0_id = format!("{tool_use_id}#q0");
+    seed_cc_thread_summary(&pool, thread_id, "running").await;
+    let hash = upload_png(&client, thread_id).await;
+
+    let client_bg = client.clone();
+    let pool_bg = pool.clone();
+    let hash_bg = hash.clone();
+    let answerer = tokio::spawn(async move {
+        wait_for_question_asked(&pool_bg, thread_id, &q0_id).await;
+        let url = format!(
+            "{}/api/v1/threads/{}/answer-question",
+            base_url(),
+            thread_id
+        );
+        let unknown = client_bg
+            .post(&url)
+            .json(&json!({
+                "tool_use_id": q0_id,
+                "answer": { "kind": "FreeText", "text": "this", "image_hashes": ["f".repeat(64)] }
+            }))
+            .send()
+            .await
+            .expect("answer post");
+        assert_eq!(
+            unknown.status().as_u16(),
+            409,
+            "an unknown image is refused"
+        );
+        let resp = client_bg
+            .post(&url)
+            .json(&json!({
+                "tool_use_id": q0_id,
+                "answer": { "kind": "FreeText", "text": "this", "image_hashes": [hash_bg] }
+            }))
+            .send()
+            .await
+            .expect("answer post");
+        assert_eq!(resp.status().as_u16(), 200, "answer-question should accept");
+    });
+
+    let resp = tokio::time::timeout(
+        Duration::from_secs(5),
+        client
+            .post(format!("{}/api/v1/internal/ask-user-question", base_url()))
+            .json(&json!({
+                "thread_id": thread_id.to_string(),
+                "tool_use_id": tool_use_id,
+                "session_id": "sid-1",
+                "questions": [{
+                    "question": "Which screen?",
+                    "header": "screen",
+                    "multiSelect": false,
+                    "options": [{"label": "A", "description": ""}, {"label": "B", "description": ""}]
+                }]
+            }))
+            .send(),
+    )
+    .await
+    .expect("did not time out")
+    .expect("hook post");
+    answerer.await.unwrap();
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let value = body["answers"]["Which screen?"]
+        .as_str()
+        .expect("string answer");
+    assert!(
+        value.starts_with("this\n\n"),
+        "typed text first, got {value:?}"
+    );
+    assert!(
+        value.contains(&format!("data/blobs/{}/{hash}.png", &hash[..2])),
+        "the blob path must be named, got {value:?}"
+    );
+
+    sqlx::query("DELETE FROM events WHERE thread_id = $1")
+        .bind(thread_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM thread_summaries WHERE thread_id = $1")
+        .bind(thread_id)
+        .execute(&pool)
+        .await
+        .ok();
+}
+
 /// An answer-less resolution releases the agent parked inside this endpoint,
 /// and ends the whole batch rather than just its own card.
 ///

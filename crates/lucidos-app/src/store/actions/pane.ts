@@ -218,15 +218,18 @@ export function focusOrToggleThreadDrawer(): boolean {
     toggleThreads();
     return false;
   }
-  if (action === 'open-focus') {
-    threadDrawerOpen.value = true;
-    // A collapsed Conversation side (Content pane group maximized) would keep the
-    // drawer hidden even with the open flag set — re-expand so focus lands on a
-    // visible drawer.
-    if (splitRatio.value <= 0) setSplitRatio(DEFAULT_SPLIT_RATIO);
-  }
+  if (action === 'open-focus') showThreadList();
   focusPaneAndControl('drawer');
   return true;
+}
+
+/** Make the thread list visible without moving focus. Mobile navigates to the
+ *  threads pane. Desktop opens the drawer and re-expands a collapsed
+ *  Conversation side, which would otherwise keep the open drawer hidden. */
+export function showThreadList(): void {
+  if (isMobile()) { navigateToPane('threads'); return; }
+  threadDrawerOpen.value = true;
+  if (splitRatio.value <= 0) setSplitRatio(DEFAULT_SPLIT_RATIO);
 }
 
 /** Collapse/expand the thread pane with two-stage focus → hide. Desktop: a

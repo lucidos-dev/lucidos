@@ -116,6 +116,7 @@ fn a_multi_select_option_answers_in_the_shape_that_card_takes() {
             answer: AnswerKind::MultiSelected {
                 option_ids: vec!["opt-0".to_string()],
                 text: None,
+                image_hashes: vec![],
             },
         }
     );

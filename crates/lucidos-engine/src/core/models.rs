@@ -3,8 +3,8 @@
 //! Plain config table (authoritative), mirroring the `mcp_servers` / `credentials`
 //! store pattern: the migration seeds builtins, the HTTP API mutates user rows,
 //! and CRUD emits audit `Model*` SystemEvents. The table drives the chat model
-//! picker and `RoutingProvider`'s provider selection; the Claude Code `/model`
-//! picker stays hand-maintained in `runtime/cc_menu_options.json`.
+//! picker and `RoutingProvider`'s provider selection. The Claude Code `/model`
+//! picker is separate, discovered from Claude Code (`runtime::cc_model_discovery`).
 
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -468,6 +468,16 @@ mod tests {
                 && m.enabled),
             "Opus 5.5 builtin must be seeded on the vertex provider, enabled"
         );
+        for id in ["claude-sonnet-5-5", "claude-sonnet-5-5[1m]"] {
+            assert!(
+                models.iter().any(|m| m.id == id
+                    && routes_to(m, "vertex")
+                    && routes_to(m, "anthropic")
+                    && m.is_builtin()
+                    && m.enabled),
+                "{id} builtin must be seeded on vertex and anthropic, enabled"
+            );
+        }
         assert!(
             models.iter().any(|m| m.id == "claude-opus-5"
                 && routes_to(m, "vertex")
@@ -489,8 +499,9 @@ mod tests {
             "Sonnet 4.6 is still SEEDED, and switched off by the prior-generation prune"
         );
         // Ordered by sort_order, newest first: Fable 5.1 (-2), Fable 5 (0),
-        // Opus 5.5 (2), Opus 5 (5), Sonnet 5 (7), Opus 4.8 (10). That groups
-        // the current generation at the top of the picker.
+        // Opus 5.5 (2), Sonnet 5.5 (4), Opus 5 (5), Sonnet 5 (7), Opus 4.8
+        // (10). That groups the current generation at the top of the picker.
+        // The Sonnet 5.5 pair shares 4, so the label breaks the tie.
         let fable51 = models
             .iter()
             .position(|m| m.id == "claude-fable-5-1")
@@ -502,6 +513,14 @@ mod tests {
         let opus55 = models
             .iter()
             .position(|m| m.id == "claude-opus-5-5")
+            .unwrap();
+        let sonnet55 = models
+            .iter()
+            .position(|m| m.id == "claude-sonnet-5-5")
+            .unwrap();
+        let sonnet55_1m = models
+            .iter()
+            .position(|m| m.id == "claude-sonnet-5-5[1m]")
             .unwrap();
         let opus5 = models.iter().position(|m| m.id == "claude-opus-5").unwrap();
         let sonnet5 = models
@@ -515,7 +534,9 @@ mod tests {
         assert!(
             fable51 < fable
                 && fable < opus55
-                && opus55 < opus5
+                && opus55 < sonnet55
+                && sonnet55 < sonnet55_1m
+                && sonnet55_1m < opus5
                 && opus5 < sonnet5
                 && sonnet5 < opus,
             "sort_order must drive display order"
@@ -668,6 +689,8 @@ mod tests {
             "claude-fable-5-1",
             "claude-fable-5",
             "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "claude-sonnet-5-5[1m]",
             "claude-opus-5",
             "claude-sonnet-5",
             "gpt-6-astra",
@@ -889,7 +912,7 @@ mod tests {
     /// its own `[1m]` id suffix (the 1M-context beta in `build_claude_request`).
     /// A bare id sends no beta, so most bare rows run at the 200k the prefix
     /// map infers. The exception is a family whose DEFAULT window is 1M (Opus
-    /// 5, Opus 5.5, Fable 5.x): its bare request is 1M too.
+    /// 5, Opus 5.5, Sonnet 5.5, Fable 5.x): its bare request is 1M too.
     #[tokio::test]
     async fn migration_declares_context_window_on_verified_builtins() {
         let (pool, db_name) = setup_test_db().await;
@@ -904,6 +927,7 @@ mod tests {
             ("claude-fable-5-1[1m]", 1_000_000),
             ("claude-fable-5[1m]", 1_000_000),
             ("claude-opus-5-5[1m]", 1_000_000),
+            ("claude-sonnet-5-5[1m]", 1_000_000),
             ("claude-opus-5[1m]", 1_000_000),
             ("claude-opus-4-8[1m]", 1_000_000),
             ("claude-opus-4-7[1m]", 1_000_000),
@@ -915,6 +939,7 @@ mod tests {
             ("claude-fable-5-1", 1_000_000),
             ("claude-fable-5", 1_000_000),
             ("claude-opus-5-5", 1_000_000),
+            ("claude-sonnet-5-5", 1_000_000),
             ("claude-opus-5", 1_000_000),
             // OpenAI — no context opt-in either; the 400k guess understates these.
             ("gpt-5.5-pro", 1_050_000),
@@ -1115,6 +1140,8 @@ mod tests {
             "claude-opus-5[1m]",
             "claude-sonnet-5",
             "claude-sonnet-5[1m]",
+            "claude-sonnet-5-5",
+            "claude-sonnet-5-5[1m]",
         ] {
             let m = ModelStore::get(&pool, id)
                 .await
@@ -1136,12 +1163,16 @@ mod tests {
                 m.preferred_provider, None,
                 "{id} must ship unpicked, so the first configured route serves"
             );
-            // The Anthropic route declares no window on a `[1m]` row or on
-            // Sonnet 5: the id-shape guess reads that route's own id, which
+            // The Anthropic route declares no window on the older `[1m]` rows or
+            // on Sonnet 5: the id-shape guess reads that route's own id, which
             // carries `[1m]` where the row does. The bare Opus 5 and 5.5 rows
             // run 1M by default, so 20260923075003 declares it on both routes.
+            // Sonnet 5.5 has no 200k mode, so its seed declares 1M on both.
             let expected = match id {
-                "claude-opus-5-5" | "claude-opus-5" => Some(1_000_000),
+                "claude-opus-5-5"
+                | "claude-opus-5"
+                | "claude-sonnet-5-5"
+                | "claude-sonnet-5-5[1m]" => Some(1_000_000),
                 _ => None,
             };
             assert_eq!(window_on(&m, "anthropic"), expected, "{id}");

@@ -55,6 +55,7 @@ mod proxy;
 mod registry;
 mod release_check;
 mod server;
+mod shell_env;
 mod slowness;
 mod stack;
 
@@ -131,6 +132,10 @@ fn boot() -> Result<(), BoxError> {
         return Ok(());
     }
 
+    // Above the runtime build: it sets process env, which is sound only while
+    // this process is single-threaded. A test below pins the order.
+    shell_env::hydrate_login_shell_env();
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_stack_size(WORKER_THREAD_STACK_SIZE)
@@ -156,5 +161,23 @@ mod tests {
         // `Error: "…"` form is what this replaced.
         assert!(!line.contains('"'));
         assert_eq!(line.lines().count(), 1);
+    }
+
+    #[test]
+    fn boot_hydrates_the_shell_env_before_it_starts_any_threads() {
+        let source = include_str!("main.rs");
+        let boot_start = source.find("fn boot()").expect("boot() exists");
+        let boot_end = boot_start + source[boot_start..].find("\n}\n").expect("boot() ends");
+        let boot = &source[boot_start..boot_end];
+        let hydrate = boot
+            .find("shell_env::hydrate_login_shell_env();")
+            .expect("boot() hydrates the login-shell env for both shipped installs");
+        let runtime = boot
+            .find("tokio::runtime::Builder")
+            .expect("boot() builds the runtime");
+        assert!(
+            hydrate < runtime,
+            "hydration calls set_var, so it must run before the runtime spawns threads"
+        );
     }
 }

@@ -371,6 +371,20 @@ fn pg_dbname_extracts_target_db() {
     assert!(pg_dbname("not a url").is_err());
 }
 
+/// psql exits 0 after a failed statement unless `ON_ERROR_STOP` is set, even
+/// though `--single-transaction` rolled the whole restore back. The restore
+/// then reported success over an empty database.
+#[test]
+fn a_failed_restore_statement_makes_psql_exit_non_zero() {
+    let args = psql_restore_args("lucidos_myws");
+    let stop = args
+        .windows(2)
+        .any(|pair| pair == ["--set", "ON_ERROR_STOP=1"]);
+    assert!(stop, "{args:?}");
+    assert!(args.contains(&"--single-transaction"), "{args:?}");
+    assert_eq!(args[args.len() - 2..], ["--dbname", "lucidos_myws"]);
+}
+
 #[test]
 fn test_key_file_path() {
     let workspace = Path::new("/home/user/my-workspace");

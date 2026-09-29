@@ -28,7 +28,7 @@ import { cssRules, rulesTargeting, styleSheetPaths } from './css-rule-helpers';
 
 const here: string = dirname(fileURLToPath(import.meta.url));
 const stylesDir: string = resolve(here, '..');
-const toggleCss: string = readFileSync(resolve(stylesDir, 'settings', 'toggle.css'), 'utf-8');
+const toggleCss: string = readFileSync(resolve(stylesDir, 'global', 'shared-components.css'), 'utf-8');
 
 const pill = cssRules(toggleCss).find(r => r.selector === '.toggle-switch');
 const rem = (v: string | undefined): number => {
@@ -38,7 +38,7 @@ const rem = (v: string | undefined): number => {
 
 describe('a toggle is the width it declares', () => {
   it('refuses to shrink, whatever the label beside it does', () => {
-    expect(pill, 'no .toggle-switch rule in toggle.css').toBeDefined();
+    expect(pill, 'no .toggle-switch rule in shared-components.css').toBeDefined();
     expect(pill!.props.get('flex-shrink')).toBe('0');
   });
 
@@ -75,7 +75,7 @@ describe('the knob travels exactly the width of the pill', () => {
   it('derives the travel from the pill, rather than restating it', () => {
     // A literal here is right until any one of the three values moves. The knob
     // then stops short of the far end, or hangs over it, silently.
-    expect(travel, 'no checked-knob rule in toggle.css').toBeDefined();
+    expect(travel, 'no checked-knob rule in shared-components.css').toBeDefined();
     expect(travel!.props.get('transform'))
       .toBe('translateX(calc(var(--toggle-width) - var(--toggle-knob) - 2 * var(--toggle-inset)))');
   });

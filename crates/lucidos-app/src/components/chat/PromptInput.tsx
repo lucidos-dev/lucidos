@@ -1,7 +1,9 @@
 import { Fragment } from 'preact';
 import { useRef, useEffect, useState, useMemo } from 'preact/hooks';
 import { Overlay } from '../shared/Overlay';
-import { signal, useSignalEffect } from '@preact/signals';
+import { useLongPress } from '../../hooks/useLongPress';
+import { SendHoldMenu, sendHoldMenuAnchor } from './SendHoldMenu';
+import { signal, untracked, useSignalEffect } from '@preact/signals';
 import { pendingChatMessage, showToast, openImagePopupFromGroup, focusedThreadId, threadMap, panelUrl, panelTitle, cancelingThreadIds, answeringThreadIds, clearThreadAnswering, effectiveThreadStatus, currentApp, wipPreviewThreadId, promptSendCollapsing, composeViewActive, scaledDurationMs } from '../../store/store';
 import { resolveCodingAgent } from '../../store/composeSelections';
 import { sendMessage, handleCancelExchange } from '../../store/actions/chat';
@@ -20,6 +22,7 @@ import { updateCompose, sendCompose, sendFollowup, ensureFocusedComposeThread } 
 import { focusPane } from '../../store/actions/pane';
 import { openAppById } from '../../store/actions/apps';
 import { pushNavState } from '../../store/actions/navigation';
+import { tooltipWithShortcut } from '../../store/actions/keybindings';
 import { getDraft } from '../../store/composeDrafts';
 import { askSideQuestion, routeSideQuestion, withSideQuestionPrefix } from '../../store/sideQuestions';
 import { ComposeDestinationRow } from './ComposeDestinationRow';
@@ -34,7 +37,7 @@ import { FOLD_KEY_ATTR, usePromptActionCollapse, type FoldGroup } from '../../ho
 import { TodoPanelSlot, closeTodoPanel, todoIndicatorAction } from './todoIndicator';
 import { WaitingPanelHost, closeWaitingPanel, waitingIndicatorAction } from './WaitingPanel';
 import { getBannerActions, getWaitingState, getStandaloneActions, type BannerState } from './WaitingBanner';
-import { composeHasContent, resolveComposerText, composerTextDisagreementToast, computeMorphMode, computeAnswerActionMode, computePromptEscapeAction, dispatchSend, computeSubmitMultiCount, recoverableAnswerDraft, findLatestPendingQuestion, promptPlaceholder, shouldClearCanceling, shouldClearSubmitting, submittingThreadIds, canceledQuestionByThread, setCanceledQuestion, canceledWhileAwaitingByThread, setCanceledWhileAwaiting, queuedUploadSends, queueUploadSend, takeQueuedUploadSend, clearQueuedUploadSend, clearSubmittingThread, armCancelSettle, isCancelSettling, type UploadSendIntent } from './prompt-input-helpers';
+import { composeHasContent, resolveComposerText, composerTextDisagreementToast, computeMorphMode, computeAnswerActionMode, computePromptEscapeAction, dispatchSend, computeSubmitMultiCount, recoverableAnswerDraft, findLatestPendingQuestion, promptPlaceholder, shouldClearCanceling, shouldClearSubmitting, submittingThreadIds, canceledQuestionByThread, setCanceledQuestion, canceledWhileAwaitingByThread, setCanceledWhileAwaiting, queuedUploadSends, queueUploadSend, takeQueuedUploadSend, clearQueuedUploadSend, clearSubmittingThread, armCancelSettle, isCancelSettling, promptStopRequested, type UploadSendIntent } from './prompt-input-helpers';
 import { SplitButton } from '../shared/SplitButton';
 export * from './prompt-input-helpers';
 import { composeHandlers } from './promptFocus';
@@ -53,7 +56,7 @@ import { errorDetail } from '../../utils/errorDetail';
 import { extractPasteUrl, escapeMarkdownLinkText } from '../../utils/extractPasteUrl';
 import { PROSE_TEXT_ATTRS } from '../../utils/noAutofill';
 import { attachDrawnCaret } from '../../utils/drawnCaret';
-import { attachedImagesForCurrentThread, getAttachedImages, removeAttachedImage, type AttachedImage } from './pastedImages';
+import { attachedImagesForCurrentThread, getAttachedImages, markHashesAsSent, removeAttachedImage, type AttachedImage } from './pastedImages';
 import { getPendingUploads, hasInFlightUploads, removePendingUpload, pendingUploads } from '../../store/pendingUploads';
 import { attachImageToActiveDraft } from './attachToDraft';
 import { computeCaptureGeometry, readDeviceAngle } from './cameraGeometry';
@@ -88,11 +91,13 @@ const TOGGLES_FADE_MS = 300;
  *  frame. Slack is a safety margin, not animation, so it stays outside the
  *  scaled call. */
 const TOGGLES_FADE_SLACK_MS = 50;
-const ANSWER_NO_IMAGES_TOAST = 'Answers to user questions are text only.';
 /** Said when Send is pressed while an attached image is still uploading. The
  *  send is real and queued, so this reports a wait, not a refusal. */
 const UPLOAD_QUEUED_SEND_TOAST = 'Sending once the image finishes uploading…';
-const ANSWER_NO_IMAGES_TOOLTIP = 'Answers are text only';
+/** The same wait for a side question, which asks once the upload lands. */
+const UPLOAD_QUEUED_SIDE_QUESTION_TOAST = 'Asking once the image finishes uploading…';
+/** Said when a multi-select answer is submitted while an image uploads. */
+const UPLOAD_BLOCKS_ANSWER_TOAST = 'An image is still uploading. Submit again once it finishes.';
 /** Tooltip on the prompt row's Cancel while a question card is pending. Nothing
  *  else on screen spells out what the red button does to a pending question: it
  *  stamps the card `Canceled`, so the user can steer the agent elsewhere. The
@@ -568,9 +573,14 @@ export function PromptInput() {
       clearSubmittingThread(threadId);
       return Promise.resolve();
     }
-    if (effectiveThreadStatus(thread) === 'waiting_for_user_answer' && currentImages.length > 0) {
-      showToast('Remove attached images to answer this question: answers are text only.', 'info');
+    const sideQuestion = routeSideQuestion(msg, {
+      started: thread.meta.state !== 'composing',
+      codex: effectiveCodingAgentBackend(thread, resolveCodingAgent(threadId)) === 'codex',
+    }, intent.asSideQuestion);
+    if (sideQuestion.kind !== 'message') {
       clearSubmittingThread(threadId);
+      if (sideQuestion.kind === 'refuse') showToast(sideQuestion.toast, 'info');
+      else askComposerSideQuestion(threadId, sideQuestion.question, currentImages);
       return Promise.resolve();
     }
     // Empty the box HERE, where this send actually dispatches. `submit` cleared
@@ -590,7 +600,9 @@ export function PromptInput() {
     return beginSend(threadId, thread, msg, currentImages, intent);
   }
 
-  async function submit() {
+  /** Send the composer's contents, or ask them as a side question when they
+   *  start with `/btw` or `asSideQuestion` says so (the Send button's hold). */
+  async function submit(asSideQuestion = false) {
     const el = inputRef.current;
     const threadId = focusedThreadId.value;
     // ONE source for "is there anything to send": the draft the Send face was
@@ -604,7 +616,6 @@ export function PromptInput() {
     const resolved = resolveComposerText(draftText, el ? el.value : null);
     const msg = resolved.text;
     const currentImages = threadId ? getAttachedImages(threadId) : [];
-    const pendingForThread = threadId ? getPendingUploads(threadId) : [];
     const uploadInFlight = threadId ? hasInFlightUploads(threadId) : false;
     // The same reading the Send face was lit from, so a press on a LIT face can
     // never land here. What still reaches it is Enter on an empty desktop
@@ -631,35 +642,23 @@ export function PromptInput() {
     const thread = threadId ? threadMap.value.get(threadId) : undefined;
     const useCodingAgent = effectiveSendMode(thread) === 'claude_code';
     const sideQuestion = routeSideQuestion(msg, {
-      codingAgent: useCodingAgent,
       started: threadId !== null && thread !== undefined && thread.meta.state !== 'composing',
-      hasImages: currentImages.length > 0 || pendingForThread.length > 0,
-    });
+      codex: effectiveCodingAgentBackend(thread, resolveCodingAgent(threadId)) === 'codex',
+    }, asSideQuestion);
     if (sideQuestion.kind === 'refuse') {
       showToast(sideQuestion.toast, 'info');
       return;
     }
-    if (sideQuestion.kind === 'ask' && threadId) {
-      if (el) {
-        writeComposerValue(el, '');
-        el.style.height = 'auto';
-      }
-      updateCompose(threadId, { text: '' });
-      followSideQuestion();
-      void askSideQuestion(threadId, sideQuestion.question);
-      restoreComposerFocus();
-      return;
-    }
-    // Backend reroutes typed text to the pending question's answer (see
-    // chat/process/run.rs free-form path), but the answer payload drops images.
-    // Refuse the send so the user can remove the images instead of silently
-    // losing them. Disabling the attach buttons covers fresh attachments; this
-    // catches images attached before the question opened.
-    if (isAnsweringQuestion && (currentImages.length > 0 || pendingForThread.length > 0)) {
-      showToast('Remove attached images to answer this question: answers are text only.', 'info');
-      return;
-    }
     const context = currentChatContext();
+    if (sideQuestion.kind === 'ask' && threadId) {
+      if (uploadInFlight) {
+        queueUploadSend(threadId, { useCodingAgent, context, asSideQuestion: true });
+        showToast(UPLOAD_QUEUED_SIDE_QUESTION_TOAST, 'info');
+        return;
+      }
+      askComposerSideQuestion(threadId, sideQuestion.question, currentImages);
+      return;
+    }
     if (threadId && uploadInFlight) {
       // A queued send still flips the button to the optimistic Cancel — settle.
       armCancelSettle();
@@ -716,6 +715,24 @@ export function PromptInput() {
     const active = document.activeElement;
     if (active && active !== document.body) return;
     focusIfNeeded(inputRef.current);
+  }
+
+  /** Ask a side question from the composer: the question and every image
+   *  already uploaded. The box and the draft empty, as a send's do. Only the
+   *  box on screen is this thread's, so another thread's box is left alone. */
+  function askComposerSideQuestion(threadId: string, question: string, images: AttachedImage[]): void {
+    const el = inputRef.current;
+    if (el && el.dataset.threadId === threadId) {
+      writeComposerValue(el, '');
+      el.style.height = 'auto';
+    }
+    const hashes = images.map((image) => image.hash);
+    // Before the draft clear, so the thumbnails keep their session blob URLs.
+    if (hashes.length > 0) markHashesAsSent(hashes);
+    updateCompose(threadId, { text: '', image_hashes: [] });
+    followSideQuestion();
+    void askSideQuestion(threadId, question, hashes);
+    restoreComposerFocus();
   }
 
   // The command menu hands a side question back, to be finished and sent here.
@@ -788,10 +805,6 @@ export function PromptInput() {
         const item = items[i];
         if (item.type.startsWith('image/')) {
           e.preventDefault();
-          if (isAnsweringQuestion) {
-            showToast(ANSWER_NO_IMAGES_TOAST, 'info');
-            return;
-          }
           const file = item.getAsFile();
           if (!file) continue;
           addImageFile(file);
@@ -818,11 +831,6 @@ export function PromptInput() {
   function handleFileSelect(e: Event) {
     const input = e.target as HTMLInputElement;
     if (!input.files) return;
-    if (isAnsweringQuestion) {
-      input.value = '';
-      showToast(ANSWER_NO_IMAGES_TOAST, 'info');
-      return;
-    }
     for (let i = 0; i < input.files.length; i++) {
       addImageFile(input.files[i]);
     }
@@ -880,15 +888,11 @@ export function PromptInput() {
   // sort + group all events. Suppress once optimistically answered so Submit
   // hides instead of flashing back as disabled.
   const focusedStatus = focusedThread ? effectiveThreadStatus(focusedThread) : 'idle';
-  // While the thread waits for an answer, ANY text typed in the prompt becomes
-  // a UserQuestion answer. Multi-select goes through `submitMultiAnswer` here.
-  // Single-select and freetext are rerouted in chat/process/run.rs as
-  // `AnswerKind::FreeText`, since the engine's fast path asks only whether the
-  // user typed instead of clicking an option.
-  //
-  // The answer payload carries only text, so an image attached on this path
-  // would be silently dropped. This flag refuses the attachment and toasts
-  // instead, until `UserQuestionAnswered` grows an `image_hashes` field.
+  // While the thread waits for an answer, ANY text or image in the prompt
+  // becomes a UserQuestion answer. Multi-select goes through
+  // `submitMultiAnswer` here. Single-select and freetext are rerouted in
+  // chat/process/run.rs as `AnswerKind::FreeText`, images included, since the
+  // engine's fast path asks only whether the user typed instead of clicking.
   const isAnsweringQuestion = focusedStatus === 'waiting_for_user_answer';
   // One exchange walk serves both consumers: the multi-select Submit control
   // and the placeholder. `waiting_for_user_answer` also covers coding-agent
@@ -1002,8 +1006,26 @@ export function PromptInput() {
   // The constructive actions blur on their own (`submit`, `submitMultiAnswer`):
   // the suppressed click never reaches `installActionBtnBlurListener`, which
   // listens on `click`.
+  // A hold on Send offers the draft as a side question instead. The release
+  // that ends the hold must not also send, so the hold marks itself. The mark
+  // is spent by that release, by the next press, or by the menu closing, so
+  // it never swallows a later Send. A started, non-Codex thread takes one.
+  const heldSendRef = useRef(false);
+  const canAskFromHold = morphMode === 'send'
+    && focusedThread !== undefined
+    && focusedThread.meta.state !== 'composing'
+    && promptCodingAgent !== 'codex';
+  const sendHold = useLongPress((target) => {
+    if (!canAskFromHold) return;
+    heldSendRef.current = true;
+    sendHoldMenuAnchor.value = target;
+  }, () => {});
   const morphActivate = useTouchActivated(
     () => {
+      if (heldSendRef.current) {
+        heldSendRef.current = false;
+        return;
+      }
       if (morphMode === 'send') void submit();
       else if (morphMode === 'cancel') cancelExchangeForTarget();
     },
@@ -1093,14 +1115,6 @@ export function PromptInput() {
     // intentionally omitted from deps.
   }, [focusedThreadId.value, threadMap.value]);
 
-  // Force-close the attach menu when a question arrives mid-open. The dropdown
-  // hides via the `!isAnsweringQuestion` render gate. But without this the
-  // signal stays `true` and the menu pops back when the question resolves,
-  // with no outside click to dismiss it.
-  useEffect(() => {
-    if (isAnsweringQuestion && attachMenuOpen.value) attachMenuOpen.value = false;
-  }, [isAnsweringQuestion]);
-
   // Bundles toggled option_ids + textarea text into one MultiSelected answer.
   // Backend joins them with `, ` for CC.
   async function submitMultiAnswer() {
@@ -1117,7 +1131,12 @@ export function PromptInput() {
     const disagreement = composerTextDisagreementToast(resolved);
     if (disagreement) showToast(disagreement, 'warning');
     const ids = getMultiSelectedIds(pendingMultiQ.toolUseId);
-    if (ids.length === 0 && text.length === 0) return;
+    if (hasInFlightUploads(focused)) {
+      showToast(UPLOAD_BLOCKS_ANSWER_TOAST, 'info');
+      return;
+    }
+    const imageHashes = getAttachedImages(focused).map((image) => image.hash);
+    if (ids.length === 0 && text.length === 0 && imageHashes.length === 0) return;
     // Once answered, pendingMultiQ clears and the row falls to the lone Cancel —
     // settle so a repeat tap can't abort the resuming turn. See armCancelSettle.
     armCancelSettle();
@@ -1125,6 +1144,7 @@ export function PromptInput() {
       kind: 'MultiSelected',
       option_ids: ids,
       ...(text.length > 0 ? { text } : {}),
+      ...(imageHashes.length > 0 ? { image_hashes: imageHashes } : {}),
     };
     setPendingAnswer(pendingMultiQ.toolUseId, answer);
     // Same ask as the composer's Send: hold the reader at the live edge while
@@ -1137,7 +1157,9 @@ export function PromptInput() {
       writeComposerValue(el, '');
       el.style.height = 'auto';
     }
-    updateCompose(focused, { text: '' });
+    // Before the draft clear, so the thumbnails keep their session blob URLs.
+    if (imageHashes.length > 0) markHashesAsSent(imageHashes);
+    updateCompose(focused, { text: '', image_hashes: [] });
     setMultiSelectedIds(pendingMultiQ.toolUseId, []);
     if (isMobile()) el?.blur();
     const ok = await answerThreadQuestion(focused, pendingMultiQ.toolUseId, answer);
@@ -1160,12 +1182,24 @@ export function PromptInput() {
       // Through the draft, never the box: the sync effect above writes the
       // textarea from it and resizes, so the two cannot end up disagreeing.
       if (recovered.text !== null) updateCompose(focused, { text: recovered.text });
+      // The images come back too, unless the user attached new ones meanwhile.
+      if (imageHashes.length > 0 && getAttachedImages(focused).length === 0) {
+        updateCompose(focused, { image_hashes: imageHashes });
+      }
     }
     restoreComposerFocus();
   }
 
   const submitMultiCount = computeSubmitMultiCount(multiSelectedIds.length, composeText);
-  const submitMultiDisabled = submitMultiCount === 0;
+  const submitMultiDisabled = submitMultiCount === 0 && images.length === 0;
+
+  // The Stop shortcut. It cancels exactly what the red button would, and does
+  // nothing while there is no running turn to cancel.
+  useSignalEffect(() => {
+    if (!promptStopRequested.value) return;
+    promptStopRequested.value = false;
+    untracked(cancelExchangeForTarget);
+  });
 
   // Cancel the current exchange: abort the turn, or stamp the pending question
   // Canceled. Shared by the morph button and the answer control's Cancel. It
@@ -1289,7 +1323,7 @@ export function PromptInput() {
       aria-label="Cancel"
       // A pending question card gets the wording that says what Cancel does to
       // it; a permission card (same button, no typed-text escape) keeps "Stop".
-      data-tooltip={answeringQuestionCard ? ANSWER_CANCEL_TOOLTIP : 'Stop'}
+      data-tooltip={answeringQuestionCard ? ANSWER_CANCEL_TOOLTIP : tooltipWithShortcut('Stop', 'stopThread')}
       data-row-item
     >
       Cancel
@@ -1308,9 +1342,22 @@ export function PromptInput() {
         'action-btn send-cancel-morph send-cancel-round'
         + (morphMode === 'placeholder' ? ' morph-placeholder' : '')
       }
-      onPointerDown={e => morphGate.down(e)}
-      onPointerMove={e => morphGate.move(e)}
-      onPointerCancel={() => morphGate.cancel()}
+      onPointerDown={e => {
+        heldSendRef.current = false;
+        sendHold.onPointerDown(e);
+        morphGate.down(e);
+      }}
+      onPointerMove={e => {
+        sendHold.onPointerMove(e);
+        morphGate.move(e);
+      }}
+      onPointerUp={sendHold.onPointerUp}
+      onPointerLeave={sendHold.onPointerLeave}
+      onPointerCancel={e => {
+        sendHold.onPointerCancel(e);
+        morphGate.cancel();
+      }}
+      onContextMenu={canAskFromHold ? sendHold.onContextMenu : undefined}
       onTouchEnd={morphActivate.onTouchEnd}
       onClick={morphActivate.onClick}
       aria-label={morphMode === 'cancel' || morphMode === 'canceling' ? 'Cancel' : 'Send message'}
@@ -1324,9 +1371,10 @@ export function PromptInput() {
         : true
       }
       data-tooltip={
-        morphMode === 'cancel' ? 'Stop'
+        morphMode === 'cancel' ? tooltipWithShortcut('Stop', 'stopThread')
         : morphMode === 'canceling' ? 'Stopping…'
         : morphMode === 'send' && uploadsBlocking ? 'Send after image upload'
+        : morphMode === 'send' && canAskFromHold ? 'Send. Hold to ask a side question'
         : morphMode === 'send' ? 'Send'
         : undefined
       }
@@ -1371,9 +1419,8 @@ export function PromptInput() {
     key: 'attach-image',
     dataRole: 'attach-image',
     label: 'Attach image',
-    tooltip: isAnsweringQuestion ? ANSWER_NO_IMAGES_TOOLTIP : 'Attach image',
+    tooltip: 'Attach image',
     icon: () => <ImageIcon />,
-    disabledTooltip: isAnsweringQuestion ? ANSWER_NO_IMAGES_TOOLTIP : undefined,
     // Folded, and on a narrow row, this IS the file picker. The `.click()` is
     // dispatched inside the menu item's own click, which <Overlay> treats as
     // inside and therefore does not swallow.
@@ -1387,14 +1434,13 @@ export function PromptInput() {
         <button
           class="icon-btn header-icon"
           {...composeHandlers(() => { attachMenuOpen.value = !attachMenuOpen.value; })}
-          disabled={isAnsweringQuestion}
-          data-tooltip={isAnsweringQuestion ? ANSWER_NO_IMAGES_TOOLTIP : 'Attach image'}
+          data-tooltip="Attach image"
           aria-label="Attach image"
         >
           <ImageIcon />
         </button>
         <Overlay
-          open={attachMenuOpen.value && !isAnsweringQuestion}
+          open={attachMenuOpen.value}
           onClose={() => { attachMenuOpen.value = false; }}
           anchor={menuRef.current}
           backdrop={false}
@@ -1536,6 +1582,10 @@ export function PromptInput() {
             `.visually-hidden` (off-screen, in layout) — `display:none` is what
             HiddenFileInput's docs blame for dropping the iOS PWA change event,
             so we match that even though .click() is a synthetic dispatch. */}
+        <SendHoldMenu
+          onAskSideQuestion={() => void submit(true)}
+          onClosed={() => { heldSendRef.current = false; }}
+        />
         <input
           ref={fileInputRef}
           type="file"

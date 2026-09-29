@@ -969,11 +969,11 @@ impl LucidosEngine {
                         "[CommandGuard] judge failed ({}); falling back to the static classifier",
                         e
                     );
-                    command_guard::fallback_classify(&ji)
+                    command_guard::fallback_classify(&ji, Some(self.workspace_path()))
                 }
             }
         } else {
-            command_guard::fallback_classify(&ji)
+            command_guard::fallback_classify(&ji, Some(self.workspace_path()))
         };
         ctx.judge_cache.insert(key, resolved.clone());
         resolved
@@ -1612,7 +1612,7 @@ mod tests {
             out_of_workspace: false,
             fast_path_refused: false,
         };
-        let c = command_guard::fallback_classify(&ji);
+        let c = command_guard::fallback_classify(&ji, None);
         assert_eq!(c.lane, RiskLane::IrreversibleDanger);
         assert_eq!(c.category, Some(SideEffectCategory::ExternalApi));
     }

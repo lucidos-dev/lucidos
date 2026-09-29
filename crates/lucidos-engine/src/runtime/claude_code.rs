@@ -9,8 +9,8 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::agent_runtime::{
-    AgentEvent, AgentInput, AgentRuntime, CodingAgent, ControlRequest, RunningAgent,
-    SideQuestionRequest, SpawnArgs,
+    AccountPin, AgentEvent, AgentInput, AgentRuntime, CodingAgent, ControlRequest, InputWithdrawal,
+    RunningAgent, SpawnArgs, WithdrawRequest,
 };
 use super::lucidos_cli::{
     ensure_workspace_bin_symlink, lucidos_cli_dir, place_lucidos_cli_skill, LUCIDOS_BIN_NAME,
@@ -18,10 +18,10 @@ use super::lucidos_cli::{
 };
 use super::spawn_env::{apply_lucidos_env, drain_stderr};
 
-/// Single source of truth for CC's `/model` and `/effort` picker entries.
-/// The data lives in `cc_menu_options.json` next to this file: see that file's
-/// `_note` for why it is hand-maintained and how to update it.
-#[derive(Debug, Clone, serde::Deserialize)]
+/// One `/model` or `/effort` picker entry. Claude Code's model rows come from
+/// discovery (`cc_model_discovery`), with `cc_menu_options.json` as the
+/// fallback. Codex's come from `codex_menu_options.json`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 pub struct CcMenuOption {
     pub value: String,
     pub label: String,
@@ -43,6 +43,10 @@ pub struct CcMenuOption {
     /// own context mode, so nothing here bounds a prompt the engine packs.
     #[serde(default)]
     pub context_window: Option<usize>,
+    /// The tiers this model accepts, when the backend said so per model.
+    /// `None` derives them from the effort rows (`efforts_for_model`).
+    #[serde(default)]
+    pub reasoning_efforts: Option<Vec<String>>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -58,8 +62,26 @@ static CC_MENU_OPTIONS: std::sync::LazyLock<CcMenuOptionsFile> = std::sync::Lazy
         .expect("cc_menu_options.json is malformed — see runtime/cc_menu_options.json")
 });
 
-pub fn cc_model_options() -> &'static [CcMenuOption] {
+/// The curated rows in `cc_menu_options.json`: the picker until discovery
+/// succeeds, and the overlay that declares context windows.
+pub fn curated_cc_model_options() -> &'static [CcMenuOption] {
     &CC_MENU_OPTIONS.models
+}
+
+static CURATED_CC_MODEL_OPTIONS: std::sync::LazyLock<std::sync::Arc<[CcMenuOption]>> =
+    std::sync::LazyLock::new(|| curated_cc_model_options().into());
+
+/// The Claude Code `/model` picker: what Claude Code itself listed, or the
+/// curated rows until it has answered.
+pub fn cc_model_options() -> std::sync::Arc<[CcMenuOption]> {
+    pick_cc_model_options(super::cc_model_discovery::discovered_options())
+}
+
+/// The discovered rows when there are any, else the curated ones. Never a mix.
+fn pick_cc_model_options(
+    discovered: Option<std::sync::Arc<[CcMenuOption]>>,
+) -> std::sync::Arc<[CcMenuOption]> {
+    discovered.unwrap_or_else(|| CURATED_CC_MODEL_OPTIONS.clone())
 }
 
 pub fn cc_reasoning_effort_options() -> &'static [CcMenuOption] {
@@ -140,7 +162,10 @@ pub(super) fn model_and_effort_options(
                 "value": m.value,
                 "label": m.label,
                 "description": m.description,
-                "reasoning_efforts": efforts_for_model(&m.value, efforts),
+                "reasoning_efforts": m
+                    .reasoning_efforts
+                    .clone()
+                    .unwrap_or_else(|| efforts_for_model(&m.value, efforts)),
             })
         })
         .collect();
@@ -163,7 +188,7 @@ pub(super) fn model_and_effort_options(
 /// picker. CC-specific — Codex and other agents have their own menus.
 pub fn cc_command_definitions() -> serde_json::Value {
     let (model_options, effort_options) =
-        model_and_effort_options(cc_model_options(), cc_reasoning_effort_options());
+        model_and_effort_options(&cc_model_options(), cc_reasoning_effort_options());
     serde_json::json!([
         {
             "subtype": "set_model",
@@ -205,23 +230,126 @@ pub fn cc_control_request_to_json(request: &ControlRequest, request_id: &str) ->
     .expect("ControlRequest serialization cannot fail")
 }
 
-/// The `side_question` control request: CC's headless form of `/btw`. CC
-/// answers it from a fork of the live context, beside any running turn, with
-/// every tool denied and nothing written to the transcript.
-fn cc_side_question_request_json(question: &str, request_id: &str) -> String {
+/// The one stream-json line a side question writes: the instructions and the
+/// question as a text block, then each image as a base64 block.
+fn side_question_message(question: &str, images: &[crate::api::ChatImage]) -> String {
+    let instructions = crate::engine::agent_session::side_question::SIDE_QUESTION_INSTRUCTIONS;
+    let mut content = vec![serde_json::json!({
+        "type": "text",
+        "text": format!("<system-reminder>{instructions}</system-reminder>\n\n{question}"),
+    })];
+    content.extend(images.iter().map(|image| {
+        let fitted = image.clone().fit_for_llm();
+        serde_json::json!({
+            "type": "image",
+            "source": { "type": "base64", "media_type": fitted.mime_type, "data": fitted.base64 },
+        })
+    }));
     let mut line = serde_json::to_string(&serde_json::json!({
-        "type": "control_request",
-        "request_id": request_id,
-        "request": { "subtype": "side_question", "question": question },
+        "type": "user",
+        "message": { "role": "user", "content": content },
     }))
     .expect("side question serialization cannot fail");
     line.push('\n');
     line
 }
 
-/// Read a `control_response` line as a side-question reply: its request id,
-/// then the answer or CC's error. `None` for any other line.
-fn side_question_reply(line: &str) -> Option<(String, Result<String, String>)> {
+/// What a side question's copy answered, with what it cost.
+#[derive(Debug)]
+pub struct SideQuestionReply {
+    /// The answer, or why there is none.
+    pub answer: Result<String, String>,
+    /// The copy's usage, summed over its turns. `None` when it reported none.
+    pub usage: Option<crate::engine::ApiUsage>,
+    /// The model the copy's init line named.
+    pub model: Option<String>,
+}
+
+/// The model a stdout `init` line names. `None` for any other line.
+fn init_model(line: &str) -> Option<String> {
+    if !line.contains("\"init\"") {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    (value.get("subtype")?.as_str()? == "init")
+        .then(|| value.get("model")?.as_str().map(str::to_string))
+        .flatten()
+}
+
+/// The usage block of a `result` line. Claude Code reports the uncached input
+/// alone, and `ApiUsage.input_tokens` is the total, so the cache counts are
+/// added in, as the main session's capture does.
+fn result_usage(value: &serde_json::Value) -> Option<crate::engine::ApiUsage> {
+    let usage = value.get("usage")?;
+    let count = |key: &str| {
+        crate::llm::clamp_provider_token_count(
+            usage.get(key).and_then(|v| v.as_u64()).unwrap_or(0),
+            "ClaudeCode",
+        )
+    };
+    let cache_read_tokens = count("cache_read_input_tokens");
+    let cache_creation_tokens = count("cache_creation_input_tokens");
+    Some(crate::engine::ApiUsage {
+        input_tokens: count("input_tokens")
+            .saturating_add(cache_read_tokens)
+            .saturating_add(cache_creation_tokens),
+        output_tokens: count("output_tokens"),
+        cache_read_tokens,
+        cache_creation_tokens,
+        modality: None,
+    })
+}
+
+/// Read a stdout line as the copy's closing `result`: the answer or why there
+/// is none, and the usage it reports. `None` for any other line.
+fn side_question_result(
+    line: &str,
+) -> Option<(Result<String, String>, Option<crate::engine::ApiUsage>)> {
+    if !line.contains("\"result\"") {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    if value.get("type")?.as_str()? != "result" {
+        return None;
+    }
+    let subtype = value.get("subtype").and_then(|s| s.as_str()).unwrap_or("");
+    let text = value
+        .get("result")
+        .and_then(|r| r.as_str())
+        .map(str::trim)
+        .unwrap_or_default();
+    let is_error = value.get("is_error").and_then(|e| e.as_bool()) == Some(true);
+    let answer = match subtype {
+        "success" if !is_error && !text.is_empty() => Ok(text.to_string()),
+        "success" if !is_error => Err("Claude Code sent an empty side answer".to_string()),
+        "error_max_turns" => {
+            Err(crate::engine::agent_session::side_question::kept_reaching_for_tools("Claude Code"))
+        }
+        _ if !text.is_empty() => Err(text.to_string()),
+        _ => Err(format!("Claude Code could not answer ({subtype})")),
+    };
+    Some((answer, result_usage(&value)))
+}
+
+/// The `cancel_async_message` control request: drop a user message still
+/// waiting in CC's queue. CC answers `cancelled: false` once it has read it.
+fn cc_cancel_async_message_json(input_uuid: uuid::Uuid, request_id: &str) -> String {
+    let mut line = serde_json::to_string(&serde_json::json!({
+        "type": "control_request",
+        "request_id": request_id,
+        "request": { "subtype": "cancel_async_message", "message_uuid": input_uuid },
+    }))
+    .expect("withdraw serialization cannot fail");
+    line.push('\n');
+    line
+}
+
+/// CC's response body, or its error text when it gave one.
+type ControlBody = Result<serde_json::Value, Option<String>>;
+
+/// Read a `control_response` line: its request id, then CC's response body or
+/// its error. `None` for any other line.
+fn control_reply(line: &str) -> Option<(String, ControlBody)> {
     if !line.contains("\"control_response\"") {
         return None;
     }
@@ -231,65 +359,77 @@ fn side_question_reply(line: &str) -> Option<(String, Result<String, String>)> {
     }
     let response = value.get("response")?;
     let request_id = response.get("request_id")?.as_str()?.to_string();
-    let answer = if response.get("subtype").and_then(|s| s.as_str()) == Some("success") {
-        response
-            .pointer("/response/response")
-            .and_then(|a| a.as_str())
-            .map(str::to_string)
-            .ok_or_else(|| "Claude Code sent an empty side answer".to_string())
+    let body = if response.get("subtype").and_then(|s| s.as_str()) == Some("success") {
+        Ok(response
+            .get("response")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null))
     } else {
         Err(response
             .get("error")
             .and_then(|e| e.as_str())
-            .unwrap_or("Claude Code refused the side question")
-            .to_string())
+            .map(str::to_string))
     };
-    Some((request_id, answer))
+    Some((request_id, body))
 }
 
-/// Side questions the driver has written and CC has not answered yet, by
-/// request id. Dropping one tells its asker the process ended first.
-type PendingSideQuestions =
-    std::collections::HashMap<String, tokio::sync::oneshot::Sender<Result<String, String>>>;
+fn withdrawal(body: ControlBody) -> InputWithdrawal {
+    match body.map(|b| b.get("cancelled").and_then(|c| c.as_bool())) {
+        Ok(Some(true)) => InputWithdrawal::Withdrawn,
+        Ok(Some(false)) => InputWithdrawal::AlreadyRead,
+        Ok(None) => InputWithdrawal::Refused("Claude Code sent no withdraw result".to_string()),
+        Err(Some(e)) => InputWithdrawal::Refused(format!("Claude Code refused the withdraw: {e}")),
+        Err(None) => InputWithdrawal::Refused("Claude Code refused the withdraw".to_string()),
+    }
+}
 
-/// Parse one stdout line. A reply to a pending side question goes to its asker
-/// and yields no event, so the answer never reaches the session's history.
+/// Withdraws the driver has written and CC has not answered yet, by request
+/// id. Dropping one tells its caller the process ended first.
+type PendingReplies =
+    std::collections::HashMap<String, tokio::sync::oneshot::Sender<InputWithdrawal>>;
+
+/// Parse one stdout line. A reply to a pending withdraw goes to its caller and
+/// yields no event, so it never reaches the session's history.
 fn route_stdout_line(
     state: &mut CcStreamState,
-    pending: &mut PendingSideQuestions,
+    pending: &mut PendingReplies,
     line: &str,
 ) -> Vec<AgentEvent> {
-    if let Some((request_id, answer)) = side_question_reply(line) {
+    if let Some((request_id, body)) = control_reply(line) {
         if let Some(reply) = pending.remove(&request_id) {
-            // An asker that gave up dropped its receiver; the answer has nowhere to go.
-            let _ = reply.send(answer);
+            // A caller that gave up dropped its receiver; the reply has nowhere to go.
+            let _ = reply.send(withdrawal(body));
             return Vec::new();
         }
     }
     parse_line(state, line)
 }
 
-/// How long a side question may take, live and cold paths together. The cold
-/// path is the slow one: its resume reads the whole transcript, and its model
-/// call is likely uncached.
-pub const SIDE_QUESTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
-
-/// What the asker reads when a side question runs past its deadline.
-pub fn side_question_timeout_message() -> String {
-    format!(
-        "Claude Code did not answer within {} seconds",
-        SIDE_QUESTION_TIMEOUT.as_secs()
-    )
-}
-
-/// A cold side-question process group, killed if its asker goes away before
-/// the normal teardown runs, as when the browser abandons the request.
+/// A cold process group: a side question or a model probe. It is killed if
+/// its caller goes away before the normal teardown runs, as when the browser
+/// abandons the request.
 struct ColdProcessGroup(Option<u32>);
 
 impl ColdProcessGroup {
     /// Hand the leader's pid to the normal teardown, which reaps it.
     fn disarm(&mut self) -> Option<u32> {
         self.0.take()
+    }
+}
+
+/// Kill a cold process group and reap its leader, whatever the exchange did.
+/// Signals the group only while the leader is unreaped: a reaped pid may be
+/// recycled.
+async fn tear_down_cold_child(mut group: ColdProcessGroup, child: &mut Child, what: &str) {
+    if let (Some(pid), Ok(None)) = (group.disarm(), child.try_wait()) {
+        crate::runtime::spawn_env::kill_child_process_group_now(pid);
+    }
+    let _ = child.start_kill();
+    if tokio::time::timeout(std::time::Duration::from_secs(2), child.wait())
+        .await
+        .is_err()
+    {
+        log!("[ClaudeCode] {what} process did not exit after SIGKILL");
     }
 }
 
@@ -302,17 +442,20 @@ impl Drop for ColdProcessGroup {
     }
 }
 
-/// Ask a side question of an idle thread's session, which has no live process.
+/// Answer a side question from a copy of the thread's session.
 ///
-/// Spawns a short-lived `--resume` process that persists nothing and sends only
-/// the control request. Its process group dies once it answers, fails, passes
-/// `deadline` or loses its asker. `args.resume_session_id` names the session
-/// and is required.
-pub async fn ask_side_question_cold(
+/// The copy is the session's own command resumed with `--no-session-persistence`,
+/// so it reads the transcript and writes nothing back. It keeps the session's
+/// tools, model and system prompt, so the transcript reads from the prompt
+/// cache. Its settings refuse every tool. Its process group dies
+/// once it answers, fails, passes `deadline` or loses its asker.
+/// `args.resume_session_id` names the session and is required.
+pub async fn ask_side_question(
     args: SpawnArgs<'_>,
     question: &str,
+    images: &[crate::api::ChatImage],
     deadline: tokio::time::Instant,
-) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<SideQuestionReply, Box<dyn std::error::Error + Send + Sync>> {
     if args.resume_session_id.is_none() {
         return Err("This thread has no Claude Code session to ask yet".into());
     }
@@ -323,35 +466,158 @@ pub async fn ask_side_question_cold(
             crate::core::PREF_CODING_AGENT_CLAUDE_PATH,
         )?;
     }
-    let child = build_side_question_command(&args, lucidos_cli_dir()).spawn()?;
-    ask_side_question_of(child, question, deadline).await
+    let settings =
+        crate::engine::cc_settings::write_cc_side_question_settings(args.workspace_path).await?;
+    let child = build_side_question_command(&args, lucidos_cli_dir(), &settings).spawn()?;
+    ask_side_question_of(child, &side_question_message(question, images), deadline).await
 }
 
-/// The cold side-question command: the session's own flags, so the model and
-/// tool list match, plus `--no-session-persistence` so CC writes no transcript.
+/// The side question's command: the session's own flags, resumed without
+/// persisting, capped in turns, under the settings that refuse every tool.
 fn build_side_question_command(
     args: &SpawnArgs<'_>,
     cli_dir: Option<&Path>,
+    settings: &Path,
 ) -> tokio::process::Command {
-    let mut cmd = build_command(args, cli_dir);
-    cmd.arg("--no-session-persistence");
+    let mut cmd = build_command_with_settings(args, cli_dir, settings);
+    cmd.arg("--no-session-persistence")
+        .arg("--max-turns")
+        .arg(crate::engine::agent_session::side_question::SIDE_QUESTION_MAX_TURNS.to_string());
     cmd
 }
 
-/// Send one side question to `child` and wait for its answer, then tear the
-/// process group down whatever happened. `child` must lead its own group.
+/// Send the side question's `message` to `child` and wait for its `result`,
+/// then tear the process group down whatever happened. `child` must lead its
+/// own group.
 async fn ask_side_question_of(
     mut child: Child,
-    question: &str,
+    message: &str,
     deadline: tokio::time::Instant,
-) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let mut group = ColdProcessGroup(child.id());
+) -> Result<SideQuestionReply, Box<dyn std::error::Error + Send + Sync>> {
+    let group = ColdProcessGroup(child.id());
+    let mut stdin = child.stdin.take().ok_or("Failed to capture stdin")?;
+    let stdout = child.stdout.take().ok_or("Failed to capture stdout")?;
+    // Input stays open until the teardown below. At end of input the copy
+    // could exit on its own, and a reaped leader is one whose group is no
+    // longer safe to signal.
+    let exchange = async {
+        stdin.write_all(message.as_bytes()).await?;
+        stdin.flush().await?;
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        let mut model = None;
+        loop {
+            line.clear();
+            if reader.read_line(&mut line).await? == 0 {
+                return Err::<SideQuestionReply, Box<dyn std::error::Error + Send + Sync>>(
+                    "Claude Code exited before it answered".into(),
+                );
+            }
+            if let Some(named) = init_model(&line) {
+                model = Some(named);
+            } else if let Some((answer, usage)) = side_question_result(&line) {
+                return Ok(SideQuestionReply {
+                    answer,
+                    usage,
+                    model,
+                });
+            }
+        }
+    };
+    let outcome = tokio::time::timeout_at(deadline, exchange).await;
+    tear_down_cold_child(group, &mut child, "side-question").await;
+
+    let reply = outcome.map_err(|_| {
+        crate::engine::agent_session::side_question::side_question_timeout_message("Claude Code")
+    })?;
+    let failure = match &reply {
+        Err(e) => Some(e.to_string()),
+        Ok(SideQuestionReply { answer: Err(e), .. }) => Some(e.clone()),
+        Ok(_) => None,
+    };
+    if let (Some(e), Some(mut stderr)) = (failure, child.stderr.take().map(BufReader::new)) {
+        let tail = drain_stderr(&mut stderr).await;
+        log!(
+            "[ClaudeCode] side question failed: {} (stderr: {})",
+            e,
+            tail.trim()
+        );
+    }
+    reply
+}
+
+/// How long a model probe may take. Claude Code runs the user's session-start
+/// hooks before it answers, so a slow hook is the usual cause of a timeout.
+pub const CC_MODEL_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The `initialize` control request: what the Agent SDK sends first, and the
+/// one request whose reply lists the models Claude Code offers.
+fn cc_initialize_request_json(request_id: &str) -> String {
+    let mut line = serde_json::to_string(&serde_json::json!({
+        "type": "control_request",
+        "request_id": request_id,
+        "request": { "subtype": "initialize" },
+    }))
+    .expect("initialize serialization cannot fail");
+    line.push('\n');
+    line
+}
+
+/// Ask Claude Code which models it offers, under the binary, env and settings
+/// a session built from `args` would run with.
+///
+/// Sends only `initialize`, never a prompt, so it costs no tokens, and writes
+/// no transcript. Pass no `resume_session_id`.
+pub async fn probe_cc_models(
+    args: SpawnArgs<'_>,
+) -> Result<super::cc_model_discovery::CcModelCache, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(path) = args.binary_override {
+        super::spawn_env::resolve_binary_override(
+            path,
+            "Claude Code (`claude`)",
+            crate::core::PREF_CODING_AGENT_CLAUDE_PATH,
+        )?;
+    }
+    // The session command names this file with --settings, and a fresh install
+    // may probe before any session wrote it.
+    if let Err(e) = crate::engine::cc_settings::write_cc_settings(args.workspace_path).await {
+        log!(
+            "[ClaudeCode] model probe could not write cc-settings.json: {}",
+            e
+        );
+    }
+    let deadline = tokio::time::Instant::now() + CC_MODEL_PROBE_TIMEOUT;
+    let mut cmd = build_command(&args, lucidos_cli_dir());
+    cmd.arg("--no-session-persistence");
+    let cc_version = super::probe_agent_version(
+        CodingAgent::ClaudeCode,
+        Path::new(cmd.as_std().get_program()),
+        std::time::Duration::from_secs(10),
+    )
+    .await;
+    let models = probe_models_of(cmd.spawn()?, deadline).await?;
+    Ok(super::cc_model_discovery::CcModelCache {
+        cc_version,
+        discovered_at: chrono::Utc::now(),
+        models,
+    })
+}
+
+/// Send `initialize` to `child` and read the model list out of its reply,
+/// then tear the process group down whatever happened. `child` must lead its
+/// own group.
+async fn probe_models_of(
+    mut child: Child,
+    deadline: tokio::time::Instant,
+) -> Result<Vec<super::cc_model_discovery::DiscoveredModel>, Box<dyn std::error::Error + Send + Sync>>
+{
+    let group = ColdProcessGroup(child.id());
     let mut stdin = child.stdin.take().ok_or("Failed to capture stdin")?;
     let stdout = child.stdout.take().ok_or("Failed to capture stdout")?;
     let request_id = uuid::Uuid::new_v4().to_string();
     let exchange = async {
         stdin
-            .write_all(cc_side_question_request_json(question, &request_id).as_bytes())
+            .write_all(cc_initialize_request_json(&request_id).as_bytes())
             .await?;
         stdin.flush().await?;
         let mut reader = BufReader::new(stdout);
@@ -359,43 +625,39 @@ async fn ask_side_question_of(
         loop {
             line.clear();
             if reader.read_line(&mut line).await? == 0 {
-                return Err::<String, Box<dyn std::error::Error + Send + Sync>>(
+                return Err::<ControlBody, Box<dyn std::error::Error + Send + Sync>>(
                     "Claude Code exited before it answered".into(),
                 );
             }
-            if let Some((id, answer)) = side_question_reply(&line) {
+            if let Some((id, body)) = control_reply(&line) {
                 if id == request_id {
-                    return answer.map_err(Into::into);
+                    return Ok(body);
                 }
             }
         }
     };
     let outcome = tokio::time::timeout_at(deadline, exchange).await;
+    tear_down_cold_child(group, &mut child, "model-probe").await;
 
-    // Signal the group only while the child is unreaped: a reaped pid may be recycled.
-    if let (Some(pid), Ok(None)) = (group.disarm(), child.try_wait()) {
-        crate::runtime::spawn_env::kill_child_process_group_now(pid);
+    let models = match outcome {
+        Err(_) => Err(format!(
+            "Claude Code did not answer initialize within {} seconds",
+            CC_MODEL_PROBE_TIMEOUT.as_secs()
+        )),
+        Ok(Err(e)) => Err(e.to_string()),
+        Ok(Ok(body)) => body
+            .map_err(|e| e.unwrap_or_else(|| "Claude Code refused initialize".to_string()))
+            .and_then(|body| super::cc_model_discovery::parse_initialize_models(&body)),
+    };
+    if let (Err(e), Some(mut stderr)) = (&models, child.stderr.take().map(BufReader::new)) {
+        let tail = drain_stderr(&mut stderr).await;
+        log!(
+            "[ClaudeCode] model probe failed: {} (stderr: {})",
+            e,
+            tail.trim()
+        );
     }
-    let _ = child.start_kill();
-    if tokio::time::timeout(std::time::Duration::from_secs(2), child.wait())
-        .await
-        .is_err()
-    {
-        log!("[ClaudeCode] cold side-question process did not exit after SIGKILL");
-    }
-
-    let answer = outcome.map_err(|_| side_question_timeout_message())?;
-    if let Err(e) = &answer {
-        if let Some(mut stderr) = child.stderr.take().map(BufReader::new) {
-            let tail = drain_stderr(&mut stderr).await;
-            log!(
-                "[ClaudeCode] cold side question failed: {} (stderr: {})",
-                e,
-                tail.trim()
-            );
-        }
-    }
-    answer
+    Ok(models?)
 }
 
 fn is_valid_effort(value: &str) -> bool {
@@ -536,7 +798,7 @@ impl AgentRuntime for ClaudeCodeRuntime {
         let (events_tx, events_rx) = mpsc::unbounded_channel::<AgentEvent>();
         let (input_tx, input_rx) = mpsc::unbounded_channel::<AgentInput>();
         let (control_tx, control_rx) = mpsc::unbounded_channel::<ControlRequest>();
-        let (side_question_tx, side_question_rx) = mpsc::unbounded_channel::<SideQuestionRequest>();
+        let (withdraw_tx, withdraw_rx) = mpsc::unbounded_channel::<WithdrawRequest>();
 
         let initial_session_id = args.resume_session_id.map(str::to_string);
         tokio::spawn(driver_task(
@@ -547,7 +809,7 @@ impl AgentRuntime for ClaudeCodeRuntime {
             events_tx,
             input_rx,
             control_rx,
-            side_question_rx,
+            withdraw_rx,
             cancel,
             initial_session_id,
             stream_state,
@@ -561,7 +823,7 @@ impl AgentRuntime for ClaudeCodeRuntime {
             // CC permissions flow out-of-band: its MCP permission-prompt
             // subprocess POSTs /api/v1/internal/permission-prompt directly.
             permission_rx: None,
-            side_question_tx: Some(side_question_tx),
+            withdraw_tx: Some(withdraw_tx),
         })
     }
 }
@@ -667,6 +929,21 @@ const CC_BYTE_STREAM_IDLE_TIMEOUT_MS: u64 = 30 * 60 * 1000;
 /// tests can inspect args/env without spawning. `cli_dir` is the directory
 /// containing the `lucidos` binary, prepended to PATH; pass `None` to skip.
 fn build_command(args: &SpawnArgs<'_>, cli_dir: Option<&Path>) -> tokio::process::Command {
+    build_command_with_settings(
+        args,
+        cli_dir,
+        &crate::engine::cc_settings::cc_settings_path_for_workspace(args.workspace_path),
+    )
+}
+
+/// [`build_command`] under a given `--settings` file. Only a side question
+/// passes its own: settings hold hooks and directories, never the tool list,
+/// so both commands keep one prompt prefix.
+fn build_command_with_settings(
+    args: &SpawnArgs<'_>,
+    cli_dir: Option<&Path>,
+    settings: &Path,
+) -> tokio::process::Command {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let claude_bin = resolve_claude_binary(home.as_deref(), args.binary_override.map(Path::new));
     let mut cmd = tokio::process::Command::new(claude_bin);
@@ -695,9 +972,7 @@ fn build_command(args: &SpawnArgs<'_>, cli_dir: Option<&Path>) -> tokio::process
         .arg(permission_mcp_config_json(cli_dir))
         .arg("--strict-mcp-config")
         .arg("--settings")
-        .arg(crate::engine::cc_settings::cc_settings_path_for_workspace(
-            args.workspace_path,
-        ))
+        .arg(settings)
         .current_dir(args.worktree_path)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -739,16 +1014,19 @@ fn build_command(args: &SpawnArgs<'_>, cli_dir: Option<&Path>) -> tokio::process
     {
         cmd.env(IDLE_TIMEOUT_ENV, CC_BYTE_STREAM_IDLE_TIMEOUT_MS.to_string());
     }
-    // Pin the session's CLAUDE_CONFIG_DIR on a RESUME. CC stores each session's
-    // transcript at `$CLAUDE_CONFIG_DIR/projects/<escaped-cwd>/<sid>.jsonl`, so
-    // a `--resume <sid>` MUST run under the config dir the session was created
-    // in. Otherwise CC returns "No conversation found with session ID".
-    // Set AFTER `apply_lucidos_env`, which applied any user-managed
-    // `CLAUDE_CONFIG_DIR` first, so this engine-owned pin wins: a live toggle of
-    // the env var cannot strand an in-flight thread's resume. `None` for a fresh
-    // session leaves the user's value or CC's default in place.
-    if let Some(dir) = args.claude_config_dir {
-        cmd.env("CLAUDE_CONFIG_DIR", dir);
+    // Replay the thread's account pin. Set AFTER `apply_lucidos_env`, which
+    // applied any user-managed `CLAUDE_CONFIG_DIR` first, so the pin wins. An
+    // unset pin must stay unset: Claude Code reads another keychain entry and
+    // another `.claude.json` once the variable exists, even at its default
+    // path, and then reports "Not logged in".
+    match args.account_pin {
+        Some(AccountPin::ExplicitConfigDir { dir }) => {
+            cmd.env("CLAUDE_CONFIG_DIR", dir);
+        }
+        Some(AccountPin::DefaultConfigDir { .. }) => {
+            cmd.env_remove("CLAUDE_CONFIG_DIR");
+        }
+        None => {}
     }
     // The effort the thread records is the effort CC runs at. So it goes AFTER
     // `apply_lucidos_env`, where a workspace `CLAUDE_CODE_EFFORT_LEVEL` cannot
@@ -974,10 +1252,25 @@ fn format_user_input(input: &AgentInput, session_id: Option<&str>) -> String {
         },
         "session_id": session_id.unwrap_or("default"),
         "parent_tool_use_id": null,
+        "uuid": input.uuid,
     });
     let mut line = serde_json::to_string(&msg).expect("user input serializes");
     line.push('\n');
     line
+}
+
+/// Write one line to CC's stdin and flush it. `false` means the pipe is gone
+/// and the driver should stop; the failure is logged here.
+async fn write_stdin_line(stdin: &mut ChildStdin, line: &str, what: &str) -> bool {
+    if let Err(e) = stdin.write_all(line.as_bytes()).await {
+        log!("[ClaudeCode] failed to write {} to stdin: {}", what, e);
+        return false;
+    }
+    if let Err(e) = stdin.flush().await {
+        log!("[ClaudeCode] failed to flush stdin after {}: {}", what, e);
+        return false;
+    }
+    true
 }
 
 /// True when an exit status indicates the process was killed by a signal.
@@ -1074,7 +1367,7 @@ async fn driver_task(
     events_tx: mpsc::UnboundedSender<AgentEvent>,
     mut input_rx: mpsc::UnboundedReceiver<AgentInput>,
     mut control_rx: mpsc::UnboundedReceiver<ControlRequest>,
-    mut side_question_rx: mpsc::UnboundedReceiver<SideQuestionRequest>,
+    mut withdraw_rx: mpsc::UnboundedReceiver<WithdrawRequest>,
     cancel: CancellationToken,
     mut session_id: Option<String>,
     mut stream_state: CcStreamState,
@@ -1101,7 +1394,7 @@ async fn driver_task(
     // arrives in several chunks. `read_until` keeps the chunks already read in
     // `line_buf`. `read_line` holds them inside its future and loses them.
     let mut line_buf: Vec<u8> = Vec::new();
-    let mut pending_side_questions = PendingSideQuestions::new();
+    let mut pending_replies = PendingReplies::new();
     loop {
         tokio::select! {
             read_result = stdout_reader.read_until(b'\n', &mut line_buf) => {
@@ -1113,7 +1406,7 @@ async fn driver_task(
                         if !line_buf.is_empty() {
                             let events = route_stdout_line(
                                 &mut stream_state,
-                                &mut pending_side_questions,
+                                &mut pending_replies,
                                 &String::from_utf8_lossy(&line_buf),
                             );
                             for ev in events {
@@ -1126,7 +1419,7 @@ async fn driver_task(
                     Ok(_) => {
                         let events = route_stdout_line(
                             &mut stream_state,
-                            &mut pending_side_questions,
+                            &mut pending_replies,
                             &String::from_utf8_lossy(&line_buf),
                         );
                         for ev in events {
@@ -1154,12 +1447,7 @@ async fn driver_task(
             input = input_rx.recv() => {
                 let Some(input) = input else { break };
                 let line = format_user_input(&input, session_id.as_deref());
-                if let Err(e) = stdin.write_all(line.as_bytes()).await {
-                    log!("[ClaudeCode] failed to write user input to stdin: {}", e);
-                    break;
-                }
-                if let Err(e) = stdin.flush().await {
-                    log!("[ClaudeCode] failed to flush stdin after user input: {}", e);
+                if !write_stdin_line(&mut stdin, &line, "user input").await {
                     break;
                 }
             }
@@ -1168,28 +1456,30 @@ async fn driver_task(
                 let request_id = uuid::Uuid::new_v4().to_string();
                 let mut line = cc_control_request_to_json(&req, &request_id);
                 line.push('\n');
-                if let Err(e) = stdin.write_all(line.as_bytes()).await {
-                    log!("[ClaudeCode] failed to write control_request to stdin: {}", e);
-                    break;
-                }
-                if let Err(e) = stdin.flush().await {
-                    log!("[ClaudeCode] failed to flush stdin after control_request: {}", e);
+                if !write_stdin_line(&mut stdin, &line, "control_request").await {
                     break;
                 }
             }
-            // A dropped sender only disables this arm: side questions are optional.
-            Some(side_question) = side_question_rx.recv() => {
-                // The one line a side question writes. It never interrupts,
-                // queues behind or adds to the running turn.
-                let request_id = uuid::Uuid::new_v4().to_string();
-                let line = cc_side_question_request_json(&side_question.question, &request_id);
-                pending_side_questions.insert(request_id, side_question.reply);
-                if let Err(e) = stdin.write_all(line.as_bytes()).await {
-                    log!("[ClaudeCode] failed to write side question to stdin: {}", e);
+            // A dropped sender only disables this arm: withdraws are optional.
+            Some(withdraw) = withdraw_rx.recv() => {
+                // Inputs and withdraws arrive on separate channels. Writing
+                // every input already handed over first keeps a cancel from
+                // overtaking the message it names.
+                let mut flushed = true;
+                while let Ok(input) = input_rx.try_recv() {
+                    let line = format_user_input(&input, session_id.as_deref());
+                    flushed = write_stdin_line(&mut stdin, &line, "user input").await;
+                    if !flushed {
+                        break;
+                    }
+                }
+                if !flushed {
                     break;
                 }
-                if let Err(e) = stdin.flush().await {
-                    log!("[ClaudeCode] failed to flush stdin after side question: {}", e);
+                let request_id = uuid::Uuid::new_v4().to_string();
+                let line = cc_cancel_async_message_json(withdraw.input_uuid, &request_id);
+                pending_replies.insert(request_id, withdraw.reply);
+                if !write_stdin_line(&mut stdin, &line, "withdraw").await {
                     break;
                 }
             }
@@ -1235,7 +1525,7 @@ async fn driver_task(
                         Ok(Ok(_)) => {
                             let events = route_stdout_line(
                                 &mut stream_state,
-                                &mut pending_side_questions,
+                                &mut pending_replies,
                                 &String::from_utf8_lossy(&line_buf),
                             );
                             for ev in events {
@@ -1252,7 +1542,7 @@ async fn driver_task(
                 if !line_buf.is_empty() {
                     let events = route_stdout_line(
                         &mut stream_state,
-                        &mut pending_side_questions,
+                        &mut pending_replies,
                         &String::from_utf8_lossy(&line_buf),
                     );
                     for ev in events {

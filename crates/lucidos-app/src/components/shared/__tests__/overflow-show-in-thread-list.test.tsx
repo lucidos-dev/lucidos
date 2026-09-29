@@ -1,0 +1,42 @@
+// @vitest-environment jsdom
+/**
+ * The thread title bars' ⋯ menu leads with Show in thread list. A drawer row's
+ * menu does not offer it, since the row IS the thread in the list. The item is
+ * present exactly when the host passes `onShowInThreadList`.
+ */
+import { describe, it, expect, afterEach, vi } from 'vitest';
+import { render } from 'preact';
+import { act } from 'preact/test-utils';
+import { ThreadOverflowMenu } from '../ThreadOverflowMenu';
+
+let host: HTMLElement | null = null;
+
+function openMenu(onShowInThreadList?: () => void): HTMLElement[] {
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    act(() => { render(<ThreadOverflowMenu threadId="t" title="T" onShowInThreadList={onShowInThreadList} />, host!); });
+    const trigger = host.querySelector<HTMLElement>('button[aria-haspopup="menu"]');
+    act(() => { trigger?.click(); });
+    return [...document.querySelectorAll<HTMLElement>('.thread-overflow-menu [role="menuitem"]')];
+}
+
+afterEach(() => {
+    if (host) { render(null, host); host.remove(); host = null; }
+    document.querySelectorAll('.thread-overflow-menu').forEach(el => el.remove());
+});
+
+describe('Show in thread list in the thread overflow menu', () => {
+    it('leads the menu and runs the action when the host passes it', () => {
+        const onShow = vi.fn();
+        const items = openMenu(onShow);
+        expect(items[0]?.textContent).toBe('Show in thread list');
+        act(() => { items[0].click(); });
+        expect(onShow).toHaveBeenCalledOnce();
+    });
+
+    it('is absent when the host does not pass it', () => {
+        const labels = openMenu().map(el => el.textContent);
+        expect(labels).not.toContain('Show in thread list');
+        expect(labels.length).toBeGreaterThan(0);
+    });
+});

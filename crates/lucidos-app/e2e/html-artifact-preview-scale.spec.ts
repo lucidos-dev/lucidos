@@ -43,16 +43,17 @@ interface FrameProbe {
 }
 
 async function probeFrame(page: Page): Promise<FrameProbe> {
-  const frame = page.locator('.file-preview-inline:visible iframe').first();
-  await expect(frame).toBeVisible({ timeout: 15_000 });
-  // The srcdoc parses on its own schedule, so poll for the body rather than
-  // racing it with a bare evaluate.
-  await expect
-    .poll(() => frame.evaluate((el: HTMLIFrameElement) => !!el.contentDocument?.querySelector('#box')),
-      { timeout: 15_000 })
-    .toBe(true);
-  return frame.evaluate((el: HTMLIFrameElement) => {
-    const doc = el.contentDocument!;
+  const element = page.locator('.file-preview-inline:visible iframe').first();
+  await expect(element).toBeVisible({ timeout: 15_000 });
+  // The preview runs at an opaque origin (ADR 0322), so the shell cannot read
+  // its `contentDocument`. Playwright can, from inside the frame. The srcdoc
+  // parses on its own schedule, so wait for the box rather than race it.
+  await expect(page.frameLocator('.file-preview-inline:visible iframe').first().locator('#box'))
+    .toBeAttached({ timeout: 15_000 });
+  const frame = await (await element.elementHandle())?.contentFrame();
+  if (!frame) throw new Error('the preview iframe has no frame');
+  return frame.evaluate(() => {
+    const doc = document;
     const width = (sel: string) => doc.querySelector(sel)!.getBoundingClientRect().width;
     return {
       boxWidth: width('#box'),

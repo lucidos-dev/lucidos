@@ -1,4 +1,4 @@
-import { signal, computed } from '@preact/signals';
+import { signal, computed, batch } from '@preact/signals';
 import { hydratePinnedAppsFromStorage } from './actions/pinnedApps';
 import { minDrawerWidth } from './paneMinimums';
 import type {
@@ -821,6 +821,17 @@ export const selectedAppIds = signal<Set<string>>(restoreIdSet(SELECTED_APP_IDS_
 export function setSelectedAppIds(next: Set<string>): void {
   selectedAppIds.value = next;
   persistIdSet(SELECTED_APP_IDS_KEY, next);
+}
+
+/** Reset the whole thread filter to "show everything": every channel, and no
+ *  trigger, repo or app sub-selection. */
+export function clearThreadFilter(): void {
+  batch(() => {
+    setThreadChannelFilter(new Set(ALL_CHANNELS));
+    setSelectedTriggerIds(new Set());
+    setSelectedRepoIds(new Set());
+    setSelectedAppIds(new Set());
+  });
 }
 
 // Whether the filter dropdown lists deleted trigger, repo and app options:
@@ -2153,8 +2164,8 @@ export function workspaceUnavailable(): boolean {
   return engineRestarting.value || appUpdateCommitted.value || !databaseReachable.value;
 }
 
-export function showToast(rawMessage: string, type: ToastType = 'info', opts?: { title?: string; key?: string; action?: ToastAction; secondaryAction?: ToastAction; onClick?: () => void; spinning?: boolean; progress?: number | null; autoDismissMs?: number; dismissable?: boolean; showWhileUnavailable?: boolean; noAutofocus?: boolean }) {
-  const { key, action, secondaryAction, onClick, spinning, progress, autoDismissMs, dismissable, showWhileUnavailable, noAutofocus } = opts ?? {};
+export function showToast(rawMessage: string, type: ToastType = 'info', opts?: { title?: string; key?: string; action?: ToastAction; secondaryAction?: ToastAction; onClick?: () => void; spinning?: boolean; progress?: number | null; autoDismissMs?: number; dismissable?: boolean; showWhileUnavailable?: boolean }) {
+  const { key, action, secondaryAction, onClick, spinning, progress, autoDismissMs, dismissable, showWhileUnavailable } = opts ?? {};
   // Bound the title and message HERE, so the store never holds a wall of text
   // whatever raised it. Both branches below then store the clamped copies, the
   // keyed in-place update included. Two callers carry no length of their own:
@@ -2189,7 +2200,7 @@ export function showToast(rawMessage: string, type: ToastType = 'info', opts?: {
   if (key) {
     const existing = toasts.value.find((t) => t.key === key);
     if (existing) {
-      toasts.value = toasts.value.map((t) => t.key === key ? { ...t, title, message, type, action, secondaryAction, onClick, spinning, progress, dismissable, noAutofocus, persistent } : t);
+      toasts.value = toasts.value.map((t) => t.key === key ? { ...t, title, message, type, action, secondaryAction, onClick, spinning, progress, dismissable, persistent } : t);
       scheduleAutoDismiss(key, autoMs);
       return;
     }
@@ -2203,7 +2214,7 @@ export function showToast(rawMessage: string, type: ToastType = 'info', opts?: {
   // Prepend, so the newest toast renders at the top of its pane's column and
   // pushes that pane's existing toasts down. Each column is pinned to the top
   // of the viewport, so array order runs top to bottom.
-  toasts.value = [{ id, title, message, type, key, action, secondaryAction, onClick, spinning, progress, dismissable, noAutofocus, persistent, pane }, ...toasts.value];
+  toasts.value = [{ id, title, message, type, key, action, secondaryAction, onClick, spinning, progress, dismissable, persistent, pane }, ...toasts.value];
   if (key) {
     scheduleAutoDismiss(key, autoMs);
     return;

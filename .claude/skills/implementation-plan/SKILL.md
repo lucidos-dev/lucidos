@@ -65,9 +65,18 @@ reports the run as blocked on a decision rather than as a failed scan. It then
 carries on with the rest of the pipeline. Ending with a plan and that line is a
 **complete** unattended run.
 
+**The blocked lane is only for a branch with no fix commits.** A proposed
+marker makes Apply refuse the whole branch, so it holds every fix on the branch
+hostage. If your session has committed a fix, or will commit one, do not write
+a plan document and do not run `planned mark --plan`. Instead, list the finding
+in your reply under `Decisions:`. Give the thorough fix and the narrow fix for
+it. The orchestrator then has the plan written in a separate session, on its
+own branch.
+
 The orchestrator's half of this lives in the workspace knowhow
-`lucidos-ops/nightly-pipeline`, § "Two cross-cutting rules every step carries"
-and § "Step 3 detail". The reasoning and the rejected alternatives are in
+`lucidos-ops/nightly-pipeline`, § "Two cross-cutting rules every step carries",
+§ "Step 3 detail" and § "A plan never rides on a branch that carries fixes".
+The reasoning and the rejected alternatives are in
 [ADR 0154](../../../docs/adr/0154-unattended-security-fixes-get-a-bounded-lane.md).
 
 ## Workflow
@@ -117,7 +126,7 @@ Use exactly one question. `Approve` is always the first option. What goes in the
 | A fork of the plan (`Frontend only`, `Skip the migration`, …) | Approve a named variant. | Whenever the plan has a genuine fork: a narrower scope, one layer instead of two, a different approach. |
 | `Request changes` | Something needs reworking before implementation. | **Only** when the plan offers no real fork. Never alongside one. |
 
-**The plan as written is the thorough, long-term fix.** The maintainer always prefers it to a narrower patch. So write the thorough variant as the plan, and offer the narrower one as the fork, never the reverse. An unattended run still stops at the plan: the preference picks which variant to recommend, not whether to ask.
+**The plan as written is the thorough, long-term fix.** The maintainer always prefers it to a narrower patch. So write the thorough variant as the plan, and offer the narrower one as the fork, never the reverse. An unattended run still stops at the decision, as a plan or under `Decisions:`: the preference picks which variant to recommend, not whether to ask.
 
 Claude Code's tool requires **2-4 options**, so a lone `Approve` button cannot be expressed. That is the *only* reason `Request changes` exists as a default second option: it fills the mandatory slot while carrying a real "don't start yet" decision. A genuine fork fills the same slot better, because it satisfies the minimum **and** tells you what to do.
 

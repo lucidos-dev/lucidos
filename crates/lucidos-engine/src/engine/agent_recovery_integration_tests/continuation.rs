@@ -166,7 +166,13 @@ async fn continuation_retry_input_recaps_the_thread_before_the_continue_message(
     .expect("emit succeeds")
     .expect("persisted");
 
-    let input = continue_retry_input(&pool, thread_id, Some(USER_CLICKED_CONTINUE_REASON)).await;
+    let input = continue_retry_input(
+        &pool,
+        std::path::Path::new("/nonexistent"),
+        thread_id,
+        Some(USER_CLICKED_CONTINUE_REASON),
+    )
+    .await;
 
     let recap_pos = input
         .find("fix the flaky drafts spec")
@@ -198,7 +204,13 @@ async fn continuation_retry_input_is_never_empty() {
     let (pool, db_name) = setup_test_db().await;
     let thread_id = Uuid::new_v4();
 
-    let input = continue_retry_input(&pool, thread_id, Some(USER_CLICKED_CONTINUE_REASON)).await;
+    let input = continue_retry_input(
+        &pool,
+        std::path::Path::new("/nonexistent"),
+        thread_id,
+        Some(USER_CLICKED_CONTINUE_REASON),
+    )
+    .await;
 
     assert_eq!(
         input, CONTINUE_RESUME_USER_MESSAGE,
@@ -282,7 +294,10 @@ async fn seed_typed_answer(bus: &EventBus, thread_id: Uuid, question: &str, type
         thread_id,
         event: ThreadEvent::UserQuestionAnswered {
             tool_use_id: tool_use_id.into(),
-            answer: AnswerKind::FreeText { text: typed.into() },
+            answer: AnswerKind::FreeText {
+                text: typed.into(),
+                image_hashes: vec![],
+            },
         },
         meta: EventMeta {
             channel: Some(EventChannel::ClaudeCode),
@@ -306,7 +321,13 @@ async fn answered_after_idle_resume_carries_the_answer_and_denies_the_rejection(
     let typed = "think hard, do we really need this or is it overengineering?";
     seed_typed_answer(&bus, thread_id, question, typed).await;
 
-    let input = continue_input_for_reason(&pool, thread_id, Some(ANSWERED_AFTER_IDLE_REASON)).await;
+    let input = continue_input_for_reason(
+        &pool,
+        std::path::Path::new("/nonexistent"),
+        thread_id,
+        Some(ANSWERED_AFTER_IDLE_REASON),
+    )
+    .await;
 
     // 1. The answer reaches the model at all. This is the whole bug.
     assert!(
@@ -371,7 +392,13 @@ async fn other_continuation_reasons_still_send_the_bare_continue_message() {
         None,
     ] {
         assert_eq!(
-            continue_input_for_reason(&pool, thread_id, reason).await,
+            continue_input_for_reason(
+                &pool,
+                std::path::Path::new("/nonexistent"),
+                thread_id,
+                reason
+            )
+            .await,
             CONTINUE_RESUME_USER_MESSAGE,
             "reason {reason:?} must not start carrying question text"
         );
@@ -394,7 +421,13 @@ async fn answered_after_idle_falls_back_to_the_bare_message_with_nothing_to_reca
     let thread_id = Uuid::new_v4();
 
     assert_eq!(
-        continue_input_for_reason(&pool, thread_id, Some(ANSWERED_AFTER_IDLE_REASON)).await,
+        continue_input_for_reason(
+            &pool,
+            std::path::Path::new("/nonexistent"),
+            thread_id,
+            Some(ANSWERED_AFTER_IDLE_REASON)
+        )
+        .await,
         CONTINUE_RESUME_USER_MESSAGE,
     );
 
@@ -421,7 +454,13 @@ async fn the_stale_resume_retry_also_carries_the_answer() {
     let typed = "no, keep the deadline required";
     seed_typed_answer(&bus, thread_id, "Approve, or derive the deadline?", typed).await;
 
-    let input = continue_retry_input(&pool, thread_id, Some(ANSWERED_AFTER_IDLE_REASON)).await;
+    let input = continue_retry_input(
+        &pool,
+        std::path::Path::new("/nonexistent"),
+        thread_id,
+        Some(ANSWERED_AFTER_IDLE_REASON),
+    )
+    .await;
 
     assert!(
         input.contains(typed),

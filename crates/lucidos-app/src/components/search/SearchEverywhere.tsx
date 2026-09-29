@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from 'preact/hooks';
 import { searchEverywhereOpen, searchEverywhereAnchor, appsList, artifacts, triggers, threadMap, settingsScrollTarget, focusedPane } from '../../store/store';
 import { Overlay } from '../shared/Overlay';
-import { searchEverywhere, type SearchCategory, type SearchResultItem } from '../../api/client';
+import { searchEverywhere, type SearchCategory, type SearchResultItem, type ServerSearchCategory } from '../../api/client';
 import { focusThreadOrBootstrap } from '../../store/actions/threads';
 import { openFilePreview } from '../../store/actions/artifacts';
 import { openAppById } from '../../store/actions/apps';
@@ -10,9 +10,9 @@ import { viewChangeDiffById } from '../../store/actions/repositories';
 import { navigateToTrigger } from '../../store/actions/triggers';
 import { focusPaneMainControl } from '../layout/paneFocus';
 import { searchResultDestinationPane, searchResultIconCategory } from './searchEverywhereActions';
-import { useDelayedLoading } from '../../hooks/useDelayedLoading';
+import { useDelayedFlag } from '../../hooks/useDelayedLoading';
 import { paneOfFocus, paneUnder, usePaneCentre } from '../../hooks/usePaneCentre';
-import { loadedOr, toFailed, type Loadable } from '../../store/types';
+import { toFailed, type Loadable } from '../../store/types';
 import { LoadingFade } from '../shared/LoadingFade';
 import { ListSkeletonOf, SkBlock, SkText } from '../shared/Skeleton';
 import { RECENTS_KEY } from '../../store/actions/entityReferences';
@@ -37,6 +37,17 @@ const CATEGORIES: { id: SearchCategory; label: string }[] = [
 ];
 
 type LocalCategory = 'settings' | 'menu';
+type ServerSection = Exclude<ServerSearchCategory, 'all'>;
+
+/** Asked one request each, so a fast category never waits on a slow one:
+ *  thread search embeds the query, the rest are listings. */
+const SERVER_SECTIONS: ServerSection[] = ['apps', 'files', 'threads', 'triggers', 'changes'];
+
+/** Keystrokes coalesce this long before the engine is asked. Local hits skip it. */
+const SERVER_DEBOUNCE_MS = 150;
+
+/** Hits per section in the All tab. The engine is asked for no more. */
+const ALL_TAB_LIMIT = 5;
 
 /** The two categories the frontend answers itself, never the engine. */
 function isLocalCategory(category: SearchCategory): category is LocalCategory {
@@ -47,6 +58,27 @@ function localSection(section: LocalCategory, query: string, limit: number): Sea
   return section === 'settings'
     ? getSettingsSearchResults(query, limit)
     : getMenuSearchResults(query, limit);
+}
+
+/** The hits the frontend holds itself, so they render on the keystroke. */
+function localHits(query: string, category: SearchCategory): Record<string, SearchResultItem[]> {
+  if (category === 'all') {
+    return { settings: localSection('settings', query, ALL_TAB_LIMIT), menu: localSection('menu', query, ALL_TAB_LIMIT) };
+  }
+  return isLocalCategory(category) ? { [category]: localSection(category, query, 50) } : {};
+}
+
+function serverSectionsFor(category: SearchCategory): ServerSection[] {
+  if (category === 'all') return SERVER_SECTIONS;
+  return isLocalCategory(category) ? [] : [category];
+}
+
+function sectionLabel(section: string): string {
+  return CATEGORIES.find(c => c.id === section)?.label ?? section;
+}
+
+function itemKey(item: SearchResultItem): string {
+  return `${item.category}:${item.id}`;
 }
 
 const MAX_RECENTS = 15;
@@ -124,8 +156,7 @@ function flattenResults(
   for (const section of SECTION_ORDER) {
     const items = results[section];
     if (!items?.length) continue;
-    // In "All" tab, cap at 5 per section
-    for (let i = 0; i < Math.min(items.length, 5); i++) {
+    for (let i = 0; i < Math.min(items.length, ALL_TAB_LIMIT); i++) {
       flat.push(items[i]);
     }
   }
@@ -139,7 +170,7 @@ function getSections(results: Record<string, SearchResultItem[]>): { section: st
   for (const section of SECTION_ORDER) {
     const items = results[section];
     if (!items?.length) continue;
-    const capped = items.slice(0, 5);
+    const capped = items.slice(0, ALL_TAB_LIMIT);
     sections.push({ section, items: capped, offset });
     offset += capped.length;
   }
@@ -179,19 +210,44 @@ function ResultRow({ item, index = 0, selected = false, onSelect, onHover }: {
   );
 }
 
+/** The trailing row while engine categories are still out. Local hits and the
+ *  categories that already answered stay above it. */
+function PendingRow({ sections }: { sections: ServerSection[] }) {
+  const names = sections.map(s => sectionLabel(s).toLowerCase()).join(', ');
+  return (
+    <div class="search-everywhere-pending" role="status">
+      <span class="mini-spinner" aria-hidden="true" />
+      <span>Searching {names}</span>
+    </div>
+  );
+}
+
+/** Engine answers, each stamped with the search it answers. A section whose
+ *  stamp is not the current search is still out, whatever it last held. */
+type ServerHits = { search: string; sections: Partial<Record<ServerSection, Loadable<SearchResultItem[]>>> };
+
 export function SearchEverywhere() {
   const [query, setQuery] = useState('');
   const [category, setCategory] = useState<SearchCategory>('all');
-  const [results, setResults] = useState<Loadable<Record<string, SearchResultItem[]>>>({ status: 'not-loaded' });
-  const [selectedIndex, setSelectedIndex] = useState(-1);
+  const [server, setServer] = useState<ServerHits>({ search: '', sections: {} });
+  const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const [recents, setRecents] = useState<SearchResultItem[]>([]);
   const inputRef = useRef<HTMLInputElement>(null);
   const resultsRef = useRef<HTMLDivElement>(null);
-  const abortRef = useRef<AbortController | null>(null);
-  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // Placeholder rows only once a search has run past the delay gate. Results
+
+  const isRecentsMode = !query && category === 'all';
+  const search = `${category}\n${query}`;
+  const requested = useMemo(() => (isRecentsMode ? [] : serverSectionsFor(category)), [isRecentsMode, category]);
+  const serverState = (section: ServerSection): Loadable<SearchResultItem[]> =>
+    (server.search === search && server.sections[section]) || { status: 'loading' };
+  const pending = requested.filter(s => serverState(s).status === 'loading');
+  const failed = requested.flatMap(s => {
+    const state = serverState(s);
+    return state.status === 'failed' ? [{ section: s, error: state.error }] : [];
+  });
+  // Placeholder rows only once a search has run past the delay gate. Hits
   // still show the instant they arrive; the fade only lets the rows go.
-  const showSearchLoading = useDelayedLoading(results);
+  const showSearchLoading = useDelayedFlag(pending.length > 0);
 
   const isOpen = searchEverywhereOpen.value;
   // Over the pane whose header holds the button that opened it. Opened with
@@ -209,66 +265,42 @@ export function SearchEverywhere() {
     searchEverywhereOpen.value = false;
     setQuery('');
     setCategory('all');
-    setResults({ status: 'not-loaded' });
-    setSelectedIndex(-1);
-    if (abortRef.current) abortRef.current.abort();
-    if (debounceRef.current) clearTimeout(debounceRef.current);
+    setSelectedKey(null);
   }, []);
 
-  // Load recents on open
+  // Load recents on open. On close, however it closed, drop the engine's
+  // answers, so a reopened palette asks again rather than showing old ones.
   useEffect(() => {
     if (isOpen) setRecents(validateRecents(loadRecents()));
+    else setServer({ search: '', sections: {} });
   }, [isOpen]);
 
-  // Fire search when query or category changes (skip in recents mode)
+  // Ask the engine one request per category, once the keystrokes pause.
   useEffect(() => {
-    if (!isOpen) return;
-    // Recents need no read. Settle any search still in flight, or its loading
-    // state would carry into the next one and skip the delay gate.
-    if (!query && category === 'all') {
-      setResults({ status: 'not-loaded' });
-      return;
-    }
-
-    if (isLocalCategory(category)) {
-      setResults({ status: 'loaded', data: { [category]: localSection(category, query, 50) } });
-      setSelectedIndex(-1);
-      return;
-    }
-
-    if (debounceRef.current) clearTimeout(debounceRef.current);
-    if (abortRef.current) abortRef.current.abort();
-
-    setResults({ status: 'loading' });
+    if (!isOpen || requested.length === 0) return;
     const controller = new AbortController();
-    abortRef.current = controller;
-
-    debounceRef.current = setTimeout(async () => {
-      try {
-        const data = await searchEverywhere(query, category, controller.signal);
-        if (!controller.signal.aborted) {
-          const merged = category === 'all'
-            ? {
-                ...data.results,
-                settings: localSection('settings', query, 5),
-                menu: localSection('menu', query, 5),
-              }
-            : data.results;
-          setResults({ status: 'loaded', data: merged });
-          setSelectedIndex(-1);
-        }
-      } catch (err) {
-        if (err instanceof DOMException && err.name === 'AbortError') return;
-        // Failed must not read as empty: the list says so where the rows go.
-        if (!controller.signal.aborted) setResults(toFailed(err));
-      }
-    }, 300);
-
-    return () => {
-      controller.abort();
-      if (debounceRef.current) clearTimeout(debounceRef.current);
+    const settle = (section: ServerSection, state: Loadable<SearchResultItem[]>) => {
+      if (controller.signal.aborted) return;
+      setServer(prev => ({
+        search,
+        sections: { ...(prev.search === search ? prev.sections : {}), [section]: state },
+      }));
     };
-  }, [query, category, isOpen]);
+    const limit = category === 'all' ? ALL_TAB_LIMIT : undefined;
+    const timer = setTimeout(() => {
+      for (const section of requested) {
+        searchEverywhere(query, section, { signal: controller.signal, limit }).then(
+          data => settle(section, { status: 'loaded', data: data.results[section] ?? [] }),
+          // Failed must not read as empty: the list says so under the rows.
+          err => settle(section, toFailed(err)),
+        );
+      }
+    }, SERVER_DEBOUNCE_MS);
+    return () => {
+      clearTimeout(timer);
+      controller.abort();
+    };
+  }, [search, query, category, requested, isOpen]);
 
   // Auto-focus input on open
   useEffect(() => {
@@ -276,15 +308,6 @@ export function SearchEverywhere() {
       inputRef.current.focus();
     }
   }, [isOpen]);
-
-  // Scroll selected result into view
-  useEffect(() => {
-    if (selectedIndex >= 0 && resultsRef.current) {
-      const buttons = resultsRef.current.querySelectorAll('[data-role="search-result"]');
-      const el = buttons[selectedIndex] as HTMLElement | undefined;
-      el?.scrollIntoView({ block: 'nearest' });
-    }
-  }, [selectedIndex]);
 
   function handleSelect(item: SearchResultItem) {
     saveRecent(item);
@@ -333,13 +356,28 @@ export function SearchEverywhere() {
     }
   }
 
-  const isRecentsMode = !query && category === 'all';
+  const local = useMemo(() => (isRecentsMode ? {} : localHits(query, category)), [isRecentsMode, query, category]);
+  const results: Record<string, SearchResultItem[]> = { ...local };
+  for (const section of requested) {
+    const state = serverState(section);
+    if (state.status === 'loaded') results[section] = state.data;
+  }
 
-  const flat = useMemo(
-    () => isRecentsMode ? recents : flattenResults(loadedOr(results, {}), category),
-    [isRecentsMode, recents, results, category],
-  );
-  const sections = useMemo(() => category === 'all' && !isRecentsMode ? getSections(loadedOr(results, {})) : [], [results, category, isRecentsMode]);
+  const flat = isRecentsMode ? recents : flattenResults(results, category);
+  const sections = category === 'all' && !isRecentsMode ? getSections(results) : [];
+  // The selection follows its row, so a category landing above it cannot move
+  // the cursor onto another hit.
+  const selectedIndex = selectedKey === null ? -1 : flat.findIndex(item => itemKey(item) === selectedKey);
+  const selectAt = (index: number) => setSelectedKey(index >= 0 && flat[index] ? itemKey(flat[index]) : null);
+
+  // Scroll selected result into view
+  useEffect(() => {
+    if (selectedIndex >= 0 && resultsRef.current) {
+      const buttons = resultsRef.current.querySelectorAll('[data-role="search-result"]');
+      const el = buttons[selectedIndex] as HTMLElement | undefined;
+      el?.scrollIntoView({ block: 'nearest' });
+    }
+  }, [selectedIndex]);
 
   function handleKeyDown(e: KeyboardEvent) {
     if (e.key === 'Escape') {
@@ -350,20 +388,19 @@ export function SearchEverywhere() {
 
     if (e.key === 'ArrowDown') {
       e.preventDefault();
-      setSelectedIndex(i => Math.min(i + 1, flat.length - 1));
+      selectAt(Math.min(selectedIndex + 1, flat.length - 1));
       return;
     }
 
     if (e.key === 'ArrowUp') {
       e.preventDefault();
-      setSelectedIndex(i => Math.max(i - 1, -1));
+      selectAt(Math.max(selectedIndex - 1, -1));
       return;
     }
 
     if (e.key === 'Enter' && flat.length > 0) {
       e.preventDefault();
-      const idx = selectedIndex >= 0 ? selectedIndex : 0;
-      if (flat[idx]) handleSelect(flat[idx]);
+      handleSelect(flat[Math.max(selectedIndex, 0)]);
       return;
     }
 
@@ -389,12 +426,12 @@ export function SearchEverywhere() {
           <div class="search-everywhere-section-header">{section}</div>
           {items.map((item, i) => (
             <ResultRow
-              key={`${item.category}:${item.id}`}
+              key={itemKey(item)}
               item={item}
               index={offset + i}
               selected={offset + i === selectedIndex}
               onSelect={handleSelect}
-              onHover={setSelectedIndex}
+              onHover={selectAt}
             />
           ))}
         </div>
@@ -402,14 +439,36 @@ export function SearchEverywhere() {
     }
     return flat.map((item, index) => (
       <ResultRow
-        key={`${item.category}:${item.id}`}
+        key={itemKey(item)}
         item={item}
         index={index}
         selected={index === selectedIndex}
         onSelect={handleSelect}
-        onHover={setSelectedIndex}
+        onHover={selectAt}
       />
     ));
+  }
+
+  function searchBody() {
+    if (!hasResults && pending.length > 0) return null;
+    if (!hasResults && failed.length > 0 && failed.length === requested.length) {
+      return <div class="search-everywhere-empty error-text">Search failed: {failed[0].error}</div>;
+    }
+    return (
+      <>
+        {hasResults ? rows() : (
+          <div class="search-everywhere-empty">
+            {query ? `No results for "${query}"` : `No ${sectionLabel(category).toLowerCase()}`}
+          </div>
+        )}
+        {failed.map(({ section, error }) => (
+          <div key={section} class="search-everywhere-note error-text">
+            {sectionLabel(section)} search failed: {error}
+          </div>
+        ))}
+        {showSearchLoading && pending.length > 0 && <PendingRow sections={pending} />}
+      </>
+    );
   }
 
   return (
@@ -434,7 +493,7 @@ export function SearchEverywhere() {
             value={query}
             onInput={(e) => {
               setQuery((e.target as HTMLInputElement).value);
-              setSelectedIndex(-1);
+              setSelectedKey(null);
             }}
             onKeyDown={handleKeyDown}
           />
@@ -444,7 +503,7 @@ export function SearchEverywhere() {
               aria-label="Clear search"
               onClick={() => {
                 setQuery('');
-                setSelectedIndex(-1);
+                setSelectedKey(null);
                 inputRef.current?.focus();
               }}
             >
@@ -475,15 +534,12 @@ export function SearchEverywhere() {
         <div class="search-everywhere-results" ref={resultsRef}>
           {isRecentsMode ? (
             hasResults ? rows() : <div class="search-everywhere-empty">No recent items</div>
-          ) : results.status === 'failed' ? (
-            <div class="search-everywhere-empty error-text">Search failed: {results.error}</div>
           ) : (
-            <LoadingFade showSkeleton={showSearchLoading} skeleton={<ListSkeletonOf count={5} row={() => <ResultRow />} />}>
-              {results.status === 'loaded' && (hasResults ? rows() : (
-                <div class="search-everywhere-empty">
-                  {query ? `No results for "${query}"` : `No ${CATEGORIES.find(c => c.id === category)!.label.toLowerCase()}`}
-                </div>
-              ))}
+            <LoadingFade
+              showSkeleton={showSearchLoading && !hasResults}
+              skeleton={<ListSkeletonOf count={5} row={() => <ResultRow />} />}
+            >
+              {searchBody()}
             </LoadingFade>
           )}
         </div>

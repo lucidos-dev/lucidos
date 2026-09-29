@@ -10,6 +10,17 @@ use base64::Engine as _;
 /// bound are still refused.
 const IMAGE_MAX_BYTES: u64 = 25 * 1024 * 1024;
 
+/// True when both paths reach one file on disk. A copy onto itself truncates
+/// the destination before it reads the source, which empties the file. A
+/// case-only rename on a case-insensitive disk reaches the same file.
+fn is_same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
+    }
+}
+
 /// Why a write to `data_path` should be rejected, or `None` if it's allowed.
 /// Centralized so all write tools share the same policy and message: every
 /// mutating file tool (`write_file`, `edit_file`, `copy_file`'s destination,
@@ -689,6 +700,13 @@ impl LucidosEngine {
         };
         let path = path.as_str();
 
+        // A `data/` edit reads, rewrites and commits under one hold of the repo
+        // lock. Read outside it, two concurrent edits both start from the same
+        // version and the later write silently drops the other's change.
+        let _repo_guard = match repo {
+            None => Some(self.lock_workspace_repo().await),
+            Some(_) => None,
+        };
         let content = std::fs::read_to_string(&full_path)
             .map_err(|_| format!("File '{}' not found", path))?;
 
@@ -742,8 +760,6 @@ impl LucidosEngine {
         let app_existed_before = data_path_app_id(path)
             .map(|id| self.app_manager.app_exists(id))
             .unwrap_or(false);
-
-        let _repo_guard = self.lock_workspace_repo().await;
 
         std::fs::write(&full_path, &new_content)
             .map_err(|e| format!("Failed to write file: {}", e))?;
@@ -1462,6 +1478,12 @@ impl LucidosEngine {
 
                 if !src_path.exists() {
                     return Ok(format!("Error: Source file '{}' not found", source));
+                }
+                if is_same_file(&src_path, &dst_path) {
+                    return Ok(format!(
+                        "Error: '{}' and '{}' are the same file, so nothing was copied",
+                        source, dst_data_path
+                    ));
                 }
 
                 let file_exists = dst_path.exists();

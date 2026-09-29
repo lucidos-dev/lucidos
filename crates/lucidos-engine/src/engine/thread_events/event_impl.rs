@@ -106,6 +106,7 @@ impl ThreadEvent {
             // the variant doc.
             cc_session_id: None,
             claude_config_dir: None,
+            claude_config_dir_explicit: None,
         })
     }
 
@@ -163,6 +164,7 @@ impl ThreadEvent {
             Self::MergeResolutionStarted { .. } => "MergeResolutionStarted",
             Self::MergeResolutionCleared { .. } => "MergeResolutionCleared",
             Self::ChangeHardened { .. } => "ChangeHardened",
+            Self::ChangeSummarized { .. } => "ChangeSummarized",
             Self::CodingAgentSettingsChanged { .. } => "CodingAgentSettingsChanged",
             Self::UserPromptInjected { .. } => "UserPromptInjected",
             Self::CredentialRequested { .. } => "CredentialRequested",
@@ -283,6 +285,7 @@ impl ThreadEvent {
         "MergeResolutionStarted",
         "MergeResolutionCleared",
         "ChangeHardened",
+        "ChangeSummarized",
         "CodingAgentSettingsChanged",
         "UserPromptInjected",
         "CredentialRequested",
@@ -435,9 +438,27 @@ impl ThreadEvent {
         )
     }
 
+    /// The only `event_type` names [`Self::indexable_text`] returns text for.
+    /// It checks this list first, so a memory rebuild that filters on it in
+    /// SQL indexes exactly what the live consumer does. A new arm there needs
+    /// its name here too, or it never fires.
+    pub const INDEXABLE_EVENT_TYPES: &'static [&'static str] = &[
+        "MessageReceived",
+        "SpokenMessageReceived",
+        "UserPromptInjected",
+        "ResponseGenerated",
+        "ResponseCanceled",
+        "ResponseAborted",
+        "ChildThreadCompleted",
+        "ImageDescribed",
+    ];
+
     /// Returns the text content to index into memory, if this event type is indexable.
     /// Used by both the live memory consumer and the rebuild path.
     pub fn indexable_text(&self) -> Option<&str> {
+        if !Self::INDEXABLE_EVENT_TYPES.contains(&self.event_type()) {
+            return None;
+        }
         match self {
             Self::MessageReceived { text, .. } => Some(text),
             // What the caller said on a CALL, which is the same fact in the

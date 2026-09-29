@@ -12,11 +12,18 @@ import { isKnownAppFrame } from '../utils/appFrame';
 import { adjustUiScale, resetUiScale, scaleModalOpen, dismissScaleModal } from '../components/shared/scaleModalState';
 import { UI_SCALE_STEP } from '../store/actions/preferences';
 import { isMobile } from '../utils/viewport';
+import { isMac } from '../utils/platform';
 import {
   toggleThreadPane, toggleContentPane,
   focusOrToggleThreadDrawer, toggleMaximizeFocusedPaneGroup,
-  stepThreadPaneWidth, stepThreadDrawerWidth, resetPaneLayout,
+  stepThreadPaneWidth, stepThreadDrawerWidth, resetPaneLayout, revealThreadPane,
 } from '../store/actions/pane';
+import { switchMenuItem, openSettingsSubview } from '../store/actions/menu';
+import { openFileSearch } from '../components/files/fileSearchActions';
+import { focusNewestToast } from '../components/shared/Toast';
+import { focusThreadTitleEditor } from '../components/chat/ThreadTitleEditor';
+import { copyLastResponse } from '../components/chat/copyLastResponse';
+import { promptStopRequested } from '../components/chat/prompt-input-helpers';
 import { seedDrawerHighlight, openHighlightedThreadActions, toggleFocusedThreadFamily } from '../components/drawer/ThreadDrawer';
 import { handlePaneTab, reconcilePaneFocus } from '../components/layout/paneFocus';
 import { historyBack, historyForward } from '../store/actions/focused-pane-history';
@@ -29,6 +36,14 @@ function startNewThread() {
   requestAnimationFrame(() => {
     focusPromptNow();
   });
+}
+
+/** Reveal the thread pane, then run `focus` once it is laid out. A collapsed
+ *  pane holds its prompt and title at zero size, where focus would land on
+ *  nothing the user can see. */
+function focusInThreadPane(focus: () => void): void {
+  revealThreadPane();
+  requestAnimationFrame(focus);
 }
 
 /** Toggle the expand/collapse of the turn currently carrying the navigation focus
@@ -77,6 +92,15 @@ const SHORTCUT_ACTIONS: Record<ShortcutId, () => void> = {
   newThread: startNewThread,
   closeThread: () => void runCloseCascade(),
   searchEverywhere: toggleSearchEverywhere,
+  searchFiles: () => openFileSearch(),
+  openSettings: () => switchMenuItem('settings'),
+  showShortcuts: () => openSettingsSubview('keyboard-shortcuts'),
+  openNotifications: () => switchMenuItem('notifications'),
+  focusNewestToast,
+  focusComposer: () => focusInThreadPane(focusPromptNow),
+  stopThread: () => { promptStopRequested.value = true; },
+  copyLastResponse,
+  renameThread: () => focusInThreadPane(focusThreadTitleEditor),
   // Context-gated: no-ops unless the thread drawer is focused with a thread row
   // highlighted, then opens that row's ⋯ menu (the keyboard route to per-row
   // actions, since the drawer is a single tab stop).
@@ -186,12 +210,33 @@ export function shouldTypeToFocusPrompt(
     && !(e.key === ' ' && isThreadTranscript(e.target));
 }
 
-/** Classify a chord forwarded from an app iframe (its keydowns never reach the
- *  host document, so the SDK forwards shortcut-shaped chords via postMessage).
- *  Returns the matching shortcut id, `'escape'` for the Escape policy, or `null`
- *  when the chord matches no shortcut (the host ignores it). Pure — exported for
- *  testing; the dispatch (running the action) lives in the message handler. */
-export function classifyForwardedChord(chord: ChordLike): ShortcutId | 'escape' | null {
+/** Whether a Mac text field owns this keydown. There Ctrl with a bare letter
+ *  edits text: Ctrl+K deletes to the line end, Ctrl+P moves up a line. So a
+ *  shortcut bound to `mod+<letter>` fires on ⌘ in a field, and anywhere else on
+ *  either key. Exported for testing, with the platform as a parameter. */
+export function isMacTextEditingKey(
+  e: Pick<KeyboardEvent, 'metaKey' | 'ctrlKey' | 'shiftKey' | 'altKey' | 'key' | 'target'>,
+  mac: boolean = isMac,
+): boolean {
+  return mac && e.ctrlKey && !e.metaKey && !e.shiftKey && !e.altKey
+    && /^[a-z]$/i.test(e.key) && isTextInput(e.target);
+}
+
+/** Whether the Escape policy would act: an overlay to close, native fullscreen
+ *  to stand down for, or a `data-escape-self` field, whose blur would commit
+ *  the edit its own Escape cancels. */
+function escapePolicyHasWork(): boolean {
+  if (overlayStack.value.length > 0 || nativeFullscreenElement() !== null) return true;
+  const active = typeof document === 'undefined' ? null : document.activeElement;
+  return active?.hasAttribute?.('data-escape-self') === true;
+}
+
+/** Who owns a chord: a shortcut id, `'escape'` for the Escape policy, or `null`
+ *  (nobody, so the key keeps its default). A registry chord on Escape (⇧Esc)
+ *  yields to the policy while it has work, so one press never does two things.
+ *  Shared by the host keydown, app-frame forwards and the PDF preview. */
+export function classifyChord(chord: ChordLike): ShortcutId | 'escape' | null {
+  if (chord.key === 'Escape' && escapePolicyHasWork()) return 'escape';
   const id = matchShortcut(chord);
   if (id) return id;
   if (chord.key === 'Escape') return 'escape';
@@ -206,7 +251,7 @@ export function classifyForwardedChord(chord: ChordLike): ShortcutId | 'escape' 
  *  the wrong state: notably `toggleContentPane` (⌘⇧3) would "focus" the
  *  already-focused pane (a no-op) instead of CLOSING it. Exported for testing. */
 export function dispatchForwardedChord(chord: ChordLike): void {
-  const result = classifyForwardedChord(chord);
+  const result = classifyChord(chord);
   if (result === null) return;
   focusedPane.value = 'content';
   if (result === 'escape') {
@@ -219,30 +264,30 @@ export function dispatchForwardedChord(chord: ChordLike): void {
   }
 }
 
-/** Run a real keydown captured INSIDE a same-origin content-pane preview iframe
- *  (file / HTML / diff previews) against the host shortcut registry. Unlike app
- *  iframes — which load the SDK and forward chords up via postMessage
- *  (`dispatchForwardedChord`) — preview iframes run no SDK, so their keydowns
- *  never reach the host: the shell's shortcuts silently die while focus is in the
- *  preview, AND the chord falls through to Chrome's own default for the combo
- *  (e.g. ⌘⇧↵ opens the page context menu). The preview document is same-origin,
- *  so the host can listen on it directly (`bridgePreviewIframeShortcuts`) and —
- *  having the real event here — `preventDefault()` the browser default, which the
- *  postMessage forward path cannot do. Because the keydown lives in the content
- *  pane, the focused pane IS content; reconcile `focusedPane` before dispatching
- *  so the pane toggles read the right state (same reason as the forwarded path).
+/** Run a real keydown captured INSIDE a same-origin PDF preview iframe against
+ *  the host shortcut registry. The frame runs no SDK, so its keydowns never
+ *  reach the host. The shell's shortcuts would silently die while focus is in
+ *  the preview. The chord would also fall through to Chrome's own default (⌘⇧↵
+ *  opens the page context menu). The document is same-origin, so the host
+ *  listens on it directly (`bridgePreviewIframeShortcuts`) and cancels the
+ *  default here. The opaque HTML artifact preview forwards over
+ *  `previewFrameBridge.ts` to `dispatchForwardedChord` instead.
+ *
+ *  Because the keydown lives in the content pane, the focused pane IS content.
+ *  Reconcile `focusedPane` before dispatching, so the pane toggles read the
+ *  right state (same reason as the forwarded path).
  *  A non-shortcut chord (plain Enter on a link, normal typing) is left untouched
  *  so the preview keeps its own behavior. Returns true when it consumed the
  *  event. Exported for testing. */
 export function dispatchPreviewIframeShortcut(e: KeyboardEvent): boolean {
-  const id = matchShortcut(e);
-  if (id) {
+  const route = classifyChord(e);
+  if (route !== null && route !== 'escape') {
     e.preventDefault();
     focusedPane.value = 'content';
-    SHORTCUT_ACTIONS[id]();
+    SHORTCUT_ACTIONS[route]();
     return true;
   }
-  if (e.key === 'Escape') {
+  if (route === 'escape') {
     // activeElement is the host <iframe> (focus is inside it) — not a text input,
     // so the policy dismisses any open host overlay and otherwise no-ops. The
     // fullscreen stand-down counts as not consumed here: the host did nothing
@@ -263,10 +308,12 @@ export function useKeyboardShortcuts(): void {
       // dropped — bare letters now fall through to type-to-focus below.
       // Runs BEFORE the Tab trap so a user who rebinds a shortcut onto Tab
       // still gets it — the trap only claims Tab presses that match no binding.
-      const id = matchShortcut(e);
-      if (id) {
+      // An Escape chord was settled in the capture phase, so 'escape' is not
+      // ours to act on here.
+      const route = isMacTextEditingKey(e) ? null : classifyChord(e);
+      if (route !== null && route !== 'escape') {
         e.preventDefault();
-        SHORTCUT_ACTIONS[id]();
+        SHORTCUT_ACTIONS[route]();
         return;
       }
 
@@ -321,6 +368,15 @@ export function useKeyboardShortcuts(): void {
     // overlay is dismissed we stop propagation so nothing downstream double-acts.
     function handleEscapeCapture(e: KeyboardEvent) {
       if (e.key !== 'Escape') return;
+      // A registry chord on Escape (⇧Esc) runs here, in capture, and stops the
+      // event, so no element's own Escape handler also acts on the press.
+      const route = classifyChord(e);
+      if (route !== null && route !== 'escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        SHORTCUT_ACTIONS[route]();
+        return;
+      }
       const result = dispatchEscape(document.activeElement);
       if (result === 'dismissed') {
         e.preventDefault();

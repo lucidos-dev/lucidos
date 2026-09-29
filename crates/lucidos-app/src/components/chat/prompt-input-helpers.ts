@@ -13,9 +13,16 @@ import type { ThreadState, ThreadStatus } from '../../store/thread-events';
  *  on send failure (the catch handler in PromptInput's `beginSend`). */
 export const submittingThreadIds = signal<Set<string>>(new Set());
 
+/** Set by the Stop shortcut, consumed by the one mounted PromptInput. The
+ *  composer owns the cancel (its settle window, its queued-upload branch), so
+ *  the shortcut asks it rather than cancelling behind its back. */
+export const promptStopRequested = signal(false);
+
 export interface UploadSendIntent<TContext = unknown> {
   useCodingAgent: boolean;
   context: TContext | null;
+  /** Ask the draft as a side question rather than send it. */
+  asSideQuestion?: boolean;
 }
 
 /** Thread sends the user clicked while an attached image was still uploading.

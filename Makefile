@@ -1,4 +1,4 @@
-.PHONY: build-local check lint lint-eval lint-fmt lint-rust lint-rust-clippy lint-shell fix fmt test test-eval test-gateway test-full test-scripts clean clean-all run-local stop restart status
+.PHONY: build-local check lint lint-eval lint-fmt lint-rust lint-rust-clippy lint-shell fix fmt test test-crates test-eval test-gateway test-full test-scripts clean clean-all run-local stop restart status
 
 # Run a heavy build under a *build slot*, so parallel coding-agent worktrees
 # cannot pile N full compiles onto one host. Degrades to a plain run when the
@@ -129,11 +129,11 @@ fmt:
 
 # Run tests. ENGINE_TEST_ARGS reaches test-engine.sh verbatim; the early suite
 # run of `/harden` passes its driver-module skips through it (ADR 0292).
-test: test-eval test-gateway
+test: test-eval test-gateway test-crates
 	./scripts/test-engine.sh $(ENGINE_TEST_ARGS)
 
 # Full test suite
-test-full: test-eval test-gateway
+test-full: test-eval test-gateway test-crates
 	./scripts/test-engine.sh --full
 
 # Run the shell-library unit tests: every scripts/lib/*_test.sh, per-suite pass
@@ -165,6 +165,15 @@ test-eval:
 # edit made on the ENGINE side.
 test-gateway:
 	cargo test --locked -p lucidos-gateway
+
+# The small library crates' own unit tests. Each one's tests are hermetic
+# (a throwaway $HOME or pool dir, no Postgres) and all six finish in about a
+# second. `make lint` compiles them under `--all-targets` and runs none, so
+# without this target a broken token check or capability check still passes.
+TEST_CRATES := lucidos-build-slot lucidos-file-backup-exclusion lucidos-frame-capability \
+	lucidos-installs lucidos-local-token lucidos-tailscale
+test-crates:
+	cargo test --locked $(addprefix -p ,$(TEST_CRATES))
 
 # Clean build artifacts (preserves workspace artifacts)
 #

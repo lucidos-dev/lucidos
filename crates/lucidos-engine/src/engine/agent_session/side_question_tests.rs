@@ -1,8 +1,12 @@
 use super::*;
 use crate::test_support::{setup_test_db, teardown_test_db};
 
-fn row(source: &str, coding_agent: Option<&str>) -> Option<(String, Option<String>)> {
-    Some((source.to_string(), coding_agent.map(str::to_string)))
+fn row(source: &str, coding_agent: Option<&str>) -> Option<ThreadRow> {
+    Some((
+        source.to_string(),
+        coding_agent.map(str::to_string),
+        "active".to_string(),
+    ))
 }
 
 #[test]
@@ -23,125 +27,38 @@ fn only_a_leading_btw_word_is_a_side_question() {
 }
 
 #[test]
-fn only_claude_code_threads_take_side_questions() {
-    assert_eq!(refusal_for(row("claude_code", Some("claude-code"))), None);
+fn claude_code_and_lucidos_threads_take_side_questions_and_codex_does_not() {
+    assert_eq!(
+        agent_for(row("claude_code", Some("claude-code"))),
+        Ok(SideQuestionAgent::ClaudeCode)
+    );
     // Rows from before the column existed were all Claude Code.
-    assert_eq!(refusal_for(row("claude_code", None)), None);
     assert_eq!(
-        refusal_for(row("claude_code", Some("codex"))),
-        Some(CODEX_UNSUPPORTED)
+        agent_for(row("claude_code", None)),
+        Ok(SideQuestionAgent::ClaudeCode)
     );
     assert_eq!(
-        refusal_for(row("chat", None)),
-        Some(NOT_CODING_AGENT_THREAD)
+        agent_for(row("claude_code", Some("codex"))),
+        Err(CODEX_UNSUPPORTED)
     );
-    assert_eq!(refusal_for(None), Some(NOT_CODING_AGENT_THREAD));
+    assert_eq!(agent_for(row("chat", None)), Ok(SideQuestionAgent::Lucidos));
+    assert_eq!(agent_for(None), Err(NO_SUCH_THREAD));
+    // A draft still composing has not started.
+    let draft = Some(("chat".to_string(), None, "composing".to_string()));
+    assert_eq!(agent_for(draft), Err(NO_SUCH_THREAD));
 }
 
-/// A session map holding one live Claude Code session whose side questions
-/// arrive on the returned receiver.
-fn live_session(
-    thread_id: Uuid,
-) -> (
-    Mutex<HashMap<Uuid, AgentSession>>,
-    tokio::sync::mpsc::UnboundedReceiver<SideQuestionRequest>,
-) {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let (mut session, _msg_rx) = AgentSession::for_test();
-    session.side_question_tx = Some(tx);
-    (Mutex::new(HashMap::from([(thread_id, session)])), rx)
-}
-
-/// A deadline no test here reaches.
-fn deadline() -> tokio::time::Instant {
-    tokio::time::Instant::now() + std::time::Duration::from_secs(10)
-}
-
-#[tokio::test]
-async fn a_live_session_answers_through_its_side_question_channel() {
-    let thread_id = Uuid::new_v4();
-    let (sessions, mut rx) = live_session(thread_id);
-    let driver = tokio::spawn(async move {
-        let request = rx.recv().await.expect("side question reaches the driver");
-        assert_eq!(request.question, "what is X?");
-        request.reply.send(Ok("X is a letter.".into())).unwrap();
-    });
-    let answer = ask_live(&sessions, thread_id, "what is X?", deadline()).await;
-    driver.await.unwrap();
-    assert_eq!(answer, Ok(Some("X is a letter.".into())));
-}
-
-#[tokio::test]
-async fn a_process_that_ends_before_answering_falls_back_to_cold() {
-    let thread_id = Uuid::new_v4();
-    let (sessions, mut rx) = live_session(thread_id);
-    // The driver exits and drops the pending reply unanswered.
-    tokio::spawn(async move { drop(rx.recv().await) });
-    assert_eq!(
-        ask_live(&sessions, thread_id, "q", deadline()).await,
-        Ok(None)
-    );
-}
-
-#[tokio::test]
-async fn claude_codes_refusal_reaches_the_asker() {
-    let thread_id = Uuid::new_v4();
-    let (sessions, mut rx) = live_session(thread_id);
-    tokio::spawn(async move {
-        let request = rx.recv().await.unwrap();
-        request.reply.send(Err("busy".into())).unwrap();
-    });
-    assert_eq!(
-        ask_live(&sessions, thread_id, "q", deadline()).await,
-        Err(SideQuestionFailure::Failed("busy".into()))
-    );
-}
-
-/// The live wait ends at the shared deadline. A cold retry after it can never
-/// push the question past the budget the browser waits for.
-#[tokio::test]
-async fn a_live_question_stops_at_the_shared_deadline() {
-    let thread_id = Uuid::new_v4();
-    let (sessions, mut rx) = live_session(thread_id);
-    // The driver holds the request and never answers.
-    let held = tokio::spawn(async move { rx.recv().await });
-    let started = tokio::time::Instant::now();
-    let deadline = started + std::time::Duration::from_millis(200);
-    assert_eq!(
-        ask_live(&sessions, thread_id, "q", deadline).await,
-        Err(SideQuestionFailure::Failed(
-            crate::runtime::claude_code::side_question_timeout_message()
-        ))
-    );
-    assert!(started.elapsed() < std::time::Duration::from_secs(5));
-    drop(held);
-}
-
-#[tokio::test]
-async fn no_live_process_goes_cold() {
-    let thread_id = Uuid::new_v4();
-    let empty = Mutex::new(HashMap::new());
-    assert_eq!(ask_live(&empty, thread_id, "q", deadline()).await, Ok(None));
-
-    let (sessions, _rx) = live_session(thread_id);
-    sessions
-        .lock()
-        .await
-        .get_mut(&thread_id)
-        .unwrap()
-        .process_exited = true;
-    assert_eq!(
-        ask_live(&sessions, thread_id, "q", deadline()).await,
-        Ok(None)
-    );
-
-    // A Codex session carries no side-question channel.
-    let (codex, _msg_rx) = AgentSession::for_test();
-    let sessions = Mutex::new(HashMap::from([(thread_id, codex)]));
-    assert_eq!(
-        ask_live(&sessions, thread_id, "q", deadline()).await,
-        Ok(None)
-    );
+/// An ask naming a blob the workspace never received is refused before
+/// anything is recorded, and the refusal names the hash.
+#[test]
+fn an_unknown_image_is_refused_by_name() {
+    let workspace = tempfile::tempdir().unwrap();
+    let hash = "d".repeat(64);
+    match check_images(workspace.path(), std::slice::from_ref(&hash)) {
+        Err(SideQuestionFailure::UnknownImage(message)) => assert!(message.contains(&hash)),
+        other => panic!("expected an unknown-image refusal, got {other:?}"),
+    }
+    assert_eq!(check_images(workspace.path(), &[]), Ok(()));
 }
 
 async fn seed_thread(pool: &sqlx::PgPool, thread_id: Uuid, source: &str, coding_agent: &str) {
@@ -178,10 +95,13 @@ async fn a_codex_thread_is_refused_and_nothing_is_recorded() {
         check_thread(&pool, codex).await,
         Err(SideQuestionFailure::Refused(CODEX_UNSUPPORTED))
     );
-    assert_eq!(check_thread(&pool, claude).await, Ok(()));
+    assert_eq!(
+        check_thread(&pool, claude).await,
+        Ok(SideQuestionAgent::ClaudeCode)
+    );
     assert_eq!(
         check_thread(&pool, Uuid::new_v4()).await,
-        Err(SideQuestionFailure::Refused(NOT_CODING_AGENT_THREAD))
+        Err(SideQuestionFailure::Refused(NO_SUCH_THREAD))
     );
     assert_eq!(event_count(&pool).await, before);
 
@@ -216,6 +136,7 @@ async fn a_recorded_ask_is_known_by_its_id_on_its_thread() {
     let asked = ThreadEvent::SideQuestionAsked {
         side_question_id,
         question: "what does it return?".into(),
+        image_hashes: vec![],
     };
     record(&bus, thread_id, asked, EventMeta::NONE)
         .await
@@ -283,6 +204,7 @@ async fn recovery_fails_only_the_asks_nothing_settled() {
         let asked = ThreadEvent::SideQuestionAsked {
             side_question_id,
             question: "q".into(),
+            image_hashes: vec![],
         };
         record(&bus, thread_id, asked, EventMeta::NONE)
             .await

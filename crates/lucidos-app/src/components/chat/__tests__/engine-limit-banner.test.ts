@@ -10,14 +10,7 @@ import { exchangeEngineLimitDetail } from '../../../store/thread-events';
 
 const here: string = dirname(fileURLToPath(import.meta.url));
 const source = readFileSync(resolve(here, '../ChatExchange.tsx'), 'utf-8');
-// settings.css is an @import barrel; inline the partials it pulls in so the
-// rule assertions below see the full concatenated stylesheet regardless of
-// which partial a rule lives in.
-const settingsBarrel = readFileSync(resolve(here, '../../../styles/settings.css'), 'utf-8');
-const css = settingsBarrel.replace(
-  /@import\s+'([^']+)';/g,
-  (_m: string, rel: string) => readFileSync(resolve(here, '../../../styles', rel), 'utf-8'),
-);
+const css = readFileSync(resolve(here, '../../../styles/chat/response.css'), 'utf-8');
 
 /**
  * When the chat agent hits the per-turn tool-call cap, the engine emits a

@@ -31,7 +31,7 @@ describe('a status glyph replaces the dot', () => {
   it('every glyph a status label can end in carries the marker class', () => {
     // The CSS keys on the marker, so a new glyph without it draws both.
     const glyphs = ['exchange-status-x', 'exchange-status-warning', 'exchange-status-continued',
-      'progress-dot-waiting', 'queued-message-remove'];
+      'progress-dot-waiting', 'queued-message-edit', 'queued-message-remove'];
     for (const glyph of glyphs) {
       const uses = chatExchange.match(new RegExp(`class(Name)?="[^"]*\\b${glyph}\\b[^"]*"`, 'g')) ?? [];
       expect(uses.length, `${glyph} is gone from ChatExchange`).toBeGreaterThan(0);

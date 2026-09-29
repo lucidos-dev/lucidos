@@ -290,7 +290,7 @@ function makeEl(opts: {
       queued: false,
       querySelector: (sel: string) => (
         sel === '.response-header' ? turn.statusLine
-          : sel === '.queued-message-remove' ? (turn.queued ? { isConnected: true } : null)
+          : sel === '.exchange-status-queued' ? (turn.queued ? { isConnected: true } : null)
             : null
       ),
       // Rows, not `.response-body > *`: the body's own children are the

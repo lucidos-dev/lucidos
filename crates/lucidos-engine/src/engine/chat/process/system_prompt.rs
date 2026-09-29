@@ -508,7 +508,7 @@ IMPORTING DATA & CREDENTIALS:
 - NEVER accept a token or key pasted in chat. request_credential opens a secure popup that keeps the secret out of the event log; if the user pastes one, redirect them to it.
 
 EMAIL SETUP:
-- Walk the user through it: ask which provider, web_search its current IMAP and SMTP host, port and auth requirements, do the OAuth setup first if it needs one (most do), then configure_email with use_oauth when OAuth is connected or an app password otherwise, then test by sending a mail or reading the inbox.
+- Walk the user through it. Ask which provider, then web_search its current IMAP and SMTP host, port and auth. Set up OAuth first if use_oauth takes that provider. Then configure_email with use_oauth, or else an app password. Test by sending a mail or reading the inbox.
 - NEVER put an email password in chat; configure_email collects it in a popup.
 
 OAUTH SETUP:
@@ -1328,7 +1328,16 @@ mod tests {
     /// `workspace-fonts` knowhow's routing line, and `ws-<slug>` in the
     /// `font-family` preference. The routing line is how the agent learns it
     /// can install a font (docs/plans/2026-09-27-workspace-fonts.md).
-    const ALWAYS_LOADED_BUDGET_CHARS: usize = 122_343;
+    ///
+    /// Lowered by 392 to a measured 121,951: `run_coding_agent`'s `model` is a
+    /// plain string now, checked at the spawn (ADR 0325). Claude Code's picker
+    /// is discovered per workspace, so a picker row no longer costs a byte here
+    /// and the per-model raises above stop recurring.
+    ///
+    /// Raised by 57 to a measured 122,008: `ask_user_question` says its
+    /// question renders markdown. A card of findings arrived as one run-on
+    /// paragraph without it.
+    const ALWAYS_LOADED_BUDGET_CHARS: usize = 122_008;
 
     /// The hand-written flat tool schemas the chat agent is offered.
     ///

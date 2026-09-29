@@ -16,7 +16,7 @@ vi.mock('./basePath', () => ({
 }));
 
 import { lucidos } from '@lucidos/sdk';
-import { renderMarkdown, renderMarkdownInline, renderMarkdownInlineWithLinks } from './renderMarkdown';
+import { renderMarkdown, renderMarkdownInline } from './renderMarkdown';
 // The downstream consumer of this output, so one test can assert the pair.
 import { linkifyPaths } from './linkifyPaths';
 
@@ -793,76 +793,6 @@ Use this pattern for all prompts.`;
     });
   });
 
-  describe('renderMarkdownInlineWithLinks (phrasing content + live links)', () => {
-    it('linkifies a bare URL into a new-tab anchor', () => {
-      const html = renderMarkdownInlineWithLinks(
-        'Draft PR #1488 is ready: https://github.com/example-org/example-repo/pull/1488 — mark it ready?',
-      );
-      expect(html).toContain(
-        '<a href="https://github.com/example-org/example-repo/pull/1488" target="_blank" rel="noopener">',
-      );
-      expect(html).toContain('https://github.com/example-org/example-repo/pull/1488</a>');
-    });
-
-    it('keeps [label](url) markdown links as anchors with the label text', () => {
-      const html = renderMarkdownInlineWithLinks('see [the PR](https://example.com/pr/1) please');
-      expect(html).toContain('<a href="https://example.com/pr/1" target="_blank" rel="noopener">');
-      expect(html).toContain('the PR</a>');
-    });
-
-    it('still renders inline markdown — bold, italic, code, breaks', () => {
-      const html = renderMarkdownInlineWithLinks('**bold** *it* `code` line\nbreak');
-      expect(html).toContain('<strong>bold</strong>');
-      expect(html).toContain('<em>it</em>');
-      expect(html).toContain('<code>code</code>');
-      expect(html).toContain('<br');
-    });
-
-    it('does NOT emit block elements — stays safe as phrasing content', () => {
-      const html = renderMarkdownInlineWithLinks('# heading\n- item one');
-      expect(html).not.toContain('<p>');
-      expect(html).not.toContain('<ul>');
-      expect(html).not.toContain('<h1');
-    });
-
-    it('drops javascript:-scheme links to label text (no anchor, no scheme)', () => {
-      const html = renderMarkdownInlineWithLinks('[click me](javascript:alert(1))');
-      expect(html).toContain('click me');
-      expect(html).not.toContain('<a ');
-      expect(html).not.toContain('javascript:');
-    });
-
-    it('does not anchor relative or non-http schemes', () => {
-      const html = renderMarkdownInlineWithLinks('[app](app:todo) and [file](data/artifacts/x.md)');
-      expect(html).not.toContain('<a ');
-      expect(html).toContain('app');
-      expect(html).toContain('file');
-    });
-
-    it('escapes quotes in the href so the attribute cannot break out', () => {
-      const html = renderMarkdownInlineWithLinks('[x](https://example.com/"onmouseover="alert(1))');
-      expect(html).not.toContain('"onmouseover="');
-      expect(html).toContain('&quot;');
-    });
-
-    it('still escapes dangerous tags from raw source', () => {
-      const html = renderMarkdownInlineWithLinks('try <script>x</script> here');
-      expect(html).not.toContain('<script>');
-      expect(html).toContain('&lt;script&gt;');
-    });
-
-    it('strips raw inline HTML javascript URLs', () => {
-      const html = renderMarkdownInlineWithLinks('<a href="javascript:alert(1)">tap</a>');
-      expect(html).toContain('<a>tap</a>');
-      expect(html).not.toContain('javascript:');
-      expect(html).not.toContain('alert(1)');
-    });
-
-    it('handles empty input', () => {
-      expect(renderMarkdownInlineWithLinks('')).toBe('');
-    });
-  });
-
   describe('thread reference links', () => {
     // No <base> stamped in tests → WORKSPACE_ID null → served-directly fallback.
     beforeEach(() => {
@@ -1102,12 +1032,10 @@ describe('renderMarkdown images', () => {
       expect(img.hasAttribute('data-size-hint')).toBe(true);
     });
 
-    it('stamps the inline variants a question card renders', () => {
-      for (const render of [renderMarkdownInline, renderMarkdownInlineWithLinks]) {
-        const img = imgOf(render('![alt](artifacts/x.png#800x600)'));
-        expect(img.getAttribute('src')).toBe('/myws/data/artifacts/x.png');
-        expect(img.getAttribute('style')).toBe('--hint-w: 800; --hint-h: 600;');
-      }
+    it('stamps the inline variant a question option renders', () => {
+      const img = imgOf(renderMarkdownInline('![alt](artifacts/x.png#800x600)'));
+      expect(img.getAttribute('src')).toBe('/myws/data/artifacts/x.png');
+      expect(img.getAttribute('style')).toBe('--hint-w: 800; --hint-h: 600;');
     });
 
     it('keeps an inline style the author gave a raw image', () => {
@@ -1183,13 +1111,11 @@ describe('renderMarkdown images', () => {
     // A question card showed an agent's mockups shrunk to the card's width,
     // with no sideways scroll and no tap to open them. The wrapper is a
     // `<span>`, so the output stays phrasing content a <button> may hold.
-    for (const render of [renderMarkdownInline, renderMarkdownInlineWithLinks]) {
-      const html = render('see ![alt](artifacts/x.png) here');
-      expect(imgSrc(html)).toBe('/myws/data/artifacts/x.png');
-      expect(html).toContain(
-        '<span class="image-scroll-wrapper"><img src="/myws/data/artifacts/x.png" alt="alt"></span>',
-      );
-    }
+    const html = renderMarkdownInline('see ![alt](artifacts/x.png) here');
+    expect(imgSrc(html)).toBe('/myws/data/artifacts/x.png');
+    expect(html).toContain(
+      '<span class="image-scroll-wrapper"><img src="/myws/data/artifacts/x.png" alt="alt"></span>',
+    );
   });
 
   it('transforms a table and an image in the same document without corrupting either', () => {

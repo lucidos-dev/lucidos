@@ -1482,6 +1482,7 @@ async fn a_proposal_keeps_the_thread_on_its_open_question() {
             tool_use_id: "tu-open".into(),
             answer: AnswerKind::FreeText {
                 text: "somewhere older".into(),
+                image_hashes: vec![],
             },
         },
     )
@@ -1982,6 +1983,7 @@ async fn free_text_answer_clears_the_draft_it_submitted() {
             // The client trims before submitting; the stored draft may not be.
             answer: AnswerKind::FreeText {
                 text: "night has passed by, any progress?".into(),
+                image_hashes: vec![],
             },
         },
         meta: EventMeta::NONE,
@@ -2024,6 +2026,7 @@ async fn free_text_answer_broadcasts_the_cleared_compose_state() {
             tool_use_id: "tu-1".into(),
             answer: AnswerKind::FreeText {
                 text: "night has passed by, any progress?".into(),
+                image_hashes: vec![],
             },
         },
         meta: EventMeta::NONE,
@@ -2205,6 +2208,7 @@ async fn an_answer_advances_the_epoch_even_when_it_cleared_no_stored_draft() {
             tool_use_id: "tu-1".into(),
             answer: AnswerKind::FreeText {
                 text: "the answer, typed and sent inside the debounce".into(),
+                image_hashes: vec![],
             },
         },
         meta: EventMeta::NONE,
@@ -2300,6 +2304,7 @@ async fn answer_that_clears_nothing_broadcasts_nothing() {
             tool_use_id: "tu-1".into(),
             answer: AnswerKind::FreeText {
                 text: "yes, go ahead".into(),
+                image_hashes: vec![],
             },
         },
         meta: EventMeta::NONE,
@@ -2337,6 +2342,7 @@ async fn answer_leaves_a_different_stored_draft_alone() {
             tool_use_id: "tu-1".into(),
             answer: AnswerKind::FreeText {
                 text: "yes, go ahead".into(),
+                image_hashes: vec![],
             },
         },
         meta: EventMeta::NONE,
@@ -2378,6 +2384,7 @@ async fn answer_leaves_an_image_bearing_draft_alone() {
             tool_use_id: "tu-1".into(),
             answer: AnswerKind::FreeText {
                 text: "look at this".into(),
+                image_hashes: vec![],
             },
         },
         meta: EventMeta::NONE,
@@ -2421,6 +2428,7 @@ async fn option_only_answer_clears_no_draft() {
             answer: AnswerKind::MultiSelected {
                 option_ids: vec!["opt-a".into()],
                 text: None,
+                image_hashes: vec![],
             },
         },
         meta: EventMeta::NONE,
@@ -2454,6 +2462,7 @@ async fn multi_select_answer_clears_the_draft_it_folded_in() {
             answer: AnswerKind::MultiSelected {
                 option_ids: vec!["opt-a".into()],
                 text: Some("and also check the logs".into()),
+                image_hashes: vec![],
             },
         },
         meta: EventMeta::NONE,

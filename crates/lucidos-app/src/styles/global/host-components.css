@@ -1921,3 +1921,28 @@ html[data-font-bold="none"] :is(.response-body .response-chunk, .response-body >
         opacity: 0;
     }
 }
+
+/* A placeholder while the backing value loads: a dimmed pill with no knob. The
+   switch then mounts in its real position instead of sliding across from a
+   default (the host's `LoadableToggle`). */
+.toggle-switch-loading {
+    background-color: var(--bg-tertiary);
+    border-radius: calc(var(--radius-control) * 2.5);
+    opacity: 0.4;
+    cursor: default;
+}
+
+/* ── A change's commit list (`CommitList`) ───────────────────────────────────
+   Unfolded under a change's headline on the change card and in the Changes
+   panel. The headline names the change, so the list reads quieter than it. */
+.change-commit-list {
+    margin: 0;
+    padding-left: 1.25rem;
+    font-size: var(--font-size-sm);
+    color: var(--text-secondary);
+}
+
+.change-commit-list li {
+    margin: 0.125rem 0;
+    overflow-wrap: anywhere;
+}

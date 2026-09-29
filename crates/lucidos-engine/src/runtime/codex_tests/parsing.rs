@@ -111,7 +111,9 @@ fn full_real_turn_maps_to_canonical_events() {
             model,
             slash_commands,
             skills,
+            agent_version,
         } => {
+            assert_eq!(agent_version, &None);
             assert_eq!(session_id, "019ebbf1-e752-7fb2-ab6b-d03f5dc7686d");
             assert_eq!(*model, None, "JSONL stream doesn't echo the model");
             assert!(slash_commands.is_empty());

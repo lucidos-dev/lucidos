@@ -1296,19 +1296,52 @@ pub(crate) fn split_tool_result(result: &str) -> ToolResultSplit {
     }
     if let Some(stub) = crate::engine::tools::files::strip_image_content_marker(result) {
         return ToolResultSplit {
-            llm_text: result.to_string(),
             event_stub: Some(stub),
-            images: Vec::new(),
+            ..ToolResultSplit::shared(result.to_string())
         };
     }
     if let Some(stub) = strip_app_capture_marker(result) {
         return ToolResultSplit {
-            llm_text: result.to_string(),
             event_stub: Some(stub),
-            images: Vec::new(),
+            ..ToolResultSplit::shared(result.to_string())
         };
     }
     ToolResultSplit::shared(result.to_string())
+}
+
+/// Take the answer-image marker off an `ask_user_question` result, returning
+/// the result and the blobs it names. Only that tool writes the marker. Any
+/// other tool may pass outside text through, so its result is left alone.
+pub(crate) fn take_answer_images(tool_name: &str, result: String) -> (String, Vec<String>) {
+    if tool_name != crate::llm::tool_names::ASK_USER_QUESTION {
+        return (result, Vec::new());
+    }
+    match crate::engine::agent_question::parse_answer_images(&result) {
+        Some((hashes, text)) => (text.to_string(), hashes),
+        None => (result, Vec::new()),
+    }
+}
+
+/// Load a result's attached blobs as images fit for the model.
+///
+/// The answer that named them was checked against the blob store moments
+/// ago, so a miss means the file was deleted in between. It is logged, and
+/// the model sees one image fewer than the result's text announced.
+pub(crate) fn load_attached_images(
+    workspace: &std::path::Path,
+    hashes: &[String],
+) -> Vec<crate::api::ChatImage> {
+    hashes
+        .iter()
+        .filter_map(|hash| {
+            let loaded = crate::core::blobs::read_blob_as_base64(workspace, hash);
+            if loaded.is_none() {
+                log!("[AgentLoop] Attached image {hash} is no longer in the blob store");
+            }
+            loaded
+        })
+        .map(|(base64, mime_type)| crate::api::ChatImage { base64, mime_type }.fit_for_llm())
+        .collect()
 }
 
 /// One finished tool call, as the wire-block builder needs it.
@@ -1320,6 +1353,8 @@ pub(crate) struct ToolOutput {
     pub text: String,
     /// The originating `ToolCalled` event id, or `None` when its emit failed.
     pub event_id: Option<uuid::Uuid>,
+    /// Images shown to the model after every result, already fit for it.
+    pub images: Vec<crate::api::ChatImage>,
 }
 
 /// Build the user message's content blocks from this iteration's tool outputs.
@@ -1343,8 +1378,14 @@ pub(crate) fn build_tool_result_blocks(
         tool_use_id,
         text: result,
         event_id,
+        images,
     } in tool_outputs
     {
+        trailing_blocks.extend(images.iter().map(|image| ContentBlock::Image {
+            source_type: "base64".to_string(),
+            media_type: image.mime_type.clone(),
+            data: image.base64.clone(),
+        }));
         if let Some((screenshot_b64, dom_text)) = parse_app_capture_marker(result) {
             result_blocks.push(ContentBlock::ToolResult {
                 tool_use_id: tool_use_id.clone(),

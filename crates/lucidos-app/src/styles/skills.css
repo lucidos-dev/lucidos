@@ -145,27 +145,6 @@
     color: var(--text-muted);
 }
 
-.trigger-type-schedule,
-.trigger-type-event,
-.trigger-type-hybrid {
-    font-size: var(--font-size-2xs);
-    font-weight: 600;
-    text-transform: uppercase;
-    padding: 0.0625rem 0.3125rem;
-    border-radius: calc(var(--radius-control) * 0.375);
-}
-
-.trigger-type-schedule {
-    background: var(--bg-tertiary);
-    color: var(--text-secondary);
-}
-
-.trigger-type-event,
-.trigger-type-hybrid {
-    background: color-mix(in srgb, var(--accent) 15%, transparent);
-    color: var(--accent);
-}
-
 /* Last-run outcome chip on the trigger row (OK / failed). Sits inline after the
    "Last run <time>" line so a threadless (script) trigger's health is visible at
    a glance; absent until the trigger has run under an engine that records status. */
@@ -173,33 +152,6 @@
     display: flex;
     align-items: baseline;
     gap: 0.375rem;
-}
-
-/* Built on `.label`, like the type chip beside it, rather than re-cutting the
-   same box: the chip sits inside `.list-row-info`, which sets
-   `word-break: break-word` for long names, and every descendant inherits it, so
-   a chip that draws its own box without `.label`'s `white-space: nowrap` breaks
-   between the two letters of OK the moment the column is squeezed. Only the
-   size and weight differ from the base chip. */
-.trigger-run-status {
-    font-size: var(--font-size-2xs);
-    font-weight: 600;
-}
-
-.trigger-run-status-ok {
-    background: color-mix(in srgb, var(--accent-green) 15%, transparent);
-    color: var(--accent-green);
-}
-
-.trigger-run-status-failed {
-    background: color-mix(in srgb, var(--accent-red) 15%, transparent);
-    color: var(--accent-red);
-}
-
-/* "from <plugin>" provenance chip on a plugin-installed trigger (ADR 0019). */
-.trigger-plugin-chip {
-    background: color-mix(in srgb, var(--accent) 12%, transparent);
-    color: var(--accent);
 }
 
 .trigger-event-list {

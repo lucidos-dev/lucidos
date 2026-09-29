@@ -238,6 +238,9 @@ pub struct Change {
     pub hardened: bool,
     pub thread_title: Option<String>,
     pub commits: Vec<String>,
+    /// The *change summary*, when a model has written one for the current
+    /// commit list. `None` for a single-commit change and until it lands.
+    pub summary: Option<String>,
     /// `true` when the originating CC turn ended in `ResponseFailed` —
     /// the worktree state reflects partial work, not a deliberate
     /// completion. The frontend reads this to surface a confirm-before-Apply
@@ -306,6 +309,7 @@ struct ChangeRow {
     post_merge_sha: Option<String>,
     thread_title: Option<String>,
     commits: Vec<String>,
+    summary: Option<String>,
     incomplete: bool,
 }
 
@@ -356,6 +360,7 @@ impl TryFrom<ChangeRow> for Change {
             hardened: row.hardened,
             thread_title: row.thread_title,
             commits: row.commits,
+            summary: row.summary,
             incomplete: row.incomplete,
         })
     }
@@ -390,6 +395,7 @@ struct ChangeWire<'a> {
     post_merge_sha: Option<&'a str>,
     thread_title: Option<&'a str>,
     commits: &'a [String],
+    summary: Option<&'a str>,
     incomplete: bool,
     thread_unsettled: bool,
     thread_settling: bool,
@@ -424,6 +430,7 @@ impl Serialize for Change {
             post_merge_sha: shas.and_then(|s| s.post.as_deref()),
             thread_title: self.thread_title.as_deref(),
             commits: &self.commits,
+            summary: self.summary.as_deref(),
             incomplete: self.incomplete,
             thread_unsettled: thread.unsettled(),
             thread_settling: thread.settling(),
@@ -840,6 +847,7 @@ mod tests {
             hardened: false,
             thread_title: None,
             commits: vec![],
+            summary: None,
             incomplete: false,
         }
     }
@@ -1368,6 +1376,7 @@ mod tests {
             hardened: true,
             thread_title: Some("T".into()),
             commits: vec!["c".into()],
+            summary: Some("S".into()),
             incomplete: false,
         }
     }
@@ -1395,7 +1404,7 @@ mod tests {
             },
         });
         let expected = format!(
-            r#"{{{IDS},{HEAD},"status":"pending","created_at":"2026-01-02T03:04:05Z","resolved_at":null,"merge_worktree_path":"/tmp/wt","merge_temp_branch":"merge-tmp/x","hardened":true,"pre_merge_sha":null,"post_merge_sha":null,"thread_title":"T","commits":["c"],"incomplete":false,"thread_unsettled":true,"thread_settling":true,"resolving_conflict":true,"apply_phase_started_at":"2026-01-02T03:10:00Z","predicted_conflict":"conflict"}}"#
+            r#"{{{IDS},{HEAD},"status":"pending","created_at":"2026-01-02T03:04:05Z","resolved_at":null,"merge_worktree_path":"/tmp/wt","merge_temp_branch":"merge-tmp/x","hardened":true,"pre_merge_sha":null,"post_merge_sha":null,"thread_title":"T","commits":["c"],"summary":"S","incomplete":false,"thread_unsettled":true,"thread_settling":true,"resolving_conflict":true,"apply_phase_started_at":"2026-01-02T03:10:00Z","predicted_conflict":"conflict"}}"#
         );
         assert_eq!(serde_json::to_string(&change).unwrap(), expected);
     }
@@ -1407,7 +1416,7 @@ mod tests {
             post: Some("bbb".into()),
         }));
         let expected = format!(
-            r#"{{{IDS},{HEAD},"status":"applied","created_at":"2026-01-02T03:04:05Z","resolved_at":null,"merge_worktree_path":null,"merge_temp_branch":null,"hardened":true,"pre_merge_sha":"aaa","post_merge_sha":"bbb","thread_title":"T","commits":["c"],"incomplete":false,"thread_unsettled":false,"thread_settling":false,"resolving_conflict":false,"apply_phase_started_at":null,"predicted_conflict":null}}"#
+            r#"{{{IDS},{HEAD},"status":"applied","created_at":"2026-01-02T03:04:05Z","resolved_at":null,"merge_worktree_path":null,"merge_temp_branch":null,"hardened":true,"pre_merge_sha":"aaa","post_merge_sha":"bbb","thread_title":"T","commits":["c"],"summary":"S","incomplete":false,"thread_unsettled":false,"thread_settling":false,"resolving_conflict":false,"apply_phase_started_at":null,"predicted_conflict":null}}"#
         );
         assert_eq!(serde_json::to_string(&change).unwrap(), expected);
     }

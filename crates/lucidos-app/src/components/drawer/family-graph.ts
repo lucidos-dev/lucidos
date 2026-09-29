@@ -200,19 +200,33 @@ export function hasCollapsedAncestor(
     collapsed: ReadonlySet<string>,
     graph: FamilyGraph,
 ): boolean {
-    const visited = new Set<string>([threadId]);
-    let current = graph.byId.get(threadId);
-    if (!current) return false;
-    let parentId = current.meta.parentThreadId;
-    while (parentId) {
-        if (collapsed.has(parentId)) return true;
-        if (visited.has(parentId)) return false;
-        visited.add(parentId);
-        const parent = graph.byId.get(parentId);
-        if (!parent) return false;
-        parentId = parent.meta.parentThreadId;
+    for (const id of ancestorIds(threadId, graph)) {
+        if (collapsed.has(id)) return true;
     }
     return false;
+}
+
+/** Every ancestor of `threadId` that is in `collapsed`, nearest first: the
+ *  families to expand so the thread's row renders. */
+export function collapsedAncestorIds(
+    threadId: string,
+    collapsed: ReadonlySet<string>,
+    graph: FamilyGraph,
+): string[] {
+    return [...ancestorIds(threadId, graph)].filter(id => collapsed.has(id));
+}
+
+/** Walk `parentThreadId` up from `threadId`, nearest first. Stops at a cycle
+ *  and at a parent missing from `graph`, but still yields that missing id,
+ *  since a collapsed set can name it. */
+function* ancestorIds(threadId: string, graph: FamilyGraph): Generator<string> {
+    const visited = new Set<string>([threadId]);
+    let parentId = graph.byId.get(threadId)?.meta.parentThreadId;
+    while (parentId && !visited.has(parentId)) {
+        yield parentId;
+        visited.add(parentId);
+        parentId = graph.byId.get(parentId)?.meta.parentThreadId;
+    }
 }
 
 /** Group threads into drawer sections. A thread's section is determined by its

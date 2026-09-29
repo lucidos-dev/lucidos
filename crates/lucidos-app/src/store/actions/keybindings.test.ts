@@ -33,7 +33,7 @@ beforeEach(() => {
 
 describe('bindingFor', () => {
   it('returns the default when preferences are not loaded or no override exists', () => {
-    expect(bindingFor('searchEverywhere')).toEqual({ mod: true, shift: true, alt: false, key: 's' });
+    expect(bindingFor('searchEverywhere')).toEqual({ mod: true, shift: false, alt: false, key: 'k' });
     setPrefs({});
     expect(bindingFor('newThread')).toEqual({ mod: true, shift: true, alt: false, key: 'o' });
   });
@@ -45,7 +45,7 @@ describe('bindingFor', () => {
 
   it('falls back to default on corrupt JSON', () => {
     preferences.value = { status: 'loaded', data: { [KEYBINDINGS_PREF_KEY]: '{not json' } };
-    expect(bindingFor('searchEverywhere')).toEqual({ mod: true, shift: true, alt: false, key: 's' });
+    expect(bindingFor('searchEverywhere')).toEqual({ mod: true, shift: false, alt: false, key: 'k' });
   });
 
   it('reads a renamed shortcut from its legacy persisted key', () => {
@@ -78,19 +78,25 @@ describe('isCustomized', () => {
 describe('matchShortcut', () => {
   it('finds the shortcut whose current binding matches the event', () => {
     setPrefs({});
-    expect(matchShortcut(evt({ ctrlKey: true, shiftKey: true, key: 'S' }))).toBe('searchEverywhere');
+    expect(matchShortcut(evt({ ctrlKey: true, key: 'k' }))).toBe('searchEverywhere');
     expect(matchShortcut(evt({ ctrlKey: true, shiftKey: true, key: 'W' }))).toBe('closeThread');
   });
 
   it('honors overrides', () => {
     setPrefs({ searchEverywhere: 'mod+shift+p' });
-    expect(matchShortcut(evt({ ctrlKey: true, shiftKey: true, key: 'S' }))).toBeNull();
+    expect(matchShortcut(evt({ ctrlKey: true, key: 'k' }))).toBeNull();
     expect(matchShortcut(evt({ ctrlKey: true, shiftKey: true, key: 'P' }))).toBe('searchEverywhere');
+  });
+
+  it('lets a chord the user bound beat a newer default on the same chord', () => {
+    // Search's default is mod+K. A user who bound New thread there keeps it.
+    setPrefs({ newThread: 'mod+k' });
+    expect(matchShortcut(evt({ ctrlKey: true, key: 'k' }))).toBe('newThread');
   });
 
   it('can exclude one id (the one being rebound)', () => {
     setPrefs({});
-    expect(matchShortcut(evt({ ctrlKey: true, shiftKey: true, key: 'S' }), 'searchEverywhere')).toBeNull();
+    expect(matchShortcut(evt({ ctrlKey: true, key: 'k' }), 'searchEverywhere')).toBeNull();
   });
 });
 
@@ -133,8 +139,8 @@ describe('recordChord', () => {
   });
 
   it('reports a conflict with a different shortcut', () => {
-    // Recording newThread, but Ctrl+Shift+S is searchEverywhere's binding.
-    expect(recordChord(evt({ ctrlKey: true, shiftKey: true, key: 'S' }), 'newThread')).toEqual({ kind: 'conflict', withId: 'searchEverywhere' });
+    // Recording newThread, but Ctrl+K is searchEverywhere's binding.
+    expect(recordChord(evt({ ctrlKey: true, key: 'k' }), 'newThread')).toEqual({ kind: 'conflict', withId: 'searchEverywhere' });
   });
 
   it('accepts a free chord', () => {
@@ -145,9 +151,9 @@ describe('recordChord', () => {
   });
 
   it('re-recording a shortcut to its own current binding is not a conflict', () => {
-    expect(recordChord(evt({ ctrlKey: true, shiftKey: true, key: 'S' }), 'searchEverywhere')).toEqual({
+    expect(recordChord(evt({ ctrlKey: true, key: 'k' }), 'searchEverywhere')).toEqual({
       kind: 'ok',
-      binding: { mod: true, shift: true, alt: false, key: 's' },
+      binding: { mod: true, shift: false, alt: false, key: 'k' },
     });
   });
 });
@@ -155,7 +161,7 @@ describe('recordChord', () => {
 describe('tooltipWithShortcut', () => {
   it('reflects the current binding (non-Mac form in the test env)', () => {
     setPrefs({});
-    expect(tooltipWithShortcut('Search everywhere', 'searchEverywhere')).toBe('Search everywhere · Ctrl+Shift+S');
+    expect(tooltipWithShortcut('Search everywhere', 'searchEverywhere')).toBe('Search everywhere · Ctrl+K');
     setPrefs({ searchEverywhere: 'mod+shift+p' });
     expect(tooltipWithShortcut('Search everywhere', 'searchEverywhere')).toBe('Search everywhere · Ctrl+Shift+P');
   });

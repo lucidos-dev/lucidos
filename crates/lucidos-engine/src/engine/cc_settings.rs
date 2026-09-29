@@ -171,6 +171,15 @@ pub(crate) fn build_cc_settings_json(additional_directories: &[PathBuf]) -> Stri
             }]
         }
     });
+    grant_directories(&mut settings, additional_directories);
+    settings.to_string()
+}
+
+/// Add the `permissions.additionalDirectories` grant, or nothing for an empty
+/// slice, so the file never names a directory that is not there. CC names
+/// these directories in its system prompt, so every settings file a session
+/// or its side-question copy runs under must grant the same set.
+fn grant_directories(settings: &mut serde_json::Value, additional_directories: &[PathBuf]) {
     if !additional_directories.is_empty() {
         settings["permissions"] = serde_json::json!({
             "additionalDirectories": additional_directories
@@ -179,29 +188,120 @@ pub(crate) fn build_cc_settings_json(additional_directories: &[PathBuf]) -> Stri
                 .collect::<Vec<_>>(),
         });
     }
-    settings.to_string()
+}
+
+/// Every directory a CC session is granted beyond its worktree.
+fn granted_directories(workspace_root: &Path) -> Vec<PathBuf> {
+    let mut granted = widened_directories(workspace_root);
+    granted.extend(os_tmp_directories());
+    granted
+}
+
+/// Write `body` to `path` whole. The temp name is unique, so two writers of
+/// the same file never rename each other's half-written copy into place.
+async fn write_whole(
+    path: &Path,
+    body: String,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let tmp = path.with_extension(format!("json.{}.tmp", uuid::Uuid::new_v4().simple()));
+    tokio::fs::write(&tmp, body).await?;
+    tokio::fs::rename(&tmp, path).await?;
+    Ok(())
 }
 
 pub(crate) async fn write_cc_settings(
     workspace_root: &Path,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let path = cc_settings_path_for_workspace(workspace_root);
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    let mut granted = widened_directories(workspace_root);
-    granted.extend(os_tmp_directories());
-    let body = build_cc_settings_json(&granted);
-    let tmp = path.with_extension("json.tmp");
-    tokio::fs::write(&tmp, body).await?;
-    tokio::fs::rename(&tmp, &path).await?;
+    write_whole(
+        &path,
+        build_cc_settings_json(&granted_directories(workspace_root)),
+    )
+    .await?;
     crate::log!("[CcSettings] wrote {}", path.display());
     Ok(())
+}
+
+/// The settings a side question's session copy runs under.
+pub(crate) fn cc_side_question_settings_path_for_workspace(workspace_root: &Path) -> PathBuf {
+    workspace_root.join(".lucidos/cc-side-question-settings.json")
+}
+
+/// Render a side question's settings: one PreToolUse hook refusing every tool,
+/// plus the session's own directory grants. The hook command single-quotes the
+/// refusal for the shell, so the refusal must hold no single quote.
+pub(crate) fn build_cc_side_question_settings_json(additional_directories: &[PathBuf]) -> String {
+    let refusal = serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason":
+                crate::engine::agent_session::side_question::SIDE_QUESTION_TOOL_REFUSAL,
+        }
+    });
+    let mut settings = serde_json::json!({
+        "hooks": {
+            "PreToolUse": [{
+                "matcher": "*",
+                "hooks": [{
+                    "type": "command",
+                    "command": format!("printf '%s' '{refusal}'"),
+                }]
+            }]
+        }
+    });
+    grant_directories(&mut settings, additional_directories);
+    settings.to_string()
+}
+
+/// Write a side question's settings and return their path.
+pub(crate) async fn write_cc_side_question_settings(
+    workspace_root: &Path,
+) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+    let path = cc_side_question_settings_path_for_workspace(workspace_root);
+    let body = build_cc_side_question_settings_json(&granted_directories(workspace_root));
+    write_whole(&path, body).await?;
+    Ok(path)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A side question must not run a single tool, whatever the model tries,
+    /// and its refusal must reach CC as a valid PreToolUse deny.
+    #[test]
+    fn side_question_settings_refuse_every_tool() {
+        let json = build_cc_side_question_settings_json(&[PathBuf::from("/w/data")]);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let entries = parsed["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(entries.len(), 1, "one hook, and it covers everything");
+        assert_eq!(entries[0]["matcher"], "*");
+        let command = entries[0]["hooks"][0]["command"].as_str().unwrap();
+        let printed = command
+            .strip_prefix("printf '%s' '")
+            .and_then(|rest| rest.strip_suffix('\''))
+            .expect("a single-quoted printf");
+        let output: serde_json::Value = serde_json::from_str(printed).unwrap();
+        assert_eq!(output["hookSpecificOutput"]["permissionDecision"], "deny");
+        assert_eq!(output["hookSpecificOutput"]["hookEventName"], "PreToolUse");
+        assert!(parsed.get("hooks").unwrap().get("Stop").is_none());
+    }
+
+    /// CC names the granted directories in its system prompt, so the copy must
+    /// grant exactly what the session does or the prompt cache misses.
+    #[test]
+    fn side_question_settings_grant_the_sessions_directories() {
+        let dirs = [PathBuf::from("/w/data"), PathBuf::from("/tmp")];
+        let session: serde_json::Value =
+            serde_json::from_str(&build_cc_settings_json(&dirs)).unwrap();
+        let copy: serde_json::Value =
+            serde_json::from_str(&build_cc_side_question_settings_json(&dirs)).unwrap();
+        assert_eq!(session["permissions"], copy["permissions"]);
+    }
 
     /// The engine's settings file outranks the user's own CC settings, so a
     /// default here would silently override the model and effort they chose.

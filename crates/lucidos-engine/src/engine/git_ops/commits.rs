@@ -212,9 +212,10 @@ fn is_internal_auto_commit(subject: &str) -> bool {
 }
 
 /// Run `git log --format=%s <args>` and return user-meaningful commit subjects.
-/// Internal auto-commits and blank lines are filtered out.
+/// Merge commits, internal auto-commits and blank lines are filtered out. A
+/// merge is the engine back-merging main, never a commit the agent wrote.
 async fn commit_subjects(repo_root: &Path, log_args: &[&str]) -> Vec<String> {
-    let mut args = vec!["log", "--format=%s"];
+    let mut args = vec!["log", "--no-merges", "--format=%s"];
     args.extend_from_slice(log_args);
     match git_cmd(&args, repo_root).await {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)

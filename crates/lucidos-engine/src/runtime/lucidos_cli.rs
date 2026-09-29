@@ -203,10 +203,10 @@ pub(crate) async fn place_lucidos_cli_skill(
     engine_copy: &str,
 ) {
     use crate::engine::agent_session::CodingAgentKind;
-    use crate::engine::git_ops::{hide_phantom_tracked_skill, unhide_tracked_skill};
+    use crate::engine::git_ops::hide_phantom_tracked_skill;
 
     match kind {
-        CodingAgentKind::Lucidos => unhide_tracked_skill(cwd, LUCIDOS_CLI_SKILL_REL_PATH).await,
+        CodingAgentKind::Lucidos => {}
         CodingAgentKind::App | CodingAgentKind::External => {
             if let Err(e) = write_lucidos_cli_skill(cwd, engine_copy) {
                 crate::log!(

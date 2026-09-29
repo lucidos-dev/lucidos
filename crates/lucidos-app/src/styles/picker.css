@@ -1170,23 +1170,16 @@
 }
 /* The message is addressed by class, never by position. `> span:first-of-type`
    reads as "the message", but in the running banner the SPINNER is the first
-   span, and at (0,2,1) that selector outranks `.ws-picker-restore-spinner`'s
-   `flex: 0 0 auto` (0,1,0): the spinner grew to the full banner width and
+   span, and at (0,2,1) that selector outranks the spinner's own flex rule
+   (0,1,0): the spinner grew to the full banner width and
    `border-radius: 50%` turned it into a rotating ellipse spilling out of the
    box. */
 .ws-picker-restore-banner > .ws-picker-restore-text { flex: 1 1 auto; min-width: 0; }
 
+/* The shared .mini-spinner, in white: the picker's brand blue is the same in
+   every theme, so its ink is too. */
 .ws-picker-restore-spinner {
-  flex: 0 0 auto;
-  width: 1rem;
-  height: 1rem;
-  border-radius: 50%;
-  border: 0.125rem solid rgba(255, 255, 255, 0.3);
-  border-top-color: #fff;
-  animation: ws-restore-spin 0.8s linear infinite;
-}
-@keyframes ws-restore-spin {
-  to { transform: rotate(360deg); }
+  --spinner-color: #fff;
 }
 
 /* ── Reduced motion ──────────────────────────────────────────────────────── */
@@ -1197,7 +1190,6 @@
 :root[data-motion="reduce"] .ws-rv-flash,
 :root[data-motion="reduce"] .ws-rv-final,
 :root[data-motion="reduce"] .ws-picker-dot-booting,
-:root[data-motion="reduce"] .ws-picker-restore-spinner,
 :root[data-motion="reduce"] .ws-picker-reload.is-reloading svg {
   animation: none;
 }

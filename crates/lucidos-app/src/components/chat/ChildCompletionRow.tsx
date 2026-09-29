@@ -1,4 +1,5 @@
 import { focusThreadOrBootstrap } from '../../store/actions/threads';
+import { threadMap } from '../../store/store';
 import { renderMarkdown } from '../../utils/renderMarkdown';
 import { eventRowBody } from './EventRow';
 import type { EventRowTone } from './EventRow';
@@ -100,11 +101,24 @@ interface StoppedProps {
   childThreadTitle?: string;
 }
 
+/** What a stopped row's state says, read from the child's live meta. The event
+ *  is immutable, but "Waiting for you" is a present-tense claim, so it holds
+ *  only while the child is still stopped. An unloaded child has no live state,
+ *  and the row then says only what the event proves. */
+function childStoppedState(childThreadId: string): { label: string; tone: EventRowTone } {
+  const child = threadMap.value.get(childThreadId);
+  if (!child) return { label: 'Stopped', tone: 'halted' };
+  return child.meta.isStoppedChild
+    ? { label: 'Waiting for you', tone: 'halted' }
+    : { label: 'No longer waiting', tone: 'none' };
+}
+
 /** A user Stop paused one of this thread's children, as an event row
  *  (ADR 0252). It is the parent-side half of a *stopped child*: the child is
  *  alive and waits for the user, and this thread was not woken. So the state
- *  says who the child is waiting for. */
+ *  says who the child is waiting for, until the child moves on. */
 export function ChildStoppedRow(props: StoppedProps) {
+  const { label, tone } = childStoppedState(props.childThreadId);
   return eventRowBody({
     kind: 'child',
     state: 'stopped',
@@ -115,8 +129,8 @@ export function ChildStoppedRow(props: StoppedProps) {
         {threadLink(props.childThreadId, props.childThreadTitle)}
       </>
     ),
-    stateLabel: 'Waiting for you',
-    tone: 'halted',
+    stateLabel: label,
+    tone,
   });
 }
 

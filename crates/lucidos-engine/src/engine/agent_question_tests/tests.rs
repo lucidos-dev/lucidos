@@ -15,7 +15,15 @@ fn validate_answer_accepts_selected_and_freetext_and_canceled() {
         false
     )
     .is_ok());
-    assert!(validate_answer(&AnswerKind::FreeText { text: "x".into() }, &opts, false).is_ok());
+    assert!(validate_answer(
+        &AnswerKind::FreeText {
+            text: "x".into(),
+            image_hashes: vec![]
+        },
+        &opts,
+        false
+    )
+    .is_ok());
     assert!(validate_answer(&AnswerKind::Canceled, &opts, false).is_ok());
 
     // Multi-select question accepts the same fall-throughs (single Selected
@@ -37,6 +45,7 @@ fn validate_answer_accepts_multi_selected_with_known_ids() {
     let answer = AnswerKind::MultiSelected {
         option_ids: vec!["opt-0".into(), "opt-2".into()],
         text: None,
+        image_hashes: vec![],
     };
     assert!(validate_answer(&answer, &opts, true).is_ok());
 }
@@ -49,6 +58,7 @@ fn validate_answer_accepts_multi_selected_with_only_text() {
     let answer = AnswerKind::MultiSelected {
         option_ids: vec![],
         text: Some("just text".into()),
+        image_hashes: vec![],
     };
     assert!(validate_answer(&answer, &opts, true).is_ok());
 }
@@ -59,6 +69,7 @@ fn validate_answer_accepts_multi_selected_with_ids_and_text() {
     let answer = AnswerKind::MultiSelected {
         option_ids: vec!["opt-0".into()],
         text: Some("plus this".into()),
+        image_hashes: vec![],
     };
     assert!(validate_answer(&answer, &opts, true).is_ok());
 }
@@ -69,6 +80,7 @@ fn validate_answer_rejects_empty_multi_selected() {
     let answer = AnswerKind::MultiSelected {
         option_ids: vec![],
         text: None,
+        image_hashes: vec![],
     };
     let err = validate_answer(&answer, &opts, true).expect_err("must reject empty");
     assert!(
@@ -84,6 +96,7 @@ fn validate_answer_rejects_multi_selected_with_only_empty_text() {
     let answer = AnswerKind::MultiSelected {
         option_ids: vec![],
         text: Some(String::new()),
+        image_hashes: vec![],
     };
     assert!(validate_answer(&answer, &opts, true).is_err());
 }
@@ -94,6 +107,7 @@ fn validate_answer_rejects_unknown_multi_selected_id() {
     let answer = AnswerKind::MultiSelected {
         option_ids: vec!["opt-0".into(), "opt-99".into()],
         text: None,
+        image_hashes: vec![],
     };
     let err = validate_answer(&answer, &opts, true).expect_err("must reject unknown id");
     assert!(
@@ -108,6 +122,7 @@ fn validate_answer_rejects_multi_selected_for_single_select_question() {
     let answer = AnswerKind::MultiSelected {
         option_ids: vec!["opt-0".into()],
         text: None,
+        image_hashes: vec![],
     };
     let err = validate_answer(&answer, &opts, false).expect_err("single-select rejects multi");
     assert!(
@@ -131,7 +146,10 @@ async fn ensure_resume_emits_continuation_requested_when_no_live_session() {
         &bus,
         &sessions,
         thread_id,
-        &AnswerKind::FreeText { text: "Y".into() },
+        &AnswerKind::FreeText {
+            text: "Y".into(),
+            image_hashes: vec![],
+        },
         None,
     )
     .await;
@@ -163,7 +181,10 @@ async fn ensure_resume_emits_continuation_requested_when_session_exited() {
         &bus,
         &sessions,
         thread_id,
-        &AnswerKind::FreeText { text: "Y".into() },
+        &AnswerKind::FreeText {
+            text: "Y".into(),
+            image_hashes: vec![],
+        },
         None,
     )
     .await;
@@ -195,7 +216,10 @@ async fn ensure_resume_skips_emit_when_session_is_alive() {
         &bus,
         &sessions,
         thread_id,
-        &AnswerKind::FreeText { text: "Y".into() },
+        &AnswerKind::FreeText {
+            text: "Y".into(),
+            image_hashes: vec![],
+        },
         None,
     )
     .await;
@@ -272,7 +296,10 @@ async fn arm_question_resume_sets_flag_on_live_session() {
     let armed = arm_question_resume_if_live(
         &sessions,
         thread_id,
-        &AnswerKind::FreeText { text: "Y".into() },
+        &AnswerKind::FreeText {
+            text: "Y".into(),
+            image_hashes: vec![],
+        },
     )
     .await;
     assert!(armed, "must report a live subprocess was armed");
@@ -300,7 +327,10 @@ async fn arm_question_resume_skips_exited_session() {
     let armed = arm_question_resume_if_live(
         &sessions,
         thread_id,
-        &AnswerKind::FreeText { text: "Y".into() },
+        &AnswerKind::FreeText {
+            text: "Y".into(),
+            image_hashes: vec![],
+        },
     )
     .await;
     assert!(!armed, "an exited subprocess must not be armed");
@@ -324,7 +354,10 @@ async fn arm_question_resume_skips_absent_session() {
     let armed = arm_question_resume_if_live(
         &sessions,
         thread_id,
-        &AnswerKind::FreeText { text: "Y".into() },
+        &AnswerKind::FreeText {
+            text: "Y".into(),
+            image_hashes: vec![],
+        },
     )
     .await;
     assert!(!armed, "an absent session must not be armed");
@@ -485,6 +518,7 @@ async fn emit_resume_marker_emits_for_free_text_answer() {
         thread_id,
         &AnswerKind::FreeText {
             text: "purple".into(),
+            image_hashes: vec![],
         },
         None,
         crate::runtime::CodingAgent::ClaudeCode,
@@ -705,15 +739,99 @@ async fn response_aborted_orphans_only_active_lookup() {
 #[test]
 fn selected_answer_resolves_to_label() {
     let answer = serde_json::json!({"kind": "Selected", "option_id": "opt-1"});
-    let out = build_hook_answers(&[answer], &questions());
+    let out = build_hook_answers(&[answer], &questions(), AnswerImages::AttachedBlocks);
     assert_eq!(out, serde_json::json!({"Fav color?": "Blue"}));
 }
 
 #[test]
 fn free_text_passes_through() {
     let answer = serde_json::json!({"kind": "FreeText", "text": "purple"});
-    let out = build_hook_answers(&[answer], &questions());
+    let out = build_hook_answers(&[answer], &questions(), AnswerImages::AttachedBlocks);
     assert_eq!(out, serde_json::json!({"Fav color?": "purple"}));
+}
+
+/// A coding agent opens an answer's image itself, so the relayed text names
+/// the blob's absolute path after the typed text.
+#[test]
+fn free_text_images_name_their_blob_paths_for_a_coding_agent() {
+    let workspace = tempfile::tempdir().unwrap();
+    // Only the leading bytes are sniffed, so a PNG header is enough.
+    let png = [
+        0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 0x0D,
+    ];
+    let blob = crate::core::blobs::write_blob(workspace.path(), &png).unwrap();
+    let answer = serde_json::json!({
+        "kind": "FreeText", "text": "this one", "image_hashes": [blob.hash]
+    });
+    let out = build_hook_answers(
+        &[answer],
+        &questions(),
+        AnswerImages::BlobPaths(workspace.path()),
+    );
+    let value = out["Fav color?"].as_str().unwrap();
+    assert!(
+        value.starts_with("this one\n\n"),
+        "text first, got {value:?}"
+    );
+    assert!(
+        value.contains(&blob.path.display().to_string()),
+        "must name the blob path, got {value:?}"
+    );
+}
+
+/// The Lucidos Agent sees the images as blocks, so its text only says so.
+/// An image-only answer is still never empty, which CC reads as unanswered.
+#[test]
+fn image_only_answer_announces_attached_blocks() {
+    let answer = serde_json::json!({
+        "kind": "MultiSelected", "option_ids": [], "image_hashes": ["a".repeat(64), "b".repeat(64)]
+    });
+    let out = build_hook_answers(&[answer], &questions(), AnswerImages::AttachedBlocks);
+    assert_eq!(
+        out["Fav color?"],
+        "[The user attached 2 images to this answer. They were shown right after this \
+         result, in this turn only.]"
+    );
+}
+
+#[test]
+fn answer_images_sentinel_round_trips_and_skips_imageless_batches() {
+    let plain = serde_json::json!({"kind": "FreeText", "text": "x"});
+    assert_eq!(
+        with_answer_images("{}".into(), std::slice::from_ref(&plain)),
+        "{}"
+    );
+    let with = serde_json::json!({"kind": "FreeText", "text": "x", "image_hashes": ["h1"]});
+    let marked = with_answer_images("{}".into(), &[plain, with]);
+    assert_eq!(
+        parse_answer_images(&marked),
+        Some((vec!["h1".to_string()], "{}"))
+    );
+}
+
+#[test]
+fn an_answer_naming_an_unknown_image_is_refused() {
+    let workspace = tempfile::tempdir().unwrap();
+    let answer = AnswerKind::FreeText {
+        text: "see".into(),
+        image_hashes: vec!["c".repeat(64)],
+    };
+    let err = check_answer_images(workspace.path(), &answer).unwrap_err();
+    assert!(
+        err.contains(&"c".repeat(64)),
+        "must name the hash, got {err:?}"
+    );
+    assert!(check_answer_images(workspace.path(), &AnswerKind::Canceled).is_ok());
+}
+
+#[test]
+fn multi_selected_accepts_images_alone() {
+    let answer = AnswerKind::MultiSelected {
+        option_ids: vec![],
+        text: None,
+        image_hashes: vec!["a".repeat(64)],
+    };
+    assert!(validate_answer(&answer, &[opt("opt-0", "A")], true).is_ok());
 }
 
 #[test]
@@ -721,7 +839,7 @@ fn canceled_returns_explicit_marker_not_empty_object() {
     // Empty `{}` would be read as "unanswered" by CC's model, causing an
     // infinite re-invocation loop. The marker terminates the call.
     let answer = serde_json::json!({"kind": "Canceled"});
-    let out = build_hook_answers(&[answer], &questions());
+    let out = build_hook_answers(&[answer], &questions(), AnswerImages::AttachedBlocks);
     assert_eq!(out, serde_json::json!({"Fav color?": "(canceled)"}));
 }
 
@@ -731,7 +849,7 @@ fn canceled_returns_explicit_marker_not_empty_object() {
 #[test]
 fn superseded_tells_the_model_the_reply_arrives_as_its_next_input() {
     let answer = serde_json::json!({"kind": "Superseded"});
-    let out = build_hook_answers(&[answer], &questions());
+    let out = build_hook_answers(&[answer], &questions(), AnswerImages::AttachedBlocks);
     let value = out["Fav color?"].as_str().expect("string answer");
     assert!(
         value.starts_with("(superseded)"),
@@ -755,7 +873,11 @@ fn a_superseded_batch_reads_superseded_for_every_card() {
         {"question": "Fav animal?", "options": [{"label": "Cat"}]},
     ]);
     let superseded = serde_json::json!({"kind": "Superseded"});
-    let out = build_hook_answers(&[superseded.clone(), superseded], &two);
+    let out = build_hook_answers(
+        &[superseded.clone(), superseded],
+        &two,
+        AnswerImages::AttachedBlocks,
+    );
     for key in ["Fav color?", "Fav animal?"] {
         let value = out[key].as_str().expect("string answer");
         assert!(
@@ -768,7 +890,7 @@ fn a_superseded_batch_reads_superseded_for_every_card() {
 #[test]
 fn missing_label_falls_back_to_option_id() {
     let answer = serde_json::json!({"kind": "Selected", "option_id": "opt-9"});
-    let out = build_hook_answers(&[answer], &questions());
+    let out = build_hook_answers(&[answer], &questions(), AnswerImages::AttachedBlocks);
     assert_eq!(out, serde_json::json!({"Fav color?": "opt-9"}));
 }
 
@@ -778,7 +900,7 @@ fn multi_selected_joins_labels_with_comma_space() {
         "kind": "MultiSelected",
         "option_ids": ["opt-0", "opt-1"]
     });
-    let out = build_hook_answers(&[answer], &questions());
+    let out = build_hook_answers(&[answer], &questions(), AnswerImages::AttachedBlocks);
     assert_eq!(out, serde_json::json!({"Fav color?": "Red, Blue"}));
 }
 
@@ -788,7 +910,7 @@ fn multi_selected_unknown_id_falls_back_to_id() {
         "kind": "MultiSelected",
         "option_ids": ["opt-0", "opt-9"]
     });
-    let out = build_hook_answers(&[answer], &questions());
+    let out = build_hook_answers(&[answer], &questions(), AnswerImages::AttachedBlocks);
     assert_eq!(out, serde_json::json!({"Fav color?": "Red, opt-9"}));
 }
 
@@ -798,7 +920,7 @@ fn multi_selected_single_id_yields_one_label() {
         "kind": "MultiSelected",
         "option_ids": ["opt-1"]
     });
-    let out = build_hook_answers(&[answer], &questions());
+    let out = build_hook_answers(&[answer], &questions(), AnswerImages::AttachedBlocks);
     assert_eq!(out, serde_json::json!({"Fav color?": "Blue"}));
 }
 
@@ -809,7 +931,7 @@ fn multi_selected_with_text_appends_after_labels() {
         "option_ids": ["opt-0", "opt-1"],
         "text": "and also purple",
     });
-    let out = build_hook_answers(&[answer], &questions());
+    let out = build_hook_answers(&[answer], &questions(), AnswerImages::AttachedBlocks);
     assert_eq!(
         out,
         serde_json::json!({"Fav color?": "Red, Blue, and also purple"})
@@ -823,7 +945,7 @@ fn multi_selected_with_only_text_yields_just_text() {
     "option_ids": [],
     "text": "freeform answer",
     });
-    let out = build_hook_answers(&[answer], &questions());
+    let out = build_hook_answers(&[answer], &questions(), AnswerImages::AttachedBlocks);
     assert_eq!(out, serde_json::json!({"Fav color?": "freeform answer"}));
 }
 
@@ -836,7 +958,7 @@ fn multi_selected_with_empty_text_omits_trailing_separator() {
         "option_ids": ["opt-0"],
         "text": "",
     });
-    let out = build_hook_answers(&[answer], &questions());
+    let out = build_hook_answers(&[answer], &questions(), AnswerImages::AttachedBlocks);
     assert_eq!(out, serde_json::json!({"Fav color?": "Red"}));
 }
 
@@ -852,7 +974,7 @@ fn build_hook_answers_pairs_each_question_with_its_own_options() {
             "option_ids": ["opt-0", "opt-1"],
         }),
     ];
-    let out = build_hook_answers(&answers, &three_questions());
+    let out = build_hook_answers(&answers, &three_questions(), AnswerImages::AttachedBlocks);
     assert_eq!(
         out,
         serde_json::json!({
@@ -869,7 +991,7 @@ fn build_hook_answers_pads_missing_answers_with_canceled_marker() {
     // surface as `(canceled)` — never empty/missing keys, which CC reads
     // as "unanswered" and retries the whole tool call.
     let answers = vec![serde_json::json!({"kind": "Selected", "option_id": "opt-0"})];
-    let out = build_hook_answers(&answers, &three_questions());
+    let out = build_hook_answers(&answers, &three_questions(), AnswerImages::AttachedBlocks);
     assert_eq!(
         out,
         serde_json::json!({
@@ -882,7 +1004,7 @@ fn build_hook_answers_pads_missing_answers_with_canceled_marker() {
 
 #[test]
 fn build_hook_answers_handles_zero_questions() {
-    let out = build_hook_answers(&[], &serde_json::json!([]));
+    let out = build_hook_answers(&[], &serde_json::json!([]), AnswerImages::AttachedBlocks);
     assert_eq!(out, serde_json::json!({}));
 }
 
@@ -895,7 +1017,7 @@ fn build_hook_answers_keys_on_question_field_ignoring_header() {
         {"question": "Real question?", "header": "Chip", "options": [{"label": "Go"}, {"label": "Stop"}]},
     ]);
     let answers = vec![serde_json::json!({"kind": "Selected", "option_id": "opt-0"})];
-    let out = build_hook_answers(&answers, &questions);
+    let out = build_hook_answers(&answers, &questions, AnswerImages::AttachedBlocks);
     assert_eq!(out, serde_json::json!({ "Real question?": "Go" }));
 }
 
@@ -957,7 +1079,7 @@ fn build_hook_answers_disambiguates_duplicate_question_texts() {
         serde_json::json!({"kind": "Selected", "option_id": "opt-0"}),
         serde_json::json!({"kind": "Selected", "option_id": "opt-0"}),
     ];
-    let out = build_hook_answers(&answers, &dupe_questions);
+    let out = build_hook_answers(&answers, &dupe_questions, AnswerImages::AttachedBlocks);
     let obj = out.as_object().expect("object");
     assert_eq!(obj.len(), 2, "both answers must survive — got {out}");
     assert_eq!(obj.get("Pick one"), Some(&serde_json::json!("A")));
@@ -1370,11 +1492,14 @@ async fn recap_carries_a_typed_answer_verbatim_and_marks_it_as_no_option() {
         &synth_question_id("toolu_vrtx_01XT", 0),
         "Approve this plan, or take the narrower deadline variant?",
         &["Approve", "Derive the deadline instead"],
-        AnswerKind::FreeText { text: typed.into() },
+        AnswerKind::FreeText {
+            text: typed.into(),
+            image_hashes: vec![],
+        },
     )
     .await;
 
-    let recap = answered_question_recap(&pool, thread_id)
+    let recap = answered_question_recap(&pool, std::path::Path::new("/nonexistent"), thread_id)
         .await
         .expect("an answered question must produce a recap");
     assert!(
@@ -1415,7 +1540,9 @@ async fn recap_resolves_a_selected_option_back_to_its_label() {
     )
     .await;
 
-    let recap = answered_question_recap(&pool, thread_id).await.unwrap();
+    let recap = answered_question_recap(&pool, std::path::Path::new("/nonexistent"), thread_id)
+        .await
+        .unwrap();
     assert!(
         recap.contains("Narrow flag"),
         "the opt-N id must resolve to its label: {recap}"
@@ -1459,11 +1586,14 @@ async fn recap_carries_every_sub_question_of_a_batch_in_ask_order() {
         &["Left", "Right"],
         AnswerKind::FreeText {
             text: "neither, do it my way".into(),
+            image_hashes: vec![],
         },
     )
     .await;
 
-    let recap = answered_question_recap(&pool, thread_id).await.unwrap();
+    let recap = answered_question_recap(&pool, std::path::Path::new("/nonexistent"), thread_id)
+        .await
+        .unwrap();
     let first = recap
         .find("First question?")
         .expect("first sub-question must be recapped");
@@ -1488,13 +1618,17 @@ async fn recap_is_none_when_nothing_has_been_answered() {
     seed_cc_thread(&bus, thread_id).await;
 
     assert!(
-        answered_question_recap(&pool, thread_id).await.is_none(),
+        answered_question_recap(&pool, std::path::Path::new("/nonexistent"), thread_id)
+            .await
+            .is_none(),
         "a thread with no question at all has nothing to recap"
     );
 
     emit_user_question(&bus, thread_id, &synth_question_id("toolu_pending", 0)).await;
     assert!(
-        answered_question_recap(&pool, thread_id).await.is_none(),
+        answered_question_recap(&pool, std::path::Path::new("/nonexistent"), thread_id)
+            .await
+            .is_none(),
         "an ASKED but unanswered question is not an answer"
     );
 

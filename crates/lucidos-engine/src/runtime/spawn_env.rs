@@ -474,7 +474,7 @@ mod tests {
             repo_name: None,
             interactive: false,
             user_env_vars: &[],
-            claude_config_dir: None,
+            account_pin: None,
             binary_override: None,
             permission_mode: None,
         }

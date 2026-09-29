@@ -175,8 +175,8 @@ pub fn empty() -> ModelRegistry {
 /// earlier than necessary; over-reporting makes the engine pack a prompt the
 /// provider then rejects.
 ///
-/// What still legitimately lands here: Claude Code model ids, which live in
-/// `runtime/cc_menu_options.json` and never get a `models` row, plus a legacy
+/// What still legitimately lands here: Claude Code model ids, which come from
+/// its own picker and never get a `models` row, plus a legacy
 /// `chat_model` preference naming a model the user has since deleted.
 ///
 /// Lives here rather than in `engine::context` because it is model-id
@@ -642,6 +642,14 @@ mod tests {
         );
         assert_eq!(
             provider_kind_for(&reg, "claude-sonnet-5[1m]"),
+            ProviderKind::Vertex
+        );
+        assert_eq!(
+            provider_kind_for(&reg, "claude-sonnet-5-5"),
+            ProviderKind::Vertex
+        );
+        assert_eq!(
+            provider_kind_for(&reg, "claude-sonnet-5-5[1m]"),
             ProviderKind::Vertex
         );
         assert_eq!(

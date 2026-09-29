@@ -152,8 +152,8 @@ function stripEnds(el: HTMLElement): StripEnds {
  * Every theme as a radio card in a strip that scrolls sideways, a page of
  * whole columns at a time. A chevron floats over each side and pages it, and
  * the cards fade out at a side with more past it. The strip is two cards
- * tall. On a phone it is one row that centres a card at a time, with its
- * neighbours peeking in. Above it, filter chips pick All or one family. All
+ * tall, or one when every card shown fits in a single row. On a phone it is
+ * one row that centres a card at a time, with its neighbours peeking in. Above it, filter chips pick All or one family. All
  * names each family above its first card.
  *
  * A pick paints at once and the strip stays, so themes can be compared.
@@ -170,13 +170,17 @@ export function ThemePicker() {
   const showSkeleton = useDelayedLoading(gallery);
   const strip = useRef<HTMLDivElement>(null);
   const phone = viewportIsMobile.value;
-  const rows = phone ? 1 : 2;
+  const maxRows = phone ? 1 : 2;
+  // How many whole columns the strip fits, 0 until it is measured.
+  const [columns, setColumns] = useState(0);
   // The family chip picked, or null for All.
   const [filter, setFilter] = useState<string | null>(null);
   const groups = gallery.status === 'loaded' ? groupThemesByFamily(gallery.data.themes) : [];
   // A family a reload dropped falls back to All rather than an empty strip.
   const picked = groups.some(group => group.name === filter) ? filter : null;
   const shown = picked === null ? groups : groups.filter(group => group.name === picked);
+  const cardCount = shown.reduce((count, group) => count + group.themes.length, 0);
+  const rows = cardCount <= columns ? 1 : maxRows;
   // All names each family above its first card, on a row of its own.
   const labelRows = picked === null ? 1 : 0;
   const families = placeFamilies(shown, rows);
@@ -188,9 +192,14 @@ export function ThemePicker() {
     const next = stripEnds(strip.current);
     setEnds(prev => (prev.atStart === next.atStart && prev.atEnd === next.atEnd ? prev : next));
   };
+  const fit = () => {
+    if (!strip.current) return;
+    fitColumns(strip.current);
+    setColumns(stripGeometry(strip.current).columns);
+  };
   const loaded = gallery.status === 'loaded';
   useLayoutEffect(() => {
-    if (strip.current) fitColumns(strip.current);
+    fit();
     measure();
   }, [loaded, phone]);
   // Opens on the page holding the active theme, once the gallery and the
@@ -213,7 +222,7 @@ export function ThemePicker() {
     const scroller = strip.current;
     if (!scroller || typeof ResizeObserver === 'undefined') return;
     const observer = new ResizeObserver(() => {
-      fitColumns(scroller);
+      fit();
       measure();
     });
     observer.observe(scroller);
@@ -235,8 +244,9 @@ export function ThemePicker() {
     const from = offset !== 0 ? Math.round(at) : direction > 0 ? Math.floor(at + 0.01) : Math.ceil(at - 0.01);
     scrollTo((from + direction) * page - offset);
   };
-  // A new filter shows a new set of cards, so the ends move with no scroll.
-  useLayoutEffect(measure, [picked]);
+  // A new filter or row count lays the cards out anew, so the ends move with
+  // no scroll.
+  useLayoutEffect(measure, [picked, rows]);
   const pickFilter = (name: string | null) => {
     if (strip.current) strip.current.scrollLeft = 0;
     setFilter(name);
@@ -256,8 +266,8 @@ export function ThemePicker() {
       skeleton={
         // The loaded frame's rows: a chip line, the names row, then the cards.
         <div class="theme-carousel-frame">
-          <div class="theme-family-chips" aria-hidden="true">
-            <span class="theme-family-chip">{'\u00a0'}</span>
+          <div class="pill-bar" aria-hidden="true">
+            <span class="pill-bar-btn">{'\u00a0'}</span>
           </div>
           <ListSkeletonOf
             containerClass={stripClass}
@@ -265,7 +275,7 @@ export function ThemePicker() {
             row={i => (
               <>
                 {i === 0 && <span class="theme-family-name">{'\u00a0'}</span>}
-                <ThemeCard mode={mode} column={1 + Math.floor(i / rows)} row={2 + (i % rows)} />
+                <ThemeCard mode={mode} column={1 + Math.floor(i / maxRows)} row={2 + (i % maxRows)} />
               </>
             )}
           />
@@ -274,12 +284,12 @@ export function ThemePicker() {
     >
       {gallery.status === 'loaded' && (
         <div class="theme-carousel-frame">
-          <div class="theme-family-chips" role="group" aria-label="Theme family">
+          <div class="pill-bar" role="group" aria-label="Theme family">
             {[null, ...groups.map(group => group.name)].map(name => (
               <button
                 key={name ?? 'all'}
                 type="button"
-                class={`theme-family-chip${picked === name ? ' active' : ''}`}
+                class={`pill-bar-btn${picked === name ? ' active' : ''}`}
                 aria-pressed={picked === name}
                 onClick={() => pickFilter(name)}
               >

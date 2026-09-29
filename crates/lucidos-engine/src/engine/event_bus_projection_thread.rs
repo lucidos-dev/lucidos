@@ -1404,23 +1404,20 @@ impl EventBus {
                 // miss the trailing newline a textarea leaves behind. Unlike a
                 // send, which replaces the composer's contents by definition, an
                 // answer says nothing about different text a peer is still
-                // writing — so an unrelated draft must survive. An answer
-                // carries no image hashes (the composer refuses to submit one
-                // with attachments), so a stored draft WITH images is likewise
-                // not the thing that was submitted and keeps them — same
-                // text-plus-hashes match the client's supersede rule uses. A
-                // click-only answer submits no composer text and clears nothing.
+                // writing, so an unrelated draft must survive. The match is on
+                // text AND image hashes, the same pair the client's supersede
+                // rule uses. A click-only answer submits no composer content
+                // and clears nothing.
                 let submitted_text = match answer {
-                    AnswerKind::FreeText { text } => Some(text.as_str()),
+                    AnswerKind::FreeText { text, .. } => Some(text.as_str()),
                     // Multi-select folds the prompt textarea's text in alongside
                     // the toggled options.
-                    AnswerKind::MultiSelected { text: Some(text), .. } => Some(text.as_str()),
+                    AnswerKind::MultiSelected { text, .. } => Some(text.as_deref().unwrap_or("")),
                     _ => None,
                 }
-                // Blank text submits no draft, and would match a row whose
-                // compose_text is already empty — clearing that row's stored
-                // `compose_selection` for nothing.
-                .filter(|t| !t.trim().is_empty());
+                // An empty submission would match a row whose composer is
+                // already empty, clearing its `compose_selection` for nothing.
+                .filter(|t| !t.trim().is_empty() || !answer.image_hashes().is_empty());
                 let mut cleared_epoch: Option<i64> = None;
                 if let Some(text) = submitted_text {
                     let cleared = sqlx::query(
@@ -1429,11 +1426,12 @@ impl EventBus {
                              compose_mode = NULL, compose_selection = NULL \
                          WHERE thread_id = $1 \
                            AND btrim(compose_text, $3) = btrim($2, $3) \
-                           AND COALESCE(compose_images, '[]'::jsonb) = '[]'::jsonb",
+                           AND COALESCE(compose_images, '[]'::jsonb) = $4",
                     )
                     .bind(thread_id)
                     .bind(text)
                     .bind(COMPOSE_TRIM_CHARS)
+                    .bind(serde_json::json!(answer.image_hashes()))
                     .execute(&mut **tx)
                     .await?
                     .rows_affected()
@@ -1506,6 +1504,20 @@ impl EventBus {
             ThreadEvent::ChangeHardened { change_id, .. } => {
                 crate::core::changes_projection::ChangesProjection::write_hardened(tx, change_id)
                     .await?;
+                Vec::new()
+            }
+            ThreadEvent::ChangeSummarized {
+                change_id,
+                summary,
+                description,
+            } => {
+                crate::core::changes_projection::ChangesProjection::write_summary(
+                    tx,
+                    change_id,
+                    summary,
+                    description,
+                )
+                .await?;
                 Vec::new()
             }
             ThreadEvent::MergeResolutionStarted {

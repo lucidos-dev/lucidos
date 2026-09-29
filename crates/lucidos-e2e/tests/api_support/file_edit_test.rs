@@ -10,6 +10,18 @@ fn write_file_to_disk(path: &str, content: &str) {
     std::fs::write(&full_path, content).expect("Failed to write test file");
 }
 
+/// Removes a file this test wrote but no edit committed, when dropped. An
+/// untracked file left in the shared tree makes every later apply refuse with
+/// "the repository has uncommitted changes". Declare it after the tree guard,
+/// so it drops first and the file is gone before the guard releases.
+struct RemoveOnDrop(std::path::PathBuf);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 /// Read a file via GET /api/v1/data/artifacts/..., return body text
 async fn read_artifact(client: &reqwest::Client, path: &str) -> String {
     let url = format!("{}/api/v1/data/artifacts/{}", base_url(), path);
@@ -152,6 +164,7 @@ async fn edit_old_string_not_found_returns_400() {
     // A new file in the shared working tree; see `workspace_tree_lock`.
     let _tree = crate::support::workspace_tree_lock().read().await;
     write_file_to_disk(&path, "some content");
+    let _uncommitted = RemoveOnDrop(workspace_path().join("data/artifacts").join(&path));
 
     let resp = post_file_edit(
         &client,
@@ -164,4 +177,44 @@ async fn edit_old_string_not_found_returns_400() {
     assert_eq!(resp.status(), 400);
     let body: serde_json::Value = resp.json().await.expect("Invalid JSON");
     assert!(body["error"].as_str().unwrap().contains("not found"));
+}
+
+/// Concurrent edits to one file must all land, and none may drop another's
+/// change. This is the shape `lucidos.data.edit` teaches apps to use.
+#[tokio::test]
+async fn concurrent_json_edits_to_one_file_all_land() {
+    let client = user_client().await;
+    let _tree = crate::support::workspace_tree_lock().read().await;
+    let marker = unique_marker("edit-concurrent");
+    let path = format!("{}.json", marker);
+    // A JSON edit sets an existing key, so every key starts out null.
+    let seed: serde_json::Map<String, serde_json::Value> = (0..8)
+        .map(|i| (format!("key{i}"), serde_json::Value::Null))
+        .collect();
+    write_file_to_disk(&path, &serde_json::Value::Object(seed).to_string());
+
+    let edits = (0..8).map(|i| {
+        let client = client.clone();
+        let path = path.clone();
+        async move {
+            post_file_edit(
+                &client,
+                serde_json::json!({
+                    "path": format!("artifacts/{path}"),
+                    "operations": [{ "json_path": format!("key{i}"), "json_value": i }]
+                }),
+            )
+            .await
+            .status()
+        }
+    });
+    for status in futures::future::join_all(edits).await {
+        assert_eq!(status, 200);
+    }
+
+    let content = read_artifact(&client, &path).await;
+    let doc: serde_json::Value = serde_json::from_str(&content).expect("Not valid JSON");
+    for i in 0..8 {
+        assert_eq!(doc[format!("key{i}")], i, "key{i} was lost: {content}");
+    }
 }

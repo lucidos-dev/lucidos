@@ -26,11 +26,13 @@ import { handleEvent, makeOptimisticThreadState, computeExchanges, queuedMessage
 import { getDraft } from '../composeDrafts';
 import { updateCompose } from './compose';
 import { requestPromptOverrideSync } from '../../components/chat/promptValueSync';
+import { focusPromptNow } from '../../components/chat/promptFocus';
 import { bumpThreadEvents } from '../threadActivity';
 import { getThreadModelOverride, clearThreadModelOverride } from '../threadModelSelections';
 import { pushThreadNavState, removeThreadNavEntries } from './thread-navigation';
 import { formatThreadLabel } from './thread-label';
 import { revealThreadPane } from './pane';
+import { retireWelcomeAfterUse } from './preferences';
 import { followSentMessage } from '../../components/chat/scrollState';
 import { setCanceledQuestion, setCanceledWhileAwaiting } from '../../components/chat/prompt-input-helpers';
 import { refreshThreadEvents, forgetThreadEventsFailures } from './thread-loading';
@@ -219,10 +221,38 @@ function retractQueuedMessage(threadId: string, messageId: string): Promise<Queu
 export async function removeQueuedMessage(threadId: string, messageId: string): Promise<void> {
   const { outcome, error } = await retractQueuedMessage(threadId, messageId);
   if (outcome === 'removed') return;
-  // Non-success (transport error OR a 409 race where the loop injected it just
-  // now): re-sync so the row reflects truth and tell the user it didn't take.
+  reportFailedRetract(threadId, 'remove', error);
+}
+
+/** The queued message an Edit takes back into compose. */
+export interface QueuedMessageToEdit {
+  id: string;
+  text: string;
+  imageHashes: string[];
+}
+
+/** Edit a queued message: take it back, then put its text and images in the
+ *  compose box after any draft. Compose changes only once the removal took, so
+ *  a message the agent already read never also sits in compose. */
+export async function editQueuedMessage(threadId: string, message: QueuedMessageToEdit): Promise<void> {
+  const { outcome, error } = await retractQueuedMessage(threadId, message.id);
+  if (outcome !== 'removed') {
+    reportFailedRetract(threadId, 'edit', error);
+    return;
+  }
+  if (message.imageHashes.length > 0) {
+    const draftImages = getDraft(threadId).image_hashes;
+    updateCompose(threadId, { image_hashes: [...draftImages, ...message.imageHashes] });
+  }
+  appendQueuedTextToCompose(threadId, message.text.length > 0 ? [message.text] : []);
+  focusPromptNow();
+}
+
+/** A transport error, or a 409 because the agent read the message just now.
+ *  Re-sync so the row shows the truth, and say why it did not take. */
+function reportFailedRetract(threadId: string, action: 'remove' | 'edit', error: unknown): void {
   void refreshThreadEvents(threadId);
-  showToast(`Failed to remove queued message: ${errorDetail(error)}`, 'error');
+  showToast(`Failed to ${action} queued message: ${errorDetail(error)}`, 'error');
 }
 
 /** Mark one pending row as never-confirmed: the safety refetch gave up on it.
@@ -598,6 +628,7 @@ export async function sendMessage(
     // thread's remembered value; drop the ephemeral pending override so future
     // resolves come from the thread's events (no-op for CC / no pick).
     clearThreadModelOverride(threadId);
+    void retireWelcomeAfterUse(threadMap.value.values());
   } catch (error: unknown) {
     if (isTransportError(error)) {
       // Engine unreachable. Render the user's message as a failed in-thread
@@ -662,10 +693,11 @@ export async function sendMessage(
  *   - 'failed'   — the API call itself failed (a toast was already shown). */
 export type CancelOutcome = 'canceled' | 'noop' | 'failed';
 
-/** The thread's queued (un-injected) chat follow-ups in FIFO order — the set a
- *  user Stop returns to compose. Chat-only: CC/Codex follow-ups go to stdin and
- *  are never queued. Derived from the same `queuedFollowupRun` the UI renders
- *  "Queued" bubbles from, so Stop clears exactly what the user saw queued. */
+/** The thread's queued (un-injected) chat follow-ups in FIFO order: the set a
+ *  user Stop returns to compose. Chat-only: a coding agent keeps its queued
+ *  messages across a Stop, so only the bin or Edit takes one back. Derived from
+ *  the same `queuedFollowupRun` the UI renders "Queued" bubbles from, so Stop
+ *  clears exactly what the user saw queued. */
 function getQueuedMessages(threadId: string): QueuedMessage[] {
   const thread = threadMap.value.get(threadId);
   if (!thread || thread.meta.channel === 'claude_code') return [];

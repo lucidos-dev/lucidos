@@ -65,6 +65,7 @@ export const EVENT_CLASSIFICATION: Readonly<Record<string, EventClass>> = {
   ChangeReverted: 'terminal',
   ChangeApplyFailed: 'terminal',
   ChangeHardened: 'metadata',
+  ChangeSummarized: 'metadata',
   MergeConflictDetected: 'start',
   MergeResolutionStarted: 'metadata',
   MergeResolutionCleared: 'metadata',

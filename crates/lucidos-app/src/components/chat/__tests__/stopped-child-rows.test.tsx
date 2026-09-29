@@ -11,6 +11,8 @@ vi.mock('../../../store/actions/threads', () => ({
 import { ChildMovedOutRow, ChildStoppedRow } from '../ChildCompletionRow';
 import { STOPPED_CHILD_CONTINUE, STOPPED_CHILD_SETTLE, StoppedChildNotice } from '../StoppedChildNotice';
 import { focusThreadOrBootstrap } from '../../../store/actions/threads';
+import { threadMap } from '../../../store/store';
+import { makeThread } from '../../../store/__tests__/thread-flows-helpers';
 import type { ThreadMeta } from '../../../store/thread-events';
 
 interface AnyVNode extends VNode<{ children?: ComponentChildren; class?: string; [k: string]: unknown }> {}
@@ -52,9 +54,25 @@ beforeEach(() => {
 });
 
 describe('ChildStoppedRow', () => {
+  function loadChild(isStoppedChild: boolean) {
+    const { map } = makeThread('child-uuid');
+    map.get('child-uuid')!.meta.isStoppedChild = isStoppedChild;
+    threadMap.value = map;
+  }
+
+  function stateLabel(): string {
+    const tree = ChildStoppedRow({ childThreadId: 'child-uuid', childThreadTitle: 'Fix the ticket' });
+    return vnodeText(findByClass(tree, 'event-row-state'));
+  }
+
+  beforeEach(() => {
+    threadMap.value = new Map();
+  });
+
   /** The parent-side row says the child is alive and waiting, never a verdict:
    *  a canceled pill is what the incident's parent read as "dead". */
   it('says the child stopped and waits for the user, with a link to it', () => {
+    loadChild(true);
     const tree = ChildStoppedRow({ childThreadId: 'child-uuid', childThreadTitle: 'Fix the ticket' });
     const row = findByClass(tree, 'event-row');
     expect(row!.props['data-state']).toBe('stopped');
@@ -65,6 +83,19 @@ describe('ChildStoppedRow', () => {
     const link = findByClass(tree, 'accent-link')!;
     (link.props as unknown as { onClick: () => void }).onClick();
     expect(focusThreadOrBootstrap).toHaveBeenCalledWith('child-uuid');
+  });
+
+  /** The incident: the user's queued messages started a new turn seconds
+   *  after the Stop, and the parent's row kept saying "Waiting for you". */
+  it('stops claiming the child waits once the child continues', () => {
+    loadChild(false);
+    expect(stateLabel()).toBe('No longer waiting');
+  });
+
+  /** A child outside the loaded window has no live state to read. "Stopped"
+   *  is the one thing the event itself proves. */
+  it('says only that the child stopped when the child is not loaded', () => {
+    expect(stateLabel()).toBe('Stopped');
   });
 });
 

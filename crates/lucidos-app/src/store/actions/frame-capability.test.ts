@@ -7,7 +7,12 @@
  * against the suite's default document stub.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { renewEveryOpenFrame, stopFrameCapabilityRenewal } from './app-frame-capability';
+import {
+  artifactPreviewCapability,
+  renewEveryOpenFrame,
+  resetArtifactPreviewCapability,
+  stopFrameCapabilityRenewal,
+} from './frame-capability';
 
 function mountAppFrame(src: string): HTMLIFrameElement {
   const frame = document.createElement('iframe');
@@ -34,6 +39,7 @@ beforeEach(() => {
 
 afterEach(() => {
   stopFrameCapabilityRenewal();
+  resetArtifactPreviewCapability();
   vi.useRealTimers();
   vi.restoreAllMocks();
 });
@@ -124,5 +130,79 @@ describe('renewEveryOpenFrame', () => {
     await renewEveryOpenFrame();
 
     expect(vi.getTimerCount()).toBe(0);
+  });
+});
+
+function mountPreviewFrame(): HTMLIFrameElement {
+  const frame = document.createElement('iframe');
+  frame.setAttribute('data-role', 'artifact-preview-frame');
+  document.body.appendChild(frame);
+  return frame;
+}
+
+/** A pass the way the engine writes one: expiry in hex seconds, then subject
+ *  and signature. */
+function passExpiringIn(secs: number, tag: string): string {
+  return `${Math.floor(Date.now() / 1000 + secs).toString(16)}~artifact..preview~${tag}`;
+}
+
+describe('the artifact preview pass', () => {
+  it('is minted from its own host-only route, and cached while it is fresh', async () => {
+    const asked: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      asked.push(url);
+      return { ok: true, json: async () => ({ capability: passExpiringIn(3600, 'a'), renew_after_secs: 1800 }) };
+    }));
+
+    const first = await artifactPreviewCapability();
+    const second = await artifactPreviewCapability();
+
+    expect(asked).toEqual(['/api/v1/artifact-preview-capability']);
+    expect(second).toBe(first);
+  });
+
+  it('is re-minted once it is close to lapsing, so a laptop that slept gets a live one', async () => {
+    let n = 0;
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      n += 1;
+      return { ok: true, json: async () => ({ capability: passExpiringIn(3600, `p${n}`), renew_after_secs: 1800 }) };
+    }));
+
+    const first = await artifactPreviewCapability();
+    vi.advanceTimersByTime(56 * 60 * 1000);
+    const later = await artifactPreviewCapability();
+
+    expect(later).not.toBe(first);
+    expect(later).toContain('~p2');
+  });
+
+  it('is null with no gateway in front', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, json: async () => ({ capability: null, renew_after_secs: 1800 }) })));
+    expect(await artifactPreviewCapability()).toBeNull();
+  });
+
+  it('is renewed into every mounted preview frame by the same round', async () => {
+    const one = capture(mountPreviewFrame());
+    const two = capture(mountPreviewFrame());
+    const pass = passExpiringIn(3600, 'renewed');
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, json: async () => ({ capability: pass, renew_after_secs: 1800 }) })));
+
+    const nextDelayMs = await renewEveryOpenFrame();
+
+    const pushed = { type: 'lucidos:preview-host', kind: 'capability', capability: pass };
+    expect(one).toEqual([pushed]);
+    expect(two).toEqual([pushed]);
+    expect(nextDelayMs).toBe(1_800_000);
+    // The round also refreshed the cache the next preview builds from.
+    expect(await artifactPreviewCapability()).toBe(pass);
+  });
+
+  it('retries sooner when the preview renewal fails', async () => {
+    const seen = capture(mountPreviewFrame());
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false, status: 503 })));
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    expect(await renewEveryOpenFrame()).toBe(60_000);
+    expect(seen).toEqual([]);
   });
 });

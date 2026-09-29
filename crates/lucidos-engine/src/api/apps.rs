@@ -495,14 +495,17 @@ pub(super) async fn serve_app_artifact(
     let content_type = content_type_for_ext(ext);
 
     match std::fs::read(&full_path) {
-        Ok(content) => (
-            [
-                (header::CONTENT_TYPE, content_type),
-                (header::CACHE_CONTROL, "no-store"),
-            ],
-            content,
-        )
-            .into_response(),
+        Ok(content) => super::file_response::sandbox_documents(
+            (
+                [
+                    (header::CONTENT_TYPE, content_type),
+                    (header::CACHE_CONTROL, "no-store"),
+                ],
+                content,
+            )
+                .into_response(),
+            content_type,
+        ),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             (StatusCode::NOT_FOUND, "File not found").into_response()
         }
@@ -670,6 +673,28 @@ async fn mint_frame_capability(
     })
 }
 
+/// GET /api/v1/artifact-preview-capability - Mint the pass the host's HTML
+/// artifact preview stamps into its `<base href>`.
+///
+/// The preview runs at an opaque origin (ADR 0322). So behind a gateway its
+/// relative images and stylesheets need a pass, just as an app frame's do. The
+/// host calls this before it builds the preview, and again at half-life to
+/// push a renewal into every open preview.
+///
+/// Classified `Host` in `app_reach`, like `app-frame-capability`. The subject is
+/// fixed here, never read from the caller, so the pass reaches the artifacts
+/// tree and nothing else.
+async fn mint_artifact_preview_capability(headers: HeaderMap) -> Json<FrameCapabilityBody> {
+    let prefix = crate::api::base_path::forwarded_prefix(&headers);
+    Json(FrameCapabilityBody {
+        capability: frame_capability::mint(
+            &prefix,
+            lucidos_frame_capability::ARTIFACT_PREVIEW_SUBJECT,
+        ),
+        renew_after_secs: lucidos_frame_capability::RENEW_AFTER_SECS,
+    })
+}
+
 /// Routes for the `/apps`, `/app*`, `/app-capture`, and `/static/*`
 /// surfaces (html2canvas is served for the app-capture flow).
 pub(super) fn router() -> Router<AppState> {
@@ -683,6 +708,10 @@ pub(super) fn router() -> Router<AppState> {
         // App capture endpoints
         .route("/app-capture", post(submit_app_capture))
         .route("/app-frame-capability", get(mint_frame_capability))
+        .route(
+            "/artifact-preview-capability",
+            get(mint_artifact_preview_capability),
+        )
         .route("/static/html2canvas.min.js", get(serve_html2canvas))
 }
 
@@ -699,6 +728,16 @@ pub(super) fn ui_router() -> Router<AppState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_app_can_hold_the_artifact_preview_subject() {
+        // The preview pass is read as a narrower grant by name. An app that could
+        // take the name would have its own bundle refused, and its frame would
+        // carry the preview's reach instead of its own.
+        assert!(!is_valid_id(
+            lucidos_frame_capability::ARTIFACT_PREVIEW_SUBJECT
+        ));
+    }
 
     #[test]
     fn a_plain_app_file_is_not_an_attachment() {

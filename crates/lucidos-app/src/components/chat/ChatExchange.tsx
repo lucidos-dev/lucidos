@@ -9,7 +9,7 @@ import type { Exchange, ReadMarker, StoredEvent, ThreadEvent, MessageOrigin, Res
 import { ENGINE_LABEL, SYSTEM_LABEL, API_CALLER_LABEL, LUCIDOS_AGENT_LABEL, abortPromisesAutoResume, exchangeUserMessage, exchangeUserImageHashes, exchangeTimestamp, exchangeResponseTimestamp, messageReadTimestamp, exchangeResponseText, exchangeEngineLimitDetail, exchangeSteps, exchangeResponseEvents, exchangeStatus, exchangeError, exchangeStarterId, dividerBodyIsSuppressed, hasRenderableResponseContent, isEmptyContinuedExchange, questionDividerResolution, changePanelHasContinuation, findCommandPermissionResolution, findMcpPermissionResolution, findPermissionResolution, findQuestionAnswer, isChangeLifecycleEvent, isLivePartialRow, isLiveReplyRow, isLiveUtteranceRow, isSpeechOnlyTurn, turnBodyFolded, modeToInitiator, originMode, continuationStartedSummary, responseAbortedSummary, eventWaitStoppedSummary, isTurnlessBoundary, agentMessageSender, RESPONSE_CANCELED_SUMMARY } from '../../store/thread-events';
 import { LucidosGlyph } from '../shared/LucidosMark';
 import { artifacts, appsList, stepsExpanded, detailsExpanded, collapsedExchanges, toggleExchangeCollapsed, expandExchange, collapsedInitiators, toggleInitiatorCollapsed, toggleMessageRoutePanel } from '../../store/store';
-import { removeQueuedMessage } from '../../store/actions/chat';
+import { editQueuedMessage, removeQueuedMessage } from '../../store/actions/chat';
 import { withScrollAnchor } from './CreateThreadView';
 import { QuestionBody } from './QuestionCard';
 import { CommandPermissionBody, McpPermissionBody, PermissionBody } from './PermissionCard';
@@ -25,7 +25,7 @@ import { FormRequestRow } from './FormRequestRow';
 import { NO_SIDE_QUESTIONS, SideQuestionGroup, placeInBody } from './SideQuestionCard';
 import type { SideQuestion } from '../../store/sideQuestions';
 import { ChangeEventRow, CheckpointCard, ContinueButton, EventDeliveryBody, EventWaitRow, FileList, HeldMessageRow, GeneratedImage, InitiatorPanel, InlineStep, LivePartialBody, LiveUtteranceBody, MarkdownBlock, ResponsePanel, ResumeNoteBody, SpokenChip, SpokenReply, TriggerFiredBody, UserMessageBody, changeAccent, describeExecutor, turnControls } from './chat-exchange-parts';
-import { TrashIcon, PowerIcon, PersonIcon, ApiPlugIcon, TriggerFiredIcon, WarningIcon, ContinuedIcon } from '../shared/icons';
+import { EditIcon, TrashIcon, PowerIcon, PersonIcon, ApiPlugIcon, TriggerFiredIcon, WarningIcon, ContinuedIcon } from '../shared/icons';
 import { useOnScreenInTranscript } from '../../hooks/useOnScreenInTranscript';
 import { engineReasonHeadline } from '../../utils/engineEventExplainers';
 
@@ -110,14 +110,15 @@ interface Props {
    *  time because the user disliked it from the first message. The head arrives
    *  by scrolling, through the same expansion older turns arrive through. */
   rowsHidden?: number;
-  /** First line of the in-thread `ChangeProposed` description + its file count
-   *  for this exchange's change_id (built once per thread in `renderExchanges`).
-   *  Seeds <ChangeEventRow> so a change-lifecycle panel paints at its final height
-   *  on first open, before the per-id `Change` lazy-fetch lands — fixing the
-   *  open-path jump. Undefined for non-change exchanges (and when no matching
-   *  ChangeProposed rode the thread). Primitives, so the memo stays cheap. */
+  /** The in-thread `ChangeProposed` description, its file count, and the
+   *  `ChangeSummarized` summary of that description, for this exchange's
+   *  change_id (built once per thread in `renderExchanges`). Seeds
+   *  <ChangeEventRow> so a change-lifecycle panel paints at its final height on
+   *  first open, before the per-id `Change` lazy-fetch lands. Undefined for
+   *  non-change exchanges. Primitives, so the memo stays cheap. */
   proposedChangeDesc?: string;
   proposedChangeFileCount?: number;
+  proposedChangeSummary?: string;
   /** The event a *thread subscription* delivered, resolved once per thread in
    *  `renderExchanges` by following this exchange's
    *  `UserPromptInjected.delivered_event_id`. Resolved THERE because the target
@@ -198,7 +199,7 @@ function heldOnThePress(fn: () => void): (e: MouseEvent) => void {
   return (e) => withScrollAnchor(e.currentTarget as HTMLElement | null, fn);
 }
 
-function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMarker, threadId, hasPriorActive, priorModel, priorEffort, isContinuableAbort, threadIsCC, threadCodingAgent, threadIdle, threadAwaitingAnswer, threadCanceling, rowsHidden = 0, proposedChangeDesc, proposedChangeFileCount, matchedEventType, matchedEventId, matchedPayloadJson, pausedBy, sideQuestions = NO_SIDE_QUESTIONS }: Props) {
+function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMarker, threadId, hasPriorActive, priorModel, priorEffort, isContinuableAbort, threadIsCC, threadCodingAgent, threadIdle, threadAwaitingAnswer, threadCanceling, rowsHidden = 0, proposedChangeDesc, proposedChangeFileCount, proposedChangeSummary, matchedEventType, matchedEventId, matchedPayloadJson, pausedBy, sideQuestions = NO_SIDE_QUESTIONS }: Props) {
   const showDetails = detailsExpanded.value;
   const showSteps = stepsExpanded.value;
   const artifactPaths = loadedOr(artifacts.value, NO_ARTIFACTS);
@@ -414,8 +415,8 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
   const responseTerminated = isTerminated(status) || exchange.questionOvertaken === true;
 
   const initiator = useMemo(
-    () => describeInitiator(exchange, userMessageHtml, userImageHashes, threadId, responseTerminated, threadIsCC, threadCodingAgent, proposedChangeDesc, proposedChangeFileCount, { eventType: matchedEventType, eventId: matchedEventId, payloadJson: matchedPayloadJson }),
-    [exchange, userMessageHtml, userImageHashes, threadId, responseTerminated, threadIsCC, threadCodingAgent, proposedChangeDesc, proposedChangeFileCount, matchedEventType, matchedEventId, matchedPayloadJson],
+    () => describeInitiator(exchange, userMessageHtml, userImageHashes, threadId, responseTerminated, threadIsCC, threadCodingAgent, { description: proposedChangeDesc, fileCount: proposedChangeFileCount, summary: proposedChangeSummary }, { eventType: matchedEventType, eventId: matchedEventId, payloadJson: matchedPayloadJson }),
+    [exchange, userMessageHtml, userImageHashes, threadId, responseTerminated, threadIsCC, threadCodingAgent, proposedChangeDesc, proposedChangeFileCount, proposedChangeSummary, matchedEventType, matchedEventId, matchedPayloadJson],
   );
   const isChangePanel = isChangeLifecycleEvent(exchange.userEvent);
   // Card-less treatment. A human chat message renders as a right-aligned
@@ -443,28 +444,47 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
   // would misattribute it: the message is the user's, and a stack of them
   // should each read as waiting.
   const isQueuedUserMessage = !!isQueued && isUserMessageBubble;
-  // A coding agent already holds its queued messages, so it offers no bin.
-  const queuedMessageId = isQueuedUserMessage && !threadIsCC ? exchange.userEvent._eventId : undefined;
+  // Claude Code can take back a message it has not read; Codex cannot.
+  const canTakeBack = !threadIsCC || threadCodingAgent === 'claude-code';
+  const queuedMessageId = isQueuedUserMessage && canTakeBack ? exchange.userEvent._eventId : undefined;
   const isLiveRow = liveRowDrawsNoPanel(exchange.userEvent);
-  // The trash button lives INSIDE the status label, an existing `display: flex`
-  // row, rather than in a separate wrapper. "Queued" and the trash then stay on
+  // The buttons live INSIDE the status label, an existing `display: flex` row,
+  // rather than in a separate wrapper. "Queued" and its buttons then stay on
   // one line using only CSS that already ships.
   const queuedStatus = (
     <span class="exchange-status-label exchange-status-queued">
       {'Queued'}
       {queuedMessageId && (
-        <button
-          type="button"
-          class="icon-btn inline-icon queued-message-remove exchange-status-glyph"
-          aria-label="Remove queued message"
-          data-tooltip="Remove queued message"
-          onClick={(e) => {
-            e.stopPropagation();
-            void removeQueuedMessage(threadId, queuedMessageId);
-          }}
-        >
-          <TrashIcon />
-        </button>
+        <>
+          <button
+            type="button"
+            class="icon-btn inline-icon queued-message-edit exchange-status-glyph"
+            aria-label="Edit queued message"
+            data-tooltip="Edit queued message"
+            onClick={(e) => {
+              e.stopPropagation();
+              void editQueuedMessage(threadId, {
+                id: queuedMessageId,
+                text: exchangeUserMessage(exchange),
+                imageHashes: exchangeUserImageHashes(exchange),
+              });
+            }}
+          >
+            <EditIcon />
+          </button>
+          <button
+            type="button"
+            class="icon-btn inline-icon queued-message-remove exchange-status-glyph"
+            aria-label="Remove queued message"
+            data-tooltip="Remove queued message"
+            onClick={(e) => {
+              e.stopPropagation();
+              void removeQueuedMessage(threadId, queuedMessageId);
+            }}
+          >
+            <TrashIcon />
+          </button>
+        </>
       )}
     </span>
   );
@@ -794,6 +814,7 @@ export function chatExchangePropsEqual(prev: Props, next: Props): boolean {
   if (prev.rowsHidden !== next.rowsHidden) return false;
   if (prev.proposedChangeDesc !== next.proposedChangeDesc) return false;
   if (prev.proposedChangeFileCount !== next.proposedChangeFileCount) return false;
+  if (prev.proposedChangeSummary !== next.proposedChangeSummary) return false;
   if (prev.matchedEventType !== next.matchedEventType) return false;
   if (prev.matchedEventId !== next.matchedEventId) return false;
   if (prev.matchedPayloadJson !== next.matchedPayloadJson) return false;
@@ -875,6 +896,13 @@ export function shouldShowResponseStatusBadge(
 // ---------------------------------------------------------------------------
 
 type InitiatorVariant = 'user' | 'system' | 'trigger' | 'lucidos';
+
+/** What the thread already says about a change, for its lifecycle card. */
+export interface ProposedChangeSeed {
+  description?: string;
+  fileCount?: number;
+  summary?: string;
+}
 
 export interface InitiatorDescriptor {
   variant: InitiatorVariant;
@@ -1072,11 +1100,10 @@ export function describeInitiator(
    *  dividers. */
   threadIsCC: boolean = false,
   threadCodingAgent: CodingAgent = 'claude-code',
-  /** First line of the in-thread `ChangeProposed` description and its file
-   *  count, forwarded to <ChangeEventRow> for the change-lifecycle arms. The body
-   *  then paints at full height on first open. */
-  proposedChangeDesc?: string,
-  proposedChangeFileCount?: number,
+  /** The in-thread seed for <ChangeEventRow> on the change-lifecycle arms, so
+   *  the body paints at full height on first open. One object, since three
+   *  same-typed positional neighbours mis-order with no type error. */
+  proposedChange: ProposedChangeSeed = {},
   /** The event a *thread subscription* delivered, already resolved through
    *  this exchange's `UserPromptInjected.delivered_event_id` (see
    *  `buildDeliveredEventInfo`). Undefined for every exchange that is not such
@@ -1195,8 +1222,9 @@ export function describeInitiator(
             type={ev.type}
             changeId={ev.change_id}
             error={ev.type === 'ChangeApplyFailed' ? ev.error : undefined}
-            seedDescription={proposedChangeDesc}
-            seedFileCount={proposedChangeFileCount}
+            seedDescription={proposedChange.description}
+            seedFileCount={proposedChange.fileCount}
+            seedSummary={proposedChange.summary}
           />
         ),
       };

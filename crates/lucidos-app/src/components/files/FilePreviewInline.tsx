@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from 'preact/hooks';
+import { useState, useEffect, useLayoutEffect, useMemo, useRef } from 'preact/hooks';
 import { filePreviewRevision, filePreviewSource, filePreviewWrap, filePreviewEditing, handshakeScriptsVersion, showToast } from '../../store/store';
 import { lucidos } from '@lucidos/sdk';
 import { renderMarkdown } from '../../utils/renderMarkdown';
@@ -24,13 +24,24 @@ import { LoadingFade } from '../shared/LoadingFade';
 import { bridgePreviewIframeShortcuts } from './previewIframeShortcuts';
 import { withPreviewRevision } from './previewRevision';
 import {
-  bridgePreviewIframeLinks,
   documentDeclaresBase,
   handlePreviewLinkClick,
   previewBaseHref,
   withPreviewBase,
   withPreviewSizing,
 } from './previewIframeLinks';
+import {
+  ARTIFACT_PREVIEW_ALLOW,
+  ARTIFACT_PREVIEW_SANDBOX,
+  previewBridgeConfig,
+  readPreviewFrameMessage,
+  routePreviewFrameMessage,
+  withPreviewBridge,
+  withPreviewCapability,
+} from './previewFrameBridge';
+import { PREVIEW_FRAME_ROLE } from '../../utils/previewFrameProtocol';
+import { artifactPreviewCapability, peekArtifactPreviewCapability } from '../../store/actions/frame-capability';
+import { allBindings } from '../../store/actions/keybindings';
 import { currentUiScale } from '../../store/actions/preferences';
 
 /** The bodies `TextContent` renders: everything reached by fetching the file as
@@ -64,6 +75,26 @@ function fetchText(url: string): Promise<string> {
     if (!r.ok) throw new ApiError(r.status, r.statusText || 'fetch failed');
     return r.text();
   });
+}
+
+/** Only an artifact gets a pass: the preview pass reaches `artifacts/` alone
+ *  (ADR 0322). An HTML file elsewhere renders, with its relative refs bare. */
+function wantsPreviewCapability(body: TextPreviewBody, path: string): boolean {
+  return body === 'html' && path.startsWith('artifacts/');
+}
+
+/** Read the body and, when it needs one, warm the asset pass, as one load. So
+ *  the frame is built once, with its pass, and never reloads to add one.
+ *
+ *  A pass that cannot be minted costs the images, not the document. The
+ *  failure is told, and the frame renders with its relative refs bare. */
+function fetchTextBody(url: string, path: string, withCapability: boolean): Promise<string> {
+  const pass: Promise<unknown> = withCapability
+    ? artifactPreviewCapability().catch((e) => {
+      showToast(`Images and styles in ${path} may not load: ${errorDetail(e)}`, 'error');
+    })
+    : Promise.resolve();
+  return Promise.all([fetchText(url), pass]).then(([text]) => text);
 }
 
 interface Props {
@@ -373,7 +404,8 @@ function TextContent({ body, url, path, revision, servesPanel }: {
   // way and takes its own grammar (see `sourceLinesFor`).
   const sourceMode = body === 'source' && RENDERABLE_EXTS.includes(ext);
   useEffect(() => (servesPanel ? registerPreviewTextBody() : undefined), [servesPanel]);
-  const { loadable, showLoading } = useLoadableFetch<string>(() => fetchText(url), [url], {
+  const withCapability = wantsPreviewCapability(body, path);
+  const { loadable, showLoading } = useLoadableFetch<string>(() => fetchTextBody(url, path, withCapability), [url, withCapability], {
     keepLoadedWhileRefetching: true,
     onSettled: servesPanel ? () => reportPreviewTextSettled(revision) : undefined,
   });
@@ -406,49 +438,19 @@ function TextContent({ body, url, path, revision, servesPanel }: {
   );
 
   function loadedBody(content: string) {
-    // An `about:srcdoc` document resolves relative and fragment hrefs against the
-    // HOST page's URL. So an artifact's own `#section` link or `img/chart.png` ref
-    // would reach for the app shell. `withPreviewBase` re-anchors resolution at the
-    // artifact's folder; `bridgePreviewIframeLinks` routes the clicks the browser
-    // would otherwise use to navigate this iframe. See previewIframeLinks.ts.
-    //
-    // `withPreviewSizing` is the other half of that isolation: the document
-    // inherits no root font-size either, so it is stamped with the UI scale and a
-    // body text default. Reading `currentUiScale()` here is what re-stamps it when
-    // the user moves the slider, since the read subscribes this component to it.
     if (body === 'html') {
-      return (
-        <iframe
-          srcDoc={withPreviewBase(withPreviewSizing(content, currentUiScale()), previewBaseHref(url))}
-          // `#fff` is functional rather than thematic, the token rule's second
-          // carve-out. An artifact is authored against a white page and usually
-          // sets no background. A themed canvas would put its black text on the
-          // dark surface and leave the document unreadable.
-          style="width:100%;height:100%;border:none;background:#fff;"
-          onLoad={(e) => {
-            bridgePreviewIframeShortcuts(e.currentTarget);
-            bridgePreviewIframeLinks(e.currentTarget, {
-              artifactPath: path,
-              declaresOwnBase: documentDeclaresBase(content),
-            });
-          }}
-        />
-      );
+      return <HtmlPreviewFrame content={content} url={url} path={path} withCapability={withCapability} />;
     }
     // A markdown artifact renders into the HOST document, so its links resolve
     // against the engine-stamped `<base href="/<slug>/">`: a plain sibling link
     // like `notes.md` becomes `/<slug>/notes.md`, the SPA fallback serves the
     // shell, and the whole workspace reloads. Same routing as the HTML preview,
-    // minus the fragment arm (see `PreviewLinkHost.claimFragments`).
+    // minus the fragment arm (see `handlePreviewLinkClick`).
     if (body === 'markdown') {
       return (
         <div
           class="response-content markdown-content"
-          onClick={(e) => handlePreviewLinkClick(e as unknown as MouseEvent, {
-            doc: document,
-            artifactPath: path,
-            claimFragments: false,
-          })}
+          onClick={(e) => handlePreviewLinkClick(e as unknown as MouseEvent, path)}
           dangerouslySetInnerHTML={{ __html: renderMarkdown(content) }}
         />
       );
@@ -460,6 +462,68 @@ function TextContent({ body, url, path, revision, servesPanel }: {
     // preview shows, and what a navigate carrying a line needs on screen.
     return <LineNumberedCode rows={sourceRows} wideLines={wideLines} />;
   }
+}
+
+/** An HTML artifact, rendered in a sandboxed frame at an opaque origin (ADR
+ *  0322). Its scripts run, and it reaches the shell only through the message
+ *  bridge in `previewFrameBridge.ts`.
+ *
+ *  An `about:srcdoc` document resolves relative and fragment hrefs against the
+ *  HOST page's URL. `withPreviewBase` re-anchors them at the artifact's folder,
+ *  carrying the asset pass behind a gateway. The bridge routes the clicks the
+ *  browser would otherwise use to navigate this frame.
+ *
+ *  `withPreviewSizing` stamps the UI scale and a body text default, since the
+ *  document inherits no root font-size either. Reading `currentUiScale()` and
+ *  the shortcut bindings here subscribes to both, so a change re-stamps. */
+function HtmlPreviewFrame({ content, url, path, withCapability }: {
+  content: string; url: string; path: string; withCapability: boolean;
+}) {
+  const scale = currentUiScale();
+  const bindings = allBindings();
+  const bindingsKey = JSON.stringify(bindings);
+  const declaresOwnBase = documentDeclaresBase(content);
+  // Keyed on the base, not the URL: the URL's revision stamp changes on every
+  // refresh, and an unchanged document must not reload and lose its scroll.
+  const baseHref = previewBaseHref(url);
+  const { srcDoc, nonce } = useMemo(() => {
+    const bridge = previewBridgeConfig(bindings);
+    // The latest pass, peeked: a renewal must not rebuild the document. It
+    // reaches the live one over the bridge instead.
+    const base = withPreviewCapability(baseHref, withCapability ? peekArtifactPreviewCapability() : null);
+    return {
+      nonce: bridge.nonce,
+      srcDoc: withPreviewBridge(withPreviewBase(withPreviewSizing(content, scale), base), bridge),
+    };
+  }, [content, baseHref, withCapability, scale, bindingsKey]);
+
+  const frameRef = useRef<HTMLIFrameElement>(null);
+  // A layout effect, so the listener is in place in the commit's own task,
+  // before the new document can load and post.
+  useLayoutEffect(() => {
+    const onMessage = (e: MessageEvent) => {
+      const frameWindow = frameRef.current?.contentWindow ?? null;
+      const msg = readPreviewFrameMessage(e, frameWindow, nonce);
+      if (msg) routePreviewFrameMessage(msg, { artifactPath: path, declaresOwnBase, frameWindow });
+    };
+    window.addEventListener('message', onMessage);
+    return () => window.removeEventListener('message', onMessage);
+  }, [nonce, path, declaresOwnBase]);
+
+  return (
+    <iframe
+      ref={frameRef}
+      data-role={PREVIEW_FRAME_ROLE}
+      sandbox={ARTIFACT_PREVIEW_SANDBOX}
+      allow={ARTIFACT_PREVIEW_ALLOW}
+      srcDoc={srcDoc}
+      // `#fff` is functional rather than thematic, the token rule's second
+      // carve-out. An artifact is authored against a white page and usually
+      // sets no background. A themed canvas would put its black text on the
+      // dark surface and leave the document unreadable.
+      style="width:100%;height:100%;border:none;background:#fff;"
+    />
+  );
 }
 
 /** `knowhow/lucidos-ops/foo.md` → `lucidos-ops/foo`; same for `system-knowhow/`.

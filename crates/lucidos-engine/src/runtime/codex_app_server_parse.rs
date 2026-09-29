@@ -284,6 +284,7 @@ impl AppServerTracker {
             model,
             slash_commands: Vec::new(),
             skills: Vec::new(),
+            agent_version: None,
         }]
     }
 

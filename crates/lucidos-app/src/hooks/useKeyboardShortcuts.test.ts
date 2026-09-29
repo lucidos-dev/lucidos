@@ -13,10 +13,11 @@ import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 // @ts-expect-error: same
 import { fileURLToPath } from 'node:url';
-import { dispatchEscape, classifyForwardedChord, dispatchForwardedChord, dispatchPreviewIframeShortcut, shouldTypeToFocusPrompt } from './useKeyboardShortcuts';
+import { dispatchEscape, classifyChord, dispatchForwardedChord, dispatchPreviewIframeShortcut, shouldTypeToFocusPrompt, isMacTextEditingKey } from './useKeyboardShortcuts';
 import { isTextInput, isThreadTranscript } from '../utils/dom';
 import { pushOverlay, _resetOverlayStackForTesting } from '../store/overlayStack';
 import { focusedPane, splitRatio, searchEverywhereAnchor, searchEverywhereOpen } from '../store/store';
+import { promptStopRequested } from '../components/chat/prompt-input-helpers';
 
 const here: string = dirname(fileURLToPath(import.meta.url));
 
@@ -177,30 +178,62 @@ describe('shouldTypeToFocusPrompt (bare-typing → prompt textarea)', () => {
   });
 });
 
-describe('classifyForwardedChord (keydowns forwarded from app iframes)', () => {
+describe('classifyChord (host keydowns, app-frame forwards, the PDF preview)', () => {
   const chord = (over: Partial<{ metaKey: boolean; ctrlKey: boolean; shiftKey: boolean; altKey: boolean; key: string }>) => ({
     metaKey: false, ctrlKey: false, shiftKey: false, altKey: false, key: '', ...over,
   });
 
   it('maps default pane chords to their shortcut id', () => {
     // Defaults from utils/shortcuts.ts (no overrides loaded in the test env).
-    expect(classifyForwardedChord(chord({ metaKey: true, shiftKey: true, key: '3' }))).toBe('toggleContentPane');
-    expect(classifyForwardedChord(chord({ metaKey: true, shiftKey: true, key: '2' }))).toBe('toggleThreadPane');
-    expect(classifyForwardedChord(chord({ metaKey: true, shiftKey: true, key: '1' }))).toBe('toggleThreadDrawer');
-    expect(classifyForwardedChord(chord({ metaKey: true, altKey: true, key: 'ArrowLeft' }))).toBe('narrowThreadPane');
-    expect(classifyForwardedChord(chord({ metaKey: true, altKey: true, key: 'ArrowRight' }))).toBe('widenThreadPane');
+    expect(classifyChord(chord({ metaKey: true, shiftKey: true, key: '3' }))).toBe('toggleContentPane');
+    expect(classifyChord(chord({ metaKey: true, shiftKey: true, key: '2' }))).toBe('toggleThreadPane');
+    expect(classifyChord(chord({ metaKey: true, shiftKey: true, key: '1' }))).toBe('toggleThreadDrawer');
+    expect(classifyChord(chord({ metaKey: true, altKey: true, key: 'ArrowLeft' }))).toBe('narrowThreadPane');
+    expect(classifyChord(chord({ metaKey: true, altKey: true, key: 'ArrowRight' }))).toBe('widenThreadPane');
   });
 
   it('treats Ctrl as the primary modifier too (matches the host leniency)', () => {
-    expect(classifyForwardedChord(chord({ ctrlKey: true, shiftKey: true, key: '3' }))).toBe('toggleContentPane');
+    expect(classifyChord(chord({ ctrlKey: true, shiftKey: true, key: '3' }))).toBe('toggleContentPane');
   });
 
   it('classifies Escape as the escape policy', () => {
-    expect(classifyForwardedChord(chord({ key: 'Escape' }))).toBe('escape');
+    expect(classifyChord(chord({ key: 'Escape' }))).toBe('escape');
+  });
+
+  it('gives Shift+Escape to the composer shortcut when the Escape policy has nothing to do', () => {
+    expect(classifyChord(chord({ shiftKey: true, key: 'Escape' }))).toBe('focusComposer');
+  });
+
+  it('gives Shift+Escape to the Escape policy while an overlay is open, so one press does one thing', () => {
+    pushOverlay({ id: 'm', dismiss: vi.fn(), hasPanel: true });
+    expect(classifyChord(chord({ shiftKey: true, key: 'Escape' }))).toBe('escape');
+  });
+
+  it('gives Shift+Escape to a field that owns its Escape, whose blur would save the edit', () => {
+    const g = globalThis as { document?: unknown };
+    const saved = g.document;
+    g.document = { activeElement: { hasAttribute: (n: string) => n === 'data-escape-self' } };
+    try {
+      expect(classifyChord(chord({ shiftKey: true, key: 'Escape' }))).toBe('escape');
+    } finally {
+      g.document = saved;
+    }
+  });
+
+  it('gives Shift+Escape to the Escape policy while an app is natively fullscreen', () => {
+    // The node test env has no document; stub the one field the check reads.
+    const g = globalThis as { document?: unknown };
+    const saved = g.document;
+    g.document = { fullscreenElement: {} };
+    try {
+      expect(classifyChord(chord({ shiftKey: true, key: 'Escape' }))).toBe('escape');
+    } finally {
+      g.document = saved;
+    }
   });
 
   it('returns null for a chord that matches no shortcut (host ignores it)', () => {
-    expect(classifyForwardedChord(chord({ metaKey: true, key: 'c' }))).toBeNull();
+    expect(classifyChord(chord({ metaKey: true, key: 'c' }))).toBeNull();
   });
 });
 
@@ -239,8 +272,39 @@ describe('dispatchForwardedChord (forwarded chord ⇒ content pane is focused)',
   });
 });
 
+describe('isMacTextEditingKey', () => {
+  const ctrlK = { metaKey: false, ctrlKey: true, shiftKey: false, altKey: false, key: 'k', target: null };
+
+  it('leaves Ctrl+letter to a Mac text field, where Ctrl+K deletes to the line end', () => {
+    vi.mocked(isTextInput).mockReturnValue(true);
+    expect(isMacTextEditingKey(ctrlK, true)).toBe(true);
+  });
+
+  it('lets the shortcut have it with ⌘, outside a field, or off a Mac', () => {
+    vi.mocked(isTextInput).mockReturnValue(true);
+    expect(isMacTextEditingKey({ ...ctrlK, metaKey: true, ctrlKey: false }, true)).toBe(false);
+    expect(isMacTextEditingKey(ctrlK, false)).toBe(false);
+    vi.mocked(isTextInput).mockReturnValue(false);
+    expect(isMacTextEditingKey(ctrlK, true)).toBe(false);
+  });
+
+  it('leaves a shifted chord to the shortcut, since the Mac shows those as ⌃⇧', () => {
+    vi.mocked(isTextInput).mockReturnValue(true);
+    expect(isMacTextEditingKey({ ...ctrlK, shiftKey: true, key: 'O' }, true)).toBe(false);
+  });
+});
+
+describe('the Stop shortcut', () => {
+  it('asks the composer to cancel rather than cancelling behind its back', () => {
+    promptStopRequested.value = false;
+    dispatchForwardedChord({ metaKey: true, ctrlKey: false, shiftKey: false, altKey: false, key: '.' });
+    expect(promptStopRequested.value).toBe(true);
+    promptStopRequested.value = false;
+  });
+});
+
 describe('the Search everywhere shortcut', () => {
-  const searchChord = { metaKey: true, ctrlKey: false, shiftKey: true, altKey: false, key: 's' };
+  const searchChord = { metaKey: true, ctrlKey: false, shiftKey: false, altKey: false, key: 'k' };
 
   it('drops the anchor a past button open left, so the palette follows the focused pane', () => {
     searchEverywhereOpen.value = false;

@@ -1,20 +1,19 @@
-//! Hydrate the user's login-shell environment for a GUI launch (macOS).
+//! Hydrate the user's login-shell environment for a service launch.
 //!
-//! A process started by launchd or by LaunchServices inherits launchd's
+//! A process started by launchd or systemd inherits the service manager's
 //! environment, not the user's. `~/.zprofile` and `~/.zshrc` never ran, so
-//! nothing exported there exists, and PATH is the bare
-//! `/usr/bin:/bin:/usr/sbin:/sbin`. That breaks two things:
+//! nothing exported there exists, and PATH is a bare system one. That breaks
+//! two things:
 //!
 //!  * **Provider discovery.** The engine and the coding agents it spawns
 //!    resolve their credentials from environment variables. Keys in a shell
-//!    profile hit the no-provider wall in the packaged app.
+//!    profile hit the no-provider wall.
 //!  * **Tool resolution.** `claude`, `codex`, `git` and `npx` installed via
-//!    Homebrew, nvm, asdf or mise are all off launchd's PATH.
+//!    Homebrew, nvm, asdf, mise or volta are all off the service PATH.
 //!
-//! **Where this runs, and why it is not the client.** In a packaged build the
-//! engine is not a descendant of the GUI client. Every link from
-//! [`crate::run_service`] down to the coding agents inherits its parent's
-//! environment, so hydrating the service reaches all of them.
+//! **Why the gateway.** It is the root both shipped installs share: the `.app`
+//! runs it under `Lucidos --service`, the headless install runs it directly.
+//! Every engine and coding agent inherits its environment (ADR 0326).
 //!
 //! The engine's `core::user_path` is a floor for the common install dirs. This
 //! reads the PATH the user actually has, and the two compose.
@@ -68,8 +67,11 @@ const HYDRATED_VARS: &[&str] = &[
 ];
 
 /// Fallback login shell when `$SHELL` says nothing usable. macOS has defaulted
-/// to zsh since Catalina.
+/// to zsh since Catalina. Linux guarantees only `/bin/sh`.
+#[cfg(target_os = "macos")]
 const DEFAULT_SHELL: &str = "/bin/zsh";
+#[cfg(not(target_os = "macos"))]
+const DEFAULT_SHELL: &str = "/bin/sh";
 
 /// Printed by the login shell immediately before the environment dump, so a
 /// profile that greets the user cannot be mistaken for the payload. Everything
@@ -80,9 +82,11 @@ const MARKER: &str = "__LUCIDOS_SHELL_ENV__";
 /// How long the login shell gets to answer.
 ///
 /// A profile can hang outright: a slow nvm or mise init, a network call, a
-/// prompt framework waiting on something. This runs before the gateway starts,
-/// so a hung shell must cost a bounded delay and nothing else. Five seconds is
-/// generous for a real profile and invisible against the gateway-health budget.
+/// prompt framework waiting on something. A service can also start at login,
+/// before the profile is comfortable to run. This runs before the gateway
+/// serves anything, so a hung shell must cost a bounded delay and nothing
+/// else. Five seconds is generous for a real profile and invisible against the
+/// gateway-health budget.
 /// A shell that cannot answer within it is hung rather than slow.
 const SHELL_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -93,15 +97,15 @@ const DRAIN_GRACE: Duration = Duration::from_millis(250);
 
 /// Resolve the login shell's environment and apply the allowlisted parts to
 /// THIS process, so everything below it inherits them. Every failure is logged
-/// and swallowed, since no shell problem may keep the app from starting.
+/// and swallowed, since no shell problem may keep the gateway from starting.
 ///
 /// # Safety contract
 ///
 /// Calls `std::env::set_var`, so it must run while the process is still
 /// single-threaded. Two things establish that, and both are load-bearing:
 ///
-///  * The one call site is the first statement of `desktop::run_service`, which
-///    `main` reaches before any Tauri, AppKit or thread setup.
+///  * The one call site is in the gateway's `boot()`, above the tokio runtime
+///    build. A test in `main.rs` pins that order.
 ///  * [`read_stdout_bounded`], which this calls first, does spawn a reader
 ///    thread. It hands back output only where it has joined that thread. Every
 ///    path that leaves the thread running returns `Err`, which returns from
@@ -110,84 +114,80 @@ const DRAIN_GRACE: Duration = Duration::from_millis(250);
 /// Anything added between them has to preserve that, which is why it is spelled
 /// out rather than left as "it is early in `main`".
 pub fn hydrate_login_shell_env() {
-    if !needs_hydration(std::env::var_os("SHLVL")) {
-        eprintln!("[shell-env] started from a shell; keeping the inherited environment");
+    let packaged = std::env::var_os("LUCIDOS_PACKAGED");
+    let shlvl = std::env::var_os("SHLVL");
+    if !should_hydrate(packaged.as_deref(), shlvl.as_deref()) {
+        if shlvl.is_some() && is_packaged(packaged.as_deref()) {
+            crate::log!("[shell-env] started from a shell; keeping the inherited environment");
+        }
         return;
     }
     let shell = login_shell(std::env::var_os("SHELL"));
     let stdout = match read_login_shell_env(&shell, SHELL_TIMEOUT) {
         Ok(stdout) => stdout,
         Err(e) => {
-            eprintln!("[shell-env] {e}; continuing without the login-shell environment");
+            crate::log!("[shell-env] {e}; continuing without the login-shell environment");
             return;
         }
     };
     let Some(payload) = env_after_marker(&stdout) else {
-        eprintln!(
+        crate::log!(
             "[shell-env] {} produced no environment dump; continuing without it",
             shell.display()
         );
         return;
     };
 
-    let shell_env = parse_null_delimited(payload);
-    let to_apply = variables_to_apply(&shell_env, |name| std::env::var_os(name).is_some());
-
-    let mut applied: Vec<&str> = Vec::new();
-    for (name, value) in &to_apply {
+    let plan = hydration_plan(&parse_null_delimited(payload), |name| {
+        std::env::var_os(name)
+    });
+    for (name, value) in &plan {
         // SAFETY: single-threaded at this point. See the safety contract above.
         unsafe {
             std::env::set_var(name, value);
         }
-        applied.push(name);
     }
 
-    // PATH is the documented exception to the never-override rule: launchd
-    // ALWAYS sets a minimal one, so leaving it to `variables_to_apply` would
-    // mean it never hydrates at all. Merged rather than replaced so no
-    // inherited directory is lost. See `merged_path`.
-    if let Some((_, shell_path)) = shell_env.iter().find(|(name, _)| name == "PATH") {
-        let merged = merged_path(OsStr::new(shell_path), std::env::var_os("PATH").as_deref());
-        // SAFETY: as above.
-        unsafe {
-            std::env::set_var("PATH", &merged);
-        }
-        applied.push("PATH");
-    }
-
-    if applied.is_empty() {
-        eprintln!(
+    if plan.is_empty() {
+        crate::log!(
             "[shell-env] {} contributed nothing new; continuing with the inherited environment",
             shell.display()
         );
     } else {
         // NAMES only. Several of these are API keys, and this line lands in the
-        // service log under `<app-data>/logs/`.
-        eprintln!(
+        // service log.
+        let names: Vec<&str> = plan.iter().map(|(name, _)| name.as_str()).collect();
+        crate::log!(
             "[shell-env] hydrated from {}: {}",
             shell.display(),
-            applied.join(", ")
+            names.join(", ")
         );
     }
 }
 
-/// Does this process need its environment hydrated from a login shell?
+/// Does this gateway need its environment hydrated from a login shell?
 ///
-/// The signal is the absence of `SHLVL`: every POSIX shell sets and exports it,
-/// and launchd sets nothing of the kind. A present `SHLVL` therefore means the
-/// environment already came through a shell and must be left exactly as it is.
+/// Two signals, both required:
 ///
-/// Both ways of being wrong are cheap. Treating a terminal run as a GUI launch
-/// costs one shell spawn whose result overrides nothing. Treating a GUI launch
-/// as a terminal run leaves the un-hydrated behaviour. Pure over its input, so
-/// the decision is testable without touching process env.
-fn needs_hydration(shlvl: Option<OsString>) -> bool {
-    shlvl.is_none()
+///  * **`LUCIDOS_PACKAGED=1`.** Both shipped installs set it, and the dev
+///    gateway never does, so dev behaviour cannot change.
+///  * **No `SHLVL`.** Every POSIX shell sets and exports it, and launchd and
+///    systemd set nothing of the kind. A present `SHLVL` means the environment
+///    already came through a shell, as in `install.sh`'s foreground launch.
+///
+/// Pure over its inputs, so the decision is testable without touching process
+/// env.
+fn should_hydrate(packaged: Option<&OsStr>, shlvl: Option<&OsStr>) -> bool {
+    is_packaged(packaged) && shlvl.is_none()
+}
+
+fn is_packaged(packaged: Option<&OsStr>) -> bool {
+    packaged == Some(OsStr::new("1"))
 }
 
 /// The user's login shell: `$SHELL` when it says something usable, else
 /// [`DEFAULT_SHELL`]. Blank and whitespace-only values are treated as unset,
-/// since a launchd environment can carry an empty one.
+/// since a service environment can carry an empty one.
 fn login_shell(shell: Option<OsString>) -> PathBuf {
     shell
         .filter(|s| !s.to_string_lossy().trim().is_empty())
@@ -250,8 +250,8 @@ fn kill_process_group(pid: u32) {
 ///
 /// **stdout is drained on a thread WHILE the child runs**, not after it exits.
 /// A full environment can exceed the 64 KiB pipe buffer, and a child blocked
-/// writing into a pipe nobody reads never exits. That is why `mobile.rs`'s
-/// `output_with_timeout` is not reused here: it waits for exit first.
+/// writing into a pipe nobody reads never exits. So a wait-for-exit-then-read
+/// helper would deadlock on exactly the large environments this must handle.
 ///
 /// **Nothing waits on that thread without a deadline, and the child gets its
 /// own process group.** Both exist for the same subtle reason. A pipe reaches
@@ -396,8 +396,9 @@ fn parse_null_delimited(payload: &[u8]) -> Vec<(String, String)> {
 ///    explicitly passed variable, a plist entry or a Lucidos-managed value is
 ///    a deliberate decision, which a shell profile may not quietly outrank.
 ///
-/// PATH is excluded here and handled by [`merged_path`] instead: launchd always
-/// sets one, so the never-override rule alone would mean PATH never hydrates.
+/// PATH is excluded here and handled by [`merged_path`] instead: the service
+/// manager always sets one, so the never-override rule alone would mean PATH
+/// never hydrates.
 /// Empty values are dropped, since an exported-but-empty key is not a
 /// credential and would only mask the fallbacks below it.
 ///
@@ -417,19 +418,41 @@ fn variables_to_apply(
         .collect()
 }
 
+/// Everything to set on this process, in order: the allowlisted variables from
+/// [`variables_to_apply`], then PATH merged by [`merged_path`] when the shell
+/// reported one.
+///
+/// `inherited` reads a variable from this process. It is injected so the whole
+/// plan is testable without mutating real process env.
+fn hydration_plan(
+    shell_env: &[(String, String)],
+    inherited: impl Fn(&str) -> Option<OsString>,
+) -> Vec<(String, OsString)> {
+    let mut plan: Vec<(String, OsString)> =
+        variables_to_apply(shell_env, |name| inherited(name).is_some())
+            .into_iter()
+            .map(|(name, value)| (name, OsString::from(value)))
+            .collect();
+    if let Some((_, shell_path)) = shell_env.iter().find(|(name, _)| name == "PATH") {
+        let merged = merged_path(OsStr::new(shell_path), inherited("PATH").as_deref());
+        plan.push(("PATH".to_string(), merged));
+    }
+    plan
+}
+
 /// Merge the login shell's PATH over the inherited one: the shell's directories
 /// first, then any inherited directory not already among them, in order.
 ///
 /// PATH is the one allowlisted variable that overrides what the process already
-/// has, and it has to be. launchd hands every packaged process a minimal PATH,
-/// so it is never absent and a strict never-override rule would skip it.
+/// has, and it has to be. launchd and systemd hand every service a minimal
+/// PATH, so it is never absent and a strict never-override rule would skip it.
 ///
-/// Merged rather than replaced so the launchd floor cannot be lost: a login
-/// shell that somehow omits `/usr/bin` still leaves the engine able to find
-/// `git`. Duplicates keep their first position, and empty components are
+/// Merged rather than replaced so the service manager's floor cannot be lost: a
+/// login shell that somehow omits `/usr/bin` still leaves the engine able to
+/// find `git`. Duplicates keep their first position, and empty components are
 /// dropped because an empty PATH element means the current directory. Same
-/// shape as the engine's `core::user_path::augmented_user_path`, which this
-/// crate cannot reuse because it links neither the engine nor the gateway.
+/// shape as the engine's `core::user_path::augmented_user_path`, which the
+/// gateway cannot reuse because it does not link the engine (ADR 0014 §1).
 fn merged_path(shell_path: &OsStr, inherited: Option<&OsStr>) -> OsString {
     let mut dirs: Vec<PathBuf> = Vec::new();
     let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
@@ -449,24 +472,58 @@ mod tests {
 
     // ── When hydration runs at all ──────────────────────────────────────────
 
+    fn os(s: &str) -> Option<&OsStr> {
+        Some(OsStr::new(s))
+    }
+
     #[test]
-    fn a_launchd_launch_has_no_shlvl_and_is_hydrated() {
+    fn a_packaged_service_launch_is_hydrated() {
         assert!(
-            needs_hydration(None),
-            "no SHLVL means launchd/LaunchServices started us and the profile never ran"
+            should_hydrate(os("1"), None),
+            "LUCIDOS_PACKAGED=1 and no SHLVL is launchd or systemd starting a shipped install"
         );
     }
 
     #[test]
-    fn a_shell_started_run_is_left_alone() {
+    fn a_packaged_gateway_started_from_a_shell_is_left_alone() {
         assert!(
-            !needs_hydration(Some(OsString::from("1"))),
+            !should_hydrate(os("1"), os("1")),
             "SHLVL present means a shell already gave us its environment"
         );
-        assert!(!needs_hydration(Some(OsString::from("3"))));
+        assert!(!should_hydrate(os("1"), os("3")));
+    }
+
+    #[test]
+    fn a_dev_gateway_is_never_hydrated() {
+        assert!(!should_hydrate(None, os("2")), "a dev gateway from a shell");
+        assert!(
+            !should_hydrate(None, None),
+            "even with no SHLVL, a gateway that is not a shipped install keeps its env"
+        );
+    }
+
+    #[test]
+    fn only_the_exact_packaged_value_counts() {
+        assert!(!should_hydrate(os("0"), None));
+        assert!(!should_hydrate(os(""), None));
+        assert!(!should_hydrate(os("true"), None));
     }
 
     // ── Which shell we ask ──────────────────────────────────────────────────
+
+    #[test]
+    fn the_fallback_shell_exists_on_this_platform() {
+        assert!(
+            Path::new(DEFAULT_SHELL).exists(),
+            "{DEFAULT_SHELL} is the fallback here, so it has to be installed"
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn linux_falls_back_to_sh_not_zsh() {
+        assert_eq!(DEFAULT_SHELL, "/bin/sh", "zsh is not a Linux default");
+    }
 
     #[test]
     fn login_shell_uses_the_users_shell() {
@@ -481,7 +538,7 @@ mod tests {
     }
 
     #[test]
-    fn login_shell_falls_back_to_zsh_when_shell_says_nothing() {
+    fn login_shell_falls_back_when_shell_says_nothing() {
         assert_eq!(login_shell(None), PathBuf::from(DEFAULT_SHELL));
         assert_eq!(
             login_shell(Some(OsString::from(""))),
@@ -634,6 +691,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_plan_merges_path_after_the_allowlisted_variables() {
+        let shell_env = env(&[
+            ("PATH", "/home/u/.nvm/versions/node/v22/bin:/usr/bin"),
+            ("ANTHROPIC_API_KEY", "sk-profile"),
+        ]);
+        let plan = hydration_plan(&shell_env, |name| {
+            (name == "PATH").then(|| OsString::from("/usr/bin:/bin"))
+        });
+        assert_eq!(
+            plan,
+            vec![
+                (
+                    "ANTHROPIC_API_KEY".to_string(),
+                    OsString::from("sk-profile")
+                ),
+                (
+                    "PATH".to_string(),
+                    OsString::from("/home/u/.nvm/versions/node/v22/bin:/usr/bin:/bin")
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_shell_with_no_path_leaves_path_out_of_the_plan() {
+        let plan = hydration_plan(&env(&[("VERTEX_REGION", "eu")]), |_| {
+            Some(OsString::from("/usr/bin"))
+        });
+        assert!(
+            plan.is_empty(),
+            "VERTEX_REGION is already set and no PATH was reported: {plan:?}"
+        );
+    }
+
     // ── PATH ────────────────────────────────────────────────────────────────
 
     #[test]
@@ -695,6 +787,68 @@ mod tests {
             "a real environment dump has a PATH; got {} entries",
             parsed.len()
         );
+    }
+
+    #[test]
+    fn a_login_shell_with_a_version_manager_on_path_hydrates_the_plan() {
+        // The headless-install regression end to end, short of `set_var`: the
+        // real command, reader, parser and plan. The exports live in the
+        // `~/.profile` of a throwaway HOME, the way a version manager installs
+        // itself. A login shell reads it after `/etc/profile`, which on Debian
+        // overwrites PATH outright.
+        let nvm_bin = "/home/u/.nvm/versions/node/v22.3.0/bin";
+        let home = a_fresh_temp_path("home");
+        std::fs::create_dir_all(&home).expect("temp HOME");
+        std::fs::write(
+            home.join(".profile"),
+            format!(
+                "export PATH=\"{nvm_bin}:$PATH\"\n\
+                 export ANTHROPIC_API_KEY=sk-from-profile\n\
+                 export OPENAI_API_KEY=sk-profile-loses\n\
+                 export LUCIDOS_BIND_ALL=1\n"
+            ),
+        )
+        .expect("write the profile");
+        let mut cmd = login_shell_command(Path::new("/bin/sh"));
+        cmd.env("HOME", &home).env_remove("ENV");
+        let stdout = read_stdout_bounded(cmd, "the test shell", Duration::from_secs(10));
+        let _ = std::fs::remove_dir_all(&home);
+        let stdout = stdout.expect("/bin/sh answers");
+        let shell_env = parse_null_delimited(env_after_marker(&stdout).expect("marker"));
+
+        let plan = hydration_plan(&shell_env, |name| match name {
+            "OPENAI_API_KEY" => Some(OsString::from("sk-from-the-unit-file")),
+            "PATH" => Some(OsString::from("/usr/bin:/bin:/usr/sbin:/sbin")),
+            _ => None,
+        });
+        let value = |name: &str| plan.iter().find(|(n, _)| n == name).map(|(_, v)| v);
+
+        assert_eq!(
+            value("ANTHROPIC_API_KEY"),
+            Some(&OsString::from("sk-from-profile"))
+        );
+        assert_eq!(
+            value("OPENAI_API_KEY"),
+            None,
+            "a value the service already has outranks the profile"
+        );
+        assert!(
+            plan.iter()
+                .all(|(name, _)| HYDRATED_VARS.contains(&name.as_str())),
+            "nothing off the allowlist may be applied: {plan:?}"
+        );
+        let path: Vec<PathBuf> =
+            std::env::split_paths(value("PATH").expect("PATH is hydrated")).collect();
+        assert!(
+            path.contains(&PathBuf::from(nvm_bin)),
+            "the version manager's bin dir reaches PATH: {path:?}"
+        );
+        for floor in ["/usr/bin", "/bin", "/usr/sbin", "/sbin"] {
+            assert!(
+                path.contains(&PathBuf::from(floor)),
+                "{floor} survives: {path:?}"
+            );
+        }
     }
 
     /// A child that never returns, standing in for a wedged `.zshrc`.

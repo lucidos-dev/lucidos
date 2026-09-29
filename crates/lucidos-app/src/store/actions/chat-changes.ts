@@ -12,6 +12,7 @@ import { errorDetail, isAbortError } from '../../utils/errorDetail';
 import { focusThread } from './threads';
 import { reconcileApplyProgress } from './applyProgress';
 import type { Change } from '../../api/client';
+import { changeHeadline } from '../changeHeadline';
 
 /** Key of the restart FAILURE toast, and of nothing else now.
  *
@@ -391,7 +392,7 @@ function reconcileApplyingNow(pending: Change[], applied: Change[]): void {
     const key = `applying-${threadId}`;
     const appliedChange = applied.find((c) => c.thread_id === threadId);
     if (appliedChange) {
-      showToast(changeToastMessage('Applied', threadId, appliedChange.description), 'success', {
+      showToast(changeToastMessage('Applied', threadId, changeHeadline(appliedChange)), 'success', {
         key,
         onClick: () => focusThread(threadId),
         autoDismissMs: TOAST_AUTO_DISMISS_MS,
@@ -525,8 +526,16 @@ export async function applySingleChange(id: string): Promise<void> {
   }
 }
 
-/** Discard a single pending change by ID. */
+/** A discard deletes the change's branch and worktree, so it asks first, as
+ *  the thread's own Discard does. */
+const DISCARD_ONE_CONFIRM = 'Discard this change? This cannot be undone.';
+/** The engine skips a change whose thread is still working or waiting. */
+const DISCARD_ALL_CONFIRM =
+  'Discard every change whose thread has finished? Threads still working keep theirs. This cannot be undone.';
+
+/** Discard a single pending change by ID, once the user confirms. */
 export async function discardSingleChange(id: string): Promise<void> {
+  if (!(await showConfirm(DISCARD_ONE_CONFIRM, 'Discard', { variant: 'danger' }))) return;
   try {
     await apiDiscard(id);
   } catch (e) {
@@ -601,8 +610,9 @@ export async function cancelApplyAllBatch(): Promise<void> {
   }
 }
 
-/** Discard all changes. */
+/** Discard all changes, once the user confirms. */
 export async function discardAllChanges(): Promise<void> {
+  if (!(await showConfirm(DISCARD_ALL_CONFIRM, 'Discard', { variant: 'danger' }))) return;
   try {
     const result = await apiDiscardAll();
     if (result.failed > 0) {
@@ -718,6 +728,15 @@ export async function revertChange(id: string): Promise<void> {
   } catch (e) {
     showToast(errorDetail(e) || 'Failed to revert change', 'error');
   }
+}
+
+/** Put a `ChangeSummarized` on a change row fetched outside the two lists.
+ *  Those lists refresh from the `ChangesUpdated` the engine sends beside it.
+ *  Guarded like the projection: a summary of an older commit list is dropped. */
+export function applyChangeSummarized(id: string, summary: string, description: string): void {
+  const cached = lazyChanges.value.get(id);
+  if (cached?.status !== 'loaded' || cached.data.description !== description) return;
+  setLazyChange(id, { status: 'loaded', data: { ...cached.data, summary } });
 }
 
 function setLazyChange(id: string, value: Loadable<Change>): void {

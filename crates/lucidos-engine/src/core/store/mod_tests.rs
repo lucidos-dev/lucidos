@@ -910,3 +910,68 @@ async fn the_recent_thread_window_skips_side_questions() {
 
     teardown_test_db(&db).await;
 }
+
+/// Memory rebuild loads only the types it indexes, never the streaming rows
+/// that fill most of the table.
+#[tokio::test]
+async fn events_of_types_chronological_returns_only_the_named_types() {
+    let (pool, db_name) = setup_test_db().await;
+    let store = EventStore::new(pool.clone());
+    let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    let wanted_a = Uuid::new_v4();
+    let wanted_b = Uuid::new_v4();
+    insert_event(
+        &pool,
+        wanted_b,
+        "ResponseGenerated",
+        t0 + chrono::Duration::seconds(2),
+    )
+    .await;
+    insert_event(
+        &pool,
+        Uuid::new_v4(),
+        "TextStreamed",
+        t0 + chrono::Duration::seconds(1),
+    )
+    .await;
+    insert_event(&pool, wanted_a, "MessageReceived", t0).await;
+
+    let rows = store
+        .events_of_types_chronological(&["MessageReceived", "ResponseGenerated"])
+        .await
+        .unwrap();
+    let ids: Vec<Uuid> = rows.iter().map(|r| r.id).collect();
+    assert_eq!(ids, vec![wanted_a, wanted_b]);
+    teardown_test_db(&db_name).await;
+}
+
+/// A conversation snapshot reads its own thread and every artifact write up
+/// to the cutoff, never another thread's messages.
+#[tokio::test]
+async fn get_conversation_events_until_reads_one_thread_and_artifact_writes() {
+    let (pool, db_name) = setup_test_db().await;
+    let store = EventStore::new(pool.clone());
+    let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    let (mine, other) = (Uuid::new_v4(), Uuid::new_v4());
+    let early = Uuid::new_v4();
+    let artifact = Uuid::new_v4();
+    insert_thread_event(&pool, early, "MessageReceived", t0, mine).await;
+    insert_thread_event(&pool, Uuid::new_v4(), "MessageReceived", t0, other).await;
+    insert_event(
+        &pool,
+        artifact,
+        "ArtifactUpdated",
+        t0 + chrono::Duration::seconds(1),
+    )
+    .await;
+    let late = t0 + chrono::Duration::seconds(5);
+    insert_thread_event(&pool, Uuid::new_v4(), "MessageReceived", late, mine).await;
+
+    let rows = store
+        .get_conversation_events_until(Some(mine), t0 + chrono::Duration::seconds(2))
+        .await
+        .unwrap();
+    let ids: Vec<Uuid> = rows.iter().map(|r| r.id).collect();
+    assert_eq!(ids, vec![early, artifact]);
+    teardown_test_db(&db_name).await;
+}

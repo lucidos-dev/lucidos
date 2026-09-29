@@ -608,18 +608,88 @@ const SUPERSEDED_HOOK_VALUE: &str = "(superseded) The user did not answer this \
     input. Work from that, and do not ask this question again unless it is \
     still open after reading it.";
 
+/// How an answer's images are written into the text its agent reads.
+#[derive(Clone, Copy)]
+pub(crate) enum AnswerImages<'a> {
+    /// A coding agent opens each image itself, from its blob path under this
+    /// workspace. Its sessions are granted `data/`, so no permission card.
+    BlobPaths(&'a std::path::Path),
+    /// The Lucidos Agent receives the images as blocks after the tool result
+    /// (see [`with_answer_images`]). The text is stored and replayed on later
+    /// turns, which carry no image, so it must stay true there too.
+    AttachedBlocks,
+    /// The Lucidos Agent resumed after a restart. Its turn is rebuilt from
+    /// stored events, and no event carries the image bytes to lift. So the
+    /// text says the images exist and asks for them again.
+    Unshown,
+}
+
+/// The lines naming an answer's images, or `None` for an imageless answer.
+fn answer_image_lines(hashes: &[String], images: AnswerImages<'_>) -> Option<String> {
+    if hashes.is_empty() {
+        return None;
+    }
+    Some(match images {
+        AnswerImages::BlobPaths(workspace) => hashes
+            .iter()
+            .map(
+                |hash| match crate::core::blobs::resolve_blob(workspace, hash) {
+                    Some(blob) => format!(
+                    "[The user attached an image to this answer: {}. Open that file to see it.]",
+                    blob.path.display()
+                ),
+                    None => format!(
+                        "[The user attached an image to this answer, but its file {hash} is gone.]"
+                    ),
+                },
+            )
+            .collect::<Vec<_>>()
+            .join("\n"),
+        AnswerImages::AttachedBlocks => match hashes.len() {
+            1 => "[The user attached an image to this answer. It was shown right after this \
+                  result, in this turn only.]"
+                .into(),
+            n => format!(
+                "[The user attached {n} images to this answer. They were shown right after this \
+                 result, in this turn only.]"
+            ),
+        },
+        AnswerImages::Unshown => format!(
+            "[The user attached {} image(s) to this answer. A restart means they cannot be \
+             shown to you. Ask the user to send them again if you need them.]",
+            hashes.len()
+        ),
+    })
+}
+
+/// Join an answer's text and its image lines, skipping whichever is empty.
+fn with_image_lines(text: String, image_lines: Option<String>) -> String {
+    match image_lines {
+        None => text,
+        Some(lines) if text.is_empty() => lines,
+        Some(lines) => format!("{text}\n\n{lines}"),
+    }
+}
+
 /// `Canceled` produces a `(canceled)` marker rather than an empty string —
 /// an empty answer causes CC's model to read the question as unanswered and
 /// re-invoke the tool in a loop. `Superseded` carries a longer sentence for the
 /// same reason, plus a pointer at the message that replaced the question.
 /// `MultiSelected` joins resolved labels with
 /// `", "` and appends any non-empty `text` (freetext typed in the prompt
-/// textarea while the card was on screen) on the same separator.
+/// textarea while the card was on screen) on the same separator. A typed
+/// answer's images follow its text, written as `images` says.
 fn answer_kind_to_hook_value(
     answer_kind: &serde_json::Value,
     cc_questions: &serde_json::Value,
     question_index: usize,
+    images: AnswerImages<'_>,
 ) -> serde_json::Value {
+    let hashes: Vec<String> = answer_kind
+        .get("image_hashes")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+    let image_lines = answer_image_lines(&hashes, images);
     let kind = answer_kind
         .get("kind")
         .and_then(|k| k.as_str())
@@ -648,12 +718,15 @@ fn answer_kind_to_hook_value(
                     parts.push(text.to_string());
                 }
             }
-            serde_json::Value::String(parts.join(", "))
+            serde_json::Value::String(with_image_lines(parts.join(", "), image_lines))
         }
-        "FreeText" => answer_kind
-            .get("text")
-            .cloned()
-            .unwrap_or(serde_json::Value::String(String::new())),
+        "FreeText" => {
+            let text = answer_kind
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            serde_json::Value::String(with_image_lines(text.to_string(), image_lines))
+        }
         "Canceled" => serde_json::Value::String("(canceled)".to_string()),
         "Superseded" => serde_json::Value::String(SUPERSEDED_HOOK_VALUE.to_string()),
         _ => serde_json::Value::String(format!("(unknown answer kind: {})", kind)),
@@ -737,6 +810,7 @@ fn answer_kind_note(answer_kind: &serde_json::Value) -> &'static str {
 /// (`CLAUDE.md` § Engine Statelessness).
 pub(crate) async fn answered_question_recap(
     pool: &sqlx::PgPool,
+    workspace: &std::path::Path,
     thread_id: Uuid,
 ) -> Option<String> {
     let newest = sqlx::query_scalar::<_, Option<String>>(
@@ -784,7 +858,8 @@ pub(crate) async fn answered_question_recap(
         // ARRAY at a given index, so wrap this row's options as a one-entry
         // array: one definition of option-label resolution, not two.
         let one = serde_json::json!([{ "options": row.options }]);
-        let rendered = answer_kind_to_hook_value(&row.answer, &one, 0);
+        let rendered =
+            answer_kind_to_hook_value(&row.answer, &one, 0, AnswerImages::BlobPaths(workspace));
         let value = rendered.as_str().unwrap_or_default();
         if !out.is_empty() {
             out.push('\n');
@@ -809,6 +884,7 @@ pub(crate) async fn answered_question_recap(
 pub(crate) fn build_hook_answers(
     answer_kinds: &[serde_json::Value],
     cc_questions: &serde_json::Value,
+    images: AnswerImages<'_>,
 ) -> serde_json::Value {
     let Some(arr) = cc_questions.as_array() else {
         return serde_json::Value::Object(serde_json::Map::new());
@@ -831,7 +907,7 @@ pub(crate) fn build_hook_answers(
             raw_text
         };
         let value = match answer_kinds.get(i) {
-            Some(ans) => answer_kind_to_hook_value(ans, cc_questions, i),
+            Some(ans) => answer_kind_to_hook_value(ans, cc_questions, i, images),
             None => serde_json::Value::String("(canceled)".to_string()),
         };
         map.insert(key, value);
@@ -843,10 +919,11 @@ pub(crate) fn build_hook_answers(
 /// `multi_select` flag. Pure function; the surrounding I/O lives in
 /// `answer_pending_question`.
 ///
-/// - `MultiSelected` requires at least one id OR non-empty `text`. Every id
-///   must exist in `options`, and the question must be marked `multi_select`.
-///   The `text` field carries freetext typed in the prompt textarea while the
-///   question was on screen — the prompt-row Submit button folds it in.
+/// - `MultiSelected` requires at least one id, non-empty `text` or an image.
+///   Every id must exist in `options`, and the question must be marked
+///   `multi_select`. The `text` field carries freetext typed in the prompt
+///   textarea while the question was on screen. The prompt-row Submit button
+///   folds it in.
 /// - `Selected`/`FreeText`/`Canceled` are unrestricted here — the existing
 ///   pre-validation (option lookup on the hook side) covers their well-formedness.
 pub(crate) fn validate_answer(
@@ -854,12 +931,19 @@ pub(crate) fn validate_answer(
     options: &[QuestionOption],
     multi_select: bool,
 ) -> Result<(), String> {
-    let AnswerKind::MultiSelected { option_ids, text } = answer else {
+    let AnswerKind::MultiSelected {
+        option_ids,
+        text,
+        image_hashes,
+    } = answer
+    else {
         return Ok(());
     };
     let has_text = text.as_deref().is_some_and(|t| !t.is_empty());
-    if option_ids.is_empty() && !has_text {
-        return Err("MultiSelected requires at least one option_id or non-empty text".into());
+    if option_ids.is_empty() && !has_text && image_hashes.is_empty() {
+        return Err(
+            "MultiSelected requires at least one option_id, non-empty text or an image".into(),
+        );
     }
     if !multi_select {
         return Err("MultiSelected answer for single-select question".into());
@@ -871,6 +955,51 @@ pub(crate) fn validate_answer(
         }
     }
     Ok(())
+}
+
+/// Refuse an answer naming an image this workspace does not hold, so a card
+/// never records a picture its agent cannot open.
+pub(crate) fn check_answer_images(
+    workspace: &std::path::Path,
+    answer: &AnswerKind,
+) -> Result<(), String> {
+    match answer
+        .image_hashes()
+        .iter()
+        .find(|hash| crate::core::blobs::resolve_blob(workspace, hash).is_none())
+    {
+        Some(hash) => Err(format!(
+            "The answer names image {hash}, which was never uploaded to this workspace"
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Marks a Lucidos Agent tool result whose answer carries images, as
+/// `[ANSWER_IMAGES:<hash>,<hash>]\n<result>`. The agentic loop strips it and
+/// attaches the images after the result (`split_tool_result`).
+const ANSWER_IMAGES_PREFIX: &str = "[ANSWER_IMAGES:";
+
+/// Prefix `result` with the images of every answer in the batch, or return it
+/// unchanged when none has any.
+pub(crate) fn with_answer_images(result: String, answer_kinds: &[serde_json::Value]) -> String {
+    let hashes: Vec<String> = answer_kinds
+        .iter()
+        .filter_map(|answer| answer.get("image_hashes")?.as_array().cloned())
+        .flatten()
+        .filter_map(|hash| hash.as_str().map(str::to_string))
+        .collect();
+    if hashes.is_empty() {
+        return result;
+    }
+    format!("{ANSWER_IMAGES_PREFIX}{}]\n{result}", hashes.join(","))
+}
+
+/// Split a [`with_answer_images`] result into its blob hashes and the result.
+pub(crate) fn parse_answer_images(result: &str) -> Option<(Vec<String>, &str)> {
+    let rest = result.strip_prefix(ANSWER_IMAGES_PREFIX)?;
+    let (list, text) = rest.split_once("]\n")?;
+    Some((list.split(',').map(str::to_string).collect(), text))
 }
 
 /// Look up `(options, multi_select)` for the most recent `UserQuestionAsked`
@@ -946,7 +1075,9 @@ pub async fn answer_pending_question(
     // race we treat as a conflict for symmetry with the answered-already arm.
     match lookup_question_options(engine.pool(), thread_id, &tool_use_id).await {
         Ok(Some((options, multi_select))) => {
-            if let Err(msg) = validate_answer(&answer, &options, multi_select) {
+            if let Err(msg) = validate_answer(&answer, &options, multi_select)
+                .and_then(|()| check_answer_images(engine.workspace_path(), &answer))
+            {
                 return AnswerResult::Conflict(msg);
             }
         }
@@ -1256,6 +1387,20 @@ async fn resume_chat_after_answer(
         result is in the tool result above. Continue the turn — do not ask the \
         same question again.";
 
+    // A multi-question batch shares one outer id (`{outer}#q{i}`).
+    let outer = sub_tool_use_id
+        .rsplit_once("#q")
+        .map(|(o, _)| o)
+        .unwrap_or(sub_tool_use_id);
+    // Read before the ToolResult below, which would mark every held delivery
+    // as read (ADR 0321).
+    let held = crate::engine::chat::held_deliveries::held_deliveries(
+        engine.pool(),
+        thread_id,
+        &synth_question_id(outer, 0),
+    )
+    .await;
+
     let ask = lookup_interrupted_ask(engine.pool(), thread_id).await;
     let anchor = resume_anchor_for_ask(ask.as_ref(), thread_id);
 
@@ -1265,12 +1410,8 @@ async fn resume_chat_after_answer(
         request_event_id,
     }) = ask
     {
-        // Gather the persisted sub-answers in index order (`{outer}#q{i}`), so a
-        // multi-question batch rebuilds its full answer map.
-        let outer = sub_tool_use_id
-            .rsplit_once("#q")
-            .map(|(o, _)| o)
-            .unwrap_or(sub_tool_use_id);
+        // Gather the persisted sub-answers in index order, so a multi-question
+        // batch rebuilds its full answer map.
         let mut answer_kinds: Vec<serde_json::Value> = Vec::new();
         let mut i = 0usize;
         loop {
@@ -1304,7 +1445,7 @@ async fn resume_chat_after_answer(
                 }
             }
         }
-        let answers_map = build_hook_answers(&answer_kinds, &questions);
+        let answers_map = build_hook_answers(&answer_kinds, &questions, AnswerImages::Unshown);
         let result_str =
             serde_json::to_string(&answers_map).unwrap_or_else(|_| answers_map.to_string());
 
@@ -1340,8 +1481,10 @@ async fn resume_chat_after_answer(
     // `spawn_chat_resume` returns a boxed `dyn Future` (its concrete return type
     // is the type-erasure boundary that breaks the mutual-async-recursion cycle —
     // see its doc), so a plain `.await` here is Send-safe.
+    let note =
+        crate::engine::chat::held_deliveries::resume_note_with_held_deliveries(RESUME_NOTE, &held);
     if let Err(e) = engine
-        .spawn_chat_resume(thread_id, RESUME_NOTE.to_string(), channel, actor, anchor)
+        .spawn_chat_resume(thread_id, note, channel, actor, anchor)
         .await
     {
         log!(

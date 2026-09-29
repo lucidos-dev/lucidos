@@ -187,14 +187,14 @@ describe('a toast is a title that stays over a message that scrolls', () => {
     expect(c.props.onClick).toBeUndefined();
   });
 
-  it('closes a passive info toast on a tap, without adding a keyboard control', () => {
+  it('leaves a passive info toast up on a tap, with no keyboard control', () => {
     showToast('Copied', 'info', { key: 'copied' });
     const c = card();
 
-    expect(c.props['data-toast-tap']).toBe('dismiss');
+    expect(c.props['data-toast-tap']).toBeUndefined();
+    expect(c.props.onClick).toBeUndefined();
     expect(findByClass(ToastList(), 'toast-tap-control')).toHaveLength(0);
-    (c.props.onClick as (e: unknown) => void)(clickOn(false));
-    expect(toasts.value.find((t) => t.key === 'copied')).toBeUndefined();
+    expect(toasts.value.find((t) => t.key === 'copied')).toBeDefined();
   });
 });
 

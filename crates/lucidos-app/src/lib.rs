@@ -26,11 +26,6 @@ mod mobile;
 mod notifications;
 mod pairing;
 mod panel_preview;
-/// Login-shell environment hydration for a GUI launch. macOS-only: it exists
-/// because launchd hands a packaged process an environment the user's profile
-/// never touched, which is a macOS packaging fact.
-#[cfg(target_os = "macos")]
-mod shell_env;
 #[cfg(test)]
 mod test_support;
 mod traffic_lights;

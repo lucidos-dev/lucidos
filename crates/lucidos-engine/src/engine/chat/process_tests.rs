@@ -1714,6 +1714,19 @@ fn human_follow_up_can_answer_pending_question() {
     assert!(message_can_answer_pending_question(
         false,
         "repo is private, not public",
+        false,
+        ActorMode::Human,
+        None,
+    ));
+}
+
+/// Images alone are an answer: a screenshot can be the whole reply.
+#[test]
+fn image_only_follow_up_can_answer_pending_question() {
+    assert!(message_can_answer_pending_question(
+        false,
+        "",
+        true,
         ActorMode::Human,
         None,
     ));
@@ -1729,6 +1742,7 @@ fn pre_emitted_message_cannot_also_answer_pending_question() {
     assert!(!message_can_answer_pending_question(
         false,
         "repo is private, not public",
+        false,
         ActorMode::Human,
         Some(PreEmittedOrigin::Message(Uuid::new_v4())),
     ));
@@ -1746,6 +1760,7 @@ fn child_completion_wake_cannot_answer_pending_question() {
     assert!(!message_can_answer_pending_question(
         false,
         "[CHILD THREAD COMPLETED] 59328631… success\nSession summary…",
+        false,
         ActorMode::Agent,
         None,
     ));
@@ -1758,6 +1773,7 @@ fn engine_driven_message_cannot_answer_pending_question() {
     assert!(!message_can_answer_pending_question(
         false,
         "engine recovery note",
+        false,
         ActorMode::Engine,
         None,
     ));
@@ -1770,12 +1786,14 @@ fn new_thread_or_empty_message_cannot_answer_pending_question() {
     assert!(!message_can_answer_pending_question(
         true,
         "first message on a brand-new thread",
+        false,
         ActorMode::Human,
         None,
     ));
     assert!(!message_can_answer_pending_question(
         false,
         "",
+        false,
         ActorMode::Human,
         None,
     ));

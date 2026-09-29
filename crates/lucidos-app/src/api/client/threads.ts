@@ -153,8 +153,14 @@ export interface SearchResults {
   results: Record<string, SearchResultItem[]>;
 }
 
-export async function searchEverywhere(query: string, category: ServerSearchCategory, signal?: AbortSignal): Promise<SearchResults> {
+/** `limit` caps hits per category. Absent, the engine returns 5 for `all` and 50 otherwise. */
+export async function searchEverywhere(
+  query: string,
+  category: ServerSearchCategory,
+  { signal, limit }: { signal?: AbortSignal; limit?: number } = {},
+): Promise<SearchResults> {
   const params = new URLSearchParams({ category });
   if (query) params.set('q', query);
+  if (limit !== undefined) params.set('limit', String(limit));
   return json<SearchResults>(`${API}/search?${params}`, { signal });
 }

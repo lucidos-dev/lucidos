@@ -160,12 +160,17 @@ export function contentScrollKey(viewKey: string): string {
   return `lucidos-scroll-content-${viewKey}`;
 }
 
+/** Drop the saved scroll under `key`, so the next attach restores nothing. */
+export function forgetSavedScroll(key: string): void {
+  try {
+    localStorage.removeItem(key);
+  } catch { /* quota or disabled, ignore */ }
+}
+
 /** Drop a ContentPane view's saved scroll so the next mount lands at the top
  *  instead of restoring (e.g., after saving a form). */
 export function resetContentScroll(viewKey: string): void {
-  try {
-    localStorage.removeItem(contentScrollKey(viewKey));
-  } catch { /* quota or disabled, ignore */ }
+  forgetSavedScroll(contentScrollKey(viewKey));
 }
 
 const SAVE_DEBOUNCE_MS = 150;

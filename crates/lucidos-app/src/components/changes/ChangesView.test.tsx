@@ -27,6 +27,7 @@ function makeChange(over: Partial<Change> = {}): Change {
     pre_merge_sha: null,
     post_merge_sha: null,
     commits: [],
+    summary: null,
     incomplete: false,
     ...over,
   };

@@ -1,6 +1,7 @@
 pub mod agent_runtime;
 pub mod browser;
 mod browser_consent;
+pub mod cc_model_discovery;
 pub mod claude_code;
 pub mod codex;
 mod codex_app_server;
@@ -11,9 +12,11 @@ pub mod python;
 pub(crate) mod spawn_env;
 pub mod vertex_relay;
 
+use std::sync::Arc;
+
 pub use agent_runtime::{
-    AgentEvent, AgentInput, AgentPermissionRequest, AgentRuntime, CodingAgent, ControlRequest,
-    ReplayedInput, RunningAgent, SideQuestionRequest, SpawnArgs,
+    AccountPin, AgentEvent, AgentInput, AgentPermissionRequest, AgentRuntime, CodingAgent,
+    ControlRequest, InputWithdrawal, ReplayedInput, RunningAgent, SpawnArgs, WithdrawRequest,
 };
 pub use browser::{BrowserLogins, BrowserRuntime, HeadlessBlocklist};
 // The three CC wire names are re-exported beside Codex's so every consumer
@@ -30,9 +33,22 @@ pub use python::PythonRuntime;
 
 /// The `/model` picker entries for one backend. Same data the frontend picker
 /// renders, reached without the caller having to know which module owns it.
-pub fn coding_agent_model_options(agent: CodingAgent) -> &'static [claude_code::CcMenuOption] {
+/// Claude Code's come from discovery once it has answered.
+pub fn coding_agent_model_options(agent: CodingAgent) -> Arc<[claude_code::CcMenuOption]> {
     match agent {
         CodingAgent::ClaudeCode => claude_code::cc_model_options(),
+        CodingAgent::Codex => CODEX_MODEL_OPTIONS.clone(),
+    }
+}
+
+static CODEX_MODEL_OPTIONS: std::sync::LazyLock<Arc<[claude_code::CcMenuOption]>> =
+    std::sync::LazyLock::new(|| codex::codex_model_options().into());
+
+/// The hand-kept rows for one backend: the fallback picker, and the overlay
+/// that declares context windows.
+fn curated_coding_agent_model_options(agent: CodingAgent) -> &'static [claude_code::CcMenuOption] {
+    match agent {
+        CodingAgent::ClaudeCode => claude_code::curated_cc_model_options(),
         CodingAgent::Codex => codex::codex_model_options(),
     }
 }
@@ -47,6 +63,11 @@ pub fn coding_agent_model_options(agent: CodingAgent) -> &'static [claude_code::
 /// session runs 1M whatever we spell, so a capture rendered a real 240k prompt
 /// as "203k / 200k (100%)" before this existed.
 ///
+/// The windows are declared on the curated rows, which stay the overlay after
+/// discovery. An alias is never followed to the model it runs: a legacy id
+/// folds onto its alias (`normalize_cc_model_id`), so the alias's current model
+/// says nothing about the session that reported it.
+///
 /// The lookup ignores a `@default` version pin, which the picker writes on two
 /// rows (`claude-opus-5@default`) and the agent strips when it echoes the model
 /// back. It deliberately does NOT ignore `[1m]`: that suffix is what keeps a 1M
@@ -54,7 +75,7 @@ pub fn coding_agent_model_options(agent: CodingAgent) -> &'static [claude_code::
 /// documents.
 pub fn coding_agent_context_window(agent: CodingAgent, model: &str) -> Option<usize> {
     let target = strip_version_pin(model);
-    coding_agent_model_options(agent)
+    curated_coding_agent_model_options(agent)
         .iter()
         .find(|o| strip_version_pin(&o.value) == target)
         .and_then(|o| o.context_window)
@@ -103,7 +124,7 @@ pub fn validate_coding_agent_model(
         .map(|o| o.value.as_str())
         .collect::<Vec<_>>()
         .join(", ");
-    let hint = likely_intended_model(model, options)
+    let hint = likely_intended_model(model, &options)
         .map(|likely| format!(", which spells that model '{likely}'"))
         .unwrap_or_default();
     Err(format!(
@@ -184,6 +205,15 @@ pub fn validate_coding_agent_effort(
     // An absent model and the `default` sentinel both mean "the backend's own
     // config picks", and neither can match a name in `supported_models`.
     let model = model.map(str::trim).unwrap_or("");
+    // A discovered row names its own tiers, and the picker offers exactly
+    // those. Refusing anything else keeps the spawn and the picker in step.
+    let row_tiers = coding_agent_model_options(agent)
+        .iter()
+        .find(|o| o.value == model)
+        .and_then(|o| o.reasoning_efforts.clone());
+    if let Some(tiers) = row_tiers {
+        return effort_within_row_tiers(agent, model, effort, &tiers);
+    }
     if claude_code::efforts_for_model(model, options)
         .iter()
         .any(|o| o == effort)
@@ -215,6 +245,28 @@ pub fn validate_coding_agent_effort(
         effort,
         agent.as_str(),
         runs_on.join(", ")
+    ))
+}
+
+/// Accept `effort` only if `tiers`, the model row's own list, names it.
+fn effort_within_row_tiers(
+    agent: CodingAgent,
+    model: &str,
+    effort: &str,
+    tiers: &[String],
+) -> Result<Option<String>, String> {
+    if tiers.iter().any(|t| t == effort) {
+        return Ok(Some(effort.to_string()));
+    }
+    let offered = if tiers.is_empty() {
+        "none".to_string()
+    } else {
+        tiers.join(", ")
+    };
+    Err(format!(
+        "reasoning_effort '{effort}' is not offered for model '{model}' by {}. \
+         It offers: {offered}",
+        agent.as_str()
     ))
 }
 
@@ -444,7 +496,7 @@ const VERSION_PROBE_LOG_EXCERPT: usize = 200;
 /// binary runs, which `AgentBinaryStatus` reports in full either way, and the
 /// version is additive. Reporting "unknown" or a placeholder version instead
 /// would be exactly the silent default the no-silent-defaults rule bans.
-async fn probe_agent_version(
+pub(crate) async fn probe_agent_version(
     agent: CodingAgent,
     binary: &std::path::Path,
     timeout: std::time::Duration,
@@ -1027,6 +1079,10 @@ mod tests {
             coding_agent_context_window(CodingAgent::ClaudeCode, "claude-opus-5-5"),
             Some(1_000_000)
         );
+        assert_eq!(
+            coding_agent_context_window(CodingAgent::ClaudeCode, "claude-sonnet-5-5"),
+            Some(1_000_000)
+        );
     }
 
     /// The picker pins a version on two rows and the agent echoes the model
@@ -1063,6 +1119,27 @@ mod tests {
             coding_agent_context_window(CodingAgent::ClaudeCode, "claude-opus-5-5[1m]"),
             None
         );
+        assert_eq!(
+            coding_agent_context_window(CodingAgent::ClaudeCode, "claude-sonnet-5-5[1m]"),
+            None
+        );
+    }
+
+    /// A discovered row names its own tiers, and the spawn holds to them: Haiku
+    /// with no effort support refuses every tier by name.
+    #[test]
+    fn a_row_with_its_own_tiers_refuses_the_rest() {
+        let tiers = ["low".to_string(), "high".to_string()];
+        assert_eq!(
+            effort_within_row_tiers(CodingAgent::ClaudeCode, "opus", "high", &tiers),
+            Ok(Some("high".to_string()))
+        );
+        let err = effort_within_row_tiers(CodingAgent::ClaudeCode, "opus", "max", &tiers)
+            .expect_err("max is not offered");
+        assert!(err.contains("It offers: low, high"), "got {err}");
+        let err = effort_within_row_tiers(CodingAgent::ClaudeCode, "haiku", "high", &[])
+            .expect_err("no tiers");
+        assert!(err.contains("It offers: none"), "got {err}");
     }
 
     /// Undeclared means "the registry answers", which is the behaviour every
@@ -1107,7 +1184,7 @@ mod tests {
     fn no_two_rows_collapse_to_the_same_lookup_key() {
         for agent in [CodingAgent::ClaudeCode, CodingAgent::Codex] {
             let mut seen = std::collections::HashSet::new();
-            for option in coding_agent_model_options(agent) {
+            for option in curated_coding_agent_model_options(agent) {
                 let key = strip_version_pin(&option.value);
                 assert!(
                     seen.insert(key.clone()),
@@ -1124,7 +1201,7 @@ mod tests {
     #[test]
     fn a_declared_window_is_a_plausible_token_count() {
         for agent in [CodingAgent::ClaudeCode, CodingAgent::Codex] {
-            for option in coding_agent_model_options(agent) {
+            for option in curated_coding_agent_model_options(agent) {
                 if let Some(window) = option.context_window {
                     assert!(
                         window >= 200_000,

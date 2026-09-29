@@ -17,7 +17,7 @@ const promptSource = readFileSync(resolve(here, '../PromptInput.tsx'), 'utf-8');
 
 describe('PromptInput upload send queue', () => {
   it('queues submit while uploads are in flight before dispatchSend can run', () => {
-    const fn = promptSource.match(/async function submit\(\)[\s\S]*?\n  \}/);
+    const fn = promptSource.match(/async function submit\(asSideQuestion = false\)[\s\S]*?\n  \}/);
     expect(fn, 'submit() not found').not.toBeNull();
     const body = fn![0];
     expect(body).toMatch(/if\s*\(\s*threadId\s*&&\s*uploadInFlight\s*\)\s*\{[\s\S]*?queueUploadSend\(threadId/);

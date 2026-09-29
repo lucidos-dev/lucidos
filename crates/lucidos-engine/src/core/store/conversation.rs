@@ -17,7 +17,9 @@ impl EventStore {
             .await?
             .ok_or_else(|| format!("Event not found: {}", event_id))?;
 
-        let events = self.get_events_until(target_event.created).await?;
+        let events = self
+            .get_conversation_events_until(target_event.thread_id, target_event.created)
+            .await?;
 
         let mut messages: Vec<ConversationMessage> = Vec::new();
         let mut current_steps: Vec<Step> = Vec::new();

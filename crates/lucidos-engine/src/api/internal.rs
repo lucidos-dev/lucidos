@@ -896,7 +896,11 @@ pub(super) async fn ask_user_question(
         .into_response();
     }
 
-    let answers = crate::engine::agent_question::build_hook_answers(&answer_kinds, &body.questions);
+    let answers = crate::engine::agent_question::build_hook_answers(
+        &answer_kinds,
+        &body.questions,
+        crate::engine::agent_question::AnswerImages::BlobPaths(state.engine.workspace_path()),
+    );
     Json(AskUserQuestionResponse {
         questions: body.questions,
         answers,

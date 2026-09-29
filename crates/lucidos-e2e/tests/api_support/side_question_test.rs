@@ -1,10 +1,9 @@
-//! E2E coverage for `POST /api/v1/coding-agents/side-question` and the chat
-//! route's `/btw` guard (ADR 0320).
+//! E2E coverage for `POST /api/v1/side-questions` and the chat route's `/btw`
+//! guard (ADR 0320).
 //!
-//! Every case here is a refusal the engine gives before any Claude Code runs,
-//! so it needs no real session. The answered path runs against a real Claude
-//! Code in `crates/lucidos-app/e2e/side-question.spec.ts`. Each case also
-//! checks that nothing was recorded on the thread.
+//! A Lucidos Agent thread is answered here by the mock model. Every Claude
+//! Code case is a refusal the engine gives before any Claude Code runs, so it
+//! needs no real session. Each refusal also checks that nothing was recorded.
 
 use crate::support::{
     base_url, db_url, seed_cc_thread_summary, seed_chat_thread_summary, user_client,
@@ -15,7 +14,7 @@ use uuid::Uuid;
 async fn post(path: &str, body: Value) -> (u16, Value) {
     let resp = user_client()
         .await
-        .post(format!("{}/api/v1/coding-agents/{path}", base_url()))
+        .post(format!("{}/api/v1/{path}", base_url()))
         .json(&body)
         .send()
         .await
@@ -33,7 +32,17 @@ async fn ask(thread_id: &str, question: &str) -> (u16, Value) {
         "side_question_id": Uuid::new_v4(),
         "question": question,
     });
-    post("side-question", body).await
+    post("side-questions", body).await
+}
+
+/// The seed helpers leave a row at the column default, a composing draft. A
+/// side question refuses a draft, so these threads are marked started.
+async fn mark_started(pool: &sqlx::PgPool, thread_id: Uuid) {
+    sqlx::query("UPDATE thread_summaries SET state = 'active' WHERE thread_id = $1")
+        .bind(thread_id)
+        .execute(pool)
+        .await
+        .expect("mark the thread started");
 }
 
 async fn thread_event_count(pool: &sqlx::PgPool, thread_id: Uuid) -> i64 {
@@ -55,8 +64,53 @@ async fn a_malformed_thread_id_is_refused() {
     assert_eq!(error_of(&body), "Invalid thread_id");
 }
 
+/// The side-question event types recorded on a thread, oldest first.
+async fn recorded_types(pool: &sqlx::PgPool, thread_id: Uuid) -> Vec<String> {
+    sqlx::query_scalar("SELECT event_type FROM events WHERE thread_id = $1 ORDER BY sequence")
+        .bind(thread_id)
+        .fetch_all(pool)
+        .await
+        .expect("read events")
+}
+
+/// A Lucidos Agent thread answers from its own model. The ask and the answer
+/// are recorded as a card with the cost beside it, and never as a turn.
 #[tokio::test]
-async fn a_chat_thread_cannot_take_a_side_question() {
+async fn a_lucidos_agent_thread_answers_a_side_question() {
+    let pool = sqlx::PgPool::connect(&db_url()).await.unwrap();
+    let thread_id = Uuid::new_v4();
+    seed_chat_thread_summary(&pool, thread_id, "idle").await;
+    mark_started(&pool, thread_id).await;
+
+    let (status, body) = ask(&thread_id.to_string(), "what is X?").await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        !body["answer"].as_str().unwrap_or_default().is_empty(),
+        "{body}"
+    );
+    assert_eq!(
+        recorded_types(&pool, thread_id).await,
+        [
+            "SideQuestionAsked",
+            "ContextCaptured",
+            "SideQuestionAnswered"
+        ]
+    );
+    let purpose: String = sqlx::query_scalar(
+        "SELECT payload->>'purpose' FROM events \
+         WHERE thread_id = $1 AND event_type = 'ContextCaptured'",
+    )
+    .bind(thread_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(purpose, "side_question");
+}
+
+/// A draft still composing has not started, so it takes no side question,
+/// and nothing is recorded on it.
+#[tokio::test]
+async fn a_composing_draft_is_refused() {
     let pool = sqlx::PgPool::connect(&db_url()).await.unwrap();
     let thread_id = Uuid::new_v4();
     seed_chat_thread_summary(&pool, thread_id, "idle").await;
@@ -64,9 +118,31 @@ async fn a_chat_thread_cannot_take_a_side_question() {
     let (status, body) = ask(&thread_id.to_string(), "what is X?").await;
     assert_eq!(status, 400, "{body}");
     assert!(
-        error_of(&body).contains("only in Claude Code threads"),
+        error_of(&body).contains("once this thread has started"),
         "{body}"
     );
+    assert_eq!(thread_event_count(&pool, thread_id).await, 0);
+}
+
+/// An ask naming an image the workspace never received is refused by name,
+/// before anything is recorded.
+#[tokio::test]
+async fn a_side_question_naming_an_unknown_image_is_refused() {
+    let pool = sqlx::PgPool::connect(&db_url()).await.unwrap();
+    let thread_id = Uuid::new_v4();
+    seed_chat_thread_summary(&pool, thread_id, "idle").await;
+    mark_started(&pool, thread_id).await;
+    let hash = "e".repeat(64);
+
+    let body = json!({
+        "thread_id": thread_id,
+        "side_question_id": Uuid::new_v4(),
+        "question": "what is this?",
+        "image_hashes": [hash],
+    });
+    let (status, body) = post("side-questions", body).await;
+    assert_eq!(status, 400, "{body}");
+    assert!(error_of(&body).contains(&hash), "{body}");
     assert_eq!(thread_event_count(&pool, thread_id).await, 0);
 }
 
@@ -75,6 +151,7 @@ async fn a_codex_thread_says_side_questions_are_not_available() {
     let pool = sqlx::PgPool::connect(&db_url()).await.unwrap();
     let thread_id = Uuid::new_v4();
     seed_cc_thread_summary(&pool, thread_id, "idle").await;
+    mark_started(&pool, thread_id).await;
     sqlx::query("UPDATE thread_summaries SET coding_agent = 'codex' WHERE thread_id = $1")
         .bind(thread_id)
         .execute(&pool)
@@ -95,6 +172,7 @@ async fn a_claude_code_thread_with_no_session_yet_is_refused_without_spawning() 
     let pool = sqlx::PgPool::connect(&db_url()).await.unwrap();
     let thread_id = Uuid::new_v4();
     seed_cc_thread_summary(&pool, thread_id, "idle").await;
+    mark_started(&pool, thread_id).await;
 
     let (status, body) = ask(&thread_id.to_string(), "what is X?").await;
     assert_eq!(status, 400, "{body}");
@@ -115,9 +193,10 @@ async fn dismissing_a_side_question_nobody_asked_is_not_found() {
     let pool = sqlx::PgPool::connect(&db_url()).await.unwrap();
     let thread_id = Uuid::new_v4();
     seed_cc_thread_summary(&pool, thread_id, "idle").await;
+    mark_started(&pool, thread_id).await;
 
     let body = json!({ "thread_id": thread_id, "side_question_id": Uuid::new_v4() });
-    let (status, body) = post("side-question/dismiss", body).await;
+    let (status, body) = post("side-questions/dismiss", body).await;
     assert_eq!(status, 404, "{body}");
     assert!(
         error_of(&body).contains("No side question with this id"),
@@ -126,14 +205,25 @@ async fn dismissing_a_side_question_nobody_asked_is_not_found() {
     assert_eq!(thread_event_count(&pool, thread_id).await, 0);
 }
 
-/// A caller that skips the composer must not turn `/btw` into a main-session
-/// turn: the chat route refuses it before recording anything.
+/// A caller that skips the composer must not turn `/btw` into a turn: the
+/// chat route refuses it on every kind of thread before recording anything.
 #[tokio::test]
-async fn the_chat_route_refuses_btw_in_a_coding_agent_thread() {
+async fn the_chat_route_refuses_btw_in_any_thread() {
     let pool = sqlx::PgPool::connect(&db_url()).await.unwrap();
-    let thread_id = Uuid::new_v4();
-    seed_cc_thread_summary(&pool, thread_id, "idle").await;
+    for seed_cc in [true, false] {
+        let thread_id = Uuid::new_v4();
+        if seed_cc {
+            seed_cc_thread_summary(&pool, thread_id, "idle").await;
+            mark_started(&pool, thread_id).await;
+        } else {
+            seed_chat_thread_summary(&pool, thread_id, "idle").await;
+            mark_started(&pool, thread_id).await;
+        }
+        refuse_btw_on_the_chat_route(&pool, thread_id).await;
+    }
+}
 
+async fn refuse_btw_on_the_chat_route(pool: &sqlx::PgPool, thread_id: Uuid) {
     let resp = user_client()
         .await
         .post(format!("{}/api/v1/chat/stream", base_url()))
@@ -148,7 +238,7 @@ async fn the_chat_route_refuses_btw_in_a_coding_agent_thread() {
     assert_eq!(resp.status().as_u16(), 400);
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["reason"], "side-question", "{body}");
-    assert_eq!(thread_event_count(&pool, thread_id).await, 0);
+    assert_eq!(thread_event_count(pool, thread_id).await, 0);
 }
 
 /// Creating a coding-agent thread with `/btw` as its first message is refused

@@ -1,6 +1,7 @@
 import { blobPreviewUrl, continueThread, postCommandCheckpointUndo } from '../../api/client';
 import type { Change } from '../../api/client';
 import { ensureChangeLoaded, revertChange } from '../../store/actions/chat-changes';
+import { changeCommitList, changeHeadline } from '../../store/changeHeadline';
 import { HELD_UNTIL_REPLY } from '../../store/exchange-status';
 import { ensureEventTargetResolved, eventHasTarget, jumpableEventId, showEventWhereItLives } from '../../store/actions/event-navigation';
 import { viewChangeDiff } from '../../store/actions/repositories';
@@ -9,6 +10,7 @@ import { prefetchStepDetail } from '../../store/stepDetailCache';
 import { LUCIDOS_AGENT_LABEL, eventWaitStoppedSummary, groupSubscriptions, isThinking, resumeEngineNote, stepStatus, subscriptionFilterNote, waitingFor } from '../../store/thread-events';
 import { LucidosGlyph } from '../shared/LucidosMark';
 import { BlobImage } from '../shared/BlobImage';
+import { CommitList } from '../shared/CommitList';
 import { Disclosure } from '../shared/Disclosure';
 import type { ChangeLifecycleType, EventSubscription, EventWaitCancelCause, Exchange, SubscriptionGroup } from '../../store/thread-events';
 import type { Loadable, ResponseEvent, StepOutcome } from '../../store/types';
@@ -44,12 +46,6 @@ const CHANGE_STATE: Record<ChangeLifecycleType, { label: string; tone: EventRowT
   ChangeApplyFailed: { label: 'Failed', tone: 'bad', accent: 'change-failed' },
 };
 
-/** A change card's title: the first line of its description. The state badge
- *  carries the resolution, so the title never repeats it. */
-export function changeSubject(description: string | undefined): string {
-  return description?.split('\n')[0].trim() || 'Change';
-}
-
 export function changeAccent(type: ChangeLifecycleType): string {
   return CHANGE_STATE[type].accent;
 }
@@ -66,26 +62,33 @@ export function FileList({ files }: { files: string[] }) {
   );
 }
 
+/** The thumbnails of images the user attached: to a message, a side question
+ *  or a typed answer. Nothing when there are none. */
+export function UserImages({ imageHashes }: { imageHashes: readonly string[] }) {
+  if (imageHashes.length === 0) return null;
+  return (
+    <div class="user-images">
+      {imageHashes.map((hash, i) => {
+        const src = getSessionBlobUrlForHash(hash) ?? blobPreviewUrl(hash);
+        return (
+          <BlobImage
+            key={hash + ':' + i}
+            src={src}
+            class="user-image-thumb"
+            alt=""
+            onClick={(e) => openImagePopupFromGroup(e.currentTarget.src, e.currentTarget)}
+          />
+        );
+      })}
+    </div>
+  );
+}
+
 export function UserMessageBody({ html, imageHashes }: { html: string; imageHashes: string[] }) {
   return (
     <>
       {html && <div class="markdown-content" dangerouslySetInnerHTML={{ __html: html }} />}
-      {imageHashes.length > 0 && (
-        <div class="user-images">
-          {imageHashes.map((hash, i) => {
-            const src = getSessionBlobUrlForHash(hash) ?? blobPreviewUrl(hash);
-            return (
-              <BlobImage
-                key={hash + ':' + i}
-                src={src}
-                class="user-image-thumb"
-                alt=""
-                onClick={(e) => openImagePopupFromGroup(e.currentTarget.src, e.currentTarget)}
-              />
-            );
-          })}
-        </div>
-      )}
+      <UserImages imageHashes={imageHashes} />
     </>
   );
 }
@@ -95,18 +98,19 @@ export function UserMessageBody({ html, imageHashes }: { html: string; imageHash
  *  change by the first line of its description, and Diff and Revert sit in the
  *  card's action slot.
  *
- *  `seedDescription` / `seedFileCount` come from the in-thread `ChangeProposed`
- *  event, already loaded with the thread. They render the card at its FINAL
- *  height on first open, before the per-id `Change` lazy-fetch lands. So a
- *  thread ending with "Change applied" does not jump when the fetched row pops
- *  its description and file count in. The authoritative live row wins once
- *  loaded, and is normally identical to the seed. */
-export function ChangeEventRow({ type, changeId, error, seedDescription, seedFileCount }: {
+ *  `seedDescription` / `seedFileCount` / `seedSummary` come from the in-thread
+ *  `ChangeProposed` and `ChangeSummarized` events, already loaded with the
+ *  thread. They render the card at its FINAL height on first open, before the
+ *  per-id `Change` lazy-fetch lands. So a thread ending with "Change applied"
+ *  does not jump when the fetched row pops its headline and file count in. The
+ *  authoritative live row wins once loaded, and is normally identical. */
+export function ChangeEventRow({ type, changeId, error, seedDescription, seedFileCount, seedSummary }: {
   type: ChangeLifecycleType;
   changeId?: string;
   error?: string;
   seedDescription?: string;
   seedFileCount?: number;
+  seedSummary?: string;
 }) {
   const change: Change | undefined = changeId ? findChangeById(changeId) : undefined;
   const lazy: Loadable<Change> = (changeId ? lazyChanges.value.get(changeId) : undefined) ?? { status: 'not-loaded' };
@@ -115,9 +119,9 @@ export function ChangeEventRow({ type, changeId, error, seedDescription, seedFil
     if (changeId) void ensureChangeLoaded(changeId);
   }, [changeId]);
 
-  const description = change?.description ?? seedDescription;
+  const naming = change ?? { description: seedDescription, summary: seedSummary };
   const fileCount = change?.file_count ?? seedFileCount;
-  const seeded = !!description?.trim() || fileCount != null;
+  const seeded = !!naming.description?.trim() || fileCount != null;
 
   // A lifecycle error wins over the lazy-fetch state. A seeded card is already
   // complete, so a fetch failure only costs it Diff and Revert. And a 404 for a
@@ -127,23 +131,28 @@ export function ChangeEventRow({ type, changeId, error, seedDescription, seedFil
   const { label, tone } = CHANGE_STATE[type];
   return changeEventRowBody({
     type,
-    subject: changeSubject(description),
+    subject: changeHeadline(naming),
     stateLabel: label,
     tone,
     fileCount,
+    commits: changeCommitList(naming),
     error: shownError,
     actions: changeActions(changeId, type === 'ChangeApplyFailed', type === 'ChangeApplied'),
   });
 }
 
 /** The card's markup, hookless for the same reason `eventWaitRowBody` is: the
- *  tests drive this, since there is no jsdom to render the wrapper. */
-export function changeEventRowBody({ type, subject, stateLabel, tone, fileCount, error, actions }: {
+ *  tests drive this, since there is no jsdom to render the wrapper.
+ *
+ *  `commits` is oldest first. The fold lists them only when there are several:
+ *  a single commit IS the headline, and a fold repeating it adds nothing. */
+export function changeEventRowBody({ type, subject, stateLabel, tone, fileCount, commits = [], error, actions }: {
   type: ChangeLifecycleType;
   subject: string;
   stateLabel: string;
   tone: EventRowTone;
   fileCount?: number;
+  commits?: readonly string[];
   error?: string;
   actions?: ComponentChildren;
 }) {
@@ -159,9 +168,13 @@ export function changeEventRowBody({ type, subject, stateLabel, tone, fileCount,
     facts: [
       fileCount != null ? { kind: 'text' as const, text: formatFileCount(fileCount) } : null,
     ],
-    // Open, because the reason an apply failed is the one thing the reader
-    // came for.
-    fold: error ? { label: 'Error', open: true, body: error } : undefined,
+    // An error is open, because the reason an apply failed is the one thing
+    // the reader came for. It takes the slot over the commit list.
+    fold: error
+      ? { label: 'Error', open: true, body: error }
+      : commits.length > 1
+        ? { label: `${commits.length} commits`, body: <CommitList commits={commits} /> }
+        : undefined,
     actions,
   });
 }

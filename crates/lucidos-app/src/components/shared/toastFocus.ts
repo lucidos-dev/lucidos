@@ -12,35 +12,6 @@ export function toastHasClose(
   return t.persistent !== false || !!t.action || !!t.secondaryAction || !!t.onClick;
 }
 
-/** Which control of an action-bearing toast should receive focus when it
- *  appears, so the user can act with Enter instead of reaching for the mouse:
- *
- *   - `'primary'` / `'secondary'` — the action button, preferring the primary,
- *     but NEVER a destructive (`variant: 'danger'`) one: a reflexive Enter on a
- *     freshly-appeared toast must not fire something like "Cancel Apply-All".
- *   - `'close'`  — fall back to the dismiss (X), which only closes the toast.
- *   - `null`     — don't move focus at all. Returned when the toast carries no
- *     actions (a plain info/success toast shouldn't steal focus), when it opts
- *     out via `noAutofocus` (an UNSOLICITED toast — a notification toast — must
- *     not yank focus mid-typing / pre-arm a reflexive Enter on its default
- *     action), or when the only thing left to focus is a destructive action
- *     with no safe dismiss: better to leave focus put than to pre-arm Enter on
- *     a footgun. The button stays reachable via Tab.
- *
- *  Pure (no DOM) so the selection is unit-tested; the caller resolves the
- *  returned slot to a real element and focuses it. The caller holds DOM gates of
- *  its own, one of which stands down for a focused text field. */
-export function toastAutofocusTarget(
-  t: Pick<ToastItem, 'action' | 'secondaryAction' | 'dismissable' | 'persistent' | 'noAutofocus'>,
-): 'primary' | 'secondary' | 'close' | null {
-  if (t.noAutofocus) return null;
-  if (!t.action && !t.secondaryAction) return null;
-  if (t.action && t.action.variant !== 'danger') return 'primary';
-  if (t.secondaryAction && t.secondaryAction.variant !== 'danger') return 'secondary';
-  if (toastHasClose(t)) return 'close';
-  return null;
-}
-
 /** Pure decision for the Tab trap over the toast that currently holds focus.
  *  Given the count of focusable controls in the toast (its action buttons, the
  *  close X, and any linkified URL), the active control's index among them,
@@ -60,9 +31,8 @@ export function toastAutofocusTarget(
  *  `overlayOpen` guards the exit. Focus can already be in a toast when an
  *  overlay opens, and the pane behind that overlay is not a valid Tab target:
  *  moving focus there would break the overlay's focus containment, the way
- *  `handlePaneTab` and the toast auto-focus already yield to
- *  `data-overlay-open`. So while an overlay is open, Shift+Tab wraps backward
- *  within the toast instead of exiting.
+ *  `handlePaneTab` already yields to `data-overlay-open`. So while an overlay
+ *  is open, Shift+Tab wraps backward within the toast instead of exiting.
  *
  *  It no longer follows that the toast is ON TOP of the overlay. A standing
  *  stack is drawn under an open modal (`components/shared/toastUrgency.ts`),

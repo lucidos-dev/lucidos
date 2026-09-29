@@ -55,7 +55,7 @@ describe('restoreBanner', () => {
     // now targets `.ws-picker-restore-text`, which only exists if the message
     // carries it, and the spinner must not.
     const out = render({ status: 'running', id: 'w1', name: 'personal', phase: 'restoring' });
-    expect(out).toContain('<span class="ws-picker-restore-spinner">');
+    expect(out).toContain('<span class="mini-spinner ws-picker-restore-spinner">');
     expect(out).toContain('<span class="ws-picker-restore-text">');
     expect(out.indexOf('ws-picker-restore-spinner')).toBeLessThan(
       out.indexOf('ws-picker-restore-text'),

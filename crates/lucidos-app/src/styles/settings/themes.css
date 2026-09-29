@@ -9,49 +9,6 @@
     gap: var(--space-xs);
 }
 
-/* Filter chips over the strip: All, then one per family. The one picked is
-   marked. They stay on one line and scroll sideways when they do not fit. */
-.theme-family-chips {
-    display: flex;
-    gap: var(--space-xs);
-    overflow-x: auto;
-    overscroll-behavior-x: contain;
-    scrollbar-width: none;
-}
-
-.theme-family-chips::-webkit-scrollbar {
-    display: none;
-}
-
-.theme-family-chip {
-    flex-shrink: 0;
-    min-height: 2.25rem;
-    padding: 0.25rem 0.75rem;
-    border: none;
-    border-radius: var(--radius-round);
-    background: none;
-    color: var(--text-muted);
-    font-size: var(--font-size-xs);
-    cursor: pointer;
-    transition: background var(--duration-normal), color var(--duration-normal);
-}
-
-.theme-family-chip.active {
-    background: var(--bg-tertiary);
-    color: var(--text-primary);
-}
-
-@media (hover: hover) {
-    .theme-family-chip:not(.active):hover {
-        color: var(--text-primary);
-    }
-}
-
-.theme-family-chip:focus-visible {
-    outline: none;
-    box-shadow: var(--focus-ring);
-}
-
 /* Two half-transparent chevrons float over the strip's sides and page it.
    The one at a reached end hides. */
 .theme-carousel-body {

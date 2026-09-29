@@ -1129,8 +1129,10 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
 - **Added:** 2026-07-01
 - **Lives in:** `crates/lucidos-engine/src/engine/agent_session/lifecycle.rs`
   (`is_definitive_session_not_found` — substring match on `"No conversation found
-  with session ID"`), consumed by the stale-resume branch in
-  `crates/lucidos-engine/src/engine/agent_session/run_session/run.rs`.
+  with session ID"`). Two consumers in
+  `crates/lucidos-engine/src/engine/agent_session/run_session/run.rs`: the run
+  loop's stale-resume branch, and `classify_startup_failure` for a refusal before
+  the first prompt.
 - **Impermanent because:** matches Claude Code's **human-readable** error prose to
   detect a definitively-gone resume session, because the `result` event we parse
   (see `runtime/claude_code_parse.rs`) exposes no structured "session not found"
@@ -1684,8 +1686,8 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
     `runtime/claude_code_parse.rs`, which renders a note as a message.
 - **Impermanent because (works around):** Claude Code 2.1.280 sets
   `thinking.display: "updates"` only when its provider is `firstParty`. On
-  Vertex, Opus 5.5 and Fable 5.x then return every note before a tool call as
-  an empty `thinking` block. The relay sets the display and the beta, so the
+  Vertex, Opus 5.5, Sonnet 5.5 and Fable 5.x then return every note before a
+  tool call as an empty `thinking` block. The relay sets the display and the beta, so the
   notes come back as text.
 
   A note is short, whatever the agent drafted: 178 to 441 characters in one
@@ -1719,7 +1721,9 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   - Delete `unhide_tracked_skill`.
   - Delete the `lucidos_source_spawn_repair*` tests in
     `engine/git_ops_tests/recover_exclude.rs`.
-- **Status:** active
+- **Status:** removed 2026-09-29. The check ran over all 26 Lucidos-source
+  worktrees under both gateways on the maintainer's machine, and none carried
+  the bit. The `Lucidos` arm is a no-op, and the repair and its tests are gone.
 
 ### Drawn caret
 
@@ -2644,9 +2648,10 @@ event that retires it.
 - **Removal / resolution condition:** Confirm every live install has started up at
   least once since 2026-04-07 (or wait for the next release that requires a fresh
   install / telemetry confirming zero workspaces retain the legacy table or
-  placeholder prompts). Then drop both functions, their call sites in `start()`,
-  and the `ScheduledTrigger*` event aliases in `triggers/replay.rs` (named by the
-  first migration's comment).
+  placeholder prompts). Then drop both functions and their call sites in
+  `start()`. Keep the `ScheduledTrigger*` arms in `triggers/replay.rs`: they
+  replay immutable historical events, which is permanent old-data tolerance, and
+  dropping them makes an old workspace's triggers vanish at boot.
 - **Status:** active
 
 ### Superseded turn-control localStorage keys cleared at load
@@ -2866,6 +2871,29 @@ event that retires it.
   a `looks/` path, which the workspace audit can check per workspace.
 - **Status:** active
 
+### Defensive double-write of tables into `init_schema`
+
+- **Added:** 2026-09-29 (registered by the /harden-project sweep; the measure
+  landed 2026-05-17)
+- **Lives in:** the `CREATE TABLE` / `CREATE INDEX` bodies of the `init_schema`
+  functions in `core/store/mod.rs` (`EventStore::init_schema`),
+  `core/credentials.rs`, `core/devices.rs`, `core/pinned_apps.rs`,
+  `core/preferences.rs`, `runtime/browser/mod.rs`, `scheduler/notifications.rs`
+  and `scheduler/push.rs`. Each carries a "defensive double-write" comment.
+- **Impermanent because:** the same DDL moved to
+  `migrations/20260517160627_consolidate_init_schema_tables.sql`, the canonical
+  home. The bodies stayed so an install booting a pre-migration build still came
+  up.
+- **Removal / resolution condition:** one release cycle after the migration
+  shipped. It first shipped in v0.26.4, and more than thirty releases have
+  followed, so the condition is met. Then:
+  - Delete the duplicated DDL from each site.
+  - Keep any non-DDL work an `init_schema` does.
+  - Drop the "one release cycle" paragraph from the migration header.
+  - Verify with `make test` and a fresh-database boot (`./scripts/e2e-api.sh`),
+    since migrations must then create every table on their own.
+- **Status:** active (condition met, cleanup pending)
+
 ---
 
 ## 4. Open investigations (parents)
@@ -2973,8 +3001,8 @@ measure now eligible for removal** — search this file for the id to find them 
   `docs/plans/2026-06-25-surface-coding-agent-reasoning-in-timeline.md`) is wired
   end-to-end but produces **zero events** for the current models. Anthropic's
   `thinking.display` defaults to `"omitted"` on every current model: Fable 5.1
-  and 5, Opus 4.7 through 5.5, Sonnet 5. Opus 5.5 is the family default rather
-  than a fresh measurement. So thinking blocks stream with
+  and 5, Opus 4.7 through 5.5, Sonnet 5 and 5.5. Opus 5.5 and Sonnet 5.5 are
+  the family default rather than a fresh measurement. So thinking blocks stream with
   EMPTY text (encrypted signature only) and no `thinking_delta` arrives. **Opus 5 does not
   resolve it** — re-checked 2026-07-25 against Opus 5 specifically, not CC in
   aggregate: the dev workspace has 15 CC threads whose selected model is

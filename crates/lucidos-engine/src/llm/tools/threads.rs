@@ -37,37 +37,6 @@ fn coding_agent_effort_vocabulary() -> Vec<&'static str> {
         .collect()
 }
 
-/// The `model` values `run_coding_agent` advertises: the union of what the two
-/// backends offer, each backend's own picker order, Claude Code first then
-/// Codex.
-///
-/// Models are not a scale, so unlike [`coding_agent_effort_vocabulary`] this
-/// does not sort. It preserves picker order and drops any value both backends
-/// offer, `default` today: it means "that backend's own default" in each, so
-/// it is one entry, not two identical ones. A future overlap dedupes the same
-/// way, with no new special case to remember.
-///
-/// The union is deliberately loose: it says nothing about which id belongs to
-/// which backend, so the schema still admits a Codex id paired with
-/// `coding_agent: "claude-code"`. `validate_coding_agent_model` refuses that
-/// at the spawn, which is correct and unchanged. The enum's job is narrower:
-/// kill the id that exists in NO backend picker, the whole class of mistake a
-/// chat-picker id used here is.
-fn coding_agent_model_vocabulary() -> Vec<&'static str> {
-    let mut seen = std::collections::HashSet::new();
-    [
-        crate::runtime::CodingAgent::ClaudeCode,
-        crate::runtime::CodingAgent::Codex,
-    ]
-    .into_iter()
-    .flat_map(crate::runtime::coding_agent_model_options)
-    .filter_map(|option| {
-        let value = option.value.as_str();
-        seen.insert(value).then_some(value)
-    })
-    .collect()
-}
-
 pub(super) fn spawn_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
@@ -134,10 +103,12 @@ pub(super) fn spawn_tools() -> Vec<ToolDefinition> {
                     // that could widen its own child's allowlist would be a
                     // boundary hole, and the system prompt is engine-owned.
                     // Declaring neither is what makes the schema honest.
+                    // A string, not an enum. Claude Code's list is discovered per
+                    // workspace, and an enum billed every picker row on every
+                    // chat request. The spawn validates against the live picker.
                     "model": {
                         "type": "string",
-                        "enum": coding_agent_model_vocabulary(),
-                        "description": "An id the chosen backend does not offer is REFUSED, never swapped for the default. Omit to inherit. A one-file edit wants Sonnet, not Opus."
+                        "description": "A picker id, e.g. 'default', 'opus', 'sonnet'. One the backend does not offer is REFUSED with the valid list, never swapped for the default. Omit to inherit. A one-file edit wants Sonnet, not Opus."
                     },
                     // Deliberately silent about the per-model restriction on a
                     // tier. `validate_coding_agent_effort` refuses the pairing
@@ -486,30 +457,17 @@ mod tests {
         assert_eq!(vocabulary, ladder, "the enum must read low-to-high");
     }
 
-    /// The model enum is built from the backends' own pickers. An id added to
-    /// either `cc_menu_options.json` or `codex_menu_options.json` shows up
-    /// here without anyone remembering to edit this file. Mirrors
-    /// `the_effort_enum_is_the_union_of_what_the_backends_offer` above.
+    /// Claude Code's picker is discovered per workspace, so no schema can list
+    /// it. An enum here would also bill every picker row on every chat request.
+    /// The spawn refuses an unknown id by name instead.
     #[test]
-    fn the_model_enum_is_the_union_of_what_the_backends_offer() {
-        let vocabulary = coding_agent_model_vocabulary();
-        for agent in [
-            crate::runtime::CodingAgent::ClaudeCode,
-            crate::runtime::CodingAgent::Codex,
-        ] {
-            for option in crate::runtime::coding_agent_model_options(agent) {
-                assert!(
-                    vocabulary.contains(&option.value.as_str()),
-                    "{} offers '{}' but the schema does not advertise it",
-                    agent.as_str(),
-                    option.value
-                );
-            }
-        }
-        assert_eq!(
-            vocabulary.iter().filter(|v| **v == "default").count(),
-            1,
-            "both backends offer 'default'; the enum must list it once"
-        );
+    fn the_model_argument_is_a_string_the_spawn_checks() {
+        let tool = spawn_tools()
+            .into_iter()
+            .find(|t| t.name == tn::RUN_CODING_AGENT)
+            .expect("run_coding_agent");
+        let model = &tool.parameters["properties"]["model"];
+        assert_eq!(model["type"], "string");
+        assert!(model.get("enum").is_none(), "got {model}");
     }
 }

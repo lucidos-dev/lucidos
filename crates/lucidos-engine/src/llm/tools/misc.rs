@@ -372,7 +372,7 @@ pub(super) fn ask_user_question_tools() -> Vec<ToolDefinition> {
                             "properties": {
                                 "question": {
                                     "type": "string",
-                                    "description": "REQUIRED, in the user's language. Never empty and never only in `header`: the engine rejects that and makes you re-ask."
+                                    "description": "REQUIRED, in the user's language. Never empty and never only in `header`: the engine rejects that and makes you re-ask. Markdown: short paragraphs or a list, the question last."
                                 },
                                 "header": {
                                     "type": "string",

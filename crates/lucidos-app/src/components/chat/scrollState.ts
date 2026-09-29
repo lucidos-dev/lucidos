@@ -709,8 +709,9 @@ function drawnRows(turn: HTMLElement): number {
  *  own? Holding for one would keep the reader at the bottom for the whole
  *  backstop, while the reply ABOVE it streamed.
  *
- *  Recognised POSITIVELY, by the remove button its queued status carries
- *  (`isQueuedUserMessage` in `ChatExchange`). Inferring it from a MISSING
+ *  Recognised POSITIVELY, by its "Queued" status label (`isQueuedUserMessage`
+ *  in `ChatExchange`). Not by its remove button: a Codex queued message has
+ *  none. Inferring it from a MISSING
  *  `.response-panel` reads true for two turns that are about to draw: a row
  *  whose panel mounts a commit later, and an unanswered question or permission
  *  divider, which renders no panel at all. The second is the turn a card submit
@@ -718,7 +719,7 @@ function drawnRows(turn: HTMLElement): number {
  *  for. */
 function turnIsQueued(turn: HTMLElement): boolean {
   return typeof turn.querySelector === 'function'
-    && turn.querySelector('.queued-message-remove') !== null;
+    && turn.querySelector('.exchange-status-queued') !== null;
 }
 
 /** The scroll offset the live edge sits at: the MAX offset rather than

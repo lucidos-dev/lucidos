@@ -3,6 +3,7 @@ pub(crate) mod child_detach;
 pub(crate) mod child_follow_up;
 mod events;
 pub(crate) mod follow_up_order;
+pub(crate) mod held_deliveries;
 mod held_messages;
 mod images;
 pub(in crate::engine) mod process;

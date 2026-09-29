@@ -44,6 +44,9 @@ export interface ModelSelectionInput {
   /** The backend this surface picked for a model, or `null` for the model's
    *  own default. Ignored where the models carry no providers. */
   providerFor?: (model: string) => string | null;
+  /** How to name a selected model no row offers, such as a thread pinned to a
+   *  model the picker has since dropped. Defaults to the bare id. */
+  labelFor?: (model: string) => string;
   onChange: (patch: ModelSelectionPatch) => void;
 }
 
@@ -82,7 +85,7 @@ export function useModelSelection(input: ModelSelectionInput): ModelSelection {
     rows,
     value: encodePair(model ?? '', resolvedEffort),
     label: formatPair(
-      current?.label ?? model ?? '',
+      current?.label ?? (model ? (input.labelFor?.(model) ?? model) : ''),
       offered.find((t) => t.value === resolvedEffort)?.label ?? resolvedEffort,
       current?.providerLabel,
     ),

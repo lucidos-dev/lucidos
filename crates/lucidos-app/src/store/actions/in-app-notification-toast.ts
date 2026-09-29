@@ -214,11 +214,10 @@ export function showInAppNotificationToast({ title, body, target }: InAppNotific
   }
 
   // Notification toasts persist (no auto-dismiss); the user drives dismissal.
-  // noAutofocus: these pop unsolicited, so they must not steal keyboard focus.
   // The notification's title and body map straight onto the toast's. A
   // body-less one is its title alone.
   const [toastTitle, message] = body ? [safeTitle, body] : [undefined, safeTitle];
-  showToast(message, 'info', { title: toastTitle, key: toastKey, onClick, noAutofocus: true });
+  showToast(message, 'info', { title: toastTitle, key: toastKey, onClick });
 }
 
 /** Wall-clock budget after which a `NotificationToastRequested` is too stale

@@ -33,18 +33,6 @@ inlineLinkStripRenderer.link = function({ tokens }: Tokens.Link): string {
   return this.parser.parseInline(tokens);
 };
 
-// KEEPS http(s) links as real <a> elements, forcing safe new-tab attributes.
-// Any other href (javascript:, data:, mailto:, relative) collapses to its
-// label text, so an LLM-supplied scheme can neither execute nor dead-end.
-// Only valid in NON-interactive containers: an <a> nested in a <button> is
-// interactive-in-interactive, so option buttons keep inlineLinkStripRenderer.
-const inlineLinkKeepRenderer = new marked.Renderer();
-inlineLinkKeepRenderer.link = function({ href, tokens }: Tokens.Link): string {
-  const text = this.parser.parseInline(tokens);
-  if (!/^https?:\/\//i.test(href)) return text;
-  return `<a href="${escapeHtmlAttr(href)}" target="_blank" rel="noopener">${text}</a>`;
-};
-
 // Boundary marker for a multiline copy block. Survives marked processing.
 // It carries `COPY_ID_NONCE`, because content can write an HTML comment too.
 const COPY_MARKER = `LUCIDOS_COPY_BLOCK_${COPY_ID_NONCE}`;
@@ -240,8 +228,8 @@ const ALLOWED_URI_REGEXP =
   /^(?:(?:(?:f|ht)tps?|mailto|tel|callto|sms|cid|xmpp|matrix|thread|app|trigger|repo|file):|[^a-z]|[a-z+.\-]+(?:[^a-z+.\-:]|$))/i;
 
 const PURIFY_CONFIG = {
-  // `inlineLinkKeepRenderer` emits `target="_blank"`, which the default
-  // attribute allowlist drops.
+  // A raw `<a target="_blank">` in content keeps its new-tab target, which
+  // the default attribute allowlist drops.
   ADD_ATTR: ['target'],
   // Paired with `ESCAPE_TO_TEXT_TAG`, so a tag the escape pass misses is still
   // removed. `style` and `animateTransform` are the two DOMPurify would
@@ -626,18 +614,3 @@ export function renderMarkdownInline(md: string): string {
 /** What the HTML spec calls interactive content, less what the sanitizer
  *  already drops. Any one of them inside an option `<button>` takes its tap. */
 const INTERACTIVE_ELEMENTS = 'a, button, input, select, textarea, label, details, audio, video';
-
-/** Like renderMarkdownInline, but KEEPS http(s) links as clickable
- *  `<a target="_blank" rel="noopener">`. Used for the AskUserQuestion question
- *  text, where a pasted bare URL must stay openable.
- *
- *  Safe ONLY in non-interactive containers: an `<a>` inside a `<button>` is
- *  invalid, so option buttons must keep `renderMarkdownInline`. */
-export function renderMarkdownInlineWithLinks(md: string): string {
-  return prepareImages(sanitizeHtmlFragments(marked.parseInline(md, {
-    async: false,
-    breaks: true,
-    gfm: true,
-    renderer: inlineLinkKeepRenderer,
-  }) as string));
-}

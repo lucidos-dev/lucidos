@@ -268,6 +268,22 @@ pub(crate) fn tool_definitions_chars(tools: &[crate::llm::provider::ToolDefiniti
         .sum()
 }
 
+/// Chars in what one single-shot round sends: an intent sub-loop round, or a
+/// side question's.
+///
+/// The same three parts a turn's own capture counts: the system prompt, the
+/// messages, and the tool schemas. The tools are included because they are
+/// resent on every round and they dominate a short prompt.
+pub(crate) fn request_chars(
+    system_prompt: &str,
+    messages: &[crate::llm::Message],
+    tools: &[crate::llm::provider::ToolDefinition],
+) -> usize {
+    system_prompt.chars().count()
+        + messages.iter().map(estimate_message_chars).sum::<usize>()
+        + tool_definitions_chars(tools)
+}
+
 /// Per-image char cost used by [`estimate_message_chars`] for budget sizing.
 ///
 /// An image's base64 `data.len()` is NOT its cost to the model: providers

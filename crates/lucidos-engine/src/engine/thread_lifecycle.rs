@@ -396,9 +396,10 @@ pub fn classify_event(event_type: &str) -> Option<EventClass> {
         // Passive change-lifecycle bookkeeping that mutates only `changes`
         // table fields (hardened flag, merge worktree paths). No section or
         // activity-timestamp impact.
-        "ChangeHardened" | "MergeResolutionStarted" | "MergeResolutionCleared" => {
-            EventClass::Metadata
-        }
+        "ChangeHardened"
+        | "ChangeSummarized"
+        | "MergeResolutionStarted"
+        | "MergeResolutionCleared" => EventClass::Metadata,
         // Phase 4 fan-in: parent's resume path renders this as the rich
         // child-completion card (an exchange-starter, like MessageReceived).
         // The parent LLM's response after the wake becomes the response panel
@@ -499,6 +500,7 @@ pub fn all_persisted_event_types() -> Vec<&'static str> {
         "ChangeReverted",
         "ChangeApplyFailed",
         "ChangeHardened",
+        "ChangeSummarized",
         "MergeConflictDetected",
         "MergeResolutionStarted",
         "MergeResolutionCleared",
@@ -769,6 +771,7 @@ pub fn resolve_transition(
         | "ChangeReverted"
         | "ChangeApplyFailed"
         | "ChangeHardened"
+        | "ChangeSummarized"
         | "MergeConflictDetected"
         | "MergeResolutionStarted"
         | "MergeResolutionCleared"

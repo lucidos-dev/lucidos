@@ -158,21 +158,29 @@ export async function sendControlRequest(threadId: string, request: Record<strin
  *  seconds, so this outlasts it and the engine's error is what the user reads. */
 export const SIDE_QUESTION_TIMEOUT_MS = 130_000;
 
-/** Ask a `/btw` side question in a coding-agent thread. The engine answers
- *  beside any running turn and records the ask and its outcome as events no
- *  agent reads (ADR 0320). `sideQuestionId` is ours, so the card reconciles. */
-export async function askSideQuestion(threadId: string, sideQuestionId: string, question: string): Promise<string> {
-  const body = await json<{ answer: string }>(`${API}/coding-agents/side-question`, {
+/** Ask a side question, with any images already uploaded to the thread. The
+ *  engine answers beside any running turn and records the ask and its outcome
+ *  as events no agent reads (ADR 0320). `sideQuestionId` is ours, so the card
+ *  reconciles. */
+export async function askSideQuestion(
+  threadId: string,
+  sideQuestionId: string,
+  question: string,
+  imageHashes: readonly string[],
+): Promise<string> {
+  const body = await json<{ answer: string }>(`${API}/side-questions`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ thread_id: threadId, side_question_id: sideQuestionId, question }),
+    body: JSON.stringify({
+      thread_id: threadId, side_question_id: sideQuestionId, question, image_hashes: imageHashes,
+    }),
   }, SIDE_QUESTION_TIMEOUT_MS);
   return body.answer;
 }
 
 /** Record that the user dismissed a side question's card. */
 export async function dismissSideQuestion(threadId: string, sideQuestionId: string): Promise<void> {
-  await json(`${API}/coding-agents/side-question/dismiss`, {
+  await json(`${API}/side-questions/dismiss`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ thread_id: threadId, side_question_id: sideQuestionId }),
@@ -211,10 +219,23 @@ export interface CodingAgentCommandsResponse {
   current_model: string | null;
   current_reasoning_effort: string | null;
   has_active_session: boolean;
+  /** Claude Code only: where its model options came from. Mirrors
+   *  `runtime::cc_model_discovery::Provenance`. */
+  models_provenance?: CodingAgentModelsProvenance;
 }
 
-/** Model aliases mirroring the `models` list in crates/lucidos-engine/src/runtime/cc_menu_options.json. */
-export type CodingAgentModelValue = 'default' | 'claude-opus-5-5' | 'claude-opus-5-5[1m]' | 'claude-fable-5-1' | 'claude-fable-5-1[1m]' | 'claude-fable-5' | 'claude-fable-5[1m]' | 'claude-opus-5@default' | 'claude-opus-5[1m]' | 'claude-sonnet-5' | 'claude-opus-4-8@default' | 'claude-opus-4-8[1m]' | 'claude-opus-4-7' | 'claude-opus-4-1' | 'opus' | 'opus[1m]' | 'sonnet' | 'haiku';
+/** `discovered` once Claude Code has listed its models, `fallback` before. */
+export interface CodingAgentModelsProvenance {
+  source: 'discovered' | 'fallback';
+  discovered_at: string | null;
+  cc_version: string | null;
+  error: string | null;
+}
+
+/** A coding-agent model id. The engine owns the vocabulary: Claude Code's is
+ *  discovered from Claude Code itself (`runtime::cc_model_discovery`), so no
+ *  union here could stay true. */
+export type CodingAgentModelValue = string;
 
 /** Reasoning effort levels mirroring the `reasoning_efforts` list in crates/lucidos-engine/src/runtime/cc_menu_options.json. */
 export type CodingAgentReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max';

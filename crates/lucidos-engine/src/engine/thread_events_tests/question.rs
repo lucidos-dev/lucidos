@@ -53,6 +53,46 @@ fn question_option_without_preview_still_decodes() {
     assert_eq!(option.preview, None);
 }
 
+/// Every answer stored before answers carried images must still decode, and
+/// an imageless answer must serialize exactly as it did.
+#[test]
+fn answers_without_images_keep_their_old_shape() {
+    let old_free: AnswerKind =
+        serde_json::from_value(serde_json::json!({ "kind": "FreeText", "text": "yes" })).unwrap();
+    assert_eq!(old_free.image_hashes(), &[] as &[String]);
+    assert_eq!(
+        serde_json::to_value(&old_free).unwrap(),
+        serde_json::json!({ "kind": "FreeText", "text": "yes" })
+    );
+    let old_multi: AnswerKind = serde_json::from_value(
+        serde_json::json!({ "kind": "MultiSelected", "option_ids": ["opt-0"] }),
+    )
+    .unwrap();
+    assert_eq!(old_multi.image_hashes(), &[] as &[String]);
+}
+
+/// Every side question stored before asks carried images must still decode.
+#[test]
+fn a_side_question_asked_without_images_still_decodes() {
+    let raw = r#"{"type":"SideQuestionAsked","side_question_id":"7f1c1b1e-5e2a-4f3a-9d77-3c0f2b9a8a11","question":"q"}"#;
+    match serde_json::from_str::<ThreadEvent>(raw).expect("legacy parses") {
+        ThreadEvent::SideQuestionAsked { image_hashes, .. } => assert!(image_hashes.is_empty()),
+        other => panic!("expected SideQuestionAsked, got {other:?}"),
+    }
+}
+
+#[test]
+fn answer_images_round_trip() {
+    let answer = AnswerKind::FreeText {
+        text: String::new(),
+        image_hashes: vec!["a".repeat(64)],
+    };
+    let v = serde_json::to_value(&answer).unwrap();
+    assert_eq!(v["image_hashes"][0], "a".repeat(64));
+    let back: AnswerKind = serde_json::from_value(v).unwrap();
+    assert_eq!(back, answer);
+}
+
 #[test]
 fn user_question_asked_empty_options_skipped() {
     let event = ThreadEvent::UserQuestionAsked {
@@ -133,6 +173,7 @@ fn user_question_answered_free_text_serialization() {
         tool_use_id: "tu_1".into(),
         answer: AnswerKind::FreeText {
             text: "let's do X".into(),
+            image_hashes: vec![],
         },
     };
     let v = serde_json::to_value(&event).unwrap();
@@ -157,6 +198,7 @@ fn user_question_answered_multi_selected_serialization() {
         answer: AnswerKind::MultiSelected {
             option_ids: vec!["opt-0".into(), "opt-2".into()],
             text: None,
+            image_hashes: vec![],
         },
     };
     let v = serde_json::to_value(&event).unwrap();
@@ -173,7 +215,9 @@ fn user_question_answered_multi_selected_serialization() {
     let parsed: ThreadEvent = serde_json::from_str(raw).expect("parse");
     match parsed {
         ThreadEvent::UserQuestionAnswered {
-            answer: AnswerKind::MultiSelected { option_ids, text },
+            answer: AnswerKind::MultiSelected {
+                option_ids, text, ..
+            },
             ..
         } => {
             assert_eq!(option_ids, vec!["opt-0", "opt-2"]);
@@ -192,6 +236,7 @@ fn user_question_answered_multi_selected_with_text_serialization() {
         answer: AnswerKind::MultiSelected {
             option_ids: vec!["opt-0".into()],
             text: Some("plus this".into()),
+            image_hashes: vec![],
         },
     };
     let v = serde_json::to_value(&event).unwrap();
@@ -201,7 +246,9 @@ fn user_question_answered_multi_selected_with_text_serialization() {
     let parsed: ThreadEvent = serde_json::from_str(&raw).expect("parse");
     match parsed {
         ThreadEvent::UserQuestionAnswered {
-            answer: AnswerKind::MultiSelected { option_ids, text },
+            answer: AnswerKind::MultiSelected {
+                option_ids, text, ..
+            },
             ..
         } => {
             assert_eq!(option_ids, vec!["opt-0"]);

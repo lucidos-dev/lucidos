@@ -7,6 +7,7 @@ use crate::engine::thread_lifecycle::ThreadType;
 use crate::engine::thread_state::ThreadState;
 use crate::engine::InjectedPrompt;
 use crate::engine::PreEmittedOrigin;
+use crate::runtime::InputWithdrawal;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 
@@ -633,43 +634,80 @@ async fn queued_message_already_injected(
     .await
 }
 
+/// Whether `thread_id` is a coding-agent thread, whose queued messages live in
+/// the agent's own queue rather than the Lucidos Agent's.
+async fn is_coding_agent_thread(pool: &sqlx::PgPool, thread_id: Uuid) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (
+            SELECT 1 FROM thread_summaries WHERE thread_id = $1 AND source = 'claude_code'
+        )",
+    )
+    .bind(thread_id)
+    .fetch_one(pool)
+    .await
+}
+
+/// The refusal for a queued message its agent already read.
+fn already_read(agent: &str) -> ApiError {
+    ApiError::new(
+        StatusCode::CONFLICT,
+        format!("{agent} has already read this message, so it can no longer be taken back."),
+    )
+    .with_reason("already_read")
+}
+
 async fn remove_queued_message(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Json(request): Json<RemoveQueuedMessageRequest>,
-) -> Result<StatusCode, StatusCode> {
-    let thread_id = Uuid::parse_str(&request.thread_id).map_err(|_| StatusCode::BAD_REQUEST)?;
-    let message_id = Uuid::parse_str(&request.message_id).map_err(|_| StatusCode::BAD_REQUEST)?;
+) -> Result<StatusCode, ApiError> {
+    let thread_id = Uuid::parse_str(&request.thread_id)
+        .map_err(|_| ApiError::bad_request(format!("Invalid thread_id {:?}", request.thread_id)))?;
+    let message_id = Uuid::parse_str(&request.message_id).map_err(|_| {
+        ApiError::bad_request(format!("Invalid message_id {:?}", request.message_id))
+    })?;
 
     let already_removed = queued_message_already_removed(&state.pool, thread_id, message_id)
         .await
-        .map_err(|e| {
-            log!(
-                "[Chat] queued-message remove: failed to check removal marker for {}: {}",
-                message_id,
-                e
-            );
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+        .map_err(ApiError::db)?;
     if already_removed {
         return Ok(StatusCode::OK);
     }
 
-    let already_injected = queued_message_already_injected(&state.pool, thread_id, message_id)
+    let actor = super::actor::user_actor(&headers, None);
+    if is_coding_agent_thread(&state.pool, thread_id)
         .await
-        .map_err(|e| {
-            log!(
-                "[Chat] queued-message remove: failed to check injection marker for {}: {}",
-                message_id,
-                e
-            );
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-    if already_injected {
-        return Err(StatusCode::CONFLICT);
+        .map_err(ApiError::db)?
+    {
+        // The session records the tombstone itself, once the agent confirms.
+        return match state
+            .engine
+            .withdraw_coding_agent_input(thread_id, message_id, actor)
+            .await
+        {
+            InputWithdrawal::Withdrawn => Ok(StatusCode::OK),
+            // A concurrent request may have withdrawn it first: stay idempotent.
+            InputWithdrawal::AlreadyRead
+                if queued_message_already_removed(&state.pool, thread_id, message_id)
+                    .await
+                    .map_err(ApiError::db)? =>
+            {
+                Ok(StatusCode::OK)
+            }
+            InputWithdrawal::AlreadyRead => Err(already_read("The coding agent")),
+            InputWithdrawal::Refused(why) => {
+                Err(ApiError::new(StatusCode::CONFLICT, why).with_reason("withdraw_refused"))
+            }
+        };
     }
 
-    let actor = super::actor::user_actor(&headers, None);
+    let already_injected = queued_message_already_injected(&state.pool, thread_id, message_id)
+        .await
+        .map_err(ApiError::db)?;
+    if already_injected {
+        return Err(already_read("The Lucidos Agent"));
+    }
+
     state
         .engine
         .event_bus
@@ -685,22 +723,9 @@ async fn remove_queued_message(
             },
         })
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|e| ApiError::internal(format!("Could not record the removal: {e}")))?;
 
     Ok(StatusCode::OK)
-}
-
-/// Whether the normal chat route refuses `message`: a `/btw` side question
-/// bound for a coding agent. That is an existing coding-agent thread (its
-/// `thread_summaries.source`), or any thread the request sends through one,
-/// including a thread it creates.
-fn refuses_side_question_message(
-    existing_source: Option<&str>,
-    use_coding_agent: Option<bool>,
-    message: &str,
-) -> bool {
-    (existing_source == Some("claude_code") || use_coding_agent == Some(true))
-        && crate::engine::agent_session::side_question::is_side_question(message)
 }
 
 /// POST endpoint for chat with progress updates.
@@ -790,11 +815,8 @@ pub(super) async fn chat_submit(
         }
     }
 
-    // A side question never becomes a turn in the main session (ADR 0318).
-    let existing_source = existing_thread_row
-        .as_ref()
-        .map(|(_, source, _, _)| source.as_str());
-    if refuses_side_question_message(existing_source, request.use_coding_agent, &request.message) {
+    // A side question never becomes a turn (ADR 0320).
+    if crate::engine::agent_session::side_question::is_side_question(&request.message) {
         return Err(ApiError::bad_request(
             crate::engine::agent_session::side_question::SIDE_QUESTION_ON_CHAT_ROUTE,
         )

@@ -1885,6 +1885,13 @@ function foldEvent(
       }
       return;
     }
+    // A withdrawn message leaves the queue. Left there, a later read or an
+    // idle turn takes it out as read, and its bubble comes back.
+    if (event.type === 'QueuedMessageRemoved') {
+      const at = state.unreadMessages.findIndex(ex => ex.userEvent._eventId === event.removed_message_id);
+      if (at !== -1) state.unreadMessages.splice(at, 1);
+      return;
+    }
     if (NON_EXCHANGE_METADATA_EVENTS.has(event.type)) return;
     if (isAuxiliaryCapture(event)) return;
     // The prompt handing a waiting message to a running agent is no step of
@@ -1895,6 +1902,21 @@ function foldEvent(
     if (event.type === 'CodingAgentPromptSent' && current && stillRunning(current)
       && state.unreadMessages.some(({ userEvent }) =>
         userEvent.type === 'MessageReceived' && userEvent.text === event.text)) {
+      return;
+    }
+
+    // A change summary is written after the turn that proposed the change,
+    // often once the change card has opened. It joins the proposing turn, as a
+    // release joins its holder: on the card it would read as a turn in flight.
+    // Outside the loaded window it has nowhere to go, so it is dropped.
+    if (event.type === 'ChangeSummarized') {
+      for (let i = exchanges.length - 1; i >= 0; i--) {
+        const holder = exchanges[i];
+        if (!holder.steps.some(s => s.event.type === 'ChangeProposed' && s.event.change_id === event.change_id)) continue;
+        holder.steps.push({ seq, event });
+        touched?.add(holder);
+        break;
+      }
       return;
     }
 

@@ -13,6 +13,7 @@ pub mod cc_permission;
 pub mod cc_question_wait;
 pub(crate) mod cc_settings;
 mod change_ops;
+pub mod change_summary_consumer;
 pub mod changelog;
 pub(in crate::engine) mod chat;
 pub(crate) mod claude_code;
@@ -683,6 +684,12 @@ pub struct LucidosEngine {
     /// Per-thread time of the last coding-agent spawn, for the spawn debounce.
     /// Keyed by thread_id so concurrent starts on different threads are not blocked.
     last_spawn: std::sync::Mutex<HashMap<Uuid, std::time::Instant>>,
+    /// The system prompt each thread's latest Claude Code spawn appended. A
+    /// side question's session copy appends the same one, so its prompt prefix
+    /// matches and the transcript reads from the prompt cache. Memory only: a
+    /// thread missing from it, after a restart or an eviction, answers every
+    /// side question uncached and without that prompt until its next spawn.
+    pub(crate) cc_system_prompts: std::sync::Mutex<HashMap<Uuid, String>>,
     /// Spawns past the spawn debounce that have not returned yet. Together with
     /// `agent_sessions` this answers whether anybody owns a thread. Shared with
     /// the worktree cleanup's liveness probe.

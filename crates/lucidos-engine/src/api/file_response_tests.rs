@@ -384,3 +384,76 @@ fn range_specs_resolve_against_the_file_length() {
         assert_eq!(resolve_range(Some(junk), 26), Full, "spec: {junk}");
     }
 }
+
+fn typed(content_type: &str) -> Response {
+    ([(header::CONTENT_TYPE, content_type.to_string())], "body").into_response()
+}
+
+#[test]
+fn an_active_document_is_sandboxed_without_the_workspace_origin() {
+    for content_type in [
+        "text/html",
+        "text/html; charset=utf-8",
+        "TEXT/HTML",
+        "application/xhtml+xml",
+        "image/svg+xml",
+        "application/xml",
+        "text/xml",
+    ] {
+        let response = sandbox_documents(typed(content_type), "application/octet-stream");
+        let csp = header_of(&response, header::CONTENT_SECURITY_POLICY)
+            .unwrap_or_else(|| panic!("{content_type} served with no sandbox"));
+        assert!(csp.starts_with("sandbox "), "{content_type}: {csp}");
+        assert!(csp.contains("allow-scripts"), "{content_type}: {csp}");
+        // The whole point: the file must not run as the shell.
+        assert!(!csp.contains("allow-same-origin"), "{content_type}: {csp}");
+        assert!(!csp.contains("escape-sandbox"), "{content_type}: {csp}");
+    }
+}
+
+#[test]
+fn every_other_type_keeps_its_exact_headers() {
+    for content_type in [
+        "text/plain",
+        "text/markdown",
+        "text/css",
+        "application/json",
+        "application/javascript",
+        "application/pdf",
+        "image/png",
+        "video/mp4",
+        "font/woff2",
+        "application/octet-stream",
+    ] {
+        let response = sandbox_documents(typed(content_type), "application/octet-stream");
+        assert_eq!(
+            header_of(&response, header::CONTENT_SECURITY_POLICY),
+            None,
+            "{content_type}"
+        );
+        assert_eq!(response.headers().len(), 1, "{content_type}");
+    }
+}
+
+#[test]
+fn a_response_with_no_type_is_left_alone() {
+    let response = sandbox_documents(StatusCode::NOT_FOUND.into_response(), "text/plain");
+    assert_eq!(header_of(&response, header::CONTENT_SECURITY_POLICY), None);
+}
+
+#[test]
+fn a_not_modified_answer_is_sandboxed_by_what_its_path_names() {
+    // `ServeDir` sends a 304 with no type. The browser merges its headers into
+    // the cached copy, so this is what sandboxes a page cached before the fix.
+    let response = sandbox_documents(StatusCode::NOT_MODIFIED.into_response(), "text/html");
+    assert_eq!(
+        header_of(&response, header::CONTENT_SECURITY_POLICY).as_deref(),
+        Some(DOCUMENT_SANDBOX_CSP)
+    );
+}
+
+#[test]
+fn the_served_type_outranks_the_path() {
+    let response = sandbox_documents(typed("text/plain"), "text/html");
+    assert_eq!(header_of(&response, header::CONTENT_SECURITY_POLICY), None);
+}

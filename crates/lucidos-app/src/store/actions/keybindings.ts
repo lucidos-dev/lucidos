@@ -72,6 +72,13 @@ function overrides(): Partial<Record<ShortcutId, Binding>> {
   return out;
 }
 
+/** Every shortcut's current binding, in registry order. Parses the override
+ *  map once, where calling `bindingFor` per shortcut would parse it each time. */
+export function allBindings(): Binding[] {
+  const o = overrides();
+  return SHORTCUT_DEFS.map((def) => o[def.id] ?? def.defaultBinding);
+}
+
 /** The current (override-or-default) binding for a shortcut. */
 export function bindingFor(id: ShortcutId): Binding {
   return overrides()[id] ?? shortcutDef(id).defaultBinding;
@@ -85,14 +92,20 @@ export function isCustomized(id: ShortcutId): boolean {
 
 /** The shortcut whose current binding matches this keydown, or null. `exclude`
  *  skips one id — used by the recorder to detect a conflict with a DIFFERENT
- *  shortcut while ignoring the one being rebound. */
+ *  shortcut while ignoring the one being rebound.
+ *
+ *  A chord the user bound beats another shortcut's default. A release that
+ *  gives a new default a chord they already use must not take it from them. */
 export function matchShortcut(e: EventLike, exclude?: ShortcutId): ShortcutId | null {
   // Parse the override map once per event, not once per def — this runs on
-  // EVERY keydown (including plain typing), and the registry is 16 entries.
+  // EVERY keydown (including plain typing), and the registry is small.
   const o = overrides();
   for (const def of SHORTCUT_DEFS) {
-    if (def.id === exclude) continue;
-    if (matchesEvent(e, o[def.id] ?? def.defaultBinding)) return def.id;
+    const own = o[def.id];
+    if (def.id !== exclude && own && matchesEvent(e, own)) return def.id;
+  }
+  for (const def of SHORTCUT_DEFS) {
+    if (def.id !== exclude && !o[def.id] && matchesEvent(e, def.defaultBinding)) return def.id;
   }
   return null;
 }

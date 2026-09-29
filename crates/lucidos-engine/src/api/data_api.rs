@@ -103,14 +103,23 @@ async fn serve_workspace_data(
     data_dir: std::path::PathBuf,
     req: axum::extract::Request,
 ) -> Response {
-    let Some(_rel) = data_mount_target(req.uri().path()) else {
+    let is_directory = req.uri().path().ends_with('/');
+    let Some(rel) = data_mount_target(req.uri().path()) else {
         // Logged because `request_logger` skips `/data`, so a refusal is
         // otherwise invisible to whoever has to explain the 404.
         log!("[data] refused {} on the /data mount", req.uri().path());
         return StatusCode::NOT_FOUND.into_response();
     };
     match ServeDir::new(&data_dir).oneshot(req).await {
-        Ok(resp) => resp.map(axum::body::Body::new),
+        Ok(resp) => {
+            // A directory request is answered with its `index.html`.
+            let path_type = if is_directory {
+                "text/html"
+            } else {
+                content_type_for_ext(&extension_of(&rel))
+            };
+            super::file_response::sandbox_documents(resp.map(axum::body::Body::new), path_type)
+        }
         Err(e) => {
             log!("[data] ServeDir failed: {}", e);
             StatusCode::NOT_FOUND.into_response()
@@ -218,8 +227,8 @@ fn walkdir(root: &std::path::Path, dir: &std::path::Path) -> Result<Vec<String>,
 
 /// GET /api/v1/data/*path — read a data file
 ///
-/// The response shape (validators, ranges, streaming) belongs to
-/// [`super::file_response::serve_file`]; this handler owns only path resolution.
+/// The response shape (validators, ranges, streaming, the document sandbox)
+/// belongs to [`super::file_response`]; this handler owns only path resolution.
 pub(super) async fn read_data(
     State(state): State<AppState>,
     Path(path): Path<String>,
@@ -238,10 +247,21 @@ pub(super) async fn read_data(
         } else {
             state.workspace_path.join(crate::core::DATA_DIR).join(&path)
         };
-    let ext = path.rsplit('.').next().unwrap_or("").to_lowercase();
-    let content_type = content_type_for_ext(&ext);
+    let content_type = content_type_for_ext(&extension_of(&path));
 
-    super::file_response::serve_file(&file_path, content_type, &headers).await
+    super::file_response::sandbox_documents(
+        super::file_response::serve_file(&file_path, content_type, &headers).await,
+        content_type,
+    )
+}
+
+/// The lowercase extension of a data path, or `""`.
+fn extension_of(path: &str) -> String {
+    std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase()
 }
 
 /// The `artifacts/` arm of [`write_data`]: store the file, commit it, announce
@@ -759,6 +779,89 @@ mod tests {
             StatusCode::NOT_FOUND,
             "a blob that exists on disk must not be served by the mount"
         );
+    }
+
+    /// `ServeDir` picks the type from the extension, so this proves the
+    /// sandbox reads the type the mount actually answered with.
+    #[tokio::test]
+    async fn the_mount_serves_an_html_file_sandboxed_and_a_note_untouched() {
+        use tower::ServiceExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        touch(tmp.path(), "artifacts/page.html");
+        touch(tmp.path(), "artifacts/note.md");
+        let app = Router::new().nest_service("/data", static_mount(tmp.path().to_path_buf()));
+
+        let csp_of = |path: &'static str| {
+            let app = app.clone();
+            async move {
+                let response = app
+                    .oneshot(
+                        axum::http::Request::builder()
+                            .uri(path)
+                            .body(axum::body::Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK, "{path}");
+                response
+                    .headers()
+                    .get(axum::http::header::CONTENT_SECURITY_POLICY)
+                    .map(|v| v.to_str().unwrap().to_string())
+            }
+        };
+
+        assert_eq!(
+            csp_of("/data/artifacts/page.html").await.as_deref(),
+            Some(super::super::file_response::DOCUMENT_SANDBOX_CSP),
+        );
+        assert_eq!(csp_of("/data/artifacts/note.md").await, None);
+    }
+
+    /// A browser revalidating a page it cached before the sandbox existed gets a
+    /// 304 with no type. It merges the 304's headers into its copy, so the 304
+    /// is what has to carry the sandbox.
+    #[tokio::test]
+    async fn a_not_modified_page_on_the_mount_is_sandboxed() {
+        use tower::ServiceExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        touch(tmp.path(), "artifacts/page.html");
+        touch(tmp.path(), "artifacts/site/index.html");
+        let app = Router::new().nest_service("/data", static_mount(tmp.path().to_path_buf()));
+
+        for path in ["/data/artifacts/page.html", "/data/artifacts/site/"] {
+            let request = |validator: Option<&str>| {
+                let mut builder = axum::http::Request::builder().uri(path);
+                if let Some(v) = validator {
+                    builder = builder.header(axum::http::header::IF_MODIFIED_SINCE, v);
+                }
+                builder.body(axum::body::Body::empty()).unwrap()
+            };
+            let first = app.clone().oneshot(request(None)).await.unwrap();
+            let last_modified = first
+                .headers()
+                .get(axum::http::header::LAST_MODIFIED)
+                .and_then(|v| v.to_str().ok())
+                .expect("the mount stamps Last-Modified")
+                .to_string();
+
+            let revalidated = app
+                .clone()
+                .oneshot(request(Some(&last_modified)))
+                .await
+                .unwrap();
+            assert_eq!(revalidated.status(), StatusCode::NOT_MODIFIED, "{path}");
+            assert_eq!(
+                revalidated
+                    .headers()
+                    .get(axum::http::header::CONTENT_SECURITY_POLICY)
+                    .and_then(|v| v.to_str().ok()),
+                Some(super::super::file_response::DOCUMENT_SANDBOX_CSP),
+                "{path}"
+            );
+        }
     }
 
     #[test]

@@ -56,10 +56,11 @@ export function CredentialInstructions({ text }: { text: string }) {
  *
  *  Normally the identity function: the service name IS the account name, since
  *  `auth_type` carries what the old `email:` prefix used to say. The strip is
- *  the frontend half of the `credential-email-prefix-fallback` temporary
- *  measure (`docs/temporary-measures.md`), for the rows the prefix migration had
- *  to leave alone because their bare name was already taken. Without it, opening
- *  such a credential for edit 404s on the server-settings fetch. Mirrors
+ *  the frontend half of a temporary measure in `docs/temporary-measures.md`:
+ *  the "`email:`-prefixed credential fallback in `get_email_password`". It
+ *  covers the rows the prefix migration left alone, because their bare name
+ *  was already taken. Without it, opening such a credential for edit 404s on
+ *  the server-settings fetch. Mirrors
  *  `EmailStore::account_name_for_credential`; remove the two together. */
 function emailAccountName(serviceName: string): string {
   return serviceName.startsWith('email:') ? serviceName.slice('email:'.length) : serviceName;

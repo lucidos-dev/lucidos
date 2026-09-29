@@ -38,6 +38,7 @@ pub(crate) mod mutating_gate;
 mod notifications;
 #[cfg(test)]
 pub(crate) mod route_scan;
+mod side_questions;
 mod themes;
 
 /// Where every `/api/v1` route is mounted, as one value.
@@ -279,6 +280,7 @@ pub(super) fn is_dangerous_git_ref(s: &str) -> bool {
 fn content_type_for_ext(ext: &str) -> &'static str {
     match ext {
         "html" | "htm" => "text/html",
+        "xhtml" => "application/xhtml+xml",
         "css" => "text/css",
         "js" | "mjs" => "application/javascript",
         "json" => "application/json",
@@ -1401,6 +1403,7 @@ pub fn create_router(
         .merge(history::router())
         .merge(chat::router())
         .merge(claude_code::router())
+        .merge(side_questions::router())
         .merge(threads::router())
         .merge(changes::router())
         .merge(notifications::router())

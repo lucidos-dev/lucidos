@@ -53,7 +53,7 @@ test('the theme carousel picks in place and lets the next click land', async ({ 
 
   // A family chip shows only that family, with no names row, and All brings
   // every theme back.
-  const chips = page.locator('.theme-family-chip');
+  const chips = page.locator('.pill-bar-btn');
   await expect(chips.first()).toHaveText('All');
   await expect(chips.first()).toHaveAttribute('aria-pressed', 'true');
   const all = await radios.count();

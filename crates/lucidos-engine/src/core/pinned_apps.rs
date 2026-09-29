@@ -23,9 +23,10 @@ pub struct PinnedAppUi {
 pub struct PinnedAppStore;
 
 impl PinnedAppStore {
-    /// Defensive double-write — the migration owns this CREATE TABLE
-    /// (see `20260517160627_consolidate_init_schema_tables.sql`). Slated
-    /// for removal in `harden-init-schema-tables-vs-migrations-pattern-finish`.
+    /// Defensive double-write: the migration owns this CREATE TABLE (see
+    /// `20260517160627_consolidate_init_schema_tables.sql`). A temporary measure:
+    /// `docs/temporary-measures.md` § "Defensive double-write of tables into
+    /// `init_schema`".
     pub async fn init_schema(
         pool: &PgPool,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {

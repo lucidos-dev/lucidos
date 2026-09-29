@@ -317,7 +317,8 @@ impl AgentRuntime for CodexRuntime {
             control_tx,
             permission_rx,
             // Codex has no side-question call in either protocol.
-            side_question_tx: None,
+            // Nor a way to take back an input.
+            withdraw_tx: None,
         })
     }
 }

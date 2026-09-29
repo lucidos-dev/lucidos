@@ -109,6 +109,32 @@ describe('groupIntoExchanges', () => {
     expect(turn.steps.map((s) => s.seq)).toEqual([3, 6]);
   });
 
+  /** A summary is written after the turn that proposed the change, often
+   *  once the change card has opened. It joins the proposal, never the card:
+   *  a stray step on the card would read as a turn in flight. */
+  it('files a late change summary under the turn that proposed the change', () => {
+    const events = new Map<number, ThreadEvent>([
+      [1, { type: 'MessageReceived', text: 'build it' }],
+      [2, { type: 'ChangeProposed', change_id: 'c1', description: 'b\na' }],
+      [3, { type: 'ResponseGenerated' }],
+      [4, { type: 'ChangeApplied', change_id: 'c1' }],
+      [5, { type: 'ChangeSummarized', change_id: 'c1', summary: 'Builds it', description: 'b\na' }],
+    ] as [number, ThreadEvent][]);
+    const exchanges = groupIntoExchanges(events);
+    const card = exchanges.find((ex) => ex.userEvent.type === 'ChangeApplied')!;
+    expect(card.steps).toEqual([]);
+    expect(exchanges[0].steps.map((s) => s.seq)).toEqual([2, 3, 5]);
+  });
+
+  it('drops a change summary whose proposal is outside the loaded window', () => {
+    const events = new Map<number, ThreadEvent>([
+      [4, { type: 'ChangeApplied', change_id: 'c1' }],
+      [5, { type: 'ChangeSummarized', change_id: 'c1', summary: 'Builds it', description: 'b\na' }],
+    ] as [number, ThreadEvent][]);
+    const [card] = groupIntoExchanges(events);
+    expect(card.steps).toEqual([]);
+  });
+
   it('handles TriggerStarted as exchange boundary', () => {
     const events = new Map<number, ThreadEvent>([
       [1, { type: 'TriggerStarted', trigger_id: 'task-1' }],

@@ -819,8 +819,18 @@
     min-width: 8.75rem;
 }
 
+/* What a hold on Send offers. Fixed, since `useAnchoredPosition` places it
+   against the button in viewport coordinates. */
+.send-hold-menu {
+    position: fixed;
+    overflow: hidden;
+    z-index: var(--z-dropdown);
+    min-width: 8.75rem;
+}
+
 .image-attach-menu button,
-.image-attach-menu label {
+.image-attach-menu label,
+.send-hold-menu button {
     display: flex;
     align-items: center;
     gap: 0.5rem;
@@ -837,7 +847,8 @@
 
 @media (hover: hover) {
     .image-attach-menu button:hover,
-    .image-attach-menu label:hover {
+    .image-attach-menu label:hover,
+    .send-hold-menu button:hover {
         background: var(--bg-hover);
     }
 }
@@ -1229,11 +1240,17 @@
    the scale entirely. Being smaller than the heading's trash was never the
    defect; being off the scale in an undersized box was. Only the colour stays
    local. */
+.queued-message-edit,
 .queued-message-remove {
     color: var(--text-muted);
 }
 
 @media (hover: hover) {
+    .queued-message-edit:hover {
+        color: var(--accent);
+        background: color-mix(in srgb, var(--accent) 12%, transparent);
+    }
+
     .queued-message-remove:hover {
         color: var(--accent-red);
         background: color-mix(in srgb, var(--accent-red) 12%, transparent);
@@ -1479,63 +1496,55 @@ html[data-theme-mode="dark"] .thread-status-question-badge::after {
     padding: var(--space-sm) 0 var(--space-sm) var(--turn-body-inset);
 }
 
+/* The head and body carry the padding, so the whole head is the toggle's hit
+   area and the body rolls with its own bottom inset. */
 .side-question-card {
-    padding: calc(var(--turn-surface-inset) - 1px);
+    --side-question-inset: calc(var(--turn-surface-inset) - 1px);
+    --side-question-folded-inset: calc(var(--space-sm) - 1px);
     background: var(--bg-secondary);
     border: 1px solid var(--border-color);
     border-radius: var(--radius-surface);
     min-width: 0;
 }
 
-/* A dismissed card: one line on the card's own edges, the question cut off
-   with an ellipsis. */
-.side-question-dismissed {
+/* Top-aligned: a note wrapped onto two lines keeps the label on its first.
+   Folded, the head is the whole card, one line with the question cut off.
+   Its padding moves on the disclosure roll's curve as the body rolls. */
+.side-question-head {
+    position: relative;
     display: flex;
     align-items: baseline;
     gap: var(--space-sm);
     width: 100%;
-    min-width: 0;
-    padding: calc(var(--space-sm) - 1px) calc(var(--turn-surface-inset) - 1px);
+    padding: var(--side-question-inset) var(--side-question-inset) 0;
     background: none;
-    border: 1px solid var(--border-color);
+    border: 0;
     border-radius: var(--radius-surface);
-    color: var(--text-muted);
+    color: inherit;
     text-align: left;
     cursor: pointer;
+    transition: padding var(--duration-slow) cubic-bezier(0.4, 0, 0.2, 1);
 }
 
-@media (hover: hover) {
-    .side-question-dismissed:hover {
-        background: var(--bg-secondary);
-    }
+.side-question-card[data-collapsed] .side-question-head {
+    padding: var(--side-question-folded-inset) var(--side-question-inset);
 }
 
-.side-question-dismissed-text {
-    flex: 1;
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+/* The head is about 1.75rem tall, so the hit area reaches half the rest of
+   the 44px (2.75rem) touch target above and below it, into the air there. */
+.side-question-head::before {
+    content: '';
+    position: absolute;
+    inset: -0.5rem 0;
 }
 
-/* The open card's collapse chevron at the same size and colour, so the two
-   sit on one right edge. */
-.side-question-dismissed-chevron {
-    display: flex;
-    align-self: center;
-    color: var(--text-secondary);
+.side-question-head:focus-visible {
+    outline: 0.125rem solid transparent;
+    box-shadow: var(--focus-ring);
 }
 
-.side-question-dismissed-chevron svg {
-    width: var(--icon-size-sm);
-    height: var(--icon-size-sm);
-}
-
-/* Top-aligned: a note wrapped onto two lines keeps the label on its first. */
-.side-question-head {
-    display: flex;
-    align-items: baseline;
-    gap: var(--space-sm);
+.side-question-body {
+    padding: 0 var(--side-question-inset) var(--side-question-inset);
 }
 
 .side-question-label {
@@ -1546,30 +1555,41 @@ html[data-theme-mode="dark"] .thread-status-question-badge::after {
     color: var(--text-secondary);
 }
 
-.side-question-note {
+.side-question-summary {
     flex: 1;
     min-width: 0;
     font-size: var(--font-size-xs);
     color: var(--text-muted);
 }
 
-/* The negative margin hands the chip padding back, so the glyph sits on the
-   card's text edge and the head stays one text line tall. */
-.side-question-dismiss {
-    position: relative;
-    align-self: flex-start;
-    margin: -0.25rem;
+.side-question-card[data-collapsed] .side-question-summary {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 
-/* A transparent 44px touch target, 2.75rem at the 16px root. */
-.side-question-dismiss::before {
-    content: '';
-    position: absolute;
-    left: 50%;
-    top: 50%;
-    width: 2.75rem;
-    height: 2.75rem;
-    transform: translate(-50%, -50%);
+/* Points down folded and up open, turning as the body rolls. */
+.side-question-chevron {
+    display: flex;
+    align-self: flex-start;
+    color: var(--text-secondary);
+}
+
+.side-question-chevron svg {
+    width: var(--icon-size-sm);
+    height: var(--icon-size-sm);
+    transform: rotate(180deg);
+    transition: transform var(--duration-slow) cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.side-question-card[data-collapsed] .side-question-chevron svg {
+    transform: none;
+}
+
+@media (hover: hover) {
+    .side-question-head:hover .side-question-chevron {
+        color: var(--text-primary);
+    }
 }
 
 /* Surface, radius, padding and leading come from `.user-bubble`, so the card

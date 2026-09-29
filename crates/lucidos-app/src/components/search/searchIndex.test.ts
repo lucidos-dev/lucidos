@@ -17,7 +17,7 @@ function setViewportWidth(px: number): void {
 }
 
 beforeEach(() => {
-  // Default bindings (no overrides) — searchEverywhere = mod+Shift+S.
+  // Default bindings (no overrides): searchEverywhere = mod+K.
   preferences.value = { status: 'not-loaded' };
   // Default to a dev install; the packaged-only cases opt in explicitly.
   enginePackaged.value = false;
@@ -44,8 +44,13 @@ describe('settings search: the iOS-only Autocorrect row', () => {
 });
 
 describe('settings search — keyboard shortcuts', () => {
-  it('finds a shortcut by its key combo typed with a space ("ctrl shift s")', () => {
-    const results = getSettingsSearchResults('ctrl shift s', 20);
+  it('finds a shortcut by its key combo typed with a space ("ctrl shift o")', () => {
+    const results = getSettingsSearchResults('ctrl shift o', 20);
+    expect(results.some((r) => r.id === 'shortcut:newThread')).toBe(true);
+  });
+
+  it('finds search by its familiar combo ("cmd k")', () => {
+    const results = getSettingsSearchResults('cmd k', 20);
     expect(results.some((r) => r.id === 'shortcut:searchEverywhere')).toBe(true);
   });
 
@@ -67,8 +72,8 @@ describe('settings search — keyboard shortcuts', () => {
   it('reflects a custom binding in search (rebound search to ctrl+shift+p)', () => {
     preferences.value = { status: 'loaded', data: { keybindings: JSON.stringify({ searchEverywhere: 'mod+shift+p' }) } };
     expect(getSettingsSearchResults('ctrl shift p', 20).some((r) => r.id === 'shortcut:searchEverywhere')).toBe(true);
-    // The old default combo no longer matches it.
-    expect(getSettingsSearchResults('ctrl shift s', 20).some((r) => r.id === 'shortcut:searchEverywhere')).toBe(false);
+    // The default combo no longer matches it.
+    expect(getSettingsSearchResults('ctrl k', 20).some((r) => r.id === 'shortcut:searchEverywhere')).toBe(false);
   });
 });
 

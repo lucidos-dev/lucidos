@@ -53,7 +53,7 @@ export function restoreBanner(p: RestoreBannerProps): VNode | null {
             names the message, but the spinner is the first span here: it won the
             cascade on specificity and stretched into a banner-wide rotating
             ellipse. */}
-        <span class="ws-picker-restore-spinner" />
+        <span class="mini-spinner ws-picker-restore-spinner" />
         <span class="ws-picker-restore-text">
           Restoring “{s.name}”: {RESTORE_PHASE_LABELS[s.phase] || s.phase}
         </span>

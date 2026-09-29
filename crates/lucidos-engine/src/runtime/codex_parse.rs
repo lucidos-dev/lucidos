@@ -303,6 +303,7 @@ impl TurnTracker {
                     model: None,
                     slash_commands: Vec::new(),
                     skills: Vec::new(),
+                    agent_version: None,
                 }]
             }
             CodexLine::TurnStarted => Vec::new(),

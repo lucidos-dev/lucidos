@@ -355,10 +355,12 @@ function submittedUserInput(event: StoredEvent): { text: string; imageHashes: st
   }
   if (event.type === 'UserQuestionAnswered') {
     const { answer } = event;
-    if (answer.kind === 'FreeText') return { text: answer.text, imageHashes: [] };
-    // Multi-select folds the prompt textarea's text into the answer; an
-    // options-only answer submitted no composer text at all.
-    if (answer.kind === 'MultiSelected' && answer.text) return { text: answer.text, imageHashes: [] };
+    if (answer.kind === 'FreeText') return { text: answer.text, imageHashes: answer.image_hashes ?? [] };
+    // Multi-select folds the prompt textarea's text and images into the
+    // answer; an options-only answer submitted no composer content at all.
+    if (answer.kind === 'MultiSelected' && (answer.text || answer.image_hashes?.length)) {
+      return { text: answer.text ?? '', imageHashes: answer.image_hashes ?? [] };
+    }
   }
   return null;
 }

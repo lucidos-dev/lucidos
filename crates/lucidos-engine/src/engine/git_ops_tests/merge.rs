@@ -322,6 +322,42 @@ async fn commits_in_range_filters_auto_commit_subjects() {
     assert_eq!(commits, vec!["fix: real change".to_string()]);
 }
 
+/// A back-merge of main into the branch is engine plumbing, not a commit the
+/// agent wrote. Listed, it would pad a change's commit list and title it.
+#[tokio::test]
+async fn commits_in_range_skips_merge_commits() {
+    let (_tmp, repo) = make_test_repo().await;
+    let rev = |r: &'static str| {
+        let repo = repo.clone();
+        async move {
+            String::from_utf8_lossy(&git_cmd(&["rev-parse", r], &repo).await.unwrap().stdout)
+                .trim()
+                .to_string()
+        }
+    };
+    let pre_sha = rev("main").await;
+
+    let _ = git_cmd(&["checkout", "-b", "feature"], &repo).await;
+    tokio::fs::write(repo.join("a.txt"), "a").await.unwrap();
+    let _ = git_cmd(&["add", "."], &repo).await;
+    let _ = git_cmd(&["commit", "-m", "feat: add a"], &repo).await;
+    let _ = git_cmd(&["checkout", "main"], &repo).await;
+    tokio::fs::write(repo.join("m.txt"), "m").await.unwrap();
+    let _ = git_cmd(&["add", "."], &repo).await;
+    let _ = git_cmd(&["commit", "-m", "chore: main moved"], &repo).await;
+    let _ = git_cmd(&["checkout", "feature"], &repo).await;
+    let _ = git_cmd(&["merge", "--no-ff", "--no-edit", "main"], &repo).await;
+
+    // Both commits land in the same second, so their order is not the point.
+    let mut commits = commits_in_range(&repo, &pre_sha, &rev("feature").await).await;
+    commits.sort();
+    assert_eq!(
+        commits,
+        vec!["chore: main moved".to_string(), "feat: add a".to_string()],
+        "the merge commit itself is not a commit subject"
+    );
+}
+
 #[tokio::test]
 async fn commits_in_range_empty_for_identical_shas() {
     let (_tmp, repo) = make_test_repo().await;

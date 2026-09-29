@@ -1,112 +1,72 @@
 ---
 name: update-lucidos-cc-models
-description: Use when updating the hardcoded Lucidos CC model list — checks current CC /model picker and updates the Rust constant
+description: Use when the Claude Code model picker looks wrong or a new Claude model ships. The picker is discovered from Claude Code itself; this covers checking discovery, the curated fallback file and its context-window overlay.
 ---
 
-# Update Lucidos CC Model List
+# The Lucidos Claude Code model picker
 
-The Lucidos CC model picker uses a hardcoded list of models matching Claude Code's `/model` picker.
-This skill helps keep that list in sync when Anthropic updates available models.
+The Claude Code `/model` picker in Lucidos is **discovered from Claude Code
+itself** (ADR 0325). Nobody resyncs it by hand any more. What still needs
+hands is the curated fallback file, and the context windows it declares.
 
-## Source of Truth
+## Where the list comes from
 
-The canonical model list comes from:
-1. **Claude Code docs**: https://code.claude.com/docs/en/model-config
-2. **Running `/model` in Claude Code** (interactive TUI — shows the live picker)
-3. **CC system init event**: the `model` field shows the current default
+- **Discovery** (`runtime/cc_model_discovery.rs`, probe in
+  `runtime/claude_code.rs::probe_cc_models`). A cold Claude Code process, built
+  like a session, gets one `initialize` control request and no prompt. Its
+  reply's `models` array is the picker, in Claude Code's order, with its own
+  labels and per-model effort tiers. The reply's account data is dropped.
+- **Cache:** `<workspace>/.lucidos/cc-models.json`. Loaded at boot, refreshed
+  in the background when missing, a day old, or when a session's handshake
+  names a new Claude Code version.
+- **Fallback:** `runtime/cc_menu_options.json`, served only until the first
+  probe succeeds.
 
-CC does NOT expose available models programmatically (see github.com/anthropics/claude-code/issues/12612).
+The picker is **exactly** the discovered list. A model Claude Code does not
+list is not offered, even one it would accept. So a new Claude model reaches
+the picker when Claude Code lists it, usually after `claude update`.
 
-## Where the List Lives
+## When the picker looks wrong
 
-**File**: `crates/lucidos-engine/src/runtime/cc_menu_options.json`
-**Loaded by**: `cc_model_options()` / `cc_reasoning_effort_options()` in `claude_code.rs` (`include_str!` + `LazyLock`).
+1. Read `models_provenance` on `GET /api/v1/claude-code/commands`. `source`
+   says `discovered` or `fallback`; `error` holds the last failed probe.
+2. Read `.lucidos/cc-models.json` for what the last probe saw.
+3. Check the engine log for `[CcModels]` lines.
+4. A list that follows the user's pins is correct. `ANTHROPIC_DEFAULT_SONNET_MODEL`
+   and friends change what `sonnet` resolves to, and the picker says so.
+5. To force a re-probe, delete the cache file and restart the engine.
 
-Each entry has:
-- `value` — the alias CC accepts (e.g., `"sonnet"`, `"opus"`, `"haiku"`)
-- `label` — display name (e.g., `"Sonnet 4.6"`)
-- `description` — one-line description (e.g., `"Best for everyday tasks"`)
-- `context_window` (optional, tokens): see "Declaring a context window" below
+## The curated fallback file
 
-The JSON file also carries the `reasoning_efforts` list (`/effort` picker entries) under the same schema.
+`cc_menu_options.json` has two jobs now: the picker before discovery, and the
+**context-window overlay** that discovery cannot supply. Keep its rows roughly
+current, but its order and labels matter only on a fresh install.
 
-## Where a row goes
-
-Rows run **newest version first**. `default` heads the list, and the
-version-free aliases (`opus`, `opus[1m]`, `sonnet`, `haiku`) sit at the tail.
-Two rows of the same version keep their relative order, and a `[1m]` twin sits
-beside its base.
-
-`the_model_rows_run_newest_version_first` enforces it, reading the version out
-of each pinned id. Order by capability tier instead and the newest model sinks.
-Opus 5.5 shipped below Fable 5.1, Fable 5 and Sonnet 5, under a panel showing
-about three rows.
-
-## Update Procedure
-
-1. **Open the JSON file** `crates/lucidos-engine/src/runtime/cc_menu_options.json`.
-2. **Compare with CC's picker**: run `claude` interactively and type `/model`, or check the model-config docs page.
-3. **Edit the JSON**: add/remove/modify entries to match, placing each row by version (see "Where a row goes"). No Rust source touch required.
-4. **Mirror the change** into `crates/lucidos-app/src/api/client/chat.ts` (`CodingAgentModelValue`) and `crates/lucidos-app/src/store/thread-events/exchange.ts` (`STATIC_MODEL_LABELS`). Both are hand-maintained, with no codegen. A value added or removed in the JSON must reach the union; a label change must reach the fallback map. Do both in the same commit.
-5. **Run tests**: `./scripts/test-engine.sh -- -- commands_tests`. That module covers the standard aliases and the row order.
-6. **Commit**: `fix: update CC model list to match current /model picker`.
-
-## Known Aliases
-
-CC accepts these short aliases for `set_model` control requests:
-- `default`: tier default
-- `fable`: the Fable model for the provider, for the hardest tasks
-- `best`: what `fable` resolves to where Fable is available, else `opus`
-- `sonnet`: latest Sonnet
-- `opus`: latest Opus
-- `haiku`: latest Haiku
-
-**The picker carries no `fable` or `best` row yet.** It pins
-`claude-fable-5-1` and `claude-fable-5` instead. Adding either alias is a real
-follow-up, and it needs a version-free label plus round-trip handling, the same
-as `opus`.
-
-**An alias resolves per provider, and it moves.** On the Anthropic API (what
-Lucidos spawns against) `opus` and `default` resolve to **Opus 5.5** as of CC
-v2.1.280, and `sonnet` to **Sonnet 5**. Elsewhere they lag: Claude Platform on
-AWS, Amazon Bedrock and Google Cloud keep `sonnet` on an older version, and
-Microsoft Foundry keeps both there. So an alias row's *label* goes stale
-silently whenever Anthropic repoints it. Two consequences for this file:
-
-- Re-check what each alias resolves to on every resync (the model-config docs
-  page has the per-provider table), and fix the label if it moved. The `opus` /
-  `opus[1m]` rows once stayed at "Opus 4.6" past that point. Both rows, and
-  their `STATIC_MODEL_LABELS` mirror, are now version-free like `sonnet`.
-- Prefer a **pinned full id** (`claude-sonnet-5`, `claude-opus-5@default`) for the
-  models the picker recommends, and keep an alias row only where "always latest"
-  is the point. A pinned id cannot drift.
-
-For 1M context variants, use the full model ID with extended context flag. Note
-that a `<model>[1m]` alias is a no-op once the alias already resolves to a model
-with a native 1M window, which is why the picker carries no `sonnet[1m]` row.
+- Rows run **newest version first**, `default` at the head and version-free
+  aliases at the tail. `the_model_rows_run_newest_version_first` enforces it.
+- The `reasoning_efforts` list is still the effort vocabulary for validation.
+- `STATIC_MODEL_LABELS` in `store/thread-events/exchange.ts` names models a
+  thread was pinned to but no picker offers any more. Add a label there when a
+  model leaves Claude Code's list.
+- Run `./scripts/test-engine.sh -- -- runtime::claude_code::` after an edit.
 
 ## Declaring a context window
 
-`context_window` says what window a CC session on that model actually runs
-under. It exists because Lucidos infers 200k for most bare `claude-` ids: 1M mode
-is gated on our own `[1m]` suffix, which is true of the requests the ENGINE
-makes and false of CC's. CC picks its own context mode. Without the
-declaration, the LLM Context Viewer rendered a real 240k Sonnet 5 prompt as
-"203k / 200k (100%)".
+`context_window` says what window a Claude Code session on that model actually
+runs under. Lucidos infers 200k for most bare `claude-` ids, because 1M mode is
+gated on our own `[1m]` suffix. Claude Code picks its own context mode, so
+without the declaration a real 240k prompt rendered as "203k / 200k (100%)".
 
-Three rules when you add a model:
+An alias is never followed to the model it runs, because a legacy id folds
+onto its alias. A session reports its concrete model at Init, and that id finds
+its own curated row. Three rules when you add one:
 
-- **Declare it on a pinned id, never on an alias row.**
-  `normalize_cc_model_id` folds old dated ids down onto `sonnet` / `opus` /
-  `haiku`. A 1M declaration there is wrong for every Sonnet 4.6 session already
-  in the store.
-- **Leave the `[1m]` rows absent.** The id-shape rule already answers 1M for
-  them, and a second copy of the number is a second thing to keep in step.
-- **Leave it absent when you do not know.** Absent means the models registry
-  answers, which is today's behaviour. Both directions cost something: too low
-  and the bar reads over 100%, too high and the user loses the running-out
-  warning.
+- **Declare it on a pinned id, never on an alias row.** `normalize_cc_model_id`
+  folds old dated ids onto `sonnet` / `opus` / `haiku`.
+- **Leave the `[1m]` rows absent.** The id-shape rule already answers 1M.
+- **Leave it absent when you do not know.** Too low reads over 100%; too high
+  hides the running-out warning.
 
 Read it through `runtime::coding_agent_context_window`, never by reaching into
-the option. The models registry (`llm/model_registry.rs`, the `models` table)
-is a separate answer for Lucidos's own calls, and it must not move.
+the option. The chat model registry (`llm/model_registry.rs`) is a separate
+answer for Lucidos's own calls.

@@ -65,7 +65,7 @@ import { installAppBridge } from './actions/app-bridge';
 import {
   startFrameCapabilityRenewal,
   stopFrameCapabilityRenewal,
-} from './actions/app-frame-capability';
+} from './actions/frame-capability';
 import { handleAppToastMessage } from './actions/app-toast-bridge';
 import { handleAppPullMessage } from './actions/app-pull-bridge';
 import { withBase, SCOPE_PATH } from '../utils/basePath';

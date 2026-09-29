@@ -17,6 +17,9 @@ rendered options they approve. It never starts with an edit.
   `--accent`"). Skip them too when the fix has one correct answer, like a
   clipped label. Say you skipped them and why. The approval gate under
   "Approval before verification" still applies.
+- **Every expand and collapse animates**, through `<Disclosure>`: options may
+  differ in how it looks, never in whether it moves (`.claude/rules/frontend.md`
+  § Every Expand and Collapse Rolls).
 
 ## Pick the mode
 
@@ -67,10 +70,10 @@ has to line up with. Render inside the running app, in the workspace's theme.
 
 - **Feedback instead of a pick** ("highlight the question more") means render
   again. Do not start editing on a half-answer.
-- **A pick** is the approval, and an exact spec means build that. Either way, build exactly that variant. Then
-  re-render the real markup with your new CSS and measure the edges it must
-  share with its neighbours (`getBoundingClientRect`). Do not trust your eyes
-  alone.
+- **A pick** is the approval, and an exact spec means build that. Either way,
+  build exactly that variant. Then re-render the real markup with your new CSS
+  and measure the edges it must share with its neighbours
+  (`getBoundingClientRect`). Do not trust your eyes alone.
 
 ## Approval before verification
 

@@ -21,7 +21,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 // @ts-expect-error: same
 import { fileURLToPath } from 'node:url';
-import { renderMarkdown, renderMarkdownInline, renderMarkdownInlineWithLinks } from '../../utils/renderMarkdown';
+import { renderMarkdown, renderMarkdownInline } from '../../utils/renderMarkdown';
 import { inlineMarkdownImage, openImagePopupFromGroup, popupImage } from '../imagePopup';
 
 const here: string = dirname(fileURLToPath(import.meta.url));
@@ -60,7 +60,7 @@ describe('inlineMarkdownImage', () => {
     // A card showed an agent's mockups, and tapping one did nothing.
     document.body.innerHTML = `
       <div class="question-body">
-        <div class="question-text">${renderMarkdownInlineWithLinks(`Which? ![All](${DIAGRAM})`)}</div>
+        <div class="question-text markdown-content">${renderMarkdown(`Which? ![All](${DIAGRAM})`)}</div>
         <button class="question-option">
           <span class="question-option-preview">${renderMarkdownInline(`![One](${CHART})`)}</span>
         </button>

@@ -1034,3 +1034,25 @@ fn no_http_handler_claims_in_process_authorship() {
         "an HTTP handler cannot vouch for a handshake script: {offenders:?}"
     );
 }
+
+// --- is_same_file --------------------------------------------------------
+
+/// `copy_file` onto its own source emptied the file: the copy truncates the
+/// destination before it reads. Every path that reaches the source counts.
+#[test]
+fn a_copy_onto_its_own_source_is_recognised() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a.md");
+    std::fs::write(&a, "x").unwrap();
+    assert!(is_same_file(&a, &a));
+    assert!(is_same_file(&a, &dir.path().join("./a.md")));
+    let link = dir.path().join("link.md");
+    std::fs::hard_link(&a, &link).unwrap();
+    assert!(is_same_file(&a, &link));
+
+    let b = dir.path().join("b.md");
+    std::fs::write(&b, "x").unwrap();
+    assert!(!is_same_file(&a, &b));
+    assert!(!is_same_file(&a, &dir.path().join("new.md")));
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "x");
+}

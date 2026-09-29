@@ -699,9 +699,8 @@
 }
 
 /* The whole card takes the tap (`toastTap`). Only a card that ACTS shows the
-   pointer and underlines its message on hover. A dismiss still closes on a
-   click, but it is no link. The underline sits on the message: set on the
-   card, it would also reach the text of its buttons. */
+   pointer and underlines its message on hover. The underline sits on the
+   message: set on the card, it would also reach the text of its buttons. */
 .toast[data-toast-tap="click"],
 .toast[data-toast-tap="action"] {
     cursor: pointer;
@@ -770,31 +769,11 @@
     margin: 0;
 }
 
-/* Action toasts move keyboard focus to a default button (so Enter acts on it)
-   and trap Tab within the toast. Because that focus is moved PROGRAMMATICALLY,
-   the global `.action-btn:focus-visible` / `.icon-btn:focus-visible` ring is
-   suppressed — browsers only show :focus-visible for keyboard-initiated focus —
-   so the focused button had no indicator and the user was "pressing blindly".
-   Show the ring on plain :focus for toast controls so the active button is
-   always visible, however focus arrived. Gated behind `hover: hover` (a real
-   pointer + keyboard, i.e. desktop) — on touch there is no keyboard to press
-   blindly with, and a tapped toast button would otherwise keep a lingering
-   focus ring. */
-@media (hover: hover) {
-    .toast .toast-actions .action-btn:focus,
-    .toast .toast-close:focus {
-        /* Shared --focus-ring on plain :focus (programmatic focus isn't
-           :focus-visible) so the toast's default button is always indicated. */
-        outline: 0.125rem solid transparent;
-        box-shadow: var(--focus-ring);
-    }
-
-    /* A card that is the action focuses a hidden button (`.toast-tap-control`),
-       so the ring goes on the card it stands for, beside the card's own shadow. */
-    .toast:has(.toast-tap-control:focus) {
-        outline: 0.125rem solid transparent;
-        box-shadow: var(--focus-ring), var(--shadow-md);
-    }
+/* A card that is the action holds a hidden button (`.toast-tap-control`), so
+   its keyboard ring goes on the card it stands for, beside the card's shadow. */
+.toast:has(.toast-tap-control:focus-visible) {
+    outline: 0.125rem solid transparent;
+    box-shadow: var(--focus-ring), var(--shadow-md);
 }
 
 .toast-close svg {

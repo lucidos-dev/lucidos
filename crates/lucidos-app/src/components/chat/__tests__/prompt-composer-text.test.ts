@@ -95,7 +95,7 @@ const here: string = dirname(fileURLToPath(import.meta.url));
 const promptSource = readFileSync(resolve(here, '../PromptInput.tsx'), 'utf-8');
 
 function submitBody(): string {
-  const fn = promptSource.match(/async function submit\(\)[\s\S]*?\n {2}\}/);
+  const fn = promptSource.match(/async function submit\(asSideQuestion = false\)[\s\S]*?\n {2}\}/);
   expect(fn, 'submit() not found').not.toBeNull();
   return fn![0];
 }
@@ -124,7 +124,7 @@ describe('the submit paths are wired to that one source', () => {
     // quiet only for Enter on a genuinely empty desktop composer. A side
     // question speaks through its card rather than a toast.
     const before = submitBody().split(/\breturn;/).slice(0, -1);
-    const silent = before.filter((seg) => !/showToast\(|askSideQuestion\(/.test(seg.slice(-400)));
+    const silent = before.filter((seg) => !/showToast\(|ask\w*SideQuestion\(/.test(seg.slice(-400)));
     expect(silent).toHaveLength(0);
   });
 

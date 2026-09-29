@@ -28,7 +28,7 @@ fn test_spawn_args<'a>(
         repo_name: None,
         interactive: false,
         user_env_vars: &[],
-        claude_config_dir: None,
+        account_pin: None,
         binary_override: None,
         permission_mode: None,
     }
@@ -54,7 +54,7 @@ fn test_spawn_args_with_event<'a>(
         repo_name: None,
         interactive: false,
         user_env_vars: &[],
-        claude_config_dir: None,
+        account_pin: None,
         binary_override: None,
         permission_mode: None,
     }
@@ -80,7 +80,7 @@ fn test_spawn_args_with_repo<'a>(
         repo_name,
         interactive: false,
         user_env_vars: &[],
-        claude_config_dir: None,
+        account_pin: None,
         binary_override: None,
         permission_mode: None,
     }
@@ -111,7 +111,7 @@ fn build_command_injects_user_env_vars_and_engine_wins() {
         repo_name: Some("engine-repo"),
         interactive: false,
         user_env_vars: &user_env,
-        claude_config_dir: None,
+        account_pin: None,
         binary_override: None,
         permission_mode: None,
     };
@@ -135,7 +135,7 @@ fn build_command_injects_user_env_vars_and_engine_wins() {
 fn build_command_pins_claude_config_dir_over_user_env() {
     // A RESUME must run under the config dir the session was created in, even
     // when the user has since toggled CLAUDE_CONFIG_DIR to something else. The
-    // pinned value (SpawnArgs.claude_config_dir) is set AFTER apply_lucidos_env's
+    // pinned value (SpawnArgs.account_pin) is set AFTER apply_lucidos_env's
     // user-env loop, so it wins the collision — the fix for dev/bf997e21.
     let thread_id = uuid::Uuid::new_v4();
     let p = std::path::Path::new("/tmp");
@@ -145,7 +145,10 @@ fn build_command_pins_claude_config_dir_over_user_env() {
     )];
     let mut args = test_spawn_args(p, p, thread_id);
     args.user_env_vars = &user_env;
-    args.claude_config_dir = Some("/home/u/.claude");
+    let pin = AccountPin::ExplicitConfigDir {
+        dir: "/home/u/.claude".to_string(),
+    };
+    args.account_pin = Some(&pin);
     let cmd = build_command(&args, None);
     let env = collect_envs(&cmd);
     assert_eq!(
@@ -153,6 +156,38 @@ fn build_command_pins_claude_config_dir_over_user_env() {
             .map(|v| v.as_os_str()),
         Some(std::ffi::OsStr::new("/home/u/.claude")),
         "pinned config dir must override the user's live CLAUDE_CONFIG_DIR on resume"
+    );
+}
+
+/// The "Please run /login" mid-thread bug. Turn 1 ran with `CLAUDE_CONFIG_DIR`
+/// unset, so it read the default keychain entry the user logged into. A respawn
+/// that sets the variable, even to `$HOME/.claude`, reads another entry and
+/// another `.claude.json`, and finds no login.
+#[test]
+fn build_command_keeps_a_default_profile_pin_unset() {
+    let thread_id = uuid::Uuid::new_v4();
+    let p = std::path::Path::new("/tmp");
+    let user_env = vec![(
+        "CLAUDE_CONFIG_DIR".to_string(),
+        "/home/u/.claude-personal".to_string(),
+    )];
+    let mut args = test_spawn_args(p, p, thread_id);
+    args.user_env_vars = &user_env;
+    let pin = AccountPin::DefaultConfigDir {
+        dir: "/home/u/.claude".to_string(),
+    };
+    args.account_pin = Some(&pin);
+    let cmd = build_command(&args, None);
+    let removed = cmd
+        .as_std()
+        .get_envs()
+        .find(|(k, _)| *k == std::ffi::OsStr::new("CLAUDE_CONFIG_DIR"))
+        .map(|(_, v)| v);
+    assert_eq!(
+        removed,
+        Some(None),
+        "a default-profile pin must remove CLAUDE_CONFIG_DIR, both the user's live \
+         value and anything the engine inherited, and never set it to the default path"
     );
 }
 
@@ -167,7 +202,7 @@ fn build_command_leaves_user_claude_config_dir_when_not_pinned() {
     )];
     let mut args = test_spawn_args(p, p, thread_id);
     args.user_env_vars = &user_env;
-    // claude_config_dir left None (fresh session)
+    // account_pin left None (fresh session)
     let cmd = build_command(&args, None);
     let env = collect_envs(&cmd);
     assert_eq!(
@@ -835,9 +870,11 @@ fn build_command_gates_rustc_wrapper_on_sccache_presence() {
 
 #[test]
 fn format_user_input_text_only() {
+    let uuid = uuid::Uuid::new_v4();
     let input = AgentInput {
         text: "hello".into(),
         images: vec![],
+        uuid,
     };
     let line = format_user_input(&input, Some("sess-1"));
     let parsed: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
@@ -845,6 +882,8 @@ fn format_user_input_text_only() {
     assert_eq!(parsed["message"]["role"], "user");
     assert_eq!(parsed["message"]["content"], "hello");
     assert_eq!(parsed["session_id"], "sess-1");
+    // The name a withdraw uses to take the input back.
+    assert_eq!(parsed["uuid"], uuid.to_string());
 }
 
 #[test]
@@ -855,6 +894,7 @@ fn format_user_input_with_images_uses_blocks() {
             base64: "deadbeef".into(),
             mime_type: "image/png".into(),
         }],
+        uuid: uuid::Uuid::new_v4(),
     };
     let line = format_user_input(&input, None);
     let parsed: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
@@ -1142,28 +1182,50 @@ fn build_command_requests_input_replays_on_fresh_and_resumed_sessions() {
     assert!(replays(&build_command(&resumed_args, None)));
 }
 
-/// The cold side-question process resumes the thread's session with the main
-/// session's own flags, and must write nothing to its transcript.
+/// A side question's copy resumes the thread's session with the session's own
+/// flags, so the prompt prefix matches and the transcript reads from cache. It
+/// writes nothing to the transcript, takes few turns, and runs under the
+/// settings that refuse every tool.
 #[test]
-fn side_question_command_resumes_without_persisting() {
+fn side_question_command_copies_the_session_without_persisting() {
     let worktree = PathBuf::from("/tmp/wt");
     let workspace = PathBuf::from("/tmp/ws");
     let mut args = test_spawn_args(&worktree, &workspace, uuid::Uuid::new_v4());
     args.resume_session_id = Some("sess-9");
     args.model = Some("opus");
-    let cmd = build_side_question_command(&args, None);
-    let argv: Vec<String> = cmd
-        .as_std()
-        .get_args()
-        .map(|a| a.to_string_lossy().into_owned())
-        .collect();
-    let resume_at = argv.iter().position(|a| a == "--resume").expect("--resume");
-    assert_eq!(argv[resume_at + 1], "sess-9");
-    assert!(argv.iter().any(|a| a == "--no-session-persistence"));
-    let model_at = argv.iter().position(|a| a == "--model").expect("--model");
-    assert_eq!(argv[model_at + 1], "opus");
+    args.system_prompt = Some("the session's prompt");
+    args.allowed_tools = Some("Read,Bash");
+    let settings = PathBuf::from("/tmp/ws/.lucidos/cc-side-question-settings.json");
+    let argv = |cmd: tokio::process::Command| -> Vec<String> {
+        cmd.as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    };
+    let copy = argv(build_side_question_command(&args, None, &settings));
+    let session = argv(build_command(&args, None));
+    let value_of = |argv: &[String], flag: &str| {
+        argv.iter()
+            .position(|a| a == flag)
+            .map(|at| argv[at + 1].clone())
+    };
+    assert_eq!(value_of(&copy, "--resume").as_deref(), Some("sess-9"));
+    assert!(copy.iter().any(|a| a == "--no-session-persistence"));
+    assert!(copy.iter().any(|a| a == "--max-turns"));
     assert!(
-        !argv.iter().any(|a| a == "--append-system-prompt"),
-        "the resumed conversation carries the context"
+        !copy.iter().any(|a| a == "--tools"),
+        "the tool list must match"
     );
+    assert_eq!(
+        value_of(&copy, "--settings").as_deref(),
+        Some(settings.to_str().unwrap())
+    );
+    for flag in [
+        "--model",
+        "--append-system-prompt",
+        "--allowedTools",
+        "--permission-mode",
+    ] {
+        assert_eq!(value_of(&copy, flag), value_of(&session, flag), "{flag}");
+    }
 }

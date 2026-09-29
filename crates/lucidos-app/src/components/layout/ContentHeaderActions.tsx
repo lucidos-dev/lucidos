@@ -16,6 +16,9 @@ import { RENDERABLE_EXTS, REPO_RENDERABLE_EXTS, isEditableDataFile } from '../fi
 import { isTauri, isIOSPwa } from '../../utils/platform';
 import { webviewReload } from '../../utils/tauri';
 import { openFileSearch } from '../files/fileSearchActions';
+import { tooltipWithShortcut } from '../../store/actions/keybindings';
+import { withPreviewCapability } from '../files/previewFrameBridge';
+import { currentArtifactPreviewCapability } from '../../store/actions/frame-capability';
 import { pushOverlay, removeOverlay } from '../../store/overlayStack';
 import { CollapsingActions, type HeaderActionSpec } from './headerActions';
 import { useHeaderActionCollapse, type HeaderCollapseTargets } from '../../hooks/useHeaderActionCollapse';
@@ -84,6 +87,9 @@ function absoluteUrl(url: string): string {
   }
 }
 
+/** A file the engine serves as a sandboxed document (`file_response.rs`). */
+const OPENS_SANDBOXED = /\.(html?|svg|xhtml|xml)$/i;
+
 /** The control that takes the previewed file out of the shell, or null where
  *  this platform cannot open this locator anywhere.
  *
@@ -94,7 +100,9 @@ function absoluteUrl(url: string): string {
  *
  *  Everywhere else it is the engine's `/data/` URL in a new tab, since no page
  *  may navigate to `file://`. That leaves a repo file with no control in a
- *  browser, which is the honest answer rather than a dead button.
+ *  browser, which is the honest answer rather than a dead button. An HTML or
+ *  SVG artifact opens sandboxed at an opaque origin (ADR 0322), so its tab
+ *  sends no cookie with its images. Its URL carries the preview pass instead.
  *
  *  An artifact that TALKS to the workspace, rather than just showing something,
  *  belongs in an app: opened from disk it is a `file://` document and the API is
@@ -104,7 +112,9 @@ export function filePreviewPopoutAction(encoded: string): HeaderActionSpec | nul
   // paths that have no file under the workspace either.
   const url = parseRepoPath(encoded) ? null : lucidos.data.url(encoded);
   if (!isTauri()) {
-    return url === null ? null : popoutSpec('file-open-in-tab', 'Open in new tab', { href: url });
+    if (url === null) return null;
+    const href = OPENS_SANDBOXED.test(encoded) ? withPreviewCapability(url, currentArtifactPreviewCapability()) : url;
+    return popoutSpec('file-open-in-tab', 'Open in new tab', { href });
   }
   const disk = previewDiskPath(encoded, workspacePath.value, loadedOr(repositories.value, []));
   if (disk) return popoutSpec('file-open-in-tab', OPEN_ON_DESKTOP, { onClick: () => openLocalFile(disk) });
@@ -360,6 +370,7 @@ export function ContentHeaderActions({ layout }: Props) {
     addAction({
       key: 'search',
       label: 'Search files',
+      tooltip: tooltipWithShortcut('Search files', 'searchFiles'),
       icon: () => <SearchIcon />,
       onClick: (e) => openFileSearch(e.currentTarget as HTMLElement),
       extraClass: 'file-search-btn',

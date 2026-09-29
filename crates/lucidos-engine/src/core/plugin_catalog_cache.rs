@@ -17,7 +17,6 @@
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
@@ -94,17 +93,7 @@ pub fn save(
     workspace_path: &Path,
     cached: &CachedCatalog,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let path = cache_path(workspace_path);
-    let dir = path
-        .parent()
-        .ok_or_else(|| format!("no parent directory for {}", path.display()))?;
-    std::fs::create_dir_all(dir)?;
-    let mut temp = tempfile::NamedTempFile::new_in(dir)?;
-    serde_json::to_writer_pretty(&mut temp, cached)?;
-    temp.write_all(b"\n")?;
-    temp.flush()?;
-    temp.persist(&path)?;
-    Ok(())
+    crate::core::write_json_atomic(&cache_path(workspace_path), cached)
 }
 
 /// Serializes the cache's read-modify-write transitions.

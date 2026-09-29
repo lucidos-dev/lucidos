@@ -1244,6 +1244,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     boot_stages.lap("apply recovery");
 
     lucidos_engine::engine::memory_consumer::spawn(shared_engine.clone());
+    lucidos_engine::engine::change_summary_consumer::spawn(shared_engine.clone());
+
+    // Serve the last discovered Claude Code model list, and refresh it in the
+    // background when it is missing or stale.
+    shared_engine.start_cc_model_discovery().await;
 
     // See `engine::worktree_cleanup` module docs.
     let cleanup_wake = std::sync::Arc::new(tokio::sync::Notify::new());

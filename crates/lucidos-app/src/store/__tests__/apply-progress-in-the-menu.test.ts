@@ -56,6 +56,7 @@ function pendingChange(id: string, threadId: string, overrides: Partial<Change> 
     pre_merge_sha: null,
     post_merge_sha: null,
     commits: [],
+    summary: null,
     incomplete: false,
     ...overrides,
   };

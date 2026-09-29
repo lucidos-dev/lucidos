@@ -14,6 +14,7 @@ import { ThreadStatusIcon, threadVisualStatus } from '../shared/ThreadStatusIcon
 import { ThreadTitleEditor } from './ThreadTitleEditor';
 import { PinThreadButton } from '../shared/PinThreadButton';
 import { ThreadOverflowMenu } from '../shared/ThreadOverflowMenu';
+import { revealThreadInList } from '../drawer/ThreadDrawer';
 import { MobileThreadTitleBar } from '../layout/MobileAppHeader';
 import { computeExchanges, exchangeKey, exchangeResponseEvents, hasContentEvents, turnBodyFolded, type Exchange } from '../../store/thread-events';
 import { rowsDrawnByClamp } from '../../store/event-rendering';
@@ -1962,7 +1963,8 @@ export function ThreadView() {
                     {eventThread.meta.state !== 'composing' && (
                         <PinThreadButton threadId={threadId} saved={eventThread.meta.saved} />
                     )}
-                    <ThreadOverflowMenu threadId={threadId} title={threadTitle} />
+                    <ThreadOverflowMenu threadId={threadId} title={threadTitle}
+                        onShowInThreadList={eventThread.meta.state === 'composing' ? undefined : () => revealThreadInList(threadId)} />
                 </span>
             </div>
             {/* `has-scroll-indicator` is what licenses the CSS to hide the

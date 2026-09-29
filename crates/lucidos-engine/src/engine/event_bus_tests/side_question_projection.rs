@@ -30,6 +30,7 @@ async fn record_every_side_question_event(bus: &EventBus, thread_id: Uuid) {
         ThreadEvent::SideQuestionAsked {
             side_question_id,
             question: "what does this function return?".into(),
+            image_hashes: vec![],
         },
     )
     .await;

@@ -9,7 +9,11 @@ If a needed concept genuinely isn't in either glossary, add it here (if dev-only
 ## Terms
 
 ### Account pin
-The `CLAUDE_CONFIG_DIR` (provider/account) a *coding-agent thread* is permanently bound to — the config dir its **first** session was created under. Resolved by `lookup_pinned_cc_config_dir` (the earliest recorded `claude_config_dir` across the thread's `CodingAgentSettingsChanged` / `CodingAgentIdled` events) and re-injected on *every* later spawn (resume, fresh, post-stale-resume retry, recovery), so a live `CLAUDE_CONFIG_DIR` toggle change never moves an existing thread to another provider — only a thread's very first turn adopts the live toggle (and thereby establishes the pin). The auto-detected resume session id is likewise scoped to the pinned account (`lookup_latest_cc_session_id_for_config_dir`), so a thread that a mid-thread flip mis-recorded onto another account still resumes the session belonging to its original account. Claude-Code-specific (Codex records no config dir → no pin). See `crates/lucidos-engine/src/engine/agent_session/resume.rs` + `run_session/run.rs`.
+The Claude Code profile a *coding-agent thread* is permanently bound to: the one its **first** session ran as. It is two facts, the config dir and whether `CLAUDE_CONFIG_DIR` was set at all. Claude Code treats an unset variable and one set to its default `~/.claude` as different logins, with different keychain entries and `.claude.json` files. Replaying the unset case as `CLAUDE_CONFIG_DIR=~/.claude` made every respawn report "Not logged in". The Rust type is `AccountPin` (`DefaultConfigDir` / `ExplicitConfigDir`).
+
+`lookup_pinned_cc_config_dir` reads the earliest recorded `claude_config_dir` and `claude_config_dir_explicit` across the thread's `CodingAgentSettingsChanged` / `CodingAgentIdled` events. The engine replays the pin on *every* later spawn: resume, fresh, post-stale-resume retry, recovery and side question. So a live `CLAUDE_CONFIG_DIR` toggle never moves an existing thread to another account. Only a thread's very first turn adopts the live toggle, and thereby establishes the pin.
+
+Rows from before the marker resolve as the default profile when their dir is `~/.claude`, unless the live env sets exactly that path. The auto-detected resume session id is scoped to the pinned dir (`lookup_latest_cc_session_id_for_config_dir`). Claude-Code-specific: Codex records no config dir, so it has no pin. See `crates/lucidos-engine/src/runtime/agent_runtime.rs`, `crates/lucidos-engine/src/engine/agent_session/resume.rs` and `run_session/run.rs`.
 
 ### Auxiliary model call
 A model call the engine makes for itself rather than as an agent's turn. Twelve
@@ -342,7 +346,16 @@ title-bar band itself (`.titlebar-strip`), which is the blue the CSS paints
 behind them.
 
 ### Login-shell hydration
-What the packaged macOS **service** role does to its own environment before it starts anything, in `crates/lucidos-app/src/shell_env.rs`. A launchd or LaunchServices launch never ran `~/.zprofile` or `~/.zshrc`, so a user's exported provider keys are absent and `PATH` is the bare `/usr/bin:/bin:/usr/sbin:/sbin`. The service therefore runs the user's login shell once (`$SHELL -ilc`, falling back to `/bin/zsh`), reads its environment back null-delimited behind a marker, and applies an **allowlist** of it to its own process, which the *Workspace gateway*, every engine and every *agent session* below it then inherit. Deliberately the *service* role and not the **client**: in a packaged build the engine is not a descendant of the GUI client, so hydrating the client would reach nothing that reads these variables. Four properties define it: an allowlist (credentials, the paths credentials live at, and `PATH`) rather than a wholesale copy, so a shell profile can never repoint a packaged install's model, topology or storage; a variable already set in the process always wins, `PATH` excepted, which is merged shell-first over the inherited one because launchd always sets one; a hard timeout after which the launch continues un-hydrated, with the shell's whole process group killed so a descendant holding the output pipe cannot outlast it; and names-only logging, never a value. A run started from a terminal is detected by `SHLVL` and skipped entirely, so dev is unaffected. Distinct from and composed with the engine's static PATH floor (`crates/lucidos-engine/src/core/user_path.rs`), which prepends the well-known install dirs with no subprocess at all: hydration picks up a version manager's shims, the floor covers what hydration missed or never ran for. The allowlist itself is documented in the `lucidos-env-vars` skill.
+What the *Workspace gateway* does to its own environment at boot, in `crates/lucidos-gateway/src/shell_env.rs` (ADR 0326). A service that launchd or systemd starts never ran `~/.zprofile` or `~/.zshrc`. So a user's exported provider keys are absent, and `PATH` is a bare system one. The gateway therefore runs the user's login shell once (`$SHELL -ilc`) and reads its environment back null-delimited behind a marker. It applies an **allowlist** of it to its own process, which every engine and every *agent session* below it inherits. The gateway is the root both shipped installs share, the `.app` and the headless install, so one call covers both.
+
+It runs only when `LUCIDOS_PACKAGED=1` is set and `SHLVL` is absent, so a terminal run and the dev gateway are unaffected. Four properties define it:
+
+- an allowlist of credentials, the paths credentials live at, and `PATH`. It is never a wholesale copy, so a profile cannot repoint a shipped install's model, topology or storage;
+- a variable already set in the process always wins, `PATH` excepted, which is merged shell-first over the inherited one;
+- a hard timeout after which boot continues un-hydrated, with the shell's whole process group killed;
+- names-only logging, never a value.
+
+Distinct from and composed with the engine's static PATH floor (`crates/lucidos-engine/src/core/user_path.rs`), which prepends the well-known install dirs with no subprocess. Hydration picks up a version manager's shims, and the floor covers what hydration missed. The allowlist itself is documented in the `lucidos-env-vars` skill.
 
 ### Stable gateway port
 The fixed TCP port the **packaged gateway** binds, default `5252`, so the mobile connect URL is constant across restarts. The legacy single-engine launcher took a random free port instead. Consumed by the gateway as `LUCIDOS_API_PORT`.
@@ -563,7 +576,22 @@ Three ways in, one concept: an engine restart (`engineRestarting`), a packaged u
 **The suppression is only honest with its toast.** So each producer owns one, and the database one is non-dismissable with no auto-dismiss. A window with nothing on screen would be the "No Hidden Errors" violation (`.claude/rules/frontend.md`) this exists to avoid. The name covers the whole window rather than one member. The flag was `showDuringRestart` while it already guarded two conditions, and a third made that name plainly wrong (`.claude/rules/glossary.md`).
 
 ### Animation speed scale
-What every animated duration in the client is multiplied by, from the diagnostic **Animation speed** slider (Settings > System > Debugging). One concept in three layers under one name root: the `durationScale` computed in `store/store.ts` (the reciprocal of `speedMultiplier`, itself `10^(slider/10)` over a -10..10 slider, so 1 at centre and 0.1x to 10x at the ends), the `--duration-scale` custom property `store/effects.ts` publishes onto `:root`, and the `scaledDurationMs(baseMs)` helper TS reads it through. Every `--duration-*` token in `styles/global/base.css` is its 1x literal times that property, which is the only thing carrying the slider into CSS: until 2026-08-09 it reached the JS-driven animations alone (the thread-row FLIP, the toast stack) while all hundred-odd token-driven transitions ran at 1x, so opening the thread drawer and maximizing a pane, both pure CSS on `--duration-slow`, ignored it entirely. Two rules follow from the token form. A TS timer that exists to **outlive** a CSS transition passes its 1x base through `scaledDurationMs` and adds its safety slack OUTSIDE the call (`scaledDurationMs(PANE_TRANSITION_MS) + 100`), since slack is a fixed margin rather than animation; an unscaled one fires partway into the transition it is supposed to outlive, blanking the drawer mid-slide at 0.1x. And an **indefinite** animation (a spinner, a shimmer) keeps its literal duration and no token, because it is an activity indicator rather than a transition. The mirror in the engine's `api/sdk_iframe.css` keeps the same 1x literals but pins the scale at 1: the host publishes the property as an inline style on its own `:root` and a custom property does not cross a document boundary, so an app iframe always animates at 1x by construction.
+What every animated duration in the client is multiplied by. It comes from the diagnostic **Animation speed** slider (Settings > System > Debugging). One concept lives in three layers under one name root:
+
+- the `durationScale` computed in `store/store.ts`: the reciprocal of `speedMultiplier`, which is `10^(slider/10)` over a -10..10 slider, so 1 at centre and 0.1x to 10x at the ends;
+- the `--duration-scale` custom property, which `store/effects.ts` publishes onto `:root`;
+- the `scaledDurationMs(baseMs)` helper, which TS reads it through.
+
+Every `--duration-*` token in `styles/global/base.css` is its 1x literal times that property, and nothing else carries the slider into CSS. Before that, only the JS-driven animations followed it (the thread-row FLIP, the toast stack). The hundred-odd token-driven transitions ran at 1x, so opening the thread drawer and maximizing a pane ignored it.
+
+Two rules follow from the token form:
+
+- A TS timer that exists to **outlive** a CSS transition passes its 1x base through `scaledDurationMs`. It adds its safety slack OUTSIDE the call (`scaledDurationMs(PANE_TRANSITION_MS) + 100`), since slack is a fixed margin rather than animation. An unscaled timer fires partway into the transition it should outlive, and blanks the drawer mid-slide at 0.1x.
+- An **indefinite** animation (a spinner, a shimmer) keeps its literal duration and no token. It is an activity indicator rather than a transition.
+
+Reduced motion sets the scale to the SDK's `REDUCED_MOTION_DURATION_SCALE`, which wins over the slider.
+
+The engine's `api/sdk_iframe.css` mirrors the same 1x literals and pins the scale at 1. The host publishes the property as an inline style on its own `:root`, and a custom property does not cross a document boundary. So an app frame animates at 1x, except under reduced motion, where its own `:root[data-motion="reduce"]` rule sets the same reduced value.
 
 `durationScale`, `speedMultiplier` and `scaledDurationMs` live in `utils/motion.ts` beside the reduced-motion signal. `store/store.ts` re-exports them.
 
@@ -741,7 +769,14 @@ The event a resolved *event wait* hangs its re-entry on, and the second half of 
 
 The anchor sets the thread `running`, except on a thread parked on a question. There the re-entry waits for the answer (ADR 0255), so the anchor keeps `waiting_for_user_answer` and the card reads "Held until you reply". See `docs/plans/2026-09-24-a-delivery-never-unparks-a-question.md`.
 
+It waits even when a restart dropped the question's turn: see *held delivery*.
+
 Called the **wake anchor** until 2026-08-13, and the whole family with it (`EventWake`, `WakeFromEvent`, the transcript's `Woke on <event>`). The word claimed the thread had been asleep, which a delivery cannot know: registration does not hold the turn, so a wait routinely resolves into a RUNNING thread, and the engine then injects it into that live loop and tells the model it arrived "while you were working". *Re-entry* is what the code already called the act (`PreEmittedOrigin::is_engine_reentry`) and is true in both lanes. See `docs/plans/2026-08-13-a-delivery-does-not-know-the-thread-was-asleep.md`.
+
+### Held delivery
+A child report or an *event wait* re-entry that reaches a chat thread whose question outlived its turn. Only an engine restart causes that. The chat admission holds it instead of starting a turn that would overtake the card (`delivery_is_held`, `engine/chat/held_deliveries.rs`). Holding writes nothing: the child card and the *re-entry anchor* are already persisted, and the card reads "Held until you reply".
+
+The answer releases it. `resume_chat_after_answer` reads every delivery held since the question and folds it into the resume prompt: a wait's prose in full, a child report as a pointer to its block in history. With the question's turn still live nothing is held, because the re-entry injects into that turn (ADR 0255). Distinct from a *held message* (ADR 0256), which is a coding-agent thread's agent-sent message and carries its own `MessageHeld` event. See ADR 0321.
 
 ### Watermark (event wait)
 The event `sequence` an *event wait* records at registration. Both the registration path and the boot rebuild run the same catch-up scan forward from it, which closes two gaps with one mechanism: events that landed while the engine was down, and the live race between emitting `EventWaitStarted` and the dispatcher inserting its cache entry. It is **forward-only and stays that way**: the third gap, everything that happened before the wait existed, is covered by the *arming lookback* instead, which reports rather than delivers. Backdating this number so the catch-up scan delivers an older match is the rejected repair recorded in ADR 0047.
@@ -944,6 +979,9 @@ The row is a synthetic `SpokenReplyGenerated` marked `_liveReply`, appended past
 **The exchange republishes the live row's words as `liveReplyText`.** It is a step, so its text moves under a stable seq, and the memo's step fingerprint cannot see that. Without the field the bubble stops on whatever prefix the first render caught.
 See also: *live utterance*, *live speech mark*, *call phase*, ADR 0174.
 
+### Session copy
+What answers a Claude Code *side question*: the thread's own `claude` command, resumed with `--no-session-persistence` under a settings file whose PreToolUse hook refuses every tool. It keeps the session's tools and appended system prompt, so it reads the transcript from the prompt cache. It writes nothing back to the session (ADR 0324). Code: `SessionCopy` and `session_copy` in `engine/agent_session/side_question.rs`, `ask_side_question` in `runtime/claude_code.rs`.
+
 ### Session clock
 The one timeline a Live call is measured on. Both transcript deltas carry `start_ms` and `end_ms` against it. So a caller fragment and a talker fragment can be placed against each other, whatever order they arrived in (ADR 0198).
 
@@ -985,6 +1023,8 @@ Each `Operation` carries the wire details (method, path, `args` with type/locati
 The short-lived URL pass an **app frame** carries to its own workspace files behind a gateway. One path segment, `/<slug>/~cap/<token>/…`. The engine mints it when it serves a framed app document. The gateway verifies it with a key both derive from the *machine-local token* (`crates/lucidos-frame-capability/`, ADR 0238). It exists because an app frame is opaque-origin (ADR 0227): the browser withholds the device credential from every subresource of its document, and a bridge cannot carry a `<script>` tag.
 
 It reaches `/<slug>/data/*` and `/<slug>/app/<app_id>/*`, with GET and HEAD, for one hour. It reaches no `/api/v1` route, no control plane and nothing under the picker's namespace. The engine stamps it into the document's `<base href>`, so the app's own relative refs pick it up with no attribute rewritten. A nested document's relative link then carries it one hop down for free. The host re-mints at half-life and pushes, and the SDK swaps the token into the same element.
+
+The *artifact preview frame* carries a narrower one, minted by the host for the reserved subject `artifact..preview`. It reaches `/<slug>/data/artifacts/*` and nothing else, because the document holding it is untrusted (ADR 0322).
 
 **Unrelated to the *capability parity manifest* and to a *Tauri capability*.** All three are "capability" and none of them is the others: this one is a URL pass, that one is which agent surfaces expose an operation, and the third is a Tauri ACL entry.
 
@@ -1094,6 +1134,12 @@ The isolated iframe an *app UI* runs in inside the host shell (ADR 0227). Its sa
 `components/apps/appFrameSandbox.ts` holds the attribute and derives `APP_FRAME_ISOLATED` from it, so the frame, its navigation and its capture cannot disagree about which realm they are in. The price is that the frame's own `fetch`, `EventSource` and storage all fail, which is what the *app bridge* carries. An app opened in its own browser tab is NOT an app frame: it is a top-level document on the engine's origin and keeps every direct path.
 
 A second constant in the same file, `APP_FRAME_ALLOW`, says what the frame may still do. An opaque origin matches no feature's `self` default, so a permissions policy has to delegate each one by name. The list itself lives in one place, `system-knowhow/js-sdk.md` § Setup, which also says what is withheld and why. Read the constant for the code side.
+
+### Artifact preview frame
+
+The sandboxed iframe that renders a previewed HTML artifact in the content pane or the file preview modal (ADR 0322). Like an *app frame* it has no `allow-same-origin`. So the artifact's scripts run at an opaque origin, and reach neither the shell nor the engine's API. Unlike an app frame it loads no SDK.
+
+The host stamps a bridge script into the srcdoc instead (`components/files/previewFrameBridge.ts`). It carries link clicks, sibling downloads and shell chords up, and fragment scrolls and *frame capability* renewals down. The bridge hides its nonce from the artifact and posts only for a real event. The host accepts a message only from that frame's own window, at origin `"null"`, with the render's nonce. The PDF preview is NOT an artifact preview frame: it stays same-origin.
 
 ### App bridge
 
@@ -1738,7 +1784,7 @@ not configure it. The `ThinkingMode` column of `ADAPTIVE_THINKING_MODELS`
 |---|---|---|
 | `OffByDefault` | Opus 4.7, Opus 4.8 | no `thinking` field |
 | `OnByDefault` | Opus 5, Sonnet 5 | `thinking: {type: "disabled"}`, no effort |
-| `AlwaysOn` | Opus 5.5, Fable 5.x | `low`, since `none` is not offered |
+| `AlwaysOn` | Opus 5.5, Sonnet 5.5, Fable 5.x | `low`, since `none` is not offered |
 
 `reasoning::supported_efforts` drops `none` for `AlwaysOn` models, so a stored
 `none` snaps to `low` at the routing chokepoint. An `AlwaysOn` model also asks
@@ -1768,12 +1814,17 @@ Every token figure in it is a share of one number, the **headline total**: `usag
 Only the section rows are shares, and a section carries a *budget delta* rather than a token count of its own. The split assumes uniform token density, which is why the rows stay labelled `≈` even when the total was measured exactly. Do not reintroduce a chars-to-tokens constant on the frontend. If you change how the bar picks its number, change `headlineTokens` rather than inlining the choice at either site.
 
 ### Coding-agent context window
-The window a *coding-agent thread*'s session actually runs under, which is not the window Lucidos would request for the same model id. Two different requests answer it. `llm::model_registry::context_window_for` answers for the call the ENGINE makes, where 1M mode is gated on our own `[1m]` suffix. A bare `claude-` id is therefore 200k there, and correctly so: the packer must not exceed the mode the request selected. The exception is a family whose default window is 1M (Opus 5, Opus 5.5, Fable 5.x), whose bare builtin rows declare it. Claude Code and Codex make their own calls and pick their own context mode, so a bare Sonnet 5 session really does run 1M.
+The window a *coding-agent thread*'s session actually runs under, which is not the window Lucidos would request for the same model id. Two different requests answer it. `llm::model_registry::context_window_for` answers for the call the ENGINE makes, where 1M mode is gated on our own `[1m]` suffix. A bare `claude-` id is therefore 200k there, and correctly so: the packer must not exceed the mode the request selected. The exception is a family whose default window is 1M (Opus 5, Opus 5.5, Sonnet 5.5, Fable 5.x), whose bare builtin rows declare it. Claude Code and Codex make their own calls and pick their own context mode, so a bare Sonnet 5 session really does run 1M.
 
-Declared per model on the backend's own picker row (`context_window` in `runtime/cc_menu_options.json`) and read through `runtime::coding_agent_context_window`. Absent means the registry's answer stands. Only the `ContextCaptured` emit for a coding-agent session reads it. That capture REPORTS a call rather than budgeting one, so nothing here can make the engine pack an oversized prompt. Declare it on a pinned id only, never on an alias row: `normalize_cc_model_id` folds old dated ids onto `sonnet` / `opus` / `haiku`.
+Declared per model on the curated rows (`context_window` in `runtime/cc_menu_options.json`), which stay the overlay after Claude Code's *discovered model list* replaces them as the picker. Read through `runtime::coding_agent_context_window`, which never follows an alias to the model it runs: a legacy id folds onto its alias, so the alias's current model says nothing about the session. Absent means the registry's answer stands. Only the `ContextCaptured` emit for a coding-agent session reads it. That capture REPORTS a call rather than budgeting one, so nothing here can make the engine pack an oversized prompt. Declare it on a pinned id only, never on an alias row: `normalize_cc_model_id` folds old dated ids onto `sonnet` / `opus` / `haiku`.
 
 Without it the *context viewer* rendered a real 240k Claude Code prompt as `203k / 200k (100%)`, which is also why `contextPercent` no longer clamps at 100. See `docs/plans/2026-08-22-coding-agent-capture-window-is-the-backends-window.md`.
 
+
+### Discovered model list
+The Claude Code `/model` picker as Claude Code itself reports it, in place of the hand-kept `runtime/cc_menu_options.json`. The engine asks a cold Claude Code process with an `initialize` control request and no prompt, so it costs no tokens (`runtime::claude_code::probe_cc_models`). The reply's `models` array is the list; the signed-in account in the same reply is dropped by the typed rows.
+
+It is cached in `.lucidos/cc-models.json` (`runtime::cc_model_discovery`). A background probe refreshes it when missing, a day old, or when a session's handshake names a new Claude Code version. The picker is exactly this list: a model Claude Code does not list is not offered, even one it would accept (ADR 0325). Until the first probe succeeds the curated JSON is the picker, and it stays the context-window overlay. `GET /api/v1/claude-code/commands` reports which one is in force as `models_provenance`.
 ### Older region
 The part of `[CONVERSATION HISTORY]` before the last `HISTORY_RECENT_MESSAGES` turns, built in `chat/process/history.rs`. It is NOT one compressed blob. Since ADR 0102 it renders chronologically, with the two roles treated differently. A **user turn is verbatim**. The **assistant turns collapse into the *conversation summary***, emitted once at the position of the oldest turn it covers.
 
@@ -2423,8 +2474,15 @@ over the registry defaults, exposing `bindingFor` / `setBinding` / `resetBinding
 `useKeyboardShortcuts` dispatches by the current binding (so rebinds take effect
 with no code change), Settings → Keyboard Shortcuts renders the cheat sheet +
 recorder, and SearchEverywhere indexes each shortcut by its combo aliases. The
-`mod` modifier matches either Cmd or Ctrl (both fire); the single-key `c`/`t`
-shortcuts were dropped in favor of modifier chords only.
+`mod` modifier matches either Cmd or Ctrl (both fire). The one exception is
+Ctrl with a bare letter in a Mac text field, which edits text there.
+The single-key `c`/`t` shortcuts were dropped in favor of modifier chords only.
+
+A default copies the chord well-known apps use for the same action: ⌘K
+searches, ⌘, opens settings, ⌘/ shows the shortcuts, ⌘P searches files, ⌘. stops
+the running thread and ⇧Esc focuses the composer. A toast never takes focus by
+itself, so Focus newest toast (⌃⇧N) is the keyboard's only way into one
+(`docs/plans/2026-09-29-familiar-keyboard-shortcuts.md`).
 
 ### last_agent_action
 `thread_summaries` column (`TIMESTAMPTZ NOT NULL`) holding when the AGENT (or trigger) last did something on a thread — streaming, a terminal response, a `CodingAgentIdled`, a trigger fire/complete, the agent asking the user, or a non-human `MessageReceived`. The counterpart to *last_user_action*. Not a sort key; it drives the thread-row tooltip's "Agent ·" line (frontend `meta.lastAgentAction`), kept distinct from `last_user_action` so the tooltip is accurate even right after the user acts. Bumped per-arm in `event_bus_projection_thread.rs` (co-located in the existing `last_activity` UPDATEs — no extra hot-path queries).
@@ -2698,7 +2756,7 @@ A surface opened from a header button that hangs just under the header, on the L
 Search Everywhere opened with no button, by a shortcut or from the Lucidos menu, centres on the focused pane group. File search with no button falls back to the Canvas pane. On mobile both centre on the screen. A palette dims nothing.
 
 ### Toast tap
-What a tap anywhere on a toast card does (`toastTap` in `components/shared/toastTap.ts`). A toast with its own `onClick` runs it, whatever its type. An info or success toast with one neutral action runs that action and draws no button for it. A passive info or success toast closes, unless it is non-dismissable, spinning or showing progress. A warning or an error keeps its buttons, since a tap to read it must not act. So do two actions, and a lone `danger` or `confirm` action.
+What a tap anywhere on a toast card does (`toastTap` in `components/shared/toastTap.ts`). A toast with its own `onClick` runs it, whatever its type. An info or success toast with one neutral action runs that action and draws no button for it. A passive toast does nothing on a tap, since a reader may tap it looking for more and must not lose it. A warning or an error keeps its buttons, since a tap to read it must not act. So do two actions, and a lone `danger` or `confirm` action.
 
 A tap on a button or a link never counts, nor does the mouseup ending a text selection inside the card. A card that acts also carries a visually hidden button for the keyboard and screen readers, labelled with the action or "Open". The card is never `role="button"` itself, since that would hide its X and links from assistive tech. A card that acts draws its X even on a timer, so closing it never means following it (`toastHasClose`).
 
@@ -3494,7 +3552,7 @@ Wider than the *child follow-up* edge, which stops at direct children, and delib
 
 Enforced on all fourteen routes carrying seven of clause 4's eight verbs, per verb rather than per route: Apply, Discard, answering a question card, restarting a turn (Continue), creating a top-thread, archiving and cancelling. Three of them arrive by more than one path, and gating the first path of each is how the ungated set grew. Three LLM tools press Apply in-process (`apply_change`, `apply_when_settled`, `apply_as_they_settle`). They carry no headers, so they name their own thread and ask the same rule through `refuse_thread_without_authority`. The eighth verb, resolving a permission card, is still ungated and recorded as such in the plan. See ADR 0083's amendment for the archive and cancel half, and ADR 0168 for the rest.
 
-Three more verbs aim at a live coding-agent session rather than at the tree's shape: controlling it (`POST /api/v1/claude-code/control`), asking it a *side question* (`POST /api/v1/coding-agents/side-question`), which reads the session's whole context, and dismissing that question's card (`POST /api/v1/coding-agents/side-question/dismiss`).
+Three more verbs aim at a thread's agent rather than at the tree's shape: controlling a live coding-agent session (`POST /api/v1/claude-code/control`), asking a *side question* (`POST /api/v1/side-questions`), which reads the thread's whole context, and dismissing that question's card (`POST /api/v1/side-questions/dismiss`).
 
 **Deleting a thread is deliberately NOT one of these verbs.** It has no place on the ladder and no `ThreadReachVerb`, because the ladder's second question admits a thread carrying the *standing instruction*. It takes the *owner-device gate* instead, which refuses every agent outright (ADR 0192).
 
@@ -3692,6 +3750,11 @@ A *worktree* on disk whose git admin dir (`<repo>/.git/worktrees/<name>`, pointe
 A chat follow-up typed mid-turn that the engine owes an answer for and nothing is going to give it. Its `MessageReceived` row is persisted, but no `UserPromptInjected` names it in `injected_message_id`, no `QueuedMessageRemoved` names it, and no terminator carries it as `request_event_id`. It renders as a "Queued" bubble pinned to the bottom of the transcript, which only the user's trash icon clears. The cause is always the same: the follow-up rode the running turn's in-memory injection channel, and the channel died with the process.
 
 Those three markers are also the definition, so the set is a query rather than a state. `chat::queued_recovery::STRANDED_QUEUED_MESSAGES_SQL` is that query, bounded below by the turn that owns the drain and above by a sequence sampled before the reader's fence. It has two readers: the turn tail (`drain_turn_orphans`, unioned with the channel drain) and the resume (`spawn_chat_resume`, where no channel exists). Announcing one writes the marker that excludes it, which is what makes a second pass a no-op. See [ADR 0236](adr/0236-queue-membership-lives-in-the-event-store.md) and `docs/plans/2026-09-21-a-queued-follow-up-survives-the-restart.md`.
+
+### Withdraw
+The engine step that takes back a queued message a *coding agent* was already sent. The user-facing act is *remove* (the bin, or Edit), recorded as `QueuedMessageRemoved`. On the Lucidos Agent lane that is the whole of it; the frontend calls it a *retract*. On a Claude Code thread the engine has already written the message to stdin. So it first asks Claude Code to drop it, with the `cancel_async_message` control request.
+
+The session's run loop owns it (`agent_session::withdraw`). It asks by the fresh `uuid` the message's stdin write carried, never by the event id, since Claude Code dedupes user messages by uuid. The tombstone follows only `cancelled: true`; every other answer is a refusal. Codex cannot withdraw. See [ADR 0323](adr/0323-a-queued-claude-code-message-is-withdrawn-until-read.md).
 
 ### Stale resume
 A `--resume` (CC) / `thread/resume` (Codex) that could not attach to the conversation it named — the persisted session id is gone (pruned transcript, agent version upgrade, a mid-flight `CLAUDE_CONFIG_DIR` switch relocating the store; see *account pin*). The recovery is always the same: shadow the dead id with `SessionEnded{StaleResume}` so no later lookup reuses it, keep the worktree and branch, and re-spawn ONCE with no resume id and the conversation reconstructed into the prompt (`prepend_reconstruction`). Detected two ways, in `is_stale_resume_signal` / `is_definitive_session_not_found`: the agent's explicit "no conversation found" error, or — only when the attach was **not** confirmed — an empty, activity-free first Result. A confirmed attach (the agent's `Init` echoes the id we asked for; a failed resume yields a different one) vetoes the second, output-shape inference outright, which is what stops a healthy-but-silent turn being killed.

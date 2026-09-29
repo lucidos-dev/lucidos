@@ -93,7 +93,7 @@ describe('the card carries no hint of its own', () => {
     );
     // Lone Cancel: question card gets the wording, a permission card keeps Stop.
     expect(promptSource).toMatch(
-      /data-tooltip=\{answeringQuestionCard\s*\?\s*ANSWER_CANCEL_TOOLTIP\s*:\s*'Stop'\}/,
+      /data-tooltip=\{answeringQuestionCard\s*\?\s*ANSWER_CANCEL_TOOLTIP\s*:\s*tooltipWithShortcut\('Stop', 'stopThread'\)\}/,
     );
     // Multi-select split button: that path only exists with a question pending.
     expect(promptSource).toMatch(/tooltip:\s*ANSWER_CANCEL_TOOLTIP/);
@@ -287,19 +287,17 @@ describe('TerminatedQuestionBody', () => {
   });
 });
 
-describe('question text — URL linkification', () => {
+describe('question text: URL linkification', () => {
   const QUESTION =
-    'Draft PR #1488 is ready: https://github.com/example-org/example-repo/pull/1488 — mark it ready?';
+    'Draft PR #1488 is ready: https://github.com/example-org/example-repo/pull/1488. Mark it ready?';
 
-  it('renders a bare URL in the question as a clickable new-tab link (terminated body)', () => {
+  it('renders a bare URL in the question as a link (terminated body)', () => {
     const text = vnodeToText(TerminatedQuestionBody({
       question: QUESTION,
       options: [{ id: 'a', label: 'Yes' }],
       multiSelect: false,
     }));
-    expect(text).toContain(
-      '<a href="https://github.com/example-org/example-repo/pull/1488" target="_blank" rel="noopener">',
-    );
+    expect(text).toContain('<a href="https://github.com/example-org/example-repo/pull/1488">');
   });
 
   it('renders the URL as a link in the answered body too', () => {
@@ -311,7 +309,31 @@ describe('question text — URL linkification', () => {
       resolved: { kind: 'Selected', option_id: 'a' },
     }));
     expect(text).toContain('href="https://github.com/example-org/example-repo/pull/1488"');
-    expect(text).toContain('target="_blank"');
+  });
+});
+
+// A card carried four findings and the decision in one run-on paragraph,
+// because the question rendered as inline markdown and flattened every block.
+describe('question text: block markdown', () => {
+  const QUESTION = [
+    'Findings on option A: it is doable.',
+    '',
+    '- **Security:** the new endpoint needs a shared secret.',
+    '- **Retries:** use the landing event id as the repeat key.',
+    '',
+    'What should happen next?',
+  ].join('\n');
+
+  it('renders paragraphs and lists as blocks, in a markdown surface', () => {
+    const text = vnodeToText(TerminatedQuestionBody({
+      question: QUESTION,
+      options: [{ id: 'a', label: 'Update the plan' }],
+      multiSelect: false,
+    }));
+    expect(text).toContain('question-text markdown-content');
+    expect(text).toContain('<p>Findings on option A: it is doable.</p>');
+    expect(text).toMatch(/<ul>\s*<li><strong>Security:<\/strong>/);
+    expect(text).toContain('<p>What should happen next?</p>');
   });
 });
 

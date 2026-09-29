@@ -57,6 +57,8 @@ pub enum AgentEvent {
         model: Option<String>,
         slash_commands: Vec<String>,
         skills: Vec<String>,
+        /// The agent CLI's own version, when its handshake names one.
+        agent_version: Option<String>,
     },
     /// Streamed assistant text fragment. `opens_block` is true when this text
     /// starts a new content block rather than continuing the open one. The
@@ -166,6 +168,30 @@ pub struct ReplayedInput {
 pub struct AgentInput {
     pub text: String,
     pub images: Vec<crate::api::ChatImage>,
+    /// The name the agent knows this write by, which a withdraw uses. Fresh
+    /// for every write: Claude Code skips a user message whose uuid it has
+    /// already seen, so reusing an event id would drop a resent message.
+    pub uuid: uuid::Uuid,
+}
+
+/// A request to take back a user input the agent has not read yet.
+#[derive(Debug)]
+pub struct WithdrawRequest {
+    /// [`AgentInput::uuid`] of the input to take back.
+    pub input_uuid: uuid::Uuid,
+    /// A dropped `reply` means the process ended before it answered.
+    pub reply: tokio::sync::oneshot::Sender<InputWithdrawal>,
+}
+
+/// How a withdraw ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InputWithdrawal {
+    /// The agent dropped the input. It will never run.
+    Withdrawn,
+    /// The agent read the input into a turn, so it can no longer be taken back.
+    AlreadyRead,
+    /// The withdraw could not be made. The text tells the user why.
+    Refused(String),
 }
 
 /// Runtime control request — set parameters or interrupt the current turn.
@@ -180,14 +206,64 @@ pub enum ControlRequest {
     SetReasoningEffort { effort: String },
 }
 
-/// A side question (`/btw`) for a live agent. The driver asks it beside the
-/// running turn, which it never touches, and nothing of it enters the session.
-/// `reply` gets the answer or the agent's refusal. A dropped `reply` means the
-/// process ended before it answered.
-#[derive(Debug)]
-pub struct SideQuestionRequest {
-    pub question: String,
-    pub reply: tokio::sync::oneshot::Sender<Result<String, String>>,
+/// The Claude Code profile a thread is bound to: its *account pin*.
+///
+/// Claude Code treats an unset `CLAUDE_CONFIG_DIR` as a different profile from
+/// one set to its default path. The two read different keychain entries and
+/// different `.claude.json` files, so only one of them holds the user's login.
+/// A pinned spawn therefore replays exactly what turn 1 ran with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccountPin {
+    /// `CLAUDE_CONFIG_DIR` was unset. `dir` is Claude Code's default,
+    /// `$HOME/.claude`, where the transcripts live.
+    DefaultConfigDir { dir: String },
+    /// `CLAUDE_CONFIG_DIR` was set to `dir`.
+    ExplicitConfigDir { dir: String },
+}
+
+impl AccountPin {
+    /// The pin a thread's first session establishes: the live
+    /// `CLAUDE_CONFIG_DIR` when set, else Claude Code's default dir. `None`
+    /// only when there is neither, which means `$HOME` is unset.
+    pub fn for_first_session(live: Option<String>, default_dir: Option<String>) -> Option<Self> {
+        match live {
+            Some(dir) => Some(Self::ExplicitConfigDir { dir }),
+            None => default_dir.map(|dir| Self::DefaultConfigDir { dir }),
+        }
+    }
+
+    /// Resolve a recorded pin.
+    ///
+    /// `explicit` is `None` on rows written before the engine recorded it.
+    /// Those rows stored `default_dir` for an unset variable too, so that one
+    /// path is ambiguous. It counts as explicit only while the live env still
+    /// sets exactly that path. Any other path can only have come from the
+    /// variable.
+    pub fn from_recorded(
+        dir: String,
+        explicit: Option<bool>,
+        live: Option<&str>,
+        default_dir: Option<&str>,
+    ) -> Self {
+        let explicit = explicit
+            .unwrap_or_else(|| Some(dir.as_str()) != default_dir || live == Some(dir.as_str()));
+        if explicit {
+            Self::ExplicitConfigDir { dir }
+        } else {
+            Self::DefaultConfigDir { dir }
+        }
+    }
+
+    /// Where Claude Code keeps this profile's transcripts.
+    pub fn dir(&self) -> &str {
+        match self {
+            Self::DefaultConfigDir { dir } | Self::ExplicitConfigDir { dir } => dir,
+        }
+    }
+
+    pub fn is_explicit(&self) -> bool {
+        matches!(self, Self::ExplicitConfigDir { .. })
+    }
 }
 
 /// Parameters for spawning an agent. Borrowed for the duration of `spawn`.
@@ -242,18 +318,13 @@ pub struct SpawnArgs<'a> {
     /// orchestration (which has the pool); empty for callers that don't inject
     /// (tests, engine-internal spawns with no user env).
     pub user_env_vars: &'a [(String, String)],
-    /// Pinned Claude Code config dir for a RESUME — the `CLAUDE_CONFIG_DIR` the
-    /// thread's session was created under. A resumed session must look up its
-    /// transcript under the same dir it was written in
-    /// (`$CLAUDE_CONFIG_DIR/projects/<cwd>/<sid>.jsonl`), so `build_command`
-    /// sets this as an engine-owned override AFTER `apply_lucidos_env`'s user-env
-    /// loop — a live user toggle of `CLAUDE_CONFIG_DIR` then can't strand the
-    /// resume (dev/bf997e21). `None` only for a thread's FIRST turn (no pin yet —
-    /// leaves the user's live env / CC's default untouched, which establishes the
-    /// pin) and for backends that don't key transcripts on a config dir (Codex
-    /// ignores it); every later spawn of a pinned thread re-injects the pin. See
-    /// `lookup_pinned_cc_config_dir`.
-    pub claude_config_dir: Option<&'a str>,
+    /// The thread's *account pin*, replayed on every spawn after turn 1.
+    /// `build_command` applies it AFTER `apply_lucidos_env`. So neither a live
+    /// user toggle nor the engine's own env can move the thread to another
+    /// profile or strand its transcript. `None` on a thread's first turn, which
+    /// leaves the env untouched and so establishes the pin. Codex ignores it.
+    /// See `lookup_pinned_cc_config_dir`.
+    pub account_pin: Option<&'a AccountPin>,
     /// User-configured absolute path to this agent's CLI binary — the
     /// `coding_agent_claude_path` / `coding_agent_codex_path` preference for
     /// the backend being spawned, resolved by the spawn orchestration.
@@ -271,7 +342,7 @@ pub struct SpawnArgs<'a> {
     /// file, so a user cannot pick a mode any other way. `None`, and anything
     /// the resolver does not recognise, means `acceptEdits`: the mode every
     /// session ran before the preference existed. Codex has no equivalent and
-    /// ignores this field, as it ignores `claude_config_dir`.
+    /// ignores this field, as it ignores `account_pin`.
     pub permission_mode: Option<&'a str>,
 }
 
@@ -319,9 +390,9 @@ pub struct RunningAgent {
     /// for backends whose permissions flow out-of-band (Claude Code's MCP
     /// HTTP path, the Codex exec driver's sandbox-only model).
     pub permission_rx: Option<mpsc::UnboundedReceiver<AgentPermissionRequest>>,
-    /// Side questions (see [`SideQuestionRequest`]). `None` for backends with
-    /// no side-question call: both Codex drivers.
-    pub side_question_tx: Option<mpsc::UnboundedSender<SideQuestionRequest>>,
+    /// Withdraws (see [`WithdrawRequest`]). `None` for backends that cannot
+    /// take back an input: both Codex drivers.
+    pub withdraw_tx: Option<mpsc::UnboundedSender<WithdrawRequest>>,
 }
 
 #[async_trait]
@@ -337,7 +408,80 @@ pub trait AgentRuntime: Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    use super::CodingAgent;
+    use super::{AccountPin, CodingAgent};
+
+    const HOME_CLAUDE: &str = "/home/u/.claude";
+
+    fn default_pin(dir: &str) -> AccountPin {
+        AccountPin::DefaultConfigDir {
+            dir: dir.to_string(),
+        }
+    }
+
+    fn explicit_pin(dir: &str) -> AccountPin {
+        AccountPin::ExplicitConfigDir {
+            dir: dir.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_first_session_pins_what_it_ran_with() {
+        assert_eq!(
+            AccountPin::for_first_session(None, Some(HOME_CLAUDE.into())),
+            Some(default_pin(HOME_CLAUDE)),
+            "an unset CLAUDE_CONFIG_DIR is the default profile, not an explicit ~/.claude"
+        );
+        assert_eq!(
+            AccountPin::for_first_session(Some(HOME_CLAUDE.into()), Some(HOME_CLAUDE.into())),
+            Some(explicit_pin(HOME_CLAUDE)),
+            "a variable set to the default path is still a set variable"
+        );
+        assert_eq!(AccountPin::for_first_session(None, None), None);
+    }
+
+    #[test]
+    fn a_recorded_marker_is_final() {
+        let live = Some("/home/u/.claude-personal");
+        assert_eq!(
+            AccountPin::from_recorded(HOME_CLAUDE.into(), Some(false), live, Some(HOME_CLAUDE)),
+            default_pin(HOME_CLAUDE)
+        );
+        assert_eq!(
+            AccountPin::from_recorded(HOME_CLAUDE.into(), Some(true), None, Some(HOME_CLAUDE)),
+            explicit_pin(HOME_CLAUDE)
+        );
+    }
+
+    /// Rows written before the marker stored `$HOME/.claude` for an unset
+    /// variable. Reading them as explicit is the "Please run /login" bug.
+    #[test]
+    fn a_legacy_default_path_is_the_default_profile_unless_the_live_env_sets_it() {
+        for (live, expected) in [
+            (None, default_pin(HOME_CLAUDE)),
+            (Some("/home/u/.claude-personal"), default_pin(HOME_CLAUDE)),
+            (Some(HOME_CLAUDE), explicit_pin(HOME_CLAUDE)),
+        ] {
+            assert_eq!(
+                AccountPin::from_recorded(HOME_CLAUDE.into(), None, live, Some(HOME_CLAUDE)),
+                expected,
+                "live CLAUDE_CONFIG_DIR = {live:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_legacy_non_default_path_was_always_explicit() {
+        let dir = "/home/u/.claude-personal";
+        assert_eq!(
+            AccountPin::from_recorded(dir.into(), None, None, Some(HOME_CLAUDE)),
+            explicit_pin(dir)
+        );
+        assert_eq!(
+            AccountPin::from_recorded(dir.into(), None, None, None),
+            explicit_pin(dir),
+            "with no $HOME there is no default path to confuse it with"
+        );
+    }
 
     #[test]
     fn coding_agent_as_str_matches_serde_wire_values() {

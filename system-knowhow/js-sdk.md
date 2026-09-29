@@ -44,7 +44,7 @@ What each piece does — include only what you need:
 | `<script src="/api/v1/sdk-prefs.js"></script>` | Synchronous prefs script. Sets `data-theme-mode`, `--bg-primary`, and `--font-ui` on `<html>` (plus `--user-ui-scale` when the user has set one) *before* any subsequent stylesheet evaluates. The engine resolves this device's theme mode, theme, font and scale and serves them inside the script, so an app frame needs no access to the shell's storage. It stamps `?device=` onto this one `src` to know whose to serve, and adds nothing to your document. The same script carries the device's Autocorrect switch, so `sdk.js` knows it before any field can take focus, and sets `data-motion` (§ Reduced motion), `data-theme-effects` (§ Theme parts) and `data-font-bold` (§ Theme variables). Eliminates the flash-of-default-theme between iframe load and `applyPreferences()`. **Place as early in `<head>` as possible: before `sdk-iframe.css`, before any other `<link rel="stylesheet">`, and before any inline `<style>` that reads theme vars.** Inlining `--bg-primary` directly (not just `data-theme-mode`) is what makes the body's `background: var(--bg-primary, …)` paint correctly even when stylesheets are loaded asynchronously (JS-injected, dynamic `import()`, dev-mode bundlers like Vite that ship CSS as JS modules). | App doesn't use `sdk-iframe.css` (no FOUC to fix) |
 | `<link rel="stylesheet" href="/api/v1/sdk-iframe.css">` | Theme tokens (`--bg-primary`, `--accent`, etc.), dark/light variables, default body/input/scrollbar styling, **and Lucidos's shared component classes** (`.action-btn` + `.action-btn-confirm`/`.action-btn-danger`, `.button-group`, `.icon-btn`, `.label`, `.title`, `.segmented-control`/`.segmented-btn`, `.list-row*`, `.markdown-content`, `.progress-bar`, `.empty-state`, `.accent-link`). Use these class names and the app's buttons/lists/etc. render identically to the host shell. The body is set to `--font-size-sm`, the step chat prose renders at, so text you do not size yourself reads at the size of the chat beside it. Inputs and buttons are set to `--font-ui` at `--font-size-md`, the host's step for labels and controls. Neither is the root font-size: the root is the user's UI scale, and `1rem` is `--font-size-xl`, a section heading. Text that names no size at all would come out two steps larger than body, which is why the defaults exist. | App ships its own complete stylesheet and doesn't want Lucidos theming |
 | `<script src="/api/v1/sdk-iframe-audio.js"></script>` | Monkey-patches `AudioContext` so app code reuses a gesture-unlocked instance, survives iOS PWA background cycles. **Must be in `<head>` before any code that creates an `AudioContext`.** | App doesn't play audio |
-| `<script src="/api/v1/sdk.js"></script>` | The `lucidos.*` API. Also installs iframe-only side effects, none of which needs a call from you: a link interceptor (`target="_blank"` links resolve in-frame; external `http(s)://` links route through `lucidos.ui.openExternal()`); a keyboard-shortcut forwarder (host shortcuts like focus/hide a pane, narrow/widen, new thread, search, and Escape keep working while the app has focus, because iframe keydowns otherwise never reach the host); per-app scroll memory (the app returns to where the user left it after an app switch or a reload); pull to refresh (a pull past the top reloads the app, see § Pull to refresh); the Lucidos **tooltip** on any `data-tooltip` element (see § Tooltips, under lucidos.ui); and the device's **Autocorrect switch** plus a key-code guard on your text fields (see § Text fields and autocorrect). Only modifier-bearing chords and Escape are forwarded; plain typing stays in the app. | App doesn't use `lucidos.*` |
+| `<script src="/api/v1/sdk.js"></script>` | The `lucidos.*` API. Also installs iframe-only side effects, none of which needs a call from you: a link interceptor (`target="_blank"` links resolve in-frame; external `http(s)://` links route through `lucidos.ui.openExternal()`); a keyboard-shortcut forwarder (host shortcuts like focus/hide a pane, narrow/widen, new thread, search, and Escape keep working while the app has focus, because iframe keydowns otherwise never reach the host; a chord bound to a host shortcut has its browser default cancelled, so ⌘P opens file search rather than printing; your own handlers still receive that key, already marked `defaultPrevented`, so a handler that skips such events stands down for it); per-app scroll memory (the app returns to where the user left it after an app switch or a reload); pull to refresh (a pull past the top reloads the app, see § Pull to refresh); the Lucidos **tooltip** on any `data-tooltip` element (see § Tooltips, under lucidos.ui); and the device's **Autocorrect switch** plus a key-code guard on your text fields (see § Text fields and autocorrect). Only modifier-bearing chords, Escape and the F-keys are forwarded; plain typing stays in the app, and so does Ctrl with a bare letter in a text field on a Mac, where it edits text. | App doesn't use `lucidos.*` |
 | `lucidos.ui.applyPreferences()` | Reads the user's theme mode/theme/font/scale (resolving a `system` preference to the live OS light/dark) and sets `data-theme-mode`, `data-font-bold` and CSS vars on `<html>`. Pairs with `sdk-iframe.css` to apply the right palette. | **Don't skip if you include `sdk-iframe.css`**: without it the app ignores the user's light/system setting and stays on the default dark palette. Skip only when opting out of Lucidos theming entirely. |
 | `lucidos.ui.watchPreferences()` | Re-applies preferences live: when the user changes one (SSE `PreferencesChanged`), when the active theme's file or plugin changes, and, under a `system` preference, when the OS light/dark appearance flips. The OS half watches `prefers-color-scheme` and the frame's own resume, on every platform, matching the host shell | Static apps that have opted out of Lucidos theming |
 
@@ -189,6 +189,10 @@ switch: under `system` it follows the OS, and `reduce` or `full` override it.
 user who picked Reduce or Full in Lucidos. A change reaches a running app
 through `watchPreferences()`.
 
+The shared component classes already stand still under `reduce`: their
+transitions run on the `--duration-*` tokens, which collapse to a single frame.
+Your own transitions on those tokens collapse with them.
+
 ### Theme parts
 
 An app that loads `sdk-iframe.css` paints the active theme's three frame parts
@@ -327,14 +331,15 @@ always defined, so a fallback is dead noise at best:
 | `--space-xl` | `1.5rem` (24px) | | `--icon-size-md` | `1rem` (16px) |
 | `--duration-fast` | `0.15s` | | `--icon-size-lg` | `1.25rem` (20px) |
 | `--duration-normal` | `0.2s` | | `--duration-slow` | `0.3s` |
-| `--duration-emphasis` | `0.5s` | | `--duration-scale` | `1` |
+| `--duration-emphasis` | `0.5s` | | `--duration-scale` | `1`, or `0.001` under reduced motion |
+| `--spinner-weight` | `0.125rem` (2px), the `.mini-spinner` ring | | | |
 
-Each `--duration-*` above is its listed value times `--duration-scale`, which is
-always `1` inside an app. The host multiplies its own copy by a debugging slider
-that slows every transition down for inspection, and a custom property does not
-cross into an iframe, so your chrome always animates at the listed durations.
-Set `--duration-scale` on your own `:root` if you want the same knob for your
-app's transitions.
+Each `--duration-*` above is its listed value times `--duration-scale`. Inside
+an app that is `1`, so your chrome animates at the listed durations. The host
+also has a debugging slider for its own copy. A custom property does not cross
+into an iframe, so that slider never reaches you. Under reduced motion the scale
+drops to `0.001`, and every transition on these tokens ends inside a frame. Set
+`--duration-scale` on your own `:root` if you want a knob of your own.
 
 **Type scale — `--font-size-*`.** The sanctioned font sizes; the host shell and
 this SDK stylesheet both size text from these, so use the token instead of a raw
@@ -400,9 +405,10 @@ class names are the contract:
 | `.button-group` | Wrap a **row of buttons** in this instead of a bare flex row. It keeps the row bound by its container: buttons that do not fit stack onto a second row rather than overflowing, and a single button whose label is wider than the row ellipsizes instead of being sliced by whatever ancestor hides its overflow. Set your own `justify-content` on the same element (the class deliberately sets none) and the buttons keep their natural widths. |
 | `.icon-btn` | A small borderless icon button (wrap an SVG sized via `--icon-size-sm`). `disabled` fades it and drops its tooltip. `aria-disabled="true"` only drops the hover wash, so a busy button keeps its tooltip. |
 | `.accent-link` | An inline text link/button in the accent color |
-| `.label` | A small uppercase badge |
+| `.label` (+ `.label-success`, `.label-warning`, `.label-error`, `.label-neutral`) | A small uppercase chip for a status or a category: the host's own. The bare class is the accent tone, and the tones are additive: `class="label label-success"`. They use the toast's words, so a status reads the same in a chip and in a toast. **Use this instead of drawing your own badge, chip or pill.** A pill the user taps is a button, not a label: see `.pill-bar`. |
 | `.title` | A list/panel/modal title |
-| `.segmented-control` + `.segmented-btn` (`.active`) | A toggle button group: a few mutually exclusive options with one picked. Two or three segments is what it is for. Not page navigation, and not a long strip: the control has no room to say where a link goes, and past a handful of segments it wraps onto a second row and reads as options to weigh rather than places to go. Use a list of rows for that. It does wrap when the segments pass their container, so a squeezed strip keeps every label on one line. |
+| `.segmented-control` + `.segmented-btn` (`.active`) | A toggle button group: a few mutually exclusive options with one picked. Two or three segments is what it is for. Not page navigation, and not a long strip: the control has no room to say where a link goes, and past a handful of segments it wraps onto a second row and reads as options to weigh rather than places to go. Use `.pill-bar` as tabs to switch between views, or a list of rows to go somewhere. It does wrap when the segments pass their container, so a squeezed strip keeps every label on one line. |
+| `.pill-bar` + `.pill-bar-btn` | A row of pills with one picked, the one Settings > Theme filters its families with. Two uses, told apart by the markup. **Tabs** that switch between views: `<div class="pill-bar" role="tablist">` holding `<button class="pill-bar-btn" role="tab" aria-selected="true">`. A **filter** that narrows one list: `role="group"` with `aria-pressed` on each button. Set the attribute to `true` on the picked pill, and the bar marks it. It stays on one line and scrolls sideways when the pills do not fit. **Use this instead of drawing your own tabs or filter pills.** |
 | `.list-rows`, `.list-row`, `.list-row-info`, `.list-row-name`, `.list-row-actions`, `.list-section-title`, … | List/row layouts |
 | `.list-row-add-card` (+ `.list-row-add-icon`, `.list-row-add-label`) | The "+ Add <thing>" row that closes a list. **Put it on a `<button type="button">`**, not a clickable `<div>`: the class carries the UA button reset and a `:focus-visible` ring, so on a button the card is in the tab order and answers Enter and Space, and on a div it is reachable by pointer only. Markup is `<button class="list-row-add-card"><span class="list-row-add-icon">+</span><span class="list-row-add-label">Add Thing</span></button>`. |
 | `.list-row-details` (+ `.list-row-details-prose`) | The small muted line under a row title. The base class is a flex row of metadata fields whose 0.75rem gap IS the separator between them, so a **sentence** takes the additive prose variant (`class="list-row-details list-row-details-prose"`): under the bare flex class every inline `<strong>`/`<code>` becomes its own flex item, which opens gaps mid-sentence and strands the punctuation after the element at the start of the next line. |
@@ -412,6 +418,8 @@ class names are the contract:
 | `data-stack` + `data-label` (attributes, not classes) | Opt a wide table into the stacked mobile layout: put `data-stack` on the `<table>` and `data-label="<column header>"` on every `<td>`. At 768px and under each row becomes a card, the header row is hidden, and each cell shows its `data-label` above its value. Worth it from about 4 columns up; below that the scroll wrapper reads better. |
 | `.progress-bar` + `.progress-bar-fill`, `.progress-label` | A progress indicator |
 | `<input type="checkbox">` (element, no class) | A plain checkbox already renders as the Lucidos checkbox: a soft accent-tinted box with a tick that draws on, sized in `em` to its row's text, identical in every browser. The `indeterminate` DOM property shows a dash. Put it in a `<label>` with its text and set no width or height on it. |
+| `.toggle-switch` + `.toggle-slider` | An on/off switch, the one Settings draws. Markup is `<label class="toggle-switch"><input type="checkbox" role="switch"><span class="toggle-slider"></span></label>`: the real checkbox stays in the markup and carries the state, so read and set `checked` as usual. `disabled` on the input dims it, and `toggle-switch-disabled` on the label adds the not-allowed cursor. Give it an accessible name with an `aria-label` on the input, or a visible `<label for>`. |
+| `.mini-spinner` | The spinning ring the host shows for a working state, such as a save in flight: `<span class="mini-spinner" aria-hidden="true"></span>` beside text that says what is happening. It stops under reduced motion and stays drawn. Recolour it with `--spinner-color`, for example `style="--spinner-color: currentColor"` inside a button. A busy button is a disabled `.action-btn` holding the ring and its label. Loading data draws a skeleton or nothing, never a spinner. |
 | `.empty-state`, `.error-text` | Empty/error placeholders |
 | `data-tooltip` (an attribute, plus the `#tooltip` rules that paint it) | A themed Lucidos tooltip on any element. You write the attribute and nothing else: `sdk.js` builds, positions and paints the box. Full contract in § Tooltips, under lucidos.ui. |
 
@@ -1707,7 +1715,7 @@ An `<a href>` inside a **previewed HTML or markdown artifact** can use the repo-
 <a href="repo:REPO_ID:file:src/main.rs#L510-L520">src/main.rs:510-520</a>
 ```
 
-The host routes that click through the same navigation this section describes, so a report full of citations works as a plain artifact and does not have to be published as an app to reach `lucidos.ui.navigate`. `#L510` is a single line; `#L510-L520` (or `#L510-520`) is a range. The suffix exists only for hrefs, since an anchor has no other way to carry a param: from JavaScript, use `line` / `line_end` above.
+The host routes that click through the same navigation this section describes. So a report full of citations works as a plain artifact, and does not have to be published as an app to reach `lucidos.ui.navigate`. The artifact itself runs sandboxed and loads no SDK, so a link is its only way to reach the host. What else it can and cannot do: `system-knowhow/best-practices.md` § What a standalone HTML document can do. `#L510` is a single line; `#L510-L520` (or `#L510-520`) is a range. The suffix exists only for hrefs, since an anchor has no other way to carry a param: from JavaScript, use `line` / `line_end` above.
 
 The revision form composes with it. The two `#` never compete: the line suffix is the trailing one, and the ref is the one inside the `file` segment.
 
@@ -1896,9 +1904,9 @@ serializable subset is exposed — the host's toast action buttons take `onClick
 callbacks, which can't cross the app-iframe boundary, so they aren't available
 from an app.
 
-**A tap on a success or info toast closes it**, unless it is `dismissable: false`
-or `spinning`. A warning or an error stays up until its X or its timer, because
-the reader may still be reading it.
+**A tap on an app's toast does nothing.** A reader may tap it looking for more,
+so it stays up until its X or its timer. A toast never takes keyboard focus when
+it appears; the user reaches it with the Focus newest toast shortcut.
 
 **The title is explicit, and the message is plain text.** Pass `opts.title` for
 a bold line over the message. A newline in the message is a line break and

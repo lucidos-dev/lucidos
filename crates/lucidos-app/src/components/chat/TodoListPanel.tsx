@@ -79,7 +79,7 @@ export function todoListPanelBody({
                   {item.status === 'in_progress' ? item.active_form : item.content}
                 </span>
                 {tag ? (
-                  <span class="todo-panel-status-tag" aria-label={tag}>
+                  <span class="label label-neutral todo-panel-status-tag" aria-label={tag}>
                     {tag}
                   </span>
                 ) : null}

@@ -16,7 +16,7 @@ use crate::engine::LucidosEngine;
 
 /// How many applied changes a `ChangesUpdated` frame carries. The panel pages
 /// the rest through `GET /api/v1/changes/applied`.
-const APPLIED_IN_BROADCAST: i64 = 15;
+pub(crate) const APPLIED_IN_BROADCAST: i64 = 15;
 
 /// The one window every `ChangesUpdated` frame answers `restart_required`
 /// over: has any restart-requiring change been applied at all.

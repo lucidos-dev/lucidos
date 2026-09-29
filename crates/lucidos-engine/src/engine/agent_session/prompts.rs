@@ -643,8 +643,8 @@ const REASONING_NOT_VISIBLE_RULE: &str = "\n\n\
     `question` / `options`. Never reference content as if they saw it (\"the six lines above\") \
     unless you put it in a visible message this turn. Before a tool call, your prose may reach \
     them only as a short note of a sentence or two, however much you drafted. So content they \
-    must read in full goes on the question card itself, in the question or the option \
-    descriptions.";
+    must read in full goes on the question card itself, in the option descriptions or the \
+    question, which renders markdown: short paragraphs or a list, the question last.";
 
 /// Backend-independent: any session can write an HTML file for the user. The
 /// type scale lived only in the `lucidos-cli` skill, and a session that never
@@ -1678,6 +1678,10 @@ mod tests {
     /// screenshot read into the agent's own context reaches the user on no
     /// backend and in no worktree shape.
     const PROMPT_FLAVOR_CEILINGS: &[(&str, &str, usize)] = &[
+        // EVERY row rose by 71 bytes when `REASONING_NOT_VISIBLE_RULE` said the
+        // question renders markdown. A card of findings arrived as one run-on
+        // paragraph without it.
+        //
         // EVERY row rose by 234 to 297 bytes for `HTML_ARTIFACT_TYPE_SCALE_RULE`
         // (ADR 0319). It rides the shared chokepoint: a session that never
         // loaded the skill wrote HTML at a 16px scale.
@@ -1702,29 +1706,29 @@ mod tests {
         // The same four rose by 185 more when `APPLY_RESTART_RULE` learned
         // that every file a binary embeds requires a restart. An agent that
         // misses it promises an Apply the running engine never picks up.
-        ("worktree", "claude-code", 26816),
-        ("worktree", "codex", 24956),
+        ("worktree", "claude-code", 26887),
+        ("worktree", "codex", 25027),
         // The four external-repo rows are 569 bytes higher than they were, for
         // `BUILD_SLOT_RULE` (ADR 0070). Only these flavors carry it. A
         // Lucidos-source session is already covered, because `make lint` and
         // `make test` take a slot themselves. Carrying it there would pay for
         // an instruction the session cannot use.
-        ("external_repo", "claude-code", 19222),
-        ("external_repo", "codex", 17362),
-        ("recovery", "claude-code", 25411),
-        ("recovery", "codex", 23551),
-        ("external_repo_recovery", "claude-code", 19098),
-        ("external_repo_recovery", "codex", 17238),
-        ("app_worktree", "claude-code", 21824),
-        ("app_worktree", "codex", 19964),
-        ("app_worktree_recovery", "claude-code", 20388),
-        ("app_worktree_recovery", "codex", 18528),
+        ("external_repo", "claude-code", 19293),
+        ("external_repo", "codex", 17433),
+        ("recovery", "claude-code", 25482),
+        ("recovery", "codex", 23622),
+        ("external_repo_recovery", "claude-code", 19169),
+        ("external_repo_recovery", "codex", 17309),
+        ("app_worktree", "claude-code", 21895),
+        ("app_worktree", "codex", 20035),
+        ("app_worktree_recovery", "claude-code", 20459),
+        ("app_worktree_recovery", "codex", 18599),
         // Both conflict_resolution rows rose by about 115 bytes when
         // `SHOWING_AN_IMAGE_RULE` learned that saving a picture shows nothing
         // either. The other rows had the slack to absorb it. Both rose again,
         // by 384, for its visual-choice clause: a real picture per option.
-        ("conflict_resolution", "claude-code", 6864),
-        ("conflict_resolution", "codex", 8134),
+        ("conflict_resolution", "claude-code", 6935),
+        ("conflict_resolution", "codex", 8205),
     ];
 
     /// Both backends, paired with the label used in `PROMPT_FLAVOR_CEILINGS`.

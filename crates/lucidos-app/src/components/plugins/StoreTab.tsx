@@ -99,10 +99,10 @@ function CategoryPill({ label, active = false, onClick, w }: {
   w?: string;
 }) {
   if (useSkeleton()) {
-    return <span class="app-store-filter-pill" aria-hidden="true"><SkText w={w} /></span>;
+    return <span class="pill-bar-btn" aria-hidden="true"><SkText w={w} /></span>;
   }
   return (
-    <button type="button" class={`app-store-filter-pill${active ? ' active' : ''}`} onClick={onClick}>
+    <button type="button" class={`pill-bar-btn${active ? ' active' : ''}`} aria-pressed={active} onClick={onClick}>
       {label}
     </button>
   );
@@ -121,7 +121,7 @@ export function StoreTabSkeleton() {
   return (
     <div class="app-store">
       <SkeletonProvider>
-        <div class="app-store-filter-pills">
+        <div class="pill-bar app-store-filter-pills">
           {SKELETON_PILL_WIDTHS.map((w, i) => <CategoryPill w={w} key={i} />)}
         </div>
       </SkeletonProvider>
@@ -520,7 +520,7 @@ function StoreTabLoaded({
   return (
     <div class="app-store">
       {availableCategories.length > 0 && (
-        <div class="app-store-filter-pills" role="group" aria-label="Filter by category">
+        <div class="pill-bar app-store-filter-pills" role="group" aria-label="Filter by category">
           <CategoryPill label="All" active={!activeCategory} onClick={() => setSelectedCategory(null)} />
           {availableCategories.map((c) => (
             <CategoryPill
@@ -638,12 +638,12 @@ function PluginStoreRow({ plugin, installingSource, stageInstall }: Partial<Plug
           <SkText w="3rem">{plugin && fileCountLabel(plugin.files_count)}</SkText>
           {sk && <SkBlock w="4rem" h="1rem" round />}
           {plugin?.content.map((kind) => (
-            <span class="app-store-content-chip" key={kind}>
+            <span class="label label-neutral" key={kind}>
               {contentLabel(kind)}
             </span>
           ))}
           {plugin?.categories.map((c) => (
-            <span class="app-store-category-chip" key={`cat-${c}`}>
+            <span class="label label-neutral" key={`cat-${c}`}>
               {categoryLabel(c)}
             </span>
           ))}

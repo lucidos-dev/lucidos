@@ -55,6 +55,25 @@ pub fn is_vendored_path(data_relative: &str) -> bool {
     dirs.split('/').any(|seg| VENDORED_DIR_NAMES.contains(&seg))
 }
 
+/// Extensions of build output that lands beside its source, outside any
+/// [`VENDORED_DIR_NAMES`] directory: Python bytecode.
+const BUILD_OUTPUT_FILE_EXTENSIONS: &[&str] = &["pyc", "pyo"];
+
+/// True when the file name alone marks build output, wherever it sits.
+pub fn is_build_output_file(file_name: &str) -> bool {
+    Path::new(file_name)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| BUILD_OUTPUT_FILE_EXTENSIONS.contains(&ext))
+}
+
+/// True when `data_relative` is machine-generated: a file under a vendored
+/// directory, or a build-output file anywhere.
+pub fn is_build_output_path(data_relative: &str) -> bool {
+    let file_name = data_relative.rsplit('/').next().unwrap_or(data_relative);
+    is_vendored_path(data_relative) || is_build_output_file(file_name)
+}
+
 /// Walk the four browseable data/ subdirs and return each file as
 /// `(data-relative path, absolute path)`, sorted lexicographically.
 /// Shared by `ArtifactManager::list_artifacts` and the search tools so

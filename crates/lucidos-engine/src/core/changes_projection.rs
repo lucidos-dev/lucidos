@@ -19,7 +19,7 @@ const SELECT_CHANGE: &str =
     "SELECT id, request_id, thread_id, branch_name, repo_root, description, \
      file_count, files, requires_restart, status, created_at, resolved_at, \
      merge_worktree_path, merge_temp_branch, hardened, pre_merge_sha, \
-     post_merge_sha, NULL::text AS thread_title, commits, incomplete FROM changes";
+     post_merge_sha, NULL::text AS thread_title, commits, summary, incomplete FROM changes";
 
 /// Event types whose latest occurrence per change decides whether that
 /// change's conflict-resolution pairing is open (`MergeConflictDetected`
@@ -157,6 +157,8 @@ impl ChangesProjection {
              description, file_count, files, requires_restart, status, created_at, hardened, incomplete) \
              VALUES ($1, $2, $3, $4, $5, COALESCE($6, ''), $7, $8, $9, $12, NOW(), $10, $11) \
              ON CONFLICT (id) DO UPDATE SET \
+                summary = CASE WHEN COALESCE($6, changes.description) = changes.description \
+                          THEN changes.summary END, \
                 description = COALESCE($6, changes.description), \
                 files = EXCLUDED.files, \
                 file_count = EXCLUDED.file_count, \
@@ -193,6 +195,7 @@ impl ChangesProjection {
     ) -> sqlx::Result<()> {
         let thread_ids: Vec<Option<Uuid>> = sqlx::query_scalar(
             "UPDATE changes SET \
+             summary = CASE WHEN COALESCE($2, description) = description THEN summary END, \
              description = COALESCE($2, description), \
              requires_restart = requires_restart OR $3, \
              hardened = FALSE \
@@ -319,6 +322,27 @@ impl ChangesProjection {
         };
         sqlx::query("UPDATE changes SET hardened = TRUE WHERE id = $1")
             .bind(id)
+            .execute(&mut **tx)
+            .await?;
+        Ok(())
+    }
+
+    /// Store a change summary, but only while `description` (the commit list
+    /// it summarized) is still the change's description. A summary of an older
+    /// commit set arriving late is dropped.
+    pub(crate) async fn write_summary(
+        tx: &mut Transaction<'_, Postgres>,
+        change_id: &str,
+        summary: &str,
+        description: &str,
+    ) -> sqlx::Result<()> {
+        let Some(id) = parse_change_id(change_id) else {
+            return Ok(());
+        };
+        sqlx::query("UPDATE changes SET summary = $2 WHERE id = $1 AND description = $3")
+            .bind(id)
+            .bind(summary)
+            .bind(description)
             .execute(&mut **tx)
             .await?;
         Ok(())
@@ -653,7 +677,7 @@ impl ChangesProjection {
              FROM events
              WHERE event_type IN (
                  'ChangeProposed','ChangeApplied','ChangeDiscarded',
-                 'ChangeReverted','ChangeHardened',
+                 'ChangeReverted','ChangeHardened','ChangeSummarized',
                  'MergeResolutionStarted','MergeResolutionCleared'
              )
                AND payload->>'change_id' IS NOT NULL
@@ -693,7 +717,7 @@ async fn rebuild_one_from_events(pool: &PgPool, change_id: Uuid) -> sqlx::Result
          WHERE payload->>'change_id' = $1
            AND event_type IN (
                'ChangeProposed','ChangeApplied','ChangeDiscarded',
-               'ChangeReverted','ChangeHardened',
+               'ChangeReverted','ChangeHardened','ChangeSummarized',
                'MergeResolutionStarted','MergeResolutionCleared'
            )
          ORDER BY created",
@@ -755,6 +779,15 @@ async fn rebuild_one_from_events(pool: &PgPool, change_id: Uuid) -> sqlx::Result
             hardened = true;
         }
     }
+    // The same guard `write_summary` applies: only a summary of the commit
+    // list the row ends up with.
+    let summary = rows
+        .iter()
+        .rev()
+        .filter(|r| r.0 == "ChangeSummarized")
+        .find(|r| str_field(&r.1, "description") == description)
+        .map(|r| str_field(&r.1, "summary"))
+        .filter(|s| !s.is_empty());
 
     let terminal = rows.iter().rev().find(|r| {
         matches!(
@@ -814,8 +847,8 @@ async fn rebuild_one_from_events(pool: &PgPool, change_id: Uuid) -> sqlx::Result
         "INSERT INTO changes (id, request_id, thread_id, branch_name, repo_root,
          description, file_count, files, requires_restart, status, created_at,
          resolved_at, hardened, commits, pre_merge_sha, post_merge_sha,
-         merge_worktree_path, merge_temp_branch, incomplete)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+         merge_worktree_path, merge_temp_branch, incomplete, summary)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
          ON CONFLICT (id) DO NOTHING",
     )
     .bind(change_id)
@@ -837,6 +870,7 @@ async fn rebuild_one_from_events(pool: &PgPool, change_id: Uuid) -> sqlx::Result
     .bind(merge_worktree_path)
     .bind(merge_temp_branch)
     .bind(incomplete)
+    .bind(summary)
     .execute(pool)
     .await?;
 
@@ -865,3 +899,7 @@ mod queries_tests;
 #[cfg(test)]
 #[path = "changes_projection_tests/rebuild.rs"]
 mod rebuild_tests;
+
+#[cfg(test)]
+#[path = "changes_projection_tests/summary.rs"]
+mod summary_tests;

@@ -147,21 +147,11 @@
     font-size: var(--font-size-sm);
 }
 
-/* One tag for both engine-written statuses (`waiting`, `abandoned`). The word
-   is the differentiator; the chrome is deliberately identical, so a row wears
-   the same shape whichever way its work ended up. */
+/* One tag for both engine-written statuses (`waiting`, `abandoned`): the shared
+   neutral label. The word is the differentiator, so a row wears the same shape
+   whichever way its work ended up. This rule only keeps it from shrinking. */
 .todo-panel-status-tag {
     flex: 0 0 auto;
-    font-size: var(--font-size-xs);
-    font-weight: 500;
-    text-transform: uppercase;
-    letter-spacing: 0.03em;
-    color: var(--text-secondary);
-    background: var(--bg-tertiary, var(--bg-primary));
-    border: 1px solid var(--border-color);
-    border-radius: calc(var(--radius-control) * 0.5);
-    padding: 0 0.25rem;
-    line-height: 1.3;
 }
 
 .todo-panel-text {

@@ -842,10 +842,10 @@ describe('handleFrontendUpdateDeferred — deferral hint (keyed, freshness-gated
     expect(shown.secondaryAction).toBeUndefined();
   });
 
-  it('is a passive hint: a tap on the card only closes it, so it reads as no link', () => {
+  it('is a passive hint: a tap on the card does nothing, so it reads as no link', () => {
     handleFrontendUpdateDeferred({ sent_at_ms: Date.now() });
     const shown = deferredToasts()[0];
-    expect(toastTap(shown)).toBe('dismiss');
+    expect(toastTap(shown)).toBeNull();
     expect(shown.persistent).toBe(true);
     dismissToast(FRONTEND_UPDATE_DEFERRED_TOAST_KEY);
     expect(deferredToasts()).toHaveLength(0);
@@ -972,7 +972,6 @@ describe('handleFrontendUpdateStranded — the change is NOT coming', () => {
     const shown = strandedToasts();
     expect(shown).toHaveLength(1);
     expect(shown[0].type).toBe('warning');
-    expect(shown[0].noAutofocus).toBe(true);
   });
 
   it('never claims the change arrives on Switch — that is the deferred hint, and here it would be false', () => {

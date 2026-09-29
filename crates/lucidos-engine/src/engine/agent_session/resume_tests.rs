@@ -417,16 +417,28 @@ async fn emit_settings_with_sid(bus: &EventBus, thread_id: Uuid, cc_session_id: 
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             cc_session_id: cc_session_id.map(String::from),
             claude_config_dir: None,
+            claude_config_dir_explicit: None,
         },
     )
     .await;
 }
 
+/// A settings emit in the shape rows had before `claude_config_dir_explicit`.
 async fn emit_settings_with_config_dir(
     bus: &EventBus,
     thread_id: Uuid,
     cc_session_id: Option<&str>,
     claude_config_dir: Option<&str>,
+) {
+    emit_init_settings(bus, thread_id, cc_session_id, claude_config_dir, None).await;
+}
+
+async fn emit_init_settings(
+    bus: &EventBus,
+    thread_id: Uuid,
+    cc_session_id: Option<&str>,
+    claude_config_dir: Option<&str>,
+    claude_config_dir_explicit: Option<bool>,
 ) {
     emit(
         bus,
@@ -438,9 +450,77 @@ async fn emit_settings_with_config_dir(
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             cc_session_id: cc_session_id.map(String::from),
             claude_config_dir: claude_config_dir.map(String::from),
+            claude_config_dir_explicit,
         },
     )
     .await;
+}
+
+async fn pinned_dir(pool: &sqlx::PgPool, thread_id: Uuid) -> Option<String> {
+    lookup_pinned_cc_config_dir(pool, thread_id)
+        .await
+        .unwrap()
+        .map(|pin| pin.dir)
+}
+
+/// The pin carries whether `CLAUDE_CONFIG_DIR` was set, from the same Init row
+/// as the dir. A thread whose first session ran with it unset must come back as
+/// the default profile, not as an explicit `~/.claude` that has no login.
+#[tokio::test]
+async fn lookup_returns_whether_the_config_dir_was_set() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+
+    seed_session_started(
+        &bus,
+        thread_id,
+        "sess-default",
+        "claude-code/default-profile",
+    )
+    .await;
+    emit_init_settings(
+        &bus,
+        thread_id,
+        Some("sess-default"),
+        Some("/home/u/.claude"),
+        Some(false),
+    )
+    .await;
+    // A later session recorded as explicit must not change the first row's answer.
+    emit_init_settings(
+        &bus,
+        thread_id,
+        Some("sess-later"),
+        Some("/home/u/.claude"),
+        Some(true),
+    )
+    .await;
+
+    let recorded = lookup_pinned_cc_config_dir(&pool, thread_id)
+        .await
+        .unwrap()
+        .expect("the Init row records a pin");
+    assert_eq!(
+        recorded,
+        RecordedAccountPin {
+            dir: "/home/u/.claude".to_string(),
+            explicit: Some(false),
+        }
+    );
+    assert_eq!(
+        recorded.resolve(&[(
+            "CLAUDE_CONFIG_DIR".to_string(),
+            "/home/u/.claude".to_string()
+        )]),
+        crate::runtime::AccountPin::DefaultConfigDir {
+            dir: "/home/u/.claude".to_string()
+        },
+        "a recorded unset pin stays unset even when the live env now sets the same path"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
 }
 
 /// The config dir pinned at Init is what a later resume must re-inject so CC finds
@@ -455,7 +535,7 @@ async fn lookup_finds_config_dir_from_init_settings() {
     emit_settings_with_config_dir(&bus, thread_id, Some("sess-cfg"), Some("/home/u/.claude")).await;
 
     assert_eq!(
-        lookup_pinned_cc_config_dir(&pool, thread_id).await.unwrap(),
+        pinned_dir(&pool, thread_id).await,
         Some("/home/u/.claude".to_string()),
         "the config dir stamped at Init must be resolvable for a later resume"
     );
@@ -478,7 +558,7 @@ async fn lookup_config_dir_is_none_for_legacy_thread() {
     emit_settings_with_sid(&bus, thread_id, Some("sess-legacy")).await;
 
     assert_eq!(
-        lookup_pinned_cc_config_dir(&pool, thread_id).await.unwrap(),
+        pinned_dir(&pool, thread_id).await,
         None,
         "a thread with no recorded config dir must resolve None, not a phantom value"
     );
@@ -509,7 +589,7 @@ async fn lookup_pinned_config_dir_prefers_first() {
     emit_settings_with_config_dir(&bus, thread_id, None, None).await;
 
     assert_eq!(
-        lookup_pinned_cc_config_dir(&pool, thread_id).await.unwrap(),
+        pinned_dir(&pool, thread_id).await,
         Some("/home/u/.claude-personal".to_string()),
         "a settings-only emit with no config dir must not shadow the pinned dir"
     );
@@ -518,7 +598,7 @@ async fn lookup_pinned_config_dir_prefers_first() {
     // the account of its first session.
     emit_settings_with_config_dir(&bus, thread_id, Some("sess-2"), Some("/home/u/.claude")).await;
     assert_eq!(
-        lookup_pinned_cc_config_dir(&pool, thread_id).await.unwrap(),
+        pinned_dir(&pool, thread_id).await,
         Some("/home/u/.claude-personal".to_string()),
         "the FIRST recorded config dir is the permanent pin; a later account must not override it"
     );
@@ -597,6 +677,60 @@ async fn lookup_prefers_most_recent_session_id_across_event_types() {
     teardown_test_db(&db_name).await;
 }
 
+/// A thread whose resumed session Claude Code no longer has. The stale-resume arm
+/// writes `SessionEnded { StaleResume }` and retries with no caller sid, so the
+/// resolver picks the id. With a pending change it reads the sid lookups, so both
+/// must hide the dead id.
+#[tokio::test]
+async fn stale_resume_shadows_the_dead_sid_until_a_new_session_records_one() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    let branch = "claude-code/dead-sid";
+    let cfg = "/home/u/.claude";
+
+    seed_session_started(&bus, thread_id, "sess-dead", branch).await;
+    emit_settings_with_config_dir(&bus, thread_id, Some("sess-dead"), Some(cfg)).await;
+    emit_idled(&bus, thread_id, Some("sess-dead"), None).await;
+    seed_pending_change(&bus, thread_id, branch).await;
+    emit(
+        &bus,
+        thread_id,
+        ThreadEvent::SessionEnded {
+            reason: SessionEndReason::StaleResume,
+        },
+    )
+    .await;
+
+    assert_eq!(lookup_latest_cc_session_id(&pool, thread_id).await, None);
+    assert_eq!(
+        lookup_latest_cc_session_id_for_config_dir(&pool, thread_id, cfg).await,
+        None
+    );
+    let (sid, resume_branch) =
+        resolve_resume_context(&pool, bus.changes_projection(), thread_id, None, Some(cfg)).await;
+    assert_eq!(sid, None, "the retry must start a fresh session");
+    assert_eq!(
+        resume_branch,
+        Some(branch.to_string()),
+        "on the thread's branch"
+    );
+
+    // The fresh session records its own id at Init, and that one resumes.
+    emit_settings_with_config_dir(&bus, thread_id, Some("sess-fresh"), Some(cfg)).await;
+    assert_eq!(
+        lookup_latest_cc_session_id(&pool, thread_id).await,
+        Some("sess-fresh".to_string())
+    );
+    assert_eq!(
+        lookup_latest_cc_session_id_for_config_dir(&pool, thread_id, cfg).await,
+        Some("sess-fresh".to_string())
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
 /// The account-scoped session lookup returns the newest session recorded UNDER a
 /// given config dir, ignoring newer sessions under other accounts. This is what
 /// lets a resume target the pinned account's session after a mid-thread flip.
@@ -669,7 +803,7 @@ async fn resolve_resume_context_resumes_session_under_pinned_account() {
     emit_idled(&bus, thread_id, Some("sess-B"), None).await;
 
     // The pin is the FIRST account.
-    let pinned = lookup_pinned_cc_config_dir(&pool, thread_id).await.unwrap();
+    let pinned = pinned_dir(&pool, thread_id).await;
     assert_eq!(pinned.as_deref(), Some("/home/u/.claude-personal"));
 
     // Auto-detect resume (no caller sid), scoped to the pin: resumes session A, not B.

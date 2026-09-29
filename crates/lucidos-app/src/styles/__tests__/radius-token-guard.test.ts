@@ -24,7 +24,7 @@ const here: string = dirname(fileURLToPath(import.meta.url));
 const src: string = resolve(here, '../..');
 
 /** Spinners keep a true circle: a rotating square reads as a glitch. */
-const SPINNERS = new Set(['.mini-spinner', '.ws-picker-restore-spinner']);
+const SPINNERS = new Set(['.mini-spinner']);
 
 /** The corners of a radius value, split on top-level spaces and the slash. */
 function corners(value: string): string[] {

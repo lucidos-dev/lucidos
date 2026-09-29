@@ -1,7 +1,9 @@
 use super::super::LucidosEngine;
 use super::bash_background_recovery;
 use super::ToolOutcome;
-use crate::core::shell::{command_shell, TaskOutcome};
+use crate::core::shell::{
+    command_shell, finalize_stream, TaskOutcome, KEPT_BYTES_CAP, MAX_OUTPUT_BYTES,
+};
 use crate::core::{redact_postgres_secrets, sanitize_for_jsonb};
 use crate::engine::event_bus::BusEvent;
 use crate::engine::thread_events::{EventMeta, ThreadEvent};
@@ -12,14 +14,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
-
-const MAX_OUTPUT_BYTES: usize = 100 * 1024; // 100 KB
-
-/// How much of one stream a pipe reader keeps. The model sees only the first
-/// `MAX_OUTPUT_BYTES`, and the slack covers what sanitizing strips. Past it
-/// the reader counts bytes and drops them, so a chatty command cannot grow the
-/// engine's memory without bound.
-const KEPT_BYTES_CAP: usize = 4 * MAX_OUTPUT_BYTES;
 
 /// How long the pipe readers may go with no bytes and no EOF before we call
 /// the pipes detached.
@@ -259,20 +253,7 @@ async fn wait_for_shell(
     })
 }
 
-/// Sanitize raw subprocess bytes for storage in a jsonb event payload and
-/// truncate to the LLM-facing cap. Centralized so the sync `run_bash` and
-/// the async background path always apply the same transformation.
-///
-/// `total` is how many bytes the stream carried, which exceeds `bytes` when
-/// the reader hit `KEPT_BYTES_CAP`.
-fn finalize_stream(bytes: &[u8], total: u64) -> String {
-    let sanitized = sanitize_for_jsonb(&String::from_utf8_lossy(bytes));
-    let dropped = total > bytes.len() as u64;
-    let dropped_total = dropped.then(|| usize::try_from(total).unwrap_or(usize::MAX));
-    truncate_output(&sanitized, MAX_OUTPUT_BYTES, dropped_total)
-}
-
-/// Same, but keeps the END of an oversized stream instead of the start.
+/// Like [`finalize_stream`], but keeps the END of an oversized stream instead of the start.
 /// A `bash_output` drain is a *window* on a still-running task: the newest
 /// lines are the ones that say where the build got to and which one failed,
 /// and head-truncation would throw away precisely those. Now that
@@ -799,20 +780,6 @@ impl LucidosEngine {
     }
 }
 
-/// The first `max` bytes of `s`, marked when anything is cut.
-///
-/// `dropped_total` is the stream's full size when the reader stopped keeping
-/// bytes. Its note is due even when `s` fits: sanitizing can shrink a mostly
-/// binary head below `max`.
-fn truncate_output(s: &str, max: usize, dropped_total: Option<usize>) -> String {
-    if s.len() <= max && dropped_total.is_none() {
-        return s.to_string();
-    }
-    let end = s.floor_char_boundary(max);
-    let total = dropped_total.unwrap_or(0).max(s.len());
-    format!("{}...\n[truncated: {} bytes total]", &s[..end], total)
-}
-
 /// Task runtime in seconds from a persisted `BackgroundBashCompleted`
 /// payload. `null` for a legacy row that predates the timestamp pair —
 /// an honest "unknown" the LLM can read, rather than a fabricated `0`
@@ -1151,33 +1118,6 @@ mod tests {
         );
     }
 
-    /// A capped stream of NULs sanitizes to nothing. The note must still say
-    /// how much output there was.
-    #[test]
-    fn a_capped_stream_that_sanitizes_to_nothing_is_still_marked() {
-        let shown = finalize_stream(&[0u8; 16], 1_000_000);
-        assert!(
-            shown.ends_with("[truncated: 1000000 bytes total]"),
-            "{shown:?}"
-        );
-        assert_eq!(finalize_stream(b"ok", 2), "ok");
-    }
-
-    #[test]
-    fn truncate_output_short_string() {
-        let s = "hello world";
-        assert_eq!(truncate_output(s, 100, None), "hello world");
-    }
-
-    #[test]
-    fn truncate_output_long_string() {
-        let s = "a".repeat(200);
-        let result = truncate_output(&s, 50, None);
-        assert!(result.starts_with(&"a".repeat(50)));
-        assert!(result.contains("[truncated"));
-        assert!(result.contains("200 bytes total"));
-    }
-
     #[test]
     fn truncate_output_tail_keeps_the_end_not_the_start() {
         // A drain window is a progress view: the newest lines say where the
@@ -1283,12 +1223,5 @@ mod tests {
             !body.contains("msg_tx") && !body.contains("agent_sessions"),
             "the watcher must leave delivery to the event wait:\n{body}"
         );
-    }
-
-    #[test]
-    fn truncate_output_multibyte_boundary() {
-        let s = "ééééé"; // 10 bytes in UTF-8
-        let result = truncate_output(s, 5, None);
-        assert!(result.contains("[truncated"));
     }
 }

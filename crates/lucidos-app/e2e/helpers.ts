@@ -567,14 +567,25 @@ export async function openDrawerView(page: Page, label: string): Promise<void> {
  *  The menu route is gated on the mobile viewport, because that is the only
  *  place the menu HAS that item. Running it on desktop would open the Lucidos
  *  menu, find nothing, and leave it standing over the app for the rest of the
- *  spec. A miss stays non-fatal: the caller may already be on the compose view,
- *  in which case the waits below pass anyway. */
+ *  spec.
+ *
+ *  The menu opens only once its lazy chunk has loaded (`whenLoaded` in
+ *  HeaderMark.tsx), so the row is awaited rather than looked up once. A menu
+ *  that never shows the row throws: skipping it would leave the old draft on
+ *  screen and fail the caller far from the cause. */
 export async function newThread(page: Page): Promise<void> {
   const clicked = await clickVisibleElement(page, 'button[aria-label="New thread"]');
-  if (!clicked && isMobileViewport(page)) {
-    await clickVisibleElement(page, 'button[aria-label^="Lucidos menu"]');
-    if (!await clickVisibleElement(page, '.brand-menu-item', 'New thread')) {
+  if (!clicked && isMobileViewport(page)
+    && await clickVisibleElement(page, 'button[aria-label^="Lucidos menu"]')) {
+    const row = page.locator('.brand-menu-item:visible', { hasText: 'New thread' });
+    try {
+      await row.waitFor({ state: 'visible', timeout: 5_000 });
+    } catch (err) {
       await page.keyboard.press('Escape'); // never leave the menu standing open
+      throw new Error(`the Lucidos menu never showed its New thread row: ${(err as Error).message}`);
+    }
+    if (!await clickVisibleElement(page, '.brand-menu-item', 'New thread')) {
+      throw new Error('the Lucidos menu New thread row vanished before it could be clicked');
     }
   }
   await ensureOnThreadPane(page);

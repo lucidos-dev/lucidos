@@ -1145,6 +1145,17 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   Re-flag only if the test stops asserting per-arm membership, which is the one
   thing that would leave the enum carrying nothing.
 
+- **An auxiliary call whose `provider.chat(...)` errors records no
+  `ContextCaptured`, by the same convention every caller follows.** A reviewer
+  sees `.await?` before `capture.record(...)` (title, change summary) and
+  reports an unrecorded attempt. But an errored call returns no `LlmResponse`
+  and so no usage, and the Token Cost app reads only rows carrying a `usage`
+  block. A row with none adds nothing it can count. Every attempt that returns
+  a response IS recorded, a rejected one included (ADR 0242).
+
+  Re-flag only if a provider starts returning usage on its error path, which
+  would give such a row something to carry.
+
 - **`UNRECORDED` being empty, plus a test asserting it is empty, is not a dead
   filter.** A reviewer sees `const UNRECORDED: &[(&str, &str)] = &[]` in
   `engine/aux_capture.rs`, a filter that removes nothing, and a second test
@@ -1266,6 +1277,15 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   evidence the fallthrough cannot reach a browser.
 
 ## Frontend
+
+- **Search Everywhere's delay gate does not restart on a keystroke while a
+  search is still out.** A reviewer reports the loader appearing on the old
+  query's clock. `useDelayedFlag(pending.length > 0)` stays armed because the
+  palette really is still waiting, and the pre-split code held `loading` across
+  keystrokes the same way. Restarting it would drop the loader for a frame and
+  bring it back 300ms later, the blink `frontend.md` § Async Data Loading
+  forbids. A cleared query does restart it, since recents request nothing.
+  Re-flag only with a path where no category is out and the loader still shows.
 
 - **The refresh indicator's holds ignore the animation speed scale, even
   where a scaled transition outlasts them.** A reviewer reports that at a slow

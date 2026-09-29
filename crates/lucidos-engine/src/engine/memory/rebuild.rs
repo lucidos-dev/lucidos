@@ -211,8 +211,14 @@ impl LucidosEngine {
             log!(@Memory, "Starting INCREMENTAL memory rebuild (resume mode)...");
         }
 
-        // Load all events and pre-filter to types that memory_content_for_event handles
-        let events: Vec<_> = match self.event_store.get_all_events_chronological().await {
+        // SQL narrows to the indexable types; memory_content_for_event decides.
+        let events: Vec<_> = match self
+            .event_store
+            .events_of_types_chronological(
+                crate::engine::thread_events::ThreadEvent::INDEXABLE_EVENT_TYPES,
+            )
+            .await
+        {
             Ok(all) => all
                 .into_iter()
                 .filter(|e| Self::memory_content_for_event(e).is_some())

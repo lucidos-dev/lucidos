@@ -25,22 +25,22 @@ use std::time::Duration;
 use sqlx::PgPool;
 
 use crate::core::{
-    PreferenceStore, DEFAULT_COMMAND_JUDGE_REASONING, PREF_IMAGE_MODEL, PREF_MODEL_COMMAND_JUDGE,
-    PREF_MODEL_CONVERSATION_SUMMARY, PREF_MODEL_IMAGE_DESCRIPTION, PREF_MODEL_MEMORY,
-    PREF_MODEL_QUERY_CLASSIFICATION, PREF_MODEL_TITLE, PREF_MODEL_VOICE_TALKER,
-    PREF_REASONING_COMMAND_JUDGE, PREF_REASONING_CONVERSATION_SUMMARY,
-    PREF_REASONING_IMAGE_DESCRIPTION, PREF_REASONING_MEMORY, PREF_REASONING_QUERY_CLASSIFICATION,
-    PREF_REASONING_TITLE,
+    PreferenceStore, DEFAULT_COMMAND_JUDGE_REASONING, PREF_IMAGE_MODEL, PREF_MODEL_CHANGE_SUMMARY,
+    PREF_MODEL_COMMAND_JUDGE, PREF_MODEL_CONVERSATION_SUMMARY, PREF_MODEL_IMAGE_DESCRIPTION,
+    PREF_MODEL_MEMORY, PREF_MODEL_QUERY_CLASSIFICATION, PREF_MODEL_TITLE, PREF_MODEL_VOICE_TALKER,
+    PREF_REASONING_CHANGE_SUMMARY, PREF_REASONING_COMMAND_JUDGE,
+    PREF_REASONING_CONVERSATION_SUMMARY, PREF_REASONING_IMAGE_DESCRIPTION, PREF_REASONING_MEMORY,
+    PREF_REASONING_QUERY_CLASSIFICATION, PREF_REASONING_TITLE,
 };
 use crate::engine::ContextPurpose;
 
 /// The reasoning half of a purpose's *model selection*.
 pub(crate) struct AuxReasoningPref {
     pub(crate) key: &'static str,
-    /// Consulted when `key` is unset, before the default. Only query
-    /// classification has one, and it is the other half of its model fallback:
-    /// the split must not quietly drop a workspace that raised
-    /// `reasoning_memory`.
+    /// Consulted when `key` is unset, before the default. Query
+    /// classification and the change summary have one, each the other half of
+    /// its model fallback. A split must not quietly drop a workspace that
+    /// raised the effort it used to run at.
     ///
     /// The conversation summary deliberately has none. Its default is `low`,
     /// which is what its call site ran at, and inheriting `reasoning_memory`
@@ -62,7 +62,8 @@ pub(crate) struct AuxModelPrefs {
     /// Consulted when `model_key` is unset. Both keys split out of
     /// `model_memory` have one, the conversation summary and query
     /// classification: a workspace that pinned a model there must keep running
-    /// all three jobs on it.
+    /// all three jobs on it. The change summary follows `model_title`, the
+    /// other job that writes one line naming a piece of work.
     pub(crate) model_fallback_key: Option<&'static str>,
     /// `None` for a purpose whose models offer no reasoning tiers, which is
     /// image generation. The tier set decides, so there is no key to store.
@@ -115,13 +116,25 @@ pub(crate) fn model_source(purpose: ContextPurpose) -> AuxModelSource {
         ContextPurpose::JudgeTool => return AuxModelSource::BackendPinned,
         ContextPurpose::IntentLoop
         | ContextPurpose::MemoryCorrection
-        | ContextPurpose::ArtifactSummary => return AuxModelSource::AgentModel,
+        | ContextPurpose::ArtifactSummary
+        | ContextPurpose::SideQuestion => return AuxModelSource::AgentModel,
         ContextPurpose::Title => AuxModelPrefs {
             model_key: PREF_MODEL_TITLE,
             model_fallback_key: None,
             reasoning: Some(AuxReasoningPref {
                 key: PREF_REASONING_TITLE,
                 fallback_key: None,
+                default: "none",
+            }),
+        },
+        // One line naming a piece of work, which is the title model's job too.
+        // So an unset pair follows whatever the user chose for titles.
+        ContextPurpose::ChangeSummary => AuxModelPrefs {
+            model_key: PREF_MODEL_CHANGE_SUMMARY,
+            model_fallback_key: Some(PREF_MODEL_TITLE),
+            reasoning: Some(AuxReasoningPref {
+                key: PREF_REASONING_CHANGE_SUMMARY,
+                fallback_key: Some(PREF_REASONING_TITLE),
                 default: "none",
             }),
         },
@@ -333,19 +346,21 @@ pub(crate) fn budget_for(purpose: ContextPurpose) -> AuxBudget {
         ContextPurpose::ConversationSummary => SUMMARY_BUDGET,
         ContextPurpose::JudgeTool => JUDGE_TOOL_BUDGET,
         ContextPurpose::Title
+        | ContextPurpose::ChangeSummary
         | ContextPurpose::ImageDescribe
         | ContextPurpose::Memory
         | ContextPurpose::QueryClassification
         | ContextPurpose::ImageGen
         | ContextPurpose::CommandJudge => SHORT_CALL_BUDGET,
-        // Five that never ask. None is an auxiliary HTTP call this module
-        // times: a turn and the three `AgentModel` purposes run on the agent's
+        // Six that never ask. None is an auxiliary HTTP call this module
+        // times: a turn and the four `AgentModel` purposes run on the agent's
         // own provider and its timeout, and the talker holds a socket.
         ContextPurpose::Turn
         | ContextPurpose::Voice
         | ContextPurpose::IntentLoop
         | ContextPurpose::MemoryCorrection
-        | ContextPurpose::ArtifactSummary => SHORT_CALL_BUDGET,
+        | ContextPurpose::ArtifactSummary
+        | ContextPurpose::SideQuestion => SHORT_CALL_BUDGET,
     }
 }
 
@@ -419,6 +434,8 @@ const ALL_PURPOSES: &[ContextPurpose] = &[
     ContextPurpose::IntentLoop,
     ContextPurpose::MemoryCorrection,
     ContextPurpose::ArtifactSummary,
+    ContextPurpose::SideQuestion,
+    ContextPurpose::ChangeSummary,
 ];
 
 #[cfg(test)]
@@ -444,10 +461,12 @@ mod tests {
                 | ContextPurpose::JudgeTool
                 | ContextPurpose::IntentLoop
                 | ContextPurpose::MemoryCorrection
-                | ContextPurpose::ArtifactSummary => {}
+                | ContextPurpose::ArtifactSummary
+                | ContextPurpose::SideQuestion
+                | ContextPurpose::ChangeSummary => {}
             }
         }
-        assert_eq!(ALL_PURPOSES.len(), 13);
+        assert_eq!(ALL_PURPOSES.len(), 15);
     }
 
     /// The invariant this module exists for. Two purposes sharing one model
@@ -477,6 +496,7 @@ mod tests {
                         ContextPurpose::IntentLoop
                             | ContextPurpose::MemoryCorrection
                             | ContextPurpose::ArtifactSummary
+                            | ContextPurpose::SideQuestion
                     ),
                     "{:?} claims to run the agent's own model",
                     purpose
@@ -561,6 +581,20 @@ mod tests {
             .expect("prefs");
         assert_eq!(prefs.model_key, PREF_MODEL_QUERY_CLASSIFICATION);
         assert_eq!(prefs.model_fallback_key, Some(PREF_MODEL_MEMORY));
+    }
+
+    /// Both halves follow the title pair while unset, so a workspace that
+    /// tuned its title model gets change summaries from the same model.
+    #[test]
+    fn the_change_summary_falls_back_to_the_title_pair() {
+        let prefs = model_source(ContextPurpose::ChangeSummary)
+            .prefs()
+            .expect("prefs");
+        assert_eq!(prefs.model_key, PREF_MODEL_CHANGE_SUMMARY);
+        assert_eq!(prefs.model_fallback_key, Some(PREF_MODEL_TITLE));
+        let reasoning = prefs.reasoning.expect("it runs at an effort");
+        assert_eq!(reasoning.key, PREF_REASONING_CHANGE_SUMMARY);
+        assert_eq!(reasoning.fallback_key, Some(PREF_REASONING_TITLE));
     }
 
     /// Fact extraction keeps `model_memory` outright. The split moved

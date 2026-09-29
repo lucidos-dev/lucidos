@@ -514,6 +514,7 @@ fn trigger_functional_eq(a: &TriggerDefinition, b: &TriggerDefinition) -> bool {
 /// Per content type, against the plugin's install commit:
 /// - **app dirs** (`apps/<id>/`): a tree→workdir diff (including untracked files)
 ///   scoped to the dir — catches edits, deletes, and user-ADDED files in the app.
+///   Build output ([`crate::core::is_build_output_path`]) never counts.
 /// - **flat files** (`knowhow/` / `scripts/` / `auth-modules/` and any non-
 ///   `trigger.toml` file the plugin recorded): the same diff scoped to each
 ///   recorded path — edits/deletes only (a brand-new file in those shared roots
@@ -603,7 +604,7 @@ pub(crate) fn modification_status_for(
                 {
                     if let Ok(rel) = path.strip_prefix("data") {
                         if let Some(rel) = rel.to_str() {
-                            if !rel.is_empty() {
+                            if !rel.is_empty() && !crate::core::is_build_output_path(rel) {
                                 changed.insert(rel.to_string());
                             }
                         }
@@ -999,6 +1000,24 @@ mod modification_status_tests {
             .modified_paths
             .iter()
             .any(|p| p == "apps/demo/extra.js"));
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn build_output_in_app_dir_is_not_modified() {
+        let ws = temp_workspace();
+        write_data(&ws, "apps/demo/index.html", "x");
+        let sha = install_commit(&ws, &["apps/demo/index.html"]);
+        write_data(&ws, "apps/demo/__pycache__/run.cpython-314.pyc", "bytecode");
+        write_data(&ws, "apps/demo/node_modules/dep/index.js", "dep");
+        write_data(&ws, "apps/demo/helper.pyc", "bytecode");
+        let status =
+            plugin_modification_status(&ws, &record(Some(&sha), &["apps/demo/index.html"]));
+        assert!(
+            !status.modified,
+            "build output is not a local edit: {:?}",
+            status.modified_paths
+        );
         let _ = std::fs::remove_dir_all(&ws);
     }
 

@@ -1,15 +1,15 @@
 import type { ComponentChildren } from 'preact';
 import { useRef, useEffect, useLayoutEffect, useCallback, useMemo } from 'preact/hooks';
 import { memo } from 'preact/compat';
-import { signal, useSignalEffect } from '@preact/signals';
-import { threadDrawerOpen, threadDrawerWidth, threadMap, focusedThreadId, threadsLoaded, splitRatio, effectiveThreadStatus, getThreadDisplaySection, threadSearchQuery, threadSearchResults, threadHasMore, threadLoadingMore, archiveThreadCount, drawerView, setDrawerView, repositories, focusedPane, scaledDurationMs } from '../../store/store';
-import { appliedThreadFilter } from '../../store/appliedThreadFilter';
+import { batch, signal, useSignalEffect } from '@preact/signals';
+import { threadDrawerOpen, threadDrawerWidth, threadMap, focusedThreadId, threadsLoaded, splitRatio, effectiveThreadStatus, getThreadDisplaySection, threadSearchQuery, threadSearchResults, threadHasMore, threadLoadingMore, archiveThreadCount, drawerView, setDrawerView, repositories, focusedPane, scaledDurationMs, showToast, ALL_CHANNELS, clearThreadFilter } from '../../store/store';
+import { appliedThreadFilter, type ThreadFilterSelection } from '../../store/appliedThreadFilter';
 import { resolveScope, resolveCodingAgent } from '../../store/composeSelections';
 import { composeDraftContextName } from '../../store/composeDestination';
 import { threadPassesChannelFilter } from '../../store/threadFilter';
-import { threadFilterPanelOpen, setThreadFilterPaneVisible } from '../../store/threadFilterPanel';
+import { threadFilterPanelOpen, setThreadFilterPaneVisible, closeThreadFilterPanel } from '../../store/threadFilterPanel';
 import { ThreadFilterCover } from './ThreadFilterCover';
-import { focusPane } from '../../store/actions/pane';
+import { focusPane, showThreadList } from '../../store/actions/pane';
 import { focusThread } from '../../store/actions/threads';
 import { loadOlderThreads, reloadAfterFilterChange, filterChangedSinceLoad, ensureThreadInMap, loadThreadEvents } from '../../store/actions/thread-loading';
 import { ThreadStatusIcon, visualStatusFor, type VisualStatus } from '../shared/ThreadStatusIcon';
@@ -29,9 +29,10 @@ import { formatMessageTimestamp } from '../../utils/formatTime';
 import { useFlipTransitions, type FlipSection } from '../../hooks/useFlipAnimation';
 import { useDelayedFlag, useDelayedLoading, useLingeringFlag } from '../../hooks/useDelayedLoading';
 import { PANE_TRANSITION_MS } from '../layout/splitHelpers';
-import { useScrollMemory } from '../../hooks/useScrollMemory';
+import { forgetSavedScroll, readSavedScroll, useScrollMemory } from '../../hooks/useScrollMemory';
 import { useRowActionsGesture } from './useRowActionsGesture';
 import { getRemPx } from '../../utils/dom';
+import { scrollBehavior } from '../../utils/motion';
 import type { ThreadSearchResult } from '../../api/threads';
 import { PinIcon, InboxIcon, ArchiveIcon, DraftsIcon, AttentionIcon, RunningIcon, ChevronRightIcon } from '../shared/icons';
 import type { ComponentType } from 'preact';
@@ -376,6 +377,160 @@ export function seedDrawerHighlight(): void {
     requestAnimationFrame(seed);
 }
 
+/** What it takes to show a thread in the full thread list. */
+export type ThreadListReveal =
+    /** Expand `section` and each of `collapsedAncestors`, then scroll to the row. */
+    | { kind: 'reveal'; section: DisplaySection; collapsedAncestors: string[] }
+    /** The thread filter hides the thread's family. */
+    | { kind: 'hidden-by-filter' }
+    /** No section lists the thread, filter or not. */
+    | { kind: 'not-listed' };
+
+const NO_THREAD_FILTER: ThreadFilterSelection = {
+    channels: new Set(ALL_CHANNELS),
+    triggerIds: new Set(),
+    repoIds: new Set(),
+    appIds: new Set(),
+};
+
+function routeInList(threadId: string, threads: ThreadState[], filter: ThreadFilterSelection) {
+    const { decorations, familyGraph } = computeDrawerCategorization(
+        threads, filter.channels, filter.triggerIds, filter.repoIds, filter.appIds,
+    );
+    return { section: decorations.routedByThread.get(threadId), familyGraph };
+}
+
+/** Pure: decide how to reveal `threadId` in the full list, under `filter` and
+ *  the current family collapse state. Routes through the same categorization
+ *  the list renders from, so the section it names is the one the row sits in. */
+export function planThreadListReveal(
+    threadId: string,
+    threads: ThreadState[],
+    filter: ThreadFilterSelection,
+    collapsed: ReadonlySet<string>,
+): ThreadListReveal {
+    const { section, familyGraph } = routeInList(threadId, threads, filter);
+    if (section) {
+        return { kind: 'reveal', section, collapsedAncestors: collapsedAncestorIds(threadId, collapsed, familyGraph) };
+    }
+    return routeInList(threadId, threads, NO_THREAD_FILTER).section
+        ? { kind: 'hidden-by-filter' }
+        : { kind: 'not-listed' };
+}
+
+/** Show `threadId`'s row in the thread list: open the list, undo whatever
+ *  hides the row, and scroll to it. The thread filter is the user's
+ *  own choice, so a filtered-out thread gets a toast offering to clear it
+ *  rather than a silent reset. */
+export function revealThreadInList(threadId: string): void {
+    showThreadList();
+    closeThreadFilterPanel();
+    const plan = planThreadListReveal(
+        threadId, Array.from(threadMap.value.values()), appliedThreadFilter.value, collapsedFamilies.value,
+    );
+    if (plan.kind === 'hidden-by-filter') {
+        showToast('This thread is hidden by the thread filter.', 'info', {
+            action: { label: 'Clear filter', onClick: () => { clearThreadFilter(); revealThreadInList(threadId); } },
+        });
+        return;
+    }
+    if (plan.kind === 'not-listed') {
+        showToast('This thread is not in the thread list.', 'info');
+        return;
+    }
+    // Leaving another view re-arms the list's scroll memory, and its restore
+    // would land after the scroll below. The reveal decides where the list sits.
+    forgetSavedScroll(DRAWER_SCROLL_KEY);
+    batch(() => {
+        threadSearchQuery.value = '';
+        threadSearchResults.value = { status: 'not-loaded' };
+        setDrawerView('all');
+        setSectionCollapsed(plan.section, false);
+        for (const id of plan.collapsedAncestors) setFamilyCollapsed(id, false);
+    });
+    scrollToRevealedRow(threadId);
+}
+
+/** Frames to wait for the row to mount after the list opens and expands. */
+const REVEAL_MAX_FRAMES = 10;
+const DRAWER_SCROLL_KEY = 'lucidos-scroll-thread-drawer';
+/** The page-in in flight, if any. Its identity is its cancellation token: a
+ *  new page-in or an unmount replaces or clears it, and the old loop stops. */
+let activePageIn: object | null = null;
+/** Set once the drawer's scroll memory stops restoring (`onRestoreSettled`),
+ *  and reset before each attach. Work done for the restore stops with it. */
+let drawerRestoreSettled = false;
+/** Set before each attach and consumed by the one page-in that serves it. A
+ *  drawer reopen does not re-attach, so it finds nothing armed and pages
+ *  nothing in. */
+let drawerRestoreArmed = false;
+
+/** Glide only the list, never its ancestors: on mobile the list sits in a
+ *  swipe pane, and `scrollIntoView` would also scroll the swipe container. */
+function centreRowInList(row: HTMLElement, list: HTMLElement): void {
+    const r = row.getBoundingClientRect();
+    const l = list.getBoundingClientRect();
+    const top = list.scrollTop + (r.top + r.height / 2) - (l.top + l.height / 2);
+    list.scrollTo({ top, behavior: scrollBehavior() });
+}
+
+/** The row's centre within the list's content, independent of scroll. The
+ *  centre, not the top: the row's own title can re-wrap as the list widens. */
+function rowContentCentre(row: HTMLElement, list: HTMLElement): number {
+    const r = row.getBoundingClientRect();
+    return r.top + r.height / 2 - list.getBoundingClientRect().top + list.scrollTop;
+}
+
+function scrollToRevealedRow(threadId: string): void {
+    let frames = 0;
+    const step = () => {
+        const row = document.querySelector<HTMLElement>(`.thread-drawer-list [data-thread-nav="${threadId}"]`);
+        const list = row?.closest<HTMLElement>('.thread-drawer-list');
+        if (!row || !list) {
+            if (frames++ < REVEAL_MAX_FRAMES) requestAnimationFrame(step);
+            return;
+        }
+        followRowUntilSettled(row, list);
+    };
+    requestAnimationFrame(step);
+}
+
+/** Frames the row and the list width must hold still before the reveal stops
+ *  following the row. */
+const SETTLED_FRAMES = 3;
+/** Runaway guard on following a row whose layout never settles. */
+const MAX_FOLLOW_FRAMES = 600;
+
+/** Keep the row centred while the layout above it still moves. Opening the
+ *  drawer animates its width, and a narrow list wraps rows taller. Chromium's
+ *  scroll anchoring hides the drift, but WebKit has none.
+ *
+ *  Settled means the row's centre AND the list's width held for a few
+ *  frames. The rows reflow some frames after the width starts to grow, so the
+ *  position alone reads as settled too early. */
+function followRowUntilSettled(row: HTMLElement, list: HTMLElement): void {
+    let lastCentre = Number.NaN;
+    let lastWidth = Number.NaN;
+    let stillFrames = 0;
+    let frames = 0;
+    const tick = () => {
+        if (!row.isConnected) return;
+        const centre = rowContentCentre(row, list);
+        const width = list.clientWidth;
+        // A pixel of slack: sub-pixel rounding must not read as movement.
+        const moved = !(Math.abs(centre - lastCentre) <= 1);
+        if (moved) {
+            centreRowInList(row, list);
+            lastCentre = centre;
+        }
+        const still = !moved && width === lastWidth && width > 0;
+        stillFrames = still ? stillFrames + 1 : 0;
+        lastWidth = width;
+        if (stillFrames < SETTLED_FRAMES && frames++ < MAX_FOLLOW_FRAMES) requestAnimationFrame(tick);
+    };
+    tick();
+}
+
 /** The drawer pane's list-nav keydown handler. Module-level (it reads only
  *  signals and module functions) so the filter-panel suppression below is
  *  unit-testable without mounting the pane. */
@@ -428,7 +583,21 @@ export function ThreadDrawer({ forceVisible }: { forceVisible?: boolean } = {}) 
     const drawerRef = useRef<HTMLDivElement>(null);
     const listRef = useRef<HTMLDivElement>(null);
     // Don't restore while in an alternate view — saved offset is for the full list.
-    useScrollMemory(listRef, 'lucidos-scroll-thread-drawer', { paused: activeView !== 'all' });
+    // Declared before the hook, so the reset runs before each attach.
+    const restorePaused = activeView !== 'all';
+    useEffect(() => {
+        drawerRestoreSettled = false;
+        drawerRestoreArmed = true;
+    }, [restorePaused]);
+    useScrollMemory(listRef, DRAWER_SCROLL_KEY, {
+        paused: restorePaused,
+        // Busy until the first threads land and the page-in takes over.
+        restoreIsBusy: () => !threadsLoaded.value || drawerRestoreArmed || activePageIn !== null,
+        onRestoreSettled: () => {
+            drawerRestoreSettled = true;
+            drawerRestoreArmed = false;
+        },
+    });
 
     // Keep the container's `aria-activedescendant` in lockstep with the keyboard
     // highlight WITHOUT re-rendering the list. The drawer is a single focusable,
@@ -502,7 +671,7 @@ export function ThreadDrawer({ forceVisible }: { forceVisible?: boolean } = {}) 
 }
 
 
-import { attentionThreads, reviewThreads, runningThreads, composingThreads, computeDrawerCategorization, depthStyle, draftThreads, hasCollapsedAncestor, nestByParent, threadHasUnsentDraft } from './family-graph';
+import { attentionThreads, reviewThreads, runningThreads, composingThreads, collapsedAncestorIds, computeDrawerCategorization, depthStyle, draftThreads, hasCollapsedAncestor, nestByParent, threadHasUnsentDraft } from './family-graph';
 import type { DrawerCategorization, NestedThread } from './family-graph';
 export * from './family-graph';
 function ThreadList() {
@@ -668,7 +837,7 @@ function ThreadList() {
                 pages++;
                 // Let the re-render commit so the next iteration measures the new
                 // layout (whether the freshly-loaded rows pushed the sentinel out).
-                await new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
+                await nextFrame();
                 // Stop when nothing was FETCHED: a concurrent call owns the round
                 // trip, or the page failed. A landed page that added no rows is
                 // not a stop, since its cursor moved and the next page continues
@@ -705,6 +874,18 @@ function ThreadList() {
         if (!hydrated || !filterChangedSinceLoad()) return;
         void reloadAfterFilterChange().then(() => void loadWhileSentinelVisible());
     }, [hydrated, applied]);
+
+    // Once per mount, bring the saved position into reach (see
+    // `pageInToSavedScroll`). The drawer's scroll memory restores it the moment
+    // the list is tall enough.
+    // When it ends, hand back to the fill loop: a short list's first page
+    // request may have lost the race to it.
+    useEffect(() => {
+        const list = containerRef.current?.closest<HTMLElement>('.thread-drawer-list');
+        if (!hydrated || !list) return;
+        void pageInToSavedScroll(list).then(() => void loadWhileSentinelVisible());
+        return () => { activePageIn = null; };
+    }, [hydrated]);
 
     const hasMore = threadHasMore.value;
     // Pagination feeds the Archive section, so a collapsed Archive has nothing
@@ -851,6 +1032,61 @@ export function setFamilyCollapsed(threadId: string, collapse: boolean) {
 
 export function toggleFamilyCollapse(threadId: string) {
     setFamilyCollapsed(threadId, !collapsedFamilies.value.has(threadId));
+}
+
+/** Page in older threads until the saved list position fits, so a reload deep
+ *  in Archive lands where the reader left it. Pagination otherwise waits for
+ *  the sentinel, which a list still parked at the top never shows.
+ *
+ *  It stops with the restore it serves: when the scroll memory lands, gives up
+ *  or the reader takes over. A landed page counts as progress even when it adds
+ *  no rows, since the cursor still moved. */
+async function pageInToSavedScroll(list: HTMLElement): Promise<void> {
+    const token = {};
+    activePageIn = token;
+    try {
+        // A child's effects run before the drawer's, so give the drawer a frame
+        // to arm its restore on a view switch.
+        await nextFrame();
+        if (activePageIn !== token || !drawerRestoreArmed) return;
+        drawerRestoreArmed = false;
+        const saved = readSavedScroll(DRAWER_SCROLL_KEY);
+        if (saved?.kind !== 'offset') return;
+        const target = saved.top;
+        while (
+            activePageIn === token &&
+            !drawerRestoreSettled &&
+            list.scrollHeight - list.clientHeight < target &&
+            threadHasMore.value &&
+            archivePaginationAllowed(collapsedSections.value)
+        ) {
+            // False also means another load owns the round trip, such as the
+            // fill loop at boot. Wait that one out rather than stopping short.
+            const inFlight = threadLoadingMore.value;
+            const landed = await loadOlderThreads();
+            if (!landed && !(inFlight && await paginationIdle())) break;
+            await nextFrame();
+        }
+    } finally {
+        if (activePageIn === token) activePageIn = null;
+    }
+}
+
+function nextFrame(): Promise<void> {
+    return new Promise(resolve => requestAnimationFrame(() => resolve()));
+}
+
+/** Frames to wait for another thread-page load to finish. */
+const PAGINATION_IDLE_MAX_FRAMES = 600;
+
+/** Resolve true once no thread-page load is in flight, or false after the
+ *  frame budget runs out. */
+async function paginationIdle(): Promise<boolean> {
+    for (let frames = 0; frames < PAGINATION_IDLE_MAX_FRAMES; frames++) {
+        if (!threadLoadingMore.value) return true;
+        await nextFrame();
+    }
+    return false;
 }
 
 // Skip pagination when Archive is collapsed. Collapsing shrinks the list and

@@ -63,6 +63,7 @@ function makeChange(): Change {
     pre_merge_sha: null,
     post_merge_sha: null,
     commits: [],
+    summary: null,
     incomplete: false,
     thread_unsettled: true,
     thread_settling: true,

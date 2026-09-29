@@ -7,10 +7,26 @@ pub struct SearchQuery {
     pub q: Option<String>,
     #[serde(default = "default_category")]
     pub category: String,
+    /// Hits per category. Search Everywhere asks each category on its own,
+    /// so it passes the All tab's cap rather than taking a single-tab page.
+    pub limit: Option<usize>,
 }
 
 fn default_category() -> String {
     "all".to_string()
+}
+
+/// A category's own page is longer than its slice of the All tab.
+const ALL_TAB_LIMIT: usize = 5;
+const CATEGORY_LIMIT: usize = 50;
+
+fn result_limit(is_all: bool, requested: Option<usize>) -> usize {
+    let default = if is_all {
+        ALL_TAB_LIMIT
+    } else {
+        CATEGORY_LIMIT
+    };
+    requested.unwrap_or(default).clamp(1, CATEGORY_LIMIT)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -29,15 +45,14 @@ pub struct SearchResponse {
     pub results: HashMap<String, Vec<SearchResultItem>>,
 }
 
-/// GET /api/v1/search?q=<query>&category=all|threads|files|apps|triggers|settings|changes
+/// GET /api/v1/search?q=<query>&category=all|threads|files|apps|triggers|settings|changes&limit=<1-50>
 pub(super) async fn search(
     State(state): State<AppState>,
     Query(query): Query<SearchQuery>,
 ) -> Result<Json<SearchResponse>, (StatusCode, String)> {
     let q = query.q.as_deref().unwrap_or("").trim().to_string();
     let category = query.category.as_str();
-    let is_all = category == "all";
-    let limit = if is_all { 5 } else { 50 };
+    let limit = result_limit(category == "all", query.limit);
 
     let mut results: HashMap<String, Vec<SearchResultItem>> = HashMap::new();
 
@@ -317,4 +332,22 @@ async fn search_changes_internal(
 /// Route for the global `/search` surface.
 pub(super) fn router() -> Router<AppState> {
     Router::new().route("/search", get(search))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_category_defaults_to_its_page_and_all_to_its_slice() {
+        assert_eq!(result_limit(true, None), ALL_TAB_LIMIT);
+        assert_eq!(result_limit(false, None), CATEGORY_LIMIT);
+    }
+
+    #[test]
+    fn a_requested_limit_is_honoured_within_bounds() {
+        assert_eq!(result_limit(false, Some(5)), 5);
+        assert_eq!(result_limit(false, Some(0)), 1);
+        assert_eq!(result_limit(true, Some(10_000)), CATEGORY_LIMIT);
+    }
 }

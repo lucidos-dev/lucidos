@@ -257,6 +257,14 @@ check_env "LUCIDOS_SYSTEM_KNOWHOW_DIR=/opt/x/runtime/current/system-knowhow"
 check_env "FASTEMBED_CACHE_DIR=/opt/x/test/fastembed"
 check_env "LUCIDOS_BOOT_WITHOUT_PROVIDER=1"
 check_env "LUCIDOS_PACKAGED=1"
+# The gateway hydrates the login-shell env only when LUCIDOS_PACKAGED=1 and
+# SHLVL is absent (ADR 0326). A unit that set SHLVL would silently disable it,
+# and one that pinned PATH would outrank the service manager's floor.
+if printf '%s\n' "$env_block" | grep -qE '^(SHLVL|PATH)='; then
+    fail "service env must not set SHLVL or PATH: $env_block"
+else
+    pass "service env leaves SHLVL and PATH to the service manager"
+fi
 # TLS is OPT-IN: the base contract must NOT carry TLS vars (packaged posture is
 # plain http; install.sh appends service_tls_env_pairs only when both flags are
 # supplied).

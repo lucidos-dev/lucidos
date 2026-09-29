@@ -369,6 +369,7 @@ describe('Pending change with file_count=0 must not show Apply/Discard', () => {
       pre_merge_sha: null,
       post_merge_sha: null,
       commits: [],
+      summary: null,
       incomplete: false,
     }] };
 
@@ -405,6 +406,7 @@ describe('Pending change with file_count=0 must not show Apply/Discard', () => {
       pre_merge_sha: null,
       post_merge_sha: null,
       commits: [],
+      summary: null,
       incomplete: false,
     }] };
 
@@ -450,6 +452,7 @@ describe('Apply* marker sources requires_restart from pending change', () => {
       pre_merge_sha: null,
       post_merge_sha: null,
       commits: [],
+      summary: null,
       incomplete: false,
     }] };
 

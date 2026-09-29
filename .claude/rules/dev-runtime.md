@@ -637,7 +637,7 @@ Two rules follow, and both are load-bearing:
 The engine's integration tests (`setup_test_db` in `crates/lucidos-engine/src/test_support.rs`) need a **real Postgres**: each test `CREATE`s a throwaway `lucidos_test_*` database, runs migrations, drops it. The connection comes from `TEST_DATABASE_URL`, falling back to a hardcoded `localhost:5432`. **Bare `cargo test -p lucidos-engine` with no `TEST_DATABASE_URL` and no PG up makes every DB-backed test panic on connect** (`.expect("admin connect")`) — hundreds of false "failures", not regressions.
 
 ```bash
-make test                       # → ./scripts/test-engine.sh  (cargo test --lib)
+make test                       # → eval, gateway and library crates, then ./scripts/test-engine.sh  (cargo test --lib)
 make test-full                  # → ./scripts/test-engine.sh --full  (whole crate)
 ./scripts/test-engine.sh -- -- migration_tests   # pass filters through to cargo test
 ./scripts/test-engine.sh --fresh                 # recreate the test DB container clean

@@ -100,14 +100,14 @@ it('draws one named group per family, with similar themes side by side', () => {
 });
 
 function chip(name: string): HTMLButtonElement {
-  const button = [...host.querySelectorAll<HTMLButtonElement>('.theme-family-chip')].find(c => c.textContent === name);
+  const button = [...host.querySelectorAll<HTMLButtonElement>('.pill-bar-btn')].find(c => c.textContent === name);
   if (!button) throw new Error(`no ${name} chip`);
   return button;
 }
 
 it('filters by family: All first and picked, then one chip per family', () => {
   showPicker();
-  expect([...host.querySelectorAll('.theme-family-chip')].map(c => c.textContent)).toEqual(['All', 'Cool', 'Warm']);
+  expect([...host.querySelectorAll('.pill-bar-btn')].map(c => c.textContent)).toEqual(['All', 'Cool', 'Warm']);
   expect(chip('All').getAttribute('aria-pressed')).toBe('true');
   act(() => { chip('Warm').click(); });
   expect(chip('Warm').getAttribute('aria-pressed')).toBe('true');
@@ -172,6 +172,29 @@ it('pages by whole columns: a page is every column that fits', () => {
   act(() => { step('Next themes').click(); });
   act(() => { step('Previous themes').click(); });
   expect(scrolls()).toEqual([600, 0]);
+});
+
+it('drops to one row when every card fits in it, and back to two when not', () => {
+  let resized: () => void = () => {};
+  vi.stubGlobal('ResizeObserver', class {
+    constructor(callback: () => void) { resized = callback; }
+    observe() {}
+    disconnect() {}
+  });
+  try {
+    showPicker();
+    const strip = sizeStrip(0);
+    const cells = () => ['Lucidos', 'Nord', 'Paper'].map(name => [card(name)!.style.gridColumn, card(name)!.style.gridRow]);
+    // 300px holds two 9rem (144px) columns, too few for three cards.
+    act(() => { resized(); });
+    expect(cells()).toEqual([['1', '2'], ['1', '3'], ['2', '2']]);
+    // 600px holds four, so all three sit on the row under the family names.
+    Object.defineProperty(strip, 'clientWidth', { configurable: true, value: 600 });
+    act(() => { resized(); });
+    expect(cells()).toEqual([['1', '2'], ['2', '2'], ['3', '2']]);
+  } finally {
+    vi.unstubAllGlobals();
+  }
 });
 
 it('never skips a column when the strip rests between page stops', () => {

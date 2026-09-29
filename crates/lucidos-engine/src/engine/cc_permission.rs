@@ -825,6 +825,27 @@ fn coding_agent_file_targets(tool_name: &str, input: &serde_json::Value) -> File
     FileTargets::Unresolved
 }
 
+/// True when the command runs in a request `cwd` outside the workspace and
+/// destroys something there. Codex states that directory. The command text
+/// alone reads a relative path as in-workspace, so neither the static verdict
+/// nor the judge can see this.
+fn destroys_from_request_cwd(
+    tool_name: &str,
+    input: &serde_json::Value,
+    workspace_path: &Path,
+) -> bool {
+    let cwd_outside = input
+        .get("cwd")
+        .and_then(|v| v.as_str())
+        .is_some_and(|cwd| path_outside_workspace(cwd, workspace_path));
+    cwd_outside
+        && matches!(
+            coding_agent_command(tool_name, input),
+            CommandPayload::Known(cmd)
+                if command_guard::destroys_when_started_outside(&unwrap_shell_command(cmd))
+        )
+}
+
 /// True when `path` provably targets somewhere OUTSIDE the workspace root. A
 /// `..` component cannot be proven contained lexically, so it reads as outside
 /// and is grant-gated. A relative path with no `..` resolves against the
@@ -1025,13 +1046,17 @@ pub fn classify_coding_agent_request(
         // left to decide on.
         CommandStatic::Unreadable => return RequestVerdict::Unclassified,
         CommandStatic::Verdict(verdict) => {
+            let destroys_from_cwd = || destroys_from_request_cwd(tool_name, input, workspace_path);
             return match verdict {
                 StaticVerdict::Settled(RiskLane::Catastrophic) => RequestVerdict::Catastrophic,
+                StaticVerdict::Settled(_) if destroys_from_cwd() => {
+                    RequestVerdict::SideEffect(SideEffectCategory::OutOfWorkspaceDestruction)
+                }
                 // `static_classify` only ever settles Safe/Catastrophic; map the
                 // rest defensively to benign.
                 StaticVerdict::Settled(_) => RequestVerdict::Benign,
                 StaticVerdict::NeedsJudge(ji) => {
-                    let judged = command_guard::fallback_classify(&ji);
+                    let judged = command_guard::fallback_classify(&ji, Some(workspace_path));
                     match judged.lane {
                         RiskLane::Catastrophic => RequestVerdict::Catastrophic,
                         // Ahead of the category arm on purpose. The fast path
@@ -1042,6 +1067,11 @@ pub fn classify_coding_agent_request(
                         RiskLane::IrreversibleDanger => RequestVerdict::SideEffect(
                             judged.category.unwrap_or(SideEffectCategory::Other),
                         ),
+                        RiskLane::Safe | RiskLane::ReversibleDanger if destroys_from_cwd() => {
+                            RequestVerdict::SideEffect(
+                                SideEffectCategory::OutOfWorkspaceDestruction,
+                            )
+                        }
                         RiskLane::Safe | RiskLane::ReversibleDanger => RequestVerdict::Benign,
                     }
                 }
@@ -1162,10 +1192,13 @@ async fn judge_escalation_lane(
 ///   it cannot see the refusal. The unattended lane and `grant_covers_command`
 ///   already deny one, and this is the third path holding that line
 ///   (ADR 0002).
+/// * **A destruction from a request `cwd` outside the workspace**, which no
+///   verdict sees. See [`destroys_from_request_cwd`].
 async fn attended_escalation_allowed(
     engine: Option<&LucidosEngine>,
     tool_name: &str,
     input: &serde_json::Value,
+    workspace_path: &Path,
     thread_id: Uuid,
 ) -> bool {
     if tool_name != CODEX_COMMAND_TOOL {
@@ -1184,6 +1217,7 @@ async fn attended_escalation_allowed(
         return false;
     }
     !command_privilege_escalation(tool_name, input)
+        && !destroys_from_request_cwd(tool_name, input, workspace_path)
 }
 
 /// Whether this command request reaches for another user's rights.
@@ -1445,7 +1479,7 @@ pub async fn prompt_coding_agent_permission(
     // Last gate before the card: classify the Codex sandbox escape. Below every
     // grant on purpose, so a command a grant covers never pays for a judge
     // call. Below the unattended branch too, which returned above.
-    if attended_escalation_allowed(judge, &tool_name, &input, thread_id).await {
+    if attended_escalation_allowed(judge, &tool_name, &input, workspace_path, thread_id).await {
         crate::log!(
             "[CCPermission] escalation auto-allowed for thread {}",
             thread_id
@@ -2340,6 +2374,70 @@ mod tests {
         }
     }
 
+    /// A relative delete or overwrite runs in the request's `cwd`. With that
+    /// outside the worktree, it destroys outside it, so it is grant-gated. The
+    /// overwrite settles Safe on the fast path, which never sees the `cwd`.
+    #[test]
+    fn a_request_cwd_outside_the_worktree_is_not_benign() {
+        for cmd in [
+            "rm -rf old",
+            "cd ~/Downloads && rm -rf old",
+            "echo x > .zshrc",
+            "/bin/zsh -lc 'echo x > .zshrc'",
+        ] {
+            let outside = serde_json::json!({ "command": cmd, "cwd": "/Users/me" });
+            assert_eq!(
+                classify_coding_agent_request("command_execution", &outside, Path::new("/ws")),
+                RequestVerdict::SideEffect(SideEffectCategory::OutOfWorkspaceDestruction),
+                "{cmd}"
+            );
+        }
+        for cmd in ["cat .zshrc", "echo x >> notes.log"] {
+            let read = serde_json::json!({ "command": cmd, "cwd": "/Users/me" });
+            assert_eq!(
+                classify_coding_agent_request("command_execution", &read, Path::new("/ws")),
+                RequestVerdict::Benign,
+                "{cmd}"
+            );
+        }
+        for cmd in ["rm -rf old", "echo x > out.txt"] {
+            let inside = serde_json::json!({ "command": cmd, "cwd": "/ws/data" });
+            assert_eq!(
+                classify_coding_agent_request("command_execution", &inside, Path::new("/ws")),
+                RequestVerdict::Benign,
+                "{cmd}"
+            );
+        }
+    }
+
+    /// Claude Code often moves into its own worktree by absolute path first.
+    /// That `cd` stays in the workspace, so the delete after it stays benign.
+    #[test]
+    fn a_cd_by_absolute_path_inside_the_worktree_stays_benign() {
+        for cmd in [
+            "cd /ws && rm -rf dist",
+            "cd /ws/crates/app && rm -rf target",
+        ] {
+            assert_eq!(
+                classify_coding_agent_request(
+                    "command_execution",
+                    &serde_json::json!({ "command": cmd }),
+                    Path::new("/ws"),
+                ),
+                RequestVerdict::Benign,
+                "{cmd}"
+            );
+        }
+        assert_eq!(
+            classify_coding_agent_request(
+                "command_execution",
+                &serde_json::json!({ "command": "cd /ws/../etc && rm -rf x" }),
+                Path::new("/ws"),
+            ),
+            RequestVerdict::SideEffect(SideEffectCategory::OutOfWorkspaceDestruction)
+        );
+    }
+
     /// A command request whose payload cannot be read is not a "not a command"
     /// request. Collapsing the two fell through to the benign default.
     #[test]
@@ -2516,7 +2614,20 @@ mod tests {
     /// case below is one the static pass settles, so the missing handle is the
     /// point rather than a shortcut.
     async fn escalation(tool_name: &str, input: serde_json::Value) -> bool {
-        attended_escalation_allowed(None, tool_name, &input, Uuid::new_v4()).await
+        attended_escalation_allowed(None, tool_name, &input, Path::new("/ws"), Uuid::new_v4()).await
+    }
+
+    /// Codex escalates when its sandbox refuses a write outside the worktree.
+    /// The fast path settles a relative overwrite Safe without the `cwd`, so
+    /// the gate reads the `cwd` itself before it skips the card.
+    #[tokio::test]
+    async fn an_overwrite_from_a_cwd_outside_the_worktree_still_cards() {
+        for cmd in ["echo x > .zshrc", "rm -rf old"] {
+            let outside = serde_json::json!({ "command": cmd, "cwd": "/Users/me" });
+            assert!(!escalation("command_execution", outside).await, "{cmd}");
+        }
+        let read = serde_json::json!({ "command": "cat .zshrc", "cwd": "/Users/me" });
+        assert!(escalation("command_execution", read).await);
     }
 
     fn zsh(script: &str) -> serde_json::Value {

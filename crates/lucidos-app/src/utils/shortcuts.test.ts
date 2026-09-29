@@ -69,12 +69,26 @@ describe('formatBinding', () => {
   it('Mac shows ⌃⇧O for the new-thread chord (Cmd+Shift+letter is OS-reserved)', () => {
     expect(formatBinding(shortcutDef('newThread').defaultBinding, true)).toBe('⌃⇧O');
   });
-  it('Mac shows ⌃⇧S for search (Cmd+Shift+letter is OS-reserved → Control)', () => {
-    expect(formatBinding(shortcutDef('searchEverywhere').defaultBinding, true)).toBe('⌃⇧S');
+  it('Mac shows ⌘K for search, the palette chord of Slack, Linear and Notion', () => {
+    expect(formatBinding(shortcutDef('searchEverywhere').defaultBinding, true)).toBe('⌘K');
   });
-  it('non-Mac shows Ctrl+Shift+O and Ctrl+Shift+S', () => {
+  it('non-Mac shows Ctrl+Shift+O and Ctrl+K', () => {
     expect(formatBinding(shortcutDef('newThread').defaultBinding, false)).toBe('Ctrl+Shift+O');
-    expect(formatBinding(shortcutDef('searchEverywhere').defaultBinding, false)).toBe('Ctrl+Shift+S');
+    expect(formatBinding(shortcutDef('searchEverywhere').defaultBinding, false)).toBe('Ctrl+K');
+  });
+  it('shows the familiar defaults for the app-wide shortcuts', () => {
+    expect(formatBinding(shortcutDef('openSettings').defaultBinding, true)).toBe('⌘,');
+    expect(formatBinding(shortcutDef('showShortcuts').defaultBinding, true)).toBe('⌘/');
+    expect(formatBinding(shortcutDef('searchFiles').defaultBinding, true)).toBe('⌘P');
+    expect(formatBinding(shortcutDef('stopThread').defaultBinding, true)).toBe('⌘.');
+    expect(formatBinding(shortcutDef('copyLastResponse').defaultBinding, true)).toBe('⌃⇧C');
+    expect(formatBinding(shortcutDef('focusNewestToast').defaultBinding, true)).toBe('⌃⇧N');
+    expect(formatBinding(shortcutDef('openNotifications').defaultBinding, true)).toBe('⌃⇧I');
+  });
+  it('renders Escape as Esc, and a bare F-key as itself', () => {
+    expect(formatBinding(shortcutDef('focusComposer').defaultBinding, true)).toBe('⇧Esc');
+    expect(formatBinding(shortcutDef('focusComposer').defaultBinding, false)).toBe('Shift+Esc');
+    expect(formatBinding(shortcutDef('renameThread').defaultBinding, false)).toBe('F2');
   });
   it('Mac shows ⌃⇧3 for a mod+shift+digit pane toggle (Cmd+Shift+digit hits the screenshot chords)', () => {
     expect(formatBinding(shortcutDef('toggleContentPane').defaultBinding, true)).toBe('⌃⇧3');

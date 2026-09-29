@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import type { ComponentChildren, VNode } from 'preact';
-import { changeEventRowBody, changeSubject } from '../chat-exchange-parts';
+import { changeEventRowBody } from '../chat-exchange-parts';
+import { CommitList } from '../../shared/CommitList';
 import { EventRowFoldView } from '../EventRow';
 
 interface AnyVNode extends VNode<{ children?: ComponentChildren; class?: string; [k: string]: unknown }> {}
@@ -96,11 +97,32 @@ describe('change event row', () => {
     expect(text(fold.props.body as ComponentChildren)).toContain('merge conflict in a.ts');
   });
 
-  // The state badge already says "Applied", so the title must not say it too.
-  it('titles the change by its description, leaving the state to the badge', () => {
-    expect(changeSubject('Fix the bug\n\nLonger body')).toBe('Fix the bug');
-    expect(changeSubject(undefined)).toBe('Change');
-    expect(changeSubject('  \n')).toBe('Change');
+  /** The headline names the change; the commits it is made of sit one fold
+   *  away, closed, oldest first. */
+  it('folds a change of several commits into a closed commit list', () => {
+    const row = changeEventRowBody({ ...base, commits: ['feat: first', 'fix: second'] });
+    const fold = byType(row, EventRowFoldView)!;
+    expect(fold.props.label).toBe('2 commits');
+    expect(fold.props.open).toBeFalsy();
+    const list = byType(fold.props.body as ComponentChildren, CommitList)!;
+    expect(list.props.commits).toEqual(['feat: first', 'fix: second']);
+  });
+
+  it('draws no fold for one commit, which the headline already is', () => {
+    const row = changeEventRowBody({ ...base, commits: ['feat: only'] });
+    expect(byType(row, EventRowFoldView)).toBeNull();
+  });
+
+  it('gives the fold to a failed apply\'s error over the commit list', () => {
+    const row = changeEventRowBody({
+      ...base,
+      type: 'ChangeApplyFailed',
+      stateLabel: 'Failed',
+      tone: 'bad',
+      commits: ['a', 'b'],
+      error: 'merge conflict',
+    });
+    expect(byType(row, EventRowFoldView)!.props.label).toBe('Error');
   });
 
   it('states no fact it does not have', () => {

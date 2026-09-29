@@ -44,6 +44,18 @@ use sha2::Sha256;
 /// namespace (`/~/`), so no workspace route can collide with it.
 pub const SEGMENT: &str = "~cap";
 
+/// The subject the host's artifact preview frame is minted for (ADR 0322).
+///
+/// A previewed HTML artifact runs at an opaque origin, like an app frame, so its
+/// own images and stylesheets need a pass too. Its content is untrusted and can
+/// read its own `<base href>`, so the pass it could leak reaches the artifacts
+/// tree only. [`admits`] gives this subject that one tree.
+///
+/// URL-safe, so [`mint`] and [`verify`] take it like an app id. The `..` in it
+/// is what `apps::is_valid_id` refuses, so no real app can be minted a pass
+/// that [`admits`] would read as this one.
+pub const ARTIFACT_PREVIEW_SUBJECT: &str = "artifact..preview";
+
 /// How long a freshly minted capability lasts.
 ///
 /// An hour bounds a leaked URL to one working session. It costs nothing to the
@@ -157,7 +169,13 @@ pub fn split(path: &str) -> Option<(&str, &str)> {
 /// Everything else is refused, `/api/v1` first among them. Widening `/api/v1`
 /// would put the whole engine API behind a pass the frame hands to any document
 /// it embeds.
+///
+/// The [`ARTIFACT_PREVIEW_SUBJECT`] pass is narrower still: `/data/artifacts/…`
+/// and nothing else.
 pub fn admits(rest: &str, app_id: &str) -> bool {
+    if app_id == ARTIFACT_PREVIEW_SUBJECT {
+        return rest.starts_with("/data/artifacts/");
+    }
     if rest.starts_with("/data/") {
         return true;
     }
@@ -416,6 +434,43 @@ mod tests {
         ] {
             assert!(!admits(rest, "site-publisher"), "{rest}");
         }
+    }
+
+    #[test]
+    fn the_preview_pass_admits_the_artifacts_tree_and_nothing_else() {
+        assert!(is_url_safe_segment(ARTIFACT_PREVIEW_SUBJECT));
+        for rest in [
+            "/data/artifacts/x.png",
+            "/data/artifacts/reports/img/chart.png",
+            "/data/artifacts/web/site/style.css",
+        ] {
+            assert!(admits(rest, ARTIFACT_PREVIEW_SUBJECT), "{rest}");
+        }
+        for rest in [
+            // The rest of the data tree an app pass reaches.
+            "/data/config/apis.json",
+            "/data/scripts/handshake.js",
+            "/data/auth-modules/signer.wasm",
+            "/data/knowhow/notes.md",
+            "/data/apps/habit-tracker/index.html",
+            "/data/artifacts",
+            // No app bundle, not even one named like the subject.
+            "/app/artifact..preview/index.html",
+            "/api/v1/threads/list",
+            "/",
+        ] {
+            assert!(!admits(rest, ARTIFACT_PREVIEW_SUBJECT), "{rest}");
+        }
+    }
+
+    #[test]
+    fn the_preview_pass_round_trips_like_an_app_pass() {
+        let token = mint(&key(), "dev", ARTIFACT_PREVIEW_SUBJECT, NOW, TTL_SECS)
+            .expect("the preview subject mints");
+        assert_eq!(
+            verify(&key(), &token, "dev", NOW).as_deref(),
+            Some(ARTIFACT_PREVIEW_SUBJECT)
+        );
     }
 
     #[test]

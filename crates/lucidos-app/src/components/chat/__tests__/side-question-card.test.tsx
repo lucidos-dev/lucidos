@@ -36,7 +36,7 @@ function show(items: SideQuestion[]) {
   });
 }
 
-const asked = { threadId: 't1', afterSeq: 0, dismissed: false };
+const asked = { threadId: 't1', imageHashes: [], afterSeq: 0, dismissed: false };
 
 beforeEach(() => {
   host = document.createElement('div');
@@ -81,32 +81,36 @@ it('shows a failure as an alert', () => {
   expect(alert.textContent).toBe('Side questions are not available in Codex threads.');
 });
 
-it('collapses one card from a stack with a labelled chevron', () => {
+it('folds one card of a stack from its head, keeping the card in place', () => {
   show([
     { ...asked, id: 'a', question: 'first', status: 'answered', answer: '1' },
     { ...asked, id: 'b', question: 'second', status: 'answered', answer: '2' },
   ]);
-  const buttons = host.querySelectorAll<HTMLButtonElement>('button[aria-label="Collapse side question"]');
-  expect(buttons).toHaveLength(2);
-  expect(buttons[0].getAttribute('data-tooltip')).toBe('Collapse side question');
-  act(() => { buttons[0].click(); });
-  const questions = [...host.querySelectorAll('.side-question-question')].map((n) => n.textContent);
-  expect(questions).toEqual(['second']);
-  expect(host.querySelector('.side-question-dismissed-text')!.textContent).toBe('first');
+  const heads = host.querySelectorAll<HTMLButtonElement>('button.side-question-head');
+  expect(heads).toHaveLength(2);
+  expect(heads[0].getAttribute('aria-expanded')).toBe('true');
+  expect(heads[0].getAttribute('aria-label')).toBe('Side question: first');
+  expect(heads[0].getAttribute('data-tooltip')).toBe('Collapse');
+  act(() => { heads[0].click(); });
+  const [folded, open] = host.querySelectorAll('[data-role="side-question-card"]');
+  expect(folded.hasAttribute('data-collapsed')).toBe(true);
+  expect(folded.querySelector('.side-question-summary')!.textContent).toBe('first');
+  expect(folded.querySelector('.side-question-question')).toBeNull();
+  expect(open.querySelector('.side-question-question')!.textContent).toBe('second');
 });
 
-it('folds a collapsed card to one line that expands it again', () => {
+it('unfolds a folded card from its head, and rolls its body through Disclosure', () => {
   show([{ ...asked, id: 'a', question: 'what is X?', status: 'answered', answer: 'X', dismissed: true }]);
-  expect(host.querySelector('[data-role="side-question-card"]')).toBeNull();
-  const row = host.querySelector<HTMLButtonElement>('[data-role="side-question-dismissed"]')!;
-  expect(row.getAttribute('data-side-question-id')).toBe('a');
-  expect(row.getAttribute('aria-label')).toBe('Expand side question: what is X?');
-  expect(row.querySelector('.side-question-dismissed-text')!.textContent).toBe('what is X?');
-  // Down on the folded row, up on the open card: the chevron points the way it moves.
-  expect(row.querySelector('.side-question-dismissed-chevron polyline')!.getAttribute('points')).toBe('6 9 12 15 18 9');
-  act(() => { row.click(); });
-  expect(host.querySelector('.side-question-dismiss polyline')!.getAttribute('points')).toBe('6 15 12 9 18 15');
-  expect(host.querySelector('[data-role="side-question-card"] .markdown-content')!.textContent!.trim()).toBe('X');
+  const card = host.querySelector('[data-role="side-question-card"]')!;
+  const head = card.querySelector<HTMLButtonElement>('button.side-question-head')!;
+  expect(card.getAttribute('data-side-question-id')).toBe('a');
+  expect(head.getAttribute('aria-expanded')).toBe('false');
+  expect(head.getAttribute('data-tooltip')).toBe('Expand');
+  expect(card.querySelector('.side-question-summary')!.textContent).toBe('what is X?');
+  act(() => { head.click(); });
+  expect(head.getAttribute('aria-expanded')).toBe('true');
+  expect(card.hasAttribute('data-collapsed')).toBe(false);
+  expect(card.querySelector('.disclosure .side-question-body .markdown-content')!.textContent!.trim()).toBe('X');
 });
 
 describe('placeSideQuestions', () => {
@@ -114,7 +118,7 @@ describe('placeSideQuestions', () => {
     ({ userEvent: { _eventId: id } as StoredEvent, userSeq, steps: [] });
   const turn = (id: string): VNode => <div key={`id:${id}`} />;
   const card = (id: string, afterSeq: number | null): SideQuestion =>
-    ({ id, threadId: 't1', question: id, afterSeq, dismissed: false, status: 'pending' });
+    ({ id, threadId: 't1', question: id, imageHashes: [], afterSeq, dismissed: false, status: 'pending' });
   const order = (nodes: VNode[]) => nodes.map((n) => String(n.key));
   const group = (above: string) => `side-questions:after:${above}`;
 

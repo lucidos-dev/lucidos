@@ -24,6 +24,7 @@ import { FrontendPreviewSection } from './FrontendPreviewSection';
 import { loadFrontendPreview } from '../../store/actions/frontend-preview';
 import { SIDE_QUESTION_COMMAND, isSideQuestionFilter } from '../../store/sideQuestions';
 import { failedIfFresh, loadedOr, setLoadingIfFresh, type Loadable } from '../../store/types';
+import { displayModelName } from '../../store/thread-events/exchange';
 
 // Signal for PromptInput to request opening the menu with a filter
 // Set to a string (the filter text) to open, consumed by the component
@@ -172,6 +173,9 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
     vocabulary: tierVocabulary,
     model: tierModel,
     effort: selectedReasoningEffort,
+    // Claude Code's picker is what Claude Code lists now, so a thread can be
+    // pinned to a model it has dropped. Name it rather than show the bare id.
+    labelFor: displayModelName,
     onChange: applySelectionOverride,
   });
 
@@ -405,7 +409,8 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
     function handleSlash(e: KeyboardEvent) {
       if (open.value) return;
       if (isTextInput(e.target)) return;
-      if (e.key === '/') {
+      // A modified slash belongs to the shortcut registry (⌘/ shows shortcuts).
+      if (e.key === '/' && !e.metaKey && !e.ctrlKey && !e.altKey) {
         e.preventDefault();
         openMenuRef.current('', true);
       }
@@ -559,7 +564,7 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
   function currentModelLabel(): string | null {
     if (!effectiveModel) return null;
     const opt = optionsOf('set_model').find(o => o.value === effectiveModel);
-    return opt?.label ?? effectiveModel;
+    return opt?.label ?? displayModelName(effectiveModel);
   }
 
   /** What a control row shows after its label. A model selection shows the

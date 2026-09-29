@@ -479,6 +479,16 @@ pub(crate) async fn latest_originating_event_id(
         .flatten()
 }
 
+/// Keeps a session-id lookup (bound to `thread_id = $1`) to events after the
+/// thread's newest `SessionEnded { StaleResume }`. That event proves every
+/// earlier id unresumable, and the fresh retry records its own id after it.
+/// Without the filter, a retry that auto-detects its sid picks the dead one
+/// again and fails the same way.
+const AFTER_LAST_STALE_RESUME_SQL: &str = "sequence > COALESCE(( \
+     SELECT MAX(sequence) FROM events \
+     WHERE thread_id = $1 AND event_type = 'SessionEnded' \
+       AND payload->>'reason' = 'stale_resume'), 0)";
+
 /// Return the most-recent CC session id recorded for a thread, so the spawn /
 /// recovery paths can `--resume` the existing conversation instead of starting
 /// fresh.
@@ -491,18 +501,22 @@ pub(crate) async fn latest_originating_event_id(
 /// `IS NOT NULL` filter also stops a recovery-emitted idle that carries no id
 /// (e.g. `engine_restart_interrupt` from a path that couldn't resolve it) from
 /// shadowing an earlier known id.
+///
+/// An id recorded before the newest `SessionEnded { StaleResume }` is dead (see
+/// [`AFTER_LAST_STALE_RESUME_SQL`]).
 pub(crate) async fn lookup_latest_cc_session_id(
     pool: &sqlx::PgPool,
     thread_id: uuid::Uuid,
 ) -> Option<String> {
-    sqlx::query_scalar::<_, Option<String>>(
+    sqlx::query_scalar::<_, Option<String>>(&format!(
         "SELECT payload->>'cc_session_id' FROM events \
          WHERE thread_id = $1 \
            AND event_type IN ('CodingAgentIdled', 'CodingAgentSettingsChanged') \
            AND payload->>'cc_session_id' IS NOT NULL \
            AND payload->>'cc_session_id' <> '' \
-         ORDER BY sequence DESC LIMIT 1",
-    )
+           AND {AFTER_LAST_STALE_RESUME_SQL} \
+         ORDER BY sequence DESC LIMIT 1"
+    ))
     .bind(thread_id)
     .fetch_optional(pool)
     .await
@@ -592,8 +606,41 @@ pub(crate) fn default_claude_config_dir() -> Option<String> {
     })
 }
 
-/// Return the `CLAUDE_CONFIG_DIR` (provider/account) the thread's **first** CC
-/// session was created under — the thread's permanent account pin. Every spawn
+/// The `CLAUDE_CONFIG_DIR` a spawn with these user variables would run under,
+/// before any pin. The user-managed variable wins, then what Claude Code
+/// inherits from the engine's own env. `None` means unset. An empty user value
+/// still overrides the inherited one, and Claude Code reads empty as unset.
+pub(crate) fn live_claude_config_dir(user_env_vars: &[(String, String)]) -> Option<String> {
+    match user_env_vars.iter().find(|(k, _)| k == "CLAUDE_CONFIG_DIR") {
+        Some((_, v)) => Some(v.clone()).filter(|v| !v.is_empty()),
+        None => crate::core::inherited_env_var("CLAUDE_CONFIG_DIR"),
+    }
+}
+
+/// A thread's account pin as its first session recorded it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RecordedAccountPin {
+    /// Where the transcripts live. Session ids are scoped by this path.
+    pub dir: String,
+    /// Whether `CLAUDE_CONFIG_DIR` was set. `None` on rows from before it was
+    /// recorded.
+    pub explicit: Option<bool>,
+}
+
+impl RecordedAccountPin {
+    /// The pin to replay, given the variables this spawn injects.
+    pub(crate) fn resolve(&self, user_env_vars: &[(String, String)]) -> crate::runtime::AccountPin {
+        crate::runtime::AccountPin::from_recorded(
+            self.dir.clone(),
+            self.explicit,
+            live_claude_config_dir(user_env_vars).as_deref(),
+            default_claude_config_dir().as_deref(),
+        )
+    }
+}
+
+/// Return the account pin the thread's **first** CC session was created
+/// under: its `CLAUDE_CONFIG_DIR` and whether it was set at all. Every spawn
 /// after turn 1 runs under this dir (see `run_session/run.rs`), so a thread can
 /// never switch provider mid-life even if the global `CLAUDE_CONFIG_DIR` toggle
 /// changes between turns. This closes the strand-on-the-wrong-account bug: a
@@ -613,9 +660,10 @@ pub(crate) fn default_claude_config_dir() -> Option<String> {
 pub(crate) async fn lookup_pinned_cc_config_dir(
     pool: &sqlx::PgPool,
     thread_id: uuid::Uuid,
-) -> Result<Option<String>, sqlx::Error> {
-    let pinned = sqlx::query_scalar::<_, Option<String>>(
-        "SELECT payload->>'claude_config_dir' FROM events \
+) -> Result<Option<RecordedAccountPin>, sqlx::Error> {
+    let pinned = sqlx::query_as::<_, (String, Option<bool>)>(
+        "SELECT payload->>'claude_config_dir', \
+                (payload->>'claude_config_dir_explicit')::boolean FROM events \
          WHERE thread_id = $1 \
            AND event_type IN ('CodingAgentIdled', 'CodingAgentSettingsChanged') \
            AND payload->>'claude_config_dir' IS NOT NULL \
@@ -625,7 +673,7 @@ pub(crate) async fn lookup_pinned_cc_config_dir(
     .bind(thread_id)
     .fetch_optional(pool)
     .await?;
-    Ok(pinned.flatten().filter(|s| !s.is_empty()))
+    Ok(pinned.map(|(dir, explicit)| RecordedAccountPin { dir, explicit }))
 }
 
 /// The newest `cc_session_id` recorded UNDER `config_dir` — the resume target
@@ -639,15 +687,16 @@ pub(crate) async fn lookup_latest_cc_session_id_for_config_dir(
     thread_id: uuid::Uuid,
     config_dir: &str,
 ) -> Option<String> {
-    sqlx::query_scalar::<_, Option<String>>(
+    sqlx::query_scalar::<_, Option<String>>(&format!(
         "SELECT payload->>'cc_session_id' FROM events \
          WHERE thread_id = $1 \
            AND event_type = 'CodingAgentSettingsChanged' \
            AND payload->>'claude_config_dir' = $2 \
            AND payload->>'cc_session_id' IS NOT NULL \
            AND payload->>'cc_session_id' <> '' \
-         ORDER BY sequence DESC LIMIT 1",
-    )
+           AND {AFTER_LAST_STALE_RESUME_SQL} \
+         ORDER BY sequence DESC LIMIT 1"
+    ))
     .bind(thread_id)
     .bind(config_dir)
     .fetch_optional(pool)

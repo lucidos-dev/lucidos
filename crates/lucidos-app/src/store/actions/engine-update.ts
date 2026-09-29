@@ -648,7 +648,6 @@ export function handleFrontendUpdateStranded(payload: FrontendUpdateStrandedPayl
   const message = strandedMessage(payload);
   showToast(message, 'warning', {
     key: FRONTEND_UPDATE_STRANDED_TOAST_KEY,
-    noAutofocus: true,
     dismissable: false,
     action: {
       label: 'OK',

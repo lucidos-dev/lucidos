@@ -123,6 +123,11 @@ fragile bandaid. Special cases layered on shared infrastructure are a sign the
 fix isn't deep enough — prefer generalizing the underlying mechanism over
 adding special cases.
 
+**Motion.** Flag UI in the diff that expands or collapses with no animation: a
+bare conditional render, or one element swapped for another (a card replaced
+by a row). Every expand and collapse rolls through `<Disclosure>`, per
+`.claude/rules/frontend.md` § Every Expand and Collapse Rolls.
+
 **Prose.** Flag writing in the diff that breaks `.claude/rules/prose.md` in a way
 no script can see. `scripts/check-prose.sh` already covers the four measurable
 limits, so do **not** re-report a long sentence or an over-long comment block.

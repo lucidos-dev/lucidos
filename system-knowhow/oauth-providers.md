@@ -151,6 +151,9 @@ connect_oauth_account(
   base_url="<the narrow API's own base URL>")
 ```
 
+`configure_email` reads a connection's issuer from its stored `token_url`. So an
+alias on Google's or Microsoft's endpoints can back an email account.
+
 Match a derived name to its base by asking what the connection is for, or by
 asking the user outright. The Connect button on **Settings → Accounts** does the
 same thing: type a name the registry does not know and it asks which known

@@ -887,12 +887,6 @@ export interface ToastItem {
    *  the user can't dismiss the toast while the dim restart overlay is still
    *  blocking the UI behind it. Defaults to true (close button shown). */
   dismissable?: boolean;
-  /** true = do NOT auto-focus this toast's button when it appears. Set for
-   *  UNSOLICITED toasts (notification toasts) that pop without a user action —
-   *  stealing keyboard focus mid-typing (and pre-arming a reflexive Enter on
-   *  "OK") would be hostile. The buttons stay Tab-reachable. Solicited action
-   *  toasts (e.g. Apply-All) leave it unset so Enter acts immediately. */
-  noAutofocus?: boolean;
   /** Desktop pane this toast is centered over, FROZEN to whichever pane was
    *  focused when the toast first appeared (drawer counts as 'thread'). It never
    *  changes afterwards — a later focus switch must not make the toast jump

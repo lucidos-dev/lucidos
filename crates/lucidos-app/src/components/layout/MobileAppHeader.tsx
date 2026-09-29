@@ -4,6 +4,7 @@ import { SearchIcon } from '../shared/icons';
 import { MobileRefreshIndicator } from './RefreshIndicator';
 import { PinThreadButton } from '../shared/PinThreadButton';
 import { ThreadOverflowMenu } from '../shared/ThreadOverflowMenu';
+import { revealThreadInList } from '../drawer/ThreadDrawer';
 import { ThreadBackButton, ThreadForwardButton } from '../shared/ThreadNav';
 import { ThreadToggleButton } from '../shared/ThreadToggleButton';
 import { HamburgerButton, ContentBackButton, ContentForwardButton } from './ContentNav';
@@ -247,7 +248,8 @@ export function MobileThreadTitleBar() {
         {eventThread.meta.state !== 'composing' && (
           <PinThreadButton threadId={threadId} saved={eventThread.meta.saved} />
         )}
-        <ThreadOverflowMenu threadId={threadId} title={threadTitle} />
+        <ThreadOverflowMenu threadId={threadId} title={threadTitle}
+            onShowInThreadList={eventThread.meta.state === 'composing' ? undefined : () => revealThreadInList(threadId)} />
       </span>
     </div>
   );

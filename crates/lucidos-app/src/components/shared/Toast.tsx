@@ -4,15 +4,13 @@ import { toasts, dismissToast, focusedPane, scaledDurationMs, splitRatio, toastP
 import type { ToastAction, ToastItem } from '../../store/types';
 import { CloseIcon, ToneIcon } from './icons';
 import { linkifyText } from './linkifyText';
-import { toastAutofocusTarget, toastHasClose, toastTabTarget } from './toastFocus';
+import { toastHasClose, toastTabTarget } from './toastFocus';
 import { toastTap } from './toastTap';
 import { computeToastShifts } from './toastReflow';
 import { toastColumns, toastLayout } from './toastColumns';
 import { toastStackUrgency } from './toastUrgency';
 import { focusPaneMainControl } from '../layout/paneFocus';
-import { hasHoverPointer } from '../../utils/platform';
 import { isReducedMotion } from '../../utils/motion';
-import { isTextInput } from '../../utils/dom';
 import { viewportIsMobile } from '../../utils/viewport';
 import { progressFillWidth } from './progressBar';
 
@@ -37,38 +35,6 @@ export const INLINE_MESSAGE_MAX_CHARS = 60;
 const paneLayout = computed(() =>
   toastLayout(viewportIsMobile.value, splitRatio.value, toastPlacement.value),
 );
-
-// Toast ids whose default button has already been auto-focused, so a re-render
-// (any toast added/removed/updated) never re-steals focus from where the user
-// has since moved it. Pruned to the live toasts on each render so it can't grow
-// unbounded over a long session.
-const autofocusedToastIds = new Set<number>();
-
-/** Ref callback: focus an action toast's default button the first time it
- *  mounts so Enter acts on it immediately. The ref identity churns per render:
- *  the `Set` guard makes the focus fire exactly once per toast. Skips when a
- *  modal/overlay is open (it owns focus while up) — the button stays Tab-able.
- *
- *  It also stands down while focus sits in a TEXT FIELD. A keystroke there
- *  carries the user's own words, and Enter means "send what I typed". A
- *  poll-driven toast can land at any moment, and the autofocus then re-aims that
- *  Enter at a button the user never looked at. The reported case left a prompt
- *  unsent and restarted the engine instead. The `Set` records it all the same:
- *  the decision belongs to the moment the toast appeared, and re-deciding on a
- *  later render would only move the steal. The button stays reachable by Tab.
- *
- *  Touch devices are skipped entirely (`hasHoverPointer`): there's no keyboard
- *  to press Enter with, so the autofocus buys nothing and only leaves a stray
- *  focus ring on the button (iOS WebKit paints `:focus-visible` for programmatic
- *  focus, which the `hover: hover`-gated toast ring rule can't suppress). Skipped
- *  before the `Set` is marked so the device never records a no-op autofocus. */
-function autofocusToastButton(id: number, el: HTMLButtonElement | null): void {
-  if (!el || autofocusedToastIds.has(id) || !hasHoverPointer()) return;
-  autofocusedToastIds.add(id);
-  if (document.documentElement.hasAttribute('data-overlay-open')) return;
-  if (isTextInput(document.activeElement)) return;
-  el.focus({ preventScroll: true });
-}
 
 /** Keyboard handling for whichever toast currently holds focus (the listener
  *  lives on the container; keydowns bubble up from the focused button):
@@ -129,6 +95,29 @@ function handleToastKeyDown(e: KeyboardEvent): void {
     focusPaneMainControl(focusedPane.value);
   } else {
     focusables[target].focus({ preventScroll: true });
+  }
+}
+
+/** Move keyboard focus to the first control of the newest toast that has one,
+ *  so its Tab trap and Escape take over. Toasts never take focus themselves, so
+ *  this shortcut is the keyboard's way in. A timed passive toast has nothing to
+ *  act on and is skipped. A no-op when no toast offers a control, and while a
+ *  standing stack sits under an open overlay (the rule keyed on
+ *  `data-toast-urgency` in components.css): focus must not leave the overlay
+ *  for something drawn beneath it. */
+export function focusNewestToast(): void {
+  const root = document.documentElement;
+  const underOverlay = root.hasAttribute('data-overlay-open') && !root.hasAttribute('data-ui-blocked')
+    && toastStackUrgency(toasts.value) === 'standing';
+  if (underOverlay) return;
+  for (const t of toasts.value) {
+    const control = document.querySelector<HTMLElement>(
+      `.toast[data-toast-id="${t.id}"] :is(a[href], button:not([disabled]))`,
+    );
+    if (control) {
+      control.focus({ preventScroll: true });
+      return;
+    }
   }
 }
 
@@ -202,12 +191,6 @@ export function Toast() {
 export function ToastList({ containerRef }: { containerRef?: { current: HTMLDivElement | null } } = {}) {
   const items = toasts.value;
 
-  // Keep the auto-focus memory bounded to the toasts currently on screen.
-  if (autofocusedToastIds.size > 0) {
-    const live = new Set(items.map((t) => t.id));
-    for (const id of autofocusedToastIds) if (!live.has(id)) autofocusedToastIds.delete(id);
-  }
-
   if (items.length === 0) return null;
 
   // Scale the CSS `toast-in` entry animation by the SAME multiplier the JS
@@ -260,7 +243,6 @@ export function ToastList({ containerRef }: { containerRef?: { current: HTMLDivE
  *  message alone, in the heading. See the `.toast-heading` and `.toast-text`
  *  rules in components.css. */
 function renderToast(t: ToastItem, entryDurationMs: number) {
-  const autoTarget = toastAutofocusTarget(t);
   // A short, single-line, untitled toast lays out on one line, with any action
   // beside the words (`.toast-inline`). A long headline takes the block layout
   // instead: in a row it would be squeezed into a narrow column, and its scroll
@@ -274,7 +256,6 @@ function renderToast(t: ToastItem, entryDurationMs: number) {
   const tap = toastTap(t);
   const tapAction = tap === 'click' ? t.onClick
     : tap === 'action' ? t.action?.onClick
-    : tap === 'dismiss' ? () => dismissToast(t.key ?? t.id)
     : undefined;
   // The card takes a tap anywhere, padding and icon included. A tap on a button
   // or a linkified URL stands down, since each is its own destination. So does
@@ -335,7 +316,6 @@ function renderToast(t: ToastItem, entryDurationMs: number) {
       {keyLabel && (
         <button
           class="toast-tap-control visually-hidden"
-          ref={autoTarget === 'primary' ? (el) => autofocusToastButton(t.id, el) : undefined}
           onClick={tapAction}
         >{keyLabel}</button>
       )}
@@ -344,14 +324,12 @@ function renderToast(t: ToastItem, entryDurationMs: number) {
           {t.secondaryAction && (
             <button
               class={actionClass(t.secondaryAction, 'action-btn-secondary')}
-              ref={autoTarget === 'secondary' ? (el) => autofocusToastButton(t.id, el) : undefined}
               onClick={t.secondaryAction.onClick}
             >{t.secondaryAction.label}</button>
           )}
           {t.action && (
             <button
               class={actionClass(t.action)}
-              ref={autoTarget === 'primary' ? (el) => autofocusToastButton(t.id, el) : undefined}
               onClick={t.action.onClick}
             >{t.action.label}</button>
           )}
@@ -360,7 +338,6 @@ function renderToast(t: ToastItem, entryDurationMs: number) {
       {toastHasClose(t) && (
         <button
           class="icon-btn toast-close"
-          ref={autoTarget === 'close' ? (el) => autofocusToastButton(t.id, el) : undefined}
           onClick={() => dismissToast(t.key ?? t.id)}
           aria-label="Dismiss"
           data-tooltip="Dismiss"

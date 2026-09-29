@@ -9,30 +9,35 @@ Full reference. The `DATABASE_URL` password-in-argv rule also lives in the root
 `CLAUDE.md` (it is a safety rule, so it must be resident even when this skill
 is not loaded) — the two must stay in sync.
 
-**Where a packaged macOS launch gets these from.** A GUI launch inherits
-launchd's environment, not the user's: `~/.zprofile` and `~/.zshrc` never ran, so
-anything exported there is absent and `PATH` is the bare
-`/usr/bin:/bin:/usr/sbin:/sbin`. So the packaged **service** role
-(`Lucidos --service`, the launchd job at the root of the gateway → engine →
-coding-agent chain) hydrates a login shell first, in
-`crates/lucidos-app/src/shell_env.rs`. It runs `$SHELL -ilc` (falling back to
-`/bin/zsh`) with a hard 5s bound, and applies an **allowlist**, not the shell's
-whole environment: `PATH`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
-`LUCIDOS_OPENROUTER_API_KEY`, `LUCIDOS_XAI_API_KEY`, `LUCIDOS_LOCAL_BASE_URL`,
-`LUCIDOS_LOCAL_API_KEY`,
-`VERTEX_PROJECT_ID`, `VERTEX_REGION`, `GOOGLE_APPLICATION_CREDENTIALS`,
-`CLOUDSDK_CONFIG`, `CODEX_HOME`, `CLAUDE_CONFIG_DIR`. Three properties matter for
-anything you reason about below: a variable **already set in the process always
-wins** (`PATH` excepted, which is merged shell-first over the inherited one,
-since launchd always sets one); a run started **from a terminal** is detected by
-`SHLVL` and skipped entirely, so dev behaviour is unchanged; and everything
-**not** on that list (`LUCIDOS_MODEL`, `LUCIDOS_BIND_*`, `LUCIDOS_TLS_*`,
-`DATABASE_URL`, the proxy variables, …) is deliberately excluded, so a shell
-profile can never repoint a packaged install's model, topology or storage. Add a
-variable to that allowlist only when its absence makes a provider or a tool
-unreachable. The headless tarball install does not need any of this: `install.sh`
-runs from a terminal and bakes the provider variables it was given straight into
-the plist/unit.
+**Where a shipped install gets these from.** A service that launchd or systemd
+starts inherits the service manager's environment, not the user's.
+`~/.zprofile` and `~/.zshrc` never ran, so anything exported there is absent and
+`PATH` is a bare system one. So the **gateway** hydrates a login shell first
+thing in `boot()`, in `crates/lucidos-gateway/src/shell_env.rs` (ADR 0326). It
+is the root of the gateway → engine → coding-agent chain in both the `.app` and
+the headless install.
+
+- **When:** only with `LUCIDOS_PACKAGED=1` set and `SHLVL` absent. Both shipped
+  installs set the first. A shell sets the second, so a terminal run is skipped,
+  and the dev gateway never sets `LUCIDOS_PACKAGED`.
+- **How:** `$SHELL -ilc` with a hard 5s bound. The fallback shell is `/bin/zsh`
+  on macOS and `/bin/sh` on Linux.
+- **What:** an **allowlist**, not the shell's whole environment: `PATH`,
+  `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `LUCIDOS_OPENROUTER_API_KEY`,
+  `LUCIDOS_XAI_API_KEY`, `LUCIDOS_LOCAL_BASE_URL`, `LUCIDOS_LOCAL_API_KEY`,
+  `VERTEX_PROJECT_ID`, `VERTEX_REGION`, `GOOGLE_APPLICATION_CREDENTIALS`,
+  `CLOUDSDK_CONFIG`, `CODEX_HOME`, `CLAUDE_CONFIG_DIR`.
+- **Never override:** a variable **already set in the process always wins**. So
+  the provider variables `install.sh` bakes into the plist or unit outrank the
+  profile. `PATH` is the exception: it is merged shell-first over the inherited
+  one, since the service manager always sets one.
+- **Excluded on purpose:** everything off the list (`LUCIDOS_MODEL`,
+  `LUCIDOS_BIND_*`, `LUCIDOS_TLS_*`, `DATABASE_URL`, the proxy variables, …). A
+  shell profile can never repoint a shipped install's model, topology or
+  storage.
+
+Add a variable to that allowlist only when its absence makes a provider or a
+tool unreachable.
 
 - `LUCIDOS_WORKSPACE` — workspace dir (default `./workspace`)
 - `DATABASE_URL` — Postgres connection string for the engine. **Never hardcode the URL or password into a `psql`/Python invocation** — the engine sets `PGUSER`/`PGPASSWORD`/`PGHOST`/`PGPORT`/`PGDATABASE` in every spawned subprocess (CC sessions, bash + python tools, scheduled scripts), so just run `psql -c '…'` bare. Putting the URL in argv leaks the password into the persisted `Bash` tool-call payload that the steps UI renders.
@@ -79,4 +84,23 @@ the plist/unit.
 - `LUCIDOS_GATEWAY_ENGINE_LOOPBACK` (gateway only). Whether the engines this gateway spawns bind loopback. Default yes, packaged and dev alike, since ADR 0096: the gateway authenticates every network caller (ADR 0094), so a network-bound engine port used to be a way straight past pairing. Nothing in the tree sets it now, and `0` / `false` / `no` / `off` restores the old all-interfaces dev topology. Since ADR 0155 that no longer restores the bypass: an engine on a wide bind requires the *local token* on every path but `/api/v1/health`, so a browser must come through the gateway either way. It also decides the engine's scheme, since a loopback engine gets its TLS cert stripped and the gateway then proxies and probes over http.
 - **Engine credentials are files, not variables.** `~/.lucidos/local-token` (full authority) and `~/.lucidos/webhook-token` (webhook delivery only) are minted mode 0600 by the gateway at boot, owned by the dependency-free `lucidos-local-token` crate. They are only CHECKED when the engine's resolved bind is not loopback (`api::local_auth`), so on a default launch nothing presents or needs them. The CLI, the gateway proxy hop and the hook socket already send the right one; nothing else should.
 - `LUCIDOS_HOOK_PORT` (set by the gateway, read by the gateway and the engine). The port the *hook socket* binds, the listener that answers webhook deliveries and nothing else (ADR 0097). Unset, it is the gateway's own port plus ten, so 5261 in dev and 5262 packaged, which keeps the two coexisting as their gateways do. The gateway resolves it once and passes it to every engine it spawns, so `scheduler/webhook_ingress` never re-derives the port it probes. `0` switches the socket off, so the probe has nothing to probe, and an unparseable value does the same with a log line: a listener on a port nobody meant to open is worse than none. Always bound to `127.0.0.1`: `tailscale funnel` proxies from this machine, so loopback is what it reaches.
-- `LUCIDOS_TAILSCALE_BIN` (absolute path to the Tailscale CLI) overrides the built-in candidate probe in `lucidos_tailscale::resolve_tailscale_binary` (one copy, shared by the engine, the gateway and the desktop app). Unset (the norm) probes `/usr/local/bin/tailscale`, `/opt/homebrew/bin/tailscale`, `/usr/bin/tailscale`, then falls back to bare `tailscale` on `PATH`. The macOS `Tailscale.app` GUI executable is deliberately excluded: it is not a CLI, headless it exits **0** while printing `Tailscale.CLIError error 3`, and since the probe stops at the first EXISTING candidate it would shadow the working CLI on every Mac that has the app. Absolute-path probing exists because a **packaged app's `PATH` holds none of the places a CLI is actually installed** (Finder/launchd give it the bare `/usr/bin:/bin:/usr/sbin:/sbin`), so a bare-name spawn silently failed there. Still true with the login-shell hydration described at the top of this file: hydration is best-effort, only the SERVICE role does it, and the CLIENT role, which is where the Access buttons run, does not. **Scope: actions only.** Since 2026-08-02 the Network access "Detected Tailscale" hint and the Mobile Access tailnet state are read from the machine's interface list with no CLI, so this variable affects only **Settings → Access**'s Sign in and Expose buttons (`tailscale up` / `tailscale serve`). Neither detection nor this override can change what a process binds to.
+- `LUCIDOS_TAILSCALE_BIN` (absolute path to the Tailscale CLI) overrides the
+  built-in candidate probe in `lucidos_tailscale::resolve_tailscale_binary`.
+  That probe has one copy, shared by the engine, the gateway and the desktop app.
+  - **Unset (the norm):** it probes `/usr/local/bin/tailscale`,
+    `/opt/homebrew/bin/tailscale` and `/usr/bin/tailscale`, then falls back to
+    bare `tailscale` on `PATH`.
+  - **The macOS `Tailscale.app` GUI executable is excluded.** It is not a CLI:
+    headless, it exits **0** while printing `Tailscale.CLIError error 3`. The
+    probe stops at the first EXISTING candidate, so the app would shadow the
+    working CLI on every Mac that has it.
+  - **Why absolute paths.** A **packaged app's `PATH` holds none of the places a
+    CLI is actually installed**. Finder and launchd give it the bare
+    `/usr/bin:/bin:/usr/sbin:/sbin`, so a bare-name spawn silently failed there.
+    Login-shell hydration does not change that: it is best-effort, only the
+    gateway does it, and the `.app` CLIENT role runs the Access buttons.
+  - **Scope: actions only.** The Network access "Detected Tailscale" hint and the
+    Mobile Access tailnet state come from the machine's interface list, with no
+    CLI. So this variable affects only **Settings → Access**'s Sign in and
+    Expose buttons (`tailscale up` / `tailscale serve`). Neither detection nor
+    this override can change what a process binds to.

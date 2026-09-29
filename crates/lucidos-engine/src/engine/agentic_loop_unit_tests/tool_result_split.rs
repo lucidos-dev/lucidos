@@ -11,7 +11,7 @@
 mod tool_result_split_tests {
     use super::super::{
         build_tool_result_blocks, holds_explicitly_requested_image, parse_app_capture_marker,
-        split_tool_result, strip_app_capture_marker, ToolOutput,
+        split_tool_result, strip_app_capture_marker, take_answer_images, ToolOutput,
     };
     use crate::core::store::synthesize_tool_use_id;
     use crate::engine::tools::files::{parse_image_content_marker, EXPLICIT_IMAGE_RESULT_TEXT};
@@ -34,6 +34,7 @@ mod tool_result_split_tests {
             tool_use_id: tool_use_id.to_string(),
             text,
             event_id: Some(event_id()),
+            images: Vec::new(),
         }
     }
 
@@ -192,6 +193,63 @@ mod tool_result_split_tests {
         assert_eq!(split.llm_text, split.event_text());
         assert_eq!(split.llm_text, "total 4\ndrwxr-xr-x  2 u  staff");
         assert!(split.images.is_empty());
+    }
+
+    /// A question answer's images are named by hash. The marker comes off the
+    /// question tool's result, and the answer text is what the model and the
+    /// event both keep: the answer card already draws the thumbnails.
+    #[test]
+    fn the_question_tool_s_answer_images_come_off_its_result() {
+        let raw = format!(
+            "[ANSWER_IMAGES:{},{}]\n{{\"Q\":\"A\"}}",
+            "a".repeat(64),
+            "b".repeat(64)
+        );
+        let (text, hashes) =
+            take_answer_images(crate::llm::tool_names::ASK_USER_QUESTION, raw.clone());
+        assert_eq!(hashes, vec!["a".repeat(64), "b".repeat(64)]);
+        assert_eq!(text, "{\"Q\":\"A\"}");
+    }
+
+    /// Only the question tool writes the marker. Any other tool may pass
+    /// outside text through verbatim, so a lookalike there is left alone.
+    #[test]
+    fn another_tool_s_lookalike_marker_is_left_alone() {
+        let raw = format!("[ANSWER_IMAGES:{}]\noutput", "a".repeat(64));
+        let (text, hashes) = take_answer_images("run_bash", raw.clone());
+        assert!(hashes.is_empty());
+        assert_eq!(text, raw);
+    }
+
+    /// A tool output's images follow every tool_result block, so the API
+    /// still sees the results first.
+    #[test]
+    fn tool_output_images_follow_the_results() {
+        let with_image = ToolOutput {
+            images: vec![crate::api::ChatImage {
+                base64: PNG_1X1.to_string(),
+                mime_type: "image/png".to_string(),
+            }],
+            ..out("call_1", "{\"Q\":\"A\"}".to_string())
+        };
+        let blocks = build_tool_result_blocks(
+            &[with_image, out("call_2", "plain".to_string())],
+            "Results.",
+        );
+
+        assert_eq!(images_in(&blocks), 1);
+        let first_image = blocks
+            .iter()
+            .position(|b| matches!(b, ContentBlock::Image { .. }))
+            .unwrap();
+        let last_result = blocks
+            .iter()
+            .rposition(|b| matches!(b, ContentBlock::ToolResult { .. }))
+            .unwrap();
+        assert!(
+            first_image > last_result,
+            "images must come after every result"
+        );
     }
 
     /// The confirm-flow redaction has to land on BOTH sides. It exists so the
@@ -393,6 +451,7 @@ mod tool_result_split_tests {
                 tool_use_id: "call_1".to_string(),
                 text: "done".to_string(),
                 event_id: None,
+                images: Vec::new(),
             }],
             "Results.",
         );

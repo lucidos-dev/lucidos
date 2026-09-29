@@ -4,8 +4,9 @@ import { dismissSideQuestion, reopenSideQuestion, type SideQuestion } from '../.
 import type { BodyRow, BodySection } from '../../store/event-rendering';
 import { exchangeKey, type Exchange } from '../../store/thread-events/exchange';
 import { renderMarkdown } from '../../utils/renderMarkdown';
-import { ChevronDownIcon, ChevronUpIcon } from '../shared/icons';
-import { MarkdownBlock } from './chat-exchange-parts';
+import { Disclosure } from '../shared/Disclosure';
+import { ChevronDownIcon } from '../shared/icons';
+import { MarkdownBlock, UserImages } from './chat-exchange-parts';
 
 /** One shared empty list, so a turn without cards keeps a stable prop. */
 export const NO_SIDE_QUESTIONS: readonly SideQuestion[] = [];
@@ -28,47 +29,42 @@ function Thinking() {
   );
 }
 
-/** A collapsed card, folded to one line at its moment. A tap expands it
- *  again on this device only. */
-function DismissedSideQuestion({ item }: { item: SideQuestion }) {
-  return (
-    <button
-      type="button"
-      class="side-question-dismissed"
-      data-role="side-question-dismissed"
-      data-side-question-id={item.id}
-      onClick={() => reopenSideQuestion(item.id)}
-      aria-label={`Expand side question: ${item.question}`}
-    >
-      <span class="side-question-label">Side question</span>
-      <span class="side-question-dismissed-text">{item.question}</span>
-      <span class="side-question-dismissed-chevron" aria-hidden="true"><ChevronDownIcon /></span>
-    </button>
-  );
-}
-
+/** One card whose head folds it to a line at its moment and unfolds it
+ *  again, with the disclosure roll. Folding records the dismissal; unfolding
+ *  a folded card shows it again on this device only. */
 export function SideQuestionCard({ item }: { item: SideQuestion }) {
-  if (item.dismissed) return <DismissedSideQuestion item={item} />;
+  const open = !item.dismissed;
   return (
-    <div class="side-question-card" data-role="side-question-card" data-side-question-id={item.id} data-status={item.status}>
-      <div class="side-question-head">
+    <div
+      class="side-question-card"
+      data-role="side-question-card"
+      data-side-question-id={item.id}
+      data-status={item.status}
+      data-collapsed={open ? undefined : ''}
+    >
+      <button
+        type="button"
+        class="side-question-head"
+        aria-expanded={open}
+        aria-label={`Side question: ${item.question}`}
+        data-tooltip={open ? 'Collapse' : 'Expand'}
+        onClick={() => (open ? void dismissSideQuestion(item) : reopenSideQuestion(item.id))}
+      >
         <span class="side-question-label">Side question</span>
-        <span class="side-question-note">{SIDE_QUESTION_NOTE}</span>
-        <button
-          class="icon-btn side-question-dismiss"
-          onClick={() => void dismissSideQuestion(item)}
-          aria-label="Collapse side question"
-          data-tooltip="Collapse side question"
-        >
-          <ChevronUpIcon />
-        </button>
-      </div>
-      <div class="user-bubble side-question-question">{item.question}</div>
-      {item.status === 'pending' && <Thinking />}
-      {item.status === 'answered' && <MarkdownBlock html={renderMarkdown(item.answer)} />}
-      {item.status === 'failed' && (
-        <div class="side-question-error" role="alert">{item.error}</div>
-      )}
+        <span class="side-question-summary">{open ? SIDE_QUESTION_NOTE : item.question}</span>
+        <span class="side-question-chevron" aria-hidden="true"><ChevronDownIcon /></span>
+      </button>
+      <Disclosure open={open} bodyClass="side-question-body">
+        <div class="user-bubble side-question-question">
+          {item.question}
+          <UserImages imageHashes={item.imageHashes} />
+        </div>
+        {item.status === 'pending' && <Thinking />}
+        {item.status === 'answered' && <MarkdownBlock html={renderMarkdown(item.answer)} />}
+        {item.status === 'failed' && (
+          <div class="side-question-error" role="alert">{item.error}</div>
+        )}
+      </Disclosure>
     </div>
   );
 }

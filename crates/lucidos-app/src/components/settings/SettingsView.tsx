@@ -1237,6 +1237,18 @@ export function SettingsView() {
             effort={currentBackgroundReasoning('reasoning_title')}
             onChange={(p) => void saveModelSelection('model_title', 'reasoning_title', p)}
           />
+          {/* Under the title model, because it inherits it while unset: both
+              write one line naming a piece of work. */}
+          <ModelSelectionRow
+            label="Change summary"
+            anchor="models:change-summary"
+            nested
+            models={backgroundModelChoices()}
+            vocabulary={LUCIDOS_TIER_VOCABULARY}
+            model={currentBackgroundModel('model_change_summary')}
+            effort={currentBackgroundReasoning('reasoning_change_summary')}
+            onChange={(p) => void saveModelSelection('model_change_summary', 'reasoning_change_summary', p)}
+          />
           <ModelSelectionRow
             label="Image description"
             anchor="models:image-description"

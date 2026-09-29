@@ -52,8 +52,9 @@ Entry shape: **Where · Gap · Why · Status / workaround.**
 - **Why:** The preview loads a cross-origin external URL. The keydown bridge
   (`bridgePreviewIframeShortcuts`) needs same-origin `contentDocument` access,
   which cross-origin blocks; and unlike an app, an external page runs no Lucidos
-  SDK to postMessage-forward its chords. Same-origin previews (file/HTML/diff/PDF)
-  and app iframes are both covered. The content focus MARKER *does* move (via the
+  SDK to postMessage-forward its chords. The PDF preview (same-origin), the HTML
+  artifact preview (its own bridge, ADR 0322) and app iframes are all covered.
+  The content focus MARKER *does* move (via the
   window-blur tracker) — only the shortcut forwarding is missing.
 - **Status:** Open — fundamental cross-origin limitation; no clean fix.
 
@@ -353,8 +354,8 @@ Entry shape: **Where · Gap · Why · Status / workaround.**
 ### App-iframe keyboard chords can't suppress the browser default
 - **Where:** `.claude/rules/frontend.md` (SDK keyboard forwarding — "that path can't suppress the browser default (it has no synchronous event to cancel)"), `packages/lucidos-sdk/src/keyboardForward.ts`
 - **Gap:** A host shortcut chord pressed while focus is inside an *app* iframe still triggers the browser's own default for that combo (e.g. a context menu), even though the Lucidos action also runs.
-- **Why:** An app iframe forwards chords up over `postMessage`, which is asynchronous — by the time the host receives it there is no live event to `preventDefault()`, so the browser default can't be cancelled. (Same-origin *preview* iframes are bridged directly and can cancel it; apps can't.)
-- **Status:** Open — cross-origin/async boundary limitation of the SDK forwarding path.
+- **Why:** An app iframe forwards chords up over `postMessage`, which is asynchronous. By the time the host receives a chord, there is no live event to `preventDefault()`. So the browser default can't be cancelled. (The same-origin PDF preview is bridged directly. The HTML artifact preview has the host's bindings stamped into its frame, which matches them synchronously. Both can cancel it; apps can't.)
+- **Status:** **Closed (2026-09-29)** by `docs/plans/2026-09-29-familiar-keyboard-shortcuts.md`. The host pushes its current bindings to each app frame on the `keybindings` channel (`store/actions/app-keybindings.ts`), on load and on every rebind. The SDK matches a keydown against them synchronously and cancels the browser default, so ⌘P opens file search and not the print dialog. One residual: a chord pressed before the frame's `load` push lands still reaches the browser.
 
 ### Screenshot capture fails on modern CSS colours → DOM-only
 - **Where:** `packages/lucidos-sdk/src/capture.ts` (html2canvas throws on `color()`/`oklab()`/`oklch()`/`color-mix()`; degrades to a DOM snapshot)

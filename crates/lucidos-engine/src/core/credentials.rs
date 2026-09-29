@@ -252,9 +252,10 @@ fn parse_credential_info(row: CredentialInfoRow) -> CredentialInfo {
 pub struct CredentialStore;
 
 impl CredentialStore {
-    /// Defensive double-write — the migration owns this CREATE TABLE
-    /// (see `20260517160627_consolidate_init_schema_tables.sql`). Slated
-    /// for removal in `harden-init-schema-tables-vs-migrations-pattern-finish`.
+    /// Defensive double-write: the migration owns this CREATE TABLE (see
+    /// `20260517160627_consolidate_init_schema_tables.sql`). A temporary measure:
+    /// `docs/temporary-measures.md` § "Defensive double-write of tables into
+    /// `init_schema`".
     ///
     /// Reachable only as a no-op: `sqlx::migrate!()` runs at construction and
     /// creates the table, and this fires afterwards behind `IF NOT EXISTS`. It

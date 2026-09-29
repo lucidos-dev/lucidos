@@ -1,5 +1,5 @@
-// Route link clicks inside an HTML artifact PREVIEW iframe through the host,
-// instead of letting the iframe navigate.
+// Route link clicks inside a file PREVIEW through the host, instead of letting
+// the browser navigate.
 //
 // The bug this exists for: `FilePreviewInline` renders an `.html` artifact into
 // `<iframe srcDoc={…}>`, and an `about:srcdoc` document has no URL of its own,
@@ -8,17 +8,15 @@
 // resolves to `https://<gateway>/<slug>/#section`, which from the iframe's point
 // of view is a real cross-document navigation: the iframe loads the whole
 // Lucidos app shell into the content pane. The same is true of every relative
-// path in the document. The host's global `.thread-link` click handler
-// (`startClient`) cannot help, because the click happens in a different document
-// and never reaches the host `document`.
+// path in the document.
 //
-// Preview iframes are SAME-ORIGIN (`about:srcdoc` inherits the host origin), so
-// the host can listen on the iframe's own `contentDocument` and, having the real
-// event, `preventDefault()` the navigation before it starts. That is exactly the
-// mechanism `bridgePreviewIframeShortcuts` already uses for keyboard chords;
-// this is its click twin, and the two are wired from the same `onLoad`.
+// The preview frame runs at an opaque origin (ADR 0322), so the host cannot
+// listen inside it. A bridge script injected into the document cancels the
+// click and posts the href up (`previewFrameBridge.ts`). This module is the
+// routing half both previews share: `classifyPreviewLink` decides, and
+// `runPreviewLinkAction` acts.
 //
-// Everything the bridge claims is routed through an existing host entry point
+// Everything is routed through an existing host entry point
 // (`openFilePreview`, `openThreadAcrossWorkspaces`, `openAppById`,
 // `handleNavigationRequest`, `openLocalFile`, `openUrl`) rather than by poking
 // store signals, which is what gives content-pane navigation from a preview its
@@ -37,8 +35,7 @@ import { openFilePreview, openUrl, openLocalFile } from '../../store/actions/art
 import { openAppById } from '../../store/actions/apps';
 import { openThreadAcrossWorkspaces } from '../../store/actions/cross-workspace';
 import { handleNavigationRequest } from '../../store/actions/navigation-request';
-import { showToast, parseRepoPath } from '../../store/store';
-import { scrollBehavior } from '../../utils/motion';
+import { parseRepoPath } from '../../store/store';
 
 /** `thread:<workspace>/<uuid>` and the bare `thread:<uuid>` form, mirroring the
  *  markdown rewrite in `utils/renderMarkdown.ts`. */
@@ -79,6 +76,13 @@ export type PreviewLinkAction =
   | { kind: 'file'; path: string }
   | { kind: 'repo-file'; filePath: string; line?: number; lineEnd?: number }
   | { kind: 'external'; url: string };
+
+/** The URL schemes `classifyPreviewLink` routes. The preview frame's bridge
+ *  script claims a click on a scheme-less href or on one of these. It leaves
+ *  every other scheme (`mailto:`, `tel:`) to the browser, as the router would.
+ *  A test pins the two together. */
+export const PREVIEW_HOST_SCHEMES: readonly string[] =
+  ['http', 'https', 'thread', 'app', 'trigger', 'repo', 'file'];
 
 /** A GitHub-style line reference on a link: `#L510` or `#L510-L520` (the
  *  `#L510-520` short form too). This is the only channel a hand-written `<a>`
@@ -264,30 +268,13 @@ export function classifyPreviewLink(
   return { kind: 'file', path: resolvePreviewRelativePath(ctx.artifactPath, href) };
 }
 
-function scrollPreviewToFragment(doc: Document, id: string): void {
-  if (!id) {
-    doc.defaultView?.scrollTo({ top: 0, behavior: scrollBehavior() });
-    return;
-  }
-  // `querySelector`, not `getElementById` (the `#app`-only ban in
-  // .claude/rules/frontend.md). An attribute selector rather than `#<id>` keeps
-  // it safe for author-written ids without depending on `CSS.escape`: only the
-  // quote and the backslash need escaping inside `[id="…"]`. `[name=…]` covers
-  // the legacy `<a name>` anchor a hand-written report may still use.
-  const quoted = id.replace(/["\\]/g, '\\$&');
-  const target = doc.querySelector(`[id="${quoted}"]`) ?? doc.querySelector(`[name="${quoted}"]`);
-  if (!target) {
-    showToast(`No "${id}" section in this document`, 'error');
-    return;
-  }
-  (target as HTMLElement).scrollIntoView({ behavior: scrollBehavior(), block: 'start' });
-}
+/** A routed click, minus the in-page anchor. Only the previewed document can
+ *  scroll itself, so each caller answers a fragment on its own. */
+export type PreviewNavigation = Exclude<PreviewLinkAction, { kind: 'fragment' }>;
 
-function runPreviewLinkAction(action: PreviewLinkAction, doc: Document): void {
+/** Carry out a routed click through the host entry point that owns it. */
+export function runPreviewLinkAction(action: PreviewNavigation): void {
   switch (action.kind) {
-    case 'fragment':
-      scrollPreviewToFragment(doc, action.id);
-      return;
     case 'thread':
       openThreadAcrossWorkspaces(action.workspace, action.threadId);
       return;
@@ -321,40 +308,32 @@ function runPreviewLinkAction(action: PreviewLinkAction, doc: Document): void {
   }
 }
 
-/** Where a previewed document lives, and how much of its link behavior the host
- *  has to take over. */
-export interface PreviewLinkHost {
-  /** The document the previewed content is IN: the iframe's `contentDocument`
-   *  for an HTML artifact, the host document for a markdown one. */
-  doc: Document;
-  /** Workspace-relative path of the previewed artifact. */
-  artifactPath: string;
-  /** The previewed document's own `<base href>`, when it declares one. Left
-   *  undefined otherwise, which is the normal case. */
-  documentBase?: string;
-  /** Whether an in-page fragment must be claimed.
-   *
-   *  TRUE inside a srcdoc iframe, where the browser resolves `#x` against the
-   *  HOST page URL and so navigates the iframe to the app shell.
-   *
-   *  FALSE for markdown rendered straight into the host document, where `#x`
-   *  resolves to the page the user is already on: an ordinary same-document hash
-   *  change that neither reloads nor destroys anything. (`marked` emits no
-   *  heading ids either, so claiming it would only toast on every link.) */
-  claimFragments: boolean;
+/** Where this page is, as `classifyPreviewLink` needs it. Guarded like
+ *  `threadLinkHref` in utils/renderMarkdown.ts: `location` is always there in
+ *  the app, never in a bare unit-test environment. */
+export function previewLinkContext(artifactPath: string, documentBase?: string): PreviewLinkContext {
+  const page = typeof location === 'undefined' ? null : location;
+  return {
+    artifactPath,
+    hostOrigin: page?.origin ?? '',
+    hostPath: page?.pathname ?? '/',
+    workspaceId: WORKSPACE_ID,
+    documentBase,
+  };
 }
 
-/** Route one click on a previewed document's link. Exported (rather than kept
- *  behind `bridgePreviewIframeLinks`) because the markdown preview renders into
- *  the HOST document and so has a Preact `onClick` instead of a bridged
- *  listener, and because it lets the tests drive a synthetic event. */
-export function handlePreviewLinkClick(e: MouseEvent, host: PreviewLinkHost): void {
+/** Route one click on a link in a MARKDOWN preview, which renders into the host
+ *  document itself.
+ *
+ *  An in-page fragment is left to the browser here. `#x` resolves to the page
+ *  the user is already on, an ordinary same-document hash change that neither
+ *  reloads nor destroys anything. (`marked` emits no heading ids either, so
+ *  claiming it would only toast on every link.) */
+export function handlePreviewLinkClick(e: MouseEvent, artifactPath: string): void {
   if (e.defaultPrevented) return;
   // A modifier or a non-primary button is the user explicitly asking the BROWSER
   // to act (new tab, new window, save link). Claiming those would break the one
-  // behavior every link on the web has. Safe to hand back now that
-  // `withPreviewBase` re-anchors the document: what the browser opens is the
-  // artifact and its siblings, not the app shell.
+  // behavior every link on the web has.
   if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || (e.button ?? 0) !== 0) return;
   const target = e.target as { closest?: (sel: string) => Element | null } | null;
   const anchor = target?.closest?.('a[href]') ?? null;
@@ -366,8 +345,7 @@ export function handlePreviewLinkClick(e: MouseEvent, host: PreviewLinkHost): vo
   // attributes over re-deriving from the href: `data-thread-workspace` carries
   // the workspace NAME the ref was written with, whereas the href carries its
   // SLUG, and only the name is what `openThreadAcrossWorkspaces` compares
-  // against. Present only for host-rendered markdown; an artifact's own HTML
-  // never carries them, so the srcdoc path falls straight through.
+  // against.
   const linkedThreadId = anchor.getAttribute('data-thread-id');
   if (linkedThreadId) {
     e.preventDefault();
@@ -376,63 +354,11 @@ export function handlePreviewLinkClick(e: MouseEvent, host: PreviewLinkHost): vo
     return;
   }
 
-  // Guarded like `threadLinkHref` in utils/renderMarkdown.ts: `location` is
-  // always there in the app, never in a bare unit-test environment.
-  const page = typeof location === 'undefined' ? null : location;
-  const action = classifyPreviewLink(anchor.getAttribute('href') ?? '', {
-    artifactPath: host.artifactPath,
-    hostOrigin: page?.origin ?? '',
-    hostPath: page?.pathname ?? '/',
-    workspaceId: WORKSPACE_ID,
-    documentBase: host.documentBase,
-  });
-  if (!action) return;
-  if (action.kind === 'fragment' && !host.claimFragments) return;
+  const action = classifyPreviewLink(anchor.getAttribute('href') ?? '', previewLinkContext(artifactPath));
+  if (!action || action.kind === 'fragment') return;
   e.preventDefault();
   e.stopPropagation();
-  runPreviewLinkAction(action, host.doc);
-}
-
-// Each iframe load installs a fresh `contentDocument`; track the ones already
-// wired so a reload that reuses a document (or a double `load`) can't stack
-// listeners. WeakSet so a discarded document is collected with its listener.
-const bridged = new WeakSet<Document>();
-
-/** Wire host link routing into a preview iframe's same-origin document. Call
- *  from the iframe's `onLoad` (the `contentDocument` only exists once loaded),
- *  alongside `bridgePreviewIframeShortcuts`. No-op for a missing iframe or a
- *  cross-origin document. Capture phase so the routing decision is made before
- *  the previewed document's own handlers can act on the click. */
-export function bridgePreviewIframeLinks(
-  iframe: HTMLIFrameElement | null,
-  opts: { artifactPath: string; declaresOwnBase: boolean },
-): void {
-  if (!iframe) return;
-  let doc: Document | null;
-  try {
-    doc = iframe.contentDocument;
-  } catch {
-    return; // cross-origin preview: can't reach in
-  }
-  if (!doc || bridged.has(doc)) return;
-  bridged.add(doc);
-  const previewDoc = doc;
-  // Only an artifact-declared base is threaded through: the one we stamp already
-  // means "resolve against the artifact's folder", which is what the default
-  // artifactPath resolution does.
-  const documentBase = opts.declaresOwnBase ? previewDoc.baseURI : undefined;
-  previewDoc.addEventListener(
-    'click',
-    (e) => {
-      handlePreviewLinkClick(e as MouseEvent, {
-        doc: previewDoc,
-        artifactPath: opts.artifactPath,
-        documentBase,
-        claimFragments: true,
-      });
-    },
-    true,
-  );
+  runPreviewLinkAction(action);
 }
 
 /** The `<base href>` a previewed artifact should carry: its own folder, so
@@ -448,20 +374,21 @@ export function previewBaseHref(fileUrl: string): string {
 const DECLARED_BASE_RE = /<base\s[^>]*href\s*=/i;
 
 /** Whether an artifact declares its own `<base href>`. Both `withPreviewBase`
- *  (which then leaves it alone) and the click bridge (which then resolves
- *  relative links against it) key off this. */
+ *  (which then leaves it alone) and the frame's link routing (which then
+ *  resolves relative links against it) key off this. */
 export function documentDeclaresBase(html: string): boolean {
   return DECLARED_BASE_RE.test(html);
 }
 
 /** Put `tag` at the start of the previewed document's head, whatever shape the
- *  artifact was written in. Shared by the two things the preview stamps, so
- *  there is one answer to "where does an injected tag go".
+ *  artifact was written in. Shared by everything the preview stamps, so there
+ *  is one answer to "where does an injected tag go".
  *
  *  Each branch stamps EARLY rather than late. A `<base>` has to precede the
- *  relative URLs it governs. Both tags have to precede the artifact's own
- *  styles, so the artifact can still override them. */
-function injectAtHeadStart(html: string, tag: string): string {
+ *  relative URLs it governs. The stamped tags have to precede the artifact's
+ *  own styles and scripts, so the artifact can still override them and the
+ *  bridge script runs first. */
+export function injectAtHeadStart(html: string, tag: string): string {
   const headOpen = /<head(\s[^>]*)?>/i.exec(html);
   if (headOpen) {
     const at = headOpen.index + headOpen[0].length;

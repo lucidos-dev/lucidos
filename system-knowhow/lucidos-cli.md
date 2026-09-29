@@ -82,7 +82,7 @@ invoke them directly.
 
 ## When to use this
 
-- **Python scripts** (`apps/<name>/scripts/*.py`, `triggers/<name>/scripts/*.py`, `knowhow/*/scripts/*.py`) — invoke via `subprocess.run(['lucidos', 'data', 'write', ...])`. The CLI is on PATH and `LUCIDOS_WORKSPACE` is set automatically.
+- **Python scripts** (`apps/<name>/scripts/*.py`, `triggers/<name>/scripts/*.py`, `knowhow/*/scripts/*.py`): invoke via `subprocess.run(['lucidos', 'data', 'write', ...])`. The CLI is on PATH and `LUCIDOS_WORKSPACE` is set automatically. Runtime state the script rewrites on every run (a cursor, a last-seen id) is the exception: write it directly, as `plugins.md` § "Where a plugin keeps its runtime state" shows.
 - **Bash scripts** (same locations, `*.sh`) — call `lucidos` directly. PATH is set up before the script runs.
 - **Coding-agent subprocesses** — running in a worktree under `<workspace>/.lucidos/worktrees/<id>/`, where editor writes land in the worktree (not the workspace), so dev-server links 404. Use `lucidos data write` instead.
 
@@ -1116,8 +1116,9 @@ its headline maximum. Every guess errs low on purpose: under-declaring only trim
 early, whereas over-declaring makes the engine pack a prompt the provider then
 rejects. (This is why most bare `claude-*` ids sit at 200k rather than the 1M
 those models advertise: Lucidos requests 1M mode only for the `[1m]` variants.
-Opus 5, Opus 5.5 and Fable 5.x are the exception. 1M is their default window, so
-their bare builtin rows declare it on each Vertex and Anthropic route.)
+Opus 5, Opus 5.5, Sonnet 5.5 and Fable 5.x are the exception. 1M is their
+default window, so their bare builtin rows declare it on each Vertex and
+Anthropic route.)
 
 `list` shows each model's window, or `inferred from id` when it has none.
 Builtins ship with theirs already declared. Builtins accept a window correction

@@ -20,7 +20,7 @@ pub(super) fn configure_email_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: tn::CONFIGURE_EMAIL.to_string(),
-            description: "Configure an email account for sending and reading. web_search the provider's IMAP and SMTP host and port first, and prefer use_oauth, which most providers now require.".to_string(),
+            description: "Configure an email account for sending and reading. web_search the provider's IMAP and SMTP host and port first.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -62,7 +62,7 @@ pub(super) fn configure_email_tools() -> Vec<ToolDefinition> {
                     },
                     "use_oauth": {
                         "type": "string",
-                        "description": "OAuth provider for SMTP auth (XOAUTH2 instead of a password); must already be connected with connect_oauth_account."
+                        "description": "Connection from connect_oauth_account, for XOAUTH2 in place of a password. Links only a Google or Microsoft token, to that issuer's mail hosts over TLS."
                     }
                 },
                 "required": ["name", "email_address", "imap_host", "smtp_host"]

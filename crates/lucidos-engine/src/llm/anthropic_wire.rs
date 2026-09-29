@@ -119,7 +119,8 @@ struct AdaptiveModel {
 /// its `max_tokens` and its [`ThinkingMode`].
 ///
 /// The first matching fragment wins, so a more specific id sits above the
-/// family it shares a prefix with: `claude-opus-5-5` before `claude-opus-5`.
+/// family it shares a prefix with: `claude-opus-5-5` before `claude-opus-5`,
+/// `claude-sonnet-5-5` before `claude-sonnet-5`.
 ///
 /// One list answers every question on purpose. `max_tokens` bounds thinking AND
 /// response text together. Too low a value cuts a deep turn wherever it had
@@ -153,6 +154,11 @@ const ADAPTIVE_THINKING_MODELS: &[AdaptiveModel] = &[
         fragment: "claude-opus-5",
         max_output_tokens: 128_000,
         mode: ThinkingMode::OnByDefault,
+    },
+    AdaptiveModel {
+        fragment: "claude-sonnet-5-5",
+        max_output_tokens: 128_000,
+        mode: ThinkingMode::AlwaysOn,
     },
     AdaptiveModel {
         fragment: "claude-sonnet-5",
@@ -1367,7 +1373,12 @@ mod tests {
         // BOTH gates. Neither fires by accident: `supports_extended_thinking`
         // matches Sonnet 4.x on `claude-sonnet-4`, which does not cover
         // `claude-sonnet-5`, and the adaptive list was Opus-only before.
-        for id in ["claude-sonnet-5", "claude-sonnet-5[1m]"] {
+        for id in [
+            "claude-sonnet-5",
+            "claude-sonnet-5[1m]",
+            "claude-sonnet-5-5",
+            "claude-sonnet-5-5[1m]",
+        ] {
             assert!(supports_extended_thinking(id), "extended: {id}");
             assert!(thinking_mode(id).is_some(), "adaptive: {id}");
         }
@@ -1419,8 +1430,8 @@ mod tests {
         }
     }
 
-    /// Opus 5.5 shares the `claude-opus-5` prefix, so the table's order is
-    /// what keeps it from inheriting Opus 5's mode.
+    /// Opus 5.5 and Sonnet 5.5 share a prefix with their 5.0 family, so the
+    /// table's order is what keeps each from inheriting the older mode.
     #[test]
     fn each_family_resolves_to_its_own_thinking_mode() {
         for (id, mode) in [
@@ -1429,6 +1440,9 @@ mod tests {
             ("claude-opus-5", ThinkingMode::OnByDefault),
             ("claude-opus-5[1m]", ThinkingMode::OnByDefault),
             ("claude-sonnet-5", ThinkingMode::OnByDefault),
+            ("claude-sonnet-5[1m]", ThinkingMode::OnByDefault),
+            ("claude-sonnet-5-5", ThinkingMode::AlwaysOn),
+            ("claude-sonnet-5-5[1m]", ThinkingMode::AlwaysOn),
             ("claude-opus-5-5", ThinkingMode::AlwaysOn),
             ("claude-opus-5-5[1m]", ThinkingMode::AlwaysOn),
             ("claude-fable-5", ThinkingMode::AlwaysOn),
@@ -1447,6 +1461,8 @@ mod tests {
         for id in [
             "claude-opus-5-5",
             "claude-opus-5-5[1m]",
+            "claude-sonnet-5-5",
+            "claude-sonnet-5-5[1m]",
             "claude-fable-5",
             "claude-fable-5-1",
         ] {
@@ -1497,7 +1513,12 @@ mod tests {
     /// the model silently falls to the 8192-token no-thinking path.
     #[test]
     fn the_output_ceiling_survives_the_context_suffix() {
-        for id in ["claude-opus-5", "claude-opus-5[1m]", "claude-sonnet-5[1m]"] {
+        for id in [
+            "claude-opus-5",
+            "claude-opus-5[1m]",
+            "claude-sonnet-5[1m]",
+            "claude-sonnet-5-5[1m]",
+        ] {
             assert_eq!(
                 adaptive_model(id).map(|entry| entry.max_output_tokens),
                 Some(128_000),
@@ -2030,8 +2051,11 @@ mod tests {
             ("claude-opus-5-5", ThinkingDisplay::ProgressUpdates),
             ("claude-fable-5-1", ThinkingDisplay::ProgressUpdates),
             ("claude-fable-5", ThinkingDisplay::ProgressUpdates),
+            ("claude-sonnet-5-5", ThinkingDisplay::ProgressUpdates),
+            ("claude-sonnet-5-5[1m]", ThinkingDisplay::ProgressUpdates),
             ("claude-opus-5", ThinkingDisplay::Hidden),
             ("claude-sonnet-5", ThinkingDisplay::Hidden),
+            ("claude-sonnet-5[1m]", ThinkingDisplay::Hidden),
             ("claude-opus-4-8", ThinkingDisplay::Hidden),
             ("claude-sonnet-4-6", ThinkingDisplay::Hidden),
             ("claude-haiku-4-5", ThinkingDisplay::Hidden),

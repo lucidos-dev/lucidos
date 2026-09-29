@@ -1,5 +1,41 @@
 # Changelog
 
+## v0.43.0
+
+### Added
+- New keyboard shortcuts: search files (Cmd+P), Settings (Cmd+,), keyboard shortcuts (Cmd+/), notifications (Cmd+Shift+I), focus the newest toast (Cmd+Shift+N), focus the composer (Shift+Esc), stop the running thread (Cmd+.), copy the last response (Cmd+Shift+C) and rename the thread (F2). Search everywhere moves to Cmd+K. You can rebind all of them.
+- Host shortcuts work while an app has focus. Cmd+P in an app opens file search, not the print dialog.
+- Edit a queued message before the agent reads it. Edit puts its text and images back in the compose box. This works on Lucidos Agent and Claude Code threads.
+- Show the open thread in the thread list from the title bar menu. The list glides to the row.
+- Side questions carry images, and work in Lucidos Agent threads too. Hold Send (or right-click it) to ask the draft as a side question.
+- A typed answer to a question carries its images to the agent.
+- Claude Sonnet 5.5 and Sonnet 5.5 (1M) in the Claude Code picker and the chat model list.
+- Apps get the shared pill bar (as tabs or a filter), the Settings switch, the spinner, and status tones on labels.
+
+### Changed
+- The Claude Code model picker shows exactly the models your Claude Code install offers, and refreshes when Claude Code updates.
+- Search everywhere shows each category's hits as they land. Settings and shortcut hits appear on the keystroke.
+- A change card, its toasts and the Changes panel row lead with a written summary of the change. The row unfolds to its commits, oldest first.
+- The welcome message retires after you start your third thread. The provider-setup welcome stays until a provider exists.
+- A tap on a toast no longer closes it. The X and the timer still do.
+
+### Fixed
+- HTML, XML and SVG files from the workspace open sandboxed. Their scripts run but cannot act as you.
+- Discard and Discard All in the Changes panel ask first.
+- A backup restore that fails partway now reports the failure.
+- copy_file onto the same file no longer empties it, and two edits to one file at once no longer lose one.
+- An email account linked to a Google or Microsoft sign-in only connects to that provider's own mail servers, over TLS.
+- The command guard catches a delete after a cd out of the workspace.
+- A coding-agent thread whose Claude Code session is gone starts a fresh session instead of failing.
+- A long thread no longer blocks every later coding-agent spawn.
+- run_python output is capped like run_bash.
+- A report or event delivery waits behind a question that survived a restart.
+- On a Mac, Ctrl+letter keeps its text-editing meaning in text fields, including inside HTML artifacts.
+- A shortcut you bound yourself wins over a newer default.
+- The thread list keeps its position after a reload deep in Archive.
+- A headless install (launchd or systemd) gets your login-shell environment, so version-manager tools and keys exported in your profile reach every engine and coding agent.
+- A question card keeps its paragraphs and lists apart, and only the closing question is bold.
+- A withdrawn coding-agent message stays gone after a Stop.
 ## v0.42.1
 
 ### Changed

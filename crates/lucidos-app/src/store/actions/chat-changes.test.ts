@@ -33,6 +33,7 @@ vi.mock(import('../../api/client'), async (importOriginal) => {
 
 const {
   ensureChangeLoaded,
+  applyChangeSummarized,
   applyAllChanges,
   armStandingApply,
   disarmStandingApply,
@@ -67,6 +68,7 @@ function makeChange(id: string, overrides: Partial<Change> = {}): Change {
     pre_merge_sha: null,
     post_merge_sha: null,
     commits: [],
+    summary: null,
     incomplete: false,
     ...overrides,
   };
@@ -316,5 +318,23 @@ describe('refreshChangesState', () => {
     land({ pending: [fresh], applied: [], has_more_applied: false });
     await refresh;
     expect(changes.value).toEqual({ status: 'loaded', data: [fresh] });
+  });
+});
+
+/** A summary lands on a change row fetched outside the two lists, but only
+ *  while it describes that row's current commit list. */
+describe('a change summary reaches a lazily loaded row', () => {
+  it('fills the summary of the commit list it describes', () => {
+    lazyChanges.value = new Map([['c-1', { status: 'loaded', data: makeChange('c-1', { description: 'b\na' }) }]]);
+    applyChangeSummarized('c-1', 'Adds a thing', 'b\na');
+    const row = lazyChanges.value.get('c-1');
+    expect(row?.status === 'loaded' && row.data.summary).toBe('Adds a thing');
+  });
+
+  it('drops a summary of an older commit list', () => {
+    lazyChanges.value = new Map([['c-1', { status: 'loaded', data: makeChange('c-1', { description: 'c\nb\na' }) }]]);
+    applyChangeSummarized('c-1', 'Stale', 'b\na');
+    const row = lazyChanges.value.get('c-1');
+    expect(row?.status === 'loaded' && row.data.summary).toBeNull();
   });
 });

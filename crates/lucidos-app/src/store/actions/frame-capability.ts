@@ -1,5 +1,6 @@
 /**
- * Keeping an open app frame's URL pass alive.
+ * Keeping an open frame's URL pass alive: an app frame's, and the HTML
+ * artifact preview frame's.
  *
  * An app frame's opaque origin sends no device credential. So behind a gateway
  * its own files load with a short-lived pass in the URL (ADR 0238). The engine
@@ -13,11 +14,17 @@
  *
  * The app id comes from the frame's `src`, which the host set, never from
  * anything the app said (ADR 0231 decision 4).
+ *
+ * The HTML artifact preview frame is opaque-origin too (ADR 0322), so it
+ * carries a pass of its own, narrowed to the artifacts tree. The same round
+ * renews it and pushes it into every mounted preview.
  */
 
+import { signal } from '@preact/signals';
 import { API } from '../../api/client';
 import { deviceIdHeader } from '../../utils/deviceIdHeader';
 import { appIdForFrame } from '../../utils/appFrame';
+import { PREVIEW_FRAME_ROLE, postToPreviewFrame } from '../../utils/previewFrameProtocol';
 import { postToAppFrame } from './app-bridge';
 
 /** Half the engine's TTL. Replaced by what the engine answers. */
@@ -69,7 +76,8 @@ async function tick(): Promise<void> {
 }
 
 /**
- * Hand every mounted app frame a fresh pass, and say when to come back.
+ * Hand every mounted app frame and preview frame a fresh pass, and say when to
+ * come back.
  *
  * Exported for the test, and it schedules nothing itself. A frame the engine
  * minted nothing for ignores the push, so this needs no idea which frames are
@@ -83,7 +91,7 @@ export async function renewEveryOpenFrame(): Promise<number> {
     const appId = appIdForFrame(frame);
     if (!appId) continue;
     try {
-      const minted = await mintFor(appId);
+      const minted = await mintAt(`${API}/app-frame-capability?app_id=${encodeURIComponent(appId)}`);
       nextDelayMs = minted.renewAfterMs;
       if (minted.capability) {
         postToAppFrame(frame, 'frame-capability', { capability: minted.capability });
@@ -97,7 +105,70 @@ export async function renewEveryOpenFrame(): Promise<number> {
       console.warn(`[app-bridge] could not renew the pass for "${appId}":`, err);
     }
   }
+  const previews = document.querySelectorAll<HTMLIFrameElement>(`iframe[data-role="${PREVIEW_FRAME_ROLE}"]`);
+  if (previews.length > 0) {
+    try {
+      const minted = await mintArtifactPreviewCapability();
+      nextDelayMs = Math.min(nextDelayMs, minted.renewAfterMs);
+      if (minted.capability) {
+        for (const preview of previews) {
+          postToPreviewFrame(preview.contentWindow, { kind: 'capability', capability: minted.capability });
+        }
+      }
+    } catch (err) {
+      failed = true;
+      // Telemetry, for the reason above: a timer round, retried in a minute.
+      // A lapsed pass shows as the preview's own broken image.
+      console.warn('[preview] could not renew the artifact preview pass:', err);
+    }
+  }
   return failed ? RETRY_AFTER_MS : nextDelayMs;
+}
+
+/** The latest preview pass, and until when it is worth handing out. */
+const previewCapability = signal<{ capability: string | null; freshUntilMs: number } | null>(null);
+let previewCapabilityInFlight: Promise<string | null> | null = null;
+
+/**
+ * The pass an HTML artifact preview stamps into its `<base href>`, or `null`
+ * with no gateway in front, where nothing needs proving.
+ *
+ * Cached for half its life, the same half-life the renewal loop runs on. So a
+ * new preview always gets a pass that outlives the next renewal round, and a
+ * second preview costs no round trip.
+ */
+export function artifactPreviewCapability(): Promise<string | null> {
+  const cached = previewCapability.peek();
+  if (cached && cached.freshUntilMs > Date.now()) return Promise.resolve(cached.capability);
+  previewCapabilityInFlight ??= mintArtifactPreviewCapability()
+    .then((minted) => minted.capability)
+    .finally(() => { previewCapabilityInFlight = null; });
+  return previewCapabilityInFlight;
+}
+
+/** The latest preview pass, read reactively. For a URL the host builds, such as
+ *  the header's "Open in new tab" link. */
+export function currentArtifactPreviewCapability(): string | null {
+  return previewCapability.value?.capability ?? null;
+}
+
+/** The latest preview pass, without subscribing. A preview stamps it when it
+ *  builds its document, and must not rebuild because a renewal landed: the
+ *  renewal reaches the live document over the bridge instead. */
+export function peekArtifactPreviewCapability(): string | null {
+  return previewCapability.peek()?.capability ?? null;
+}
+
+async function mintArtifactPreviewCapability(): Promise<MintedCapability> {
+  const minted = await mintAt(`${API}/artifact-preview-capability`);
+  previewCapability.value = { capability: minted.capability, freshUntilMs: Date.now() + minted.renewAfterMs };
+  return minted;
+}
+
+/** Forget the cached preview pass. For tests. */
+export function resetArtifactPreviewCapability(): void {
+  previewCapability.value = null;
+  previewCapabilityInFlight = null;
 }
 
 interface MintedCapability {
@@ -105,8 +176,7 @@ interface MintedCapability {
   renewAfterMs: number;
 }
 
-async function mintFor(appId: string): Promise<MintedCapability> {
-  const url = `${API}/app-frame-capability?app_id=${encodeURIComponent(appId)}`;
+async function mintAt(url: string): Promise<MintedCapability> {
   const res = await fetch(url, { headers: deviceIdHeader() });
   if (!res.ok) throw new Error(`the engine answered ${res.status}`);
   const body = await res.json() as { capability?: unknown; renew_after_secs?: unknown };

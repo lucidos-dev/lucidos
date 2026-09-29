@@ -300,7 +300,7 @@ describe('describeInitiator — label is WHO, summary is WHAT', () => {
       delivered_event_id: 'evt-1',
     });
     const desc = describeInitiator(
-      ex, '<p>raw json</p>', [], 'tid', false, false, 'claude-code', undefined, undefined,
+      ex, '<p>raw json</p>', [], 'tid', false, false, 'claude-code', {},
       { eventType: 'CodingAgentIdled', eventId: 'evt-src-1', payloadJson: '{\n  "has_changes": true\n}' },
     );
     expect(desc.summary).toBeUndefined();

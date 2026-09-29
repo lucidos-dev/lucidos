@@ -51,6 +51,7 @@ fn only_always_thinking_models_are_rewritten() {
         ("claude-opus-5-5@20260901", true),
         ("claude-fable-5-1", true),
         ("claude-fable-5", true),
+        ("claude-sonnet-5-5", true),
         ("claude-opus-5", false),
         ("claude-sonnet-5", false),
         ("claude-haiku-4-5@20251001", false),

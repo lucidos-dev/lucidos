@@ -1,6 +1,6 @@
 import { OverflowMenu, type HostOpener } from './OverflowMenu';
 import type { ComponentChildren } from 'preact';
-import { CopyIcon, DownloadIcon, ArchiveIcon, CheckIcon, MoveToTopIcon, PinIcon, StandingApplyIcon, TrashIcon } from './icons';
+import { CopyIcon, DownloadIcon, ArchiveIcon, CheckIcon, LocateIcon, MoveToTopIcon, PinIcon, StandingApplyIcon, TrashIcon } from './icons';
 import { copyThreadRef, copyThreadTitle } from '../../utils/threadRef';
 import { exportThread } from '../../utils/exportThread';
 import { resolveChangeMenuActions, resolveThreadActions } from '../../store/actions/threadActions';
@@ -18,8 +18,8 @@ const CHANGE_ACTION_ICON: Partial<Record<Action, (armed: boolean) => ComponentCh
   discard: () => <TrashIcon />,
 };
 
-/** Per-thread overflow (⋯) menu for a STARTED thread: a Pin/Unpin toggle first,
- *  then Copy thread reference / Copy thread title / Download thread, then the
+/** Per-thread overflow (⋯) menu for a STARTED thread: Show in thread list and a
+ *  Pin/Unpin toggle first, then Copy thread reference / Copy thread title / Download thread, then the
  *  conditional change, Archive and Delete actions, with the Info row
  *  auto-appended by <OverflowMenu>.
  *  Built on the shared <OverflowMenu> shell (trigger + anchored menu/Info
@@ -46,6 +46,10 @@ const CHANGE_ACTION_ICON: Partial<Record<Action, (armed: boolean) => ComponentCh
  *  sits with the mutating actions. It confirms, because it cannot be undone,
  *  but it is not red: nothing is stopped or lost.
  *
+ *  **Show in thread list leads the menu, in the thread title bars only**:
+ *  they pass `onShowInThreadList`. On a drawer row it would point at the row
+ *  just opened.
+ *
  *  **Pin/Unpin shows only on a keyboard-open.** Every inline pin button sitting
  *  next to a ⋯ trigger is mouse-only (`tabindex=-1`), so the menu is the
  *  keyboard's only route to it — but on a pointer-open that inline button is
@@ -55,9 +59,10 @@ const CHANGE_ACTION_ICON: Partial<Record<Action, (armed: boolean) => ComponentCh
  *  Type / Exchanges / Started) — the same rows that used to ride the drawer
  *  row's hover tooltip, now reachable everywhere the ⋯ menu lives (drawer row +
  *  both thread-title headers). */
-export function ThreadOverflowMenu({ threadId, title, stopPropagation, extraClass, tabIndex, hostOpener }: {
+export function ThreadOverflowMenu({ threadId, title, onShowInThreadList, stopPropagation, extraClass, tabIndex, hostOpener }: {
   threadId: string;
   title: string;
+  onShowInThreadList?: () => void;
   stopPropagation?: boolean;
   extraClass?: string;
   tabIndex?: number;
@@ -101,6 +106,15 @@ export function ThreadOverflowMenu({ threadId, title, stopPropagation, extraClas
           );
         return (
           <>
+            {onShowInThreadList && (
+              <>
+                <button type="button" class="thread-overflow-item" role="menuitem" onClick={run(onShowInThreadList)}>
+                  <LocateIcon />
+                  Show in thread list
+                </button>
+                <div class="thread-overflow-divider" role="separator" />
+              </>
+            )}
             {showPin && (
               <>
                 <button type="button" class="thread-overflow-item" role="menuitem"

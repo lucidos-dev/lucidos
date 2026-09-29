@@ -46,9 +46,20 @@ describe('availableReasoningLevels', () => {
       'claude-fable-5-1[1m]',
       'claude-opus-5-5',
       'claude-opus-5-5[1m]',
+      'claude-sonnet-5-5',
+      'claude-sonnet-5-5[1m]',
     ]) {
       const values = availableReasoningLevels(id).map(l => l.value);
       expect(values).toEqual(['low', 'medium', 'high', 'xhigh', 'max']);
+    }
+  });
+
+  // Sonnet 5 can still turn thinking off. The Sonnet 5.5 branch must not
+  // swallow it through the shared prefix.
+  it('exposes full set for Sonnet 5', () => {
+    for (const id of ['claude-sonnet-5', 'claude-sonnet-5[1m]']) {
+      const values = availableReasoningLevels(id).map(l => l.value);
+      expect(values).toEqual(['none', 'low', 'medium', 'high', 'xhigh', 'max']);
     }
   });
 

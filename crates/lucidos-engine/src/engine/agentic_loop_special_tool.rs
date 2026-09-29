@@ -437,27 +437,6 @@ impl LucidosEngine {
                         ));
                     }
                 }
-                // The model and effort pins, checked against the backend that
-                // will actually run them. A bad id fails the spawn HERE, in the
-                // same turn, so the caller learns its pin did not apply instead
-                // of reporting a model choice the session never made.
-                let spawn_model = match crate::runtime::validate_coding_agent_model(
-                    coding_agent,
-                    tool_args.get("model").and_then(|v| v.as_str()),
-                ) {
-                    Ok(m) => m,
-                    Err(e) => return Some(format!("Error: {}", e)),
-                };
-                // Validated model, not the raw arg: a tier Codex restricts is
-                // checked against the id the spawn will actually carry.
-                let spawn_effort = match crate::runtime::validate_coding_agent_effort(
-                    coding_agent,
-                    spawn_model.as_deref(),
-                    tool_args.get("reasoning_effort").and_then(|v| v.as_str()),
-                ) {
-                    Ok(e) => e,
-                    Err(e) => return Some(format!("Error: {}", e)),
-                };
                 let workspace_arg = tool_args
                     .get("workspace")
                     .and_then(|v| v.as_str())
@@ -488,6 +467,28 @@ impl LucidosEngine {
                         .await,
                     );
                 }
+                // The model and effort pins, checked against the backend that
+                // will actually run them. A bad id fails the spawn HERE, in the
+                // same turn. The caller then learns its pin did not apply, and
+                // cannot report a model choice the session never made. Below the
+                // cross-workspace branch: this engine's list is not the target's.
+                let spawn_model = match crate::runtime::validate_coding_agent_model(
+                    coding_agent,
+                    tool_args.get("model").and_then(|v| v.as_str()),
+                ) {
+                    Ok(m) => m,
+                    Err(e) => return Some(format!("Error: {}", e)),
+                };
+                // Validated model, not the raw arg: a tier Codex restricts is
+                // checked against the id the spawn will actually carry.
+                let spawn_effort = match crate::runtime::validate_coding_agent_effort(
+                    coding_agent,
+                    spawn_model.as_deref(),
+                    tool_args.get("reasoning_effort").and_then(|v| v.as_str()),
+                ) {
+                    Ok(e) => e,
+                    Err(e) => return Some(format!("Error: {}", e)),
+                };
                 let (parent_thread_id, spawning_event_id) =
                     relation.spawn_linkage(thread_id, tool_called_event_id);
                 let origin = spawn_origin(thread_id, tool_called_event_id);
@@ -853,22 +854,34 @@ impl LucidosEngine {
             .get("folder")
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty());
-        // Validate the pins HERE too. This path returns before the local
-        // spawn's validation, and the receiving engine cannot do it for us: it
-        // sees an ordinary `ChatRequest` and would apply its own default for an
-        // id it does not recognise, which is the silent-drop this whole change
-        // removes. The vocabulary is compiled into both engines, so checking on
-        // the sending side gives the caller the error in its own turn.
-        let model = match crate::runtime::validate_coding_agent_model(
-            coding_agent,
-            tool_args.get("model").and_then(|v| v.as_str()),
-        ) {
-            Ok(m) => m,
-            Err(e) => return format!("Error: {}", e),
+        // Validate the pins HERE too: this path returns before the local
+        // spawn's validation, and the receiving engine passes them straight to
+        // the agent. Codex's list is compiled into both engines, so the sender
+        // can check it. Claude Code's is discovered per workspace, so this
+        // engine's list says nothing about the target's: the id goes through,
+        // and the target's Claude Code accepts it or fails the child loudly.
+        let requested_model = tool_args.get("model").and_then(|v| v.as_str());
+        let model = match coding_agent {
+            crate::runtime::CodingAgent::ClaudeCode => requested_model
+                .map(str::trim)
+                .filter(|m| !m.is_empty())
+                .map(str::to_string),
+            crate::runtime::CodingAgent::Codex => {
+                match crate::runtime::validate_coding_agent_model(coding_agent, requested_model) {
+                    Ok(m) => m,
+                    Err(e) => return format!("Error: {}", e),
+                }
+            }
+        };
+        // For Claude Code only the shared tier vocabulary applies: a model's
+        // own tiers come from the target's list, which this engine cannot see.
+        let effort_model = match coding_agent {
+            crate::runtime::CodingAgent::ClaudeCode => None,
+            crate::runtime::CodingAgent::Codex => model.as_deref(),
         };
         let reasoning_effort = match crate::runtime::validate_coding_agent_effort(
             coding_agent,
-            model.as_deref(),
+            effort_model,
             tool_args.get("reasoning_effort").and_then(|v| v.as_str()),
         ) {
             Ok(e) => e,
@@ -949,8 +962,10 @@ impl LucidosEngine {
             return "Error: `questions` array was empty — pass at least one question".to_string();
         }
 
-        let answers = crate::engine::agent_question::build_hook_answers(&answer_kinds, &questions);
-        serde_json::to_string(&answers).unwrap_or_else(|_| answers.to_string())
+        use crate::engine::agent_question::{build_hook_answers, with_answer_images, AnswerImages};
+        let answers = build_hook_answers(&answer_kinds, &questions, AnswerImages::AttachedBlocks);
+        let result = serde_json::to_string(&answers).unwrap_or_else(|_| answers.to_string());
+        with_answer_images(result, &answer_kinds)
     }
 
     /// Run an isolated agentic loop for intent execution.
@@ -1033,7 +1048,8 @@ impl LucidosEngine {
             );
 
             // Call LLM with no streaming (sub-loop doesn't stream text to frontend)
-            let request_chars = intent_request_chars(system_prompt, &messages, &tools);
+            let request_chars =
+                crate::engine::context::request_chars(system_prompt, &messages, &tools);
             let response = provider
                 .chat(
                     messages.clone(),
@@ -1143,8 +1159,10 @@ impl LucidosEngine {
                 last_tool_call = None;
             }
 
-            // Execute each tool call
+            // Execute each tool call. Images a question answer carried follow
+            // every tool result, as the main loop's block builder places them.
             let mut result_blocks: Vec<ContentBlock> = Vec::new();
+            let mut answer_images: Vec<crate::api::ChatImage> = Vec::new();
             for tc in &response.tool_calls {
                 // Emit ToolCalled via bus. Capture the event_id so spawn-style tools
                 // can record it as the spawning_event_id of the new thread. Redact
@@ -1205,6 +1223,13 @@ impl LucidosEngine {
                     Ok(text) => (text, false),
                     Err(text) => (text, true),
                 };
+                let (answered, hashes) =
+                    crate::engine::agentic_loop::take_answer_images(&tc.name, result);
+                result = answered;
+                answer_images.extend(crate::engine::agentic_loop::load_attached_images(
+                    &self.workspace_path,
+                    &hashes,
+                ));
                 // The same form-request handling as the main loop. Without it a
                 // form this sub-loop asks for never opens, and its raw JSON
                 // reaches the model as if the call had returned.
@@ -1255,30 +1280,17 @@ impl LucidosEngine {
                 });
             }
 
+            result_blocks.extend(answer_images.into_iter().map(|image| ContentBlock::Image {
+                source_type: "base64".to_string(),
+                media_type: image.mime_type,
+                data: image.base64,
+            }));
             messages.push(Message {
                 role: "user".to_string(),
                 content: MessageContent::Blocks(result_blocks),
             });
         }
     }
-}
-
-/// Chars in what one intent sub-loop round sends.
-///
-/// The same three parts a turn's own capture counts: the system prompt, the
-/// messages, and the tool schemas. The tools are included because they are
-/// resent on every round and they dominate a short prompt.
-fn intent_request_chars(
-    system_prompt: &str,
-    messages: &[Message],
-    tools: &[crate::llm::provider::ToolDefinition],
-) -> usize {
-    system_prompt.chars().count()
-        + messages
-            .iter()
-            .map(crate::engine::context::estimate_message_chars)
-            .sum::<usize>()
-        + crate::engine::context::tool_definitions_chars(tools)
 }
 
 /// Decide whether an intent sub-loop LLM response carries narrative prose worth
@@ -1319,9 +1331,11 @@ mod tests {
             content: MessageContent::Text("Task: tidy the inbox".to_string()),
         }];
         let tools = build_intent_tools(&crate::llm::ToolCapabilities::default());
-        let sized = intent_request_chars("You are the Director.", &messages, &tools);
+        let sized =
+            crate::engine::context::request_chars("You are the Director.", &messages, &tools);
 
-        let without_tools = intent_request_chars("You are the Director.", &messages, &[]);
+        let without_tools =
+            crate::engine::context::request_chars("You are the Director.", &messages, &[]);
         assert!(
             sized > without_tools,
             "the tool schemas are part of what was sent"
