@@ -10,6 +10,8 @@ vi.mock('../../../api/client', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../../api/client')>();
   return { ...actual, dismissSideQuestion: () => Promise.resolve() };
 });
+const openRepoFileLink = vi.hoisted(() => vi.fn(async () => {}));
+vi.mock('../../../store/actions/repoFileLink', () => ({ openRepoFileLink }));
 
 import { SIDE_QUESTION_NOTE, SIDE_QUESTION_THINKING_DELAY_MS, placeSideQuestions } from '../SideQuestionCard';
 import {
@@ -63,6 +65,20 @@ it('renders the answer as markdown, with the not-recorded note', () => {
   expect(card.querySelector('.side-question-question')!.textContent).toBe('what is X?');
   expect(card.querySelector('.markdown-content strong')!.textContent).toBe('bold');
   expect(card.textContent).toContain(SIDE_QUESTION_NOTE);
+});
+
+// The card sits outside the turn body, so it carries the link router itself.
+// Without it the webview followed a `repo:` link to macOS, which refused it.
+it('opens a repo link in the answer in the app, never the OS', () => {
+  show([{ ...asked, id: 'a', question: 'where?', status: 'answered', answer: 'In [main](repo:lucidos:file:src/main.rs).' }]);
+  const anchor = host.querySelector('.markdown-content a')!;
+  const click = new MouseEvent('click', { bubbles: true, cancelable: true });
+  anchor.dispatchEvent(click);
+  expect(click.defaultPrevented).toBe(true);
+  expect(openRepoFileLink).toHaveBeenCalledWith(
+    { locator: { repoId: 'lucidos', mode: 'file', ref: undefined, path: 'src/main.rs' } },
+    undefined,
+  );
 });
 
 it('says Thinking only after a delay while pending, shimmering like the live step row', () => {

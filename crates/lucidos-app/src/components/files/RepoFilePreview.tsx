@@ -1,4 +1,4 @@
-import { useEffect, useMemo } from 'preact/hooks';
+import { useEffect, useMemo, useState } from 'preact/hooks';
 import type { DiffFile, RepoDiff, RepoLocator } from '../../store/store';
 import { repoDiff, repoPending, filePreviewSource, filePreviewWrap, diffSideBySide, repoSelectedChangeId, openFilePreviewRevision } from '../../store/store';
 import { diffBodyKind } from '../../store/diffBody';
@@ -229,12 +229,19 @@ function RepoFileMedia({ repoId, path, changeId, gitRef, revision, kind }: RepoF
     revision ?? 0,
   );
 
-  if (kind === 'image') {
-    return <PreviewImage src={url} alt={path} />;
-  }
+  if (kind === 'image') return <RepoImage key={url} src={url} path={path} />;
   if (kind === 'pdf') return <iframe src={url} style="width:100%;height:100%;border:none;" onLoad={(e) => bridgePreviewIframeShortcuts(e.currentTarget)} />;
   if (kind === 'video') return <video src={url} controls style="max-width:100%;max-height:100%;" />;
   return <audio src={url} controls style="width:100%;" />;
+}
+
+/** A repository image, or a load error when it cannot be read: a `repo:` link
+ *  can name a file or ref that does not exist. Keyed by `src` at the call site,
+ *  so the next file starts without the last one's failure. */
+function RepoImage({ src, path }: { src: string; path: string }) {
+  const [failed, setFailed] = useState(false);
+  if (failed) return <LoadableError noun="image" error={`${path} could not be read from the repository`} />;
+  return <PreviewImage src={src} alt={path} onError={() => setFailed(true)} />;
 }
 
 function RepoFileText({ repoId, path, changeId, gitRef, revision, body }: RepoFileContentProps & { body: 'markdown' | 'csv' | 'svg' | 'source' }) {

@@ -30,7 +30,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 // @ts-expect-error — same
 import { fileURLToPath } from 'node:url';
-import { linkifyPaths, extractAppTargetFromHref, extractNavTargetFromHref, extractLocalFileTarget, extractBareAppRef, extractDataPathTarget, extractTriggerIdFromHref, hasUrlScheme, browserHandlesHref } from '../../../utils/linkifyPaths';
+import { linkifyPaths, extractAppTargetFromHref, extractNavTargetFromHref, extractLocalFileTarget, extractBareAppRef, extractDataPathTarget, extractTriggerIdFromHref, extractRepoFileTargetFromHref, hasUrlScheme, browserHandlesHref, type RepoFileHrefTarget } from '../../../utils/linkifyPaths';
 import { renderMarkdown } from '../../../utils/renderMarkdown';
 import type { App } from '../../../store/types';
 
@@ -99,6 +99,7 @@ type Callbacks = {
    *  the navigate source this surface never sets. */
   openAppById: (id: string, fragment?: string) => void;
   openTrigger: (id: string) => void;
+  openRepoFile: (target: RepoFileHrefTarget) => void;
   navigate: (req: { target: string }) => void;
   osOpen: (target: string) => void;
   toast: (message: string) => void;
@@ -150,6 +151,12 @@ function runHandleLinkClick(e: ReturnType<typeof mkEvent>, apps: App[], cb: Call
       cb.openTrigger(triggerId);
       return;
     }
+    const repoFile = extractRepoFileTargetFromHref(href);
+    if (repoFile) {
+      e.preventDefault();
+      cb.openRepoFile(repoFile);
+      return;
+    }
     const navName = extractNavTargetFromHref(href);
     if (navName) {
       e.preventDefault();
@@ -191,6 +198,7 @@ describe('chat link click — the bug-report scenario', () => {
     openApp: ReturnType<typeof vi.fn>;
     openAppById: ReturnType<typeof vi.fn>;
     openTrigger: ReturnType<typeof vi.fn>;
+    openRepoFile: ReturnType<typeof vi.fn>;
     navigate: ReturnType<typeof vi.fn>;
     osOpen: ReturnType<typeof vi.fn>;
     toast: ReturnType<typeof vi.fn>;
@@ -203,6 +211,7 @@ describe('chat link click — the bug-report scenario', () => {
       openApp: vi.fn() as Callbacks['openApp'] & ReturnType<typeof vi.fn>,
       openAppById: vi.fn() as Callbacks['openAppById'] & ReturnType<typeof vi.fn>,
       openTrigger: vi.fn() as Callbacks['openTrigger'] & ReturnType<typeof vi.fn>,
+      openRepoFile: vi.fn() as Callbacks['openRepoFile'] & ReturnType<typeof vi.fn>,
       navigate: vi.fn() as Callbacks['navigate'] & ReturnType<typeof vi.fn>,
       osOpen: vi.fn() as Callbacks['osOpen'] & ReturnType<typeof vi.fn>,
       toast: vi.fn() as Callbacks['toast'] & ReturnType<typeof vi.fn>,
@@ -726,11 +735,42 @@ describe('chat link click — the bug-report scenario', () => {
   it('the app OWN schemes never reach the guard', () => {
     // Each is claimed by its extractor first, so closing the guard cannot make
     // one of them toast.
-    for (const href of ['app:habit-tracker', 'trigger:abc-123', '/Applications/X.app']) {
+    for (const href of ['app:habit-tracker', 'trigger:abc-123', 'repo:lucidos:file:README.md', '/Applications/X.app']) {
       cb.toast.mockClear();
       runHandleLinkClick(mkEvent(mkAnchor(href)), APPS, cb);
       expect(cb.toast, `${href} must not reach the terminal guard`).not.toHaveBeenCalled();
     }
+  });
+});
+
+describe('chat link click — repository file links', () => {
+  const openRepoFile = vi.fn();
+  const cb = {
+    openImage: vi.fn(), openArtifact: vi.fn(), openApp: vi.fn(), openAppById: vi.fn(),
+    openTrigger: vi.fn(), openRepoFile, navigate: vi.fn(), osOpen: vi.fn(), toast: vi.fn(),
+  };
+  beforeEach(() => { for (const f of Object.values(cb)) f.mockClear(); });
+
+  // The reported bug: `repo:<repo>:file:<path>` in a reply went to macOS,
+  // which answered "unsupported scheme". It must open in the app, never the OS.
+  it.each([
+    ['repo:lucidos:file:crates/lucidos-app/src/main.tsx', 'lucidos', undefined, 'crates/lucidos-app/src/main.tsx'],
+    ['repo:6f1c2a90-0000-5000-8000-000000000001:file:README.md', '6f1c2a90-0000-5000-8000-000000000001', undefined, 'README.md'],
+    ['repo:lucidos:file#v1.2.0:docs/adr/index.md', 'lucidos', 'v1.2.0', 'docs/adr/index.md'],
+  ])('%s → repository file preview', (href, repoId, ref, path) => {
+    const e = mkEvent(mkAnchor(href));
+    runHandleLinkClick(e, APPS, cb);
+    expect(e.defaultPrevented).toBe(true);
+    expect(openRepoFile).toHaveBeenCalledWith({ locator: { repoId, mode: 'file', ref, path } });
+    expect(cb.osOpen).not.toHaveBeenCalled();
+    expect(cb.toast).not.toHaveBeenCalled();
+  });
+
+  it('END-TO-END: a rendered repo link keeps its href for the router', () => {
+    // The sanitizer allows `repo:` and linkify leaves it alone, so the router
+    // reads the exact href the agent wrote.
+    const html = linkifyPaths(renderMarkdown('[main](repo:lucidos:file:src/main.rs)'), [], APPS);
+    expect(html).toContain('href="repo:lucidos:file:src/main.rs"');
   });
 });
 
@@ -754,17 +794,18 @@ describe('chat link click — handler structure pin', () => {
     expect(body).toMatch(sequence);
   });
 
-  it('handleMarkdownLinkClick uses all six href extractors in the fallback branch', () => {
-    expect(routerSource).toMatch(/import[\s\S]*?extractAppTargetFromHref[\s\S]*?extractNavTargetFromHref[\s\S]*?extractLocalFileTarget[\s\S]*?extractBareAppRef[\s\S]*?extractDataPathTarget[\s\S]*?extractTriggerIdFromHref[\s\S]*?from '..\/..\/utils\/linkifyPaths'/);
+  it('handleMarkdownLinkClick uses all seven href extractors in the fallback branch', () => {
+    expect(routerSource).toMatch(/import[\s\S]*?extractAppTargetFromHref[\s\S]*?extractNavTargetFromHref[\s\S]*?extractLocalFileTarget[\s\S]*?extractBareAppRef[\s\S]*?extractDataPathTarget[\s\S]*?extractTriggerIdFromHref[\s\S]*?extractRepoFileTargetFromHref[\s\S]*?from '..\/..\/utils\/linkifyPaths'/);
     expect(routerSource).toMatch(/extractAppTargetFromHref\(rawHref\)/);
     expect(routerSource).toMatch(/extractTriggerIdFromHref\(rawHref\)/);
+    expect(routerSource).toMatch(/extractRepoFileTargetFromHref\(rawHref\)/);
     expect(routerSource).toMatch(/extractNavTargetFromHref\(rawHref\)/);
     expect(routerSource).toMatch(/extractBareAppRef\(rawHref\)/);
     expect(routerSource).toMatch(/extractDataPathTarget\(rawHref\)/);
     expect(routerSource).toMatch(/extractLocalFileTarget\(rawHref\)/);
   });
 
-  it('fallback branch calls openAppById, openApp, handleNavigationRequest, openFilePreview and openLocalFileOnConfirm with preventDefault', () => {
+  it('fallback branch calls openAppById, openApp, openRepoFileLink, handleNavigationRequest, openFilePreview and openLocalFileOnConfirm with preventDefault', () => {
     const m = routerSource.match(/closest\('a'\)[\s\S]*?\n\}\n/);
     expect(m).not.toBeNull();
     const body = m![0];
@@ -776,6 +817,7 @@ describe('chat link click — handler structure pin', () => {
     );
     expect(body).toContain('openApp(app)');
     expect(body).toContain('navigateToTrigger(triggerId, source)');
+    expect(body).toContain('openRepoFileLink(repoFile, source)');
     expect(body).toContain('handleNavigationRequest({ target: navName })');
     expect(body).toContain('openFilePreview(dataPath)');
     expect(body).toContain('openLocalFileOnConfirm(localFile, source)');
@@ -790,7 +832,7 @@ describe('chat link click — handler structure pin', () => {
     expect(m![0]).not.toContain('apps.find');
   });
 
-  it('the fallback extractors run in order: app, trigger, nav, bare-app-ref, data-path, OS-open', () => {
+  it('the fallback extractors run in order: app, trigger, repo, nav, bare-app-ref, data-path, OS-open', () => {
     // extractLocalFileTarget must appear after the app/nav extractors, or an
     // absolute /apps/… or /notifications href could be handed to the OS instead
     // of routed in-app. extractBareAppRef must run AFTER nav so a reserved panel
@@ -800,17 +842,19 @@ describe('chat link click — handler structure pin', () => {
     // ever claims single-segment hrefs, so they cannot collide) and before
     // OS-open, so an absolute /artifacts/… is read as a workspace file rather
     // than a disk path.
-    // The trigger extractor claims `trigger:` and nothing else, so its slot is
-    // for narrative order rather than for resolving a collision.
+    // The trigger and repo extractors each claim one scheme and nothing else,
+    // so their slots are for narrative order rather than for resolving a collision.
     const appIdx = routerSource.indexOf('extractAppTargetFromHref(rawHref)');
     const trigIdx = routerSource.indexOf('extractTriggerIdFromHref(rawHref)');
+    const repoIdx = routerSource.indexOf('extractRepoFileTargetFromHref(rawHref)');
     const navIdx = routerSource.indexOf('extractNavTargetFromHref(rawHref)');
     const bareIdx = routerSource.indexOf('extractBareAppRef(rawHref)');
     const dataIdx = routerSource.indexOf('extractDataPathTarget(rawHref)');
     const fileIdx = routerSource.indexOf('extractLocalFileTarget(rawHref)');
     expect(appIdx).toBeGreaterThanOrEqual(0);
     expect(trigIdx).toBeGreaterThan(appIdx);
-    expect(navIdx).toBeGreaterThan(trigIdx);
+    expect(repoIdx).toBeGreaterThan(trigIdx);
+    expect(navIdx).toBeGreaterThan(repoIdx);
     expect(bareIdx).toBeGreaterThan(navIdx);
     expect(dataIdx).toBeGreaterThan(bareIdx);
     expect(fileIdx).toBeGreaterThan(dataIdx);

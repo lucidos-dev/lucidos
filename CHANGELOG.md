@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.44.1 — 2026-09-30
+
+### Fixed
+
+- A `repo:` file link in chat opens the file in the app. The link takes a repository id or a repository name.
+- A `repo:` link to a repository that is not in the list retries once with a fresh repository read before it reports the repository missing.
+- The file preview shows a load error when a repository image cannot be read.
+- On mobile, the repo diff preview scrolls the content pane, so the header hides as you scroll.
+- On mobile, a PDF in the diff preview keeps its full height.
 ## v0.44.0
 
 ### Added

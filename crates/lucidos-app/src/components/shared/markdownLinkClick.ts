@@ -4,6 +4,7 @@ import { openFilePreview, openLocalFileOnConfirm } from '../../store/actions/art
 import { openApp, openAppById } from '../../store/actions/apps';
 import { navigateToTrigger } from '../../store/actions/triggers';
 import { handleNavigationRequest } from '../../store/actions/navigation-request';
+import { openRepoFileLink } from '../../store/actions/repoFileLink';
 import {
   extractAppTargetFromHref,
   extractNavTargetFromHref,
@@ -11,6 +12,7 @@ import {
   extractBareAppRef,
   extractDataPathTarget,
   extractTriggerIdFromHref,
+  extractRepoFileTargetFromHref,
   hasUrlScheme,
   browserHandlesHref,
 } from '../../utils/linkifyPaths';
@@ -107,6 +109,15 @@ export function handleMarkdownLinkClick(e: MouseEvent, apps: App[], source?: str
     if (triggerId) {
       e.preventDefault();
       void navigateToTrigger(triggerId, source);
+      return;
+    }
+    // A file in a registered repository clone. Unconditional, like the app
+    // arm: the resolver re-reads the registry and toasts what it cannot open,
+    // so a `repo:` href never reaches the terminal guard or the OS.
+    const repoFile = extractRepoFileTargetFromHref(rawHref);
+    if (repoFile) {
+      e.preventDefault();
+      void openRepoFileLink(repoFile, source);
       return;
     }
     const navName = extractNavTargetFromHref(rawHref);

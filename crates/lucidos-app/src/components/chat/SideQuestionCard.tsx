@@ -4,7 +4,10 @@ import { dismissSideQuestion, reopenSideQuestion, type SideQuestion } from '../.
 import type { BodyRow, BodySection } from '../../store/event-rendering';
 import { exchangeKey, type Exchange } from '../../store/thread-events/exchange';
 import { renderMarkdown } from '../../utils/renderMarkdown';
+import { appsList } from '../../store/store';
+import { loadedOr } from '../../store/types';
 import { Disclosure } from '../shared/Disclosure';
+import { handleMarkdownLinkClick } from '../shared/markdownLinkClick';
 import { ChevronDownIcon } from '../shared/icons';
 import { MarkdownBlock, UserImages } from './chat-exchange-parts';
 
@@ -60,7 +63,14 @@ export function SideQuestionCard({ item }: { item: SideQuestion }) {
           <UserImages imageHashes={item.imageHashes} />
         </div>
         {item.status === 'pending' && <Thinking />}
-        {item.status === 'answered' && <MarkdownBlock html={renderMarkdown(item.answer)} />}
+        {item.status === 'answered' && (
+          // The card sits outside the turn body, so it carries the router
+          // itself. Without it the webview follows a `repo:` link to the OS.
+          <MarkdownBlock
+            html={renderMarkdown(item.answer)}
+            onClick={(e) => handleMarkdownLinkClick(e, loadedOr(appsList.value, []))}
+          />
+        )}
         {item.status === 'failed' && (
           <div class="side-question-error" role="alert">{item.error}</div>
         )}

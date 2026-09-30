@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { linkifyPaths, extractAppTargetFromHref, extractNavTargetFromHref, extractLocalFileTarget, extractBareAppRef, extractTriggerIdFromHref, browserHandlesHref, _resetLinkifyCacheForTesting, DATA_PATH_PREFIXES, PROSE_DATA_PATH_PREFIXES } from './linkifyPaths';
+import { linkifyPaths, extractAppTargetFromHref, extractNavTargetFromHref, extractLocalFileTarget, extractBareAppRef, extractTriggerIdFromHref, extractRepoFileTargetFromHref, browserHandlesHref, _resetLinkifyCacheForTesting, DATA_PATH_PREFIXES, PROSE_DATA_PATH_PREFIXES } from './linkifyPaths';
 
 describe('DATA_PATH_PREFIXES', () => {
   // `every_data_prefix_list_matches_the_engine` in the CLI crate pins the full
@@ -229,6 +229,54 @@ describe('extractTriggerIdFromHref', () => {
     ['', null],
   ])('returns null for %s', (href, expected) => {
     expect(extractTriggerIdFromHref(href)).toBe(expected);
+  });
+});
+
+// The chat router and the preview router both claim `repo:` through this, so a
+// repo citation never reaches the terminal guard or the OS opener.
+describe('extractRepoFileTargetFromHref', () => {
+  it('reads a repository named by name, at HEAD', () => {
+    expect(extractRepoFileTargetFromHref('repo:lucidos:file:crates/lucidos-app/src/main.tsx')).toEqual({
+      locator: { repoId: 'lucidos', mode: 'file', ref: undefined, path: 'crates/lucidos-app/src/main.tsx' },
+    });
+  });
+
+  it('reads a `file#<ref>` link together with a cited range', () => {
+    expect(extractRepoFileTargetFromHref('repo:r1:file#origin/main:src/a.rs#L10-L20')).toEqual({
+      locator: { repoId: 'r1', mode: 'file', ref: 'origin/main', path: 'src/a.rs' },
+      line: 10,
+      lineEnd: 20,
+    });
+  });
+
+  it('reads a single cited line', () => {
+    expect(extractRepoFileTargetFromHref('repo:r1:file:src/a.rs#L7')).toEqual({
+      locator: { repoId: 'r1', mode: 'file', ref: undefined, path: 'src/a.rs' },
+      line: 7,
+      lineEnd: undefined,
+    });
+  });
+
+  it('decodes what markdown percent-encoded', () => {
+    // `[x](<repo:My Repo:file:docs/read me.md>)` renders with %20 in the href.
+    expect(extractRepoFileTargetFromHref('repo:My%20Repo:file:docs/read%20me.md')?.locator)
+      .toEqual({ repoId: 'My Repo', mode: 'file', ref: undefined, path: 'docs/read me.md' });
+  });
+
+  it('keeps a malformed escape as written instead of throwing', () => {
+    expect(extractRepoFileTargetFromHref('repo:r1:file:100%.md')?.locator.path).toBe('100%.md');
+  });
+
+  it.each([
+    'repo::file:src/main.rs',
+    'repo:r1:file:',
+    'repo:r1:weird:a.md',
+    'repo:r1:file#:src/main.rs',
+    'repo:',
+    'artifacts/repo:r1:file:a.md',
+    'https://example.com/repo:r1:file:a.md',
+  ])('declines %s', (href) => {
+    expect(extractRepoFileTargetFromHref(href)).toBeNull();
   });
 });
 

@@ -50,6 +50,7 @@ const {
   withPreviewSizing,
   documentDeclaresBase,
 } = await import('./previewIframeLinks');
+const { parseRepoPath, repositories } = await import('../../store/store');
 
 const TID = '961b9b83-53b7-47cd-8982-3c959d7f1137';
 
@@ -231,13 +232,13 @@ describe('classifyPreviewLink', () => {
     const ENCODED = 'repo:repo-1:file:src/main.rs';
 
     it('routes a bare repo file', () => {
-      expect(classifyPreviewLink(ENCODED, ctx())).toEqual({ kind: 'repo-file', filePath: ENCODED });
+      expect(classifyPreviewLink(ENCODED, ctx())).toEqual({ kind: 'repo-file', locator: parseRepoPath(ENCODED) });
     });
 
     it('carries a single cited line', () => {
       expect(classifyPreviewLink(`${ENCODED}#L510`, ctx())).toEqual({
         kind: 'repo-file',
-        filePath: ENCODED,
+        locator: parseRepoPath(ENCODED),
         line: 510,
         lineEnd: undefined,
       });
@@ -248,13 +249,13 @@ describe('classifyPreviewLink', () => {
       ['#L510-520', 510, 520],
     ])('carries a cited range written as %s', (frag, line, lineEnd) => {
       expect(classifyPreviewLink(`${ENCODED}${frag}`, ctx()))
-        .toEqual({ kind: 'repo-file', filePath: ENCODED, line, lineEnd });
+        .toEqual({ kind: 'repo-file', locator: parseRepoPath(ENCODED), line, lineEnd });
     });
 
     it('keeps a path that contains colons intact', () => {
       const weird = 'repo:repo-1:file:src/weird:name.rs';
       expect(classifyPreviewLink(`${weird}#L7`, ctx()))
-        .toEqual({ kind: 'repo-file', filePath: weird, line: 7, lineEnd: undefined });
+        .toEqual({ kind: 'repo-file', locator: parseRepoPath(weird), line: 7, lineEnd: undefined });
     });
 
     // Two `#` in one href, and they mean different things: the one inside the
@@ -264,12 +265,12 @@ describe('classifyPreviewLink', () => {
     it('carries a named ref and a cited range together', () => {
       const atRef = 'repo:repo-1:file#origin/main:src/main.rs';
       expect(classifyPreviewLink(`${atRef}#L10-L20`, ctx()))
-        .toEqual({ kind: 'repo-file', filePath: atRef, line: 10, lineEnd: 20 });
+        .toEqual({ kind: 'repo-file', locator: parseRepoPath(atRef), line: 10, lineEnd: 20 });
     });
 
     it('routes a bare repo file at a named ref', () => {
       const atRef = 'repo:repo-1:file#v1.2.0:src/main.rs';
-      expect(classifyPreviewLink(atRef, ctx())).toEqual({ kind: 'repo-file', filePath: atRef });
+      expect(classifyPreviewLink(atRef, ctx())).toEqual({ kind: 'repo-file', locator: parseRepoPath(atRef) });
     });
 
     // parseRepoPath stays the single predicate: a structurally incomplete
@@ -291,7 +292,7 @@ describe('classifyPreviewLink', () => {
     it('does not read a non-line fragment as a line', () => {
       expect(classifyPreviewLink(`${ENCODED}#section`, ctx())).toEqual({
         kind: 'repo-file',
-        filePath: `${ENCODED}#section`,
+        locator: parseRepoPath(`${ENCODED}#section`),
       });
     });
   });
@@ -389,10 +390,20 @@ describe('markdown preview links (rendered in the host document)', () => {
   });
 
   it('routes a repo citation through the navigate router, lines and all', () => {
+    repositories.value = { status: 'loaded', data: [{ id: 'repo-1', name: 'example-repo', path: '/src/example' }] };
     const e = clickInMarkdown('repo:repo-1:file:src/main.rs#L510-L520');
     expect(e.defaultPrevented).toBe(true);
     expect(mocks.handleNavigationRequest).toHaveBeenCalledWith(
       { target: 'file', file_path: 'repo:repo-1:file:src/main.rs', line: 510, line_end: 520 },
+      { source: 'a file preview' },
+    );
+  });
+
+  it('resolves a repo citation that names its repository', () => {
+    repositories.value = { status: 'loaded', data: [{ id: 'repo-1', name: 'example-repo', path: '/src/example' }] };
+    clickInMarkdown('repo:example-repo:file:src/main.rs');
+    expect(mocks.handleNavigationRequest).toHaveBeenCalledWith(
+      expect.objectContaining({ file_path: 'repo:repo-1:file:src/main.rs' }),
       { source: 'a file preview' },
     );
   });

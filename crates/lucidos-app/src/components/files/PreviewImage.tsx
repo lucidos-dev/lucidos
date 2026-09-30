@@ -8,12 +8,13 @@ import { openImagePopup } from '../../store/store';
  *  fit, which leaves a tall screenshot too small to read. Enter and Space do
  *  the same, because an image carrying the pane's only action has to be
  *  reachable by keyboard. */
-export function PreviewImage({ src, alt }: { src: string; alt: string }) {
+export function PreviewImage({ src, alt, onError }: { src: string; alt: string; onError?: () => void }) {
   return (
     <img
       class="preview-image"
       src={src}
       alt={alt}
+      onError={onError}
       role="button"
       tabIndex={0}
       onClick={() => openImagePopup(src)}

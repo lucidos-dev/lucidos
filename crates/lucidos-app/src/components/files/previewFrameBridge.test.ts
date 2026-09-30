@@ -48,6 +48,7 @@ const {
   withPreviewBridge,
   withPreviewCapability,
 } = await import('./previewFrameBridge');
+const { repositories } = await import('../../store/store');
 const { PREVIEW_HOST_SCHEMES, classifyPreviewLink, withPreviewBase } = await import('./previewIframeLinks');
 const { PREVIEW_FRAME_MESSAGE, PREVIEW_HOST_MESSAGE } = await import('../../utils/previewFrameProtocol');
 
@@ -481,6 +482,7 @@ describe('routePreviewFrameMessage', () => {
   });
 
   it('routes a thread, an external page and a repo citation', () => {
+    repositories.value = { status: 'loaded', data: [{ id: 'repo-1', name: 'example-repo', path: '/src/example' }] };
     route(`thread:dev/${TID}`);
     route('https://example.com/docs');
     route('repo:repo-1:file:src/main.rs#L510-L520');

@@ -50,8 +50,8 @@ export function changeAccent(type: ChangeLifecycleType): string {
   return CHANGE_STATE[type].accent;
 }
 
-export function MarkdownBlock({ html }: { html: string }) {
-  return <div class="markdown-content" dangerouslySetInnerHTML={{ __html: html }} />;
+export function MarkdownBlock({ html, onClick }: { html: string; onClick?: (e: MouseEvent) => void }) {
+  return <div class="markdown-content" onClick={onClick} dangerouslySetInnerHTML={{ __html: html }} />;
 }
 
 export function FileList({ files }: { files: string[] }) {

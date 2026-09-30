@@ -29,13 +29,15 @@ import {
   extractNavTargetFromHref,
   extractLocalFileTarget,
   extractTriggerIdFromHref,
+  extractRepoFileTargetFromHref,
   hasUrlScheme,
+  type RepoFileHrefTarget,
 } from '../../utils/linkifyPaths';
 import { openFilePreview, openUrl, openLocalFileOnConfirm } from '../../store/actions/artifacts';
 import { openAppById } from '../../store/actions/apps';
 import { openThreadAcrossWorkspaces } from '../../store/actions/cross-workspace';
 import { handleNavigationRequest } from '../../store/actions/navigation-request';
-import { parseRepoPath } from '../../store/store';
+import { openRepoFileLink } from '../../store/actions/repoFileLink';
 
 /** `thread:<workspace>/<uuid>` and the bare `thread:<uuid>` form, mirroring the
  *  markdown rewrite in `utils/renderMarkdown.ts`. */
@@ -74,7 +76,7 @@ export type PreviewLinkAction =
   | { kind: 'nav'; target: string }
   | { kind: 'local-file'; target: string }
   | { kind: 'file'; path: string }
-  | { kind: 'repo-file'; filePath: string; line?: number; lineEnd?: number }
+  | ({ kind: 'repo-file' } & RepoFileHrefTarget)
   | { kind: 'external'; url: string };
 
 /** The URL schemes `classifyPreviewLink` routes. The preview frame's bridge
@@ -83,32 +85,6 @@ export type PreviewLinkAction =
  *  A test pins the two together. */
 export const PREVIEW_HOST_SCHEMES: readonly string[] =
   ['http', 'https', 'thread', 'app', 'trigger', 'repo', 'file'];
-
-/** A GitHub-style line reference on a link: `#L510` or `#L510-L520` (the
- *  `#L510-520` short form too). This is the only channel a hand-written `<a>`
- *  has for a line, since the navigate params it maps onto aren't reachable from
- *  an href. */
-const LINE_FRAGMENT_RE = /#L(\d+)(?:-L?(\d+))?$/;
-
-/** A `repo:<repoId>:file:<path>` href written inside an artifact, with an
- *  optional trailing line reference split off.
- *
- *  `parseRepoPath` stays the sole predicate for "is this a repo path": this only
- *  removes a `#L…` suffix before asking it, and hands back the encoded path
- *  untouched otherwise. A malformed encoding therefore returns null here and the
- *  caller leaves the href to the existing scheme handling, exactly as before. */
-export function parseRepoFileHref(href: string): PreviewLinkAction | null {
-  const lineMatch = LINE_FRAGMENT_RE.exec(href);
-  const filePath = lineMatch ? href.slice(0, lineMatch.index) : href;
-  if (!parseRepoPath(filePath)) return null;
-  if (!lineMatch) return { kind: 'repo-file', filePath };
-  return {
-    kind: 'repo-file',
-    filePath,
-    line: Number(lineMatch[1]),
-    lineEnd: lineMatch[2] === undefined ? undefined : Number(lineMatch[2]),
-  };
-}
 
 function decodeFragment(id: string): string {
   try {
@@ -228,12 +204,10 @@ export function classifyPreviewLink(
 
   // A file in a registered repository clone. `repo:` is a scheme, so without
   // this arm the guard below hands it back to the browser and the link
-  // dead-ends: that is why a report citing repo code had to be published as an
-  // app (only an app iframe reaches the SDK's `lucidos.ui.navigate`) rather than
-  // as a plain artifact. Routed through the same navigate router the SDK call
-  // reaches, so both spellings of a citation land identically.
-  const repoFile = parseRepoFileHref(href);
-  if (repoFile) return repoFile;
+  // dead-ends. Opened by the same resolver as a chat link, so both accept a
+  // repository name and land identically.
+  const repoFile = extractRepoFileTargetFromHref(href);
+  if (repoFile) return { kind: 'repo-file', ...repoFile };
 
   // A scheme we don't own (`mailto:`, `tel:`, …): leave the browser to it.
   if (hasUrlScheme(href)) return null;
@@ -298,10 +272,7 @@ export function runPreviewLinkAction(action: PreviewNavigation, artifactPath: st
       openFilePreview(action.path);
       return;
     case 'repo-file':
-      handleNavigationRequest(
-        { target: 'file', file_path: action.filePath, line: action.line, line_end: action.lineEnd },
-        { source: 'a file preview' },
-      );
+      void openRepoFileLink(action, 'a file preview');
       return;
     case 'external':
       openUrl(action.url);

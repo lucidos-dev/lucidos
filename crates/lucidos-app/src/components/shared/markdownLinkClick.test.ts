@@ -20,6 +20,7 @@ const mocks = vi.hoisted(() => ({
   openAppById: vi.fn(async () => {}),
   navigateToTrigger: vi.fn(async () => {}),
   handleNavigationRequest: vi.fn(),
+  openRepoFileLink: vi.fn(async () => {}),
   showToast: vi.fn(),
 }));
 
@@ -35,6 +36,7 @@ vi.mock('../../store/actions/triggers', () => ({ navigateToTrigger: mocks.naviga
 vi.mock('../../store/actions/navigation-request', () => ({
   handleNavigationRequest: mocks.handleNavigationRequest,
 }));
+vi.mock('../../store/actions/repoFileLink', () => ({ openRepoFileLink: mocks.openRepoFileLink }));
 vi.mock('../../store/store', async () => {
   const actual = await vi.importActual<typeof import('../../store/store')>('../../store/store');
   return { ...actual, showToast: mocks.showToast };
@@ -118,6 +120,39 @@ describe('handleMarkdownLinkClick', () => {
     );
   });
 
+  // The reported bug: macOS got a `repo:` link and answered "unsupported
+  // scheme". The router claims it, with the repository named by id or name.
+  // The resolver gets the file, the ref and the cited lines.
+  it.each([
+    ['repo:lucidos:file:crates/lucidos-app/src/main.tsx', { locator: { repoId: 'lucidos', mode: 'file', ref: undefined, path: 'crates/lucidos-app/src/main.tsx' } }],
+    ['repo:6f1c2a90-0000-5000-8000-000000000001:file:README.md', { locator: { repoId: '6f1c2a90-0000-5000-8000-000000000001', mode: 'file', ref: undefined, path: 'README.md' } }],
+    ['repo:lucidos:file#origin/main:src/a.rs#L5', { locator: { repoId: 'lucidos', mode: 'file', ref: 'origin/main', path: 'src/a.rs' }, line: 5, lineEnd: undefined }],
+  ])('opens %s in the repository file preview', (href, target) => {
+    const prevented = clickFirstLink(`See [the file](${href}).`, 'a notification');
+    expect(prevented).toBe(true);
+    expect(mocks.openRepoFileLink).toHaveBeenCalledWith(target, 'a notification');
+    expect(mocks.showToast).not.toHaveBeenCalled();
+  });
+
+  it('decodes a repo link whose destination markdown percent-encoded', () => {
+    clickFirstLink('[notes](<repo:My Repo:file:docs/read me.md>)');
+    expect(mocks.openRepoFileLink).toHaveBeenCalledWith(
+      { locator: { repoId: 'My Repo', mode: 'file', ref: undefined, path: 'docs/read me.md' } },
+      undefined,
+    );
+  });
+
+  it('toasts a malformed repo link in the app instead of handing it to the OS', () => {
+    const prevented = clickFirstLink('[broken](repo::file:src/main.rs)');
+    expect(prevented).toBe(true);
+    expect(mocks.openRepoFileLink).not.toHaveBeenCalled();
+    expect(mocks.showToast).toHaveBeenCalledWith(
+      expect.stringContaining('uses a scheme nothing here can open'),
+      'error',
+      expect.anything(),
+    );
+  });
+
   it('leaves an https link to the browser', () => {
     const prevented = clickFirstLink('[site](https://example.com)');
     expect(prevented).toBe(false);
@@ -130,6 +165,7 @@ describe('every surface rendering agent markdown uses the shared router', () => 
   it.each([
     ['../notifications/NotificationDetailInline.tsx', "handleMarkdownLinkClick(e, apps, 'a notification')"],
     ['../chat/ChatExchange.tsx', 'handleMarkdownLinkClick(e, apps)'],
+    ['../chat/SideQuestionCard.tsx', 'handleMarkdownLinkClick(e, loadedOr(appsList.value, []))'],
   ])('%s', (path, call) => {
     expect(readFileSync(resolve(here, path), 'utf-8')).toContain(call);
   });

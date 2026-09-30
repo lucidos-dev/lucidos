@@ -9,6 +9,7 @@
 import { makeInertBody } from './escapeHtml';
 import { escapeHtmlAttr } from './markedConfig';
 import { addLinkifyMs } from './renderPhaseTimers';
+import { parseRepoPath, type RepoLocator } from '../store/repoPath';
 
 // Cap how many alternatives go into a single regex. WebKit's YARR throws
 // "regular expression too large" on big alternations; V8 has no such limit.
@@ -573,6 +574,41 @@ export function extractTriggerIdFromHref(href: string): string | null {
   const id = trimmed.slice(0, slash);
   // `trigger:<id>/` is the same destination; `trigger:<id>/sub` has no meaning.
   return trimmed.slice(slash + 1).length === 0 ? (id || null) : null;
+}
+
+/** A file in a registered repository clone, named by a `repo:` href. The
+ *  locator's `repoId` is whatever the link wrote, an id or a repository name,
+ *  so a caller resolves it against the registry before opening. */
+export interface RepoFileHrefTarget {
+  locator: RepoLocator;
+  line?: number;
+  lineEnd?: number;
+}
+
+/** A GitHub-style line reference: `#L510`, `#L510-L520` or `#L510-520`. The
+ *  only channel an href has for a line. */
+const LINE_FRAGMENT_RE = /#L(\d+)(?:-L?(\d+))?$/;
+
+/** Extract a `repo:<repo>:file:<path>` href (or `file#<ref>`, or `diff`),
+ *  with an optional trailing line reference split off.
+ *
+ *  `parseRepoPath` stays the sole predicate for "is this a repo path", so a
+ *  malformed encoding returns null and falls to the caller's scheme handling.
+ *  The href is percent-decoded first, because markdown encodes a destination
+ *  carrying spaces or non-ASCII characters. */
+export function extractRepoFileTargetFromHref(href: string): RepoFileHrefTarget | null {
+  if (!href.startsWith('repo:')) return null;
+  let decoded = href;
+  try { decoded = decodeURIComponent(href); } catch { /* malformed escape: parse the raw href */ }
+  const lineMatch = LINE_FRAGMENT_RE.exec(decoded);
+  const locator = parseRepoPath(lineMatch ? decoded.slice(0, lineMatch.index) : decoded);
+  if (!locator) return null;
+  if (!lineMatch) return { locator };
+  return {
+    locator,
+    line: Number(lineMatch[1]),
+    lineEnd: lineMatch[2] === undefined ? undefined : Number(lineMatch[2]),
+  };
 }
 
 /** Extract a BARE app reference from an href: a single path segment with no

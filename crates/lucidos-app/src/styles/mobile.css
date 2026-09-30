@@ -1063,6 +1063,31 @@
         padding-bottom: calc(1rem + env(safe-area-inset-bottom, 0px));
     }
 
+    /* The repo preview (a diff, the rendered diff, the whole file) flows in the
+       pane's own scroller too, for the same reason as the form above. As a
+       pane-height box with its own inner scroller, it hid from the header: a
+       drag on the diff never hid the header, and a drag on the path row stuck
+       after one header height. The `:has()` names the text bodies only. A repo
+       PDF or video, whole-file in a diff included, keeps the definite height
+       it sizes itself by. */
+    .mobile-swipe-pane .file-preview-frame:has(.diff-view, .rendered-diff, .repo-file-content, .repo-file-rendered),
+    .mobile-swipe-pane .file-preview-frame:has(.diff-view, .rendered-diff, .repo-file-content, .repo-file-rendered) :is(.repo-preview-split, .repo-preview-fade, .repo-file-content, .rendered-diff) {
+        height: auto;
+    }
+    .mobile-swipe-pane .file-preview-frame:has(.diff-view, .rendered-diff, .repo-file-content, .repo-file-rendered) .repo-preview-fade {
+        grid-template-rows: auto;
+    }
+    .mobile-swipe-pane .file-preview-frame:has(.diff-view, .rendered-diff, .repo-file-content, .repo-file-rendered) :is(.repo-preview-split-main, .rendered-diff) {
+        overflow: visible;
+    }
+    /* `clip` rather than `hidden`, which would turn the visible y back into a
+       scroller. The wide-line pan of `.repo-file-content` stays: at auto height
+       its own scroller has nothing to scroll vertically. */
+    .mobile-swipe-pane .file-preview-frame:has(.diff-view, .rendered-diff, .repo-file-content, .repo-file-rendered) .diff-view {
+        overflow-x: clip;
+        overflow-y: visible;
+    }
+
     /* The ::before spacer replaces padding-top, so zero out the base padding-top
        on .thread-content (the base rule reserves top room past the desktop fade
        mask, which mobile doesn't have — the sticky title covers the top instead).
