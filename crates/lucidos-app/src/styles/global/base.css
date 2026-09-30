@@ -259,8 +259,8 @@ html {
        leaves to a turn's content on all four sides (chat/response.css). */
     --turn-body-inset: 0.4rem;
     /* Distance from a NESTED thread-pane surface's outer edge to its content.
-       Two of them stack on the --turn-body-inset edge above: a question /
-       change card inside a turn (.question-option) and the composer box below
+       Two of them stack on the --turn-body-inset edge above: a question or
+       permission card inside a turn (.question-body) and the composer box below
        the transcript (.prompt-box). The composer docks directly under the
        cards, so their CONTENT has to start at the same x. Matching the outer
        box edges alone still leaves the typed text a few px right of the card
@@ -605,6 +605,15 @@ html.ios-pwa[data-theme-mode="dark"] {
     --header-bar-bottom: #0b3a66;
     --header-gradient: linear-gradient(180deg, var(--header-bar-top) 0%, var(--header-bar-bottom) 100%);
     --titlebar-strip-bg: var(--header-bar-top);
+}
+
+/* A theme or mode swap repaints every colour at once. Until it has painted, no
+   transition runs, so no control eases from the old colours while the page
+   around it snaps (markThemeSwap in store/actions/preferences.ts). */
+html[data-theme-swap] *,
+html[data-theme-swap] *::before,
+html[data-theme-swap] *::after {
+    transition: none !important;
 }
 
 /* Light theme */

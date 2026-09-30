@@ -97,28 +97,6 @@ pub enum HandOver {
 pub struct DeviceStore;
 
 impl DeviceStore {
-    /// Defensive double-write: the migration owns this CREATE TABLE (see
-    /// `20260517160627_consolidate_init_schema_tables.sql`). A temporary measure:
-    /// `docs/temporary-measures.md` § "Defensive double-write of tables into
-    /// `init_schema`".
-    pub async fn init_schema(
-        pool: &PgPool,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS devices (
-                id TEXT PRIMARY KEY,
-                name TEXT,
-                user_agent TEXT,
-                push_enabled BOOLEAN NOT NULL DEFAULT false,
-                last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )",
-        )
-        .execute(pool)
-        .await?;
-        Ok(())
-    }
-
     /// Register or update a device (upsert by id). Returns `(device, inserted)`
     /// where `inserted` is true iff a new row was created (false on
     /// last-seen-at refresh).

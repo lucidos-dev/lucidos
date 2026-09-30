@@ -3,50 +3,67 @@ use std::sync::Arc;
 use crate::core::EventRow;
 use crate::engine::LucidosEngine;
 
+/// The events that end a turn, as an SQL list. Shared with the boot settle
+/// (`agent_recovery::settle_orphaned_running_threads`), so the two recovery
+/// passes agree on when a turn is over.
+macro_rules! turn_terminal_events {
+    () => {
+        "'ResponseGenerated','ResponseCanceled','ResponseAborted','ResponseFailed',\
+         'CodingAgentIdled','SessionEnded'"
+    };
+}
+
+/// The events that show a turn did something, as an SQL list. Shared with the
+/// boot settle for the same reason.
+macro_rules! turn_activity_events {
+    () => {
+        "'TextStreamed','Thinking','ThoughtStreamed','ToolCalled','ToolResult',\
+         'CodingAgentTextStreamed','CodingAgentToolCalled','CodingAgentToolResult'"
+    };
+}
+
+pub(crate) use {turn_activity_events, turn_terminal_events};
+
 /// SQL the orphan-recovery sweep runs to find chat / trigger / CC threads
 /// whose last exchange has activity events but no terminal event. Extracted
 /// from `recover_orphaned_threads` as a `const` so the test in the sibling
-/// module can run the exact same query against a hand-built fixture and
-/// assert the filter contract (archived threads are excluded) without
+/// module can run the exact same query against a hand-built fixture without
 /// duplicating the SQL.
-const ORPHAN_THREADS_SQL: &str = r#"
+///
+/// An archived thread is a candidate only while it is still `running`, so its
+/// turn died with the last engine. A turn that died then still died, and an
+/// archived thread left `running` shows in Current. The status test keeps the
+/// sweep off history: every earlier engine reset those rows to `idle` at boot,
+/// so a first boot does not revive every archived thread that ever crashed.
+const ORPHAN_THREADS_SQL: &str = concat!(
+    r#"
 WITH candidate_threads AS (
-    -- Skip archived threads outright. The user dismissed them;
-    -- emitting a fresh `ResponseAborted` here would route the
-    -- thread back to inbox via the contract layer's `to_inbox`
-    -- rule (`thread_lifecycle::resolve_transition`), silently
-    -- reviving a row the user deliberately closed. The
-    -- projection's `status` column for those rows stays at
-    -- whatever value it carried (typically `running`), but
-    -- nothing user-visible reads `status` for archived threads
-    -- — inbox / active queries already filter on
-    -- `archive_state`.
     SELECT thread_id::text AS aggregate_id
     FROM thread_summaries
     WHERE thread_id != ALL($1::uuid[])
-      AND archive_state != 'archived'
+      AND (archive_state != 'archived' OR status = 'running')
 ),
 per_thread AS (
     SELECT
         e.aggregate_id,
         MAX(CASE WHEN e.event_type IN ('MessageReceived','TriggerStarted','ChildThreadCompleted')
                  THEN e.created END) AS last_start,
-        MAX(CASE WHEN e.event_type IN ('TextStreamed','Thinking','ThoughtStreamed','ToolCalled','ToolResult',
-                                        'CodingAgentTextStreamed','CodingAgentToolCalled','CodingAgentToolResult')
+        MAX(CASE WHEN e.event_type IN ("#,
+    turn_activity_events!(),
+    r#")
                  THEN e.created END) AS last_activity,
-        MAX(CASE WHEN e.event_type IN ('ResponseGenerated','ResponseCanceled','ResponseAborted','ResponseFailed',
-                                        'CodingAgentIdled','SessionEnded')
+        MAX(CASE WHEN e.event_type IN ("#,
+    turn_terminal_events!(),
+    r#")
                  THEN e.created END) AS last_terminal
     FROM events e
     WHERE e.aggregate = 'thread'
       AND e.aggregate_id IN (SELECT aggregate_id FROM candidate_threads)
-      AND e.event_type IN (
-          'MessageReceived','TriggerStarted','ChildThreadCompleted',
-          'TextStreamed','Thinking','ThoughtStreamed','ToolCalled','ToolResult',
-          'CodingAgentTextStreamed','CodingAgentToolCalled','CodingAgentToolResult',
-          'ResponseGenerated','ResponseCanceled','ResponseAborted','ResponseFailed',
-          'CodingAgentIdled','SessionEnded'
-      )
+      AND e.event_type IN ('MessageReceived','TriggerStarted','ChildThreadCompleted',"#,
+    turn_activity_events!(),
+    ",",
+    turn_terminal_events!(),
+    r#")
     GROUP BY e.aggregate_id
 ),
 orphans AS (
@@ -73,7 +90,8 @@ LEFT JOIN LATERAL (
       AND e3.created = o.last_start
     ORDER BY e3.sequence DESC LIMIT 1
 ) start_evt ON true
-"#;
+"#
+);
 
 /// [`ORPHAN_THREADS_SQL`] plus the shared **preserve guard**: a thread parked on
 /// an unanswered `AskUserQuestion` is a stable, resumable checkpoint, never an
@@ -121,15 +139,77 @@ fn orphan_tool_calls_sql() -> String {
 /// SQL the orphan-recovery sweep runs to fetch the `(ToolCalled, ToolResult)`
 /// pairs it pairs into orphans. Extracted from `recover_orphan_tool_calls`
 /// for the same testability reason as `ORPHAN_THREADS_SQL`.
+///
+/// Archived threads take the same status test as `ORPHAN_THREADS_SQL`, for
+/// the same reason. It is why this sweep runs before that one at boot: the
+/// abort it emits moves the thread off `running`.
 const ORPHAN_TOOL_CALLS_SQL: &str = r#"
 SELECT e.id, e.event_type, e.payload, e.created, e.thread_id, e.sequence
 FROM events e
 JOIN thread_summaries ts ON ts.thread_id = e.thread_id
 WHERE e.event_type IN ('ToolCalled', 'ToolResult')
   AND e.thread_id IS NOT NULL
-  AND ts.archive_state != 'archived'
+  AND (ts.archive_state != 'archived' OR ts.status = 'running')
 ORDER BY e.thread_id, e.created, e.sequence
 "#;
+
+/// What a recovery abort says when the dead turn streamed no text of its own.
+pub(crate) const RESTART_INTERRUPTED_TEXT: &str =
+    "This response was interrupted by an engine restart.";
+
+/// The channel a recovery abort is emitted on: the one stamped on the turn's
+/// start row. A legacy start carries none, so its event type decides.
+/// `ChildThreadCompleted` rows carry the parent's channel, stamped by
+/// `notify_parent_of_child_completion`.
+pub(crate) fn start_channel(
+    stamped: Option<&str>,
+    start_type: Option<&str>,
+) -> Option<crate::engine::thread_events::EventChannel> {
+    use crate::engine::thread_events::EventChannel;
+    stamped
+        .and_then(EventChannel::from_wire)
+        .or(match start_type {
+            Some("TriggerStarted") => Some(EventChannel::Trigger),
+            Some("MessageReceived") => Some(EventChannel::Chat),
+            _ => None,
+        })
+}
+
+/// Record that the restart interrupted a thread's turn: a
+/// `ResponseAborted { RecoveryAfterRestart }` anchored on the turn's start
+/// event, so it reads "Response interrupted" with a Continue. The chat sweep
+/// and the boot settle both end a dead turn this way.
+///
+/// Direct `.emit` rather than `emit_response_aborted`, so each caller can log
+/// the `Err` against the thread it was settling.
+pub(crate) async fn emit_restart_abort(
+    bus: &crate::engine::event_bus::EventBus,
+    thread_id: uuid::Uuid,
+    text: String,
+    start_id: Option<uuid::Uuid>,
+    channel: Option<crate::engine::thread_events::EventChannel>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use crate::engine::event_bus::BusEvent;
+    use crate::engine::thread_events::{AbortCause, EventMeta, MessageOrigin, ThreadEvent};
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::ResponseAborted {
+            text,
+            images: vec![],
+            model: None,
+            reasoning_effort: None,
+            cause: AbortCause::RecoveryAfterRestart,
+        },
+        meta: EventMeta {
+            channel,
+            request_event_id: start_id,
+            actor: Some(MessageOrigin::system()),
+            ..EventMeta::NONE
+        },
+    })
+    .await?;
+    Ok(())
+}
 
 impl LucidosEngine {
     /// Detect threads whose last exchange has activity events but no terminal event.
@@ -149,9 +229,6 @@ impl LucidosEngine {
     /// `exclude_thread_ids` — threads being actively recovered by worktree recovery;
     /// they should not be aborted here since CC recovery will handle them.
     pub async fn recover_orphaned_threads(self: &Arc<Self>, exclude_thread_ids: &[uuid::Uuid]) {
-        use crate::engine::event_bus::BusEvent;
-        use crate::engine::thread_events::{EventChannel, EventMeta, MessageOrigin, ThreadEvent};
-
         // Find threads where the LAST exchange boundary (MessageReceived or
         // TriggerStarted) has activity events after it but no terminal
         // event. Returns the originating event id and the originating event's
@@ -205,44 +282,21 @@ impl LucidosEngine {
         {
             let text = match partial_text {
                 Some(t) if !t.is_empty() => t,
-                _ => "This response was interrupted by an engine restart.".to_string(),
+                _ => RESTART_INTERRUPTED_TEXT.to_string(),
             };
-            // ChildThreadCompleted-anchored turns inherit the parent thread's
-            // emit channel from the CTC row itself (stamped by
-            // `notify_parent_of_child_completion`). MR / TriggerStarted callers
-            // hardcoded chat/trigger via the originating_event_type below, but
-            // the wire channel on those rows is the same — fall back to the
-            // event-type mapping when the payload's channel field is missing
-            // (legacy rows that predated stamping it on starts).
-            let channel = originating_channel
-                .as_deref()
-                .and_then(EventChannel::from_wire)
-                .or(match originating_event_type.as_deref() {
-                    Some("TriggerStarted") => Some(EventChannel::Trigger),
-                    Some("MessageReceived") => Some(EventChannel::Chat),
-                    _ => None,
-                });
+            let channel = start_channel(
+                originating_channel.as_deref(),
+                originating_event_type.as_deref(),
+            );
 
-            // Direct .emit (not emit_response_aborted): wants the Err for the per-thread log below.
-            if let Err(e) = self
-                .event_bus
-                .emit(BusEvent::Thread {
-                    thread_id,
-                    event: ThreadEvent::ResponseAborted {
-                        text,
-                        images: vec![],
-                        model: None,
-                        reasoning_effort: None,
-                        cause: crate::engine::thread_events::AbortCause::RecoveryAfterRestart,
-                    },
-                    meta: EventMeta {
-                        channel,
-                        request_event_id: originating_event_id,
-                        actor: Some(MessageOrigin::system()),
-                        ..EventMeta::NONE
-                    },
-                })
-                .await
+            if let Err(e) = emit_restart_abort(
+                &self.event_bus,
+                thread_id,
+                text,
+                originating_event_id,
+                channel,
+            )
+            .await
             {
                 log!(
                     "[Recovery] Failed to emit ResponseAborted for thread {}: {}",
@@ -431,12 +485,10 @@ impl LucidosEngine {
         use crate::engine::event_bus::BusEvent;
         use crate::engine::thread_events::{EventMeta, MessageOrigin, ThreadEvent};
 
-        // Skip archived threads — same reasoning as the
-        // `recover_orphaned_threads` sweep: don't emit follow-up events
-        // (here, synthetic ToolResults) on a row the user dismissed.
-        // SQL is in the `ORPHAN_TOOL_CALLS_SQL` const at module top so
-        // the sibling test in `recovery_tests` can run the exact same
-        // query.
+        // Archived threads included, as in `recover_orphaned_threads`: the
+        // aborted turn's dangling call still needs its pair. SQL is in the
+        // `ORPHAN_TOOL_CALLS_SQL` const at module top so the sibling test in
+        // `recovery_tests` can run the exact same query.
         let rows: Vec<EventRow> = match sqlx::query_as::<_, EventRow>(&orphan_tool_calls_sql())
             .fetch_all(self.pool())
             .await

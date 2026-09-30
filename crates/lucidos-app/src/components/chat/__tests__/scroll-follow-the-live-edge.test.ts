@@ -2758,7 +2758,7 @@ describe('answering a question card lands the same way', () => {
   /** TYPING the answer is the third way to answer, and it is a SEND. The engine
    *  routes the text to the open question as a `FreeText` answer. It emits no
    *  `MessageReceived` for it, so what the reader submitted renders as the
-   *  card's own "Custom answer" block. The optimistic row the send inserted is
+   *  card's own typed-answer block. The optimistic row the send inserted is
    *  torn down again when that answer lands.
    *
    *  So the row is the wrong thing to wait for. Against a local engine the
@@ -2779,7 +2779,7 @@ describe('answering a question card lands the same way', () => {
   });
 
   it('holds that card while the answer and the reply render into it', () => {
-    // The Custom answer block lands inside the card a moment after the submit,
+    // The typed-answer block lands inside the card a moment after the submit,
     // and the agent's first row after that. Both are what the reader submitted
     // to see, so the hold carries them exactly as a clicked option's does.
     const el = makeEl({ scrollTop: 500, scrollHeight: 3000 });
@@ -2791,7 +2791,7 @@ describe('answering a question card lands the same way', () => {
     vi.advanceTimersByTime(1500);
     expect(el.scrollTop).toBe(2500);
 
-    el.answerQuestionCard(card); // the Custom answer block grows the card
+    el.answerQuestionCard(card); // the typed-answer block grows the card
     el.scrollHeight = 3200;
     onResize();
     vi.advanceTimersByTime(1500);

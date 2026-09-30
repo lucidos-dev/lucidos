@@ -31,6 +31,7 @@ beforeEach(() => {
 
 afterEach(() => {
   _setBridgedForTesting(null);
+  vi.unstubAllGlobals();
 });
 
 describe('preferences.get scoping', () => {
@@ -47,6 +48,18 @@ describe('preferences.get scoping', () => {
     const { preferences } = await import('./preferences');
     await preferences.get();
     expect(asked[0]).toBe('/preferences?device_id=device-abc');
+  });
+
+  it('follows the opener named in the page URL over the stored id', async () => {
+    // A popped-out app tab carries `?device=` for the shell it left. The engine
+    // seeds the first paint from that device, so the live read must agree, or
+    // the tab repaints in this browser's own theme.
+    _setBridgedForTesting(false);
+    storedId = 'this-browser';
+    vi.stubGlobal('location', { search: '?device=opener-device' });
+    const { preferences } = await import('./preferences');
+    await preferences.get();
+    expect(asked[0]).toBe('/preferences?device_id=opener-device');
   });
 
   it('sends no device at all for the explicit global view', async () => {

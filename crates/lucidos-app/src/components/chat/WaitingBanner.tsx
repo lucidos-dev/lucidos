@@ -1,10 +1,11 @@
 import type { ComponentChildren } from 'preact';
-import { threadMap, focusedThreadId, applyingNowThreadIds, applyingChangeThreadIds, archivingThreadIds, discardingCCThreadIds, cancelingThreadIds, effectiveThreadStatus, isMidTurn, standingApplyThreadIds, armingStandingApplyThreadIds } from '../../store/store';
+import { threadMap, focusedThreadId, applyingNowThreadIds, applyingChangeThreadIds, archivingThreadIds, discardingCCThreadIds, cancelingThreadIds, effectiveThreadStatus, isMidTurn, standingApplyThreadIds, armingStandingApplyThreadIds, setAsideChangeForThread } from '../../store/store';
+import { bringBackSingleChange } from '../../store/actions/chat-changes';
 import { resolveThreadActions, type TaggedAction } from '../../store/actions/threadActions';
 import type { ThreadState } from '../../store/thread-events';
 import { viewThreadCcDiff } from '../../store/actions/repositories';
 import { SplitButton, type SplitButtonMenuItem } from '../shared/SplitButton';
-import { ArchiveIcon, CheckIcon, DiffIcon, StandingApplyIcon, TrashIcon } from '../shared/icons';
+import { ArchiveIcon, CheckIcon, DiffIcon, MoveToTopIcon, SetAsideIcon, StandingApplyIcon, TrashIcon } from '../shared/icons';
 import type { HeaderActionSpec } from '../layout/headerActions';
 import type { OverflowMenuContext } from '../shared/OverflowMenu';
 import { useTouchActivated } from '../../hooks/useTouchActivated';
@@ -15,13 +16,24 @@ import { PROTECTED_SURFACE } from '../shared/protectedSurface';
  *  selector and live elsewhere, so both are excluded. Discard-draft is a
  *  compose-draft action the close-cascade shortcut resolves. Pin/Unpin is
  *  `PinThreadButton`, in the thread header. */
-const BANNER_CLOSE_KINDS: ReadonlySet<string> = new Set(['discard', 'apply', 'archive']);
+const BANNER_CLOSE_KINDS: ReadonlySet<string> = new Set(['discard', 'apply', 'set_aside', 'archive']);
+
+const BRING_BACK_TOOLTIP =
+  "This thread's change is set aside. Bring it back to review and apply it.";
 
 type WaitingState =
   | { type: 'applying' }
   | { type: 'discarding' }
   | { type: 'canceling'; threadId: string; isCanceling: boolean }
-  | { type: 'actions'; actions: TaggedAction[]; threadId: string; isArchiving: boolean; showDiff: boolean };
+  | {
+      type: 'actions';
+      actions: TaggedAction[];
+      threadId: string;
+      isArchiving: boolean;
+      showDiff: boolean;
+      /** The thread's set-aside change, which the banner offers to bring back. */
+      setAsideChangeId?: string;
+    };
 
 /** Banner state passed to `getBannerActions`. The 'canceling' variant is owned
  *  by PromptInput's morphable Send→Cancel button (so the swap can animate the
@@ -89,7 +101,9 @@ export function getWaitingState(): WaitingState | null {
   // Apply restart/partial-work hints are all single-sourced (no enablement
   // drift vs the close cascade, which drives the same TaggedActions).
   const actions = resolveThreadActions(focused).filter((a) => BANNER_CLOSE_KINDS.has(a.kind));
-  if (actions.length === 0) return null;
+  // A set-aside change keeps a way back on its own thread, archived or not.
+  const setAsideChangeId = setAsideChangeForThread(focused)?.id;
+  if (actions.length === 0 && !setAsideChangeId) return null;
 
   // The Diff button is shown only when the CC branch actually has a diff on
   // disk (`codingAgentHasDiff` — single git-truth signal maintained by the
@@ -98,7 +112,7 @@ export function getWaitingState(): WaitingState | null {
   // into an empty diff. `getStandaloneActions` reads the same gate.
   const showDiff = hasCcDiff(thread);
 
-  return { type: 'actions', actions, threadId: focused, isArchiving: false, showDiff };
+  return { type: 'actions', actions, threadId: focused, isArchiving: false, showDiff, setAsideChangeId };
 }
 
 /** ONE close-set action, as a ⋯ menu row. The composite split button folds into
@@ -123,6 +137,7 @@ function actionMenuRow(action: TaggedAction, ctx: OverflowMenuContext) {
 const ACTION_ICON: Record<string, () => ComponentChildren> = {
   apply: () => <CheckIcon />,
   discard: () => <TrashIcon />,
+  set_aside: () => <SetAsideIcon />,
   archive: () => <ArchiveIcon />,
 };
 
@@ -144,6 +159,7 @@ export function getBannerActions(state: BannerState): HeaderActionSpec[] {
   // The historical change-row Diff buttons (ChatExchange, ChangesView) call
   // viewChangeDiff for one Change; this asks what the branch looks like now.
   if (state.showDiff) members.push(diffAction(state.threadId));
+  if (state.setAsideChangeId) members.push(bringBackAction(state.setAsideChangeId));
 
   // When the close set has a primary Apply, the remaining close-set buttons
   // collapse into a split button: a one-tap face plus a caret menu holding the
@@ -151,7 +167,10 @@ export function getBannerActions(state: BannerState): HeaderActionSpec[] {
   // menu rows, because the caret's actions would otherwise go with it.
   const applyAction = state.actions.find((a) => a.kind === 'apply');
   if (applyAction) {
-    const menuActions = state.actions.filter((a) => a !== applyAction);
+    // Discard goes last: the destructive choice sits furthest from the face.
+    const menuActions = state.actions
+      .filter((a) => a !== applyAction)
+      .sort((a, b) => Number(a.kind === 'discard') - Number(b.kind === 'discard'));
     members.push({
       key: 'change-actions',
       label: applyAction.label,
@@ -197,6 +216,7 @@ export function getStandaloneActions(): HeaderActionSpec[] {
       dataRole: 'standing-apply',
       label: standing.label,
       tooltip: standing.tooltip,
+      active: standingApplyThreadIds.value.has(focused),
       icon: () => <StandingApplyIcon armed={standingApplyThreadIds.value.has(focused)} />,
       render: (attrs) => (
         <StandingApplyButton threadId={focused} action={standing} attrs={attrs} />
@@ -225,6 +245,29 @@ function diffAction(threadId: string): HeaderActionSpec {
       blurPromptInputIfFocused();
       void viewThreadCcDiff(threadId);
     },
+  };
+}
+
+/** Bring a set-aside change back to pending, from its own thread. */
+function bringBackAction(changeId: string): HeaderActionSpec {
+  return {
+    key: 'bring-back',
+    label: 'Bring back',
+    tooltip: BRING_BACK_TOOLTIP,
+    icon: () => <MoveToTopIcon />,
+    extraClass: PROTECTED_SURFACE,
+    render: (attrs) => (
+      <button
+        {...attrs}
+        data-thread-action=""
+        class={protectedButtonClass('')}
+        data-tooltip={BRING_BACK_TOOLTIP}
+        onClick={() => void bringBackSingleChange(changeId)}
+      >
+        Bring back
+      </button>
+    ),
+    onClick: () => void bringBackSingleChange(changeId),
   };
 }
 

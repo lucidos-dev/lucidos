@@ -90,18 +90,16 @@ impl ThreadEvent {
         coding_agent: CodingAgent,
     ) -> Option<Self> {
         use crate::runtime::ControlRequest;
-        let (model, effort, perm) = match request {
-            ControlRequest::SetModel { model } => (Some(model.clone()), None, None),
-            ControlRequest::SetReasoningEffort { effort } => (None, Some(effort.clone()), None),
-            ControlRequest::SetPermissionMode { mode } => (None, None, Some(mode.clone())),
-            _ => return None,
+        let (model, effort) = match request {
+            ControlRequest::SetModel { model } => (Some(model.clone()), None),
+            ControlRequest::SetReasoningEffort { effort } => (None, Some(effort.clone())),
+            ControlRequest::Interrupt => return None,
         };
         Some(Self::CodingAgentSettingsChanged {
             model,
             reasoning_effort: effort,
-            permission_mode: perm,
             coding_agent,
-            // Settings-only emit (user changed model/effort/permission mid-session).
+            // Settings-only emit (user changed model or effort mid-session).
             // The session id AND config dir are pinned by the Init-time emit; see
             // the variant doc.
             cc_session_id: None,
@@ -159,6 +157,8 @@ impl ThreadEvent {
             Self::ChangeApplied { .. } => "ChangeApplied",
             Self::ChangeDiscarded { .. } => "ChangeDiscarded",
             Self::ChangeReverted { .. } => "ChangeReverted",
+            Self::ChangeSetAside { .. } => "ChangeSetAside",
+            Self::ChangeBroughtBack { .. } => "ChangeBroughtBack",
             Self::ChangeApplyFailed { .. } => "ChangeApplyFailed",
             Self::MergeConflictDetected { .. } => "MergeConflictDetected",
             Self::MergeResolutionStarted { .. } => "MergeResolutionStarted",
@@ -280,6 +280,8 @@ impl ThreadEvent {
         "ChangeApplied",
         "ChangeDiscarded",
         "ChangeReverted",
+        "ChangeSetAside",
+        "ChangeBroughtBack",
         "ChangeApplyFailed",
         "MergeConflictDetected",
         "MergeResolutionStarted",

@@ -18,7 +18,7 @@ import type { Binding } from '../../utils/shortcuts';
 import { isMac } from '../../utils/platform';
 import { lucidos } from '@lucidos/sdk';
 import { dispatchForwardedChord } from '../../hooks/useKeyboardShortcuts';
-import { showConfirm, showToast } from '../../store/store';
+import { showToast } from '../../store/store';
 import { scrollBehavior } from '../../utils/motion';
 import {
   PREVIEW_FRAME_MESSAGE,
@@ -366,11 +366,7 @@ export function routePreviewFrameMessage(msg: PreviewFrameMessage, ctx: PreviewF
         refuseUnclicked(`open "${msg.href}"`, ctx.artifactPath);
         return;
       }
-      if (action.kind === 'local-file') {
-        void openLocalFileOnConfirm(action.target, ctx.artifactPath);
-        return;
-      }
-      runPreviewLinkAction(action);
+      runPreviewLinkAction(action, ctx.artifactPath);
       return;
     }
     case 'download': {
@@ -380,7 +376,7 @@ export function routePreviewFrameMessage(msg: PreviewFrameMessage, ctx: PreviewF
       }
       const target = downloadTarget(msg, ctx);
       if (target.kind === 'file') downloadDataFile(target.path, msg.name);
-      else runPreviewLinkAction(target);
+      else runPreviewLinkAction(target, ctx.artifactPath);
       return;
     }
     case 'chord':
@@ -418,18 +414,6 @@ function decodeSegments(path: string): string {
       return segment;
     }
   }).join('/');
-}
-
-/** Hand a path to the OS opener only after the user agrees. It launches
- *  whatever the path names, and a hostile report can dress any click on it as a
- *  click on such a link. */
-async function openLocalFileOnConfirm(target: string, artifactPath: string): Promise<void> {
-  const open = await showConfirm(
-    `${artifactPath} links to ${target} on this computer. Open it with the app your system picks for it?`,
-    'Open',
-    { variant: 'default', title: 'Open a local file?' },
-  );
-  if (open) runPreviewLinkAction({ kind: 'local-file', target });
 }
 
 function refuseUnclicked(what: string, artifactPath: string): void {

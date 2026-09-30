@@ -408,7 +408,7 @@ impl LucidosEngine {
                                 // engine-driven: nothing else is watching it. The
                                 // in-memory watchdogs only scan live
                                 // `agent_sessions`, and
-                                // `settle_orphaned_running_coding_agent_threads`
+                                // `settle_orphaned_running_threads`
                                 // runs only at boot, so a `running` projection
                                 // left behind here survives until the user clicks
                                 // Stop. Safe to run for EVERY settling error, not
@@ -766,7 +766,6 @@ impl LucidosEngine {
         }
 
         let event_store = EventStore::new(pool.clone());
-        event_store.init_schema().await?;
 
         // EventBus must exist before `image_described_backfill` runs so the
         // backfill can route through `replay_historical_event` instead of
@@ -860,17 +859,6 @@ impl LucidosEngine {
         let embedder = crate::memory::embedder_slot::EmbedderSlot::empty();
 
         let browser_runtime = BrowserRuntime::new(workspace_path.clone(), pool.clone());
-
-        // Initialize scheduler schemas (notifications)
-        // This ensures tables exist even before SchedulerManager is created
-        crate::scheduler::NotificationStore::init_schema(&pool).await?;
-
-        // Initialize credentials, preferences, and pinned apps schemas
-        CredentialStore::init_schema(&pool).await?;
-        PreferenceStore::init_schema(&pool).await?;
-        PinnedAppStore::init_schema(&pool).await?;
-        HeadlessBlocklist::init_schema(&pool).await?;
-        BrowserLogins::init_schema(&pool).await?;
 
         // Resolve the OpenAI key once: a stored `openai` credential (Settings →
         // Providers) is preferred, then the OPENAI_API_KEY launch env var, then a

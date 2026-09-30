@@ -424,9 +424,17 @@ function addPendingMessage(
 // (`import { loadRepositories } from '../store/actions/chat'`) keep working.
 export { loadRepositories } from './repositoriesLoader';
 
+/** What became of a send's text.
+ *   - 'sent': the engine accepted it.
+ *   - 'shown-as-failed': the engine was unreachable, so the text stays in the
+ *     thread as a failed exchange.
+ *   - 'dropped': the engine refused it and the optimistic row is gone. A toast
+ *     was shown, and the caller owns putting the text back. */
+export type SendOutcome = 'sent' | 'shown-as-failed' | 'dropped';
+
 /**
  * Send a chat message. Side effects (modals, refreshes) are handled by
- * thread-sync.ts via ThreadEvent SSE events — no listener registry needed.
+ * thread-sync.ts via ThreadEvent SSE events, with no listener registry.
  */
 export async function sendMessage(
   message: string,
@@ -448,7 +456,7 @@ export async function sendMessage(
     ccModelOverride?: CodingAgentModelValue | null;
     ccReasoningEffortOverride?: CodingAgentReasoningEffort | null;
   },
-): Promise<void> {
+): Promise<SendOutcome> {
   threadsLoaded.value = true;
   const eventId = generateUuid();
   const explicitThreadId = options?.threadId;
@@ -629,6 +637,7 @@ export async function sendMessage(
     // resolves come from the thread's events (no-op for CC / no pick).
     clearThreadModelOverride(threadId);
     void retireWelcomeAfterUse(threadMap.value.values());
+    return 'sent';
   } catch (error: unknown) {
     if (isTransportError(error)) {
       // Engine unreachable. Render the user's message as a failed in-thread
@@ -653,7 +662,7 @@ export async function sendMessage(
       // MessageReceived + ResponseFailed events land in `thread.events` but
       // `activeExchanges` keeps its cached value until the next SSE event.
       bumpThreadEvents(threadId);
-      return;
+      return 'shown-as-failed';
     }
     // HTTP error (4xx/5xx with body) or unknown bug. Raw new sends create
     // the thread optimistically (`threadBeforeSend === undefined`); the
@@ -676,6 +685,7 @@ export async function sendMessage(
       removePendingMessage(threadId, eventId);
     }
     showToast(`Failed to send message: ${errorDetail(error)}`, 'error');
+    return 'dropped';
   } finally {
     // Whatever happened to this POST, the next send on the thread may go. A
     // throw between `enterSendChain` and here would skip this, which is why

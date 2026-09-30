@@ -138,15 +138,6 @@ html[data-theme-mode="light"] .protected-surface {
     background-color: var(--bg-primary);
 }
 
-/* The turn focus marker washes its turn from behind, and a card's fill would
-   cover it, so a focused card repaints the same wash over its own fill. */
-.nav-focus-stuck .protected-surface:where(.permission-body, .question-body) {
-    background-image: linear-gradient(
-        color-mix(in srgb, var(--nav-focus-glow) 16%, transparent),
-        color-mix(in srgb, var(--nav-focus-glow) 16%, transparent)
-    );
-}
-
 /* A folded change action sits in an unprotected menu, so it paints its own,
    busy or not. */
 .thread-overflow-item:where(.protected-surface) {

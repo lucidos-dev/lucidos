@@ -200,6 +200,65 @@ describe('the active theme', () => {
     expect(getTheme).toHaveBeenCalledWith('new');
   });
 
+  it('setTheme paints a map it is handed at once, then lets the fetch confirm it', async () => {
+    vi.spyOn(apiClient, 'setPreference').mockResolvedValue(undefined as never);
+    let answer: (theme: Theme) => void = () => {};
+    vi.spyOn(apiClient, 'getTheme').mockReturnValue(new Promise(resolve => { answer = resolve; }));
+    void setTheme('new', theme('new', { '--accent': '#555555' }).resolved);
+    expect(props.get('--accent')).toBe('#555555');
+
+    answer(theme('new', { '--accent': '#666666' }));
+    await vi.waitFor(() => expect(props.get('--accent')).toBe('#666666'));
+  });
+
+  it('a fetch that confirms the painted map repaints nothing, so no transition is cut off', async () => {
+    vi.spyOn(apiClient, 'setPreference').mockResolvedValue(undefined as never);
+    const picked = theme('new', { '--accent': '#555555' });
+    vi.spyOn(apiClient, 'getTheme').mockResolvedValue(picked);
+    const swaps = vi.fn(() => 0);
+    vi.stubGlobal('requestAnimationFrame', swaps);
+    try {
+      await setTheme('new', picked.resolved);
+      await vi.waitFor(() => expect(apiClient.getTheme).toHaveBeenCalled());
+      await Promise.resolve();
+      expect(swaps).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('a pick that already shows its theme says nothing when the confirming fetch fails', async () => {
+    vi.spyOn(apiClient, 'setPreference').mockResolvedValue(undefined as never);
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(apiClient, 'getTheme').mockRejectedValue(new TypeError('Load failed'));
+    toasts.value = [];
+    await refreshActiveTheme('new', true, theme('new', { '--accent': '#555555' }).resolved);
+
+    expect(props.get('--accent')).toBe('#555555');
+    expect(toasts.value).toEqual([]);
+  });
+
+  it('turns transitions off for the frame a swap paints, and back on after it', () => {
+    const frames: FrameRequestCallback[] = [];
+    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => frames.push(callback));
+    const attributes = new Set<string>();
+    const root = document.documentElement;
+    vi.spyOn(root, 'setAttribute').mockImplementation(name => { attributes.add(name); });
+    vi.spyOn(root, 'removeAttribute').mockImplementation(name => { attributes.delete(name); });
+    try {
+      const swapping = () => attributes.has('data-theme-swap');
+      applyThemeMode('light');
+      expect(swapping()).toBe(true);
+      // The browser paints the swap after the first frame's callbacks.
+      frames.shift()!(0);
+      expect(swapping()).toBe(true);
+      frames.shift()!(0);
+      expect(swapping()).toBe(false);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it('knows its own file', () => {
     preferences.value = { status: 'loaded', data: { theme: 'mine' } };
     expect(isActiveThemePath('themes/mine.json')).toBe(true);

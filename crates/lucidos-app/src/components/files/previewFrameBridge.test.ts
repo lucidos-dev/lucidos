@@ -5,19 +5,18 @@ import FILE_RESPONSE_RS from '../../../../lucidos-engine/src/api/file_response.r
 const mocks = vi.hoisted(() => ({
   openFilePreview: vi.fn(),
   openUrl: vi.fn(),
-  openLocalFile: vi.fn(),
+  openLocalFileOnConfirm: vi.fn(async (_target: string, _source?: string) => {}),
   openAppById: vi.fn(async () => {}),
   openThreadAcrossWorkspaces: vi.fn(),
   handleNavigationRequest: vi.fn(),
   dispatchForwardedChord: vi.fn(),
   showToast: vi.fn(),
-  showConfirm: vi.fn(async (_message: string, _okLabel: string, _options: unknown) => true),
 }));
 
 vi.mock('../../store/actions/artifacts', () => ({
   openFilePreview: mocks.openFilePreview,
   openUrl: mocks.openUrl,
-  openLocalFile: mocks.openLocalFile,
+  openLocalFileOnConfirm: mocks.openLocalFileOnConfirm,
 }));
 vi.mock('../../store/actions/apps', () => ({ openAppById: mocks.openAppById }));
 vi.mock('../../store/actions/cross-workspace', () => ({
@@ -31,7 +30,7 @@ vi.mock('../../hooks/useKeyboardShortcuts', () => ({
 }));
 vi.mock('../../store/store', async () => {
   const actual = await vi.importActual<typeof import('../../store/store')>('../../store/store');
-  return { ...actual, showToast: mocks.showToast, showConfirm: mocks.showConfirm };
+  return { ...actual, showToast: mocks.showToast };
 });
 vi.mock('../../utils/basePath', async () => {
   const actual = await vi.importActual<typeof import('../../utils/basePath')>('../../utils/basePath');
@@ -519,18 +518,21 @@ describe('routePreviewFrameMessage', () => {
     expect(posted).toHaveLength(1);
   });
 
-  it('opens a local file only once the user agrees', async () => {
+  it('opens a local file only through the confirm, naming the artifact', () => {
     vi.stubGlobal('navigator', { userActivation: { isActive: true } });
     route('file:///Users/me/report.pdf');
-    expect(mocks.showConfirm.mock.calls[0][0]).toContain('file:///Users/me/report.pdf');
-    await vi.waitFor(() => expect(mocks.openLocalFile).toHaveBeenCalledWith('file:///Users/me/report.pdf'));
+    expect(mocks.openLocalFileOnConfirm).toHaveBeenCalledWith('file:///Users/me/report.pdf', ARTIFACT);
+  });
 
-    vi.clearAllMocks();
-    mocks.showConfirm.mockResolvedValueOnce(false);
-    route('file:///Users/me/report.pdf');
-    await Promise.resolve();
-    await Promise.resolve();
-    expect(mocks.openLocalFile).not.toHaveBeenCalled();
+  // An artifact that declares its own base routes a download like a link, so
+  // it can name a local file too. That arm used to skip the confirm.
+  it('sends a download that resolves to a local file through the confirm', () => {
+    vi.stubGlobal('navigator', { userActivation: { isActive: true } });
+    routePreviewFrameMessage(
+      { kind: 'download', href: 'file:///Users/me/report.pdf', name: '', baseUri: 'https://example.com/docs/' },
+      { artifactPath: ARTIFACT, declaresOwnBase: true, frameWindow },
+    );
+    expect(mocks.openLocalFileOnConfirm).toHaveBeenCalledWith('file:///Users/me/report.pdf', ARTIFACT);
   });
 
   it('refuses a download posted with no click behind it', () => {

@@ -55,7 +55,9 @@ export async function loadThemeGallery(): Promise<void> {
 export async function pickTheme(theme: Theme): Promise<void> {
   const only = theme.modes.length === 1 ? theme.modes[0] : null;
   const painted = paintedThemeMode.value;
-  if (!only || only === painted) return setTheme(theme.id);
+  // The picker already holds the theme's maps, so it paints at once. With a
+  // mode switch, both then land in one frame rather than two.
+  if (!only || only === painted) return setTheme(theme.id, theme.resolved);
 
   const followsSystem = currentThemeMode() === 'system'
     ? '\n\nThis device then stops following the system setting.'
@@ -66,7 +68,7 @@ export async function pickTheme(theme: Theme): Promise<void> {
     { variant: 'default', title: `${theme.name} is ${only} only` },
   );
   if (!ok) return;
-  await Promise.all([setThemeMode(only), setTheme(theme.id)]);
+  await Promise.all([setThemeMode(only), setTheme(theme.id, theme.resolved)]);
 }
 
 /** Re-read after a theme file changed, but only once something asked: nothing

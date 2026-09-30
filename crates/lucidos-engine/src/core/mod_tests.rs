@@ -759,6 +759,8 @@ fn describe_tool_labels_every_changes_action() {
         ("apply_when_settled", "Arming a standing apply..."),
         ("apply_as_they_settle", "Applying, and arming the rest..."),
         ("cancel_standing_apply", "Canceling a standing apply..."),
+        ("set_aside", "Setting a change aside..."),
+        ("bring_back", "Bringing a change back..."),
     ] {
         assert_eq!(
             describe_tool("changes", &serde_json::json!({ "action": action })),

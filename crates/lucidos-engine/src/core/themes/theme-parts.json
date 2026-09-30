@@ -330,7 +330,7 @@
       "label": "Header titles",
       "group": "chrome",
       "description": "Pane, thread and workspace titles in the header. Their colour follows --header-fg.",
-      "selector": ".threads-header-title, .mobile-header-title, .mobile-content-title, .workspace-name-label, .pane-header-title-text, .panel-url-title, .thread-title-display",
+      "selector": ".threads-header-title, .mobile-header-title, .mobile-content-title, .workspace-name-label, .pane-header-title-text, .panel-url-title, .thread-title",
       "frames": false,
       "properties": [
         {

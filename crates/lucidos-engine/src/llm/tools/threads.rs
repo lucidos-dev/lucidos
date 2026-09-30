@@ -108,7 +108,7 @@ pub(super) fn spawn_tools() -> Vec<ToolDefinition> {
                     // chat request. The spawn validates against the live picker.
                     "model": {
                         "type": "string",
-                        "description": "A picker id, e.g. 'default', 'opus', 'sonnet'. One the backend does not offer is REFUSED with the valid list, never swapped for the default. Omit to inherit. A one-file edit wants Sonnet, not Opus."
+                        "description": "A picker id ('default', 'opus', 'sonnet') or the model a thread reports. Others are REFUSED with the valid list, never swapped for default. Omit to inherit. A one-file edit wants Sonnet, not Opus."
                     },
                     // Deliberately silent about the per-model restriction on a
                     // tier. `validate_coding_agent_effort` refuses the pairing

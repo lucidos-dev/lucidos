@@ -39,7 +39,7 @@ function makeQueuedThread(pending: Array<{ text: string; eventId: string }>): Th
   return {
     meta: {
       id: 't-1', title: '', channel: 'chat', initiator: 'user', saved: false,
-      createdAt: '', updatedAt: '', status: 'running',
+      createdAt: '', updatedAt: '', summaryVersion: 0, status: 'running',
       codingAgentProposed: false, codingAgentRequiresRestart: false,
       codingAgentIsExternalRepo: false, codingAgentHasDiff: false,
       lastRevivedAt: '', messageCount: 0, section: 'archived',

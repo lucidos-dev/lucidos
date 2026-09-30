@@ -1035,6 +1035,81 @@ fn no_http_handler_claims_in_process_authorship() {
     );
 }
 
+// --- change_owner --------------------------------------------------------
+
+/// `delete_file` resolved a shared knowhow file into the user dir, then
+/// deleted on the workspace path, so the shared file survived every delete.
+#[test]
+fn a_file_resolved_into_the_shared_user_dir_is_owned_by_it() {
+    let user_dir = Path::new("/home/user/.lucidos");
+    let shared = user_dir.join("knowhow/cooking.md");
+    assert_eq!(
+        change_owner(Some(user_dir), "knowhow/cooking.md", &shared),
+        ChangeOwner::SharedUserDir {
+            root: user_dir,
+            relative: "knowhow/cooking.md".to_string(),
+        }
+    );
+}
+
+#[test]
+fn a_workspace_file_is_owned_by_its_app_or_the_workspace() {
+    let user_dir = Path::new("/home/user/.lucidos");
+    let data = Path::new("/home/user/workspaces/myws/data");
+    assert_eq!(
+        change_owner(
+            Some(user_dir),
+            "knowhow/cooking.md",
+            &data.join("knowhow/cooking.md")
+        ),
+        ChangeOwner::Workspace
+    );
+    assert_eq!(
+        change_owner(
+            Some(user_dir),
+            "apps/habit-tracker/index.html",
+            &data.join("apps/habit-tracker/index.html")
+        ),
+        ChangeOwner::App("habit-tracker/index.html")
+    );
+    assert_eq!(
+        change_owner(None, "artifacts/notes.md", &data.join("artifacts/notes.md")),
+        ChangeOwner::Workspace
+    );
+}
+
+/// The shared arm end to end: the owner `change_owner` names is the repo the
+/// file leaves, and the removal lands as a commit there.
+#[test]
+fn deleting_a_shared_file_removes_it_from_the_shared_repo() {
+    let tmp = tempfile::tempdir().unwrap();
+    let user_dir = tmp.path().join(".lucidos");
+    std::fs::create_dir_all(user_dir.join("knowhow")).unwrap();
+    crate::core::user_dir::ensure_git_init(&user_dir);
+    let shared = user_dir.join("knowhow/cooking.md");
+    std::fs::write(&shared, "Content.").unwrap();
+    crate::core::user_dir::auto_commit(&user_dir, "knowhow/cooking.md", "add");
+
+    let ChangeOwner::SharedUserDir { root, relative } =
+        change_owner(Some(&user_dir), "knowhow/cooking.md", &shared)
+    else {
+        panic!("a shared file must be owned by the shared user dir");
+    };
+    crate::core::user_dir::remove_and_commit(root, &relative, "delete").unwrap();
+
+    assert!(!shared.exists(), "the shared file must be gone");
+    let status = std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(&user_dir)
+        .output()
+        .unwrap();
+    assert!(
+        status.stdout.is_empty(),
+        "the removal must be committed: {}",
+        String::from_utf8_lossy(&status.stdout)
+    );
+}
+
 // --- is_same_file --------------------------------------------------------
 
 /// `copy_file` onto its own source emptied the file: the copy truncates the

@@ -68,28 +68,10 @@
     border-bottom: 1px solid var(--border-color);
 }
 
-.search-everywhere-header-icon {
-    width: var(--icon-size-md);
-    height: var(--icon-size-md);
-    flex-shrink: 0;
-    color: var(--text-muted);
-}
-
-.search-everywhere-input {
+.search-everywhere-field {
     flex: 1;
-    background: none;
-    border: none;
-    outline: none;
-    color: var(--text-primary);
-    font-size: var(--font-size-lg);
-    font-family: var(--font-ui);
 }
 
-.search-everywhere-input::placeholder {
-    color: var(--text-muted);
-}
-
-.search-everywhere-clear,
 .search-everywhere-close {
     color: var(--text-muted);
 }
@@ -101,10 +83,12 @@
     flex-wrap: wrap;
     gap: var(--space-xs);
     border-bottom: 1px solid var(--border-color);
-    /* A chip's side padding, read by the chip below. Taking it off the inset
-       puts the first label on the surface inset, under the search icon. */
+    /* A chip's side padding, read by the chip below. Taking it off the pill's
+       glyph inset puts the first label under the search glyph. The 1px is the
+       pill's border. */
     --search-tab-pad-x: 0.625rem;
     padding: var(--space-sm) calc(var(--surface-inset) - var(--search-tab-pad-x));
+    padding-left: calc(var(--surface-inset) + var(--search-field-pad-x) + 1px - var(--search-tab-pad-x));
     /* The results list takes the column's slack, never the chips. */
     flex-shrink: 0;
 }

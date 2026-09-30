@@ -722,20 +722,35 @@ fn has_iso_date(s: &str) -> bool {
     })
 }
 
+/// True for a dash `em_dash_scan.sh` bans: any U+2015, or a U+2014 that a
+/// character other than a space, tab or CR touches. A line edge counts as a
+/// space, matching `banned()` there byte for byte.
+fn has_banned_dash(s: &str) -> bool {
+    let spaced = |c: Option<&char>| c.is_none_or(|c| matches!(c, ' ' | '\t' | '\r'));
+    let chars: Vec<char> = s.chars().collect();
+    chars.iter().enumerate().any(|(i, &c)| {
+        c == '\u{2015}'
+            || (c == '\u{2014}'
+                && !(spaced(i.checked_sub(1).and_then(|p| chars.get(p)))
+                    && spaced(chars.get(i + 1))))
+    })
+}
+
 /// Reasons this doc cannot be copied into the generated file.
 ///
 /// The generated file ships, and it is scanned like any hand-written source.
-/// So a carried em dash or ISO date fails a gate on a file nobody wrote.
+/// So a carried unspaced em dash or ISO date fails a gate on a file nobody wrote.
 /// Refusing here points the author at the Rust line, where the rule binds
 /// anyway.
 fn doc_faults(owner: &str, doc: &Doc) -> Vec<String> {
     let (lines, _) = doc.first_paragraph();
     let mut out = Vec::new();
     for l in &lines {
-        if l.contains('\u{2014}') || l.contains('\u{2015}') {
+        if has_banned_dash(l) {
             out.push(format!(
-                "{owner}: the doc comment carries an em dash or horizontal bar. Rewrite the \
-                 Rust line with a comma, a colon, parentheses or two sentences: {l}"
+                "{owner}: the doc comment carries an unspaced em dash or a horizontal bar. \
+                 Rewrite the Rust line with a spaced em dash, a comma, a colon, parentheses \
+                 or two sentences: {l}"
             ));
         }
         if has_iso_date(l) {
@@ -1018,8 +1033,11 @@ fn assert_output_prose_is_clean(out: &str) {
         if !(t.starts_with("//") || t.starts_with("/*") || t.starts_with('*')) {
             continue;
         }
-        if line.contains('\u{2014}') || line.contains('\u{2015}') {
-            faults.push(format!("line {}: em dash or horizontal bar: {line}", i + 1));
+        if has_banned_dash(line) {
+            faults.push(format!(
+                "line {}: unspaced em dash or horizontal bar: {line}",
+                i + 1
+            ));
         }
         if has_iso_date(line) {
             faults.push(format!("line {}: ISO date: {line}", i + 1));
@@ -1110,6 +1128,31 @@ fn all_persisted_event_types_matches_the_enum() {
 #[cfg(test)]
 mod unit {
     use super::*;
+
+    /// Must agree with `banned()` in `scripts/lib/em_dash_scan.sh`, whose own
+    /// test covers the same cases.
+    #[test]
+    fn banned_dash_matches_the_em_dash_gate() {
+        for spaced in [
+            "a \u{2014} b",
+            "\u{2014} opens a wrapped line",
+            "closes a wrapped line \u{2014}",
+            "\u{2014}",
+            "two \u{2014} on \u{2014} one",
+            "range 3\u{2013}5",
+        ] {
+            assert!(!has_banned_dash(spaced), "spaced must pass: {spaced}");
+        }
+        for banned in [
+            "a\u{2014}b",
+            "a \u{2014}b",
+            "a\u{2014} b",
+            "spaced \u{2014} and unspaced\u{2014}here",
+            "a \u{2015} b",
+        ] {
+            assert!(has_banned_dash(banned), "must be banned: {banned}");
+        }
+    }
 
     fn variant<'a>(ir: &'a Ir, name: &str) -> &'a Variant {
         ir.variants

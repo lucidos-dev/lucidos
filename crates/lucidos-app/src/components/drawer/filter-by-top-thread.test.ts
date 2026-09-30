@@ -32,6 +32,7 @@ function makeThread(
         createdAt: '2026-04-12T00:00:00Z',
         updatedAt: '2026-04-12T00:00:00Z',
         status: 'idle',
+        summaryVersion: 0,
         messageCount: 1,
         section: 'inbox',
         activeChildrenCount: 0,

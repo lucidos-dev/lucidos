@@ -36,7 +36,7 @@ the authoritative one. They should almost never say the same thing: see
 with `CODEX_PROJECT_DOC_MAX_BYTES` raising codex's 32 KiB cap to 65,536 so the
 tail rules are not silently truncated). That is how ADR 0004 got CC parity for
 the working agreement without shipping an `AGENTS.md`. What a Codex session does
-*not* get is the unscoped `.claude/rules/*.md`, so the em-dash ban and the
+*not* get is the unscoped `.claude/rules/*.md`, so the em-dash rule and the
 private-data rule bind it only through `/harden` and the release guard, after
 the fact.
 
@@ -97,7 +97,7 @@ Two asymmetries make this test decide cases rather than merely describe them.
   only in the engine prompt.
 - **A hand-run `claude` in this repo gets no engine prompt.** Check where the
   enforcing hook is registered before deciding. A hook in the repo's own
-  `.claude/settings.json` (`pre-kill.sh`, `pre-push.sh`, `no-em-dashes.sh`)
+  `.claude/settings.json` (`pre-kill.sh`, `pre-push.sh`, `em-dashes.sh`)
   fires for that session, so the rule explaining the refusal must be reachable
   from `CLAUDE.md`. A hook registered only in the engine-generated
   `.lucidos/cc-settings.json` (`cc-plan-gate`) never fires there, which is what
@@ -239,8 +239,8 @@ and `system-knowhow.md`.
 Two settings files register hooks, and both apply.
 
 - **`.claude/settings.json`** (tracked, this repo): `PreToolUse` on `Bash`
-  (`pre-push.sh`, `pre-kill.sh`, `no-em-dashes.sh`), on `Edit` and `Write`
-  (`no-em-dashes.sh`), and `InstructionsLoaded`
+  (`pre-push.sh`, `pre-kill.sh`, `em-dashes.sh`), on `Edit` and `Write`
+  (`em-dashes.sh`), and `InstructionsLoaded`
   (`log-instructions-loaded.sh`).
 - **`.lucidos/cc-settings.json`** (generated per workspace by
   `crates/lucidos-engine/src/engine/cc_settings.rs`, passed with `--settings`):
@@ -276,6 +276,11 @@ and triggers an agent reaches from a worktree that is their sibling. `/tmp` is
 the OS temp dir, where an `Edit` cards with reason `workingDir`. That card hides
 its "Always allow" button, because CC honours no bare `Edit` allow rule in any
 mode. Both directories live in `engine/cc_settings.rs`.
+
+A repo can grant more in its own `.claude/settings.json`. Claude Code resolves a
+relative entry there against the worktree, so `../sibling-repo` names nothing.
+The engine re-resolves each entry that leaves the repo against the main
+checkout, and passes it as `--add-dir` (`engine/repo_directory_grants.rs`, ADR 0327).
 
 Four shapes stay unsuppressable at any scope, because no rule reaches them:
 `cd` with an output redirection, `cd` with a write command, `cd` before `git`,

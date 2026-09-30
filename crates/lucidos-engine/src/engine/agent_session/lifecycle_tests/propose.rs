@@ -195,7 +195,7 @@ fn conflict_session_never_proposes_change_at_idle() {
     // Not external, not shutdown, conflict session: must refuse — even on a
     // Generated terminal, because the merge result is the original change.
     assert!(
-        !may_touch_change_state_at_idle(false, false, true, &Some(TerminalKind::Generated)),
+        idle_change_write(false, false, true, &Some(TerminalKind::Generated)).is_none(),
         "conflict-resolution sessions must NOT propose a phantom change at idle"
     );
 }
@@ -205,7 +205,8 @@ fn conflict_session_never_proposes_change_at_idle() {
 #[test]
 fn normal_generated_session_may_touch_change_state() {
     assert!(
-        may_touch_change_state_at_idle(false, false, false, &Some(TerminalKind::Generated)),
+        idle_change_write(false, false, false, &Some(TerminalKind::Generated))
+            == Some(IdleChangeWrite::Complete),
         "normal Generated session must reach the propose/reconcile branch"
     );
 }
@@ -221,7 +222,8 @@ fn normal_generated_session_may_touch_change_state() {
 #[test]
 fn generated_proposes_regardless_of_background_bash() {
     assert!(
-        may_touch_change_state_at_idle(false, false, false, &Some(TerminalKind::Generated)),
+        idle_change_write(false, false, false, &Some(TerminalKind::Generated))
+            == Some(IdleChangeWrite::Complete),
         "Generated idle with changes must propose immediately — background \
          bash no longer gates the proposal (harden-at-apply is the net)"
     );
@@ -237,8 +239,8 @@ fn generated_proposes_regardless_of_background_bash() {
 /// existing pending row to zero when empty.
 #[test]
 fn gate_is_blind_to_whether_the_branch_has_a_diff() {
-    let clean_idle =
-        may_touch_change_state_at_idle(false, false, false, &Some(TerminalKind::Generated));
+    let clean_idle = idle_change_write(false, false, false, &Some(TerminalKind::Generated))
+        == Some(IdleChangeWrite::Complete);
     assert!(
         clean_idle,
         "an empty-diff Generated idle must still reach the reconcile arm"
@@ -248,7 +250,7 @@ fn gate_is_blind_to_whether_the_branch_has_a_diff() {
 #[test]
 fn external_repo_does_not_propose() {
     assert!(
-        !may_touch_change_state_at_idle(true, false, false, &Some(TerminalKind::Generated)),
+        idle_change_write(true, false, false, &Some(TerminalKind::Generated)).is_none(),
         "external repos manage their own push/PR — no Lucidos change row"
     );
 }
@@ -256,45 +258,50 @@ fn external_repo_does_not_propose() {
 #[test]
 fn shutdown_does_not_propose() {
     assert!(
-        !may_touch_change_state_at_idle(false, true, false, &Some(TerminalKind::Generated)),
+        idle_change_write(false, true, false, &Some(TerminalKind::Generated)).is_none(),
         "shutdown is mid-work, not a genuine idle — would create a spurious panel on resume"
     );
 }
 
-/// Failed terminal (CC error / empty Result / mid-stream API drop) MUST
-/// NOT auto-propose. Previously this proposed with `incomplete: true`
-/// flag — the user's directive is to never auto-surface half-assed work
-/// for Apply. The work stays in the worktree on the branch; the user
-/// can resume the thread to continue or discard manually.
+/// A failed terminal (CC error, empty Result, mid-stream API drop) does not
+/// propose. The user never ended that turn, so it is not surfaced for Apply.
+/// The work stays on the branch, and the user resumes or discards it.
 #[test]
 fn failed_terminal_does_not_propose_at_idle() {
     assert!(
-        !may_touch_change_state_at_idle(
+        idle_change_write(
             false,
             false,
             false,
             &Some(TerminalKind::Failed {
                 error: "stream interrupted".into(),
             })
-        ),
-        "Failed terminal must NOT auto-propose — half-assed work, no Apply card"
+        )
+        .is_none(),
+        "Failed terminal must NOT auto-propose"
     );
 }
 
-/// User clicked Stop mid-turn. The work is partial — never auto-surface
-/// for Apply. The user can resume the thread to continue.
+/// A user Stop proposes what the turn left, marked incomplete, so the work
+/// keeps an Apply and never drops off with an archive (ADR 0328). The other
+/// cancels propose nothing: a redirect's follow-up continues the branch, and
+/// an Apply or Discard stop owns the change itself.
 #[test]
-fn canceled_terminal_does_not_propose_at_idle() {
+fn only_a_user_stop_proposes_a_cancelled_turn_and_as_incomplete() {
     use crate::engine::thread_events::CancelCause;
-    assert!(
-        !may_touch_change_state_at_idle(
-            false,
-            false,
-            false,
-            &Some(TerminalKind::Canceled(CancelCause::UserStop))
-        ),
-        "Canceled terminal must NOT auto-propose — user stopped mid-work"
+    let write =
+        |cause| idle_change_write(false, false, false, &Some(TerminalKind::Canceled(cause)));
+    assert_eq!(
+        write(CancelCause::UserStop),
+        Some(IdleChangeWrite::Incomplete)
     );
+    for cause in [
+        CancelCause::SupersededByFollowup,
+        CancelCause::UserAction,
+        CancelCause::Unknown,
+    ] {
+        assert_eq!(write(cause), None, "{cause:?} must not propose");
+    }
 }
 
 /// Aborted terminal (engine shutdown) MUST NOT propose. The is_shutdown
@@ -305,12 +312,13 @@ fn canceled_terminal_does_not_propose_at_idle() {
 fn aborted_terminal_does_not_propose_at_idle() {
     use crate::engine::thread_events::AbortCause;
     assert!(
-        !may_touch_change_state_at_idle(
+        idle_change_write(
             false,
             false,
             false,
             &Some(TerminalKind::Aborted(AbortCause::EngineShutdown))
-        ),
+        )
+        .is_none(),
         "Aborted terminal must NOT auto-propose — engine-side, work preserved for recovery"
     );
 }
@@ -326,7 +334,7 @@ fn aborted_terminal_does_not_propose_at_idle() {
 #[test]
 fn no_terminal_kind_does_not_propose_at_idle() {
     assert!(
-        !may_touch_change_state_at_idle(false, false, false, &None),
+        idle_change_write(false, false, false, &None).is_none(),
         "None terminal (safety-net abort) must NOT auto-propose"
     );
 }
@@ -356,7 +364,7 @@ fn answered_non_empty_probe_without_restart_files() {
 fn answered_empty_probe_clears_a_previously_true_state() {
     // Commit then revert: git ANSWERED, and the answer is that the branch
     // carries no diff. Carrying `true` forward here is the phantom-Apply
-    // regression `may_touch_change_state_at_idle` documents.
+    // regression `idle_change_write` documents.
     assert_eq!(
         idle_change_flags(Some(&[]), (true, true)),
         (false, false),

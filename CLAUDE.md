@@ -10,7 +10,7 @@ Working agreement for AI coding agents (Claude Code, Codex) and human contributo
 
 A plan is not actionable until it lists load-bearing invariants, explicit non-goals, phase ordering, and a verification strategy per invariant. Those invariants stay in view while you edit, rather than first appearing at `/harden`. Enforcement is a durable *plan marker* gating the first edit and Apply ([`docs/glossary.md`](docs/glossary.md) § plan marker), and the engine states the procedure to every session.
 
-Detailed conventions live in `.claude/rules/`. Six load in every session, and are already in front of you: `glossary.md`, `no-em-dashes.md`, `no-private-data.md`, `philosophy.md`, `prose.md`, `temporary-measures.md`. Ten load only when you read a matching file: `rust.md`, `db.md`, `frontend.md`, `frontend-css.md`, `testing.md`, `dev-runtime.md`, `build-release.md`, `front-door.md`, `system-knowhow.md`, `sdk.md`.
+Detailed conventions live in `.claude/rules/`. Six load in every session, and are already in front of you: `glossary.md`, `em-dashes.md`, `no-private-data.md`, `philosophy.md`, `prose.md`, `temporary-measures.md`. Ten load only when you read a matching file: `rust.md`, `db.md`, `frontend.md`, `frontend-css.md`, `testing.md`, `dev-runtime.md`, `build-release.md`, `front-door.md`, `system-knowhow.md`, `sdk.md`.
 
 **[`docs/agent-config.md`](docs/agent-config.md) is where the mechanism is documented**: how scoping works, where a new instruction belongs (rule, skill, hook, or that page), and the context budget the whole set is gated on. Read it before adding or moving a rule. Three things bind here because they bind *before* any file is touched:
 
@@ -71,7 +71,7 @@ A **workspace** is a user's live Lucidos instance: a workspace directory with gi
 - **No provider-specific instructions in code.** Use `web_search` for those.
 - **No private data in shipping files.** Everything except `docs/plans/**` and `WORKSPACES.md` ships verbatim to the public mirror — test fixtures and comments included. Never use real personal/family/company-internal data or machine paths as examples; use the generic placeholders. Single source of truth: `.claude/rules/no-private-data.md` (enforced by `/harden`, `/harden-project`, and the release guard).
 - **Public API parameter values are kebab-case.** Use values like `coding-agent`, not `coding_agent`; reserve snake_case for JSON/DB/Rust/TS field identifiers where that is the established contract.
-- **Conventional commits**: `feat:`, `fix:`, `docs:`, `refactor:`, `chore:`. No em dashes in the subject or body, same as everywhere else (`.claude/rules/no-em-dashes.md`); a `git commit -m` carrying one is blocked at the Bash hook.
+- **Conventional commits**: `feat:`, `fix:`, `docs:`, `refactor:`, `chore:`. No unspaced em dashes in the subject or body, same as everywhere else (`.claude/rules/em-dashes.md`); a `git commit -m` carrying one is blocked at the Bash hook.
 
 ## Engine Statelessness
 

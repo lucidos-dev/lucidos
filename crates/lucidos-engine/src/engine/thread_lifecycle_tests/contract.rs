@@ -71,6 +71,7 @@ fn generate_cross_validation_fixture() -> String {
                                         Action::DiscardDraft => "discard_draft",
                                         Action::Discard => "discard",
                                         Action::Apply => "apply",
+                                        Action::SetAside => "set_aside",
                                         Action::ApplyWhenSettled => "apply_when_settled",
                                         Action::Archive => "archive",
                                         Action::Save => "save",
@@ -184,7 +185,7 @@ fn generate_typescript() -> String {
         status_literals.join(", ")
     ));
     out.push_str("export type EventClass = 'metadata' | 'start' | 'activity' | 'terminal' | 'action_required';\n");
-    out.push_str("export type Action = 'discard_draft' | 'discard' | 'apply' | 'apply_when_settled' | 'archive' | 'save' | 'unsave';\n\n");
+    out.push_str("export type Action = 'discard_draft' | 'discard' | 'apply' | 'set_aside' | 'apply_when_settled' | 'archive' | 'save' | 'unsave';\n\n");
 
     // LEGAL_SECTIONS
     out.push_str(
@@ -268,7 +269,7 @@ fn generate_typescript() -> String {
     out.push_str("  if (hasUnsentDraft) actions.push('discard_draft');\n");
     out.push_str("  if (!live) {\n");
     out.push_str("    if (codingAgentPending) {\n");
-    out.push_str("      if (!hasLiveEventWaits) actions.push('discard', 'apply');\n");
+    out.push_str("      if (!hasLiveEventWaits) actions.push('discard', 'apply', 'set_aside');\n");
     out.push_str("    } else if (storedSection === 'inbox' && !descendantsBlockArchive) {\n");
     out.push_str("      actions.push('archive');\n");
     out.push_str("    }\n");

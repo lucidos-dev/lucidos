@@ -39,6 +39,7 @@ function makeActiveThread(overrides: MakeThreadOpts = {}): ThreadState {
       createdAt: '',
       updatedAt: '',
       status: 'idle',
+      summaryVersion: 0,
       codingAgentProposed: false,
       codingAgentRequiresRestart: false,
       codingAgentIsExternalRepo: false,

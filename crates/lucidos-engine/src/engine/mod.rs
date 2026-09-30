@@ -54,6 +54,7 @@ mod pending_apply_actors;
 pub(crate) mod preferences;
 pub(crate) mod question_card_gate;
 pub mod release_notices;
+pub(crate) mod repo_directory_grants;
 mod session_seed;
 pub mod standing_apply;
 pub mod startup_lease;
@@ -84,6 +85,7 @@ pub(crate) use change_ops::now_epoch_millis;
 // into an HTTP status by identity against this const (a 404 there means "no
 // live session" to the frontend, so misclassifying it runs the wrong fallback).
 pub(crate) use change_ops::MERGE_OWNED_BY_RESOLVER_MESSAGE;
+pub(crate) use change_ops::SET_ASIDE_APPLY_REFUSAL;
 // The child-follow-up vocabulary, re-exported for the HTTP route in
 // `api::threads::follow_up`, which is outside `engine`. Only the ack and the
 // refusal taxonomy: the delivery half stays reachable solely as
@@ -120,14 +122,11 @@ pub mod spawn_dispatcher {
     pub use super::agent_session::spawn_dispatcher::{SpawnDispatcher, SpawnRequest};
 }
 
-use crate::core::{
-    AppManager, ArtifactManager, CredentialStore, EventStore, PinnedAppStore, PreferenceStore,
-};
+use crate::core::{AppManager, ArtifactManager, CredentialStore, EventStore, PreferenceStore};
 use crate::llm::LlmProvider;
 use crate::memory::{EmbedderSlot, MemoryExtractor, PgVectorIndex};
 use crate::runtime::{
-    AgentRuntime, BrowserLogins, BrowserRuntime, ClaudeCodeRuntime, CodexRuntime, CodingAgent,
-    HeadlessBlocklist, PythonRuntime,
+    AgentRuntime, BrowserRuntime, ClaudeCodeRuntime, CodexRuntime, CodingAgent, PythonRuntime,
 };
 use git_ops::auto_commit_safe_files_if_dirty;
 use std::collections::HashMap;

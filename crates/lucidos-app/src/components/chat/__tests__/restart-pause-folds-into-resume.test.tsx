@@ -25,6 +25,7 @@ function makeThread(id: string): ThreadState {
       createdAt: TS,
       updatedAt: TS,
       status: 'idle',
+      summaryVersion: 0,
       messageCount: 0,
       section: 'inbox',
       activeChildrenCount: 0,

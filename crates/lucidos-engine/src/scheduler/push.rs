@@ -9,6 +9,7 @@ use sqlx::PgPool;
 #[cfg(feature = "e2e-test-hooks")]
 use super::push_test_log;
 
+use super::notification_plain_text::plain_text_body;
 use crate::api::presence_pong::PresencePong;
 use crate::api::SharedEngine;
 
@@ -67,28 +68,6 @@ pub struct VapidKeys {
 pub struct PushSubscriptionStore;
 
 impl PushSubscriptionStore {
-    /// Defensive double-write: the migration owns this CREATE TABLE (see
-    /// `20260517160627_consolidate_init_schema_tables.sql`). A temporary measure:
-    /// `docs/temporary-measures.md` § "Defensive double-write of tables into
-    /// `init_schema`".
-    pub async fn init_schema(
-        pool: &PgPool,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS push_subscriptions (
-                endpoint TEXT PRIMARY KEY,
-                p256dh TEXT NOT NULL,
-                auth TEXT NOT NULL,
-                scope_url TEXT,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )",
-        )
-        .execute(pool)
-        .await?;
-
-        Ok(())
-    }
-
     /// Store a push subscription (upsert by endpoint)
     pub async fn subscribe(
         pool: &PgPool,
@@ -296,6 +275,8 @@ pub async fn send_push_to_all_with_app(
     link_event_id: Option<uuid::Uuid>,
     tap: crate::scheduler::notifications::Tap,
 ) {
+    // Every surface below shows text verbatim, so none of them gets markdown.
+    let body = &plain_text_body(body);
     let pool = engine.pool();
     // MAY be empty: a desktop-only workspace never creates one, because the
     // embedded WKWebView cannot subscribe to Web Push. Do NOT bail on empty
@@ -1205,21 +1186,25 @@ fn build_wake_payload(
     ios_scope_url: Option<&str>,
     app_badge: Option<i64>,
 ) -> serde_json::Value {
-    fit_payload_body(&notification.message, "wake", |candidate_body| {
-        let mut payload = build_push_payload(
-            &notification.title,
-            candidate_body,
-            Some(notification.id),
-            notification.app_id.as_deref(),
-            notification.thread_id,
-            notification.event_id,
-            &notification.tap,
-            ios_scope_url,
-            app_badge,
-        );
-        payload["wake"] = serde_json::Value::Bool(true);
-        payload
-    })
+    fit_payload_body(
+        &plain_text_body(&notification.message),
+        "wake",
+        |candidate_body| {
+            let mut payload = build_push_payload(
+                &notification.title,
+                candidate_body,
+                Some(notification.id),
+                notification.app_id.as_deref(),
+                notification.thread_id,
+                notification.event_id,
+                &notification.tap,
+                ios_scope_url,
+                app_badge,
+            );
+            payload["wake"] = serde_json::Value::Bool(true);
+            payload
+        },
+    )
 }
 
 /// [`build_push_payload`] with the body fitted to the transport ceiling.

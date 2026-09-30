@@ -147,7 +147,7 @@ fn prepare_install_request_returns_sentinel_and_registers_pending() {
         &scratch,
         &pending,
         archive.to_str().unwrap(),
-        &Default::default(),
+        &Ok(Default::default()),
         &GitCredentials::none(),
     );
 
@@ -194,7 +194,7 @@ fn prepare_install_request_lists_overwrites_when_files_already_exist() {
         &scratch,
         &pending,
         archive.to_str().unwrap(),
-        &Default::default(),
+        &Ok(Default::default()),
         &GitCredentials::none(),
     );
     let payload = parse_sentinel_payload(&result);
@@ -215,6 +215,64 @@ fn prepare_install_request_lists_overwrites_when_files_already_exist() {
 }
 
 #[test]
+fn unreadable_baselines_refuse_a_staging_that_would_overwrite_files() {
+    let scratch = fresh_workspace();
+    let archive_dir = scratch.join("archive");
+    std::fs::create_dir_all(&archive_dir).unwrap();
+    let archive = build_fixture_archive(&archive_dir, "v2");
+    std::fs::create_dir_all(scratch.join("data/knowhow")).unwrap();
+    std::fs::write(scratch.join("data/knowhow/fixture.md"), "my local edit").unwrap();
+    let pending = fresh_pending_map();
+
+    let result = prepare_install_request(
+        &scratch,
+        &pending,
+        archive.to_str().unwrap(),
+        &Err("connection refused".to_string()),
+        &GitCredentials::none(),
+    );
+
+    assert!(result.starts_with("Error:"), "got: {}", result);
+    assert!(result.contains("connection refused"), "got: {}", result);
+    assert!(
+        pending.lock().unwrap().is_empty(),
+        "an update that cannot see local edits must not reach the confirm panel"
+    );
+    assert_eq!(
+        std::fs::read_to_string(scratch.join("data/knowhow/fixture.md")).unwrap(),
+        "my local edit"
+    );
+
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+#[test]
+fn unreadable_baselines_still_stage_a_fresh_install() {
+    let scratch = fresh_workspace();
+    let archive_dir = scratch.join("archive");
+    std::fs::create_dir_all(&archive_dir).unwrap();
+    let archive = build_fixture_archive(&archive_dir, "v1");
+    let pending = fresh_pending_map();
+
+    let result = prepare_install_request(
+        &scratch,
+        &pending,
+        archive.to_str().unwrap(),
+        &Err("connection refused".to_string()),
+        &GitCredentials::none(),
+    );
+
+    assert!(
+        result.starts_with(PLUGIN_INSTALL_REQUEST_PREFIX),
+        "a fresh install has nothing to lose, got: {}",
+        result
+    );
+    assert_eq!(pending.lock().unwrap().len(), 1);
+
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+#[test]
 fn prepare_install_request_returns_error_string_on_invalid_source() {
     let scratch = fresh_workspace();
     let pending = fresh_pending_map();
@@ -223,7 +281,7 @@ fn prepare_install_request_returns_error_string_on_invalid_source() {
         &scratch,
         &pending,
         "not-a-real-source",
-        &Default::default(),
+        &Ok(Default::default()),
         &GitCredentials::none(),
     );
 
@@ -253,7 +311,7 @@ async fn cancel_pending_install_emits_event_and_drops_staging() {
         &scratch,
         &pending,
         archive.to_str().unwrap(),
-        &Default::default(),
+        &Ok(Default::default()),
         &GitCredentials::none(),
     );
     let payload = parse_sentinel_payload(&result);

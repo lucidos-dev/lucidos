@@ -1239,7 +1239,7 @@ export async function sendSeededPrompt(text: string, what: string): Promise<bool
   // flight, rather than after a round trip.
   revealThreadPane();
   try {
-    await sendCompose(threadId, { focus: true });
+    return await sendCompose(threadId, { focus: true });
   } catch (err) {
     // `sendCompose` rethrows after rolling the draft back, and its other callers
     // toast (see `beginSend` in PromptInput). Every entry point here fires this
@@ -1248,7 +1248,6 @@ export async function sendSeededPrompt(text: string, what: string): Promise<bool
     showToast(`Failed to ${what}: ${errorDetail(err)}`, 'error');
     return false;
   }
-  return true;
 }
 
 /** Discard a composing thread. Optimistic state→discarded for instant
@@ -1332,11 +1331,14 @@ function pushClearedComposeAfterSend(threadId: string): void {
  *  Reads text/images from the draft signal so the caller doesn't need to
  *  pass them. Optimistic local clear + state→active before the chat POST so
  *  the input is immediately usable for follow-up text. On failure we restore
- *  the typed text — losing it would be the worst possible UX. */
+ *  the typed text, because losing it would be the worst possible UX.
+ *
+ *  Resolves false when the engine refused the send, after its toast and the
+ *  restore. Rejects, after the restore, when the thread could not start. */
 export async function sendCompose(
   threadId: string,
   opts: { useCodingAgent?: boolean; context?: ChatContext | null; focus?: boolean },
-): Promise<void> {
+): Promise<boolean> {
   // Both guards below end a send the user asked for, so neither may be silent.
   // A dispatched send that produces no message and no word is a dead button, and
   // this is the path a compose-view Send takes. See
@@ -1344,7 +1346,7 @@ export async function sendCompose(
   const thread = threadMap.value.get(threadId);
   if (!thread) {
     showToast('Could not send: that draft is no longer open.', 'error');
-    return;
+    return false;
   }
   const draft = getDraft(threadId);
   const text = draft.text;
@@ -1352,7 +1354,7 @@ export async function sendCompose(
   const mode = draft.mode;
   if (!text.trim() && wireHashes.length === 0) {
     showToast('Could not send: the saved draft was empty.', 'error');
-    return;
+    return false;
   }
 
   cancelPendingPush(threadId);
@@ -1409,6 +1411,18 @@ export async function sendCompose(
   lastSyncedImageHashes.delete(threadId);
   const shouldFocus = opts.focus ?? true;
   if (shouldFocus) setFocusedThread(threadId);
+  // Restore text and images only if the user has not started typing into the
+  // now-empty textarea. Overwriting fresh keystrokes would lose work the user
+  // can see they typed.
+  const rollBack = () => {
+    mutateThreadMeta(threadId, { state: 'composing' });
+    const current = getDraft(threadId);
+    const restore: Partial<ComposeDraft> = {};
+    if (current.text === '') restore.text = text;
+    if (current.image_hashes.length === 0) restore.image_hashes = wireHashes;
+    if (current.mode === null) restore.mode = mode;
+    if (Object.keys(restore).length > 0) patchDraft(threadId, restore);
+  };
   try {
     // The chat POST needs the thread row to exist server-side, and on a
     // first-send `POST /threads` may still be in flight.
@@ -1422,7 +1436,7 @@ export async function sendCompose(
     // failed start rejects here and lands in the catch below, which rolls the
     // draft back and rethrows for the caller to toast.
     await awaitThreadStarted(threadId);
-    await sendMessage(text, wireHashes.length > 0 ? wireHashes : undefined, {
+    const outcome = await sendMessage(text, wireHashes.length > 0 ? wireHashes : undefined, {
       useCodingAgent: opts.useCodingAgent,
       context: opts.context,
       threadId,
@@ -1433,6 +1447,11 @@ export async function sendCompose(
       ccModelOverride,
       ccReasoningEffortOverride,
     });
+    if (outcome === 'dropped') {
+      // `sendMessage` already toasted, and the draft is all that holds the text.
+      rollBack();
+      return false;
+    }
     // A compose-view pick is a one-shot intent, now carried into this spawn's
     // chat body, so consume the draft's selection. Without this the override
     // would linger in `composeSelections` for a thread no longer composing.
@@ -1447,17 +1466,9 @@ export async function sendCompose(
     // NULL. A send that FAILS schedules nothing: it consumed no draft, so there
     // is no stale write to out-order, and the restored text must stay put.
     pushClearedComposeAfterSend(threadId);
+    return true;
   } catch (err) {
-    // Roll back state. Restore text and images only if the user has not started
-    // typing into the now-empty textarea. Overwriting fresh keystrokes would
-    // lose work the user can see they typed.
-    mutateThreadMeta(threadId, { state: 'composing' });
-    const current = getDraft(threadId);
-    const restore: Partial<ComposeDraft> = {};
-    if (current.text === '') restore.text = text;
-    if (current.image_hashes.length === 0) restore.image_hashes = wireHashes;
-    if (current.mode === null) restore.mode = mode;
-    if (Object.keys(restore).length > 0) patchDraft(threadId, restore);
+    rollBack();
     throw err;
   }
 }
@@ -1481,7 +1492,15 @@ export async function sendFollowup(
   // scheduling a second write.
   updateCompose(threadId, { text: '', image_hashes: [] });
   lastSyncedImageHashes.delete(threadId);
-  await sendMessage(text, imageHashes, { ...opts, threadId, focus: opts?.focus ?? true });
+  const outcome = await sendMessage(text, imageHashes, { ...opts, threadId, focus: opts?.focus ?? true });
+  if (outcome !== 'dropped') return;
+  // The refused send's row is gone, so the draft is all that can hold the text.
+  // Typing that landed meanwhile wins, as in `sendCompose`'s roll-back.
+  const current = getDraft(threadId);
+  const restore: ComposePatch = {};
+  if (current.text === '') restore.text = text;
+  if (current.image_hashes.length === 0 && imageHashes?.length) restore.image_hashes = imageHashes;
+  if (Object.keys(restore).length > 0) updateCompose(threadId, restore);
 }
 
 /** Tab-close-safe flush. Each pending PUT goes out with `keepalive: true`, so

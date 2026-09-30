@@ -374,16 +374,26 @@ export async function waitAndClick(page: Page, selector: string, text?: string, 
   await clickVisibleElement(page, selector, text);
 }
 
-/** Drive the open model picker's two steps: a model, then one of its tiers.
+/** Drive the open model picker: a model, then one of its tiers when it has any.
  *
- *  A step-1 row carries the model id, because a model is not a selection yet.
- *  A step-2 row carries the encoded pair, which is what the pick reports.
- *  Returns that pair. Omit `tier` to take the first the model offers. */
+ *  A step-1 row carries the model id. A row that opens a step draws the
+ *  drill-down glyph. One without it (a model with no tiers, like Haiku)
+ *  commits on the first click, as `modelStepCommit` does. A step-2 row carries
+ *  the encoded pair, which is what the pick reports. Returns that pair. Omit
+ *  `tier` to take the first the model offers. */
 export async function pickModelPair(page: Page, model: string, tier?: string): Promise<string> {
-  await waitAndClick(page, `.control-option[data-value="${model}"]`, undefined, 10_000);
+  const modelRow = page.locator(`.control-option[data-value="${model}"]:visible`).first();
+  await expect(modelRow).toBeVisible({ timeout: 10_000 });
+  if ((await modelRow.locator('.control-option-more').count()) === 0) {
+    if (tier) throw new Error(`pickModelPair: "${model}" offers no tiers, so "${tier}" cannot be picked`);
+    await modelRow.click();
+    await expect(page.locator('.control-option:visible')).toHaveCount(0);
+    return `${model}|`;
+  }
+  await modelRow.click();
   const row = tier
     ? page.locator(`.control-option[data-value="${model}|${tier}"]:visible`).first()
-    : page.locator('.control-option:visible').first();
+    : page.locator(`.control-option[data-value^="${model}|"]:visible`).first();
   await expect(row).toBeVisible({ timeout: 5_000 });
   const pair = (await row.getAttribute('data-value')) ?? '';
   await row.click();
@@ -694,41 +704,42 @@ export async function getHeaderTop(page: Page): Promise<number> {
   });
 }
 
-/** Opt out of the default-ON "Keep header visible" mobile preference, so the
- *  header's hide-on-scroll and hide-on-keyboard-open behavior is exercisable.
- *  With the pin on, the header never slides off and the hide assertions time
- *  out. Set the GLOBAL pref to 'false' BEFORE navigating so the page boots with
- *  hide enabled: with `device_id` omitted, the app's device-scoped preference
- *  load merges the global value. Must be called before `navigateToApp`.
+/** Turn on the default-OFF "Dynamic bars" mobile preference, so the header's
+ *  and prompt's hide-on-scroll, and the header's hide-on-keyboard-open, are
+ *  exercisable. With the bars pinned, nothing slides off and the hide
+ *  assertions time out. Set the GLOBAL pref to 'true' BEFORE navigating so the
+ *  page boots with hide enabled: with `device_id` omitted, the app's
+ *  device-scoped preference load merges the global value. Must be called
+ *  before `navigateToApp`.
  *
  *  A spec about the reader's own EDGE calls it for a second reason. That edge is
  *  the bottom of the sticky thread title. A pinned header holds it still, so the
  *  spec stops covering the half where chrome slides over the transcript. Being
  *  global, the pref is otherwise whatever the previous spec left.
  *
- *  PUT IT BACK. Every caller pairs this with `enableMobileHeaderSticky` in an
+ *  PUT IT BACK. Every caller pairs this with `disableMobileDynamicBars` in an
  *  `afterEach`, because the pref is global and the e2e database resets only
  *  between projects. A later spec then runs with live hide-on-scroll it never
  *  asked for, and a header moving mid-click is not a layout it was written
  *  against. That cost `trigger-groups` its save. The mousedown landed on the
  *  button and the header then shifted the form, so the mouseup landed on the
  *  wrapper. No click reached the button, and the form never submitted. */
-export async function disableMobileHeaderSticky(page: Page): Promise<void> {
-  const res = await apiRequest(page).put('/api/v1/preferences?key=mobile_header_sticky', {
-    data: { value: 'false' },
+export async function enableMobileDynamicBars(page: Page): Promise<void> {
+  const res = await apiRequest(page).put('/api/v1/preferences?key=mobile_dynamic_bars', {
+    data: { value: 'true' },
   });
   expect(res.ok()).toBeTruthy();
 }
 
-/** Force-ON the default "Keep header visible" pin. `mobile_header_sticky` is a
- *  GLOBAL preference, and the e2e DB is reset only between projects. So a test
- *  that called `disableMobileHeaderSticky` leaks the off state into later tests
- *  assuming the pinned default. A test depending on the pinned header calls
- *  this in its beforeEach BEFORE navigating, so it boots pinned whatever the
- *  order. Pairs with `disableMobileHeaderSticky`. */
-export async function enableMobileHeaderSticky(page: Page): Promise<void> {
-  const res = await apiRequest(page).put('/api/v1/preferences?key=mobile_header_sticky', {
-    data: { value: 'true' },
+/** Force the default pinned bars ("Dynamic bars" off). `mobile_dynamic_bars` is
+ *  a GLOBAL preference, and the e2e DB is reset only between projects. So a test
+ *  that called `enableMobileDynamicBars` leaks the on state into later tests
+ *  assuming the pinned default. A test depending on the pinned bars calls this
+ *  in its beforeEach BEFORE navigating, so it boots pinned whatever the order.
+ *  Pairs with `enableMobileDynamicBars`. */
+export async function disableMobileDynamicBars(page: Page): Promise<void> {
+  const res = await apiRequest(page).put('/api/v1/preferences?key=mobile_dynamic_bars', {
+    data: { value: 'false' },
   });
   expect(res.ok()).toBeTruthy();
 }
@@ -1162,36 +1173,87 @@ export async function dismissCCSession(page: Page): Promise<void> {
   }
 }
 
-/** Wait for a visible `.thread-title-display` (read-only <div>) with non-empty
- *  text (dual-layout safe). */
+/** Where the focused thread's title shows: the thread pane's title row, on
+ *  both layouts and whether or not the drawer is open. */
+export const VISIBLE_TITLE_SELECTOR = '.thread-title';
+
+/** Wait for a visible thread title with non-empty text (dual-layout safe). */
 export async function waitForThreadTitle(page: Page, timeout = 30_000): Promise<void> {
-  await page.waitForFunction(() => {
-    const els = document.querySelectorAll('.thread-title-display');
+  await page.waitForFunction((sel) => {
+    const els = document.querySelectorAll(sel);
     return Array.from(els).some(el => {
       const rect = el.getBoundingClientRect();
       return rect.width > 0 && rect.height > 0 && (el.textContent ?? '').trim().length > 0;
     });
-  }, undefined, { timeout });
+  }, VISIBLE_TITLE_SELECTOR, { timeout });
 }
 
-/** Wait for the thread title editor to enter edit mode (wrapper gains
- *  `.is-editing`), returning a locator for the visible input. */
-export async function waitForTitleInput(page: Page, timeout = 5_000) {
-  await page.waitForFunction(() => {
-    const wrappers = document.querySelectorAll('.thread-title-edit.is-editing');
-    return Array.from(wrappers).some(w => {
-      const rect = w.getBoundingClientRect();
-      return rect.width > 0 && rect.height > 0;
-    });
-  }, undefined, { timeout });
-  return page.locator('.thread-title-edit.is-editing .thread-title-edit-input').first();
+/** The focused thread's desktop pin toggle in the title row, labelled
+ *  `label`. A phone's title row draws no pin: see `toggleFocusedPin`. */
+function focusedPinSelector(label: string): string {
+  return `.thread-view-header-actions button[aria-label="${label}"]:visible`;
 }
 
-/** Height (px) of the visible mobile thread-title-display div, ignoring
- *  the desktop copy. Returns 0 if neither layout's display is rendered. */
+/** The phone's thread title, which is its own menu button. */
+const MOBILE_TITLE_MENU = '.mobile-thread-title-row .thread-title-menu:visible';
+
+function isPhoneLayout(page: Page): boolean {
+  return (page.viewportSize()?.width ?? Infinity) <= 768;
+}
+
+function threadMenuItem(page: Page, label: string): Locator {
+  return page.locator('.thread-overflow-menu').getByRole('menuitem', { name: label, exact: true });
+}
+
+/** Pin or unpin the focused thread: the title row's button on desktop, the
+ *  title menu's item on a phone. Unpinning asks to confirm, and the caller
+ *  answers that. */
+export async function toggleFocusedPin(page: Page, to: 'pinned' | 'unpinned'): Promise<void> {
+  if (!isPhoneLayout(page)) {
+    await page.locator(focusedPinSelector(to === 'pinned' ? 'Pin thread' : 'Remove thread from Pinned section')).first().click();
+    return;
+  }
+  await page.locator(MOBILE_TITLE_MENU).click();
+  await threadMenuItem(page, to === 'pinned' ? 'Pin thread' : 'Unpin thread').click();
+}
+
+/** Assert the focused thread's pin state. A phone reads it off the title
+ *  menu's item, then closes the menu again. */
+export async function expectFocusedPinned(page: Page, pinned: boolean, timeout = 10_000): Promise<void> {
+  if (!isPhoneLayout(page)) {
+    await expect(page.locator(focusedPinSelector(pinned ? 'Remove thread from Pinned section' : 'Pin thread')).first())
+      .toBeVisible({ timeout });
+    return;
+  }
+  await expect(async () => {
+    await page.locator(MOBILE_TITLE_MENU).click();
+    try {
+      await expect(threadMenuItem(page, pinned ? 'Unpin thread' : 'Pin thread')).toBeVisible({ timeout: 1_000 });
+    } finally {
+      await page.keyboard.press('Escape');
+      await expect(page.locator('.thread-overflow-menu')).toHaveCount(0);
+    }
+  }).toPass({ timeout });
+}
+
+/** Rename the focused thread through the thread menu's Rename… dialog. Opens
+ *  the menu on whichever surface shows it: the thread title on either layout,
+ *  or the drawer row's ⋯. */
+export async function renameThreadViaMenu(page: Page, title: string): Promise<void> {
+  const opened = await clickVisibleElement(page, '.thread-title-menu, .thread-row-focused [aria-label="More thread actions"]');
+  if (!opened) throw new Error('no visible thread menu to rename from');
+  await page.locator('.thread-overflow-menu [role="menuitem"]', { hasText: 'Rename' }).first().click();
+  const field = page.locator('.confirm-dialog .prompt-input');
+  await field.waitFor({ state: 'visible' });
+  await field.fill(title);
+  await page.locator('[data-role="prompt-ok"]').click();
+}
+
+/** Height (px) of the visible mobile thread title, ignoring the desktop copy.
+ *  Returns 0 if neither layout's title is rendered. */
 export async function getMobileTitleHeight(page: Page): Promise<number> {
   return page.evaluate(() => {
-    const els = document.querySelectorAll('.mobile-thread-title-row .thread-title-display');
+    const els = document.querySelectorAll('.mobile-thread-title-row .thread-title');
     for (const el of els) {
       const rect = el.getBoundingClientRect();
       if (rect.width > 0) return rect.height;
@@ -1200,11 +1262,11 @@ export async function getMobileTitleHeight(page: Page): Promise<number> {
   });
 }
 
-/** Visible thread title text from whichever layout's display div is
- *  currently rendered (dual-layout safe). */
+/** Visible thread title text from wherever it currently shows (dual-layout
+ *  safe; see VISIBLE_TITLE_SELECTOR). */
 export async function getVisibleTitleText(page: Page): Promise<string> {
-  return page.evaluate(() => {
-    const els = document.querySelectorAll('.thread-title-display');
+  return page.evaluate((sel) => {
+    const els = document.querySelectorAll(sel);
     for (const el of els) {
       const rect = el.getBoundingClientRect();
       if (rect.width > 0 && rect.height > 0) {
@@ -1212,7 +1274,7 @@ export async function getVisibleTitleText(page: Page): Promise<string> {
       }
     }
     return '';
-  });
+  }, VISIBLE_TITLE_SELECTOR);
 }
 
 // =====================================================================

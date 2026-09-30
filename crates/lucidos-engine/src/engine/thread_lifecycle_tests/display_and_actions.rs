@@ -529,7 +529,15 @@ fn cc_inbox_with_changes_shows_apply_discard() {
         false,
         false,
     );
-    assert_eq!(actions, vec![Action::Discard, Action::Apply, Action::Save]);
+    assert_eq!(
+        actions,
+        vec![
+            Action::Discard,
+            Action::Apply,
+            Action::SetAside,
+            Action::Save
+        ]
+    );
 }
 
 #[test]
@@ -600,7 +608,15 @@ fn cc_archived_with_pending_changes_shows_apply_discard() {
         false,
         false,
     );
-    assert_eq!(actions, vec![Action::Discard, Action::Apply, Action::Save]);
+    assert_eq!(
+        actions,
+        vec![
+            Action::Discard,
+            Action::Apply,
+            Action::SetAside,
+            Action::Save
+        ]
+    );
 }
 
 #[test]
@@ -655,7 +671,15 @@ fn cc_inbox_pending_changes_still_show_apply_discard_when_descendants_block() {
         false,
         false,
     );
-    assert_eq!(actions, vec![Action::Discard, Action::Apply, Action::Save]);
+    assert_eq!(
+        actions,
+        vec![
+            Action::Discard,
+            Action::Apply,
+            Action::SetAside,
+            Action::Save
+        ]
+    );
 }
 
 // ── new axes: draft + save/unsave ──
@@ -716,6 +740,7 @@ fn full_cascade_draft_change_then_save() {
             Action::DiscardDraft,
             Action::Discard,
             Action::Apply,
+            Action::SetAside,
             Action::Save
         ]
     );
@@ -752,7 +777,12 @@ fn saved_cc_pending_shows_unsave() {
     );
     assert_eq!(
         actions,
-        vec![Action::Discard, Action::Apply, Action::Unsave]
+        vec![
+            Action::Discard,
+            Action::Apply,
+            Action::SetAside,
+            Action::Unsave
+        ]
     );
 }
 
@@ -874,7 +904,15 @@ fn clearing_the_last_wait_restores_apply_and_discard() {
         false,
         false,
     );
-    assert_eq!(actions, vec![Action::Discard, Action::Apply, Action::Save]);
+    assert_eq!(
+        actions,
+        vec![
+            Action::Discard,
+            Action::Apply,
+            Action::SetAside,
+            Action::Save
+        ]
+    );
 }
 
 /// The draft layer is orthogonal to the gate, as it already is to `live`.

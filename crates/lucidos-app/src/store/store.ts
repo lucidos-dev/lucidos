@@ -940,12 +940,12 @@ export function isThreadQuiescent(status: ThreadStatus | undefined): boolean {
  *  (`pendingUserMessages`).
  *
  *  Without this carve-out the answer-to-resume gap mislabels the answered turn
- *  as aborted. The backend flips the projection to `running` on
+ *  as done. The backend flips the projection to `running` on
  *  `UserQuestionAnswered`, but the client's `meta.status` advances only when a
  *  per-event aggregate carrying `running` arrives. The resume's first events
  *  can land while the snapshot still reads `waiting_for_user_answer`. The
  *  answered divider then has steps, no terminal and `threadIdle`, and the
- *  stale detector in `exchange-render.ts` flashes "Aborted" until the
+ *  stale detector in `exchange-render.ts` flashes "Done" until the
  *  aggregate lands. An unknown thread falls back to treat-as-active. */
 export function isRenderedThreadIdle(thread: ThreadState | undefined): boolean {
   if (!thread) return false;
@@ -1597,7 +1597,7 @@ export const queuedMessageRemovalKey = (threadId: string, messageId: string): st
 /** Thread IDs whose pending question was just answered, where the agent's
  *  resume has not yet moved the client's `meta.status` off
  *  `waiting_for_user_answer`. `isRenderedThreadIdle` reads it to suppress the
- *  "Aborted" flash in that gap. Set in the `answerThreadQuestion` action, and
+ *  "Done" flash in that gap. Set in the `answerThreadQuestion` action, and
  *  cleared once the real status moves or the answer fails. */
 export const answeringThreadIds = signal<Set<string>>(new Set());
 
@@ -1622,6 +1622,16 @@ export function clearThreadAnswering(threadId: string): void {
 export const changes = signal<Loadable<Change[]>>({ status: 'not-loaded' });
 /** Recently applied/reverted changes. Same Loadable shape as `changes`. */
 export const appliedChanges = signal<Loadable<Change[]>>({ status: 'not-loaded' });
+/** Changes kept for later (ADR 0328). Loads in lockstep with `changes`. */
+export const setAsideChanges = signal<Loadable<Change[]>>({ status: 'not-loaded' });
+/** A thread's set-aside change, if it has one. A thread holds at most one
+ *  open change, so the first match is the only one. */
+export function setAsideChangeForThread(threadId: string): Change | undefined {
+  const loadable = setAsideChanges.value;
+  return loadable.status === 'loaded'
+    ? loadable.data.find((c) => c.thread_id === threadId)
+    : undefined;
+}
 /** Per-id cache for changes fetched on-demand by `ChangeEventRow` when the id
  *  isn't in `changes` or `appliedChanges`. `loading` doubles as the dedup
  *  token; `failed` prevents refetching a 404. */
@@ -1637,6 +1647,10 @@ export function findChangeById(id: string): Change | undefined {
   if (appliedChanges.value.status === 'loaded') {
     const applied = appliedChanges.value.data.find(c => c.id === id);
     if (applied) return applied;
+  }
+  if (setAsideChanges.value.status === 'loaded') {
+    const setAside = setAsideChanges.value.data.find(c => c.id === id);
+    if (setAside) return setAside;
   }
   const lazy = lazyChanges.value.get(id);
   return lazy?.status === 'loaded' ? lazy.data : undefined;

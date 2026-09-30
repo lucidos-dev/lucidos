@@ -19,7 +19,7 @@ import { availableThreadActions, type Action } from '../../generated/thread-life
 import { getDraft, draftIsEmpty } from '../composeDrafts';
 import { handleArchiveThread, handleSaveThread, handleUnsaveThread } from './threads';
 import { endClaudeCodeAndApply, handleDiscardCCChanges } from './chat-claude-code';
-import { armStandingApply, disarmStandingApply, APPLY_NEW_VERSION_TOOLTIP } from './chat-changes';
+import { armStandingApply, disarmStandingApply, setAsideSingleChange, APPLY_NEW_VERSION_TOOLTIP } from './chat-changes';
 import { discardCompose, updateCompose } from './compose';
 
 export type ActionCategory = 'close' | 'primary' | 'save';
@@ -39,8 +39,10 @@ export interface TaggedAction {
  *  destructive (typed text is lost), so it confirms. */
 const DISCARD_DRAFT_CONFIRM = 'Discard this unsent draft?';
 const DISCARD_CHANGE_CONFIRM = 'Discard all changes from this session? This cannot be undone.';
-const APPLY_INCOMPLETE_CONFIRM =
-  'This change was proposed by a turn that ended in failure (e.g. mid-stream API drop). The worktree contents may be incomplete. Apply anyway?';
+export const APPLY_INCOMPLETE_CONFIRM =
+  'This change comes from a turn that did not finish: it was stopped, or it was cut short. The work may be partial. Apply anyway?';
+const SET_ASIDE_TOOLTIP =
+  'Keep this change for later. It leaves Review and Apply All, and the thread can be archived. Bring it back from the Changes panel.';
 
 /** Discard the focused thread's unsent draft, confirming first. The confirm
  *  lives HERE, on the action — not in any one entry point — so the "Discard
@@ -107,7 +109,7 @@ export function resolveThreadActions(threadId: string): TaggedAction[] {
   //
   // Read off `meta`, never off `ccInfo`. That helper answers null while the
   // thread runs AND whenever nothing is proposed, and an external-repo thread
-  // never proposes at all (`may_touch_change_state_at_idle` refuses). So it is
+  // never proposes at all (`idle_change_write` refuses). So it is
   // null in every state such a thread can reach, and this whole carve-out sat
   // dead. `codingAgentKind` is the fact that survives: written at
   // `SessionStarted` and locked, so it is there from the thread's first moment,
@@ -119,11 +121,14 @@ export function resolveThreadActions(threadId: string): TaggedAction[] {
   let kinds: Action[] = raw;
   if (isExternalRepo && (raw.includes('apply') || raw.includes('discard'))) {
     kinds = raw.flatMap((a): Action[] => {
-      if (a === 'discard') return [];
+      if (a === 'discard' || a === 'set_aside') return [];
       if (a === 'apply') return ['archive'];
       return [a];
     });
   }
+  // Set aside acts on one change by id. Until the pending list names it (the
+  // proposal flag can land first), there is nothing to act on yet.
+  if (!pendingChange) kinds = kinds.filter((a) => a !== 'set_aside');
   // The standing apply is an Apply the owner presses early, so it goes wherever
   // Apply goes. An external repo has no Apply to arm, and a change resolving
   // merge conflicts is already mid-apply.
@@ -161,12 +166,13 @@ export function resolveThreadActions(threadId: string): TaggedAction[] {
   );
 }
 
-/** Menu order for the change layer: the positive actions before Discard. */
-const CHANGE_MENU_ORDER: readonly Action[] = ['apply', 'apply_when_settled', 'discard'];
+/** Menu order for the change layer: the positive actions, then Set aside,
+ *  then Discard. */
+const CHANGE_MENU_ORDER: readonly Action[] = ['apply', 'apply_when_settled', 'set_aside', 'discard'];
 
 /**
- * The thread's change actions (Apply, Apply on settle, Discard) for the
- * thread ⋯ menu, positive first. The menu hides an action it cannot run
+ * The thread's change actions (Apply, Apply on settle, Set aside, Discard)
+ * for the thread ⋯ menu, positive first. The menu hides an action it cannot run
  * rather than disabling it (ADR 0168), and the thread's banner shows the
  * progress. So it drops every action while an apply or a discard is in
  * flight, and the standing apply while its own request is.
@@ -230,7 +236,7 @@ function tagAction(
         // Tooltip prefers the partial-work warning (more critical) over the
         // new-version hint when both apply.
         tooltip: opts.incomplete
-          ? 'This change was proposed by a turn that ended in failure. The worktree contents may be partial work. You will be asked to confirm.'
+          ? 'This change comes from a turn that did not finish. The work may be partial, so you will be asked to confirm.'
           : opts.requiresRestart
             ? APPLY_NEW_VERSION_TOOLTIP
             : undefined,
@@ -239,14 +245,24 @@ function tagAction(
           void endClaudeCodeAndApply(threadId);
         },
       };
+    case 'set_aside':
+      return {
+        kind,
+        category: 'close',
+        label: 'Set aside',
+        tooltip: SET_ASIDE_TOOLTIP,
+        invoke: () => {
+          if (opts.pendingChangeId) return setAsideSingleChange(opts.pendingChangeId);
+        },
+      };
     case 'apply_when_settled':
       return {
         kind,
         category: 'primary',
-        // A checked state that toggles off on click, the shape `unsave` already
-        // uses. Never a disabled Apply: ADR 0168 replaces a control that cannot
-        // act with the one that can.
-        label: opts.armed ? '✓ Applying on settle' : 'Apply on settle',
+        // A checked state that toggles off on click. Each surface draws the check
+        // itself: the thread menu puts it at the row's end. Never a disabled
+        // Apply: ADR 0168 replaces a control that cannot act with the one that can.
+        label: opts.armed ? 'Applying on settle' : 'Apply on settle',
         tooltip: opts.armed
           ? 'Armed. The change applies when this thread finishes, and drops with a report if the thread stops on a question or fails. Click to cancel.'
           : 'The thread has not finished. Apply its change the moment it does.',
@@ -330,9 +346,10 @@ export async function runCloseCascade(): Promise<void> {
       return;
     }
     case 'change': {
-      // The change layer is a choice. The dialog IS the confirmation, so the
-      // branches call the raw handlers directly rather than the TaggedAction
-      // invokes (which would add a redundant second confirm).
+      // The change layer is a choice, and the dialog is its confirmation.
+      // Discard calls its raw handler, whose own confirm would repeat this
+      // one. Apply calls its action, whose only extra confirm is for
+      // incomplete work.
       const apply = actions.find((a) => a.kind === 'apply');
       const ok = await showConfirm(
         'This thread has a pending change. Apply it now, or discard it?',
@@ -345,7 +362,8 @@ export async function runCloseCascade(): Promise<void> {
             : undefined,
         },
       );
-      if (ok && apply) void endClaudeCodeAndApply(focused);
+      // The action's own invoke, so incomplete work still asks first.
+      if (ok && apply) await apply.invoke();
       return;
     }
     case 'archive': {

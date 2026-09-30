@@ -9,6 +9,7 @@ use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 
 mod activation;
 mod app_window;
+mod boot_splash_guard;
 /// Whether the running `.app` is somewhere it can keep. macOS-only, because
 /// the two traps it detects (a mounted `.dmg`, App Translocation) are macOS ones.
 #[cfg(target_os = "macos")]
@@ -973,6 +974,7 @@ pub fn run() {
         )
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(boot_splash_guard::plugin())
         .manage(panel_preview::PanelPreviewSlots::default())
         .manage(panel_preview::PanelContentChannel::default())
         .manage(crash_watchdog::Heartbeats::default())

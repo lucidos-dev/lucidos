@@ -368,7 +368,27 @@ function osPrefersLight(): boolean {
   return window.matchMedia('(prefers-color-scheme: light)').matches;
 }
 
+/** Marks <html> while a theme or mode swap paints. base.css turns every
+ *  transition off under it, so no colour eases from the old theme to the new
+ *  while the rest of the page snaps. */
+const THEME_SWAP_ATTRIBUTE = 'data-theme-swap';
+let themeSwapCount = 0;
+
+/** The mark must outlast the first frame, because the browser paints the swap
+ *  after that frame's callbacks. It lifts on the second, once nothing is left to
+ *  ease. */
+function markThemeSwap(): void {
+  if (typeof requestAnimationFrame !== 'function') return;
+  const root = document.documentElement;
+  const swap = ++themeSwapCount;
+  root.setAttribute(THEME_SWAP_ATTRIBUTE, '');
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    if (swap === themeSwapCount) root.removeAttribute(THEME_SWAP_ATTRIBUTE);
+  }));
+}
+
 export function applyThemeMode(mode: ThemeMode): void {
+  markThemeSwap();
   const prefersLight = osPrefersLight();
   const resolved = resolveThemeMode(mode, prefersLight);
   // The theme is per mode, so it is re-laid on every mode apply. Stale names
@@ -500,21 +520,30 @@ let refusedThemeWarned: string | null = null;
  * now refuses, with a warning. Any other failure keeps what is painted, so a
  * transient failure never flashes the default. The next preference load asks
  * again. `picked` marks a theme the user just chose, who is owed a toast
- * whenever it cannot load.
+ * whenever it cannot load. `known` is a map already in hand, such as the
+ * picker's. It paints at once, and the fetch then confirms it.
  */
 
-export async function refreshActiveTheme(id: string = currentThemeId(), picked = false): Promise<void> {
+export async function refreshActiveTheme(
+  id: string = currentThemeId(),
+  picked = false,
+  known?: ResolvedTheme,
+): Promise<void> {
   const seq = ++themeLoadSeq;
   requestedThemeId = id;
   if (id === DEFAULT_THEME_ID) {
     applyTheme(EMPTY_THEME);
     return;
   }
+  if (known) applyTheme(sanitizeResolvedTheme(known));
   try {
     const theme = await getTheme(id);
     if (seq !== themeLoadSeq) return;
     if (refusedThemeWarned === id) refusedThemeWarned = null;
-    applyTheme(sanitizeResolvedTheme(theme.resolved));
+    const fetched = sanitizeResolvedTheme(theme.resolved);
+    // Repainting the map a pick already painted would cut off every running
+    // transition, and change nothing.
+    if (!known || JSON.stringify(fetched) !== JSON.stringify(activeTheme)) applyTheme(fetched);
   } catch (e) {
     if (seq !== themeLoadSeq) return;
     if (e instanceof ApiError && (e.httpCode === 404 || e.httpCode === 400)) {
@@ -534,13 +563,13 @@ export async function refreshActiveTheme(id: string = currentThemeId(), picked =
     }
     // Forget the request, so the next preference load asks again.
     requestedThemeId = null;
-    if (picked) {
+    if (picked && !known) {
       showToast(`Could not load the theme "${id}": ${errorDetail(e)}`, 'error');
       return;
     }
-    // Carve-out: best-effort telemetry (.claude/rules/frontend.md). No user
-    // intent is on this line: it is a background refresh after an SSE event or
-    // a preference load, and the next one asks again.
+    // Carve-out: best-effort telemetry (.claude/rules/frontend.md). This is a
+    // background refresh after an SSE event or a preference load, or a pick
+    // that already shows its theme. The next preference load asks again.
     console.warn(`[themes] could not load theme "${id}"`, e);
   }
 }
@@ -557,10 +586,10 @@ export function isActiveThemePath(path: string | undefined): boolean {
   return path === `themes/${currentThemeId()}.json`;
 }
 
-export function setTheme(id: string): Promise<void> {
+export function setTheme(id: string, known?: ResolvedTheme): Promise<void> {
   // The id is passed on, because `savePreference` runs the side effect before
   // it updates the signal `currentThemeId` reads.
-  return savePreference(THEME_KEY, id, () => void refreshActiveTheme(id, true), true);
+  return savePreference(THEME_KEY, id, () => void refreshActiveTheme(id, true, known), true);
 }
 
 // --- Following the OS under a `system` preference ---
@@ -1386,18 +1415,18 @@ export function externalLinkTargetConfigurable(): boolean {
   return isIOSPwa();
 }
 
-// --- Mobile header sticky ---
+// --- Mobile dynamic bars ---
 
-/** When true, the mobile header stays fully visible — disables hide-on-scroll,
- *  hide-on-keyboard-open, and the app-UI-active pin. Defaults to true; only an
- *  explicit `'false'` opts out of the pinned header. */
-export function currentMobileHeaderSticky(): boolean {
-  if (preferences.value.status !== 'loaded') return true;
-  return preferences.value.data['mobile_header_sticky'] !== 'false';
+/** When true, the mobile header and prompt slide away on scroll down and come
+ *  back on scroll up (`hooks/useHideOnScroll.ts`). Defaults to false, where
+ *  both stay pinned; only an explicit `'true'` turns the bars dynamic. */
+export function currentMobileDynamicBars(): boolean {
+  if (preferences.value.status !== 'loaded') return false;
+  return preferences.value.data['mobile_dynamic_bars'] === 'true';
 }
 
-export function setMobileHeaderSticky(enabled: boolean): Promise<void> {
-  return savePreference('mobile_header_sticky', enabled ? 'true' : 'false');
+export function setMobileDynamicBars(enabled: boolean): Promise<void> {
+  return savePreference('mobile_dynamic_bars', enabled ? 'true' : 'false');
 }
 
 // --- Background model ---

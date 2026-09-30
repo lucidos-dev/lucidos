@@ -119,6 +119,7 @@ function makeActiveThread(id: string, overrides: Partial<ThreadState['meta']> = 
       createdAt: '2026-05-11T19:00:00Z',
       updatedAt: '2026-05-11T19:00:00Z',
       status: 'idle',
+      summaryVersion: 0,
       messageCount: 1,
       section: 'archived',
       activeChildrenCount: 0,

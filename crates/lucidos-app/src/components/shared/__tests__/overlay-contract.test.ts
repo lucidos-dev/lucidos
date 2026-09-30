@@ -119,3 +119,14 @@ describe('every onClose keeps its no-op signal to itself', () => {
     expect(offenders).toEqual([]);
   });
 });
+
+describe('Dropdown hands the Overlay a close that returns nothing', () => {
+  // `closeDropdown` also restores focus, and that step reports whether it did.
+  // Returning that report as `onClose` would read as a no-op whenever focus
+  // stayed put, so no outside click would be swallowed on any dropdown.
+  it('declares closeDropdown void', () => {
+    const dropdown: string = readFileSync(resolve(here, '../Dropdown.tsx'), 'utf-8');
+    expect(dropdown).toContain('onClose={closeDropdown}');
+    expect(dropdown).toMatch(/function closeDropdown\(\): void \{/);
+  });
+});

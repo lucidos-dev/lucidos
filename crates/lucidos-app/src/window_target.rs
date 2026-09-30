@@ -81,6 +81,12 @@ pub(crate) fn window_is_navigated(url: &str) -> bool {
     strip_http_scheme(url).is_some()
 }
 
+/// Is this the bundled `tauri://` app URL, the boot splash every window starts on?
+pub(crate) fn is_bundled_app_url(url: &str) -> bool {
+    url.split_once("://")
+        .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("tauri"))
+}
+
 /// The gateway URL serving `workspace`, e.g. `http://localhost:3210/myws/`.
 /// `origin` carries no trailing slash; the slug is known-safe (callers gate on
 /// [`is_workspace_slug`]), so nothing needs escaping.
@@ -357,6 +363,20 @@ mod tests {
         // The picker IS navigated: the user left a window there on purpose.
         assert!(window_is_navigated("http://localhost:3210/~/"));
         assert!(window_is_navigated("http://localhost:3210/myws/"));
+    }
+
+    #[test]
+    fn is_bundled_app_url_names_only_the_tauri_scheme() {
+        assert!(is_bundled_app_url("tauri://localhost"));
+        assert!(is_bundled_app_url("TAURI://localhost/index.html"));
+        for other in [
+            "http://localhost:3210/myws/",
+            "about:blank",
+            "blob:http://localhost:3210/x",
+            "",
+        ] {
+            assert!(!is_bundled_app_url(other), "{other}");
+        }
     }
 
     #[test]

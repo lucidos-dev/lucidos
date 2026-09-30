@@ -203,8 +203,8 @@
     font-size: var(--font-size-lg);
 }
 
-/* Put the typed text on the same content edge as a question / change card's
-   text, the surface the composer docks under: --turn-surface-inset measured from
+/* Put the typed text on the same content edge as a question card's text, the
+   surface the composer docks under. That edge is --turn-surface-inset from
    .prompt-box's outer edge, so the box's own border is subtracted here
    (base.css). The shared shell's `padding: 0.5rem 1rem` (panels/previews.css)
    carried a wider inset than a card's, which left the composer's text a few px
@@ -572,6 +572,8 @@
  * the send button folds into the ⋯ menu, so there is always a count the row can
  * hold and nothing is left to wrap. */
 .prompt-actions-right {
+    --send-round-size: 1.625rem;
+    position: relative;
     display: flex;
     align-items: center;
     gap: 0.5rem;
@@ -579,28 +581,33 @@
     justify-content: flex-end;
 }
 
+/* The --space-lg gutter matches the .list-row change rows below, so the right
+   edge lines up with their content. */
 .changes-bulk-actions {
-    display: flex;
-    /* Right-aligned, on the same --space-lg gutter the .list-row change rows
-       below use, so the buttons' right edge lines up with the rows' content.
-       Wraps so the "Keep going as the rest settle" label keeps its own line on
-       a narrow pane instead of squeezing the buttons. */
-    justify-content: flex-end;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: 0.5rem;
     padding: 0 var(--space-lg) var(--space-sm);
 }
 
-/* The sweep checkbox beside Apply All. It reads as a modifier on the button it
-   sits next to, so it takes the muted text colour rather than a control's. */
-.changes-keep-going {
+/* Never wraps. Packed right, so the apply side holds the right edge with or
+   without Discard All, whose auto margin takes it to the left edge. Stretched,
+   so a label that wraps makes every button taller, not just its own. */
+.changes-bulk-buttons {
     display: flex;
-    align-items: center;
-    gap: var(--space-xs);
-    color: var(--text-secondary);
-    font-size: var(--font-size-sm);
-    cursor: pointer;
+    justify-content: flex-end;
+    align-items: stretch;
+    gap: 0.5rem;
+}
+
+/* Equal shares of the line, capped so a wide pane keeps them button-sized. On a
+   phone three do not fit at their natural width, so a long label wraps inside
+   its share rather than being clipped. */
+.changes-bulk-buttons > .action-btn {
+    flex: 1 1 0;
+    max-width: 10rem;
+    white-space: normal;
+}
+
+.changes-bulk-buttons > .action-btn-danger {
+    margin-right: auto;
 }
 
 .change-description {
@@ -688,36 +695,13 @@
     height: calc(var(--run-ink) / var(--mark-art-fill));
 }
 
-/* Set once the backend answers with a command list, which is also when the
-   button starts opening something (openMenu bails until then). One pulse marks
-   the arrival. The state used to be carried by tinting the mark
-   --initiator-coding-agent and holding it there; the hold is what made this the
-   only colored glyph in the row, so the waiting state is a dim instead. Only
-   the coding-agent control has the state at all, hence the exclusion: the
-   Lucidos model picker never carries the class and is always ready. */
+/* `.commands-btn-active` is set once the backend answers with a command list,
+   which is also when the button starts opening something (openMenu bails until
+   then). Until then the mark is dim, and it never moves. Only the coding-agent
+   control has the state at all, hence the exclusion: the Lucidos model picker
+   never carries the class and is always ready. */
 .commands-btn:not(.lucidos-commands-btn):not(.commands-btn-active) {
     opacity: 0.45;
-}
-
-/* The pulse rides the GLYPH, not the button. The button's own `transform` is
-   now spoken for by the row's `.icon-btn.header-icon` translateY, so a keyframe
-   on the button would drop that nudge for the 0.6s it runs and jump the button
-   up and back. Pulsing the mark is also the better read: the 2.25rem hit box
-   carries a hover fill, and swelling that reads as the button growing rather
-   than the mark announcing itself.
-
-   On --duration-emphasis rather than the 0.6s literal it carried: this is
-   exactly what that token is for, a one-off state-change cue the user is meant
-   to register, and a literal is the one animation in the app that ignores the
-   animation-speed slider (the scale rides the tokens). */
-.commands-btn-active svg {
-    animation: control-connect-pulse var(--duration-emphasis) ease-out;
-}
-
-@keyframes control-connect-pulse {
-    0% { transform: scale(1); }
-    40% { transform: scale(1.3); }
-    100% { transform: scale(1); }
 }
 
 /* Placed by `useAnchoredPosition`, which writes viewport `top`/`left` inline
@@ -788,27 +772,6 @@
     color: var(--text-secondary);
 }
 
-.control-form {
-    display: flex;
-    flex-direction: column;
-    gap: 0.375rem;
-    padding: 0.5rem;
-}
-
-.control-form-title {
-    font-size: var(--font-size-sm);
-    font-weight: 600;
-    color: var(--text-secondary);
-    text-transform: uppercase;
-    letter-spacing: 0.03em;
-}
-
-.control-form-actions {
-    display: flex;
-    gap: 0.375rem;
-    justify-content: flex-end;
-}
-
 .image-attach-menu {
     position: absolute;
     bottom: 100%;
@@ -819,18 +782,90 @@
     min-width: 8.75rem;
 }
 
-/* What a hold on Send offers. Fixed, since `useAnchoredPosition` places it
-   against the button in viewport coordinates. */
+/* The Side question half of the split pill Send opens into. It is out of
+   flow, so the row's fold never measures it and nothing in the row moves.
+   The box ends at Send's left edge and clips only there, so the half slides
+   out of Send. */
 .send-hold-menu {
-    position: fixed;
-    overflow: hidden;
-    z-index: var(--z-dropdown);
-    min-width: 8.75rem;
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    right: var(--send-round-size);
+    display: flex;
+    align-items: center;
+    z-index: 1;
+    clip-path: inset(-0.5rem 0 -0.5rem -0.5rem);
+}
+
+.send-hold-menu > .action-btn {
+    height: var(--send-round-size);
+    padding: 0 0.625rem 0 0.75rem;
+    border-radius: var(--radius-round) 0 0 var(--radius-round);
+    font-size: var(--font-size-sm);
+    animation: send-hold-slide-out var(--duration-normal) ease-out;
+}
+
+/* Send paints over the half, so its own focus ring shows at the seam. */
+.prompt-actions-right > .send-cancel-morph {
+    position: relative;
+    z-index: 2;
+}
+
+/* Send is the pill's right half while it is open: its left side squares off
+   behind a hairline, as a split button's caret does. */
+.prompt-actions-right > .send-cancel-round.split-open {
+    border-top-left-radius: 0;
+    border-bottom-left-radius: 0;
+    border-left: 1px solid color-mix(in srgb, var(--text-on-accent) 30%, transparent);
+    clip-path: inset(-0.25rem -0.25rem -0.25rem 0);
+}
+
+/* Focus rings the whole pill, whichever half holds it. Both halves draw the
+   ring and each clips it at the seam, so the two join into one outline. The
+   focused half lightens, to say which one Enter presses. The transparent
+   outline is the forced-colors ring, where box-shadow is stripped. */
+.prompt-actions-right:has(.send-hold-menu > .action-btn:focus-visible) > .send-cancel-morph,
+.prompt-actions-right:has(> .send-cancel-round.split-open:focus-visible) .send-hold-menu > .action-btn {
+    outline: 0.125rem solid transparent;
+    box-shadow: var(--focus-ring);
+}
+.send-hold-menu > .action-btn:focus-visible,
+.prompt-actions-right > .send-cancel-round.split-open:focus-visible {
+    background-color: color-mix(in srgb, var(--accent-action) 80%, var(--text-on-accent));
+}
+
+/* Starts wholly behind the seam. */
+@keyframes send-hold-slide-out {
+    from {
+        transform: translateX(100%);
+    }
+    to {
+        transform: none;
+    }
+}
+
+/* Shutting reverses the entrance: a drawing of the half slides back behind
+   the seam. It is a span, so it centres its label as the button does. */
+.send-hold-menu-leaving {
+    pointer-events: none;
+}
+.send-hold-menu-leaving > .action-btn {
+    display: inline-flex;
+    align-items: center;
+    animation: send-hold-slide-in var(--duration-normal) ease-in forwards;
+}
+
+@keyframes send-hold-slide-in {
+    from {
+        transform: none;
+    }
+    to {
+        transform: translateX(100%);
+    }
 }
 
 .image-attach-menu button,
-.image-attach-menu label,
-.send-hold-menu button {
+.image-attach-menu label {
     display: flex;
     align-items: center;
     gap: 0.5rem;
@@ -847,8 +882,7 @@
 
 @media (hover: hover) {
     .image-attach-menu button:hover,
-    .image-attach-menu label:hover,
-    .send-hold-menu button:hover {
+    .image-attach-menu label:hover {
         background: var(--bg-hover);
     }
 }

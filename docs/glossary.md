@@ -170,6 +170,16 @@ that surface has a write or an unsaved draft in flight, and releases rather than
 drops it. Used where a store signal would be the wrong home, because the data is
 one settings page's and nothing else reads it. See also *subscribing surface*.
 
+### Summary version
+`thread_summaries.summary_version`, carried as `summary_version` on a thread
+summary and `summaryVersion` on an aggregate. It goes up by one on every change
+to the row, and two Postgres triggers own it, so no writer can skip or choose
+it. The client keeps the highest one it has seen in `ThreadMeta.summaryVersion`
+and refuses any older summary, through `applySummaryVersion`, the only writer
+of `ThreadMeta.status`. That is what stops a stale read putting an old status
+back on screen. Not a *version counter*: that one is a client-side signal.
+ADR 0329.
+
 ### User profile cache
 The engine's hot copy of `artifacts/user_profile.md`, `UserProfileCache` in
 `crates/lucidos-engine/src/engine/user_profile.rs`. Loaded once at construction
@@ -1032,7 +1042,11 @@ The *artifact preview frame* carries a narrower one, minted by the host for the 
 An entry in `crates/lucidos-app/capabilities/*.json` (or built at runtime by `desktop::gateway_capability`) granting a set of **Tauri permissions** to named webviews on a named origin — the ACL that decides whether an `invoke` from the desktop app's page is allowed to reach a command at all. **Unrelated to the *capability parity manifest* above**, which is about which agent surfaces expose an engine operation; the two senses of "capability" collide only in the word. Three parts matter: `permissions` (plugin ones like `core:default`, plus the app's own, declared in `crates/lucidos-app/permissions/`), the origin (`local` for the Tauri app URL, `remote.urls` for URLPattern-matched HTTP origins), and the scope — always `webviews`, never `windows`, because a window entry enables the capability on *every* webview of that window including the `url-preview-*` previews of third-party sites. Since tauri 2.11 a page on a non-local origin is `Origin::Remote` and ACL-checked, which is why the packaged client — whose window is navigated to the gateway — needs an explicit remote capability pinned to its resolved port. See `docs/adr/0028-the-packaged-window-is-a-remote-origin.md`.
 
 ### ChangeState
-The Rust model of where a *change* stands, in `core/changes.rs`: the status together with the data only that status has. `Pending` holds the Tier-3 `MergeWorktree` (path and temp branch, both or neither), the `PendingThreadState` and the `PendingApplyOutlook`. `Applied` and `Reverted` hold the `MergeShas`. `Discarded` holds nothing. `ChangeStatus` is its fieldless discriminant, the four wire strings of the user-facing *change* entry, and an unknown string fails decode.
+The Rust model of where a *change* stands, in `core/changes.rs`: the status together with the data only that status has. `Pending` holds the Tier-3 `MergeWorktree` (path and temp branch, both or neither), the `PendingThreadState` and the `PendingApplyOutlook`. `Applied` and `Reverted` hold the `MergeShas`. `SetAside` and `Discarded` hold nothing. `ChangeStatus` is its fieldless discriminant, the five wire strings of the user-facing *change* entry, and an unknown string fails decode.
+
+The **archive net** sets aside branch work no change carries once its thread is archived: `spawn_archive_net` after each `ThreadArchived`, and `set_aside_archived_branch_work_on_startup` at boot. It skips any branch a `changes` row already names (ADR 0328).
+
+An **open change** is one that is pending or set aside (ADR 0328). A thread holds at most one, and `idx_changes_unique_open_branch` allows one per branch. The reconciles and reads that enforce it say *open* in their names (`open_for_thread`, `get_open_by_branch`, `discard_open_changes_for_thread`).
 
 The `changes` table keeps its flat columns: a private `ChangeRow` maps them at the boundary and refuses half a merge pair, and `Change` serializes back to the same flat JSON. `PendingThreadState` keeps `unsettled` and `settling` as two bools because all four combinations occur. Its constructor keeps `resolving_conflict` false unless one of them holds.
 
@@ -1041,7 +1055,9 @@ The `changes` table keeps its flat columns: a private `ChangeRow` maps them at t
 ### change_action_refusal
 The single definition of the **per-change gate**: the function in `api/changes.rs` saying why an *Apply* or Discard on one *change* is refused, or `None`. Typed, not a string, because two surfaces render it. `guard_change_action` writes the HTTP 409, and the `changes` LLM tool writes an error for the agent to read (ADR 0233). It asks *available_thread_actions* through `available_thread_actions_for`, so the button and the tool cannot drift.
 
-Four reasons. `NoFilesLeft` is a pending change whose branch left nothing to merge, and it is Apply-only. `ThreadSettling`, `ThreadParked` and `ActionUnavailable` split the thread's state, and only the first can be waited out with a *standing apply*. `standing_verdict` waits through a *settling thread*, and drops on one parked on a question card. Collapsing the three sends a caller to a control that ends on its first look.
+Five reasons. `NoFilesLeft` is a pending change whose branch left nothing to merge, and it is Apply-only. `ChangeSetAside` is an Apply on a set-aside change, which is brought back first; the HTTP 409 carries the `change_set_aside` reason. Set aside asks the same gate as Discard, so it is refused wherever Discard is.
+
+`ThreadSettling`, `ThreadParked` and `ActionUnavailable` split the thread's state, and only the first can be waited out with a *standing apply*. `standing_verdict` waits through a *settling thread*, and drops on one parked on a question card. Collapsing the three sends a caller to a control that ends on its first look.
 
 Three rows fall through with no refusal, because the engine answers them better. An unknown change id, a change naming no thread, and one already applied or discarded. Gating a terminal row would turn an idempotent retry into a 409. Engine-internal apply paths do not ask it at all, and `change_ops_tests.rs` enrolls each one.
 
@@ -1673,6 +1689,11 @@ Two mechanisms draw it. The thread drawer rolls FLIP copies of its rows (`hooks/
 
 The transcript's full-response and steps toggles roll each prose chunk and each run of steps this way (`responseBody` in `store/event-rendering.ts`). Plans: `docs/plans/2026-09-26-one-disclosure-roll.md`, `docs/plans/2026-09-27-turn-toggles-roll.md`.
 
+### Keyboard handoff
+How a menu with a filter box treats an on-screen keyboard that is already up. Say a text field, usually the prompt, holds the keyboard as a touch menu opens. The menu moves focus to its own filter box, so typing filters the menu instead of the field. A step with no text field hands focus back to the field in the same tap. Closing hands it back too, so the keyboard never drops and the panel never jumps. With no keyboard up, a menu raises none.
+
+One module serves every such menu: `components/shared/keyboardHandoff.ts` (`keyboardHolder`, `returnKeyboard`). Its callers are `Dropdown`, `ModelSelectionPicker` and both prompt-bar control menus. A filter box that takes the keyboard is pinned to 16px on a coarse pointer, so iOS does not zoom into it.
+
 ### Navigation cover
 The opaque theme surface that hides a pane's view swap, so a view switch is a fade rather than a hard cut. It is `NavigationCover` (`components/shared/NavigationCover.tsx`) with `.nav-cover` in `styles/global/host-components.css`. Two panes host it, each on its own view key and with its own *motion* (`NAV_COVER_MOTIONS`):
 
@@ -2209,7 +2230,15 @@ Holding is only honest because `ThreadList` is the one surface that renders from
 One of the two transparent host-owned strips pinned to the left and right screen edges on the mobile layout: `.edge-swipe-zone` + `.edge-swipe-left` (2.5rem) / `.edge-swipe-right` (1.25rem) in `crates/lucidos-app/src/styles/mobile.css`, rendered as a pair by the `EdgeSwipeZones` component (`components/layout/EdgeSwipeZones.tsx`). Their whole purpose is to be the topmost thing at the screen edge, ABOVE any app iframe, so a touch there reaches the host document instead of the frame. That buys two things. First, an iframe captures every touch it covers, so inside a *swipe pane* these strips are the only place a pane swipe over an app can begin. Second, and the reason they exist at all, they are what lets `MobileSwipeContainer`'s touchstart handler see an edge touch and `preventDefault()` it, which is the only way to suppress WebKit's native back/forward navigation gesture in the standalone iOS PWA (no CSS opt-out exists: neither `touch-action` nor `overscroll-behavior-x` disables it, and WebKit's edge recognizer commits before the in-app 8px horizontal lock, so an `onTouchMove` preventDefault runs too late). The strip widths are mirrored by `EDGE_NAV_GUARD_LEFT_PX` (40) / `EDGE_NAV_GUARD_RIGHT_PX` (24), the bounds of the pure `shouldSuppressEdgeNavigation` decision; change a width without its constant and a touch lands on a strip the suppression does not cover, which is exactly the 24-to-40px band that once popped the PWA out to the workspace gateway picker. Mounted in **two** places: inside every `.mobile-swipe-pane` (there, rather than on the swipe container, so they share a stacking context with `.prompt-area` and its `z-index: 2` buttons stay clickable), and inside a *pseudo-fullscreen* app overlay, which is `position: fixed` at `var(--z-app-fullscreen)` over the whole viewport and therefore covers the panes' own strips. **Mounted does not mean a pane swipe is available**: `shouldStartPaneSwipe` turns the pane swipe off entirely while an app is fullscreen, and the strips there earn their place purely by keeping WebKit's gesture suppressed. They go `pointer-events: none` under `:root[data-keyboard-active]`, so an edge touch while the on-screen keyboard is up belongs to whatever is underneath.
 
 ### Em-dash gate
-The deterministic enforcement of `.claude/rules/no-em-dashes.md` (never write U+2014 EM DASH or U+2015 HORIZONTAL BAR; U+2013 EN DASH stays legal in numeric ranges). Two layers over one shared library, `scripts/lib/em_dash_scan.sh`, which owns the two characters (spelled as byte escapes, never literals, so the gate's own files stay clean under it) and the replacement advice. **Write time:** `.claude/hooks/no-em-dashes.sh`, a `PreToolUse` hook on Claude Code's `Edit`, `Write` and `Bash`, blocking with exit 2 and naming file, line and text. The `Bash` arm covers `git commit`, whose message reaches disk through neither `Edit` nor `Write`. It fails **open** on infrastructure trouble, so a hook bug cannot brick a session. **Review time:** `scripts/check-em-dashes.sh`, run by `/harden` Phase 4.5 on every diff including docs-only, which is what covers Codex (no hooks); it fails **closed**, since a scan that cannot run must not read as clean. Both are **diff-scoped, added lines only**: the rule is deliberately not retroactive, and the ~29,000 pre-existing lines decay as files are touched. Rewording a line that keeps its dash counts as adding one. No exemption list exists, by design. Tested by `scripts/lib/em_dash_scan_test.sh`.
+The deterministic enforcement of `.claude/rules/em-dashes.md`. A banned dash is an **unspaced** U+2014 EM DASH (a non-whitespace character touches it) or any U+2015 HORIZONTAL BAR. A spaced em dash passes, and U+2013 EN DASH is never checked.
+
+- **One definition.** `banned()` in `scripts/lib/em_dash_scan.sh`, which also owns the characters (as byte escapes) and the advice text.
+- **Write time.** `.claude/hooks/em-dashes.sh`, a `PreToolUse` hook on `Edit`, `Write` and `Bash`. The `Bash` arm covers `git commit`. It fails **open**, so a hook bug cannot brick a session.
+- **Review time.** `scripts/check-em-dashes.sh`, in `/harden` Phase 4.5 on every diff. It covers Codex, which has no hooks, and fails **closed**.
+- **Added lines only.** The rule is not retroactive. Rewording a line that keeps an unspaced dash counts as adding one.
+- **No exemption list**, by design. Tested by `scripts/lib/em_dash_scan_test.sh`.
+
+The chat renderer also spaces an unspaced dash that slips through (`spaceUnspacedEmDashes`). ADR 0332 records why spaced is allowed.
 
 ### Early suite run
 The Phase 4.5 test suites that `/harden` starts at the Phase 1 kickoff, alongside the review phases, via `scripts/harden-suites.sh start --early`. Its result counts only if every path changed since its start commit is on the harden safe-path allowlist (`HARDEN_SAFE_PATHS` in `scripts/lib/harden_suites.sh`). Any other change voids it, and the suites run again. A fix outside the allowlist stops the run before the edit.
@@ -2767,7 +2796,17 @@ The dimming wash behind a modal surface, one the app waits on until it closes: a
 How a popover shows more detail without a second layer (ADR 0290). The detail replaces the popover's content in place, under a head whose back link names the view it returns to. Escape steps back first, through an Escape-only registrant on the *overlay stack*, and a second Escape closes the popover. The waiting panel's condition is the worked example (`components/chat/WaitingPanel.tsx`). A dialog may still stack a confirm on itself, because a confirm needs an answer.
 
 ### Overlay stack
-The central LIFO registry of dismissable overlays (`store/overlayStack.ts`). Every overlay *panel* registers through the `<Overlay>` component (the sole panel registrant since `ModalOverlay` was deleted); the panel-less pseudo-fullscreen mode also pushes an Escape-dismiss entry directly. Each entry registers its `dismiss` on mount and removes it on unmount. Replaces the per-instance `document` Escape listeners that used to race each other and any global key handler; the one capture-phase Escape dispatcher in `useKeyboardShortcuts` (`dispatchEscape`) pops the top entry. Escape policy is non-destructive, in order: while an element is NATIVELY fullscreen, stand down entirely (the browser takes that Escape to exit fullscreen and no handler can stop it, so acting too would make one keypress do two things; the dispatcher still `stopPropagation`s, without `preventDefault`, so `<Overlay>`'s own bubble-phase Escape cannot close the overlay behind the stand-down's back) → else dismiss the top overlay → else, if the focused text input opts out via `data-escape-self`, leave it for the element's own Escape handler (used where a blur commits work, e.g. the thread-title editor whose blur saves a rename, so blurring on Escape there would save instead of cancel) → else blur a focused text input → else no-op (it never touches the focused thread or discards work). *Pseudo-fullscreen* is deliberately NOT covered by the stand-down: it is painted in the normal layer and dismissed through this same stack, where LIFO already gives the right answer (it registers before the overlay, so the overlay pops first and fullscreen survives). The *close cascade* lives on a separate trigger, not Escape, so a double-Escape on a cascade confirm cancels the dialog, it can't skip a layer.
+The central LIFO registry of dismissable overlays (`store/overlayStack.ts`). Every overlay *panel* registers through the `<Overlay>` component, its sole panel registrant. The panel-less pseudo-fullscreen mode pushes an Escape-dismiss entry directly. Each entry registers its `dismiss` on mount and removes it on unmount. One capture-phase dispatcher in `useKeyboardShortcuts` (`dispatchEscape`) pops the top entry, so per-instance Escape listeners no longer race.
+
+Escape policy is non-destructive. The dispatcher tries these in order:
+
+1. **While an element is NATIVELY fullscreen, stand down.** The browser takes that Escape to exit fullscreen, and no handler can stop it. The dispatcher still calls `stopPropagation`, without `preventDefault`, so `<Overlay>`'s own bubble-phase Escape cannot close the overlay as well.
+2. **Else dismiss the top overlay.**
+3. **Else leave a `data-escape-self` input to its own handler.** Fields whose blur commits work opt out this way, such as the trigger group rename field. There a blur on Escape would save instead of cancel.
+4. **Else blur a focused text input.**
+5. **Else do nothing.** Escape never touches the focused thread or discards work.
+
+*Pseudo-fullscreen* is NOT covered by the stand-down. It is painted in the normal layer and dismissed through this same stack. It registers before the overlay, so LIFO pops the overlay first and fullscreen survives. The *close cascade* has its own trigger, not Escape. So a double Escape on a cascade confirm cancels the dialog and skips no layer.
 
 **An entry either owns a panel or answers only Escape, and the two are asked different questions.** `<Overlay>` marks its entry `hasPanel`. Everything else is an **Escape-only registrant**: a surface answering the key while owning no pixels, namely pseudo-fullscreen, the thread filter, and a step inside a panel (`useEscapeStep`). **Escape asks `topOverlay`; a POINTER asks `topPanelOverlay`.** A registrant can never receive a click, and one deliberately sits ABOVE the panel it belongs to. Answering the raw top for the pointer switched outside-click dismiss off on every model menu whose tier row was open.
 
@@ -2889,7 +2928,7 @@ The frontend half is one module, one hook and one component. `store/modelSelecti
 
 Step 1 filters, because the registry runs to about thirty models. `filterModelRows` matches every term against the model's own name, so `opus 1m` finds `Opus 5 (1M)`. Tiers are not matched: they are the next step. Pinned by `store/__tests__/reasoning-picker-registry-guard.test.ts`. See `docs/plans/2026-08-23-two-step-model-picker.md`.
 
-The panel opens with no filter box. Typing brings it out, the way `Dropdown` reveals its own, so a panel opened to click a row shows rows. A touch device is the exception, showing the box from the start, since no keystroke can reveal it there. The test is the touch capability, never the mobile width breakpoint, which a phone in landscape is on the wrong side of. The box opens unfocused, so the on-screen keyboard stays down.
+The panel opens with no filter box. Typing brings it out, the way `Dropdown` reveals its own, so a panel opened to click a row shows rows. A touch device is the exception, showing the box from the start, since no keystroke can reveal it there. The test is the touch capability, never the mobile width breakpoint, which a phone in landscape is on the wrong side of. The box opens unfocused, so no on-screen keyboard rises, unless one was already up: then the *keyboard handoff* gives the box focus.
 
 ### Per-thread model memory
 A Lucidos Agent (chat) thread reuses the *model* and *reasoning effort* it last ran with. It does not snap back to the account default on each new message.
@@ -3946,6 +3985,11 @@ comes back during IME composition. Chromium draws the shape natively and gets
 no drawn caret. Code: `utils/drawnCaret.ts`.
 
 See also: ADR 0317, `docs/temporary-measures.md` § Drawn caret.
+
+### Repo directory grant
+A directory outside a repo that the repo's own committed `.claude/settings.json` grants its Claude Code sessions, through a relative `permissions.additionalDirectories` entry such as `../sibling-repo/`. From a worktree that entry names nothing, so the engine resolves it against the main checkout and passes it as `--add-dir` (`engine/repo_directory_grants.rs`). Not a *permission grant*: the repo decides it, not a click, and nothing is stored.
+
+See also: ADR 0327.
 
 ## When to add a term
 

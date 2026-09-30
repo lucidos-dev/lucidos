@@ -159,6 +159,7 @@ fn all_scenarios_pass() {
                         Action::Apply => Some("apply".to_string()),
                         Action::Discard => Some("discard".to_string()),
                         Action::ApplyWhenSettled
+                        | Action::SetAside
                         | Action::Save
                         | Action::Unsave
                         | Action::DiscardDraft => None,

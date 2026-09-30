@@ -114,6 +114,7 @@ describe('ensureThreadInMap', () => {
       total_children_count: 0,
       blocking_descendant_count: 0, attention_descendant_count: 0, live_event_wait_count: 0,
       status: 'idle',
+      summary_version: 0,
       coding_agent_proposed: false,
       coding_agent_requires_restart: false,
       coding_agent_is_external_repo: false,
@@ -153,6 +154,7 @@ describe('ensureThreadInMap', () => {
       total_children_count: 0,
       blocking_descendant_count: 0, attention_descendant_count: 0, live_event_wait_count: 0,
       status: 'idle',
+      summary_version: 0,
       coding_agent_proposed: false,
       coding_agent_requires_restart: false,
       coding_agent_is_external_repo: false,
@@ -188,6 +190,7 @@ describe('ensureThreadByIdInMap', () => {
       active_children_count: 0,
       total_children_count: 0,
       status: 'idle',
+      summary_version: 0,
       coding_agent_proposed: false,
       coding_agent_requires_restart: false,
       coding_agent_is_external_repo: false,
@@ -298,6 +301,7 @@ describe('focusThreadOrBootstrapResult, optimistic focus while bootstrapping', (
       active_children_count: 0,
       total_children_count: 0,
       status: 'idle',
+      summary_version: 0,
       coding_agent_proposed: false,
       coding_agent_requires_restart: false,
       coding_agent_is_external_repo: false,
@@ -494,6 +498,7 @@ describe('CC thread spawned by chat — status from API is authoritative', () =>
         createdAt: '2026-03-19T20:00:00Z',
         updatedAt: '2026-03-19T20:00:00Z',
         status: 'running',
+        summaryVersion: 0,
       codingAgentProposed: false,
       codingAgentRequiresRestart: false,
       codingAgentIsExternalRepo: false,
@@ -539,6 +544,7 @@ describe('CC thread spawned by chat — status from API is authoritative', () =>
         createdAt: '2026-03-19T20:00:00Z',
         updatedAt: '2026-03-19T20:00:00Z',
         status: 'running',
+        summaryVersion: 0,
       codingAgentProposed: false,
       codingAgentRequiresRestart: false,
       codingAgentIsExternalRepo: false,
@@ -659,6 +665,7 @@ describe('event replay must not override API status', () => {
       messageCount: 5,
       section: 'inbox',
       status: 'idle',
+      summaryVersion: 0,
       activeChildrenCount: 0,
       totalChildrenCount: 0,
       blockingDescendantCount: 0, attentionDescendantCount: 0,
@@ -715,6 +722,7 @@ describe('event replay must not override API status', () => {
       messageCount: 2,
       section: 'archived',
       status: 'running',
+      summaryVersion: 0,
       activeChildrenCount: 0,
       totalChildrenCount: 0,
       blockingDescendantCount: 0, attentionDescendantCount: 0,
@@ -1607,6 +1615,7 @@ describe('upsertThread — updatedAt monotonic', () => {
       message_count: 1,
       section: 'archived',
       status: 'running',
+      summaryVersion: 0,
     } as any, false);
 
     // updatedAt must keep the newer SSE value, not regress to the stale API value
@@ -1635,6 +1644,7 @@ describe('upsertThread — updatedAt monotonic', () => {
       message_count: 2,
       section: 'archived',
       status: 'idle',
+      summaryVersion: 0,
     } as any, false);
 
     // API has a newer timestamp — should advance

@@ -63,6 +63,7 @@ async fn recovery_marks_pending_change_incomplete_for_mid_turn_branch() {
             repo_root: "/tmp/repo".into(),
             hardened: false,
             incomplete: false,
+            set_aside: false,
             path: String::new(),
             diff: String::new(),
         },
@@ -196,6 +197,7 @@ async fn apply_now_no_live_session_fast_path_preserves_clean_pending_change() {
             repo_root: "/tmp/repo".into(),
             hardened: true,
             incomplete: false,
+            set_aside: false,
             path: String::new(),
             diff: String::new(),
         },
@@ -597,6 +599,94 @@ async fn last_turn_ended_cleanly_distinguishes_terminal_kinds() {
     teardown_test_db(&db_name).await;
 }
 
+/// O1 at boot: the held-back sweep proposes what the live idle gate would.
+/// A clean turn is complete work, a user Stop is incomplete work, and a
+/// failed, aborted, redirected or absent terminal proposes nothing.
+#[tokio::test]
+async fn last_turn_proposal_mirrors_the_idle_gate() {
+    use crate::engine::agent_recovery::last_turn_proposal;
+    use crate::engine::thread_events::{AbortCause, CancelCause};
+
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let cc_meta = EventMeta {
+        channel: Some(EventChannel::ClaudeCode),
+        ..EventMeta::NONE
+    };
+    let canceled = |cause| ThreadEvent::ResponseCanceled {
+        text: String::new(),
+        images: Vec::new(),
+        model: None,
+        reasoning_effort: None,
+        cause,
+    };
+    let cases = [
+        (
+            Some(ThreadEvent::ResponseGenerated {
+                text: "Done.".into(),
+                images: Vec::new(),
+                model: None,
+                reasoning_effort: None,
+            }),
+            Some(false),
+        ),
+        (Some(canceled(CancelCause::UserStop)), Some(true)),
+        (Some(canceled(CancelCause::SupersededByFollowup)), None),
+        (
+            Some(ThreadEvent::ResponseFailed {
+                error: "stream interrupted".into(),
+            }),
+            None,
+        ),
+        (
+            Some(ThreadEvent::ResponseAborted {
+                text: String::new(),
+                images: Vec::new(),
+                model: None,
+                reasoning_effort: None,
+                cause: AbortCause::EngineShutdown,
+            }),
+            None,
+        ),
+        (None, None),
+    ];
+    for (terminal, expected) in cases {
+        let thread_id = Uuid::new_v4();
+        bus.emit(BusEvent::Thread {
+            thread_id,
+            event: ThreadEvent::SessionStarted {
+                coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+                session_id: format!("sid-{thread_id}"),
+                branch: format!("claude-code/{thread_id}"),
+                repo_id: None,
+                coding_agent_kind: Default::default(),
+                coding_agent_folder: String::new(),
+                app_id: None,
+            },
+            meta: cc_meta.clone(),
+        })
+        .await
+        .expect("emit succeeds");
+        let name = terminal.as_ref().map(|t| t.event_type());
+        if let Some(event) = terminal {
+            bus.emit(BusEvent::Thread {
+                thread_id,
+                event,
+                meta: cc_meta.clone(),
+            })
+            .await
+            .expect("emit succeeds");
+        }
+        assert_eq!(
+            last_turn_proposal(&pool, thread_id).await,
+            expected,
+            "last terminal {name:?}"
+        );
+    }
+
+    teardown_test_db(&db_name).await;
+}
+
 /// Regression: a coding-agent turn the user **canceled** must classify as `idle`,
 /// not `running`, so the next engine restart leaves it alone.
 ///
@@ -963,6 +1053,7 @@ async fn boot_floor_withdraws_only_the_switch_promises_it_did_not_keep() {
                     repo_root: "/tmp".into(),
                     hardened: false,
                     incomplete: false,
+                    set_aside: false,
                     path: String::new(),
                     diff: String::new(),
                 },
@@ -1446,6 +1537,7 @@ async fn an_applied_change_on_the_branch_does_not_cost_a_later_turn_its_resume()
             repo_root: "/tmp/repo".into(),
             hardened: false,
             incomplete: false,
+            set_aside: false,
             path: String::new(),
             diff: String::new(),
         },

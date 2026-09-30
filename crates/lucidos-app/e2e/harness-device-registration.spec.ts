@@ -34,8 +34,8 @@ test.describe('Harness apiRequest registers a borrowed device id', () => {
     // Set the pinned default, so the mutation itself leaks no state. The point
     // is the status code: a borrowed id the app never registered must still be
     // accepted, because apiRequest registers it before the call.
-    const res = await apiRequest(page).put('/api/v1/preferences?key=mobile_header_sticky', {
-      data: { value: 'true' },
+    const res = await apiRequest(page).put('/api/v1/preferences?key=mobile_dynamic_bars', {
+      data: { value: 'false' },
     });
     expect(res.ok(), `PUT /api/v1/preferences -> ${res.status()}`).toBeTruthy();
   });

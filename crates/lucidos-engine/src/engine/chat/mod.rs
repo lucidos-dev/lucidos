@@ -10,7 +10,7 @@ pub(in crate::engine) mod process;
 mod process_cc;
 mod process_helpers;
 pub(crate) mod queued_recovery;
-mod recovery;
+pub(crate) mod recovery;
 mod recursion_guard;
 pub(crate) mod rerun;
 mod spawn;

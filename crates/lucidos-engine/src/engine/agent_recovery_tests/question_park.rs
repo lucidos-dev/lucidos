@@ -151,6 +151,7 @@ async fn pending_change_reemit_keeps_the_park() {
             repo_root: "/tmp/repo".into(),
             hardened: false,
             incomplete: true,
+            set_aside: false,
             path: String::new(),
             diff: String::new(),
         }))

@@ -293,9 +293,10 @@ pub(crate) async fn resume_sid_for_account(
 }
 
 /// Resolve `(resume_session_id, resume_branch)` for a follow-up CC request.
-/// Priority: pending-change branch > caller-supplied session > most recent
-/// `CodingAgentIdled` > fresh start. Pending-change branch wins because the
-/// change-proposal flow removes the worktree but keeps the branch's commits.
+/// Priority: open-change branch > caller-supplied session > most recent
+/// `CodingAgentIdled` > fresh start. The branch of an open change (pending or
+/// set aside) wins because the change-proposal flow removes the worktree but
+/// keeps the branch's commits.
 ///
 /// `pinned_config_dir` is the thread's account pin (its first config dir): the
 /// auto-detected resume session id is resolved WITHIN that account, so a thread
@@ -308,13 +309,13 @@ pub(super) async fn resolve_resume_context(
     caller_session_id: Option<String>,
     pinned_config_dir: Option<&str>,
 ) -> (Option<String>, Option<String>) {
-    let pending_branch = changes
-        .pending_for_thread(thread_id)
+    let open_branch = changes
+        .open_for_thread(thread_id)
         .await
         .unwrap_or_else(|e| {
             log!(
-                "[AgentSession] resume: pending_for_thread({}): {} — \
-                 skipping pending-branch resume path",
+                "[AgentSession] resume: open_for_thread({}): {}; \
+                 skipping the open-branch resume path",
                 thread_id,
                 e
             );
@@ -323,13 +324,13 @@ pub(super) async fn resolve_resume_context(
         .pop()
         .map(|c| c.branch_name);
 
-    if let Some(branch) = pending_branch {
+    if let Some(branch) = open_branch {
         let resume_sid = match caller_session_id {
             Some(sid) => Some(sid),
             None => resume_sid_for_account(pool, thread_id, pinned_config_dir).await,
         };
         log!(
-            "[AgentSession] Resuming on pending-change branch {} for thread {} (sid={:?})",
+            "[AgentSession] Resuming on open-change branch {} for thread {} (sid={:?})",
             branch,
             thread_id,
             resume_sid

@@ -130,7 +130,7 @@ describe('releaseNotesBody', () => {
 
 /** The separator this repo's changelog headings use. Built from its code point
  *  rather than typed, so this file stays clean under
- *  `.claude/rules/no-em-dashes.md`. */
+ *  `.claude/rules/em-dashes.md`. */
 const EM_DASH = String.fromCharCode(0x2014);
 /** An en dash, which that rule does NOT ban. Built the same way only so it
  *  cannot be mistaken for the one above at a glance. */

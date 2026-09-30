@@ -94,6 +94,8 @@ pub enum SystemEvent {
     },
     ChangesUpdated {
         pending: Vec<crate::core::changes::Change>,
+        /// Kept for later, newest first (ADR 0328).
+        set_aside: Vec<crate::core::changes::Change>,
         applied: Vec<crate::core::changes::Change>,
         total_pending: usize,
         restart_required: bool,

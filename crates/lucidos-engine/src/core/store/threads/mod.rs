@@ -197,6 +197,10 @@ pub struct ThreadSummary {
     /// Thread status, computed by the backend. Nothing writes `waiting` any
     /// more; it survives on historical rows.
     pub status: ThreadStatus,
+    /// The row's version, one higher after every change to it. A trigger owns
+    /// the column, so two reads with the same version saw the same row. The
+    /// client never applies a summary older than the one it holds.
+    pub summary_version: i64,
     /// Whether the coding-agent branch has any diff against main on disk — pure git
     /// truth. Set by the projection on `ChangeProposed`, cleared on
     /// `ChangeApplied` / `ChangeDiscarded` / `ThreadArchived`, seeded at
@@ -390,6 +394,7 @@ struct ThreadRow {
     /// decodes a JSONB column into a typed value.
     live_event_waits: sqlx::types::Json<Vec<EventWaitSummary>>,
     status: String,
+    summary_version: i64,
     /// Pure git truth — `git diff main..branch` is non-empty.
     coding_agent_has_diff: bool,
     /// Coding-agent thread's formal "ready for review" — set by `ChangeProposed` only.
@@ -445,6 +450,8 @@ pub struct ThreadAggregate {
     pub message_count: i64,
     pub section: String,
     pub status: ThreadStatus,
+    /// See `ThreadSummary::summary_version`.
+    pub summary_version: i64,
     pub active_children_count: i64,
     /// See `ThreadSummary::waiting_children_count`. Carried on the per-event
     /// SSE aggregate so a parent's Waiting dot follows its children live.
@@ -551,6 +558,7 @@ fn row_to_thread_aggregate(
         message_count: r.message_count,
         section: r.section,
         status: ThreadStatus::parse(&r.status),
+        summary_version: r.summary_version,
         active_children_count: r.active_children_count,
         waiting_children_count: r.waiting_children_count,
         total_children_count: r.total_children_count,
@@ -602,7 +610,7 @@ fn thread_cols(alias: &str) -> String {
         {a}.message_count::bigint, {a}.archive_state AS section, {a}.active_children_count::bigint, {a}.waiting_children_count::bigint, {a}.total_children_count::bigint, \
         {a}.blocking_descendant_count::bigint, {a}.attention_descendant_count::bigint, {a}.is_stopped_child, \
         {a}.live_event_wait_count::bigint, {a}.live_event_waits, \
-        {a}.status, {a}.coding_agent_has_diff, {a}.coding_agent_proposed, {a}.coding_agent_requires_restart, \
+        {a}.status, {a}.summary_version, {a}.coding_agent_has_diff, {a}.coding_agent_proposed, {a}.coding_agent_requires_restart, \
         {a}.coding_agent_is_external_repo, {a}.last_revived_at, \
         {a}.is_saved, {a}.has_response, \
         {a}.parent_thread_id::text AS parent_thread_id, \
@@ -692,6 +700,7 @@ fn row_to_thread_summary(
         live_event_wait_count: r.live_event_wait_count,
         live_event_waits: r.live_event_waits.0,
         status: ThreadStatus::parse(&r.status),
+        summary_version: r.summary_version,
         coding_agent_has_diff: r.coding_agent_has_diff,
         coding_agent_proposed: r.coding_agent_proposed,
         coding_agent_requires_restart: r.coding_agent_requires_restart,
@@ -927,3 +936,7 @@ mod turn_clock_tests;
 #[cfg(test)]
 #[path = "../threads_tests/wire_fixture.rs"]
 mod wire_fixture_tests;
+
+#[cfg(test)]
+#[path = "../threads_tests/summary_version.rs"]
+mod summary_version_tests;

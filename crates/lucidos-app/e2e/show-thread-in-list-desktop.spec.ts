@@ -27,13 +27,13 @@ function seedFamilyAmongFillers(): { parentId: string; childId: string; stamp: n
     return { parentId, childId, stamp };
 }
 
-/** Pick Show in thread list from the title bar's ⋯ menu. Then require the
+/** Pick Show in thread list from the title bar's thread menu. Then require the
  *  child row to be the focused row, inside the list's own viewport. */
 async function showInThreadListAndExpectRowInView(page: Page, childId: string, stamp: number): Promise<void> {
     const header = page.locator('.thread-view-header');
     await expect(header).toContainText(`reveal-child-${stamp}`);
 
-    await header.locator('button[aria-haspopup="menu"]').click();
+    await header.locator('.thread-title-menu').click();
     await page.getByRole('menuitem', { name: 'Show in thread list' }).click();
 
     const childRow = page.locator(`.thread-drawer-list .thread-row[data-thread-nav="${childId}"]`);
@@ -54,7 +54,7 @@ async function showInThreadListAndExpectRowInView(page: Page, childId: string, s
     expect(await rowInList()).toBe(true);
 }
 
-/** Show in thread list, from the thread title bar's ⋯ menu. One menu pick has
+/** Show in thread list, from the thread title bar's thread menu. One menu pick has
  *  to bring the open thread's row into view, whatever hid it. */
 test.describe('Show in thread list', () => {
     test.beforeEach(async ({ page }) => {
@@ -80,12 +80,13 @@ test.describe('Show in thread list', () => {
     });
 
     // Leaving another view re-arms the list's scroll memory. A restore of the
-    // saved offset must not land after the reveal and undo its scroll.
+    // saved offset must not land after the reveal and undo its scroll. The
+    // drawer starts shut, so the reveal opens it as well.
     test('scrolls to the row when leaving another view with nothing to expand', async ({ page, context }) => {
         const { childId, stamp } = seedFamilyAmongFillers();
         await context.addInitScript((childId) => {
             localStorage.setItem('lucidos-focused-thread', childId);
-            localStorage.setItem('lucidos-thread-drawer-open', 'true');
+            localStorage.setItem('lucidos-thread-drawer-open', 'false');
             localStorage.setItem('lucidos-alt-view', 'attention');
             localStorage.setItem('lucidos-scroll-thread-drawer', '0');
             localStorage.removeItem('lucidos-drawer-collapsed');

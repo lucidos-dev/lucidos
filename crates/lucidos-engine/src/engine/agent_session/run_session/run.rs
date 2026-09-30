@@ -21,11 +21,11 @@ use uuid::Uuid;
 use crate::engine::agent_session::input_ledger::{announce_reads, InputLedger, SILENT_GRACE};
 use crate::engine::agent_session::io_helpers::{drain_lost_followups, lost_followups_to_orphans};
 use crate::engine::agent_session::lifecycle::{
-    classify_result, idle_action, is_definitive_session_not_found, is_resume_settle_result,
-    is_stale_resume_signal, may_touch_change_state_at_idle, require_agent_input,
-    reset_per_turn_flags, result_auto_commits, should_auto_commit_on_cleanup,
-    starts_turn_after_terminal, terminal_clears_user_hit_stop, terminate_decision, watchdog_gate,
-    IdleAction, StaleResumeInputs, TerminalKind, TerminateDecision, TurnTerminal, WatchdogGate,
+    classify_result, idle_action, idle_change_write, is_definitive_session_not_found,
+    is_resume_settle_result, is_stale_resume_signal, require_agent_input, reset_per_turn_flags,
+    result_auto_commits, should_auto_commit_on_cleanup, starts_turn_after_terminal,
+    terminal_clears_user_hit_stop, terminate_decision, watchdog_gate, IdleAction,
+    StaleResumeInputs, TerminalKind, TerminateDecision, TurnTerminal, WatchdogGate,
     WATCHDOG_DIAG_LOG_THRESHOLD_MS, WATCHDOG_HUNG_TOOL_CEILING_MS, WATCHDOG_INACTIVITY_LIMIT_MS,
     WATCHDOG_TICK_INTERVAL_SECS,
 };
@@ -697,9 +697,13 @@ impl LucidosEngine {
             }),
             crate::runtime::CodingAgent::Codex => None,
         };
-        if coding_agent == crate::runtime::CodingAgent::ClaudeCode {
-            self.remember_cc_system_prompt(thread_id, &system_prompt);
-        }
+        let repo_directory_grants = match coding_agent {
+            crate::runtime::CodingAgent::ClaudeCode => {
+                self.remember_cc_system_prompt(thread_id, &system_prompt);
+                crate::engine::repo_directory_grants::resolve(&cwd, self.workspace_path()).await
+            }
+            crate::runtime::CodingAgent::Codex => Vec::new(),
+        };
         let runtime = match spawn_or_resume(
             self,
             coding_agent,
@@ -720,6 +724,7 @@ impl LucidosEngine {
                 binary_override: binary_override.as_deref(),
                 permission_mode: permission_mode.as_deref(),
                 account_pin: injected_pin.as_ref(),
+                additional_directories: &repo_directory_grants,
             },
             agent_cancel.clone(),
         )
@@ -1023,7 +1028,6 @@ impl LucidosEngine {
                     event: crate::engine::thread_events::ThreadEvent::CodingAgentSettingsChanged {
                         model: normalized_model.clone(),
                         reasoning_effort: cc_reasoning_effort.clone(),
-                        permission_mode: None,
                         coding_agent,
                         // Fires before CC's Init, so the session id is not known
                         // yet. The Init handler emits a second SettingsChanged
@@ -1375,7 +1379,6 @@ impl LucidosEngine {
                                 event: crate::engine::thread_events::ThreadEvent::CodingAgentSettingsChanged {
                                     model: normalized_model.clone(),
                                     reasoning_effort: cc_reasoning_effort.clone(),
-                                    permission_mode: None,
                                     coding_agent,
                                     cc_session_id: Some(cc_sid.clone()),
                                     // Pin the session-to-config-dir pairing at
@@ -2005,7 +2008,7 @@ impl LucidosEngine {
                                         // CC skipped /harden, hardened=false propagates to the
                                         // change record and Apply runs hardening at click time.
                                         // Background bash deliberately does NOT gate
-                                        // this. See `may_touch_change_state_at_idle`
+                                        // this. See `idle_change_write`
                                         // for that and for the other guards.
                                         //
                                         // Before the idle emit, never after it: the idle
@@ -2018,7 +2021,7 @@ impl LucidosEngine {
                                         // A branch whose diff cancelled out still has a
                                         // pending row to reconcile, which would otherwise
                                         // keep claiming files the branch no longer has.
-                                        if may_touch_change_state_at_idle(
+                                        if let Some(write) = idle_change_write(
                                             is_external_repo,
                                             is_shutdown,
                                             conflict_change.is_some(),
@@ -2073,11 +2076,9 @@ impl LucidosEngine {
                                                         // recovery paths stamp Engine origin
                                                         // via propose_branch_changes.
                                                         origin: None,
-                                                        // Always false now: `may_touch_change_state_at_idle`
-                                                        // refuses every non-Generated terminal, so partial
-                                                        // work never reaches this point. The field stays in
-                                                        // the event for backward compat with persisted rows.
-                                                        incomplete: false,
+                                                        // A user Stop proposes what the
+                                                        // turn left, marked incomplete.
+                                                        incomplete: write.incomplete(),
                                                     }).await {
                                                         Ok(_) => {
                                                             // Track for the ProcessResult returned via the

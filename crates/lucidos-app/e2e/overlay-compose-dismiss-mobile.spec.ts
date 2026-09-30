@@ -1,5 +1,5 @@
 import { test, expect } from './fixtures';
-import { navigateToApp, assertHealthy, enableMobileHeaderSticky, ensureMobileView } from './helpers';
+import { navigateToApp, assertHealthy, disableMobileDynamicBars, ensureMobileView } from './helpers';
 
 // Touch-only regression: when an overlay is open, tapping a sibling button that
 // runs its action on `touchend` (the iOS keyboard-nudge pattern in
@@ -39,7 +39,7 @@ test.describe('Overlay swallows a touch-driven sibling action', () => {
     // Pin the header so nothing slides the sibling button off-screen. The
     // default state, but an earlier test that disabled the global pin leaks
     // here. Must precede navigate.
-    await enableMobileHeaderSticky(page);
+    await disableMobileDynamicBars(page);
   });
 
   test('tapping Search threads while the Lucidos menu is open dismisses it without opening search', async ({ page }) => {

@@ -59,6 +59,23 @@ export function collectSearchResults(
   return results;
 }
 
+/** The most rows the modal renders at once. A workspace holds thousands of
+ *  files, and building a row for each one stalls a phone for seconds. */
+export const MAX_SHOWN_RESULTS = 100;
+
+/** The matches the modal renders, and how many it left out. Change rows lead,
+ *  so a repository's many files never push the pending edits past the cap. */
+export function visibleSearchResults(
+  results: FileSearchResult[],
+): { shown: FileSearchResult[]; hidden: number } {
+  const changes = results.filter(r => r.source === 'change');
+  const rest = results.filter(r => r.source !== 'change');
+  return {
+    shown: [...changes, ...rest].slice(0, MAX_SHOWN_RESULTS),
+    hidden: Math.max(0, results.length - MAX_SHOWN_RESULTS),
+  };
+}
+
 /** Filter results by substring match on path (case-insensitive). */
 export function filterSearchResults(
   results: FileSearchResult[],

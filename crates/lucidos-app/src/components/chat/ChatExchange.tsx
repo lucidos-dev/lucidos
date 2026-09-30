@@ -92,8 +92,8 @@ interface Props {
   threadIdle: boolean;
   /** Lifted from `threadMap.value.get(threadId)?.meta.status === 'waiting_for_user_answer'`.
    *  Tells `exchangeStatus` the thread is parked on a question or permission
-   *  card rather than crashed. A just-answered divider must not flash "Aborted"
-   *  during the answer-to-resume gap. */
+   *  card, so a just-answered divider keeps reading "Working" during the
+   *  answer-to-resume gap. */
   threadAwaitingAnswer: boolean;
   /** Lifted from `cancelingThreadIds.value.has(threadId)`. */
   threadCanceling: boolean;

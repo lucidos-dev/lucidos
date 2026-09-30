@@ -4,16 +4,20 @@
 //! - [`recovery`] — the `impl LucidosEngine` block: stale-waiting-session
 //!   settlement and orphaned-worktree recovery.
 //! - [`has_diff`] — resume-dispatch / startup reconciliation free functions.
+//! - [`orphaned_branch_work`]: branch work no change carries, proposed after a
+//!   Stop and set aside after an archive (ADR 0328).
 //!
 //! Free items are re-exported here so existing `agent_recovery::X` callers (and
 //! the `super::X` references in the test sibling modules) keep resolving.
 
 mod has_diff;
 mod helpers;
+mod orphaned_branch_work;
 mod recovery;
 
 pub use has_diff::*;
 pub use helpers::*;
+pub use orphaned_branch_work::spawn_archive_net;
 // `recovery`'s free predicates stay in that file next to the recovery pass
 // that documents them; re-export the ones the teardown emit + its tests share
 // (`engine_impl/shutdown.rs`), so both sides of the preserve/resume contract
@@ -22,6 +26,9 @@ pub(crate) use recovery::{
     newest_open_question, preserve_question_park_at_shutdown, thread_has_unanswered_question,
     thread_parked_on_question, unanswered_question_exists_sql,
 };
+// The last boot step that touches thread status, called from `main.rs` once
+// every recovery sweep has run.
+pub use recovery::settle_orphaned_running_threads;
 // "Does a boundary already cover this turn?", in its two strengths. The
 // recovery pass asks the window-only form before emitting its own boundary; a
 // coding-agent session that registered mid-teardown asks the anchored form

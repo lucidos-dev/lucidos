@@ -181,64 +181,6 @@ impl EventStore {
         Self { pool }
     }
 
-    /// Defensive double-write: the migration owns this CREATE TABLE (see
-    /// `20260517160627_consolidate_init_schema_tables.sql`). A temporary measure:
-    /// `docs/temporary-measures.md` § "Defensive double-write of tables into
-    /// `init_schema`".
-    pub async fn init_schema(&self) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS events (
-                id UUID PRIMARY KEY,
-                event_type TEXT NOT NULL,
-                payload JSONB NOT NULL,
-                created TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        // Composite index: event_type + created for event queries
-        sqlx::query(
-            r#"
-            CREATE INDEX IF NOT EXISTS idx_events_type_created
-            ON events (event_type, created ASC)
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        // Functional index on JSONB request_id for request lookups
-        sqlx::query(
-            r#"
-            CREATE INDEX IF NOT EXISTS idx_events_request_id
-            ON events ((payload->>'request_id'))
-            WHERE payload->>'request_id' IS NOT NULL
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        // Legacy payload thread_id index — replaced by thread_id column + idx_events_thread_seq.
-        // Drop if it still exists from older installations.
-        sqlx::query("DROP INDEX IF EXISTS idx_events_thread_id")
-            .execute(&self.pool)
-            .await?;
-
-        // Index on created for range queries (get_conversation_events_until, chronological loads)
-        sqlx::query(
-            r#"
-            CREATE INDEX IF NOT EXISTS idx_events_created
-            ON events (created ASC)
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        Ok(())
-    }
-
     /// Query events with optional filters and a limit, no cursor paging.
     /// Used by App UIs and the LLM `query_events` tool to fetch domain events
     /// (e.g. GoogleDocEdited). Newest-first; rows sharing one timestamp tie-

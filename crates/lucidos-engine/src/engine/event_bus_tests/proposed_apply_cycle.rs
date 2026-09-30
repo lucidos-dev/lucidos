@@ -318,6 +318,7 @@ async fn full_apply_cycle_ends_idle_not_waiting() {
                 repo_root: String::new(),
                 hardened: false,
                 incomplete: false,
+                set_aside: false,
                 path: String::new(),
                 diff: String::new(),
             },
@@ -496,6 +497,7 @@ async fn seed_pending_change(bus: &EventBus, thread_id: Uuid, branch: &str) -> U
             repo_root: "/tmp".into(),
             hardened: false,
             incomplete: false,
+            set_aside: false,
             path: String::new(),
             diff: String::new(),
         },
@@ -784,6 +786,7 @@ async fn propose_time_reconcile_keeps_single_pending_and_proposed_flag() {
             repo_root: "/tmp".into(),
             hardened: false,
             incomplete: false,
+            set_aside: false,
             path: String::new(),
             diff: String::new(),
         },
@@ -855,7 +858,7 @@ async fn propose_time_reconcile_keeps_single_pending_and_proposed_flag() {
 fn propose_change_reconciles_stale_branches_before_change_proposed_emit() {
     let src = include_str!("../change_ops/propose.rs");
     let discard_pos = src
-        .find("discard_pending_for_thread_except")
+        .find("discard_open_changes_for_thread_except")
         .expect("propose_change must reconcile stale other-branch pending changes");
     let proposed_pos = src
         .find("ThreadEvent::ChangeProposed")
@@ -1059,8 +1062,8 @@ fn every_apply_clears_the_branch_gate_markers_from_the_shared_emit() {
 fn discard_change_notifies_apply_all_driver_so_batch_advances() {
     let discard = include_str!("../change_ops/discard.rs");
     assert!(
-        discard.contains("notify_apply_all") && discard.contains("DISCARDED_MEMBER_REASON"),
-        "discard_change must notify the Apply-All driver (Failed / DISCARDED_MEMBER_REASON) so a \
+        discard.contains("notify_apply_all") && discard.contains("WITHDRAWN_MEMBER_REASON"),
+        "discard_change must notify the Apply-All driver (Failed / WITHDRAWN_MEMBER_REASON) so a \
          batch member discarded mid-batch advances the batch instead of stalling it"
     );
 }

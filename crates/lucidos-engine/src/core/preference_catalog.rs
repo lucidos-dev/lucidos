@@ -409,12 +409,12 @@ pub const CATALOG: &[PrefSpec] = &[
         side_effect: PrefSideEffect::None,
     },
     PrefSpec {
-        key: "mobile_header_sticky",
-        label: "Sticky mobile header",
+        key: "mobile_dynamic_bars",
+        label: "Dynamic bars",
         scope: PrefScope::Global,
         value: PrefValue::Bool,
-        default: "true",
-        description: "Keep the mobile header always visible ('true') instead of hiding it on scroll ('false').",
+        default: "false",
+        description: "On a phone, slide the header and the prompt away while scrolling down and bring them back on scroll up ('true'), instead of keeping both always visible ('false').",
         side_effect: PrefSideEffect::None,
     },
     PrefSpec {

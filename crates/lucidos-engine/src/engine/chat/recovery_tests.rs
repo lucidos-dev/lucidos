@@ -157,11 +157,7 @@ type OrphanThreadRow = (
 
 #[tokio::test]
 async fn orphan_threads_query_includes_unarchived_orphan() {
-    // Precondition assertion that anchors the negative test below: the
-    // exact same query DOES return a row for an orphan turn on a regular
-    // inbox thread. Without this, the negative case ("archived → no row")
-    // could be passing for the wrong reason (e.g. a typo in the orphan
-    // fixture making no thread ever match).
+    // The ordinary case: an orphan turn on an inbox thread is swept.
     let (pool, db_name) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
 
@@ -184,14 +180,47 @@ async fn orphan_threads_query_includes_unarchived_orphan() {
     teardown_test_db(&db_name).await;
 }
 
+/// Put an archived thread back to `running`, the state a turn that died on
+/// the last engine leaves: archiving settles status, and nothing resets it now.
+async fn died_while_archived(pool: &sqlx::PgPool, thread_id: Uuid) {
+    sqlx::query("UPDATE thread_summaries SET status = 'running' WHERE thread_id = $1")
+        .bind(thread_id)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+async fn orphan_ids(pool: &sqlx::PgPool) -> Vec<Uuid> {
+    let rows: Vec<OrphanThreadRow> = sqlx::query_as(ORPHAN_THREADS_SQL)
+        .bind(Vec::<Uuid>::new())
+        .fetch_all(pool)
+        .await
+        .unwrap();
+    rows.into_iter().map(|r| r.0).collect()
+}
+
 #[tokio::test]
-async fn orphan_threads_query_skips_archived_thread() {
-    // The user's scenario: a thread had an in-flight turn that never
-    // settled, the user archived the row, and a later engine restart's
-    // recovery sweep flipped it back to inbox via the contract layer's
-    // `ResponseAborted → to_inbox` rule. Fix: filter the sweep's
-    // candidate set on `archive_state != 'archived'` so the recovery
-    // event never gets emitted.
+async fn orphan_threads_query_includes_an_archived_thread_that_died_running() {
+    // A turn that died on an archived thread still died, and an archived thread
+    // left `running` shows in Current. The sweep aborts it like any other.
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+
+    let archived_id = Uuid::new_v4();
+    emit_orphan_turn(&bus, archived_id).await;
+    archive(&bus, archived_id).await;
+    died_while_archived(&pool, archived_id).await;
+
+    assert!(orphan_ids(&pool).await.contains(&archived_id));
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn orphan_threads_query_leaves_archived_history_alone() {
+    // An archived orphan an earlier engine reset to `idle` is history. Sweeping
+    // it would revive every archived thread that ever crashed, all at once.
     let (pool, db_name) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
 
@@ -199,37 +228,7 @@ async fn orphan_threads_query_skips_archived_thread() {
     emit_orphan_turn(&bus, archived_id).await;
     archive(&bus, archived_id).await;
 
-    // Sanity: the projection records the archive on `archive_state` (sole
-    // archive flag post-collapse).
-    let archive_state: String =
-        sqlx::query_scalar("SELECT archive_state FROM thread_summaries WHERE thread_id = $1")
-            .bind(archived_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(archive_state, "archived");
-
-    // Add a control row: an unarchived thread with the same orphan shape.
-    // The query MUST return it but NOT the archived one.
-    let control_id = Uuid::new_v4();
-    emit_orphan_turn(&bus, control_id).await;
-
-    let rows: Vec<OrphanThreadRow> = sqlx::query_as(ORPHAN_THREADS_SQL)
-        .bind(Vec::<Uuid>::new())
-        .fetch_all(&pool)
-        .await
-        .unwrap();
-    let returned: Vec<Uuid> = rows.iter().map(|r| r.0).collect();
-    assert!(
-        returned.contains(&control_id),
-        "control (unarchived) orphan must be returned — got {:?}",
-        returned
-    );
-    assert!(
-        !returned.contains(&archived_id),
-        "archived orphan must NOT be returned — got {:?}",
-        returned
-    );
+    assert!(!orphan_ids(&pool).await.contains(&archived_id));
 
     pool.close().await;
     teardown_test_db(&db_name).await;
@@ -423,38 +422,34 @@ async fn orphan_tool_calls_query_skips_question_parked_thread() {
     teardown_test_db(&db_name).await;
 }
 
+async fn tool_call_thread_ids(pool: &sqlx::PgPool) -> std::collections::HashSet<Uuid> {
+    let rows: Vec<EventRow> = sqlx::query_as(ORPHAN_TOOL_CALLS_SQL)
+        .fetch_all(pool)
+        .await
+        .unwrap();
+    rows.iter().filter_map(|r| r.thread_id).collect()
+}
+
 #[tokio::test]
-async fn orphan_tool_calls_query_skips_archived_thread() {
-    // Mirror the orphan-thread test for the inner-tool-layer sweep: a
-    // synthetic `ToolResult` for an archived thread would bump
-    // `last_activity` (via the projection's ToolResult branch) and surface
-    // the row in any activity-sorted list. Filter at the SQL JOIN.
+async fn orphan_tool_calls_query_takes_archived_threads_only_while_running() {
+    // Mirror of the orphan-thread pair for the inner tool layer. A dangling
+    // call on an archived thread whose turn just died gets its pair. One an
+    // earlier engine left behind is history, and stays out.
     let (pool, db_name) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
 
-    let archived_id = Uuid::new_v4();
-    emit_orphan_tool_call(&bus, archived_id).await;
-    archive(&bus, archived_id).await;
+    let died = Uuid::new_v4();
+    emit_orphan_tool_call(&bus, died).await;
+    archive(&bus, died).await;
+    died_while_archived(&pool, died).await;
 
-    let control_id = Uuid::new_v4();
-    emit_orphan_tool_call(&bus, control_id).await;
+    let history = Uuid::new_v4();
+    emit_orphan_tool_call(&bus, history).await;
+    archive(&bus, history).await;
 
-    let rows: Vec<EventRow> = sqlx::query_as(ORPHAN_TOOL_CALLS_SQL)
-        .fetch_all(&pool)
-        .await
-        .unwrap();
-    let returned_threads: std::collections::HashSet<Uuid> =
-        rows.iter().filter_map(|r| r.thread_id).collect();
-    assert!(
-        returned_threads.contains(&control_id),
-        "control thread's ToolCalled must be returned — got {:?}",
-        returned_threads
-    );
-    assert!(
-        !returned_threads.contains(&archived_id),
-        "archived thread's ToolCalled must NOT be returned — got {:?}",
-        returned_threads
-    );
+    let returned = tool_call_thread_ids(&pool).await;
+    assert!(returned.contains(&died), "got {returned:?}");
+    assert!(!returned.contains(&history), "got {returned:?}");
 
     pool.close().await;
     teardown_test_db(&db_name).await;
@@ -825,8 +820,9 @@ mod switch_resume {
         teardown_test_db(&db_name).await;
     }
 
-    /// Same rationale as the orphan sweep's archived filter: the user closed the
-    /// thread, and resuming it would revive the row they deliberately dismissed.
+    /// The user closed the thread, and resuming it would revive the row they
+    /// deliberately dismissed. Recording a crash is not resuming: the orphan
+    /// sweep covers archived threads.
     #[tokio::test]
     async fn archived_threads_are_not_candidates() {
         let (pool, db_name) = setup_test_db().await;

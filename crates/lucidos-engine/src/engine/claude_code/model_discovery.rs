@@ -60,6 +60,7 @@ impl LucidosEngine {
                 account_pin: None,
                 binary_override: binary_override.as_deref(),
                 permission_mode: permission_mode.as_deref(),
+                additional_directories: &[],
             };
             match crate::runtime::claude_code::probe_cc_models(args).await {
                 Ok(found) => {

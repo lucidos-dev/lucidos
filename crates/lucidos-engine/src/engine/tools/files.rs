@@ -2,6 +2,7 @@ use super::super::context::sanitize_file_content_for_llm;
 use super::super::LucidosEngine;
 use crate::engine::event_bus::{BusEvent, SystemEvent};
 use base64::Engine as _;
+use std::path::Path;
 
 /// Outer safety bound on image files `read_file` will load. This is *not* the
 /// reject point for normal photos — anything under this cap is read, and if its
@@ -13,7 +14,7 @@ const IMAGE_MAX_BYTES: u64 = 25 * 1024 * 1024;
 /// True when both paths reach one file on disk. A copy onto itself truncates
 /// the destination before it reads the source, which empties the file. A
 /// case-only rename on a case-insensitive disk reaches the same file.
-fn is_same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
+fn is_same_file(a: &Path, b: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
     match (std::fs::metadata(a), std::fs::metadata(b)) {
         (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
@@ -181,6 +182,45 @@ pub(crate) fn json_set_value(
     }
 }
 
+/// The repo that records a change to a resolved file.
+#[derive(Debug, PartialEq)]
+enum ChangeOwner<'a> {
+    /// The shared user dir, keyed by the path inside it. `resolve_data_path`
+    /// sends an existing shared knowhow file here, not into the workspace.
+    SharedUserDir {
+        root: &'a Path,
+        relative: String,
+    },
+    /// An app repo, keyed by the path under `apps/`.
+    App(&'a str),
+    Workspace,
+}
+
+/// Which repo a mutating tool writes, commits and deletes in. A resolved
+/// shared file must never be committed or deleted on the workspace path.
+fn change_owner<'a>(
+    user_dir: Option<&'a Path>,
+    data_path: &'a str,
+    full_path: &Path,
+) -> ChangeOwner<'a> {
+    if let Some(root) = user_dir {
+        if let Ok(relative) = full_path.strip_prefix(root) {
+            return ChangeOwner::SharedUserDir {
+                root,
+                relative: relative.to_string_lossy().into_owned(),
+            };
+        }
+    }
+    match data_path.strip_prefix("apps/") {
+        Some(app_path) => ChangeOwner::App(app_path),
+        None => ChangeOwner::Workspace,
+    }
+}
+
+/// The commit id a shared user-dir change reports, since `auto_commit` keeps
+/// none.
+const SHARED_COMMIT: &str = "shared";
+
 /// The app id a `data/`-relative path belongs to, if it lives under `apps/<id>/`.
 /// `None` for non-app paths or a bare `apps/` with no id segment.
 fn data_path_app_id(data_path: &str) -> Option<&str> {
@@ -339,7 +379,7 @@ impl LucidosEngine {
     async fn record_script_authorship(
         &self,
         authorship: WriteAuthorship,
-        full_path: &std::path::Path,
+        full_path: &Path,
         bytes: &[u8],
     ) {
         let Some(rel) =
@@ -378,7 +418,7 @@ impl LucidosEngine {
 
     /// Drop a `data/scripts/` file's approval, so a later file at the same path
     /// starts unapproved. A no-op for every other path.
-    async fn forget_script_authorship(&self, full_path: &std::path::Path) {
+    async fn forget_script_authorship(&self, full_path: &Path) {
         let Some(rel) =
             crate::core::handshake_approvals::workspace_relative(self.workspace_path(), full_path)
         else {
@@ -403,23 +443,41 @@ impl LucidosEngine {
     async fn commit_file_change(
         &self,
         data_path: &str,
-        full_path: &std::path::Path,
+        full_path: &Path,
         message: &str,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        if let Some(ud) = self.user_dir() {
-            if full_path.starts_with(ud) {
-                let rel = full_path.strip_prefix(ud).unwrap();
-                crate::core::user_dir::auto_commit(ud, &rel.to_string_lossy(), message);
-                return Ok("shared".to_string());
+        match change_owner(self.user_dir(), data_path, full_path) {
+            ChangeOwner::SharedUserDir { root, relative } => {
+                crate::core::user_dir::auto_commit(root, &relative, message);
+                Ok(SHARED_COMMIT.to_string())
             }
-        }
-        if let Some(app_path) = data_path.strip_prefix("apps/") {
-            Ok(self.app_manager.commit(app_path, message)?)
-        } else {
-            Ok(self
+            ChangeOwner::App(app_path) => Ok(self.app_manager.commit(app_path, message)?),
+            ChangeOwner::Workspace => Ok(self
                 .artifact_manager
                 .commit_data_path(data_path, message)
-                .await?)
+                .await?),
+        }
+    }
+
+    /// Delete a file and commit the removal in the repo that owns it.
+    async fn delete_file_change(
+        &self,
+        data_path: &str,
+        full_path: &Path,
+        message: &str,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        match change_owner(self.user_dir(), data_path, full_path) {
+            ChangeOwner::SharedUserDir { root, relative } => {
+                crate::core::user_dir::remove_and_commit(root, &relative, message)?;
+                Ok(SHARED_COMMIT.to_string())
+            }
+            ChangeOwner::App(app_path) => {
+                Ok(self.app_manager.delete_file_and_commit(app_path, message)?)
+            }
+            ChangeOwner::Workspace => Ok(self
+                .artifact_manager
+                .delete_data_path_and_commit(&self.event_bus, data_path, message)
+                .await?),
         }
     }
 }
@@ -630,7 +688,7 @@ impl LucidosEngine {
         relative: &str,
     ) -> Result<(String, std::path::PathBuf), String> {
         let repo = super::repo_files::resolve_repo(self.pool(), repo_arg).await?;
-        let root = std::path::Path::new(&repo.path);
+        let root = Path::new(&repo.path);
         let full = super::repo_files::resolve_in_repo(root, relative)?;
         let clean = relative.trim().trim_start_matches("./");
         if let Some(live) = super::repo_files::shadowed_tracked_path(root, clean).await {
@@ -648,7 +706,7 @@ impl LucidosEngine {
         repo_arg: &str,
     ) -> Result<Vec<(String, std::path::PathBuf)>, String> {
         let repo = super::repo_files::resolve_repo(self.pool(), repo_arg).await?;
-        super::repo_files::repo_entries(std::path::Path::new(&repo.path)).await
+        super::repo_files::repo_entries(Path::new(&repo.path)).await
     }
 }
 
@@ -823,7 +881,7 @@ impl LucidosEngine {
 /// workspace read had the two equal only by coincidence.
 fn read_resolved_file(
     display_path: &str,
-    full_path: &std::path::Path,
+    full_path: &Path,
     args: &serde_json::Value,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let extension = lowercase_extension(display_path);
@@ -840,7 +898,7 @@ fn read_resolved_file(
             // surfaces. The engine cannot regenerate one, but older workspaces
             // still carry useful ones.
             let text_sidecar = format!("{}.txt", full_path.display());
-            let text_sidecar_path = std::path::Path::new(&text_sidecar);
+            let text_sidecar_path = Path::new(&text_sidecar);
             if text_sidecar_path.exists() {
                 if let Ok(text) = std::fs::read_to_string(text_sidecar_path) {
                     return Ok(format!("[PDF Text Content]\n\n{}", text));
@@ -947,7 +1005,7 @@ pub(crate) fn encode_image_for_read(bytes: Vec<u8>, media_type: &str) -> String 
 
 /// Lowercased file extension via `Path::extension`, or `""` if none.
 fn lowercase_extension(path: &str) -> String {
-    std::path::Path::new(path)
+    Path::new(path)
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
@@ -1037,7 +1095,7 @@ pub(crate) fn line_window_from_args(args: &serde_json::Value) -> Option<(usize, 
 /// empty names are rejected before the lookup. The uncompressed entry size is checked
 /// against `max_uncompressed` before decompression — protects against zip-bombs.
 pub(crate) fn read_text_from_zip(
-    archive_path: &std::path::Path,
+    archive_path: &Path,
     inner_path: &str,
     max_uncompressed: u64,
 ) -> Result<String, String> {
@@ -1634,20 +1692,14 @@ and emits the PluginUninstalled event so the registry stays in sync.",
 
                 let _repo_guard = self.lock_workspace_repo().await;
 
-                // Delete and commit via appropriate manager
                 let commit_msg = args
                     .get("message")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| format!("Delete {}", path));
-                let commit_sha = if let Some(app_path) = path.strip_prefix("apps/") {
-                    self.app_manager
-                        .delete_file_and_commit(app_path, &commit_msg)?
-                } else {
-                    self.artifact_manager
-                        .delete_data_path_and_commit(&self.event_bus, path, &commit_msg)
-                        .await?
-                };
+                let commit_sha = self
+                    .delete_file_change(path, &full_path, &commit_msg)
+                    .await?;
 
                 // A deleted profile has to leave the cache too, or the engine
                 // keeps rendering it into every chat turn forever.

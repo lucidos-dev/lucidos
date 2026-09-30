@@ -1,7 +1,7 @@
 use super::*;
 
 impl LucidosEngine {
-    /// If a pending change already exists for this branch, returns its ID instead of creating a duplicate.
+    /// If an open change already exists for this branch, returns its ID instead of creating a duplicate.
     pub(crate) async fn propose_change(
         &self,
         input: ProposeChangeInput<'_>,
@@ -19,8 +19,8 @@ impl LucidosEngine {
             incomplete,
         } = input;
 
-        // Reconcile the "a coding-agent thread has at most one pending change"
-        // invariant BEFORE proposing on this branch: discard any pending change
+        // Reconcile the "a coding-agent thread has at most one open change"
+        // invariant BEFORE proposing on this branch: discard any open change
         // the thread still holds on a DIFFERENT branch (e.g. a merge-conflict
         // recovery re-ran on a fresh branch). Doing this *before* the
         // `ChangeProposed` emit below is load-bearing: `ChangeDiscarded` clears
@@ -28,7 +28,7 @@ impl LucidosEngine {
         // diff flag this proposal is about to set. Same-branch
         // multi-change is preserved (keep = same branch). See
         // docs/plans/2026-07-01-orphaned-pending-change-blocks-archive.md.
-        self.discard_pending_for_thread_except(thread_id, origin.clone(), |c| {
+        self.discard_open_changes_for_thread_except(thread_id, origin.clone(), |c| {
             c.branch_name == branch_name
         })
         .await;
@@ -49,8 +49,9 @@ impl LucidosEngine {
     }
 
     /// The emit half of [`propose_change`], WITHOUT its sibling-discard
-    /// reconcile. If a pending change already exists for this branch, reuse its
-    /// `change_id` and re-emit `ChangeProposed`; otherwise mint a new one.
+    /// reconcile. If an open change already exists for this branch, reuse its
+    /// `change_id` and re-emit `ChangeProposed`; otherwise mint a new one. New
+    /// work on a set-aside change brings it back first (ADR 0328).
     ///
     /// Split out because `reconcile_emptied_pending_change` must correct a row
     /// without resolving anything: routing it through `propose_change` would
@@ -85,12 +86,22 @@ impl LucidosEngine {
 
         let existing = self
             .changes()
-            .get_pending_by_branch(branch_name)
+            .get_open_by_branch(branch_name)
             .await
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                format!("get_pending_by_branch({}): {}", branch_name, e).into()
+                format!("get_open_by_branch({}): {}", branch_name, e).into()
             })?;
         let change_id = existing.as_ref().map(|c| c.id).unwrap_or_else(Uuid::new_v4);
+        let new_work = existing
+            .as_ref()
+            .is_none_or(|e| e.description != description || e.files != files);
+        // A Stop marks what it proposes incomplete, but a Stop that added
+        // nothing leaves finished work finished. A clean turn still clears
+        // the mark.
+        let incomplete = match existing.as_ref() {
+            Some(e) if !new_work => e.incomplete && incomplete,
+            _ => incomplete,
+        };
         let needs_emit = existing.as_ref().is_none_or(|e| {
             e.description != description
                 || e.files != files
@@ -99,7 +110,32 @@ impl LucidosEngine {
                 || e.incomplete != incomplete
         });
 
+        // Only new work brings a set-aside change back. A proposal that
+        // differs in its flags alone leaves the change where the user put it.
+        let set_aside = existing
+            .as_ref()
+            .is_some_and(|e| e.status() == ChangeStatus::SetAside);
+        if set_aside && !new_work {
+            return Ok(change_id);
+        }
+
         if needs_emit {
+            if set_aside {
+                self.event_bus
+                    .emit_or_log(
+                        crate::engine::event_bus::BusEvent::Thread {
+                            thread_id,
+                            event: crate::engine::thread_events::ThreadEvent::ChangeBroughtBack {
+                                change_id: change_id.to_string(),
+                            },
+                            meta: crate::engine::thread_events::EventMeta::with_actor(
+                                origin.clone(),
+                            ),
+                        },
+                        "[Changes] ChangeBroughtBack (new work)",
+                    )
+                    .await;
+            }
             self.event_bus
                 .emit_or_log(
                     crate::engine::event_bus::BusEvent::Thread {
@@ -115,6 +151,7 @@ impl LucidosEngine {
                             repo_root: repo_root.to_string(),
                             hardened,
                             incomplete,
+                            set_aside: false,
                             path: String::new(),
                             diff: String::new(),
                         },

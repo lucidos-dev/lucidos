@@ -2339,3 +2339,155 @@ async fn the_frame_closing_a_fire_carries_the_fires_depth() {
     f.executor.release_one();
     teardown_test_db(&f.db).await;
 }
+
+fn delay_titles(
+    rx: &mut tokio::sync::broadcast::Receiver<crate::engine::event_bus::EmittedEvent>,
+) -> Vec<String> {
+    let mut titles = Vec::new();
+    while let Ok(emitted) = rx.try_recv() {
+        if let BusEvent::System(SystemEvent::NotificationCreated { title, .. }) = &emitted.typed {
+            if title.contains("significantly delayed") {
+                titles.push(title.clone());
+            }
+        }
+    }
+    titles
+}
+
+/// The 23-fire burst from a recovery pass: the queue got deep, drained in
+/// seconds, and must never have said the trigger was delayed.
+#[tokio::test]
+async fn a_deep_burst_that_drains_fast_never_reports_a_delay() {
+    const BURST: usize = 23;
+    let f = fixture(10).await;
+    f.queue
+        .set_policy(
+            CapacityPolicy {
+                max_queued_per_trigger: 50,
+                ..test_policy(10)
+            },
+            None,
+        )
+        .await
+        .expect("set_policy");
+    f.trigger_configs
+        .write()
+        .unwrap()
+        .insert("trig-a".to_string(), test_trigger_config("trig-a"));
+    let mut rx = f.bus.subscribe();
+
+    for _ in 0..BURST {
+        f.queue
+            .submit(event_trigger_request("trig-a"), None, None)
+            .await;
+    }
+    let depth = f.queue.state.lock().await.queued.len();
+    assert_eq!(depth, BURST - 1, "per-trigger cap of 1 queues all but one");
+    let due = {
+        let mut state = f.queue.state.lock().await;
+        f.queue.delay_notifications_due(&mut state, Utc::now())
+    };
+    assert!(
+        due.is_empty(),
+        "a deep but fresh backlog is not a delay: {due:?}"
+    );
+
+    for _ in 0..BURST {
+        f.executor.release_one();
+    }
+    let executor = f.executor.clone();
+    wait_until(|| {
+        let executor = executor.clone();
+        async move { executor.executed_ids().len() == BURST }
+    })
+    .await;
+    assert!(
+        delay_titles(&mut rx).is_empty(),
+        "no delay notification for a burst that drained"
+    );
+
+    teardown_test_db(&f.db).await;
+}
+
+/// A fire stuck behind a busy slot alerts once its wait passes the threshold,
+/// states the wait, and the cooldown keeps the next check quiet.
+#[tokio::test]
+async fn a_fire_stalled_past_the_wait_threshold_reports_a_delay_once() {
+    let f = fixture(10).await;
+    f.trigger_configs
+        .write()
+        .unwrap()
+        .insert("trig-a".to_string(), test_trigger_config("trig-a"));
+    let running = f
+        .queue
+        .submit(event_trigger_request("trig-a"), None, None)
+        .await;
+    let stalled = f
+        .queue
+        .submit(event_trigger_request("trig-a"), None, None)
+        .await;
+    assert!(running.admitted);
+    assert!(!stalled.admitted, "the second fire waits behind the first");
+
+    let now = Utc::now();
+    let check = |after: chrono::Duration| {
+        let queue = f.queue.clone();
+        async move {
+            let mut state = queue.state.lock().await;
+            queue.delay_notifications_due(&mut state, now + after)
+        }
+    };
+    assert!(
+        check(chrono::Duration::minutes(4)).await.is_empty(),
+        "under the threshold stays quiet"
+    );
+    let due = check(chrono::Duration::minutes(6)).await;
+    assert_eq!(due.len(), 1, "one alert for the stalled trigger: {due:?}");
+    let (title, message) = &due[0];
+    assert_eq!(title, "Trigger trig-a is significantly delayed");
+    assert!(
+        message.contains("has waited 6 min") && message.contains("(1 waiting)"),
+        "the message states the wait and the count: {message}"
+    );
+    assert!(
+        check(chrono::Duration::minutes(8)).await.is_empty(),
+        "the per-trigger cooldown suppresses a repeat"
+    );
+
+    // A paused trigger's fires wait for resume on purpose: no alert until
+    // the user resumes it.
+    f.trigger_configs
+        .write()
+        .unwrap()
+        .insert("trig-p".to_string(), test_trigger_config("trig-p"));
+    for _ in 0..2 {
+        f.queue
+            .submit(event_trigger_request("trig-p"), None, None)
+            .await;
+    }
+    let set_paused = |paused: bool| {
+        f.trigger_configs
+            .write()
+            .unwrap()
+            .get_mut("trig-p")
+            .expect("trig-p registered")
+            .paused = paused;
+    };
+    set_paused(true);
+    assert!(
+        check(chrono::Duration::minutes(30)).await.is_empty(),
+        "a paused trigger never reports a delay"
+    );
+    set_paused(false);
+    let due = check(chrono::Duration::minutes(30)).await;
+    assert_eq!(
+        due.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>(),
+        vec!["Trigger trig-p is significantly delayed"],
+        "once resumed, its stalled fire alerts"
+    );
+
+    for _ in 0..4 {
+        f.executor.release_one();
+    }
+    teardown_test_db(&f.db).await;
+}

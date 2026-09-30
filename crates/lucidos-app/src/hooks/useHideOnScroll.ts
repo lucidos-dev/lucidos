@@ -1,32 +1,33 @@
 import { useEffect } from 'preact/hooks';
-import { mobileView, panelOverlay, preferences, type MobileView, type PanelOverlay } from '../store/store';
+import { composeViewActive, mobileView, panelOverlay, preferences, type MobileView, type PanelOverlay } from '../store/store';
 import { opensSoftwareKeyboard, getRemPx } from '../utils/dom';
+import { afterPressSettles } from '../utils/pointerPress';
 import { isAnchorScroll, isNavigationScroll, isHeaderPinnedForScroll, onAnchorScroll } from '../components/chat/scrollState';
 import { isMobile } from '../utils/viewport';
 import { isRepaintNudging } from '../utils/webkitRepaint';
 import { isUserScrolling } from '../utils/scrollActivity';
-import { currentMobileHeaderSticky } from '../store/actions/preferences';
+import { currentMobileDynamicBars } from '../store/actions/preferences';
 
 /** Pure rule for when hide-on-scroll should be inert and the header pinned visible.
- *  Sticky preference wins everywhere; otherwise only the content pane with an
- *  open app-UI iframe pins (its scroll events leak to the parent — other panes
- *  don't have that problem and should hide normally). */
+ *  Pinned bars (dynamic bars off) win everywhere. Otherwise only the content
+ *  pane with an open app-UI iframe pins, because its scroll events leak to the
+ *  parent. Other panes don't have that problem and hide normally. */
 export function shouldKeepHeaderVisible(opts: {
   view: MobileView;
   overlayType: NonNullable<PanelOverlay>['type'] | null | undefined;
-  stickyPref: boolean;
+  dynamicBars: boolean;
 }): boolean {
-  if (opts.stickyPref) return true;
+  if (!opts.dynamicBars) return true;
   return opts.view === 'content' && opts.overlayType === 'app-ui';
 }
 
 /** Pixel height for the `--mobile-header-height` spacer that sits below the
  *  fixed header. Collapses to the safe-area inset only while the header is
  *  actually sliding off to make room for the keyboard. When the header is
- *  pinned visible (`disabled` — sticky pref or app-ui), it never slides off,
+ *  pinned visible (`disabled`: pinned bars or app-ui), it never slides off,
  *  so the spacer MUST stay at full header height — otherwise content slides up
  *  behind the still-visible header (editing a device name on an iOS PWA with
- *  "Keep header visible" on rendered the input under the header). */
+ *  the bars pinned rendered the input under the header). */
 export function spacerHeightPx(opts: {
   cachedHeight: number;
   safeAreaTop: number;
@@ -34,6 +35,30 @@ export function spacerHeightPx(opts: {
   disabled: boolean;
 }): number {
   return opts.keyboardOpen && !opts.disabled ? opts.safeAreaTop : opts.cachedHeight;
+}
+
+/** How far the prompt sits below its resting place, in px: 0 is fully shown and
+ *  `promptHeight` fully hidden. It follows the scroll delta like the header, but
+ *  never hides further than the distance left to the bottom. So the live edge
+ *  always shows it, the way the top of a thread always shows the header. */
+export function nextPromptOffsetPx(opts: {
+  offset: number;
+  delta: number;
+  promptHeight: number;
+  distanceToBottom: number;
+}): number {
+  return Math.max(0, Math.min(opts.promptHeight, opts.distanceToBottom, opts.offset + opts.delta));
+}
+
+/** Whether the prompt may be anywhere but fully shown. It stays shown while the
+ *  reader types into it and in the compose-empty view. It also stays shown while
+ *  the bars are pinned (`disabled`, which dynamic bars off always implies). */
+export function promptCanSlide(opts: {
+  disabled: boolean;
+  keyboardOpen: boolean;
+  composeEmpty: boolean;
+}): boolean {
+  return !opts.disabled && !opts.keyboardOpen && !opts.composeEmpty;
 }
 
 // Selectors scoped to .mobile-swipe-pane to avoid finding the desktop elements
@@ -46,7 +71,8 @@ const SCROLL_SELECTORS: Record<string, string> = {
 
 /**
  * Hides the fixed mobile header on scroll-down and reveals it on scroll-up,
- * tracking pixel-for-pixel in both directions (no CSS transitions).
+ * tracking pixel-for-pixel in both directions (no CSS transitions). With
+ * dynamic bars on, the thread pane's prompt slides down and back the same way.
  *
  * Clamps scrollTop to [0, maxScroll] so iOS Safari elastic bounce at the
  * bottom/top doesn't move the header.
@@ -76,12 +102,24 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
      *  however late it lands. See the reveal in `onScroll`. */
     let anchoredTop = -1;
     let keyboardOpen = false; // true while a prompt input is focused
+    let disposed = false; // a deferred focusout must not write after cleanup
+    let closePending = false; // a focusout is waiting for its press to click
     let disabled = false;
+    // Mirrors `mobile_dynamic_bars`, and gates the prompt's overlay layout.
+    let dynamicBars = false;
     // Per-pane scroll state so each pane has independent header position
     const paneState: Record<string, { headerOffset: number; prevScrollTop: number }> = {};
     let cachedRemSize = getRemPx();
     // Change-detection guard (avoid needless style invalidation on every scroll)
     let lastOffsetRem = 0;
+    // The thread pane's prompt and the scroll-to-bottom chevron above it. Only
+    // the thread pane has a prompt, so the offset changes only on its scroll.
+    let promptEl: HTMLElement | null = null;
+    let downChevronEl: HTMLElement | null = null;
+    let promptResizeObserver: ResizeObserver | null = null;
+    let promptHeight = 0;
+    let promptOffset = 0; // px below resting: 0 = shown, promptHeight = hidden
+    let lastPromptOffsetRem = 0;
 
     /** Clamp offset to [-(cachedHeight + titleBarHeight), 0].
      *  The extended range lets the sticky title bar scroll out at the same
@@ -95,7 +133,7 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
      *    at the notch / dynamic-island clearance so focused inputs near the top
      *    of the page don't end up behind iOS chrome. Resolves to 0 on platforms
      *    without a safe-area inset (Android, pre-notch iPhones, desktop).
-     *  Header pinned visible (sticky pref / app-ui) or keyboard closed → actual
+     *  Header pinned visible (pinned bars / app-ui) or keyboard closed → actual
      *    header height, so content stays clear of the still-visible header. */
     function updateHeaderVar() {
       const heightPx = spacerHeightPx({
@@ -167,18 +205,72 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
       // it, so this reaches up one level. `:scope >` keeps it to THIS pane's
       // chevron rather than the first one in document order.
       const nextChevron = (container?.parentElement?.querySelector(':scope > .scroll-to-top') ?? null) as HTMLElement | null;
-      if (nextTitleBar === titleBarEl && nextChevron === chevronEl) return false;
+      // The down chevron is the third consumer, of the PROMPT's offset: it sits
+      // just above the prompt, so it has to slide with it.
+      const nextDownChevron = (container?.parentElement?.querySelector(':scope > .scroll-to-bottom') ?? null) as HTMLElement | null;
+      if (nextTitleBar === titleBarEl && nextChevron === chevronEl && nextDownChevron === downChevronEl) return false;
       // The outgoing elements keep their last value rather than being cleared.
       // They are on their way out, and clearing would snap a still-visible title
       // bar back to its resting position mid pane-swipe. `paneState` restores
       // the real offset when the pane comes back.
       bindTitleBar(nextTitleBar);
       chevronEl = nextChevron;
+      downChevronEl = nextDownChevron;
       // Force the next applyTransform to write. The freshly-bound elements carry
       // no value (or a stale one), and the change-detection guard below would
       // otherwise skip them because the OFFSET itself has not moved.
       lastOffsetRem = NaN;
+      lastPromptOffsetRem = NaN;
       return true;
+    }
+
+    /** Publish `--mobile-prompt-height`, the transcript's bottom spacer under
+     *  the overlaid prompt (styles/mobile.css). It moves only when the prompt
+     *  resizes, never per scroll frame, so the root is the right place for it. */
+    function updatePromptHeightVar() {
+      const root = document.documentElement.style;
+      if (dynamicBars && promptHeight > 0) {
+        root.setProperty('--mobile-prompt-height', `${promptHeight / cachedRemSize}rem`);
+      } else {
+        root.removeProperty('--mobile-prompt-height');
+      }
+    }
+
+    function refreshPromptHeight() {
+      promptHeight = promptEl ? promptEl.getBoundingClientRect().height : 0;
+      promptOffset = Math.min(promptOffset, promptHeight);
+      updatePromptHeightVar();
+      applyTransform();
+    }
+
+    /** Bind the thread pane's prompt, the element the prompt offset moves. It
+     *  mounts with the swipe panes, which can land after this hook's effect. */
+    function bindPrompt() {
+      const next = document.querySelector<HTMLElement>('.mobile-swipe-pane .prompt-area');
+      if (next === promptEl) return;
+      promptResizeObserver?.disconnect();
+      promptResizeObserver = null;
+      if (promptEl) promptEl.style.transform = '';
+      promptEl = next;
+      lastPromptOffsetRem = NaN;
+      if (next) {
+        promptResizeObserver = new ResizeObserver(refreshPromptHeight);
+        promptResizeObserver.observe(next, { box: 'border-box' });
+      }
+      refreshPromptHeight();
+    }
+
+    /** How far `container` is from its bottom, iOS bounce clamped away. */
+    function distanceToBottom(container: Element): number {
+      const maxScroll = Math.max(0, container.scrollHeight - container.clientHeight);
+      return maxScroll - clampedScrollTop(container);
+    }
+
+    /** Shown again wherever the thread's end has come within a prompt's height,
+     *  whether the reader scrolled there or the content shrank to it. */
+    function clampPromptToBottom() {
+      if (currentViewKey !== 'thread' || !currentContainer) return;
+      promptOffset = Math.min(promptOffset, distanceToBottom(currentContainer));
     }
 
     function applyTransform() {
@@ -202,9 +294,18 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
           chevronEl?.style.setProperty('--mobile-header-offset', value);
         }
       }
+      const slides = promptCanSlide({ disabled, keyboardOpen, composeEmpty: composeViewActive.peek() });
+      const promptOffsetRem = (slides ? promptOffset : 0) / cachedRemSize;
+      if (promptOffsetRem !== lastPromptOffsetRem) {
+        lastPromptOffsetRem = promptOffsetRem;
+        // A transform, never a layout property, and on the two consumers only.
+        if (promptEl) promptEl.style.transform = promptOffsetRem ? `translateY(${promptOffsetRem}rem)` : '';
+        downChevronEl?.style.setProperty('--mobile-prompt-offset', `${promptOffsetRem}rem`);
+      }
     }
 
-    /** Sync headerOffset to match a container's scroll position (keyboard dismiss). */
+    /** Sync headerOffset to match a container's scroll position (keyboard dismiss).
+     *  The prompt stays shown: the reader was just typing into it. */
     function syncToScroll(container: Element | null) {
       if (container) {
         const scrollPos = Math.max(0, container.scrollTop);
@@ -214,6 +315,7 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
         headerOffset = 0;
         prevScrollTop = 0;
       }
+      promptOffset = 0;
       applyTransform();
     }
 
@@ -315,9 +417,15 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
       // and takes the reveal. The POSITION answers it exactly. An event that
       // finds the container where the anchor write left it is that write's
       // own, whoever marked in between.
+      // The prompt answers to the same rule as the header: revealed by our own
+      // placements and held rides, and held still by an anchor write.
       if (isNavigationScroll() || isHeaderPinnedForScroll()) {
         prevScrollTop = scrollTop;
-        if (!isAnchorScroll() && !atAnchoredTop) headerOffset = 0;
+        if (!isAnchorScroll() && !atAnchoredTop) {
+          headerOffset = 0;
+          promptOffset = 0;
+        }
+        clampPromptToBottom();
         applyTransform();
         return;
       }
@@ -332,6 +440,14 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
       const delta = scrollTop - prevScrollTop;
 
       headerOffset = clampOffset(headerOffset - delta);
+      if (currentViewKey === 'thread') {
+        promptOffset = nextPromptOffsetPx({
+          offset: promptOffset,
+          delta,
+          promptHeight,
+          distanceToBottom: distanceToBottom(currentContainer),
+        });
+      }
       applyTransform();
       prevScrollTop = scrollTop;
     }
@@ -341,7 +457,7 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
      *  the transform; updateHeaderVar alone leaves the header stuck at
      *  translateY(-cachedHeight) above the viewport. */
     function recoverKeyboardState() {
-      if (!keyboardOpen) return;
+      if (!keyboardOpen || closePending) return;
       const active = document.activeElement;
       if (active && opensSoftwareKeyboard(active)) return;
       keyboardOpen = false;
@@ -367,6 +483,7 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
       // element with no value at all, so the title bar would sit at its resting
       // position while the header is scrolled away.
       const rebound = bindOffsetConsumers(container);
+      bindPrompt();
 
       if (container === currentContainer) {
         // Nothing else changed, but freshly-bound elements need the current
@@ -409,12 +526,14 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
           headerOffset = clampOffset(-actualScroll);
           prevScrollTop = actualScroll;
         }
+        clampPromptToBottom();
         container.addEventListener('scroll', onScroll, { passive: true });
       } else {
         // No scroll container — reset scroll-based offset. applyTransform
         // still hides the header if keyboard is open (keyboardOpen flag).
         headerOffset = 0;
         prevScrollTop = 0;
+        if (view === 'thread') promptOffset = 0;
       }
       applyTransform();
     }
@@ -432,7 +551,7 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
       // Title bar is inside the scroll pane (not the header) but should
       // behave like a header input — don't hide when editing the title.
       if (target.closest('.mobile-thread-title-row')) return;
-      // Header pinned visible (sticky pref / app-ui): it never slides off for
+      // Header pinned visible (pinned bars / app-ui): it never slides off for
       // the keyboard, so the spacer must stay full-height. Collapsing it here
       // would slide content up behind the still-visible header (editing a
       // device name on an iOS PWA rendered the input under the header).
@@ -460,16 +579,26 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
       // Focus moving to another text input (e.g. prompt → CC menu filter):
       // skip header restore — the subsequent focusin keeps keyboardOpen true
       // without a visible flash.
-      const next = e.relatedTarget as HTMLElement | null;
-      if (next && opensSoftwareKeyboard(next) && !headerRef.current?.contains(next)
-          && !next.closest('.mobile-thread-title-row')) return;
-      keyboardOpen = false;
-      updateHeaderVar();
-      // Mirror onFocusIn: spacer grows back, so add the same delta to scrollTop.
-      if (currentContainer) {
-        currentContainer.scrollTop += cachedHeight - cachedSafeAreaTop;
-      }
-      syncToScroll(currentContainer);
+      if (keepsHeaderAway(e.relatedTarget as Element | null)) return;
+      // After the press that blurred, so its release still hits its target.
+      // Until then `recoverKeyboardState` leaves the close to this, which also
+      // compensates the scroll.
+      closePending = true;
+      afterPressSettles(() => {
+        closePending = false;
+        if (disposed || !keyboardOpen || keepsHeaderAway(document.activeElement)) return;
+        keyboardOpen = false;
+        updateHeaderVar();
+        // Mirror onFocusIn: spacer grows back, so add the same delta to scrollTop.
+        if (currentContainer) {
+          currentContainer.scrollTop += cachedHeight - cachedSafeAreaTop;
+        }
+        syncToScroll(currentContainer);
+      });
+    }
+    function keepsHeaderAway(el: Element | null): boolean {
+      return !!el && opensSoftwareKeyboard(el) && !headerRef.current?.contains(el)
+        && !el.closest('.mobile-thread-title-row');
     }
     document.addEventListener('focusout', onFocusOut);
 
@@ -504,6 +633,11 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
               applyTransform();
             }
           }
+          // The mirror at the bottom: a shrink that brings the thread's end
+          // within a prompt's height shows the prompt again.
+          const promptBefore = promptOffset;
+          clampPromptToBottom();
+          if (promptOffset !== promptBefore) applyTransform();
         }
       });
     });
@@ -549,21 +683,30 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
     }
     coldStartPollId = requestAnimationFrame(coldStartPoll);
 
-    // Reveal header when a change is applied/discarded/reverted — the user
-    // is typically scrolled far down and the header is hidden, but the state
-    // transition warrants showing the app header again.
-    function onRevealHeader() {
+    // Reveal the header and the prompt on request: a change applied, discarded
+    // or reverted, a deep link landing, or the prompt about to take focus. The
+    // reader is often scrolled far down with both bars away.
+    function onRevealBars() {
       headerOffset = 0;
+      promptOffset = 0;
       prevScrollTop = currentContainer ? Math.max(0, currentContainer.scrollTop) : 0;
       applyTransform();
     }
-    document.addEventListener('reveal-mobile-header', onRevealHeader);
+    document.addEventListener('reveal-mobile-bars', onRevealBars);
 
     function recomputeDisabled() {
+      const nextDynamicBars = currentMobileDynamicBars();
+      if (nextDynamicBars !== dynamicBars) {
+        dynamicBars = nextDynamicBars;
+        // Gates the prompt's overlay layout in styles/mobile.css. Off, the
+        // prompt keeps its in-flow place and the transcript no spacer.
+        document.documentElement.toggleAttribute('data-mobile-dynamic-bars', dynamicBars);
+        updatePromptHeightVar();
+      }
       const next = shouldKeepHeaderVisible({
         view: mobileView.value,
         overlayType: panelOverlay.value?.type,
-        stickyPref: currentMobileHeaderSticky(),
+        dynamicBars,
       });
       if (next === disabled) return;
       disabled = next;
@@ -611,14 +754,21 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
 
     const unsubOverlay = panelOverlay.subscribe(recomputeDisabled);
     const unsubPrefs = preferences.subscribe(recomputeDisabled);
+    // Entering or leaving the compose-empty view: its prompt never slides, and
+    // the thread a first send lands on starts with the prompt shown.
+    const unsubCompose = composeViewActive.subscribe(() => {
+      promptOffset = 0;
+      applyTransform();
+    });
 
     return () => {
+      disposed = true;
       if (currentContainer) {
         currentContainer.removeEventListener('scroll', onScroll);
       }
       document.removeEventListener('focusin', onFocusIn);
       document.removeEventListener('focusout', onFocusOut);
-      document.removeEventListener('reveal-mobile-header', onRevealHeader);
+      document.removeEventListener('reveal-mobile-bars', onRevealBars);
       window.removeEventListener('resize', refreshHeight);
       window.visualViewport?.removeEventListener('resize', refreshHeight);
       if (coldStartPollId !== null) cancelAnimationFrame(coldStartPollId);
@@ -631,12 +781,18 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
       unsub();
       unsubOverlay();
       unsubPrefs();
+      unsubCompose();
+      promptResizeObserver?.disconnect();
+      if (promptEl) promptEl.style.transform = '';
+      downChevronEl?.style.removeProperty('--mobile-prompt-offset');
+      document.documentElement.removeAttribute('data-mobile-dynamic-bars');
+      document.documentElement.style.removeProperty('--mobile-prompt-height');
       if (headerRef.current) {
         headerRef.current.style.transform = '';
       }
       document.documentElement.style.removeProperty('--mobile-header-height');
       document.documentElement.style.removeProperty('--mobile-thread-title-height');
-      // The offset lives on its two consumers, not the root (bindOffsetConsumers).
+      // The offsets live on their consumers, not the root (bindOffsetConsumers).
       titleBarEl?.style.removeProperty('--mobile-header-offset');
       chevronEl?.style.removeProperty('--mobile-header-offset');
     };

@@ -24,6 +24,11 @@ use super::spawn_env::{apply_lucidos_env, drain_stderr};
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 pub struct CcMenuOption {
     pub value: String,
+    /// The concrete model this row runs, when the backend said so. A session
+    /// reports this id at Init, and the thread records it, so a spawn must
+    /// accept it too. Only discovered Claude Code rows carry it.
+    #[serde(default)]
+    pub resolved_model: Option<String>,
     pub label: String,
     pub description: String,
     /// Optional model compatibility metadata used by Codex reasoning efforts.
@@ -160,6 +165,7 @@ pub(super) fn model_and_effort_options(
         .map(|m| {
             serde_json::json!({
                 "value": m.value,
+                "resolved_model": m.resolved_model,
                 "label": m.label,
                 "description": m.description,
                 "reasoning_efforts": m
@@ -184,11 +190,60 @@ pub(super) fn model_and_effort_options(
     (model_options, effort_options)
 }
 
+/// Model families, strongest first: the order the picker groups them in.
+const CC_FAMILIES_STRONGEST_FIRST: [&str; 4] = ["fable", "opus", "sonnet", "haiku"];
+
+/// The model a row runs: the id Claude Code resolved it to, else its own value.
+fn model_run_by(option: &CcMenuOption) -> &str {
+    option.resolved_model.as_deref().unwrap_or(&option.value)
+}
+
+/// A model id's family rank and version, read from its dash-separated parts.
+/// `claude-opus-4-8[1m]` is Opus 4.8. A version-free alias such as `opus`
+/// has an empty version, so it sorts after every numbered one in its family.
+/// A dated id's date part is not a version, so a number stops the read.
+fn family_and_version(id: &str) -> (usize, Vec<u32>) {
+    let base = id.split(['[', '@']).next().unwrap_or(id);
+    let parts: Vec<&str> = base.split('-').collect();
+    for (rank, family) in CC_FAMILIES_STRONGEST_FIRST.iter().enumerate() {
+        if let Some(at) = parts.iter().position(|p| p == family) {
+            let version = parts[at + 1..]
+                .iter()
+                .map_while(|p| p.parse::<u32>().ok().filter(|_| p.len() <= 2))
+                .collect();
+            return (rank, version);
+        }
+    }
+    (CC_FAMILIES_STRONGEST_FIRST.len(), Vec::new())
+}
+
+/// The rows the Claude Code picker shows, in the order it shows them.
+///
+/// Default first, then the strongest family first, newest version first. A
+/// row that runs the same model as a row above it is left out, Default
+/// excepted. Display only: a spawn validates against the full list, so the
+/// id of a row left out here is still accepted.
+pub(super) fn cc_picker_rows(options: &[CcMenuOption]) -> Vec<CcMenuOption> {
+    let mut sorted: Vec<&CcMenuOption> = options.iter().collect();
+    sorted.sort_by_cached_key(|o| {
+        let (family, version) = family_and_version(model_run_by(o));
+        (o.value != "default", family, std::cmp::Reverse(version))
+    });
+    let mut shown_models = std::collections::HashSet::new();
+    sorted
+        .into_iter()
+        .filter(|o| o.value == "default" || shown_models.insert(model_run_by(o)))
+        .cloned()
+        .collect()
+}
+
 /// Render the menu of supported control commands for the frontend's `/model`
-/// picker. CC-specific — Codex and other agents have their own menus.
+/// picker. CC-specific: Codex and other agents have their own menus.
 pub fn cc_command_definitions() -> serde_json::Value {
-    let (model_options, effort_options) =
-        model_and_effort_options(&cc_model_options(), cc_reasoning_effort_options());
+    let (model_options, effort_options) = model_and_effort_options(
+        &cc_picker_rows(&cc_model_options()),
+        cc_reasoning_effort_options(),
+    );
     serde_json::json!([
         {
             "subtype": "set_model",
@@ -199,11 +254,6 @@ pub fn cc_command_definitions() -> serde_json::Value {
             "subtype": "set_reasoning_effort",
             "label": "Reasoning Effort",
             "params": [{ "key": "effort", "label": "Reasoning Effort", "options": effort_options }]
-        },
-        {
-            "subtype": "set_permission_mode",
-            "label": "Permission Mode",
-            "params": [{ "key": "mode", "label": "Mode", "placeholder": "plan" }]
         }
     ])
 }
@@ -214,9 +264,6 @@ pub fn cc_control_request_to_json(request: &ControlRequest, request_id: &str) ->
         ControlRequest::Interrupt => serde_json::json!({ "subtype": "interrupt" }),
         ControlRequest::SetModel { model } => {
             serde_json::json!({ "subtype": "set_model", "model": model })
-        }
-        ControlRequest::SetPermissionMode { mode } => {
-            serde_json::json!({ "subtype": "set_permission_mode", "mode": mode })
         }
         ControlRequest::SetReasoningEffort { effort } => {
             serde_json::json!({ "subtype": "set_reasoning_effort", "effort": effort })
@@ -274,6 +321,12 @@ fn init_model(line: &str) -> Option<String> {
     (value.get("subtype")?.as_str()? == "init")
         .then(|| value.get("model")?.as_str().map(str::to_string))
         .flatten()
+}
+
+/// Whether a stdout line is Claude Code's replay of an input it read.
+fn replays_an_input(line: &str) -> bool {
+    line.contains("\"isReplay\"")
+        && serde_json::from_str(line.trim()).is_ok_and(|value| parse::is_input_replay(&value))
 }
 
 /// The usage block of a `result` line. Claude Code reports the uncached input
@@ -489,6 +542,10 @@ fn build_side_question_command(
 /// Send the side question's `message` to `child` and wait for its `result`,
 /// then tear the process group down whatever happened. `child` must lead its
 /// own group.
+///
+/// Only a `result` after the question's replay answers it. A resumed session
+/// may first close older work with an empty `result`, such as a background
+/// task it reports stopped.
 async fn ask_side_question_of(
     mut child: Child,
     message: &str,
@@ -506,6 +563,7 @@ async fn ask_side_question_of(
         let mut reader = BufReader::new(stdout);
         let mut line = String::new();
         let mut model = None;
+        let mut question_read = false;
         loop {
             line.clear();
             if reader.read_line(&mut line).await? == 0 {
@@ -515,7 +573,11 @@ async fn ask_side_question_of(
             }
             if let Some(named) = init_model(&line) {
                 model = Some(named);
-            } else if let Some((answer, usage)) = side_question_result(&line) {
+            } else if replays_an_input(&line) {
+                question_read = true;
+            } else if let Some((answer, usage)) =
+                side_question_result(&line).filter(|_| question_read)
+            {
                 return Ok(SideQuestionReply {
                     answer,
                     usage,
@@ -972,8 +1034,11 @@ fn build_command_with_settings(
         .arg(permission_mcp_config_json(cli_dir))
         .arg("--strict-mcp-config")
         .arg("--settings")
-        .arg(settings)
-        .current_dir(args.worktree_path)
+        .arg(settings);
+    for dir in args.additional_directories {
+        cmd.arg("--add-dir").arg(dir);
+    }
+    cmd.current_dir(args.worktree_path)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())

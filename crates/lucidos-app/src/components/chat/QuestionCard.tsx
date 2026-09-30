@@ -306,7 +306,7 @@ function OptionButton({
 }
 
 /** Resolved-state rendering: options dim, the picked one is highlighted; the
- *  Custom-answer block surfaces freetext (FreeText answers, or the freetext
+ *  typed-answer block surfaces freetext (FreeText answers, or the freetext
  *  typed alongside a MultiSelected); Canceled renders a disabled Cancel button
  *  styled like the picked permission affordance. Exported for unit tests.
  *
@@ -358,7 +358,7 @@ export function AnsweredBody({
       )}
       {((customText && customText.length > 0) || imageHashes.length > 0) && (
         <div class="question-freetext">
-          <span class="question-freetext-label">Custom answer</span>
+          <span class="question-freetext-label">Your answer</span>
           <div class="user-bubble question-freetext-text">
             {customText}
             <UserImages imageHashes={imageHashes} />

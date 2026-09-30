@@ -170,7 +170,7 @@ describe('AnsweredBody: the custom answer wears the user bubble', () => {
   // things this pins can fail it: the header comes first, and the answer
   // still wears `.user-bubble`.
   const LABEL_THEN_BUBBLE =
-    /class="question-freetext-label">Custom answer<\/span><div class="[^"]*\buser-bubble\b[^"]*">/;
+    /class="question-freetext-label">Your answer<\/span><div class="[^"]*\buser-bubble\b[^"]*">/;
 
   it('renders a FreeText answer in a user bubble under its header', () => {
     const text = vnodeToText(AnsweredBody({
@@ -205,7 +205,7 @@ describe('AnsweredBody: the custom answer wears the user bubble', () => {
       resolved: { kind: 'Selected', option_id: 'a' },
     }));
     expect(text).not.toContain('question-freetext');
-    expect(text).not.toContain('Custom answer');
+    expect(text).not.toContain('Your answer');
   });
 });
 

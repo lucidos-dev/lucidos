@@ -772,17 +772,6 @@ const PERMISSION_ASK_RULE: &str = "\n\n\
     question (Codex: your escalation justification). Write it for the user: what it does and \
     why, like \"Read the triggers doc, to see how triggers install\", not \"Run sed\".";
 
-/// When to archive is the agent's call, not an engine rule, so it has to be
-/// told the rule (ADR 0310). Carried beside [`BACKGROUND_PROCESS_RULE`] by every
-/// flavor that can spawn a sub-thread; a merge session cannot. Mirrored for the
-/// chat agent in `chat::process::system_prompt`'s PARALLEL WORK section. Change
-/// both together.
-const ARCHIVING_THREADS_RULE: &str = "\
-    ARCHIVING THREADS: Nothing archives a thread for you. Once its change is applied and no \
-    follow-up is expected, run `lucidos threads archive --thread <child-uuid|current>` \
-    (`current` lands when your turn ends). Not while a follow-up, question, pending change or \
-    live event wait remains.";
-
 /// Append backend-specific rules — plus the backend-independent
 /// [`REASONING_NOT_VISIBLE_RULE`], which rides every prompt here — to a finished
 /// system prompt — the single
@@ -868,7 +857,6 @@ pub(super) fn worktree_system_prompt(branch_name: &str, workspace_name: &str) ->
          {raise_findings}\n\n\
          {apply_confirmation}\n\n\
          {background_process}\n\n\
-         {archiving_threads}\n\n\
          SESSION SUMMARY: After hardening completes, output a structured summary of what \
          was implemented in this session. List each change with its status (committed, applied, \
          pending). Include file names and brief descriptions. This is the last thing you output \
@@ -888,7 +876,6 @@ pub(super) fn worktree_system_prompt(branch_name: &str, workspace_name: &str) ->
         raise_findings = RAISE_USER_REACHING_FINDINGS_RULE,
         apply_confirmation = APPLY_CONFIRMATION_NOTE,
         background_process = BACKGROUND_PROCESS_RULE,
-        archiving_threads = ARCHIVING_THREADS_RULE,
         process_safety = process_safety_rule(true),
     )
 }
@@ -920,7 +907,6 @@ pub(super) fn external_repo_system_prompt(
          {ask_user_question}\n\n\
          {raise_findings}\n\n\
          {background_process}\n\n\
-         {archiving_threads}\n\n\
          CRITICAL: Never run `exit` as a bash command. If the user asks you to exit or stop, \
          simply say goodbye and finish your response — the Lucidos engine manages your lifecycle. \
          Running `exit` in bash can crash the host application.{process_safety}{build_slot}",
@@ -928,7 +914,6 @@ pub(super) fn external_repo_system_prompt(
         ask_user_question = ASK_USER_QUESTION_RULE,
         raise_findings = RAISE_USER_REACHING_FINDINGS_RULE,
         background_process = BACKGROUND_PROCESS_RULE,
-        archiving_threads = ARCHIVING_THREADS_RULE,
         process_safety = process_safety_rule(false),
         build_slot = BUILD_SLOT_RULE,
     )
@@ -953,7 +938,6 @@ pub(super) fn external_repo_recovery_system_prompt(repo_name: &str, branch_name:
          {ask_user_question}\n\n\
          {raise_findings}\n\n\
          {background_process}\n\n\
-         {archiving_threads}\n\n\
          CRITICAL: Never run `exit` as a bash command.{process_safety}{build_slot}",
         branch = branch_name,
         repo = repo_name,
@@ -962,7 +946,6 @@ pub(super) fn external_repo_recovery_system_prompt(repo_name: &str, branch_name:
         ask_user_question = ASK_USER_QUESTION_RULE,
         raise_findings = RAISE_USER_REACHING_FINDINGS_RULE,
         background_process = BACKGROUND_PROCESS_RULE,
-        archiving_threads = ARCHIVING_THREADS_RULE,
         process_safety = process_safety_rule(false),
         build_slot = BUILD_SLOT_RULE,
     )
@@ -1000,7 +983,6 @@ pub(super) fn recovery_system_prompt(branch_name: &str, workspace_name: &str) ->
          {raise_findings}\n\n\
          {apply_confirmation}\n\n\
          {background_process}\n\n\
-         {archiving_threads}\n\n\
          CRITICAL: Never run `exit` as a bash command.{process_safety}",
         preamble = workspace_preamble(workspace_name),
         branch = branch_name,
@@ -1015,7 +997,6 @@ pub(super) fn recovery_system_prompt(branch_name: &str, workspace_name: &str) ->
         raise_findings = RAISE_USER_REACHING_FINDINGS_RULE,
         apply_confirmation = APPLY_CONFIRMATION_NOTE,
         background_process = BACKGROUND_PROCESS_RULE,
-        archiving_threads = ARCHIVING_THREADS_RULE,
         process_safety = process_safety_rule(true),
     )
 }
@@ -1080,7 +1061,6 @@ pub(super) fn app_worktree_system_prompt(
          {raise_findings}\n\n\
          {apply_confirmation}\n\n\
          {background_process}\n\n\
-         {archiving_threads}\n\n\
          SESSION SUMMARY: Output a structured summary of what was implemented in this \
          session. List each change with a brief description. This is the last thing you \
          output before finishing.\n\n\
@@ -1092,7 +1072,6 @@ pub(super) fn app_worktree_system_prompt(
         raise_findings = RAISE_USER_REACHING_FINDINGS_RULE,
         apply_confirmation = APPLY_CONFIRMATION_NOTE,
         background_process = BACKGROUND_PROCESS_RULE,
-        archiving_threads = ARCHIVING_THREADS_RULE,
         app_knowhow = APP_KNOWHOW_RULE,
         process_safety = process_safety_rule(false),
     )
@@ -1130,7 +1109,6 @@ pub(super) fn app_worktree_recovery_system_prompt(
          {raise_findings}\n\n\
          {apply_confirmation}\n\n\
          {background_process}\n\n\
-         {archiving_threads}\n\n\
          CRITICAL: Never run `exit` as a bash command.{process_safety}",
         restart_not_rejection = RESTART_NOT_REJECTION_RULE,
         commit_cadence = COMMIT_CADENCE_RULE,
@@ -1138,7 +1116,6 @@ pub(super) fn app_worktree_recovery_system_prompt(
         raise_findings = RAISE_USER_REACHING_FINDINGS_RULE,
         apply_confirmation = APPLY_CONFIRMATION_NOTE,
         background_process = BACKGROUND_PROCESS_RULE,
-        archiving_threads = ARCHIVING_THREADS_RULE,
         app_knowhow = APP_KNOWHOW_RULE,
         process_safety = process_safety_rule(false),
     )
@@ -1635,19 +1612,6 @@ mod tests {
         );
     }
 
-    /// When to archive is the agent's call (ADR 0310), so a session that can
-    /// spawn a sub-thread is told the rule. A merge session cannot spawn one.
-    #[test]
-    fn the_archiving_rule_reaches_every_flavor_that_can_spawn() {
-        let full = append_backend_rules(
-            worktree_system_prompt("feature/x", "dev"),
-            crate::runtime::CodingAgent::ClaudeCode,
-        );
-        assert!(full.contains("ARCHIVING THREADS"));
-        assert!(full.contains("lucidos threads archive"));
-        assert!(!conflict_resolution_system_prompt().contains("ARCHIVING THREADS"));
-    }
-
     /// Byte ceiling for each assembled system prompt, measured AFTER
     /// `append_backend_rules` because that is what a session actually receives.
     ///
@@ -1699,15 +1663,11 @@ mod tests {
         // Those four rows and both conflict_resolution rows are 257 bytes
         // higher for `PERMISSION_ASK_RULE`. The other rows had the slack.
         //
-        // The same four rows rose again, by 74 (Claude Code) and 91 (Codex),
-        // for `ARCHIVING_THREADS_RULE` (ADR 0310). The other spawning flavors
-        // had the slack; a merge session does not carry it.
-        //
         // The same four rose by 185 more when `APPLY_RESTART_RULE` learned
         // that every file a binary embeds requires a restart. An agent that
         // misses it promises an Apply the running engine never picks up.
-        ("worktree", "claude-code", 26887),
-        ("worktree", "codex", 25027),
+        ("worktree", "claude-code", 26813),
+        ("worktree", "codex", 24936),
         // The four external-repo rows are 569 bytes higher than they were, for
         // `BUILD_SLOT_RULE` (ADR 0070). Only these flavors carry it. A
         // Lucidos-source session is already covered, because `make lint` and
@@ -1715,8 +1675,8 @@ mod tests {
         // an instruction the session cannot use.
         ("external_repo", "claude-code", 19293),
         ("external_repo", "codex", 17433),
-        ("recovery", "claude-code", 25482),
-        ("recovery", "codex", 23622),
+        ("recovery", "claude-code", 25408),
+        ("recovery", "codex", 23531),
         ("external_repo_recovery", "claude-code", 19169),
         ("external_repo_recovery", "codex", 17309),
         ("app_worktree", "claude-code", 21895),

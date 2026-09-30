@@ -426,7 +426,7 @@ $ lucidos threads archive --thread current
 - **From inside a thread you can archive only yourself and your own DIRECT children.** The engine reads the calling thread off the origin token, and resolves `current` to it. Anything else is a 403 with `not_your_thread`, an unknown id a 404, and a discarded thread a 409. Outside a thread, with no origin token, it archives any thread, as the Archive button does.
 - **A child is archived now**, with its own sub-threads. **`current` is archived once this turn ends** and the thread has settled. A new message into it before then keeps it open.
 - **The Archive button's refusals apply.** A running target or one waiting on the user is a 409 with `parent_not_archivable`. A pending change is `parent_has_pending_changes`, and a blocking sub-thread is `descendants_blocking`. Each body carries a `message` saying what to do. A pinned target is a 409 with `thread_pinned`: only the user archives a pinned thread. A pinned sub-thread of the target stays open and is listed under `skipped`.
-- **Archive once the change is applied and no follow-up is expected.** Archiving lets the worktree be reclaimed, so a later follow-up rebuilds it.
+- **Archiving lets the worktree be reclaimed**, so a later follow-up rebuilds it.
 
 ### `lucidos spawn-thread --to <WS> --message <M> [--coding-agent <backend>] [--folder <path> | --repo <name>] [--relation child|top] [--title <T>] [--model <M>] [--coding-agent-model <M>] [--reasoning-effort <level>]`
 
@@ -1199,18 +1199,18 @@ delta. No CLI flag for it: the set is a selection, not a scalar.
 
 ### `lucidos changes list [--sub-threads-of <uuid> | --my-sub-threads]`
 
-List pending and recently-applied *changes*. Wraps `GET /api/v1/changes` and echoes the engine's payload verbatim to stdout. This is the canonical way for a script to find a pending change's id before `apply` — read `.pending[].id`. Don't scan `ChangeProposed` events for the id when this one command gives it directly.
+List pending, set-aside and recently-applied *changes*. Wraps `GET /api/v1/changes` and echoes the engine's payload verbatim to stdout. This is the canonical way for a script to find a pending change's id before `apply`: read `.pending[].id`. Don't scan `ChangeProposed` events for the id when this one command gives it directly.
 
 ```bash
 $ lucidos changes list
-{"pending":[{"id":"fbcc4a3a-...","branch_name":"lucidos-claude-code-repo-lucidos-fix-...","description":"fix: …","status":"pending",...}],"applied":[...],"total_pending":1,"restart_required":false,"restart_groups":[],"client_update_available":false,"has_more_applied":false}
+{"pending":[{"id":"fbcc4a3a-...","branch_name":"lucidos-claude-code-repo-lucidos-fix-...","description":"fix: …","status":"pending",...}],"set_aside":[],"applied":[...],"total_pending":1,"restart_required":false,"restart_groups":[],"client_update_available":false,"has_more_applied":false}
 
 # Find the single pending change's id (e.g. in a build → apply pipeline):
 $ CID=$(lucidos changes list | jq -r '.pending[0].id')
 $ lucidos changes apply "$CID"
 ```
 
-The response carries `pending`, `applied` (recently applied), `total_pending`, and `restart_required`. Each pending change has `id` / `branch_name` / `description` / `status` / `file_count` / `requires_restart` / `thread_id` / `thread_title`. Its apply state is `thread_unsettled` / `thread_settling` / `resolving_conflict` / `apply_phase_started_at` / `predicted_conflict`. Exit non-zero on transport / HTTP error.
+The response carries `pending`, `set_aside` (kept for later, newest first), `applied` (recently applied), `total_pending`, and `restart_required`. Each pending change has `id` / `branch_name` / `description` / `status` / `file_count` / `requires_restart` / `thread_id` / `thread_title`. Its apply state is `thread_unsettled` / `thread_settling` / `resolving_conflict` / `apply_phase_started_at` / `predicted_conflict`. Exit non-zero on transport / HTTP error.
 
 `predicted_conflict` is `conflict`, `clean` or `unknown`: would merging the change into `main` right now conflict. `unknown` means git could not answer, so never read it as clean. `apply_phase_started_at` is when a running hardening or conflict resolution began.
 
@@ -1227,7 +1227,7 @@ $ lucidos changes list --my-sub-threads
 
 `--my-sub-threads` reads `LUCIDOS_THREAD_ID`, like `threads list --my-children`, so it works only from inside a Lucidos thread. `total_pending` counts the narrowed list.
 
-> **In-thread agent:** the chat Lucidos Agent has the equivalent `changes` tool. Its `list` action returns the same `{pending, applied, total_pending}` shape **in-process** (no HTTP round-trip), with the same flags filled. Its `sub_threads_of` argument takes a thread id, or `current` for its own thread. Use it from a chat / trigger thread; use this CLI from a `script:`-typed trigger or a bash / Python subprocess.
+> **In-thread agent:** the chat Lucidos Agent has the equivalent `changes` tool. Its `list` action returns the same `{pending, set_aside, applied, total_pending}` shape **in-process** (no HTTP round-trip), with the same flags filled. Its `sub_threads_of` argument takes a thread id, or `current` for its own thread. Use it from a chat / trigger thread; use this CLI from a `script:`-typed trigger or a bash / Python subprocess.
 
 ### `lucidos changes apply <change-id>`
 
@@ -1250,7 +1250,9 @@ $ lucidos changes apply fbcc4a3a-2c14-4d5b-8d1a-9e84d4c9d4ec
 
 > **Taking one back:** `cancel_standing_apply` is the off for both. With a `thread_id` it cancels that thread's instruction. Without one it cancels every standing apply in the workspace, which is what the Changes panel's own off does. It stops future applies only: a change already merging or hardening keeps going, and nothing already applied is reverted. Cancelling a running Apply All batch is a different action.
 
-> **All four ask the same authority question the CLI does.** Applying a change from your own subtree needs nothing. Anything wider is the *workspace owner*'s, and the tool returns the refusal above rather than applying. `apply_as_they_settle` is always wider, since the sweep reaches every thread in the workspace, and so is a `cancel_standing_apply` naming no thread.
+> **Setting a change aside:** `set_aside` keeps a pending change for later, out of Review and Apply All, and lets its thread be archived. `bring_back` returns it to pending. Neither loses the branch. `set_aside` is refused where Discard is, and `apply` refuses a set-aside change until it is brought back. LLM-only, with no CLI form.
+
+> **All six ask the same authority question the CLI does.** Applying a change from your own subtree needs nothing. Anything wider is the *workspace owner*'s, and the tool returns the refusal above rather than applying. `apply_as_they_settle` is always wider, since the sweep reaches every thread in the workspace, and so is a `cancel_standing_apply` naming no thread.
 
 The response carries:
 

@@ -11,6 +11,7 @@ import {
   discardingCCThreadIds,
   cancelingThreadIds,
   changes,
+  setAsideChanges,
 } from '../../../store/store';
 import type { ThreadState } from '../../../store/thread-events';
 import type { TaggedAction } from '../../../store/actions/threadActions';
@@ -42,6 +43,7 @@ function makeCCThread(id: string, overrides: Partial<ThreadState['meta']> = {}):
       createdAt: '',
       updatedAt: '',
       status: 'waiting',
+      summaryVersion: 0,
       messageCount: 0,
       section: 'inbox',
       activeChildrenCount: 0,
@@ -76,6 +78,7 @@ beforeEach(() => {
   discardingCCThreadIds.value = new Set();
   cancelingThreadIds.value = new Set();
   changes.value = { status: 'loaded', data: [] };
+  setAsideChanges.value = { status: 'loaded', data: [] };
   vi.mocked(viewChangeDiff).mockReset();
   vi.mocked(viewThreadCcDiff).mockReset();
 });
@@ -266,7 +269,7 @@ describe('getBannerActions', () => {
       isArchiving: false,
       showDiff: false,
     });
-    const ctx = { openedViaKeyboard: false, run: (fn: () => void) => () => fn(), anchor: null };
+    const ctx = { run: (fn: () => void) => () => fn(), anchor: null };
     const menu = members[0].menuRows!(ctx);
     expect(buttonLabels(menu)).toEqual(['Apply', 'Discard']);
   });
@@ -454,5 +457,30 @@ describe('getStandaloneActions', () => {
 
     expect(diffNodes(rows(getStandaloneActions())).map((v) => v.props.threadId)).toEqual(['tid']);
     expect(viewChangeDiff).not.toHaveBeenCalled();
+  });
+});
+
+// A set-aside change keeps a way back on its own thread, even once the thread
+// is archived and offers nothing else (ADR 0328).
+describe('a thread holding a set-aside change', () => {
+  it('offers Bring back, archived or not', () => {
+    const thread = makeCCThread('t-aside', { status: 'idle', section: 'archived' });
+    threadMap.value = new Map([['t-aside', thread]]);
+    focusedThreadId.value = 't-aside';
+    setAsideChanges.value = {
+      status: 'loaded',
+      data: [{ id: 'c-aside', thread_id: 't-aside', status: 'set_aside' } as never],
+    };
+    const state = getWaitingState();
+    expect(state).toMatchObject({ type: 'actions', setAsideChangeId: 'c-aside' });
+    const keys = getBannerActions(state as Parameters<typeof getBannerActions>[0]).map((m) => m.key);
+    expect(keys).toContain('bring-back');
+  });
+
+  it('offers nothing to bring back when the thread has no set-aside change', () => {
+    const thread = makeCCThread('t-none', { status: 'idle', section: 'archived' });
+    threadMap.value = new Map([['t-none', thread]]);
+    focusedThreadId.value = 't-none';
+    expect(getWaitingState()).toBeNull();
   });
 });

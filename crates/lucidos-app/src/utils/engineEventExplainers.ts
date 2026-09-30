@@ -99,6 +99,8 @@ export function describeEngineReason(reason: EngineReason): string | null {
       return 'The engine re-triggers `/harden` when the hardening marker is missing or stale, so changes aren’t applied unhardened.';
     case 'stale_session':
       return 'The engine cleans up Claude Code sessions that became stale (process gone, marker missing). This event marks the cleanup.';
+    case 'archived_branch_work':
+      return 'This thread was archived with work on its branch that no change carried. The engine set that work aside so it is not lost. Bring it back from the Changes panel to apply it.';
     case 'merge_conflict':
       return 'The engine detected a conflict when merging changes from main into your branch. We need to resolve it before applying.';
     case 'missing_hardening':

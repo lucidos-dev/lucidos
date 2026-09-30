@@ -235,6 +235,9 @@ export type EngineReason =
   | { kind: 'harden_retrigger' }
   /** Stale Claude Code session detected on startup; changes proposed from its branch. */
   | { kind: 'stale_session' }
+  /** An archived thread's branch held work no change carried, so the
+   *  engine set it aside rather than lose it (ADR 0328). */
+  | { kind: 'archived_branch_work' }
   /** Engine detected a merge conflict pulling main into a CC branch. */
   | { kind: 'merge_conflict' }
   /** Engine detected the harden marker is missing or stale before apply. */
@@ -1327,14 +1330,15 @@ export type ThreadEvent =
        *  Stamped from `is_harden_marker_present` at end-of-turn aggregate
        *  emit; engine-internal recovery emits resolve it the same way. */
       hardened?: boolean;
-      /** `true` only when engine-internal recovery proposes commits whose
-       *  originating turn was killed before closure (stale-session sweep,
-       *  orphan worktree recovery). The frontend reads this to confirm
-       *  before Apply so the user knows they're landing recovered work.
-       *  Live end-of-turn aggregate emits always stamp `false` because
-       *  `may_touch_change_state_at_idle` refuses to emit on non-`Generated`
-       *  terminals. */
+      /** `true` when the work did not come from a finished turn: a user Stop
+       *  cut it short, or recovery found it after a turn was killed. The
+       *  frontend confirms before Apply, and Apply All passes it over. A
+       *  later clean turn re-emits with `false`. */
       incomplete?: boolean;
+      /** `true` when the engine proposes the change straight into set-aside:
+       *  work found on an archived thread's branch (ADR 0328). It leaves
+       *  the thread where it is instead of surfacing it for review. */
+      set_aside?: boolean;
       path?: string;
       diff?: string;
       /** Links this event back to the request that opened the turn. */
@@ -1382,6 +1386,30 @@ export type ThreadEvent =
       request_event_id?: string;
       /** Source channel. Always set on an origin event. */
       channel?: EventChannel;
+    }
+  /** The change was kept for later: out of Review and every bulk path until
+   *  it is brought back (ADR 0328). The actor rides on `EventMeta`. */
+  | {
+      type: 'ChangeSetAside';
+      change_id: string;
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
+  /** A set-aside change returned to pending, by the user or because its
+   *  thread proposed new work on the same branch. */
+  | {
+      type: 'ChangeBroughtBack';
+      change_id: string;
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
     }
   | {
       type: 'ChangeReverted';
@@ -1475,15 +1503,15 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** Coding-agent session settings changed mid-session (model, reasoning effort,
-   *  or permission mode). Persisted per-thread so settings survive idle exit
-   *  and respawn.
+  /** Coding-agent session settings changed mid-session (model or reasoning
+   *  effort). Persisted per-thread so settings survive idle exit and respawn.
+   *  Older stored rows may also carry a `permission_mode` key, so this variant
+   *  must keep ignoring unknown fields.
    *  Full reasoning is on the Rust variant. */
   | {
       type: 'CodingAgentSettingsChanged';
       model?: string;
       reasoning_effort?: string;
-      permission_mode?: string;
       coding_agent?: CodingAgent;
       cc_session_id?: string;
       /** Absolute `CLAUDE_CONFIG_DIR` the session was created under, stamped
@@ -1494,7 +1522,7 @@ export type ThreadEvent =
        *  `SpawnArgs::account_pin`), and a mid-flight user toggle of the
        *  env var cannot strand the session. `None` on legacy rows,
        *  on the pre-Init settings emit, and on mid-session settings-only emits
-       *  (model/effort/permission changes). The Init emit is the carrier. */
+       *  (model/effort changes). The Init emit is the carrier. */
       claude_config_dir?: string;
       /** Whether `CLAUDE_CONFIG_DIR` was actually set for that session, stamped
        *  beside `claude_config_dir`. `false` means it was unset and the dir is
@@ -2374,6 +2402,8 @@ const THREAD_EVENT_TYPE_FLAGS = {
   ChangeProposed: true,
   ChangeApplied: true,
   ChangeDiscarded: true,
+  ChangeSetAside: true,
+  ChangeBroughtBack: true,
   ChangeReverted: true,
   ChangeApplyFailed: true,
   MergeConflictDetected: true,

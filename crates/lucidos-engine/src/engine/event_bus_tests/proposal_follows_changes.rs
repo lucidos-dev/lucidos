@@ -62,6 +62,7 @@ fn proposal(
         repo_root: "/tmp".into(),
         hardened: false,
         incomplete: false,
+        set_aside: false,
         path: String::new(),
         diff: String::new(),
     }

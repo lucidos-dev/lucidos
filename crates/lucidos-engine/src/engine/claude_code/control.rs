@@ -287,7 +287,20 @@ impl LucidosEngine {
                 if self.cancel_thread(tid, actor.clone()) {
                     return Ok(true);
                 }
-                settle_stuck_running_thread(&self.pool, &self.event_bus, tid, actor, terminal).await
+                let settled = settle_stuck_running_thread(
+                    &self.pool,
+                    &self.event_bus,
+                    tid,
+                    actor.clone(),
+                    terminal,
+                )
+                .await?;
+                // No live session will propose what the stopped turn left, so
+                // this Stop does (ADR 0328).
+                if settled && terminal == SettleTerminal::CanceledQuestion {
+                    self.propose_stopped_work(tid, actor).await;
+                }
+                Ok(settled)
             }
         } else {
             if guard.is_empty() {

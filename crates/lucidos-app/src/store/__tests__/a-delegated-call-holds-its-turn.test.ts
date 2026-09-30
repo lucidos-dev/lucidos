@@ -186,8 +186,7 @@ describe('a delegated call', () => {
   });
 
   /** A hangup settles the CALL, never the work. The doer's answer outlives the
-   *  line, so a turn that produced nothing is still a turn that produced
-   *  nothing. */
+   *  line, so while the doer still runs, the card stays live. */
   it('is not settled by the caller ringing off either', () => {
     const events = aDelegatedCall();
     put(events, 20, {
@@ -198,6 +197,6 @@ describe('a delegated call', () => {
     });
     put(events, 30, { type: 'VoiceSessionEnded', session_id: 'sess-1', reason: 'hangup', duration_secs: 30 });
     const card = theCard(groupIntoExchanges(events));
-    expect(exchangeStatus(card, '', true, false, false, true)).not.toBe('done');
+    expect(exchangeStatus(card, '', true, false, false, /* threadIdle */ false)).not.toBe('done');
   });
 });

@@ -8,14 +8,16 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ChangeStatus {
     Pending,
+    SetAside,
     Applied,
     Discarded,
     Reverted,
 }
 
 impl ChangeStatus {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::Pending,
+        Self::SetAside,
         Self::Applied,
         Self::Discarded,
         Self::Reverted,
@@ -24,6 +26,7 @@ impl ChangeStatus {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Pending => "pending",
+            Self::SetAside => "set_aside",
             Self::Applied => "applied",
             Self::Discarded => "discarded",
             Self::Reverted => "reverted",
@@ -204,6 +207,9 @@ pub enum ChangeState {
         thread: PendingThreadState,
         apply: PendingApplyOutlook,
     },
+    /// Kept for later, out of Review and every bulk path. Apply refuses it
+    /// until it is brought back (ADR 0328).
+    SetAside,
     Applied(MergeShas),
     Reverted(MergeShas),
     Discarded,
@@ -213,6 +219,7 @@ impl ChangeState {
     pub fn status(&self) -> ChangeStatus {
         match self {
             Self::Pending { .. } => ChangeStatus::Pending,
+            Self::SetAside => ChangeStatus::SetAside,
             Self::Applied(_) => ChangeStatus::Applied,
             Self::Reverted(_) => ChangeStatus::Reverted,
             Self::Discarded => ChangeStatus::Discarded,
@@ -241,10 +248,9 @@ pub struct Change {
     /// The *change summary*, when a model has written one for the current
     /// commit list. `None` for a single-commit change and until it lands.
     pub summary: Option<String>,
-    /// `true` when the originating CC turn ended in `ResponseFailed` —
-    /// the worktree state reflects partial work, not a deliberate
-    /// completion. The frontend reads this to surface a confirm-before-Apply
-    /// warning so the user knows they're about to land partial changes.
+    /// `true` when the work did not come from a finished turn: a user Stop
+    /// cut it short, or recovery found it after a turn was killed. Apply
+    /// confirms first, and Apply All passes it over.
     pub incomplete: bool,
 }
 
@@ -340,6 +346,7 @@ impl TryFrom<ChangeRow> for Change {
                 thread: PendingThreadState::default(),
                 apply: PendingApplyOutlook::default(),
             },
+            ChangeStatus::SetAside => ChangeState::SetAside,
             ChangeStatus::Applied => ChangeState::Applied(shas),
             ChangeStatus::Reverted => ChangeState::Reverted(shas),
             ChangeStatus::Discarded => ChangeState::Discarded,
@@ -644,6 +651,13 @@ pub fn drop_empty_changes(changes: Vec<Change>) -> Vec<Change> {
         .collect()
 }
 
+/// Return the subset of `changes` a bulk apply may land: everything except
+/// incomplete work. A Stop or a killed turn left it, so only a per-change Apply,
+/// which confirms first, lands it (ADR 0328).
+pub fn drop_incomplete_changes(changes: Vec<Change>) -> Vec<Change> {
+    changes.into_iter().filter(|c| !c.incomplete).collect()
+}
+
 /// Which pending changes a reader asked for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PendingScope {
@@ -673,6 +687,22 @@ pub async fn list_pending_for_readers(
     enrich_thread_titles(pool, &mut pending).await?;
     enrich_pending_state(pool, &mut pending).await?;
     Ok(pending)
+}
+
+/// The set-aside changes as every reader sees them: titled, newest first, and
+/// scoped the same way as the pending list.
+pub async fn list_set_aside_for_readers(
+    pool: &PgPool,
+    proj: &crate::core::changes_projection::ChangesProjection,
+    scope: PendingScope,
+) -> Result<Vec<Change>, sqlx::Error> {
+    let mut set_aside = proj.list_set_aside().await?;
+    if let PendingScope::SubThreadsOf(root) = scope {
+        let below = sub_thread_ids(pool, root).await?;
+        set_aside.retain(|c| c.thread_id.is_some_and(|tid| below.contains(&tid)));
+    }
+    enrich_thread_titles(pool, &mut set_aside).await?;
+    Ok(set_aside)
 }
 
 /// Fill the [`PendingThreadState`] and [`PendingApplyOutlook`] of each pending
@@ -1218,6 +1248,20 @@ mod tests {
         assert_eq!(kept_ids, vec![normal_id, applied_id]);
     }
 
+    /// O4: a bulk apply never lands incomplete work, which a Stop or a killed
+    /// turn left. Only its own Apply, which confirms first, lands it.
+    #[test]
+    fn drop_incomplete_changes_keeps_only_finished_work() {
+        let finished = make_change(None);
+        let mut stopped = make_change(None);
+        stopped.incomplete = true;
+
+        let finished_id = finished.id;
+        let kept = drop_incomplete_changes(vec![finished, stopped]);
+        let kept_ids: Vec<_> = kept.iter().map(|c| c.id).collect();
+        assert_eq!(kept_ids, vec![finished_id]);
+    }
+
     /// Every surface that serves a pending list reads it through
     /// `list_pending_for_readers`. A behavioural test cannot catch a new
     /// reader that forgets: it has no flags to assert against, only `false`.
@@ -1266,7 +1310,10 @@ mod tests {
     #[test]
     fn every_change_status_round_trips_through_its_wire_string() {
         let wire: Vec<&str> = ChangeStatus::ALL.iter().map(|s| s.as_str()).collect();
-        assert_eq!(wire, ["pending", "applied", "discarded", "reverted"]);
+        assert_eq!(
+            wire,
+            ["pending", "set_aside", "applied", "discarded", "reverted"]
+        );
         for status in ChangeStatus::ALL {
             assert_eq!(status.as_str().parse::<ChangeStatus>(), Ok(status));
             let json = serde_json::to_string(&status).unwrap();

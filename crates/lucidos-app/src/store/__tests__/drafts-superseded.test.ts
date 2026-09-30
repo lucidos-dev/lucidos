@@ -82,6 +82,7 @@ function makeActiveThread(id: string, updatedAt: string): ThreadState {
       createdAt: '2026-07-28T00:00:00.000Z',
       updatedAt,
       status: 'idle',
+      summaryVersion: 0,
       messageCount: 1,
       section: 'inbox',
       activeChildrenCount: 0,

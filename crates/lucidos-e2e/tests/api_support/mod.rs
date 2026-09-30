@@ -570,3 +570,45 @@ pub async fn poll_thread_summary_by_marker(
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
 }
+
+/// Commit one file on a new branch in the e2e workspace, off `main`, through a
+/// throwaway worktree. The worktree is removed afterwards and the branch kept,
+/// the shape a coding-agent branch has once cleanup reclaimed its tree.
+pub fn commit_on_new_branch(branch: &str, file: &str, contents: &str) {
+    let wt_dir = std::env::temp_dir().join(format!("e2e-wt-{}", branch.replace('/', "-")));
+    git(&[
+        "worktree",
+        "add",
+        wt_dir.to_str().unwrap(),
+        "-b",
+        branch,
+        "main",
+    ]);
+    std::fs::write(wt_dir.join(file), contents).unwrap();
+    git_in(&wt_dir, &["add", file]);
+    git_in(&wt_dir, &["commit", "-m", &format!("e2e: {file}")]);
+    git(&["worktree", "remove", "--force", wt_dir.to_str().unwrap()]);
+}
+
+/// Record a coding-agent session on `branch` for `thread_id`, straight into
+/// the events table. Kind `app` routes the engine to the workspace repo, where
+/// `commit_on_new_branch` puts the work.
+pub async fn insert_session_started(pool: &sqlx::PgPool, thread_id: uuid::Uuid, branch: &str) {
+    let payload = serde_json::json!({
+        "coding_agent": "claude-code",
+        "session_id": format!("sess-{thread_id}"),
+        "branch": branch,
+        "coding_agent_kind": "app",
+        "channel": "claude_code",
+    });
+    sqlx::query(
+        "INSERT INTO events (id, aggregate, aggregate_id, event_type, payload, created, thread_id) \
+         VALUES ($1, 'thread', $2::text, 'SessionStarted', $3, NOW(), $2)",
+    )
+    .bind(uuid::Uuid::new_v4())
+    .bind(thread_id)
+    .bind(payload)
+    .execute(pool)
+    .await
+    .expect("failed to insert SessionStarted");
+}

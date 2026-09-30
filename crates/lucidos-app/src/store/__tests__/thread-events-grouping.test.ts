@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { TS, makeThreadState } from './thread-events-helpers';
-import { abortPromisesAutoResume, abortTookEngineDown, computeExchanges, exchangeKey, exchangeStatus, groupIntoExchanges, handleEvent, isSwitchTeardownAbort, responseAbortedSummary, resumeEngineNote, continuableAbortIndex, type AbortCause, type Exchange, type MessageOrigin, type StoredEvent, type ThreadAggregate, type ThreadEvent, type ThreadState, type TransientEvent } from '../thread-events';
+import { applySummaryVersion, abortPromisesAutoResume, abortTookEngineDown, computeExchanges, exchangeKey, exchangeStatus, groupIntoExchanges, handleEvent, isSwitchTeardownAbort, responseAbortedSummary, resumeEngineNote, continuableAbortIndex, type AbortCause, type Exchange, type MessageOrigin, type StoredEvent, type ThreadAggregate, type ThreadEvent, type ThreadState, type TransientEvent } from '../thread-events';
 
 describe('aggregate-takes-precedence over event-type lookups', () => {
   function makeAggregate(overrides: Partial<ThreadAggregate> = {}): ThreadAggregate {
@@ -14,6 +14,7 @@ describe('aggregate-takes-precedence over event-type lookups', () => {
       messageCount: 1,
       section: 'archived',
       status: 'idle',
+      summaryVersion: 0,
       activeChildrenCount: 0,
       totalChildrenCount: 0,
       blockingDescendantCount: 0, attentionDescendantCount: 0, liveEventWaitCount: 0,
@@ -51,7 +52,7 @@ describe('aggregate-takes-precedence over event-type lookups', () => {
 
   it('aggregate.status overrides updateStatusFromEvent', () => {
     const thread = makeThreadState();
-    thread.meta.status = 'running';
+    applySummaryVersion(thread.meta, thread.meta.summaryVersion, 'running');
     const map = new Map([['thread-1', thread]]);
     // ResponseGenerated with no CC changes would normally drive status='idle' —
     // aggregate says 'waiting' (e.g. coding_agent_proposed was set in the same exchange).

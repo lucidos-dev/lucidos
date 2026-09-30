@@ -331,27 +331,11 @@ pub(crate) async fn has_pending_fan_in(pool: &PgPool, thread_id: Uuid) -> bool {
 /// the user manually deleted `.git/worktrees/<name>` so the worktree is now
 /// stranded). Tier 2 callers fall back to a `remove_dir_all` in that case.
 pub(crate) async fn resolve_repo_root_from_worktree(worktree: &Path) -> Option<PathBuf> {
-    let out = git_cmd(&["rev-parse", "--git-common-dir"], worktree)
+    let common = crate::engine::git_ops::git_common_dir(worktree)
         .await
         .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if raw.is_empty() {
-        return None;
-    }
-    // `--git-common-dir` may return a relative path (relative to the worktree)
-    // or an absolute path. Resolve to absolute against the worktree.
-    let common = PathBuf::from(&raw);
-    let abs = if common.is_absolute() {
-        common
-    } else {
-        worktree.join(common)
-    };
     // Strip the trailing `.git` segment to get the main working tree root.
-    let parent = abs.parent()?.to_path_buf();
-    Some(parent)
+    Some(common.parent()?.to_path_buf())
 }
 
 /// True iff `worktree` is a *stranded* linked worktree: its `.git` file points

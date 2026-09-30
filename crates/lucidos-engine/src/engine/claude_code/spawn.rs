@@ -265,7 +265,7 @@ impl LucidosEngine {
             claimant,
         );
 
-        self.discard_pending_for_thread(thread_id, actor).await;
+        self.discard_open_changes_for_thread(thread_id, actor).await;
 
         self.reset_worktree_and_idle(thread_id, &worktree).await;
 

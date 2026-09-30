@@ -120,6 +120,55 @@ pub(crate) async fn git_ran_ok(args: &[&str], dir: &Path) -> Result<(), String> 
     }
 }
 
+/// The repo's shared `.git` directory, as an absolute path. Asked from a linked
+/// worktree, it names the main checkout's `.git`. A failed spawn, the timeout,
+/// a non-zero exit and an empty answer are all `Err`, never a guessed path.
+pub(crate) async fn git_common_dir(dir: &Path) -> Result<PathBuf, String> {
+    let out = git_cmd(&["rev-parse", "--git-common-dir"], dir).await?;
+    if !out.status.success() {
+        return Err(format!(
+            "git rev-parse --git-common-dir failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if raw.is_empty() {
+        return Err("git rev-parse --git-common-dir returned nothing".to_string());
+    }
+    // Git may answer relative to `dir`. Joining an absolute answer returns it.
+    Ok(dir.join(raw))
+}
+
+/// The repo's main working tree, asked from any worktree of it. Git lists it
+/// first in `git worktree list`, which holds for a submodule too. A bare repo
+/// has none. Nor does a `--separate-git-dir` clone asked from a linked
+/// worktree: git records no path for it and names the git dir instead. Both
+/// are `Err`, like every failure to ask.
+pub(crate) async fn git_main_worktree(dir: &Path) -> Result<PathBuf, String> {
+    let out = git_cmd(&["worktree", "list", "--porcelain"], dir).await?;
+    if !out.status.success() {
+        return Err(format!(
+            "git worktree list failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut first = stdout.lines().take_while(|line| !line.is_empty());
+    let path = first
+        .next()
+        .and_then(|line| line.strip_prefix("worktree "))
+        .ok_or("git worktree list named no worktree")?;
+    if first.any(|line| line == "bare") {
+        return Err("the repo is bare, so it has no main working tree".to_string());
+    }
+    let main = PathBuf::from(path);
+    let same = |a: &Path, b: &Path| std::fs::canonicalize(a).ok() == std::fs::canonicalize(b).ok();
+    if same(&main, &git_common_dir(dir).await?) {
+        return Err("git records no main working tree for this repo".to_string());
+    }
+    Ok(main)
+}
+
 /// Like [`git_cmd`] but with extra environment variables. Used by the command
 /// checkpoint helpers, which set `GIT_INDEX_FILE` to a throwaway index so a
 /// snapshot/restore never disturbs the repo's real index or working tree.

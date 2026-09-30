@@ -44,8 +44,13 @@ async fn changes_updated_payload(
     proj: &crate::core::changes_projection::ChangesProjection,
     apply_estimates: crate::engine::apply_estimate::ApplyEstimates,
 ) -> Option<SystemEvent> {
-    let (pending_r, applied_r, restart_r) = tokio::join!(
+    let (pending_r, set_aside_r, applied_r, restart_r) = tokio::join!(
         crate::core::changes::list_pending_for_readers(
+            pool,
+            proj,
+            crate::core::changes::PendingScope::All,
+        ),
+        crate::core::changes::list_set_aside_for_readers(
             pool,
             proj,
             crate::core::changes::PendingScope::All,
@@ -53,37 +58,45 @@ async fn changes_updated_payload(
         proj.list_recently_applied(APPLIED_IN_BROADCAST, None),
         proj.requires_restart_since(RESTART_REQUIRED_WINDOW),
     );
-    let (pending, mut applied, restart_required) = match (pending_r, applied_r, restart_r) {
-        (Ok(p), Ok(a), Ok(r)) => (p, a, r),
-        (perr, aerr, rerr) => {
-            if let Err(e) = perr {
-                log!(
-                    "[Changes] changes_updated_payload: list_pending_for_readers: {}",
-                    e
-                );
+    let (pending, set_aside, mut applied, restart_required) =
+        match (pending_r, set_aside_r, applied_r, restart_r) {
+            (Ok(p), Ok(s), Ok(a), Ok(r)) => (p, s, a, r),
+            (perr, serr, aerr, rerr) => {
+                if let Err(e) = perr {
+                    log!(
+                        "[Changes] changes_updated_payload: list_pending_for_readers: {}",
+                        e
+                    );
+                }
+                if let Err(e) = serr {
+                    log!(
+                        "[Changes] changes_updated_payload: list_set_aside_for_readers: {}",
+                        e
+                    );
+                }
+                if let Err(e) = aerr {
+                    log!(
+                        "[Changes] changes_updated_payload: list_recently_applied: {}",
+                        e
+                    );
+                }
+                if let Err(e) = rerr {
+                    log!(
+                        "[Changes] changes_updated_payload: requires_restart_since: {}",
+                        e
+                    );
+                }
+                log!("[Changes] changes_updated_payload: skipping ChangesUpdated emit");
+                return None;
             }
-            if let Err(e) = aerr {
-                log!(
-                    "[Changes] changes_updated_payload: list_recently_applied: {}",
-                    e
-                );
-            }
-            if let Err(e) = rerr {
-                log!(
-                    "[Changes] changes_updated_payload: requires_restart_since: {}",
-                    e
-                );
-            }
-            log!("[Changes] changes_updated_payload: skipping ChangesUpdated emit");
-            return None;
-        }
-    };
+        };
     if let Err(e) = crate::core::changes::enrich_thread_titles(pool, &mut applied).await {
         log!("[Changes] enrich applied titles: {}", e);
     }
     Some(SystemEvent::ChangesUpdated {
         total_pending: pending.len(),
         pending,
+        set_aside,
         applied,
         restart_required,
         apply_estimates,
@@ -802,6 +815,7 @@ mod tests {
                 repo_root: "/repo".to_string(),
                 hardened: true,
                 incomplete: false,
+                set_aside: false,
                 path: String::new(),
                 diff: String::new(),
             },

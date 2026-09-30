@@ -42,10 +42,11 @@ use source::{
     write_atomic_like, SourceType,
 };
 
-/// Every installed plugin's merge baseline, keyed by plugin id. Resolved before
-/// the blocking fetch and handed into it, since the staged plugin's id is only
-/// known once its manifest parses inside that task.
-type PluginBaselines = std::collections::BTreeMap<String, PluginBaseline>;
+/// Every installed plugin's merge baseline, keyed by plugin id, or why they
+/// could not be read. Resolved before the blocking fetch and handed into it,
+/// since the staged plugin's id is only known once its manifest parses inside
+/// that task.
+type PluginBaselines = Result<std::collections::BTreeMap<String, PluginBaseline>, String>;
 
 // Named by other modules via the `plugins::` path (`engine::tools::files`
 // routes plugin-owned deletes here), so it stays a re-export.
@@ -254,15 +255,11 @@ pub(crate) async fn stage_install_request(engine: &LucidosEngine, source_str: &s
     let source = source_str.to_string();
     // Read every plugin's merge baseline up front. The staged plugin's id
     // appears only when the fetched manifest parses, inside the blocking task.
-    // So it cannot look up its own baseline from in there. A read failure
-    // degrades to no baselines, which is today's plain overwrite.
-    let baselines = match project_baselines(&engine.pool).await {
-        Ok(b) => b,
-        Err(e) => {
-            log!(@Plugins, "read merge baselines failed (updates will overwrite local edits): {}", e);
-            PluginBaselines::new()
-        }
-    };
+    // So it cannot look up its own baseline from in there.
+    let baselines = project_baselines(&engine.pool).await.map_err(|e| {
+        log!(@Plugins, "read merge baselines failed: {}", e);
+        e.to_string()
+    });
     // The staging body is synchronous, so its credentials are resolved here.
     let credentials = credentials_for_source(&engine.pool, source_str).await;
     match tokio::task::spawn_blocking(move || {
@@ -360,9 +357,22 @@ pub(crate) fn prepare_install_request(
     // An update over a plugin the user has edited: work out per file whether
     // their edit merges, conflicts, or is simply lost, so the panel can say so
     // before they confirm. A fresh install has no baseline and no plan.
-    let merge = match baselines.get(&manifest.id) {
-        Some(baseline) => merge::plan_local_changes(workspace_path, baseline, &planned),
-        None => MergePlan::default(),
+    // Unreadable baselines refuse any staging that would overwrite a file: the
+    // panel could not name the user's edits, and confirm would not save them.
+    let merge = match baselines {
+        Ok(baselines) => match baselines.get(&manifest.id) {
+            Some(baseline) => merge::plan_local_changes(workspace_path, baseline, &planned),
+            None => MergePlan::default(),
+        },
+        Err(e) if !overwrites.is_empty() => {
+            return format!(
+                "Error: could not read the installed plugins' records, so Lucidos cannot tell \
+                 whether '{}' would overwrite your local edits. Nothing was changed. Try again \
+                 in a moment. Cause: {}",
+                manifest.id, e
+            );
+        }
+        Err(_) => MergePlan::default(),
     };
 
     let preview = serde_json::json!({

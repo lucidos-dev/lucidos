@@ -1,6 +1,7 @@
 #!/bin/bash
-# PreToolUse hook: refuse to WRITE a U+2014 EM DASH or U+2015 HORIZONTAL BAR.
-# The primary gate for `.claude/rules/no-em-dashes.md`, and the only layer that
+# PreToolUse hook: refuse to WRITE an unspaced U+2014 EM DASH, or any U+2015
+# HORIZONTAL BAR. A spaced em dash passes: `banned()` in the library decides.
+# The primary gate for `.claude/rules/em-dashes.md`, and the only layer that
 # stops the text before it exists: prose alone is what already failed, and the
 # review-time scanner (scripts/check-em-dashes.sh, /harden Phase 4.5) can only
 # catch it after the fact.
@@ -53,19 +54,19 @@ source "$LIB"
 # argument matched as the message. Every attempt to recognise the message
 # argument leaks: `-m "text"`, `-m"text"`, `-am "text"`, `--message=text` and a
 # `-F` file all reach the same place, and a pattern for the first form misses
-# the rest. A `git commit` invocation has no legitimate reason to carry one of
-# these characters anywhere, and a message read from a file was already gated
-# when that file was written.
+# the rest. A `git commit` invocation has no legitimate reason to carry a
+# banned dash anywhere, and a message read from a file was already gated when
+# that file was written.
 if [ "$TOOL" = "Bash" ]; then
     COMMAND=$(printf '%s' "$INPUT" | jq -r '.tool_input.command // empty' 2> /dev/null) || exit 0
     [ -n "$COMMAND" ] || exit 0
     printf '%s' "$COMMAND" | grep -qE '(^|[^[:alnum:]_./-])git([[:space:]]|$)' || exit 0
     printf '%s' "$COMMAND" | grep -qE '(^|[^[:alnum:]_./-])commit([[:space:]]|$)' || exit 0
-    em_dash_text_has "$COMMAND" || exit 0
+    em_dash_text_has_banned "$COMMAND" || exit 0
     {
-        echo "BLOCKED: no em dashes in commit messages (.claude/rules/no-em-dashes.md)."
+        echo "BLOCKED: an unspaced em dash in a commit message (.claude/rules/em-dashes.md)."
         echo
-        echo "This commit message carries U+2014 EM DASH or U+2015 HORIZONTAL BAR:"
+        echo "This commit message carries an unspaced U+2014 EM DASH or a U+2015 HORIZONTAL BAR:"
         echo
         printf '%s\n' "$COMMAND" | sed 's/^/  /'
         echo
@@ -100,9 +101,9 @@ OFFENDERS="$(em_dash_added_lines "$TMP_BASE" "$TMP_CAND")" || exit 0
 [ -n "$OFFENDERS" ] || exit 0
 
 {
-    echo "BLOCKED: no em dashes (.claude/rules/no-em-dashes.md)."
+    echo "BLOCKED: an unspaced em dash (.claude/rules/em-dashes.md)."
     echo
-    echo "This $TOOL adds U+2014 EM DASH or U+2015 HORIZONTAL BAR to $FILE:"
+    echo "This $TOOL adds an unspaced U+2014 EM DASH or a U+2015 HORIZONTAL BAR to $FILE:"
     echo
     printf '%s\n' "$OFFENDERS" | awk -v w="$WHERE" '{ n = $0; sub(/:.*$/, "", n); sub(/^[0-9]+:/, ""); printf "  %s %s: %s\n", w, n, $0 }'
     echo

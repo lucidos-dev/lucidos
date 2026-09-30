@@ -52,6 +52,16 @@ pub const MOCK_READ_FILES_SENTINEL: &str = "MOCK_READ_FILES:";
 /// because each also shapes the turn around its call.
 pub const MOCK_TOOL_CALL_SENTINEL: &str = "MOCK_TOOL_CALL:";
 
+/// Sentinel that makes the mock end its reply on a question typed as prose:
+/// `MOCK_ASK_IN_PROSE: <question>`, to the end of the line. The engine then
+/// sends the turn back once, and the mock declines with
+/// [`MOCK_PROSE_NUDGE_REASON`], as a model does for an open-ended question.
+pub const MOCK_ASK_IN_PROSE_SENTINEL: &str = "MOCK_ASK_IN_PROSE:";
+
+/// What the mock says when sent back for a prose question. The user must never
+/// see it, so a test can search the transcript for it.
+pub const MOCK_PROSE_NUDGE_REASON: &str = "Open-ended, so any options would be guesses.";
+
 /// What the mock says on any turn whose message array already carries the
 /// `await_event` call: the iteration right after it subscribes, and the
 /// re-entered turn later. Distinct from [`MOCK_RESPONSE`] so a test can tell those from a
@@ -165,16 +175,39 @@ pub fn scripted_tool_call(messages: &[Message]) -> Option<(String, serde_json::V
     args.is_object().then(|| (name.to_string(), args))
 }
 
+/// What this turn's reply ends on, when it was scripted to end on a question.
+///
+/// The question itself on the first round. On the round the engine sent back,
+/// the decline: the turn's assembled prompt is then an earlier message, with
+/// the drafted question after it.
+pub fn scripted_prose_question(messages: &[Message]) -> Option<String> {
+    if let Some(question) = sentinel_line(messages, MOCK_ASK_IN_PROSE_SENTINEL) {
+        return Some(question);
+    }
+    let (_, earlier) = messages.split_last()?;
+    let asked = earlier
+        .iter()
+        .position(|m| sentinel_line_in(m, MOCK_ASK_IN_PROSE_SENTINEL).is_some())?;
+    earlier[asked + 1..]
+        .iter()
+        .any(|m| m.role == "assistant")
+        .then(|| MOCK_PROSE_NUDGE_REASON.to_string())
+}
+
 /// The rest of the request line after `sentinel`, read from this turn's
 /// assembled prompt only.
 fn sentinel_line(messages: &[Message], sentinel: &str) -> Option<String> {
+    sentinel_line_in(messages.last()?, sentinel)
+}
+
+fn sentinel_line_in(message: &Message, sentinel: &str) -> Option<String> {
     let from_text = |text: &str| {
         let request = text.rsplit(REQUEST_LINE_MARKER).next()?;
         let rest = request.split(sentinel).nth(1)?;
         let line = rest.lines().next()?.trim();
         (!line.is_empty()).then(|| line.to_string())
     };
-    match &messages.last()?.content {
+    match &message.content {
         MessageContent::Text(text) => from_text(text),
         MessageContent::Blocks(blocks) => blocks.iter().find_map(|b| match b {
             ContentBlock::Text { text } => from_text(text),
@@ -319,10 +352,12 @@ impl LlmProvider for MockProvider {
         // Once the array carries an `await_event` call, the turn says its piece
         // and ends: this is the "subscribe, then finish" shape the real tool
         // description asks for.
-        let body = if already_called(&messages, crate::llm::tool_names::AWAIT_EVENT) {
-            MOCK_REENTRY_RESPONSE
+        let body = if let Some(text) = scripted_prose_question(&messages) {
+            text
+        } else if already_called(&messages, crate::llm::tool_names::AWAIT_EVENT) {
+            MOCK_REENTRY_RESPONSE.to_string()
         } else {
-            MOCK_RESPONSE
+            MOCK_RESPONSE.to_string()
         };
 
         if let Some(cb) = &on_token {
@@ -336,7 +371,7 @@ impl LlmProvider for MockProvider {
         }
 
         Ok(LlmResponse {
-            content: Some(body.to_string()),
+            content: Some(body),
             tool_calls: vec![],
             stop_reason: Some("end_turn".to_string()),
             output_tokens: None,
@@ -405,6 +440,30 @@ mod tests {
             "just answer normally",
         );
         assert_eq!(scripted_await_event(&msgs), None);
+    }
+
+    #[test]
+    fn a_prose_question_is_asked_then_declined_when_sent_back() {
+        let mut msgs = assembled("", "MOCK_ASK_IN_PROSE: What are we working on?");
+        assert_eq!(
+            scripted_prose_question(&msgs).as_deref(),
+            Some("What are we working on?")
+        );
+        for (role, text) in [("assistant", "What are we working on?"), ("user", "nudge")] {
+            msgs.push(Message {
+                role: role.to_string(),
+                content: MessageContent::Text(text.to_string()),
+            });
+        }
+        assert_eq!(
+            scripted_prose_question(&msgs).as_deref(),
+            Some(MOCK_PROSE_NUDGE_REASON)
+        );
+        assert_eq!(
+            scripted_prose_question(&assembled("", "hello")),
+            None,
+            "an ordinary turn is not scripted"
+        );
     }
 
     #[test]

@@ -76,6 +76,16 @@
     align-self: flex-end;
 }
 
+/* The control after Diff keeps one width on every row, so Diff sits in one
+   column down the list. 8rem holds "Apply on settle", the longest common face. */
+.change-row-primary {
+    min-width: 8rem;
+}
+
+.change-row-primary .split-button-primary {
+    flex: 1;
+}
+
 .trigger-disabled > .list-row-info {
     opacity: 0.55;
 }

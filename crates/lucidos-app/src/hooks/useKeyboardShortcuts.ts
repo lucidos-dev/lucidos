@@ -1,7 +1,7 @@
 import { useEffect } from 'preact/hooks';
 import { unfocusThread } from '../store/actions/threads';
 import { focusPromptNow } from '../components/chat/promptFocus';
-import { searchEverywhereOpen, searchEverywhereAnchor, focusedPane, toggleExchangeCollapsed, toggleInitiatorCollapsed } from '../store/store';
+import { searchEverywhereOpen, searchEverywhereAnchor, focusedPane, focusedThreadId, toggleExchangeCollapsed, toggleInitiatorCollapsed } from '../store/store';
 import { isTextInput, isThreadTranscript } from '../utils/dom';
 import { dismissTopOverlay, overlayStack } from '../store/overlayStack';
 import { nativeFullscreenElement } from '../store/appFullscreenHost';
@@ -21,9 +21,9 @@ import {
 import { switchMenuItem, openSettingsSubview } from '../store/actions/menu';
 import { openFileSearch } from '../components/files/fileSearchActions';
 import { focusNewestToast } from '../components/shared/Toast';
-import { focusThreadTitleEditor } from '../components/chat/ThreadTitleEditor';
+import { promptRenameThread } from '../store/actions/threadRename';
 import { copyLastResponse } from '../components/chat/copyLastResponse';
-import { promptStopRequested } from '../components/chat/prompt-input-helpers';
+import { promptStopRequested, promptSideQuestionRequested } from '../components/chat/prompt-input-helpers';
 import { seedDrawerHighlight, openHighlightedThreadActions, toggleFocusedThreadFamily } from '../components/drawer/ThreadDrawer';
 import { handlePaneTab, reconcilePaneFocus } from '../components/layout/paneFocus';
 import { historyBack, historyForward } from '../store/actions/focused-pane-history';
@@ -39,8 +39,8 @@ function startNewThread() {
 }
 
 /** Reveal the thread pane, then run `focus` once it is laid out. A collapsed
- *  pane holds its prompt and title at zero size, where focus would land on
- *  nothing the user can see. */
+ *  pane holds its prompt at zero size, where focus would land on nothing the
+ *  user can see. */
 function focusInThreadPane(focus: () => void): void {
   revealThreadPane();
   requestAnimationFrame(focus);
@@ -99,8 +99,15 @@ const SHORTCUT_ACTIONS: Record<ShortcutId, () => void> = {
   focusNewestToast,
   focusComposer: () => focusInThreadPane(focusPromptNow),
   stopThread: () => { promptStopRequested.value = true; },
+  askSideQuestion: () => {
+    revealThreadPane();
+    promptSideQuestionRequested.value = true;
+  },
   copyLastResponse,
-  renameThread: () => focusInThreadPane(focusThreadTitleEditor),
+  renameThread: () => {
+    const id = focusedThreadId.value;
+    if (id) void promptRenameThread(id);
+  },
   // Context-gated: no-ops unless the thread drawer is focused with a thread row
   // highlighted, then opens that row's ⋯ menu (the keyboard route to per-row
   // actions, since the drawer is a single tab stop).
@@ -141,9 +148,9 @@ const SHORTCUT_ACTIONS: Record<ShortcutId, () => void> = {
  *     then plainly visible in the normal layout for the next Escape to close.
  *  1. dismiss the top registered overlay (modal / confirm / pseudo-fullscreen),
  *  2. else, if the focused text input manages its own Escape (`data-escape-self`),
- *     leave focus alone so its keydown handler can run — used by inputs where a
- *     blur commits work (e.g. the thread-title editor, where blur saves a rename
- *     so a blur-on-Escape would SAVE instead of cancel),
+ *     leave focus alone so its keydown handler can run. Inputs whose blur
+ *     commits work use it, such as the trigger group rename field: there a
+ *     blur-on-Escape would SAVE instead of cancel,
  *  3. else blur a focused text input (the universal "Esc defocuses" gesture),
  *  4. else no-op — Escape NEVER touches the focused thread or discards work.
  *  Returns which branch fired so the caller can preventDefault/stopPropagation

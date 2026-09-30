@@ -4,7 +4,7 @@ vi.mock('../../store/actions/threads', () => ({
   focusThreadOrBootstrap: vi.fn(),
 }));
 
-import { openChangeThread, applyBlockedReason, changeRowActions, bulkApplyState, THREAD_UNSETTLED_TIP } from './ChangesView';
+import { openChangeThread, applyBlockedReason, changeRowActions, rowActionClass, rowActionLayout, bulkApplyState, THREAD_UNSETTLED_TIP } from './ChangesView';
 import { focusThreadOrBootstrap } from '../../store/actions/threads';
 import type { Change } from '../../api/client';
 
@@ -113,15 +113,44 @@ describe('changeRowActions: never a disabled change action', () => {
     expect(actions.map((a) => a.kind)).toEqual(['discard']);
   });
 
-  it('offers both on an ordinary settled change', () => {
+  it('offers Discard, Set aside and Apply on an ordinary settled change', () => {
     const actions = changeRowActions(makeChange(), false);
-    expect(actions.map((a) => a.kind)).toEqual(['discard', 'apply']);
-    expect(actions[1]).toMatchObject({ label: 'Apply' });
+    expect(actions.map((a) => a.kind)).toEqual(['discard', 'set-aside', 'apply']);
+    expect(actions[2]).toMatchObject({ label: 'Apply' });
   });
 
   it('marks a restart-requiring Apply, as the old row did', () => {
     const actions = changeRowActions(makeChange({ requires_restart: true }), false);
-    expect(actions[1]).toMatchObject({ kind: 'apply', label: 'Apply*' });
+    expect(actions[2]).toMatchObject({ kind: 'apply', label: 'Apply*' });
+  });
+
+  it('offers no Set aside where Discard is withheld, as the engine gate does', () => {
+    const working = makeChange({ thread_unsettled: true, thread_settling: true });
+    expect(changeRowActions(working, false).map((a) => a.kind)).not.toContain('set-aside');
+    const emptied = makeChange({ file_count: 0 });
+    expect(changeRowActions(emptied, false).map((a) => a.kind)).toEqual(['discard']);
+  });
+
+  // The thread's own change menu draws Set aside as the neutral blue button.
+  it('colours Set aside the way the thread does', () => {
+    expect(rowActionClass({ kind: 'set-aside' }, false)).toBe('action-btn');
+  });
+});
+
+// The row draws the thread's own change button: Apply, with the rest behind
+// its caret and Discard furthest from the face.
+describe('rowActionLayout', () => {
+  it('folds Set aside and Discard behind the Apply caret', () => {
+    const layout = rowActionLayout(changeRowActions(makeChange({ requires_restart: true }), false));
+    expect(layout).toMatchObject({ kind: 'split', primary: { kind: 'apply', label: 'Apply*' } });
+    expect(layout.kind === 'split' && layout.menu.map((a) => a.kind)).toEqual(['set-aside', 'discard']);
+  });
+
+  it('keeps plain buttons where there is no Apply', () => {
+    const emptied = rowActionLayout(changeRowActions(makeChange({ file_count: 0 }), false));
+    expect(emptied).toEqual({ kind: 'flat', buttons: [{ kind: 'discard' }] });
+    const working = makeChange({ thread_unsettled: true, thread_settling: true });
+    expect(rowActionLayout(changeRowActions(working, false)).kind).toBe('flat');
   });
 });
 
@@ -133,27 +162,42 @@ describe('bulkApplyState: Apply All, and the sweep beside it', () => {
     expect(bulkApplyState([settled], 0, 0).show).toBe(false);
   });
 
-  it('offers Apply All plus the checkbox when both are true', () => {
+  it('never counts incomplete work as appliable in bulk', () => {
+    const stopped = makeChange({ id: 'c', incomplete: true });
+    expect(bulkApplyState([stopped], 0, 0).canApplyNow).toBe(false);
+    expect(bulkApplyState([stopped, settled], 0, 0).canApplyNow).toBe(true);
+  });
+
+  it('offers Discard All, the sweep and Apply All when both are true', () => {
     const state = bulkApplyState([settled, working], 1, 0);
-    expect(state).toMatchObject({
+    expect(state).toEqual({
       show: true,
       canApplyNow: true,
-      sweepOnly: false,
+      offerSweep: true,
       armed: false,
-      offerKeepGoing: true,
+      showApplyAll: true,
       showDiscardAll: true,
     });
   });
 
-  it('reads as the sweep alone when nothing can be applied now', () => {
+  it('offers the sweep alone when nothing can be applied now', () => {
     const state = bulkApplyState([working], 2, 0);
-    expect(state).toMatchObject({ show: true, canApplyNow: false, sweepOnly: true });
-    // No checkbox: with nothing appliable, arming IS the button.
-    expect(state.offerKeepGoing).toBe(false);
+    expect(state).toMatchObject({ show: true, canApplyNow: false, offerSweep: true, showApplyAll: false });
+  });
+
+  // The sweep's own request sets the in-flight flag too. Drawing Apply All's
+  // "Applying..." for it would flash a faded pill beside the toggle.
+  it('keeps Apply All hidden while the sweep alone is in flight', () => {
+    expect(bulkApplyState([working], 1, 0, true).showApplyAll).toBe(false);
+  });
+
+  it('keeps Apply All drawn while a batch runs with nothing left to sweep', () => {
+    expect(bulkApplyState([settled, working], 0, 0, true).showApplyAll).toBe(true);
+    expect(bulkApplyState([settled], 1, 0).showApplyAll).toBe(true);
   });
 
   it('offers the sweep with no pending changes at all', () => {
-    expect(bulkApplyState([], 3, 0)).toMatchObject({ show: true, sweepOnly: true });
+    expect(bulkApplyState([], 3, 0)).toMatchObject({ show: true, offerSweep: true });
   });
 
   it('offers nothing with no pending changes and nothing working', () => {
@@ -169,16 +213,16 @@ describe('bulkApplyState: Apply All, and the sweep beside it', () => {
   // only ever re-arm.
   it('flips the sweep to its cancel face once anything is armed', () => {
     const state = bulkApplyState([working], 2, 1);
-    expect(state).toMatchObject({ show: true, sweepOnly: true, armed: true });
+    expect(state).toMatchObject({ show: true, offerSweep: true, armed: true });
   });
 
-  it('withdraws the checkbox once armed, because the toggle says it', () => {
+  it('keeps Apply All beside the armed toggle while a change is ready', () => {
     const state = bulkApplyState([settled, working], 1, 1);
-    expect(state).toMatchObject({ armed: true, canApplyNow: true, offerKeepGoing: false });
+    expect(state).toMatchObject({ armed: true, canApplyNow: true, offerSweep: true });
   });
 
   it('keeps the off reachable after the last thread stops working', () => {
     const state = bulkApplyState([], 0, 1);
-    expect(state).toMatchObject({ show: true, sweepOnly: true, armed: true });
+    expect(state).toMatchObject({ show: true, offerSweep: true, armed: true });
   });
 });

@@ -677,7 +677,7 @@ pub enum SettleTerminal {
 /// Callers come in two kinds, and `actor` is what tells them apart. A **user
 /// button** (Stop, or cancelling a question) passes the clicking device, so the
 /// chip reads "You". An **engine sweep** passes `MessageOrigin::system()`: the
-/// boot floor `settle_orphaned_running_coding_agent_threads`, and the external
+/// boot floor `settle_orphaned_running_threads`, and the external
 /// watchdog's orphan reconciliation pass on its 30s tick.
 ///
 /// A sweep caller must keep passing the system actor. `AbortCause::StaleSettle`
@@ -731,14 +731,35 @@ pub(crate) async fn settle_stuck_running_thread(
         }
     };
 
+    // A coding-agent cancel carries its channel, as the live loop's does.
+    // Readers of "how did the last coding-agent turn end" filter on it, and
+    // without it they read past this Stop to the turn before.
+    let mut meta = crate::engine::thread_events::EventMeta::with_actor(actor);
+    if terminal == SettleTerminal::CanceledQuestion
+        && thread_is_coding_agent(pool, thread_id).await?
+    {
+        meta.channel = Some(crate::engine::thread_events::EventChannel::ClaudeCode);
+    }
     bus.emit(crate::engine::event_bus::BusEvent::Thread {
         thread_id,
         event,
-        meta: crate::engine::thread_events::EventMeta::with_actor(actor),
+        meta,
     })
     .await?;
 
     Ok(true)
+}
+
+async fn thread_is_coding_agent(
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let is_coding_agent: Option<bool> =
+        sqlx::query_scalar("SELECT is_coding_agent FROM thread_summaries WHERE thread_id = $1")
+            .bind(thread_id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(is_coding_agent == Some(true))
 }
 
 #[cfg(test)]

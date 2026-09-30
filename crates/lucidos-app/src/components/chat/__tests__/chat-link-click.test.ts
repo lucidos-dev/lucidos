@@ -764,7 +764,7 @@ describe('chat link click — handler structure pin', () => {
     expect(routerSource).toMatch(/extractLocalFileTarget\(rawHref\)/);
   });
 
-  it('fallback branch calls openAppById, openApp, handleNavigationRequest, openFilePreview and openLocalFile with preventDefault', () => {
+  it('fallback branch calls openAppById, openApp, handleNavigationRequest, openFilePreview and openLocalFileOnConfirm with preventDefault', () => {
     const m = routerSource.match(/closest\('a'\)[\s\S]*?\n\}\n/);
     expect(m).not.toBeNull();
     const body = m![0];
@@ -778,7 +778,7 @@ describe('chat link click — handler structure pin', () => {
     expect(body).toContain('navigateToTrigger(triggerId, source)');
     expect(body).toContain('handleNavigationRequest({ target: navName })');
     expect(body).toContain('openFilePreview(dataPath)');
-    expect(body).toContain('openLocalFile(localFile)');
+    expect(body).toContain('openLocalFileOnConfirm(localFile, source)');
     expect(body).toContain('e.preventDefault()');
   });
 

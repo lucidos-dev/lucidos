@@ -1,7 +1,7 @@
 import { threadMap, awaitedThreadId, focusedThreadId, setFocusedThread, showToast, removeToast, connectionStatus, threadsLoaded, generatedTitleIds, threadHasMore, threadLoadingMore, archiveThreadCount, ALL_CHANNELS, filterFacets, codingAgentSessionVersion, engineRestarting, archivingThreadIds, CODING_AGENT_CHANNEL, toasts, THREAD_EVENTS_LOAD_TOAST_KEY, THREAD_EVENTS_REFRESH_TOAST_KEY, THREAD_EVENTS_FETCH_CONCURRENCY, THREAD_EVENTS_PREFETCH_LIMIT, threadChannelToFilterSource, type ThreadFilterSource } from '../store';
 import { appliedThreadFilter, type ThreadFilterSelection } from '../appliedThreadFilter';
 import { threadPassesChannelFilter } from '../threadFilter';
-import { handleEvent, isCallerUtterance, isChannelDefiningEvent, offerCallerUtterance, PENDING_TITLE_PLACEHOLDER, applyAggregateToMeta, createdKey, isExcludedFromSections, type ThreadAggregate, type ThreadState, type ThreadEvent, type StoredEvent, type ThreadMeta } from '../thread-events';
+import { handleEvent, isCallerUtterance, isChannelDefiningEvent, offerCallerUtterance, PENDING_TITLE_PLACEHOLDER, applyAggregateToMeta, applySummaryVersion, isSummaryCurrent, createdKey, isExcludedFromSections, type ThreadAggregate, type ThreadState, type ThreadEvent, type StoredEvent, type ThreadMeta } from '../thread-events';
 import { bumpThreadEvents } from '../threadActivity';
 import { recordPerfSample } from '../../utils/perfQueue';
 import { runWithConcurrency } from '../../utils/concurrentPool';
@@ -55,6 +55,7 @@ function makeThreadState(info: ThreadSummary, saved: boolean, batch?: DraftBatch
       lastUserAction: info.last_user_action || info.last_activity || info.created_at || new Date().toISOString(),
       lastAgentAction: info.last_agent_action || info.last_activity || info.created_at || new Date().toISOString(),
       status: info.status || 'idle',
+      summaryVersion: info.summary_version,
       messageCount: info.message_count || 0,
       section: (info.section as ThreadMeta['section']) || 'archived',
       activeChildrenCount: info.active_children_count || 0,
@@ -173,12 +174,6 @@ export function upsertThread(
     const existing = map.get(info.thread_id)!;
     if (info.title && info.title !== PENDING_TITLE_PLACEHOLDER && !generatedTitleIds.has(info.thread_id)) existing.meta.title = info.title;
     if (info.created_at) existing.meta.createdAt = info.created_at;
-    // Snapshot the live, pre-overlay last_activity so the status guard below
-    // can spot a stale GET. `apiTime`, `existing.meta.updatedAt` and the
-    // per-thread refresh's currentAggregate all read the SAME monotonic
-    // thread_summaries.last_activity column at different times. An older
-    // `apiTime` therefore means this GET fired before a live event we applied.
-    const liveUpdatedAt = existing.meta.updatedAt;
     const apiTime = info.last_activity || info.created_at;
     // A backend ISO-8601 UTC timestamp is fixed-width with the same timezone
     // suffix, so lexicographic order IS chronological order. A string `>` is
@@ -191,60 +186,50 @@ export function upsertThread(
     if (info.last_agent_action && (!existing.meta.lastAgentAction || info.last_agent_action > existing.meta.lastAgentAction)) existing.meta.lastAgentAction = info.last_agent_action;
     if (info.channel) existing.meta.channel = info.channel as ThreadMeta['channel'];
     if (info.initiator) existing.meta.initiator = info.initiator;
-    // Status is backend-authoritative, but only when this GET is not stale. A
-    // resync GET fired while the thread was `running` can land after live SSE
-    // applied the terminal event. It would then clobber idle back to running,
-    // sticking the dot until a reload. `apiTime < liveUpdatedAt` means exactly
-    // that. Mirrors the monotonic stale-GET guards above.
-    const statusSnapshotStale = !!apiTime && !!liveUpdatedAt && apiTime < liveUpdatedAt;
-    if (info.status && !statusSnapshotStale) existing.meta.status = info.status;
-    if (info.message_count) existing.meta.messageCount = info.message_count;
-    // A local archive or pin flip AT OR AFTER this GET went out makes its
-    // section, pin and codingAgentProposed stale, so skip them. See
-    // `sectionMutatedAt`.
-    const sectionEditedSinceRequest = (sectionMutatedAt.get(info.thread_id) ?? 0) >= requestStartedAt;
-    if (!sectionEditedSinceRequest) {
-      if (saved) existing.meta.saved = true;
-      if (info.section) existing.meta.section = info.section as ThreadMeta['section'];
-      existing.meta.codingAgentProposed = info.coding_agent_proposed || false;
+    // The row's own fields apply only from a summary at least as new as the
+    // one this meta holds (`ThreadMeta.summaryVersion`). A GET that fired
+    // before a live event landed carries an older version and changes none of
+    // them: not the status, the counts, the waits or the flags.
+    const summaryIsCurrent = applySummaryVersion(existing.meta, info.summary_version, info.status);
+    if (summaryIsCurrent) {
+      if (info.message_count) existing.meta.messageCount = info.message_count;
+      // A local archive or pin flip AT OR AFTER this GET went out makes its
+      // section, pin and codingAgentProposed stale, so skip them. See
+      // `sectionMutatedAt`.
+      const sectionEditedSinceRequest = (sectionMutatedAt.get(info.thread_id) ?? 0) >= requestStartedAt;
+      if (!sectionEditedSinceRequest) {
+        if (saved) existing.meta.saved = true;
+        if (info.section) existing.meta.section = info.section as ThreadMeta['section'];
+        existing.meta.codingAgentProposed = info.coding_agent_proposed || false;
+      }
+      existing.meta.activeChildrenCount = info.active_children_count || 0;
+      existing.meta.waitingChildrenCount = info.waiting_children_count || 0;
+      existing.meta.totalChildrenCount = info.total_children_count || 0;
+      existing.meta.blockingDescendantCount = info.blocking_descendant_count || 0;
+      existing.meta.attentionDescendantCount = info.attention_descendant_count || 0;
+      existing.meta.isStoppedChild = info.is_stopped_child === true;
+      existing.meta.liveEventWaitCount = info.live_event_wait_count || 0;
+      // Absence is not emptiness: an older engine or a partial test fixture
+      // omits the field, and must leave a populated list alone. Only an
+      // explicit `[]` clears it.
+      if (info.live_event_waits) existing.meta.liveEventWaits = info.live_event_waits;
+      existing.meta.codingAgentHasDiff = info.coding_agent_has_diff || false;
+      existing.meta.codingAgentRequiresRestart = info.coding_agent_requires_restart || false;
+      existing.meta.codingAgentIsExternalRepo = info.coding_agent_is_external_repo || false;
+      if (info.last_revived_at) existing.meta.lastRevivedAt = info.last_revived_at;
+      // A null clears: a thread moved to top level has no parent any more, and
+      // a truthiness guard would re-nest it on every refresh (ADR 0278).
+      // Absent leaves the value alone, for a partial fixture.
+      if (info.parent_thread_id !== undefined) existing.meta.parentThreadId = info.parent_thread_id ?? undefined;
+      if (info.parent_thread_title !== undefined) existing.meta.parentThreadTitle = info.parent_thread_title ?? undefined;
+      if (info.trigger_id) existing.meta.triggerId = info.trigger_id;
+      if (info.trigger_name) existing.meta.triggerName = info.trigger_name;
+      if (info.cc_repo_id) existing.meta.repoId = info.cc_repo_id;
+      if (info.cc_repo_name) existing.meta.repoName = info.cc_repo_name;
+      if (info.coding_agent_kind) existing.meta.codingAgentKind = info.coding_agent_kind;
+      if (info.coding_agent_folder) existing.meta.codingAgentFolder = info.coding_agent_folder;
+      if (info.coding_agent) existing.meta.codingAgent = info.coding_agent;
     }
-    existing.meta.activeChildrenCount = info.active_children_count || 0;
-    existing.meta.waitingChildrenCount = info.waiting_children_count || 0;
-    existing.meta.totalChildrenCount = info.total_children_count || 0;
-    existing.meta.blockingDescendantCount = info.blocking_descendant_count || 0;
-    existing.meta.attentionDescendantCount = info.attention_descendant_count || 0;
-    existing.meta.isStoppedChild = info.is_stopped_child === true;
-    existing.meta.liveEventWaitCount = info.live_event_wait_count || 0;
-    // The *event wait* list, under the SAME staleness guard as status, and for
-    // the same reason: both directions lose real state. A GET fired before a
-    // wait was armed would blank it. One fired before its delivery would
-    // resurrect a dead wait, countdown and all.
-    //
-    // The guard is exact here. All four `EventWait*` projection arms bump
-    // `last_activity`, and all four are 'activity' in `EVENT_CLASSIFICATION`.
-    // So an arm or a resolution applied over SSE has already advanced
-    // `meta.updatedAt` past this snapshot's `apiTime`.
-    //
-    // Absence is not emptiness: an older engine or a partial test fixture
-    // omits the field, and must leave a populated list alone. Only an explicit
-    // `[]` clears it, which is the reported bug's repair.
-    if (info.live_event_waits && !statusSnapshotStale) existing.meta.liveEventWaits = info.live_event_waits;
-    existing.meta.codingAgentHasDiff = info.coding_agent_has_diff || false;
-    existing.meta.codingAgentRequiresRestart = info.coding_agent_requires_restart || false;
-    existing.meta.codingAgentIsExternalRepo = info.coding_agent_is_external_repo || false;
-    if (info.last_revived_at) existing.meta.lastRevivedAt = info.last_revived_at;
-    // A null clears: a thread moved to top level has no parent any more, and a
-    // truthiness guard would re-nest it on every refresh (ADR 0278). Absent
-    // leaves the value alone, for a partial fixture.
-    if (info.parent_thread_id !== undefined) existing.meta.parentThreadId = info.parent_thread_id ?? undefined;
-    if (info.parent_thread_title !== undefined) existing.meta.parentThreadTitle = info.parent_thread_title ?? undefined;
-    if (info.trigger_id) existing.meta.triggerId = info.trigger_id;
-    if (info.trigger_name) existing.meta.triggerName = info.trigger_name;
-    if (info.cc_repo_id) existing.meta.repoId = info.cc_repo_id;
-    if (info.cc_repo_name) existing.meta.repoName = info.cc_repo_name;
-    if (info.coding_agent_kind) existing.meta.codingAgentKind = info.coding_agent_kind;
-    if (info.coding_agent_folder) existing.meta.codingAgentFolder = info.coding_agent_folder;
-    if (info.coding_agent) existing.meta.codingAgent = info.coding_agent;
     // Refresh compose state from the API. Without this, an SSE skeleton stuck
     // at state='composing' stays invisible forever: `categorizeThreads` skips
     // a composing row, so the thread surfaces in no drawer section even after
@@ -257,11 +242,10 @@ export function upsertThread(
     //   3. A local edit happened AFTER this GET went out, so the response is
     //      stale with respect to compose by definition.
     //
-    // The lifecycle marker takes the same staleness guard as `status` above.
+    // The lifecycle marker takes the same version guard as `status` above.
     // A GET fired before the send lands after it, still saying `composing`.
-    // `ThreadPane` then swaps the transcript back for the compose view and the
-    // drawer drops the row, until the next event carrying an aggregate.
-    if (!statusSnapshotStale) existing.meta.state = info.state;
+    // `ThreadPane` would then swap the transcript back for the compose view.
+    if (summaryIsCurrent) existing.meta.state = info.state;
     const isFocusedThread = info.thread_id === focusedThreadId.value;
     // An EMPTY server snapshot genuinely means the shared draft was sent or
     // discarded by somebody, since the backend clears compose_text on those
@@ -1781,19 +1765,11 @@ function applyEventRows(
   // Backend snapshot is the source of truth for meta — overlay last so any
   // per-event mutations during replay don't leak through to thread.meta.
   if (currentAggregate) {
-    // Staleness guard (mirrors upsertThread): `currentAggregate.lastActivity`
-    // and `thread.meta.updatedAt` are the SAME monotonic
-    // thread_summaries.last_activity column read at different times. A snapshot
-    // fetched before a live event this device already applied is stale.
-    // Applying it would regress status, updatedAt and counts back in time, most
-    // visibly as the dot stuck on "running" until reload. Skip the overlay
-    // entirely: the fresher live SSE state stands. New event rows above are
-    // folded in first and advance updatedAt, so a refresh that brought
-    // genuinely-new work is never misclassified as stale.
-    const snapshotStale = !!currentAggregate.lastActivity && !!thread.meta.updatedAt
-      && currentAggregate.lastActivity < thread.meta.updatedAt;
-    if (!snapshotStale) {
-      applyAggregateToMeta(thread.meta, currentAggregate);
+    // A snapshot older than the live state this device already applied
+    // changes nothing (`ThreadMeta.summaryVersion`).
+    const current = isSummaryCurrent(thread.meta, currentAggregate.summaryVersion);
+    applyAggregateToMeta(thread.meta, currentAggregate);
+    if (current) {
       // Same archive race guard as the SSE path in thread-sync.ts: a replay
       // initiated before the user's Archive click ships a pre-archive
       // aggregate that would otherwise revert the optimistic flip.

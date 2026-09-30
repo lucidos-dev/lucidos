@@ -15,6 +15,7 @@ vi.mock('../../../store/actions/themes', async importOriginal => ({
 import { paintedThemeMode } from '../../../store/actions/preferences';
 import { preferences } from '../../../store/store';
 import { viewportIsMobile } from '../../../utils/viewport';
+import { motionPreference } from '../../../utils/motion';
 import { ThemePicker, groupThemesByFamily } from '../ThemePicker';
 
 function theme(id: string, name: string, family?: ThemeFamily): Theme {
@@ -118,6 +119,46 @@ it('filters by family: All first and picked, then one chip per family', () => {
   expect(card('Paper')!.style.gridRow).toBe('1');
   act(() => { chip('All').click(); });
   expect(radios()).toHaveLength(3);
+});
+
+/** Gives the strip a height layout would: taller while it draws the names row.
+ *  Records each animation the strip itself runs. */
+function measureStripHeight(): () => Keyframe[][] {
+  const strip = host.querySelector<HTMLElement>('.theme-carousel')!;
+  strip.getBoundingClientRect = () => ({ height: host.querySelector('.theme-family-name') ? 200 : 100 }) as DOMRect;
+  const played: { target: Element; frames: Keyframe[] }[] = [];
+  HTMLElement.prototype.animate = vi.fn(function (this: HTMLElement, frames: Keyframe[]) {
+    played.push({ target: this, frames });
+    return { cancel: vi.fn(), finished: new Promise(() => {}) } as unknown as Animation;
+  }) as unknown as typeof HTMLElement.prototype.animate;
+  return () => played.filter(p => p.target === strip).map(p => p.frames);
+}
+
+afterEach(() => {
+  delete (HTMLElement.prototype as { animate?: unknown }).animate;
+});
+
+it('eases the strip to its new height when a family chip changes it', () => {
+  showPicker();
+  const animations = measureStripHeight();
+  act(() => { chip('Warm').click(); });
+  act(() => { chip('All').click(); });
+  expect(animations()).toEqual([
+    [{ height: '200px' }, { height: '100px' }],
+    [{ height: '100px' }, { height: '200px' }],
+  ]);
+});
+
+it('snaps the strip to its new height under reduced motion', () => {
+  act(() => { motionPreference.value = 'reduce'; });
+  try {
+    showPicker();
+    const animations = measureStripHeight();
+    act(() => { chip('Warm').click(); });
+    expect(animations()).toEqual([]);
+  } finally {
+    act(() => { motionPreference.value = 'system'; });
+  }
 });
 
 function step(label: string): HTMLButtonElement {

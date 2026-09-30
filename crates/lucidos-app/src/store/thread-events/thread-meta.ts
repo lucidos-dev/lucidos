@@ -26,6 +26,8 @@ export type ThreadAggregate = {
   messageCount: number;
   section: ThreadSection;
   status: ThreadStatus;
+  /** See `ThreadMeta.summaryVersion`. */
+  summaryVersion: number;
   activeChildrenCount: number;
   /** See `ThreadMeta.waitingChildrenCount`. */
   waitingChildrenCount?: number;
@@ -108,10 +110,36 @@ function sameWaits(a: EventWaitSummary[], b: EventWaitSummary[]): boolean {
   return a.length === b.length && a.every((w, i) => w.wait_id === b[i].wait_id);
 }
 
+/** The version of a row the client drew before any server summary existed.
+ *  Every server version is at least 0, so the first summary always wins. */
+export const UNVERSIONED = -1;
+
+/** Whether a server summary at `version` is at least as new as what `meta`
+ *  holds. Equal versions saw the same row, so either may be applied. Written
+ *  as "not older" on purpose: a summary with no version compares false both
+ *  ways, and is taken as current rather than refused forever. */
+export function isSummaryCurrent(meta: ThreadMeta, version: number): boolean {
+  return !(version < meta.summaryVersion);
+}
+
+/** Take a server summary's status if it is current (`isSummaryCurrent`).
+ *  The one writer of `meta.status` and `meta.summaryVersion`. Returns whether
+ *  the summary is current, so the caller applies its other fields with it. */
+export function applySummaryVersion(meta: ThreadMeta, version: number, status: ThreadStatus): boolean {
+  if (!isSummaryCurrent(meta, version)) return false;
+  const writable = meta as { status: ThreadStatus; summaryVersion: number };
+  writable.summaryVersion = version;
+  writable.status = status;
+  return true;
+}
+
 /** Apply an aggregate snapshot to a thread's meta. Used by live SSE (per-event
  *  aggregate) and historical replay (fetchThreadEvents.currentAggregate).
  *  Nullable fields propagate cleared values; trigger/repo fields are omitted
  *  by the backend when not applicable, so absence preserves prior values.
+ *
+ *  An aggregate older than the meta's `summaryVersion` changes nothing, so a
+ *  reordered broadcast or a stale read cannot put an old status back.
  *
  *  Returns `true` when any shape-relevant field actually changed value. The
  *  `updatedAt` / `messageCount` ticks are intentionally excluded from the
@@ -119,9 +147,10 @@ function sameWaits(a: EventWaitSummary[], b: EventWaitSummary[]): boolean {
  *  fan-out gate in `thread-sync.ts`. ThreadDrawer's "X ago" stays approximate
  *  during a stream and refreshes on the next shape change (status flip etc.). */
 export function applyAggregateToMeta(meta: ThreadMeta, agg: ThreadAggregate): boolean {
-  let changed = false;
+  const prevStatus = meta.status;
+  if (!applySummaryVersion(meta, agg.summaryVersion, agg.status)) return false;
+  let changed = meta.status !== prevStatus;
   if (meta.section !== agg.section) { meta.section = agg.section; changed = true; }
-  if (meta.status !== agg.status) { meta.status = agg.status; changed = true; }
   if (meta.activeChildrenCount !== agg.activeChildrenCount) { meta.activeChildrenCount = agg.activeChildrenCount; changed = true; }
   if ((meta.waitingChildrenCount ?? 0) !== (agg.waitingChildrenCount ?? 0)) { meta.waitingChildrenCount = agg.waitingChildrenCount ?? 0; changed = true; }
   if (meta.totalChildrenCount !== agg.totalChildrenCount) { meta.totalChildrenCount = agg.totalChildrenCount; changed = true; }
@@ -196,8 +225,13 @@ export type ThreadMeta = {
    *  thread-row tooltip's "Agent ·" line, distinct from `lastUserAction` so the
    *  tooltip stays accurate even right after the user acts. */
   lastAgentAction?: string;
-  /** Thread status computed by the backend: 'idle', 'running', or 'waiting'. */
-  status: ThreadStatus;
+  /** Thread status computed by the backend. Read-only: only a server summary
+   *  writes it, through `applyAggregateToMeta` or `applySummaryVersion`. */
+  readonly status: ThreadStatus;
+  /** The `summary_version` of the newest server summary applied here. A
+   *  summary older than this is refused, so a stale read cannot win. A row
+   *  the client drew before the server had one starts at `UNVERSIONED`. */
+  readonly summaryVersion: number;
   /** Server-computed exchange count (MESSAGE_COUNT_EVENTS in thread_lifecycle.rs). */
   messageCount: number;
   /** Section from backend DB projection — used as initial section before events load. */
@@ -494,6 +528,7 @@ export function makeOptimisticThreadState(opts: {
       lastUserAction: ts,
       lastAgentAction: ts,
       status: opts.status ?? 'running',
+      summaryVersion: UNVERSIONED,
       messageCount: 0,
       section: 'archived',
       activeChildrenCount: 0,

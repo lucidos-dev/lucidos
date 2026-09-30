@@ -627,7 +627,9 @@ fn changes_grouped_tool_exposes_list_and_apply() {
             "apply",
             "apply_when_settled",
             "apply_as_they_settle",
-            "cancel_standing_apply"
+            "cancel_standing_apply",
+            "set_aside",
+            "bring_back"
         ]
     );
     let change_id = props

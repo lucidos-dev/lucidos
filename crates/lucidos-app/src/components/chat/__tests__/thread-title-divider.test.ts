@@ -1,9 +1,9 @@
 import { describe, it, expect } from 'vitest';
-// @ts-expect-error — Node APIs available at runtime via Vitest
+// @ts-expect-error: Node APIs available at runtime via Vitest
 import { readFileSync } from 'node:fs';
-// @ts-expect-error — same
+// @ts-expect-error: same
 import { dirname, resolve } from 'node:path';
-// @ts-expect-error — same
+// @ts-expect-error: same
 import { fileURLToPath } from 'node:url';
 
 const here: string = dirname(fileURLToPath(import.meta.url));
@@ -11,31 +11,26 @@ const drawerCss = readFileSync(resolve(here, '../../../styles/drawer.css'), 'utf
 const mobileCss = readFileSync(resolve(here, '../../../styles/mobile.css'), 'utf-8');
 
 /**
- * Regression: the thread title header divider was missing on mobile.
+ * The title row sits on the page while the transcript rests at its top, and
+ * its tinted band fades in once the transcript scrolls. There is no hairline
+ * under it on either layout.
  *
- * On desktop the title bar is `.thread-view-header` (ThreadView.tsx) and carries
- * its divider as a `::after` 1px hairline in `var(--border-color)`. On mobile the
- * desktop element is `display: none` and the title renders instead in the sticky
- * `.mobile-thread-title-row` (inside the scroll container) — which never got the
- * equivalent hairline. Its only `::after` is the scroll-fade gradient (opacity 0
- * at rest), so at rest there was no divider at all. The two viewports render the
- * title bar with two different elements and only the desktop one had the line.
- *
- * The fix gives `.mobile-thread-title-row` a matching bottom hairline via
- * `::before` (`::after` is taken by the fade gradient), absolutely positioned so
- * it adds no layout height (the `--mobile-thread-title-height` scroll offset is
- * unchanged), always visible like desktop.
+ * The band matters most on mobile. The title slides away with the header as
+ * one bar. Without a band it drifts like loose transcript text.
  */
-describe('Thread title header divider — desktop/mobile parity', () => {
-  it('desktop .thread-view-header has a 1px var(--border-color) bottom hairline', () => {
-    expect(drawerCss).toMatch(
-      /\.thread-view-header::after\s*\{[^}]*bottom:\s*0[^}]*height:\s*1px[^}]*background:\s*var\(--border-color\)/,
-    );
+describe('Thread title band, desktop and mobile alike', () => {
+  it('desktop: page colour at rest, --bg-secondary once scrolled', () => {
+    expect(drawerCss).toMatch(/\n\.thread-view-header \{[^}]*background:\s*transparent/);
+    expect(drawerCss).toMatch(/\.thread-view-header\.scrolled \{[^}]*background:\s*var\(--bg-secondary\)/);
   });
 
-  it('mobile .mobile-thread-title-row has a matching 1px var(--border-color) bottom hairline', () => {
-    expect(mobileCss).toMatch(
-      /\.mobile-thread-title-row::before\s*\{[^}]*bottom:\s*0[^}]*height:\s*1px[^}]*background:\s*var\(--border-color\)/,
-    );
+  it('mobile: page colour at rest, --bg-secondary once scrolled', () => {
+    expect(mobileCss).toMatch(/\.mobile-swipe-pane \.mobile-thread-title-row \{[^}]*background:\s*var\(--bg-primary\)/);
+    expect(mobileCss).toMatch(/\.mobile-thread-title-row\.scrolled \{[^}]*background:\s*var\(--bg-secondary\)/);
+  });
+
+  it('draws no hairline under either row', () => {
+    expect(drawerCss).not.toMatch(/\.thread-view-header::after/);
+    expect(mobileCss).not.toMatch(/\.mobile-thread-title-row::before/);
   });
 });

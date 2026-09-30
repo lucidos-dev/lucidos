@@ -492,6 +492,7 @@ pub const TABLES: &[TableRule] = &[
             "core/image_migration.rs",
             "core/store/threads/backfill.rs",
             "engine/agent_recovery/has_diff.rs",
+            "engine/agent_recovery/recovery.rs",
             "engine/event_bus/mod.rs",
             "engine/event_bus/parent_callback.rs",
             "engine/event_bus_projection_propagation.rs",

@@ -1012,6 +1012,7 @@ impl EventBus {
                 repo_root,
                 hardened,
                 incomplete,
+                set_aside,
                 ..
             } => {
                 // `coding_agent_proposed` and `coding_agent_requires_restart`
@@ -1068,6 +1069,11 @@ impl EventBus {
                         *requires_restart,
                         *hardened,
                         *incomplete,
+                        if *set_aside {
+                            crate::core::changes::ChangeStatus::SetAside
+                        } else {
+                            crate::core::changes::ChangeStatus::Pending
+                        },
                     )
                     .await?;
                 } else if commit_sha.is_some() {
@@ -1494,6 +1500,24 @@ impl EventBus {
                 .await?;
                 Vec::new()
             }
+            ThreadEvent::ChangeSetAside { change_id } => {
+                crate::core::changes_projection::ChangesProjection::write_status(
+                    tx,
+                    change_id,
+                    crate::core::changes::ChangeStatus::SetAside,
+                )
+                .await?;
+                Vec::new()
+            }
+            ThreadEvent::ChangeBroughtBack { change_id } => {
+                crate::core::changes_projection::ChangesProjection::write_status(
+                    tx,
+                    change_id,
+                    crate::core::changes::ChangeStatus::Pending,
+                )
+                .await?;
+                Vec::new()
+            }
             ThreadEvent::ChangeReverted { change_id, .. } => {
                 crate::core::changes_projection::ChangesProjection::write_status(
                     tx, change_id, crate::core::changes::ChangeStatus::Reverted,
@@ -1811,6 +1835,17 @@ impl EventBus {
                     }
                 ) && current == ArchiveState::Inbox
                 {
+                    transition.new_section = None;
+                }
+                // A change proposed straight into set-aside asks nothing of
+                // the user, so it must not pull an archived thread back out.
+                if matches!(
+                    event,
+                    ThreadEvent::ChangeProposed {
+                        set_aside: true,
+                        ..
+                    }
+                ) {
                     transition.new_section = None;
                 }
                 Self::apply_transition(tx, thread_id, &transition).await?;

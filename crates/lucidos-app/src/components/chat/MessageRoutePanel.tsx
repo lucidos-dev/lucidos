@@ -151,13 +151,12 @@ export function resolveThreadLinkTitle(
  *  the session id from those, falling back to a non-empty `SessionStarted.session_id` only
  *  for legacy rows. Like branch, it's session-scoped, so it rides the same full-thread walk.
  *
- *  Permission/context info is per-exchange and stays scoped to `exchange.steps`. */
+ *  Context info is per-exchange and stays scoped to `exchange.steps`. */
 export function executorExtras(
   exchange: Exchange,
   threadEvents: Map<number, StoredEvent>,
 ): {
   branch?: string;
-  permissionMode?: string;
   ccSessionId?: string;
   contextTokens?: number;
   contextTrimmed?: boolean;
@@ -194,13 +193,10 @@ export function executorExtras(
     if (seq === lastSeq) break;
   }
 
-  let permissionMode: string | undefined;
   let contextTokens: number | undefined;
   let contextTrimmed: boolean | undefined;
   for (const { event } of exchange.steps) {
-    if (event.type === 'CodingAgentSettingsChanged') {
-      if (event.permission_mode) permissionMode = event.permission_mode;
-    } else if (event.type === 'ThoughtStreamed') {
+    if (event.type === 'ThoughtStreamed') {
       // Legacy DB rows — ContextCaptured below overrides when present.
       if (typeof event.context_tokens === 'number') contextTokens = event.context_tokens;
       if (typeof event.trimmed === 'boolean') contextTrimmed = event.trimmed;
@@ -213,7 +209,7 @@ export function executorExtras(
       if (typeof event.trimmed === 'boolean') contextTrimmed = event.trimmed;
     }
   }
-  return { branch, permissionMode, ccSessionId, contextTokens, contextTrimmed, repoId };
+  return { branch, ccSessionId, contextTokens, contextTrimmed, repoId };
 }
 
 export function MessageRoutePanel() {
@@ -683,7 +679,7 @@ export function renderExecutorSection(
   const model = exchangeResponseModel(exchange) ?? priorModel;
   const effort = exchangeReasoningEffort(exchange) ?? priorEffort;
   const extras = executorExtras(exchange, threadEvents);
-  const hasContent = model || effort || extras.branch || extras.permissionMode
+  const hasContent = model || effort || extras.branch
     || extras.ccSessionId || typeof extras.contextTokens === 'number';
   const ccActive = extras.branch !== undefined || extras.ccSessionId !== undefined;
   const repo = ccActive ? resolveRepoLabel(extras.repoId) : undefined;
@@ -715,12 +711,6 @@ export function renderExecutorSection(
             {extras.contextTokens.toLocaleString()} tokens
             {extras.contextTrimmed && <span class="pill"> trimmed</span>}
           </span>
-        </div>
-      )}
-      {extras.permissionMode && (
-        <div class="route-row">
-          <strong>Permission</strong>
-          <span>{extras.permissionMode}</span>
         </div>
       )}
       {repo && (

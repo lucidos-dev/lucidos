@@ -267,7 +267,7 @@ impl GapEvent {
     ///
     /// Apply and Discard reset the worktree of the CHANGE'S branch, which is
     /// not always this session's: the reconcile path
-    /// (`discard_pending_for_thread_except`) discards stale siblings on other
+    /// (`discard_open_changes_for_thread_except`) discards stale siblings on other
     /// branches, and answering "yes, a reset explains the HEAD move" for one of
     /// those would silence a genuine external-edit report about a worktree
     /// nothing touched. An unresolved branch counts as ours, because the note
@@ -829,7 +829,7 @@ fn child_name(child_thread_id: &str, title: &str) -> String {
 
 /// A Discard resets the change's branch to `main`. Whether that is the agent's
 /// own branch is the difference between "your work is gone" and "a stale change
-/// of yours was cleaned up" (the `discard_pending_for_thread_except` reconcile
+/// of yours was cleaned up" (the `discard_open_changes_for_thread_except` reconcile
 /// path discards siblings on OTHER branches), so say which.
 fn discarded_line(label: &str, branch: &str, session_branch: Option<&str>) -> String {
     match (branch.is_empty(), session_branch) {

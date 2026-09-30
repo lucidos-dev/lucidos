@@ -1467,6 +1467,62 @@ async fn a_tier3_catchup_conflict_removes_the_temp_state_and_reads_as_a_collisio
     );
 }
 
+/// A Tier-3 temp branch starts at `main`, and the resolving agent merges the
+/// change branch in itself. A turn that skipped that merge used to report the
+/// change applied. It then force-deleted the change branch, which held the
+/// only copy of the work.
+#[tokio::test]
+async fn a_tier3_resolution_that_never_merged_the_change_branch_refuses_and_keeps_it() {
+    let (_tmp, repo) = make_test_repo().await;
+    let (_feature_tmp, feature_dir) = conflicting_branch_worktree(&repo, "feature").await;
+    // Tier 3 runs only when no worktree holds the change branch.
+    git_cmd(
+        &[
+            "worktree",
+            "remove",
+            "--force",
+            feature_dir.to_str().unwrap(),
+        ],
+        &repo,
+    )
+    .await
+    .unwrap();
+    let feature_sha = sha_of(&repo, "feature").await;
+    let wt_tmp = tempfile::tempdir().unwrap();
+    let wt_dir = wt_tmp.path().join("merge-x");
+    git_cmd(
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "merge-tmp/x",
+            wt_dir.to_str().unwrap(),
+            "main",
+        ],
+        &repo,
+    )
+    .await
+    .unwrap();
+    let main_before = sha_of(&repo, "main").await;
+
+    let err = ff_merge_to_main(&repo, wt_dir.to_str().unwrap(), "merge-tmp/x", "feature")
+        .await
+        .expect_err("nothing merged the change branch");
+
+    assert!(err.to_string().contains("feature"), "{err}");
+    assert_eq!(
+        sha_of(&repo, "main").await,
+        main_before,
+        "main must not move"
+    );
+    assert_eq!(
+        sha_of(&repo, "feature").await,
+        feature_sha,
+        "the change branch keeps its commits"
+    );
+    assert!(!git_ref_exists(&repo, "refs/heads/merge-tmp/x").await);
+}
+
 /// The Tier-2 half: the session ran in the thread's own worktree on the real
 /// change branch, which a failed merge must never delete (ADR 0035).
 #[tokio::test]

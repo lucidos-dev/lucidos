@@ -241,12 +241,11 @@ async fn fetch_published_changelog() -> Option<String> {
 ///
 /// **Separator-blind by construction.** The headings are written
 /// `## v0.26.3 <separator> 2026-08-11`, and the separator in this repo's file is
-/// an em dash, which `.claude/rules/no-em-dashes.md` forbids this source from
-/// containing. So the date is not matched against a separator at all: it is
-/// whatever remains once the leading non-alphanumeric run is dropped. That
-/// tolerates an em dash, an en dash, a hyphen, a comma or nothing, and it is the
-/// same posture `release_notes_extract_section` (scripts/lib/release_notes.sh)
-/// takes for the same reason.
+/// an em dash. Nothing here depends on that. The date is not matched against a
+/// separator at all: it is whatever remains once the leading non-alphanumeric
+/// run is dropped. That tolerates an em dash, an en dash, a hyphen, a comma or
+/// nothing, the same posture `release_notes_extract_section`
+/// (scripts/lib/release_notes.sh) takes.
 ///
 /// A heading counts as a release only when a DIGIT follows `## v`, so a prose
 /// heading such as `## various notes` stays body text instead of becoming a
@@ -319,7 +318,7 @@ mod tests {
 
     /// The em dash this repo's changelog separates version from date with,
     /// written as an escape so this file stays clean under
-    /// `.claude/rules/no-em-dashes.md`.
+    /// `.claude/rules/em-dashes.md`.
     const EM_DASH: char = '\u{2014}';
 
     /// A stand-in release, so a selection test says only what it is about.

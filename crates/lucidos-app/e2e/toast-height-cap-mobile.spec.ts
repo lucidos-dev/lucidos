@@ -21,7 +21,7 @@
  * engine's push-suppression decision (`NotificationToastRequested`, which only
  * fires when a device pongs in), and that path already has unit coverage; what
  * is under test here is the box, which resolves identically however it got
- * mounted. Same technique, and the same reason, as the `.question-option` probe
+ * mounted. Same technique, and the same reason, as the `.question-body` probe
  * in `prompt-transcript-alignment.spec.ts`.
  */
 import { test, expect } from './fixtures';

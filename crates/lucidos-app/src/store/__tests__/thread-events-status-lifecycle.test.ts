@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { TS, buildCCThread, makeThreadState } from './thread-events-helpers';
-import { computeExchanges, exchangeResponseEvents, exchangeStatus, groupIntoExchanges, handleEvent, isExchangeStartEvent, synthesizeContextCapture, type StoredEvent, type ThreadEvent } from '../thread-events';
+import { applySummaryVersion, computeExchanges, exchangeResponseEvents, exchangeStatus, exchangeSteps, groupIntoExchanges, handleEvent, isExchangeStartEvent, synthesizeContextCapture, type StoredEvent, type ThreadEvent } from '../thread-events';
 import { handleEventWithAgg } from './aggregate-test-helper';
 
 describe('exchangeStatus — CC follow-up in-progress states', () => {
@@ -533,7 +533,7 @@ describe('Phase 4 — thread lifecycle under terminal-only SessionEnded', () => 
     // overwriting each other (they live in the events Map keyed by seq).
     const thread = makeThreadState();
     thread.meta.channel = 'claude_code';
-    thread.meta.status = 'running';
+    applySummaryVersion(thread.meta, thread.meta.summaryVersion, 'running');
     const map = new Map([['t1', thread]]);
 
     handleEventWithAgg(map, 't1', 1, { type: 'MessageReceived', text: 'do work' } as ThreadEvent, '2026-04-24T10:00:00Z');
@@ -632,6 +632,61 @@ describe('ContextCaptured projection — main_llm vs claude_code', () => {
     expect(respSteps).toHaveLength(1);
     expect(respSteps[0].description).not.toBe('Thinking');
     expect(respSteps[0].contextCapture?.producer).toBe('main_llm');
+  });
+
+  describe('a held-back prose-nudge round', () => {
+    // The engine sends a reply that ended on a question back once, and holds
+    // that round back: it opens no Thinking row unless it calls a tool. Its
+    // snapshot still lands, and must not replace the draft round's own.
+    const capture = (input_tokens: number) => ({
+      type: 'ContextCaptured',
+      producer: 'main_llm',
+      model: 'claude-opus-4-7',
+      context_window: 200_000,
+      sections: [],
+      tools: [],
+      estimated_total_tokens: input_tokens,
+      usage: { input_tokens, output_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0 },
+    } as ThreadEvent);
+    type Row = { description: string; contextCapture?: { usage?: { input_tokens: number } } };
+    const rowsOf = (events: Map<number, ThreadEvent>): Record<string, Row[]> => {
+      const exchange = groupIntoExchanges(events)[0];
+      return {
+        exchangeSteps: exchangeSteps(exchange) as Row[],
+        exchangeResponseEvents: exchangeResponseEvents(exchange).filter(e => e.type === 'step') as Row[],
+      };
+    };
+    const draftRound: Array<[number, ThreadEvent]> = [
+      [1, { type: 'MessageReceived', text: 'hey!', created: '2026-09-30T06:30:30Z' } as ThreadEvent],
+      [2, { type: 'ThoughtStreamed', text: 'Context: 100 tokens, 1 messages' } as ThreadEvent],
+      [3, capture(100)],
+      [4, { type: 'TextStreamed', text: 'What are we working on this morning?' } as ThreadEvent],
+    ];
+
+    it('declined: the draft row keeps its own snapshot', () => {
+      const events = new Map<number, ThreadEvent>([
+        ...draftRound,
+        [5, capture(200)],
+        [6, { type: 'ResponseGenerated', text: 'What are we working on this morning?' } as ThreadEvent],
+      ]);
+      for (const [projection, rows] of Object.entries(rowsOf(events))) {
+        expect(rows, projection).toHaveLength(1);
+        expect(rows[0].contextCapture?.usage?.input_tokens, projection).toBe(100);
+      }
+    });
+
+    it('calling a tool: the round gets its own row and snapshot', () => {
+      const events = new Map<number, ThreadEvent>([
+        ...draftRound,
+        [5, { type: 'ThoughtStreamed', text: 'Context: 200 tokens, 3 messages' } as ThreadEvent],
+        [6, capture(200)],
+        [7, { type: 'ToolCalled', name: 'ask_user_question', args: {}, description: 'Asking: which one?' } as ThreadEvent],
+      ]);
+      for (const [projection, rows] of Object.entries(rowsOf(events))) {
+        expect(rows.map(r => r.description), projection).toEqual(['Thinking', 'Asking: which one?']);
+        expect(rows.map(r => r.contextCapture?.usage?.input_tokens), projection).toEqual([100, 200]);
+      }
+    });
   });
 
   it('claude_code snapshot binds to the most recent step (any kind)', () => {

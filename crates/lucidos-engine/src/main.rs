@@ -999,8 +999,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     .await;
 
     // Auto-resolve permission cards orphaned by the previous engine's death.
-    // Must run before the orphan running/waiting resets: emitting Resolved
-    // flips status to 'running', which those resets then settle to 'idle'.
+    // Must run before recovery: emitting Resolved flips status to 'running',
+    // which the recovery sweeps and the final settle then resolve.
     lucidos_engine::engine::agent_recovery::recover_orphan_cc_permission_requests(
         shared_engine.pool(),
         &shared_engine.event_bus,
@@ -1039,24 +1039,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     .await;
     boot_stages.lap("orphan requests");
 
-    // Reset threads orphaned in 'running' by the previous engine process. The
-    // recovery below sets the correct status.
-    //
-    // Scoped to 'running' ON PURPOSE. `waiting_for_user_answer` stays out of
-    // it, because the user's answer is what resumes such a thread. A thread
-    // holding an *event wait* needs no exemption: a subscription does not hold
-    // a turn, so it is already `idle` here (ADR 0049).
-    if let Err(e) = sqlx::query(&format!(
-        "UPDATE thread_summaries SET status = {} WHERE status = {}",
-        ThreadStatus::Idle.sql_literal(),
-        ThreadStatus::Running.sql_literal(),
-    ))
-    .execute(shared_engine.pool())
-    .await
-    {
-        log!("[Startup] Failed to reset orphaned running threads: {}", e);
-    }
-
     // Reset coding-agent threads stuck in 'waiting' with no pending proposal.
     // Their sessions are dead after a restart, so there is nothing for the user
     // to act on. Chat threads cannot reach 'waiting', so the
@@ -1071,35 +1053,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     .await
     {
         log!("[Startup] Failed to reset orphaned waiting threads: {}", e);
-    }
-
-    // Reconcile the three child counts in either drift direction. The query and
-    // its reasons live with the in-tx reconcile it must agree with, so the two
-    // cannot drift apart on what "in flight" means.
-    if let Err(e) =
-        lucidos_engine::engine::event_bus::EventBus::rebuild_children_counts(shared_engine.pool())
-            .await
-    {
-        log!("[Startup] Failed to reconcile the child counts: {}", e);
-    }
-
-    // Reconcile blocking_descendant_count. The two resets above move child rows
-    // out of blocking states by direct UPDATE, bypassing the projection's
-    // sampling wrapper, so no parent count is decremented.
-    //
-    // The later recovery sweep emits its terminators through EventBus, but
-    // `prev_sample` already reads 'idle' by then and the projection computes a
-    // zero delta. Without this reconciliation the parent's Archive button stays
-    // disabled forever, and its cascade never runs.
-    if let Err(e) = lucidos_engine::engine::event_bus::EventBus::rebuild_blocking_descendant_count(
-        shared_engine.pool(),
-    )
-    .await
-    {
-        log!(
-            "[Startup] Failed to reconcile blocking_descendant_count: {}",
-            e
-        );
     }
 
     // Place this workspace in the release-notice sequence, once. Both inputs
@@ -1121,16 +1074,61 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Recover worktrees whose in-flight session an engine crash interrupted. An
     // idle session stays idle, shown in the waiting UI for the user to act on.
     let recovering_threads = shared_engine.recover_orphaned_worktrees().await;
-    shared_engine
-        .recover_orphaned_threads(&recovering_threads)
-        .await;
     boot_stages.lap("worktree recovery");
 
     // Recover orphan `ToolCalled` events, left by an engine that died mid-tool.
     // Without this the thread's next LLM call rebuilds an assistant `tool_use`
     // block whose pair is missing, and the provider rejects the request.
+    //
+    // BEFORE the chat sweep: an archived thread qualifies only while it is
+    // still `running`, and the sweep's abort moves it off `running`.
     shared_engine.recover_orphan_tool_calls().await;
     boot_stages.lap("orphan tool calls");
+
+    shared_engine
+        .recover_orphaned_threads(&recovering_threads)
+        .await;
+    boot_stages.lap("chat recovery");
+
+    // Settle every thread still `running`, now that each recovery sweep has
+    // had its turn. A turn the restart interrupted gets an abort event, and
+    // anything else goes to idle. No live turn exists yet, so nothing
+    // legitimate is settled: event-wait re-entries, child-completion refires
+    // and switch resumes all start below. No thread leaves boot idle over a
+    // dead turn with no terminator, the state the client read as a crash.
+    lucidos_engine::engine::agent_recovery::settle_orphaned_running_threads(
+        shared_engine.pool(),
+        &shared_engine.event_bus,
+        &recovering_threads.iter().copied().collect(),
+    )
+    .await;
+
+    // Reconcile the three child counts in either drift direction. After the
+    // settle above, because a recovery abort is transient: it leaves a parent's
+    // count alone, expecting a resume, and this is what drops a dead child out.
+    // The query and its reasons live with the in-tx reconcile it must agree
+    // with, so the two cannot drift apart on what "in flight" means.
+    if let Err(e) =
+        lucidos_engine::engine::event_bus::EventBus::rebuild_children_counts(shared_engine.pool())
+            .await
+    {
+        log!("[Startup] Failed to reconcile the child counts: {}", e);
+    }
+
+    // Reconcile blocking_descendant_count, for the settle's direct `idle`
+    // writes and the `waiting` reset above, which bypass the projection's
+    // sampling wrapper. Without it a parent's Archive button can stay disabled
+    // forever, and its cascade never runs.
+    if let Err(e) = lucidos_engine::engine::event_bus::EventBus::rebuild_blocking_descendant_count(
+        shared_engine.pool(),
+    )
+    .await
+    {
+        log!(
+            "[Startup] Failed to reconcile blocking_descendant_count: {}",
+            e
+        );
+    }
 
     // Reconcile `thread_summaries.coding_agent_has_diff` against on-disk git
     // for every active coding-agent thread. Live updates flow through the
@@ -1148,7 +1146,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Propose changes never surfaced at idle: an idle coding-agent thread with
     // a committed branch diff but no pending change. A safety net for any
     // missed idle-proposal, and a no-op in steady state, because
-    // `may_touch_change_state_at_idle` already fires for every clean idle.
+    // `idle_change_write` already fires for every clean idle and user Stop.
     lucidos_engine::engine::agent_recovery::propose_held_back_changes_on_startup(
         shared_engine.pool(),
         &shared_engine.event_bus,
@@ -1166,6 +1164,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     lucidos_engine::engine::agent_recovery::reconcile_emptied_changes_on_startup(&shared_engine)
         .await;
     boot_stages.lap("change reconcile");
+
+    // Archived threads whose branch still holds work no change carries: set it
+    // aside so it stays reachable (ADR 0328). Git work, so off the boot path.
+    {
+        let engine = shared_engine.clone();
+        tokio::spawn(async move { engine.set_aside_archived_branch_work_on_startup().await });
+    }
 
     // Re-deliver parent-resume re-entries lost to the restart (ADR 0011). The
     // in-memory channel was recreated empty above. So a blocking child that
@@ -1245,6 +1250,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     lucidos_engine::engine::memory_consumer::spawn(shared_engine.clone());
     lucidos_engine::engine::change_summary_consumer::spawn(shared_engine.clone());
+    lucidos_engine::engine::agent_recovery::spawn_archive_net(shared_engine.clone());
 
     // Serve the last discovered Claude Code model list, and refresh it in the
     // background when it is missing or stale.

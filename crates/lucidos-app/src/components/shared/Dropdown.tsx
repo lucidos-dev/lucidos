@@ -1,13 +1,14 @@
 import { useState, useEffect, useRef } from 'preact/hooks';
 import type { JSX } from 'preact';
-import { hasCoarsePointer, isMobile } from '../../utils/viewport';
 import { keepFocusOnPress } from '../../utils/dom';
 import { useAnchoredPosition, type AnchorPosition } from '../../hooks/useAnchoredPopover';
 import { useHidePanelWebviewWhile } from '../../hooks/useHidePanelWebviewWhile';
 import { Overlay } from './Overlay';
+import { SearchField } from './SearchField';
 import { SkeletonProvider, SkText } from './Skeleton';
 import { isTypeaheadSeedKey } from './typeahead';
 import { protectedClassFrom } from './protectedSurface';
+import { isTouchLayout, keyboardHolder, returnKeyboard } from './keyboardHandoff';
 
 export interface DropdownOption {
   value: string;
@@ -69,10 +70,12 @@ export function filterDropdownOptions(options: DropdownOption[], query: string):
  *  the mouse left focus where it already was. In the Tauri app that is usually
  *  the prompt textarea, where the filter query landed instead of filtering.
  *
- *  `null` leaves focus alone, in two cases. On a touch device, an iPad as much
- *  as a phone, moving focus blurs the field being typed in. That drops the
- *  on-screen keyboard, and there is no keyboard to type-to-search with anyway.
- *  Before the panel is positioned it is `visibility: hidden`, and unfocusable.
+ *  On a touch device the trigger never takes focus: a `<button>` holds no
+ *  on-screen keyboard. The filter box does, once the keyboard handoff
+ *  (`keyboardHandoff.ts`) has shown it.
+ *
+ *  `null` leaves focus alone: on an unsearched touch menu, and while the panel
+ *  is unpositioned, since it is then `visibility: hidden` and unfocusable.
  *  Pure, exported for testing. */
 export function openMenuFocusTarget(opts: {
   freeText: boolean;
@@ -81,9 +84,8 @@ export function openMenuFocusTarget(opts: {
   touch: boolean;
 }): 'input' | 'filter' | 'trigger' | null {
   if (opts.freeText) return 'input';
-  if (opts.touch) return null;
   if (opts.searching) return opts.positioned ? 'filter' : null;
-  return 'trigger';
+  return opts.touch ? null : 'trigger';
 }
 
 /** Class list for the menu panel. The menu is portaled to `<body>` (see the
@@ -188,6 +190,9 @@ export function Dropdown({
   const menuRef = useRef<HTMLDivElement>(null);
   const draftRef = useRef(value);
   const lastCommittedRef = useRef(value);
+  // The text field the filter box took the keyboard from. Closing hands
+  // focus back to it, so the keyboard stays up for the message being typed.
+  const keyboardHolderRef = useRef<HTMLElement | null>(null);
   const selected = options.find((o) => o.value === value);
   const open = anchor !== null;
   const pos = useAnchoredPosition(anchor, menuRef);
@@ -224,7 +229,7 @@ export function Dropdown({
   useEffect(() => {
     if (!open) return;
     const target = openMenuFocusTarget({
-      freeText: !!freeText, searching, positioned: pos !== null, touch: isMobile() || hasCoarsePointer(),
+      freeText: !!freeText, searching, positioned: pos !== null, touch: isTouchLayout(),
     });
     if (target === 'input') {
       requestAnimationFrame(() => {
@@ -249,11 +254,24 @@ export function Dropdown({
   const filterOptions = (query: string) => filterDropdownOptions(options, query);
   const filtered = filterOptions(filter);
 
-  function closeDropdown() {
+  // Returns nothing on purpose: it is the Overlay's `onClose`, which reads a
+  // `false` return as a no-op and then lets the dismissing click through.
+  function closeDropdown(): void {
+    hideMenu();
+    restoreKeyboardHolder();
+  }
+
+  function hideMenu() {
     setAnchor(null);
     setFilter('');
     setSearching(false);
     setFocusedIndex(-1);
+  }
+
+  function restoreKeyboardHolder(): boolean {
+    const field = keyboardHolderRef.current;
+    keyboardHolderRef.current = null;
+    return returnKeyboard(field, menuRef.current);
   }
 
   /** Commit the focused option (or the typed freeText draft) and close. Returns
@@ -264,9 +282,10 @@ export function Dropdown({
       const focused = filtered[focusedIndex];
       if (focused.disabled) return false;
       if (freeText) commit(focused.value); else onChange(focused.value);
-      closeDropdown();
+      hideMenu();
+      const restored = restoreKeyboardHolder();
       inputRef.current?.blur();
-      if (restoreFocusOnSelect) buttonRef.current?.focus();
+      if (restoreFocusOnSelect && !restored) buttonRef.current?.focus();
       return true;
     }
     if (freeText && draftRef.current.trim()) {
@@ -289,6 +308,8 @@ export function Dropdown({
   function openDropdown() {
     if (!ref.current) return;
     showMenu();
+    keyboardHolderRef.current = keyboardHolder();
+    if (keyboardHolderRef.current) setSearching(true);
     const currentIdx = options.findIndex((o) => o.value === value);
     // Seed at the saved value, or — when missing/stale or pointing at a
     // disabled row (stale scope that collides with a section header after
@@ -434,20 +455,21 @@ export function Dropdown({
         panelStyle={dropdownPanelStyle(anchor ? anchor.getBoundingClientRect().width : null, pos)}
       >
           {!freeText && searching && (
-            <input
-              ref={filterRef}
-              class="dropdown-filter"
-              type="text"
-              value={filter}
-              onInput={(e) => {
-                const v = (e.target as HTMLInputElement).value;
-                setFilter(v);
-                // Highlight the first match so Enter picks the top result.
-                setFocusedIndex(nextEnabledIndex(filterOptions(v), -1, +1));
-              }}
-              onKeyDown={handleKeyDown}
-              placeholder="Filter..."
-            />
+            <div class="dropdown-filter-bar">
+              <SearchField
+                inputRef={filterRef}
+                inputClass="dropdown-filter"
+                value={filter}
+                onInput={(e) => {
+                  const v = e.currentTarget.value;
+                  setFilter(v);
+                  // Highlight the first match so Enter picks the top result.
+                  setFocusedIndex(nextEnabledIndex(filterOptions(v), -1, +1));
+                }}
+                onKeyDown={handleKeyDown}
+                placeholder="Filter…"
+              />
+            </div>
           )}
           {filtered.length === 0 && (
             <div class="dropdown-option dropdown-no-results">No matches</div>

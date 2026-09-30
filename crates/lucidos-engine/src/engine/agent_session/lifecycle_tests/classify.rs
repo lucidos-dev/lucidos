@@ -118,7 +118,7 @@ fn user_hit_stop_wins_over_cc_error() {
 /// and `CodingAgentIdled { has_changes: true }` — the UI then shows a
 /// silent "completed" turn even though the user got nothing back. Routing
 /// through `Failed` surfaces the red dot in the UI and (via
-/// `may_touch_change_state_at_idle`) refuses to auto-propose the partial
+/// `idle_change_write`) refuses to auto-propose the partial
 /// worktree state for Apply.
 #[test]
 fn empty_text_classifies_as_failed_with_empty_response_error() {
@@ -228,7 +228,7 @@ fn shutdown_wins_over_empty_text() {
 fn empty_text_failed_does_not_propose() {
     let (terminal, _) = classify_result(false, false, false, None, true);
     assert!(
-        !may_touch_change_state_at_idle(false, false, false, &Some(terminal)),
+        idle_change_write(false, false, false, &Some(terminal)).is_none(),
         "empty-text Failed (OOM / SIGTERM) must NOT auto-propose — half-assed"
     );
 }
@@ -907,26 +907,29 @@ fn run_direct_agent_refuses_empty_input_before_anything_else() {
 ///     is KEPT (the session is resumable) — `KeepEmptyBranch` no longer
 ///     deletes (the thread-9e37697e data-loss fix); only the explicit
 ///     Discard / conflict paths `git branch -D`.
-///   - A user cancel (`user_canceled=true`) keeps the branch
-///     (`KeepCanceledBranch`) so the session stays resumable — even with no
-///     commits. It carries the cancel-specific "half-finished, don't propose"
-///     semantics distinct from the ordinary `KeepEmptyBranch`, ranking below
-///     the external/crash keep-branch arms.
+///   - A cancel keeps the branch so the session stays resumable, even with no
+///     commits. A Stop with net work proposes it as incomplete, so stopped work
+///     keeps an Apply (ADR 0328). A redirect never proposes: its follow-up
+///     continues the branch. Both rank below the external and crash arms.
 #[test]
 fn classify_session_end_action_table() {
     use SessionEndAction::*;
+    use TurnCancel::{None as NotCanceled, Redirected, Stopped};
     let cases = [
-        // (has_commits, files_empty, is_external, safety_net_fired, user_canceled) → action
+        // (has_commits, files_empty, is_external, safety_net_fired, cancel) → action
         //
-        // Healthy turn (safety_net_fired=false, user_canceled=false) — same as before:
-        ((true, false, false, false, false), Propose),
-        ((true, true, false, false, false), KeepEmptyBranch), // phantom-Change regression
-        ((true, false, true, false, false), KeepExternalBranch),
-        ((true, true, true, false, false), KeepExternalBranch),
-        ((false, false, false, false, false), KeepEmptyBranch),
-        ((false, true, false, false, false), KeepEmptyBranch),
-        ((false, false, true, false, false), KeepEmptyBranch),
-        ((false, true, true, false, false), KeepEmptyBranch),
+        // Healthy turn (no safety net, not cancelled):
+        (
+            (true, false, false, false, NotCanceled),
+            Propose { incomplete: false },
+        ),
+        ((true, true, false, false, NotCanceled), KeepEmptyBranch), // phantom-Change regression
+        ((true, false, true, false, NotCanceled), KeepExternalBranch),
+        ((true, true, true, false, NotCanceled), KeepExternalBranch),
+        ((false, false, false, false, NotCanceled), KeepEmptyBranch),
+        ((false, true, false, false, NotCanceled), KeepEmptyBranch),
+        ((false, false, true, false, NotCanceled), KeepEmptyBranch),
+        ((false, true, true, false, NotCanceled), KeepEmptyBranch),
         //
         // Safety-net fired — CC died mid-stream:
         //   - In our own repo with commits: CrashedKeepBranch (keep work,
@@ -935,39 +938,45 @@ fn classify_session_end_action_table() {
         //   - External repo with commits: still KeepExternalBranch — user
         //     owns the ref regardless of how the session ended.
         //   - No commits: KeepEmptyBranch — nothing to propose (branch still kept, resumable).
-        ((true, false, false, true, false), CrashedKeepBranch),
-        ((true, true, false, true, false), CrashedKeepBranch),
-        ((true, false, true, true, false), KeepExternalBranch),
-        ((true, true, true, true, false), KeepExternalBranch),
-        ((false, false, false, true, false), KeepEmptyBranch),
-        ((false, true, false, true, false), KeepEmptyBranch),
-        ((false, false, true, true, false), KeepEmptyBranch),
-        ((false, true, true, true, false), KeepEmptyBranch),
+        ((true, false, false, true, NotCanceled), CrashedKeepBranch),
+        ((true, true, false, true, NotCanceled), CrashedKeepBranch),
+        ((true, false, true, true, NotCanceled), KeepExternalBranch),
+        ((true, true, true, true, NotCanceled), KeepExternalBranch),
+        ((false, false, false, true, NotCanceled), KeepEmptyBranch),
+        ((false, true, false, true, NotCanceled), KeepEmptyBranch),
+        ((false, false, true, true, NotCanceled), KeepEmptyBranch),
+        ((false, true, true, true, NotCanceled), KeepEmptyBranch),
         //
-        // User cancel (Stop = Esc, user_canceled=true) — keep the branch so the
-        // session stays resumable; never propose. The grilling-cancel bug is the
-        // no-commits row: it MUST be KeepCanceledBranch, not KeepEmptyBranch.
-        ((false, true, false, false, true), KeepCanceledBranch), // grilling cancel (the bug)
-        ((false, false, false, false, true), KeepCanceledBranch),
-        ((true, false, false, false, true), KeepCanceledBranch), // commits but cancelled → keep, don't propose
-        ((true, true, false, false, true), KeepCanceledBranch),
-        // External repo and crash arms still win over the cancel arm:
-        ((true, false, true, false, true), KeepExternalBranch),
-        ((true, false, false, true, true), CrashedKeepBranch), // defensive: can't really co-occur
+        // A Stop keeps the branch so the session stays resumable. The
+        // grilling-cancel bug is the no-commits row: it MUST be
+        // KeepCanceledBranch, not KeepEmptyBranch. Net work proposes as
+        // incomplete, so stopped work never loses its Apply.
+        ((false, true, false, false, Stopped), KeepCanceledBranch), // grilling cancel (the bug)
+        ((false, false, false, false, Stopped), KeepCanceledBranch),
+        (
+            (true, false, false, false, Stopped),
+            Propose { incomplete: true },
+        ),
+        ((true, true, false, false, Stopped), KeepCanceledBranch),
+        // A redirect never proposes: its follow-up continues on the branch.
+        ((true, false, false, false, Redirected), KeepCanceledBranch),
+        ((false, true, false, false, Redirected), KeepCanceledBranch),
+        // External repo and crash arms still win over both cancels:
+        ((true, false, true, false, Stopped), KeepExternalBranch),
+        ((true, false, false, true, Stopped), CrashedKeepBranch), // defensive: can't really co-occur
+        ((true, false, true, false, Redirected), KeepExternalBranch),
     ];
-    for ((has_commits, files_empty, is_external, safety_net_fired, user_canceled), expected) in
-        cases
-    {
+    for ((has_commits, files_empty, is_external, safety_net_fired, cancel), expected) in cases {
         assert_eq!(
             classify_session_end_action(
                 has_commits,
                 files_empty,
                 is_external,
                 safety_net_fired,
-                user_canceled,
+                cancel,
             ),
             expected,
-            "(has_commits={has_commits}, files_empty={files_empty}, is_external={is_external}, safety_net_fired={safety_net_fired}, user_canceled={user_canceled})",
+            "(has_commits={has_commits}, files_empty={files_empty}, is_external={is_external}, safety_net_fired={safety_net_fired}, cancel={cancel:?})",
         );
     }
 }

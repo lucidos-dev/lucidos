@@ -307,6 +307,8 @@ impl LucidosEngine {
             tn::APPLY_WHEN_SETTLED => self.execute_apply_when_settled(args, thread_id).await,
             tn::APPLY_AS_THEY_SETTLE => self.execute_apply_as_they_settle(thread_id).await,
             tn::CANCEL_STANDING_APPLY => self.execute_cancel_standing_apply(args, thread_id).await,
+            tn::SET_ASIDE_CHANGE => self.execute_set_aside_change(args, thread_id).await,
+            tn::BRING_BACK_CHANGE => self.execute_bring_back_change(args, thread_id).await,
             tn::LIST_THREAD_QUEUE => self.execute_list_thread_queue().await,
             tn::UPDATE_THREAD_QUEUE_POLICY => {
                 self.execute_update_thread_queue_policy(args, thread_id)
@@ -876,6 +878,9 @@ impl LucidosEngine {
         let pending = crate::core::changes::list_pending_for_readers(self.pool(), proj, scope)
             .await
             .map_err(|e| format!("Error: failed to list pending changes: {}", e))?;
+        let set_aside = crate::core::changes::list_set_aside_for_readers(self.pool(), proj, scope)
+            .await
+            .map_err(|e| format!("Error: failed to list set-aside changes: {}", e))?;
         // A small applied window gives the LLM enough recent history to confirm
         // a just-applied change without flooding the context with the full log.
         let mut applied = proj
@@ -889,10 +894,58 @@ impl LucidosEngine {
         // Compact JSON — same convention as list_threads / query_events.
         serde_json::to_string(&serde_json::json!({
             "pending": pending,
+            "set_aside": set_aside,
             "applied": applied,
             "total_pending": total_pending,
         }))
         .map_err(|e| format!("Error: failed to serialise changes: {}", e))
+    }
+
+    /// LLM tool: set a pending change aside, as the Set aside button does. It
+    /// asks the same per-change gate, because it is the same act.
+    async fn execute_set_aside_change(
+        &self,
+        args: &serde_json::Value,
+        thread_id: uuid::Uuid,
+    ) -> ToolOutcome {
+        let change_id = parse_required_uuid(args, "change_id")?;
+        if let Some(target) = self.change_target(change_id).await {
+            self.refuse_tool_without_authority(thread_id, target, ThreadReachVerb::SetAside)
+                .await?;
+        }
+        let refusal = crate::api::changes::change_action_refusal(
+            self.pool(),
+            change_id,
+            crate::engine::thread_lifecycle::Action::SetAside,
+        )
+        .await
+        .map_err(|e| format!("Error: failed to check whether this change can be set aside: {e}"))?;
+        if let Some(refusal) = refusal {
+            return Err(set_aside_refusal_message(refusal));
+        }
+        let actor = agent_tool_actor(thread_id);
+        self.set_aside_change(change_id, Some(actor))
+            .await
+            .map_err(|e| format!("Error: failed to set the change aside: {e}"))?;
+        Ok(format!("Change {change_id} set aside."))
+    }
+
+    /// LLM tool: bring a set-aside change back to pending.
+    async fn execute_bring_back_change(
+        &self,
+        args: &serde_json::Value,
+        thread_id: uuid::Uuid,
+    ) -> ToolOutcome {
+        let change_id = parse_required_uuid(args, "change_id")?;
+        if let Some(target) = self.change_target(change_id).await {
+            self.refuse_tool_without_authority(thread_id, target, ThreadReachVerb::BringBack)
+                .await?;
+        }
+        let actor = agent_tool_actor(thread_id);
+        self.bring_back_change(change_id, Some(actor))
+            .await
+            .map_err(|e| format!("Error: failed to bring the change back: {e}"))?;
+        Ok(format!("Change {change_id} brought back to pending."))
     }
 
     /// LLM tool: apply a pending *change* — merge the coding-agent branch into
@@ -1244,6 +1297,22 @@ pub(crate) fn describe_agent_archive(
     Ok(format!("Thread {target} was already archived.{left_open}"))
 }
 
+/// Why the `changes` tool's `set_aside` was refused, for the agent to read.
+pub(crate) fn set_aside_refusal_message(
+    refusal: crate::api::changes::ChangeActionRefusal,
+) -> String {
+    use crate::api::changes::ChangeActionRefusal as R;
+    match refusal {
+        R::ThreadSettling | R::ThreadParked => "Error: the thread that proposed this change \
+             is still working or waiting on the user, so it can't be set aside now. Tell \
+             the user."
+            .to_string(),
+        R::ActionUnavailable | R::NoFilesLeft | R::ChangeSetAside => "Error: this change \
+             can't be set aside. Re-read the 'list' action and tell the user what you found."
+            .to_string(),
+    }
+}
+
 /// The `changes` tool's wording for a refused Apply. Pure, so every branch is
 /// asserted without booting an engine.
 ///
@@ -1279,6 +1348,9 @@ pub(crate) fn apply_refusal_message(refusal: crate::api::changes::ChangeActionRe
         R::ActionUnavailable => "Error: the thread that proposed this change does not offer \
              Apply, and no wait resolves that. Re-read the 'list' action and tell the user what \
              you found."
+            .to_string(),
+        R::ChangeSetAside => "Error: this change is set aside. The 'bring_back' action returns \
+             it to pending, and then it can be applied. Do that only if the user asked."
             .to_string(),
     }
 }

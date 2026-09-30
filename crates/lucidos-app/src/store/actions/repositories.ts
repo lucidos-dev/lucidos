@@ -221,10 +221,10 @@ export async function viewChangeDiffById(changeId: string): Promise<void> {
   }
 }
 
-/** The pending-branch info a change carries. Applied changes have none: they
- *  read at HEAD. */
+/** The branch info an open change carries, pending or set aside. Applied
+ *  changes have none: they read at HEAD. */
 function pendingFromChange(change: Change): RepoPendingInfo | null {
-  if (change.status !== 'pending') return null;
+  if (change.status !== 'pending' && change.status !== 'set_aside') return null;
   return {
     branch_name: change.branch_name,
     files: change.files,

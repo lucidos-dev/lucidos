@@ -40,6 +40,7 @@ function makeThread(id: string, status: ThreadStatus): ThreadState {
       createdAt: '2026-05-01T00:00:00Z',
       updatedAt: '2026-05-01T00:00:00Z',
       status,
+      summaryVersion: 0,
       messageCount: 1,
       section: 'inbox',
       activeChildrenCount: 0,

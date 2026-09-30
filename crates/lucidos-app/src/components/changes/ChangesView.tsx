@@ -1,7 +1,8 @@
 import { useRef, useCallback, useEffect } from 'preact/hooks';
 import { useSignal } from '@preact/signals';
-import { changes, appliedChanges, changesHasMore, changesLoadingMore, busyChangeIds, applyAllInProgress, showConfirm, standingApplyThreadIds, armingStandingApplySweep, disarmingAllStandingApply, settlingThreadCount } from '../../store/store';
-import { applySingleChange, discardSingleChange, applyAllChanges, discardAllChanges, revertChange, loadMoreChanges, armStandingApply, disarmStandingApply, disarmAllStandingApplies, refreshChangesState, APPLY_NEW_VERSION_TOOLTIP } from '../../store/actions/chat-changes';
+import { changes, appliedChanges, setAsideChanges, findChangeById, threadMap, effectiveThreadStatus, isMidTurn, changesHasMore, changesLoadingMore, busyChangeIds, applyAllInProgress, showConfirm, standingApplyThreadIds, armingStandingApplySweep, disarmingAllStandingApply, settlingThreadCount } from '../../store/store';
+import { applySingleChange, discardSingleChange, setAsideSingleChange, bringBackSingleChange, applyAllChanges, discardAllChanges, revertChange, loadMoreChanges, armStandingApply, disarmStandingApply, disarmAllStandingApplies, refreshChangesState, APPLY_NEW_VERSION_TOOLTIP } from '../../store/actions/chat-changes';
+import { APPLY_INCOMPLETE_CONFIRM } from '../../store/actions/threadActions';
 import { viewChangeDiff } from '../../store/actions/repositories';
 import { focusThreadOrBootstrap } from '../../store/actions/threads';
 import type { Change } from '../../api/client';
@@ -13,6 +14,7 @@ import { LoadableError } from '../shared/LoadableError';
 import { ListSkeletonOf, useSkeleton, SkText, SkBlock } from '../shared/Skeleton';
 import { LoadingFade } from '../shared/LoadingFade';
 import { CommitList } from '../shared/CommitList';
+import { SplitButton } from '../shared/SplitButton';
 import { EventRowFoldView } from '../chat/EventRow';
 import { changeCommitList, changeHeadline } from '../../store/changeHeadline';
 
@@ -40,6 +42,7 @@ interface ChangeRowProps {
   onOpen: () => void;
   onDiff: () => void;
   onDiscard: () => void;
+  onSetAside: () => void;
   onApply: () => void;
   onStanding: () => void;
 }
@@ -61,10 +64,14 @@ export function applyBlockedReason(change: Change): string | null {
   return null;
 }
 
+export const SET_ASIDE_ROW_TIP =
+  'Keep this change for later. It leaves Review and Apply All, and its thread can be archived.';
+
 /** One action button on a pending change's row. */
 export type ChangeRowAction =
   | { kind: 'standing'; label: string; tooltip: string }
   | { kind: 'discard' }
+  | { kind: 'set-aside' }
   | { kind: 'apply'; label: string; tooltip?: string };
 
 /** Which actions a pending change's row draws, and never a disabled one.
@@ -83,7 +90,8 @@ export type ChangeRowAction =
  *    flight, and the row wears its "Applying..." face.
  *  - Nothing left in the change: Discard alone. That IS how an emptied change
  *    is resolved, and Apply is removed rather than faded.
- *  - Otherwise: Discard and Apply, both live.
+ *  - Otherwise: Discard, Set aside and Apply, all live. Set aside is offered
+ *    exactly where Discard is, as the engine's gate says (ADR 0328).
  *
  *  Pure, so the rule is one testable function rather than a pile of `disabled`
  *  expressions in the markup. */
@@ -103,6 +111,7 @@ export function changeRowActions(change: Change, armed: boolean): ChangeRowActio
   if (change.file_count === 0) return [{ kind: 'discard' }];
   return [
     { kind: 'discard' },
+    { kind: 'set-aside' },
     {
       kind: 'apply',
       label: change.requires_restart ? 'Apply*' : 'Apply',
@@ -111,17 +120,33 @@ export function changeRowActions(change: Change, armed: boolean): ChangeRowActio
   ];
 }
 
+type ApplyRowAction = Extract<ChangeRowAction, { kind: 'apply' }>;
+
+/** How the row draws its actions. With an Apply, it is the thread's own change
+ *  button: Apply as a split button, the rest behind its caret, Discard last. */
+export function rowActionLayout(actions: ChangeRowAction[]):
+  | { kind: 'split'; primary: ApplyRowAction; menu: ChangeRowAction[] }
+  | { kind: 'flat'; buttons: ChangeRowAction[] } {
+  const primary = actions.find((a): a is ApplyRowAction => a.kind === 'apply');
+  if (!primary) return { kind: 'flat', buttons: actions };
+  const menu = actions
+    .filter((a) => a !== primary)
+    .sort((a, b) => Number(a.kind === 'discard') - Number(b.kind === 'discard'));
+  return { kind: 'split', primary, menu };
+}
+
 /** Self-skeletonizing pending change row: rendered with no props inside a
  *  SkeletonProvider (`<ChangeRow />`) it draws itself as a loading placeholder
  *  via the Sk* leaves; with real props it renders normally. Props are optional
  *  only to support the skeleton call; real call sites pass them all. */
-function ChangeRow({ change, busy, armed, onOpen, onDiff, onDiscard, onApply, onStanding }: Partial<ChangeRowProps>) {
+function ChangeRow({ change, busy, armed, onOpen, onDiff, onDiscard, onSetAside, onApply, onStanding }: Partial<ChangeRowProps>) {
   const sk = useSkeleton();
-  const actions = change ? changeRowActions(change, !!armed) : [];
+  const layout = rowActionLayout(change ? changeRowActions(change, !!armed) : []);
   const clickable = !sk && !!change?.thread_id;
   const runAction = (kind: ChangeRowAction['kind']) => {
     if (kind === 'standing') onStanding?.();
     else if (kind === 'discard') onDiscard?.();
+    else if (kind === 'set-aside') onSetAside?.();
     else onApply?.();
   };
   return (
@@ -144,6 +169,7 @@ function ChangeRow({ change, busy, armed, onOpen, onDiff, onDiscard, onApply, on
               {formatFileCount(change.file_count)}
               {change.requires_restart && ' · Requires engine restart'}
               {!change.hardened && ' · Not hardened'}
+              {change.incomplete && ' · Incomplete'}
               {/* No action can resolve an unsettled change, so the reason is
                   read here rather than from a tooltip on a control that is
                   not drawn. */}
@@ -165,31 +191,41 @@ function ChangeRow({ change, busy, armed, onOpen, onDiff, onDiscard, onApply, on
             what the disabled ban is about. */}
         {busy ? (
           <SkBlock w="4.75rem" h="2rem" round>
-            <button class="action-btn action-btn-confirm" disabled>Applying...</button>
+            <button class="action-btn action-btn-confirm change-row-primary" disabled>Applying...</button>
           </SkBlock>
         ) : sk ? (
-          <>
-            <SkBlock w="4.25rem" h="2rem" round />
-            <SkBlock w="3.75rem" h="2rem" round />
-          </>
+          <div class="change-row-primary"><SkBlock w="100%" h="2rem" round /></div>
+        ) : layout.kind === 'split' ? (
+          // The menu renders inside the row, so its clicks must not open the thread.
+          <div class="change-row-primary" onClick={(e) => e.stopPropagation()}>
+            <SplitButton
+              primaryLabel={layout.primary.label}
+              primaryClassName="action-btn action-btn-confirm"
+              primaryTooltip={layout.primary.tooltip}
+              onPrimary={() => runAction('apply')}
+              caretClassName="action-btn action-btn-confirm"
+              caretAriaLabel="More change actions"
+              menuItems={layout.menu.map((action) => ({
+                key: action.kind,
+                label: rowActionLabel(action),
+                className: rowActionClass(action, !!armed),
+                tooltip: rowActionTooltip(action),
+                onClick: () => runAction(action.kind),
+              }))}
+            />
+          </div>
         ) : (
-          actions.map((action) => (
+          layout.buttons.map((action) => (
             <button
               key={action.kind}
-              class={
-                action.kind === 'discard'
-                  ? 'action-btn action-btn-danger'
-                  : action.kind === 'standing' && armed
-                    ? 'action-btn'
-                    : 'action-btn action-btn-confirm'
-              }
+              class={`${rowActionClass(action, !!armed)} change-row-primary`}
               // The standing apply is a toggle, so it says so the way the
               // prompt-row icon and the bulk control do.
               aria-pressed={action.kind === 'standing' ? armed : undefined}
-              data-tooltip={action.kind === 'discard' ? undefined : action.tooltip}
+              data-tooltip={rowActionTooltip(action)}
               onClick={(e) => { e.stopPropagation(); runAction(action.kind); }}
             >
-              {action.kind === 'discard' ? 'Discard' : action.label}
+              {rowActionLabel(action)}
             </button>
           ))
         )}
@@ -198,8 +234,96 @@ function ChangeRow({ change, busy, armed, onOpen, onDiff, onDiscard, onApply, on
   );
 }
 
-export const SWEEP_ONLY_TIP =
-  'Nothing can be applied yet. Arm this and every thread still settling applies its change the moment it finishes.';
+export function rowActionClass(action: ChangeRowAction, armed: boolean): string {
+  switch (action.kind) {
+    case 'discard': return 'action-btn action-btn-danger';
+    case 'set-aside': return 'action-btn';
+    case 'standing': return armed ? 'action-btn' : 'action-btn action-btn-confirm';
+    case 'apply': return 'action-btn action-btn-confirm';
+  }
+}
+
+function rowActionTooltip(action: ChangeRowAction): string | undefined {
+  switch (action.kind) {
+    case 'discard': return undefined;
+    case 'set-aside': return SET_ASIDE_ROW_TIP;
+    case 'standing':
+    case 'apply': return action.tooltip;
+  }
+}
+
+function rowActionLabel(action: ChangeRowAction): string {
+  switch (action.kind) {
+    case 'discard': return 'Discard';
+    case 'set-aside': return 'Set aside';
+    case 'standing':
+    case 'apply': return action.label;
+  }
+}
+
+/** Apply one change from its row. Incomplete work confirms first, as the
+ *  thread's own Apply does. */
+async function applyFromRow(id: string): Promise<void> {
+  const incomplete = findChangeById(id)?.incomplete ?? false;
+  if (incomplete && !(await showConfirm(APPLY_INCOMPLETE_CONFIRM, 'Apply', { variant: 'default' }))) return;
+  await applySingleChange(id);
+}
+
+export const BRING_BACK_ROW_TIP =
+  'Return this change to pending, where it can be applied or discarded.';
+
+/** A set-aside change's row: its headline, and the ways back or out. Discard
+ *  is withheld while its thread works, since the engine refuses it then. */
+function SetAsideRow({ change, busy, onBringBack, onDiscard }: {
+  change: Change;
+  busy: boolean;
+  onBringBack: () => void;
+  onDiscard: () => void;
+}) {
+  const thread = change.thread_id ? threadMap.value.get(change.thread_id) : undefined;
+  const threadWorking = !!thread && isMidTurn(effectiveThreadStatus(thread));
+  return (
+    <div
+      class={`list-row change-row${change.thread_id ? ' clickable' : ''}`}
+      onClick={change.thread_id ? () => openChangeThread(change) : undefined}
+    >
+      <div class="list-row-info">
+        {change.thread_title && <span class="list-row-label">{change.thread_title}</span>}
+        <ChangeHeadline change={change} />
+        <span class="list-row-details">
+          {formatFileCount(change.file_count)}
+          {change.requires_restart && ' · Requires engine restart'}
+          {change.incomplete && ' · Incomplete'}
+          {` · ${formatTimeAgo(new Date(change.created_at))}`}
+        </span>
+      </div>
+      <div class="list-row-actions">
+        <button class="action-btn" onClick={(e) => { e.stopPropagation(); void viewChangeDiff(change); }}>Diff</button>
+        {/* The menu renders inside the row, so its clicks must not open the thread. */}
+        <div class="change-row-primary" onClick={(e) => e.stopPropagation()}>
+          <SplitButton
+            primaryLabel="Bring back"
+            primaryClassName="action-btn"
+            primaryTooltip={busy ? undefined : BRING_BACK_ROW_TIP}
+            primaryDisabled={busy}
+            onPrimary={onBringBack}
+            caretClassName="action-btn"
+            caretAriaLabel="More set-aside actions"
+            menuItems={threadWorking || busy ? [] : [{
+              key: 'discard',
+              label: 'Discard',
+              className: 'action-btn action-btn-danger',
+              onClick: onDiscard,
+            }]}
+          />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export const SWEEP_TIP =
+  'Apply every change that is ready, and each one still settling the moment its thread finishes.';
 
 export const SWEEP_ARMED_TIP =
   'Armed. Each change applies the moment its thread finishes. Click to cancel every standing apply here. Anything already applying keeps going.';
@@ -207,24 +331,24 @@ export const SWEEP_ARMED_TIP =
 /** What the bulk row offers, given the pending list, how many threads are still
  *  working, and how many carry a *standing apply*.
  *
- *  ADR 0168 gives Apply All a "Keep going as the rest settle" checkbox. The
- *  button reads "Apply all on settle" when nothing is pending, and it is a
- *  TOGGLE: armed, the same control cancels. Everything falls out of three
- *  questions. Is there something to apply now, something to arm, and is
- *  anything armed already?
+ *  Up to three buttons: Discard All, "Apply all on settle" and Apply All. The
+ *  sweep is a TOGGLE: armed, the same control cancels (ADR 0168). Everything
+ *  falls out of three questions. Is there something to apply now, something to
+ *  arm, and is anything armed already?
  *
  *  Pure, so the answer is testable without a render. */
 export interface BulkApplyState {
   show: boolean;
   /** At least one pending change the server would apply right now. */
   canApplyNow: boolean;
-  /** Nothing to apply now, but threads are working, so arming IS the action. */
-  sweepOnly: boolean;
+  /** Threads are working, or something is armed, so the sweep toggle draws. */
+  offerSweep: boolean;
   /** Something is armed, so the sweep control wears its cancel face. */
   armed: boolean;
-  /** Both, so the checkbox is a real choice. Withdrawn once armed: the toggle
-   *  says the same thing and can turn it off, which a checkbox cannot. */
-  offerKeepGoing: boolean;
+  /** Something to apply now, or a batch running with no sweep to offer. The
+   *  sweep's own request also sets the in-flight flag, and must not draw
+   *  Apply All's "Applying..." beside the toggle. */
+  showApplyAll: boolean;
   showDiscardAll: boolean;
 }
 
@@ -232,20 +356,21 @@ export function bulkApplyState(
   pending: Change[],
   workingThreads: number,
   armedThreads: number,
+  applyAllRunning = false,
 ): BulkApplyState {
-  const canApplyNow = pending.some((c) => !applyBlockedReason(c));
+  // Apply All passes incomplete work over, as the engine's batch does.
+  const canApplyNow = pending.some((c) => !applyBlockedReason(c) && !c.incomplete);
   const armed = armedThreads > 0;
   // Armed with nothing left working still draws the control, or the last arm
   // would be unreachable in the window before it fires.
-  const sweepOnly = !canApplyNow && (workingThreads > 0 || armed);
-  const offerKeepGoing = canApplyNow && workingThreads > 0 && !armed;
+  const offerSweep = workingThreads > 0 || armed;
   const showDiscardAll = pending.length > 1;
   return {
-    show: showDiscardAll || sweepOnly || offerKeepGoing || armed,
+    show: showDiscardAll || offerSweep,
     canApplyNow,
-    sweepOnly,
+    offerSweep,
     armed,
-    offerKeepGoing,
+    showApplyAll: canApplyNow || (applyAllRunning && !offerSweep),
     showDiscardAll,
   };
 }
@@ -276,12 +401,9 @@ export function ChangesView() {
     });
   }, []);
 
-  // The checkbox is a per-view choice, not a preference: it modifies the press
-  // the user is about to make and nothing beyond it.
-  const keepGoing = useSignal(false);
-
   const pendingLoadable = changes.value;
   const appliedLoadable = appliedChanges.value;
+  const setAsideLoadable = setAsideChanges.value;
   const hasMore = changesHasMore.value;
   const loadingMore = changesLoadingMore.value;
   const showLoadingMore = useDelayedFlag(loadingMore);
@@ -313,9 +435,10 @@ export function ChangesView() {
   // user is waiting on for the next render.
   const showLoading = useDelayedLoading(pendingLoadable);
 
-  if (pendingLoadable.status === 'failed' || appliedLoadable.status === 'failed') {
+  if (pendingLoadable.status === 'failed' || appliedLoadable.status === 'failed' || setAsideLoadable.status === 'failed') {
     const err = pendingLoadable.status === 'failed' ? pendingLoadable.error
               : appliedLoadable.status === 'failed' ? appliedLoadable.error
+              : setAsideLoadable.status === 'failed' ? setAsideLoadable.error
               : 'Unknown error';
     return (
       <div class="panel-content protected-surface">
@@ -323,95 +446,87 @@ export function ChangesView() {
       </div>
     );
   }
-  const bothLoaded = pendingLoadable.status === 'loaded' && appliedLoadable.status === 'loaded';
+  const allLoaded =
+    pendingLoadable.status === 'loaded' &&
+    appliedLoadable.status === 'loaded' &&
+    setAsideLoadable.status === 'loaded';
 
   return (
     <div class="panel-content protected-surface">
       <LoadingFade showSkeleton={showLoading} skeleton={<ListSkeletonOf fill containerClass="list-rows" row={() => <ChangeRow />} />}>
-        {bothLoaded ? (() => {
+        {allLoaded ? (() => {
           const pending = pendingLoadable.data;
           const applied = appliedLoadable.data;
+          const setAside = setAsideLoadable.data;
           // A pending cancel holds every face unarmed. It waits for an
           // in-flight sweep, whose arm frames would otherwise flick them back.
           const cancelingAll = disarmingAllStandingApply.value;
           const armedThreads = cancelingAll
             ? 0
             : standingApplyThreadIds.value.size || (armingStandingApplySweep.value ? 1 : 0);
-          const bulk = bulkApplyState(pending, settlingThreadCount.value, armedThreads);
+          const bulk = bulkApplyState(pending, settlingThreadCount.value, armedThreads, applyAllInProgress.value);
           const bulkRow = bulk.show ? (
             <div class="changes-bulk-actions">
-              {/* Discard All skips changes whose thread is still working
-                  (server-side too); disable the button when none are eligible. */}
-              {bulk.showDiscardAll && (
-                <button class="action-btn action-btn-danger" disabled={applyAllInProgress.value || !pending.some(c => !c.thread_unsettled)} onClick={() => void discardAllChanges()}>Discard All</button>
-              )}
-              {/* "Keep going as the rest settle": the sweep. Everything
-                  pending, plus everything still settling, as each one lands
-                  (ADR 0168). Withdrawn once armed, where the toggle beside it
-                  says the same thing and can also turn it off. */}
-              {bulk.offerKeepGoing && (
-                <label class="changes-keep-going">
-                  <input
-                    type="checkbox"
-                    checked={keepGoing.value}
-                    onChange={(e) => { keepGoing.value = (e.currentTarget as HTMLInputElement).checked; }}
-                  />
-                  Keep going as the rest settle
-                </label>
-              )}
-              {/* The sweep, as ONE control with two faces. Armed it loses the
-                  green and cancels on click, the shape the per-change row and
-                  the prompt-row flag icon already wear, so all three surfaces
-                  read one state and all three can turn it off.
+              <div class="changes-bulk-buttons">
+                {/* Discard All skips changes whose thread is still working
+                    (server-side too); disable the button when none are eligible. */}
+                {bulk.showDiscardAll && (
+                  <button class="action-btn action-btn-danger" disabled={applyAllInProgress.value || !pending.some(c => !c.thread_unsettled)} onClick={() => void discardAllChanges()}>Discard All</button>
+                )}
+                {/* The sweep, as ONE control with two faces. Armed it loses the
+                    green and cancels on click, the shape the per-change row and
+                    the prompt-row flag icon already wear, so all three surfaces
+                    read one state and all three can turn it off.
 
-                  TWO faces, never a third. This control ARMS, so it has no
-                  progress of its own to report: a press lands on the armed
-                  face at once, and the `StandingApplyArmed` events hold it
-                  there. Apply All's "Applying..." belongs to a batch this
-                  press never starts, and wearing it flashes a narrower, faded
-                  pill on the way.
+                    TWO faces, never a third. This control ARMS, so it has no
+                    progress of its own to report: a press lands on the armed
+                    face at once, and the `StandingApplyArmed` events hold it
+                    there. Apply All's "Applying..." belongs to a batch this
+                    press never starts, and wearing it flashes a narrower, faded
+                    pill on the way.
 
-                  Neither face is disabled, even mid-batch. Cancelling an
-                  instruction is not the batch, and a faded control takes its
-                  explaining tooltip with it (ADR 0168). A second press while
-                  the request is in flight is dropped by the action. */}
-              {(bulk.sweepOnly || bulk.armed) && (
-                bulk.armed ? (
-                  <button
-                    class="action-btn"
-                    aria-pressed
-                    data-tooltip={SWEEP_ARMED_TIP}
-                    onClick={() => void disarmAllStandingApplies()}
-                  >
-                    ✓ Applying all on settle
-                  </button>
-                ) : (
+                    Neither face is disabled, even mid-batch. Cancelling an
+                    instruction is not the batch, and a faded control takes its
+                    explaining tooltip with it (ADR 0168). A second press while
+                    the request is in flight is dropped by the action. */}
+                {bulk.offerSweep && (
+                  bulk.armed ? (
+                    <button
+                      class="action-btn"
+                      aria-pressed
+                      data-tooltip={SWEEP_ARMED_TIP}
+                      onClick={() => void disarmAllStandingApplies()}
+                    >
+                      ✓ Applying all on settle
+                    </button>
+                  ) : (
+                    <button
+                      class="action-btn action-btn-confirm"
+                      aria-pressed={false}
+                      data-tooltip={SWEEP_TIP}
+                      onClick={() => void applyAllChanges(true)}
+                    >
+                      Apply all on settle
+                    </button>
+                  )
+                )}
+                {/* Apply All never lights up for a batch the server would reject:
+                    enablement reads the same rule the per-row control and the
+                    server use. With nothing appliable now the sweep toggle is
+                    the whole action, so this is not drawn at all. */}
+                {bulk.showApplyAll && (
                   <button
                     class="action-btn action-btn-confirm"
-                    aria-pressed={false}
-                    data-tooltip={SWEEP_ONLY_TIP}
-                    onClick={() => void applyAllChanges(true)}
+                    disabled={applyAllInProgress.value || !bulk.canApplyNow}
+                    onClick={() => void applyAllChanges(false)}
                   >
-                    Apply all on settle
+                    {applyAllInProgress.value ? 'Applying...' : 'Apply All'}
                   </button>
-                )
-              )}
-              {/* Apply All never lights up for a batch the server would reject:
-                  enablement reads the same rule the per-row control and the
-                  server use. With nothing appliable now the sweep toggle above
-                  is the whole action, so this is not drawn at all. */}
-              {!bulk.sweepOnly && (
-                <button
-                  class="action-btn action-btn-confirm"
-                  disabled={applyAllInProgress.value || !bulk.canApplyNow}
-                  onClick={() => void applyAllChanges(keepGoing.value)}
-                >
-                  {applyAllInProgress.value ? 'Applying...' : 'Apply All'}
-                </button>
-              )}
+                )}
+              </div>
             </div>
           ) : null;
-          return pending.length === 0 && applied.length === 0 ? (
+          return pending.length === 0 && applied.length === 0 && setAside.length === 0 ? (
             <>
               {bulkRow}
               <div class="empty-state">No changes</div>
@@ -438,7 +553,8 @@ export function ChangesView() {
                 onOpen={() => openChangeThread(change)}
                 onDiff={() => void viewChangeDiff(change)}
                 onDiscard={() => guardedAction(change.id, discardSingleChange)}
-                onApply={() => guardedAction(change.id, applySingleChange)}
+                onSetAside={() => guardedAction(change.id, setAsideSingleChange)}
+                onApply={() => guardedAction(change.id, applyFromRow)}
                 onStanding={() => {
                   if (!change.thread_id) return;
                   void (armed
@@ -448,6 +564,20 @@ export function ChangesView() {
               />
             );
           })}
+          {setAside.length > 0 && (
+            <>
+              <div class="list-section-title">Set aside</div>
+              {setAside.map(change => (
+                <SetAsideRow
+                  key={change.id}
+                  change={change}
+                  busy={busyIds.value.has(change.id)}
+                  onBringBack={() => guardedAction(change.id, bringBackSingleChange)}
+                  onDiscard={() => guardedAction(change.id, discardSingleChange)}
+                />
+              ))}
+            </>
+          )}
           {applied.length > 0 && (
             <>
               <div class="list-section-title">Recently Applied</div>
@@ -472,7 +602,7 @@ export function ChangesView() {
                       <button class="action-btn" onClick={(e) => { e.stopPropagation(); void viewChangeDiff(change); }}>Diff</button>
                     )}
                     {change.status === 'applied' ? (
-                      <button class="action-btn action-btn-danger" disabled={busyIds.value.has(change.id)} onClick={async (e) => {
+                      <button class="action-btn action-btn-danger change-row-primary" disabled={busyIds.value.has(change.id)} onClick={async (e) => {
                         e.stopPropagation();
                         if (await showConfirm('Revert this change? Any later applied changes that touch the same files may conflict.', 'Revert', { variant: 'default' })) {
                           guardedAction(change.id, revertChange);

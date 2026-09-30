@@ -764,15 +764,17 @@ pub enum ThreadEvent {
         /// emit; engine-internal recovery emits resolve it the same way.
         #[serde(default, skip_serializing_if = "is_false")]
         hardened: bool,
-        /// `true` only when engine-internal recovery proposes commits whose
-        /// originating turn was killed before closure (stale-session sweep,
-        /// orphan worktree recovery). The frontend reads this to confirm
-        /// before Apply so the user knows they're landing recovered work.
-        /// Live end-of-turn aggregate emits always stamp `false` because
-        /// `may_touch_change_state_at_idle` refuses to emit on non-`Generated`
-        /// terminals.
+        /// `true` when the work did not come from a finished turn: a user Stop
+        /// cut it short, or recovery found it after a turn was killed. The
+        /// frontend confirms before Apply, and Apply All passes it over. A
+        /// later clean turn re-emits with `false`.
         #[serde(default, skip_serializing_if = "is_false")]
         incomplete: bool,
+        /// `true` when the engine proposes the change straight into set-aside:
+        /// work found on an archived thread's branch (ADR 0328). It leaves
+        /// the thread where it is instead of surfacing it for review.
+        #[serde(default, skip_serializing_if = "is_false")]
+        set_aside: bool,
         // Legacy fields — kept for backward compat with old DB rows
         #[serde(default, skip_serializing_if = "is_empty_str")]
         path: String,
@@ -821,6 +823,16 @@ pub enum ThreadEvent {
         // Legacy
         #[serde(default, skip_serializing_if = "is_empty_str")]
         path: String,
+    },
+    /// The change was kept for later: out of Review and every bulk path until
+    /// it is brought back (ADR 0328). The actor rides on `EventMeta`.
+    ChangeSetAside {
+        change_id: String,
+    },
+    /// A set-aside change returned to pending, by the user or because its
+    /// thread proposed new work on the same branch.
+    ChangeBroughtBack {
+        change_id: String,
     },
     ChangeReverted {
         #[serde(default, skip_serializing_if = "is_empty_str")]
@@ -893,9 +905,10 @@ pub enum ThreadEvent {
         description: String,
     },
 
-    /// Coding-agent session settings changed mid-session (model, reasoning effort,
-    /// or permission mode). Persisted per-thread so settings survive idle exit
-    /// and respawn.
+    /// Coding-agent session settings changed mid-session (model or reasoning
+    /// effort). Persisted per-thread so settings survive idle exit and respawn.
+    /// Older stored rows may also carry a `permission_mode` key, so this variant
+    /// must keep ignoring unknown fields.
     ///
     /// Also carries `cc_session_id`: the agent emits this event at `Init` (the
     /// first moment CC reports its session id) with `cc_session_id: Some(..)`,
@@ -903,7 +916,7 @@ pub enum ThreadEvent {
     /// interrupted by an engine restart *before* it ever reaches a
     /// `CodingAgentIdled` boundary (the only other event that carries it). The
     /// id is CC's authoritative Init fact, exactly like `model`. Settings-only
-    /// emits (startup persist, mid-session model/effort/permission changes) pass
+    /// emits (startup persist, mid-session model/effort changes) pass
     /// `None`; the lookups read the most recent non-null value across both
     /// event types.
     #[serde(alias = "CCSettingsChanged")]
@@ -912,8 +925,6 @@ pub enum ThreadEvent {
         model: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reasoning_effort: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        permission_mode: Option<String>,
         #[serde(default = "default_coding_agent_claude_code", alias = "agent")]
         coding_agent: CodingAgent,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -926,7 +937,7 @@ pub enum ThreadEvent {
         /// `SpawnArgs::account_pin`), and a mid-flight user toggle of the
         /// env var cannot strand the session. `None` on legacy rows,
         /// on the pre-Init settings emit, and on mid-session settings-only emits
-        /// (model/effort/permission changes). The Init emit is the carrier.
+        /// (model/effort changes). The Init emit is the carrier.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         claude_config_dir: Option<String>,
         /// Whether `CLAUDE_CONFIG_DIR` was actually set for that session, stamped

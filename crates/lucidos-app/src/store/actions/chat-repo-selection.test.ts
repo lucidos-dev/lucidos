@@ -109,6 +109,7 @@ function makeMeta(id: string, overrides: Partial<ThreadMeta>): ThreadMeta {
     createdAt: '',
     updatedAt: '',
     status: 'idle',
+    summaryVersion: 0,
     messageCount: 0,
     section: 'archived',
     activeChildrenCount: 0,

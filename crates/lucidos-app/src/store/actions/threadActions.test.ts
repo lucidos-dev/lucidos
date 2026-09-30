@@ -4,7 +4,7 @@ import type { ThreadMeta, ThreadState } from '../thread-events';
 import type { Change } from '../../api/client';
 import { makeThreadState } from './threads-test-helpers';
 import { _resetComposeDraftsForTesting, getDraft } from '../composeDrafts';
-import { resolveThreadActions, resolveChangeMenuActions, nextCloseLayer, runCloseCascade, discardDraft, type TaggedAction } from './threadActions';
+import { resolveThreadActions, resolveChangeMenuActions, nextCloseLayer, runCloseCascade, discardDraft, APPLY_INCOMPLETE_CONFIRM, type TaggedAction } from './threadActions';
 import { ARCHIVE_PINNED_CONFIRM } from './threads';
 import {
   pushOverlay,
@@ -75,15 +75,26 @@ describe('resolveThreadActions', () => {
     expect(kinds(resolveThreadActions('t1'))).toEqual(['archive', 'unsave']);
   });
 
-  it('CC thread with a pending change → Discard (close) + Apply (primary) + Pin', () => {
+  it('CC thread with a pending change → Discard (close) + Apply (primary) + Set aside + Pin', () => {
     setThread(makeThreadState('t1', {
       meta: { channel: 'claude_code', section: 'inbox', status: 'idle', codingAgentProposed: true },
     }));
     changes.value = { status: 'loaded', data: [pendingChangeRow('t1')] };
     const actions = resolveThreadActions('t1');
-    expect(kinds(actions)).toEqual(['discard', 'apply', 'save']);
+    expect(kinds(actions)).toEqual(['discard', 'apply', 'set_aside', 'save']);
     expect(actions.find((a) => a.kind === 'apply')).toMatchObject({ category: 'primary', label: 'Apply' });
     expect(actions.find((a) => a.kind === 'discard')).toMatchObject({ category: 'close', label: 'Discard' });
+    expect(actions.find((a) => a.kind === 'set_aside')).toMatchObject({ category: 'close', label: 'Set aside' });
+  });
+
+  // Set aside acts on one change by id. A proposal flag can land before the
+  // pending list, and then Apply and Discard show but Set aside waits.
+  it('offers no Set aside until the pending list names the change', () => {
+    setThread(makeThreadState('t1', {
+      meta: { channel: 'claude_code', section: 'inbox', status: 'idle', codingAgentProposed: true },
+    }));
+    changes.value = { status: 'loaded', data: [] };
+    expect(kinds(resolveThreadActions('t1'))).toEqual(['discard', 'apply', 'save']);
   });
 
   // A delegating parent: idle apart from a running sub-thread. The child
@@ -96,7 +107,7 @@ describe('resolveThreadActions', () => {
     });
     setThread(parent);
     changes.value = { status: 'loaded', data: [pendingChangeRow('t1')] };
-    expect(kinds(resolveThreadActions('t1'))).toEqual(['discard', 'apply', 'save']);
+    expect(kinds(resolveThreadActions('t1'))).toEqual(['discard', 'apply', 'set_aside', 'save']);
 
     setThread(makeThreadState('t1', {
       meta: { ...parent.meta, liveEventWaitCount: 1 },
@@ -234,9 +245,9 @@ describe('resolveChangeMenuActions', () => {
     changes.value = { status: 'loaded', data: [pendingChangeRow('t1')] };
   }
 
-  it('lists Apply before Discard for a pending change, and nothing else', () => {
+  it('lists Apply, then Set aside, then Discard for a pending change, and nothing else', () => {
     proposedCcThread();
-    expect(kinds(resolveChangeMenuActions('t1'))).toEqual(['apply', 'discard']);
+    expect(kinds(resolveChangeMenuActions('t1'))).toEqual(['apply', 'set_aside', 'discard']);
   });
 
   it('offers the standing apply while an event wait withholds Apply', () => {
@@ -361,6 +372,26 @@ describe('runCloseCascade no-op gates', () => {
     expect(confirmState.value.okLabel).toBe('Apply');
     expect(confirmState.value.extraAction?.label).toBe('Discard');
     confirmState.value.resolve?.(false);
+  });
+});
+
+describe('the close shortcut on incomplete work', () => {
+  it('asks the incomplete confirm after the apply/discard choice', async () => {
+    setThread(makeThreadState('t1', {
+      meta: { channel: 'claude_code', section: 'inbox', status: 'idle', codingAgentProposed: true },
+    }));
+    changes.value = { status: 'loaded', data: [pendingChangeRow('t1', { incomplete: true })] };
+    focusedThreadId.value = 't1';
+
+    const pending = runCloseCascade();
+    await Promise.resolve();
+    confirmState.value.resolve?.(true);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(confirmState.value.visible).toBe(true);
+    expect(confirmState.value.message).toBe(APPLY_INCOMPLETE_CONFIRM);
+    confirmState.value.resolve?.(false);
+    await pending;
   });
 });
 

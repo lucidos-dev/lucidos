@@ -1,5 +1,5 @@
-import { describe, it, expect, afterEach } from 'vitest';
-import { primaryPointerIsDown } from './pointerPress';
+import { describe, it, expect, afterEach, vi } from 'vitest';
+import { afterPressSettles, primaryPointerIsDown } from './pointerPress';
 
 /** Drives the document stub from `test-setup.ts`, which dispatches to every
  *  listener of a type regardless of phase. That is enough here: the module
@@ -47,5 +47,47 @@ describe('primaryPointerIsDown', () => {
     dispatch('pointerdown');
     dispatch('pointerup', { isPrimary: false });
     expect(primaryPointerIsDown()).toBe(true);
+  });
+});
+
+/** A relayout on focus loss waits for the press that moved the focus, so the
+ *  release is hit-tested against the layout the press landed on. */
+describe('afterPressSettles', () => {
+  afterEach(() => {
+    dispatch('pointerup');
+    vi.useRealTimers();
+  });
+
+  it('runs in the next task when no press is held, after a tap has clicked', () => {
+    vi.useFakeTimers();
+    const fn = vi.fn();
+    afterPressSettles(fn);
+    expect(fn).not.toHaveBeenCalled();
+    vi.runAllTimers();
+    expect(fn).toHaveBeenCalledOnce();
+  });
+
+  it('waits for a held press to lift, then runs in the task after its click', () => {
+    vi.useFakeTimers();
+    const fn = vi.fn();
+    dispatch('pointerdown');
+    afterPressSettles(fn);
+    vi.runAllTimers();
+    expect(fn).not.toHaveBeenCalled();
+    dispatch('pointerup');
+    expect(fn).not.toHaveBeenCalled();
+    vi.runAllTimers();
+    expect(fn).toHaveBeenCalledOnce();
+  });
+
+  it('runs once a cancelled press ends, and only once', () => {
+    vi.useFakeTimers();
+    const fn = vi.fn();
+    dispatch('pointerdown');
+    afterPressSettles(fn);
+    dispatch('pointercancel');
+    dispatch('pointerup');
+    vi.runAllTimers();
+    expect(fn).toHaveBeenCalledOnce();
   });
 });

@@ -16,7 +16,7 @@
 # IS a hit: touch a line and you own it.
 #
 # Blocks with exit 2 and an actionable stderr message, matching its neighbours
-# pre-push.sh, pre-kill.sh and no-em-dashes.sh. The message names the file, the
+# pre-push.sh, pre-kill.sh and em-dashes.sh. The message names the file, the
 # line and the limit, so the fix needs no further questions.
 #
 # FAILS OPEN on anything infrastructural (no jq, unparseable payload, missing

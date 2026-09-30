@@ -2889,10 +2889,14 @@ event that retires it.
   followed, so the condition is met. Then:
   - Delete the duplicated DDL from each site.
   - Keep any non-DDL work an `init_schema` does.
-  - Drop the "one release cycle" paragraph from the migration header.
+  - **Never edit the migration file**, its header included. sqlx checksums the
+    whole file, comments too, so an edit stops every workspace that applied it
+    from booting. A fresh database cannot catch that.
   - Verify with `make test` and a fresh-database boot (`./scripts/e2e-api.sh`),
     since migrations must then create every table on their own.
-- **Status:** active (condition met, cleanup pending)
+- **Status:** removed 2026-09-30. Every body was DDL the migration already runs,
+  so each function and its call went. `populate_memory` now runs the migrations
+  itself. The migration header still names the bodies, and stays unedited.
 
 ---
 

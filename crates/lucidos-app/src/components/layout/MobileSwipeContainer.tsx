@@ -105,20 +105,15 @@ export function shouldStartPaneSwipe(args: {
  *  app, i.e. should `data-keyboard-active` be set?
  *
  *  Scoped to `<textarea>` (not every text input) so the header search bar stays
- *  interactive while its `<input>` is focused. The thread-title editor is
- *  excluded because its own container (`.mobile-thread-title-row`) is one of the
- *  things the flag inerts, which would lock the user out of the editor they just
- *  opened and defeat tap-outside-to-blur.
+ *  interactive while its `<input>` is focused.
  *
  *  Takes the element rather than reading `document.activeElement` itself, so the
  *  same predicate answers for a focus EVENT's target and for the live focus (see
- *  `reconcileKeyboardActive`). Duck-typed on `tagName` + `closest` rather than
- *  `instanceof`, matching `shouldSuppressDragStart`: testable without a DOM, and
+ *  `reconcileKeyboardActive`). Duck-typed on `tagName` rather than `instanceof`,
+ *  matching `shouldSuppressDragStart`: testable without a DOM, and
  *  realm-agnostic. */
 export function isKeyboardActiveTarget(el: EventTarget | null): boolean {
-  const node = el as { tagName?: string; closest?: (sel: string) => unknown } | null;
-  if (!node || node.tagName !== 'TEXTAREA' || typeof node.closest !== 'function') return false;
-  return node.closest('.mobile-thread-title-row') == null;
+  return (el as { tagName?: string } | null)?.tagName === 'TEXTAREA';
 }
 
 /** Attribute sink: `<html>` in the app, a recording stub in tests. */

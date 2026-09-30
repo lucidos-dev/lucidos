@@ -62,7 +62,7 @@ CONTEXT_BUDGET_CEILING=48375
 CONTEXT_BUDGET_EXPECTED_ALWAYS=(
     "CLAUDE.md"
     ".claude/rules/glossary.md"
-    ".claude/rules/no-em-dashes.md"
+    ".claude/rules/em-dashes.md"
     ".claude/rules/no-private-data.md"
     ".claude/rules/philosophy.md"
     ".claude/rules/prose.md"

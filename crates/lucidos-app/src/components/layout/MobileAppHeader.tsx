@@ -1,10 +1,8 @@
 import type { ComponentType } from 'preact';
 import { scrolledFromTop } from '../chat/scrollState';
 import { SearchIcon } from '../shared/icons';
+import { SearchField } from '../shared/SearchField';
 import { MobileRefreshIndicator } from './RefreshIndicator';
-import { PinThreadButton } from '../shared/PinThreadButton';
-import { ThreadOverflowMenu } from '../shared/ThreadOverflowMenu';
-import { revealThreadInList } from '../drawer/ThreadDrawer';
 import { ThreadBackButton, ThreadForwardButton } from '../shared/ThreadNav';
 import { ThreadToggleButton } from '../shared/ThreadToggleButton';
 import { HamburgerButton, ContentBackButton, ContentForwardButton } from './ContentNav';
@@ -15,8 +13,8 @@ import { threadSearchQuery, mobileView, MOBILE_VIEWS, focusedThreadId, threadMap
 import { navigateToPane } from '../../store/actions/pane';
 import { useThreadsHeaderState } from '../../hooks/useThreadsHeaderState';
 import { ThreadFilterButton, ThreadsPaneTitle } from './ThreadFilterButton';
-import { ThreadTitleEditor } from '../chat/ThreadTitleEditor';
-import { ThreadStatusIcon, threadVisualStatus } from '../shared/ThreadStatusIcon';
+import { ThreadTitleMenu } from '../chat/ThreadTitle';
+import { threadVisualStatus } from '../shared/ThreadStatusIcon';
 import { threadDisplayTitle } from '../../utils/threadTitle';
 import { MobileThreadsPane } from './MobileThreadsPane';
 import { ThreadPane } from './ThreadPane';
@@ -49,12 +47,10 @@ function MobileThreadsHeader() {
     <div class={`mobile-threads-header${searchOpen ? ' search-active' : ''}`}>
       <div class="mobile-header-row">
         <div class="mobile-thread-search-bar">
-          <SearchIcon className="thread-search-bar-icon" />
-          <input
-            ref={searchInputRef}
-            class="thread-search-input"
-            type="text"
-            placeholder="Search threads..."
+          <SearchField
+            inputRef={searchInputRef}
+            inputClass="thread-search-input"
+            placeholder="Search threads…"
             value={threadSearchQuery.value}
             onInput={onSearchInput}
             onKeyDown={onSearchKeyDown}
@@ -231,7 +227,6 @@ export function MobileThreadTitleBar() {
   if (!threadId || !eventThread) return null;
 
   const threadTitle = threadDisplayTitle(eventThread);
-  const visualStatus = threadVisualStatus(eventThread);
 
   return (
     // data-scroller-pinned: the transcript's iOS repaint nudge compensates its
@@ -242,15 +237,7 @@ export function MobileThreadTitleBar() {
       class={`mobile-thread-title-row${scrolledFromTop.value ? ' scrolled' : ''}`}
       data-scroller-pinned
     >
-      <ThreadStatusIcon status={visualStatus} />
-      <ThreadTitleEditor key={threadId} threadId={threadId} title={threadTitle} />
-      <span class="thread-view-header-actions">
-        {eventThread.meta.state !== 'composing' && (
-          <PinThreadButton threadId={threadId} saved={eventThread.meta.saved} />
-        )}
-        <ThreadOverflowMenu threadId={threadId} title={threadTitle}
-            onShowInThreadList={eventThread.meta.state === 'composing' ? undefined : () => revealThreadInList(threadId)} />
-      </span>
+      <ThreadTitleMenu thread={eventThread} title={threadTitle} status={threadVisualStatus(eventThread)} />
     </div>
   );
 }

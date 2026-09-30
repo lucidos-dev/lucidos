@@ -715,6 +715,7 @@ describe('Bug: SSE-born scheduled trigger thread categorization', () => {
         createdAt: '',
         updatedAt: '',
         status: 'idle',
+        summaryVersion: 0,
         messageCount: 0,
         section: 'archived',
         activeChildrenCount: 0,

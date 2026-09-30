@@ -512,6 +512,78 @@ function wrapImagesIn(body: HTMLElement): void {
   }
 }
 
+const EM_DASH = String.fromCharCode(0x2014);
+
+/** Inline elements whose text continues the sentence around them. Any other
+ *  neighbour (a `<br>`, a block, nothing) is a line edge, which counts as a
+ *  space. */
+const INLINE_TEXT_TAGS = new Set(['A', 'B', 'CODE', 'DEL', 'EM', 'I', 'KBD', 'MARK', 'S', 'SPAN', 'STRONG', 'SUB', 'SUP']);
+
+const isInline = (node: Node): boolean => node.nodeType === Node.TEXT_NODE
+  || (node.nodeType === Node.ELEMENT_NODE && INLINE_TEXT_TAGS.has((node as Element).tagName));
+
+/** The character a text node meets on one side. With no sibling there, an
+ *  inline parent passes the question up, so `**x<dash>**` sees what follows
+ *  the bold. */
+function neighbourChar(node: Node, side: 'before' | 'after'): string {
+  for (let cur: Node = node; ; cur = cur.parentNode as Node) {
+    const sibling = side === 'before' ? cur.previousSibling : cur.nextSibling;
+    if (sibling) {
+      const text = isInline(sibling) ? sibling.textContent ?? '' : '';
+      return (side === 'before' ? text[text.length - 1] : text[0]) ?? ' ';
+    }
+    if (!cur.parentNode || !isInline(cur.parentNode)) return ' ';
+  }
+}
+
+const HTML_NS = 'http://www.w3.org/1999/xhtml';
+
+/** Whether a span may replace part of this text node and survive a re-parse.
+ *  SVG and MathML text would eject an HTML span, and a text-only element such
+ *  as `<textarea>` would show its markup as characters. Code is left alone. */
+function acceptsSpan(node: Text): boolean {
+  const parent = node.parentElement;
+  return parent !== null
+    && parent.namespaceURI === HTML_NS
+    && parent.closest('code, pre, textarea, option, title') === null;
+}
+
+/** Wrap each unspaced em dash in `.em-dash-gap`, which pads it in CSS.
+ *
+ *  A monospace font draws the dash one cell wide, so an unspaced one reads as
+ *  a hyphenated word. `.claude/rules/em-dashes.md` bans that form, but a model
+ *  still writes it. A span changes only the rendering: the text and what the
+ *  user copies stay exactly as written. */
+function spaceUnspacedEmDashes(html: string): string {
+  return inDom(html, [EM_DASH], (body) => {
+    const walker = body.ownerDocument.createTreeWalker(body, NodeFilter.SHOW_TEXT);
+    const texts: Text[] = [];
+    for (let n = walker.nextNode(); n; n = walker.nextNode()) texts.push(n as Text);
+    for (const node of texts) {
+      if (node.data.includes(EM_DASH) && acceptsSpan(node)) spaceDashesIn(node);
+    }
+  });
+}
+
+function spaceDashesIn(node: Text): void {
+  const { data } = node;
+  const parts: (string | Node)[] = [];
+  let from = 0;
+  for (let i = data.indexOf(EM_DASH); i !== -1; i = data.indexOf(EM_DASH, i + 1)) {
+    const before = i > 0 ? data[i - 1] : neighbourChar(node, 'before');
+    const after = i < data.length - 1 ? data[i + 1] : neighbourChar(node, 'after');
+    if (/\s/.test(before) && /\s/.test(after)) continue;
+    const gap = node.ownerDocument.createElement('span');
+    gap.className = 'em-dash-gap';
+    gap.textContent = EM_DASH;
+    parts.push(data.slice(from, i), gap);
+    from = i + 1;
+  }
+  if (parts.length === 0) return;
+  parts.push(data.slice(from));
+  node.replaceWith(...parts.filter((p) => p !== ''));
+}
+
 /** A bare email autolink right after a `/`. marked's GFM autolinker reads any
  *  `local@domain.tld` run as an email, even inside a path. A home folder like
  *  `/Users/me.x@example.com/` then grows a `mailto:` link mid-path, and a click
@@ -560,6 +632,7 @@ export function renderMarkdown(md: string, opts?: { cache?: boolean }): string {
     html = resolveCopyTargets(html, copyTexts);
     html = prepareImages(html);
     html = transformTables(html);
+    html = spaceUnspacedEmDashes(html);
     // The workspace-qualified form is what the copy-ref button emits.
     html = html.replace(
       /href="thread:(?:([a-zA-Z0-9_-]+)\/)?([0-9a-f-]+)"/g,

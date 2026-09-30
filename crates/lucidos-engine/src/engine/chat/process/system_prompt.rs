@@ -564,7 +564,6 @@ EVENTS (the `events` tool):
 
 PARALLEL WORK (FAN-OUT):
 - run_coding_agent starts a coding-agent thread for code work; run_thread starts a Lucidos thread for non-code work; follow_up_child_thread steers a child you already spawned, and `threads` 'detach_child' stops waiting for one. You can only address your own DIRECT children, which the `threads` tool's 'list' action lists with `my_children: true`.
-- Nothing archives a thread for you. Once a child's change is applied and you expect no follow-up, archive it with `threads` 'archive'. Leave it open while a follow-up, a question, a pending change or a live event wait remains.
 - The resume callback that reports a child's result back here only works for same-workspace children spawned with these tools.
 - For a pipeline where step N depends on step N-1, spawn ONE child per response and wait for the callback. Never batch sequential spawns into one response.
 - SPAWN SPARINGLY. Default to doing the work yourself. Spawn only for genuinely independent subtasks that gain from running in parallel, never for what a few sequential tool calls would do, and never one thread per item in a list. Maximum __MAX_CHILDREN_PER_THREAD__ children per thread, maximum depth 3.
@@ -1337,7 +1336,10 @@ mod tests {
     /// Raised by 57 to a measured 122,008: `ask_user_question` says its
     /// question renders markdown. A card of findings arrived as one run-on
     /// paragraph without it.
-    const ALWAYS_LOADED_BUDGET_CHARS: usize = 122_008;
+    ///
+    /// Lowered by 260 to a measured 121,748: the PARALLEL WORK rule on when to
+    /// archive is gone (ADR 0330). No prompt says when to archive.
+    const ALWAYS_LOADED_BUDGET_CHARS: usize = 121_748;
 
     /// The hand-written flat tool schemas the chat agent is offered.
     ///

@@ -15,7 +15,7 @@ import { dirname, resolve } from 'node:path';
 
 const mocks = vi.hoisted(() => ({
   openFilePreview: vi.fn(),
-  openLocalFile: vi.fn(),
+  openLocalFileOnConfirm: vi.fn(async () => {}),
   openApp: vi.fn(),
   openAppById: vi.fn(async () => {}),
   navigateToTrigger: vi.fn(async () => {}),
@@ -25,7 +25,7 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock('../../store/actions/artifacts', () => ({
   openFilePreview: mocks.openFilePreview,
-  openLocalFile: mocks.openLocalFile,
+  openLocalFileOnConfirm: mocks.openLocalFileOnConfirm,
 }));
 vi.mock('../../store/actions/apps', () => ({
   openApp: mocks.openApp,
@@ -81,16 +81,16 @@ describe('handleMarkdownLinkClick', () => {
     expect(mocks.openFilePreview).toHaveBeenCalledWith('artifacts/releases/changelog-v0.40.1.md');
   });
 
-  it('hands a file:// link to the OS opener', () => {
-    const prevented = clickFirstLink('[DMG](file:///Users/me/Lucidos.dmg)');
+  it('hands a file:// link to the OS opener, behind the confirm', () => {
+    const prevented = clickFirstLink('[DMG](file:///Users/me/Lucidos.dmg)', 'a notification');
     expect(prevented).toBe(true);
-    expect(mocks.openLocalFile).toHaveBeenCalledWith('file:///Users/me/Lucidos.dmg');
+    expect(mocks.openLocalFileOnConfirm).toHaveBeenCalledWith('file:///Users/me/Lucidos.dmg', 'a notification');
   });
 
   it('hands a bare file:// URL in prose to the OS opener, even under an email-shaped home folder', () => {
     const prevented = clickFirstLink('DMG: file:///Users/me.x@example.com/p/Lucidos.dmg');
     expect(prevented).toBe(true);
-    expect(mocks.openLocalFile).toHaveBeenCalledWith('file:///Users/me.x@example.com/p/Lucidos.dmg');
+    expect(mocks.openLocalFileOnConfirm).toHaveBeenCalledWith('file:///Users/me.x@example.com/p/Lucidos.dmg', undefined);
   });
 
   it('routes a trigger link with the surface named as its source', () => {

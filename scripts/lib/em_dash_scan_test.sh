@@ -1,8 +1,8 @@
 #!/bin/bash
-# Tests for the no-em-dash gate (`.claude/rules/no-em-dashes.md`): the shared
+# Tests for the em-dash gate (`.claude/rules/em-dashes.md`): the shared
 # library scripts/lib/em_dash_scan.sh, the review-time CLI
 # scripts/check-em-dashes.sh, and the write-time hook
-# .claude/hooks/no-em-dashes.sh.
+# .claude/hooks/em-dashes.sh.
 #
 # Hermetic: the diff-scoped half runs against a throwaway git repo, the hook
 # half against synthesized PreToolUse payloads. Nothing reads the real tree, so
@@ -14,7 +14,8 @@
 #
 # Covered: an added line flagged; a file with PRE-EXISTING dashes on untouched
 # lines staying clean (the whole reason the gate is diff-scoped); a reworded
-# line that keeps its dash flagged; a deleted dash line clean; U+2015 flagged;
+# line that keeps its dash flagged; a deleted dash line clean; a SPACED em dash
+# clean, a one-sided or mixed line flagged; U+2015 flagged even when spaced;
 # U+2013 EN DASH never flagged; untracked files scanned whole; the CLI's exit
 # status in all three states (clean, hits, cannot-run); and every hook path,
 # Edit / Write / `git commit -m` / carried-over lines / unrelated tools.
@@ -26,7 +27,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/lib/em_dash_scan.sh
 source "$SCRIPT_DIR/em_dash_scan.sh"
 CLI="$SCRIPT_DIR/../check-em-dashes.sh"
-HOOK="$SCRIPT_DIR/../../.claude/hooks/no-em-dashes.sh"
+HOOK="$SCRIPT_DIR/../../.claude/hooks/em-dashes.sh"
 
 EM="$EM_DASH_U2014"
 BAR="$EM_DASH_U2015"
@@ -79,8 +80,8 @@ bash_payload() { # <command>
 # `legacy.md` stands in for the ~29,000 lines already in the real tree: it is
 # committed WITH dashes on the base commit, so nothing about it may ever be
 # reported unless a later commit touches those lines.
-write legacy.md "A settled line ${EM} with a dash already in it.
-A second settled line ${EM} likewise.
+write legacy.md "A settled line${EM}with a dash already in it.
+A second settled line${EM}likewise.
 A clean line nobody has touched."
 write clean.md "Nothing to see here."
 commit "base"
@@ -90,7 +91,7 @@ git -C "$REPO" checkout -qb feature
 
 test_flags_added_line() {
     echo "test: an added line carrying U+2014 is flagged"
-    write added.md "Fresh prose ${EM} with a dash."
+    write added.md "Fresh prose${EM}with a dash."
     commit "add"
     run_cli
     if [ "$CLI_RC" -eq 1 ] && printf '%s' "$CLI_OUT" | grep -q "added.md:1:"; then
@@ -113,8 +114,8 @@ test_flags_added_line() {
 
 test_ignores_untouched_preexisting() {
     echo "test: touching a file with pre-existing dashes on untouched lines is clean"
-    write legacy.md "A settled line ${EM} with a dash already in it.
-A second settled line ${EM} likewise.
+    write legacy.md "A settled line${EM}with a dash already in it.
+A second settled line${EM}likewise.
 A clean line nobody has touched, now reworded."
     commit "touch the clean line only"
     run_cli
@@ -127,8 +128,8 @@ A clean line nobody has touched, now reworded."
 
 test_flags_reworded_line_that_keeps_its_dash() {
     echo "test: rewording a line that KEEPS its dash is flagged (touch it, own it)"
-    write legacy.md "A settled line ${EM} now reworded but still dashed.
-A second settled line ${EM} likewise.
+    write legacy.md "A settled line${EM}now reworded but still dashed.
+A second settled line${EM}likewise.
 A clean line nobody has touched, now reworded."
     commit "reword a dashed line"
     run_cli
@@ -142,7 +143,7 @@ A clean line nobody has touched, now reworded."
 
 test_deleting_a_dash_line_is_clean() {
     echo "test: deleting a dashed line is clean"
-    write legacy.md "A second settled line ${EM} likewise.
+    write legacy.md "A second settled line${EM}likewise.
 A clean line nobody has touched."
     commit "delete the first dashed line"
     run_cli
@@ -155,7 +156,7 @@ A clean line nobody has touched."
 }
 
 test_flags_horizontal_bar() {
-    echo "test: U+2015 HORIZONTAL BAR is flagged too"
+    echo "test: U+2015 HORIZONTAL BAR is flagged, even with spaces around it"
     write bar.md "A lookalike ${BAR} not just U+2014."
     commit "bar"
     run_cli
@@ -165,6 +166,48 @@ test_flags_horizontal_bar() {
         fail "expected a hit on bar.md:1, rc=$CLI_RC out=$CLI_OUT"
     fi
     git -C "$REPO" rm -q bar.md && commit "undo bar"
+}
+
+test_spaced_em_dash_is_not_flagged() {
+    echo "test: an em dash with a space or line edge on both sides is NOT flagged"
+    write spaced.md "Mid line ${EM} like this.
+${EM} opening a wrapped line
+closing a wrapped line ${EM}
+${EM}
+| cell | ${EM} |
+Two ${EM} on ${EM} one line."
+    run_cli
+    if [ "$CLI_RC" -eq 0 ]; then
+        pass "left alone while untracked"
+    else
+        fail "a spaced em dash must never be flagged, rc=$CLI_RC out=$CLI_OUT"
+    fi
+    commit "spaced"
+    run_cli
+    if [ "$CLI_RC" -eq 0 ]; then
+        pass "left alone once committed"
+    else
+        fail "a spaced em dash must never be flagged, rc=$CLI_RC out=$CLI_OUT"
+    fi
+    git -C "$REPO" rm -q spaced.md && commit "undo spaced"
+}
+
+test_flags_one_sided_and_mixed_lines() {
+    echo "test: a one-sided em dash, or a mixed line, is flagged"
+    write sided.md "Space before ${EM}only.
+Space after${EM} only.
+Spaced ${EM} here, but unspaced${EM}there."
+    commit "sided"
+    run_cli
+    local n
+    for n in 1 2 3; do
+        if printf '%s' "$CLI_OUT" | grep -q "sided.md:$n:"; then
+            pass "line $n flagged"
+        else
+            fail "expected a hit on sided.md:$n, rc=$CLI_RC out=$CLI_OUT"
+        fi
+    done
+    git -C "$REPO" rm -q sided.md && commit "undo sided"
 }
 
 test_en_dash_is_not_flagged() {
@@ -182,7 +225,7 @@ test_en_dash_is_not_flagged() {
 
 test_uncommitted_and_untracked_are_scanned() {
     echo "test: uncommitted edits and untracked files are scanned"
-    printf '%s\n' "Uncommitted ${EM} prose." >> "$REPO/clean.md"
+    printf '%s\n' "Uncommitted${EM}prose." >> "$REPO/clean.md"
     run_cli
     if [ "$CLI_RC" -eq 1 ] && printf '%s' "$CLI_OUT" | grep -q "clean.md:"; then
         pass "uncommitted working-tree edit flagged"
@@ -191,7 +234,7 @@ test_uncommitted_and_untracked_are_scanned() {
     fi
     git -C "$REPO" checkout -q -- clean.md
 
-    printf '%s\n' "Brand new ${EM} file." > "$REPO/untracked.md"
+    printf '%s\n' "Brand new${EM}file." > "$REPO/untracked.md"
     run_cli
     if [ "$CLI_RC" -eq 1 ] && printf '%s' "$CLI_OUT" | grep -q "untracked.md:1:"; then
         pass "untracked file scanned whole"
@@ -242,7 +285,7 @@ test_unresolvable_base_fails_closed() {
 
 test_hook_blocks_edit_adding_a_dash() {
     echo "test: hook blocks an Edit whose new_string adds a dash"
-    run_hook "$(edit_payload "/tmp/x.md" "old text" "new text ${EM} with a dash")"
+    run_hook "$(edit_payload "/tmp/x.md" "old text" "new text${EM}with a dash")"
     if [ "$HOOK_RC" -eq 2 ]; then
         pass "blocked"
     else
@@ -267,7 +310,7 @@ test_hook_blocks_edit_adding_a_dash() {
 
 test_hook_allows_carried_over_line() {
     echo "test: hook allows an Edit that CARRIES an existing dashed line along"
-    local shared="A settled line ${EM} with a dash already in it."
+    local shared="A settled line${EM}with a dash already in it."
     run_hook "$(edit_payload "/tmp/x.md" "${shared}"$'\n'"old tail" "${shared}"$'\n'"new tail")"
     if [ "$HOOK_RC" -eq 0 ]; then
         pass "allowed, the dash is not being added"
@@ -280,7 +323,7 @@ test_hook_blocks_a_duplicated_dashed_line() {
     echo "test: hook blocks a SECOND copy of a line the baseline already had"
     # The baseline vouches for one copy, not two. Plain set membership would
     # let the new copy through; the baseline is a multiset for this reason.
-    local shared="A settled line ${EM} with a dash already in it."
+    local shared="A settled line${EM}with a dash already in it."
     run_hook "$(edit_payload "/tmp/x.md" "${shared}" "${shared}"$'\n'"${shared}")"
     if [ "$HOOK_RC" -eq 2 ]; then
         pass "blocked, the duplicate is an added line"
@@ -309,9 +352,25 @@ test_hook_allows_en_dash_edit() {
     fi
 }
 
+test_hook_allows_spaced_em_dash() {
+    echo "test: hook allows an Edit and a commit message with a spaced em dash"
+    run_hook "$(edit_payload "/tmp/x.md" "old" "new text ${EM} with a spaced dash")"
+    if [ "$HOOK_RC" -eq 0 ]; then
+        pass "Edit allowed"
+    else
+        fail "expected exit 0, got $HOOK_RC: $HOOK_OUT"
+    fi
+    run_hook "$(bash_payload "git commit -m \"fix(gate): block the thing ${EM} it was noisy\"")"
+    if [ "$HOOK_RC" -eq 0 ]; then
+        pass "commit allowed"
+    else
+        fail "expected exit 0, got $HOOK_RC: $HOOK_OUT"
+    fi
+}
+
 test_hook_blocks_write_of_new_file() {
     echo "test: hook blocks a Write creating a file with a dash"
-    run_hook "$(write_payload "$REPO/brand-new.md" "line one"$'\n'"line two ${EM} dashed")"
+    run_hook "$(write_payload "$REPO/brand-new.md" "line one"$'\n'"line two${EM}dashed")"
     if [ "$HOOK_RC" -eq 2 ] && printf '%s' "$HOOK_OUT" | grep -q "line 2"; then
         pass "blocked, with the line number"
     else
@@ -321,7 +380,7 @@ test_hook_blocks_write_of_new_file() {
 
 test_hook_allows_write_preserving_existing_dashes() {
     echo "test: hook allows a Write that preserves an existing file's dashed lines"
-    run_hook "$(write_payload "$REPO/legacy.md" "A settled line ${EM} with a dash already in it."$'\n'"A second settled line ${EM} likewise."$'\n'"A rewritten clean line.")"
+    run_hook "$(write_payload "$REPO/legacy.md" "A settled line${EM}with a dash already in it."$'\n'"A second settled line${EM}likewise."$'\n'"A rewritten clean line.")"
     if [ "$HOOK_RC" -eq 0 ]; then
         pass "allowed, no dash is being introduced"
     else
@@ -331,7 +390,7 @@ test_hook_allows_write_preserving_existing_dashes() {
 
 test_hook_blocks_commit_message() {
     echo "test: hook blocks a 'git commit -m' whose message carries a dash"
-    run_hook "$(bash_payload "git commit -m \"fix(gate): block the thing ${EM} it was noisy\"")"
+    run_hook "$(bash_payload "git commit -m \"fix(gate): block the thing${EM}it was noisy\"")"
     if [ "$HOOK_RC" -eq 2 ]; then
         pass "blocked"
     else
@@ -348,19 +407,19 @@ test_hook_blocks_combined_and_attached_commit_flags() {
     echo "test: hook blocks 'git commit -am' and an attached -m\"...\" too"
     # Recognising the message ARGUMENT is what leaks: a pattern for a standalone
     # -m misses both of these. Inside a git commit the whole line is checked.
-    run_hook "$(bash_payload "git commit -am \"fix: the thing ${EM} it was noisy\"")"
+    run_hook "$(bash_payload "git commit -am \"fix: the thing${EM}it was noisy\"")"
     if [ "$HOOK_RC" -eq 2 ]; then
         pass "combined -am blocked"
     else
         fail "expected exit 2 for -am, got $HOOK_RC: $HOOK_OUT"
     fi
-    run_hook "$(bash_payload "git commit -m\"fix: the thing ${EM} it was noisy\"")"
+    run_hook "$(bash_payload "git commit -m\"fix: the thing${EM}it was noisy\"")"
     if [ "$HOOK_RC" -eq 2 ]; then
         pass "attached -m\"...\" blocked"
     else
         fail "expected exit 2 for attached -m, got $HOOK_RC: $HOOK_OUT"
     fi
-    run_hook "$(bash_payload "git commit --message=\"fix: the thing ${EM} it was noisy\"")"
+    run_hook "$(bash_payload "git commit --message=\"fix: the thing${EM}it was noisy\"")"
     if [ "$HOOK_RC" -eq 2 ]; then
         pass "--message= blocked"
     else
@@ -390,7 +449,7 @@ test_hook_allows_searching_for_the_character() {
 
 test_hook_ignores_other_tools() {
     echo "test: hook ignores tools it does not gate"
-    run_hook "$(jq -n --arg c "read this ${EM} file" '{tool_name: "Read", tool_input: {file_path: $c}}')"
+    run_hook "$(jq -n --arg c "read this${EM}file" '{tool_name: "Read", tool_input: {file_path: $c}}')"
     if [ "$HOOK_RC" -eq 0 ]; then
         pass "passthrough"
     else
@@ -414,6 +473,8 @@ test_ignores_untouched_preexisting
 test_flags_reworded_line_that_keeps_its_dash
 test_deleting_a_dash_line_is_clean
 test_flags_horizontal_bar
+test_spaced_em_dash_is_not_flagged
+test_flags_one_sided_and_mixed_lines
 test_en_dash_is_not_flagged
 test_uncommitted_and_untracked_are_scanned
 test_clean_branch_exits_zero
@@ -426,6 +487,7 @@ test_hook_allows_carried_over_line
 test_hook_blocks_a_duplicated_dashed_line
 test_hook_allows_clean_edit
 test_hook_allows_en_dash_edit
+test_hook_allows_spaced_em_dash
 test_hook_blocks_write_of_new_file
 test_hook_allows_write_preserving_existing_dashes
 test_hook_blocks_commit_message

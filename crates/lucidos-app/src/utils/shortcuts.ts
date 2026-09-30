@@ -14,6 +14,7 @@ export type ShortcutId =
   | 'openNotifications'
   | 'focusComposer'
   | 'stopThread'
+  | 'askSideQuestion'
   | 'copyLastResponse'
   | 'renameThread'
   | 'focusNewestToast'
@@ -85,6 +86,7 @@ export const SHORTCUT_DEFS: readonly ShortcutDef[] = [
   { id: 'nextTurnOrNotification', label: 'Next turn (thread) or older notification', category: 'Navigation', defaultBinding: B(true, false, false, 'ArrowDown') },
   { id: 'focusComposer', label: 'Focus the composer', category: 'Thread', defaultBinding: B(false, true, false, 'Escape') },
   { id: 'stopThread', label: 'Stop the running thread', category: 'Thread', defaultBinding: B(true, false, false, '.') },
+  { id: 'askSideQuestion', label: 'Ask the draft as a side question', category: 'Thread', defaultBinding: B(false, false, true, 'Enter') },
   { id: 'copyLastResponse', label: 'Copy last response', category: 'Thread', defaultBinding: B(true, true, false, 'c') },
   { id: 'renameThread', label: 'Rename thread', category: 'Thread', defaultBinding: B(false, false, false, 'F2') },
   { id: 'toggleThreadDrawer', label: 'Show or hide thread drawer', category: 'Panes', defaultBinding: B(true, true, false, '1') },

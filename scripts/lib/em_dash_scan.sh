@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Canonical em-dash detection: the SINGLE source of truth for the
-# deterministic side of the no-em-dash rule (see
-# `.claude/rules/no-em-dashes.md`). Sourced by:
-#   - .claude/hooks/no-em-dashes.sh        (write-time PreToolUse gate)
+# deterministic side of the em-dash rule (see
+# `.claude/rules/em-dashes.md`). Sourced by:
+#   - .claude/hooks/em-dashes.sh           (write-time PreToolUse gate)
 #   - scripts/check-em-dashes.sh           (diff-scoped gate, /harden Phase 4.5)
 #   - scripts/lib/em_dash_scan_test.sh     (its test)
 # Do NOT copy the characters or the advice text anywhere else, reference this
@@ -12,33 +12,58 @@
 # EVERYTHING HERE IS ADDED-LINES-ONLY, on purpose. Roughly 29,000 lines in this
 # repo already carry the character; a whole-file or whole-tree scanner would
 # red-light on all of them and be switched off within a day. Both consumers ask
-# the same question: "does the text this write ADDS carry a banned character?"
+# the same question: "does the text this write ADDS carry a banned dash?"
 
-# The two banned characters, spelled as byte escapes rather than literals so
-# this file and its consumers stay clean under the rule they enforce, and so a
-# future edit to any of them is not blocked by our own write-time hook. No
-# exemption list exists anywhere in this gate, and this is why none is needed.
-EM_DASH_U2014=$'\xe2\x80\x94' # U+2014 EM DASH
-EM_DASH_U2015=$'\xe2\x80\x95' # U+2015 HORIZONTAL BAR, a visual lookalike that
-                              # would slip through a check written for U+2014.
+# The two characters, spelled as byte escapes rather than literals so this file
+# and its consumers stay clean under the rule they enforce, and so a future edit
+# to any of them is not blocked by our own write-time hook. No exemption list
+# exists anywhere in this gate, and this is why none is needed.
+EM_DASH_U2014=$'\xe2\x80\x94' # U+2014 EM DASH, banned only when unspaced.
+EM_DASH_U2015=$'\xe2\x80\x95' # U+2015 HORIZONTAL BAR, a lookalike, always banned.
 # U+2013 EN DASH is deliberately absent: it is legitimate in numeric ranges
 # (`3-5`, `2024-2026`) and is NOT banned. Do not widen this on a guess.
 
 # One sentence, shared by every failure message so the fix is always spelled the
 # same way. Callers print it verbatim.
-# shellcheck disable=SC2034 # printed by both consumers: check-em-dashes.sh and .claude/hooks/no-em-dashes.sh
-EM_DASH_ADVICE='Use a comma, a colon, parentheses, or split it into two sentences. See .claude/rules/no-em-dashes.md.'
+# shellcheck disable=SC2034 # printed by both consumers: check-em-dashes.sh and .claude/hooks/em-dashes.sh
+EM_DASH_ADVICE='Put a space on both sides of the em dash, or use a comma, a colon, parentheses or two sentences. See .claude/rules/em-dashes.md.'
 
-# em_dash_text_has <text>
-# True when the text carries either banned character. `grep -F` on the raw
-# bytes, so it is locale-independent.
-em_dash_text_has() {
-    printf '%s' "$1" | grep -qF -e "$EM_DASH_U2014" -e "$EM_DASH_U2015"
+# The one definition of a banned dash, as an awk function every scan below
+# prepends to its program. A line is banned when it carries U+2015 at all, or a
+# U+2014 that a non-whitespace character touches. The line edges count as
+# whitespace, so a dash opening or closing a wrapped line is spaced.
+#
+# The loop removes spaced dashes until none is left, since one pass cannot remove
+# two that share a space. Any em dash that survives was touching something.
+# Callers run awk under LC_ALL=C, so the match is on raw bytes.
+EM_DASH_AWK_BANNED='
+function banned(line,    s, prev) {
+    if (index(line, hb)) return 1
+    if (!index(line, em)) return 0
+    s = " " line " "
+    do { prev = s; gsub("[ \t\r]" em "[ \t\r]", " ", s) } while (s != prev)
+    return index(s, em) > 0
+}
+'
+
+# em_dash_awk <program> [operand...]
+# Run awk with the two characters bound and `banned()` defined. Operands follow
+# the program, so pass a variable as a `name=value` operand, never as `-v`.
+em_dash_awk() {
+    local program="$1"
+    shift
+    LC_ALL=C awk -v em="$EM_DASH_U2014" -v hb="$EM_DASH_U2015" "$EM_DASH_AWK_BANNED$program" "$@"
+}
+
+# em_dash_text_has_banned <text>
+# True when any line of the text carries a banned dash.
+em_dash_text_has_banned() {
+    printf '%s\n' "$1" | em_dash_awk 'banned($0) { found = 1 } END { exit !found }'
 }
 
 # em_dash_added_lines <baseline-file> <candidate-file>
 # Print `<lineno-in-candidate>:<content>` for every candidate line that carries
-# a banned character AND does not appear verbatim in the baseline.
+# a banned dash AND does not appear verbatim in the baseline.
 #
 # The baseline subtraction is the whole point: it is what makes a write that
 # merely CARRIES an existing line along (an Edit whose old_string and new_string
@@ -55,21 +80,21 @@ em_dash_text_has() {
 # a dash would let the new copy through, since the original vouched for it. A
 # git diff counts that second copy as added, and so does this.
 em_dash_added_lines() {
-    awk -v base="$1" -v em="$EM_DASH_U2014" -v hb="$EM_DASH_U2015" '
+    em_dash_awk '
         FILENAME == base { seen[$0]++; next }
-        (index($0, em) || index($0, hb)) {
+        banned($0) {
             if (seen[$0] > 0) { seen[$0]--; next }
             printf "%d:%s\n", FNR, $0
         }
-    ' "$1" "$2"
+    ' base="$1" "$1" "$2"
 }
 
 # em_dash_filter_diff
 # Read a `git diff -U0` on stdin, print `path:line:content` for every ADDED line
-# carrying a banned character. Removed and context lines are ignored, so a file
-# that is merely touched never reports the dashes it already had.
+# carrying a banned dash. Removed and context lines are ignored, so a file that
+# is merely touched never reports the dashes it already had.
 em_dash_filter_diff() {
-    awk -v em="$EM_DASH_U2014" -v hb="$EM_DASH_U2015" '
+    em_dash_awk '
         # `+++ b/<path>` opens a file. Checked before the generic `^\+` rule,
         # which it would otherwise match.
         /^\+\+\+ / {
@@ -89,7 +114,7 @@ em_dash_filter_diff() {
         }
         /^\+/ {
             line = substr($0, 2)
-            if (path != "" && (index(line, em) || index(line, hb)))
+            if (path != "" && banned(line))
                 printf "%s:%d:%s\n", path, ln, line
             ln++
             next
@@ -98,7 +123,7 @@ em_dash_filter_diff() {
 }
 
 # em_dash_scan_diff <base-commit> [repo-root]
-# Print `path:line:content` for every banned character this branch ADDS to a
+# Print `path:line:content` for every banned dash this branch ADDS to a
 # tracked file, comparing the base commit against the WORKING TREE (so
 # uncommitted edits count too, not just committed ones).
 #
@@ -127,9 +152,10 @@ em_dash_scan_diff() {
 }
 
 # em_dash_scan_untracked [repo-root]
-# Print `path:line:content` for every banned character in an untracked file.
+# Print `path:line:content` for every banned dash in an untracked file.
 # Untracked files are absent from `git diff` entirely, yet every one of their
-# lines is new, so they are scanned whole.
+# lines is new, so they are scanned whole. `grep` finds the candidate lines,
+# and `banned()` decides which of them count.
 #
 # The listing is captured BEFORE the loop, with its status checked. Feeding the
 # loop from a process substitution instead would discard `git ls-files`'s exit
@@ -159,7 +185,15 @@ em_dash_scan_untracked() {
             rc=$?
         fi
         case "$rc" in
-            0) printf '%s\n' "$hits" | awk -v p="$f" '{ print p ":" $0 }' ;;
+            0)
+                printf '%s\n' "$hits" | em_dash_awk '
+                    { text = $0; sub(/^[0-9]+:/, "", text) }
+                    banned(text) { print p ":" $0 }
+                ' p="$f" || {
+                    echo "em_dash_scan_untracked: the dash filter failed on: $f" >&2
+                    return 1
+                }
+                ;;
             1) ;; # no match, the clean case
             *)
                 echo "em_dash_scan_untracked: grep failed (status $rc) on: $f" >&2

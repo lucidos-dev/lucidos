@@ -91,27 +91,25 @@ fn is_linked_worktree(path: &Path) -> bool {
 
 impl LucidosEngine {
     pub async fn is_external_repo_thread(&self, thread_id: Uuid) -> Result<bool, sqlx::Error> {
-        sqlx::query_scalar::<_, bool>(
-            "SELECT coding_agent_is_external_repo FROM thread_summaries WHERE thread_id = $1",
-        )
-        .bind(thread_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map(|opt| opt.unwrap_or(false))
+        super::thread_is_external_repo(&self.pool, thread_id).await
     }
 
-    /// Discard all pending changes for a thread. `actor` flows into the
-    /// resulting `ChangeDiscarded` events so the chip reads "You" rather than
-    /// the engine fallback.
-    pub async fn discard_pending_for_thread(&self, thread_id: Uuid, actor: Option<MessageOrigin>) {
+    /// Discard every open change (pending or set aside) for a thread. `actor`
+    /// flows into the resulting `ChangeDiscarded` events so the chip reads
+    /// "You" rather than the engine fallback.
+    pub async fn discard_open_changes_for_thread(
+        &self,
+        thread_id: Uuid,
+        actor: Option<MessageOrigin>,
+    ) {
         // Before the loop, so a thread with no change yet still loses its tasks.
         self.abandon_background_tasks(thread_id, "Discard").await;
-        let pending = match self.changes().pending_for_thread(thread_id).await {
+        let pending = match self.changes().open_for_thread(thread_id).await {
             Ok(v) => v,
             Err(e) => {
                 log!(
-                    "[Changes] discard_pending_for_thread({}): pending_for_thread: {} — \
-                     skipping discard (pending changes remain in DB)",
+                    "[Changes] discard_open_changes_for_thread({}): open_for_thread: {}; \
+                     skipping discard (open changes remain in DB)",
                     thread_id,
                     e
                 );
@@ -130,9 +128,9 @@ impl LucidosEngine {
         }
     }
 
-    /// Enforce the "a coding-agent thread has at most one pending change at a
-    /// time" invariant: discard every pending change for `thread_id` that the
-    /// `keep` predicate rejects. `ChangeDiscarded` is event-sourced, so a stale
+    /// Enforce the "a coding-agent thread has at most one open change at a
+    /// time" invariant: discard every open change (pending or set aside) for
+    /// `thread_id` that the `keep` predicate rejects. `ChangeDiscarded` is event-sourced, so a stale
     /// row closes cleanly (its branch/worktree reset to main) instead of
     /// dangling as `pending` — which the frontend reads as "has pending changes"
     /// (`resolveThreadActions`) and which then suppresses Archive forever. See
@@ -142,18 +140,18 @@ impl LucidosEngine {
     /// exactly what survives: `propose_change` keeps the branch being proposed
     /// (dropping stale OTHER-branch changes), and the apply-time net keeps the
     /// change that just applied.
-    pub(crate) async fn discard_pending_for_thread_except(
+    pub(crate) async fn discard_open_changes_for_thread_except(
         &self,
         thread_id: Uuid,
         actor: Option<MessageOrigin>,
         keep: impl Fn(&crate::core::changes::Change) -> bool,
     ) {
-        let pending = match self.changes().pending_for_thread(thread_id).await {
+        let pending = match self.changes().open_for_thread(thread_id).await {
             Ok(v) => v,
             Err(e) => {
                 log!(
-                    "[Changes] discard_pending_for_thread_except({}): pending_for_thread: {} — \
-                     skipping reconcile (stale pending changes remain in DB)",
+                    "[Changes] discard_open_changes_for_thread_except({}): open_for_thread: {}; \
+                     skipping reconcile (stale open changes remain in DB)",
                     thread_id,
                     e
                 );
@@ -165,7 +163,7 @@ impl LucidosEngine {
                 continue;
             }
             log!(
-                "[Changes] Reconcile: discarding stale pending change {} (branch {}) for thread {} — \
+                "[Changes] Reconcile: discarding stale open change {} (branch {}) for thread {}: \
                  thread already has a newer change",
                 change.id,
                 change.branch_name,
@@ -182,8 +180,8 @@ impl LucidosEngine {
         }
     }
 
-    /// Apply-time net for the "≤1 pending change per thread" invariant: after a
-    /// change applies, discard any OTHER pending change the thread still holds.
+    /// Apply-time net for the "≤1 open change per thread" invariant: after a
+    /// change applies, discard any OTHER open change the thread still holds.
     /// `propose_change` is the primary guard (it prevents a second pending change
     /// from ever coexisting); this catches a pre-existing orphan that predates
     /// that guard or reached the thread via a path that bypassed it.
@@ -193,11 +191,12 @@ impl LucidosEngine {
         keep_change_id: Uuid,
         actor: Option<MessageOrigin>,
     ) {
-        self.discard_pending_for_thread_except(thread_id, actor, |c| c.id == keep_change_id)
+        self.discard_open_changes_for_thread_except(thread_id, actor, |c| c.id == keep_change_id)
             .await;
     }
 
-    /// Discard a single pending change because the user asked to.
+    /// Discard a single open change (pending or set aside) because the user
+    /// asked to.
     ///
     /// Also settles the thread's parent when the thread still owed it a card
     /// (ADR 0252). The engine's own reconciles call
@@ -226,7 +225,7 @@ impl LucidosEngine {
         Ok(())
     }
 
-    /// Discard a single pending change, and tell no parent.
+    /// Discard a single open change, and tell no parent.
     ///
     /// Phase 6.3 of the CC resume architecture: Discard preserves the thread's
     /// worktree directory and the branch ref so the thread stays alive and the
@@ -236,10 +235,10 @@ impl LucidosEngine {
     /// NOT deleted — keeping it lets the same `cc_session_id` resume on the
     /// same branch ref instead of having to recreate everything.
     ///
-    /// If the discarded change leaves OTHER pending changes referencing the
-    /// same branch (multi-change-on-one-branch case), skip the worktree reset
-    /// — the other changes' commits would be wiped along with this one. The
-    /// branch and worktree stay as-is, preserving the still-pending work.
+    /// If the discarded change leaves OTHER open changes referencing the same
+    /// branch (multi-change-on-one-branch case), skip the worktree reset: the
+    /// other changes' commits would be wiped along with this one. The branch
+    /// and worktree stay as-is, preserving the still-open work.
     pub(crate) async fn discard_change_quietly(
         &self,
         change_id: Uuid,
@@ -251,7 +250,7 @@ impl LucidosEngine {
             .await?
             .ok_or("Change not found")?;
         match change.status() {
-            ChangeStatus::Pending => {}
+            ChangeStatus::Pending | ChangeStatus::SetAside => {}
             // Idempotent: already discarded, return success
             ChangeStatus::Discarded => return Ok(()),
             status @ (ChangeStatus::Applied | ChangeStatus::Reverted) => {
@@ -298,21 +297,20 @@ impl LucidosEngine {
         // the batch never completes and the "Applying changes…" toast sticks.
         self.notify_apply_all(crate::engine::apply_all_driver::ApplyAllDriveMsg::Failed(
             change_id,
-            crate::engine::apply_all_driver::DISCARDED_MEMBER_REASON.to_string(),
+            crate::engine::apply_all_driver::WITHDRAWN_MEMBER_REASON.to_string(),
         ));
 
-        // Other pending changes on the same branch? If so, leave the branch
-        // and worktree untouched — wiping the branch back to main would also
-        // discard the still-pending work. On DB error, treat as if others
-        // exist — preserving the branch is safer than wiping work we can't
-        // tell is still referenced.
+        // Other open changes on the same branch? If so, leave the branch and
+        // worktree untouched: wiping the branch back to main would also discard
+        // the still-open work. On DB error, treat as if others exist, since
+        // preserving the branch is safer than wiping work that may be referenced.
         let others = self
             .changes()
-            .other_pending_for_branch(&change.branch_name, change_id)
+            .other_open_for_branch(&change.branch_name, change_id)
             .await
             .unwrap_or_else(|e| {
                 log!(
-                    "[Changes] discard_change: other_pending_for_branch({}, {}): {} — \
+                    "[Changes] discard_change: other_open_for_branch({}, {}): {}; \
                      keeping branch defensively",
                     change.branch_name,
                     change_id,
@@ -322,7 +320,7 @@ impl LucidosEngine {
             });
         if others {
             log!(
-                "[Changes] Discarded change {} but kept branch {} and worktree — other pending changes reference it",
+                "[Changes] Discarded change {} but kept branch {} and worktree: other open changes reference it",
                 change_id,
                 change.branch_name
             );
@@ -349,7 +347,7 @@ impl LucidosEngine {
         let shas = match &change.state {
             ChangeState::Applied(shas) => shas,
             ChangeState::Reverted(_) => return Ok("Change already reverted.".to_string()),
-            ChangeState::Pending { .. } | ChangeState::Discarded => {
+            ChangeState::Pending { .. } | ChangeState::SetAside | ChangeState::Discarded => {
                 return Err(format!(
                     "Change is '{}', only applied changes can be reverted",
                     change.status()

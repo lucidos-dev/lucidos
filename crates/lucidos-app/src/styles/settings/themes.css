@@ -6,7 +6,8 @@
 .theme-carousel-frame {
     display: flex;
     flex-direction: column;
-    gap: var(--space-xs);
+    gap: var(--space-sm);
+    padding-top: var(--space-sm);
 }
 
 /* Two half-transparent chevrons float over the strip's sides and page it.
@@ -67,15 +68,23 @@
    --theme-columns to the whole number of columns that fit, and the width below
    fills the strip with exactly that many. Snapping on each column keeps a
    swipe on whole cards. The inset padding keeps the selected outline and the
-   focus ring clear of the clip. */
+   focus ring clear of the clip.
+
+   A family chip eases the strip to a new height (themeStripMotion.ts). Rows
+   pack at the top meanwhile, since a grid taller than its rows would stretch
+   them and every card with them. A growing strip clips its cards rather than
+   scrolling them. */
 .theme-carousel {
     --theme-fade: 2.5rem;
+    position: relative;
     display: grid;
     grid-auto-rows: auto;
+    align-content: start;
     grid-auto-columns: calc((100% - (var(--theme-columns, 3) - 1) * var(--space-sm)) / var(--theme-columns, 3));
     gap: var(--space-sm);
     padding: var(--space-xs);
     overflow-x: auto;
+    overflow-y: hidden;
     overscroll-behavior-x: contain;
     scroll-snap-type: x mandatory;
     scroll-padding-inline: var(--space-xs);
@@ -97,11 +106,12 @@
     scroll-snap-align: center;
 }
 
-.theme-carousel-peek .theme-family:first-child .theme-card:first-of-type {
+/* Of-type, since a card a chip dropped fades out as a strip child too. */
+.theme-carousel-peek .theme-family:first-of-type .theme-card:first-of-type {
     scroll-snap-align: start;
 }
 
-.theme-carousel-peek .theme-family:last-child .theme-card:last-of-type {
+.theme-carousel-peek .theme-family:last-of-type .theme-card:last-of-type {
     scroll-snap-align: end;
 }
 
@@ -149,6 +159,17 @@
     grid-row: 1;
     font-size: var(--font-size-xs);
     color: var(--text-muted);
+}
+
+/* A card or family name a chip dropped, fading out where it stood. It sits
+   over the strip at the spot it held, outside the grid and the snap points.
+   It follows every rule above that could reach it, so it wins on a tie. */
+.theme-carousel > .theme-strip-ghost {
+    position: absolute;
+    grid-area: auto;
+    margin: 0;
+    pointer-events: none;
+    scroll-snap-align: none;
 }
 
 .theme-card {

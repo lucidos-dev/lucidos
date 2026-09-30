@@ -429,10 +429,8 @@ pub async fn refresh_coding_agent_has_diff_on_startup(pool: &sqlx::PgPool, works
 /// `POST /internal/seed-change-for-test`. See thread
 /// `c1cec485-b1d0-483d-b31d-e2ba21dd76fb` / `7f971704-75cf-4a9e-8280-973eb2bea45d`.
 ///
-/// With the gate gone, `may_touch_change_state_at_idle` fires for every clean
-/// idle, so this sweep is a no-op in steady state — it only does work on the
-/// restart that lands the gate removal, and as a general safety net for any
-/// future missed idle-proposal.
+/// `idle_change_write` fires for every clean idle and user Stop, so this sweep
+/// is a no-op in steady state: a safety net for a missed idle proposal.
 ///
 /// Selection (column-independent): idle coding-agent threads, not archived,
 /// with `coding_agent_has_diff = TRUE` and `coding_agent_proposed = FALSE`,
@@ -545,8 +543,9 @@ pub async fn propose_held_back_changes_on_startup_with_roots(
 ///   - `coding_agent_has_diff = FALSE` → no work to propose.
 ///   - `coding_agent_is_external_repo = TRUE` → engine doesn't own proposals
 ///     for external repos (CC pushes/PRs from the session).
-///   - last turn did NOT end cleanly (Generated) → only finished threads are
-///     re-proposed; interrupted/canceled/failed threads recover via Continue.
+///   - last turn neither finished nor was stopped by the user
+///     ([`last_turn_proposal`]) → a failed or aborted turn recovers via
+///     Continue. A stopped one proposes as incomplete (ADR 0328).
 ///   - empty / missing SessionStarted branch → can't resolve a branch.
 ///   - `proposal_files_for_branch` returns `None` → no committed net diff.
 ///   - existing pending change for the branch → already rescued.
@@ -586,17 +585,12 @@ async fn propose_one_held_back_change(
     if proposed || !has_diff || is_external {
         return Ok(false);
     }
-    // Only re-propose threads whose last turn ended cleanly (Generated),
-    // mirroring `may_touch_change_state_at_idle`'s terminal-kind gate. This
-    // sweep exists to un-wedge threads that FINISHED cleanly but whose
-    // per-idle `propose_change` never landed (the removed bg-bash gate, or
-    // an engine death between idle and proposal). A thread whose latest turn
-    // was interrupted / canceled / failed is not finished — surfacing an
-    // Apply card for its committed-so-far work would be a surprise. Those
-    // recover via Continue or the archive-cascade propose path instead.
-    if !last_turn_ended_cleanly(pool, thread_id).await {
+    // The same rule as the live idle gate, `idle_change_write`: this sweep
+    // catches a proposal an engine death lost between the turn's end and its
+    // `propose_change`.
+    let Some(incomplete) = last_turn_proposal(pool, thread_id).await else {
         return Ok(false);
-    }
+    };
     let repo_root: &Path = match kind.as_deref() {
         Some("app") => workspace_path,
         _ => lucidos_repo_root,
@@ -621,7 +615,7 @@ async fn propose_one_held_back_change(
     // coding_agent_proposed).
     if event_bus
         .changes_projection()
-        .get_pending_by_branch(&branch_name)
+        .get_open_by_branch(&branch_name)
         .await?
         .is_some()
     {
@@ -649,10 +643,6 @@ async fn propose_one_held_back_change(
         &branch_name,
     )
     .await;
-    // We only reach here when the last turn ended cleanly (checked above), so
-    // the proposed change is never flagged incomplete.
-    let incomplete = false;
-
     event_bus
         .emit_or_log(
             BusEvent::Thread {
@@ -668,6 +658,7 @@ async fn propose_one_held_back_change(
                     repo_root: repo_root.to_string_lossy().to_string(),
                     hardened,
                     incomplete,
+                    set_aside: false,
                     path: String::new(),
                     diff: String::new(),
                 },

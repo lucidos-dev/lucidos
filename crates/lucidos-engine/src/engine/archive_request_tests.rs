@@ -108,6 +108,7 @@ async fn propose(bus: &EventBus, thread_id: Uuid) {
             repo_root: "/tmp".into(),
             hardened: true,
             incomplete: false,
+            set_aside: false,
             path: String::new(),
             diff: String::new(),
         },

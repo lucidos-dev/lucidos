@@ -1135,6 +1135,7 @@ async fn interrupted_thread_with_a_pending_change_keeps_its_verdict() {
         repo_root: "/tmp".into(),
         hardened: false,
         incomplete: false,
+        set_aside: false,
         path: String::new(),
         diff: String::new(),
     };
@@ -1397,6 +1398,7 @@ async fn a_proposal_keeps_the_thread_on_its_open_question() {
         repo_root: "/tmp".into(),
         hardened: false,
         incomplete: true,
+        set_aside: false,
         path: String::new(),
         diff: String::new(),
     };

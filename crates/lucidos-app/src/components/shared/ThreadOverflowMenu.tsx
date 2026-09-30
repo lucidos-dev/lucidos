@@ -1,6 +1,7 @@
-import { OverflowMenu, type HostOpener } from './OverflowMenu';
+import { OverflowMenu, type HostOpener, type TriggerFace } from './OverflowMenu';
 import type { ComponentChildren } from 'preact';
-import { CopyIcon, DownloadIcon, ArchiveIcon, CheckIcon, LocateIcon, MoveToTopIcon, PinIcon, StandingApplyIcon, TrashIcon } from './icons';
+import { CopyIcon, DownloadIcon, ArchiveIcon, CheckIcon, EditIcon, LocateIcon, MoveToTopIcon, PinIcon, SetAsideIcon, SparkleIcon, StandingApplyIcon, TrashIcon } from './icons';
+import { canRenameThread, promptRenameThread, suggestThreadName } from '../../store/actions/threadRename';
 import { copyThreadRef, copyThreadTitle } from '../../utils/threadRef';
 import { exportThread } from '../../utils/exportThread';
 import { resolveChangeMenuActions, resolveThreadActions } from '../../store/actions/threadActions';
@@ -15,6 +16,7 @@ import { threadInfoRows } from '../drawer/threadRowInfo';
 const CHANGE_ACTION_ICON: Partial<Record<Action, (armed: boolean) => ComponentChildren>> = {
   apply: () => <CheckIcon />,
   apply_when_settled: (armed) => <StandingApplyIcon armed={armed} />,
+  set_aside: () => <SetAsideIcon />,
   discard: () => <TrashIcon />,
 };
 
@@ -46,20 +48,23 @@ const CHANGE_ACTION_ICON: Partial<Record<Action, (armed: boolean) => ComponentCh
  *  sits with the mutating actions. It confirms, because it cannot be undone,
  *  but it is not red: nothing is stopped or lost.
  *
- *  **Show in thread list leads the menu, in the thread title bars only**:
- *  they pass `onShowInThreadList`. On a drawer row it would point at the row
+ *  **Show in thread list leads the menu, in the thread titles only**: they
+ *  pass `onShowInThreadList`. On a drawer row it would point at the row
  *  just opened.
  *
- *  **Pin/Unpin shows only on a keyboard-open.** Every inline pin button sitting
- *  next to a ⋯ trigger is mouse-only (`tabindex=-1`), so the menu is the
- *  keyboard's only route to it — but on a pointer-open that inline button is
- *  right there. So the item is gated on `ctx.openedViaKeyboard`.
+ *  **Rename… and Suggest name follow, on a sent thread.** This menu is the only
+ *  place to rename, because the title is display-only. A draft is titled by
+ *  its compose text, so a rename there would change nothing on screen.
+ *
+ *  **Pin/Unpin shows on every open.** The mobile title row draws no pin, and a
+ *  drawer row's pin is mouse-only (`tabindex=-1`), so the menu must carry it.
+ *  Beside an inline pin it repeats that button, which costs nothing.
  *
  *  The Info popover shows the thread's structured details (Status / You / Agent /
  *  Type / Exchanges / Started) — the same rows that used to ride the drawer
  *  row's hover tooltip, now reachable everywhere the ⋯ menu lives (drawer row +
  *  both thread-title headers). */
-export function ThreadOverflowMenu({ threadId, title, onShowInThreadList, stopPropagation, extraClass, tabIndex, hostOpener }: {
+export function ThreadOverflowMenu({ threadId, title, onShowInThreadList, stopPropagation, extraClass, tabIndex, hostOpener, face }: {
   threadId: string;
   title: string;
   onShowInThreadList?: () => void;
@@ -69,26 +74,31 @@ export function ThreadOverflowMenu({ threadId, title, onShowInThreadList, stopPr
   /** Lets the drawer row open this menu from its own gesture: a desktop
    *  right-click, or a mobile long press. See <OverflowMenu>. */
   hostOpener?: HostOpener;
+  /** The thread title, drawn as the menu button. See <OverflowMenu>. */
+  face?: TriggerFace;
 }) {
+  const opening = face ? { face } : { hostOpener };
   return (
     <OverflowMenu
       ariaLabel="More thread actions"
       stopPropagation={stopPropagation}
       extraClass={extraClass}
       tabIndex={tabIndex}
-      hostOpener={hostOpener}
+      {...opening}
       // Read live thread meta only while a popover is open (OverflowMenu gates the
       // call). An unhydrated search hit has no live thread → null → no Info.
       infoRows={() => {
         const thread = threadMap.value.get(threadId);
         return thread ? threadInfoRows(thread.meta, effectiveThreadStatus(thread)) : null;
       }}
-      items={({ openedViaKeyboard, run }) => {
+      items={({ run }) => {
         // These selectors read threadMap/changes signals; OverflowMenu invokes
         // `items` only while open, so a closed menu subscribes to neither.
         const liveThread = threadMap.value.get(threadId);
         const saved = liveThread?.meta.saved ?? false;
-        const showPin = !!liveThread && openedViaKeyboard;
+        // A draft has nothing to pin until it is sent.
+        const pinnable = !!liveThread && liveThread.meta.state !== 'composing';
+        const renamable = canRenameThread(liveThread);
         const archiveAction = resolveThreadActions(threadId).find((a) => a.kind === 'archive');
         const changeActions = resolveChangeMenuActions(threadId);
         const standingApplyArmed = standingApplyThreadIds.value.has(threadId);
@@ -115,12 +125,25 @@ export function ThreadOverflowMenu({ threadId, title, onShowInThreadList, stopPr
                 <div class="thread-overflow-divider" role="separator" />
               </>
             )}
-            {showPin && (
+            {pinnable && (
               <>
                 <button type="button" class="thread-overflow-item" role="menuitem"
                   onClick={run(() => { if (saved) void handleUnsaveThread(threadId); else void handleSaveThread(threadId); })}>
                   <PinIcon filled={saved} />
                   {saved ? 'Unpin thread' : 'Pin thread'}
+                </button>
+                <div class="thread-overflow-divider" role="separator" />
+              </>
+            )}
+            {renamable && (
+              <>
+                <button type="button" class="thread-overflow-item" role="menuitem" onClick={run(() => { void promptRenameThread(threadId); })}>
+                  <EditIcon />
+                  Rename…
+                </button>
+                <button type="button" class="thread-overflow-item" role="menuitem" onClick={run(() => { void suggestThreadName(threadId); })}>
+                  <SparkleIcon />
+                  Suggest name
                 </button>
                 <div class="thread-overflow-divider" role="separator" />
               </>
@@ -138,15 +161,23 @@ export function ThreadOverflowMenu({ threadId, title, onShowInThreadList, stopPr
               Download thread
             </button>
             {changeActions.length > 0 && <div class="thread-overflow-divider" role="separator" />}
-            {changeActions.map((action) => (
-              <button key={action.kind} type="button" role="menuitem"
-                class={action.kind === 'discard' ? 'thread-overflow-item thread-overflow-item-danger' : 'thread-overflow-item'}
-                data-tooltip={action.tooltip}
-                onClick={run(() => { void action.invoke(); })}>
-                {CHANGE_ACTION_ICON[action.kind]?.(standingApplyArmed)}
-                {action.label}
-              </button>
-            ))}
+            {changeActions.map((action) => {
+              const toggle = action.kind === 'apply_when_settled';
+              return (
+                <button key={action.kind} type="button"
+                  role={toggle ? 'menuitemcheckbox' : 'menuitem'}
+                  aria-checked={toggle ? standingApplyArmed : undefined}
+                  class={action.kind === 'discard' ? 'thread-overflow-item thread-overflow-item-danger' : 'thread-overflow-item'}
+                  data-tooltip={action.tooltip}
+                  onClick={run(() => { void action.invoke(); })}>
+                  {CHANGE_ACTION_ICON[action.kind]?.(standingApplyArmed)}
+                  {action.label}
+                  {toggle && standingApplyArmed && (
+                    <span class="thread-overflow-check thread-overflow-check-end" aria-hidden="true">✓</span>
+                  )}
+                </button>
+              );
+            })}
             {(movable || archiveAction || deletable) && <div class="thread-overflow-divider" role="separator" />}
             {movable && (
               <button type="button" class="thread-overflow-item" role="menuitem"

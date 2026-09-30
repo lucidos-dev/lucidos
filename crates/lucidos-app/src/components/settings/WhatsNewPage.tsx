@@ -289,8 +289,8 @@ export function ReleaseNotes({ release }: { release: ChangelogRelease }) {
  * Its version and date come off with it rather than being discarded. The
  * heading is the one place the offered release NAMES itself, which is what
  * {@link offeredRelease} identifies the row by. Same separator-blind rule the
- * engine parser uses, and for the same reason: the separator is an em dash that
- * `.claude/rules/no-em-dashes.md` forbids this source from naming.
+ * engine parser uses, so a heading parses whichever dash separates its version
+ * from its date.
  */
 export function stripReleaseHeading(
   notes: string,

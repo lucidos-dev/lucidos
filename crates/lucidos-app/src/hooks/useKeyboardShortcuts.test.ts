@@ -17,7 +17,7 @@ import { dispatchEscape, classifyChord, dispatchForwardedChord, dispatchPreviewI
 import { isTextInput, isThreadTranscript } from '../utils/dom';
 import { pushOverlay, _resetOverlayStackForTesting } from '../store/overlayStack';
 import { focusedPane, splitRatio, searchEverywhereAnchor, searchEverywhereOpen } from '../store/store';
-import { promptStopRequested } from '../components/chat/prompt-input-helpers';
+import { promptStopRequested, promptSideQuestionRequested } from '../components/chat/prompt-input-helpers';
 
 const here: string = dirname(fileURLToPath(import.meta.url));
 
@@ -45,9 +45,10 @@ describe('dispatchEscape (non-destructive Escape policy)', () => {
   });
 
   it('leaves a self-managing text input untouched so its own Escape handler can cancel', () => {
-    // The thread-title editor marks its input data-escape-self because a blur
-    // there commits a rename — the universal blur-on-Escape would SAVE instead
-    // of cancel. dispatchEscape must NOT blur it.
+    // A rename field such as the trigger group's marks its input
+    // data-escape-self because a blur there commits the rename. The universal
+    // blur-on-Escape would SAVE instead of cancel, so dispatchEscape must NOT
+    // blur it.
     vi.mocked(isTextInput).mockReturnValue(true);
     const blur = vi.fn();
     const active = { blur, hasAttribute: (n: string) => n === 'data-escape-self' };
@@ -300,6 +301,18 @@ describe('the Stop shortcut', () => {
     dispatchForwardedChord({ metaKey: true, ctrlKey: false, shiftKey: false, altKey: false, key: '.' });
     expect(promptStopRequested.value).toBe(true);
     promptStopRequested.value = false;
+  });
+});
+
+describe('the Side question shortcut', () => {
+  it('asks the composer to offer the side question, and claims Alt+Enter from the send', () => {
+    promptSideQuestionRequested.value = false;
+    splitRatio.value = 0.5;
+    const altEnter = { metaKey: false, ctrlKey: false, shiftKey: false, altKey: true, key: 'Enter' };
+    expect(classifyChord(altEnter)).toBe('askSideQuestion');
+    dispatchForwardedChord(altEnter);
+    expect(promptSideQuestionRequested.value).toBe(true);
+    promptSideQuestionRequested.value = false;
   });
 });
 

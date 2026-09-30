@@ -119,11 +119,8 @@ pub(super) fn validate_codex_effort<'a>(
     }
 }
 
-/// Render the control-command menu for the frontend's `/model` picker —
-/// Codex counterpart of `claude_code::cc_command_definitions`. No
-/// `set_permission_mode`: Codex has no CC-style permission-MODE protocol to
-/// switch — approvals are per-request cards under the app-server driver and
-/// absent entirely under the exec escape hatch (sandbox is the guard).
+/// Render the control-command menu for the frontend's `/model` picker, the
+/// Codex counterpart of `claude_code::cc_command_definitions`.
 pub fn codex_command_definitions() -> serde_json::Value {
     let (model_options, effort_options) = super::claude_code::model_and_effort_options(
         codex_model_options(),
@@ -429,50 +426,23 @@ pub(crate) fn grants_more_than_the_data_tree(resolved_data: &Path, workspace: &P
     }
 }
 
-/// `git rev-parse --git-common-dir` for the worktree. `None` (log + degrade)
-/// when git fails — Codex still runs, but its own `git commit` would be
-/// blocked by the sandbox; the engine's auto-commit (which runs unsandboxed)
-/// still captures the work.
+/// The worktree's shared `.git` directory. `None` (log + degrade) when git
+/// fails: Codex still runs, but the sandbox blocks its own `git commit`. The
+/// engine's auto-commit runs unsandboxed and still captures the work.
 async fn resolve_git_common_dir(worktree: &Path) -> Option<PathBuf> {
-    let out = match crate::engine::git_ops::git_cmd(&["rev-parse", "--git-common-dir"], worktree)
-        .await
-    {
-        Ok(out) => out,
-        // `git_cmd` returns `Err` for a spawn failure AND for its 30s timeout,
-        // and on a saturated host the timeout is the likelier of the two. It
-        // must not degrade the sandbox silently: without this line the user
-        // sees in-agent `git commit` blocked with nothing in the log saying why.
+    match crate::engine::git_ops::git_common_dir(worktree).await {
+        Ok(dir) => Some(dir),
+        // Never degrade the sandbox silently: without this line the user sees
+        // in-agent `git commit` blocked with nothing in the log saying why.
         Err(e) => {
             crate::log!(
-                "[Codex] git rev-parse --git-common-dir could not run in {} ({}): sandbox will block in-agent git commits",
-                worktree.display(),
-                e
+                "[Codex] {} in {}: sandbox will block in-agent git commits",
+                e,
+                worktree.display()
             );
-            return None;
+            None
         }
-    };
-    if !out.status.success() {
-        crate::log!(
-            "[Codex] git rev-parse --git-common-dir failed in {} — sandbox will block in-agent git commits",
-            worktree.display()
-        );
-        return None;
     }
-    let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if raw.is_empty() {
-        crate::log!(
-            "[Codex] git rev-parse --git-common-dir returned nothing in {}: sandbox will block in-agent git commits",
-            worktree.display()
-        );
-        return None;
-    }
-    let path = PathBuf::from(&raw);
-    let abs = if path.is_absolute() {
-        path
-    } else {
-        worktree.join(path)
-    };
-    Some(abs)
 }
 
 /// Build one per-turn `codex exec` command. Pure over its inputs so the unit
@@ -860,10 +830,6 @@ fn apply_idle_control(
         ControlRequest::Interrupt => {}
         ControlRequest::SetModel { model: m } => *model = Some(m),
         ControlRequest::SetReasoningEffort { effort: e } => *effort = Some(e),
-        // No permission protocol — Codex runs under the OS sandbox.
-        ControlRequest::SetPermissionMode { .. } => {
-            log!("[Codex] SetPermissionMode is a no-op for the Codex backend");
-        }
     }
 }
 
@@ -982,9 +948,6 @@ async fn run_turn(
                     }
                     Some(ControlRequest::SetModel { model: m }) => *model = Some(m),
                     Some(ControlRequest::SetReasoningEffort { effort: e }) => *effort = Some(e),
-                    Some(ControlRequest::SetPermissionMode { .. }) => {
-                        log!("[Codex] SetPermissionMode is a no-op for the Codex backend");
-                    }
                     None => {
                         shutdown = true;
                         break 'turn;

@@ -985,10 +985,23 @@
     text-underline-offset: 0.125rem;
 }
 
-/* CC question divider — body of an UserQuestionAsked initiator panel. The
-   surrounding .initiator-body provides padding/border/background, so the
-   body itself is just a vertical stack of the question text, options, and
-   (in answered state) the resolution block. */
+/* The question and permission cards paint their own fill, border and padding,
+   so their content never sits flush on the edge of a protected fill that
+   differs from the page behind it, as the turn focus wash does.
+
+   The padding puts the card's text on the composer's text column: the card is
+   a nested surface, so it keeps --turn-surface-inset minus its own 1px border
+   (base.css). */
+.question-body,
+.permission-body {
+    padding: calc(var(--turn-surface-inset) - 1px);
+    background-color: var(--surface-bg);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-surface);
+}
+
+/* A vertical stack of the question text, options, and (in answered state) the
+   resolution block. */
 .question-body {
     display: flex;
     flex-direction: column;
@@ -1061,10 +1074,15 @@
     transform: translate(-55%, -65%) rotate(45deg);
 }
 
+/* A tinted option (picked, toggled, hovered) is a rounded card shaped like
+   `.user-bubble`. The list bleeds into the card's padding to leave a
+   `--space-md` margin at the card edges. Its text sits inset from the
+   question's column, so a tinted option never looks crammed. */
 .question-options {
     display: flex;
     flex-direction: column;
-    gap: 0.5rem;
+    gap: var(--space-sm);
+    margin-inline: calc(var(--space-md) - var(--turn-surface-inset));
 }
 
 /* Two-column grid shared by the live button and the resolved-state row.
@@ -1081,24 +1099,13 @@
     row-gap: 0.25rem;
     align-items: start;
     width: 100%;
-    /* Horizontal padding is NOT free: this card and the composer box below the
-       transcript are the two nested thread-pane surfaces, and the composer docks
-       directly under a stack of these, so both put their content on the shared
-       --turn-surface-inset edge (base.css) by subtracting their own border. */
-    padding: 0.75rem calc(var(--turn-surface-inset) - 1px);
-    background: var(--bg-tertiary);
-    border: 1px solid var(--border-color);
-    border-radius: var(--radius-control);
+    padding: var(--space-md) var(--space-lg);
+    background: transparent;
+    border: 0;
+    border-radius: calc(var(--radius-surface) * 1.2);
     color: var(--text-primary);
     text-align: left;
     white-space: normal;
-}
-
-/* Answered recap rows are borderless, like the user message bubble — the picked
-   one carries the accent tint, the rest read as dimmed. (Live options keep their
-   border for tap affordance.) */
-.question-option-static {
-    border-color: transparent;
 }
 
 .question-option {
@@ -1106,7 +1113,6 @@
     font-family: inherit;
     transition:
         background-color var(--duration-normal),
-        border-color var(--duration-normal),
         transform var(--duration-fast);
 }
 
@@ -1139,21 +1145,26 @@
    to fall back on the way `.action-btn` does, so it needs its own.
 
    `choiceCardNav`'s seed gates on `hasHoverPointer()`, the JS mirror of the
-   media query, so the seed and the gated ring stay in lockstep. */
+   media query, so the seed and the gated ring stay in lockstep.
+
+   The ring is inset, so it traces the option's own rounded card and stays
+   clear of its neighbours. The forced-colors outline takes a matching negative
+   offset for the same reason (see `.context-role-header:focus-visible`). */
 .question-option:focus-visible {
     outline: 0.125rem solid transparent;
-    box-shadow: var(--focus-ring);
+    outline-offset: -0.125rem;
+    box-shadow: inset var(--focus-ring);
 }
 
 @media (hover: hover) {
     .question-option:focus {
         outline: 0.125rem solid transparent;
-        box-shadow: var(--focus-ring);
+        outline-offset: -0.125rem;
+        box-shadow: inset var(--focus-ring);
     }
 
     .question-option:hover {
         background: var(--picked-surface);
-        border-color: color-mix(in srgb, var(--accent) 50%, var(--border-color));
     }
 }
 
@@ -1215,12 +1226,11 @@
     border-radius: calc(var(--radius-surface) / 3);
 }
 
-/* Highlighted: the picked option in Selected answers — accent tint, no border
-   (matches the user message bubble). Same treatment for live multi-select
-   toggles via aria-pressed, so changing the accent recipe touches one block. */
+/* Highlighted: the picked option in Selected answers carries the accent tint.
+   Same treatment for live multi-select toggles via aria-pressed, so changing
+   the accent recipe touches one block. */
 .question-option-selected,
 .question-option[aria-pressed="true"] {
-    border-color: transparent;
     background: var(--picked-surface);
 }
 
@@ -1254,8 +1264,7 @@
 
 @media (hover: hover) {
     .question-body-terminated .question-option:disabled:hover {
-        background: var(--bg-tertiary);
-        border-color: var(--border-color);
+        background: transparent;
     }
 }
 
@@ -1275,12 +1284,11 @@
     gap: 0.25rem;
 }
 
-/* A small muted "who said this" mark, over the answer it labels. */
+/* A small muted "who said this" mark, over the answer it labels. Sentence
+   case: capitals would shout over the answer it only names. */
 .question-freetext-label {
-    font-size: var(--font-size-2xs);
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
-    text-transform: uppercase;
-    letter-spacing: 0.03em;
 }
 
 /* Surface, radius, padding and leading all come from `.user-bubble`. What is
@@ -1309,9 +1317,8 @@
     font-style: italic;
 }
 
-/* CC permission divider — body of a CodingAgentPermissionRequest initiator
-   panel. Like .question-body, the .initiator-body wrapper provides chrome;
-   the body is just a vertical stack of the prompt text and action rows. After
+/* Body of a CodingAgentPermissionRequest initiator panel, framed like
+   .question-body above: a vertical stack of the prompt text and action rows. After
    the user resolves the request the same buttons stay rendered (disabled, with
    the picked one marked and the rest struck through) so layout doesn't jump
    and history reads at a glance. */
@@ -1337,7 +1344,8 @@
 .permission-file-list {
     margin: 0.5rem 0 0;
     padding: 0.5rem 0.625rem;
-    background: var(--bg-secondary);
+    /* Inset below the card's --surface-bg fill. */
+    background: var(--bg-primary);
     border-radius: calc(var(--radius-surface) * 0.5);
     font-size: var(--font-size-md);
     font-weight: 400;

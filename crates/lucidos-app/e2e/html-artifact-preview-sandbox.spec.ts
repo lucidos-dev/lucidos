@@ -115,11 +115,18 @@ async function openReport(page: Page): Promise<void> {
 }
 
 /** Run a function inside the preview document, where the shell itself cannot. */
-async function inFrame<T>(page: Page, fn: () => T): Promise<T> {
+async function inFrame<T>(page: Page, fn: () => T): Promise<T | null> {
   const handle = await page.locator(FRAME).first().elementHandle();
   const inner = await handle?.contentFrame();
   if (!inner) throw new Error('the preview iframe has no frame');
-  return inner.evaluate(fn);
+  // A UI-scale change re-stamps the srcdoc and replaces the document, so a
+  // read can outlive the one it began in. It answers null, and a poll asks again.
+  try {
+    return await inner.evaluate(fn);
+  } catch (e) {
+    if (e instanceof Error && e.message.includes('Execution context was destroyed')) return null;
+    throw e;
+  }
 }
 
 function boxWidth(): number {
@@ -223,6 +230,9 @@ test.describe('a previewed HTML artifact', () => {
       // One 12.5% step. The preview re-stamps its zoom, so its px box grows.
       await expect.poll(() => inFrame(page, boxWidth), { timeout: 10_000 }).toBeCloseTo(112.5, 0);
     } finally {
+      // A forwarded chord sends the shell no keyup, so the zoom panel lingers
+      // and its scrim covers the preview. A click then lands on the shell.
+      await expect(page.locator('.scale-modal')).toHaveCount(0, { timeout: 5_000 });
       await frame(page).locator('#probe').click();
       await page.keyboard.press('Control+0');
     }

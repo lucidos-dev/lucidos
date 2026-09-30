@@ -169,7 +169,7 @@ export function renderExchanges(
   const threadIdle = isRenderedThreadIdle(thread);
   // Backend says the thread is parked on / resuming from a question or
   // permission card. A just-answered divider whose resume `running` aggregate
-  // hasn't reached the client yet must NOT flash "Aborted" — see exchangeStatus.
+  // hasn't reached the client yet keeps reading "Working". See exchangeStatus.
   const threadAwaitingAnswer = threadMeta?.status === 'waiting_for_user_answer';
   const threadCanceling = cancelingThreadIds.value.has(threadId);
   // When the agent is busy (running, or paused on a question), chat follow-ups

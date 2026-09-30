@@ -276,21 +276,17 @@ mod question_reask_tests {
     }
 
     #[test]
-    fn declining_the_nudge_repeats_the_question_rather_than_dropping_it() {
-        // Only the LAST round's text becomes `ResponseGenerated`. A model told
-        // to "drop the question and hand back" therefore erases a question the
-        // user was supposed to answer. Taking the carve-out means repeating it.
-        //
-        // The exit needs no help from the instruction: `MAX_PROSE_QUESTION_NUDGE`
-        // is one, so the repeated prose finalizes instead of looping.
+    fn declining_the_nudge_keeps_the_draft_and_the_reason_stays_private() {
+        // The draft has already streamed, and the loop ends the turn on it when
+        // the model declines. A model told to repeat the question, or to explain
+        // itself to the user, shows them the question twice with a justification
+        // wedged between.
         let prose = QuestionReaskCause::AskedInProse.instruction();
+        assert!(prose.contains("stays as your answer"));
+        assert!(prose.contains("The user never sees that line"));
         assert!(
-            prose.contains("ask it again here"),
-            "the carve-out must tell the model to repeat the question"
-        );
-        assert!(
-            !prose.contains("drop the question"),
-            "never instruct the model to delete a question the user must answer"
+            !prose.contains("ask it again"),
+            "the draft is already on screen, so a repeat shows it twice"
         );
     }
 

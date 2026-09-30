@@ -587,6 +587,8 @@ The panel also carries one **Keep my edits** control, on by default. Clearing it
 
 **A discarded edit is never simply deleted.** Before anything is overwritten, the engine writes your version and a `.patch` of it under `data/artifacts/plugin-local-changes/<plugin-id>/v<version>/`, with a `README.md` explaining the folder. That root is git-tracked and never auto-deleted. A clean merge saves nothing, because your edit survives in the file itself.
 
+**The panel never opens blind.** Staging reads every installed plugin's install commit from the event log. When that read fails, the engine cannot tell which files you edited. So staging refuses any install that would overwrite an existing file, and tells you to try again. A fresh install has nothing to lose and stages as usual.
+
 Installing one version twice is allowed, so a second save of the same version lands in `v<version>-2` rather than replacing the first. The engine never writes over a folder it already saved edits into.
 
 **Why a conflict does not get conflict markers.** These files are LLM context: `knowhow/*.md` is loaded into the agent's prompt as instructions. A file containing `<<<<<<<` is not a broken file you notice, it is a corrupted instruction the engine acts on. So upstream's coherent version wins on disk, and yours is preserved beside it.

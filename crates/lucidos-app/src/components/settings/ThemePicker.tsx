@@ -20,6 +20,7 @@ import { ChevronLeftIcon, ChevronRightIcon } from '../shared/icons';
 import { LoadingFade } from '../shared/LoadingFade';
 import { LoadableError } from '../shared/LoadableError';
 import { ListSkeletonOf, SkBlock, SkText, useSkeleton } from '../shared/Skeleton';
+import { playStripMove, snapshotStrip, type StripSnapshot } from './themeStripMotion';
 
 function modesLabel(theme: Theme): string | null {
   if (theme.modes.length !== 1) return null;
@@ -247,8 +248,27 @@ export function ThemePicker() {
   // A new filter or row count lays the cards out anew, so the ends move with
   // no scroll.
   useLayoutEffect(measure, [picked, rows]);
+  // A chip re-lays the strip out, so it plays the move from the layout it
+  // showed before the pick. The ends are read again once it settles.
+  const beforePick = useRef<StripSnapshot | null>(null);
+  const cancelMove = useRef<(() => void) | null>(null);
+  useLayoutEffect(() => {
+    const scroller = strip.current;
+    const before = beforePick.current;
+    beforePick.current = null;
+    if (scroller && before) cancelMove.current = playStripMove(scroller, before, measure);
+  }, [picked]);
   const pickFilter = (name: string | null) => {
-    if (strip.current) strip.current.scrollLeft = 0;
+    const scroller = strip.current;
+    if (!scroller) return setFilter(name);
+    if (name !== picked) {
+      // Taken mid-move too, so a second pick carries on from what shows. The
+      // old move then goes before anything measures the new layout.
+      beforePick.current = snapshotStrip(scroller);
+      cancelMove.current?.();
+      cancelMove.current = null;
+    }
+    scroller.scrollLeft = 0;
     setFilter(name);
   };
   if (gallery.status === 'failed') return <LoadableError noun="themes" error={gallery.error} />;
@@ -313,7 +333,12 @@ export function ThemePicker() {
               {families.map(({ group, column, span }) => (
                 <div key={group.name} class="theme-family" role="group" aria-label={group.name}>
                   {labelRows > 0 && (
-                    <span class="theme-family-name" aria-hidden="true" style={{ gridColumn: `${column} / span ${span}` }}>
+                    <span
+                      class="theme-family-name"
+                      aria-hidden="true"
+                      data-strip-key={`family:${group.name}`}
+                      style={{ gridColumn: `${column} / span ${span}` }}
+                    >
                       {group.name}
                     </span>
                   )}
@@ -376,6 +401,7 @@ function ThemeCard({ theme, defaults, mode, selected = false, column, row, onCli
       role="radio"
       aria-checked={selected}
       class={`theme-card${selected ? ' selected' : ''}`}
+      data-strip-key={theme ? `theme:${theme.id}` : undefined}
       style={{ gridColumn: String(column), gridRow: String(row) }}
       data-tooltip={tooltip || undefined}
       disabled={sk}

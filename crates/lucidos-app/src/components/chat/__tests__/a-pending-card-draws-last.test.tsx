@@ -21,6 +21,7 @@ function makeThread(status: ThreadState['meta']['status']): ThreadState {
       createdAt: TS,
       updatedAt: TS,
       status,
+      summaryVersion: 0,
       messageCount: 0,
       section: 'inbox',
       activeChildrenCount: 0,

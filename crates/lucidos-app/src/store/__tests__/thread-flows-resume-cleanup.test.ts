@@ -111,7 +111,7 @@ describe('CC stale resume — SessionEnded(stale_resume) must not cause aborted 
 describe('stale exchange recovery (incomplete last exchange)', () => {
   const t = (ms: number) => new Date(Date.now() + ms).toISOString();
 
-  it('chat thread: last exchange with ToolCalled but no terminal event shows aborted when thread is idle', () => {
+  it('chat thread: last exchange with ToolCalled but no terminal event settles done when thread is idle', () => {
     resetSeqCounter();
     // Thread with status 'idle' — as it would be after engine restart
     const { map, id } = makeThread('stale-exchange-1', 'idle');
@@ -136,12 +136,12 @@ describe('stale exchange recovery (incomplete last exchange)', () => {
     // Exchange 1: completed normally
     expect(exchangeStatus(exchanges[0], '', false)).toBe('done');
 
-    // Exchange 2: should show as aborted since thread is idle but no terminal event
+    // Exchange 2: the thread is idle, so nothing is running. No abort event
+    // is in the log, so it settles as done rather than claiming an abort.
     const lastExchange = exchanges[1];
-    const threadIdle = true;  // thread DB status is 'idle' after engine restart
+    const threadIdle = true;
     const status = exchangeStatus(lastExchange, '', true, false, false, threadIdle);
-    // Must return 'aborted' — the engine crashed mid-response, not still streaming
-    expect(status).toBe('aborted');
+    expect(status).toBe('done');
 
     // Pending steps should be resolved (no spinning "Running Python")
     const steps = exchangeSteps(lastExchange, true, threadIdle);
@@ -149,7 +149,7 @@ describe('stale exchange recovery (incomplete last exchange)', () => {
     expect(pendingSteps).toHaveLength(0);
   });
 
-  it('chat thread: last exchange with only TextStreamed (no tools) shows aborted when thread is idle', () => {
+  it('chat thread: last exchange with only TextStreamed (no tools) settles done when thread is idle', () => {
     resetSeqCounter();
     const { map, id } = makeThread('stale-exchange-2', 'idle');
 
@@ -169,7 +169,7 @@ describe('stale exchange recovery (incomplete last exchange)', () => {
     const lastExchange = exchanges[1];
     const threadIdle = true;
     const status = exchangeStatus(lastExchange, '', true, false, false, threadIdle);
-    expect(status).toBe('aborted');
+    expect(status).toBe('done');
   });
 
   it('exchange with streaming buffer is NOT aborted even when thread is idle', () => {
@@ -317,8 +317,7 @@ describe('CC SessionEnded(changes_proposed) without preceding CodingAgentIdled',
 // loop is still running. The loop folds the new prompt in via UPI and keeps
 // emitting events under the parent's request_event_id; the parent must keep
 // its 'Working' state and pending spinners until the real terminator lands,
-// and the follow-up's absorbed UPI must read as 'done', not the threadIdle
-// stale-detector's 'aborted'.
+// and the follow-up's absorbed UPI must read as 'done'.
 // ---------------------------------------------------------------------------
 describe('chat follow-up while parent loop still running', () => {
   const t = (offset: number) => new Date(Date.now() + offset).toISOString();
@@ -509,8 +508,8 @@ describe('chat follow-up while parent loop still running', () => {
       { type: 'ResponseGenerated', text: 'Ferdig.', request_event_id: MR1, created: '2026-05-05T06:12:00.046Z' } as ThreadEvent,
       // ThreadSaved lands AFTER ResponseGenerated as a metadata event with
       // no request_event_id. Without `current` being reset by the absorbed
-      // UPI, this leaks into exchange 2 → onlyStep check fails (length > 1) →
-      // threadIdle stale-detector flips status to 'aborted'.
+      // UPI, this leaks into exchange 2 and the onlyStep check fails
+      // (length > 1), so the placeholder loses its 'done'.
       { type: 'ThreadSaved', created: '2026-05-05T06:12:00.056Z' } as ThreadEvent,
     ]);
 
@@ -708,13 +707,13 @@ describe('coding-agent turn with no terminator must not read Working forever', (
     return getExchanges(map, id);
   };
 
-  it('reads aborted once the thread has settled, not coding-agent-working', () => {
+  it('reads done once the thread has settled, not coding-agent-working', () => {
     resetSeqCounter();
     const exchanges = seedOvertakenQuestion('cc-no-terminator-1', 'idle');
     const last = exchanges[exchanges.length - 1];
 
     const status = exchangeStatus(last, '', true, false, /* threadIsCC */ true, /* threadIdle */ true);
-    expect(status).toBe('aborted');
+    expect(status).toBe('done');
     expect(isActive(status)).toBe(false);
   });
 
@@ -742,14 +741,14 @@ describe('coding-agent turn with no terminator must not read Working forever', (
   /** The exact Esc shape, with no trailing text to rescue it. The card is
    *  already overtaken (struck through, buttons disabled), so claiming it
    *  "Needs your answer" is a dead end the user cannot act on. */
-  it('a lone rejected tool result reads aborted, not "Needs your answer"', () => {
+  it('a lone rejected tool result reads done, not "Needs your answer"', () => {
     resetSeqCounter();
     const exchanges = seedOvertakenQuestion('cc-no-terminator-4', 'idle', /* trailingText */ false);
     const last = exchanges[exchanges.length - 1];
     expect(last.questionOvertaken).toBe(true);
 
     const status = exchangeStatus(last, '', true, false, /* threadIsCC */ true, /* threadIdle */ true);
-    expect(status).toBe('aborted');
+    expect(status).toBe('done');
   });
 
   /** The complement: a question nothing has raced past is still answerable,

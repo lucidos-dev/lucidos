@@ -10,7 +10,7 @@
  * unspent and closes the form around it.
  *
  * A source scan over every `<input />` whose handlers are written inline.
- * A field with named handlers, such as `ThreadTitleEditor`, is not covered.
+ * A field with named handlers is not covered.
  */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project

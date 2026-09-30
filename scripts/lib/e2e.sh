@@ -875,10 +875,9 @@ stop_e2e_engine() {
 # silently fell back to the prefix heuristic for every model.
 #
 # It owns the engine lifecycle, and has to: Postgres refuses to drop a database
-# that still has open connections, and migrations, `EventStore::init_schema()`
-# and the pgvector setup all run exactly once, at engine boot (see
-# engine/engine_impl/construction.rs) — so the engine serving the tests must be
-# the one started AFTER the recreate. On return the workspace is running on a
+# that still has open connections, and migrations and the pgvector setup both
+# run exactly once, at engine boot (see engine/engine_impl/construction.rs). So
+# the engine serving the tests must be the one started AFTER the recreate. On return the workspace is running on a
 # genuinely fresh database.
 #
 # Deliberately NOT creating the `vector` extension here: a brand-new workspace

@@ -29,7 +29,7 @@ As a **query filter** (`--active` on `lucidos threads list` / `count`, `active` 
 ### Agent archive
 An agent archiving a *thread* itself, through the `threads` tool's `archive` action or `lucidos threads archive`. It reaches only its own thread and its own direct *child threads*. It runs the same *cascading archive* as the Archive button, so the same states refuse it. A *pinned thread* is the one difference: an agent is refused one (`thread_pinned`), and a pinned sub-thread stays open while the rest goes (ADR 0312). A child is archived at once.
 
-An agent's own thread is archived once its turn ends and it has settled, and a new message before then keeps it open. The agent decides when: Lucidos never archives a thread by itself, not even after its change is applied (ADR 0310). The rule agents follow is to archive once the change is applied and no follow-up is expected.
+An agent's own thread is archived once its turn ends and it has settled, and a new message before then keeps it open. Lucidos never archives a thread by itself, not even after its change is applied (ADR 0310).
 
 <!--gloss-app-start-->
 ### App
@@ -287,6 +287,9 @@ See also: `docs/adr/0192-thread-delete-is-the-one-sanctioned-removal.md`.
 An *event* the workspace itself emits via the `emit_event` LLM tool or `lucidos events emit` CLI: anything observable about the user's world (`MorningRoutineCompleted`, `JobListingFound`, `PanasonicHeatpumpAdjusted`). Persisted with the inner event type (not the literal string `"DomainEvent"`). Flows through the trigger matcher unconditionally, so a *trigger*'s `on_event:` can subscribe to any domain event name. Persisted `ThreadEvent` variants are also subscribable, except the per-token streaming ones and the side-question events. See *scheduler blocklist* (dev).
 **The name must be your own.** Every engine event name is refused, both the `SystemEvent` ones and the `ThreadEvent` ones (including legacy spellings like `Thinking`). A domain event's `aggregate_id` is its event TYPE, where a thread event's is a thread uuid. So a borrowed name writes a permanent row that breaks any query reading the name as an id.
 See also: `system-knowhow/thread-events.md` § "Today the scheduler uses a blocklist", `.claude/rules/rust.md` § "Apps — Event APIs".
+
+### Dynamic bars
+On a phone, the header and the prompt slide away as you scroll down a thread. They come back as you scroll up, following your finger. The prompt also comes back near the end of the thread, and stays in place while you type. Off by default, so both bars stay visible. Set in Settings > Appearance & Behavior > Mobile, or through the `mobile_dynamic_bars` preference.
 
 ### Endpoint catalog
 The knowhow half of a *derived proxy entry*: a `data/knowhow/<name>-api.md` file cataloguing the endpoints observed on a site. Each one carries its params, response shape and quirks. The `apis.json` entry beside it is pure transport, so it says nothing about which paths exist. Without the catalog the LLM knows only that a proxy exists, so a derivation emitting one and not the other has failed. Never records the user's own rows, only field names and types.
@@ -1199,7 +1202,7 @@ The button for *Switch to new version* reads **Switch**, on the toast and in the
 One packaged failure is reported differently from the rest, and it is worth knowing on sight: if the swap leaves no runnable app on disk, Lucidos does **not** restart anything. It says so, and tells you to reinstall from the `.dmg`, because retrying an update has nothing left to install over. The background service keeps running the version it already loaded, so your workspaces stay up until you reboot.
 
 ### Apply All
-The user-clicked action that triggers an *Apply* on every pending *change* in one batch. UI button label: **Apply All** (sibling to per-row *Apply* / Discard on the changes panel).
+The user-clicked action that triggers an *Apply* on every pending *change* in one batch. UI button label: **Apply All** (sibling to each row's *Apply* on the changes panel, whose caret holds Set aside and Discard).
 
 The batch skips exactly what a per-row *Apply* refuses: changes whose thread has not settled, and changes with no file changes left. So the bulk path can't do what the button won't. Discard All skips neither.
 
@@ -1220,12 +1223,12 @@ The engine emits `ApplyAllBatchStarted` with the full change-id list and the act
 
 While the batch runs, its line in the Lucidos menu offers **Cancel** (`POST /api/v1/changes/apply-all/cancel`). The engine then stops advancing to further members and interrupts the in-flight *hardening* or merge session, and every parked resolution. It marks the remaining members `failed` with "Apply All canceled", so the batch resolves and `ApplyAllBatchCompleted` still fires. Already-applied members stay applied. The rest return to pending (best-effort for an in-progress merge that already landed). A single *Apply* that woke a *hardening* or merge session can likewise be canceled from its *coding-agent thread* (the thread's Cancel button).
 
-**The checkbox beside it is the sweep.** *Keep going as the rest settle* adds a *standing apply* to every *settling* thread whose change Lucidos applies. Each one then applies as it lands, rather than waiting for you. An *external-repo coding-agent thread* is passed over, having no change to apply. With nothing appliable now, arming IS the action and the button reads **Apply all on settle**. The batch's **Cancel**, in the Lucidos menu, takes the whole sweep back with it.
+**The button beside it is the sweep.** **Apply all on settle** applies what is ready now and adds a *standing apply* to every *settling* thread whose change Lucidos applies. Each one then applies as it lands, rather than waiting for you. An *external-repo coding-agent thread* is passed over, having no change to apply. It draws whenever a thread is still settling, so the Changes panel can show three buttons: Discard All, Apply all on settle, and Apply All. The batch's **Cancel**, in the Lucidos menu, takes the whole sweep back with it.
 
 ### Standing apply
 The owner's instruction to *Apply* a *change* once its thread finishes. Pressed while the thread is still settling, carried out by the engine later (ADR 0168 clause 5). It is what the Apply button becomes on a thread that has not settled: a control that cannot act is replaced by the one that can, so nothing on either surface renders disabled.
 
-Two forms. **Apply on settle** arms one change, from the thread's own prompt row or its row in the Changes panel. **Apply all on settle**, the *Apply All* checkbox, arms every *settling* thread. Both read the same rule and both are one-shot.
+Two forms. **Apply on settle** arms one change, from the thread's own prompt row or its row in the Changes panel. **Apply all on settle**, the button beside *Apply All*, arms every *settling* thread. Both read the same rule and both are one-shot.
 
 It goes wherever *Apply* goes, and nowhere else. An *external-repo coding-agent thread* is never offered one: Lucidos does not merge into that repo, and the thread proposes no *change* to arm. So its prompt row draws no flag, the sweep passes it over, and the engine refuses an arm anything else asks for.
 
@@ -1241,14 +1244,27 @@ Cancelling stops what has not started. A change already merging or hardening fin
 A *coding-agent thread* that has not finished but will by itself: it is running, paused, or waiting on an *event wait*. A *standing apply* waits through these, and through the moment after a turn ends while the agent saves its last edits. A thread parked on a question is not settling, because only you can end that. While it runs or watches an event, its *Apply* is withheld, and the standing apply takes its place.
 
 ### Cancel (Stop)
-The user-clicked **Stop** action on a working *coding-agent thread*. Behaves like pressing **Esc** in the *Claude Code* CLI: it *interrupts* the current turn but keeps the session resumable — the same `cc_session_id` and branch are preserved, so the next message continues the *same* conversation (a `--resume`) with full context. It is NOT a kill and NOT a fresh start. Emits `ResponseCanceled` (the visible "Canceled" chip) + `CodingAgentIdled` (the resume anchor). Distinct from *Apply* / Discard / Archive, which terminate the turn via their own lifecycle event. Routed through `interrupt_agent` (`POST /api/v1/claude-code/stop`, default `StopReason::UserStop`); a bounded fallback hard-stops only if the agent fails to honor the interrupt. Source: `crates/lucidos-engine/src/engine/claude_code/control.rs`, `agent_session/lifecycle.rs` (`SessionEndAction::KeepCanceledBranch`).
+The user-clicked **Stop** action on a working *coding-agent thread*. It behaves like pressing **Esc** in the *Claude Code* CLI: it *interrupts* the current turn but keeps the session resumable. The same `cc_session_id` and branch are kept, so the next message continues the *same* conversation (a `--resume`) with full context. It is NOT a kill and NOT a fresh start.
+
+It emits `ResponseCanceled` (the visible "Canceled" chip) and `CodingAgentIdled` (the resume anchor). *Apply*, Discard and Archive are distinct: each ends the turn with its own lifecycle event. Work the stopped turn left on the branch is proposed as an *incomplete* change, so it keeps an Apply (ADR 0328).
+
+It routes through `interrupt_agent` (`POST /api/v1/claude-code/stop`, default `StopReason::UserStop`). A bounded fallback hard-stops only if the agent fails to honor the interrupt. Source: `crates/lucidos-engine/src/engine/claude_code/control.rs`, `agent_session/lifecycle.rs` (`idle_change_write`, `SessionEndAction`).
 
 ### Change
-A *coding-agent*-proposed set of file edits shown as a pending branch in the UI. Resolved by *Apply* (non-disruptive merge into main; an engine-affecting change then surfaces *New version available / Switch to new version*) or Discard. Lifecycle events: `ChangeProposed`, `ChangeApplied`, `ChangeDiscarded`. Stored as a row in the `changes` table. Internal (Lucidos-repo) coding-agent threads produce changes; *external-repo coding-agent threads* skip this flow.
+A *coding-agent*-proposed set of file edits shown as a pending branch in the UI. It is resolved by *Apply* or Discard, or kept for later with **Set aside**. Apply is a non-disruptive merge into main; an engine-affecting change then surfaces *New version available / Switch to new version*. Lifecycle events: `ChangeProposed`, `ChangeApplied`, `ChangeDiscarded`, `ChangeSetAside`, `ChangeBroughtBack`. Stored as a row in the `changes` table. Internal (Lucidos-repo) coding-agent threads produce changes; *external-repo coding-agent threads* skip this flow.
 
-A change's `status` is one of four values: `pending` (awaiting Apply or Discard), `applied`, `discarded`, or `reverted` (applied, then undone). No other value exists.
+A change's `status` is one of five values: `pending` (awaiting Apply or Discard), `set_aside` (a *set-aside change*), `applied`, `discarded`, or `reverted` (applied, then undone). No other value exists.
+
+A user **Stop** that leaves work on the branch proposes it as an *incomplete* change, so stopped work always has an Apply. Its Apply asks you to confirm, and *Apply All* passes it over. The next turn that finishes cleanly clears the mark.
 
 A change's file list tracks git: when later commits on the branch cancel the diff out (a commit plus its revert), the engine re-syncs the row to **zero files** and the card reads "No file changes" instead of claiming edits its Diff can't show. Such a change stays pending — the engine never resolves a change on the user's behalf — but *Apply* is refused (there is nothing to merge, and it would only add no-op commits); **Discard** is the resolution. The re-sync runs when the coding agent next idles, when its session ends, and as an engine-startup sweep for rows that went stale while nothing was running.
+
+### Set-aside change
+A *change* you keep for later, out of the way. **Set aside** sits in the Apply button's menu, the thread's ⋯ menu and each Changes panel row. A set-aside change leaves the Review list, the attention badge and *Apply All*, and its thread can be archived. Nothing is lost: the branch stays, and the Changes panel lists the change under **Set aside**.
+
+**Bring back** returns it to pending, from that list or from its thread's banner. Apply it from there; a set-aside change is never applied directly. It also comes back by itself when its thread's agent proposes new work on the same branch.
+
+Lucidos sets work aside for you in one case. When a thread is archived with work on its branch that was never proposed, the work becomes a set-aside change instead of being lost.
 
 ### Change summary
 One line saying what a *change* of several commits does, written by a background model once the change is proposed. It heads the change card in the thread, the Applied / Discarded / Reverted toasts, and the Changes panel row. The card and the panel row unfold to the change's commits, oldest first. A change of one commit gets no summary, since its commit subject already is the line. Until a summary lands, the oldest commit subject stands in, never the newest: the newest is usually a small fix. New commits clear the summary and a fresh one is written.
@@ -1300,7 +1316,7 @@ A *thread* driven by a *coding agent* (Claude Code or Codex) inside an isolated 
 See also: `system-knowhow/coding-agent-events.md`.
 
 ### Side question
-A quick question put to a thread by typing `/btw <question>` in its composer, or by holding Send and choosing "Ask as side question". It may carry images. The thread's agent answers from the thread's full context, beside any running turn, with no tools: a Claude Code thread asks a copy of its session, a Lucidos Agent thread asks its own model once. The answer shows on a card at the moment it was asked, and later output draws below it.
+A quick question put to a thread by typing `/btw <question>` in its composer, or by holding Send and choosing "Side question". Holding Stop during a turn and choosing it puts `/btw ` in the empty composer to finish. Pressing ⌥↵ (Alt+Enter) and then Enter asks one too. It may carry images. The thread's agent answers from the thread's full context, beside any running turn, with no tools: a Claude Code thread asks a copy of its session, a Lucidos Agent thread asks its own model once. The answer shows on a card at the moment it was asked, and later output draws below it.
 
 Kept as events **no agent ever sees** (ADR 0320), the card survives reloads and shows on every device. A tap on its head folds it to one line, and a second tap unfolds it. Codex threads refuse side questions.
 See also: `system-knowhow/coding-agent-events.md` § Side questions are recorded, and hidden from every agent.

@@ -477,6 +477,7 @@ mod tests {
             account_pin: None,
             binary_override: None,
             permission_mode: None,
+            additional_directories: &[],
         }
     }
 

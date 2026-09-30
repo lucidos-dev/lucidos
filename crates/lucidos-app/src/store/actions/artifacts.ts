@@ -8,6 +8,7 @@ import {
   selectedLines,
   lineScrollTarget,
   showToast,
+  showConfirm,
   dismissToast,
   parseRepoPath,
 } from '../store';
@@ -317,6 +318,10 @@ export function openUrlOutsideApp(url: string, source?: string): void {
     openExternalUrl(normalized, source);
     return;
   }
+  if (osOpenerMayLaunchAProgram(normalized)) {
+    void openLocalFileOnConfirm(normalized, source);
+    return;
+  }
   // The OS opener, the same path openLocalFile uses.
   const from = source ? ` (requested by ${source})` : '';
   void openExternal(normalized).catch((err) =>
@@ -361,6 +366,37 @@ export function openLocalFile(target: string): void {
   void openExternal(target).catch((err) =>
     showToast(`Couldn't open ${target}: ${errorDetail(err)}`, 'error'),
   );
+}
+
+/** Schemes the OS opener hands to a browser, a mail client or a dialer. Every
+ *  other target, a `file:` URL or a bare path above all, can launch a program. */
+const OS_OPENER_WEB_SCHEMES = new Set(['http:', 'https:', 'mailto:', 'tel:']);
+
+function osOpenerMayLaunchAProgram(target: string): boolean {
+  try {
+    return !OS_OPENER_WEB_SCHEMES.has(new URL(target).protocol);
+  } catch {
+    return true;
+  }
+}
+
+/** Open a target that content chose, such as a link or an app's navigate, only
+ *  after the user agrees. On the desktop app the OS opener launches whatever it
+ *  names. A hostile page can fake a click on such a link, and an app or agent
+ *  needs no click at all (ADR 0322). User chrome that names its own target calls
+ *  `openLocalFile` directly. */
+export async function openLocalFileOnConfirm(target: string, source?: string): Promise<void> {
+  if (!isTauri()) {
+    openLocalFile(target);
+    return;
+  }
+  const from = source ? `\n\nRequested by ${source}.` : '';
+  const open = await showConfirm(
+    `Open ${target} on this computer, with the app your system picks for it?${from}`,
+    'Open',
+    { variant: 'default', title: 'Open outside Lucidos?' },
+  );
+  if (open) openLocalFile(target);
 }
 
 /** Update panelUrl display from in-webview navigation (link clicks, history back/forward).

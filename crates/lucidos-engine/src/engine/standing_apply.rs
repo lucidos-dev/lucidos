@@ -121,6 +121,9 @@ pub(crate) const TURN_FAILED: &str = "The turn failed.";
 pub(crate) const NOTHING_PROPOSED: &str = "The thread settled without proposing a change.";
 pub(crate) const CHANGE_RESOLVED: &str = "The change was already applied or discarded.";
 pub(crate) const CHANGE_EMPTY: &str = "The change has no file changes left.";
+pub(crate) const CHANGE_INCOMPLETE: &str =
+    "The change is unfinished work from a stopped turn. Apply it from its own Apply, which asks first.";
+pub(crate) const CHANGE_SET_ASIDE: &str = "The change was set aside.";
 pub(crate) const THREAD_GONE: &str = "The thread no longer exists.";
 pub(crate) const TURN_CUT_OFF: &str = "The session stopped before its turn finished settling.";
 /// Reported when the owner takes the instruction back, by hand or by
@@ -151,7 +154,7 @@ static SETTLING_THREAD_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::n
 /// apply IS an Apply, one settle later, so it is offered exactly where Apply
 /// is. An external repo is reviewed and pushed from the repo itself.
 ///
-/// Such a thread never proposes at all (`may_touch_change_state_at_idle`), so
+/// Such a thread never proposes at all (`idle_change_write`), so
 /// an arm on one reads `Unproposed` forever, and its branch diff keeps the
 /// verdict at `Wait`. That is the one shape breaking this module's promise
 /// that an arm always ends, which is why the refusal is structural.
@@ -256,16 +259,24 @@ pub(crate) fn thread_to_resolve(event: &BusEvent) -> Option<Uuid> {
     }
 }
 
+/// One stored change row, as a standing apply reads it.
+pub(crate) type ArmedChangeRow = (Uuid, ChangeStatus, i32, bool);
+
 /// Classify the change an arm is bound to from its stored row. Pure, so the
 /// mapping is testable without a database. `None` = the row is gone.
-pub(crate) fn classify_bound_change(row: Option<(Uuid, ChangeStatus, i32)>) -> ArmedChange {
+///
+/// Incomplete work never lands through an arm: only its own Apply, which
+/// confirms, lands it (ADR 0328).
+pub(crate) fn classify_bound_change(row: Option<ArmedChangeRow>) -> ArmedChange {
     match row {
         None => ArmedChange::Gone(CHANGE_RESOLVED),
-        Some((_, status, _)) if status != ChangeStatus::Pending => {
+        Some((_, ChangeStatus::SetAside, _, _)) => ArmedChange::Gone(CHANGE_SET_ASIDE),
+        Some((_, status, _, _)) if status != ChangeStatus::Pending => {
             ArmedChange::Gone(CHANGE_RESOLVED)
         }
-        Some((_, _, 0)) => ArmedChange::Gone(CHANGE_EMPTY),
-        Some((id, _, _)) => ArmedChange::Ready(id),
+        Some((_, _, 0, _)) => ArmedChange::Gone(CHANGE_EMPTY),
+        Some((_, _, _, true)) => ArmedChange::Gone(CHANGE_INCOMPLETE),
+        Some((id, _, _, false)) => ArmedChange::Ready(id),
     }
 }
 
@@ -574,10 +585,10 @@ async fn read_armed_change(pool: &sqlx::PgPool, arm: &StandingApply) -> Option<A
     // Scoped to the arm's own thread, so a binding that named somebody else's
     // change can never fire whatever wrote it. `arm_standing_apply` refuses one
     // at the door; this is what makes the refusal structural.
-    let probe: Result<Option<(Uuid, ChangeStatus, i32)>, sqlx::Error> = match arm.change_id {
+    let probe: Result<Option<ArmedChangeRow>, sqlx::Error> = match arm.change_id {
         Some(change_id) => {
             sqlx::query_as(
-                "SELECT id, status, file_count FROM changes \
+                "SELECT id, status, file_count, incomplete FROM changes \
                  WHERE id = $1 AND thread_id = $2",
             )
             .bind(change_id)
@@ -587,7 +598,7 @@ async fn read_armed_change(pool: &sqlx::PgPool, arm: &StandingApply) -> Option<A
         }
         None => {
             sqlx::query_as(
-                "SELECT id, status, file_count FROM changes \
+                "SELECT id, status, file_count, incomplete FROM changes \
                  WHERE thread_id = $1 AND status = $2 \
                  ORDER BY created_at LIMIT 1",
             )
@@ -2327,20 +2338,29 @@ mod tests {
     fn bound_change_classification() {
         let id = Uuid::new_v4();
         assert_eq!(
-            classify_bound_change(Some((id, ChangeStatus::Pending, 3))),
+            classify_bound_change(Some((id, ChangeStatus::Pending, 3, false))),
             ArmedChange::Ready(id)
         );
         assert_eq!(
-            classify_bound_change(Some((id, ChangeStatus::Applied, 3))),
+            classify_bound_change(Some((id, ChangeStatus::Applied, 3, false))),
             ArmedChange::Gone(CHANGE_RESOLVED)
         );
         assert_eq!(
-            classify_bound_change(Some((id, ChangeStatus::Discarded, 3))),
+            classify_bound_change(Some((id, ChangeStatus::Discarded, 3, false))),
             ArmedChange::Gone(CHANGE_RESOLVED)
         );
         assert_eq!(
-            classify_bound_change(Some((id, ChangeStatus::Pending, 0))),
+            classify_bound_change(Some((id, ChangeStatus::Pending, 0, false))),
             ArmedChange::Gone(CHANGE_EMPTY)
+        );
+        assert_eq!(
+            classify_bound_change(Some((id, ChangeStatus::Pending, 3, true))),
+            ArmedChange::Gone(CHANGE_INCOMPLETE),
+            "a Stop's unfinished work never lands through an arm"
+        );
+        assert_eq!(
+            classify_bound_change(Some((id, ChangeStatus::SetAside, 3, false))),
+            ArmedChange::Gone(CHANGE_SET_ASIDE)
         );
         assert_eq!(
             classify_bound_change(None),

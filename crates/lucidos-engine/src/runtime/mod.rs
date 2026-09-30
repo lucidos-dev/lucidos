@@ -102,7 +102,8 @@ pub fn coding_agent_reasoning_effort_options(
 /// than a session that quietly runs on the wrong model.
 ///
 /// The vocabulary is the backend's own picker list, so this cannot drift from
-/// what the user can pick in the UI.
+/// what the user can pick in the UI. A row is named by its value or by the
+/// concrete model it runs (see [`offered_row`]).
 ///
 /// When the rejected id is not offered but is a close spelling of one that
 /// is, `likely_intended_model` names it before the full list. A caller can
@@ -112,25 +113,60 @@ pub fn validate_coding_agent_model(
     agent: CodingAgent,
     model: Option<&str>,
 ) -> Result<Option<String>, String> {
+    validate_model_against(agent, model, &coding_agent_model_options(agent))
+}
+
+fn validate_model_against(
+    agent: CodingAgent,
+    model: Option<&str>,
+    options: &[claude_code::CcMenuOption],
+) -> Result<Option<String>, String> {
     let Some(model) = model.map(str::trim).filter(|m| !m.is_empty()) else {
         return Ok(None);
     };
-    let options = coding_agent_model_options(agent);
-    if options.iter().any(|o| o.value == model) {
+    if offered_row(options, model).is_some() {
         return Ok(Some(model.to_string()));
     }
     let offered = options
         .iter()
-        .map(|o| o.value.as_str())
+        .map(describe_row)
         .collect::<Vec<_>>()
         .join(", ");
-    let hint = likely_intended_model(model, &options)
+    let hint = likely_intended_model(model, options)
         .map(|likely| format!(", which spells that model '{likely}'"))
         .unwrap_or_default();
     Err(format!(
         "model '{model}' is not offered by {}{hint}. Choose one of: {offered}",
         agent.as_str(),
     ))
+}
+
+/// The picker row a caller's `model` names: the row with that value, else the
+/// first row that runs that concrete model.
+///
+/// The second arm is what a caller copying a thread's model needs. The picker
+/// sends `sonnet`, Claude Code reports `claude-sonnet-5[1m]` at Init, and the
+/// thread records that. The recorded id names a model the picker offers, so it
+/// must pass. Several rows can run one model (`default` and `opus` often do), and
+/// then the first one answers.
+fn offered_row<'a>(
+    options: &'a [claude_code::CcMenuOption],
+    model: &str,
+) -> Option<&'a claude_code::CcMenuOption> {
+    options.iter().find(|o| o.value == model).or_else(|| {
+        options
+            .iter()
+            .find(|o| o.resolved_model.as_deref() == Some(model))
+    })
+}
+
+/// One row as a refusal lists it: the value, and the model it runs when that
+/// differs, so the caller sees the same pairing the picker shows.
+fn describe_row(option: &claude_code::CcMenuOption) -> String {
+    match option.resolved_model.as_deref() {
+        Some(runs) if runs != option.value => format!("{} (runs {runs})", option.value),
+        _ => option.value.clone(),
+    }
 }
 
 /// The single offered id that is a close misspelling of a rejected `model`,
@@ -207,9 +243,7 @@ pub fn validate_coding_agent_effort(
     let model = model.map(str::trim).unwrap_or("");
     // A discovered row names its own tiers, and the picker offers exactly
     // those. Refusing anything else keeps the spawn and the picker in step.
-    let row_tiers = coding_agent_model_options(agent)
-        .iter()
-        .find(|o| o.value == model)
+    let row_tiers = offered_row(&coding_agent_model_options(agent), model)
         .and_then(|o| o.reasoning_efforts.clone());
     if let Some(tiers) = row_tiers {
         return effort_within_row_tiers(agent, model, effort, &tiers);
@@ -986,6 +1020,142 @@ mod tests {
         assert!(
             validate_coding_agent_model(CodingAgent::ClaudeCode, Some("gpt-5.6-luna")).is_err()
         );
+    }
+
+    /// The picker rows discovery builds from the list Claude Code 2.1.280
+    /// returned under a Vertex setup that pins `sonnet` to Sonnet 5 (1M).
+    fn discovered_picker() -> Vec<claude_code::CcMenuOption> {
+        let row = |value: &str, runs: &str| {
+            serde_json::json!({
+                "value": value,
+                "resolvedModel": runs,
+                "displayName": value,
+                "supportsEffort": true,
+                "supportedEffortLevels": ["low", "high"],
+            })
+        };
+        let reply = serde_json::json!({ "models": [
+            row("default", "claude-opus-5-5[1m]"),
+            row("sonnet", "claude-sonnet-5[1m]"),
+            row("claude-fable-5-1", "claude-fable-5-1"),
+            row("opus", "claude-opus-5-5[1m]"),
+            { "value": "haiku", "resolvedModel": "claude-haiku-4-5", "displayName": "Haiku 4.5" },
+            row("claude-opus-5-5[1m]", "claude-opus-5-5[1m]"),
+        ]});
+        cc_model_discovery::menu_options(
+            &cc_model_discovery::parse_initialize_models(&reply).expect("recorded reply parses"),
+        )
+    }
+
+    /// The reported bug. The composer sent `sonnet`, Claude Code reported
+    /// `claude-sonnet-5[1m]` at Init, and the thread recorded that id. A spawn
+    /// copying it was refused, although the picker offers the model.
+    #[test]
+    fn the_model_a_picker_row_runs_is_accepted() {
+        let picker = discovered_picker();
+        assert_eq!(
+            validate_model_against(
+                CodingAgent::ClaudeCode,
+                Some("claude-sonnet-5[1m]"),
+                &picker
+            ),
+            Ok(Some("claude-sonnet-5[1m]".to_string()))
+        );
+    }
+
+    /// Every row the picker serves is accepted by its value AND by the model it
+    /// runs. The rows come from the one function the picker's wire reads.
+    #[test]
+    fn every_discovered_picker_row_is_accepted_both_ways() {
+        let picker = discovered_picker();
+        let (served, _) = claude_code::model_and_effort_options(
+            &picker,
+            claude_code::cc_reasoning_effort_options(),
+        );
+        assert_eq!(served.len(), picker.len());
+        for (wire, row) in served.iter().zip(&picker) {
+            let value = wire["value"].as_str().expect("a served row has a value");
+            let runs = row
+                .resolved_model
+                .as_deref()
+                .expect("a discovered row runs a model");
+            for id in [value, runs] {
+                assert_eq!(
+                    validate_model_against(CodingAgent::ClaudeCode, Some(id), &picker),
+                    Ok(Some(id.to_string())),
+                    "the picker offers {value}, which runs {runs}"
+                );
+            }
+        }
+    }
+
+    /// The picker shows Opus 5.5 once, but a spawn still takes the full id it
+    /// hides: the fold shapes the display, never the accepted list.
+    #[test]
+    fn a_row_the_picker_folds_is_still_accepted() {
+        let picker = discovered_picker();
+        let shown = claude_code::cc_picker_rows(&picker);
+        assert!(!shown.iter().any(|r| r.value == "claude-opus-5-5[1m]"));
+        for id in ["opus", "claude-opus-5-5[1m]"] {
+            assert_eq!(
+                validate_model_against(CodingAgent::ClaudeCode, Some(id), &picker),
+                Ok(Some(id.to_string()))
+            );
+        }
+    }
+
+    /// The live pair: what the picker endpoint serves is what the spawn takes.
+    #[test]
+    fn every_model_the_picker_endpoint_serves_is_accepted() {
+        let definitions = claude_code::cc_command_definitions();
+        let set_model = definitions
+            .as_array()
+            .and_then(|all| all.iter().find(|c| c["subtype"] == "set_model"))
+            .expect("the picker serves set_model");
+        let served = set_model["params"][0]["options"]
+            .as_array()
+            .expect("set_model has options");
+        assert!(!served.is_empty());
+        for row in served {
+            let value = row["value"].as_str().expect("a served row has a value");
+            assert_eq!(
+                validate_coding_agent_model(CodingAgent::ClaudeCode, Some(value)),
+                Ok(Some(value.to_string()))
+            );
+        }
+    }
+
+    /// The refusal lists the picker's rows, each with the model it runs. The
+    /// caller can then map a recorded id back to a row.
+    #[test]
+    fn a_refusal_names_the_model_each_row_runs() {
+        let err = validate_model_against(
+            CodingAgent::ClaudeCode,
+            Some("claude-sonnet-9"),
+            &discovered_picker(),
+        )
+        .expect_err("no row offers or runs it");
+        assert!(
+            err.ends_with(
+                "Choose one of: default (runs claude-opus-5-5[1m]), \
+                 sonnet (runs claude-sonnet-5[1m]), claude-fable-5-1, \
+                 opus (runs claude-opus-5-5[1m]), haiku (runs claude-haiku-4-5), \
+                 claude-opus-5-5[1m]"
+            ),
+            "got {err}"
+        );
+    }
+
+    /// A recorded id finds its own row, so the effort check reads that row's
+    /// tiers rather than the universal table.
+    #[test]
+    fn the_model_a_row_runs_finds_that_row() {
+        let picker = discovered_picker();
+        let haiku = offered_row(&picker, "claude-haiku-4-5").expect("haiku runs it");
+        assert_eq!(haiku.value, "haiku");
+        assert_eq!(haiku.reasoning_efforts.as_deref(), Some(&[][..]));
+        let sonnet = offered_row(&picker, "claude-sonnet-5[1m]").expect("sonnet runs it");
+        assert_eq!(sonnet.value, "sonnet");
     }
 
     #[test]

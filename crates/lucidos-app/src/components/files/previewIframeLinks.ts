@@ -18,7 +18,7 @@
 //
 // Everything is routed through an existing host entry point
 // (`openFilePreview`, `openThreadAcrossWorkspaces`, `openAppById`,
-// `handleNavigationRequest`, `openLocalFile`, `openUrl`) rather than by poking
+// `handleNavigationRequest`, `openLocalFileOnConfirm`, `openUrl`) rather than by poking
 // store signals, which is what gives content-pane navigation from a preview its
 // nav-history entry for free: those helpers already push one.
 
@@ -31,7 +31,7 @@ import {
   extractTriggerIdFromHref,
   hasUrlScheme,
 } from '../../utils/linkifyPaths';
-import { openFilePreview, openUrl, openLocalFile } from '../../store/actions/artifacts';
+import { openFilePreview, openUrl, openLocalFileOnConfirm } from '../../store/actions/artifacts';
 import { openAppById } from '../../store/actions/apps';
 import { openThreadAcrossWorkspaces } from '../../store/actions/cross-workspace';
 import { handleNavigationRequest } from '../../store/actions/navigation-request';
@@ -272,8 +272,9 @@ export function classifyPreviewLink(
  *  scroll itself, so each caller answers a fragment on its own. */
 export type PreviewNavigation = Exclude<PreviewLinkAction, { kind: 'fragment' }>;
 
-/** Carry out a routed click through the host entry point that owns it. */
-export function runPreviewLinkAction(action: PreviewNavigation): void {
+/** Carry out a routed click through the host entry point that owns it.
+ *  `artifactPath` names the previewed file that asked, in the local-file confirm. */
+export function runPreviewLinkAction(action: PreviewNavigation, artifactPath: string): void {
   switch (action.kind) {
     case 'thread':
       openThreadAcrossWorkspaces(action.workspace, action.threadId);
@@ -291,7 +292,7 @@ export function runPreviewLinkAction(action: PreviewNavigation): void {
       handleNavigationRequest({ target: action.target });
       return;
     case 'local-file':
-      openLocalFile(action.target);
+      void openLocalFileOnConfirm(action.target, artifactPath);
       return;
     case 'file':
       openFilePreview(action.path);
@@ -358,7 +359,7 @@ export function handlePreviewLinkClick(e: MouseEvent, artifactPath: string): voi
   if (!action || action.kind === 'fragment') return;
   e.preventDefault();
   e.stopPropagation();
-  runPreviewLinkAction(action);
+  runPreviewLinkAction(action, artifactPath);
 }
 
 /** The `<base href>` a previewed artifact should carry: its own folder, so

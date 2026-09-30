@@ -252,46 +252,6 @@ fn parse_credential_info(row: CredentialInfoRow) -> CredentialInfo {
 pub struct CredentialStore;
 
 impl CredentialStore {
-    /// Defensive double-write: the migration owns this CREATE TABLE (see
-    /// `20260517160627_consolidate_init_schema_tables.sql`). A temporary measure:
-    /// `docs/temporary-measures.md` § "Defensive double-write of tables into
-    /// `init_schema`".
-    ///
-    /// Reachable only as a no-op: `sqlx::migrate!()` runs at construction and
-    /// creates the table, and this fires afterwards behind `IF NOT EXISTS`. It
-    /// still mirrors the current constraint shape rather than the pre-2026-08-05
-    /// `service_name TEXT UNIQUE`, because a dead copy that contradicts the live
-    /// schema is exactly the drift that made a prefix necessary in the first
-    /// place: the next reader takes it for the contract.
-    pub async fn init_schema(pool: &PgPool) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS credentials (
-                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                service_name TEXT NOT NULL,
-                base_urls TEXT[] NOT NULL DEFAULT '{}',
-                auth_type TEXT NOT NULL,
-                auth_value TEXT NOT NULL,
-                auth_header TEXT DEFAULT 'Authorization',
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                CONSTRAINT credentials_service_name_auth_type_key UNIQUE (service_name, auth_type)
-            )
-            "#,
-        )
-        .execute(pool)
-        .await?;
-
-        sqlx::query(
-            "CREATE UNIQUE INDEX IF NOT EXISTS credentials_service_name_not_oauth_key \
-             ON credentials (service_name) WHERE auth_type <> 'oauth_client'",
-        )
-        .execute(pool)
-        .await?;
-
-        Ok(())
-    }
-
     /// Insert or update a credential (upsert by service_name), reporting
     /// whether the row was created.
     ///
@@ -554,13 +514,27 @@ impl CredentialStore {
     /// key), so a name-keyed DELETE would be a coin flip over which one goes.
     /// `RETURNING` is what keeps the event able to name the deleted service
     /// without a second round trip.
+    ///
+    /// An `email_password` also clears the mailbox password in the same
+    /// transaction. IMAP and SMTP read it from `email_accounts`, so leaving it
+    /// kept mail access alive after the user revoked it.
     async fn delete_row(pool: &PgPool, id: Uuid) -> Result<Option<String>, sqlx::Error> {
-        sqlx::query_scalar::<_, String>(
-            "DELETE FROM credentials WHERE id = $1 RETURNING service_name",
+        let mut tx = pool.begin().await?;
+        let removed = sqlx::query_as::<_, (String, String)>(
+            "DELETE FROM credentials WHERE id = $1 RETURNING service_name, auth_type",
         )
         .bind(id)
-        .fetch_optional(pool)
-        .await
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((service_name, auth_type)) = removed else {
+            return Ok(None);
+        };
+        if AuthType::parse(&auth_type) == AuthType::EmailPassword {
+            let account = crate::core::EmailStore::account_name_for_credential(&service_name);
+            crate::core::EmailStore::clear_password(&mut tx, account).await?;
+        }
+        tx.commit().await?;
+        Ok(Some(service_name))
     }
 
     /// Delete a credential and announce it. The only way to remove one.
@@ -1376,6 +1350,74 @@ mod tests {
             1,
             "and therefore announces nothing"
         );
+
+        teardown_test_db(&db).await;
+    }
+
+    /// IMAP and SMTP log in with the copy of the password in `email_accounts`,
+    /// so deleting the credential alone left mail access live and invisible.
+    #[tokio::test]
+    async fn delete_of_an_email_password_clears_the_mailbox_password() {
+        use crate::core::EmailStore;
+        let (pool, db) = setup_test_db().await;
+        let (bus, _callback_rx) = EventBus::new(pool.clone());
+
+        EmailStore::upsert(
+            &pool,
+            "mail",
+            "user@example.com",
+            "imap.example.com",
+            993,
+            "smtp.example.com",
+            465,
+            "user@example.com",
+            true,
+            true,
+        )
+        .await
+        .unwrap();
+        EmailStore::upsert(
+            &pool,
+            "other",
+            "other@example.com",
+            "imap.example.com",
+            993,
+            "smtp.example.com",
+            465,
+            "other@example.com",
+            true,
+            true,
+        )
+        .await
+        .unwrap();
+        EmailStore::update_password(&pool, "mail", "hunter2")
+            .await
+            .unwrap();
+        EmailStore::update_password(&pool, "other", "kept")
+            .await
+            .unwrap();
+        let id = CredentialStore::upsert(
+            &pool,
+            &bus,
+            "mail",
+            &[],
+            AuthType::EmailPassword,
+            "hunter2",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(CredentialStore::delete(&pool, &bus, id, None)
+            .await
+            .unwrap());
+
+        let account = EmailStore::get(&pool, "mail").await.unwrap().unwrap();
+        assert_eq!(account.password, "", "the mailbox password must go with it");
+        let other = EmailStore::get(&pool, "other").await.unwrap().unwrap();
+        assert_eq!(other.password, "kept", "another account is untouched");
 
         teardown_test_db(&db).await;
     }

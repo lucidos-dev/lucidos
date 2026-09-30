@@ -105,7 +105,7 @@ pub(super) async fn delete_repository(pool: &PgPool, repo_id: Uuid) {
 /// repo-name scavenge backfill: a pre-`RepositoryAdded` repo's name is
 /// recoverable from this path's basename even when no event recorded it.
 pub(super) async fn insert_change(pool: &PgPool, thread_id: Uuid, repo_root: &str) {
-    // `branch_name` is unique per pending change (`idx_changes_unique_pending_branch`),
+    // `branch_name` is unique per open change (`idx_changes_unique_open_branch`),
     // so derive a fresh one per row.
     let request_id = Uuid::new_v4();
     sqlx::query("INSERT INTO changes (request_id, branch_name, repo_root, thread_id) VALUES ($1, $2, $3, $4)")

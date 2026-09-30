@@ -2101,6 +2101,7 @@ async fn emit_pending_change(bus: &EventBus, thread_id: Uuid, change_id: Uuid) {
             repo_root: "/tmp".into(),
             hardened: false,
             incomplete: false,
+            set_aside: false,
             path: String::new(),
             diff: String::new(),
         },

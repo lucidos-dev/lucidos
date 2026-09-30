@@ -104,23 +104,26 @@ describe('settings search — Permissions section', () => {
 });
 
 describe('settings search — mobile-only rows', () => {
-  it('hides the "Keep header visible" mobile row from search on a desktop viewport', () => {
+  it('hides the "Dynamic bars" mobile row from search on a desktop viewport', () => {
     setViewportWidth(1280);
-    const results = getSettingsSearchResults('keep header visible', 20);
-    expect(results.some((r) => r.id === 'appearance:mobile-header-sticky')).toBe(false);
+    const results = getSettingsSearchResults('dynamic bars', 20);
+    expect(results.some((r) => r.id === 'appearance:mobile-dynamic-bars')).toBe(false);
     // The "Mobile" section row is mobile-only too.
     expect(getSettingsSearchResults('mobile', 20).some((r) => r.id === 'appearance:mobile')).toBe(false);
   });
 
-  it('surfaces the "Keep header visible" mobile row in search on a mobile viewport', () => {
+  it('surfaces the "Dynamic bars" mobile row in search on a mobile viewport', () => {
     setViewportWidth(375);
-    const results = getSettingsSearchResults('keep header visible', 20);
-    expect(results.some((r) => r.id === 'appearance:mobile-header-sticky')).toBe(true);
+    const results = getSettingsSearchResults('dynamic bars', 20);
+    expect(results.some((r) => r.id === 'appearance:mobile-dynamic-bars')).toBe(true);
+    // Someone who remembers the old "Keep header visible" row still finds it.
+    const byOldName = getSettingsSearchResults('keep header visible', 20);
+    expect(byOldName.some((r) => r.id === 'appearance:mobile-dynamic-bars')).toBe(true);
   });
 
   it('keeps the entry resolvable by id regardless of viewport (navigation by recents)', () => {
     setViewportWidth(1280);
-    expect(findSettingsEntry('appearance:mobile-header-sticky')?.subview).toBe('appearance');
+    expect(findSettingsEntry('appearance:mobile-dynamic-bars')?.subview).toBe('appearance');
   });
 });
 

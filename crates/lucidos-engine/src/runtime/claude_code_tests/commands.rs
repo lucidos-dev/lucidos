@@ -23,17 +23,28 @@ fn cc_control_request_set_model_serializes() {
     assert_eq!(parsed["request"]["model"], "claude-sonnet-4-6");
 }
 
+/// The mode is chosen once, in Settings, and passed at spawn. A mid-session
+/// switch would override that choice with an unchecked string.
 #[test]
-fn cc_control_request_set_permission_mode_serializes() {
-    let json = cc_control_request_to_json(
-        &ControlRequest::SetPermissionMode {
-            mode: "plan".to_string(),
-        },
-        "test-id-789",
+fn command_definitions_offer_no_permission_mode() {
+    let defs = cc_command_definitions();
+    let subtypes: Vec<&str> = defs
+        .as_array()
+        .expect("array")
+        .iter()
+        .map(|d| d["subtype"].as_str().expect("subtype"))
+        .collect();
+    assert_eq!(subtypes, ["set_model", "set_reasoning_effort"]);
+}
+
+/// The control endpoint deserializes the body into `ControlRequest`, so this is
+/// what refuses a mode switch sent over HTTP.
+#[test]
+fn control_request_refuses_set_permission_mode() {
+    let parsed = serde_json::from_str::<ControlRequest>(
+        r#"{"subtype":"set_permission_mode","mode":"plan"}"#,
     );
-    let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-    assert_eq!(parsed["request"]["subtype"], "set_permission_mode");
-    assert_eq!(parsed["request"]["mode"], "plan");
+    assert!(parsed.is_err(), "got {parsed:?}");
 }
 
 fn assert_command_options(
@@ -188,10 +199,6 @@ fn control_request_deserializes_all_variants() {
         (
             r#"{"subtype":"set_model","model":"claude-sonnet-4-6"}"#,
             "set_model",
-        ),
-        (
-            r#"{"subtype":"set_permission_mode","mode":"plan"}"#,
-            "set_permission_mode",
         ),
         (
             r#"{"subtype":"set_reasoning_effort","effort":"high"}"#,
@@ -546,6 +553,7 @@ fn the_picker_is_the_discovered_list_or_the_curated_one() {
     assert_eq!(&*pick_cc_model_options(None), curated_cc_model_options());
     let discovered: std::sync::Arc<[CcMenuOption]> = vec![CcMenuOption {
         value: "sonnet".to_string(),
+        resolved_model: None,
         label: "Sonnet 5".to_string(),
         description: String::new(),
         supported_models: None,
@@ -562,6 +570,7 @@ fn the_picker_is_the_discovered_list_or_the_curated_one() {
 fn a_discovered_row_offers_its_own_tiers() {
     let row = CcMenuOption {
         value: "haiku".to_string(),
+        resolved_model: None,
         label: "Haiku 4.5".to_string(),
         description: String::new(),
         supported_models: None,
@@ -570,4 +579,88 @@ fn a_discovered_row_offers_its_own_tiers() {
     };
     let (models, _) = model_and_effort_options(&[row], cc_reasoning_effort_options());
     assert_eq!(models[0]["reasoning_efforts"], serde_json::json!([]));
+}
+
+/// A discovered row, as Claude Code lists it: its own value, and the model it
+/// runs.
+fn discovered_row(value: &str, runs: &str) -> CcMenuOption {
+    CcMenuOption {
+        value: value.to_string(),
+        resolved_model: Some(runs.to_string()),
+        label: value.to_string(),
+        description: String::new(),
+        supported_models: None,
+        context_window: None,
+        reasoning_efforts: None,
+    }
+}
+
+/// The list Claude Code sent for the reported picker, in its own order.
+fn reported_claude_code_list() -> Vec<CcMenuOption> {
+    vec![
+        discovered_row("default", "claude-opus-5-5[1m]"),
+        discovered_row("sonnet", "claude-sonnet-5[1m]"),
+        discovered_row("claude-fable-5-1", "claude-fable-5-1"),
+        discovered_row("opus", "claude-opus-5-5[1m]"),
+        discovered_row("haiku", "claude-haiku-4-5"),
+        discovered_row("claude-opus-5-5[1m]", "claude-opus-5-5[1m]"),
+    ]
+}
+
+fn values(rows: &[CcMenuOption]) -> Vec<&str> {
+    rows.iter().map(|r| r.value.as_str()).collect()
+}
+
+/// The reported picker: Default, then the strongest family first, and Opus 5.5
+/// once, although Claude Code lists it under two ids.
+#[test]
+fn the_picker_runs_strongest_first_and_shows_each_model_once() {
+    let rows = cc_picker_rows(&reported_claude_code_list());
+    assert_eq!(
+        values(&rows),
+        ["default", "claude-fable-5-1", "opus", "sonnet", "haiku"]
+    );
+}
+
+/// The fallback list groups by family and runs newest version first. A
+/// version-free alias sits last in its family, and no row is folded, because
+/// each curated row runs a model of its own.
+#[test]
+fn the_fallback_picker_groups_by_family_newest_first() {
+    let rows = cc_picker_rows(curated_cc_model_options());
+    assert_eq!(
+        values(&rows),
+        [
+            "default",
+            "claude-fable-5-1",
+            "claude-fable-5-1[1m]",
+            "claude-fable-5",
+            "claude-fable-5[1m]",
+            "claude-opus-5-5",
+            "claude-opus-5-5[1m]",
+            "claude-opus-5@default",
+            "claude-opus-5[1m]",
+            "claude-opus-4-8@default",
+            "claude-opus-4-8[1m]",
+            "claude-opus-4-7",
+            "claude-opus-4-1",
+            "opus",
+            "opus[1m]",
+            "claude-sonnet-5-5",
+            "claude-sonnet-5-5[1m]",
+            "claude-sonnet-5",
+            "sonnet",
+            "haiku",
+        ]
+    );
+}
+
+/// The wire serves the sorted, folded picker. Each row names the model it runs,
+/// so the picker can mark a thread on a resolved id.
+#[test]
+fn the_served_picker_names_the_model_each_row_runs() {
+    let rows = cc_picker_rows(&reported_claude_code_list());
+    let (served, _) = model_and_effort_options(&rows, cc_reasoning_effort_options());
+    assert_eq!(served[2]["value"], "opus");
+    assert_eq!(served[2]["resolved_model"], "claude-opus-5-5[1m]");
 }

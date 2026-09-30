@@ -10,16 +10,13 @@ import { rebuildCorruptedThreadEvents } from '../../store/actions/thread-sync';
 import { useScrollObservers, renderExchanges, ScrollControls } from './CreateThreadView';
 import { StoppedChildNotice } from './StoppedChildNotice';
 import { sideQuestionsFor } from '../../store/sideQuestions';
-import { ThreadStatusIcon, threadVisualStatus } from '../shared/ThreadStatusIcon';
-import { ThreadTitleEditor } from './ThreadTitleEditor';
-import { PinThreadButton } from '../shared/PinThreadButton';
-import { ThreadOverflowMenu } from '../shared/ThreadOverflowMenu';
-import { revealThreadInList } from '../drawer/ThreadDrawer';
+import { threadVisualStatus } from '../shared/ThreadStatusIcon';
+import { ThreadTitleMenu, ThreadTitlePin } from './ThreadTitle';
 import { MobileThreadTitleBar } from '../layout/MobileAppHeader';
 import { computeExchanges, exchangeKey, exchangeResponseEvents, hasContentEvents, turnBodyFolded, type Exchange } from '../../store/thread-events';
 import { rowsDrawnByClamp } from '../../store/event-rendering';
 import { statusLabel } from '../../store/exchange-status';
-import { awayFromBottom, notAtTop, scrollToBottomAnimated, scrollToTop, hasPendingEventScroll, isElementVisible, isNavigationScroll, isScrollbarHeld, isWhereWeLastScrolledIt, markAnchorScroll, onScrollbarReleased, scrollbarReleased, deepLinkRenderAll } from './scrollState';
+import { awayFromBottom, notAtTop, scrollToBottomAnimated, scrollToTop, hasPendingEventScroll, isElementVisible, isNavigationScroll, isScrollbarHeld, isWhereWeLastScrolledIt, markAnchorScroll, onScrollbarReleased, scrollbarReleased, deepLinkRenderAll, scrolledFromTop } from './scrollState';
 import { EMPTY_FILL_LEDGER, WHOLE_THREAD, chargeFillRound, drawnRowsInWindow, fillRoundAllowed, settleFillLedger, anythingAbove, atScrollTop, canSeedRenderWindow, deepLinkMustPersist, edgeHasMoreAbove, edgeMustReachRow, exchangeRenderCost, readingChaseAction, READING_CHASE_PAGE_SIZE, expandWindowEdge, fillAction, reseedOnReopen, seedWindowEdge, transcriptScrolls, UPWARD_SCROLL_KEYS, WINDOW_EXPAND_MARGIN_PX, scrollToTopNeedsRenderAll, type FillLedger, type RowsAt, type WindowEdge } from './threadWindow';
 import { anchorTargetTop, readScrollAnchor, type ScrollAnchor } from './scrollAnchor';
 import { useScrollMemory, threadScrollKey, readSavedScroll, type SavedScroll } from '../../hooks/useScrollMemory';
@@ -1949,24 +1946,12 @@ export function ThreadView() {
         );
     }
 
-    const threadTitle = threadDisplayTitle(eventThread);
-    const visualStatus = threadVisualStatus(eventThread);
     // Is there a feed to draw? The empty state is the other branch, and it
     // centres itself rather than flowing from the top.
     const hasFeed = exchanges.length > 0;
     return (
         <div class="thread-view">
-            <div class="thread-view-header">
-                <ThreadStatusIcon status={visualStatus} />
-                <ThreadTitleEditor key={threadId} threadId={threadId} title={threadTitle} />
-                <span class="thread-view-header-actions">
-                    {eventThread.meta.state !== 'composing' && (
-                        <PinThreadButton threadId={threadId} saved={eventThread.meta.saved} />
-                    )}
-                    <ThreadOverflowMenu threadId={threadId} title={threadTitle}
-                        onShowInThreadList={eventThread.meta.state === 'composing' ? undefined : () => revealThreadInList(threadId)} />
-                </span>
-            </div>
+            <DesktopThreadTitleBar threadId={eventThread.meta.id} />
             {/* `has-scroll-indicator` is what licenses the CSS to hide the
                 native scrollbar on this scroller: the suppression is scoped to
                 a wrap that actually carries a replacement, so a transcript can
@@ -2071,6 +2056,22 @@ export function ThreadView() {
                     onScrollDown={scrollToBottomAnimated}
                 />
             </div>
+        </div>
+    );
+}
+
+/** The desktop title row. Its own component, so the scroll flag it reads
+ *  re-renders this row alone and not the whole transcript. It reads
+ *  `threadMap` itself: thread meta changes in place, and a signal-reading
+ *  component skips a parent render whose props are unchanged. */
+export function DesktopThreadTitleBar({ threadId }: { threadId: string }) {
+    const thread = threadMap.value.get(threadId);
+    if (!thread) return null;
+    const title = threadDisplayTitle(thread);
+    return (
+        <div class={`thread-view-header${scrolledFromTop.value ? ' scrolled' : ''}`}>
+            <ThreadTitleMenu thread={thread} title={title} status={threadVisualStatus(thread)} />
+            <ThreadTitlePin thread={thread} />
         </div>
     );
 }

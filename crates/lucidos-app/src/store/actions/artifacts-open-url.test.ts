@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { panelOverlay, preferences, webviewInitialUrl, toasts } from '../store';
+import { confirmState, panelOverlay, preferences, webviewInitialUrl, toasts } from '../store';
 
 // Spy on the panel side effects — real implementations dirty localStorage,
 // a module-level nav stack, and touch viewport/DOM state. artifacts.ts imports
@@ -33,7 +33,7 @@ const postClientLog = vi.hoisted(() => vi.fn());
 vi.mock('../../utils/clientLog', () => ({ postClientLog }));
 
 // Imports must come after vi.mock so the mocked deps are wired in.
-const { openUrl, openUrlOutsideApp } = await import('./artifacts');
+const { openUrl, openUrlOutsideApp, openLocalFileOnConfirm } = await import('./artifacts');
 
 // jsdom doesn't implement window.open, so stub it as a global rather than
 // spying on a non-existent property. It returns a window handle by default:
@@ -246,6 +246,58 @@ describe('openUrl / openUrlOutsideApp: system browser vs in-app webview routing'
 
       expect(window.open).toHaveBeenCalledWith(TARGET_URL, '_blank');
       expect(toasts.value).toEqual([]);
+    });
+  });
+
+  // An app frame or an agent can raise a navigate with no click behind it. On
+  // the desktop app, the OS opener launches whatever a `file:` URL names.
+  describe('asks before handing a local file to the OS opener', () => {
+    const LOCAL = 'file:///Applications/Terminal.app';
+
+    beforeEach(() => {
+      confirmState.value = { visible: false, message: '', okLabel: 'Delete' };
+    });
+
+    it('a navigate from an app waits for the confirm, and opens only on yes', async () => {
+      platformMocks.isTauri = true;
+
+      openUrl(LOCAL, 'an app');
+
+      expect(openExternal).not.toHaveBeenCalled();
+      expect(confirmState.value.visible).toBe(true);
+      expect(confirmState.value.message).toContain(LOCAL);
+      expect(confirmState.value.message).toContain('an app');
+      confirmState.value.resolve?.(true);
+      await vi.waitFor(() => expect(openExternal).toHaveBeenCalledWith(LOCAL));
+    });
+
+    it('a declined confirm opens nothing', async () => {
+      platformMocks.isTauri = true;
+
+      openUrlOutsideApp('/Applications/Terminal.app', 'thread "Book a flight"');
+      confirmState.value.resolve?.(false);
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(openExternal).not.toHaveBeenCalled();
+    });
+
+    it('a content link to a local file asks too', async () => {
+      platformMocks.isTauri = true;
+
+      void openLocalFileOnConfirm(LOCAL, 'artifacts/reports/q3.html');
+
+      expect(confirmState.value.message).toContain('artifacts/reports/q3.html');
+      expect(openExternal).not.toHaveBeenCalled();
+    });
+
+    it('a web url still opens at once, with no confirm', () => {
+      platformMocks.isTauri = true;
+
+      openUrlOutsideApp(TARGET_URL, 'an app');
+
+      expect(openExternal).toHaveBeenCalledWith(TARGET_URL);
+      expect(confirmState.value.visible).toBe(false);
     });
   });
 });

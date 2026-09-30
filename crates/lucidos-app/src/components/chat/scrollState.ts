@@ -38,9 +38,9 @@ export const notAtTop = signal(false);
  *  var) so the render subscribes. */
 export const deepLinkRenderAll = signal(false);
 /** True once the transcript is scrolled even slightly from the very top (2px
- *  subpixel slack). Drives the mobile thread-title fade overlay, so it eases in
- *  the moment content slides under the sticky title. `notAtTop`'s 80px chevron
- *  threshold is too coarse for that. */
+ *  subpixel slack). Drives the title row's band on both layouts, and the mobile
+ *  fade under it, so both ease in as content slides under the title.
+ *  `notAtTop`'s 80px chevron threshold is too coarse for that. */
 export const scrolledFromTop = signal(false);
 
 /** The currently-active scroll container element, set by `useScrollObservers`
@@ -760,7 +760,7 @@ function isAtLiveEdge(el: HTMLElement): boolean {
 }
 
 /** Can this transcript be scrolled at all? One definition, read by the up
- *  chevron (`notAtTop`) and the mobile title fade (`scrolledFromTop`). A
+ *  chevron (`notAtTop`) and the title band (`scrolledFromTop`). A
  *  transcript with a hair of overflow, from a border or a rounded line height,
  *  then answers the same for both. That is what the slack absorbs.
  *
@@ -1808,7 +1808,7 @@ function landsOnCard(bodySelector: string, attr: string, value: string): TurnRes
  *  UNLESS a question is open, where the send IS that card's answer and lands on
  *  the card. The engine routes typed text to the pending question as a
  *  `FreeText` answer, emitting no `MessageReceived`. So what the reader
- *  submitted renders as the card's own "Custom answer" block, and the optimistic
+ *  submitted renders as the card's own typed-answer block, and the optimistic
  *  row is torn down when that answer lands. Against a local engine it is torn
  *  down inside the frame it was inserted in. Waiting for it therefore waited for
  *  a turn that never got a box: the landing lapsed and the reader never saw
@@ -2912,7 +2912,7 @@ function scrollToSelectorAndPulse(
     // a half-hidden header. No-op on desktop. See useHideOnScroll.onScroll.
     pinHeaderForScroll();
     if (typeof document !== 'undefined' && document.dispatchEvent) {
-      document.dispatchEvent(new Event('reveal-mobile-header'));
+      document.dispatchEvent(new Event('reveal-mobile-bars'));
     }
     // WHERE THIS LANDING RESTS decides the ride's fate, and it is measured
     // before anything moves. `landingTargetOf` is the number the scroll below

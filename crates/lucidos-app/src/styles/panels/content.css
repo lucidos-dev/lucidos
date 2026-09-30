@@ -1031,25 +1031,8 @@
     border-bottom: 1px solid var(--border-color);
 }
 
-.file-search-icon {
-    width: var(--icon-size-md);
-    height: var(--icon-size-md);
-    flex-shrink: 0;
-    color: var(--text-muted);
-}
-
-.file-search-input {
+.file-search-field {
     flex: 1;
-    background: none;
-    border: none;
-    outline: none;
-    color: var(--text-primary);
-    font-size: var(--font-size-lg);
-    font-family: var(--font-ui);
-}
-
-.file-search-input::placeholder {
-    color: var(--text-muted);
 }
 
 .file-search-close {
@@ -1067,6 +1050,13 @@
     text-align: center;
     color: var(--text-muted);
     font-size: var(--font-size-sm);
+    font-family: var(--font-ui);
+}
+
+.file-search-more {
+    padding: var(--space-sm) var(--surface-inset);
+    color: var(--text-muted);
+    font-size: var(--font-size-xs);
     font-family: var(--font-ui);
 }
 

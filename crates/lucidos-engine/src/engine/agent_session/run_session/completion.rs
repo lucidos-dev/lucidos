@@ -4,8 +4,8 @@ use crate::engine::agent_session::lifecycle::{
     auto_resume_after_api_error, classify_session_end_action, conflict_abort_deletes_temp_state,
     conflict_resolution_cleanup_action, discarded_worktree_removal, held_completion_release,
     should_auto_commit_on_cleanup, transient_api_failure_error, ConflictResolutionCleanupAction,
-    HeldCompletionRelease, SafetyNetAction, SessionEndAction, TerminalKind, WorktreeRemoval,
-    MAX_API_ERROR_AUTO_RESUMES,
+    HeldCompletionRelease, SafetyNetAction, SessionEndAction, TerminalKind, TurnCancel,
+    WorktreeRemoval, MAX_API_ERROR_AUTO_RESUMES,
 };
 use crate::engine::agent_session::resume::{
     api_error_auto_resumes_spent, change_description_fallback,
@@ -878,15 +878,16 @@ impl LucidosEngine {
             }
 
             if should_discard {
-                // User chose "Discard & End Session" — remove worktree, delete branch
-                // Discard any pending change for this branch so the frontend doesn't show it as waiting
+                // User chose "Discard & End Session": remove worktree, delete
+                // branch. Close the branch's open change, pending or set aside,
+                // so no row outlives the branch.
                 let pending_lookup = self
                     .changes()
-                    .get_pending_by_branch(&branch_name)
+                    .get_open_by_branch(&branch_name)
                     .await
                     .unwrap_or_else(|e| {
                         log!(
-                            "[AgentSession] get_pending_by_branch({}): {} — skipping discard emit",
+                            "[AgentSession] get_open_by_branch({}): {}; skipping discard emit",
                             branch_name,
                             e
                         );
@@ -974,33 +975,18 @@ impl LucidosEngine {
                 // disk it ever reclaimed was near zero, while its whole risk
                 // surface was the failure paths.
 
-                // A user cancel is a resumable turn boundary, not a terminator:
-                // keep the branch even with no commits so the next message can
-                // `--resume` this session, and never propose half-finished work.
-                // Both real-cancel causes qualify: `UserStop` (Stop = Esc) and
-                // `SupersededByFollowup` (a follow-up interrupted a mid-turn Codex
-                // turn — the redirected-away partial work must NOT be proposed,
-                // and the branch is kept so the follow-up turn resumes on it).
-                // Normally the follow-up turn's own terminal overwrites this, but
-                // if the follow-up never ran (routing failure / subprocess death
-                // after the interrupt) the redirect cancel is the final terminal,
-                // and it must still get the keep-branch/no-propose semantics.
-                // Apply/Discard/Archive carry their own terminators and never
-                // surface here as the turn's terminal kind.
-                let user_canceled = matches!(
-                    last_terminal_kind,
-                    Some(TerminalKind::Canceled(
-                        crate::engine::thread_events::CancelCause::UserStop
-                            | crate::engine::thread_events::CancelCause::SupersededByFollowup
-                    ))
-                );
-
+                // A cancel is a resumable turn boundary, not a terminator: the
+                // branch stays so the next message can `--resume` this session.
+                // A redirect keeps its partial work off the change list, since
+                // the follow-up turn continues it. That holds even when the
+                // follow-up never ran and the redirect is the final terminal.
+                // A Stop proposes what it left as incomplete (ADR 0328).
                 match classify_session_end_action(
                     has_commits,
                     changed_files.is_empty(),
                     is_external_repo,
                     safety_net_fired,
-                    user_canceled,
+                    TurnCancel::of(&last_terminal_kind),
                 ) {
                     SessionEndAction::KeepExternalBranch => {
                         log!(
@@ -1010,7 +996,7 @@ impl LucidosEngine {
                     }
                     SessionEndAction::KeepCanceledBranch => {
                         log!(
-                            "[AgentSession] User cancelled (Esc) on branch {} — keeping branch resumable, no change proposed",
+                            "[AgentSession] Turn cancelled on branch {} with nothing to propose; keeping branch resumable",
                             effective_branch
                         );
                     }
@@ -1020,7 +1006,7 @@ impl LucidosEngine {
                             effective_branch
                         );
                     }
-                    SessionEndAction::Propose => {
+                    SessionEndAction::Propose { incomplete } => {
                         let requires_restart = files_require_restart(&changed_files);
 
                         log!(
@@ -1055,11 +1041,7 @@ impl LucidosEngine {
                                 // Live agent proposal at session end — origin is
                                 // carried by the surrounding MessageReceived.
                                 origin: None,
-                                // Session-end cleanup runs after the terminal
-                                // event already landed; the per-turn idle path
-                                // owns the failure tag, so this fallback path
-                                // never originates `incomplete`.
-                                incomplete: false,
+                                incomplete,
                             })
                             .await
                         {

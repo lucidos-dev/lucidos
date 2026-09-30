@@ -1031,9 +1031,7 @@ describe('groupIntoExchanges — question asked while a queued follow-up message
   // on msg-2's id instead of the turn's real req_id. The post-answer
   // TextStreamed / ResponseGenerated (req msg-1) therefore routed back to the
   // ORIGINAL msg-1 exchange (above the card), leaving the divider with only the
-  // answer and no terminal — which the `threadIdle && !awaiting && hasSteps`
-  // stale-detector renders as a PERSISTENT "Aborted" once the thread idles
-  // (deterministic from history, so it survives reloads — not just a flash).
+  // answer and no terminal, and the reply drawn above the card it answers.
   //
   // Fix: track the turn's real req_id (`lastChatTurnReqId`, set by the
   // divider-raising tool call) and redirect THAT to the divider, independent of

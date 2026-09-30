@@ -302,6 +302,7 @@ fn thread_event_type_name_extraction() {
                 repo_root: String::new(),
                 hardened: false,
                 incomplete: false,
+                set_aside: false,
                 path: String::new(),
                 diff: String::new(),
             },

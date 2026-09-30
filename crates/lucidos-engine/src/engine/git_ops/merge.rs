@@ -260,6 +260,14 @@ pub(crate) async fn ff_merge_to_main(
         if let Err(e) = catchup_with_main(Path::new(wt_path)).await {
             break e;
         }
+        if temp_branch != feature_branch
+            && !temp_branch_contains_change(repo_root, temp_branch, feature_branch).await
+        {
+            break format!(
+                "The conflict resolution did not merge {feature_branch}, so nothing was applied"
+            )
+            .into();
+        }
 
         let main_sha = branch_head_sha(repo_root, "main").await.unwrap_or_default();
         let branch_sha = branch_head_sha(repo_root, temp_branch)
@@ -277,7 +285,8 @@ pub(crate) async fn ff_merge_to_main(
                 } else {
                     let _ = git_cmd(&["worktree", "remove", "--force", wt_path], repo_root).await;
                     let _ = git_cmd(&["branch", "-D", temp_branch], repo_root).await;
-                    let _ = git_cmd(&["branch", "-D", feature_branch], repo_root).await;
+                    // `-d`, not `-D`: git itself refuses to drop a branch main lacks.
+                    let _ = git_cmd(&["branch", "-d", feature_branch], repo_root).await;
                 }
                 push_main_in_background(repo_root);
                 return Ok(shas);
@@ -313,6 +322,24 @@ pub(crate) async fn ff_merge_to_main(
         );
     }
     Err(err)
+}
+
+/// Whether a Tier-3 temp branch holds every commit of the change branch.
+///
+/// The temp branch starts at `main` and only the resolving agent merges the
+/// change in, so a turn that skipped the merge leaves it out. `or_unknown(false)`:
+/// a yes authorizes publishing and then deleting the change branch.
+async fn temp_branch_contains_change(
+    repo_root: &Path,
+    temp_branch: &str,
+    feature_branch: &str,
+) -> bool {
+    git_answer(
+        &["merge-base", "--is-ancestor", feature_branch, temp_branch],
+        repo_root,
+    )
+    .await
+    .or_unknown(false)
 }
 
 /// Check if an `origin` remote exists in the repository.

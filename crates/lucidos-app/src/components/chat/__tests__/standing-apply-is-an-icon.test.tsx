@@ -9,9 +9,8 @@
  *
  * This file pins the two things an icon-only toggle owes. It must still carry
  * the word, for a reader who cannot see the glyph, and it must say which
- * state it is in. Both come from the same
- * `TaggedAction` the other surface renders as text, so the wordings cannot
- * drift apart.
+ * state it is in. The words match the Changes panel's. The check is not
+ * part of them: each surface draws its own, and here `aria-pressed` carries it.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render, type ComponentChild } from 'preact';
@@ -81,6 +80,7 @@ function makeThread(): ThreadState {
       createdAt: '',
       updatedAt: '',
       status: 'running',
+      summaryVersion: 0,
       messageCount: 0,
       section: 'inbox',
       activeChildrenCount: 0,
@@ -220,7 +220,14 @@ describe('the icon keeps the word it stopped showing', () => {
   it('names the action for a reader in both states', () => {
     expect(control().getAttribute('aria-label')).toBe('Apply on settle');
     standingApplyThreadIds.value = new Set([THREAD]);
-    expect(control().getAttribute('aria-label')).toBe('✓ Applying on settle');
+    expect(control().getAttribute('aria-label')).toBe('Applying on settle');
+  });
+
+  it('folds into the ⋯ menu as a toggle that says whether it is armed', () => {
+    const member = () => getStandaloneActions().find((m) => m.key === 'standing-apply');
+    expect(member()?.active).toBe(false);
+    standingApplyThreadIds.value = new Set([THREAD]);
+    expect(member()?.active).toBe(true);
   });
 
   it('carries a tooltip that changes with the state', () => {

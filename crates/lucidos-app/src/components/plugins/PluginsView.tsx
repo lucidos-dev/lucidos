@@ -9,7 +9,8 @@ import {
   installedPlugins,
 } from '../../store/store';
 import { closeAppSearch } from '../../store/actions/apps';
-import { SearchIcon, CloseIcon } from '../shared/icons';
+import { CloseIcon } from '../shared/icons';
+import { SearchField } from '../shared/SearchField';
 import { Dropdown } from '../shared/Dropdown';
 import type { DropdownOption } from '../shared/Dropdown';
 import {
@@ -26,15 +27,13 @@ function PluginSearchBar() {
   useEffect(() => { inputRef.current?.focus({ preventScroll: true }); }, []);
   return (
     <div class="apps-search-bar">
-      <SearchIcon className="apps-search-icon" />
-      <input
-        ref={inputRef}
-        class="apps-search-input"
+      <SearchField
+        class="apps-search-field"
+        inputRef={inputRef}
         data-role="plugins-search-input"
-        type="text"
-        placeholder="Search plugins..."
+        placeholder="Search plugins…"
         value={appSearchQuery.value}
-        onInput={(e) => { appSearchQuery.value = (e.currentTarget as HTMLInputElement).value; }}
+        onInput={(e) => { appSearchQuery.value = e.currentTarget.value; }}
         onKeyDown={(e) => { if (e.key === 'Escape') closeAppSearch(); }}
       />
       <button class="icon-btn header-icon" onClick={closeAppSearch} aria-label="Close search">

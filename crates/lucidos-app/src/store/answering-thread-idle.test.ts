@@ -34,6 +34,7 @@ function makeThread(id = 'thread-1', status: ThreadStatus = 'idle'): ThreadState
       createdAt: '',
       updatedAt: '',
       status,
+      summaryVersion: 0,
       messageCount: 0,
       section: 'archived',
       activeChildrenCount: 0,

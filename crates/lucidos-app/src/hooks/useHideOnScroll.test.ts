@@ -5,7 +5,39 @@ import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 // @ts-expect-error: same
 import { fileURLToPath } from 'node:url';
-import { shouldKeepHeaderVisible, spacerHeightPx } from './useHideOnScroll';
+import { nextPromptOffsetPx, promptCanSlide, shouldKeepHeaderVisible, spacerHeightPx } from './useHideOnScroll';
+
+describe('nextPromptOffsetPx (dynamic bars)', () => {
+  const promptHeight = 80;
+  const far = 10_000;
+
+  it('slides down with a scroll down and back with a scroll up, pixel for pixel', () => {
+    expect(nextPromptOffsetPx({ offset: 0, delta: 30, promptHeight, distanceToBottom: far })).toBe(30);
+    expect(nextPromptOffsetPx({ offset: 30, delta: -10, promptHeight, distanceToBottom: far })).toBe(20);
+  });
+
+  it('stops at fully hidden and at fully shown', () => {
+    expect(nextPromptOffsetPx({ offset: 70, delta: 50, promptHeight, distanceToBottom: far })).toBe(promptHeight);
+    expect(nextPromptOffsetPx({ offset: 10, delta: -50, promptHeight, distanceToBottom: far })).toBe(0);
+  });
+
+  it('comes back in the last prompt-height of the thread, and is fully shown at the bottom', () => {
+    expect(nextPromptOffsetPx({ offset: promptHeight, delta: 10, promptHeight, distanceToBottom: 25 })).toBe(25);
+    expect(nextPromptOffsetPx({ offset: promptHeight, delta: 10, promptHeight, distanceToBottom: 0 })).toBe(0);
+  });
+});
+
+describe('promptCanSlide (dynamic bars)', () => {
+  it('slides only with the bars dynamic, no keyboard, and a real thread', () => {
+    expect(promptCanSlide({ disabled: false, keyboardOpen: false, composeEmpty: false })).toBe(true);
+  });
+
+  it('stays shown while pinned, while typing, and in the compose-empty view', () => {
+    expect(promptCanSlide({ disabled: true, keyboardOpen: false, composeEmpty: false })).toBe(false);
+    expect(promptCanSlide({ disabled: false, keyboardOpen: true, composeEmpty: false })).toBe(false);
+    expect(promptCanSlide({ disabled: false, keyboardOpen: false, composeEmpty: true })).toBe(false);
+  });
+});
 
 describe('--mobile-header-offset stays off the document root', () => {
   // The var is rewritten on essentially every scroll frame. Custom properties
@@ -38,11 +70,33 @@ describe('--mobile-header-offset stays off the document root', () => {
     expect(hookSource).toMatch(/chevronEl\?\.style\.setProperty\(\s*['"]--mobile-header-offset/);
   });
 
+  it('moves the down chevron with the prompt by transform, never by a layout property', () => {
+    // The offset changes every scroll frame. Only the prompt's HEIGHT, which
+    // moves on a resize, may reach `bottom`.
+    const mobileCss = readFileSync(
+      resolve(dirname(fileURLToPath(import.meta.url)), '../styles/mobile.css'),
+      'utf8',
+    );
+    const offsetUses = mobileCss.split('\n').filter((line: string) => line.includes('--mobile-prompt-offset'));
+    expect(offsetUses.length).toBeGreaterThan(0);
+    for (const line of offsetUses) expect(line).toMatch(/^\s*transform: translateY\(var\(--mobile-prompt-offset/);
+  });
+
+  it('keeps the prompt offset off the root too, on the prompt and the down chevron', () => {
+    // Same per-frame write, same reason (dynamic bars). The prompt takes a
+    // transform directly; the down chevron reads the var.
+    expect(hookSource).not.toMatch(/documentElement\.style\.setProperty\(\s*['"]--mobile-prompt-offset/);
+    expect(hookSource).toMatch(/promptEl\.style\.transform = promptOffsetRem/);
+    expect(hookSource).toMatch(/downChevronEl\?\.style\.setProperty\(\s*['"]--mobile-prompt-offset/);
+  });
+
   // The scroll-delta logic below is a hand-written MIRROR of the hook, so these
   // two keep the mirror honest about the anchored-reveal behaviour it pins.
   it('gates the navigation reveal on the anchor kind and the anchored position', () => {
+    // The prompt shares the gate: our own placements reveal it, anchor writes
+    // hold it where it was.
     expect(hookSource).toMatch(
-      /if \(!isAnchorScroll\(\) && !atAnchoredTop\) headerOffset = 0;/,
+      /if \(!isAnchorScroll\(\) && !atAnchoredTop\) \{\s*headerOffset = 0;\s*promptOffset = 0;\s*\}/,
     );
   });
 
@@ -982,37 +1036,37 @@ describe('shouldKeepHeaderVisible', () => {
   // on threads/chat panes the iframe is off-screen, so its scroll events
   // can't reach the parent and the header should hide normally.
   it('app-ui overlay forces visible on the content pane', () => {
-    expect(shouldKeepHeaderVisible({ view: 'content', overlayType: 'app-ui', stickyPref: false })).toBe(true);
+    expect(shouldKeepHeaderVisible({ view: 'content', overlayType: 'app-ui', dynamicBars: true })).toBe(true);
   });
 
   it('app-ui overlay does NOT force visible on the threads pane', () => {
-    expect(shouldKeepHeaderVisible({ view: 'threads', overlayType: 'app-ui', stickyPref: false })).toBe(false);
+    expect(shouldKeepHeaderVisible({ view: 'threads', overlayType: 'app-ui', dynamicBars: true })).toBe(false);
   });
 
   it('app-ui overlay does NOT force visible on the chat pane', () => {
-    expect(shouldKeepHeaderVisible({ view: 'thread', overlayType: 'app-ui', stickyPref: false })).toBe(false);
+    expect(shouldKeepHeaderVisible({ view: 'thread', overlayType: 'app-ui', dynamicBars: true })).toBe(false);
   });
 
   it('non-app-ui overlay on content pane does NOT force visible', () => {
-    expect(shouldKeepHeaderVisible({ view: 'content', overlayType: 'url-preview', stickyPref: false })).toBe(false);
+    expect(shouldKeepHeaderVisible({ view: 'content', overlayType: 'url-preview', dynamicBars: true })).toBe(false);
   });
 
   it('no overlay on any pane does NOT force visible', () => {
-    expect(shouldKeepHeaderVisible({ view: 'threads', overlayType: null, stickyPref: false })).toBe(false);
-    expect(shouldKeepHeaderVisible({ view: 'thread', overlayType: null, stickyPref: false })).toBe(false);
-    expect(shouldKeepHeaderVisible({ view: 'content', overlayType: null, stickyPref: false })).toBe(false);
+    expect(shouldKeepHeaderVisible({ view: 'threads', overlayType: null, dynamicBars: true })).toBe(false);
+    expect(shouldKeepHeaderVisible({ view: 'thread', overlayType: null, dynamicBars: true })).toBe(false);
+    expect(shouldKeepHeaderVisible({ view: 'content', overlayType: null, dynamicBars: true })).toBe(false);
   });
 
-  it('sticky preference forces visible regardless of pane or overlay', () => {
-    expect(shouldKeepHeaderVisible({ view: 'threads', overlayType: null, stickyPref: true })).toBe(true);
-    expect(shouldKeepHeaderVisible({ view: 'thread', overlayType: null, stickyPref: true })).toBe(true);
-    expect(shouldKeepHeaderVisible({ view: 'content', overlayType: 'app-ui', stickyPref: true })).toBe(true);
-    expect(shouldKeepHeaderVisible({ view: 'content', overlayType: 'url-preview', stickyPref: true })).toBe(true);
+  it('pinned bars (dynamic bars off) force visible regardless of pane or overlay', () => {
+    expect(shouldKeepHeaderVisible({ view: 'threads', overlayType: null, dynamicBars: false })).toBe(true);
+    expect(shouldKeepHeaderVisible({ view: 'thread', overlayType: null, dynamicBars: false })).toBe(true);
+    expect(shouldKeepHeaderVisible({ view: 'content', overlayType: 'app-ui', dynamicBars: false })).toBe(true);
+    expect(shouldKeepHeaderVisible({ view: 'content', overlayType: 'url-preview', dynamicBars: false })).toBe(true);
   });
 });
 
 /**
- * Repro for: with "Keep header visible" (sticky) on, editing a device name on
+ * Repro for: with the bars pinned (dynamic bars off), editing a device name on
  * an iOS PWA rendered the input UNDER the still-visible header.
  *
  * Cause: the spacer (--mobile-header-height) collapsed to the safe-area inset

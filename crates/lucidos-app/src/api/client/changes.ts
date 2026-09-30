@@ -3,8 +3,8 @@ import type { DiffFile, RepoDiff } from '../../store/store';
 
 // --- Changes ---
 
-/** Mirrors the engine's `ChangeStatus`, the four values `changes.status` holds. */
-export type ChangeStatus = 'pending' | 'applied' | 'discarded' | 'reverted';
+/** Mirrors the engine's `ChangeStatus`, the five values `changes.status` holds. */
+export type ChangeStatus = 'pending' | 'set_aside' | 'applied' | 'discarded' | 'reverted';
 
 export interface Change {
   id: string;
@@ -28,10 +28,9 @@ export interface Change {
    *  commits. Null for a single commit and until it lands. Read it through
    *  `changeHeadline`, never on its own. */
   summary: string | null;
-  /** True when the originating CC turn ended in `ResponseFailed` — the
-   * worktree state reflects partial work, not a deliberate completion.
-   * `WaitingBanner` reads this to confirm before Apply so the user knows
-   * they're about to land partial changes from a failed run. */
+  /** True when the work did not come from a finished turn: a user Stop cut it
+   *  short, or recovery found it after a turn was killed. Apply confirms
+   *  first, and Apply All passes it over. */
   incomplete: boolean;
   /** True when the originating thread has not finished with this change: it is
    * mid-turn (Running or WaitingForUserAnswer) or holds a live event wait.
@@ -84,6 +83,8 @@ export interface ApiRestartGroup {
 
 export interface ChangesState {
   pending: Change[];
+  /** Changes kept for later, newest first. Absent on an older payload. */
+  set_aside?: Change[];
   applied: Change[];
   total_pending: number;
   restart_required: boolean;
@@ -164,6 +165,16 @@ export async function discardChange(id: string): Promise<{ message: string }> {
   return json(`${API}/changes/${id}/discard`, { method: 'POST' });
 }
 
+/** Keep a pending change for later, out of Review and Apply All. */
+export async function setAsideChange(id: string): Promise<{ message: string }> {
+  return json(`${API}/changes/${id}/set-aside`, { method: 'POST' });
+}
+
+/** Return a set-aside change to pending. */
+export async function bringBackChange(id: string): Promise<{ message: string }> {
+  return json(`${API}/changes/${id}/bring-back`, { method: 'POST' });
+}
+
 export interface ApplyAllResult {
   message: string;
   restart_required?: boolean;
@@ -187,8 +198,8 @@ export interface ApplyAllResult {
   review_thread_id?: string;
   applied?: number;
   failed?: number;
-  /** How many threads the sweep armed, when "Keep going as the rest settle"
-   *  was on. */
+  /** How many threads the sweep armed, when "Apply all on settle" was
+   *  pressed. */
   armed?: number;
 }
 

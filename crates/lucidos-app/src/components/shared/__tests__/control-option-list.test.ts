@@ -45,16 +45,23 @@ describe('selectedOptionIndex', () => {
 });
 
 describe('offeredControlCommands', () => {
+  const pick = (key: string) => [{ key, options: [{ value: 'a', label: 'A', description: '' }] }];
   const COMMANDS = [
-    { subtype: 'set_model', label: 'Model', params: [] },
-    { subtype: 'set_reasoning_effort', label: 'Reasoning Effort', params: [] },
-    { subtype: 'set_permission_mode', label: 'Permission Mode', params: [] },
+    { subtype: 'set_model', label: 'Model', params: pick('model') },
+    { subtype: 'set_reasoning_effort', label: 'Reasoning Effort', params: pick('effort') },
+    { subtype: 'set_output_style', label: 'Output Style', params: pick('style') },
   ];
 
   it('never offers the effort command on its own', () => {
     // A model selection is one pick, so the tier rides on the `set_model`
     // rows. The command still exists on the wire for the reconciling request.
     expect(offeredControlCommands(COMMANDS).map((c) => c.subtype))
-      .toEqual(['set_model', 'set_permission_mode']);
+      .toEqual(['set_model', 'set_output_style']);
+  });
+
+  it('never offers a command that asks for free text', () => {
+    const freeText = { subtype: 'set_something', label: 'Something', params: [{ key: 'mode' }] };
+    expect(offeredControlCommands([...COMMANDS, freeText]).map((c) => c.subtype))
+      .toEqual(['set_model', 'set_output_style']);
   });
 });

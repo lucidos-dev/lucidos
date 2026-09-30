@@ -1379,3 +1379,56 @@ describe('renderMarkdown email autolinks inside a path', () => {
     expect(html).toContain('<a href="mailto:me.x@example.com">me.x@example.com</a>');
   });
 });
+
+describe('renderMarkdown unspaced em dashes', () => {
+  const EM = String.fromCharCode(0x2014);
+  const gaps = (html: string): number => (html.match(/class="em-dash-gap"/g) ?? []).length;
+  const text = (html: string): string => {
+    const div = document.createElement('div');
+    div.innerHTML = html;
+    return div.textContent ?? '';
+  };
+
+  it('wraps an unspaced em dash so it cannot read as a hyphen', () => {
+    const html = renderMarkdown(`couldn't start${EM}another thread`, { cache: false });
+    expect(html).toContain(`start<span class="em-dash-gap">${EM}</span>another`);
+  });
+
+  it('wraps a one-sided em dash', () => {
+    expect(gaps(renderMarkdown(`left ${EM}right`, { cache: false }))).toBe(1);
+    expect(gaps(renderMarkdown(`left${EM} right`, { cache: false }))).toBe(1);
+  });
+
+  it('leaves a spaced em dash alone', () => {
+    const html = renderMarkdown(`start ${EM} another\n\n${EM} opens a line`, { cache: false });
+    expect(gaps(html)).toBe(0);
+  });
+
+  it('treats a line break as a space', () => {
+    expect(gaps(renderMarkdown(`first line\n${EM} second line`, { cache: false }))).toBe(0);
+  });
+
+  it('reads the neighbour across inline markup', () => {
+    expect(gaps(renderMarkdown(`**bold**${EM} next`, { cache: false }))).toBe(1);
+    expect(gaps(renderMarkdown(`word**${EM}** next`, { cache: false }))).toBe(1);
+    expect(gaps(renderMarkdown(`word **${EM}** next`, { cache: false }))).toBe(0);
+  });
+
+  it('leaves SVG and text-only elements alone, where a span would not survive', () => {
+    const svg = `<svg width="10"><text x="1">A${EM}B</text></svg>`;
+    expect(gaps(renderMarkdown(svg, { cache: false }))).toBe(0);
+    expect(gaps(renderMarkdown(`<textarea>a${EM}b</textarea>`, { cache: false }))).toBe(0);
+  });
+
+  it('never touches code', () => {
+    const html = renderMarkdown(`\`a${EM}b\`\n\n\`\`\`\nx${EM}y\n\`\`\``, { cache: false });
+    expect(gaps(html)).toBe(0);
+  });
+
+  it('keeps the text exactly as written', () => {
+    const md = `one${EM}two, three ${EM} four, five${EM}six`;
+    const html = renderMarkdown(md, { cache: false });
+    expect(gaps(html)).toBe(2);
+    expect(text(html).trim()).toBe(md);
+  });
+});

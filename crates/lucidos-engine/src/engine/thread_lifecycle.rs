@@ -259,6 +259,9 @@ pub enum Action {
     DiscardDraft,
     Discard,
     Apply,
+    /// Keep the pending change for later, out of Review and every bulk path
+    /// (ADR 0328). Offered wherever Discard is. Serializes as `"set_aside"`.
+    SetAside,
     /// Arm a *standing apply*: the change applies once the thread settles (ADR
     /// 0168 clause 5). Offered while the thread is *settling*: running, paused,
     /// or watching an event. Where `Apply` is withheld, a control that cannot act
@@ -398,6 +401,8 @@ pub fn classify_event(event_type: &str) -> Option<EventClass> {
         // activity-timestamp impact.
         "ChangeHardened"
         | "ChangeSummarized"
+        | "ChangeSetAside"
+        | "ChangeBroughtBack"
         | "MergeResolutionStarted"
         | "MergeResolutionCleared" => EventClass::Metadata,
         // Phase 4 fan-in: parent's resume path renders this as the rich
@@ -498,6 +503,8 @@ pub fn all_persisted_event_types() -> Vec<&'static str> {
         "ChangeApplied",
         "ChangeDiscarded",
         "ChangeReverted",
+        "ChangeSetAside",
+        "ChangeBroughtBack",
         "ChangeApplyFailed",
         "ChangeHardened",
         "ChangeSummarized",
@@ -689,6 +696,13 @@ pub fn resolve_transition(
             ThreadType::CodingAgent => to_inbox,
             ThreadType::Chat => violation("ChangeProposed is coding-agent-only"),
         },
+        // A change brought back asks for review again, so it surfaces the thread
+        // the way a proposal does. An archived thread never holds a pending
+        // change (ADR 0328).
+        "ChangeBroughtBack" => match thread_type {
+            ThreadType::CodingAgent => to_inbox,
+            ThreadType::Chat => violation("ChangeBroughtBack is coding-agent-only"),
+        },
         // UserQuestionAsked surfaces the thread in REVIEW so the user sees the
         // question card and the action buttons. Raised by CC's
         // `AskUserQuestion` tool AND by the chat agent's `ask_user_question`
@@ -769,6 +783,7 @@ pub fn resolve_transition(
         | "TriggerStarted"
         | "TriggerCompleted"
         | "ChangeReverted"
+        | "ChangeSetAside"
         | "ChangeApplyFailed"
         | "ChangeHardened"
         | "ChangeSummarized"
@@ -1156,7 +1171,7 @@ pub fn is_attention_needing(
 /// on it server-side.
 ///
 /// Returned order makes the front-most close LAYER positional:
-/// `[DiscardDraft?, Discard?, Apply?, Archive?, Unsave|Save]`. The close set is
+/// `[DiscardDraft?, Discard?, Apply?, SetAside?, Archive?, Unsave|Save]`. The close set is
 /// the prefix; the retention toggle (`Save`/`Unsave`) always appends exactly
 /// one entry for a focused thread, matching the always-present prompt section
 /// toggle.
@@ -1210,7 +1225,7 @@ pub fn available_thread_actions(
     }
     // Layers 2 & 3 — change resolution then archive. Both are suppressed while
     // the thread is live (mid-turn). A pending change outranks archive: the
-    // user must Apply or Discard before the thread can be archived.
+    // user must Apply, Discard or Set aside before the thread can be archived.
     //
     // A thread parked on an event wait loses Apply and Discard too, because both
     // resolve a change it has not finished producing: it wakes on its delivery
@@ -1232,6 +1247,7 @@ pub fn available_thread_actions(
             if !has_live_event_waits {
                 actions.push(Action::Discard);
                 actions.push(Action::Apply);
+                actions.push(Action::SetAside);
             }
         } else if stored_section == ArchiveState::Inbox && !descendants_block_archive {
             actions.push(Action::Archive);

@@ -132,6 +132,7 @@ async fn emit_change_proposed(
             repo_root: "/tmp/repo".into(),
             hardened: true,
             incomplete: false,
+            set_aside: false,
             path: String::new(),
             diff: String::new(),
         },
@@ -579,7 +580,7 @@ async fn discard_note_self_clears() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// 10. The reconcile path (`discard_pending_for_thread_except`) discards STALE
+/// 10. The reconcile path (`discard_open_changes_for_thread_except`) discards STALE
 ///     siblings on other branches. That must not read as "your work is gone".
 #[tokio::test]
 async fn other_branch_says_current_work_untouched() {

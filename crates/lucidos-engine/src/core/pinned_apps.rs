@@ -23,28 +23,6 @@ pub struct PinnedAppUi {
 pub struct PinnedAppStore;
 
 impl PinnedAppStore {
-    /// Defensive double-write: the migration owns this CREATE TABLE (see
-    /// `20260517160627_consolidate_init_schema_tables.sql`). A temporary measure:
-    /// `docs/temporary-measures.md` § "Defensive double-write of tables into
-    /// `init_schema`".
-    pub async fn init_schema(
-        pool: &PgPool,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS pinned_apps (
-                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                app_id TEXT NOT NULL,
-                ui_id TEXT NOT NULL DEFAULT 'main',
-                device_id TEXT NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                UNIQUE (app_id, ui_id, device_id)
-            )",
-        )
-        .execute(pool)
-        .await?;
-        Ok(())
-    }
-
     /// List pinned app UIs for a device, ordered by creation time
     pub async fn list_for_device(
         pool: &PgPool,

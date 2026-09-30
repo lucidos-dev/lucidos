@@ -13,8 +13,8 @@
 //! the resume path (no fresh CC spawn) and just emits `UserQuestionAnswered`.
 
 use crate::support::{
-    base_url, count_events_of_type, db_url, seed_cc_thread_summary, seed_chat_thread_summary,
-    user_client,
+    base_url, commit_on_new_branch, count_events_of_type, db_url, git, insert_session_started,
+    seed_cc_thread_summary, seed_chat_thread_summary, user_client,
 };
 use uuid::Uuid;
 
@@ -706,4 +706,82 @@ async fn stop_with_pending_question_and_no_live_agent_emits_canceled_not_stale_s
         aborted, 0,
         "no stale-settle abort: the cancel's own write is what made the row running"
     );
+}
+
+/// The case that lost a plan: a question card parked with no live agent, the
+/// user presses Stop, and the thread later gets archived. Stop now proposes
+/// what the turn committed, marked incomplete, so the work keeps an Apply
+/// (ADR 0328).
+#[tokio::test]
+async fn stop_on_a_parked_question_proposes_the_branch_work_as_incomplete() {
+    let client = user_client().await;
+    let pool = sqlx::PgPool::connect(&db_url())
+        .await
+        .expect("Failed to connect to E2E workspace database");
+
+    let suffix = Uuid::new_v4().as_simple().to_string()[..8].to_string();
+    let branch = format!("e2e-test/stopped-plan-{suffix}");
+    commit_on_new_branch(&branch, &format!("e2e-plan-{suffix}.md"), "a plan");
+    let thread_id = Uuid::new_v4();
+    let tool_use_id = format!("tu-stopplan-{suffix}");
+    insert_session_started(&pool, thread_id, &branch).await;
+    // An earlier turn that finished cleanly. The Stop must still read as
+    // the newest coding-agent terminal, so the work stays incomplete.
+    sqlx::query(
+        "INSERT INTO events (id, aggregate, aggregate_id, event_type, payload, created, thread_id) \
+         VALUES ($1, 'thread', $2::text, 'ResponseGenerated', $3, NOW(), $2)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(thread_id)
+    .bind(serde_json::json!({ "text": "Done.", "channel": "claude_code" }))
+    .execute(&pool)
+    .await
+    .expect("insert an earlier clean turn");
+    insert_user_question_asked(&pool, thread_id, &tool_use_id).await;
+
+    let resp = client
+        .post(format!(
+            "{}/api/v1/claude-code/stop?thread_id={}",
+            base_url(),
+            thread_id
+        ))
+        .send()
+        .await
+        .expect("stop request failed");
+    assert_eq!(resp.status().as_u16(), 200, "stop should return 200");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let row = loop {
+        let row: Option<(String, bool, i32)> = sqlx::query_as(
+            "SELECT status, incomplete, file_count FROM changes WHERE branch_name = $1",
+        )
+        .bind(&branch)
+        .fetch_optional(&pool)
+        .await
+        .expect("changes lookup");
+        if row.is_some() || std::time::Instant::now() >= deadline {
+            break row;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    };
+    assert_eq!(
+        row,
+        Some(("pending".to_string(), true, 1)),
+        "the stopped turn's commit must be a pending, incomplete change"
+    );
+    let cancel = await_event_payload(&pool, thread_id, "ResponseCanceled").await;
+    assert_eq!(
+        cancel["channel"], "claude_code",
+        "the Stop reads as the newest coding-agent terminal"
+    );
+
+    let _ = git(&["branch", "-D", &branch]);
+    let _ = sqlx::query("DELETE FROM changes WHERE branch_name = $1")
+        .bind(&branch)
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM events WHERE thread_id = $1")
+        .bind(thread_id)
+        .execute(&pool)
+        .await;
 }

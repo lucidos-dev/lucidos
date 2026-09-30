@@ -138,7 +138,7 @@ fn describe_content_block(block: &serde_json::Value) -> String {
 /// A replay of an input the engine wrote to stdin (`--replay-user-messages`).
 /// A tool-result line is never one, whatever its flag. A tool result is Claude
 /// Code's own output, not an input it took in.
-fn is_input_replay(val: &serde_json::Value) -> bool {
+pub(super) fn is_input_replay(val: &serde_json::Value) -> bool {
     let replayed = val.get("isReplay").and_then(|v| v.as_bool()) == Some(true);
     let carries_tool_result = val
         .get("message")

@@ -639,9 +639,6 @@ pub(super) async fn app_server_driver_task(
                     }
                     Some(ControlRequest::SetModel { model: m }) => model = Some(m),
                     Some(ControlRequest::SetReasoningEffort { effort: e }) => effort = Some(e),
-                    Some(ControlRequest::SetPermissionMode { .. }) => {
-                        log!("[CodexAppServer] SetPermissionMode is a no-op for the Codex backend");
-                    }
                     None => {
                         shutdown = true;
                         break 'session;

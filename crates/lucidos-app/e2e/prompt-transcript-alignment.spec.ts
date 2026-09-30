@@ -95,11 +95,11 @@ async function measure(page: Page): Promise<Edges | null> {
     const boxRect = box.getBoundingClientRect();
     const boxStyle = getComputedStyle(box);
 
-    // A `.question-option` probe is spliced into the live transcript rather than
+    // A question-card probe is spliced into the live transcript rather than
     // waiting for a real pending question, so the card's inset is read off the
     // same cascade a real card would get. Removed before anything can paint.
-    const probe = document.createElement('button');
-    probe.className = 'question-option';
+    const probe = document.createElement('div');
+    probe.className = 'question-body protected-surface';
     scroller.appendChild(probe);
     const probeWidth = probe.getBoundingClientRect().width;
     const probeStyle = getComputedStyle(probe);
@@ -186,7 +186,7 @@ test.describe('Composer aligns with the transcript content', () => {
     // its content has to match too.
     //
     // Tripwires for the two measurements below, before their comparison runs.
-    expect(e.probeWidth, 'question-option probe did not lay out').toBeGreaterThan(0);
+    expect(e.probeWidth, 'question-body probe did not lay out').toBeGreaterThan(0);
     expect(
       e.rowLeftGap,
       `something sits between .prompt-box's content edge and the textarea (${e.rowLeftGap}px)`,

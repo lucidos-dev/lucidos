@@ -189,6 +189,9 @@ export async function dismissSideQuestion(threadId: string, sideQuestionId: stri
 
 export interface CodingAgentCommandOption {
   value: string;
+  /** The concrete model a discovered Claude Code row runs. A thread records
+   *  this id, so the picker matches it to find the thread's row. */
+  resolved_model?: string | null;
   label: string;
   description: string;
   /** Present on a MODEL option only: the reasoning tiers that model accepts.
@@ -202,7 +205,6 @@ export interface CodingAgentCommandOption {
 export interface CodingAgentCommandParam {
   key: string;
   label?: string;
-  placeholder?: string;
   options?: CodingAgentCommandOption[];
 }
 

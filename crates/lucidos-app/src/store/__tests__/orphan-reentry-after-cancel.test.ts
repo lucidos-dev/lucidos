@@ -148,9 +148,8 @@ describe('absorbed-UPI placeholder, the mid-flight shape it exists for', () => {
 
   /** The oldest rows carry NEITHER id. Two `undefined`s must not compare equal
    *  into "this announcement names my own message": that would revoke the
-   *  placeholder from the exact shape it was written for and drop it through to
-   *  the stale detector, surfacing "Aborted ⚠" on an exchange that was answered
-   *  in the turn above it. */
+   *  placeholder from the exact shape it was written for, on an exchange that
+   *  was answered in the turn above it. */
   it('still reads done when neither the message nor the announcement has an id', () => {
     // Built directly rather than folded: a legacy row has no `_eventId` for the
     // absorb to match on, so the fold would make the announcement its own

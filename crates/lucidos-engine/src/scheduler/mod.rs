@@ -10,6 +10,7 @@
 //! - Panic-safe task execution
 //! - Fresh task data fetch on each execution
 
+pub(crate) mod notification_plain_text;
 pub mod notifications;
 pub(crate) mod plugin_updates;
 pub mod push;
@@ -202,11 +203,6 @@ impl SchedulerManager {
         pool: PgPool,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let scheduler = JobScheduler::new().await?;
-
-        // Initialize database schemas
-        NotificationStore::init_schema(&pool).await?;
-        PushSubscriptionStore::init_schema(&pool).await?;
-        crate::core::DeviceStore::init_schema(&pool).await?;
 
         // Share the same trigger_configs Arc as the engine
         let trigger_configs = engine.trigger_configs.clone();

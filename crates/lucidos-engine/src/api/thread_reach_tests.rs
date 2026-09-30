@@ -21,6 +21,8 @@ const EVERY_VERB: &[ThreadReachVerb] = &[
     ThreadReachVerb::Control,
     ThreadReachVerb::Apply,
     ThreadReachVerb::Discard,
+    ThreadReachVerb::SetAside,
+    ThreadReachVerb::BringBack,
     ThreadReachVerb::Revert,
     ThreadReachVerb::AnswerQuestion,
     ThreadReachVerb::Continue,

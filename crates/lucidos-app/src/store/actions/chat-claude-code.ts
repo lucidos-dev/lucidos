@@ -212,7 +212,7 @@ export async function answerThreadQuestion(
     markThreadRerenderStart(threadId, { ...currentPerfBaseline(), cause: 'answer' });
   }
   // Optimistically mark the thread as resuming so the answered question-divider
-  // doesn't flash "Aborted" while the client's status still reads
+  // doesn't settle as "Done" while the client's status still reads
   // `waiting_for_user_answer` (see `isRenderedThreadIdle`). Cleared by the
   // PromptInput effect once the real status leaves that state, or below on a
   // 409 / failure (no resume is coming).
@@ -234,7 +234,7 @@ export async function answerThreadQuestion(
 }
 
 /** Send a control request to a running Claude Code session.
- *  Generic — works with any CC control subtype (set_model, set_permission_mode, etc.).
+ *  Generic: works with any control subtype the engine serves (set_model, set_reasoning_effort).
  *  Returns:
  *    'ok'      — applied to the live session
  *    'pending' — 404 (no live session, caller falls back to pending preference);

@@ -64,6 +64,7 @@ function makeThread(
       createdAt: '',
       updatedAt: '',
       status,
+      summaryVersion: 0,
       messageCount: 1,
       section: 'inbox',
       activeChildrenCount: 0,

@@ -593,6 +593,7 @@ async fn startup_clears_orphan_proposed_chip_without_pending_change() {
             repo_root: "/tmp".into(),
             hardened: false,
             incomplete: false,
+            set_aside: false,
             path: String::new(),
             diff: String::new(),
         },

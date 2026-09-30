@@ -668,21 +668,6 @@
         transition: opacity var(--duration-slow) ease, scale var(--duration-slow) ease;
     }
 
-    /* Title-bar copy/pin: height matches the title text (~1.14rem) so the
-     * buttons sit flush with the title baseline. Width keeps the slot. */
-    .mobile-thread-title-row .icon-btn.header-icon {
-        width: 1.75rem;
-        height: 1.25rem;
-    }
-
-    /* Title-bar copy/pin glyphs use the compact md size; .mobile-header-row
-     * keeps --icon-size-lg. (Drawer-row glyphs are sized unconditionally in
-     * drawer.css.) */
-    .mobile-thread-title-row .icon-btn.header-icon svg {
-        width: var(--icon-size-md);
-        height: var(--icon-size-md);
-    }
-
     /* Above .edge-swipe-zone (z-index: 1), like .prompt-area above, and for the
        same reason: an action cluster pinned to a row's right edge sits under
        that transparent strip, which is 1.25rem of the screen and therefore a
@@ -693,8 +678,8 @@
        host control, and the swipe container sees an edge touch through a lifted
        button anyway, because touch events bubble to it either way.
 
-       The third control column at this edge, the thread title bar's pin and
-       overflow, needs nothing here: `.mobile-thread-title-row` already carries
+       The thread title bar's menu button needs nothing here either:
+       `.mobile-thread-title-row` already carries
        its own `z-index: 2` below, and its `transform` makes it a stacking
        context, so its children are lifted with it and could not be lifted past
        it. Pinned by e2e/trigger-group-actions-edge-mobile.spec.ts, which
@@ -796,43 +781,31 @@
         display: none !important;
     }
 
-    .mobile-thread-search-bar .thread-search-input {
+    .mobile-thread-search-bar .search-field {
         flex: 1;
-        background: none;
-        border: none;
-        outline: none;
-        /* Rides directly on the brand-blue bar — light text + caret (same as the
-           desktop threads search in shell.css's brand-blue header block). */
-        color: var(--header-fg);
-        caret-color: var(--header-fg);
-        font-size: var(--font-size-lg);
-        font-family: var(--font-ui);
-        min-width: 0;
-    }
-
-    .mobile-thread-search-bar .thread-search-input::placeholder {
-        color: var(--header-fg-muted);
     }
 
     /* ─── Sticky thread title bar inside the scroll container ─── */
     /* Positioned via CSS vars set by useHideOnScroll so it tracks the header
        bottom edge and hides proportionally when the header scrolls out. */
     .mobile-swipe-pane .mobile-thread-title-row {
+        --title-icon-box: 1.25rem;
         display: flex;
-        align-items: center;
+        align-items: flex-start;
         gap: 0.75rem;
         /* Right padding matches `.pane-header`'s `--header-padding-x` so the
          * action icons land in the same slot as the mobile header above.
-         * Symmetric 0.5rem top/bottom — just the title's own padding, with no
+         * Symmetric 0.5rem top/bottom: just the title's own padding, with no
          * extra gap before the first message. */
         padding: 0.5rem 0.625rem 0.5rem 1rem;
-        /* Faint neutral tint (--bg-secondary, one step up from the page) so the
-         * sticky title reads as a header band, matching the desktop header. Opaque,
-         * so content is cleanly covered behind the title text as it scrolls under
-         * the sticky bar. The fade that dissolves content just below the bar is the
-         * ::after overlay (dissolving into the page background) — kept out of the
-         * box so it adds no at-rest gap. */
-        background: var(--bg-secondary);
+        /* Opaque, so content scrolling under the sticky bar is covered. On the
+         * page colour at the top of the thread; once content slides under it,
+         * the faint --bg-secondary band fades in. Without the band the title
+         * would slide away with the header like loose transcript text. The
+         * ::after fade below dissolves the content, kept out of the box so it
+         * adds no at-rest gap. */
+        background: var(--bg-primary);
+        transition: background-color var(--duration-normal) ease;
         -webkit-user-select: none;
         user-select: none;
         flex-shrink: 0;
@@ -878,22 +851,8 @@
          * before the first message. */
     }
 
-    /* Hairline divider under the sticky title bar — the mobile counterpart of the
-       desktop `.thread-view-header::after`, a plain full-width 1px line in the
-       subtle border token so the header reads as separated from the transcript on
-       mobile too (the desktop element is display:none here). Always visible, like
-       desktop — independent of `.scrolled`. `::before` because `::after` is the
-       scroll-fade gradient below; absolute (no layout height) so the
-       --mobile-thread-title-height scroll offset is unchanged. */
-    .mobile-swipe-pane .mobile-thread-title-row::before {
-        content: '';
-        position: absolute;
-        left: 0;
-        right: 0;
-        bottom: 0;
-        height: 1px;
-        background: var(--border-color);
-        pointer-events: none;
+    .mobile-swipe-pane .mobile-thread-title-row.scrolled {
+        background: var(--bg-secondary);
     }
 
     /* Fade transition below the sticky title: while the transcript is scrolled,
@@ -940,10 +899,10 @@
         pointer-events: none;
     }
 
-    /* Pin/unpin is an intentional in-place action on the current thread,
-       not a navigation — keep it tappable while the keyboard is up so iOS
-       Safari (which has no fallback click path) can still toggle the pin. */
-    :root[data-keyboard-active] .mobile-thread-title-row .icon-btn {
+    /* The title's menu holds in-place actions on the current thread, not a
+       navigation. Keep it tappable while the keyboard is up, since iOS Safari
+       has no fallback click path. */
+    :root[data-keyboard-active] .mobile-thread-title-row .thread-title-menu {
         pointer-events: auto;
     }
 
@@ -1265,6 +1224,13 @@
             z-index: 3;
         }
 
+        /* With dynamic bars the prompt overlays the wrap's bottom, so the track
+           ends above it, as the down chevron does. Otherwise the thumb slides
+           under the prompt just as the reader reaches the end of the thread. */
+        :root[data-mobile-dynamic-bars] .mobile-swipe-pane .thread-pane:not(.compose-empty) .thread-scroll-indicator {
+            bottom: calc(0.25rem + var(--mobile-prompt-height, 0rem));
+        }
+
         /* The thumb. Its height here is the BASE that useThreadScrollIndicator
            scales from: the hook writes `translateY(...) scaleY(...)`, never a
            layout property, so the whole per-scroll path stays composited. Hidden
@@ -1421,6 +1387,36 @@
        Centering causes the prompt to jump when the first message is sent. */
     .compose-empty .thread-pane-body {
         justify-content: flex-end;
+    }
+
+    /* Dynamic bars: the prompt overlays the transcript's bottom so it can slide
+       away, the shape the fixed header already has at the top. The transcript
+       reserves the prompt's height as bottom padding. The down chevron sits
+       above the prompt and rides its offset, as a transform only, because the
+       offset changes on every scroll frame. hooks/useHideOnScroll.ts sets the
+       attribute and all three vars. Pinned bars and the compose-empty view keep
+       the in-flow prompt. */
+    :root[data-mobile-dynamic-bars] .thread-pane:not(.compose-empty) .thread-pane-body {
+        position: relative;
+    }
+
+    /* One above the transcript's z-index 2 below, so the prompt it overlays
+       paints and takes taps on top without leaning on DOM order. */
+    :root[data-mobile-dynamic-bars] .thread-pane:not(.compose-empty) .prompt-area {
+        position: absolute;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        z-index: 3;
+    }
+
+    :root[data-mobile-dynamic-bars] .mobile-swipe-pane .thread-pane:not(.compose-empty) .thread-content {
+        padding-bottom: calc(var(--prompt-fade) + var(--nav-focus-reach) + var(--mobile-prompt-height, 0rem));
+    }
+
+    :root[data-mobile-dynamic-bars] .mobile-swipe-pane .thread-pane:not(.compose-empty) .scroll-to-bottom {
+        bottom: calc(0.75rem + var(--mobile-prompt-height, 0rem));
+        transform: translateY(var(--mobile-prompt-offset, 0rem));
     }
 
     /* The welcome floats in the middle of the free space instead of docking on

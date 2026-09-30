@@ -380,6 +380,7 @@ fn system_changes_updated_matches_server_event_shape() {
         created: Utc::now(),
         typed: BusEvent::System(SystemEvent::ChangesUpdated {
             pending: vec![],
+            set_aside: vec![],
             applied: vec![],
             total_pending: 0,
             restart_required: false,
@@ -690,6 +691,7 @@ fn reserved_type_names_match_event_type() {
         },
         ChangesUpdated {
             pending: vec![],
+            set_aside: vec![],
             applied: vec![],
             total_pending: 0,
             restart_required: false,

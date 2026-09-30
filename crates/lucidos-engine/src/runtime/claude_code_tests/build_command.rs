@@ -31,6 +31,7 @@ fn test_spawn_args<'a>(
         account_pin: None,
         binary_override: None,
         permission_mode: None,
+        additional_directories: &[],
     }
 }
 
@@ -57,6 +58,7 @@ fn test_spawn_args_with_event<'a>(
         account_pin: None,
         binary_override: None,
         permission_mode: None,
+        additional_directories: &[],
     }
 }
 
@@ -83,6 +85,7 @@ fn test_spawn_args_with_repo<'a>(
         account_pin: None,
         binary_override: None,
         permission_mode: None,
+        additional_directories: &[],
     }
 }
 
@@ -114,6 +117,7 @@ fn build_command_injects_user_env_vars_and_engine_wins() {
         account_pin: None,
         binary_override: None,
         permission_mode: None,
+        additional_directories: &[],
     };
     let cmd = build_command(&args, None);
     let env = collect_envs(&cmd);
@@ -1195,6 +1199,8 @@ fn side_question_command_copies_the_session_without_persisting() {
     args.model = Some("opus");
     args.system_prompt = Some("the session's prompt");
     args.allowed_tools = Some("Read,Bash");
+    let grants = [PathBuf::from("/p/sibling"), PathBuf::from("/p/other")];
+    args.additional_directories = &grants;
     let settings = PathBuf::from("/tmp/ws/.lucidos/cc-side-question-settings.json");
     let argv = |cmd: tokio::process::Command| -> Vec<String> {
         cmd.as_std()
@@ -1228,4 +1234,38 @@ fn side_question_command_copies_the_session_without_persisting() {
     ] {
         assert_eq!(value_of(&copy, flag), value_of(&session, flag), "{flag}");
     }
+    // Claude Code names the granted directories in its system prompt.
+    assert_eq!(add_dirs(&copy), add_dirs(&session));
+    assert_eq!(add_dirs(&copy), ["/p/sibling", "/p/other"]);
+}
+
+/// The values of every `--add-dir`, in order.
+fn add_dirs(argv: &[String]) -> Vec<&str> {
+    argv.iter()
+        .enumerate()
+        .filter(|(_, a)| *a == "--add-dir")
+        .map(|(at, _)| argv[at + 1].as_str())
+        .collect()
+}
+
+/// A repo's grants reach Claude Code as one `--add-dir` each, in order.
+#[test]
+fn build_command_passes_each_repo_grant_as_add_dir() {
+    let p = Path::new("/tmp");
+    let grants = [PathBuf::from("/p/sibling"), PathBuf::from("/p/other")];
+    let mut args = test_spawn_args(p, p, uuid::Uuid::new_v4());
+    args.additional_directories = &grants;
+    let argv = collect_args(&build_command(&args, None));
+    assert_eq!(add_dirs(&argv), ["/p/sibling", "/p/other"]);
+}
+
+/// A repo without the setting spawns exactly as before.
+#[test]
+fn build_command_has_no_add_dir_without_repo_grants() {
+    let p = Path::new("/tmp");
+    let argv = collect_args(&build_command(
+        &test_spawn_args(p, p, uuid::Uuid::new_v4()),
+        None,
+    ));
+    assert!(add_dirs(&argv).is_empty());
 }

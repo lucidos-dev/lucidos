@@ -41,6 +41,7 @@ Agents get an archive action and decide when to use it:
   coding-agent prompt and `orchestrating-sub-threads.md` say: archive a thread
   once its change is applied and no follow-up is expected. Leave it open while
   a follow-up, a question, a pending change or a live event wait remains.
+  ADR 0330 removed this guidance: no prompt or knowhow says when to archive.
 
 ## Rationale
 

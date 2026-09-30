@@ -155,6 +155,19 @@ impl EmailStore {
         Ok(result.rows_affected() > 0)
     }
 
+    /// Forget an account's password, inside the transaction that deletes the
+    /// credential supplying it.
+    pub(crate) async fn clear_password(
+        conn: &mut sqlx::PgConnection,
+        name: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE email_accounts SET password = '', updated_at = NOW() WHERE name = $1")
+            .bind(name)
+            .execute(conn)
+            .await?;
+        Ok(())
+    }
+
     /// Get an email account by name (includes the password)
     pub async fn get(pool: &PgPool, name: &str) -> Result<Option<EmailAccount>, sqlx::Error> {
         sqlx::query_as::<_, EmailAccount>(

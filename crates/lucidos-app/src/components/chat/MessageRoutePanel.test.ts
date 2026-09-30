@@ -456,14 +456,14 @@ describe('executorExtras', () => {
     const userEvent = stamp(0, { type: 'MessageReceived', text: 'go' });
     const sessionStarted = stamp(1, { type: 'SessionStarted', session_id: '', branch: 'claude-code/x' });
     const init = stamp(2, { type: 'CodingAgentSettingsChanged', cc_session_id: 'real-sid' });
-    // User flips permission mode mid-session — this settings event carries no id.
-    const permChange = stamp(3, { type: 'CodingAgentSettingsChanged', permission_mode: 'plan' });
+    // User switches model mid-session. This settings event carries no id.
+    const modelChange = stamp(3, { type: 'CodingAgentSettingsChanged', model: 'opus' });
     const exchange: Exchange = {
       userEvent,
       userSeq: 1,
-      steps: [{ seq: 2, event: sessionStarted }, { seq: 3, event: init }, { seq: 4, event: permChange }],
+      steps: [{ seq: 2, event: sessionStarted }, { seq: 3, event: init }, { seq: 4, event: modelChange }],
     };
-    const events = new Map<number, StoredEvent>([[1, userEvent], [2, sessionStarted], [3, init], [4, permChange]]);
+    const events = new Map<number, StoredEvent>([[1, userEvent], [2, sessionStarted], [3, init], [4, modelChange]]);
     const extras = executorExtras(exchange, events);
     expect(extras.ccSessionId).toBe('real-sid');
   });
@@ -524,18 +524,16 @@ describe('executorExtras', () => {
     expect(extras.repoId).toBe('repo-uuid-b');
   });
 
-  it('still extracts permissionMode and context from the current exchange steps only', () => {
+  it('still extracts context from the current exchange steps only', () => {
     const userEvent = stamp(0, { type: 'MessageReceived', text: 'go' });
-    const settings = stamp(1, { type: 'CodingAgentSettingsChanged', permission_mode: 'plan' });
     const thinking = stamp(2, { type: 'ThoughtStreamed', text: '...', context_tokens: 12345, trimmed: true });
     const exchange: Exchange = {
       userEvent,
       userSeq: 1,
-      steps: [{ seq: 2, event: settings }, { seq: 3, event: thinking }],
+      steps: [{ seq: 3, event: thinking }],
     };
-    const events = new Map<number, StoredEvent>([[1, userEvent], [2, settings], [3, thinking]]);
+    const events = new Map<number, StoredEvent>([[1, userEvent], [3, thinking]]);
     const extras = executorExtras(exchange, events);
-    expect(extras.permissionMode).toBe('plan');
     expect(extras.contextTokens).toBe(12345);
     expect(extras.contextTrimmed).toBe(true);
   });
@@ -769,6 +767,7 @@ const EVERY_ENGINE_REASON: { [K in EngineReason['kind']]: Extract<EngineReason, 
   scheduler: { kind: 'scheduler', trigger_id: 't1', trigger_name: 'nightly' },
   harden_retrigger: { kind: 'harden_retrigger' },
   stale_session: { kind: 'stale_session' },
+  archived_branch_work: { kind: 'archived_branch_work' },
   merge_conflict: { kind: 'merge_conflict' },
   missing_hardening: { kind: 'missing_hardening' },
   plugin_auto_update: {
@@ -1035,7 +1034,7 @@ describe('route rows contribute exactly two grid cells', () => {
       created: '2026-08-10T12:00:01.000Z',
     };
     const settings: StoredEvent = {
-      type: 'CodingAgentSettingsChanged', cc_session_id: 'sid-1', permission_mode: 'plan',
+      type: 'CodingAgentSettingsChanged', cc_session_id: 'sid-1',
       created: '2026-08-10T12:00:02.000Z',
     };
     const context: StoredEvent = {
@@ -1056,10 +1055,10 @@ describe('route rows contribute exactly two grid cells', () => {
       codingAgentFolder: 'data/apps/habit-tracker',
     } as unknown as ThreadMeta;
 
-    // Model, Effort, Context, Permission, Repository, App, Branch, Session.
+    // Model, Effort, Context, Repository, App, Branch, Session.
     expectTwoCellRows(
       renderExecutorSection(exchange, events, meta, 'claude-opus-5[1m]', 'xhigh'),
-      8,
+      7,
     );
   });
 });

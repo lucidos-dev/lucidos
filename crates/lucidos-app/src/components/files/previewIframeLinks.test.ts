@@ -3,7 +3,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 const mocks = vi.hoisted(() => ({
   openFilePreview: vi.fn(),
   openUrl: vi.fn(),
-  openLocalFile: vi.fn(),
+  openLocalFileOnConfirm: vi.fn(async () => {}),
   openAppById: vi.fn(async () => {}),
   openThreadAcrossWorkspaces: vi.fn(),
   handleNavigationRequest: vi.fn(),
@@ -16,7 +16,7 @@ const mocks = vi.hoisted(() => ({
 vi.mock('../../store/actions/artifacts', () => ({
   openFilePreview: mocks.openFilePreview,
   openUrl: mocks.openUrl,
-  openLocalFile: mocks.openLocalFile,
+  openLocalFileOnConfirm: mocks.openLocalFileOnConfirm,
 }));
 vi.mock('../../store/actions/apps', () => ({ openAppById: mocks.openAppById }));
 vi.mock('../../store/actions/cross-workspace', () => ({

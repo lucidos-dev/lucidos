@@ -46,6 +46,30 @@ fn claude_code_idled_has_changes_serialization() {
     }
 }
 
+/// Rows persisted while the in-thread permission-mode command existed carry a
+/// `permission_mode` key. They must still read, and resume must still find the
+/// session id on them.
+#[test]
+fn settings_changed_row_with_a_permission_mode_still_reads() {
+    let row = json!({
+        "type": "CodingAgentSettingsChanged",
+        "model": "sonnet",
+        "permission_mode": "plan",
+        "cc_session_id": "sid-1",
+    });
+    match serde_json::from_value::<ThreadEvent>(row).unwrap() {
+        ThreadEvent::CodingAgentSettingsChanged {
+            model,
+            cc_session_id,
+            ..
+        } => {
+            assert_eq!(model.as_deref(), Some("sonnet"));
+            assert_eq!(cc_session_id.as_deref(), Some("sid-1"));
+        }
+        other => panic!("wrong variant: {other:?}"),
+    }
+}
+
 #[test]
 fn tool_called_description_serialization() {
     // With description → included in JSON
@@ -304,6 +328,7 @@ fn change_proposed_new_format() {
         repo_root: String::new(),
         hardened: false,
         incomplete: false,
+        set_aside: false,
         path: String::new(),
         diff: String::new(),
     };

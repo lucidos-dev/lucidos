@@ -156,6 +156,11 @@ const MIRRORING_TIMERS: Array<{ file: string; expr: RegExp; what: string }> = [
     expr: /scaledDurationMs\(DRAWER_SLIDE_OUT_MS\) \+ DRAWER_SLIDE_OUT_SLACK_MS/,
     what: 'closes the menu drawer if its slide-out end never arrives',
   },
+  {
+    file: '../../components/chat/PromptInput.tsx',
+    expr: /scaledDurationMs\(SEND_HOLD_SLIDE_MS\) \+ SEND_HOLD_SLIDE_SLACK_MS/,
+    what: 'keeps the side question pill drawn while its half slides back',
+  },
   // The only entry whose transition is INLINE rather than a token. The FLIP
   // writes `transform` and `height` durations onto the element itself, so
   // nothing in the CSS carries the scale for it. Both come off the same

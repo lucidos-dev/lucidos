@@ -3,6 +3,8 @@ import {
   collectSearchResults,
   filterSearchResults,
   openableChangeFiles,
+  visibleSearchResults,
+  MAX_SHOWN_RESULTS,
   type FileSearchResult,
 } from '../fileSearch';
 
@@ -151,5 +153,38 @@ describe('filterSearchResults', () => {
     const filtered = filterSearchResults(allResults, '.rs');
     expect(filtered).toHaveLength(2);
     expect(filtered.map(r => r.source)).toEqual(['repo', 'change']);
+  });
+});
+
+/** Regression: the modal rendered every match, about 3,400 rows in a real
+ *  workspace, so opening it on a phone took seconds. */
+describe('visibleSearchResults', () => {
+  const results: FileSearchResult[] = Array.from({ length: 250 }, (_, i) => ({
+    path: `apps/demo/file-${i}.md`,
+    source: 'workspace',
+  }));
+
+  it('shows at most the cap and counts the rest as hidden', () => {
+    const { shown, hidden } = visibleSearchResults(results);
+    expect(shown).toHaveLength(MAX_SHOWN_RESULTS);
+    expect(shown[0]).toBe(results[0]);
+    expect(hidden).toBe(250 - MAX_SHOWN_RESULTS);
+  });
+
+  it('keeps change rows visible when repo rows alone would fill the cap', () => {
+    const repo: FileSearchResult[] = Array.from({ length: 150 }, (_, i) => ({
+      path: `src/file-${i}.rs`,
+      source: 'repo',
+    }));
+    const change: FileSearchResult = { path: 'src/api.rs', source: 'change', changeStatus: 'modified' };
+    const { shown, hidden } = visibleSearchResults([...repo, change]);
+    expect(shown[0]).toBe(change);
+    expect(shown[1]).toBe(repo[0]);
+    expect(hidden).toBe(151 - MAX_SHOWN_RESULTS);
+  });
+
+  it('shows everything when the matches fit', () => {
+    const few = results.slice(0, 3);
+    expect(visibleSearchResults(few)).toEqual({ shown: few, hidden: 0 });
   });
 });

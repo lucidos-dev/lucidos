@@ -2,7 +2,8 @@ import { Fragment } from 'preact';
 import { useRef, useEffect, useState, useMemo } from 'preact/hooks';
 import { Overlay } from '../shared/Overlay';
 import { useLongPress } from '../../hooks/useLongPress';
-import { SendHoldMenu, sendHoldMenuAnchor } from './SendHoldMenu';
+import { SendHoldMenu, sendHoldMenuOpener, SEND_HOLD_SLIDE_MS, SEND_HOLD_SLIDE_SLACK_MS } from './SendHoldMenu';
+import { useLingeringFlag } from '../../hooks/useDelayedLoading';
 import { signal, untracked, useSignalEffect } from '@preact/signals';
 import { pendingChatMessage, showToast, openImagePopupFromGroup, focusedThreadId, threadMap, panelUrl, panelTitle, cancelingThreadIds, answeringThreadIds, clearThreadAnswering, effectiveThreadStatus, currentApp, wipPreviewThreadId, promptSendCollapsing, composeViewActive, scaledDurationMs } from '../../store/store';
 import { resolveCodingAgent } from '../../store/composeSelections';
@@ -22,9 +23,9 @@ import { updateCompose, sendCompose, sendFollowup, ensureFocusedComposeThread } 
 import { focusPane } from '../../store/actions/pane';
 import { openAppById } from '../../store/actions/apps';
 import { pushNavState } from '../../store/actions/navigation';
-import { tooltipWithShortcut } from '../../store/actions/keybindings';
+import { tooltipWithShortcut, matchShortcut } from '../../store/actions/keybindings';
 import { getDraft } from '../../store/composeDrafts';
-import { askSideQuestion, routeSideQuestion, withSideQuestionPrefix } from '../../store/sideQuestions';
+import { askSideQuestion, routeSideQuestion, SIDE_QUESTION_COMMAND, withSideQuestionPrefix } from '../../store/sideQuestions';
 import { ComposeDestinationRow } from './ComposeDestinationRow';
 import { followAnsweredQuestion, followCanceledTurn, followSentMessage, followSideQuestion } from './scrollState';
 import { CaptureIcon, ImageIcon, CameraIcon, FileIcon, CloseIcon, ClearIcon, GlobeIcon, SendArrowIcon, StopIcon } from '../shared/icons';
@@ -37,7 +38,7 @@ import { FOLD_KEY_ATTR, usePromptActionCollapse, type FoldGroup } from '../../ho
 import { TodoPanelSlot, closeTodoPanel, todoIndicatorAction } from './todoIndicator';
 import { WaitingPanelHost, closeWaitingPanel, waitingIndicatorAction } from './WaitingPanel';
 import { getBannerActions, getWaitingState, getStandaloneActions, type BannerState } from './WaitingBanner';
-import { composeHasContent, resolveComposerText, composerTextDisagreementToast, computeMorphMode, computeAnswerActionMode, computePromptEscapeAction, dispatchSend, computeSubmitMultiCount, recoverableAnswerDraft, findLatestPendingQuestion, promptPlaceholder, shouldClearCanceling, shouldClearSubmitting, submittingThreadIds, canceledQuestionByThread, setCanceledQuestion, canceledWhileAwaitingByThread, setCanceledWhileAwaiting, queuedUploadSends, queueUploadSend, takeQueuedUploadSend, clearQueuedUploadSend, clearSubmittingThread, armCancelSettle, isCancelSettling, promptStopRequested, type UploadSendIntent } from './prompt-input-helpers';
+import { composeHasContent, resolveComposerText, composerTextDisagreementToast, computeMorphMode, computeAnswerActionMode, computePromptEscapeAction, dispatchSend, computeSubmitMultiCount, recoverableAnswerDraft, findLatestPendingQuestion, promptPlaceholder, shouldClearCanceling, shouldClearSubmitting, submittingThreadIds, canceledQuestionByThread, setCanceledQuestion, canceledWhileAwaitingByThread, setCanceledWhileAwaiting, queuedUploadSends, queueUploadSend, takeQueuedUploadSend, clearQueuedUploadSend, clearSubmittingThread, armCancelSettle, isCancelSettling, promptStopRequested, promptSideQuestionRequested, sideQuestionAction, type UploadSendIntent } from './prompt-input-helpers';
 import { SplitButton } from '../shared/SplitButton';
 export * from './prompt-input-helpers';
 import { composeHandlers } from './promptFocus';
@@ -60,6 +61,7 @@ import { attachedImagesForCurrentThread, getAttachedImages, markHashesAsSent, re
 import { getPendingUploads, hasInFlightUploads, removePendingUpload, pendingUploads } from '../../store/pendingUploads';
 import { attachImageToActiveDraft } from './attachToDraft';
 import { computeCaptureGeometry, readDeviceAngle } from './cameraGeometry';
+import { isImeComposingKey } from '../../utils/ime';
 
 const attachMenuOpen = signal(false);
 const cameraOpen = signal(false);
@@ -109,22 +111,6 @@ const UPLOAD_BLOCKS_ANSWER_TOAST = 'An image is still uploading. Submit again on
  *  text, so there it stays the plain "Stop". */
 export const ANSWER_CANCEL_TOOLTIP = 'Cancel this question and ask something else';
 
-/** The legacy `keyCode` a browser reports for a key the IME swallowed. */
-const IME_HANDLED_KEYCODE = 229;
-
-/** Whether this keydown belongs to an IME composition, and so is not a command.
- *
- *  A Japanese, Chinese or Korean user presses Enter to COMMIT the candidate the
- *  IME is showing. The browser dispatches that keydown before `compositionend`,
- *  so an ungated Enter branch sends the half-converted text to the agent.
- *
- *  `isComposing` is the standard reading, and the one `shouldTypeToFocusPrompt`
- *  takes in `hooks/useKeyboardShortcuts.ts`. The `keyCode` arm covers browsers
- *  that report only the sentinel. Pure, and exported for testing and for
- *  `ThreadTitleEditor`, whose Enter carries the same hazard. */
-export function isImeComposingKey(e: Pick<KeyboardEvent, 'isComposing' | 'keyCode'>): boolean {
-  return e.isComposing || e.keyCode === IME_HANDLED_KEYCODE;
-}
 
 /** Whether an input event opens the Claude Code slash-command menu. Opening it
  *  clears the box, so only a box holding a lone `/` qualifies. A value that
@@ -516,10 +502,16 @@ export function PromptInput() {
       }
       return;
     }
-    if (e.key === 'Enter' && !e.shiftKey && !isMobile()) {
+    // A modified Enter a shortcut claims (⌥↵ asks a side question) is the
+    // shortcut's, so it must not also send. With the split pill open, Enter
+    // presses its Side question half, as it does when the shortcut opened it.
+    if (e.key === 'Enter' && !e.shiftKey && !isMobile() && matchShortcut(e) === null) {
       e.preventDefault();
       if (hasPendingMultiQ) void submitMultiAnswer();
-      else void submit();
+      else if (sendHoldMenuOpener.value !== null) {
+        sendHoldMenuOpener.value = null;
+        askFromSideQuestionPill();
+      } else void submit();
     }
   }
 
@@ -740,6 +732,12 @@ export function PromptInput() {
     const handoff = codingAgentMenuComposerText.value;
     if (handoff === null) return;
     codingAgentMenuComposerText.value = null;
+    startSideQuestionDraft(handoff);
+  });
+
+  /** Put `handoff` (`/btw …`) in the composer and the caret after it, for the
+   *  user to finish the side question there. */
+  function startSideQuestionDraft(handoff: string): void {
     const el = inputRef.current;
     const threadId = ensureFocusedComposeThread();
     const text = withSideQuestionPrefix(handoff, el ? el.value : getDraft(threadId).text);
@@ -749,7 +747,7 @@ export function PromptInput() {
     autoResize();
     focusIfNeeded(el);
     el.setSelectionRange(text.length, text.length);
-  });
+  }
 
   useSignalEffect(() => {
     const queued = queuedUploadSends.value;
@@ -1006,28 +1004,80 @@ export function PromptInput() {
   // The constructive actions blur on their own (`submit`, `submitMultiAnswer`):
   // the suppressed click never reaches `installActionBtnBlurListener`, which
   // listens on `click`.
-  // A hold on Send offers the draft as a side question instead. The release
-  // that ends the hold must not also send, so the hold marks itself. The mark
-  // is spent by that release, by the next press, or by the menu closing, so
-  // it never swallows a later Send. A started, non-Codex thread takes one.
+  // A hold on Send offers the draft as a side question instead, and a hold on
+  // Stop starts one. The release that ends the hold must not also send or
+  // stop, so the hold marks itself. That release, the next press or the menu
+  // closing spends the mark, so it never swallows a later tap.
+  // `sideQuestionAction` says who takes one. The answer control is not the
+  // morph button, so its Cancel offers none.
   const heldSendRef = useRef(false);
-  const canAskFromHold = morphMode === 'send'
-    && focusedThread !== undefined
-    && focusedThread.meta.state !== 'composing'
-    && promptCodingAgent !== 'codex';
-  const sendHold = useLongPress((target) => {
+  const startedSideQuestionDraftRef = useRef(false);
+  // A mouse press moves focus off the composer. The pill keeps the draft
+  // editable, so a hold that began mid-typing hands the focus back.
+  const typingAtPressRef = useRef(false);
+  const [sendButtonEl, setSendButtonEl] = useState<HTMLButtonElement | null>(null);
+  const holdSideQuestion = sideQuestionAction({
+    hasContent: morphMode === 'send',
+    stopShown: morphMode === 'cancel' && !isAnsweringQuestion,
+    threadStarted: focusedThread !== undefined && focusedThread.meta.state !== 'composing',
+    isCodex: promptCodingAgent === 'codex',
+  });
+  const sideQuestionBlocker = holdSideQuestion.kind === 'unavailable' ? holdSideQuestion.reason : null;
+  const canAskFromHold = sideQuestionBlocker === null;
+  // With the pill open, the side question is already on screen beside the
+  // button, so its tooltip stops advertising the hold.
+  const offersHoldHint = canAskFromHold && sendHoldMenuOpener.value === null;
+  const sendHold = useLongPress(() => {
     if (!canAskFromHold) return;
     heldSendRef.current = true;
-    sendHoldMenuAnchor.value = target;
+    // The hold took the press, so the gate must not rule on its lift. Stop
+    // asks the gate before the mark, so drift under the new pill would toast.
+    morphGate.spend();
+    sendHoldMenuOpener.value = 'hold';
+    if (typingAtPressRef.current) focusIfNeeded(inputRef.current);
   }, () => {});
+  /** The Side question half's action, whether tapped or pressed with Enter. */
+  function askFromSideQuestionPill(): void {
+    if (holdSideQuestion.kind === 'start-draft') {
+      startedSideQuestionDraftRef.current = true;
+      startSideQuestionDraft(`/${SIDE_QUESTION_COMMAND} `);
+    } else void submit(true);
+  }
+  // The pill stays drawn while its half slides back behind Send, and Send
+  // keeps its squared seam until the half is gone.
+  const sendHoldMenuShown = useLingeringFlag(
+    sendHoldMenuOpener.value !== null,
+    scaledDurationMs(SEND_HOLD_SLIDE_MS) + SEND_HOLD_SLIDE_SLACK_MS,
+  );
+  // The pill shuts once the button under it offers no side question, such as
+  // a Stop whose turn just ended.
+  useEffect(() => {
+    if (sideQuestionBlocker !== null) sendHoldMenuOpener.value = null;
+  }, [sideQuestionBlocker]);
+  useSignalEffect(() => {
+    if (!promptSideQuestionRequested.value) return;
+    promptSideQuestionRequested.value = false;
+    // A second press shuts the open pill, as Escape does.
+    if (sendHoldMenuOpener.peek() !== null) sendHoldMenuOpener.value = null;
+    else if (sideQuestionBlocker === null) sendHoldMenuOpener.value = 'shortcut';
+    else showToast(sideQuestionBlocker, 'info');
+  });
   const morphActivate = useTouchActivated(
     () => {
       if (heldSendRef.current) {
         heldSendRef.current = false;
+        // This click still reaches the `.action-btn` blur listener, so the
+        // composer takes focus back a frame later.
+        if (typingAtPressRef.current) requestAnimationFrame(() => focusIfNeeded(inputRef.current));
         return;
       }
-      if (morphMode === 'send') void submit();
-      else if (morphMode === 'cancel') cancelExchangeForTarget();
+      if (morphMode === 'send') {
+        sendHoldMenuOpener.value = null;
+        void submit();
+      } else if (morphMode === 'cancel') {
+        sendHoldMenuOpener.value = null;
+        cancelExchangeForTarget();
+      }
     },
     morphMode === 'send' || (morphMode === 'cancel' && !cancelSettling),
     morphActivationGate,
@@ -1101,7 +1151,7 @@ export function PromptInput() {
   // finished, so the real status can drive `isRenderedThreadIdle` from here.
   //
   // Read RAW `meta.status`, NOT `effectiveThreadStatus`. The flag itself is
-  // what suppresses the false "Aborted", through `isRenderedThreadIdle`, so
+  // what suppresses the false "Done", through `isRenderedThreadIdle`, so
   // gating on raw status keeps the release honest against the projection.
   useEffect(() => {
     const focused = focusedThreadId.value;
@@ -1341,9 +1391,14 @@ export function PromptInput() {
       class={
         'action-btn send-cancel-morph send-cancel-round'
         + (morphMode === 'placeholder' ? ' morph-placeholder' : '')
+        + (sendHoldMenuShown ? ' split-open' : '')
       }
+      ref={setSendButtonEl}
       onPointerDown={e => {
         heldSendRef.current = false;
+        // Read before the press's own mousedown moves focus. Never on touch,
+        // where the keyboard stays up through a hold on its own.
+        typingAtPressRef.current = e.pointerType === 'mouse' && document.activeElement === inputRef.current;
         sendHold.onPointerDown(e);
         morphGate.down(e);
       }}
@@ -1359,6 +1414,12 @@ export function PromptInput() {
       }}
       onContextMenu={canAskFromHold ? sendHold.onContextMenu : undefined}
       onTouchEnd={morphActivate.onTouchEnd}
+      // A key press is never a hold's release. A right-click leaves the mark
+      // with no click to spend it, and Send takes its own clicks while the
+      // pill is open.
+      onKeyDown={e => {
+        if (e.key === 'Enter' || e.key === ' ') heldSendRef.current = false;
+      }}
       onClick={morphActivate.onClick}
       aria-label={morphMode === 'cancel' || morphMode === 'canceling' ? 'Cancel' : 'Send message'}
       aria-hidden={morphMode === 'placeholder' ? 'true' : undefined}
@@ -1371,10 +1432,11 @@ export function PromptInput() {
         : true
       }
       data-tooltip={
-        morphMode === 'cancel' ? tooltipWithShortcut('Stop', 'stopThread')
+        morphMode === 'cancel' && offersHoldHint ? tooltipWithShortcut('Stop. Hold to ask a side question', 'stopThread')
+        : morphMode === 'cancel' ? tooltipWithShortcut('Stop', 'stopThread')
         : morphMode === 'canceling' ? 'Stopping…'
         : morphMode === 'send' && uploadsBlocking ? 'Send after image upload'
-        : morphMode === 'send' && canAskFromHold ? 'Send. Hold to ask a side question'
+        : morphMode === 'send' && offersHoldHint ? tooltipWithShortcut('Send. Hold to ask a side question', 'askSideQuestion')
         : morphMode === 'send' ? 'Send'
         : undefined
       }
@@ -1425,11 +1487,24 @@ export function PromptInput() {
     // dispatched inside the menu item's own click, which <Overlay> treats as
     // inside and therefore does not swallow.
     onClick: () => fileInputRef.current?.click(),
-    // A wide row keeps the Camera / File popover instead, which the default
-    // button cannot express: it is an anchor hosting an <Overlay> of its own.
-    // composeHandlers keeps the textarea focused (the iPad PWA keyboard stays
-    // open) so the menu anchors to the right spot, see 5ca953fd7.
-    render: isNarrow ? undefined : (attrs) => (
+    // Both full-size buttons run on touchend through composeHandlers, so a tap
+    // leaves focus on the prompt and the iOS keyboard stays up.
+    //
+    // The narrow one passes no focus nudge: a closed keyboard stays closed, and
+    // no focus moves inside the gesture that opens the picker.
+    render: isNarrow ? (attrs) => (
+      <button
+        {...attrs}
+        class="icon-btn header-icon"
+        {...composeHandlers(() => fileInputRef.current?.click(), () => {})}
+        data-tooltip="Attach image"
+        aria-label="Attach image"
+      >
+        <ImageIcon />
+      </button>
+    ) : (attrs) => (
+      // The wide row keeps the Camera / File popover, which the default button
+      // cannot express: it is an anchor hosting an <Overlay> of its own.
       <div class="image-attach-anchor" ref={menuRef} {...attrs}>
         <button
           class="icon-btn header-icon"
@@ -1582,10 +1657,6 @@ export function PromptInput() {
             `.visually-hidden` (off-screen, in layout) — `display:none` is what
             HiddenFileInput's docs blame for dropping the iOS PWA change event,
             so we match that even though .click() is a synthetic dispatch. */}
-        <SendHoldMenu
-          onAskSideQuestion={() => void submit(true)}
-          onClosed={() => { heldSendRef.current = false; }}
-        />
         <input
           ref={fileInputRef}
           type="file"
@@ -1625,6 +1696,20 @@ export function PromptInput() {
             {bannerActions.filter(standing).map((a) => (
               <Fragment key={a.key}>{renderHeaderAction(a, foldAttrs(a.key))}</Fragment>
             ))}
+            <SendHoldMenu
+              anchor={sendButtonEl}
+              leaving={sendHoldMenuShown && sendHoldMenuOpener.value === null}
+              onAskSideQuestion={askFromSideQuestionPill}
+              onClosed={(opener) => {
+                heldSendRef.current = false;
+                const startedDraft = startedSideQuestionDraftRef.current;
+                startedSideQuestionDraftRef.current = false;
+                // The shortcut took focus from the draft, and a started draft
+                // needs it to be typed. A frame later, after the closing
+                // click's `.action-btn` blur.
+                if (opener === 'shortcut' || startedDraft) requestAnimationFrame(() => inputRef.current?.focus());
+              }}
+            />
             {isAnsweringQuestion ? answerControl : sendButton}
           </div>
         </div>

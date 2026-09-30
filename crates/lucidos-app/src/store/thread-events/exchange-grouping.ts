@@ -723,8 +723,8 @@ function findAbsorbTarget(
  *  **Every event the chat agentic loop stamps with `meta.request_event_id` must
  *  appear here.** Anything missing falls through to the `current` pointer. It
  *  then leaks into a follow-up MR's empty exchange whenever the loop's events
- *  arrive after the follow-up. That leak flips `exchangeStatus` to 'aborted'
- *  for the follow-up.
+ *  arrive after the follow-up. The follow-up then holds steps with no
+ *  terminator, and settles as 'done' before its own turn has run.
  *
  *  `ContextCaptured` is the live event. `ContextAssembled` and
  *  `ContextTokensMeasured` are its retired predecessors, kept so legacy DB rows
@@ -2278,7 +2278,7 @@ function foldEvent(
       // `previousCurrent` IS that turn's exchange. An UNINGESTED queued
       // follow-up MessageReceived that intervened makes it the queued MR
       // instead. The bootstrap above then anchors on the WRONG id, and the
-      // divider strands terminal-less on a persistent 'aborted'.
+      // divider strands terminal-less, with its reply in another exchange.
       //
       // Redirect the turn's real req_id, tracked as `lastChatTurnReqId`, to the
       // divider directly. Additive and idempotent in the common no-queue case,

@@ -312,26 +312,6 @@ impl ResolvedModelSelection {
 }
 
 impl PreferenceStore {
-    /// Defensive double-write: the migration owns this CREATE TABLE (see
-    /// `20260517160627_consolidate_init_schema_tables.sql`). A temporary measure:
-    /// `docs/temporary-measures.md` § "Defensive double-write of tables into
-    /// `init_schema`".
-    pub async fn init_schema(pool: &PgPool) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS preferences (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL,
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )
-            "#,
-        )
-        .execute(pool)
-        .await?;
-
-        Ok(())
-    }
-
     /// Write a global preference row with no announcement.
     ///
     /// Tests only. The announcing [`Self::set`] needs an `EventBus`, and a test
@@ -1141,6 +1121,62 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(left, 0, "nothing is left under an old key");
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// The dynamic bars rename keeps every stored choice with the polarity
+    /// flipped, so a device that had unpinned its header still hides it.
+    #[tokio::test]
+    async fn the_dynamic_bars_rename_flips_every_stored_choice() {
+        const STICKY_TO_DYNAMIC_BARS: &str = include_str!(
+            "../../migrations/20260930060747_rename_mobile_header_sticky_to_mobile_dynamic_bars.sql"
+        );
+        let (pool, db_name) = setup_test_db().await;
+        sqlx::query(
+            "INSERT INTO preferences (key, value, device_id) VALUES \
+             ('mobile_header_sticky', 'false', NULL), \
+             ('mobile_header_sticky', 'true', 'd1'), \
+             ('mobile_header_sticky', 'false', 'd2'), \
+             ('mobile_dynamic_bars', 'false', 'd2')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(STICKY_TO_DYNAMIC_BARS)
+            .execute(&pool)
+            .await
+            .expect("the dynamic bars rename re-runs");
+
+        let value = |device: Option<&'static str>| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, String>(
+                    "SELECT value FROM preferences WHERE key = 'mobile_dynamic_bars' \
+                     AND COALESCE(device_id, '') = COALESCE($1, '')",
+                )
+                .bind(device)
+                .fetch_optional(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        assert_eq!(value(None).await.as_deref(), Some("true"));
+        assert_eq!(value(Some("d1")).await.as_deref(), Some("false"));
+        assert_eq!(
+            value(Some("d2")).await.as_deref(),
+            Some("false"),
+            "a row already under the new key wins"
+        );
+        let left: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM preferences WHERE key = 'mobile_header_sticky'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(left, 0, "nothing is left under the old key");
 
         pool.close().await;
         teardown_test_db(&db_name).await;

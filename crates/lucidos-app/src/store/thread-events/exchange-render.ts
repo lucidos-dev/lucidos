@@ -316,22 +316,29 @@ function capturedEventToData(
  *  manages its own loop and has no per-API-call Thinking step. Its snapshot
  *  binds to whichever step is on top of the stack.
  *
+ *  A Thinking row already holding a main-LLM snapshot keeps it. A round the
+ *  engine holds back (`prose_nudge_draft`) opens a row only to call a tool.
+ *  Otherwise its snapshot describes a request the row never made.
+ *
  *  Shared by both projections so the inline chip and the summary agree on
- *  which step owns each snapshot. The caller supplies `assign` because Step
- *  and the ResponseEvent step variant share the `contextCapture` field but
- *  live in different unions. */
+ *  which step owns each snapshot. The caller supplies `captureOf` and `assign`
+ *  because Step and the ResponseEvent step variant share the `contextCapture`
+ *  field but live in different unions. */
 function bindSnapshotToStep<T>(
   data: ContextCapture,
   items: T[],
   isStep: (item: T) => boolean,
   isThinking: (item: T) => boolean,
+  captureOf: (item: T) => ContextCapture | undefined,
   assign: (item: T, snap: ContextCapture) => void,
 ): void {
   // Coding-agent captures anchor to tool steps; main-LLM captures to thinking.
-  const acceptable = data.producer === 'main_llm' ? isThinking : isStep;
+  const mainLlm = data.producer === 'main_llm';
+  const acceptable = mainLlm ? isThinking : isStep;
   for (let i = items.length - 1; i >= 0; i--) {
     if (acceptable(items[i])) {
-      assign(items[i], data);
+      const held = captureOf(items[i]);
+      if (!(mainLlm && held && !held.legacy)) assign(items[i], data);
       return;
     }
   }
@@ -425,6 +432,7 @@ export function exchangeSteps(exchange: Exchange, isLast = true, threadIdle = fa
           steps,
           () => true,
           (s) => s.description === 'Thinking',
+          (s) => s.contextCapture,
           (s, snap) => { s.contextCapture = snap; },
         );
         break;
@@ -748,6 +756,7 @@ export function exchangeResponseEvents(exchange: Exchange, isLast = true, thread
           events,
           (e) => e.type === 'step',
           (e) => e.type === 'step' && e.description === 'Thinking',
+          (e) => (e.type === 'step' ? e.contextCapture : undefined),
           (e, snap) => { if (e.type === 'step') e.contextCapture = snap; },
         );
         break;
@@ -1978,6 +1987,36 @@ export function opensAwaitingAnswer(exchange: Exchange): boolean {
   }
 }
 
+declare const abortEvidenceBrand: unique symbol;
+
+/** The logged event an 'aborted' verdict rests on. `abortEvidenceOf` is its
+ *  only constructor, so no verdict reads "Aborted" without one. */
+export type AbortEvidence = {
+  readonly event: StoredEvent;
+  readonly [abortEvidenceBrand]: true;
+};
+
+/** Evidence from an event that records an abort: a `ResponseAborted`, or a
+ *  `SessionEnded` whose reason is not a normal lifecycle end. Null otherwise. */
+export function abortEvidenceOf(event: StoredEvent): AbortEvidence | null {
+  const records = event.type === 'ResponseAborted'
+    || (event.type === 'SessionEnded' && !NORMAL_SESSION_END_REASONS.has(event.reason ?? 'completed'));
+  return records ? { event } as AbortEvidence : null;
+}
+
+/** An exchange's status, with the abort event behind an 'aborted' one. */
+export type ExchangeVerdict =
+  | { readonly status: Exclude<ExchangeStatus, 'aborted'> }
+  | { readonly status: 'aborted'; readonly evidence: AbortEvidence };
+
+function verdict(status: Exclude<ExchangeStatus, 'aborted'>): ExchangeVerdict {
+  return { status };
+}
+
+function aborted(evidence: AbortEvidence): ExchangeVerdict {
+  return { status: 'aborted', evidence };
+}
+
 /** Derive ExchangeStatus for an exchange.
  *
  *  @param isLast the last (newest) exchange in the thread.
@@ -1987,18 +2026,22 @@ export function opensAwaitingAnswer(exchange: Exchange): boolean {
  *
  *  @param threadIdle the coding agent is not producing output (see
  *         `isThreadQuiescent` in store.ts). With no terminal event, the
- *         exchange was interrupted by a crash or a lid close and shows as
- *         'aborted' rather than 'streaming'.
+ *         exchange settles as 'done' rather than spinning 'streaming'.
  *
  *  @param threadAwaitingAnswer the backend status is
  *         `waiting_for_user_answer`, so the thread is parked on or resuming
- *         from a question or permission card. Such a thread is NEVER crashed,
- *         so the stale-`'aborted'` detector below must not fire for it. The
- *         client `meta.status` can briefly lag behind the resolution event,
- *         and a just-answered divider would otherwise flash "Aborted" in the
- *         gap. A genuine crash settles to `idle` or `failed`, never to
- *         `waiting_for_user_answer`, so this cannot mask a real abort. */
+ *         from a question or permission card. Its continuation and terminal
+ *         are in flight, so the stale detector below must not settle it.
+ *
+ *  'aborted' needs an abort event in the log. Status flags are a lagging
+ *  copy of the projection, so they never produce it on their own. */
 export function exchangeStatus(exchange: Exchange, streamingBuffer: string, isLast: boolean, hasPriorActive?: boolean, threadIsCC?: boolean, threadIdle = false, threadAwaitingAnswer = false): ExchangeStatus {
+  return exchangeVerdict(exchange, streamingBuffer, isLast, hasPriorActive, threadIsCC, threadIdle, threadAwaitingAnswer).status;
+}
+
+/** `exchangeStatus` with its evidence. An aborted verdict names the abort
+ *  event it rests on, so a verdict without one does not type-check. */
+export function exchangeVerdict(exchange: Exchange, streamingBuffer: string, isLast: boolean, hasPriorActive?: boolean, threadIsCC?: boolean, threadIdle = false, threadAwaitingAnswer = false): ExchangeVerdict {
   // A row the client drew for the caller's own utterance, before the engine's
   // row for it exists. It carries no steps and can carry none. So no terminal
   // verdict below is about it, and every one of them would be a guess.
@@ -2013,25 +2056,25 @@ export function exchangeStatus(exchange: Exchange, streamingBuffer: string, isLa
   // do start arrives as its own exchange within a second, carrying its real
   // status. See `docs/plans/2026-09-16-a-pause-spends-nothing.md`.
   if (isLiveUtteranceRow(exchange.userEvent)) {
-    return isSettledLiveUtterance(exchange.userEvent) ? 'done' : 'pending';
+    return verdict(isSettledLiveUtterance(exchange.userEvent) ? 'done' : 'pending');
   }
   // The talker's own live row. Nothing is in flight BEHIND it: the row is the
   // activity, and the words moving in it are what says so. The row itself
   // claims no liveness (ADR 0197). So a pending verdict here would be the one
   // thing on screen calling the reply unfinished, long after it ended.
-  if (isLiveReplyRow(exchange.userEvent)) return 'done';
+  if (isLiveReplyRow(exchange.userEvent)) return verdict('done');
   let isComplete = false;
   let isCanceled = false;
-  let isAborted = false;
+  let abortedBy: AbortEvidence | null = null;
   let isFailed = false;
   let isCC = false;
   let isCCWaiting = false;
-  let isSessionEnded = false;
   // SessionEnded with a normal lifecycle reason. Terminal for a coding-agent
   // exchange even when CodingAgentIdled was skipped, as the engine's
   // auto-harden `continue` path can bail out before emitting it.
   let isSessionEndedNormally = false;
-  let isShutdown = false;
+  let shutdownBy: AbortEvidence | null = null;
+  let abnormalEndBy: AbortEvidence | null = null;
   // The agent is paused on AskUserQuestion. The QuestionCard owns the action
   // surface, and the exchange reads as "done" so it shows no "Working" spinner
   // while the user thinks. Resume clears this flag and the exchange falls back
@@ -2073,10 +2116,10 @@ export function exchangeStatus(exchange: Exchange, streamingBuffer: string, isLa
       case 'ResponseAborted':
         if (supersededAborts.has(i)) break; // superseded by a later same-id terminal
         if (wasCompleted) completedBeforeAbort = true;
-        isAborted = true; isComplete = true; break;
+        abortedBy = abortEvidenceOf(event); isComplete = true; break;
       case 'ResponseFailed': isFailed = true; isComplete = true; break;
       case 'SessionStarted':
-        isCC = true; isSessionEnded = false; isSessionEndedNormally = false; isShutdown = false;
+        isCC = true; abnormalEndBy = null; isSessionEndedNormally = false; shutdownBy = null;
         break;
       // A deliberate lifecycle ending must NOT flash the "engine restarted"
       // aborted banner, even when a CodingAgentPromptSent transiently cleared
@@ -2087,10 +2130,10 @@ export function exchangeStatus(exchange: Exchange, streamingBuffer: string, isLa
         const reason = event.reason ?? 'completed';
         if (reason === 'shutdown') {
           if (wasCompleted) completedBeforeAbort = true;
-          isShutdown = true;
+          shutdownBy = abortEvidenceOf(event);
         }
         if (!NORMAL_SESSION_END_REASONS.has(reason)) {
-          isSessionEnded = true;
+          abnormalEndBy = abortEvidenceOf(event);
         } else if (reason !== 'stale_resume') {
           // stale_resume is mid-flight: a fresh SessionStarted follows.
           isSessionEndedNormally = true;
@@ -2203,21 +2246,25 @@ export function exchangeStatus(exchange: Exchange, streamingBuffer: string, isLa
   // the wording, the withheld Continue button and the status badge, and says
   // nothing about whether anything is still running. A terminal `stop.sh`
   // tears the engine down just as thoroughly as the button.
-  const isEngineDownBoundary = abortTookEngineDown(exchange.userEvent);
+  const boundaryAbort = abortTookEngineDown(exchange.userEvent) ? abortEvidenceOf(exchange.userEvent) : null;
+  const isEngineDownBoundary = boundaryAbort !== null;
 
-  // Stale exchange: the thread's projection says quiescent, but this exchange
-  // has steps and no terminal event. The loop or the subprocess died without
-  // emitting a terminator, through a crash, a lid close, or a teardown that
-  // skipped it. Nothing is running, so the panel must read "Aborted" rather
-  // than spin forever. `hasSteps` covers tool calls AND streamed text.
+  // Stale exchange: the thread reads quiescent, but this exchange has steps
+  // and no terminal event. Nothing is running, so the panel must not spin
+  // "Working" forever. `hasSteps` covers tool calls AND streamed text.
+  //
+  // Stale is NOT aborted. The engine records every real abort as an event,
+  // and the client's status copy lags the events: a follow-up or a resumed
+  // answer can land its first steps while the copy still reads idle. So a
+  // stale exchange settles as 'done', and only the engine-down boundary,
+  // which IS an abort event, reads 'aborted'.
   //
   // EXCEPT under `threadAwaitingAnswer`: a thread parked on or resuming from a
-  // question or permission card is never crashed. Its continuation and
-  // terminal are in flight, so render it as working. A genuine crash settles
-  // to `idle` or `failed`, so this cannot mask a real abort.
+  // question or permission card has its continuation and terminal in flight,
+  // so render it as working.
   //
   // The absorbed-UPI placeholder is excluded because its lone UPI step means
-  // the real response lives in the PRIOR exchange: it is 'done', not crashed.
+  // the real response lives in the PRIOR exchange.
   //
   // An engine-down boundary supplies the quiescence itself, so it need not
   // wait for the projection to say so. It is deliberately NOT exempt from
@@ -2228,30 +2275,28 @@ export function exchangeStatus(exchange: Exchange, streamingBuffer: string, isLa
     && isLast && !isComplete && hasSteps
     && !isAbsorbedUpiPlaceholder;
 
-  if (isFailed) return 'error';
+  if (isFailed) return verdict('error');
   // An abort or shutdown AFTER the exchange completed does not undo the user's
   // work. The auto-harden crash following a clean idle is the shape.
-  if ((isAborted || isShutdown) && completedBeforeAbort) return 'done';
+  if ((abortedBy || shutdownBy) && completedBeforeAbort) return verdict('done');
   // Both are system-initiated interruptions, not a user cancel.
-  if (isAborted) return 'aborted';
-  if (isShutdown) return 'aborted';
-  if (isCanceled) return 'canceled';
+  if (abortedBy) return aborted(abortedBy);
+  if (shutdownBy) return aborted(shutdownBy);
+  if (isCanceled) return verdict('canceled');
   // Session ended without a proper response: no ResponseGenerated for chat, no
   // CodingAgentIdled for an agent killed mid-work.
-  if (isSessionEnded && !isComplete && !isCCWaiting) return 'aborted';
+  if (abnormalEndBy && !isComplete && !isCCWaiting) return aborted(abnormalEndBy);
   // A user stop is a boundary that states its own outcome, and nothing
   // continues out of it. Terminal by construction, so it never spins
-  // "Requesting" while an unrelated turn keeps the thread `running`, and never
-  // falls through to the stale detector's "Aborted".
+  // "Requesting" while an unrelated turn keeps the thread `running`.
   //
   // Placed AFTER the terminal-verdict arms above, defensively. Grouping
   // deliberately does not make this boundary `current`
   // (`isExchangeStartEvent`), so it should hold no steps. If a future routing
   // path lands a real terminal in it, that terminal reports itself.
-  if (isTurnlessBoundary(exchange.userEvent)) return 'done';
-  // A stretch of a call, holding no turn at all. The stale detector below has
-  // nothing to have caught: it reads a transcript with no terminator as a
-  // crash, and every finished call rendered "Aborted" until this arm.
+  if (isTurnlessBoundary(exchange.userEvent)) return verdict('done');
+  // A stretch of a call, holding no turn at all, so it never gets a
+  // terminator and the stale detector below has nothing to judge.
   //
   // The LIVE one settles on either of two facts. The caller has heard back, so
   // nothing is pending. Or the call rang off, which ends the wait however it
@@ -2281,42 +2326,40 @@ export function exchangeStatus(exchange: Exchange, streamingBuffer: string, isLa
   // queues behind another one like any message, and the queued arm below is
   // live exactly when the thread is busy.
   if ((threadIdle || exchangeHoldsNoTurn(exchange)) && isCallOnly(exchange)) {
-    if (!isLast) return 'done';
-    if (callAnswered(exchange)) return 'done';
-    if (!callHasEnded(exchange)) return 'streaming';
+    if (!isLast) return verdict('done');
+    if (callAnswered(exchange)) return verdict('done');
+    if (!callHasEnded(exchange)) return verdict('streaming');
     // Ringing off settles the CALL, and for a talker-only utterance that is
     // the same thing: no doer was asked, so nothing else was coming.
     //
     // A DELEGATED one is not settled by it. Its answer is the doer's and
     // outlives the call, so a hangup says nothing about whether the turn ran.
-    // Falling through hands it to the ordinary machinery, which reports a turn
-    // that produced nothing as the crash it is.
+    // Falling through hands it to the ordinary machinery, which keeps it live
+    // while the thread runs the doer's turn.
     //
     // `tookTheTurn` is the fact, and the type beside it covers the rows
     // written before ADR 0201, where a delegation was a `MessageReceived`.
-    if (!exchange.tookTheTurn && exchange.userEvent.type !== 'MessageReceived') return 'done';
+    if (!exchange.tookTheTurn && exchange.userEvent.type !== 'MessageReceived') return verdict('done');
   }
   // A prior exchange is still active and this one has no events yet, so it is
   // queued. Checked BEFORE the `!isLast` fallthrough, which would otherwise
   // show "No response generated". A coding-agent thread's queue comes from
   // `queuedFollowupRun` instead. Only the LAST queued exchange shows "Queued":
   // earlier ones were superseded and the empty-non-last rule below takes them.
-  if (hasPriorActive && !hasSteps && !isCC && isLast) return 'queued';
+  if (hasPriorActive && !hasSteps && !isCC && isLast) return verdict('queued');
   // Agent idle. WaitingBanner handles the "can interact" state separately.
-  if (isCCWaiting) return 'done';
+  if (isCCWaiting) return verdict('done');
   // Parked on an event wait: the turn ran to its end and registered a
   // subscription, which is completed work rather than work in flight. Nothing
   // is running, and the surface owning the live half is the subscription
   // indicator, with its countdown and Stop.
   //
-  // Placed before the stale detector, so a settled thread whose wait the user
-  // stopped does not read "Aborted". Placed before the `!isLast` 'interrupted'
-  // arm, so a delivery landing in a later exchange does not retroactively mark
-  // the park as abandoned.
-  if (isParkedOnEventWait) return 'done';
+  // Placed before the `!isLast` 'interrupted' arm, so a delivery landing in a
+  // later exchange does not retroactively mark the park as abandoned.
+  if (isParkedOnEventWait) return verdict('done');
   // A normal session-end reason is terminal even when CodingAgentIdled was
   // missing.
-  if (isCC && isSessionEndedNormally) return 'done';
+  if (isCC && isSessionEndedNormally) return verdict('done');
   // Paused on a question or permission prompt. 'awaiting-answer' stops the
   // surrounding spinner AND makes the header read "Needs your answer" rather
   // than a misleading "Done ✓". The card inside the exchange carries the
@@ -2329,23 +2372,23 @@ export function exchangeStatus(exchange: Exchange, streamingBuffer: string, isLa
   // to the overtaken flag means one list decides both, mirroring the engine's
   // single park-ending set. An overtaken divider falls through to the stale
   // detector, or to 'coding-agent-working' while the agent is still going.
-  if (isWaitingForAnswer && !exchange.questionOvertaken) return 'awaiting-answer';
+  if (isWaitingForAnswer && !exchange.questionOvertaken) return verdict('awaiting-answer');
   // A callback that landed under that open question: a child's report or an
   // event-wait delivery. It waits for the answer (ADR 0255), so nothing is
   // running for it yet, and neither "Requesting" nor "Done" is true.
   // `threadIdle` is false once the user has answered, so the resume reads
   // "Requesting" before the engine's `running` reaches the client.
-  if (threadAwaitingAnswer && threadIdle && isLast && !hasSteps) return 'held';
+  if (threadAwaitingAnswer && threadIdle && isLast && !hasSteps) return verdict('held');
   // Non-last with steps but no terminator: the user moved past this exchange.
   // The chat fast path injects the follow-up via UPI under the parent's
   // request_event_id and redirects later events to the new exchange. A coding
   // agent shares one session across exchanges. 'interrupted' keeps "Working"
   // on the last panel only.
-  if (!isLast && !isComplete && hasSteps && !isAbsorbedUpiPlaceholder) return 'interrupted';
-  if (isComplete) return 'done';
+  if (!isLast && !isComplete && hasSteps && !isAbsorbedUpiPlaceholder) return verdict('interrupted');
+  if (isComplete) return verdict('done');
   // A non-last coding-agent exchange without a terminator was skipped by the
   // msg_tx queue, so it is safely 'done'.
-  if (!isLast && (isCC || threadIdle)) return 'done';
+  if (!isLast && (isCC || threadIdle)) return verdict('done');
   // Empty chat exchange once the engine has gone idle. This extends the
   // `!isLast` empty-to-done rule to the isLast case, so an MR whose response
   // landed in a sibling exchange does not spin "Requesting" forever. Without
@@ -2356,7 +2399,7 @@ export function exchangeStatus(exchange: Exchange, streamingBuffer: string, isLa
   // exchange is non-last, the loop has moved past it. Mid-flight injection
   // routes new events back to the parent's request_event_id, so a non-last
   // exchange the loop is still processing has steps.
-  if (!hasSteps && !isCC && (!isLast || threadIdle)) return 'done';
+  if (!hasSteps && !isCC && (!isLast || threadIdle)) return verdict('done');
   // A child-completion row is itself terminal: it renders the spawned
   // sub-thread's result. The stepless card is terminal when the parent is
   // QUIESCENT and never resumed to react, or when a newer boundary superseded
@@ -2368,7 +2411,7 @@ export function exchangeStatus(exchange: Exchange, streamingBuffer: string, isLa
   // the redirect-advance for ChildThreadCompleted in exchange-grouping.ts).
   // Fall through to the normal machinery, so the card shows a live spinner in
   // the gap before the first post-completion step rather than "Done ✓".
-  if (exchange.userEvent.type === 'ChildThreadCompleted' && !hasSteps && (threadIdle || !isLast)) return 'done';
+  if (exchange.userEvent.type === 'ChildThreadCompleted' && !hasSteps && (threadIdle || !isLast)) return verdict('done');
 
   // A coding-agent exchange is 'coding-agent-working' once it has steps.
   //
@@ -2378,27 +2421,27 @@ export function exchangeStatus(exchange: Exchange, streamingBuffer: string, isLa
   // See
   // `docs/plans/2026-08-01-preserve-question-parked-session-through-teardown.md`.
   // A live turn is `running`, so `isStale` is false and this branch wins.
-  if (isCC && !isStale) return hasSteps ? 'coding-agent-working' : 'pending';
+  if (isCC && !isStale) return verdict(hasSteps ? 'coding-agent-working' : 'pending');
   // A live streaming buffer beats staleness for either agent: tokens are
   // arriving right now, whatever the projection last said.
-  if (streamingBuffer) return 'streaming';
+  if (streamingBuffer) return verdict('streaming');
 
   // The absorbed-UPI placeholder, for the isLast case that the `!isLast`
   // branch above bypasses. It must not read as a crash, which is why `isStale`
   // excludes it outright rather than relying on this line's position.
-  if (isAbsorbedUpiPlaceholder) return 'done';
+  if (isAbsorbedUpiPlaceholder) return verdict('done');
 
-  if (isStale) return 'aborted';
+  if (isStale) return boundaryAbort ? aborted(boundaryAbort) : verdict('done');
 
   // Persisted response text without a completion event means the response is
   // still in progress: a persisted event arrival just cleared the streaming
   // buffer.
   const responseText = exchangeResponseText(exchange);
-  if (responseText) return 'streaming';
+  if (responseText) return verdict('streaming');
 
   const steps = exchangeSteps(exchange, isLast, threadIdle);
   const events = exchangeResponseEvents(exchange, isLast, threadIdle);
-  if (steps.length > 0 || events.length > 0) return 'streaming';
+  if (steps.length > 0 || events.length > 0) return verdict('streaming');
 
-  return 'pending';
+  return verdict('pending');
 }

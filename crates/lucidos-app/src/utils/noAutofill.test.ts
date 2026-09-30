@@ -219,7 +219,6 @@ function componentSources(): Array<[string, string]> {
 
 const PROSE_FIELDS = [
   '../components/chat/PromptInput.tsx',        // the chat prompt
-  '../components/chat/ThreadTitleEditor.tsx',  // thread rename (both layouts)
   '../components/shared/AutoTextarea.tsx',     // app description, new-app description, email body
   '../components/shared/PromptDialog.tsx',     // free-text answer to the LLM
   '../components/email/EmailConfirmModal.tsx', // email subject

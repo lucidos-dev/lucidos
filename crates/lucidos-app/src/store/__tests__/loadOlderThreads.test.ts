@@ -16,7 +16,7 @@ import { fetchOlderThreads, fetchArchivedCount } from '../../api/threads';
 import { loadAllThreads, loadOlderThreads, reloadAfterFilterChange, refreshArchivedCount, filterChangedSinceLoad, _clearFamilyExtensionIdsForTest, _clearLoadedFilterSelectionForTest, _clearOlderThreadsCursorForTest } from '../actions/thread-loading';
 import { threadMap, threadHasMore, threadLoadingMore, threadChannelFilter, selectedTriggerIds, selectedRepoIds, selectedAppIds, archiveThreadCount, ALL_CHANNELS } from '../store';
 import { closeThreadFilterPanel, openThreadFilterPanel } from '../threadFilterPanel';
-import { makeOptimisticThreadState } from '../thread-events';
+import { applySummaryVersion, makeOptimisticThreadState } from '../thread-events';
 import type { ThreadState } from '../thread-events';
 import type { ThreadSummary } from '../../api/threads';
 
@@ -39,6 +39,7 @@ function summary(over: Partial<ThreadSummary> & { thread_id: string; created_at:
     attention_descendant_count: 0,
     live_event_wait_count: 0,
     status: 'idle',
+    summary_version: 0,
     coding_agent_has_diff: false,
     coding_agent_proposed: false,
     coding_agent_requires_restart: false,
@@ -258,7 +259,7 @@ describe('loadOlderThreads', () => {
     });
     oldFailed.meta.section = 'archived';
     oldFailed.meta.createdAt = '2026-02-24T00:00:00Z';
-    oldFailed.meta.status = 'failed';
+    applySummaryVersion(oldFailed.meta, oldFailed.meta.summaryVersion, 'failed');
     const recent = loaded(makeOptimisticThreadState({
       id: 'recent', title: 'Recent archived', channel: 'chat', initiator: 'user',
       eventsLoaded: false,

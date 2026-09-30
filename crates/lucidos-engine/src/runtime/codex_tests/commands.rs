@@ -472,12 +472,7 @@ fn codex_command_definitions_shape() {
     let defs = codex_command_definitions();
     let arr = defs.as_array().expect("array");
     let subtypes: Vec<&str> = arr.iter().map(|d| d["subtype"].as_str().unwrap()).collect();
-    assert!(subtypes.contains(&"set_model"));
-    assert!(subtypes.contains(&"set_reasoning_effort"));
-    assert!(
-        !subtypes.contains(&"set_permission_mode"),
-        "codex has no permission protocol — the sandbox is the guard"
-    );
+    assert_eq!(subtypes, ["set_model", "set_reasoning_effort"]);
     let model_def = &arr[0];
     let options = model_def["params"][0]["options"]
         .as_array()

@@ -1,6 +1,6 @@
 import type { App } from '../../store/types';
 import { openImagePopupFromGroup, showToast } from '../../store/store';
-import { openFilePreview, openLocalFile } from '../../store/actions/artifacts';
+import { openFilePreview, openLocalFileOnConfirm } from '../../store/actions/artifacts';
 import { openApp, openAppById } from '../../store/actions/apps';
 import { navigateToTrigger } from '../../store/actions/triggers';
 import { handleNavigationRequest } from '../../store/actions/navigation-request';
@@ -148,11 +148,12 @@ export function handleMarkdownLinkClick(e: MouseEvent, apps: App[], source?: str
     // via the in-app file preview or the /data/* static mount, which are for
     // workspace-relative paths only. Runs AFTER the app and nav extractors so
     // their absolute routes keep working. An http(s) URL returns null here
-    // and keeps its browser or panel behavior.
+    // and keeps its browser or panel behavior. The message text came from an
+    // agent or a fetched page, so the user confirms before anything launches.
     const localFile = extractLocalFileTarget(rawHref);
     if (localFile) {
       e.preventDefault();
-      openLocalFile(localFile);
+      void openLocalFileOnConfirm(localFile, source);
       return;
     }
     // TERMINAL GUARD: nothing above claimed this href, so it goes nowhere

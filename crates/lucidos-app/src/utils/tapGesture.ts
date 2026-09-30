@@ -211,8 +211,8 @@ export interface TouchActivateOptions {
  *  A DESTRUCTIVE face is the exception and asks the gate, so a scroll cannot
  *  fire it. See `opts.destructive`.
  *
- *  Local copies of this repair live in `promptFocus.ts` (`composeHandlers`,
- *  which adds focus-first) and `FileSearchModal.tsx`. */
+ *  `composeHandlers` in `promptFocus.ts` wraps this with focus-first. A local
+ *  copy of the repair lives in `FileSearchModal.tsx`. */
 export function touchActivated(action: () => void, opts: TouchActivateOptions = {}) {
   const enabled = opts.enabled ?? (() => true);
   const destructive = opts.destructive ?? (() => false);

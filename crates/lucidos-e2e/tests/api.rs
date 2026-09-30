@@ -95,6 +95,9 @@ mod event_wait_test;
 #[path = "api_support/agent_question_test.rs"]
 mod agent_question_test;
 
+#[path = "api_support/prose_question_nudge_test.rs"]
+mod prose_question_nudge_test;
+
 #[path = "api_support/lucidos_cli_test.rs"]
 mod lucidos_cli_test;
 
@@ -148,6 +151,9 @@ mod snapshot_compression_test;
 
 #[path = "api_support/events_paging_test.rs"]
 mod events_paging_test;
+
+#[path = "api_support/summary_version_test.rs"]
+mod summary_version_test;
 
 #[path = "api_support/trigger_groups_test.rs"]
 mod trigger_groups_test;

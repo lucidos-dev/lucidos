@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { TS, makeThread } from './thread-wiring-helpers';
-import { getCodingAgentWaitingInfo, handleEvent, type StoredEvent, type ThreadState } from '../thread-events';
+import { applySummaryVersion, getCodingAgentWaitingInfo, handleEvent, type StoredEvent, type ThreadState } from '../thread-events';
 import { upsertThread } from '../actions/thread-loading';
 import { getDraft, setDraft } from '../composeDrafts';
 import { focusedThreadId } from '../store';
@@ -39,7 +39,7 @@ describe('SSE skeleton must not prevent DB backfill', () => {
     // Frontend connects to SSE late, misses MessageReceived, gets later CC events.
     // SSE creates skeleton with eventsLoaded=true, so loadThreadEvents skips DB load.
     const skeleton: ThreadState = {
-      meta: { id: 'recovery-1', title: 'Recovering...', channel: 'claude_code', initiator: 'user', saved: false, createdAt: '', updatedAt: '', status: 'idle', codingAgentProposed: false, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, codingAgentHasDiff: false, lastRevivedAt: '', messageCount: 0, section: 'archived', activeChildrenCount: 0, totalChildrenCount: 0, blockingDescendantCount: 0, attentionDescendantCount: 0, liveEventWaitCount: 0, state: 'active', latestTodoList: null, liveEventWaits: [] },
+      meta: { id: 'recovery-1', title: 'Recovering...', channel: 'claude_code', initiator: 'user', saved: false, createdAt: '', updatedAt: '', summaryVersion: 0, status: 'idle', codingAgentProposed: false, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, codingAgentHasDiff: false, lastRevivedAt: '', messageCount: 0, section: 'archived', activeChildrenCount: 0, totalChildrenCount: 0, blockingDescendantCount: 0, attentionDescendantCount: 0, liveEventWaitCount: 0, state: 'active', latestTodoList: null, liveEventWaits: [] },
       events: new Map(),
       streamingBuffer: '',
       eventsLoaded: true, // Old CodingAgentThreadSpawned behavior — now fixed to false
@@ -65,7 +65,7 @@ describe('SSE skeleton must not prevent DB backfill', () => {
     // After the fix: skeleton.eventsLoaded=false, so loadThreadEvents runs,
     // loads MessageReceived from DB, and the thread shows its messages.
     const skeleton: ThreadState = {
-      meta: { id: 'recovery-1', title: 'Recovering...', channel: 'claude_code', initiator: 'user', saved: false, createdAt: '', updatedAt: '', status: 'idle', codingAgentProposed: false, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, codingAgentHasDiff: false, lastRevivedAt: '', messageCount: 0, section: 'archived', activeChildrenCount: 0, totalChildrenCount: 0, blockingDescendantCount: 0, attentionDescendantCount: 0, liveEventWaitCount: 0, state: 'active', latestTodoList: null, liveEventWaits: [] },
+      meta: { id: 'recovery-1', title: 'Recovering...', channel: 'claude_code', initiator: 'user', saved: false, createdAt: '', updatedAt: '', summaryVersion: 0, status: 'idle', codingAgentProposed: false, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, codingAgentHasDiff: false, lastRevivedAt: '', messageCount: 0, section: 'archived', activeChildrenCount: 0, totalChildrenCount: 0, blockingDescendantCount: 0, attentionDescendantCount: 0, liveEventWaitCount: 0, state: 'active', latestTodoList: null, liveEventWaits: [] },
       events: new Map(),
       streamingBuffer: '',
       eventsLoaded: false, // Fix: allows DB backfill
@@ -352,21 +352,21 @@ describe('Created timestamp storage', () => {
 describe('getCodingAgentWaitingInfo', () => {
   it('returns null when status is not waiting', () => {
     const thread = makeThread();
-    thread.meta.status = 'idle';
+    applySummaryVersion(thread.meta, thread.meta.summaryVersion, 'idle');
     thread.meta.channel = 'claude_code';
     expect(getCodingAgentWaitingInfo(thread.meta)).toBeNull();
   });
 
   it('returns null when channel is not claude_code', () => {
     const thread = makeThread();
-    thread.meta.status = 'waiting';
+    applySummaryVersion(thread.meta, thread.meta.summaryVersion, 'waiting');
     thread.meta.channel = 'chat';
     expect(getCodingAgentWaitingInfo(thread.meta)).toBeNull();
   });
 
   it('returns info when status=waiting and channel=claude_code', () => {
     const thread = makeThread();
-    thread.meta.status = 'waiting';
+    applySummaryVersion(thread.meta, thread.meta.summaryVersion, 'waiting');
     thread.meta.channel = 'claude_code';
     thread.meta.codingAgentProposed = true;
     thread.meta.codingAgentRequiresRestart = false;
@@ -505,6 +505,7 @@ describe('Focused thread preserved across reload', () => {
       total_children_count: 0,
       blocking_descendant_count: 0, attention_descendant_count: 0, live_event_wait_count: 0,
       status: 'idle',
+      summary_version: 0,
       coding_agent_proposed: false,
       coding_agent_requires_restart: false,
       coding_agent_is_external_repo: false,
@@ -552,6 +553,7 @@ describe('Focused thread preserved across reload', () => {
       total_children_count: 0,
       blocking_descendant_count: 0, attention_descendant_count: 0, live_event_wait_count: 0,
       status: 'waiting',
+      summary_version: 0,
       coding_agent_proposed: true,
       coding_agent_requires_restart: false,
       coding_agent_is_external_repo: false,

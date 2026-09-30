@@ -85,6 +85,10 @@ describe('formatBinding', () => {
     expect(formatBinding(shortcutDef('focusNewestToast').defaultBinding, true)).toBe('⌃⇧N');
     expect(formatBinding(shortcutDef('openNotifications').defaultBinding, true)).toBe('⌃⇧I');
   });
+  it('asks a side question on Alt+Enter, beside the plain Enter that sends', () => {
+    expect(formatBinding(shortcutDef('askSideQuestion').defaultBinding, true)).toBe('⌥↵');
+    expect(formatBinding(shortcutDef('askSideQuestion').defaultBinding, false)).toBe('Alt+↵');
+  });
   it('renders Escape as Esc, and a bare F-key as itself', () => {
     expect(formatBinding(shortcutDef('focusComposer').defaultBinding, true)).toBe('⇧Esc');
     expect(formatBinding(shortcutDef('focusComposer').defaultBinding, false)).toBe('Shift+Esc');

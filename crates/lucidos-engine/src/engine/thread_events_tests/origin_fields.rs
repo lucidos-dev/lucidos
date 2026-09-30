@@ -67,6 +67,7 @@ fn change_proposed_event_can_carry_engine_origin() {
         repo_root: String::new(),
         hardened: false,
         incomplete: false,
+        set_aside: false,
         path: String::new(),
         diff: String::new(),
     };
@@ -107,6 +108,7 @@ fn change_proposed_event_can_carry_orphan_recovery_origin() {
         repo_root: String::new(),
         hardened: false,
         incomplete: false,
+        set_aside: false,
         path: String::new(),
         diff: String::new(),
     };

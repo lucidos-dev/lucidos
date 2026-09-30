@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { getExchanges, getExchangesWithPending, getLabel, insertEvents, makeThread, resetSeqCounter } from './thread-flows-helpers';
-import { exchangeStatus, exchangeTimestamp, exchangeUserMessage, getCodingAgentWaitingInfo, groupIntoExchanges } from '../thread-events';
+import { applySummaryVersion, exchangeStatus, exchangeTimestamp, exchangeUserMessage, getCodingAgentWaitingInfo, groupIntoExchanges } from '../thread-events';
 import { displaySection } from '../../generated/thread-lifecycle';
 import { effectiveThreadStatus } from '../store';
 
@@ -11,7 +11,7 @@ describe('Bug: dismissed thread keeps red status dot until SSE round-trip lands'
     const { archivingThreadIds } = await import('../store');
     const { map, id } = makeThread('failed-thread');
     const thread = map.get(id)!;
-    thread.meta.status = 'failed';
+    applySummaryVersion(thread.meta, thread.meta.summaryVersion, 'failed');
 
     // Without dismiss in flight: red dot status surfaces.
     expect(effectiveThreadStatus(thread)).toBe('failed');
@@ -35,7 +35,7 @@ describe('Bug: applying a change keeps thread in Review until CC actually runs',
     const { map, id } = makeThread('cc-with-changes');
     const thread = map.get(id)!;
     thread.meta.channel = 'claude_code';
-    thread.meta.status = 'waiting';
+    applySummaryVersion(thread.meta, thread.meta.summaryVersion, 'waiting');
     thread.meta.section = 'inbox';
     thread.meta.codingAgentProposed = true;
 

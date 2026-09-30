@@ -54,6 +54,7 @@ async fn cc_idle_no_changes_from_inbox_stays_inbox() {
             repo_root: String::new(),
             hardened: false,
             incomplete: false,
+            set_aside: false,
             path: String::new(),
             diff: String::new(),
         },

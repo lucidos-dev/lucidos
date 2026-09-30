@@ -585,14 +585,15 @@ mod startup_sweep_coding_agent_has_diff {
     }
 }
 
-// -- Phase C: orphaned-running coding-agent settle sweep -----------------------
+// -- Phase C: the final boot settle of `running` threads ----------------------
 //
-// `settle_orphaned_running_coding_agent_threads` is the boot-recovery floor that
-// would have caught thread-72120ca6: a coding-agent thread left `running` after
-// a restart (the worktree-recovery skip paths drop it without settling) is a
-// permanent zombie, since the in-memory watchdogs only scan live sessions.
+// `settle_orphaned_running_threads` is the last boot step that touches thread
+// status. A turn the restart interrupted gets an abort event, and anything else
+// goes to idle. So no thread leaves boot idle over a dead turn with no end. It is also
+// the floor that would have caught thread-72120ca6: a coding-agent thread left
+// `running` by a worktree-recovery skip path.
 mod settle_orphaned_running_sweep {
-    use crate::engine::agent_recovery::recovery::settle_orphaned_running_coding_agent_threads;
+    use crate::engine::agent_recovery::recovery::settle_orphaned_running_threads;
     use crate::engine::event_bus::{BusEvent, EventBus};
     use crate::engine::thread_events::{ActorMode, EventChannel, EventMeta, ThreadEvent};
     use crate::test_support::{setup_test_db, start_cc_session, teardown_test_db};
@@ -618,8 +619,40 @@ mod settle_orphaned_running_sweep {
         .unwrap()
     }
 
-    /// Emit a chat-channel MessageReceived → is_coding_agent=false, status=running.
-    async fn seed_running_chat_thread(bus: &EventBus, thread_id: Uuid) {
+    /// The cause of the thread's one abort, if it has one.
+    async fn abort_cause(pool: &sqlx::PgPool, thread_id: Uuid) -> Option<String> {
+        sqlx::query_scalar(
+            "SELECT payload->>'cause' FROM events \
+             WHERE aggregate_id = $1 AND event_type = 'ResponseAborted'",
+        )
+        .bind(thread_id.to_string())
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+    }
+
+    /// A start written straight to the log, for the two kinds boot runs later.
+    async fn bare_start(pool: &sqlx::PgPool, thread_id: Uuid, event_type: &str) {
+        sqlx::query(
+            "INSERT INTO events (id, event_type, payload, thread_id, aggregate, aggregate_id) \
+             VALUES ($1, $2, '{}'::jsonb, $3, 'thread', $3::text)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(event_type)
+        .bind(thread_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    fn meta(channel: EventChannel) -> EventMeta {
+        EventMeta {
+            channel: Some(channel),
+            ..EventMeta::NONE
+        }
+    }
+
+    async fn message(bus: &EventBus, thread_id: Uuid, channel: EventChannel) {
         bus.emit(BusEvent::Thread {
             thread_id,
             event: ThreadEvent::MessageReceived {
@@ -636,61 +669,199 @@ mod settle_orphaned_running_sweep {
                 reasoning_effort: None,
                 origin: None,
             },
-            meta: EventMeta {
-                channel: Some(EventChannel::Chat),
-                ..EventMeta::NONE
-            },
+            meta: meta(channel),
         })
         .await
         .unwrap();
     }
 
-    /// The fix: a running coding-agent thread that recovery did NOT pick up
-    /// (empty `recovering` set) is settled — exactly the thread-72120ca6 case.
+    async fn tool_call(bus: &EventBus, thread_id: Uuid) {
+        bus.emit(BusEvent::Thread {
+            thread_id,
+            event: ThreadEvent::CodingAgentToolCalled {
+                name: "Bash".into(),
+                args: serde_json::json!({"command": "ls"}),
+                description: String::new(),
+                coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+                tool_use_id: format!("toolu-{thread_id}"),
+            },
+            meta: meta(EventChannel::ClaudeCode),
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn idled(bus: &EventBus, thread_id: Uuid) {
+        bus.emit(BusEvent::Thread {
+            thread_id,
+            event: ThreadEvent::CodingAgentIdled {
+                has_changes: false,
+                is_external_repo: false,
+                requires_restart: false,
+                cc_session_id: None,
+                coding_agent: crate::runtime::agent_runtime::CodingAgent::ClaudeCode,
+                reason: None,
+                worktree_path: None,
+                worktree_head_sha: None,
+                bg_bash_pending: false,
+            },
+            meta: meta(EventChannel::ClaudeCode),
+        })
+        .await
+        .unwrap();
+    }
+
+    /// The event-less parent wake: `running` over a turn that already ended.
+    async fn force_running(pool: &sqlx::PgPool, thread_id: Uuid) {
+        sqlx::query("UPDATE thread_summaries SET status = 'running' WHERE thread_id = $1")
+            .bind(thread_id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    /// A coding-agent turn that died mid-work, as thread-72120ca6 did.
+    async fn died_cc_turn(bus: &EventBus, thread_id: Uuid) {
+        start_cc_session(bus, thread_id, "claude-code/orphan", None).await;
+        message(bus, thread_id, EventChannel::ClaudeCode).await;
+        tool_call(bus, thread_id).await;
+    }
+
     #[tokio::test]
-    async fn settles_orphaned_running_cc_thread() {
+    async fn settles_a_died_turn_with_one_abort() {
         let (pool, db_name) = setup_test_db().await;
         let (bus, _rx) = EventBus::new(pool.clone());
         let thread_id = Uuid::new_v4();
-        start_cc_session(&bus, thread_id, "claude-code/orphan", None).await;
+        died_cc_turn(&bus, thread_id).await;
         assert_eq!(
             status_of(&pool, thread_id).await.as_deref(),
             Some("running")
         );
 
-        settle_orphaned_running_coding_agent_threads(&pool, &bus, &HashSet::new()).await;
+        settle_orphaned_running_threads(&pool, &bus, &HashSet::new()).await;
 
-        assert_ne!(
-            status_of(&pool, thread_id).await.as_deref(),
-            Some("running"),
-            "orphaned running CC thread must be settled out of `running`"
-        );
+        assert_eq!(status_of(&pool, thread_id).await.as_deref(), Some("failed"));
+        assert_eq!(aborted_count(&pool, thread_id).await, 1);
         assert_eq!(
-            aborted_count(&pool, thread_id).await,
-            1,
-            "settle must emit exactly one ResponseAborted"
+            abort_cause(&pool, thread_id).await.as_deref(),
+            Some("recovery_after_restart"),
+            "a turn the restart killed reads as interrupted, not as a stuck row"
         );
 
         pool.close().await;
         teardown_test_db(&db_name).await;
     }
 
-    /// A thread the recovery loop already owns (in `recovering`) is left for
-    /// that path to resume/settle — the sweep must not double-handle it.
+    /// The chat sweep settles most dead chat turns; this is the floor under it.
+    #[tokio::test]
+    async fn settles_a_died_chat_turn_with_one_abort() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread_id = Uuid::new_v4();
+        message(&bus, thread_id, EventChannel::Chat).await;
+        bus.emit(BusEvent::Thread {
+            thread_id,
+            event: ThreadEvent::TextStreamed {
+                text: "partial reply".into(),
+            },
+            meta: EventMeta::NONE,
+        })
+        .await
+        .unwrap();
+
+        settle_orphaned_running_threads(&pool, &bus, &HashSet::new()).await;
+
+        assert_ne!(
+            status_of(&pool, thread_id).await.as_deref(),
+            Some("running")
+        );
+        assert_eq!(aborted_count(&pool, thread_id).await, 1);
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// `running` over a turn that ended is a status no event backs. Idling it
+    /// records nothing: an abort here would be one that never happened.
+    #[tokio::test]
+    async fn idles_an_ended_turn_without_an_abort() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread_id = Uuid::new_v4();
+        died_cc_turn(&bus, thread_id).await;
+        idled(&bus, thread_id).await;
+        force_running(&pool, thread_id).await;
+
+        settle_orphaned_running_threads(&pool, &bus, &HashSet::new()).await;
+
+        assert_eq!(status_of(&pool, thread_id).await.as_deref(), Some("idle"));
+        assert_eq!(aborted_count(&pool, thread_id).await, 0);
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// A message the crash took before its first token. Nothing at boot runs it
+    /// again, so without the abort it sat unanswered with nothing saying why.
+    #[tokio::test]
+    async fn settles_a_message_the_crash_dropped_with_one_abort() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread_id = Uuid::new_v4();
+        message(&bus, thread_id, EventChannel::Chat).await;
+
+        settle_orphaned_running_threads(&pool, &bus, &HashSet::new()).await;
+
+        assert_eq!(status_of(&pool, thread_id).await.as_deref(), Some("failed"));
+        assert_eq!(aborted_count(&pool, thread_id).await, 1);
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// Two starts run later in boot on their own: the parent-resume refire
+    /// takes a bare `ChildThreadCompleted`, and the spawn dispatcher's
+    /// backfill takes a bare `ContinuationRequested`. An abort would record an
+    /// interruption that never happened, and would stop the dispatcher.
+    #[tokio::test]
+    async fn idles_a_start_boot_will_run_without_an_abort() {
+        for start in ["ChildThreadCompleted", "ContinuationRequested"] {
+            let (pool, db_name) = setup_test_db().await;
+            let (bus, _rx) = EventBus::new(pool.clone());
+            let thread_id = Uuid::new_v4();
+            died_cc_turn(&bus, thread_id).await;
+            idled(&bus, thread_id).await;
+            bare_start(&pool, thread_id, start).await;
+            force_running(&pool, thread_id).await;
+
+            settle_orphaned_running_threads(&pool, &bus, &HashSet::new()).await;
+
+            assert_eq!(
+                status_of(&pool, thread_id).await.as_deref(),
+                Some("idle"),
+                "{start}"
+            );
+            assert_eq!(aborted_count(&pool, thread_id).await, 0, "{start}");
+
+            pool.close().await;
+            teardown_test_db(&db_name).await;
+        }
+    }
+
+    /// A thread the recovery loop already owns is left for that path to resume.
     #[tokio::test]
     async fn skips_thread_in_recovering_set() {
         let (pool, db_name) = setup_test_db().await;
         let (bus, _rx) = EventBus::new(pool.clone());
         let thread_id = Uuid::new_v4();
-        start_cc_session(&bus, thread_id, "claude-code/recovering", None).await;
+        died_cc_turn(&bus, thread_id).await;
 
         let recovering: HashSet<Uuid> = [thread_id].into_iter().collect();
-        settle_orphaned_running_coding_agent_threads(&pool, &bus, &recovering).await;
+        settle_orphaned_running_threads(&pool, &bus, &recovering).await;
 
         assert_eq!(
             status_of(&pool, thread_id).await.as_deref(),
-            Some("running"),
-            "a thread owned by recovery must not be settled by the sweep"
+            Some("running")
         );
         assert_eq!(aborted_count(&pool, thread_id).await, 0);
 
@@ -698,26 +869,27 @@ mod settle_orphaned_running_sweep {
         teardown_test_db(&db_name).await;
     }
 
-    /// Chat threads are out of scope — they're settled by
-    /// `recover_orphaned_threads`, and a chat thread blocked on a child sits
-    /// `running` pending parent-resume. The `is_coding_agent` filter excludes them.
+    /// A parked question is `waiting_for_user_answer`, never `running`, so the
+    /// settle cannot reach it.
     #[tokio::test]
-    async fn skips_running_chat_thread() {
+    async fn leaves_a_parked_thread_alone() {
         let (pool, db_name) = setup_test_db().await;
         let (bus, _rx) = EventBus::new(pool.clone());
         let thread_id = Uuid::new_v4();
-        seed_running_chat_thread(&bus, thread_id).await;
+        died_cc_turn(&bus, thread_id).await;
+        sqlx::query(
+            "UPDATE thread_summaries SET status = 'waiting_for_user_answer' WHERE thread_id = $1",
+        )
+        .bind(thread_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        settle_orphaned_running_threads(&pool, &bus, &HashSet::new()).await;
+
         assert_eq!(
             status_of(&pool, thread_id).await.as_deref(),
-            Some("running")
-        );
-
-        settle_orphaned_running_coding_agent_threads(&pool, &bus, &HashSet::new()).await;
-
-        assert_eq!(
-            status_of(&pool, thread_id).await.as_deref(),
-            Some("running"),
-            "the sweep must not touch chat threads (is_coding_agent=false)"
+            Some("waiting_for_user_answer")
         );
         assert_eq!(aborted_count(&pool, thread_id).await, 0);
 

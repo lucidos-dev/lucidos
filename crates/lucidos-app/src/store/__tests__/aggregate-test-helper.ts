@@ -34,6 +34,9 @@ function aggregateFromMeta(meta: ThreadMeta): ThreadAggregate {
     messageCount: meta.messageCount,
     section: meta.section,
     status: meta.status,
+    // Each event the engine folds changes the row, so its aggregate is one
+    // version past the meta it builds from.
+    summaryVersion: Math.max(meta.summaryVersion, 0) + 1,
     activeChildrenCount: meta.activeChildrenCount,
     totalChildrenCount: meta.totalChildrenCount,
     blockingDescendantCount: meta.blockingDescendantCount,

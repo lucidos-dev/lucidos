@@ -863,6 +863,28 @@ fn s4_5_truncation_preserves_every_structural_envelope_field() {
 }
 
 #[test]
+fn a_markdown_body_reaches_the_banner_as_plain_text() {
+    use crate::scheduler::notifications::Notification;
+    let n = Notification {
+        id: uuid::Uuid::new_v4(),
+        task_id: None,
+        app_id: None,
+        thread_id: None,
+        event_id: None,
+        title: "Lucidos is asking".into(),
+        message: "**The fix is live.**\n\n- **Weight:** normal\n\nWhat next?".into(),
+        read: false,
+        created_at: chrono::Utc::now(),
+        tap: Tap::Modal,
+    };
+    let payload = build_wake_payload(&n, None, None);
+    assert_eq!(
+        payload["notification"]["body"],
+        "The fix is live.\n\n• Weight: normal\n\nWhat next?"
+    );
+}
+
+#[test]
 fn s4_5_wake_payload_of_an_overflowing_body_also_builds() {
     // The Layer-3 wake carries the same envelope plus `wake: true`, so it is
     // strictly LARGER than the original send: a body that just fits the push

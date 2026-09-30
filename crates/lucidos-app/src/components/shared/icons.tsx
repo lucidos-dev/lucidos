@@ -730,6 +730,15 @@ export function EditIcon() {
   );
 }
 
+export function SparkleIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z" />
+      <path d="M19 3v4M21 5h-4" />
+    </svg>
+  );
+}
+
 export function EyeOffIcon() {
   return (
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -843,6 +852,18 @@ export function PauseIcon() {
     <svg viewBox="0 0 12 16" fill="currentColor" stroke="none" aria-hidden="true">
       <rect x="0" y="0" width="4.5" height="16" rx="1" />
       <rect x="7.5" y="0" width="4.5" height="16" rx="1" />
+    </svg>
+  );
+}
+
+// Set aside: the change action in menus. A line icon sized like its menu
+// neighbours, never the status slot's PauseIcon above.
+export function SetAsideIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <circle cx="12" cy="12" r="9" />
+      <path d="M10 9v6" />
+      <path d="M14 9v6" />
     </svg>
   );
 }

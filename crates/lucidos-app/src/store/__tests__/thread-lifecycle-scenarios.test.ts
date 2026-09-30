@@ -76,6 +76,7 @@ describe('Thread Lifecycle Scenarios (shared contract)', () => {
           createdAt: new Date(baseTime).toISOString(),
           updatedAt: new Date(baseTime).toISOString(),
           status: 'idle' as ThreadStatus,
+          summaryVersion: 0,
           messageCount: 0,
           section: 'archived',
           activeChildrenCount: 0,

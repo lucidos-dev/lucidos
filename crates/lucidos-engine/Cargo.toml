@@ -107,6 +107,7 @@ semver = "1"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 wasmtime = { version = "36", default-features = false, features = ["cranelift", "async", "cache"] }
 unicode-normalization = "0.1"
+pulldown-cmark = { version = "0.13", default-features = false }
 
 [dev-dependencies]
 # Enables `#[tokio::test(start_paused = true)]` for time-mocked tests.

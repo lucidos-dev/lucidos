@@ -18,19 +18,16 @@
  * next touch and on a return to the foreground.
  *
  * Both helpers are duck-typed (the frontend test environment has no DOM), so the
- * stand-ins below carry just `tagName` and `closest`.
+ * stand-ins below carry just `tagName`.
  */
 import { describe, it, expect } from 'vitest';
 import { isKeyboardActiveTarget, reconcileKeyboardActive } from '../MobileSwipeContainer';
 
 const ATTR = 'data-keyboard-active';
 
-/** An element stand-in. `inTitleRow` decides what `closest` answers. */
-function el(tagName: string, inTitleRow = false): EventTarget {
-  return {
-    tagName,
-    closest: (sel: string) => (inTitleRow && sel === '.mobile-thread-title-row' ? {} : null),
-  } as unknown as EventTarget;
+/** An element stand-in. */
+function el(tagName: string): EventTarget {
+  return { tagName } as unknown as EventTarget;
 }
 
 /** `<html>` stand-in that records the attribute the way the DOM would. */
@@ -49,17 +46,12 @@ describe('isKeyboardActiveTarget', () => {
     expect(isKeyboardActiveTarget(el('TEXTAREA'))).toBe(true);
   });
 
-  it('is false for the thread-title editor, which the flag would lock out', () => {
-    expect(isKeyboardActiveTarget(el('TEXTAREA', true))).toBe(false);
-  });
-
   it('is false for an <input>, so the header search bar stays interactive', () => {
     expect(isKeyboardActiveTarget(el('INPUT'))).toBe(false);
   });
 
-  it('is false for a non-element target and for nothing at all', () => {
+  it('is false for nothing at all', () => {
     expect(isKeyboardActiveTarget(null)).toBe(false);
-    expect(isKeyboardActiveTarget({ tagName: 'TEXTAREA' } as unknown as EventTarget)).toBe(false);
   });
 });
 

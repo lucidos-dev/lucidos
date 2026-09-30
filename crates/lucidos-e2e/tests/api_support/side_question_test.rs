@@ -35,14 +35,14 @@ async fn ask(thread_id: &str, question: &str) -> (u16, Value) {
     post("side-questions", body).await
 }
 
-/// The seed helpers leave a row at the column default, a composing draft. A
-/// side question refuses a draft, so these threads are marked started.
-async fn mark_started(pool: &sqlx::PgPool, thread_id: Uuid) {
-    sqlx::query("UPDATE thread_summaries SET state = 'active' WHERE thread_id = $1")
+/// The seed helpers leave a row at the column default, a started thread. Only
+/// `ThreadStarted` records a composing draft, so a draft is marked explicitly.
+async fn mark_composing(pool: &sqlx::PgPool, thread_id: Uuid) {
+    sqlx::query("UPDATE thread_summaries SET state = 'composing' WHERE thread_id = $1")
         .bind(thread_id)
         .execute(pool)
         .await
-        .expect("mark the thread started");
+        .expect("mark the thread a composing draft");
 }
 
 async fn thread_event_count(pool: &sqlx::PgPool, thread_id: Uuid) -> i64 {
@@ -80,7 +80,6 @@ async fn a_lucidos_agent_thread_answers_a_side_question() {
     let pool = sqlx::PgPool::connect(&db_url()).await.unwrap();
     let thread_id = Uuid::new_v4();
     seed_chat_thread_summary(&pool, thread_id, "idle").await;
-    mark_started(&pool, thread_id).await;
 
     let (status, body) = ask(&thread_id.to_string(), "what is X?").await;
     assert_eq!(status, 200, "{body}");
@@ -114,6 +113,7 @@ async fn a_composing_draft_is_refused() {
     let pool = sqlx::PgPool::connect(&db_url()).await.unwrap();
     let thread_id = Uuid::new_v4();
     seed_chat_thread_summary(&pool, thread_id, "idle").await;
+    mark_composing(&pool, thread_id).await;
 
     let (status, body) = ask(&thread_id.to_string(), "what is X?").await;
     assert_eq!(status, 400, "{body}");
@@ -131,7 +131,6 @@ async fn a_side_question_naming_an_unknown_image_is_refused() {
     let pool = sqlx::PgPool::connect(&db_url()).await.unwrap();
     let thread_id = Uuid::new_v4();
     seed_chat_thread_summary(&pool, thread_id, "idle").await;
-    mark_started(&pool, thread_id).await;
     let hash = "e".repeat(64);
 
     let body = json!({
@@ -151,7 +150,6 @@ async fn a_codex_thread_says_side_questions_are_not_available() {
     let pool = sqlx::PgPool::connect(&db_url()).await.unwrap();
     let thread_id = Uuid::new_v4();
     seed_cc_thread_summary(&pool, thread_id, "idle").await;
-    mark_started(&pool, thread_id).await;
     sqlx::query("UPDATE thread_summaries SET coding_agent = 'codex' WHERE thread_id = $1")
         .bind(thread_id)
         .execute(&pool)
@@ -172,7 +170,6 @@ async fn a_claude_code_thread_with_no_session_yet_is_refused_without_spawning() 
     let pool = sqlx::PgPool::connect(&db_url()).await.unwrap();
     let thread_id = Uuid::new_v4();
     seed_cc_thread_summary(&pool, thread_id, "idle").await;
-    mark_started(&pool, thread_id).await;
 
     let (status, body) = ask(&thread_id.to_string(), "what is X?").await;
     assert_eq!(status, 400, "{body}");
@@ -193,7 +190,6 @@ async fn dismissing_a_side_question_nobody_asked_is_not_found() {
     let pool = sqlx::PgPool::connect(&db_url()).await.unwrap();
     let thread_id = Uuid::new_v4();
     seed_cc_thread_summary(&pool, thread_id, "idle").await;
-    mark_started(&pool, thread_id).await;
 
     let body = json!({ "thread_id": thread_id, "side_question_id": Uuid::new_v4() });
     let (status, body) = post("side-questions/dismiss", body).await;
@@ -214,10 +210,8 @@ async fn the_chat_route_refuses_btw_in_any_thread() {
         let thread_id = Uuid::new_v4();
         if seed_cc {
             seed_cc_thread_summary(&pool, thread_id, "idle").await;
-            mark_started(&pool, thread_id).await;
         } else {
             seed_chat_thread_summary(&pool, thread_id, "idle").await;
-            mark_started(&pool, thread_id).await;
         }
         refuse_btw_on_the_chat_route(&pool, thread_id).await;
     }

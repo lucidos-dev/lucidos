@@ -31,11 +31,12 @@ vi.mock('../../../store/actions/chat-changes', async (importOriginal) => ({
   disarmAllStandingApplies: disarmAll,
 }));
 
-import { ChangesView, SWEEP_ONLY_TIP } from '../ChangesView';
+import { ChangesView, SWEEP_TIP } from '../ChangesView';
 import { getStandaloneActions } from '../../chat/WaitingBanner';
 import {
   changes,
   appliedChanges,
+  setAsideChanges,
   applyingChangeIds,
   applyingNowThreadIds,
   applyAllInProgress,
@@ -128,6 +129,7 @@ beforeEach(() => {
     data: [makeChange({ thread_unsettled: true, thread_settling: true })],
   };
   appliedChanges.value = { status: 'loaded', data: [] };
+  setAsideChanges.value = { status: 'loaded', data: [] };
   applyingChangeIds.value = new Set();
   applyingNowThreadIds.value = new Map();
   applyAllInProgress.value = false;
@@ -253,7 +255,7 @@ describe('the Changes panel bulk control', () => {
     render(<ChangesView />, host);
     expect(bulkButton().textContent).toBe('Apply all on settle');
     expect(bulkButton().disabled).toBe(false);
-    expect(bulkButton().getAttribute('data-tooltip')).toBe(SWEEP_ONLY_TIP);
+    expect(bulkButton().getAttribute('data-tooltip')).toBe(SWEEP_TIP);
   });
 
   it('keeps the armed face live while a batch runs, so the off is reachable', () => {

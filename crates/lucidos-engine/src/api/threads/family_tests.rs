@@ -318,6 +318,7 @@ async fn spawn_cc_child(
                 repo_root: "/tmp".into(),
                 hardened: false,
                 incomplete: false,
+                set_aside: false,
                 path: String::new(),
                 diff: String::new(),
             },

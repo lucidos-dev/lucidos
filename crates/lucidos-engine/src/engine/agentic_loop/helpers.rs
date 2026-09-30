@@ -1510,9 +1510,9 @@ impl QuestionReaskCause {
                  the question now as an `ask_user_question` TOOL CALL with 2-4 options, and do \
                  NOT inline them as a typed-reply menu. Reserve plaintext for a genuinely \
                  open-ended question (e.g. \"what should I name this?\") where pre-baked options \
-                 would be guesses. If yours is one, KEEP it: say why options would be guesses, \
-                 and ask it again here, because this reply replaces the draft above. You are not \
-                 asked a second time."
+                 would be guesses. If yours is one, say in one line why options would be \
+                 guesses, and call no tool. The user never sees that line: your draft above \
+                 already reached them and stays as your answer. You are not asked a second time."
             }
         }
     }

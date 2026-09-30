@@ -160,7 +160,7 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   { id: 'appearance:font', label: 'Font', subview: 'appearance', path: 'Settings → Appearance & Behavior → Typography', anchor: 'appearance:font' },
   { id: 'appearance:ui-scale', label: 'UI scale', subview: 'appearance', path: 'Settings → Appearance & Behavior → Typography', anchor: 'appearance:ui-scale' },
   { id: 'appearance:mobile', label: 'Mobile', subview: 'appearance', path: 'Settings → Appearance & Behavior', anchor: 'appearance:mobile', mobileOnly: true },
-  { id: 'appearance:mobile-header-sticky', label: 'Keep header visible', subview: 'appearance', path: 'Settings → Appearance & Behavior → Mobile', anchor: 'appearance:mobile-header-sticky', mobileOnly: true },
+  { id: 'appearance:mobile-dynamic-bars', label: 'Dynamic bars', subview: 'appearance', path: 'Settings → Appearance & Behavior → Mobile', anchor: 'appearance:mobile-dynamic-bars', mobileOnly: true, keywords: 'keep header visible hide on scroll prompt sticky pinned' },
   // The current device's push switch, the same one its row in Devices carries.
   // Both entries are kept: someone hunting "notifications" means the device they
   // are holding, someone hunting "devices" means the fleet.

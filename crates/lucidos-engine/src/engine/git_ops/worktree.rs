@@ -708,26 +708,10 @@ fn existing_lucidos_chain_hook(hook_path: &Path) -> Option<PathBuf> {
 }
 
 async fn common_post_commit_hook(wt_path: &Path) -> Result<PathBuf, String> {
-    let out = git_cmd(&["rev-parse", "--git-common-dir"], wt_path).await?;
-    if !out.status.success() {
-        return Err(format!(
-            "git rev-parse --git-common-dir failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if raw.is_empty() {
-        return Err("git rev-parse --git-common-dir returned empty path".to_string());
-    }
-    let common_dir = {
-        let p = PathBuf::from(raw);
-        if p.is_absolute() {
-            p
-        } else {
-            wt_path.join(p)
-        }
-    };
-    Ok(common_dir.join("hooks").join(LUCIDOS_POST_COMMIT_HOOK))
+    Ok(super::git_common_dir(wt_path)
+        .await?
+        .join("hooks")
+        .join(LUCIDOS_POST_COMMIT_HOOK))
 }
 
 fn render_coding_agent_diff_hook(chain_hook: &Path) -> String {

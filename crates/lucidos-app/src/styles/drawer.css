@@ -1008,8 +1008,11 @@ html[data-theme-mode="dark"] .thread-row .message-channel-tag.channel-error {
  * no room either.
  *
  * The row's pin and ⋯ take the same box. They are taller than the line, so
- * they overhang it both ways and still take no room. */
+ * they overhang it both ways and still take no room.
+ *
+ * The thread pane's title draws its mark the same way, so the two read alike. */
 .thread-row-title-text > .thread-status,
+.thread-title > .thread-status,
 .thread-row-actions {
     display: inline-flex;
     vertical-align: middle;
@@ -1017,17 +1020,21 @@ html[data-theme-mode="dark"] .thread-row .message-channel-tag.channel-error {
     margin-bottom: calc(1cap - 1ex);
 }
 
-.thread-row-title-text > .thread-status {
+.thread-row-title-text > .thread-status,
+.thread-title > .thread-status {
     margin-right: 0.375rem;
 }
 
-/* A step under the header's spinner: a row title is smaller than the pane's. */
-.thread-row-title-text > .thread-status .mini-spinner {
+/* Under the question badge's size, which suits a mark beside a title. The row
+ * and the pane title set the same text, so they share one spinner. */
+.thread-row-title-text > .thread-status .mini-spinner,
+.thread-title > .thread-status .mini-spinner {
     width: 0.5rem;
     height: 0.5rem;
 }
 
-.thread-row-title-text > .thread-status-idle {
+.thread-row-title-text > .thread-status-idle,
+.thread-title > .thread-status-idle {
     display: none;
 }
 
@@ -1104,27 +1111,8 @@ html[data-theme-mode="dark"] .thread-row .message-channel-tag.channel-error {
     display: none !important;
 }
 
-.thread-search-bar-icon {
-    width: var(--icon-size-sm);
-    height: var(--icon-size-sm);
-    flex-shrink: 0;
-    color: var(--text-secondary);
-}
-
-.thread-search-input {
+.thread-search-bar .search-field {
     flex: 1;
-    min-width: 0;
-    background: transparent;
-    border: none;
-    outline: none;
-    color: var(--text-primary);
-    font-size: var(--font-size-md);
-    font-family: inherit;
-    padding: 0.125rem 0;
-}
-
-.thread-search-input::placeholder {
-    color: var(--text-muted);
 }
 
 .thread-search-close {
@@ -1483,53 +1471,101 @@ html[data-theme-mode="dark"] .thread-row .message-channel-tag.channel-error {
     min-height: 0;
 }
 
+/* The title rows: this desktop one and the mobile `.mobile-thread-title-row`.
+ *
+ * The desktop pin centres on the title's FIRST line, as a drawer row's does,
+ * so a wrapped title does not drag it down to its middle. The row aligns to
+ * the top, and whichever of the two is shorter, the title's first line or the
+ * icon box, is pushed down by half the difference. A one-line title lands
+ * exactly where a centred row put it.
+ *
+ * The mobile row has no icons. Its title pads by
+ * the same half difference on both sides, so the row keeps its height and the
+ * button's hit area fills it. */
+.thread-view-header,
+.mobile-thread-title-row {
+    --title-line-box: calc(var(--title-line-height) * var(--font-size-md));
+    --title-line-height: 1.3;
+}
+
+.thread-view-header .thread-view-header-actions {
+    margin-top: max(0px, calc((var(--title-line-box) - var(--title-icon-box)) / 2));
+}
+
+.mobile-thread-title-row .thread-title-menu {
+    padding-block: max(0px, calc((var(--title-icon-box) - var(--title-line-box)) / 2));
+}
+
+/* Never edits in place: Rename… lives in the thread menu it opens. */
+.thread-title {
+    flex: 1;
+    min-width: 0;
+    font-weight: 600;
+    font-size: var(--font-size-md);
+    line-height: var(--title-line-height);
+    color: var(--text-primary);
+    overflow-wrap: anywhere;
+}
+
+/* A hold on the title opens its menu, so it must not select the text. Copy
+ * thread title, in that menu, stands in for a selection. */
+.thread-title-menu {
+    display: block;
+    margin: 0;
+    padding: 0;
+    background: none;
+    border: 0;
+    border-radius: var(--radius-control);
+    text-align: left;
+    cursor: pointer;
+    -webkit-user-select: none;
+    user-select: none;
+}
+
+.thread-title-menu:focus-visible {
+    outline: 0.125rem solid transparent;
+    box-shadow: var(--focus-ring);
+}
+
+/* Shown whether or not the drawer is open. The open thread's drawer row can be
+ * scrolled, folded or filtered away, and this row's title opens the menu with
+ * Show in thread list. */
 .thread-view-header {
+    --title-icon-box: 1.75rem;
+    flex-shrink: 0;
     display: flex;
-    align-items: center;
+    align-items: flex-start;
     gap: 0.75rem;
     /* Right padding matches `.pane-header`'s `--header-padding-x` so the action
      * icons land in the same horizontal slot as the AppHeader icons above. */
     padding: 0.25rem 0.625rem 0.25rem 1rem;
-    /* Faint neutral tint (--bg-secondary, one step up from the page) so the title
-     * row reads as the conversation's header band, anchored by the hairline below
-     * (::after). Kept to a quiet elevation that doesn't compete with the vivid blue
-     * app-header strip above. position:relative anchors that pseudo-element. */
-    position: relative;
-    background: var(--bg-secondary);
+    /* On the page while the transcript rests at its top. Once it scrolls, the
+     * faint --bg-secondary band fades in to say there is more above. */
+    background: transparent;
+    transition: background-color var(--duration-normal) ease;
     -webkit-user-select: none;
     user-select: none;
-    flex-shrink: 0;
 }
 
-/* Hairline divider under the thread title row: a plain full-width 1px line in the
- * subtle border token, so the header reads as separated from the transcript.
- * Desktop-only by construction — the mobile app header hides .thread-view-header. */
-.thread-view-header::after {
-    content: '';
-    position: absolute;
-    left: 0;
-    right: 0;
-    bottom: 0;
-    height: 1px;
-    background: var(--border-color);
-    pointer-events: none;
+.thread-view-header.scrolled {
+    background: var(--bg-secondary);
 }
 
-/* While editing, the suggestion is rendered below the input but pulled out of
- * flow (absolute, rule further down) so .thread-title-edit stays exactly
- * input-height and the status icon + action icons remain centered on the input
- * field — not dropped to the middle of input+suggestion. Reserve room beneath
- * the row so the out-of-flow suggestion doesn't overlap the transcript. The
- * reserve tracks the suggestion's own min-height (1.25rem) plus the row's gap. */
-.thread-view-header:has(.thread-title-edit.is-editing) {
-    padding-bottom: 1.5rem;
+/* The desktop title hugs its text on one line, so the pin sits right beside
+ * it, and ellipsises once the row is too narrow. */
+.thread-view-header .thread-title {
+    margin-top: max(0px, calc((var(--title-icon-box) - var(--title-line-box)) / 2));
+    flex: 0 1 auto;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
 }
 
-/* Desktop title-bar icons run smaller than the AppHeader slot — keep the
+/* Desktop title-bar icons run smaller than the AppHeader slot, keeping the
  * thread title row compact rather than matching the 2.25rem header-icon. */
 .thread-view-header .icon-btn.header-icon {
-    width: 1.75rem;
-    height: 1.75rem;
+    width: var(--title-icon-box);
+    height: var(--title-icon-box);
 }
 
 .thread-view-header .icon-btn.header-icon svg {
@@ -1543,14 +1579,8 @@ html[data-theme-mode="dark"] .thread-row .message-channel-tag.channel-error {
     gap: 0.25rem;
 }
 
-/* Hidden by default, revealed on row hover/focus; they sit on the right of the
- * title, right beside its text (the field hugs the title — rule below).
- * (hover: none) keeps them visible on touch. Scoped to .thread-view-header
- * (desktop only) — the same actions span is
- * reused by the mobile app header (.mobile-thread-title-row), which must stay
- * always-visible; leaving the hide rule unscoped would strand its icons
- * invisible on a narrow (≤768px) desktop window with a mouse, where neither
- * reveal path matches. */
+/* The pin hides until the row is hovered or it takes focus, right beside the
+ * title's text. (hover: none) keeps it visible on touch. */
 .thread-view-header .thread-view-header-actions .icon-btn {
     opacity: 0;
     transition: opacity var(--duration-fast) ease-in-out;
@@ -1569,205 +1599,7 @@ html[data-theme-mode="dark"] .thread-row .message-channel-tag.channel-error {
     }
 }
 
-/* Keep the overflow trigger visible while its menu is open (see the same rule
- * for `.thread-row-action` — the open overlay's inert-behind kills `:hover`). */
-.thread-view-header .thread-view-header-actions .icon-btn[aria-expanded="true"] {
-    opacity: 1;
-}
-
-/* position:relative so the edit <input> can absolutely-position over the display textarea. */
-.thread-title-edit {
-    flex: 1;
-    min-width: 0;
-    display: flex;
-    flex-direction: column;
-    gap: 0.25rem;
-    position: relative;
-}
-
-.thread-title-input {
-    font-family: inherit;
-    font-weight: 600;
-    font-size: var(--font-size-md);
-    line-height: 1.3;
-    color: var(--text-primary);
-    background: var(--bg-tertiary);
-    border: 1px solid var(--accent);
-    border-radius: calc(var(--radius-control) * 0.5);
-    padding: 0.125rem 0.25rem;
-    outline: none;
-    width: 100%;
-    min-width: 0;
-}
-
-/* Desktop thread-view-header only (the mobile app header reuses these classes
- * full-width and hides .thread-view-header on mobile, so this scoping leaves it
- * alone). The field hugs its text so the action icons sit right beside the title,
- * and the wrapper hugs that field (flex:0 1 auto). max-width:100% caps both to
- * the row; align-items:flex-start keeps them at text width, not stretched. */
-.thread-view-header .thread-title-edit {
-    flex: 0 1 auto;
-    min-width: 0;
-    /* Cap the title to the row. max-width:100% here resolves against the header
-     * (a stable width), so it doesn't feed back into the field's size the way a
-     * cap on the field itself would. overflow:hidden is only a backstop now: the
-     * display below ellipsises itself, and this trims the 0.25rem its negative
-     * margin hangs over the wrapper's right edge. */
-    max-width: 100%;
-    overflow: hidden;
-    align-items: flex-start;
-}
-
-.thread-view-header .thread-title-input {
-    min-width: 4ch;
-}
-
-/* The read-only display hugs its title on ONE line and ellipsises when the row
- * is too narrow for it. `align-self: stretch` (overriding the wrapper's
- * flex-start) with `width: auto` is what makes both true at once: the wrapper's
- * own width is content-based, so stretch resolves to exactly the title's
- * one-line width while it fits (and re-resolves when a web font loads, which a
- * JS measurement can't time reliably), and to the shrunken wrapper's width once
- * it doesn't, which is when text-overflow can finally fire.
- *
- * The two shapes that look equivalent and aren't:
- *   - `width: max-content` (what this was) makes the box as wide as the text
- *     ALWAYS, so the text never overflows its own box, text-overflow never
- *     applies, and the wrapper's overflow:hidden hard-cuts the title mid-word
- *     with no ellipsis.
- *   - `max-width: 100%` ellipsises, but ~1 char early on EVERY title: this
- *     element carries negative horizontal margins (-0.25rem a side, to cancel
- *     the field's padding), so the wrapper's content box is 0.5rem narrower
- *     than the title's own max-content width. Stretch resolves against the same
- *     box but adds the margins back, so it lands exactly on the text. */
-.thread-view-header .thread-title-input.thread-title-display {
-    width: auto;
-    align-self: stretch;
-    white-space: nowrap;
-    text-overflow: ellipsis;
-}
-
-/* While editing, the <input> hugs its value via its size attribute (set in JS);
- * width:auto lets that drive the width, capped to the row by max-width. */
-.thread-view-header .thread-title-input.thread-title-edit-input {
-    width: auto;
-    max-width: 100%;
-}
-
-/* While editing, drop the clip so the out-of-flow suggestion below is visible.
- * Safe: the edit <input> is capped at max-width:100% so there's nothing to clip
- * horizontally mid-edit. Using `visible` (not `clip`) also dodges the Chrome bug
- * where overflow-x:clip on a positioned ancestor eats pointer events on its
- * y-overflowing absolute children — here the suggestion button must stay
- * clickable. (Non-editing keeps overflow:hidden to clip an over-long title.) */
-.thread-view-header .thread-title-edit.is-editing {
-    overflow: visible;
-}
-
-/* Anchor the suggestion just below the input, taken out of flow so it doesn't
- * stretch .thread-title-edit (which would re-center the action icons). left:0
- * lines it up under the title because .thread-title-edit hugs the title text;
- * right:0 gives it a definite width (so the loading shimmer's width:60% has
- * something to resolve against instead of collapsing to shrink-to-fit). */
-.thread-view-header .thread-title-edit .thread-title-suggestion {
-    position: absolute;
-    top: 100%;
-    left: 0;
-    right: 0;
-}
-
-.thread-title-input.thread-title-display {
-    background: transparent;
-    border-color: transparent;
-    cursor: pointer;
-    margin: -0.125rem -0.25rem;
-    transition: background var(--duration-fast) ease;
-    overflow: hidden;
-    word-break: break-word;
-    overflow-wrap: anywhere;
-    -webkit-user-select: none;
-    user-select: none;
-}
-
-@media (hover: hover) {
-    .thread-title-input.thread-title-display:hover {
-        background: color-mix(in srgb, var(--accent) 15%, transparent);
-    }
-}
-
-/* Overlaid (transparent) on top of the display textarea so taps reach the
- * input directly — iOS opens the keyboard on native focus, no JS focus dance.
- * user-select:text overrides the row's user-select:none so iOS PWA opens the
- * keyboard on focus. */
-.thread-title-input.thread-title-edit-input {
-    position: absolute;
-    inset: 0;
-    opacity: 0;
-    cursor: pointer;
-    -webkit-user-select: text;
-    user-select: text;
-}
-
-.thread-title-edit.is-editing .thread-title-display {
-    display: none;
-}
-
-.thread-title-edit.is-editing .thread-title-input.thread-title-edit-input {
-    position: static;
-    opacity: 1;
-    cursor: text;
-}
-
-/* Mobile edit field is a <textarea> so a long title wraps to multiple lines
- * instead of scrolling on one line. No manual resize handle; its height is
- * driven to fit the content by autoResizeTextarea (overflow hidden so no
- * scrollbar flickers mid-grow). overflow-wrap:anywhere matches the read-only
- * display so an unbreakable string still wraps. Desktop stays a single-line
- * <input> and never matches this rule. */
-textarea.thread-title-edit-input {
-    resize: none;
-    overflow: hidden;
-    overflow-wrap: anywhere;
-}
-
-/* Suggestion area below the input */
-.thread-title-suggestion {
-    min-height: 1.25rem;
-}
-
-.thread-title-suggestion-btn {
-    background: none;
-    border: none;
-    color: var(--text-muted);
-    font-size: var(--font-size-sm);
-    font-style: italic;
-    cursor: pointer;
-    padding: 0;
-    text-align: left;
-    transition: color var(--duration-fast) ease;
-}
-
-@media (hover: hover) {
-    .thread-title-suggestion-btn:hover {
-        color: var(--accent);
-    }
-}
-
-/* Shimmer loading animation for suggestion */
-.thread-title-shimmer {
-    height: 0.75rem;
-    width: 60%;
-    border-radius: calc(var(--radius-control) * 0.5);
-    background: linear-gradient(
-        90deg,
-        var(--bg-tertiary) 25%,
-        color-mix(in srgb, var(--accent) 20%, var(--bg-tertiary)) 50%,
-        var(--bg-tertiary) 75%
-    );
-    background-size: 200% 100%;
-    animation: shimmer 1.5s infinite;
-}
-
+/* Shared by the loading shimmers in components.css and chat/response.css. */
 @keyframes shimmer {
     0% { background-position: 200% 0; }
     100% { background-position: -200% 0; }
@@ -1818,13 +1650,8 @@ textarea.thread-title-edit-input {
 
 /* Reduced motion: disable decorative animations */
 :root[data-motion="reduce"] .thread-drawer,
-:root[data-motion="reduce"] .drawer-divider,
-:root[data-motion="reduce"] .thread-title-display {
+:root[data-motion="reduce"] .drawer-divider {
     transition: none;
-}
-
-:root[data-motion="reduce"] .thread-title-shimmer {
-    animation: none;
 }
 
 /* The row already separates its items with its own `gap`, so the explainer's

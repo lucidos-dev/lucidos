@@ -28,6 +28,7 @@ function makeThread(id: string, overrides: Partial<ThreadMeta> = {}): ThreadStat
       createdAt: '2026-04-12T00:00:00Z',
       updatedAt: '2026-04-12T00:00:00Z',
       status: 'idle',
+      summaryVersion: 0,
       codingAgentProposed: false,
       codingAgentRequiresRestart: false,
       codingAgentIsExternalRepo: false,

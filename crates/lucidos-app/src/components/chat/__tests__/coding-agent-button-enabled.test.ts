@@ -38,7 +38,7 @@ function menuOpens(
 }
 
 describe('Control menu opens (openMenu guard)', () => {
-  const controlCmds = [{ subtype: 'set_model' }, { subtype: 'set_permission_mode' }];
+  const controlCmds = [{ subtype: 'set_model' }];
 
   it('opens when only control commands exist (no builtin/skill yet)', () => {
     expect(menuOpens(controlCmds, [], [])).toBe(true);
@@ -80,7 +80,7 @@ describe('codingAgentSlashCommandsReady (CC binary connected)', () => {
 });
 
 describe('button visual state', () => {
-  const controlCmds = [{ subtype: 'set_model' }, { subtype: 'set_permission_mode' }];
+  const controlCmds = [{ subtype: 'set_model' }];
 
   /** Mirrors the button's class expression in CodingAgentControlMenu.tsx.
    *  Built from `menuOpens` (the hasAnyCommands mirror) on purpose: deriving it

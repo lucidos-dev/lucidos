@@ -119,8 +119,12 @@ describe('openMenuFocusTarget (who owns keystrokes while the menu is open)', () 
     expect(target({ freeText: true, searching: true, positioned: false })).toBe('input');
   });
 
-  it('never moves focus on a touch device, where it would drop the on-screen keyboard', () => {
+  it('never focuses the trigger on a touch device, where a button holds no keyboard', () => {
     expect(target({ touch: true })).toBeNull();
-    expect(target({ touch: true, searching: true })).toBeNull();
+  });
+
+  it('hands input to the filter box on a touch device once it is shown', () => {
+    expect(target({ touch: true, searching: true })).toBe('filter');
+    expect(target({ touch: true, searching: true, positioned: false })).toBeNull();
   });
 });

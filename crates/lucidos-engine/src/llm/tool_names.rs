@@ -153,6 +153,10 @@ pub const APPLY_AS_THEY_SETTLE: &str = "apply_as_they_settle";
 /// Take a *standing apply* back: one thread's, or every one in the workspace.
 /// The off for both arms above (philosophy rule 2: prompt-first).
 pub const CANCEL_STANDING_APPLY: &str = "cancel_standing_apply";
+/// Keep a pending change for later, out of Review and Apply All (ADR 0328).
+pub const SET_ASIDE_CHANGE: &str = "set_aside_change";
+/// Return a set-aside change to pending.
+pub const BRING_BACK_CHANGE: &str = "bring_back_change";
 
 // Thread Queue (background admission-control policy + live queue) — grouped
 // `thread_queue` tool (list/update_policy) from the capability parity manifest;

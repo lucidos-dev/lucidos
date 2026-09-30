@@ -22,13 +22,20 @@ const THIS_DEVICE = '@device';
  * with no device gets only the global rows. So an app that named none would
  * theme itself from a value the shell around it is not using.
  *
- * A standalone app tab is a top-level document and reads the id itself. The id
- * is per-workspace (`ws:<slug>:lucidos-device-id`), which is why it comes from
- * `_storage.ts` rather than raw `localStorage`.
+ * A standalone app tab is a top-level document and reads the id itself. A
+ * popped-out tab carries `?device=` for the shell it left, and the engine seeds
+ * its first paint from that device. So the URL wins, or the tab repaints in this
+ * browser's own theme. Otherwise the per-workspace stored id answers.
  */
 function thisDevice(): string | undefined {
   if (isBridged()) return THIS_DEVICE;
-  return wsDeviceId() ?? undefined;
+  return openerDevice() ?? wsDeviceId() ?? undefined;
+}
+
+/** The device named in this document's `?device=`, as `appUrl` stamps it. */
+function openerDevice(): string | null {
+  const search = globalThis.location?.search;
+  return search ? new URLSearchParams(search).get('device') : null;
 }
 
 export const preferences = {

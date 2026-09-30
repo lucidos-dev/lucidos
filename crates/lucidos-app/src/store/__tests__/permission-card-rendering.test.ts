@@ -171,10 +171,10 @@ describe('exchangeStatus around CommandPermissionRequested (chat command guard)'
     ]);
   });
 
-  // A genuine crash after the grant (engine died before the agent resumed)
-  // leaves the divider holding only the resolution. At idle that must read
-  // 'aborted', not a misleading 'done' — the work never completed.
-  it('command-permission divider with only the resolution reads aborted at idle', () => {
+  // A divider holding only the resolution on an idle thread runs nothing, so
+  // it stops spinning. A real crash records an abort event of its own, which
+  // opens its own boundary, so this divider never claims one.
+  it('command-permission divider with only the resolution settles done at idle', () => {
     const divider: Exchange = {
       userEvent: commandRequestStep(1, { request_id: 'creq-6' }).event,
       userSeq: 1,
@@ -182,7 +182,7 @@ describe('exchangeStatus around CommandPermissionRequested (chat command guard)'
         step(2, { type: 'CommandPermissionResolved', request_id: 'creq-6', allowed: true }),
       ],
     };
-    expect(exchangeStatus(divider, '', true, false, false, true)).toBe('aborted');
+    expect(exchangeStatus(divider, '', true, false, false, true)).toBe('done');
   });
 });
 

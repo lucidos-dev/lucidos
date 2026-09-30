@@ -1,8 +1,7 @@
 import { test, expect, Page } from './fixtures';
 import {
   apiRequest, assertHealthy, ensureOnThreadPane, navigateToApp, openThreadDrawer, sendMessage,
-  uniqueMessage, waitForResponse, waitForVisibleInput,
-} from './helpers';
+  uniqueMessage, waitForResponse, waitForVisibleInput, toggleFocusedPin, expectFocusedPinned } from './helpers';
 
 test.describe('Section-aware Save/Archive buttons', () => {
   test.beforeEach(async ({ page }) => {
@@ -73,15 +72,13 @@ test.describe('Section-aware Save/Archive buttons', () => {
 
     await focusThreadFromDrawer(page, threadId);
 
-    // Scope pin selectors to the focused thread's header actions — the drawer
-    // rows each carry their own pin button now, and the drawer is open here (and
-    // always mounted on mobile), so an unscoped selector counts/clicks drawer-row
-    // pins of OTHER threads. Archive lives only in the prompt row, so its
-    // aria-label is unambiguous and stays unscoped.
-    await expect(page.locator('.thread-view-header-actions button[aria-label="Pin thread"]:visible').first()).toBeVisible();
+    // The pin helpers act on the focused thread only: every drawer row carries
+    // its own pin. Archive lives only in the prompt row, so its aria-label is
+    // unambiguous and stays unscoped.
+    await expectFocusedPinned(page, false);
     expect(await page.locator('button[aria-label="Archive thread"]:visible').count()).toBe(0);
 
-    await page.locator('.thread-view-header-actions button[aria-label="Pin thread"]:visible').first().click();
+    await toggleFocusedPin(page, 'pinned');
     await waitForThreadInSection(page, threadId, 'saved');
     expect(await isThreadInSection(page, threadId, 'saved')).toBe(true);
   });
@@ -107,12 +104,9 @@ test.describe('Section-aware Save/Archive buttons', () => {
     await focusThreadFromDrawer(page, threadId);
 
     await expect(page.locator('button[aria-label="Archive thread"]:visible').first()).toBeVisible();
-    // Pinned threads always carry the "✓ Pinned" unpin toggle alongside Archive
-    // so the user can drop back to regular flow at any time.
-    await expect(
-      page.locator('.thread-view-header-actions button[aria-label="Remove thread from Pinned section"]:visible').first(),
-    ).toBeVisible();
-    expect(await page.locator('.thread-view-header-actions button[aria-label="Pin thread"]:visible').count()).toBe(0);
+    // A pinned thread always offers Unpin alongside Archive, so the user can
+    // drop back to the regular flow at any time.
+    await expectFocusedPinned(page, true);
 
     await page.locator('button[aria-label="Archive thread"]:visible').first().click();
     await expect(

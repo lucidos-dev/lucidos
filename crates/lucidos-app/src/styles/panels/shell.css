@@ -1532,6 +1532,27 @@
         pointer-events: none;
     }
 
+    /* The header regions that hold a badge, centred on whole pixels. A
+       region's -50% is half its own height, which is -24.75px at 137.5%.
+       Inside a fractional translate, Chrome snaps a badge's pill and digit
+       apart. On a 1x screen the pill then loses a row and the count sits low.
+       Pinned by e2e/badge-glyph-centring.spec.ts.
+       Gated, and after every rule it rounds. An engine without `round()`
+       drops a whole transform that carries a `var()`, and the region would
+       fall half its height down the bar. */
+    @supports (width: round(1.5px, 1px)) {
+        .threads-header,
+        .app-header .pane-header-brand,
+        .app-header .content-header-elements,
+        .thread-toggle-slot {
+            transform: translateY(round(calc(-50% - var(--header-band-lift)), 1px));
+        }
+
+        .app-header .pane-header-brand .pane-header-brand-label {
+            transform: translate(round(-50%, 1px), round(-50%, 1px));
+        }
+    }
+
     /* …and the members are targets again, EXCEPT while an overlay owns the
        screen. The gate is the desktop copy of the one `.header-nav-cluster > *`
        carries in styles/header-mark.css, and it is load-bearing rather than
@@ -2060,19 +2081,12 @@
     color: var(--header-fg-muted);
 }
 
-/* The threads search field is a transparent input riding directly on the bar,
-   so its text, caret, placeholder, and leading icon all flip light. */
-.app-header .thread-search-bar-icon {
-    color: var(--header-fg-muted);
-}
-
-.app-header .thread-search-input {
-    color: var(--header-fg);
-    caret-color: var(--header-fg);
-}
-
-.app-header .thread-search-input::placeholder {
-    color: var(--header-fg-muted);
+/* The threads search field rides on the bar, so it takes the header's own
+   veil as its fill and flips its text, caret and glyph light. */
+.app-header .search-field {
+    --search-field-bg: color-mix(in srgb, var(--header-fg) var(--header-control-veil-hover), transparent);
+    --search-field-fg: var(--header-fg);
+    --search-field-muted: var(--header-fg-muted);
 }
 
 /* Count badges (notification bell, brand update count): a white pill with blue

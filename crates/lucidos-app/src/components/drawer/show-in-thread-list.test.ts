@@ -27,6 +27,7 @@ function makeThread(id: string, opts: ThreadOpts = {}): ThreadState {
         createdAt: '2026-09-01T00:00:00Z',
         updatedAt: '2026-09-01T00:00:00Z',
         status: 'idle',
+        summaryVersion: 0,
         messageCount: 1,
         section: opts.section ?? 'inbox',
         activeChildrenCount: 0,

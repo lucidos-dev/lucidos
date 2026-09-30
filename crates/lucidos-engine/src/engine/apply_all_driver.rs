@@ -27,19 +27,19 @@ use crate::engine::event_bus::{BusEvent, SystemEvent};
 use crate::engine::thread_events::MessageOrigin;
 use crate::engine::LucidosEngine;
 
-/// Failure reason recorded for a batch member that was discarded or whose change
-/// row vanished before the batch finished — so recovery can mark it terminal and
-/// let the batch reach `is_complete()` instead of stalling on a member that can
+/// Failure reason for a batch member that left `pending` before the batch
+/// finished: set aside, discarded, or its row gone. Recovery marks it terminal,
+/// so the batch reaches `is_complete()` instead of stalling on a member that can
 /// never apply. Also used by `discard_change`'s live `notify_apply_all(Failed …)`
 /// so a member discarded mid-batch (e.g. the "≤1 pending change per thread"
 /// reconcile dropping a sibling that is itself a batch member) advances the batch
 /// instead of stalling it on an `apply_change` that returns `Err` without a
 /// terminal event.
-pub(crate) const DISCARDED_MEMBER_REASON: &str =
-    "Change was discarded or removed before the batch finished";
+pub(crate) const WITHDRAWN_MEMBER_REASON: &str =
+    "Change was set aside, discarded or removed before the batch finished";
 
 /// How recovery should treat a batch member, derived from its `changes.status`.
-/// `Terminal` covers a discarded or reverted member and a missing row. All
+/// `Terminal` covers a set-aside, discarded or reverted member and a missing row. All
 /// must become a terminal `Failed` so the batch can complete; leaving such a
 /// member `Pending` would re-drive it into an `apply_change` `Noop` that never
 /// emits a terminal event, stalling the batch forever.
@@ -56,7 +56,9 @@ fn classify_recovered_member(status: Option<ChangeStatus>) -> RecoveredMember {
     match status {
         Some(ChangeStatus::Applied) => RecoveredMember::Applied,
         Some(ChangeStatus::Pending) => RecoveredMember::Pending,
-        Some(ChangeStatus::Discarded | ChangeStatus::Reverted) | None => RecoveredMember::Terminal,
+        Some(ChangeStatus::SetAside | ChangeStatus::Discarded | ChangeStatus::Reverted) | None => {
+            RecoveredMember::Terminal
+        }
     }
 }
 
@@ -187,7 +189,7 @@ impl LucidosEngine {
         // would merge a branch the coding agent is still committing on, racing
         // the session's next proposal (real thread 76b4ee76).
         //
-        // "Keep going as the rest settle" is what the sweep answers those
+        // "Apply all on settle" is what the sweep answers those
         // dropped changes with: not applied now, applied when their thread
         // lands.
         let live_filtered =
@@ -196,7 +198,10 @@ impl LucidosEngine {
         // Also drop changes with no files left. The per-change endpoint 409s
         // those, and this path would otherwise do what the button refuses:
         // merge no-op commits, possibly spending a harden run on an empty diff.
-        let pending = crate::core::changes::drop_empty_changes(live_filtered);
+        // Incomplete work goes too: only its own Apply, which confirms, lands it.
+        let pending = crate::core::changes::drop_incomplete_changes(
+            crate::core::changes::drop_empty_changes(live_filtered),
+        );
         let change_ids: Vec<Uuid> = pending.iter().map(|c| c.id).collect();
 
         // Arm BEFORE the first apply. That apply is awaited here and can spend
@@ -508,7 +513,7 @@ impl LucidosEngine {
                     }
                     RecoveredMember::Pending => { /* leave pending — re-drive below */ }
                     RecoveredMember::Terminal => {
-                        progress.record_failed(change_id, DISCARDED_MEMBER_REASON.to_string());
+                        progress.record_failed(change_id, WITHDRAWN_MEMBER_REASON.to_string());
                     }
                 }
             }
@@ -805,7 +810,7 @@ mod tests {
                     progress.record_applied(id);
                 }
                 RecoveredMember::Terminal => {
-                    progress.record_failed(id, DISCARDED_MEMBER_REASON.to_string());
+                    progress.record_failed(id, WITHDRAWN_MEMBER_REASON.to_string());
                 }
                 RecoveredMember::Pending => unreachable!(),
             }
@@ -813,7 +818,7 @@ mod tests {
         assert!(progress.is_complete());
         assert_eq!(progress.applied_ids(), vec![ids[0], ids[1]]);
         assert_eq!(progress.failures().len(), 1);
-        assert_eq!(progress.failures()[0].error, DISCARDED_MEMBER_REASON);
+        assert_eq!(progress.failures()[0].error, WITHDRAWN_MEMBER_REASON);
     }
 
     /// A batch with a still-`pending` member reconstructs as incomplete, and

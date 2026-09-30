@@ -65,6 +65,8 @@ export interface ThreadSummary {
   /** Thread status computed by the backend. One of the generated `ThreadStatus`
    *  values. Nothing writes 'waiting' any more; historical rows may hold it. */
   status: ThreadStatus;
+  /** The row's version (`ThreadMeta.summaryVersion`). */
+  summary_version: number;
   /** Whether the coding-agent branch has any diff against main on disk — pure git
    *  truth. Backs the WaitingBanner Diff button independently of the
    *  proposal lifecycle. */
@@ -176,12 +178,11 @@ export async function fetchThreadById(threadId: string): Promise<ThreadSummary |
     }
 }
 
-async function postThreadAction(path: string, body: Record<string, unknown>, signal?: AbortSignal): Promise<Response> {
+async function postThreadAction(path: string, body: Record<string, unknown>): Promise<Response> {
     const res = await mutatingFetch(`${API}/threads/${path}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
-        signal,
     });
     await throwIfNotOk(res);
     return res;
@@ -276,8 +277,8 @@ export async function renameThread(threadId: string, title: string): Promise<voi
     await postThreadAction('rename', { thread_id: threadId, title });
 }
 
-export async function suggestTitle(threadId: string, signal?: AbortSignal): Promise<string> {
-    const res = await postThreadAction('suggest-title', { thread_id: threadId }, signal);
+export async function suggestTitle(threadId: string): Promise<string> {
+    const res = await postThreadAction('suggest-title', { thread_id: threadId });
     const data = await res.json();
     return data.title;
 }

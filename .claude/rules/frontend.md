@@ -135,6 +135,12 @@ return (
 - **A chevron turns with the roll**, on a `transition` of its `transform`.
 - **Enforced** by `components/shared/__tests__/expand-collapse-rolls-guard.test.ts`. A toggle that rolls elsewhere takes a row there saying where.
 
+**Whatever animates in animates out, by default and unasked.** A popover, pill, menu or panel with an entrance motion leaves with its reverse, however it is shut. That covers Escape, an outside click, a second press, and its own action. An instant unmount at dismiss is a bug, and the user should never have to ask for the exit.
+
+- **Prefer a drawing held for the exit.** Keep the element, or a non-interactive drawing of it, with `useLingeringFlag` and a scaled timer (`frontend-css.md` § Every duration is scaled). The overlay is shut by then, so the UI behind is live again at once.
+- **An overlay that stays open through its exit returns `false` from `onClose`** until it has gone, as `closeDrawer` does (§ Modals & Popovers). Otherwise it keeps the UI behind inert and swallows the next tap.
+- **Worked example:** the Side question pill (`SendHoldMenu.tsx`). Its half slides out of Send on open, and a `.send-hold-menu-leaving` drawing slides back behind the seam on close.
+
 **A block the user unfolds in place renders through `<Disclosure open>`** (`components/shared/Disclosure.tsx`), never a bare `{open && …}`. That gives it the *disclosure roll* (`docs/glossary.md`), the thread drawer's own motion, from one curve and length in `utils/disclosureMotion.ts`. Pass the children unconditionally: the component unmounts them when closed and keeps them, inert, for the exit. A navigation that opens it to land on a row inside passes `instant`, since a scroll mid-roll measures a moving box. A suite that flattens vnodes with a bare call mocks it with `components/shared/__tests__/disclosureStub.ts`.
 
 ## No Hidden Errors — Fail Fast, Tell the User

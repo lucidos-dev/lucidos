@@ -217,9 +217,12 @@ prioritized; cancel it from the chat, not here.
 
 ## Notifications
 
-- A trigger's backlog reaches 10 waiting fires, or its oldest waiting fire is
-  older than 5 minutes → "`<trigger>` is significantly delayed" (10-minute
-  cooldown per trigger).
+- A trigger's oldest waiting fire has waited 5 minutes or more →
+  "`<trigger>` is significantly delayed". The message states that wait and
+  how many fires are waiting (10-minute cooldown per trigger). Queue depth
+  alone never alerts: a burst of quick fires drains in seconds. A paused
+  trigger never alerts either, since its fires wait for resume. The check
+  runs with the minute-long drain loop, so an alert can lag by up to a minute.
 - The pool hits `max_concurrent_total` (background + user) → one "Lucidos is at
   capacity" notification (10-minute cooldown), not one per queued entry.
 - A per-trigger queue overflow → notification naming what was dropped (or

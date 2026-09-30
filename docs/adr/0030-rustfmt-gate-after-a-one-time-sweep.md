@@ -5,8 +5,9 @@
 - **Amended by**: [0270: /harden applies rustfmt before it checks](0270-harden-applies-rustfmt-before-it-checks.md).
   The gate still checks; `/harden` now runs `make fmt` first.
 
-(This entry uses colons where its neighbours use dashes. `.claude/rules/no-em-dashes.md`
-bans the character outright and grants no exemption for house style.)
+(This entry uses colons where its neighbours use dashes. When it was written,
+`.claude/rules/em-dashes.md` banned the character outright, with no exemption
+for house style.)
 
 ## Context
 
@@ -51,7 +52,7 @@ Three supporting decisions, each of which had a plausible alternative:
 ## Rationale
 
 **The em-dash precedent does not transfer, and that is the crux.**
-`.claude/rules/no-em-dashes.md` refuses a retroactive sweep and enforces itself
+`.claude/rules/em-dashes.md` refuses a retroactive sweep and enforces itself
 diff-scoped instead. The reasoning there is that ~29,000 prose substitutions are
 a judgment call per hunk, with no way to tell a safe one from a wrong one at a
 glance. Neither half holds for rustfmt: it is deterministic and

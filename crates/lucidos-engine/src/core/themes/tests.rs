@@ -747,6 +747,30 @@ fn every_built_in_theme_gets_a_palette_that_holds() {
     }
 }
 
+/// A hovered row and a menu's keyboard cursor paint `--bg-hover` on the page
+/// and on every popover, so the fill has to show on both.
+#[test]
+fn every_built_in_hover_fill_shows_on_the_page_and_on_a_surface() {
+    const MIN_RATIO: f64 = 1.04;
+    for theme in BUILT_INS.iter() {
+        for mode in [ThemeMode::Dark, ThemeMode::Light] {
+            let tokens = resolve_theme_tokens(&theme.definition, mode, None);
+            let fill = |token: &str| colour_in(&tokens, mode, token).unwrap();
+            let hover = fill("--bg-hover");
+            for under in ["--bg-primary", "--surface-bg"] {
+                let under_fill = fill(under);
+                let ratio = color::contrast(hover.over(under_fill), under_fill);
+                assert!(
+                    ratio >= MIN_RATIO,
+                    "{} {}: --bg-hover is {ratio:.3}:1 on {under}",
+                    theme.id,
+                    mode.label()
+                );
+            }
+        }
+    }
+}
+
 /// The clamp holds for any tokens at all, including ones validation refuses:
 /// a style override never passes through the theme validator.
 #[test]

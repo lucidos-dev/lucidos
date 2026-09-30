@@ -93,6 +93,19 @@ pub fn auto_commit(user_dir: &Path, relative_path: &str, message: &str) {
     }
 }
 
+/// Delete a file in the user dir and commit the removal. The delete fails
+/// loudly, so a caller never reports a file gone that is still there. The
+/// commit is best-effort, as in [`auto_commit`].
+pub fn remove_and_commit(
+    user_dir: &Path,
+    relative_path: &str,
+    message: &str,
+) -> std::io::Result<()> {
+    std::fs::remove_file(user_dir.join(relative_path))?;
+    auto_commit(user_dir, relative_path, message);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,5 +163,42 @@ mod tests {
             "commit message should match, got: {}",
             log
         );
+    }
+
+    fn git_stdout(dir: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    #[test]
+    fn remove_and_commit_deletes_the_file_and_records_the_removal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".lucidos");
+        std::fs::create_dir_all(dir.join("knowhow")).unwrap();
+        ensure_git_init(&dir);
+        std::fs::write(dir.join("knowhow/test.md"), "Content.").unwrap();
+        auto_commit(&dir, "knowhow/test.md", "add knowhow: test");
+
+        remove_and_commit(&dir, "knowhow/test.md", "delete knowhow: test").unwrap();
+
+        assert!(!dir.join("knowhow/test.md").exists());
+        let log = git_stdout(&dir, &["log", "--oneline", "-1"]);
+        assert!(log.contains("delete knowhow: test"), "got: {log}");
+        let status = git_stdout(&dir, &["status", "--porcelain"]);
+        assert!(status.is_empty(), "the removal must be committed: {status}");
+    }
+
+    #[test]
+    fn remove_and_commit_fails_when_the_file_is_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".lucidos");
+        std::fs::create_dir_all(&dir).unwrap();
+        ensure_git_init(&dir);
+
+        assert!(remove_and_commit(&dir, "knowhow/absent.md", "delete").is_err());
     }
 }

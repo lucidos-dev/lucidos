@@ -13,7 +13,7 @@
     "--bg-tertiary": "#26233a",
     "--bg-quaternary": "#403d52",
     "--border-color": "#403d52",
-    "--bg-hover": "#21202e",
+    "--bg-hover": "#242234",
     "--bg-selected": "#26233a",
     "--text-primary": "#e0def4",
     "--text-secondary": "#908caa",

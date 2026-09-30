@@ -15,6 +15,7 @@ pub(super) fn aggregate_proposed(change_id: Uuid, branch: &str, repo_root: &str)
         repo_root: repo_root.to_string(),
         hardened: true,
         incomplete: false,
+        set_aside: false,
         path: String::new(),
         diff: String::new(),
     }
@@ -37,6 +38,7 @@ pub(super) fn per_commit_proposed(
         repo_root: String::new(),
         hardened: false,
         incomplete: false,
+        set_aside: false,
         path: String::new(),
         diff: String::new(),
     }
@@ -132,6 +134,7 @@ pub(super) fn proposed_with_files(
         repo_root: repo_root.into(),
         hardened: true,
         incomplete: false,
+        set_aside: false,
         path: String::new(),
         diff: String::new(),
     }

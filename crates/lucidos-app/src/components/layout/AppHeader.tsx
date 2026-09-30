@@ -5,6 +5,7 @@ import { useWindowDragRegion } from '../../hooks/useWindowDragRegion';
 import { watchTitlebarBand } from '../../store/actions/trafficLights';
 import { ThreadToggleButton } from '../shared/ThreadToggleButton';
 import { SearchIcon } from '../shared/icons';
+import { SearchField } from '../shared/SearchField';
 import { ThreadBackButton, ThreadForwardButton } from '../shared/ThreadNav';
 import { openUrl } from '../../store/actions/artifacts';
 import { navigateToPane, resolveSwipePane, focusPane } from '../../store/actions/pane';
@@ -45,12 +46,10 @@ function ThreadsHeader() {
     <div class={`threads-header${searchOpen ? ' search-active' : ''}`}
          onClick={() => focusPane('drawer')}>
       <div class="thread-search-bar">
-        <SearchIcon className="thread-search-bar-icon" />
-        <input
-          ref={searchInputRef}
-          class="thread-search-input"
-          type="text"
-          placeholder="Search threads..."
+        <SearchField
+          inputRef={searchInputRef}
+          inputClass="thread-search-input"
+          placeholder="Search threads…"
           value={threadSearchQuery.value}
           onInput={onSearchInput}
           onKeyDown={onSearchKeyDown}

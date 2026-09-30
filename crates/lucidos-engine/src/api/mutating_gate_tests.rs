@@ -32,6 +32,8 @@ const GATED_ROUTES: &[&str] = &[
     "/cc-allowed-tools",
     "/changes/:id/apply",
     "/changes/:id/discard",
+    "/changes/:id/set-aside",
+    "/changes/:id/bring-back",
     "/changes/:id/revert",
     "/changes/apply-all",
     "/changes/apply-all/cancel",

@@ -23,6 +23,7 @@ import { anchoredPanelStyle, useAnchoredPosition } from '../../hooks/useAnchored
 import { viewportIsMobile } from '../../utils/viewport';
 import { keepFocusOnPress } from '../../utils/dom';
 import { ModelSelectionPicker } from '../shared/ModelSelectionPicker';
+import { keyboardHolder, returnKeyboard } from '../shared/keyboardHandoff';
 
 /** The Lucidos Agent's model + reasoning picker — the chat-agent sibling of
  *  {@link CodingAgentControlMenu}. Mounted in the prompt-bar actions row whenever the
@@ -51,6 +52,9 @@ export function LucidosControlMenu({ threadId, composeContext }: { threadId?: st
   const menuRef = useRef<HTMLDivElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
   const open = useSignal(false);
+  // The prompt, when it held the keyboard as the menu opened. The filter box
+  // takes the keyboard from it, and closing hands it back.
+  const keyboardHolderRef = useRef<HTMLElement | null>(null);
   // Placed like CodingAgentControlMenu, whose `.control-dropdown` box it shares.
   const pos = useAnchoredPosition(
     open.value ? menuRef.current : null,
@@ -65,6 +69,8 @@ export function LucidosControlMenu({ threadId, composeContext }: { threadId?: st
   if (chatModels.value.status === 'not-loaded') void loadChatModels();
 
   function close() {
+    returnKeyboard(keyboardHolderRef.current, panelRef.current);
+    keyboardHolderRef.current = null;
     // Blur before DOM removal so any focusout-driven header restore fires while
     // the element is still connected (same convention as CodingAgentControlMenu).
     const active = document.activeElement as HTMLElement | null;
@@ -132,8 +138,9 @@ export function LucidosControlMenu({ threadId, composeContext }: { threadId?: st
         aria-label={`${LUCIDOS_AGENT_LABEL} model`}
         onMouseDown={keepFocusOnPress}
         onClick={() => {
-          if (open.value) close();
-          else open.value = true;
+          if (open.value) { close(); return; }
+          keyboardHolderRef.current = keyboardHolder();
+          open.value = true;
         }}
       >
         {/* The flat mark, not `<LucidosMark/>`: this button is one of the
@@ -155,6 +162,7 @@ export function LucidosControlMenu({ threadId, composeContext }: { threadId?: st
         <ModelSelectionPicker
           label={LUCIDOS_AGENT_LABEL}
           selection={selection}
+          keyboardHolder={keyboardHolderRef.current}
           onPick={pick}
         />
       </Overlay>

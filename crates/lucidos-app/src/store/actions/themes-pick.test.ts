@@ -82,6 +82,16 @@ describe('pickTheme', () => {
     expect(paintedThemeMode.value).toBe('dark');
   });
 
+  it('paints the picked theme with its mode in one step, not waiting on the fetch', async () => {
+    vi.mocked(apiClient.getTheme).mockReturnValue(new Promise(() => {}));
+    const paper = theme('paper', ['light']);
+    paper.resolved.light = { '--accent': '#abcdef' };
+    await answer(pickTheme(paper), true);
+
+    // The boot cache holds what was painted.
+    expect(JSON.parse(localStorage.getItem('lucidos-theme-resolved')!).light['--accent']).toBe('#abcdef');
+  });
+
   it('changes nothing when the confirm is cancelled', async () => {
     await answer(pickTheme(theme('paper', ['light'])), false);
 

@@ -45,8 +45,8 @@ use crate::api::standing_instruction::carries_standing_instruction;
 pub(crate) enum ThreadReachVerb {
     Archive,
     Cancel,
-    /// Driving a live coding-agent session: interrupt it, or change its model,
-    /// reasoning effort or permission mode (`POST /api/v1/claude-code/control`).
+    /// Driving a live coding-agent session: interrupt it, or change its model or
+    /// reasoning effort (`POST /api/v1/claude-code/control`).
     /// Controlling another thread's session is as much a reach as cancelling it.
     Control,
     /// Asking a side question, which reads the thread's whole context
@@ -56,6 +56,8 @@ pub(crate) enum ThreadReachVerb {
     DismissSideQuestion,
     Apply,
     Discard,
+    SetAside,
+    BringBack,
     Revert,
     AnswerQuestion,
     Continue,
@@ -80,6 +82,8 @@ impl ThreadReachVerb {
             Self::DismissSideQuestion => "dismiss a side question on",
             Self::Apply => "apply a change from",
             Self::Discard => "discard a change from",
+            Self::SetAside => "set aside a change from",
+            Self::BringBack => "bring back a change from",
             Self::Revert => "revert a change from",
             Self::AnswerQuestion => "answer a question card on",
             Self::Continue => "restart the turn on",
@@ -100,6 +104,8 @@ impl ThreadReachVerb {
             Self::DismissSideQuestion => "dismissing a side question",
             Self::Apply => "applying a change",
             Self::Discard => "discarding a change",
+            Self::SetAside => "setting a change aside",
+            Self::BringBack => "bringing a change back",
             Self::Revert => "reverting a change",
             Self::AnswerQuestion => "answering a question card",
             Self::Continue => "restarting a turn",

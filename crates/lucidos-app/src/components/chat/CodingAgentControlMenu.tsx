@@ -6,20 +6,22 @@ import { resolveScope, resolveCodingAgent, getComposeSelectionOverride } from '.
 import { updateComposeSelection } from '../../store/actions/compose';
 import { sendCodingAgentControl } from '../../store/actions/chat-claude-code';
 import { sendMessage } from '../../store/actions/chat';
-import { fetchCodingAgentCommands, type CodingAgentCommandDef, type CodingAgentCommandsResponse, type CodingAgentModelValue, type CodingAgentReasoningEffort } from '../../api/client';
+import { fetchCodingAgentCommands, type CodingAgentCommandDef, type CodingAgentCommandOption, type CodingAgentCommandsResponse, type CodingAgentModelValue, type CodingAgentReasoningEffort } from '../../api/client';
 import type { CodingAgent } from '../../api/types';
 import { ClaudeIcon, CodexIcon } from '../shared/icons';
-import { focusIfNeeded, isTextInput, keepFocusOnPress } from '../../utils/dom';
+import { isTextInput, keepFocusOnPress } from '../../utils/dom';
 import { hasCoarsePointer, viewportIsMobile } from '../../utils/viewport';
 import { errorDetail } from '../../utils/errorDetail';
 import { Overlay } from '../shared/Overlay';
 import { anchoredPanelStyle, useAnchoredPosition } from '../../hooks/useAnchoredPopover';
 import { useModelSelection, type ModelSelectionPatch } from '../../hooks/useModelSelection';
+import { useFocusWhenPlaced } from '../../hooks/useFocusWhenPlaced';
 import {
   decodePair, pairLabelOf, type ModelChoice, type ModelRow, type TierChoice,
 } from '../../store/modelSelection';
-import { ControlOptionList, type ControlOption } from '../shared/ControlOptionList';
+import { ControlFilter, ControlOptionList, type ControlOption } from '../shared/ControlOptionList';
 import { ModelSelectionPicker } from '../shared/ModelSelectionPicker';
+import { keyboardHolder, returnKeyboard } from '../shared/keyboardHandoff';
 import { FrontendPreviewSection } from './FrontendPreviewSection';
 import { loadFrontendPreview } from '../../store/actions/frontend-preview';
 import { SIDE_QUESTION_COMMAND, isSideQuestionFilter } from '../../store/sideQuestions';
@@ -34,11 +36,12 @@ export const codingAgentMenuOpenRequest = signal<string | null>(null);
  *  question is typed in the composer, never sent from the menu. */
 export const codingAgentMenuComposerText = signal<string | null>(null);
 
-/** Whether the open menu moves focus into itself. Under a finger it leaves
- *  focus in the prompt: moving it drops the keyboard and the panel jumps. A
- *  typed "/" is the exception, since the typing continues in the filter. */
-export function menuTakesFocus(opts: { coarsePointer: boolean; typed: boolean }): boolean {
-  return opts.typed || !opts.coarsePointer;
+/** Whether the open menu moves focus into itself. Under a finger with no
+ *  keyboard up it leaves focus in the prompt: moving it would drop focus from
+ *  the prompt, and the panel would jump. With the keyboard up, the filter box
+ *  takes it (`keyboard`, the keyboard handoff), and so does a typed "/". */
+export function menuTakesFocus(opts: { coarsePointer: boolean; typed: boolean; keyboard: boolean }): boolean {
+  return opts.typed || opts.keyboard || !opts.coarsePointer;
 }
 
 /** The builtin commands to list. A live Claude Code thread also offers `/btw`,
@@ -86,11 +89,31 @@ type ListItem =
  *  A *model selection* is one thing, so it is one entry: the `set_model` rows
  *  carry the tier too. The backend still serves `set_reasoning_effort`, and the
  *  request this menu sends to reconcile a live session still uses it. It is
- *  never a row the user picks on its own. */
+ *  never a row the user picks on its own.
+ *
+ *  A command is a pick from served options, never free text, so one that
+ *  serves no options is not offered. */
 export function offeredControlCommands(
   commands: readonly CodingAgentCommandDef[],
 ): CodingAgentCommandDef[] {
-  return commands.filter(c => c.subtype !== 'set_reasoning_effort');
+  return commands.filter(c =>
+    c.subtype !== 'set_reasoning_effort' && c.params.length === 1 && !!c.params[0].options?.length);
+}
+
+/** The row a thread's model shows as: the row with that value, else the
+ *  first row other than Default that runs it. A thread records the id Claude
+ *  Code reports, which is often no row's own value. */
+export function pickerRowValue(options: readonly CodingAgentCommandOption[], model: string): string {
+  if (options.some(o => o.value === model)) return model;
+  return options.find(o => o.value !== 'default' && o.resolved_model === model)?.value ?? model;
+}
+
+/** The muted note beside a model's row. A fallback Default row also names
+ *  what it resolves to. Claude Code's own Default row says so itself, and
+ *  only a discovered row carries a resolved model. */
+export function modelRowNote(option: CodingAgentCommandOption, currentLabel: string | null): string | undefined {
+  if (option.value !== 'default' || option.resolved_model || !currentLabel) return option.description || undefined;
+  return option.description ? `${option.description} (currently ${currentLabel})` : `Currently ${currentLabel}`;
 }
 
 interface Props {
@@ -112,12 +135,14 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
   const retryTimerRef = useRef<number | null>(null);
   const retryCountRef = useRef(0);
   const openedByTypingRef = useRef(false);
+  // The prompt, when it held the keyboard as the menu opened. The filter box
+  // takes the keyboard from it, and closing hands it back.
+  const keyboardHolderRef = useRef<HTMLElement | null>(null);
   // Only the newest `loadCommands` may apply its response. A scope or backend
   // switch fires a second fetch, and the first can land after it.
   const loadSeqRef = useRef(0);
   const open = useSignal(false);
   const activeCommand = useSignal<string | null>(null);
-  const paramValues = useSignal<Record<string, string>>({});
   const sending = useSignal(false);
   const cached = loadedOr(commandCache.peek(), NO_COMMANDS);
   const controlCommands = useSignal<CodingAgentCommandDef[]>(cached.control);
@@ -167,7 +192,7 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
   // No model picked yet means the backend's own default, which IS the
   // `default` row. Asking that row keeps the compose view (no session, no
   // recorded model) offering the universally-accepted tiers.
-  const tierModel = effectiveModel ?? 'default';
+  const tierModel = effectiveModel ? pickerRowValue(optionsOf('set_model'), effectiveModel) : 'default';
   const selection = useModelSelection({
     models: modelChoices,
     vocabulary: tierVocabulary,
@@ -303,6 +328,7 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
   function openMenu(filterText = '', typed = false) {
     if (!hasAnyCommands(controlCommands.value, effectiveBuiltinCommands, effectiveSkillCommands)) return;
     openedByTypingRef.current = typed;
+    keyboardHolderRef.current = keyboardHolder();
     open.value = true;
     filter.value = filterText;
     highlightIndex.value = 0;
@@ -437,26 +463,28 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
 
   const takesFocus = () => menuTakesFocus({
     coarsePointer: hasCoarsePointer(), typed: openedByTypingRef.current,
+    keyboard: keyboardHolderRef.current !== null,
   });
 
-  // Focus filter input when dropdown opens (autoFocus is unreliable for conditional rendering)
-  useEffect(() => {
-    if (open.value && !activeCommand.value && takesFocus()) {
-      requestAnimationFrame(() => focusIfNeeded(filterRef.current));
-    }
-  }, [open.value, activeCommand.value]);
+  // Focus the filter box on open and on the way back from a step.
+  useFocusWhenPlaced(
+    () => (open.value && !activeCommand.value && takesFocus() ? filterRef.current : null),
+    [open.value, activeCommand.value],
+  );
 
   // Focus the options view on entry, so its arrow keys are live. The model
-  // picker focuses whichever of its own two steps is showing.
-  useEffect(() => {
-    if (activeCommand.value !== null && activeCommand.value !== 'set_model' && takesFocus()) {
-      focusIfNeeded(optionsListRef.current);
-    }
+  // picker focuses whichever of its own steps is showing. Under a finger with
+  // the keyboard up, the list hands it back to the prompt in the same tap, so
+  // it never drops.
+  useFocusWhenPlaced(() => {
+    if (activeCommand.value === null || activeCommand.value === 'set_model') return null;
+    const holder = keyboardHolderRef.current;
+    if (holder && hasCoarsePointer()) return holder;
+    return takesFocus() ? optionsListRef.current : null;
   }, [activeCommand.value]);
 
   function selectCommand(subtype: string) {
     activeCommand.value = subtype;
-    paramValues.value = {};
     // The filter box is shared with the command list behind it, so a query
     // typed to FIND this command must not also narrow its options.
     filter.value = '';
@@ -465,7 +493,19 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
     highlightIndex.value = 0;
   }
 
+  /** Back from a command's own view to the list. A field the step had focused
+   *  unmounts with it, so the keyboard goes back to its holder first. The query
+   *  goes too: it is the option filter, and the list would read it as its own. */
+  function backToCommands() {
+    returnKeyboard(keyboardHolderRef.current, panelRef.current);
+    activeCommand.value = null;
+    filter.value = '';
+    highlightIndex.value = 0;
+  }
+
   function close() {
+    returnKeyboard(keyboardHolderRef.current, panelRef.current);
+    keyboardHolderRef.current = null;
     // Blur focused input before DOM removal — ensures focusout fires while
     // elements are still connected, so useHideOnScroll can restore the header.
     const active = document.activeElement as HTMLElement | null;
@@ -474,7 +514,6 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
     }
     open.value = false;
     activeCommand.value = null;
-    paramValues.value = {};
     filter.value = '';
     highlightIndex.value = -1;
   }
@@ -563,7 +602,9 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
    *  values or pending overrides, so nothing leaks across threads. */
   function currentModelLabel(): string | null {
     if (!effectiveModel) return null;
-    const opt = optionsOf('set_model').find(o => o.value === effectiveModel);
+    const options = optionsOf('set_model');
+    const rowValue = pickerRowValue(options, effectiveModel);
+    const opt = options.find(o => o.value === rowValue);
     return opt?.label ?? displayModelName(effectiveModel);
   }
 
@@ -574,49 +615,7 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
     return currentModelLabel() ? selection.label : null;
   }
 
-  async function submit() {
-    const cmd = controlCommands.value.find(c => c.subtype === activeCommand.value);
-    if (!cmd) return;
-
-    const request: Record<string, string> = { subtype: cmd.subtype };
-    for (const p of cmd.params) {
-      const val = paramValues.value[p.key]?.trim();
-      if (!val) {
-        showToast(`${p.label} is required`, 'error');
-        return;
-      }
-      request[p.key] = val;
-    }
-
-    if (!threadId || !hasActiveSession.value) {
-      showToast(`${cmd.label} requires an active session`, 'error');
-      close();
-      return;
-    }
-
-    sending.value = true;
-    const result = await sendCodingAgentControl(threadId, request);
-    sending.value = false;
-    if (result === 'ok') {
-      showToast(`${cmd.label} sent`, 'success');
-      close();
-      return;
-    }
-    if (result === 'pending') {
-      // 404: the session idle-exited between the menu render (which saw
-      // `has_active_session`) and this click, so nothing was delivered and, unlike
-      // `selectOption`, this form captures no pending preference to replay. Report
-      // the same verdict as the pre-flight guard above rather than no-op silently.
-      showToast(`${cmd.label} requires an active session`, 'error');
-      close();
-      return;
-    }
-    // 'error': sendCodingAgentControl already toasted the reason. Leave the form
-    // open so the typed value survives a retry.
-  }
-
   const cmd = controlCommands.value.find(c => c.subtype === activeCommand.value);
-  const hasOptions = cmd && cmd.params.length === 1 && cmd.params[0].options?.length;
   const q = filter.value.toLowerCase();
   const offeredControl = offeredControlCommands(controlCommands.value);
   const filteredControl = q ? offeredControl.filter(c => c.label.toLowerCase().includes(q)) : offeredControl;
@@ -630,20 +629,16 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
     ...filteredSkills.map(sc => ({ type: 'slash' as const, name: sc })),
   ] : [];
 
-  /** The muted note beside a model's row. The Default row also names what it
-   *  resolves to, so the user sees what they inherit. */
   function modelNote(row: ModelRow): string | undefined {
-    const current = row.value === 'default' ? currentModelLabel() : null;
-    if (!current) return row.description;
-    return row.description ? `${row.description} (currently ${current})` : `Currently ${current}`;
+    const option = optionsOf('set_model').find(o => o.value === row.value);
+    return option ? modelRowNote(option, currentModelLabel()) : row.description;
   }
 
   // A model selection has its own picker, with its own steps and keyboard.
-  // Every other option-bearing command (today none, but `set_permission_mode`
-  // could grow options) renders as served.
+  // Any other offered command renders its served options.
   const showsModelPicker = cmd?.subtype === 'set_model';
-  const optionItems: ControlOption[] = hasOptions && !showsModelPicker
-    ? cmd.params[0].options!
+  const optionItems: ControlOption[] = cmd && !showsModelPicker
+    ? cmd.params[0]?.options ?? []
     : [];
 
   function handleKeyDown(e: KeyboardEvent) {
@@ -652,20 +647,14 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
     if (showsModelPicker) return;
     if (e.key === 'Escape') {
       e.preventDefault();
-      // Clear the query on the way out too. It is the option filter, and the
-      // command list behind this view would read it as its own and show
-      // nothing.
-      if (cmd) { activeCommand.value = null; filter.value = ''; highlightIndex.value = 0; }
+      if (cmd) backToCommands();
       else close();
       return;
     }
     if (e.key === 'Enter') {
-      if (cmd && !hasOptions) {
+      if (highlightIndex.value >= 0 && highlightIndex.value < (cmd ? optionItems.length : flatItems.length)) {
         e.preventDefault();
-        void submit();
-      } else if (highlightIndex.value >= 0 && highlightIndex.value < (cmd ? optionItems.length : flatItems.length)) {
-        e.preventDefault();
-        if (cmd && hasOptions) {
+        if (cmd) {
           const opt = optionItems[highlightIndex.value];
           void selectOption(cmd, opt.value, opt.label);
         } else {
@@ -732,24 +721,19 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
       >
           {!cmd ? (
             <div class="control-list">
-              <div class="control-filter-bar">
-                <input
-                  type="text"
-                  class="control-input control-filter"
-                  placeholder="Filter commands..."
-                  value={filter.value}
-                  ref={filterRef}
-                  onInput={(e: Event) => {
-                    const value = (e.target as HTMLInputElement).value;
-                    if (offersSideQuestion && isSideQuestionFilter(value)) {
-                      handBackSideQuestion(value);
-                      return;
-                    }
-                    filter.value = value;
-                    highlightIndex.value = 0;
-                  }}
-                />
-              </div>
+              <ControlFilter
+                placeholder="Filter commands…"
+                value={filter.value}
+                inputRef={filterRef}
+                onInput={(value) => {
+                  if (offersSideQuestion && isSideQuestionFilter(value)) {
+                    handBackSideQuestion(value);
+                    return;
+                  }
+                  filter.value = value;
+                  highlightIndex.value = 0;
+                }}
+              />
               {sections.map(section => (
                 <Fragment key={section.label}>
                   <div class="control-section-label">{section.label}</div>
@@ -799,11 +783,12 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
               // opened from a row there.
               back={{
                 label: 'All commands',
-                onBack: () => { activeCommand.value = null; highlightIndex.value = 0; },
+                onBack: backToCommands,
               }}
+              keyboardHolder={keyboardHolderRef.current}
               onPick={(encoded) => void pickModelSelection(encoded)}
             />
-          ) : hasOptions ? (
+          ) : (
             <ControlOptionList
               label={cmd.label}
               options={optionItems}
@@ -814,29 +799,6 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
               onPick={(opt) => void selectOption(cmd, opt.value, opt.label)}
               onHighlight={(i) => { highlightIndex.value = i; }}
             />
-          ) : (
-            <div class="control-form">
-              <div class="control-form-title">{cmd.label}</div>
-              {cmd.params.map(p => (
-                <input
-                  key={p.key}
-                  type="text"
-                  class="control-input"
-                  placeholder={p.placeholder}
-                  value={paramValues.value[p.key] ?? ''}
-                  onInput={(e: Event) => {
-                    paramValues.value = { ...paramValues.value, [p.key]: (e.target as HTMLInputElement).value };
-                  }}
-                  autoFocus
-                />
-              ))}
-              <div class="control-form-actions">
-                <button class="action-btn" onClick={close}>Cancel</button>
-                <button class="action-btn action-btn-confirm" disabled={sending.value} onClick={submit}>
-                  {sending.value ? 'Sending...' : 'Send'}
-                </button>
-              </div>
-            </div>
           )}
       </Overlay>
     </div>

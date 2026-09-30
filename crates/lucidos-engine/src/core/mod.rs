@@ -1819,6 +1819,8 @@ pub(crate) fn tool_label(name: &str, args: &serde_json::Value) -> Option<String>
         "apply_when_settled" => "Arming a standing apply...".to_string(),
         "apply_as_they_settle" => "Applying, and arming the rest...".to_string(),
         "cancel_standing_apply" => "Canceling a standing apply...".to_string(),
+        "set_aside_change" => "Setting a change aside...".to_string(),
+        "bring_back_change" => "Bringing a change back...".to_string(),
         "correct_memory" | "correct_memory_by_id" => "Updating memory...".to_string(),
         "search_memory" => search_label("Searching memory", args),
         "memory_source" => "Tracing a memory to its conversation...".to_string(),
@@ -1944,6 +1946,8 @@ pub(crate) fn tool_label(name: &str, args: &serde_json::Value) -> Option<String>
             Some("apply_when_settled") => "Arming a standing apply...".to_string(),
             Some("apply_as_they_settle") => "Applying, and arming the rest...".to_string(),
             Some("cancel_standing_apply") => "Canceling a standing apply...".to_string(),
+            Some("set_aside") => "Setting a change aside...".to_string(),
+            Some("bring_back") => "Bringing a change back...".to_string(),
             _ => "Listing changes...".to_string(),
         },
         // Flat back-compat aliases for the two LLM-exposed `thread_queue`

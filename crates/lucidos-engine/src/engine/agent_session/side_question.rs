@@ -186,6 +186,7 @@ struct SessionCopy {
     user_env: Vec<(String, String)>,
     binary_override: Option<String>,
     permission_mode: Option<String>,
+    additional_directories: Vec<PathBuf>,
 }
 
 /// Whether a side question with this id was already asked on the thread.
@@ -451,6 +452,7 @@ impl LucidosEngine {
             account_pin: copy.account_pin.as_ref(),
             binary_override: copy.binary_override.as_deref(),
             permission_mode: copy.permission_mode.as_deref(),
+            additional_directories: &copy.additional_directories,
         };
         let reply =
             crate::runtime::claude_code::ask_side_question(args, question, images, deadline)
@@ -502,6 +504,10 @@ impl LucidosEngine {
             .cloned();
         let user_env =
             crate::core::EnvironmentVariableStore::spawn_pairs(pool, "SideQuestion").await;
+        // Computed from the same cwd as the session's own spawn, so both name
+        // the same directories and share one prompt prefix.
+        let additional_directories =
+            crate::engine::repo_directory_grants::resolve(&cwd, self.workspace_path()).await;
         Ok(SessionCopy {
             cwd,
             session_id,
@@ -514,6 +520,7 @@ impl LucidosEngine {
             binary_override: preference(crate::core::PREF_CODING_AGENT_CLAUDE_PATH).await,
             permission_mode: preference(crate::core::PREF_CODING_AGENT_CLAUDE_PERMISSION_MODE)
                 .await,
+            additional_directories,
         })
     }
 }

@@ -245,10 +245,26 @@ input[type="checkbox"]:disabled {
     }
 }
 
-/* A finger needs a taller target than a pointer does. */
+/* A finger needs a taller target than a pointer does, but the pill keeps its
+   size: an invisible layer takes the taps past it, above and below. The scroll
+   box clips taps too, so the bar pads out that reach and a negative margin
+   hands the room back. A bar that sets its own padding adds
+   var(--pill-bar-hit-slop, 0rem) to it. */
 @media (pointer: coarse) {
+    .pill-bar {
+        --pill-bar-hit-slop: 0.5rem;
+        padding-block: var(--pill-bar-hit-slop);
+        margin-block: calc(-1 * var(--pill-bar-hit-slop));
+    }
+
     .pill-bar-btn {
-        min-height: 2.25rem;
+        position: relative;
+    }
+
+    .pill-bar-btn::before {
+        content: '';
+        position: absolute;
+        inset: calc(-1 * var(--pill-bar-hit-slop)) 0;
     }
 }
 

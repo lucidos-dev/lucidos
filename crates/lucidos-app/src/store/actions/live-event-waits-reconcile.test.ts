@@ -40,7 +40,7 @@ vi.hoisted(() => {
 });
 
 import { makeThreadState } from './threads-test-helpers';
-import { handleEvent, type EventWaitSummary, type ThreadAggregate, type ThreadEvent, type ThreadState } from '../thread-events';
+import { applySummaryVersion, handleEvent, type EventWaitSummary, type ThreadAggregate, type ThreadEvent, type ThreadState } from '../thread-events';
 import type { ThreadSummary } from '../../api/threads';
 import { focusedThreadId, threadMap } from '../store';
 import { upsertThread } from './thread-loading';
@@ -50,9 +50,7 @@ vi.mock('../../api/threads', () => ({
   fetchThreadEvents: vi.fn().mockResolvedValue({ events: [], currentAggregate: null }),
 }));
 
-/** When the wait was armed, and when the engine resolved it. Both are
- *  `thread_summaries.last_activity` values: the four `EventWait*` projection
- *  arms all bump it, so a resolution's snapshot is strictly newer. */
+/** When the wait was armed, and when the engine resolved it. */
 const ARMED_AT = '2026-08-14T10:00:00.000Z';
 const RESOLVED_AT = '2026-08-14T10:07:00.000Z';
 
@@ -80,6 +78,7 @@ function summary(overrides: Partial<ThreadSummary>): ThreadSummary {
     live_event_wait_count: 0,
     live_event_waits: [],
     status: 'idle',
+    summary_version: 0,
     coding_agent_has_diff: false,
     coding_agent_proposed: false,
     coding_agent_requires_restart: false,
@@ -136,25 +135,29 @@ describe('upsertThread reconciles the live event-wait list against the server', 
   });
 
   /** A GET issued before the arm, landing after live SSE already applied it.
-   *  Without the staleness guard this blanks a wait that is genuinely live. */
-  it('does not blank a freshly armed wait when the GET snapshot is stale', () => {
+   *  Without the version guard this blanks a wait that is genuinely live. */
+  it('does not blank a freshly armed wait when the GET snapshot is older', () => {
     const map = new Map<string, ThreadState>();
-    map.set('t1', makeThreadState('t1', {
+    const thread = makeThreadState('t1', {
       meta: { id: 't1', updatedAt: RESOLVED_AT, liveEventWaitCount: 1, liveEventWaits: [WAIT] },
-    }));
+    });
+    applySummaryVersion(thread.meta, 5, 'idle');
+    map.set('t1', thread);
 
-    upsertThread(map, summary({ live_event_waits: [], last_activity: ARMED_AT }), false);
+    upsertThread(map, summary({ live_event_waits: [], summary_version: 4, last_activity: ARMED_AT }), false);
 
     expect(map.get('t1')!.meta.liveEventWaits).toEqual([WAIT]);
   });
 
   /** The mirror image: a GET issued before the delivery must not put a dead
    *  wait back on screen, counting down to a deadline nobody is waiting for. */
-  it('does not resurrect a resolved wait when the GET snapshot is stale', () => {
+  it('does not resurrect a resolved wait when the GET snapshot is older', () => {
     const map = new Map<string, ThreadState>();
-    map.set('t1', makeThreadState('t1', { meta: { id: 't1', updatedAt: RESOLVED_AT } }));
+    const thread = makeThreadState('t1', { meta: { id: 't1', updatedAt: RESOLVED_AT } });
+    applySummaryVersion(thread.meta, 5, 'idle');
+    map.set('t1', thread);
 
-    upsertThread(map, summary({ live_event_wait_count: 1, live_event_waits: [WAIT], last_activity: ARMED_AT }), false);
+    upsertThread(map, summary({ live_event_wait_count: 1, live_event_waits: [WAIT], summary_version: 4, last_activity: ARMED_AT }), false);
 
     expect(map.get('t1')!.meta.liveEventWaits).toEqual([]);
   });

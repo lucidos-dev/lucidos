@@ -18,6 +18,32 @@ export const submittingThreadIds = signal<Set<string>>(new Set());
  *  the shortcut asks it rather than cancelling behind its back. */
 export const promptStopRequested = signal(false);
 
+/** Set by the Side question shortcut, consumed by the one mounted PromptInput.
+ *  Only the composer knows whether this draft can be asked aside. */
+export const promptSideQuestionRequested = signal(false);
+
+/** What the Side question half of the split pill does, or why it is not
+ *  offered. The hold on Send or Stop and the Side question shortcut share it.
+ *  From Send it asks the draft. Stop shows only over an empty box, so there it
+ *  starts a `/btw` draft for the user to finish while the turn runs. */
+export type SideQuestionAction =
+  | { kind: 'ask-draft' }
+  | { kind: 'start-draft' }
+  | { kind: 'unavailable'; reason: string };
+
+export function sideQuestionAction(args: {
+  hasContent: boolean;
+  stopShown: boolean;
+  threadStarted: boolean;
+  isCodex: boolean;
+}): SideQuestionAction {
+  if (!args.threadStarted) return { kind: 'unavailable', reason: 'Side questions need a started thread.' };
+  if (args.isCodex) return { kind: 'unavailable', reason: "Codex threads don't take side questions." };
+  if (args.hasContent) return { kind: 'ask-draft' };
+  if (args.stopShown) return { kind: 'start-draft' };
+  return { kind: 'unavailable', reason: 'Type the side question first.' };
+}
+
 export interface UploadSendIntent<TContext = unknown> {
   useCodingAgent: boolean;
   context: TContext | null;
@@ -375,12 +401,12 @@ export function promptPlaceholder(
 // the new id from focusedThreadId after send's sync prefix runs setFocusedThread.
 export function dispatchSend(
   threadId: string | null,
-  send: () => Promise<void>,
+  send: () => Promise<unknown>,
 ): { promise: Promise<void>; submittedId: string | null } {
   if (threadId) {
     markSubmittingThread(threadId);
   }
-  const promise = send();
+  const promise = send().then(() => undefined);
   const submittedId = threadId ?? focusedThreadId.value;
   if (!threadId && submittedId) {
     markSubmittingThread(submittedId);

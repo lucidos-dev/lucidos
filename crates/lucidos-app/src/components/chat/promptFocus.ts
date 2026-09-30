@@ -1,4 +1,5 @@
 import { isElementVisible } from './scrollState';
+import { touchActivated } from '../../utils/tapGesture';
 
 /** The currently focused prompt textarea, or null if focus is elsewhere.
  *  Reads document.activeElement directly rather than locating the visible
@@ -47,10 +48,16 @@ export function getVisiblePromptInput(): HTMLElement | null {
  * iOS Safari auto-scrolls overflow:hidden containers to reveal focused
  * elements, which permanently offsets the swipe track (the "half panel" bug).
  * preventScroll still opens the keyboard within the gesture window.
+ *
+ * With dynamic bars on, the prompt may sit slid away under a transform. The
+ * reveal clears that transform synchronously, before the focus, since a
+ * transformed prompt can keep iOS Safari from opening the keyboard.
  */
 export function focusPromptNow(): void {
   const el = getVisiblePromptInput();
-  if (el) el.focus({ preventScroll: true });
+  if (!el) return;
+  document.dispatchEvent(new Event('reveal-mobile-bars'));
+  el.focus({ preventScroll: true });
 }
 
 /** Blur the prompt textarea iff it is the active element. No-op otherwise.
@@ -103,21 +110,8 @@ export function installActionBtnBlurListener(): void {
  * Usage: <button {...composeHandlers(() => unfocusThread())} />
  */
 export function composeHandlers(action: () => void, focusFn: () => void = focusPromptNow) {
-  let handledByTouch = false;
-  return {
-    onTouchEnd: (e: TouchEvent) => {
-      handledByTouch = true;
-      e.preventDefault();
-      focusFn();
-      action();
-    },
-    onClick: () => {
-      if (handledByTouch) {
-        handledByTouch = false;
-        return;
-      }
-      focusFn();
-      action();
-    },
-  };
+  return touchActivated(() => {
+    focusFn();
+    action();
+  });
 }

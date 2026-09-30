@@ -75,6 +75,7 @@ async fn seed_pending_change(bus: &EventBus, thread_id: Uuid, branch: &str) -> U
             repo_root: "/tmp/repo".to_string(),
             hardened: true,
             incomplete: false,
+            set_aside: false,
             path: String::new(),
             diff: String::new(),
         },
@@ -413,7 +414,6 @@ async fn emit_settings_with_sid(bus: &EventBus, thread_id: Uuid, cc_session_id: 
         ThreadEvent::CodingAgentSettingsChanged {
             model: None,
             reasoning_effort: None,
-            permission_mode: None,
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             cc_session_id: cc_session_id.map(String::from),
             claude_config_dir: None,
@@ -446,7 +446,6 @@ async fn emit_init_settings(
         ThreadEvent::CodingAgentSettingsChanged {
             model: None,
             reasoning_effort: None,
-            permission_mode: None,
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             cc_session_id: cc_session_id.map(String::from),
             claude_config_dir: claude_config_dir.map(String::from),

@@ -17,6 +17,38 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
 
+/// What a proposal says about a branch's work beyond its files.
+pub(super) struct BranchProposalDetails {
+    pub description: String,
+    pub hardened: bool,
+    pub requires_restart: bool,
+}
+
+/// What a proposal says about a branch's work beyond its files.
+pub(super) async fn branch_proposal_details(
+    pool: &sqlx::PgPool,
+    changes: &crate::core::changes_projection::ChangesProjection,
+    thread_id: Uuid,
+    branch_name: &str,
+    repo_root: &Path,
+    changed_files: &[String],
+) -> BranchProposalDetails {
+    let fallback = change_description_fallback(pool, thread_id, branch_name).await;
+    let base = default_local_branch(repo_root).await;
+    let log_range = format!("{}..{}", base, branch_name);
+    let description = describe_branch_changes(repo_root, &log_range, &fallback, None).await;
+    // The marker is keyed by repo root plus branch name, so it survives the
+    // cleanup worker removing the worktree. Without this lookup,
+    // `propose_change` downgrades hardened to false and Apply re-runs
+    // `/harden` on already-hardened work.
+    let hardened = branch_is_hardened(pool, changes, repo_root, branch_name).await;
+    BranchProposalDetails {
+        description,
+        hardened,
+        requires_restart: files_require_restart(changed_files),
+    }
+}
+
 impl LucidosEngine {
     /// Gather branch metadata and propose a Change record. Callers must pass a
     /// non-empty `changed_files` list, so this never creates a phantom `changes`
@@ -24,7 +56,7 @@ impl LucidosEngine {
     ///
     /// `origin` reaches the emitted `ChangeProposed`, so the route popover can
     /// name which engine path proposed the change.
-    async fn propose_branch_changes(
+    pub(super) async fn propose_branch_changes(
         &self,
         thread_id: Uuid,
         branch_name: &str,
@@ -32,32 +64,50 @@ impl LucidosEngine {
         changed_files: &[String],
         origin: Option<MessageOrigin>,
     ) -> Result<Uuid, Box<dyn std::error::Error + Send + Sync>> {
+        let incomplete = !last_turn_ended_cleanly(self.pool(), thread_id).await;
+        self.propose_branch_work(
+            thread_id,
+            branch_name,
+            repo_root,
+            changed_files,
+            origin,
+            incomplete,
+        )
+        .await
+    }
+
+    /// Propose a branch's committed work, stating whether it is incomplete.
+    pub(super) async fn propose_branch_work(
+        &self,
+        thread_id: Uuid,
+        branch_name: &str,
+        repo_root: &Path,
+        changed_files: &[String],
+        origin: Option<MessageOrigin>,
+        incomplete: bool,
+    ) -> Result<Uuid, Box<dyn std::error::Error + Send + Sync>> {
         debug_assert!(
             !changed_files.is_empty(),
-            "propose_branch_changes called with empty file list — caller must filter"
+            "propose_branch_work called with empty file list; caller must filter"
         );
-        let requires_restart = files_require_restart(changed_files);
-        let fallback = change_description_fallback(self.pool(), thread_id, branch_name).await;
-        let base = default_local_branch(repo_root).await;
-        let log_range = format!("{}..{}", base, branch_name);
-        let description = describe_branch_changes(repo_root, &log_range, &fallback, None).await;
-        let repo_root_str = repo_root.to_string_lossy();
-        // The marker is keyed by repo root plus branch name, so it survives the
-        // cleanup worker removing the worktree. Without this lookup,
-        // `propose_change` downgrades hardened to false and Apply re-runs
-        // `/harden` on already-hardened work.
-        let hardened =
-            branch_is_hardened(self.pool(), self.changes(), repo_root, branch_name).await;
-        let incomplete = !last_turn_ended_cleanly(self.pool(), thread_id).await;
+        let details = branch_proposal_details(
+            self.pool(),
+            self.changes(),
+            thread_id,
+            branch_name,
+            repo_root,
+            changed_files,
+        )
+        .await;
         self.propose_change(crate::engine::change_ops::ProposeChangeInput {
             thread_id,
             branch_name,
-            repo_root: &repo_root_str,
-            description: &description,
+            repo_root: &repo_root.to_string_lossy(),
+            description: &details.description,
             files: changed_files,
-            requires_restart,
+            requires_restart: details.requires_restart,
             channel: EventChannel::ClaudeCode,
-            hardened,
+            hardened: details.hardened,
             origin,
             incomplete,
         })
@@ -255,7 +305,7 @@ impl LucidosEngine {
                 "[Recovery] Discarding stale session changes (branch {})",
                 branch_name
             );
-            self.discard_pending_for_thread(thread_id, actor.clone())
+            self.discard_open_changes_for_thread(thread_id, actor.clone())
                 .await;
         }
 
@@ -981,15 +1031,6 @@ impl LucidosEngine {
             (t0.elapsed() - t_lost_branches).as_millis(),
             recovering_threads.len()
         );
-
-        // Catch-all: settle any coding-agent thread the projection still shows
-        // `running` that this pass neither resumed nor settled.
-        settle_orphaned_running_coding_agent_threads(
-            self.pool(),
-            &self.event_bus,
-            &recovering_threads,
-        )
-        .await;
 
         recovering_threads.into_iter().collect()
     }
@@ -1719,28 +1760,59 @@ pub(crate) async fn settle_unresumed_switch_threads(
     }
 }
 
-/// Settle any coding-agent thread still `running` in the projection that boot
-/// recovery neither resumed nor settled. After a restart there are NO live
-/// subprocesses, so such a thread is a permanent zombie: the in-memory watchdogs
-/// only scan live `agent_sessions`, which is empty at boot. The skip paths in
-/// `recover_orphaned_worktrees` that DROP a worktree leave the projection
-/// unsettled, and this is the floor under those. The question-park preserve is
-/// not one of them: it keeps the worktree and must stay unsettled.
+/// The start of a thread's latest turn, when that turn was interrupted: no
+/// terminator came after it, and either it did something or it was never
+/// going to run on its own. Two starts DO run on their own, so a bare one is
+/// pending rather than interrupted: a `ChildThreadCompleted` (the
+/// parent-resume refire) and a `ContinuationRequested` (the spawn
+/// dispatcher's backfill). Ordered by `sequence`, which is total.
 ///
-/// Scoped to coding-agent threads on purpose. Chat orphans are settled by
-/// `recover_orphaned_threads`, and a chat thread blocked on a child legitimately
-/// sits `running` pending parent-resume. A coding-agent thread exits its
-/// subprocess at every turn boundary, so at boot a `running` one has no live
-/// session. `settle_stuck_running_thread` re-checks per thread, so a thread
-/// settled elsewhere in the meantime is a no-op.
-pub(crate) async fn settle_orphaned_running_coding_agent_threads(
+/// The terminator and activity lists are the chat sweep's own. The start list
+/// is wider than the chat sweep's: a coding-agent turn or a Continue rerun can
+/// also die before the settle runs.
+const INTERRUPTED_TURN_START_SQL: &str = concat!(
+    "WITH start AS ( \
+        SELECT id, event_type, payload->>'channel' AS channel, sequence FROM events \
+        WHERE aggregate = 'thread' AND aggregate_id = $1::text \
+          AND event_type IN ('MessageReceived','TriggerStarted','ChildThreadCompleted', \
+                             'ContinuationRequested','ContinuationStarted', \
+                             'CodingAgentUserMessageSent') \
+        ORDER BY sequence DESC LIMIT 1 \
+    ), marks AS ( \
+        SELECT MAX(sequence) FILTER (WHERE event_type IN (",
+    crate::engine::chat::recovery::turn_terminal_events!(),
+    ")) AS last_terminal, \
+               MAX(sequence) FILTER (WHERE event_type IN (",
+    crate::engine::chat::recovery::turn_activity_events!(),
+    ")) AS last_activity \
+        FROM events WHERE aggregate = 'thread' AND aggregate_id = $1::text \
+    ) \
+    SELECT s.id, s.event_type, s.channel FROM start s, marks m \
+    WHERE s.sequence > COALESCE(m.last_terminal, 0) \
+      AND (m.last_activity > s.sequence \
+           OR s.event_type NOT IN ('ChildThreadCompleted','ContinuationRequested'))"
+);
+
+/// The last boot step that touches thread status: settle every thread still
+/// `running` once recovery has had its turn. No turn runs at boot, so each one
+/// is either a turn the restart interrupted or a status write no event backs.
+///
+/// - **An interrupted turn** gets `ResponseAborted { RecoveryAfterRestart }`,
+///   what the chat sweep emits, so it reads "Response interrupted" with a
+///   Continue. That includes a message the crash dropped before its first
+///   token, which otherwise sat unanswered with nothing saying why.
+/// - **Anything else** goes straight to `idle`. An ended turn's `running` came
+///   from the event-less parent wake, and a pending start runs later in boot.
+///   An abort for either would record one that never happened.
+///
+/// `recovering` holds threads the coding-agent pass is about to resume.
+pub async fn settle_orphaned_running_threads(
     pool: &sqlx::PgPool,
     bus: &crate::engine::event_bus::EventBus,
     recovering: &std::collections::HashSet<Uuid>,
 ) {
     let running: Vec<Uuid> = match sqlx::query_scalar::<_, Uuid>(&format!(
-        "SELECT thread_id FROM thread_summaries \
-         WHERE is_coding_agent = true AND status = {}",
+        "SELECT thread_id FROM thread_summaries WHERE status = {}",
         ThreadStatus::Running.sql_literal(),
     ))
     .fetch_all(pool)
@@ -1759,25 +1831,52 @@ pub(crate) async fn settle_orphaned_running_coding_agent_threads(
         if recovering.contains(&tid) {
             continue;
         }
-        match crate::engine::claude_code::settle_stuck_running_thread(
-            pool,
-            bus,
-            tid,
-            Some(MessageOrigin::system()),
-            crate::engine::claude_code::SettleTerminal::StuckProjection,
-        )
-        .await
-        {
-            Ok(true) => log!(
-                "[Recovery] Settled orphaned `running` coding-agent thread {} — no live session after restart and not picked up by recovery",
-                tid
-            ),
-            Ok(false) => {}
-            Err(e) => log!(
+        if let Err(e) = settle_one_orphaned_running_thread(pool, bus, tid).await {
+            log!(
                 "[Recovery] Failed to settle orphaned running thread {}: {}",
                 tid,
                 e
-            ),
+            );
         }
     }
+}
+
+async fn settle_one_orphaned_running_thread(
+    pool: &sqlx::PgPool,
+    bus: &crate::engine::event_bus::EventBus,
+    tid: Uuid,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use crate::engine::chat::recovery::{
+        emit_restart_abort, start_channel, RESTART_INTERRUPTED_TEXT,
+    };
+
+    let interrupted: Option<(Uuid, String, Option<String>)> =
+        sqlx::query_as(INTERRUPTED_TURN_START_SQL)
+            .bind(tid)
+            .fetch_optional(pool)
+            .await?;
+    let Some((start_id, start_type, stamped_channel)) = interrupted else {
+        sqlx::query(&format!(
+            "UPDATE thread_summaries SET status = {} WHERE thread_id = $1 AND status = {}",
+            ThreadStatus::Idle.sql_literal(),
+            ThreadStatus::Running.sql_literal(),
+        ))
+        .bind(tid)
+        .execute(pool)
+        .await?;
+        return Ok(());
+    };
+    emit_restart_abort(
+        bus,
+        tid,
+        RESTART_INTERRUPTED_TEXT.to_string(),
+        Some(start_id),
+        start_channel(stamped_channel.as_deref(), Some(start_type.as_str())),
+    )
+    .await?;
+    log!(
+        "[Recovery] Settled orphaned `running` thread {}: the restart interrupted its turn",
+        tid
+    );
+    Ok(())
 }

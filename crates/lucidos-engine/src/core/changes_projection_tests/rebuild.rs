@@ -126,6 +126,7 @@ async fn rebuild_missing_from_events_uses_latest_proposed_payload() {
             repo_root: "/r".to_string(),
             hardened: false,
             incomplete: false,
+            set_aside: false,
             path: String::new(),
             diff: String::new(),
         },
@@ -185,6 +186,7 @@ async fn rebuild_missing_from_events_applies_change_hardened_after_proposed() {
             repo_root: "/r".to_string(),
             hardened: false,
             incomplete: false,
+            set_aside: false,
             path: String::new(),
             diff: String::new(),
         },
@@ -402,7 +404,7 @@ async fn rebuild_missing_from_events_is_noop_when_projection_healthy() {
 }
 
 /// External repo CC threads must not have rows in the changes table — the
-/// runtime gates (`may_touch_change_state_at_idle`, the SessionEnded
+/// runtime gates (`idle_change_write`, the SessionEnded
 /// cleanup path) all skip propose_change for external repos, and the
 /// cleanup migration removes any rows that survived from before those
 /// gates were added. This test pins the SQL pattern itself: run the same

@@ -346,8 +346,8 @@ describe('a turn parked on an event wait', () => {
 
   /** The stop turn states its own outcome and nothing continues out of it, so
    *  it is terminal whatever the thread is doing. A stop while an unrelated turn
-   *  is still running must not spin "Requesting", and once the thread settles it
-   *  must not fall through to the stale detector's "Aborted". */
+   *  is still running must not spin "Requesting", and it reads "Done" once the
+   *  thread settles. */
   it.each([
     ['idle', true],
     ['running', false],

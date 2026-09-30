@@ -80,6 +80,8 @@ pub const ROUTE_REACH: &[(&str, Reach, &[&str])] = &[
     ("/changes/:id/apply", Host, &[]),
     ("/changes/:id/diff", Host, &[]),
     ("/changes/:id/discard", Host, &[]),
+    ("/changes/:id/set-aside", Host, &[]),
+    ("/changes/:id/bring-back", Host, &[]),
     ("/changes/:id/file", Host, &[]),
     ("/changes/:id/revert", Host, &[]),
     ("/changes/applied", Host, &[]),

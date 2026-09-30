@@ -7,6 +7,7 @@ import { SurfaceHead } from './Surface';
 import { trapDialogTab } from './dialogFocusTrap';
 import { dialogOwnsKey } from './dialogKeyScope';
 import { PROSE_TEXT_ATTRS } from '../../utils/noAutofill';
+import { isImeComposingKey } from '../../utils/ime';
 
 /** What the reader has typed into the prompt that is currently open, kept
  *  outside the component so it survives a REMOUNT of the same prompt.
@@ -34,6 +35,20 @@ export function promptInputSeed(
   defaultValue: string | undefined,
 ): string {
   return (draft && draft.resolve === resolve ? draft.value : defaultValue) ?? '';
+}
+
+/** Whether this keydown submits the prompt. Buttons answer Enter themselves,
+ *  and a multiline textarea keeps Enter for newlines. An Enter that commits an
+ *  IME candidate belongs to the IME, so it never submits half-converted text.
+ *  Pure, and exported for testing. */
+export function promptEnterSubmits(
+  e: Pick<KeyboardEvent, 'key' | 'isComposing' | 'keyCode'>,
+  targetTag: string | undefined,
+  multiline: boolean | undefined,
+): boolean {
+  if (e.key !== 'Enter' || isImeComposingKey(e)) return false;
+  if (targetTag === 'BUTTON') return false;
+  return !(multiline && targetTag === 'TEXTAREA');
 }
 
 function close(value: string | null) {
@@ -67,11 +82,7 @@ export function PromptDialog() {
       // otherwise close it with the input's text. See dialogOwnsKey.
       if (!dialogOwnsKey(target, dialogRef.current)) return;
       if (e.key === 'Enter') {
-        // Buttons handle Enter natively (triggers click). A multiline textarea
-        // needs newlines, so it does NOT submit on a bare Enter; a single-line
-        // input does.
-        if (target?.tagName === 'BUTTON') return;
-        if (state.multiline && target?.tagName === 'TEXTAREA') return;
+        if (!promptEnterSubmits(e, target?.tagName, state.multiline)) return;
         e.preventDefault();
         const el = dialogRef.current?.querySelector<HTMLInputElement | HTMLTextAreaElement>('.prompt-input');
         close(el?.value ?? '');

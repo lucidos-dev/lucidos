@@ -194,21 +194,11 @@ the child reported done. Four things to expect:
 - A follow-up into an **archived** coding-agent child resurfaces it in the
   user's Inbox at its next idle.
 
-## Archiving a child when it is done
+## Archiving a child
 
 Nothing archives a thread on its own, not even after its change is applied.
-That call is yours (ADR 0310). Use the `threads` tool's `archive` action with
-the child's id (or `lucidos threads archive --thread <id>`).
-
-**Archive a child once its change is applied and you expect no follow-up.**
-Leave it open while any of these remains:
-
-- a follow-up you still mean to send, or a review round still to come;
-- a question card, or a permission card, waiting on the user;
-- a pending change, not yet applied or discarded;
-- a live event wait of its own.
-
-What to expect:
+The `threads` tool's `archive` action archives a child by its id (or
+`lucidos threads archive --thread <id>`). What to expect:
 
 - **It runs the Archive button's cascade.** The child's own sub-threads go
   with it, and the same states refuse it: a running child, one waiting on the
@@ -221,7 +211,7 @@ What to expect:
   sub-thread of the child stays open while the rest of the family goes.
 - **Archiving frees the child's worktree.** A merged, clean worktree is
   reclaimed about an hour after the child goes idle. A follow-up after that
-  rebuilds it from scratch, which is why you archive only when none is coming.
+  rebuilds it from scratch.
 - **Your own thread** takes `thread_id: 'current'`. It is archived once this
   turn ends and it has settled, and a new message before then keeps it open.
 

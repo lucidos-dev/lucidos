@@ -131,7 +131,7 @@ fn every_user_discard_kills_the_threads_background_tasks() {
         &crate::test_support::source_scan::src_root().join("engine/change_ops/discard.rs"),
     );
     for entry in [
-        "pub async fn discard_pending_for_thread(",
+        "pub async fn discard_open_changes_for_thread(",
         "pub async fn discard_change(",
     ] {
         let body = &src[src.find(entry).expect(entry)..];

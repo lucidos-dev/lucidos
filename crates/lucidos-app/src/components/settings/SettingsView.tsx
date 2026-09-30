@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'preact/hooks';
 import { currentModel, reasoningEffort, preferences, showToast, showConfirm, oauthAccounts, credentials, settingsSubview, settingsScrollTarget, repositories, knownOAuthProviders, oauthConnectPrefill } from '../../store/store';
 import { devices, getDeviceId, updateDeviceName, removeDevice } from '../../store/actions/devices';
-import { setImageModel, setThemeMode, setFontFamily, setChatModelSelection, currentThemeMode, currentFontFamily, currentUiScale, currentImageModel, currentBackgroundModel, currentBackgroundReasoning, saveModelSelection, currentVertexRegion, setVertexRegion, currentCommandGuard, setCommandGuard, currentCommandGuardJudge, setCommandGuardJudge, currentMobileHeaderSticky, setMobileHeaderSticky, currentNotificationToasts, setNotificationToasts, currentInAppBrowser, setInAppBrowser, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, currentMaxToolCalls, setMaxToolCalls, estimateTurnDuration, MAX_TOOL_CALLS_MIN, MAX_TOOL_CALLS_REPRESENTABLE, currentStyleOverrides, clearStyleOverrides, setMotion, setThemeEffects, type ExternalLinkTarget, type ThemeMode, type FontPreference } from '../../store/actions/preferences';
+import { setImageModel, setThemeMode, setFontFamily, setChatModelSelection, currentThemeMode, currentFontFamily, currentUiScale, currentImageModel, currentBackgroundModel, currentBackgroundReasoning, saveModelSelection, currentVertexRegion, setVertexRegion, currentCommandGuard, setCommandGuard, currentCommandGuardJudge, setCommandGuardJudge, currentMobileDynamicBars, setMobileDynamicBars, currentNotificationToasts, setNotificationToasts, currentInAppBrowser, setInAppBrowser, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, currentMaxToolCalls, setMaxToolCalls, estimateTurnDuration, MAX_TOOL_CALLS_MIN, MAX_TOOL_CALLS_REPRESENTABLE, currentStyleOverrides, clearStyleOverrides, setMotion, setThemeEffects, type ExternalLinkTarget, type ThemeMode, type FontPreference } from '../../store/actions/preferences';
 import { THEME_EFFECTS_PREFS, MOTION_PREFS, type ThemeEffectsPref, type MotionPref } from '@lucidos/appearance';
 import { openScaleModal } from '../shared/scaleModalState';
 import { applyNavFocus } from '../shared/focusMarker';
@@ -1474,13 +1474,22 @@ export function SettingsView() {
         {viewportIsMobile.value && (
           <div class="settings-section">
             <div class="settings-section-title" data-search-anchor="appearance:mobile">Mobile</div>
-            <div class="settings-row" data-search-anchor="appearance:mobile-header-sticky">
-              <span class="settings-row-label">Keep header visible</span>
+            <div class="settings-row" data-search-anchor="appearance:mobile-dynamic-bars">
+              <span class="settings-row-label">
+                Dynamic bars
+                <Explainer title="Dynamic bars">
+                  <p>
+                    The header and the prompt slide away as you scroll down a
+                    thread, and come back as you scroll up.
+                  </p>
+                  <p>Off, both stay in place.</p>
+                </Explainer>
+              </span>
               <label class="toggle-switch">
                 <input
                   type="checkbox"
-                  checked={currentMobileHeaderSticky()}
-                  onChange={(e) => void setMobileHeaderSticky((e.currentTarget as HTMLInputElement).checked)}
+                  checked={currentMobileDynamicBars()}
+                  onChange={(e) => void setMobileDynamicBars((e.currentTarget as HTMLInputElement).checked)}
                 />
                 <span class="toggle-slider" />
               </label>

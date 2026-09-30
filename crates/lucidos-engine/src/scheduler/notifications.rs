@@ -355,54 +355,6 @@ pub struct Notification {
 pub struct NotificationStore;
 
 impl NotificationStore {
-    /// Defensive double-write: the migration owns this CREATE TABLE (see
-    /// `20260517160627_consolidate_init_schema_tables.sql`). A temporary measure:
-    /// `docs/temporary-measures.md` § "Defensive double-write of tables into
-    /// `init_schema`".
-    /// The `tap` column shape (TEXT → JSONB) is owned by the dedicated
-    /// migrations; this defensive create only spins up the bare row schema.
-    pub async fn init_schema(pool: &PgPool) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS notifications (
-                id UUID PRIMARY KEY,
-                task_id UUID,
-                app_id TEXT,
-                thread_id UUID,
-                event_id UUID,
-                title TEXT NOT NULL,
-                message TEXT NOT NULL,
-                read BOOLEAN DEFAULT false,
-                created_at TIMESTAMPTZ DEFAULT NOW()
-            )
-            "#,
-        )
-        .execute(pool)
-        .await?;
-
-        // Index for efficient unread queries
-        sqlx::query(
-            r#"
-            CREATE INDEX IF NOT EXISTS idx_notifications_unread
-            ON notifications (read, created_at DESC)
-            "#,
-        )
-        .execute(pool)
-        .await?;
-
-        // Standalone created_at index for "all" filter cursor pagination
-        sqlx::query(
-            r#"
-            CREATE INDEX IF NOT EXISTS idx_notifications_created_at
-            ON notifications (created_at DESC)
-            "#,
-        )
-        .execute(pool)
-        .await?;
-
-        Ok(())
-    }
-
     /// Insert a notification with a custom timestamp (for backdating).
     ///
     /// The single insert path. A callerless `Utc::now()` wrapper used to sit

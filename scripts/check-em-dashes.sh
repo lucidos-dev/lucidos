@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 #
-# check-em-dashes.sh: fail if this branch ADDS a U+2014 EM DASH or U+2015
-# HORIZONTAL BAR. The deterministic review-time half of
-# `.claude/rules/no-em-dashes.md`; the write-time half is the Claude Code hook
-# `.claude/hooks/no-em-dashes.sh`, which stops the text before it is ever
+# check-em-dashes.sh: fail if this branch ADDS an unspaced U+2014 EM DASH or any
+# U+2015 HORIZONTAL BAR. The deterministic review-time half of
+# `.claude/rules/em-dashes.md`; the write-time half is the Claude Code hook
+# `.claude/hooks/em-dashes.sh`, which stops the text before it is ever
 # written. This one is what covers Codex (no hooks), a hand edit, and anything
 # that reached disk some other way.
 #
@@ -72,7 +72,7 @@ if [ "$SCAN_RC" -ne 0 ]; then
 fi
 
 if [ -z "$HITS" ]; then
-    echo "✓ no em dashes added since $(git -C "$REPO_ROOT" rev-parse --short "$BASE_COMMIT")"
+    echo "✓ no unspaced em dashes added since $(git -C "$REPO_ROOT" rev-parse --short "$BASE_COMMIT")"
     exit 0
 fi
 
@@ -84,7 +84,8 @@ COUNT="$(printf '%s\n' "$HITS" | wc -l | tr -d ' ')"
     printf '%s\n' "$HITS" | sed 's/^/  /'
     echo
     echo "$EM_DASH_ADVICE"
-    echo "Banned: U+2014 EM DASH and U+2015 HORIZONTAL BAR. U+2013 EN DASH is fine."
+    echo "Banned: an unspaced U+2014 EM DASH, and U+2015 HORIZONTAL BAR in any form."
+    echo "Allowed: an em dash with a space on both sides, and U+2013 EN DASH."
     echo "No file type and no context is exempt, code comments and error strings included."
     echo
     echo "Only lines this branch ADDS or REWORDS are checked. Lines that already"

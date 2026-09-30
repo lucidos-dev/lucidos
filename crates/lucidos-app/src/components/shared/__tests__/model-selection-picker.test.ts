@@ -121,41 +121,66 @@ describe('pickerShowsFilter', () => {
   it('draws no box on a freshly opened desktop panel', () => {
     // The user opened it to click a row. A caret blinking in an empty box is
     // the thing this replaced.
-    expect(pickerShowsFilter({ searching: false, touch: false })).toBe(false);
+    expect(pickerShowsFilter({ searching: false, touch: false, keyboard: false })).toBe(false);
   });
 
   it('draws it once a keystroke has started the search', () => {
-    expect(pickerShowsFilter({ searching: true, touch: false })).toBe(true);
+    expect(pickerShowsFilter({ searching: true, touch: false, keyboard: false })).toBe(true);
   });
 
   it('always draws it on a touch device, where no keystroke can reveal it', () => {
     // The capability, never the mobile width breakpoint. A phone in landscape
     // is wider than 768px, and has no more keyboard than it had upright. A
     // width test would leave it a box it can never summon.
-    expect(pickerShowsFilter({ searching: false, touch: true })).toBe(true);
+    expect(pickerShowsFilter({ searching: false, touch: true, keyboard: false })).toBe(true);
+  });
+
+  it('draws it for a host opened mid-typing, so the keystrokes have a home', () => {
+    // A phone-width window under a mouse is no touch device, yet the prompt
+    // held focus as the menu opened.
+    expect(pickerShowsFilter({ searching: false, touch: false, keyboard: true })).toBe(true);
   });
 });
 
 describe('pickerFocusTarget', () => {
+  const target = (over: Partial<Parameters<typeof pickerFocusTarget>[0]> = {}) =>
+    pickerFocusTarget({ tierStep: false, searching: false, touch: false, keyboard: false, ...over });
+
   it('gives the list the keystrokes before the search starts', () => {
     // The list's own handler turns a printable key into the query, so it holds
     // focus while there is no box to type into.
-    expect(pickerFocusTarget({ tierStep: false, searching: false, touch: false })).toBe('list');
+    expect(target()).toBe('list');
   });
 
   it('hands over to the box once the search has started', () => {
-    expect(pickerFocusTarget({ tierStep: false, searching: true, touch: false })).toBe('filter');
+    expect(target({ searching: true })).toBe('filter');
   });
 
   it('keeps the tier step on the list, which has no filter to focus', () => {
-    expect(pickerFocusTarget({ tierStep: true, searching: true, touch: false })).toBe('list');
+    expect(target({ tierStep: true, searching: true })).toBe('list');
   });
 
-  it('leaves focus alone on a touch device, on every step', () => {
+  it('leaves focus alone on a touch device with no keyboard up', () => {
     // Focusing the list takes focus from the prompt, and on iOS the keyboard
     // then slides away under the open panel.
-    expect(pickerFocusTarget({ tierStep: false, searching: false, touch: true })).toBeNull();
-    expect(pickerFocusTarget({ tierStep: true, searching: false, touch: true })).toBeNull();
+    expect(target({ touch: true })).toBeNull();
+    expect(target({ touch: true, tierStep: true })).toBeNull();
+  });
+
+  it('gives the box the keyboard a touch host opened mid-typing', () => {
+    // Typing then filters the models instead of going into the prompt.
+    expect(target({ touch: true, keyboard: true })).toBe('filter');
+  });
+
+  it('gives the box focus for any host opened mid-typing, a mouse one included', () => {
+    // A phone-width window leaves the prompt focused under a mouse too.
+    expect(target({ keyboard: true })).toBe('filter');
+    expect(target({ keyboard: true, tierStep: true })).toBe('list');
+  });
+
+  it('hands the keyboard back to its holder on the tier step, which has no box', () => {
+    // Focus left on nothing would drop the keyboard, and the panel would jump.
+    expect(target({ touch: true, keyboard: true, tierStep: true })).toBe('holder');
   });
 });
 

@@ -80,8 +80,8 @@ const CC_LIFECYCLE_EVENTS_SQL: &str = "'SessionStarted', 'CodingAgentIdled', \
 /// SQL fragment for "this `ContinuationRequested` is no longer live": any CC
 /// lifecycle event (actuated), a LATER `ContinuationRequested` (superseded —
 /// this yields newest-per-thread for free), or a terminal response event (the
-/// thread was settled after the request — e.g. by
-/// `settle_orphaned_running_coding_agent_threads` — and must stay settled with
+/// thread was settled after the request, for example by
+/// `settle_orphaned_running_threads`, and must stay settled with
 /// its manual Continue affordance). Shared by the orphan scan and
 /// [`thread_has_unactuated_continuation`].
 fn continuation_superseded_events_sql() -> String {

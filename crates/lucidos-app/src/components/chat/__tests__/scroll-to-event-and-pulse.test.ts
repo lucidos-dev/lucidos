@@ -1824,13 +1824,13 @@ describe('scrollToEventAndPulse — mobile header pin', () => {
     return el;
   }
 
-  it('pins the header visible on resolve, dispatches reveal-mobile-header, then releases the pin after the scroll settles', () => {
+  it('pins the header visible on resolve, dispatches reveal-mobile-bars, then releases the pin after the scroll settles', () => {
     const visibleEl = makeVisibleEl();
     restore = installFakeDom({ dataEventMatches: [visibleEl] });
 
     let revealed = false;
     const onReveal = () => { revealed = true; };
-    document.addEventListener('reveal-mobile-header', onReveal);
+    document.addEventListener('reveal-mobile-bars', onReveal);
 
     expect(isHeaderPinnedForScroll()).toBe(false);
     scrollToEventAndPulse('e-7');
@@ -1850,7 +1850,7 @@ describe('scrollToEventAndPulse — mobile header pin', () => {
     vi.advanceTimersByTime(200); // total 900, past HEADER_PIN_MS (800)
     expect(isHeaderPinnedForScroll()).toBe(false);
 
-    document.removeEventListener('reveal-mobile-header', onReveal);
+    document.removeEventListener('reveal-mobile-bars', onReveal);
   });
 });
 

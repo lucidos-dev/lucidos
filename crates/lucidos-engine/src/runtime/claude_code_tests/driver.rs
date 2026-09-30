@@ -568,11 +568,15 @@ fn side_question_message_carries_the_question_then_each_image() {
     assert_eq!(content[1]["source"]["type"], "base64");
 }
 
-/// A shell stand-in for Claude Code: it logs the line it reads to `log`, then
-/// answers with a `result` whose text is `answer`.
+/// The replay Claude Code prints when it reads the side question.
+const SIDE_QUESTION_REPLAY: &str =
+    r#"{"type":"user","message":{"role":"user","content":"q"},"isReplay":true}"#;
+
+/// A shell stand-in for Claude Code: it logs the line it reads to `log`,
+/// replays it, then answers with a `result` whose text is `answer`.
 fn answer_side_question_script(log: &Path, answer: &str) -> String {
     format!(
-        r#"read l; printf '%s\n' "$l" >> {log}; printf '{{"type":"result","subtype":"success","is_error":false,"result":"{answer}"}}\n'"#,
+        r#"read l; printf '%s\n' "$l" >> {log}; printf '{SIDE_QUESTION_REPLAY}\n'; printf '{{"type":"result","subtype":"success","is_error":false,"result":"{answer}"}}\n'"#,
         log = log.display(),
     )
 }
@@ -736,6 +740,24 @@ async fn a_side_question_is_answered_past_unrelated_lines() {
         1,
         "only the side question: {stdin_log}"
     );
+}
+
+/// A resumed session with a background task still running reports the task
+/// stopped and closes that with an empty `result` of its own. That `result`
+/// comes before Claude Code reads the question, so it is not the answer.
+#[tokio::test]
+async fn a_side_question_skips_a_result_from_before_it_was_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("stdin.log");
+    let script = format!(
+        r#"printf '{{"type":"system","subtype":"task_notification","status":"stopped"}}\n'; printf '{{"type":"result","subtype":"success","is_error":false,"num_turns":0,"result":""}}\n'; {}; sleep 30"#,
+        answer_side_question_script(&log, "after the notice")
+    );
+    let child = spawn_cold_fake(&script);
+    let reply = ask_side_question_of(child, "q\n", deadline_in(std::time::Duration::from_secs(5)))
+        .await
+        .unwrap();
+    assert_eq!(reply.answer.unwrap(), "after the notice");
 }
 
 /// The side-question process never outlives the request: a timeout kills its whole

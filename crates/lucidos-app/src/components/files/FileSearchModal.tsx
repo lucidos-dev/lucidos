@@ -7,7 +7,8 @@ import { openFilePreview } from '../../store/actions/artifacts';
 import { openRepoFilePreview } from '../../store/actions/repositories';
 import { FileTypeIcon } from '../../utils/fileIcons';
 import {
-  collectSearchResults, filterSearchResults, openableChangeFiles, type FileSearchResult,
+  collectSearchResults, filterSearchResults, openableChangeFiles, visibleSearchResults,
+  type FileSearchResult,
 } from './fileSearch';
 import { closeFileSearch } from './fileSearchActions';
 import { changeBadgeLabel } from './changeBadge';
@@ -18,14 +19,15 @@ import { ListSkeletonOf, SkBlock, SkText, useSkeleton } from '../shared/Skeleton
 import { useDelayedFlag } from '../../hooks/useDelayedLoading';
 import { paneUnder, usePaneCentre } from '../../hooks/usePaneCentre';
 import { CloseIcon } from '../shared/icons';
+import { SearchField } from '../shared/SearchField';
 
 function sourceBadgeLabel(source: FileSearchResult['source']): string {
   return source === 'workspace' ? 'W' : source === 'repo' ? 'R' : 'C';
 }
 
 /** One search hit. Inside a `SkeletonProvider` it is the results list's
- *  loading placeholder. The list can hold thousands of rows, so the loaded
- *  path is plain markup and the skeleton check runs once per row. */
+ *  loading placeholder. The list holds up to `MAX_SHOWN_RESULTS` rows, so the
+ *  loaded path is plain markup and the skeleton check runs once per row. */
 function SearchResultRow({ result, selected = false, showBadge = false, onHover, onPick }: {
   result?: FileSearchResult;
   selected?: boolean;
@@ -72,7 +74,7 @@ function SearchResultRow({ result, selected = false, showBadge = false, onHover,
 }
 
 /** The open-state body. Mounted by `<Overlay>` only while the modal is open, so
- *  the 4k+ result nodes (and their signal subscriptions) and the search compute
+ *  the result rows (and their signal subscriptions) and the search compute
  *  don't run on every `visualViewport.resize` while closed — the same reason the
  *  overlay element itself stays mounted (hidden) rather than unmounting. */
 function FileSearchPanel() {
@@ -130,6 +132,7 @@ function FileSearchPanel() {
 
   const allResults = collectSearchResults(workspacePaths, repoPaths, diffFiles, ccChangeFiles);
   const filtered = filterSearchResults(allResults, query);
+  const { shown, hidden } = visibleSearchResults(filtered);
   const showBadge = allResults.some(r => r.source !== allResults[0]?.source);
 
   const selectResult = (result: FileSearchResult) => {
@@ -153,33 +156,29 @@ function FileSearchPanel() {
   return (
     <>
       <div class="surface-head file-search-header">
-        <svg class="file-search-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-          <circle cx="7" cy="7" r="4.5" />
-          <path d="M10.5 10.5L14 14" />
-        </svg>
-        <input
-          ref={inputRef}
-          class="file-search-input"
+        <SearchField
+          class="file-search-field"
+          inputRef={inputRef}
+          inputClass="file-search-input"
           data-role="file-search-input"
-          type="text"
-          placeholder="Search files..."
+          placeholder="Search files…"
           value={query}
           onInput={(e) => {
-            setQuery((e.target as HTMLInputElement).value);
+            setQuery(e.currentTarget.value);
             setSelectedIndex(-1);
           }}
           onKeyDown={(e) => {
             if (e.key === 'Escape') closeFileSearch();
             if (e.key === 'ArrowDown') {
               e.preventDefault();
-              setSelectedIndex(i => Math.min(i + 1, filtered.length - 1));
+              setSelectedIndex(i => Math.min(i + 1, shown.length - 1));
             } else if (e.key === 'ArrowUp') {
               e.preventDefault();
               setSelectedIndex(i => Math.max(i - 1, -1));
-            } else if (e.key === 'Enter' && filtered.length > 0) {
+            } else if (e.key === 'Enter' && shown.length > 0) {
               e.preventDefault();
               const idx = selectedIndex >= 0 ? selectedIndex : 0;
-              selectResult(filtered[idx]);
+              selectResult(shown[idx]);
             }
           }}
         />
@@ -192,19 +191,26 @@ function FileSearchPanel() {
         ) : (
           // The field above is live from the first frame; only the results wait.
           <LoadingFade showSkeleton={showLoading} skeleton={<ListSkeletonOf count={6} row={() => <SearchResultRow />} />}>
-            {anyLoaded && (filtered.length === 0 ? (
+            {anyLoaded && (shown.length === 0 ? (
               <div class="file-search-empty">No matching files</div>
             ) : (
-              filtered.map((result, index) => (
-                <SearchResultRow
-                  key={`${result.source}:${result.path}`}
-                  result={result}
-                  selected={index === selectedIndex}
-                  showBadge={showBadge}
-                  onHover={() => setSelectedIndex(index)}
-                  onPick={() => selectResult(result)}
-                />
-              ))
+              <>
+                {shown.map((result, index) => (
+                  <SearchResultRow
+                    key={`${result.source}:${result.path}`}
+                    result={result}
+                    selected={index === selectedIndex}
+                    showBadge={showBadge}
+                    onHover={() => setSelectedIndex(index)}
+                    onPick={() => selectResult(result)}
+                  />
+                ))}
+                {hidden > 0 && (
+                  <div class="file-search-more">
+                    {hidden} more {hidden === 1 ? 'file' : 'files'}. Type to narrow the list.
+                  </div>
+                )}
+              </>
             ))}
           </LoadingFade>
         )}

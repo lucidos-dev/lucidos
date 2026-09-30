@@ -36,6 +36,7 @@ function makeThread(totalChildrenCount: number): ThreadState {
     createdAt: '2026-05-01T00:00:00Z',
     updatedAt: '2026-05-01T00:00:00Z',
     status: 'idle',
+    summaryVersion: 0,
     messageCount: 1,
     section: 'inbox',
     activeChildrenCount: 0,

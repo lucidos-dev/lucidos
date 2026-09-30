@@ -1,5 +1,5 @@
 import { test, expect } from './fixtures';
-import { navigateToApp, assertHealthy, enableMobileHeaderSticky, ensureMobileView } from './helpers';
+import { navigateToApp, assertHealthy, disableMobileDynamicBars, ensureMobileView } from './helpers';
 
 // Touch-only regression: tapping an anchored overlay's toggle again (while the
 // overlay is open) closes it and does NOT reopen. The toggle is the overlay's
@@ -26,7 +26,7 @@ test.describe('Lucidos mark menu (touch)', () => {
     // Pin the header so opening an overlay (which may auto-focus an input)
     // can't slide the toggle off-screen. The default state, but an earlier test
     // that disabled the global pin leaks it here. Must precede navigate.
-    await enableMobileHeaderSticky(page);
+    await disableMobileDynamicBars(page);
   });
 
   test('tapping the mark again closes its menu', async ({ page }) => {

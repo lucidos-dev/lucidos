@@ -55,6 +55,7 @@ function makeCCThread(id: string, status: 'idle' | 'running' | 'waiting' | 'wait
       createdAt: '',
       updatedAt: '',
       status,
+      summaryVersion: 0,
       messageCount: 0,
       section,
       activeChildrenCount: 0,

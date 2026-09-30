@@ -33,7 +33,7 @@
  * in main.tsx), and a screenshot is not worth that.
  */
 import { test, expect, Page } from './fixtures';
-import { assertHealthy, navigateToApp, ensureMobileView, enableMobileHeaderSticky } from './helpers';
+import { assertHealthy, navigateToApp, ensureMobileView, disableMobileDynamicBars } from './helpers';
 
 const SHOOTING = process.env.HEADER_SHOTS === '1';
 const DIR = 'test-results/header-shots';
@@ -71,7 +71,7 @@ test.describe('Header shots', () => {
 
   test.beforeEach(async ({ page }) => {
     await assertHealthy(page);
-    await enableMobileHeaderSticky(page);
+    await disableMobileDynamicBars(page);
   });
 
   test('every pane and both connection states', async ({ page, context }) => {

@@ -17,7 +17,8 @@ import { LoadableError } from '../shared/LoadableError';
 import { ListRowAddCard } from '../shared/ListRowAddCard';
 import { ListSkeletonOf } from '../shared/Skeleton';
 import { LoadingFade } from '../shared/LoadingFade';
-import { SearchIcon, CloseIcon } from '../shared/icons';
+import { CloseIcon } from '../shared/icons';
+import { SearchField } from '../shared/SearchField';
 import { AppRow, type AppPluginInfo } from './AppCard';
 import { resolvePluginInfo } from './pluginInfo';
 
@@ -34,15 +35,13 @@ function AppSearchBar() {
   useEffect(() => { inputRef.current?.focus({ preventScroll: true }); }, []);
   return (
     <div class="apps-search-bar">
-      <SearchIcon className="apps-search-icon" />
-      <input
-        ref={inputRef}
-        class="apps-search-input"
+      <SearchField
+        class="apps-search-field"
+        inputRef={inputRef}
         data-role="apps-search-input"
-        type="text"
-        placeholder="Search apps..."
+        placeholder="Search apps…"
         value={appSearchQuery.value}
-        onInput={(e) => { appSearchQuery.value = (e.currentTarget as HTMLInputElement).value; }}
+        onInput={(e) => { appSearchQuery.value = e.currentTarget.value; }}
         onKeyDown={(e) => { if (e.key === 'Escape') closeAppSearch(); }}
       />
       <button class="icon-btn header-icon" onClick={closeAppSearch} aria-label="Close search">

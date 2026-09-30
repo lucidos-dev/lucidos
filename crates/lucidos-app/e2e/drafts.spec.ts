@@ -563,7 +563,7 @@ test.describe('Per-thread drafts', () => {
     const pane = page.locator('.thread-pane.compose-empty:visible').first();
     await expect(pane).toBeVisible({ timeout: 5_000 });
 
-    // No ThreadView header rendered at all (drafts have no editable title).
+    // No ThreadView header rendered at all (a draft shows no title row).
     await expect(page.locator('.thread-view-header')).toHaveCount(0);
     // Scoped to the PANE, which is what the claim is about. The drawer this
     // test opened lists every thread in the workspace. A titleless one with no
@@ -588,7 +588,7 @@ test.describe('Per-thread drafts', () => {
     // user is back on the empty CreateThreadView.
     await restored.fill('');
     await expect(draftRow).toHaveCount(0, { timeout: 5_000 });
-    await expect(page.locator('.thread-title-display:visible')).toHaveCount(0);
+    await expect(page.locator('.thread-title:visible')).toHaveCount(0);
     await expect(page.getByText('Empty draft')).toHaveCount(0);
   });
 

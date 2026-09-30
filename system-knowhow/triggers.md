@@ -345,6 +345,8 @@ Don't use `condition` for logic that depends on external state (e.g. "only if th
 
 A persisted **system event** is the same case. `BackupFailed` belongs to no thread, so a `thread_id` condition never matches it. Condition on the variant's own fields instead, such as `filename` on `BackupCompleted`. The stored row wraps the event in a `type` / `data` envelope, and the matcher unwraps it for you, so never name those two keys.
 
+**`ChangeProposed` also records parked work.** It fires for a new or updated change, including one the engine files straight into set-aside (`set_aside: true`). That covers work found on an archived thread's branch, and the first boot on a new version can file many at once. A trigger for "a change is ready to apply" therefore carries `{ "set_aside": { "$ne": true } }`. A pending proposal omits the field, so a bare `false` matches nothing.
+
 ### Who emitted a domain event: `actor`
 
 **A domain event's `actor` is written by the engine, never by the emitter.** The engine records who called, and it drops any `actor` the emitter put in its own payload. So a condition on `actor.kind` reads who really emitted the event:

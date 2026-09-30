@@ -15,6 +15,7 @@ export function makeThread(overrides: Partial<ThreadState> = {}): ThreadState {
       createdAt: '',
       updatedAt: '',
       status: 'idle',
+      summaryVersion: 0,
       codingAgentProposed: false,
       codingAgentRequiresRestart: false,
       codingAgentIsExternalRepo: false,

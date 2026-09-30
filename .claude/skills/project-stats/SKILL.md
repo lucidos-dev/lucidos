@@ -370,8 +370,8 @@ Produce a per-module assessment table:
 The names and numbers there show the table's shape. They are not current figures, and
 they are not claims about any real module. Always recompute.
 
-Write `n/a` in an empty ratio cell, never a bare dash. An em dash is banned repo-wide
-(`.claude/rules/no-em-dashes.md`) and a hyphen reads as a minus beside numbers.
+Write `n/a` in an empty ratio cell, never a bare dash. A lone em dash reads as a hyphen in a monospace font
+(`.claude/rules/em-dashes.md`), and a hyphen reads as a minus beside numbers.
 
 ### Rating scale
 

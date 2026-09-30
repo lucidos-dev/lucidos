@@ -5,6 +5,7 @@ if (typeof globalThis.requestAnimationFrame === 'undefined') {
 }
 
 import { focusPromptNow, composeHandlers, isComposeFocusedHere, blurPromptInputIfFocused } from '../promptFocus';
+import { takePressOutcome } from '../../../utils/tapGesture';
 
 describe('focusPromptNow', () => {
   it('focuses the visible prompt-input element (non-zero width)', () => {
@@ -173,6 +174,15 @@ describe('composeHandlers', () => {
     handlers.onClick();
 
     expect(action).not.toHaveBeenCalled();
+  });
+
+  // The composer's dead-press probe warns about a row press nobody claimed.
+  // Unclaimed, every tap on a composeHandlers button read as dead.
+  it('a touch press claims itself as served', () => {
+    mockDoc();
+    takePressOutcome(0);
+    composeHandlers(vi.fn(), () => {}).onTouchEnd({ preventDefault: vi.fn() } as any);
+    expect(takePressOutcome(1_000)).toBe('served');
   });
 
   it('onClick works again after the skip-once reset', () => {

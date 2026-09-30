@@ -1,5 +1,6 @@
 use crate::support::{
-    base_url, db_url, git, git_in, seed_cc_thread_summary, user_client, workspace_path,
+    base_url, commit_on_new_branch, db_url, git, git_in, http_client, insert_session_started,
+    seed_cc_thread_summary, user_client, workspace_path,
 };
 use serde_json::json;
 use uuid::Uuid;
@@ -1204,5 +1205,282 @@ async fn apply_change_with_no_files_is_rejected_409() {
         .bind(change_id)
         .execute(&pool)
         .await;
+    pool.close().await;
+}
+
+/// Poll a change row's status until it reads `want`, or fail after 10s. The
+/// archive net runs off the request, so its row lands a moment later.
+async fn await_change_status_for_branch(
+    pool: &sqlx::PgPool,
+    branch: &str,
+    want: &str,
+) -> (Uuid, bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let row: Option<(Uuid, String, bool)> =
+            sqlx::query_as("SELECT id, status, incomplete FROM changes WHERE branch_name = $1")
+                .bind(branch)
+                .fetch_optional(pool)
+                .await
+                .expect("changes lookup");
+        if let Some((id, status, incomplete)) = &row {
+            if status == want {
+                return (*id, *incomplete);
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "branch {branch} never reached {want}: {row:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    }
+}
+
+async fn post_change_verb(
+    client: &reqwest::Client,
+    change_id: Uuid,
+    verb: &str,
+) -> reqwest::Response {
+    client
+        .post(format!(
+            "{}/api/v1/changes/{}/{}",
+            base_url(),
+            change_id,
+            verb
+        ))
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("{verb} request failed: {e}"))
+}
+
+async fn listed_change_ids(client: &reqwest::Client, list: &str) -> Vec<String> {
+    let body: serde_json::Value = client
+        .get(format!("{}/api/v1/changes", base_url()))
+        .send()
+        .await
+        .expect("list changes")
+        .json()
+        .await
+        .expect("changes JSON");
+    body[list]
+        .as_array()
+        .unwrap_or_else(|| panic!("no {list} list in {body}"))
+        .iter()
+        .filter_map(|c| c["id"].as_str().map(String::from))
+        .collect()
+}
+
+/// A set-aside change leaves Review and does not block Archive. Apply refuses
+/// it until it is brought back, and then it merges what was proposed, though
+/// its worktree is long gone (ADR 0328).
+#[tokio::test]
+async fn a_set_aside_change_waits_out_of_the_way_until_brought_back() {
+    let client = user_client().await;
+    let ws = workspace_path();
+    let pool = sqlx::PgPool::connect(&db_url())
+        .await
+        .expect("Failed to connect to E2E workspace database");
+
+    let suffix = Uuid::new_v4().as_simple().to_string()[..8].to_string();
+    let branch = format!("e2e-test/set-aside-{suffix}");
+    let file = format!("e2e-set-aside-{suffix}.txt");
+    commit_on_new_branch(&branch, &file, "kept for later");
+    let thread_id = Uuid::new_v4();
+    let change_id = Uuid::new_v4();
+    seed_cc_thread_summary(&pool, thread_id, "idle").await;
+    seed_change_for_test(
+        &client,
+        change_id,
+        thread_id,
+        &branch,
+        ws.to_str().unwrap(),
+        "E2E set aside",
+        &[&file],
+        false,
+        true,
+    )
+    .await;
+
+    let anon = post_change_verb(&http_client(), change_id, "set-aside").await;
+    assert_eq!(anon.status().as_u16(), 401, "no credential, no move");
+
+    let resp = post_change_verb(&client, change_id, "set-aside").await;
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "set aside: {:?}",
+        resp.text().await
+    );
+    assert!(listed_change_ids(&client, "set_aside")
+        .await
+        .contains(&change_id.to_string()));
+    assert!(!listed_change_ids(&client, "pending")
+        .await
+        .contains(&change_id.to_string()));
+    let proposed: bool = sqlx::query_scalar(
+        "SELECT coding_agent_proposed FROM thread_summaries WHERE thread_id = $1",
+    )
+    .bind(thread_id)
+    .fetch_one(&pool)
+    .await
+    .expect("thread row");
+    assert!(!proposed, "a set-aside change leaves Review and attention");
+
+    let refused = post_change_verb(&client, change_id, "apply").await;
+    assert_eq!(refused.status().as_u16(), 409);
+    let body: serde_json::Value = refused.json().await.expect("refusal JSON");
+    assert_eq!(body["reason"], "change_set_aside", "{body}");
+
+    let archived = client
+        .post(format!("{}/api/v1/threads/archive", base_url()))
+        .json(&json!({ "thread_id": thread_id.to_string() }))
+        .send()
+        .await
+        .expect("archive request");
+    assert_eq!(
+        archived.status().as_u16(),
+        200,
+        "a set-aside change never blocks Archive"
+    );
+
+    let resp = post_change_verb(&client, change_id, "bring-back").await;
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "bring back: {:?}",
+        resp.text().await
+    );
+    assert!(listed_change_ids(&client, "pending")
+        .await
+        .contains(&change_id.to_string()));
+
+    let _tree = crate::support::workspace_tree_lock().write().await;
+    let applied = apply_ok(&client, change_id).await;
+    assert_eq!(applied["status"], "applied", "{applied}");
+    assert!(ws.join(&file).exists(), "the set-aside work merged intact");
+
+    std::fs::remove_file(ws.join(&file)).unwrap();
+    git(&["add", &file]);
+    git(&[
+        "commit",
+        "-m",
+        &format!("chore: clean up e2e set-aside file ({suffix})"),
+    ]);
+    let _ = std::process::Command::new("git")
+        .args(["branch", "-D", &branch])
+        .current_dir(&ws)
+        .output();
+    let _ = sqlx::query("DELETE FROM changes WHERE id = $1")
+        .bind(change_id)
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM thread_summaries WHERE thread_id = $1")
+        .bind(thread_id)
+        .execute(&pool)
+        .await;
+    pool.close().await;
+}
+
+/// Archiving a thread whose branch holds unproposed work sets that work aside
+/// instead of losing it. A branch the user already decided on is left alone,
+/// so a discarded change never comes back (ADR 0328).
+#[tokio::test]
+async fn archive_sets_aside_unproposed_branch_work_but_never_a_decided_one() {
+    let client = user_client().await;
+    let ws = workspace_path();
+    let pool = sqlx::PgPool::connect(&db_url())
+        .await
+        .expect("Failed to connect to E2E workspace database");
+
+    let suffix = Uuid::new_v4().as_simple().to_string()[..8].to_string();
+    let orphan_branch = format!("e2e-test/orphan-{suffix}");
+    let decided_branch = format!("e2e-test/decided-{suffix}");
+    commit_on_new_branch(
+        &orphan_branch,
+        &format!("e2e-orphan-{suffix}.txt"),
+        "unproposed",
+    );
+    commit_on_new_branch(
+        &decided_branch,
+        &format!("e2e-decided-{suffix}.txt"),
+        "discarded",
+    );
+
+    let orphan_thread = Uuid::new_v4();
+    let decided_thread = Uuid::new_v4();
+    for (thread_id, branch) in [
+        (orphan_thread, &orphan_branch),
+        (decided_thread, &decided_branch),
+    ] {
+        seed_cc_thread_summary(&pool, thread_id, "idle").await;
+        insert_session_started(&pool, thread_id, branch).await;
+    }
+    sqlx::query(
+        "INSERT INTO changes (request_id, branch_name, repo_root, thread_id, status)          VALUES ($1, $2, $3, $4, 'discarded')",
+    )
+    .bind(Uuid::new_v4())
+    .bind(&decided_branch)
+    .bind(ws.to_str().unwrap())
+    .bind(decided_thread)
+    .execute(&pool)
+    .await
+    .expect("seed the discarded change");
+
+    // The decided thread goes first, so its net has run by the time the
+    // orphan's row appears.
+    for thread_id in [decided_thread, orphan_thread] {
+        let resp = client
+            .post(format!("{}/api/v1/threads/archive", base_url()))
+            .json(&json!({ "thread_id": thread_id.to_string() }))
+            .send()
+            .await
+            .expect("archive request");
+        assert_eq!(resp.status().as_u16(), 200, "archive {thread_id}");
+    }
+
+    let (_, incomplete) = await_change_status_for_branch(&pool, &orphan_branch, "set_aside").await;
+    assert!(
+        incomplete,
+        "work nobody finished reviewing is marked incomplete"
+    );
+    let section: String =
+        sqlx::query_scalar("SELECT archive_state FROM thread_summaries WHERE thread_id = $1")
+            .bind(orphan_thread)
+            .fetch_one(&pool)
+            .await
+            .expect("thread row");
+    assert_eq!(
+        section, "archived",
+        "setting work aside leaves the thread archived"
+    );
+
+    let decided_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM changes WHERE branch_name = $1")
+            .bind(&decided_branch)
+            .fetch_one(&pool)
+            .await
+            .expect("count rows");
+    assert_eq!(decided_rows, 1, "a discarded change is never resurrected");
+
+    for branch in [&orphan_branch, &decided_branch] {
+        let _ = std::process::Command::new("git")
+            .args(["branch", "-D", branch])
+            .current_dir(&ws)
+            .output();
+        let _ = sqlx::query("DELETE FROM changes WHERE branch_name = $1")
+            .bind(branch)
+            .execute(&pool)
+            .await;
+    }
+    for thread_id in [orphan_thread, decided_thread] {
+        let _ = sqlx::query("DELETE FROM events WHERE thread_id = $1")
+            .bind(thread_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM thread_summaries WHERE thread_id = $1")
+            .bind(thread_id)
+            .execute(&pool)
+            .await;
+    }
     pool.close().await;
 }

@@ -1,5 +1,6 @@
 import type { RefObject } from 'preact';
 import { keepFocusOnPress } from '../../utils/dom';
+import { SearchField } from './SearchField';
 
 /** One row in a control menu's option list. */
 export interface ControlOption {
@@ -27,6 +28,31 @@ export function selectedOptionIndex(
 ): number {
   const idx = options.findIndex((o) => o.value === currentValue);
   return idx >= 0 ? idx : 0;
+}
+
+/** The search box pinned over a control-menu list. */
+export function ControlFilter({
+  value,
+  placeholder,
+  inputRef,
+  onInput,
+}: {
+  value: string;
+  placeholder: string;
+  inputRef?: RefObject<HTMLInputElement>;
+  onInput: (value: string) => void;
+}) {
+  return (
+    <div class="control-filter-bar">
+      <SearchField
+        inputClass="control-filter"
+        placeholder={placeholder}
+        value={value}
+        inputRef={inputRef}
+        onInput={(e) => onInput(e.currentTarget.value)}
+      />
+    </div>
+  );
 }
 
 /** The control-menu list: a section label over `control-item` buttons, the
@@ -75,18 +101,7 @@ export function ControlOptionList({
 }) {
   return (
     <div class="control-list" tabIndex={0} ref={listRef} onKeyDown={onKeyDown}>
-      {filter && (
-        <div class="control-filter-bar">
-          <input
-            type="text"
-            class="control-input control-filter"
-            placeholder={filter.placeholder}
-            value={filter.value}
-            ref={filter.inputRef}
-            onInput={(e: Event) => filter.onInput((e.target as HTMLInputElement).value)}
-          />
-        </div>
-      )}
+      {filter && <ControlFilter {...filter} />}
       {back && (
         <button class="control-item control-back" onMouseDown={keepFocusOnPress} onClick={back.onBack}>
           <span class="control-back-glyph" aria-hidden="true">&#8249;</span>
@@ -110,14 +125,16 @@ export function ControlOptionList({
             onClick={() => onPick(opt)}
             onMouseEnter={() => onHighlight(index)}
           >
-            <span class="control-option-label">
-              {isCurrent && <span class="control-checkmark">&#10003;</span>}
-              {opt.label}
-              {opt.drilldown && (
-                <span class="control-option-more" aria-hidden="true">&#8250;</span>
-              )}
+            <span class="control-option-text">
+              <span class="control-option-label">
+                {isCurrent && <span class="control-checkmark">&#10003;</span>}
+                {opt.label}
+              </span>
+              {opt.description && <span class="control-option-desc">{opt.description}</span>}
             </span>
-            {opt.description && <span class="control-option-desc">{opt.description}</span>}
+            {opt.drilldown && (
+              <span class="control-option-more" aria-hidden="true">&#8250;</span>
+            )}
           </button>
         );
       })}

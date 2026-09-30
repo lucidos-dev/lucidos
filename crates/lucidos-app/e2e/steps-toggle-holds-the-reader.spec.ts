@@ -1,6 +1,6 @@
 import { test, expect } from './fixtures';
 import type { Page } from './fixtures';
-import { assertHealthy, disableMobileHeaderSticky, disarmFollowSeed, enableMobileHeaderSticky, ensureOnThreadPane, navigateToApp, renderWholeTranscript, waitForScrollSettled } from './helpers';
+import { assertHealthy, enableMobileDynamicBars, disarmFollowSeed, disableMobileDynamicBars, ensureOnThreadPane, navigateToApp, renderWholeTranscript, waitForScrollSettled } from './helpers';
 import { psql } from './db-helpers';
 import { randomUUID } from 'crypto';
 
@@ -117,8 +117,8 @@ async function openThread(page: Page, threadId: string, { disarm = true, renderA
   // who is READING, so it starts them disarmed. The two live-edge cases keep the
   // seeded arm, to press from the end of a quiet thread with the ride still on.
   if (disarm) await disarmFollowSeed(page);
-  // Hide-on-scroll LIVE rather than inherited: see `disableMobileHeaderSticky`.
-  await disableMobileHeaderSticky(page);
+  // Hide-on-scroll LIVE rather than inherited: see `enableMobileDynamicBars`.
+  await enableMobileDynamicBars(page);
   await navigateToApp(page);
   await ensureOnThreadPane(page);
   await expect(page.locator('.chat-exchange').first()).toBeVisible({ timeout: 30_000 });
@@ -324,9 +324,9 @@ async function edgeState(page: Page): Promise<{ gap: number }> {
 test.describe('the step-log control holds what the reader pressed', () => {
   // `openThread` turns the global header pin off. It is global and the e2e
   // database resets only between projects, so put it back. See
-  // `disableMobileHeaderSticky`.
+  // `enableMobileDynamicBars`.
   test.afterEach(async ({ page }) => {
-    await enableMobileHeaderSticky(page);
+    await disableMobileDynamicBars(page);
   });
 
   // The gerund is spelled out rather than built from the verb. `hide` plus

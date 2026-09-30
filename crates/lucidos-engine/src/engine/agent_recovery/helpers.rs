@@ -44,6 +44,7 @@ pub(crate) async fn mark_pending_change_incomplete(
                     repo_root: change.repo_root.clone(),
                     hardened: change.hardened,
                     incomplete: true,
+                    set_aside: false,
                     path: String::new(),
                     diff: String::new(),
                 },
@@ -700,6 +701,41 @@ pub(crate) async fn last_turn_ended_cleanly(pool: &sqlx::PgPool, thread_id: Uuid
         None
     });
     matches!(row.as_deref(), Some("ResponseGenerated"))
+}
+
+/// What a recovery sweep may propose for a thread, read from how its last
+/// coding-agent turn ended: `Some(false)` for complete work, `Some(true)` for
+/// incomplete work, `None` for nothing. It mirrors the live idle gate: a clean
+/// turn proposes, a user Stop proposes as incomplete (ADR 0328), and a failed,
+/// aborted or redirected turn proposes nothing. A failed read proposes nothing.
+pub(crate) async fn last_turn_proposal(pool: &sqlx::PgPool, thread_id: Uuid) -> Option<bool> {
+    let row: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT event_type, payload->>'cause' FROM events \
+         WHERE thread_id = $1 \
+           AND event_type IN ('ResponseGenerated', 'ResponseAborted', 'ResponseCanceled', 'ResponseFailed') \
+           AND payload->>'channel' = 'claude_code' \
+         ORDER BY sequence DESC LIMIT 1",
+    )
+    .bind(thread_id)
+    .fetch_optional(pool)
+    .await
+    .unwrap_or_else(|e| {
+        log!(
+            "[Recovery] last_turn_proposal({}): {}; proposing nothing",
+            thread_id,
+            e
+        );
+        None
+    });
+    match row {
+        Some((event_type, _)) if event_type == "ResponseGenerated" => Some(false),
+        Some((event_type, Some(cause)))
+            if event_type == "ResponseCanceled" && cause == "user_stop" =>
+        {
+            Some(true)
+        }
+        _ => None,
+    }
 }
 
 /// Last-resort recovery for an actively-running coding-agent branch whose ref

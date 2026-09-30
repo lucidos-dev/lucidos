@@ -9,7 +9,6 @@
 //! Usage: cargo run -p lucidos-engine --bin populate_memory [workspace_path]
 
 use chrono::{Duration, Utc};
-use lucidos_engine::core::EventStore;
 use lucidos_engine::log;
 use lucidos_engine::memory::{EmbeddingProvider, FastEmbedProvider, MemorySource, PgVectorIndex};
 use lucidos_engine::scheduler::NotificationStore;
@@ -3548,14 +3547,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .connect(&database_url)
         .await?;
 
-    // Initialize event store schema
-    let event_store = EventStore::new(pool.clone());
-    event_store.init_schema().await?;
-    log!("[Populate] Event store initialized");
-
-    // Initialize scheduler schemas (notifications)
-    NotificationStore::init_schema(&pool).await?;
-    log!("[Populate] Scheduler schemas initialized");
+    // The migrations own every table, as they do for the engine.
+    sqlx::migrate!().run(&pool).await?;
+    log!("[Populate] Schema migrated");
 
     // Initialize embedder and memory index. Share the engine's per-user model
     // cache rather than fetching a private copy next to the working directory.

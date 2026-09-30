@@ -74,7 +74,15 @@ describe('drawer status mark starts the title line', () => {
   });
 
   it('takes no room on an idle row', () => {
-    expect(decl(block(drawerCss, '.thread-row-title-text > .thread-status-idle {'), 'display')).toBe('none');
+    const idle = cssRules(drawerCss).find(r => selectorList(r.selector).includes('.thread-row-title-text > .thread-status-idle'));
+    expect(idle?.props.get('display')).toBe('none');
+  });
+
+  it('draws the thread pane title\'s mark the same way, so the two read alike', () => {
+    const shared = cssRules(drawerCss).find(r => selectorList(r.selector).includes(MARK));
+    expect(selectorList(shared!.selector)).toContain('.thread-title > .thread-status');
+    const idle = cssRules(drawerCss).find(r => selectorList(r.selector).includes('.thread-title > .thread-status-idle'));
+    expect(idle?.props.get('display')).toBe('none');
   });
 
   it('centers the row actions on the same cap height as the mark', () => {

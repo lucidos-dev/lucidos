@@ -72,6 +72,7 @@ pub(super) async fn list_changes(
     // events aren't replayed. Joined with the other reads — independent query.
     let (
         pending_r,
+        set_aside_r,
         applied_r,
         client_update_r,
         restart_groups_r,
@@ -80,6 +81,13 @@ pub(super) async fn list_changes(
         apply_estimates_r,
     ) = tokio::join!(
         crate::core::changes::list_pending_for_readers(
+            pool,
+            proj,
+            query
+                .sub_threads_of
+                .map_or(PendingScope::All, PendingScope::SubThreadsOf),
+        ),
+        crate::core::changes::list_set_aside_for_readers(
             pool,
             proj,
             query
@@ -95,6 +103,7 @@ pub(super) async fn list_changes(
         state.engine.apply_estimates.current(pool),
     );
     let pending = pending_r.map_err(ApiError::db)?;
+    let set_aside = set_aside_r.map_err(ApiError::db)?;
     let mut applied = applied_r.map_err(ApiError::db)?;
     let client_update = client_update_r.map_err(ApiError::db)?;
     let mut restart_groups = restart_groups_r.map_err(ApiError::db)?;
@@ -115,6 +124,7 @@ pub(super) async fn list_changes(
 
     Ok(Json(serde_json::json!({
         "pending": pending,
+        "set_aside": set_aside,
         "applied": applied,
         "total_pending": pending.len(),
         "restart_required": !restart_groups.is_empty(),
@@ -208,6 +218,8 @@ pub(crate) enum ChangeActionRefusal {
     ThreadParked,
     /// The selector withholds the action for a reason no wait resolves.
     ActionUnavailable,
+    /// Apply on a set-aside change. It is brought back first (ADR 0328).
+    ChangeSetAside,
 }
 
 /// Why the availability selector refuses `action` on this change, or `None`.
@@ -244,20 +256,25 @@ pub(crate) async fn change_action_refusal(
     // reason, and only for Apply: Discard is how the user resolves one. See
     // `core::changes::is_empty_pending_change`.
     if let Some((_, status, file_count)) = row.as_ref() {
-        if *status == ChangeStatus::Pending
-            && *file_count == 0
-            && action == crate::engine::thread_lifecycle::Action::Apply
-        {
+        let apply = action == crate::engine::thread_lifecycle::Action::Apply;
+        if *status == ChangeStatus::Pending && *file_count == 0 && apply {
             return Ok(Some(ChangeActionRefusal::NoFilesLeft));
+        }
+        if *status == ChangeStatus::SetAside && apply {
+            return Ok(Some(ChangeActionRefusal::ChangeSetAside));
         }
     }
     let Some((Some(thread_id), status, _)) = row else {
         return Ok(None);
     };
-    if status != ChangeStatus::Pending {
+    // Discarding a set-aside change resets its branch, which a resumed
+    // session may be working on. So it takes the thread-state half of the
+    // gate. The selector offers no Discard without a pending change.
+    let set_aside_discard = status == ChangeStatus::SetAside
+        && action == crate::engine::thread_lifecycle::Action::Discard;
+    if status != ChangeStatus::Pending && !set_aside_discard {
         return Ok(None);
     }
-    let actions = crate::api::threads::available_thread_actions_for(pool, thread_id).await?;
     // Asked even when the selector grants the action. The selector reads the
     // status alone, and a thread can read `idle` with its question still open
     // (see `unsettled_thread_ids`). They otherwise agree, so this adds no
@@ -265,8 +282,14 @@ pub(crate) async fn change_action_refusal(
     let unsettled = crate::core::changes::unsettled_thread_ids(pool, std::iter::once(thread_id))
         .await?
         .contains(&thread_id);
-    if actions.contains(&action) && !unsettled {
-        return Ok(None);
+    if !unsettled {
+        if set_aside_discard {
+            return Ok(None);
+        }
+        let actions = crate::api::threads::available_thread_actions_for(pool, thread_id).await?;
+        if actions.contains(&action) {
+            return Ok(None);
+        }
     }
     // They ask the canonical predicates rather than a third copy of their SQL,
     // which is the drift this whole function exists to stop. An open question
@@ -304,6 +327,13 @@ async fn guard_change_action(
         None => return Ok(()),
         Some(ChangeActionRefusal::NoFilesLeft) => {
             "This change has no file changes left. Discard it instead."
+        }
+        Some(ChangeActionRefusal::ChangeSetAside) => {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                crate::engine::SET_ASIDE_APPLY_REFUSAL,
+            )
+            .with_reason("change_set_aside"));
         }
         // The three thread-state refusals are one 409 here. The panel already
         // draws the difference, and the caller's sentence has always said
@@ -360,6 +390,43 @@ pub(super) async fn discard_change(
             state.engine.broadcast_changes_updated().await;
             Ok(Json(serde_json::json!({ "message": "Change discarded." })))
         }
+        Err(e) => Err(ApiError::bad_request(e.to_string())),
+    }
+}
+
+/// POST /api/v1/changes/:id/set-aside: keep a pending change for later.
+pub(super) async fn set_aside_change(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let actor = Some(require_user_actor(&headers, &state.pool, None).await?);
+    refuse_change_verb(&state, &headers, id, ThreadReachVerb::SetAside).await?;
+    guard_change_action(
+        &state,
+        id,
+        crate::engine::thread_lifecycle::Action::SetAside,
+        "This change can't be set aside in the thread's current state",
+    )
+    .await?;
+    match state.engine.set_aside_change(id, actor).await {
+        Ok(()) => Ok(Json(serde_json::json!({ "message": "Change set aside." }))),
+        Err(e) => Err(ApiError::bad_request(e.to_string())),
+    }
+}
+
+/// POST /api/v1/changes/:id/bring-back: return a set-aside change to pending.
+pub(super) async fn bring_back_change(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let actor = Some(require_user_actor(&headers, &state.pool, None).await?);
+    refuse_change_verb(&state, &headers, id, ThreadReachVerb::BringBack).await?;
+    match state.engine.bring_back_change(id, actor).await {
+        Ok(()) => Ok(Json(
+            serde_json::json!({ "message": "Change brought back." }),
+        )),
         Err(e) => Err(ApiError::bad_request(e.to_string())),
     }
 }
@@ -500,23 +567,24 @@ pub(super) async fn disarm_all_standing_applies(
 /// Query for `POST /api/v1/changes/apply-all`.
 #[derive(serde::Deserialize, Default)]
 pub(super) struct ApplyAllQuery {
-    /// "Keep going as the rest settle": arm every thread still settling, so its
-    /// change applies when it lands.
+    /// "Apply all on settle": arm every thread still settling, so its change
+    /// applies when it lands.
     #[serde(default)]
     keep_going: bool,
 }
 
-/// What Apply All says when nothing could be applied now and the checkbox was
-/// off. Pure, so each refusal names the real reason rather than one blanket
+/// What Apply All says when nothing could be applied now and the sweep was not
+/// asked for. Pure, so each refusal names the real reason rather than one blanket
 /// message.
 pub(super) fn empty_apply_all_refusal(total_pending: usize, unsettled: usize) -> &'static str {
     if total_pending == 0 {
         "No pending changes"
     } else if unsettled == total_pending {
         "All pending changes belong to threads that are still working or waiting for something. \
-         Turn on \"Keep going as the rest settle\", or wait for them to finish."
+         Use \"Apply all on settle\", or wait for them to finish."
     } else {
-        "All pending changes that could be applied have no file changes left. Discard them instead."
+        "None of the settled changes can be applied together: each has no file changes left, \
+         or is incomplete work that needs its own Apply."
     }
 }
 
@@ -543,8 +611,8 @@ pub(super) async fn apply_all_changes(
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let actor = Some(require_user_actor(&headers, &state.pool, None).await?);
-    // Apply All aims at the workspace rather than at one thread, and with the
-    // checkbox on it arms threads that have proposed nothing yet. No subtree
+    // Apply All aims at the workspace rather than at one thread, and as the
+    // sweep it arms threads that have proposed nothing yet. No subtree
     // contains that, so clause 3 cannot cover it and a thread caller needs the
     // owner's standing instruction. Before the batch record and the first
     // merge, so a refusal leaves neither.
@@ -566,7 +634,7 @@ pub(super) async fn apply_all_changes(
         ApplyAllOutcome::Started { .. } => (0, 0, 0),
     };
     if let ApplyAllOutcome::NothingToApply { .. } = outcome {
-        // With the checkbox on, the sweep IS the action: "Apply all on settle".
+        // Asked for the sweep, arming IS the action: "Apply all on settle".
         if !query.keep_going {
             return Err(ApiError::bad_request(empty_apply_all_refusal(
                 total_pending,
@@ -799,6 +867,8 @@ pub(super) fn router() -> Router<AppState> {
         .route("/changes/for-repo/:repo_id", get(list_changes_for_repo))
         .route("/changes/:id/apply", post(apply_change))
         .route("/changes/:id/discard", post(discard_change))
+        .route("/changes/:id/set-aside", post(set_aside_change))
+        .route("/changes/:id/bring-back", post(bring_back_change))
         .route("/changes/:id/revert", post(revert_change))
         .route(
             "/changes/:id/diff",
@@ -814,6 +884,14 @@ pub(super) fn router() -> Router<AppState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The refusal names the control the Changes panel draws.
+    #[test]
+    fn all_unsettled_refusal_points_at_apply_all_on_settle() {
+        let msg = empty_apply_all_refusal(2, 2);
+        assert!(msg.contains("\"Apply all on settle\""), "{msg}");
+        assert!(!msg.contains("Keep going"), "{msg}");
+    }
 
     /// Pin the wire format so wire-breaking changes (renamed fields,
     /// changed status casing, removed optionality) trip a test instead of
@@ -1079,6 +1157,91 @@ mod tests {
                 .expect("ask the gate"),
             None,
             "discard is how an empty change is resolved",
+        );
+        teardown_test_db(&db_name).await;
+    }
+
+    /// S5: Set aside is refused exactly where Discard is, in every thread
+    /// state, and granted where Discard is granted.
+    #[tokio::test]
+    async fn set_aside_is_refused_where_discard_is() {
+        use crate::engine::thread_lifecycle::Action;
+        use crate::test_support::{setup_test_db, teardown_test_db};
+
+        let (pool, db_name) = setup_test_db().await;
+        for (status, waits) in [
+            ("idle", 0),
+            ("running", 0),
+            ("idle", 1),
+            ("failed", 1),
+            ("waiting_for_user_answer", 0),
+        ] {
+            let thread_id = Uuid::new_v4();
+            let change_id = Uuid::new_v4();
+            seed_cc_thread(&pool, thread_id, status, waits, 0).await;
+            seed_change(&pool, change_id, Some(thread_id), ChangeStatus::Pending, 3).await;
+            let ask = |action| change_action_refusal(&pool, change_id, action);
+            assert_eq!(
+                ask(Action::SetAside).await.expect("ask the gate"),
+                ask(Action::Discard).await.expect("ask the gate"),
+                "status={status} waits={waits}: Set aside must follow Discard",
+            );
+        }
+        teardown_test_db(&db_name).await;
+    }
+
+    /// Discarding a set-aside change resets its branch, so it waits out a
+    /// thread still working on that branch, and passes on a settled one.
+    #[tokio::test]
+    async fn a_set_aside_change_is_not_discarded_under_a_working_thread() {
+        use crate::engine::thread_lifecycle::Action;
+        use crate::test_support::{setup_test_db, teardown_test_db};
+
+        let (pool, db_name) = setup_test_db().await;
+        for (status, expected) in [
+            ("running", Some(ChangeActionRefusal::ThreadSettling)),
+            ("idle", None),
+        ] {
+            let thread_id = Uuid::new_v4();
+            let change_id = Uuid::new_v4();
+            seed_cc_thread(&pool, thread_id, status, 0, 0).await;
+            seed_change(&pool, change_id, Some(thread_id), ChangeStatus::SetAside, 3).await;
+            assert_eq!(
+                change_action_refusal(&pool, change_id, Action::Discard)
+                    .await
+                    .expect("ask the gate"),
+                expected,
+                "thread {status}"
+            );
+        }
+        teardown_test_db(&db_name).await;
+    }
+
+    /// A set-aside change is refused Apply with its own reason, so both
+    /// surfaces can say "bring it back first". Setting it aside again is an
+    /// idempotent retry, which the engine answers.
+    #[tokio::test]
+    async fn a_set_aside_change_is_refused_apply_until_brought_back() {
+        use crate::engine::thread_lifecycle::Action;
+        use crate::test_support::{setup_test_db, teardown_test_db};
+
+        let (pool, db_name) = setup_test_db().await;
+        let thread_id = Uuid::new_v4();
+        let change_id = Uuid::new_v4();
+        seed_cc_thread(&pool, thread_id, "idle", 0, 0).await;
+        seed_change(&pool, change_id, Some(thread_id), ChangeStatus::SetAside, 3).await;
+
+        assert_eq!(
+            change_action_refusal(&pool, change_id, Action::Apply)
+                .await
+                .expect("ask the gate"),
+            Some(ChangeActionRefusal::ChangeSetAside),
+        );
+        assert_eq!(
+            change_action_refusal(&pool, change_id, Action::SetAside)
+                .await
+                .expect("ask the gate"),
+            None,
         );
         teardown_test_db(&db_name).await;
     }

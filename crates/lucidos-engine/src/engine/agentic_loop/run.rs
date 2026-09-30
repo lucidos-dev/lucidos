@@ -258,6 +258,11 @@ impl LucidosEngine {
         // `MAX_PROSE_QUESTION_NUDGE` allows one nudge where a broken call gets
         // two.
         let mut question_prose_nudges_forced = 0usize;
+        // The draft a prose nudge sent back. It already streamed to the user,
+        // so the round after the nudge streams nothing unless it calls a tool.
+        // A reply without a tool call keeps the question, and the turn ends on
+        // this draft rather than on that reply.
+        let mut prose_nudge_draft: Option<String> = None;
         // Wake check: how many times this turn has been sent back for leaving
         // todo work open with nothing that would re-open the thread. Bounded by
         // `MAX_TODO_WAKE_NUDGE`, so a model that answers and still walks away
@@ -604,21 +609,31 @@ impl LucidosEngine {
             let context_tokens = estimate_tokens_from_chars(context_chars);
             let context_messages = messages.len();
             let trimmed_str = if trimmed { " (trimmed)" } else { "" };
-            self.event_bus
-                .emit_or_log(
-                    crate::engine::event_bus::BusEvent::Thread {
-                        thread_id,
-                        event: crate::engine::thread_events::ThreadEvent::ThoughtStreamed {
-                            text: format!(
-                                "Context: {} tokens, {} messages{}",
-                                context_tokens, context_messages, trimmed_str
-                            ),
-                        },
-                        meta: meta.clone(),
-                    },
-                    "[AgenticLoop] ThoughtStreamed (context summary)",
-                )
-                .await;
+            let holding_back = prose_nudge_draft.is_some();
+            let context_summary = crate::engine::event_bus::BusEvent::Thread {
+                thread_id,
+                event: crate::engine::thread_events::ThreadEvent::ThoughtStreamed {
+                    text: format!(
+                        "Context: {} tokens, {} messages{}",
+                        context_tokens, context_messages, trimmed_str
+                    ),
+                },
+                meta: meta.clone(),
+            };
+            // The UI draws each `ThoughtStreamed` as a Thinking row. A held-back
+            // round shows nothing unless it calls a tool, so its row waits for
+            // the answer: see `deferred_summary` below.
+            let deferred_summary = if holding_back {
+                Some(context_summary)
+            } else {
+                self.event_bus
+                    .emit_or_log(
+                        context_summary,
+                        "[AgenticLoop] ThoughtStreamed (context summary)",
+                    )
+                    .await;
+                None
+            };
 
             // Create token streaming callback — buffers text, flushes as HTML at paragraph boundaries
             let raw_buffer = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
@@ -668,7 +683,10 @@ impl LucidosEngine {
                     // round. Same shape as the two repairs beside it: once the
                     // opening fragment lands, stop flushing and let the final
                     // splice below emit the cleaned text.
-                    if crate::engine::inline_question_repair::buffer_contains_inline_tag(&text)
+                    // A round held back after a prose nudge streams nothing:
+                    // see `prose_nudge_draft`.
+                    if holding_back
+                        || crate::engine::inline_question_repair::buffer_contains_inline_tag(&text)
                         || crate::engine::inline_tool_call_repair::buffer_contains_inline_tool_call(
                             &text,
                         )
@@ -787,7 +805,7 @@ impl LucidosEngine {
                     // splice that shortened it below what already streamed
                     // flushes nothing. `get` rather than a slice: the cut can
                     // land off a char boundary.
-                    {
+                    if !holding_back {
                         let last = *last_persisted_len.lock().unwrap();
                         if let Some(remaining) = partial.get(last..).filter(|r| !r.is_empty()) {
                             self.event_bus.emit_or_log(
@@ -803,6 +821,9 @@ impl LucidosEngine {
                         }
                     }
                     drop(persist_tx);
+                    // The held-back round was never shown, so what the user
+                    // has is the draft before it.
+                    let partial = prose_nudge_draft.take().unwrap_or(partial);
                     crate::engine::thread_events::emit_response_canceled(
                         &self.event_bus,
                         &self.pool,
@@ -914,28 +935,6 @@ impl LucidosEngine {
                     }
                 );
             }
-            self.event_bus
-                .emit_or_log(
-                    crate::engine::event_bus::BusEvent::Thread {
-                        thread_id,
-                        event: crate::engine::thread_events::ThreadEvent::ContextCaptured {
-                            producer: crate::engine::ContextProducer::MainLlm,
-                            model: capture_seed.model.to_string(),
-                            context_window: capture_window,
-                            sections: iter_sections,
-                            tools: tools.names().to_vec(),
-                            estimated_total_tokens,
-                            usage,
-                            trimmed,
-                            trim_passes: trim_passes.clone(),
-                            purpose: crate::engine::ContextPurpose::Turn,
-                            reconstructed: false,
-                        },
-                        meta: meta.clone(),
-                    },
-                    "[AgenticLoop] ContextCaptured",
-                )
-                .await;
 
             // Post-response repair: the model sometimes emits
             // `<ask_user_question>...</ask_user_question>` as inline text
@@ -1029,6 +1028,39 @@ impl LucidosEngine {
                     synth_id,
                 );
             }
+
+            // A held-back round that calls a tool gets its own row, opened
+            // before its capture so the capture binds there. A declined round
+            // opens none, and the draft stays the last thing on screen. Both
+            // wait for the repairs above, which may synthesise the call.
+            if let Some(summary) = deferred_summary.filter(|_| !response.tool_calls.is_empty()) {
+                self.event_bus
+                    .emit_or_log(summary, "[AgenticLoop] ThoughtStreamed (held-back round)")
+                    .await;
+            }
+            self.event_bus
+                .emit_or_log(
+                    crate::engine::event_bus::BusEvent::Thread {
+                        thread_id,
+                        event: crate::engine::thread_events::ThreadEvent::ContextCaptured {
+                            producer: crate::engine::ContextProducer::MainLlm,
+                            model: capture_seed.model.to_string(),
+                            context_window: capture_window,
+                            sections: iter_sections,
+                            tools: tools.names().to_vec(),
+                            estimated_total_tokens,
+                            usage,
+                            trimmed,
+                            trim_passes: trim_passes.clone(),
+                            purpose: crate::engine::ContextPurpose::Turn,
+                            reconstructed: false,
+                        },
+                        meta: meta.clone(),
+                    },
+                    "[AgenticLoop] ContextCaptured",
+                )
+                .await;
+
             // Post-response repair (argument text): the model sometimes
             // HTML-entity-escapes the text it puts in a tool argument, so a
             // trigger group the user asked to call `Machine & Tooling Health`
@@ -1144,6 +1176,21 @@ impl LucidosEngine {
                 response.content = (!cleaned.is_empty()).then_some(cleaned);
             }
 
+            // The round after a prose nudge came back without a tool call, so
+            // the model kept its question. Its reply only says why, and the
+            // turn ends on the draft the user already has.
+            let kept_draft = prose_nudge_draft
+                .take()
+                .filter(|_| response.tool_calls.is_empty());
+            if let Some(draft) = &kept_draft {
+                log!(
+                    "[AgenticLoop] thread={} kept its prose question after the nudge: {}",
+                    thread_id,
+                    response.content.as_deref().unwrap_or("").trim()
+                );
+                response.content = Some(draft.clone());
+            }
+
             // Final flush — send any remaining buffered text and persist
             // remainder. This includes the assistant's preamble on a tool-call
             // turn ("Let me organize the cards…" before write_file): the loop
@@ -1151,7 +1198,10 @@ impl LucidosEngine {
             // end. When inline repair fired, use the cleaned text (tag-stripped)
             // so the frontend's live view and persisted TextStreamed events both
             // reflect the repaired body.
-            let (flush_text, remaining_to_persist) = {
+            let (flush_text, remaining_to_persist) = if kept_draft.is_some() {
+                // The draft streamed in its own round.
+                (None, None)
+            } else {
                 let raw = raw_buffer.lock().unwrap();
                 // When EITHER repair fired, the raw buffer still holds the
                 // leaked tag (the streaming callback appends before suppressing),
@@ -1223,13 +1273,15 @@ impl LucidosEngine {
                 // below can send the refused text back to the model. The text
                 // already persisted as `TextStreamed` stays beside the failure.
                 // The stop reason is checked first, so an ordinary turn does
-                // not pay for a second `clean_response`.
+                // not pay for a second `clean_response`. A held-back reply is
+                // exempt: the user never saw it, and the turn ends on the draft.
                 if let Some(error) =
                     declined_partway_error(response.stop_reason.as_deref()).filter(|_| {
-                        response
-                            .content
-                            .as_deref()
-                            .is_some_and(|c| !self.clean_response(c).is_empty())
+                        kept_draft.is_none()
+                            && response
+                                .content
+                                .as_deref()
+                                .is_some_and(|c| !self.clean_response(c).is_empty())
                     })
                 {
                     self.refresh_apps_modified_this_turn(thread_id, &modified_app_uis)
@@ -1304,7 +1356,10 @@ impl LucidosEngine {
                     // ones share `MAX_QUESTION_REASK`, the prose nudge has
                     // `MAX_PROSE_QUESTION_NUDGE` to itself.
                     match cause {
-                        QuestionReaskCause::AskedInProse => question_prose_nudges_forced += 1,
+                        QuestionReaskCause::AskedInProse => {
+                            question_prose_nudges_forced += 1;
+                            prose_nudge_draft = Some(answer.clone());
+                        }
                         QuestionReaskCause::CallRejected | QuestionReaskCause::LeakedAsText => {
                             question_reask_forced += 1
                         }

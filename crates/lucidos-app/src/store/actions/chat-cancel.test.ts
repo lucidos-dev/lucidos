@@ -42,6 +42,7 @@ function makeThread(channel: ThreadMeta['channel']): ThreadState {
       createdAt: '',
       updatedAt: '',
       status: 'running',
+      summaryVersion: 0,
       codingAgentProposed: false,
       codingAgentRequiresRestart: false,
       codingAgentIsExternalRepo: false,

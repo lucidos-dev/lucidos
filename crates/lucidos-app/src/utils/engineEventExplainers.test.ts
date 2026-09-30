@@ -58,6 +58,10 @@ describe('describeEngineReason', () => {
     expect(describeEngineReason({ kind: 'stale_session' }))
       .toMatch(/stale/i);
   });
+  it('returns explainer for archived_branch_work', () => {
+    expect(describeEngineReason({ kind: 'archived_branch_work' }))
+      .toMatch(/set that work aside/i);
+  });
   it('returns explainer for merge_conflict', () => {
     expect(describeEngineReason({ kind: 'merge_conflict' }))
       .toMatch(/conflict/i);

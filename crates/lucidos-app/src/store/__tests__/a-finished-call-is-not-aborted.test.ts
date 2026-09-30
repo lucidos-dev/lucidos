@@ -2,13 +2,8 @@
  *  answer reads "Requesting", not silence.
  *
  *  A call is not a turn (ADR 0148), so an exchange holding only spoken rows
- *  never gets a terminator. The stale detector reads steps with no terminator
- *  as a crashed turn. That is right for a turn and wrong for a call. Every
- *  finished call carried a red "Aborted" badge until the exchange said it was
- *  terminal by construction.
- *
- *  The detector itself must survive intact, so the second and third cases pin
- *  what it still catches.
+ *  never gets a terminator, and nothing reads "Aborted" without an abort
+ *  event (`aborted-needs-an-abort.test.ts`).
  *
  *  The other half is the wait itself. An utterance whose doer has not woken
  *  holds no steps, and a stepless exchange on an idle thread read as finished.
@@ -48,21 +43,20 @@ describe('a finished call is not aborted', () => {
     expect(exchangeStatus(exchange, '', true, false, false, true)).toBe('done');
   });
 
-  it('still reads as a crash when a real turn died in the same exchange', () => {
+  it('hands a real turn in the same exchange to the ordinary machinery', () => {
     const events = theCall();
-    // A delegated turn's work, with no terminator: the crash shape.
     put(events, 8, { type: 'ToolCalled', name: 'list_files', args: {} });
     const exchange = lastExchange(events);
-    expect(exchangeStatus(exchange, '', true, false, false, true)).toBe('aborted');
+    expect(exchangeStatus(exchange, '', true, false, false, false)).toBe('streaming');
   });
 
-  it('leaves an ordinary crashed turn alone', () => {
+  it('settles an unterminated turn on an idle thread without claiming an abort', () => {
     const events = new Map([
       ev(1, { type: 'MessageReceived', text: 'do the thing', mode: 'human', _eventId: MSG }),
       ev(2, { type: 'ToolCalled', name: 'list_files', args: {}, request_event_id: MSG }),
     ]);
     const exchange = lastExchange(events);
-    expect(exchangeStatus(exchange, '', true, false, false, true)).toBe('aborted');
+    expect(exchangeStatus(exchange, '', true, false, false, true)).toBe('done');
   });
 
   // A thread's status is about its TURN, and this exchange holds none, so the
@@ -166,13 +160,22 @@ describe('a call in progress says so', () => {
   });
 
   // Ringing off settles the call, not the question. A delegated one is
-  // answered by the doer, and that answer outlives the call. A turn that
-  // produced nothing before the hangup is the crash it looks like.
+  // answered by the doer, and that answer outlives the call, so it stays live
+  // while the thread runs the doer's turn.
   it('does not let a hangup settle a question the doer never answered', () => {
     const events = delegatedAndWaiting();
     put(events, 5, { type: 'VoiceSessionEnded', session_id: 'sess-1', reason: 'hangup', duration_secs: 12 });
     const exchange = lastExchange(events);
-    expect(exchangeStatus(exchange, '', true, false, false, true)).toBe('aborted');
+    expect(exchangeStatus(exchange, '', true, false, false, false)).toBe('pending');
+  });
+
+  // Once the thread settles, nothing runs for it. No abort event is in the
+  // log, so it settles as done rather than claiming an abort.
+  it('settles an unanswered delegated question once the thread idles', () => {
+    const events = delegatedAndWaiting();
+    put(events, 5, { type: 'VoiceSessionEnded', session_id: 'sess-1', reason: 'hangup', duration_secs: 12 });
+    const exchange = lastExchange(events);
+    expect(exchangeStatus(exchange, '', true, false, false, true)).toBe('done');
   });
 
   // The same on a busy thread, which is where a delegated utterance still
@@ -212,8 +215,8 @@ describe('a call in progress says so', () => {
     put(events, 5, { type: 'ToolCalled', name: 'list_files', args: {}, request_event_id: MSG });
     const exchange = lastExchange(events);
     // Not the call arm any more: a real step landed, so the ordinary machinery
-    // owns the verdict and the stale detector is live again.
-    expect(exchangeStatus(exchange, '', true, false, false, true)).toBe('aborted');
+    // owns the verdict.
+    expect(exchangeStatus(exchange, '', true, false, false, false)).toBe('streaming');
   });
 });
 

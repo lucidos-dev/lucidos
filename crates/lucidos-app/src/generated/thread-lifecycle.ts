@@ -11,7 +11,7 @@ export type DisplaySection = 'saved' | 'current' | 'archive';
 export type ThreadStatus = 'idle' | 'running' | 'waiting' | 'waiting_for_user_answer' | 'paused' | 'failed';
 export const THREAD_STATUSES: readonly ThreadStatus[] = ['idle', 'running', 'waiting', 'waiting_for_user_answer', 'paused', 'failed'] as const;
 export type EventClass = 'metadata' | 'start' | 'activity' | 'terminal' | 'action_required';
-export type Action = 'discard_draft' | 'discard' | 'apply' | 'apply_when_settled' | 'archive' | 'save' | 'unsave';
+export type Action = 'discard_draft' | 'discard' | 'apply' | 'set_aside' | 'apply_when_settled' | 'archive' | 'save' | 'unsave';
 
 export const LEGAL_SECTIONS: Readonly<Record<ThreadType, readonly ArchiveState[]>> = {
   chat: ['archived', 'inbox'],
@@ -63,6 +63,8 @@ export const EVENT_CLASSIFICATION: Readonly<Record<string, EventClass>> = {
   ChangeApplied: 'terminal',
   ChangeDiscarded: 'terminal',
   ChangeReverted: 'terminal',
+  ChangeSetAside: 'metadata',
+  ChangeBroughtBack: 'metadata',
   ChangeApplyFailed: 'terminal',
   ChangeHardened: 'metadata',
   ChangeSummarized: 'metadata',
@@ -202,7 +204,7 @@ export function availableThreadActions(
   if (hasUnsentDraft) actions.push('discard_draft');
   if (!live) {
     if (codingAgentPending) {
-      if (!hasLiveEventWaits) actions.push('discard', 'apply');
+      if (!hasLiveEventWaits) actions.push('discard', 'apply', 'set_aside');
     } else if (storedSection === 'inbox' && !descendantsBlockArchive) {
       actions.push('archive');
     }

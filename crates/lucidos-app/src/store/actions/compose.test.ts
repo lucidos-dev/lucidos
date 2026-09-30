@@ -42,6 +42,10 @@ import { _resetComposeDraftsForTesting, getDraft, setDraft, type ComposeDraft } 
 
 const originalFetch = globalThis.fetch;
 
+/** What the engine answers an accepted chat POST. A bodiless 200 fails to
+ *  parse, so it would test a refused send instead. */
+const chatAccepted = () => new Response(JSON.stringify({ event_id: 'e-1' }), { status: 200 });
+
 interface MakeThreadOpts extends Partial<ThreadMeta> {
   composeText?: string;
   composeImages?: string[];
@@ -68,6 +72,7 @@ function makeThread(overrides: MakeThreadOpts = {}): ThreadState {
       createdAt: '',
       updatedAt: '',
       status: 'idle',
+      summaryVersion: 0,
       codingAgentProposed: false,
       codingAgentRequiresRestart: false,
       codingAgentIsExternalRepo: false,
@@ -101,7 +106,7 @@ describe('sendFollowup clears the active-thread draft', () => {
   let mockFetch: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
-    mockFetch = vi.fn().mockResolvedValue(new Response(null, { status: 200 }));
+    mockFetch = vi.fn(() => Promise.resolve(chatAccepted()));
     globalThis.fetch = mockFetch as unknown as typeof fetch;
     connectionStatus.value = 'connected';
     focusedThreadId.value = 't-1';
@@ -138,7 +143,7 @@ describe('sendFollowup clears the active-thread draft', () => {
     expect(draft.text).toBe('');
     expect(draft.image_hashes).toEqual([]);
 
-    resolveSend!(new Response(null, { status: 200 }));
+    resolveSend!(chatAccepted());
     await sendPromise;
   });
 
@@ -1902,6 +1907,79 @@ describe('a send leaves the engine holding an empty draft', () => {
 });
 
 /**
+ * A chat POST the engine refuses (a 500, a 409, the boot splash's 503) drops
+ * the optimistic row. The typed text then has to go back into the draft,
+ * because nothing else on screen holds it.
+ */
+describe('a send the engine refuses keeps the typed text', () => {
+  let mockFetch: ReturnType<typeof vi.fn>;
+
+  const composePutTexts = () => mockFetch.mock.calls
+    .filter(([url, init]) => String(url).endsWith('/compose') && (init as RequestInit | undefined)?.method === 'PUT')
+    .map(([, init]) => JSON.parse(String((init as RequestInit).body)).text as string);
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    connectionStatus.value = 'connected';
+    focusedThreadId.value = 't-1';
+    _resetComposeDraftsForTesting();
+    _resetUndeliveredComposeDraftsForTesting();
+    _resetComposeSelectionsForTesting();
+    toasts.value = [];
+    mockFetch = vi.fn((url: unknown) => Promise.resolve(String(url).endsWith('/chat/stream')
+      ? new Response(JSON.stringify({ error: 'the engine said no' }), { status: 500 })
+      : new Response(JSON.stringify({ event_id: 'e-1' }), { status: 200 })));
+    globalThis.fetch = mockFetch as unknown as typeof fetch;
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    globalThis.fetch = originalFetch;
+    connectionStatus.value = 'disconnected';
+    focusedThreadId.value = null;
+    threadMap.value = new Map();
+    _resetComposeDraftsForTesting();
+    _resetUndeliveredComposeDraftsForTesting();
+    _resetComposeSelectionsForTesting();
+    toasts.value = [];
+    vi.restoreAllMocks();
+  });
+
+  it('sendCompose restores the draft and leaves the thread composing', async () => {
+    threadMap.value = new Map([['t-1', makeThread({ id: 't-1', state: 'composing', composeText: 'the draft' })]]);
+
+    await sendCompose('t-1', {}).catch(() => {});
+    await vi.runAllTimersAsync();
+
+    expect(getDraft('t-1').text).toBe('the draft');
+    expect(threadMap.value.get('t-1')?.meta.state).toBe('composing');
+    expect(composePutTexts()).not.toContain('');
+  });
+
+  it('sendFollowup puts the text back into the draft', async () => {
+    threadMap.value = new Map([['t-1', makeActiveThread({ id: 't-1', composeText: 'a follow-up' })]]);
+
+    await sendFollowup('t-1', 'a follow-up');
+    await vi.runAllTimersAsync();
+
+    expect(getDraft('t-1').text).toBe('a follow-up');
+    const texts = composePutTexts();
+    expect(texts[texts.length - 1]).toBe('a follow-up');
+  });
+
+  it('sendFollowup leaves new typing alone', async () => {
+    threadMap.value = new Map([['t-1', makeActiveThread({ id: 't-1', composeText: 'a follow-up' })]]);
+
+    const send = sendFollowup('t-1', 'a follow-up');
+    updateCompose('t-1', { text: 'typed meanwhile' });
+    await send;
+    await vi.runAllTimersAsync();
+
+    expect(getDraft('t-1').text).toBe('typed meanwhile');
+  });
+});
+
+/**
  * `sendCompose` must not race `POST /threads`.
  *
  * `ensureFocusedComposeThread` fires the thread creation WITHOUT awaiting it and
@@ -1926,7 +2004,7 @@ describe('sendCompose waits for the thread row before the chat POST', () => {
       if (typeof url === 'string' && url.endsWith('/threads') && init?.method === 'POST') {
         return new Promise<Response>((resolve) => { releaseThreadStart = resolve; });
       }
-      return Promise.resolve(new Response(null, { status: 200 }));
+      return Promise.resolve(chatAccepted());
     });
     globalThis.fetch = mockFetch as unknown as typeof fetch;
     connectionStatus.value = 'connected';
@@ -2031,7 +2109,7 @@ describe('a suggestion never lands on an already-sent thread', () => {
     .map(([, init]) => JSON.parse((init as RequestInit).body as string));
 
   beforeEach(() => {
-    mockFetch = vi.fn().mockResolvedValue(new Response(null, { status: 200 }));
+    mockFetch = vi.fn(() => Promise.resolve(chatAccepted()));
     globalThis.fetch = mockFetch as unknown as typeof fetch;
     connectionStatus.value = 'connected';
     threadMap.value = new Map([['cc-1', makeActiveThread({

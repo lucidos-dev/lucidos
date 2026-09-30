@@ -15,6 +15,15 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 
 ## Rust engine
 
+- **A side question recomputes its repo directory grants rather than copying
+  the session's.** A reviewer reports privilege escalation: an agent edits
+  `.claude/settings.json` and its side question gains an `--add-dir`. But a side
+  question refuses every tool call (`build_cc_side_question_settings_json`), so
+  a directory grants it nothing. And `.claude/` is a Claude Code protected path,
+  so the edit itself needs a permission card. The session's own next spawn
+  re-reads the file anyway, as Claude Code does in a clone (ADR 0327). Re-flag
+  only if side questions gain a tool.
+
 - **The archive request resolver hears a descendant settle through its
   ancestor's own events.** A reviewer reports a request stuck on
   `blocking_descendants`, since the resolver only resolves the event's own
@@ -3072,6 +3081,27 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   Re-flag only with a render where the mark drops while the mark plus the
   first word fits on one line.
 
+- **A touch menu judges "keyboard up" by focus alone, not by a shrunk
+  visual viewport.** A reviewer reports a field left focused after the user
+  hid the keyboard (Android Back). `keyboardHolder` then names it, and the
+  menu's filter box raises the keyboard again. The viewport check it asks for
+  misses an iPad with a hardware keyboard, since that viewport never shrinks.
+  Typing there would go back into the prompt. Playwright's emulation never
+  shrinks it either, which would leave the behaviour untested.
+
+  The miss costs one keyboard over a menu the user can type into. Re-flag only
+  with a signal that tells a hidden soft keyboard from a hardware one
+  (`components/shared/keyboardHandoff.ts`).
+
+- **Only a coarse pointer hands the keyboard back on a step with no text
+  field.** A reviewer reports that a phone-width window with a mouse skips the
+  hand-back in `CodingAgentControlMenu` and `ModelSelectionPicker`, so the
+  keyboard drops. That window has a physical keyboard, so nothing drops, and
+  focusing the list is what keeps its arrow keys live. `keyboardHolder` still
+  follows the touch layout, because `Dropdown` leaves its trigger unfocused
+  there. Re-flag only with a fine-pointer device that shows an on-screen
+  keyboard.
+
 ## Scripts (bash)
 
 - **Several positional test filters after `--` are valid libtest input.** A
@@ -3106,7 +3136,7 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   otherwise succeeds. (`install.sh` `record_instance_port`.)
 
 - **The em-dash hook's four `jq` calls must NOT be short-circuited by grepping
-  the raw payload first.** `.claude/hooks/no-em-dashes.sh` spawns `jq` up to
+  the raw payload first.** `.claude/hooks/em-dashes.sh` spawns `jq` up to
   four times per `Edit` (tool_name, file_path, old_string, new_string), and the
   obvious optimization is to `grep -qF` the banned characters over the raw stdin
   and `exit 0` when absent, since a field cannot carry what the payload does not.
@@ -3117,7 +3147,7 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   gate. Decoding is exactly what the `jq` calls are for. A fast path would have
   to match the escape forms too, and the few milliseconds saved per edit do not
   pay for that coupling. Re-flag only with evidence that the payload encoding is
-  contractually raw UTF-8. (`.claude/hooks/no-em-dashes.sh`.)
+  contractually raw UTF-8. (`.claude/hooks/em-dashes.sh`.)
 
 - **`dev-runtime.md` / `build-release.md` list scripts in `paths:` that their
   bodies never name — that over-match is deliberate.** Reviewers flag that

@@ -19,9 +19,8 @@
  * `waiting_for_user_answer`.
  *
  * Fix: `exchangeStatus` takes `threadAwaitingAnswer` (status ===
- * 'waiting_for_user_answer') and skips the stale-`'aborted'` detector when set —
- * a parked / resuming thread is never crashed. A genuine crash settles to
- * `idle`/`failed`, so the detector still fires there.
+ * 'waiting_for_user_answer') and skips the stale detector when set. Only an
+ * abort event reads "Aborted" (`aborted-needs-an-abort.test.ts`).
  */
 import { describe, it, expect } from 'vitest';
 import {
@@ -82,13 +81,12 @@ describe('answered divider never flashes Aborted during resume', () => {
     expect(exchangeStatus(divider, '', true, false, false, /*threadIdle*/ true, /*threadAwaitingAnswer*/ true)).not.toBe('aborted');
   });
 
-  // The distinguisher must remain intact: a genuine crash settles to idle, NOT
-  // waiting_for_user_answer, so the stale-detector still fires there.
-  it('genuinely idle answered divider (crash, status NOT waiting) still reads aborted', () => {
+  // A settled idle thread runs nothing, so the divider stops spinning. No
+  // abort event is in the log, so it settles as done, never as aborted.
+  it('idle answered divider (status NOT waiting) settles done, not aborted', () => {
     const divider = answeredQuestionDivider();
-    // threadIdle=true, threadAwaitingAnswer=false (status idle/failed = crash).
     const status = exchangeStatus(divider, '', true, false, false, /*threadIdle*/ true, /*threadAwaitingAnswer*/ false);
-    expect(status).toBe('aborted');
+    expect(status).toBe('done');
   });
 
   // Full live sequence through the real grouping pipeline: the answered divider

@@ -13,6 +13,8 @@ use uuid::Uuid;
 mod apply;
 mod discard;
 mod propose;
+mod set_aside;
+pub(crate) use set_aside::SET_ASIDE_APPLY_REFUSAL;
 
 #[path = "../change_ops_emitters.rs"]
 mod emitters;
@@ -364,7 +366,7 @@ pub(crate) fn bind_in_place_conflict_resolution(
 /// True iff the branch counts as hardened for Apply purposes. Marker existence
 /// (Fresh or Stale) means CC ran `/harden` at least once and is trusted; if
 /// the marker was consumed by a prior apply (Missing), fall back to the DB
-/// `hardened` flag on the pending change row.
+/// `hardened` flag on the open change row, pending or set aside.
 pub(crate) async fn branch_is_hardened(
     pool: &sqlx::PgPool,
     changes: &crate::core::changes_projection::ChangesProjection,
@@ -373,12 +375,12 @@ pub(crate) async fn branch_is_hardened(
 ) -> bool {
     match harden_marker_state(pool, repo_root, branch_name).await {
         HardenMarkerState::Fresh | HardenMarkerState::Stale => true,
-        HardenMarkerState::Missing => match changes.get_pending_by_branch(branch_name).await {
+        HardenMarkerState::Missing => match changes.get_open_by_branch(branch_name).await {
             Ok(Some(c)) => c.hardened,
             Ok(None) => false,
             Err(e) => {
                 log!(
-                    "[Changes] branch_is_hardened: get_pending_by_branch({}): {} — \
+                    "[Changes] branch_is_hardened: get_open_by_branch({}): {}; \
                      treating as not hardened (safer than letting a stale check pass)",
                     branch_name,
                     e
@@ -387,6 +389,21 @@ pub(crate) async fn branch_is_hardened(
             }
         },
     }
+}
+
+/// `thread_summaries.coding_agent_is_external_repo`. A thread with no
+/// summary row answers `false`.
+pub(crate) async fn thread_is_external_repo(
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT coding_agent_is_external_repo FROM thread_summaries WHERE thread_id = $1",
+    )
+    .bind(thread_id)
+    .fetch_optional(pool)
+    .await
+    .map(|opt| opt.unwrap_or(false))
 }
 
 /// Phase 6.2: Reset a thread's worktree to the new main HEAD after a successful

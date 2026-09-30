@@ -27,6 +27,7 @@ function makeThread(id: string, createdAt: string, lastUserAction: string): Thre
         updatedAt: lastUserAction,
         lastUserAction,
         status: 'idle',
+        summaryVersion: 0,
         messageCount: 1,
         section: 'archived',
         activeChildrenCount: 0,

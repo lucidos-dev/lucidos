@@ -3,7 +3,7 @@ import type { ApplyEstimates, Change } from '../../api/client';
 import { eventStreamTargets, openEventStream, type EventStreamTargets } from '@lucidos/event-stream';
 import { getEventStream, setEventStream } from './event-stream';
 import { fanOutEventFrame, fanOutEventStreamStatus } from './app-bridge';
-import { threadMap, focusedThreadId, changes, appliedChanges, applyingChangeIds, applyingNowThreadIds, applyAllInProgress, applyAllBatch, applyAllCanceling, APPLY_ALL_SUMMARY_TOAST_KEY, applyEstimates, applyPhases, standingApplyThreadIds, generatedTitleIds, codingAgentSessionVersion, setFocusedThread, archivingThreadIds, removingQueuedMessageIds, queuedMessageRemovalKey } from '../store';
+import { threadMap, focusedThreadId, changes, appliedChanges, setAsideChanges, applyingChangeIds, applyingNowThreadIds, applyAllInProgress, applyAllBatch, applyAllCanceling, APPLY_ALL_SUMMARY_TOAST_KEY, applyEstimates, applyPhases, standingApplyThreadIds, generatedTitleIds, codingAgentSessionVersion, setFocusedThread, archivingThreadIds, removingQueuedMessageIds, queuedMessageRemovalKey } from '../store';
 import { findChangeById, memoryRebuildProgress, backupProgress, backupStatusVersion, backupPreferencesVersion, responseStylesVersion, appSourceEpoch, recoveryProgress, showConfirm, showToast, dismissToast, repoSource, TOAST_AUTO_DISMISS_MS } from '../store';
 import { isFormRequest } from '../thread-events/thread-event-types';
 import { handleEvent, isChannelDefiningEvent, makeOptimisticThreadState, PENDING_TITLE_PLACEHOLDER, type ThreadAggregate, type ThreadMeta, type ThreadEvent, type TransientEvent } from '../thread-events';
@@ -708,7 +708,7 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
   // chevron is how they go to it.
   if (event.type === 'ChangeApplied' || event.type === 'ChangeDiscarded' || event.type === 'ChangeReverted') {
     if (threadId === focusedThreadId.value) {
-      document.dispatchEvent(new Event('reveal-mobile-header'));
+      document.dispatchEvent(new Event('reveal-mobile-bars'));
     }
     // Any terminal change event for a thread removes its worktree (Apply
     // ff-merges + cleans up, Discard deletes the branch + worktree). Drop
@@ -1101,6 +1101,7 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
       const applied = (data.applied ?? []) as Change[];
       changes.value = { status: 'loaded', data: pending };
       appliedChanges.value = { status: 'loaded', data: applied };
+      setAsideChanges.value = { status: 'loaded', data: (data.set_aside ?? []) as Change[] };
       if (data.apply_estimates) applyEstimates.value = data.apply_estimates as ApplyEstimates;
       // `changesHasMore` tracks whether more APPLIED changes are pageable, and
       // the ChangesUpdated payload carries no `has_more_applied`. Its

@@ -1146,7 +1146,7 @@ const EVENTS_DOMAIN: Domain = Domain {
 const CHANGES_OPS: &[Operation] = &[
     Operation {
         action: "list",
-        summary: "Pending and applied changes. thread_unsettled means its thread is still working. Read .pending[].id before 'apply'.",
+        summary: "Pending, set-aside and applied changes; thread_unsettled means still working.",
         method: Method::Get,
         path: "/changes",
         args: &[],
@@ -1161,7 +1161,7 @@ const CHANGES_OPS: &[Operation] = &[
     },
     Operation {
         action: "apply",
-        summary: "Merge the branch into main, as the Apply button does; returns status, SHAs and restart_required. Refused while its thread is unsettled; the error says what to do. ONLY when the user asked. (requires: change_id)",
+        summary: "Merge into main as the Apply button does; returns status, SHAs, restart_required. Refused while its thread is unsettled; the error says why. (requires: change_id)",
         method: Method::Post,
         path: "/changes/:change_id/apply",
         args: &[],
@@ -1169,14 +1169,14 @@ const CHANGES_OPS: &[Operation] = &[
         sdk_name: "apply",
         mutating: true,
         llm_alias: Some("apply_change"),
-        llm_schema: Some(r#"{"change_id":{"type":"string","description":"Pending change UUID, from 'list' (.pending[].id)."}}"#),
+        llm_schema: Some(r#"{"change_id":{"type":"string","description":"Change UUID, from 'list'."}}"#),
         llm: None,
         cli: None,
         sdk: None,
     },
     Operation {
         action: "apply_when_settled",
-        summary: "Apply a thread's change once it settles, waiting out event waits. Drops on a question or failure. ONLY when the user asked. (requires: thread_id)",
+        summary: "Apply a thread's change once it settles, through event waits. Drops on a question or failure. (requires: thread_id)",
         method: Method::Post,
         path: "/standing-applies",
         args: &[],
@@ -1184,14 +1184,14 @@ const CHANGES_OPS: &[Operation] = &[
         sdk_name: "applyWhenSettled",
         mutating: true,
         llm_alias: Some("apply_when_settled"),
-        llm_schema: Some(r#"{"thread_id":{"type":"string","description":"Thread whose change to apply once it settles."},"change_id":{"type":"string","description":"Omit if nothing is proposed yet."}}"#),
+        llm_schema: Some(r#"{"thread_id":{"type":"string","description":"The thread to act on."},"change_id":{"type":"string","description":"Omit if nothing is proposed yet."}}"#),
         llm: None,
         cli: None,
         sdk: None,
     },
     Operation {
         action: "apply_as_they_settle",
-        summary: "Apply every settled pending change, then keep going as the settling threads land theirs. ONLY when the user asked.",
+        summary: "Apply every settled change, then each settling thread's as it lands.",
         method: Method::Post,
         path: "/changes/apply-all?keep_going=true",
         args: &[],
@@ -1219,12 +1219,42 @@ const CHANGES_OPS: &[Operation] = &[
         cli: None,
         sdk: None,
     },
+    Operation {
+        action: "set_aside",
+        summary: "Keep a pending change for later, out of Review and Apply All. (requires: change_id)",
+        method: Method::Post,
+        path: "/changes/:change_id/set-aside",
+        args: &[],
+        cli_name: "set-aside",
+        sdk_name: "setAside",
+        mutating: true,
+        llm_alias: Some("set_aside_change"),
+        llm_schema: Some(r#"{"change_id":{"type":"string","description":"Change UUID, from 'list'."}}"#),
+        llm: None,
+        cli: None,
+        sdk: None,
+    },
+    Operation {
+        action: "bring_back",
+        summary: "Return a set-aside change to pending. (requires: change_id)",
+        method: Method::Post,
+        path: "/changes/:change_id/bring-back",
+        args: &[],
+        cli_name: "bring-back",
+        sdk_name: "bringBack",
+        mutating: true,
+        llm_alias: Some("bring_back_change"),
+        llm_schema: Some(r#"{"change_id":{"type":"string","description":"Change UUID, from 'list'."}}"#),
+        llm: None,
+        cli: None,
+        sdk: None,
+    },
 ];
 
 const CHANGES_DOMAIN: Domain = Domain {
     name: "changes",
     tool_name: "changes",
-    tool_summary: "Changes: coding-agent branches awaiting Apply. 'list' finds a change's id. Only 'apply' when the user asked.",
+    tool_summary: "Changes: coding-agent branches awaiting Apply. 'list' finds ids; the rest ONLY when the user asked.",
     llm: true,
     // `lucidos changes list|apply` is a hand-written CLI; not regenerated. No SDK
     // consumer. Grouped LLM tool only.
@@ -1821,7 +1851,7 @@ const THREADS_OPS: &[Operation] = &[
 const THREADS_DOMAIN: Domain = Domain {
     name: "threads",
     tool_name: "threads",
-    tool_summary: "Read threads, cheaper than querying events for what exists and its status, stop awaiting a child, or archive a finished one. 'list' and 'count' share filters. To START a thread use run_thread or run_coding_agent, to REDIRECT one follow_up_child_thread.",
+    tool_summary: "Read threads, cheaper than querying events for what exists and its status, stop awaiting a child, or archive one. 'list' and 'count' share filters. To START a thread use run_thread or run_coding_agent, to REDIRECT one follow_up_child_thread.",
     llm: true,
     // The `lucidos threads list|count` CLI is hand-written (kept, not regenerated)
     // and no SDK consumer needs this. Grouped LLM tool only.
@@ -2743,7 +2773,7 @@ pub fn build_llm_tool(domain: &Domain) -> ToolDefinition {
     description.push_str("\n\nActions:");
     for op in &llm_ops {
         // Colon rather than an em dash: this string is LLM-facing prose the
-        // engine emits on every turn, so `.claude/rules/no-em-dashes.md`
+        // engine emits on every turn, so `.claude/rules/em-dashes.md`
         // applies to it exactly as to a source line.
         description.push_str(&format!("\n• {}: {}", op.action, op.summary));
         // Required-args hint: from the raw llm_schema when the op supplies one
@@ -3207,7 +3237,9 @@ mod tests {
                 "apply",
                 "apply_when_settled",
                 "apply_as_they_settle",
-                "cancel_standing_apply"
+                "cancel_standing_apply",
+                "set_aside",
+                "bring_back"
             ]
         );
         assert!(changes.llm && !changes.cli && !changes.sdk);

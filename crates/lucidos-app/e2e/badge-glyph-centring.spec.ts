@@ -120,3 +120,97 @@ test.describe('Badge glyph centring', () => {
     }
   });
 });
+
+/** Where each header badge rides, as its real host renders it. */
+const HEADER_HOSTS: Record<string, { host: string; badge: string }> = {
+  'unread count on the mark': { host: '.brand-mark-slot', badge: 'badge brand-unread-badge' },
+  'bell count': { host: '.notifications-bell', badge: 'badge' },
+};
+
+/** Painted rows of the pill, and of the ink above and below the glyph. */
+async function paintedRows(page: import('@playwright/test').Page, png: Buffer) {
+  return page.evaluate(async (b64) => {
+    const img = new Image();
+    img.src = `data:image/png;base64,${b64}`;
+    await img.decode();
+    const canvas = document.createElement('canvas');
+    canvas.width = img.width;
+    canvas.height = img.height;
+    const ctx = canvas.getContext('2d')!;
+    ctx.drawImage(img, 0, 0);
+    const d = ctx.getImageData(0, 0, img.width, img.height).data;
+    let pillTop = Infinity, pillBottom = -1, inkTop = Infinity, inkBottom = -1;
+    for (let y = 0; y < img.height; y++) {
+      for (let x = 0; x < img.width; x++) {
+        const p = (y * img.width + x) * 4;
+        if (d[p + 1] > 60 || d[p + 2] > 60) continue;
+        pillTop = Math.min(pillTop, y);
+        pillBottom = Math.max(pillBottom, y);
+        if (d[p] > 128) {
+          inkTop = Math.min(inkTop, y);
+          inkBottom = Math.max(inkBottom, y);
+        }
+      }
+    }
+    return { pill: pillBottom - pillTop + 1, above: inkTop - pillTop, below: pillBottom - inkBottom };
+  }, png.toString('base64'));
+}
+
+/**
+ * The same badges inside the header, on a 1x screen.
+ *
+ * Each header region is centred with a `-50%` translate, which is -24.75px at
+ * 137.5%. Unrounded, Chrome snaps the pill and the digit apart inside it: the
+ * pill loses its bottom row and the count sits low. Only a 1x screen shows it,
+ * so the probe above, at 4x on a plain host, cannot.
+ */
+test.describe('Header badge centring on a 1x screen', () => {
+  test.use({ deviceScaleFactor: 1 });
+
+  test.beforeEach(async ({ page }) => {
+    await assertHealthy(page);
+  });
+
+  test('a header badge paints its whole pill, with its glyph in the middle', async ({ page }) => {
+    await navigateToApp(page);
+    // The splash fades out over the header, and a screenshot would read it.
+    await expect(page.locator('.boot-splash')).toHaveCount(0);
+    const failures: string[] = [];
+    for (let scale = 100; scale <= 200; scale += 12.5) {
+      for (const [name, { host, badge }] of Object.entries(HEADER_HOSTS)) {
+        await page.evaluate(({ scale, host, badge }) => {
+          document.documentElement.style.setProperty('--user-ui-scale', `${scale}%`);
+          document.querySelector('[data-badge-probe]')?.remove();
+          const slot = [...document.querySelectorAll<HTMLElement>(host)]
+            .find(e => e.getBoundingClientRect().width > 0)!;
+          const probe = document.createElement('span');
+          probe.className = badge;
+          probe.dataset.badgeProbe = '';
+          probe.textContent = '0';
+          slot.appendChild(probe);
+          // A white ring keeps the black pill apart from whatever it rides.
+          probe.style.cssText = 'background:#000!important;color:#f00!important;'
+            + 'box-shadow:0 0 0 3px #fff!important;border-radius:0!important';
+        }, { scale, host, badge });
+        // The app writes the scale itself, and a late preference load would
+        // take it back and leave every pass measuring 100%.
+        await expect.poll(() => page.evaluate(() => getComputedStyle(document.documentElement).fontSize))
+          .toBe(`${(16 * scale) / 100}px`);
+        // The workspace name folds away at some scales, which moves the mark.
+        await page.waitForTimeout(200);
+        const box = await page.locator('[data-badge-probe]').boundingBox();
+        const png = await page.screenshot({
+          clip: { x: box!.x - 2, y: box!.y - 2, width: box!.width + 4, height: box!.height + 4 },
+        });
+        const rows = await paintedRows(page, png);
+        // styles/badges.css makes the height a whole pixel, so all of it paints.
+        // The glyph's two gaps may differ by the one row an odd split leaves.
+        if (rows.pill !== box!.height || Math.abs(rows.above - rows.below) > 1) {
+          failures.push(`${name} at ${scale}%: box ${box!.height}px, painted `
+            + `${rows.pill}px, ${rows.above} above and ${rows.below} below the glyph`);
+        }
+      }
+    }
+    expect(failures).toEqual([]);
+  });
+});

@@ -395,7 +395,7 @@ Commit any fixes from this phase before proceeding to Phase 4.5, naming the file
 ./scripts/check-em-dashes.sh
 ```
 
-Runs for **every** diff, with no fast path: the docs-only skip below does NOT apply to it, because prose is exactly where em dashes come from. It is diff-scoped and added-lines-only, so the ~29,000 pre-existing ones in the tree never fire it (see `.claude/rules/no-em-dashes.md`). A non-zero exit is a hardening failure like any other: fix the flagged lines, commit, and return to Phase 1.
+Runs for **every** diff, with no fast path: the docs-only skip below does NOT apply to it, because prose is exactly where unspaced em dashes come from. It is diff-scoped and added-lines-only, so the ~29,000 pre-existing ones in the tree never fire it (see `.claude/rules/em-dashes.md`). A non-zero exit is a hardening failure like any other: fix the flagged lines, commit, and return to Phase 1.
 
 This is also the layer that covers **Codex**, which has no `PreToolUse` hooks and therefore never met the write-time gate.
 

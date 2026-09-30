@@ -774,7 +774,7 @@ pub struct AgentSession {
     /// aborting the apply and tearing down the merge worktree underneath the
     /// continuation the watchdog just dispatched.
     pub external_continuation_requested: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Channel for sending control requests (set_model, set_permission_mode, etc.)
+    /// Channel for sending control requests (interrupt, set_model, set_reasoning_effort)
     /// from outside the event loop. The event loop forwards them to the runtime.
     pub control_tx: tokio::sync::mpsc::UnboundedSender<crate::runtime::ControlRequest>,
     /// Withdraws for this session's run loop, which owns the input ledger.

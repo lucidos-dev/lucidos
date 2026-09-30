@@ -50,6 +50,9 @@ pub enum EngineReason {
     HardenRetrigger,
     /// Stale Claude Code session detected on startup; changes proposed from its branch.
     StaleSession,
+    /// An archived thread's branch held work no change carried, so the
+    /// engine set it aside rather than lose it (ADR 0328).
+    ArchivedBranchWork,
     /// Engine detected a merge conflict pulling main into a CC branch.
     MergeConflict,
     /// Engine detected the harden marker is missing or stale before apply.

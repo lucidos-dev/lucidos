@@ -5,7 +5,8 @@ import {
 } from '../../store/modelSelection';
 import type { ModelSelection } from '../../hooks/useModelSelection';
 import { useEscapeStep } from '../../hooks/useEscapeStep';
-import { focusIfNeeded, isTextInput } from '../../utils/dom';
+import { useFocusWhenPlaced } from '../../hooks/useFocusWhenPlaced';
+import { isTextInput } from '../../utils/dom';
 import { hasCoarsePointer, isTouchDevice } from '../../utils/viewport';
 import {
   ControlOptionList, selectedOptionIndex, wrapHighlight, type ControlOption,
@@ -92,9 +93,12 @@ export function pickerKeyAction(key: string): 'choose' | 'next' | 'prev' | null 
  *  A touch device always has it, because a box that waits to be typed into is
  *  a box a finger can never reach. `touch` is the capability, NOT the mobile
  *  width breakpoint: a phone held in landscape is over 768px wide and has no
- *  more keyboard than it had upright. */
-export function pickerShowsFilter(opts: { searching: boolean; touch: boolean }): boolean {
-  return opts.searching || opts.touch;
+ *  more keyboard than it had upright.
+ *
+ *  A host opened mid-typing (`keyboard`, the keyboard handoff) has it too, so
+ *  the box is there to take the keystrokes. */
+export function pickerShowsFilter(opts: { searching: boolean; touch: boolean; keyboard: boolean }): boolean {
+  return opts.searching || opts.touch || opts.keyboard;
 }
 
 /** Which element must hold focus, since whatever holds it owns the keystrokes.
@@ -103,14 +107,19 @@ export function pickerShowsFilter(opts: { searching: boolean; touch: boolean }):
  *  what turns that key into the query. The tier step has no filter, so it is
  *  always the list there.
  *
- *  `null` on a touch device leaves focus where it is. The box it always shows
- *  opens unfocused, so the keyboard cannot cover the panel before the user
- *  asks to search. A tap on the box is the asking. Nor does the list take
- *  focus: that blurs the prompt, and the keyboard slides away under the panel. */
+ *  A host that opened mid-typing (`keyboard`, the keyboard handoff) gives the
+ *  box focus at once, so typing filters the models.
+ *
+ *  On a touch device the list never takes focus: that blurs the prompt, and
+ *  the keyboard slides away under the panel. The tier step has no box, so a
+ *  finger's keyboard goes back to its `'holder'`. With no keyboard up it stays
+ *  `null`, and the box opens unfocused rather than raising one over the panel.
+ *  A tap on the box asks. */
 export function pickerFocusTarget(
-  opts: { tierStep: boolean; searching: boolean; touch: boolean },
-): 'filter' | 'list' | null {
-  if (opts.touch) return null;
+  opts: { tierStep: boolean; searching: boolean; touch: boolean; keyboard: boolean },
+): 'filter' | 'list' | 'holder' | null {
+  if (opts.keyboard && !opts.tierStep) return 'filter';
+  if (opts.touch) return opts.keyboard ? 'holder' : null;
   return opts.searching && !opts.tierStep ? 'filter' : 'list';
 }
 
@@ -138,6 +147,7 @@ export function ModelSelectionPicker({
   disabled,
   describeModel,
   back,
+  keyboardHolder = null,
   onPick,
 }: {
   /** The section label over the model step. The tier step names the model. */
@@ -150,6 +160,10 @@ export function ModelSelectionPicker({
   /** A way out of the MODEL step, for a host that opened the picker from a
    *  list of its own. Omit it where the picker IS the panel. */
   back?: { label: string; onBack: () => void };
+  /** The text field that held the on-screen keyboard as the host opened
+   *  (`keyboardHolder`). The filter box takes the keyboard from it, and the
+   *  host hands it back on close. */
+  keyboardHolder?: HTMLElement | null;
   /** One encoded pair, plus the backend when the provider step chose one. The
    *  host applies the whole selection and closes. */
   onPick: (encoded: string, provider?: string) => void;
@@ -173,7 +187,9 @@ export function ModelSelectionPicker({
     ? []
     : openStep.step === 'tiers' ? tierStepOptions(openRow) : providerStepOptions(openRow);
   const rows = openStep ? stepOptions : modelOptions;
-  const showsFilter = pickerShowsFilter({ searching: searching.value, touch: isTouchDevice() });
+  const showsFilter = pickerShowsFilter({
+    searching: searching.value, touch: isTouchDevice(), keyboard: keyboardHolder !== null,
+  });
 
   // Land on the model in force, so a long registry opens where the user is.
   useEffect(() => {
@@ -182,22 +198,16 @@ export function ModelSelectionPicker({
 
   // Whichever element owns the keystrokes has to hold focus, so focus follows
   // the step, and follows the filter box the moment typing reveals it.
-  //
-  // The effect asks twice. A host that places its own panel (the Settings
-  // field) opens it `visibility: hidden`, and a hidden element cannot take
-  // focus, which the frame-late retry covers. The first call wins on a panel
-  // already on screen, which is every reveal, and there the next keystroke is
-  // already on its way.
-  useEffect(() => {
+  useFocusWhenPlaced(() => {
     // A coarse pointer, not any touch capability: a touchscreen laptop driven
     // by its trackpad still wants the arrow keys in the list.
     const target = pickerFocusTarget({
       tierStep: !!openStep, searching: searching.value, touch: hasCoarsePointer(),
+      keyboard: keyboardHolder !== null,
     });
-    if (target === null) return;
-    const ref = target === 'filter' ? filterRef : listRef;
-    focusIfNeeded(ref.current);
-    requestAnimationFrame(() => focusIfNeeded(ref.current));
+    if (target === 'holder') return keyboardHolder;
+    if (target === 'filter') return filterRef.current;
+    return target === 'list' ? listRef.current : null;
   }, [open.value, searching.value]);
 
   // The model step can overflow the panel, and it opens scrolled part-way down.
@@ -330,7 +340,7 @@ export function ModelSelectionPicker({
       back={back}
       filter={showsFilter ? {
         value: filter.value,
-        placeholder: 'Filter models...',
+        placeholder: 'Filter models…',
         inputRef: filterRef,
         onInput: (value) => { filter.value = value; highlight.value = 0; },
       } : undefined}

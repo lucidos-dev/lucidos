@@ -59,25 +59,6 @@ fn detect_bot_block(content: &str) -> Option<String> {
 pub struct HeadlessBlocklist;
 
 impl HeadlessBlocklist {
-    /// Defensive double-write: the migration owns this CREATE TABLE (see
-    /// `20260517160627_consolidate_init_schema_tables.sql`). A temporary measure:
-    /// `docs/temporary-measures.md` § "Defensive double-write of tables into
-    /// `init_schema`".
-    pub async fn init_schema(
-        pool: &PgPool,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS headless_blocked (
-                domain TEXT PRIMARY KEY,
-                reason TEXT NOT NULL,
-                created_at TIMESTAMPTZ DEFAULT NOW()
-            )",
-        )
-        .execute(pool)
-        .await?;
-        Ok(())
-    }
-
     pub async fn is_blocked(pool: &PgPool, domain: &str) -> Result<Option<String>, sqlx::Error> {
         let row: Option<(String,)> =
             sqlx::query_as("SELECT reason FROM headless_blocked WHERE domain = $1")
@@ -120,25 +101,6 @@ impl HeadlessBlocklist {
 pub struct BrowserLogins;
 
 impl BrowserLogins {
-    /// Defensive double-write: the migration owns this CREATE TABLE (see
-    /// `20260517160627_consolidate_init_schema_tables.sql`). A temporary measure:
-    /// `docs/temporary-measures.md` § "Defensive double-write of tables into
-    /// `init_schema`".
-    pub async fn init_schema(
-        pool: &PgPool,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS browser_logins (
-                domain TEXT PRIMARY KEY,
-                label TEXT NOT NULL,
-                logged_in_at TIMESTAMPTZ DEFAULT NOW()
-            )",
-        )
-        .execute(pool)
-        .await?;
-        Ok(())
-    }
-
     pub async fn record(pool: &PgPool, domain: &str, label: &str) -> Result<(), sqlx::Error> {
         sqlx::query(
             "INSERT INTO browser_logins (domain, label) VALUES ($1, $2)

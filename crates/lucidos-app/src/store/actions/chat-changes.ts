@@ -1,10 +1,10 @@
-import { showToast, showConfirm, dismissToast, removeToast, changes, appliedChanges, lazyChanges, findChangeById, changesHasMore, changesLoadingMore, restartRequired, restartGroups, applyingChangeIds, applyingNowThreadIds, applyAllInProgress, applyAllBatch, applyAllCanceling, applyEstimates, standingApplyThreadIds, armingStandingApplyThreadIds, armingStandingApplySweep, disarmingAllStandingApply, settlingThreadCount, threadMap, effectiveThreadStatus, isMidTurn, TOAST_AUTO_DISMISS_MS, engineRestarting, engineRestartNewVersion, engineStartedAt, engineVersion, latestEngineVersion, engineNewVersionReady, enginePackaged, enginePendingCommits, NEW_VERSION_TOAST_KEY, FRONTEND_UPDATE_DEFERRED_TOAST_KEY } from '../store';
+import { showToast, showConfirm, dismissToast, removeToast, changes, appliedChanges, setAsideChanges, lazyChanges, findChangeById, changesHasMore, changesLoadingMore, restartRequired, restartGroups, applyingChangeIds, applyingNowThreadIds, applyAllInProgress, applyAllBatch, applyAllCanceling, applyEstimates, standingApplyThreadIds, armingStandingApplyThreadIds, armingStandingApplySweep, disarmingAllStandingApply, settlingThreadCount, threadMap, effectiveThreadStatus, isMidTurn, TOAST_AUTO_DISMISS_MS, engineRestarting, engineRestartNewVersion, engineStartedAt, engineVersion, latestEngineVersion, engineNewVersionReady, enginePackaged, enginePendingCommits, NEW_VERSION_TOAST_KEY, FRONTEND_UPDATE_DEFERRED_TOAST_KEY } from '../store';
 import { changeToastMessage } from './changeToast';
 import { restartConfirmCopy } from '../restartConfirmCopy';
 import { loadedOr, toFailed } from '../types';
 import type { Loadable } from '../types';
 import type { RestartGroup } from '../store';
-import { applyChange as apiApply, discardChange as apiDiscard, applyAllChanges as apiApplyAll, cancelApplyAllChanges as apiCancelApplyAll, discardAllChanges as apiDiscardAll, revertChange as apiRevert, fetchChanges as apiFetchChanges, getChangeById as apiGetChangeById, armStandingApply as apiArmStandingApply, disarmStandingApply as apiDisarmStandingApply, disarmAllStandingApplies as apiDisarmAllStandingApplies, restartEngine, ApiError, isTransportError } from '../../api/client';
+import { applyChange as apiApply, discardChange as apiDiscard, setAsideChange as apiSetAside, bringBackChange as apiBringBack, applyAllChanges as apiApplyAll, cancelApplyAllChanges as apiCancelApplyAll, discardAllChanges as apiDiscardAll, revertChange as apiRevert, fetchChanges as apiFetchChanges, getChangeById as apiGetChangeById, armStandingApply as apiArmStandingApply, disarmStandingApply as apiDisarmStandingApply, disarmAllStandingApplies as apiDisarmAllStandingApplies, restartEngine, ApiError, isTransportError } from '../../api/client';
 import { isTauri } from '../../utils/platform';
 import { invoke } from '../../utils/tauri';
 import { isNewerVersion } from '../../utils/version';
@@ -439,6 +439,7 @@ export function refreshChangesState(): Promise<void> {
       const previousPending = loadedOr(changes.value, []);
       changes.value = { status: 'loaded', data: state.pending };
       appliedChanges.value = { status: 'loaded', data: applied };
+      setAsideChanges.value = { status: 'loaded', data: state.set_aside ?? [] };
       changesHasMore.value = state.has_more_applied;
       restartRequired.value = state.restart_required || isEngineOutdated();
       // Backend is the source of truth across page reloads — the live
@@ -505,6 +506,7 @@ export function refreshChangesState(): Promise<void> {
       if (isAbortError(e) || isTransportError(e)) return;
       changes.value = toFailed<Change[]>(e);
       appliedChanges.value = toFailed<Change[]>(e);
+      setAsideChanges.value = toFailed<Change[]>(e);
       showToast(`Failed to fetch changes: ${errorDetail(e)}`, 'error');
     });
 }
@@ -543,11 +545,29 @@ export async function discardSingleChange(id: string): Promise<void> {
   }
 }
 
+/** Keep a pending change for later. Nothing is lost, so it asks no confirm. */
+export async function setAsideSingleChange(id: string): Promise<void> {
+  try {
+    await apiSetAside(id);
+  } catch (e) {
+    showToast(errorDetail(e) || 'Failed to set the change aside', 'error');
+  }
+}
+
+/** Return a set-aside change to pending. */
+export async function bringBackSingleChange(id: string): Promise<void> {
+  try {
+    await apiBringBack(id);
+  } catch (e) {
+    showToast(errorDetail(e) || 'Failed to bring the change back', 'error');
+  }
+}
+
 /** Apply all changes.
  *
  *  With `keepGoing`, the call also arms a standing apply on every thread still
- *  working, so each one applies as it lands. With nothing pending that IS the
- *  action, and the button reads "Apply all on settle". */
+ *  working, so each one applies as it lands. The "Apply all on settle" button
+ *  passes it. */
 export async function applyAllChanges(keepGoing = false): Promise<void> {
   // Single flight, guarded here rather than by a `disabled` button. "Apply all
   // on settle" presses this too and is never disabled: it arms, so it has no

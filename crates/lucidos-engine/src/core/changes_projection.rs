@@ -128,6 +128,8 @@ impl ChangesProjection {
     }
 
     /// Insert (or update on re-emit) the row for an aggregate `ChangeProposed`.
+    /// `status` applies to an insert only: a re-emit never moves a row's
+    /// status, which belongs to the status events.
     /// `request_id` is `Uuid::nil()` — the event payload doesn't carry it; auto-apply
     /// correlation is dead code today. Revive: extend the event variant first.
     #[allow(clippy::too_many_arguments)]
@@ -142,6 +144,7 @@ impl ChangesProjection {
         requires_restart: bool,
         hardened: bool,
         incomplete: bool,
+        status: ChangeStatus,
     ) -> sqlx::Result<()> {
         let Some(id) = parse_change_id(change_id) else {
             return Ok(());
@@ -177,7 +180,7 @@ impl ChangesProjection {
         .bind(requires_restart)
         .bind(hardened)
         .bind(incomplete)
-        .bind(ChangeStatus::Pending)
+        .bind(status)
         .execute(&mut **tx)
         .await?;
         Self::sync_thread_proposal(&mut **tx, thread_id).await
@@ -297,10 +300,14 @@ impl ChangesProjection {
             return Ok(());
         };
         let row: Option<Option<Uuid>> = sqlx::query_scalar(
-            "UPDATE changes SET status = $2, resolved_at = NOW() WHERE id = $1 RETURNING thread_id",
+            "UPDATE changes SET status = $2, \
+             resolved_at = CASE WHEN $2 IN ($3, $4) THEN NULL ELSE NOW() END \
+             WHERE id = $1 RETURNING thread_id",
         )
         .bind(id)
         .bind(status)
+        .bind(ChangeStatus::Pending)
+        .bind(ChangeStatus::SetAside)
         .fetch_optional(&mut **tx)
         .await?;
         match row {
@@ -410,6 +417,16 @@ impl ChangesProjection {
             .await
     }
 
+    /// All set-aside changes, most recently created first.
+    pub async fn list_set_aside(&self) -> sqlx::Result<Vec<Change>> {
+        sqlx::query_as(&format!(
+            "{SELECT_CHANGE} WHERE status = $1 ORDER BY created_at DESC"
+        ))
+        .bind(ChangeStatus::SetAside)
+        .fetch_all(&self.pool)
+        .await
+    }
+
     /// Get the pending change for a given branch, if one exists.
     pub async fn get_pending_by_branch(&self, branch_name: &str) -> sqlx::Result<Option<Change>> {
         sqlx::query_as(&format!(
@@ -421,6 +438,27 @@ impl ChangesProjection {
         .await
     }
 
+    /// The open change (pending or set aside) for a branch, if one exists.
+    pub async fn get_open_by_branch(&self, branch_name: &str) -> sqlx::Result<Option<Change>> {
+        sqlx::query_as(&format!(
+            "{SELECT_CHANGE} WHERE branch_name = $1 AND status IN ($2, $3) \
+             ORDER BY status = $2 DESC LIMIT 1"
+        ))
+        .bind(branch_name)
+        .bind(ChangeStatus::Pending)
+        .bind(ChangeStatus::SetAside)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    /// Whether any `changes` row, in any status, names this branch.
+    pub async fn any_for_branch(&self, branch_name: &str) -> sqlx::Result<bool> {
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM changes WHERE branch_name = $1)")
+            .bind(branch_name)
+            .fetch_one(&self.pool)
+            .await
+    }
+
     /// All pending changes for a specific thread.
     pub async fn pending_for_thread(&self, thread_id: Uuid) -> sqlx::Result<Vec<Change>> {
         sqlx::query_as(&format!(
@@ -428,6 +466,18 @@ impl ChangesProjection {
         ))
         .bind(thread_id)
         .bind(ChangeStatus::Pending)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// A thread's open changes: pending or set aside.
+    pub async fn open_for_thread(&self, thread_id: Uuid) -> sqlx::Result<Vec<Change>> {
+        sqlx::query_as(&format!(
+            "{SELECT_CHANGE} WHERE status IN ($2, $3) AND thread_id = $1 ORDER BY created_at ASC"
+        ))
+        .bind(thread_id)
+        .bind(ChangeStatus::Pending)
+        .bind(ChangeStatus::SetAside)
         .fetch_all(&self.pool)
         .await
     }
@@ -509,19 +559,20 @@ impl ChangesProjection {
             .is_some_and(|c| c.is_pending()))
     }
 
-    /// Whether any OTHER pending change exists for the given branch (excluding `exclude_id`).
-    pub async fn other_pending_for_branch(
+    /// Whether any OTHER open change (pending or set aside) names the branch.
+    pub async fn other_open_for_branch(
         &self,
         branch_name: &str,
         exclude_id: Uuid,
     ) -> sqlx::Result<bool> {
         sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS(SELECT 1 FROM changes \
-             WHERE status = $3 AND branch_name = $1 AND id <> $2)",
+             WHERE status IN ($3, $4) AND branch_name = $1 AND id <> $2)",
         )
         .bind(branch_name)
         .bind(exclude_id)
         .bind(ChangeStatus::Pending)
+        .bind(ChangeStatus::SetAside)
         .fetch_one(&self.pool)
         .await
     }
@@ -678,6 +729,7 @@ impl ChangesProjection {
              WHERE event_type IN (
                  'ChangeProposed','ChangeApplied','ChangeDiscarded',
                  'ChangeReverted','ChangeHardened','ChangeSummarized',
+                 'ChangeSetAside','ChangeBroughtBack',
                  'MergeResolutionStarted','MergeResolutionCleared'
              )
                AND payload->>'change_id' IS NOT NULL
@@ -718,6 +770,7 @@ async fn rebuild_one_from_events(pool: &PgPool, change_id: Uuid) -> sqlx::Result
            AND event_type IN (
                'ChangeProposed','ChangeApplied','ChangeDiscarded',
                'ChangeReverted','ChangeHardened','ChangeSummarized',
+               'ChangeSetAside','ChangeBroughtBack',
                'MergeResolutionStarted','MergeResolutionCleared'
            )
          ORDER BY created",
@@ -789,12 +842,27 @@ async fn rebuild_one_from_events(pool: &PgPool, change_id: Uuid) -> sqlx::Result
         .map(|r| str_field(&r.1, "summary"))
         .filter(|s| !s.is_empty());
 
-    let terminal = rows.iter().rev().find(|r| {
-        matches!(
-            r.0.as_str(),
-            "ChangeApplied" | "ChangeDiscarded" | "ChangeReverted"
-        )
-    });
+    // The latest status-moving event decides. Bringing a change back returns
+    // it to pending, the same as having no status event at all. A proposal
+    // made straight into set-aside counts as a set-aside.
+    let proposed_set_aside = |r: &(String, serde_json::Value, Option<Uuid>, DateTime<Utc>)| {
+        is_aggregate_proposed(r) && bool_field(&r.1, "set_aside")
+    };
+    let terminal = rows
+        .iter()
+        .rev()
+        .find(|r| {
+            proposed_set_aside(r)
+                || matches!(
+                    r.0.as_str(),
+                    "ChangeApplied"
+                        | "ChangeDiscarded"
+                        | "ChangeReverted"
+                        | "ChangeSetAside"
+                        | "ChangeBroughtBack"
+                )
+        })
+        .filter(|r| r.0 != "ChangeBroughtBack");
 
     // Active merge worktree state: the latest unpaired MergeResolutionStarted.
     // Without this, a recovered change with a half-finished merge is invisible
@@ -819,6 +887,9 @@ async fn rebuild_one_from_events(pool: &PgPool, change_id: Uuid) -> sqlx::Result
     };
 
     let (status, resolved_at, commits, pre_sha, post_sha) = match terminal {
+        Some(t) if t.0 == "ChangeSetAside" || t.0 == "ChangeProposed" => {
+            (ChangeStatus::SetAside, None, Vec::new(), None, None)
+        }
         Some(t) => {
             let status = match t.0.as_str() {
                 "ChangeApplied" => ChangeStatus::Applied,
@@ -899,6 +970,10 @@ mod queries_tests;
 #[cfg(test)]
 #[path = "changes_projection_tests/rebuild.rs"]
 mod rebuild_tests;
+
+#[cfg(test)]
+#[path = "changes_projection_tests/set_aside.rs"]
+mod set_aside_tests;
 
 #[cfg(test)]
 #[path = "changes_projection_tests/summary.rs"]

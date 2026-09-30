@@ -28,7 +28,7 @@ test.describe('CC model pre-session selection', () => {
 
     await waitAndClick(page, '.commands-btn-active', undefined, 15_000);
     await waitAndClick(page, '.control-item', 'Model');
-    // Two steps: the model, then one of its tiers. Only the tier reports.
+    // Haiku offers no tiers, so picking the model commits it.
     await pickModelPair(page, 'haiku');
 
     let sentThreadId: string | null = null;

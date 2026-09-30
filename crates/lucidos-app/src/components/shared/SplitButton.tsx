@@ -18,7 +18,8 @@ import { useTouchActivated } from '../../hooks/useTouchActivated';
  *  menu rather than firing the primary action by accident.
  *
  *  Reused by the change-action banner (Apply + Discard/Archive; the Diff button
- *  sits outside this cluster) and the chat prompt's multi-select answer control
+ *  sits outside this cluster), each pending row in the Changes panel (Apply +
+ *  Set aside/Discard), and the chat prompt's multi-select answer control
  *  (Submit + Cancel). Pass the same class on `primaryClassName`/`caretClassName`
  *  to keep the pill one colour. Both are approvals, so the face, the caret and
  *  the menu are each a protected surface (ADR 0309). The root is not: its
@@ -58,10 +59,10 @@ export interface SplitButtonProps {
   menuItems: SplitButtonMenuItem[];
   /** Attributes for the root box, from a host whose row is MEASURED.
    *
-   *  The root always carries `data-row-item`, because every split button this
-   *  app draws sits in the composer row and the measurement has to see it. A
-   *  host spreads these AFTER it, so a foldable one can overwrite the marker
-   *  with its own fold key. */
+   *  The root always carries `data-row-item`, because the composer row measures
+   *  its split buttons. The measurement looks only inside that row, so a split
+   *  button elsewhere is unaffected. A host spreads these AFTER it, so a
+   *  foldable one can overwrite the marker with its own fold key. */
   attrs?: Record<string, string>;
 }
 

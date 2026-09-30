@@ -296,7 +296,7 @@ pub async fn get_change_diff(
 
     let repo_root = std::path::Path::new(&change.repo_root);
     let range = match &change.state {
-        ChangeState::Pending { .. } => {
+        ChangeState::Pending { .. } | ChangeState::SetAside => {
             if super::is_dangerous_git_ref(&change.branch_name) {
                 return Err((StatusCode::BAD_REQUEST, "Invalid branch name".into()));
             }
@@ -780,7 +780,7 @@ pub async fn get_change_file(
     };
 
     let git_ref = match &change.state {
-        ChangeState::Pending { .. } => change.branch_name.clone(),
+        ChangeState::Pending { .. } | ChangeState::SetAside => change.branch_name.clone(),
         ChangeState::Applied(shas) | ChangeState::Reverted(shas) => match shas.post.as_deref() {
             Some(sha) => sha.to_string(),
             None => return (StatusCode::BAD_REQUEST, "No post-merge SHA recorded").into_response(),

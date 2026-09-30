@@ -129,11 +129,11 @@ async fn a_proposal_after_an_apply_on_the_same_branch_is_a_new_change() {
     teardown_test_db(&db).await;
 }
 
-/// `idx_changes_unique_pending_branch` keeps the pending count per branch
-/// to one, so `other_pending_for_branch` is always false in practice.
+/// `idx_changes_unique_open_branch` keeps the open count per branch to one,
+/// so `other_open_for_branch` is always false in practice.
 /// `change_ops::discard_change` calls it defensively before wiping a branch.
 #[tokio::test]
-async fn other_pending_for_branch_returns_false_when_only_one_pending() {
+async fn other_open_for_branch_returns_false_when_only_one_is_open() {
     let (pool, db) = setup_test_db().await;
     let (bus, _cb_rx) = EventBus::new(pool.clone());
     let thread = Uuid::new_v4();
@@ -142,8 +142,8 @@ async fn other_pending_for_branch_returns_false_when_only_one_pending() {
 
     emit(&bus, thread, aggregate_proposed(id, "branch-x", "/repo")).await;
     let proj = ChangesProjection::new(pool.clone());
-    assert!(!proj.other_pending_for_branch("branch-x", id).await.unwrap());
-    assert!(!proj.other_pending_for_branch("branch-y", id).await.unwrap());
+    assert!(!proj.other_open_for_branch("branch-x", id).await.unwrap());
+    assert!(!proj.other_open_for_branch("branch-y", id).await.unwrap());
 
     // A different change on a different branch — still no overlap on branch-x.
     let other_id = Uuid::new_v4();
@@ -153,9 +153,9 @@ async fn other_pending_for_branch_returns_false_when_only_one_pending() {
         aggregate_proposed(other_id, "branch-y", "/repo"),
     )
     .await;
-    assert!(!proj.other_pending_for_branch("branch-x", id).await.unwrap());
+    assert!(!proj.other_open_for_branch("branch-x", id).await.unwrap());
     assert!(!proj
-        .other_pending_for_branch("branch-y", other_id)
+        .other_open_for_branch("branch-y", other_id)
         .await
         .unwrap());
 

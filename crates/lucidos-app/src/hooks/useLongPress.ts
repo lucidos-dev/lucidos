@@ -36,7 +36,7 @@ export type LongPressCallback = (target: HTMLElement, at?: ViewportPoint) => voi
 /** Pure long-press / right-click gesture machine. Returns DOM handlers that
  *  call `onLongPress(target)` when the pointer is held still past `delayMs`,
  *  or `onLongPress(target, at)` on a right-click `contextmenu`, and
- *  `onClick()` for an ordinary tap.
+ *  `onClick(e)` for an ordinary tap.
  *  The `click` the browser pairs with a fired long-press is swallowed
  *  (`preventDefault` + `stopPropagation`) so the host button's primary action
  *  doesn't also run.
@@ -45,7 +45,7 @@ export type LongPressCallback = (target: HTMLElement, at?: ViewportPoint) => voi
  *  `useLongPress` wires it to a component with stable refs. */
 export function makeLongPressHandlers(
   onLongPress: LongPressCallback,
-  onClick: () => void,
+  onClick: (e: MouseEvent) => void,
   opts: LongPressOptions = {},
 ): LongPressHandlers {
   const delayMs = opts.delayMs ?? LONG_PRESS_DELAY_MS;
@@ -127,7 +127,7 @@ export function makeLongPressHandlers(
         e.stopPropagation();
         return;
       }
-      onClick();
+      onClick(e);
     },
     cancel() {
       clearTimer();
@@ -142,7 +142,7 @@ export function makeLongPressHandlers(
  *  rebuilt (which would reset the in-flight gesture). */
 export function useLongPress(
   onLongPress: LongPressCallback,
-  onClick: () => void,
+  onClick: (e: MouseEvent) => void,
   opts?: LongPressOptions,
 ): LongPressHandlers {
   const longPressRef = useRef(onLongPress);
@@ -153,7 +153,7 @@ export function useLongPress(
   if (!handlersRef.current) {
     handlersRef.current = makeLongPressHandlers(
       (t, at) => longPressRef.current(t, at),
-      () => clickRef.current(),
+      (e) => clickRef.current(e),
       opts,
     );
   }

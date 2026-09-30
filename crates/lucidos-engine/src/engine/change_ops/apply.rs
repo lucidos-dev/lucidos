@@ -346,7 +346,10 @@ impl LucidosEngine {
         // event it waits on. And it advances an Apply All batch past a member
         // somebody discarded mid-run, which the driver waits on this event for.
         if !change.is_pending() {
-            let msg = format!("Change is already {}", change.status());
+            let msg = match change.status() {
+                ChangeStatus::SetAside => SET_ASIDE_APPLY_REFUSAL.to_string(),
+                status => format!("Change is already {status}"),
+            };
             self.emit_apply_failed(
                 change.thread_id.unwrap_or(change_id),
                 change_id,

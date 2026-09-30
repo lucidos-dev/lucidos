@@ -71,16 +71,17 @@ use crate::engine::thread_lifecycle::ThreadStatus;
 use crate::engine::LucidosEngine;
 use crate::triggers::TriggerConfig;
 
-/// Backlog size at which a per-trigger "significantly delayed" notification fires.
-const BACKLOG_COUNT_THRESHOLD: usize = 10;
-/// Oldest-waiting age at which a per-trigger "significantly delayed" notification fires.
-const BACKLOG_AGE: Duration = Duration::from_secs(5 * 60);
+/// How long a trigger's oldest queued fire waits before the "significantly
+/// delayed" notification fires. Wait time, never queue depth: a burst of quick
+/// fires drains in seconds. One agentic fire often runs a few minutes, so a
+/// shorter wait would alert whenever two fires of one trigger overlap.
+const DELAY_ALERT_WAIT: Duration = Duration::from_secs(5 * 60);
 /// Minimum spacing between notifications for the same trigger (and for the
 /// global at-capacity notice) so a hot queue doesn't spam the inbox.
 const NOTIFY_COOLDOWN: Duration = Duration::from_secs(10 * 60);
 /// Safety-net drain interval — normal drains are event-driven (completion,
 /// drop, policy change, trigger resume); the timer catches anything missed
-/// and drives the backlog-age notification check.
+/// and drives the delay notification check.
 const DRAIN_INTERVAL: Duration = Duration::from_secs(60);
 
 /// One queued spawn, in memory. Mirrors a `thread_queue` row with
@@ -160,7 +161,7 @@ struct QueueState {
     parked_user_slots: HashMap<Uuid, Uuid>,
     /// Per-trigger notification cooldowns (allowed-ephemeral — a restart
     /// resetting the cooldown at worst re-notifies once).
-    backlog_notified: HashMap<String, Instant>,
+    delay_notified: HashMap<String, Instant>,
     global_notified: Option<Instant>,
 }
 
@@ -168,6 +169,42 @@ impl QueueState {
     /// Everything occupying the shared pool — background admits + user admits.
     fn total_active(&self) -> usize {
         self.active.len() + self.user_active.len()
+    }
+
+    /// The "Lucidos is at capacity" notification, when the pool is full and
+    /// its cooldown has elapsed. Call under the state lock, send after.
+    fn capacity_notification_due(&mut self) -> Option<(String, String)> {
+        if self.total_active() < self.policy.max_concurrent_total
+            || self
+                .global_notified
+                .is_some_and(|t| t.elapsed() < NOTIFY_COOLDOWN)
+        {
+            return None;
+        }
+        self.global_notified = Some(Instant::now());
+        let total_queued = self.queued.len() + self.user_queued.len();
+        Some((
+            "Lucidos is at capacity".to_string(),
+            format!(
+                "All {} slots are busy; {total_queued} thread(s) are waiting \
+                 in the Thread Queue.",
+                self.policy.max_concurrent_total
+            ),
+        ))
+    }
+
+    /// Whether the trigger's delay cooldown has elapsed. Starts a new
+    /// cooldown when it has, so the caller must then notify.
+    fn delay_cooldown_elapsed(&mut self, trigger_id: &str) -> bool {
+        let elapsed = self
+            .delay_notified
+            .get(trigger_id)
+            .is_none_or(|t| t.elapsed() >= NOTIFY_COOLDOWN);
+        if elapsed {
+            self.delay_notified
+                .insert(trigger_id.to_string(), Instant::now());
+        }
+        elapsed
     }
 
     fn counts_for(&self, kind: ThreadQueueKind, trigger_id: Option<&str>) -> AdmissionCounts {
@@ -400,7 +437,7 @@ impl ThreadQueue {
                 user_active: HashMap::new(),
                 user_queued: VecDeque::new(),
                 parked_user_slots: HashMap::new(),
-                backlog_notified: HashMap::new(),
+                delay_notified: HashMap::new(),
                 global_notified: None,
             }),
         }
@@ -490,6 +527,14 @@ impl ThreadQueue {
             .read()
             .ok()
             .and_then(|configs| configs.get(trigger_id).map(|c| c.name.clone()))
+    }
+
+    /// Whether the registry says the trigger is paused. An unreadable
+    /// registry answers `false`, so a stuck queue still alerts.
+    fn trigger_paused(&self, trigger_id: &str) -> bool {
+        self.trigger_configs
+            .read()
+            .is_ok_and(|configs| configs.get(trigger_id).is_some_and(|c| c.paused))
     }
 
     /// Submit a background spawn. Admits immediately when capacity allows
@@ -591,11 +636,9 @@ impl ThreadQueue {
                 let (position, notify) = {
                     let mut state = self.state.lock().await;
                     state.queued.push_back(entry);
-                    let position = state.queued.len();
-                    let notify = self.backlog_notifications_due(&mut state, trigger_id.as_deref());
-                    (position, notify)
+                    (state.queued.len(), state.capacity_notification_due())
                 };
-                for (title, message) in notify {
+                if let Some((title, message)) = notify {
                     self.notify(title, message).await;
                 }
                 SubmitOutcome {
@@ -724,61 +767,6 @@ impl ThreadQueue {
                 .await;
             }
         }
-    }
-
-    /// Collect any due backlog notifications (call under the state lock,
-    /// send after releasing it). Count-based check at enqueue time; the
-    /// age-based check lives in the periodic drain loop.
-    fn backlog_notifications_due(
-        &self,
-        state: &mut QueueState,
-        trigger_id: Option<&str>,
-    ) -> Vec<(String, String)> {
-        let mut due = Vec::new();
-        if let Some(tid) = trigger_id {
-            let backlog = state
-                .queued
-                .iter()
-                .filter(|e| e.trigger_id.as_deref() == Some(tid))
-                .count();
-            if backlog >= BACKLOG_COUNT_THRESHOLD && self.cooldown_elapsed_for(state, tid) {
-                let label = self.trigger_name(tid).unwrap_or_else(|| tid.to_string());
-                due.push((
-                    format!("{label} is significantly delayed"),
-                    format!("Trigger \"{label}\" has {backlog} fires waiting in the Thread Queue."),
-                ));
-            }
-        }
-        let total_queued = state.queued.len() + state.user_queued.len();
-        if state.total_active() >= state.policy.max_concurrent_total
-            && state
-                .global_notified
-                .is_none_or(|t| t.elapsed() >= NOTIFY_COOLDOWN)
-        {
-            state.global_notified = Some(Instant::now());
-            due.push((
-                "Lucidos is at capacity".to_string(),
-                format!(
-                    "All {} slots are busy; {total_queued} thread(s) are waiting \
-                     in the Thread Queue.",
-                    state.policy.max_concurrent_total
-                ),
-            ));
-        }
-        due
-    }
-
-    fn cooldown_elapsed_for(&self, state: &mut QueueState, trigger_id: &str) -> bool {
-        let elapsed = state
-            .backlog_notified
-            .get(trigger_id)
-            .is_none_or(|t| t.elapsed() >= NOTIFY_COOLDOWN);
-        if elapsed {
-            state
-                .backlog_notified
-                .insert(trigger_id.to_string(), Instant::now());
-        }
-        elapsed
     }
 
     /// Admit whatever fits, by priority. Three passes run under one lock:
@@ -1737,7 +1725,7 @@ impl ThreadQueue {
     }
 
     /// Kick off the drain loop: an immediate drain (queued backlog from the
-    /// previous process), then the periodic safety-net drain + backlog-age
+    /// previous process), then the periodic safety-net drain + delay
     /// notification check. Call AFTER the scheduler has replayed trigger
     /// configs — drain consults them for pause/deletion.
     pub fn start_draining(self: &Arc<Self>) {
@@ -1747,7 +1735,7 @@ impl ThreadQueue {
                 mgr.drain().await;
                 let due = {
                     let mut state = mgr.state.lock().await;
-                    mgr.age_notifications_due(&mut state)
+                    mgr.delay_notifications_due(&mut state, Utc::now())
                 };
                 for (title, message) in due {
                     mgr.notify(title, message).await;
@@ -1757,9 +1745,15 @@ impl ThreadQueue {
         });
     }
 
-    /// Per-trigger "oldest waiting too long" check, driven by the periodic
-    /// drain loop.
-    fn age_notifications_due(&self, state: &mut QueueState) -> Vec<(String, String)> {
+    /// One "significantly delayed" notification per trigger whose oldest
+    /// queued fire has waited [`DELAY_ALERT_WAIT`] or longer, subject to the
+    /// per-trigger cooldown. A paused trigger's fires wait for resume on
+    /// purpose, so it never alerts. Driven by the periodic drain loop.
+    fn delay_notifications_due(
+        &self,
+        state: &mut QueueState,
+        now: DateTime<Utc>,
+    ) -> Vec<(String, String)> {
         let mut oldest: HashMap<String, (DateTime<Utc>, usize)> = HashMap::new();
         for e in &state.queued {
             if let Some(ref tid) = e.trigger_id {
@@ -1768,21 +1762,24 @@ impl ThreadQueue {
                 slot.1 += 1;
             }
         }
-        let now = Utc::now();
         let mut due = Vec::new();
         for (tid, (oldest_at, count)) in oldest {
-            let age = (now - oldest_at).to_std().unwrap_or_default();
-            if age >= BACKLOG_AGE && self.cooldown_elapsed_for(state, &tid) {
-                let label = self.trigger_name(&tid).unwrap_or_else(|| tid.clone());
-                due.push((
-                    format!("{label} is significantly delayed"),
-                    format!(
-                        "Trigger \"{label}\" has {count} fire(s) waiting in the Thread Queue; \
-                         the oldest has waited {} min.",
-                        age.as_secs() / 60
-                    ),
-                ));
+            let waited = (now - oldest_at).to_std().unwrap_or_default();
+            if waited < DELAY_ALERT_WAIT
+                || self.trigger_paused(&tid)
+                || !state.delay_cooldown_elapsed(&tid)
+            {
+                continue;
             }
+            let label = self.trigger_name(&tid).unwrap_or_else(|| tid.clone());
+            due.push((
+                format!("{label} is significantly delayed"),
+                format!(
+                    "Trigger \"{label}\"'s oldest fire has waited {} min in the Thread \
+                     Queue ({count} waiting).",
+                    waited.as_secs() / 60
+                ),
+            ));
         }
         due
     }

@@ -42,7 +42,8 @@ overlay that declares context windows.
   consult the picker, and the chip names it through `STATIC_MODEL_LABELS`.
 - `run_coding_agent` takes `model` as a string checked at the spawn. An enum
   could not track a per-workspace list, and billed every row on every chat
-  request.
+  request. The check accepts a row's value or its `resolvedModel`, from the
+  same reply: a session reports the resolved id, and the thread records it.
 - A cross-workspace spawn cannot see the target's list, so the sender passes a
   Claude Code model through. The target's Claude Code runs it or fails loudly.
 - A failed probe waits an hour before the next, so a lasting failure does not

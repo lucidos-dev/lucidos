@@ -37,9 +37,9 @@ an empty database — **migration seeds included**, which a truncate that spared
 So e2e tests may assert on seeded data, e.g. the builtin model registry. Two rules
 follow:
 
-- **The reset owns the engine lifecycle** — it stops the engine, recreates the
-  database, and starts it again, because migrations / `EventStore::init_schema()`
-  / the pgvector setup run only at boot. Call `reset_e2e_database` **instead of**
+- **The reset owns the engine lifecycle.** It stops the engine, recreates the
+  database, and starts it again, because migrations and the pgvector setup run
+  only at boot. Call `reset_e2e_database` **instead of**
   `ensure_workspace_running`, never before it.
 - **Registry-style seeded rows are shared state within a run.** A test that
   mutates one (a builtin's `context_window`, say) must restore it; the database is
@@ -135,7 +135,7 @@ hand-write. Four things fail loudly instead:
 
 - **A new supporting type** fails the generator until you add it to
   `TYPE_SOURCES` with the file that declares it.
-- **A carried doc comment** with an em dash or an ISO date fails the generator.
+- **A carried doc comment** with an unspaced em dash or an ISO date fails the generator.
   Rewrite the Rust line; the generated file ships and is scanned like any source.
   Its FIRST PARAGRAPH is what gets carried, so that paragraph is bound by
   `.claude/rules/prose.md` too. A sentence or paragraph over the limit surfaces

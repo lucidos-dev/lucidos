@@ -127,6 +127,7 @@ pub fn menu_options(models: &[DiscoveredModel]) -> Vec<CcMenuOption> {
         .iter()
         .map(|m| CcMenuOption {
             value: m.value.clone(),
+            resolved_model: m.resolved_model.clone(),
             label: m.display_name.clone(),
             description: m.description.clone(),
             supported_models: None,

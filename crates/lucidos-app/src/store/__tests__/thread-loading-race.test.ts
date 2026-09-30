@@ -24,6 +24,7 @@ function makeThread(id: string, overrides: Partial<ThreadState> = {}): ThreadSta
       createdAt: '',
       updatedAt: '',
       status: 'idle',
+      summaryVersion: 0,
       codingAgentProposed: false,
       codingAgentRequiresRestart: false,
       codingAgentIsExternalRepo: false,

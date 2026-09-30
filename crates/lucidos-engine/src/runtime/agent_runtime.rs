@@ -11,7 +11,7 @@
 //! `runtime::*` modules.
 
 use async_trait::async_trait;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -202,7 +202,6 @@ pub enum InputWithdrawal {
 pub enum ControlRequest {
     Interrupt,
     SetModel { model: String },
-    SetPermissionMode { mode: String },
     SetReasoningEffort { effort: String },
 }
 
@@ -344,6 +343,11 @@ pub struct SpawnArgs<'a> {
     /// session ran before the preference existed. Codex has no equivalent and
     /// ignores this field, as it ignores `account_pin`.
     pub permission_mode: Option<&'a str>,
+    /// Directories the repo's own Claude Code settings grant outside the repo,
+    /// resolved against the main checkout by
+    /// `engine::repo_directory_grants::resolve`. Each becomes one
+    /// `--add-dir`. Claude Code only: Codex does not read those settings.
+    pub additional_directories: &'a [PathBuf],
 }
 
 /// An in-band permission request raised by the agent's own protocol — the

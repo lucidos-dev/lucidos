@@ -491,3 +491,41 @@ describe('both desktop builds show one bar of the same height', () => {
     }
   });
 });
+
+/** Where the badge-holding regions round their centring to whole pixels. */
+const ROUNDED = `${DESKTOP} @supports (width: round(1.5px, 1px))`;
+
+describe('the regions holding a badge centre on whole pixels', () => {
+  // A fractional translate lets Chrome snap a badge's pill and digit apart, and
+  // on a 1x screen the count sits low (e2e/badge-glyph-centring.spec.ts).
+  function roundedRule(selector: string): { rule: CssRule; index: number } {
+    const index = shellRules.findIndex(
+      r => r.atRules === ROUNDED && selectorList(r.selector).includes(selector),
+    );
+    expect(index, `expected \`${selector}\` in the rounded block`).toBeGreaterThanOrEqual(0);
+    return { rule: shellRules[index], index };
+  }
+
+  it.each([
+    ['.threads-header', 'translateY(round(calc(-50% - var(--header-band-lift)), 1px))'],
+    ['.app-header .pane-header-brand', 'translateY(round(calc(-50% - var(--header-band-lift)), 1px))'],
+    ['.app-header .content-header-elements', 'translateY(round(calc(-50% - var(--header-band-lift)), 1px))'],
+    ['.thread-toggle-slot', 'translateY(round(calc(-50% - var(--header-band-lift)), 1px))'],
+    ['.app-header .pane-header-brand .pane-header-brand-label', 'translate(round(-50%, 1px), round(-50%, 1px))'],
+  ])('%s rounds, after the rule it overrides', (selector, rounded) => {
+    const { rule, index } = roundedRule(selector);
+    expect(rule.props.get('transform')).toBe(rounded);
+    expect(index, 'an earlier rule would lose on source order').toBeGreaterThan(
+      shellRules.indexOf(desktopRule(selector)),
+    );
+  });
+
+  it('never rounds outside the gate', () => {
+    // A transform carrying a `var()` is dropped whole where `round()` is
+    // unknown, and the region falls half its height down the bar.
+    const ungated = shellRules.filter(
+      r => !r.atRules.includes('@supports') && (r.props.get('transform') ?? '').includes('round('),
+    );
+    expect(ungated.map(r => r.selector)).toEqual([]);
+  });
+});

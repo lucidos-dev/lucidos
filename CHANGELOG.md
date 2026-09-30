@@ -1,5 +1,39 @@
 # Changelog
 
+## v0.44.0
+
+### Added
+- Set a pending change aside and bring it back later. Set aside keeps it out of Review and Apply All. It works from the Changes panel and from the thread.
+- Apply all on settle in the Changes panel applies every change as its thread settles.
+- Rename a thread or ask for a suggested name from the thread menu. On desktop and mobile the thread title opens that menu on a click (or right-click on desktop).
+- Send opens into a split pill with a side question half. Alt+Enter slides the side question button out beside Send and focuses it.
+- Hold Stop to start a side question.
+- Claude Code gets the directory grants from a repo's settings, resolved against the main checkout.
+- Dynamic bars on mobile: the prompt slides with the header and footer bars.
+- Dropdown menus in the prompt bar take the keyboard for their filter.
+- A stopped Claude Code thread proposes the work already on its branch as a change.
+- Every search box uses one soft-pill search field with the glyph sized by theme token.
+
+### Changed
+- The Claude Code picker lists models strongest first, each model once, and marks a thread's row by the model it runs.
+- A picked question option is drawn as a rounded card. Question and permission cards are framed.
+- The Changes panel draws Bring back as a split button with Discard behind the caret, and Set aside and Discard fold behind the Apply caret.
+- Markdown shows a spaced em dash as written and spaces an unspaced one.
+- Toasts and banners show notification bodies as plain text.
+- The thread queue alerts on how long a trigger's oldest fire has waited.
+
+### Fixed
+- File search opens fast on mobile. It renders up to 100 rows and keeps pending-change rows above that cap.
+- Sticky filter bars use the menu's own surface colour.
+- The hover fill shows on popovers in four dark themes.
+- Switching a theme or mode repaints in one frame.
+- A mouse Back button no longer strands the desktop window on the boot splash.
+- A message the engine refuses keeps the text you typed.
+- A thread that ends on a crash reports that it was interrupted.
+- Deleting an email password clears the mailbox password.
+- Desktop asks before opening a local file or folder with the OS opener.
+- Plugin updates stop when the merge baselines cannot be read.
+- Dependency update: undici 7.29.0 to 7.30.0 (10 high advisories).
 ## v0.43.0
 
 ### Added

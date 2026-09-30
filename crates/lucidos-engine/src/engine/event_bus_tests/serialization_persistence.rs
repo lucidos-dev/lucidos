@@ -485,6 +485,7 @@ fn coding_agent_idled_is_last_event_after_change_proposed() {
             repo_root: String::new(),
             hardened: false,
             incomplete: false,
+            set_aside: false,
             path: String::new(),
             diff: String::new(),
         },

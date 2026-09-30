@@ -16,7 +16,8 @@ import { toFailed, type Loadable } from '../../store/types';
 import { LoadingFade } from '../shared/LoadingFade';
 import { ListSkeletonOf, SkBlock, SkText } from '../shared/Skeleton';
 import { RECENTS_KEY } from '../../store/actions/entityReferences';
-import { SearchIcon, CloseIcon, ClearIcon } from '../shared/icons';
+import { CloseIcon, ClearIcon } from '../shared/icons';
+import { SearchField } from '../shared/SearchField';
 import { CategoryIcon } from '../shared/CategoryIcon';
 import { getSettingsSearchResults, findSettingsEntry } from './searchIndex';
 import { getMenuSearchResults, findMenuSearchEntry } from './menuIndex';
@@ -484,32 +485,32 @@ export function SearchEverywhere() {
       hiddenClass="search-everywhere-hidden"
     >
         <div class="surface-head search-everywhere-header">
-          <span class="search-everywhere-header-icon"><SearchIcon /></span>
-          <input
-            ref={inputRef}
-            class="search-everywhere-input"
-            type="text"
-            placeholder="Search everywhere..."
+          <SearchField
+            class="search-everywhere-field"
+            inputRef={inputRef}
+            inputClass="search-everywhere-input"
+            placeholder="Search everywhere…"
             value={query}
             onInput={(e) => {
-              setQuery((e.target as HTMLInputElement).value);
+              setQuery(e.currentTarget.value);
               setSelectedKey(null);
             }}
             onKeyDown={handleKeyDown}
-          />
-          {query && (
-            <button
-              class="icon-btn search-everywhere-clear"
-              aria-label="Clear search"
-              onClick={() => {
-                setQuery('');
-                setSelectedKey(null);
-                inputRef.current?.focus();
-              }}
-            >
-              <ClearIcon />
-            </button>
-          )}
+          >
+            {query && (
+              <button
+                class="icon-btn search-field-clear"
+                aria-label="Clear search"
+                onClick={() => {
+                  setQuery('');
+                  setSelectedKey(null);
+                  inputRef.current?.focus();
+                }}
+              >
+                <ClearIcon />
+              </button>
+            )}
+          </SearchField>
           <button
             class="icon-btn surface-close search-everywhere-close"
             aria-label="Close search"
