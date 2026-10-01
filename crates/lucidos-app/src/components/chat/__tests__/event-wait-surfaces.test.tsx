@@ -751,11 +751,12 @@ describe('triggerFiredBody', () => {
     const el = findByRole(tree, 'trigger-fired');
     expect(String(el?.props.class)).toContain('event-row');
     expect(el?.props['data-kind']).toBe('trigger');
-    expect(vnodeText(tree)).toContain('Trigger fired: Nightly release check');
+    expect(vnodeText(findByClass(tree, 'event-row-subject'))).toBe('Trigger fired');
+    expect(vnodeText(findByClass(tree, 'event-row-meta'))).toContain('Nightly release check');
     expect(vnodeText(findByClass(tree, 'event-row-state'))).toBe('Fired');
     const fold = findFold(tree);
     expect(fold?.props.open).toBeUndefined();
-    expect(fold?.props.label).toBe('Prompt');
+    expect(fold?.props.label).toBe('Details');
   });
 
   /** **`TriggerStarted` carries no cron expression**, only
@@ -763,8 +764,8 @@ describe('triggerFiredBody', () => {
    *  stops, rather than inventing a schedule to look complete. */
   it('says a scheduled run is scheduled, and names no schedule', () => {
     const tree = fired({ trigger_name: 'Nightly', invocation: { kind: 'Schedule' } });
-    expect(vnodeText(tree)).toContain('scheduled');
-    expect(findByClass(tree, 'event-name')).toBeNull();
+    expect(vnodeText(findByClass(tree, 'event-row-state'))).toBe('Scheduled');
+    expect(findByClass(findByClass(tree, 'event-row-meta'), 'event-name')).toBeNull();
     expect(findByRole(tree, 'trigger-event-jump')).toBeNull();
   });
 
@@ -781,12 +782,12 @@ describe('triggerFiredBody', () => {
 
   it('chips the matched event type whether or not it can be opened', () => {
     const plain = fired({ invocation: eventFire });
-    expect(vnodeText(findByClass(plain, 'event-name'))).toBe('change applied');
+    expect(vnodeText(findByClass(findByClass(plain, 'event-row-meta'), 'event-name'))).toBe('change applied');
     expect(findByRole(plain, 'trigger-event-jump')).toBeNull();
     expect(findByClass(plain, 'event-name-link')).toBeNull();
 
     const linkable = firedLinked({ invocation: eventFire });
-    expect(vnodeText(findByClass(linkable, 'event-name'))).toBe('change applied');
+    expect(vnodeText(findByClass(findByClass(linkable, 'event-row-meta'), 'event-name'))).toBe('change applied');
     expect(findByRole(linkable, 'trigger-event-jump')).not.toBeNull();
   });
 

@@ -4,7 +4,6 @@ import { useHidePanelWebviewWhile } from '../../hooks/useHidePanelWebviewWhile';
 import { DialogMessage } from './DialogMessage';
 import { Overlay } from './Overlay';
 import { SurfaceHead } from './Surface';
-import { trapDialogTab } from './dialogFocusTrap';
 import { dialogOwnsKey } from './dialogKeyScope';
 import { PROSE_TEXT_ATTRS } from '../../utils/noAutofill';
 import { isImeComposingKey } from '../../utils/ime';
@@ -86,9 +85,7 @@ export function PromptDialog() {
         e.preventDefault();
         const el = dialogRef.current?.querySelector<HTMLInputElement | HTMLTextAreaElement>('.prompt-input');
         close(el?.value ?? '');
-        return;
       }
-      trapDialogTab(e, dialogRef.current);
     }
     document.addEventListener('keydown', handleKey);
     return () => {

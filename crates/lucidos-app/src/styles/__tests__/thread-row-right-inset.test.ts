@@ -7,7 +7,7 @@
  * inset is larger than the desktop one.
  *
  * The two values used to be hand-synced copies: `padding-right` on the row and
- * `right` on the bottom divider, each written `0.5rem`. Moving one and not the
+ * the right end of the bottom divider, each written `0.5rem`. Moving one and not the
  * other overruns the content column by exactly the difference, which is what
  * `--thread-row-pad-right` now prevents. Pinned here because a var nobody reads
  * is the same bug wearing a better name.
@@ -41,22 +41,25 @@ const VAR = '--thread-row-pad-right';
 describe('the thread row right inset', () => {
   it('is declared once on the drawer, as a var the row pads by', () => {
     // On the drawer rather than the row, so a section header reads it too.
-    expect(ruleFor('.thread-drawer', '').props.get(VAR)).toBe('0.5rem');
+    expect(ruleFor('.thread-drawer', '', VAR).props.get(VAR)).toBe('0.5rem');
     expect(ruleFor('.thread-row', '').props.get('padding-right')).toBe(`var(${VAR})`);
     expect(RULES.filter(r => r.props.has(VAR)).map(r => r.selector))
       .toEqual(['.thread-drawer', '.thread-drawer']);
   });
 
   it('is what both dividers stop at, rather than a second copy', () => {
-    const rowDivider = ruleFor('.thread-drawer .thread-row::after', '');
-    expect(rowDivider.props.get('right')).toBe(`var(${VAR})`);
+    // The shared hairline rule (section-header.css) reads its insets from
+    // these vars. So the row's line and a collapsed header's line both stop
+    // at the row's content column.
+    const rowDivider = ruleFor('.thread-drawer .thread-row', '', '--row-hairline-right');
+    expect(rowDivider.props.get('--row-hairline-right')).toBe(`var(${VAR})`);
     // The collapsed divider and the line that carries it share one rule, so
     // the carried line lands on the divider exactly.
-    const shared = RULES.filter(r => r.props.has('right')
-      && selectorList(r.selector).includes('.thread-drawer .list-section-title-collapsible.collapsed::after'));
+    const shared = RULES.filter(r => r.props.has('--row-hairline-right')
+      && selectorList(r.selector).includes('.thread-drawer .list-section-title-collapsible'));
     expect(shared).toHaveLength(1);
     expect(selectorList(shared[0].selector)).toContain('.thread-drawer .flip-disclosure-hairline');
-    expect(shared[0].props.get('right')).toBe(`var(${VAR})`);
+    expect(shared[0].props.get('--row-hairline-right')).toBe(`var(${VAR})`);
   });
 
   it('grows on mobile, so the pin does not inherit the vacated corner', () => {

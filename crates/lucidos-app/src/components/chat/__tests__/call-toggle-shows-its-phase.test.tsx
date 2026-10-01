@@ -25,6 +25,7 @@ import { preferences } from '../../../store/store';
 import { pressCallToggle, voiceCall } from '../../../store/voice';
 import { microphones } from '../../../store/microphones';
 import { CALL_IDLE, callStatusLabel } from '../../../voice/callState';
+import { tooltipWithShortcut } from '../../../store/actions/keybindings';
 import type { CallPhase, CallState } from '../../../voice/callState';
 
 const PHASES: CallPhase[] = ['idle', 'connecting', 'listening', 'speaking', 'ending'];
@@ -261,7 +262,7 @@ describe('a connect that dwells says what it is waiting for', () => {
    *  is a product decision, and a test reading it from the source proves only
    *  that the source equals itself. */
   const DWELL_MS = 2_000;
-  const CONNECTING_TIP = 'Connecting. Press to cancel';
+  const CONNECTING_TIP = tooltipWithShortcut('Connecting. Press to cancel', 'toggleCall');
   const WAITING_TIP = 'Waiting for microphone access';
 
   function tip(): string | null {
@@ -312,7 +313,7 @@ describe('a connect that dwells says what it is waiting for', () => {
     expect(control().dataset.callWait).toBe('microphone');
     moveTo('listening');
     expect(control().hasAttribute('data-call-wait')).toBe(false);
-    expect(tip()).toBe('On a call. Press to end it');
+    expect(tip()).toBe(tooltipWithShortcut('On a call. Press to end it', 'toggleCall'));
   });
 
   it('never dwells in a phase that is not connecting', () => {

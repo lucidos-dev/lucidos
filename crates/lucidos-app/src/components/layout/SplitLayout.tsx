@@ -1,7 +1,7 @@
 import { useRef, useCallback, useLayoutEffect } from 'preact/hooks';
 import { splitRatio, threadDrawerOpen, threadDrawerWidth, focusedPane, SPLIT_RATIO_KEY } from '../../store/store';
-import { focusPane } from '../../store/actions/pane';
-import { setSplitRatio, clampSplitRatio, migratedSplitRatio, beginPaneResize, endPaneResize, DEFAULT_SPLIT_RATIO } from './splitHelpers';
+import { focusPane, toggleSplitFromDivider } from '../../store/actions/pane';
+import { setSplitRatio, clampSplitRatio, migratedSplitRatio, beginPaneResize, endPaneResize } from './splitHelpers';
 import { splitBounds } from '../../store/paneMinimums';
 import { startDividerDrag } from './dividerDrag';
 import { createDblClickGate } from '../../utils/dblClickGate';
@@ -79,9 +79,7 @@ export function SplitLayout({ threadPane, contentPane }: Props) {
 
   const onDividerDblClick = useCallback(() => {
     if (!dividerDblGate.allow()) return;
-    const ratio = splitRatio.value;
-    const expanding = ratio === 0 || ratio >= 1;
-    setSplitRatio(expanding ? DEFAULT_SPLIT_RATIO : 0);
+    toggleSplitFromDivider();
   }, []);
 
   const ratio = splitRatio.value;

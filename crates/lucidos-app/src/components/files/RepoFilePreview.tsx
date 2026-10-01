@@ -9,7 +9,7 @@ import { refreshFilePreview, registerPreviewTextBody, reportPreviewTextSettled }
 import { usePanelRefresh } from '../../hooks/usePanelRefresh';
 import { highlightFileLines, CODE_EXTS } from '../../utils/syntaxHighlight';
 import { escapeHtml } from '../../utils/escapeHtml';
-import { renderMarkdown } from '../../utils/renderMarkdown';
+import { MarkdownDocument } from './MarkdownDocument';
 import { renderCsvTable } from '../../utils/csv';
 import { PreviewImage } from './PreviewImage';
 import { previewExt, repoPreviewBody } from './previewBody';
@@ -26,6 +26,7 @@ import { FileSourceSkeleton, ProseSkeleton } from './previewSkeletons';
 import { LoadingFade } from '../shared/LoadingFade';
 import { bridgePreviewIframeShortcuts } from './previewIframeShortcuts';
 import { withPreviewRevision } from './previewRevision';
+import { IframeTabExit } from '../shared/IframeTabExit';
 
 interface Props {
   /** The parsed `repo:` locator the panel overlay holds. Its per-mode qualifier
@@ -230,7 +231,7 @@ function RepoFileMedia({ repoId, path, changeId, gitRef, revision, kind }: RepoF
   );
 
   if (kind === 'image') return <RepoImage key={url} src={url} path={path} />;
-  if (kind === 'pdf') return <iframe src={url} style="width:100%;height:100%;border:none;" onLoad={(e) => bridgePreviewIframeShortcuts(e.currentTarget)} />;
+  if (kind === 'pdf') return <><iframe src={url} style="width:100%;height:100%;border:none;" onLoad={(e) => bridgePreviewIframeShortcuts(e.currentTarget)} /><IframeTabExit /></>;
   if (kind === 'video') return <video src={url} controls style="max-width:100%;max-height:100%;" />;
   return <audio src={url} controls style="width:100%;" />;
 }
@@ -272,11 +273,10 @@ function RepoFileText({ repoId, path, changeId, gitRef, revision, body }: RepoFi
   const isCode = CODE_EXTS.includes(ext);
 
   // What this string IS depends on `body`, which is why it cannot be named for
-  // HTML: markdown and csv render to markup, and svg renders to an object URL an
-  // `<img src>` loads. Only the branch that produced it may say which.
+  // HTML: csv renders to markup, and svg renders to an object URL an `<img src>`
+  // loads. Only the branch that produced it may say which.
   const renderedBody = useMemo(() => {
     if (!content) return null;
-    if (body === 'markdown') return renderMarkdown(content);
     if (body === 'csv') return renderCsvTable(content);
     if (body === 'svg') return URL.createObjectURL(new Blob([content], { type: 'image/svg+xml' }));
     return null;
@@ -313,7 +313,7 @@ function RepoFileText({ repoId, path, changeId, gitRef, revision, body }: RepoFi
     //
     // `.repo-file-rendered` insets the content to match the rendered diff
     // (.rendered-diff), so toggling between them keeps the same gutter.
-    if (body === 'markdown') return <div class="repo-file-rendered"><div class="response-content markdown-content" dangerouslySetInnerHTML={{ __html: renderedBody! }} /></div>;
+    if (body === 'markdown') return <div class="repo-file-rendered"><MarkdownDocument content={content!} /></div>;
     if (body === 'csv') return <div class="repo-file-rendered" dangerouslySetInnerHTML={{ __html: renderedBody! }} />;
     // The media variant keeps a definite height so the image's max-height:100%
     // still fits the pane (the bare padding wrapper would leave it unconstrained).

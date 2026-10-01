@@ -1,5 +1,5 @@
 import { useState } from 'preact/hooks';
-import { threadQueue, threadMap } from '../../store/store';
+import { threadQueue, threadMap, collapsedThreadQueueSectionIds, toggleThreadQueueSectionCollapsed } from '../../store/store';
 import {
   dropQueueEntry,
   loadThreadQueue,
@@ -17,6 +17,8 @@ import { LoadableError } from '../shared/LoadableError';
 import { ListSkeletonOf, useSkeleton, SkText, SkBlock } from '../shared/Skeleton';
 import { LoadingFade } from '../shared/LoadingFade';
 import { Dropdown } from '../shared/Dropdown';
+import { SectionHeader } from '../shared/SectionHeader';
+import { Disclosure } from '../shared/Disclosure';
 
 const KIND_LABELS: Record<ThreadQueueEntry['kind'], string> = {
   'event-trigger': 'Event trigger',
@@ -215,7 +217,7 @@ export function ThreadQueueView() {
 
   return (
     <div class="content-view active">
-      <div class="list-rows">
+      <div class="list-rows list-rows-divided">
         <LoadingFade
           showSkeleton={showLoading}
           skeleton={<ListSkeletonOf fill containerClass="list-rows" row={() => <ThreadQueueRow />} />}
@@ -225,39 +227,54 @@ export function ThreadQueueView() {
                 const { entries, policy } = loadable.data;
                 const running = entries.filter((e) => e.status === 'admitted');
                 const queued = entries.filter((e) => e.status === 'queued');
+                const runningCollapsed = collapsedThreadQueueSectionIds.value.has('running');
+                const queuedCollapsed = collapsedThreadQueueSectionIds.value.has('queued');
                 return (
                   <>
-                    <div class="thread-queue-section-header">
-                      <span class="thread-queue-section-title">
-                        Running ({running.length}/{policy.max_concurrent_total})
-                      </span>
-                      <button
-                        class="action-btn"
-                        data-role="toggle-capacity-policy"
-                        onClick={() => setPolicyOpen(!policyOpen)}
-                      >
-                        {policyOpen ? 'Hide policy' : 'Capacity policy'}
-                      </button>
-                    </div>
-                    {policyOpen && <CapacityPolicyEditor policy={policy} />}
-                    {running.length === 0 && (
-                      <div class="empty thread-queue-empty">Nothing running.</div>
-                    )}
-                    {running.map((entry) => (
-                      <ThreadQueueRow key={entry.id} entry={entry} />
-                    ))}
+                    <SectionHeader
+                      title="Running"
+                      count={`${running.length}/${policy.max_concurrent_total}`}
+                      collapsed={runningCollapsed}
+                      onToggle={() => toggleThreadQueueSectionCollapsed('running')}
+                      actions={
+                        <button
+                          class="action-btn"
+                          data-role="toggle-capacity-policy"
+                          aria-expanded={policyOpen}
+                          onClick={() => setPolicyOpen(!policyOpen)}
+                        >
+                          {policyOpen ? 'Hide policy' : 'Capacity policy'}
+                        </button>
+                      }
+                    />
+                    <Disclosure open={policyOpen}>
+                      <CapacityPolicyEditor policy={policy} />
+                    </Disclosure>
+                    <Disclosure open={!runningCollapsed}>
+                      {running.length === 0 && (
+                        <div class="empty thread-queue-empty">Nothing running.</div>
+                      )}
+                      {running.map((entry) => (
+                        <ThreadQueueRow key={entry.id} entry={entry} />
+                      ))}
+                    </Disclosure>
 
-                    <div class="thread-queue-section-header">
-                      <span class="thread-queue-section-title">Queued ({queued.length})</span>
-                    </div>
-                    {queued.length === 0 && (
-                      <div class="empty thread-queue-empty" data-role="thread-queue-empty">
-                        Nothing waiting — threads run immediately while capacity is free.
-                      </div>
-                    )}
-                    {queued.map((entry) => (
-                      <ThreadQueueRow key={entry.id} entry={entry} />
-                    ))}
+                    <SectionHeader
+                      title="Queued"
+                      count={queued.length}
+                      collapsed={queuedCollapsed}
+                      onToggle={() => toggleThreadQueueSectionCollapsed('queued')}
+                    />
+                    <Disclosure open={!queuedCollapsed}>
+                      {queued.length === 0 && (
+                        <div class="empty thread-queue-empty" data-role="thread-queue-empty">
+                          Nothing waiting — threads run immediately while capacity is free.
+                        </div>
+                      )}
+                      {queued.map((entry) => (
+                        <ThreadQueueRow key={entry.id} entry={entry} />
+                      ))}
+                    </Disclosure>
                   </>
                 );
               })()

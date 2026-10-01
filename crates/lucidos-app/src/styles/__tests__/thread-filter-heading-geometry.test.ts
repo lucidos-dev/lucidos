@@ -64,11 +64,11 @@ describe('the filter heading reserves a glyph row, checkmark or not', () => {
 });
 
 describe('the filter headings sit on the list headings cap band', () => {
-  it('wraps each heading word in the drawer section label, which carries the trim', () => {
+  it('wraps each heading word in the section label, which carries the trim', () => {
     // Untrimmed caps ride above their line box's middle, so "STATUS" stood a
     // hair higher than "PINNED" in the list the panel covers.
     for (const title of ['Status', 'By thread types']) {
-      expect(panelTsx).toContain(`<span class="drawer-section-label">${title}</span>`);
+      expect(panelTsx).toContain(`<span class="section-label">${title}</span>`);
     }
   });
 });

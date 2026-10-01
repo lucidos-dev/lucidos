@@ -38,6 +38,37 @@ use crate::engine::LucidosEngine;
 pub(crate) const WITHDRAWN_MEMBER_REASON: &str =
     "Change was set aside, discarded or removed before the batch finished";
 
+const MEMBER_THREAD_UNSETTLED: &str = "Its thread was working again when its turn in the batch \
+     came. Apply it once the thread settles.";
+const MEMBER_SETTLE_UNKNOWN: &str = "Lucidos could not check whether its thread had settled, so \
+     it was not applied. Apply it again.";
+const MEMBER_INCOMPLETE: &str = "It became unfinished work from a stopped turn. Apply it from \
+     its own Apply, which asks first.";
+const MEMBER_EMPTY: &str = "It has no file changes left.";
+
+/// Why the driver must not apply a pending `change` when its turn comes, or
+/// `None` to apply it. This is `run_apply_all`'s opening filter, asked again:
+/// a later member's turn can come minutes after the press.
+///
+/// A change that left `pending` goes ahead, because `apply_change` answers it
+/// with the terminal event the batch waits on.
+fn batch_member_skip_reason(
+    change: &crate::core::changes::Change,
+    thread_unsettled: bool,
+) -> Option<&'static str> {
+    if !change.is_pending() {
+        None
+    } else if thread_unsettled {
+        Some(MEMBER_THREAD_UNSETTLED)
+    } else if change.incomplete {
+        Some(MEMBER_INCOMPLETE)
+    } else if crate::core::changes::is_empty_pending_change(change) {
+        Some(MEMBER_EMPTY)
+    } else {
+        None
+    }
+}
+
 /// How recovery should treat a batch member, derived from its `changes.status`.
 /// `Terminal` covers a set-aside, discarded or reverted member and a missing row. All
 /// must become a terminal `Failed` so the batch can complete; leaving such a
@@ -271,10 +302,36 @@ impl LucidosEngine {
     ) {
         let engine = self.clone();
         tokio::spawn(async move {
+            if let Some(reason) = engine.batch_member_refusal(change_id).await {
+                log!("[ApplyAll] not applying batch member {change_id}: {reason}");
+                engine.notify_apply_all(ApplyAllDriveMsg::Failed(change_id, reason.to_string()));
+                return;
+            }
             if let Err(e) = engine.apply_batch_member(change_id, actor).await {
                 log!("[ApplyAll] apply_change({change_id}) returned Err: {e}");
             }
         });
+    }
+
+    /// [`batch_member_skip_reason`] for the stored row. A row that is gone or
+    /// unreadable goes ahead, and `apply_change` reports that failure itself.
+    /// A settle check that could not run refuses, since applying is the
+    /// direction that can merge a branch still being written.
+    async fn batch_member_refusal(&self, change_id: Uuid) -> Option<&'static str> {
+        let change = match self.changes().get_by_id(change_id).await {
+            Ok(Some(change)) => change,
+            Ok(None) | Err(_) => return None,
+        };
+        let thread_ids = change.thread_id.into_iter();
+        let unsettled = crate::core::changes::unsettled_thread_ids(self.pool(), thread_ids).await;
+        let thread_unsettled = match unsettled {
+            Ok(ids) => change.thread_id.is_some_and(|tid| ids.contains(&tid)),
+            Err(e) => {
+                log!("[ApplyAll] settle check for batch member {change_id} failed: {e}");
+                return Some(MEMBER_SETTLE_UNKNOWN);
+            }
+        };
+        batch_member_skip_reason(&change, thread_unsettled)
     }
 
     /// Seed a new Apply All batch. Emits the durable `ApplyAllBatchStarted`
@@ -858,5 +915,70 @@ mod tests {
             "a queued resume inherits the open resolution"
         );
         assert_eq!(owner_is_resolving(&RecoveredDrive::Drive, Some(true)), None);
+    }
+
+    fn pending_member() -> crate::core::changes::Change {
+        use crate::core::changes::{Change, ChangeState};
+        Change {
+            id: Uuid::new_v4(),
+            request_id: Uuid::new_v4(),
+            thread_id: Some(Uuid::new_v4()),
+            branch_name: "claude-code/member".into(),
+            repo_root: "/repo".into(),
+            description: "desc".into(),
+            file_count: 1,
+            files: vec!["a.rs".into()],
+            requires_restart: false,
+            state: ChangeState::Pending {
+                merge: None,
+                thread: Default::default(),
+                apply: Default::default(),
+            },
+            created_at: chrono::Utc::now(),
+            resolved_at: None,
+            hardened: false,
+            thread_title: None,
+            commits: vec![],
+            summary: None,
+            incomplete: false,
+        }
+    }
+
+    /// A later member's turn comes minutes after the press. What the opening
+    /// filter would drop then must not be applied, or a live agent's
+    /// half-written branch lands on main.
+    #[test]
+    fn a_member_the_opening_filter_would_drop_is_skipped_when_its_turn_comes() {
+        let clean = pending_member();
+        assert_eq!(batch_member_skip_reason(&clean, false), None);
+        assert_eq!(
+            batch_member_skip_reason(&clean, true),
+            Some(MEMBER_THREAD_UNSETTLED)
+        );
+        let incomplete = crate::core::changes::Change {
+            incomplete: true,
+            ..pending_member()
+        };
+        assert_eq!(
+            batch_member_skip_reason(&incomplete, false),
+            Some(MEMBER_INCOMPLETE)
+        );
+        let empty = crate::core::changes::Change {
+            file_count: 0,
+            ..pending_member()
+        };
+        assert_eq!(batch_member_skip_reason(&empty, false), Some(MEMBER_EMPTY));
+    }
+
+    /// A member that already left `pending` goes to `apply_change`, whose
+    /// terminal event is what advances the batch.
+    #[test]
+    fn a_resolved_member_is_left_to_apply_change() {
+        let applied = crate::core::changes::Change {
+            state: crate::core::changes::ChangeState::Applied(Default::default()),
+            incomplete: true,
+            ..pending_member()
+        };
+        assert_eq!(batch_member_skip_reason(&applied, true), None);
     }
 }

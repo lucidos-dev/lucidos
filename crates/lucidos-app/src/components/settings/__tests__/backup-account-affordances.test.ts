@@ -223,6 +223,7 @@ describe('the Backup section is laid out by CSS, not by inline styles', () => {
 
   it('gives every row a class', () => {
     for (const cls of [
+      'backup-provider-access',
       'backup-blocked-state',
       'backup-actions-row',
       'backup-schedule-hint',

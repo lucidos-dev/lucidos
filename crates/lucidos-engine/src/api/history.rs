@@ -601,50 +601,63 @@ fn restart_via_launchd() -> Result<StatusCode, (StatusCode, Json<serde_json::Val
 }
 
 /// List all Lucidos workspaces by calling `status.sh --json`, the current one
-/// included. The control panel renders that one as the active row with its
-/// refresh control, matching the gateway picker. Times out after 10s, so an
-/// unresponsive Docker or target engine cannot block the request.
-pub(super) async fn list_workspaces() -> Json<serde_json::Value> {
-    let empty = || Json(serde_json::json!({ "workspaces": [] }));
-    let script = match crate::paths::script("status.sh") {
-        Ok(p) => p,
-        Err(e) => {
-            log!("[Workspaces] {}", e);
-            return empty();
+/// included. A page served straight off an engine port reads it to reach a
+/// peer workspace on its own port. Times out after 10s, so an unresponsive
+/// Docker or target engine cannot block the request.
+///
+/// Every failure is an error response, never an empty list: an empty list
+/// reads as a machine with no workspaces, which hides a broken script.
+pub(super) async fn list_workspaces() -> Result<Json<serde_json::Value>, ApiError> {
+    let script = crate::paths::script("status.sh")
+        .map_err(|e| workspace_list_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    read_workspace_list(&script, std::time::Duration::from_secs(10))
+        .await
+        .map(Json)
+}
+
+async fn read_workspace_list(
+    script: &std::path::Path,
+    timeout: std::time::Duration,
+) -> Result<serde_json::Value, ApiError> {
+    let internal = |msg: String| workspace_list_error(StatusCode::INTERNAL_SERVER_ERROR, msg);
+    let run = tokio::process::Command::new(script)
+        .arg("--json")
+        .kill_on_drop(true)
+        .output();
+    let output = match tokio::time::timeout(timeout, run).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(e)) => return Err(internal(format!("could not run status.sh: {e}"))),
+        Err(_) => {
+            return Err(workspace_list_error(
+                StatusCode::GATEWAY_TIMEOUT,
+                format!("status.sh timed out after {}s", timeout.as_secs_f32()),
+            ))
         }
     };
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        tokio::process::Command::new(&script)
-            .args(["--json"])
-            .output(),
-    )
-    .await;
-    match result {
-        Ok(Ok(output)) if output.status.success() => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            match serde_json::from_str::<serde_json::Value>(&stdout) {
-                Ok(val) => Json(val),
-                Err(e) => {
-                    log!("[Workspaces] Failed to parse status.sh JSON: {}", e);
-                    empty()
-                }
-            }
-        }
-        Ok(Ok(output)) => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            log!("[Workspaces] status.sh failed: {}", stderr);
-            empty()
-        }
-        Ok(Err(e)) => {
-            log!("[Workspaces] Failed to run status.sh: {}", e);
-            empty()
-        }
-        Err(_) => {
-            log!("[Workspaces] status.sh timed out");
-            empty()
-        }
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let last_line = stderr.lines().rev().find(|l| !l.trim().is_empty());
+        let detail = last_line.unwrap_or("no stderr").trim();
+        let detail = &detail[..detail.floor_char_boundary(300)];
+        let exit = output
+            .status
+            .code()
+            .map_or_else(|| "a signal".to_string(), |c| format!("exit {c}"));
+        return Err(internal(format!("status.sh failed ({exit}): {detail}")));
     }
+    let list: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|e| internal(format!("status.sh printed unparseable JSON: {e}")))?;
+    if !list["workspaces"].is_array() {
+        return Err(internal(
+            "status.sh printed JSON with no \"workspaces\" array".to_string(),
+        ));
+    }
+    Ok(list)
+}
+
+fn workspace_list_error(status: StatusCode, detail: String) -> ApiError {
+    log!("[Workspaces] {}", detail);
+    ApiError::new(status, format!("Could not list workspaces: {detail}"))
 }
 
 /// Get conversation history up to a specific event
@@ -1081,6 +1094,73 @@ pub(super) fn router() -> Router<AppState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stub `status.sh` with the given body, executable, in its own dir.
+    fn stub_status_script(body: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("status.sh");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (dir, path)
+    }
+
+    async fn list_from(body: &str) -> Result<serde_json::Value, ApiError> {
+        let (_dir, path) = stub_status_script(body);
+        read_workspace_list(&path, std::time::Duration::from_secs(5)).await
+    }
+
+    #[tokio::test]
+    async fn a_workspace_list_passes_through() {
+        let list = list_from(r#"echo '{"workspaces":[{"name":"dev"}]}'"#)
+            .await
+            .unwrap();
+        assert_eq!(list["workspaces"][0]["name"], "dev");
+    }
+
+    /// A broken status script must not read as a machine with no workspaces.
+    #[tokio::test]
+    async fn a_failing_status_script_is_an_error_not_an_empty_list() {
+        let err = list_from("echo 'jq: command not found' >&2; exit 127")
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(err.message.contains("exit 127"), "{}", err.message);
+        assert!(
+            err.message.contains("jq: command not found"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn unparseable_or_misshapen_output_is_an_error() {
+        for body in ["echo 'not json'", r#"echo '{"other":1}'"#] {
+            let err = list_from(body).await.unwrap_err();
+            assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_missing_status_script_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = read_workspace_list(
+            &dir.path().join("status.sh"),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn a_hung_status_script_times_out_as_an_error() {
+        let (_dir, path) = stub_status_script("sleep 30");
+        let err = read_workspace_list(&path, std::time::Duration::from_millis(200))
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, StatusCode::GATEWAY_TIMEOUT);
+    }
 
     /// A draining engine must not read as healthy, or a gateway adopts it.
     #[test]

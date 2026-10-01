@@ -1,8 +1,8 @@
 import {
   repoSource, repoFiles, repoDiff, repoPending,
-  repoViewMode, repoExpandedFolders, selectedLines,
+  repoViewMode, repoExpandedFolders, expandedFolders, revealedFolder, selectedLines,
   repoSelectedChangeId, repoChanges, repoChangesLoadingMore,
-  activeMenuItem, repositories, showToast,
+  repositories, showToast,
   panelOverlay, parseRepoPath, encodeRepoPath, SELECTED_CHANGE_KEY,
   threadMap, type RepoDiff, type RepoLocator, type RepoPendingInfo, type Repository,
 } from '../store';
@@ -11,6 +11,7 @@ import type { Change, ThreadCcDiff } from '../../api/client';
 import { toFailed, failedIfFresh, loadedOr, setLoadingIfFresh, type Loadable } from '../types';
 import { openFilePreview } from './artifacts';
 import { revealContentPane } from './pane';
+import { setActiveMenu } from './menu';
 // From the module that DEFINES it, not chat.ts's back-compat re-export: the
 // loader was split out of chat.ts precisely so a consumer needn't pull chat's
 // transitive tree (connection, chat-changes, ...) in behind it.
@@ -18,6 +19,7 @@ import { loadRepositories } from './repositoriesLoader';
 import { pushNavState, replaceNavState } from './navigation';
 import { errorDetail } from '../../utils/errorDetail';
 import { appIdFromFolder } from '../../utils/appIdFromFolder';
+import { resetContentScroll } from '../../hooks/useScrollMemory';
 
 /** Bumped by every Files panel navigation. A diff load checks it after each
  *  await and stops writing once a newer navigation has taken the panel. */
@@ -41,13 +43,14 @@ export async function switchRepoSource(repoId: string | null): Promise<void> {
   ]);
 }
 
-/** Point the Files panel at a repo and drop the previous repo's state. Leaves
- *  the view mode, diff and change selection alone, so a diff navigation that
- *  staged them keeps them. */
+/** Point the Files panel at a repo and drop the previous repo's state,
+ *  including a folder reveal meant for its tree. Leaves the view mode, diff and
+ *  change selection alone, so a diff navigation that staged them keeps them. */
 function bindRepoSource(repoId: string | null): void {
   repoSource.value = repoId;
   selectedLines.value = null;
   repoExpandedFolders.value = new Set();
+  revealedFolder.value = null;
   repoFiles.value = { status: 'not-loaded' };
   repoChanges.value = { status: 'not-loaded' };
 }
@@ -72,12 +75,40 @@ function failStagedDiff(isCurrent: () => boolean, reason: string): void {
   if (isCurrent()) repoDiff.value = { status: 'failed', error: reason };
 }
 
-/** Land on the staged diff view: one navigation, one history entry. */
+/** Land on the Files panel: one navigation, one history entry. `setActiveMenu`
+ *  also forgets the preview restore key, so a reload stays on Files. */
 function landOnFilesPanel(): void {
-  activeMenuItem.value = 'files';
-  panelOverlay.value = null;
+  setActiveMenu('files');
   revealContentPane();
   pushNavState();
+}
+
+/** Open the Files panel on `folder`, in the tree the previewed file came from.
+ *
+ *  `locator` is the preview's own path, so a repo file lands in its repo and a
+ *  workspace file in the workspace. The repo is bound BEFORE its folders are
+ *  opened, because binding resets `repoExpandedFolders`. The folder and every
+ *  ancestor open, and nothing already open closes.
+ *
+ *  The Files view's remembered scroll is dropped, so its restore cannot land
+ *  over the tree's scroll to the revealed row. */
+export function revealFolderInFiles(locator: string, folder: string): void {
+  const repoId = parseRepoPath(locator)?.repoId ?? null;
+  if (repoSource.value !== repoId) {
+    void switchRepoSource(repoId);
+  } else {
+    repoViewMode.value = 'all';
+  }
+
+  const expanded = repoId ? repoExpandedFolders : expandedFolders;
+  const next = new Set(expanded.value);
+  const parts = folder.split('/');
+  for (let i = 1; i <= parts.length; i++) next.add(parts.slice(0, i).join('/'));
+  expanded.value = next;
+
+  revealedFolder.value = folder;
+  resetContentScroll('files');
+  landOnFilesPanel();
 }
 
 export async function loadRepoFiles(repoId: string, opts: { reread?: boolean } = {}): Promise<void> {

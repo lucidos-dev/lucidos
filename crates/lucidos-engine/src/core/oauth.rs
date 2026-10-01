@@ -116,7 +116,7 @@ pub struct ConnectedAccount {
 // per-credential JSON. That JSON is the single source of truth both
 // `prepare_oauth_flow` and `refresh_oauth_if_needed` read back.
 
-/// Endpoint and scope values used to pre-fill the credential modal. Whatever
+/// Endpoint values used to pre-fill the credential modal. Whatever
 /// is present lands in the request's `defaults` block, which tells the modal to
 /// pre-fill (and stop requiring) the endpoint fields. All-`None` means no
 /// `defaults` block, so the modal expands its endpoint section for manual entry.
@@ -133,7 +133,6 @@ pub struct OAuthClientOverrides {
     /// the provider's own spelling of "issue a refresh token". Omit to keep
     /// [`DEFAULT_AUTHORIZE_PARAMS`]. See [`AuthorizeParams`].
     pub authorize_params: Option<String>,
-    pub scopes: Option<String>,
     /// Loopback callback URI to register with this provider. Omit for the
     /// default (`127.0.0.1`); supply the `localhost` form only for a provider
     /// that won't accept the IP literal. See `default_redirect_uri` and the
@@ -182,7 +181,6 @@ pub fn oauth_client_request(provider: &str, overrides: &OAuthClientOverrides) ->
         ("userinfo_url", &overrides.userinfo_url),
         ("userinfo_method", &overrides.userinfo_method),
         ("authorize_params", &overrides.authorize_params),
-        ("scopes", &overrides.scopes),
         ("redirect_uri", &overrides.redirect_uri),
     ] {
         if let Some(v) = value {
@@ -204,8 +202,8 @@ impl OAuthClientOverrides {
     /// reads endpoints back out of the stored credential, so a credential keeps
     /// fully describing its own authorization.
     ///
-    /// `scopes` comes from the caller, never the row: the scope set is a
-    /// property of what the connection is FOR, not of the provider.
+    /// No scopes: each connection names its own when it starts, because a scope
+    /// set belongs to what the connection is FOR, not to the provider.
     pub fn from_registry(row: &crate::core::oauth_registry::OAuthProviderRow) -> Self {
         Self {
             base_url: Some(row.base_url.clone()),
@@ -214,7 +212,6 @@ impl OAuthClientOverrides {
             userinfo_url: row.userinfo_url.clone(),
             userinfo_method: row.userinfo_method.clone(),
             authorize_params: row.authorize_params.clone(),
-            scopes: None,
             redirect_uri: row.redirect_uri.clone(),
         }
     }

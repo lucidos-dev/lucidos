@@ -59,6 +59,9 @@ const BUILT_IN_THEMES: &[(&str, &str)] = &[
     ("tokyo-night", include_str!("builtin/tokyo-night.json")),
     ("everforest", include_str!("builtin/everforest.json")),
     ("paper", include_str!("builtin/paper.json")),
+    ("ember", include_str!("builtin/ember.json")),
+    ("harbour", include_str!("builtin/harbour.json")),
+    ("real-computer", include_str!("builtin/real-computer.json")),
 ];
 
 /// Caps that mirror the style-override rules in
@@ -1219,106 +1222,9 @@ fn workspace_theme_path(data_dir: &Path, id: &str) -> std::path::PathBuf {
     data_dir.join(THEMES_DIR).join(format!("{id}.json"))
 }
 
-/// Where workspace themes lived when they were called looks.
+/// Where workspace themes lived when they were called looks. The plugin
+/// refusal hint and the plugin registry's path lookup still read it.
 pub const LEGACY_THEMES_DIR: &str = "looks";
-
-/// Move every file in `data/looks/` into `data/themes/`, once, at startup, and
-/// commit the move. An uncommitted change would make the next Apply refuse.
-///
-/// Never overwrites: a file already in `data/themes/` wins, and the old one
-/// stays where it is with a log line. The old folder goes only once it is
-/// empty (docs/temporary-measures.md § Legacy `data/looks/` folder).
-pub fn adopt_legacy_themes_dir(workspace_path: &Path) {
-    let mut moves = move_legacy_theme_files(&workspace_path.join(super::DATA_DIR));
-    for pending in uncommitted_legacy_moves(workspace_path) {
-        if !moves.contains(&pending) {
-            moves.push(pending);
-        }
-    }
-    if moves.is_empty() {
-        return;
-    }
-    match super::commit_data_paths_moved(workspace_path, &moves, "Move looks/ to themes/") {
-        Ok(_) => crate::log!(
-            "[Themes] committed {} file(s) moved into themes/",
-            moves.len()
-        ),
-        Err(e) => crate::log!(
-            "[Themes] moved {} file(s) into themes/, but the commit failed: {e}",
-            moves.len()
-        ),
-    }
-}
-
-/// The filesystem half of [`adopt_legacy_themes_dir`]: the `(from, to)` pairs
-/// it moved, `data/`-relative.
-fn move_legacy_theme_files(data_dir: &Path) -> Vec<(String, String)> {
-    let legacy = data_dir.join(LEGACY_THEMES_DIR);
-    let Ok(entries) = std::fs::read_dir(&legacy) else {
-        return Vec::new();
-    };
-    let target = data_dir.join(THEMES_DIR);
-    if let Err(e) = std::fs::create_dir_all(&target) {
-        crate::log!("[Themes] could not create {}: {e}", target.display());
-        return Vec::new();
-    }
-    let mut moved = Vec::new();
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let dest = target.join(&name);
-        if dest.exists() {
-            crate::log!(
-                "[Themes] {} stays, since {} already exists",
-                entry.path().display(),
-                dest.display()
-            );
-            continue;
-        }
-        match std::fs::rename(entry.path(), &dest) {
-            Ok(()) => moved.push(legacy_move(&name)),
-            Err(e) => crate::log!("[Themes] could not move {}: {e}", entry.path().display()),
-        }
-    }
-    // `remove_dir` refuses a folder that still holds a file, which is the point.
-    if std::fs::remove_dir(&legacy).is_ok() {
-        crate::log!("[Themes] removed the empty {}", legacy.display());
-    }
-    moved
-}
-
-/// Files git still records under `data/looks/` that now live only in
-/// `data/themes/`: moves an earlier boot made but could not commit.
-fn uncommitted_legacy_moves(workspace_path: &Path) -> Vec<(String, String)> {
-    let Ok(repo) = git2::Repository::open(workspace_path) else {
-        return Vec::new();
-    };
-    let legacy_in_head = format!("{}/{LEGACY_THEMES_DIR}", super::DATA_DIR);
-    let Ok(legacy_tree) = repo
-        .head()
-        .and_then(|head| head.peel_to_tree())
-        .and_then(|tree| tree.get_path(Path::new(&legacy_in_head)))
-        .and_then(|entry| repo.find_tree(entry.id()))
-    else {
-        return Vec::new();
-    };
-    let data_dir = workspace_path.join(super::DATA_DIR);
-    legacy_tree
-        .iter()
-        .filter_map(|entry| entry.name().map(String::from))
-        .filter(|name| {
-            !data_dir.join(LEGACY_THEMES_DIR).join(name).exists()
-                && data_dir.join(THEMES_DIR).join(name).exists()
-        })
-        .map(|name| legacy_move(&name))
-        .collect()
-}
-
-fn legacy_move(name: &str) -> (String, String) {
-    (
-        format!("{LEGACY_THEMES_DIR}/{name}"),
-        format!("{THEMES_DIR}/{name}"),
-    )
-}
 
 /// One theme by id, built-in first. `None` when no theme has that id.
 pub fn get(data_dir: &Path, id: &str) -> ThemeResult<Option<Theme>> {

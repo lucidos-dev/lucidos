@@ -660,3 +660,53 @@ async fn an_engine_reentry_supersedes_when_no_session_is_live() {
     pool.close().await;
     teardown_test_db(&db_name).await;
 }
+
+// --- permission supersedes -------------------------------------------------
+
+use super::{chat_follow_up_supersedes_cards, reentry_reaches_live_session};
+use crate::engine::thread_events::ActorMode;
+
+/// A child's completion or a wait delivery reaching a live coding-agent
+/// session parked on a permission card must leave the card to the user.
+#[tokio::test]
+async fn an_engine_reentry_on_a_live_session_keeps_the_permission_card() {
+    let thread_id = Uuid::new_v4();
+    let (sessions, _msg_rx) = live_sessions(thread_id);
+    for origin in [
+        PreEmittedOrigin::EngineReentry(Uuid::new_v4()),
+        PreEmittedOrigin::WaitReentry(Uuid::new_v4()),
+    ] {
+        assert!(reentry_reaches_live_session(&sessions, thread_id, Some(origin)).await);
+    }
+}
+
+/// A message sends its own prompt, and a dead session has no parked card, so
+/// both still supersede.
+#[tokio::test]
+async fn a_message_or_a_dead_session_still_supersedes_the_permission_card() {
+    let thread_id = Uuid::new_v4();
+    let (sessions, _msg_rx) = live_sessions(thread_id);
+    for origin in [None, Some(PreEmittedOrigin::Message(Uuid::new_v4()))] {
+        assert!(!reentry_reaches_live_session(&sessions, thread_id, origin).await);
+    }
+    let (exited, _exited_rx) = make_test_session(true);
+    let reentry = Some(PreEmittedOrigin::EngineReentry(Uuid::new_v4()));
+    for sessions in [
+        TokioSessions::default(),
+        tokio::sync::Mutex::new(HashMap::from([(thread_id, exited)])),
+    ] {
+        assert!(!reentry_reaches_live_session(&sessions, thread_id, reentry).await);
+    }
+}
+
+/// On the chat lane only a person denies a card a live turn waits on. With no
+/// live turn, nothing waits, so any input clears the stale card.
+#[test]
+fn only_a_person_denies_a_card_a_live_chat_turn_waits_on() {
+    assert!(chat_follow_up_supersedes_cards(ActorMode::Human, true));
+    assert!(!chat_follow_up_supersedes_cards(ActorMode::Agent, true));
+    assert!(!chat_follow_up_supersedes_cards(ActorMode::Engine, true));
+    for mode in [ActorMode::Human, ActorMode::Agent, ActorMode::Engine] {
+        assert!(chat_follow_up_supersedes_cards(mode, false));
+    }
+}

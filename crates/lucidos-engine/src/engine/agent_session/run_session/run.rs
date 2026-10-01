@@ -24,8 +24,8 @@ use crate::engine::agent_session::lifecycle::{
     classify_result, idle_action, idle_change_write, is_definitive_session_not_found,
     is_resume_settle_result, is_stale_resume_signal, require_agent_input, reset_per_turn_flags,
     result_auto_commits, should_auto_commit_on_cleanup, starts_turn_after_terminal,
-    terminal_clears_user_hit_stop, terminate_decision, watchdog_gate, IdleAction,
-    StaleResumeInputs, TerminalKind, TerminateDecision, TurnTerminal, WatchdogGate,
+    terminal_clears_user_hit_stop, terminate_decision, turn_has_terminal, watchdog_gate,
+    IdleAction, StaleResumeInputs, TerminalKind, TerminateDecision, TurnTerminal, WatchdogGate,
     WATCHDOG_DIAG_LOG_THRESHOLD_MS, WATCHDOG_HUNG_TOOL_CEILING_MS, WATCHDOG_INACTIVITY_LIMIT_MS,
     WATCHDOG_TICK_INTERVAL_SECS,
 };
@@ -1323,6 +1323,7 @@ impl LucidosEngine {
                         new_turn_after_terminal && read_owed_input,
                     )
                     .await;
+                    let turn_ended = turn_has_terminal(emitted_terminal_event, &external_terminal_emitted);
                     match ev {
                         AgentEvent::Init { session_id: cc_sid, model: init_model, slash_commands: cmds, skills, agent_version } => {
                             log!("[AgentSession] [TIMING] Init event received: {:?}", cc_start.elapsed());
@@ -1414,7 +1415,7 @@ impl LucidosEngine {
                         // the projection to `running` and strand an already-idled
                         // thread there forever. Drop it. A real follow-up turn
                         // re-arms emission through `reset_per_turn_flags`.
-                        AgentEvent::Message { text, .. } if emitted_terminal_event => {
+                        AgentEvent::Message { text, .. } if turn_ended => {
                             log!(
                                 "[AgentSession] Dropping post-terminal straggler text ({} chars) for thread {} — would resurrect 'running' on an idled thread",
                                 text.len(),
@@ -1450,7 +1451,7 @@ impl LucidosEngine {
                         // Message and ToolUse. Its projection arm bumps
                         // `running`, so a thought arriving after the turn's
                         // terminal event would resurrect an idled thread.
-                        AgentEvent::Thought { .. } if emitted_terminal_event => {}
+                        AgentEvent::Thought { .. } if turn_ended => {}
                         AgentEvent::Thought { text } => {
                             // A thought is the first sign of life on a resumed
                             // turn, so clear the waiting state.
@@ -1480,7 +1481,7 @@ impl LucidosEngine {
                         // Straggler guard, as in the Message arm above. Drop it
                         // without touching the in-flight counter, because a
                         // post-terminal turn has no live watchdog to disarm.
-                        AgentEvent::ToolUse { .. } if emitted_terminal_event => {
+                        AgentEvent::ToolUse { .. } if turn_ended => {
                             log!(
                                 "[AgentSession] Dropping post-terminal straggler tool call for thread {} — would resurrect 'running' on an idled thread",
                                 thread_id
@@ -1559,7 +1560,7 @@ impl LucidosEngine {
                         // emitting. `release_tool_slot` floors at 0, so an
                         // unpaired result is a no-op. Its call's name is
                         // dropped too, so a reused id cannot inherit it.
-                        AgentEvent::ToolResult { id, .. } if emitted_terminal_event => {
+                        AgentEvent::ToolResult { id, .. } if turn_ended => {
                             release_tool_slot(&tools_in_flight);
                             tool_names.take(&id);
                             log!(
@@ -1689,6 +1690,15 @@ impl LucidosEngine {
                                             &meta,
                                         )
                                         .await;
+                                        // After an external terminal, text in
+                                        // `Result.text` beyond the buffer is the
+                                        // agent's reply to the teardown
+                                        // interrupt, which the Message guard
+                                        // dropped. Only the external half counts:
+                                        // a command sent mid-turn answers after
+                                        // the loop's own terminal.
+                                        let result_text_is_live = !external_terminal_emitted
+                                            .load(std::sync::atomic::Ordering::Acquire);
                                         // Final flush of any pending text
                                         if !claude_text_buf.is_empty() {
                                             // `Result.text` may carry text beyond
@@ -1701,13 +1711,15 @@ impl LucidosEngine {
                                             let extra = result_trimmed
                                                 .strip_prefix(claude_text_buf.as_str().trim())
                                                 .map(str::trim)
-                                                .filter(|extra| !extra.is_empty());
+                                                .filter(|extra| result_text_is_live && !extra.is_empty());
                                             if let Some(extra) = extra {
                                                 claude_text_buf.break_paragraph();
                                                 claude_text_buf.push(extra);
                                             }
                                             claude_text_buf.flush(&self.event_bus, thread_id, coding_agent, &meta, "[AgentSession] CodingAgentTextStreamed (Result flush)").await;
-                                        } else if result_text_is_own_prose(&text, cc_error.as_deref()) {
+                                        } else if result_text_is_live
+                                            && result_text_is_own_prose(&text, cc_error.as_deref())
+                                        {
                                             // A slash command produces a Result
                                             // with no preceding Message events,
                                             // so emit its text for the frontend.

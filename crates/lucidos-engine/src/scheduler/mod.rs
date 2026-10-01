@@ -421,9 +421,10 @@ impl SchedulerManager {
     /// migrations". Dead-on-arrival for any
     /// install created after that date (the `trigger_crons` table never exists).
     /// Removal blocked on confirming every live install has started up at least
-    /// once since the migration shipped; once verified, drop this function, its
-    /// call site in `start()`, and the `ScheduledTrigger*` event aliases in
-    /// `triggers/replay.rs`. Safe target: drop after the next major release that
+    /// once since the migration shipped. Once verified, drop this function and
+    /// its call site in `start()`. Keep the `ScheduledTrigger*` arms in
+    /// `triggers/replay.rs`: they replay immutable historical events.
+    /// Safe target: drop after the next major release that
     /// requires a fresh install (or after telemetry confirms zero workspaces
     /// retain the legacy table).
     async fn migrate_db_triggers_to_events(

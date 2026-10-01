@@ -1,5 +1,5 @@
 import { Fragment } from 'preact';
-import { useRef, useEffect, useState, useMemo } from 'preact/hooks';
+import { useRef, useEffect, useLayoutEffect, useState, useMemo } from 'preact/hooks';
 import { Overlay } from '../shared/Overlay';
 import { useLongPress } from '../../hooks/useLongPress';
 import { SendHoldMenu, sendHoldMenuOpener, SEND_HOLD_SLIDE_MS, SEND_HOLD_SLIDE_SLACK_MS } from './SendHoldMenu';
@@ -31,19 +31,20 @@ import { followAnsweredQuestion, followCanceledTurn, followSentMessage, followSi
 import { CaptureIcon, ImageIcon, CameraIcon, FileIcon, CloseIcon, ClearIcon, GlobeIcon, SendArrowIcon, StopIcon } from '../shared/icons';
 import { BlobImage } from '../shared/BlobImage';
 import { codingAgentMenuComposerText, codingAgentMenuOpenRequest } from './CodingAgentControlMenu';
-import { PromptRowControls, promptRowToggles } from './PromptRowControls';
+import { isComposeContext, PromptRowControls, promptRowToggles } from './PromptRowControls';
 import { renderHeaderAction, renderMenuAction, type HeaderActionSpec } from '../layout/headerActions';
 import { OverflowMenu } from '../shared/OverflowMenu';
 import { FOLD_KEY_ATTR, usePromptActionCollapse, type FoldGroup } from '../../hooks/usePromptActionCollapse';
 import { TodoPanelSlot, closeTodoPanel, todoIndicatorAction } from './todoIndicator';
 import { WaitingPanelHost, closeWaitingPanel, waitingIndicatorAction } from './WaitingPanel';
-import { getBannerActions, getWaitingState, getStandaloneActions, type BannerState } from './WaitingBanner';
+import { composerBannerState, getBannerActions, getWaitingState, getStandaloneActions } from './WaitingBanner';
 import { composeHasContent, resolveComposerText, composerTextDisagreementToast, computeMorphMode, computeAnswerActionMode, computePromptEscapeAction, dispatchSend, computeSubmitMultiCount, recoverableAnswerDraft, findLatestPendingQuestion, promptPlaceholder, shouldClearCanceling, shouldClearSubmitting, submittingThreadIds, canceledQuestionByThread, setCanceledQuestion, canceledWhileAwaitingByThread, setCanceledWhileAwaiting, queuedUploadSends, queueUploadSend, takeQueuedUploadSend, clearQueuedUploadSend, clearSubmittingThread, armCancelSettle, isCancelSettling, promptStopRequested, promptSideQuestionRequested, sideQuestionAction, type UploadSendIntent } from './prompt-input-helpers';
 import { SplitButton } from '../shared/SplitButton';
 export * from './prompt-input-helpers';
 import { composeHandlers } from './promptFocus';
 import { focusIfNeeded } from '../../utils/dom';
 import { threadEntryFocusTarget } from './choiceCardNav';
+import { focusIntoPane } from '../layout/paneFocus';
 import { syncTextareaValue, shouldSkipSyncWhileEditing, resolveEmptyDraftSync, promptOverrideSyncSeq, promptOverrideReplacesDraft } from './promptValueSync';
 import { reportDraftClobbered } from './deadKeystrokeProbe';
 import { effectiveCodingAgentBackend, effectiveSendMode } from './promptToggleMode';
@@ -367,7 +368,9 @@ export function PromptInput() {
   // the last value we acted on so a bump forces exactly one sync.
   const overrideSyncSeq = promptOverrideSyncSeq.value;
   const lastOverrideSyncSeqRef = useRef(overrideSyncSeq);
-  useEffect(() => {
+  // A layout effect, so the box holds the new thread's text before ThreadPane's
+  // FLIP measures where the prompt docks. A child's layout effects run first.
+  useLayoutEffect(() => {
     const el = inputRef.current;
     if (!el) return;
     const sameThread = prevTidRef.current === tid;
@@ -430,8 +433,9 @@ export function PromptInput() {
       // focused, not the prompt, so Enter answers straight away.
       // `threadEntryFocusTarget` is the SINGLE place deciding between the two.
       // The card's own mount seed also fires on a switch, and letting both
-      // decide independently would race on mount order.
-      requestAnimationFrame(() => focusIfNeeded(threadEntryFocusTarget(el)));
+      // decide independently would race on mount order. The switch may come from
+      // a drawer row, so the focused-pane marker follows focus and Tab stays here.
+      requestAnimationFrame(() => focusIntoPane(threadEntryFocusTarget(el)));
     }
     prevTidRef.current = tid;
     wasComposeViewRef.current = isComposeView;
@@ -938,7 +942,7 @@ export function PromptInput() {
   // view (no focused thread). NOT an active thread. Drives the control menus'
   // per-draft/pending routing so a fresh-compose pick lands in the pending slot,
   // never a global that every override-less draft reads.
-  const inComposeContext = !focusedThread || focusedThread.meta.state === 'composing';
+  const inComposeContext = isComposeContext(focusedThread);
   const promptCodingAgent = effectiveCodingAgentBackend(
     focusedThread,
     resolveCodingAgent(focusedThreadId.value),
@@ -967,10 +971,7 @@ export function PromptInput() {
     : (focusedTid && submittingThreadIds.value.has(focusedTid)) ? focusedTid
     : null;
   const isCanceling = cancelTargetId !== null && cancelingThreadIds.value.has(cancelTargetId);
-  const bannerState: BannerState | null =
-    !hasContent && waitingState && waitingState.type !== 'canceling'
-      ? waitingState
-      : null;
+  const bannerState = composerBannerState(waitingState, hasContent);
 
   const morphMode = computeMorphMode({
     hasContent: morphHasContent,
@@ -1013,8 +1014,10 @@ export function PromptInput() {
   const heldSendRef = useRef(false);
   const startedSideQuestionDraftRef = useRef(false);
   // A mouse press moves focus off the composer. The pill keeps the draft
-  // editable, so a hold that began mid-typing hands the focus back.
-  const typingAtPressRef = useRef(false);
+  // editable, so a hold that began mid-typing hands the focus back. So does a
+  // hold that started a draft.
+  const holdRefocusesComposerRef = useRef(false);
+  const pressPointerTypeRef = useRef('');
   const [sendButtonEl, setSendButtonEl] = useState<HTMLButtonElement | null>(null);
   const holdSideQuestion = sideQuestionAction({
     hasContent: morphMode === 'send',
@@ -1033,14 +1036,25 @@ export function PromptInput() {
     // The hold took the press, so the gate must not rule on its lift. Stop
     // asks the gate before the mark, so drift under the new pill would toast.
     morphGate.spend();
+    // Over an empty box the half could only start the draft, and while it is
+    // open the box takes no typing. A touch hold still opens it: only a tap
+    // can raise the iOS keyboard.
+    if (holdSideQuestion.kind === 'start-draft' && pressPointerTypeRef.current === 'mouse') {
+      startEmptySideQuestion();
+      holdRefocusesComposerRef.current = true;
+      return;
+    }
     sendHoldMenuOpener.value = 'hold';
-    if (typingAtPressRef.current) focusIfNeeded(inputRef.current);
+    if (holdRefocusesComposerRef.current) focusIfNeeded(inputRef.current);
   }, () => {});
+  function startEmptySideQuestion(): void {
+    startSideQuestionDraft(`/${SIDE_QUESTION_COMMAND} `);
+  }
   /** The Side question half's action, whether tapped or pressed with Enter. */
   function askFromSideQuestionPill(): void {
     if (holdSideQuestion.kind === 'start-draft') {
       startedSideQuestionDraftRef.current = true;
-      startSideQuestionDraft(`/${SIDE_QUESTION_COMMAND} `);
+      startEmptySideQuestion();
     } else void submit(true);
   }
   // The pill stays drawn while its half slides back behind Send, and Send
@@ -1059,6 +1073,7 @@ export function PromptInput() {
     promptSideQuestionRequested.value = false;
     // A second press shuts the open pill, as Escape does.
     if (sendHoldMenuOpener.peek() !== null) sendHoldMenuOpener.value = null;
+    else if (holdSideQuestion.kind === 'start-draft') startEmptySideQuestion();
     else if (sideQuestionBlocker === null) sendHoldMenuOpener.value = 'shortcut';
     else showToast(sideQuestionBlocker, 'info');
   });
@@ -1068,7 +1083,7 @@ export function PromptInput() {
         heldSendRef.current = false;
         // This click still reaches the `.action-btn` blur listener, so the
         // composer takes focus back a frame later.
-        if (typingAtPressRef.current) requestAnimationFrame(() => focusIfNeeded(inputRef.current));
+        if (holdRefocusesComposerRef.current) requestAnimationFrame(() => focusIfNeeded(inputRef.current));
         return;
       }
       if (morphMode === 'send') {
@@ -1398,7 +1413,8 @@ export function PromptInput() {
         heldSendRef.current = false;
         // Read before the press's own mousedown moves focus. Never on touch,
         // where the keyboard stays up through a hold on its own.
-        typingAtPressRef.current = e.pointerType === 'mouse' && document.activeElement === inputRef.current;
+        pressPointerTypeRef.current = e.pointerType;
+        holdRefocusesComposerRef.current = e.pointerType === 'mouse' && document.activeElement === inputRef.current;
         sendHold.onPointerDown(e);
         morphGate.down(e);
       }}

@@ -133,11 +133,15 @@ pub fn router() -> Router<GatewayState> {
 // strong defense-in-depth rather than an absolute boundary. Serving an app tab
 // from a distinct origin would close that, and ADR 0014 records it as future
 // work.
+//
+// The auth plane's credentialed routes sit behind this same gate. They mint a
+// pairing code and list and revoke devices, which is worse in an app's hands
+// than stopping a workspace.
 
-/// Axum middleware: reject a control-plane request that an app document (or a
-/// cross-site page) originated. Allows non-browser clients and same-origin
-/// picker / workspace-shell requests. See the module note above.
-async fn control_authz(req: Request, next: Next) -> Response {
+/// Axum middleware: reject a control-plane or auth-plane request that an app
+/// document (or a cross-site page) originated. Allows non-browser clients and
+/// same-origin picker / workspace-shell requests. See the module note above.
+pub(crate) async fn control_authz(req: Request, next: Next) -> Response {
     let host = req
         .headers()
         .get(header::HOST)
@@ -149,7 +153,7 @@ async fn control_authz(req: Request, next: Next) -> Response {
     } else {
         (
             StatusCode::FORBIDDEN,
-            "control plane is not reachable from app iframes or cross-origin requests",
+            "the gateway API is not reachable from app documents or cross-origin requests",
         )
             .into_response()
     }

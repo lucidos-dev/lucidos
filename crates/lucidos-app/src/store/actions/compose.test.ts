@@ -1956,6 +1956,19 @@ describe('a send the engine refuses keeps the typed text', () => {
     expect(composePutTexts()).not.toContain('');
   });
 
+  it('sendCompose stores the restored text when Send beat the draft write', async () => {
+    threadMap.value = new Map([['t-1', makeThread({ id: 't-1', state: 'composing' })]]);
+    // Typed and sent inside the debounce, so the send cancels this write.
+    updateCompose('t-1', { text: 'typed then sent' });
+
+    await sendCompose('t-1', {}).catch(() => {});
+    await vi.runAllTimersAsync();
+
+    expect(getDraft('t-1').text).toBe('typed then sent');
+    const texts = composePutTexts();
+    expect(texts[texts.length - 1]).toBe('typed then sent');
+  });
+
   it('sendFollowup puts the text back into the draft', async () => {
     threadMap.value = new Map([['t-1', makeActiveThread({ id: 't-1', composeText: 'a follow-up' })]]);
 

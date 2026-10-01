@@ -36,7 +36,8 @@ test('the settings column holds still as the page grows past the pane', async ({
 
   // Appearance is several sections deep, past the pane.
   await openSettingsView(page, 'appearance');
-  await expect(page.locator('.theme-carousel')).toBeVisible();
+  // The loaded strip only: the picker's reserve and skeleton draw one too.
+  await expect(page.locator('.theme-carousel[role="radiogroup"]')).toBeVisible();
   // Proves the page outgrew the pane, or the check below proves nothing.
   await expect.poll(overflows, { message: 'Appearance never outgrew the pane' }).toBe(true);
   expect(await rightEdge(), 'the column moved as the page outgrew the pane').toBe(fits);

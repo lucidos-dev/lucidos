@@ -24,7 +24,7 @@ async function openThreadQueuePanel(page: Page): Promise<void> {
   });
   expect(res.ok(), `POST /api/v1/ui/navigate -> ${res.status()}`).toBeTruthy();
   // Section headers render only once the queue state has loaded.
-  await expect(page.locator('.thread-queue-section-title').first()).toBeVisible({
+  await expect(page.locator('.list-section-title .section-label', { hasText: 'Running' })).toBeVisible({
     timeout: 10_000,
   });
 }

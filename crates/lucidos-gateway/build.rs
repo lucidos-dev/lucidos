@@ -47,16 +47,15 @@ fn main() {
     let manifest_dir = manifest_dir.as_path();
     let project_root = manifest_dir.parent().unwrap().parent().unwrap();
 
-    // Re-run when gateway source, the manifest, or git state changes. `.git/HEAD`
-    // covers commits/checkouts; `.git/index` covers staging so the dirty-diff
-    // component stays fresh.
+    // Re-run when gateway source, the manifest, or HEAD changes.
     println!("cargo:rerun-if-changed=src");
     println!("cargo:rerun-if-changed=Cargo.toml");
     // `Cargo.lock` feeds the dirty-diff component below, so watch it too — else an
     // uncommitted lock-only change wouldn't recompute the build id.
     println!("cargo:rerun-if-changed=../../Cargo.lock");
-    println!("cargo:rerun-if-changed=../../.git/HEAD");
-    println!("cargo:rerun-if-changed=../../.git/index");
+    for path in head_trigger_paths(project_root) {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
     // Declaring any trigger opts out of cargo's default "rerun on any change in
     // the package", so an embedded file needs its own: rustc's own dep-info
     // recompiles the crate when it changes, but only this brings the id along.
@@ -96,11 +95,44 @@ fn git_short_head(project_root: &Path) -> Option<String> {
     }
 }
 
+/// The git files that change exactly when HEAD moves: HEAD itself (checkout,
+/// detached moves), the branch ref it names (commits), and `packed-refs`.
+/// Hand-synced with crates/lucidos-engine/build.rs, which says why.
+fn head_trigger_paths(project_root: &Path) -> Vec<PathBuf> {
+    let git = |args: &[&str]| -> Option<String> {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(project_root)
+            .output()
+            .ok()?;
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (out.status.success() && !s.is_empty()).then_some(s)
+    };
+    let git_path =
+        |name: &str| git(&["rev-parse", "--git-path", name]).map(|p| Path::new("../..").join(p));
+
+    let mut paths: Vec<PathBuf> = git_path("HEAD").into_iter().collect();
+    if let Some(branch_ref) = git(&["symbolic-ref", "-q", "HEAD"]) {
+        paths.extend(git_path(&branch_ref));
+    }
+    paths.extend(git_path("packed-refs").filter(|p| p.exists()));
+    paths
+}
+
 /// Uncommitted changes (staged + unstaged) to gateway-relevant paths. `None` when
 /// git fails — the caller then treats the tree as clean rather than inventing a
 /// dirty marker.
 fn gateway_diff(project_root: &Path) -> Option<String> {
-    let mut args = vec!["diff", "HEAD", "--", "crates/lucidos-gateway", "Cargo.lock"];
+    // `--no-optional-locks`: a plain `git diff` rewrites a stale index, and a
+    // build must not take the index lock under a concurrent git command.
+    let mut args = vec![
+        "--no-optional-locks",
+        "diff",
+        "HEAD",
+        "--",
+        "crates/lucidos-gateway",
+        "Cargo.lock",
+    ];
     args.extend_from_slice(EMBEDDED_SOURCES);
     let out = Command::new("git")
         .args(&args)

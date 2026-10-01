@@ -1409,13 +1409,13 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   where it was, so the trim costs no layout.
 
   Three things ride on the box staying put, and none is visible from the rule.
-  A drawer section header stays the same height collapsed and expanded, which
-  is the jump `styles/drawer.css` documents. A `background-clip: text` shimmer
+  A section header stays the same height collapsed and expanded, which is
+  the jump `styles/section-header.css` documents. A `background-clip: text` shimmer
   keeps a positioning area covering the whole glyph. A pill sized by its line
   box keeps its pill.
 
   Every site is `styles/badges.css` or the `@supports` block in
-  `styles/drawer.css`, and `styles/__tests__/badge-glyph-centring.test.ts`
+  `styles/section-header.css`, and `styles/__tests__/badge-glyph-centring.test.ts`
   pins each one. Re-flagging needs a site whose box may genuinely shrink.
 
 - **`answerThreadQuestion`'s retry can report `false` for an answer that
@@ -1532,18 +1532,18 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 
   Neither was reachable. `handleToastKeyDown` (`components/shared/Toast.tsx`)
   intercepts every Tab inside a toast that owns a button, and cycles
-  `a[href], button` only. `trapDialogTab` wraps at the confirm dialog's two
-  buttons via `trapTargetIndex`, which acts at the boundaries and answers null
-  in between. `.confirm-details` sits before both in DOM order, so native
-  movement only ever steps Cancel to OK. A plain scroller is not click-focusable
-  either. The attribute states in the DOM what the trap already enforced, and
-  stops the promotion racing it.
+  `a[href], button` only. The overlay Tab rule (ADR 0335) wraps at the confirm
+  dialog's two buttons. Its `trapTargetIndex` acts at the boundaries and
+  answers null in between. `.confirm-details` sits before
+  both in DOM order, so native movement only ever steps Cancel to OK. A plain
+  scroller is not click-focusable either. The attribute states in the DOM what
+  the trap already enforced, and stops the promotion racing it.
 
-  The file preview modal is the counter-case and is written the other way:
-  nothing traps Tab there, so `.file-preview-modal-body` declares
-  `tabIndex={0}` with a role, a label and the shared `--focus-ring`. Re-flag
-  only if a toast or the confirm dialog grows a Tab cycle that includes its
-  scroll box.
+  The file preview modal is the counter-case and is written the other way. Its
+  body is meant to be a stop in the dialog's Tab cycle. So
+  `.file-preview-modal-body` declares `tabIndex={0}` with a role, a label and
+  the shared `--focus-ring`. Re-flag only if a toast or the confirm dialog grows
+  a Tab cycle that includes its scroll box.
 
 - **`sessionCanInstall` subtracts `installer-rerun` rather than requiring
   `desktop-app`, and that asymmetry is deliberate.** (It was inside
@@ -2709,7 +2709,7 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   Re-flag with a fix that clears the residue and still leaves the click path a
   press to rule on. A report of a real dead keyboard activation does it too.
 
-- **`useHideOnScroll`'s `anchoredTop` stamp has no explicit expiry, and must not
+- **`useHideOnScroll`'s `rebasedTop` stamp has no explicit expiry, and must not
   grow one.** A reviewer sees a stamp set on an anchor write and never
   `-1`-ed on a timer, and reads it as state that outlives its event: a later
   navigation landing at the same offset would be misread as the old anchor, so

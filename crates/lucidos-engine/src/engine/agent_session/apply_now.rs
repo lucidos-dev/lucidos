@@ -1,3 +1,4 @@
+use super::lifecycle::foreign_worktree_reason;
 use crate::engine::change_ops::{
     branch_is_hardened, now_epoch_millis, MergeOwnership, MERGE_OWNED_BY_RESOLVER_MESSAGE,
 };
@@ -6,7 +7,7 @@ use crate::engine::git_ops::{
     branch_changed_files, branch_head_sha, catchup_and_ff_to_main, commits_in_range,
     default_local_branch, describe_branch_changes, files_have_client_update, files_require_restart,
     git_answer_when_ok, git_cmd, git_ran_ok, has_branch_commits, push_main_in_background,
-    resolution_merged_main,
+    resolution_merged_main, worktree_current_branch,
 };
 use crate::engine::thread_events::{EventChannel, MessageOrigin};
 use crate::engine::{AgentUserInput, LucidosEngine};
@@ -686,7 +687,8 @@ impl LucidosEngine {
                     // cleared the applied change's branch markers. Make sure the
                     // already-merged main reaches the remote: the abandoned
                     // apply that merged it may never have pushed.
-                    self.reset_worktree_and_idle(thread_id, worktree_path).await;
+                    self.reset_worktree_and_idle(thread_id, worktree_path, branch_name)
+                        .await;
                     push_main_in_background(repo_root);
                     self.broadcast_changes_updated().await;
                     return Ok(());
@@ -714,7 +716,8 @@ impl LucidosEngine {
                     "[ApplyNow] ChangeApplyFailed",
                 )
                 .await;
-            self.reset_worktree_and_idle(thread_id, worktree_path).await;
+            self.reset_worktree_and_idle(thread_id, worktree_path, branch_name)
+                .await;
             return Ok(());
         }
 
@@ -818,6 +821,7 @@ impl LucidosEngine {
                     &post_sha,
                     worktree_path,
                     repo_root,
+                    branch_name,
                     actor.clone(),
                 )
                 .await;
@@ -1104,6 +1108,7 @@ impl LucidosEngine {
                             &post_sha,
                             &worktree_path,
                             &repo_root,
+                            &branch_name,
                             actor,
                         )
                         .await;
@@ -1136,6 +1141,7 @@ impl LucidosEngine {
         post_sha: &str,
         worktree_path: &Path,
         repo_root: &Path,
+        branch_name: &str,
         actor: Option<MessageOrigin>,
     ) -> Vec<String> {
         let commits = commits_in_range(repo_root, pre_sha, post_sha).await;
@@ -1226,7 +1232,8 @@ impl LucidosEngine {
 
         // The branch is reset for reuse below. `emit_change_applied` cleared
         // the applied change's branch markers, so new work re-triggers both.
-        self.reset_worktree_and_idle(thread_id, worktree_path).await;
+        self.reset_worktree_and_idle(thread_id, worktree_path, branch_name)
+            .await;
         push_main_in_background(repo_root);
         self.broadcast_changes_updated().await;
 
@@ -1237,38 +1244,16 @@ impl LucidosEngine {
     ///
     /// Used after apply, discard, and no-commits to keep the session alive.
     /// ONLY safe when the branch's work is already on main (or there is no
-    /// work): the worktree's HEAD is attached to the session branch, so
-    /// `reset --hard main` moves that BRANCH REF and `clean -fd` wipes the
-    /// tree. On a path where the change is still pending, call
-    /// [`Self::mark_session_idle`] instead.
-    ///
-    /// The `clean` waits on the reset landing, because the reset is what makes
-    /// deleting untracked files safe: run it alone and the branch keeps its
-    /// commits while the agent's untracked work is gone.
-    ///
-    /// The base stays the literal `main`, deliberately. Resolving the repo's
-    /// real default here would make this line disagree with the apply pipeline
-    /// that runs immediately before it: `catchup_and_ff_to_main` publishes to
-    /// `main`, so a reset onto anything else rewinds the session branch off the
-    /// work just applied. The whole family has to move together, which is
-    /// tracked as `harden-hardcoded-main-branch-in-change-ops`.
-    pub(crate) async fn reset_worktree_and_idle(&self, thread_id: Uuid, worktree_path: &Path) {
-        match git_ran_ok(&["reset", "--hard", "main"], worktree_path).await {
-            Ok(()) => {
-                if let Err(e) = git_ran_ok(&["clean", "-fd"], worktree_path).await {
-                    log!(
-                        "[ApplyNow] git clean -fd failed in {}: {}",
-                        worktree_path.display(),
-                        e
-                    );
-                }
-            }
-            Err(e) => log!(
-                "[ApplyNow] git reset --hard main failed in {}: {}. Leaving the tree alone, so the worktree still holds whatever was there",
-                worktree_path.display(),
-                e
-            ),
-        }
+    /// work). On a path where the change is still pending, call
+    /// [`Self::mark_session_idle`] instead. See
+    /// [`reset_session_worktree_to_main`] for the branch check.
+    pub(crate) async fn reset_worktree_and_idle(
+        &self,
+        thread_id: Uuid,
+        worktree_path: &Path,
+        session_branch: &str,
+    ) {
+        reset_session_worktree_to_main(worktree_path, session_branch).await;
         self.mark_session_idle(thread_id, worktree_path).await;
     }
 
@@ -1319,6 +1304,53 @@ impl LucidosEngine {
                 "[ApplyNow] CodingAgentIdled",
             )
             .await;
+    }
+}
+
+/// `git reset --hard main` then `git clean -fd` in the session's worktree, but
+/// only while its HEAD is still on `session_branch`.
+///
+/// The reset moves whatever branch HEAD is attached to. Claude Code can
+/// `git checkout` inside its own worktree, and a reset there would rewind that
+/// other branch to main and wipe its untracked files. So a worktree on another
+/// branch, or one whose branch git cannot name, is left untouched.
+///
+/// The `clean` waits on the reset landing, because the reset is what makes
+/// deleting untracked files safe: run it alone and the branch keeps its
+/// commits while the agent's untracked work is gone.
+///
+/// The base stays the literal `main`, deliberately. Resolving the repo's real
+/// default here would make this line disagree with the apply pipeline that
+/// runs immediately before it: `catchup_and_ff_to_main` publishes to `main`, so
+/// a reset onto anything else rewinds the session branch off the work just
+/// applied. The whole family has to move together, which is tracked as
+/// `harden-hardcoded-main-branch-in-change-ops`.
+async fn reset_session_worktree_to_main(worktree_path: &Path, session_branch: &str) {
+    let worktree_branch = worktree_current_branch(worktree_path).await;
+    if let Some(reason) = foreign_worktree_reason(worktree_branch.as_deref(), session_branch) {
+        log!(
+            "[ApplyNow] Not resetting {} to main for session branch {}: {}",
+            worktree_path.display(),
+            session_branch,
+            reason
+        );
+        return;
+    }
+    match git_ran_ok(&["reset", "--hard", "main"], worktree_path).await {
+        Ok(()) => {
+            if let Err(e) = git_ran_ok(&["clean", "-fd"], worktree_path).await {
+                log!(
+                    "[ApplyNow] git clean -fd failed in {}: {}",
+                    worktree_path.display(),
+                    e
+                );
+            }
+        }
+        Err(e) => log!(
+            "[ApplyNow] git reset --hard main failed in {}: {}. Leaving the tree alone, so the worktree still holds whatever was there",
+            worktree_path.display(),
+            e
+        ),
     }
 }
 
@@ -1584,6 +1616,109 @@ mod tests {
             gate < at("self.reset_worktree_and_idle("),
             "the dirtiness gate must precede every reset in apply_now_inner"
         );
+    }
+
+    const SESSION_BRANCH: &str = "lucidos-claude-code-repo-lucidos-reset-gate";
+
+    /// A real repo on `main` with a linked worktree on [`SESSION_BRANCH`]
+    /// holding one commit, the way an applied or discarded session finds it.
+    async fn session_worktree() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let wt = tmp.path().join("wt");
+        tokio::fs::create_dir_all(&repo).await.unwrap();
+        let wt_str = wt.to_str().unwrap();
+        for args in [
+            &["init", "-b", "main"][..],
+            &["config", "user.email", "test@example.com"],
+            &["config", "user.name", "Test"],
+            &["commit", "--allow-empty", "-m", "initial"],
+            &["worktree", "add", "-b", SESSION_BRANCH, wt_str],
+        ] {
+            git_ran_ok(args, &repo).await.unwrap();
+        }
+        tokio::fs::write(wt.join("session.txt"), "session work")
+            .await
+            .unwrap();
+        git_ran_ok(&["add", "."], &wt).await.unwrap();
+        git_ran_ok(&["commit", "-m", "session work"], &wt)
+            .await
+            .unwrap();
+        (tmp, repo, wt)
+    }
+
+    async fn rev(repo: &Path, name: &str) -> String {
+        let out = git_cmd(&["rev-parse", name], repo).await.unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// The reset the session paths depend on still happens on the session's
+    /// own branch: the branch is rewound to main and untracked files go.
+    #[tokio::test]
+    async fn the_reset_rewinds_the_session_branch_it_can_name() {
+        let (_tmp, repo, wt) = session_worktree().await;
+        tokio::fs::write(wt.join("scratch.txt"), "untracked")
+            .await
+            .unwrap();
+
+        reset_session_worktree_to_main(&wt, SESSION_BRANCH).await;
+
+        assert_eq!(rev(&repo, SESSION_BRANCH).await, rev(&repo, "main").await);
+        assert!(!wt.join("scratch.txt").exists());
+    }
+
+    /// **Regression.** The agent ran `git checkout -b` mid-session, then the
+    /// user clicked Discard. The reset moved the OTHER branch's ref to main and
+    /// `clean -fd` wiped its untracked files. A worktree on another branch is
+    /// not the session's to reset.
+    #[tokio::test]
+    async fn the_reset_leaves_a_worktree_the_agent_moved_to_another_branch() {
+        let (_tmp, repo, wt) = session_worktree().await;
+        git_ran_ok(&["checkout", "-b", "agent-side-branch"], &wt)
+            .await
+            .unwrap();
+        tokio::fs::write(wt.join("side.txt"), "side work")
+            .await
+            .unwrap();
+        git_ran_ok(&["add", "."], &wt).await.unwrap();
+        git_ran_ok(&["commit", "-m", "side work"], &wt)
+            .await
+            .unwrap();
+        tokio::fs::write(wt.join("scratch.txt"), "untracked")
+            .await
+            .unwrap();
+        let side_before = rev(&repo, "agent-side-branch").await;
+        let session_before = rev(&repo, SESSION_BRANCH).await;
+
+        reset_session_worktree_to_main(&wt, SESSION_BRANCH).await;
+
+        assert_eq!(
+            rev(&repo, "agent-side-branch").await,
+            side_before,
+            "the other branch's ref must not be rewound to main"
+        );
+        assert_eq!(rev(&repo, SESSION_BRANCH).await, session_before);
+        assert!(
+            wt.join("scratch.txt").exists(),
+            "untracked files on the other branch must survive"
+        );
+    }
+
+    /// A detached HEAD names no branch, so it is not a positive match either.
+    #[tokio::test]
+    async fn the_reset_leaves_a_detached_worktree() {
+        let (_tmp, repo, wt) = session_worktree().await;
+        git_ran_ok(&["checkout", "--detach"], &wt).await.unwrap();
+        tokio::fs::write(wt.join("scratch.txt"), "untracked")
+            .await
+            .unwrap();
+        let head_before = rev(&wt, "HEAD").await;
+
+        reset_session_worktree_to_main(&wt, SESSION_BRANCH).await;
+
+        assert_eq!(rev(&wt, "HEAD").await, head_before);
+        assert_ne!(head_before, rev(&repo, "main").await);
+        assert!(wt.join("scratch.txt").exists());
     }
 
     /// The other direction: a Stop, Discard or Archive is refused while an apply

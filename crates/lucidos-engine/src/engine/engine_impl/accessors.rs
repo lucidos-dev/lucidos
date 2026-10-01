@@ -167,11 +167,10 @@ impl LucidosEngine {
         }
     }
 
-    /// Hold across any write+commit on the workspace repo, so
-    /// `change_ops::apply_change`'s dirty check (which also holds it) never
-    /// observes a half-written file from a commit-in-flight.
-    pub(crate) async fn lock_workspace_repo(&self) -> tokio::sync::MutexGuard<'_, ()> {
-        self.workspace_repo_lock.lock().await
+    /// Hold across any write+commit on the workspace repo. See
+    /// [`crate::engine::git_ops::WORKSPACE_REPO_MUTEX`] for what else holds it.
+    pub(crate) async fn lock_workspace_repo(&self) -> tokio::sync::MutexGuard<'static, ()> {
+        crate::engine::git_ops::WORKSPACE_REPO_MUTEX.lock().await
     }
 
     /// Get the Lucidos source repo root (resolved at startup).

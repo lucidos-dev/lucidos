@@ -7,6 +7,21 @@ vi.mock('../utils/dom', async (importOriginal) => {
   return { ...actual, isTextInput: vi.fn(() => false), isThreadTranscript: vi.fn(() => false) };
 });
 
+// The new shortcuts' own actions are tested beside their buttons. Here only
+// the wiring, and who may run it, is under test.
+vi.mock('../components/chat/WaitingBanner', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../components/chat/WaitingBanner')>();
+  return { ...actual, applyFocusedThreadChange: vi.fn(), showFocusedThreadDiff: vi.fn() };
+});
+vi.mock('../components/chat/PromptRowControls', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../components/chat/PromptRowControls')>();
+  return { ...actual, toggleFollowLiveEdge: vi.fn(), pressCallToggleIfShown: vi.fn() };
+});
+vi.mock('../components/layout/ContentHeaderActions', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../components/layout/ContentHeaderActions')>();
+  return { ...actual, toggleAppFullscreenIfShown: vi.fn(), toggleSourceView: vi.fn(), toggleLineWrap: vi.fn() };
+});
+
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
 // @ts-expect-error: same
@@ -18,6 +33,9 @@ import { isTextInput, isThreadTranscript } from '../utils/dom';
 import { pushOverlay, _resetOverlayStackForTesting } from '../store/overlayStack';
 import { focusedPane, splitRatio, searchEverywhereAnchor, searchEverywhereOpen } from '../store/store';
 import { promptStopRequested, promptSideQuestionRequested } from '../components/chat/prompt-input-helpers';
+import { applyFocusedThreadChange, showFocusedThreadDiff } from '../components/chat/WaitingBanner';
+import { toggleFollowLiveEdge, pressCallToggleIfShown } from '../components/chat/PromptRowControls';
+import { toggleAppFullscreenIfShown, toggleSourceView, toggleLineWrap } from '../components/layout/ContentHeaderActions';
 
 const here: string = dirname(fileURLToPath(import.meta.url));
 
@@ -384,5 +402,62 @@ describe('dispatchPreviewIframeShortcut (keydown INSIDE a content-pane preview i
     expect(dispatchPreviewIframeShortcut(e)).toBe(true);
     expect(dismiss).toHaveBeenCalledTimes(1);
     expect((e as { defaultPrevented: boolean }).defaultPrevented).toBe(true);
+  });
+});
+
+describe('the toggle shortcuts reach their actions', () => {
+  const ctrlShift = (key: string) => ({ metaKey: false, ctrlKey: true, shiftKey: true, altKey: false, key });
+
+  beforeEach(() => vi.clearAllMocks());
+
+  it.each([
+    ['l', toggleFollowLiveEdge],
+    ['d', showFocusedThreadDiff],
+    ['f', toggleAppFullscreenIfShown],
+    ['s', toggleSourceView],
+    ['b', toggleLineWrap],
+  ])('Ctrl+Shift+%s runs its action', (key, action) => {
+    dispatchForwardedChord(ctrlShift(key));
+    expect(action).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('the host-only shortcuts', () => {
+  const chord = (key: string) => ({ metaKey: false, ctrlKey: true, shiftKey: true, altKey: false, key });
+  const applyChord = chord('a');
+  const hostKeydown = (key = 'a') => {
+    const e = { ...chord(key), defaultPrevented: false } as unknown as KeyboardEvent & { defaultPrevented: boolean };
+    (e as { preventDefault: () => void }).preventDefault = () => { e.defaultPrevented = true; };
+    return e;
+  };
+
+  beforeEach(() => vi.clearAllMocks());
+
+  it('never applies from a chord a frame forwarded, since its script can forge one', () => {
+    dispatchForwardedChord(applyChord);
+    expect(applyFocusedThreadChange).not.toHaveBeenCalled();
+  });
+
+  it('applies from a keydown the host itself received', () => {
+    // The same-origin PDF preview hands the host a real keydown, as the
+    // document listener does.
+    expect(dispatchPreviewIframeShortcut(hostKeydown())).toBe(true);
+    expect(applyFocusedThreadChange).toHaveBeenCalledTimes(1);
+  });
+
+  it('never starts a call from a forwarded chord, which would open the microphone', () => {
+    dispatchForwardedChord(chord('h'));
+    expect(pressCallToggleIfShown).not.toHaveBeenCalled();
+  });
+
+  it('starts a call from a keydown the host itself received', () => {
+    expect(dispatchPreviewIframeShortcut(hostKeydown('h'))).toBe(true);
+    expect(pressCallToggleIfShown).toHaveBeenCalledTimes(1);
+  });
+
+  it('does nothing behind an open dialog, where it would stack a second confirm', () => {
+    pushOverlay({ id: 'confirm', dismiss: vi.fn(), hasPanel: true });
+    dispatchPreviewIframeShortcut(hostKeydown());
+    expect(applyFocusedThreadChange).not.toHaveBeenCalled();
   });
 });

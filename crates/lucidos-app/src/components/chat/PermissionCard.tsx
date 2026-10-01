@@ -5,7 +5,7 @@ import { showToast } from '../../store/store';
 import { resolveCodingAgentPermission, resolveCommandPermission, resolveMcpPermission } from '../../store/actions/permissions';
 import { changeKindName, type AllowScope } from '../../store/thread-events';
 import { errorDetail } from '../../utils/errorDetail';
-import { CHOICE_CARD_ROLE, handleChoiceCardKeyDown, seedChoiceCardFocus } from './choiceCardNav';
+import { CHOICE_CARD_ROLE, handAnsweredCardFocusToPrompt, handleChoiceCardKeyDown, seedChoiceCardFocus } from './choiceCardNav';
 import { followResolvedPermission } from './scrollState';
 
 interface PermissionEvent {
@@ -492,6 +492,7 @@ function usePermissionDecide(
 ) {
   const pending = useSignal<{ allowed: boolean; persist_scope?: AllowScope } | null>(null);
   const decide = async (allowed: boolean, persist?: AllowScope) => {
+    handAnsweredCardFocusToPrompt();
     pending.value = { allowed, persist_scope: persist };
     // Deciding a card is a SUBMIT: the agent is expected to respond to it, so it
     // gets the same one reaction every other submit gets, anchored on this card's

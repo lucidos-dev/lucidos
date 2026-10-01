@@ -1,7 +1,11 @@
 # 0178: A window is born on the display its frame names, and a placement moves before it resizes
 
-- **Status**: Accepted
+- **Status**: Accepted, amended by ADR 0334
 - **Date**: 2026-09-09
+
+> **Amended.** The birth half holds only on the primary display. AppKit moves a
+> window built off the primary as it initialises, so the client now seats it
+> after the build. See [ADR 0334](0334-macos-defaults-the-desktop-client-overrides.md).
 
 ## Context
 

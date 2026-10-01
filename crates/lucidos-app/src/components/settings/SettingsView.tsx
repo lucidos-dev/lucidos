@@ -1479,10 +1479,10 @@ export function SettingsView() {
                 Dynamic bars
                 <Explainer title="Dynamic bars">
                   <p>
-                    The header and the prompt slide away as you scroll down a
-                    thread, and come back as you scroll up.
+                    The header, the thread title and the prompt glide away as
+                    you scroll down a thread, and come back as you scroll up.
                   </p>
-                  <p>Off, both stay in place.</p>
+                  <p>Off, they stay in place.</p>
                 </Explainer>
               </span>
               <label class="toggle-switch">

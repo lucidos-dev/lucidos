@@ -35,7 +35,7 @@ When a service needs OAuth client credentials:
    (see the alias rule below) runs on a known provider's endpoints.
 3. The values are stored in the credential's JSON
    (`{client_id, client_secret?, auth_url, token_url, userinfo_url,
-   userinfo_method?, authorize_params?, scopes, redirect_uri?}`), which is the
+   userinfo_method?, authorize_params?, redirect_uri?}`), which is the
    **per-credential source of truth** for endpoints. Token refresh and
    re-authorization read them back from there, and the registry is not consulted
    again: a credential fully describes its own flow.
@@ -216,7 +216,8 @@ table says is exactly what Lucidos sends.
   contains `&` or `=`.
 - The flow owns `client_id`, `redirect_uri`, `response_type`, `scope`, `state`,
   `code_challenge` and `code_challenge_method`. Setting one of those here is
-  refused outright, so use the `redirect_uri` and `scopes` arguments for those.
+  refused outright. Set `redirect_uri` on the credential, and pass scopes to
+  `connect_oauth_account` when you connect.
   `state` is generated per authorization and required back on the callback (see
   "One authorization at a time" below), so a pinned value would break the
   callback rather than configure anything.

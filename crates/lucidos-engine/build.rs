@@ -33,14 +33,16 @@ fn main() {
     // (but NOT when VERSION changes — that would create a feedback loop).
     println!("cargo:rerun-if-changed=src");
     println!("cargo:rerun-if-changed=migrations");
+    println!("cargo:rerun-if-changed=static");
     println!("cargo:rerun-if-changed=Cargo.toml");
     // Rebuild when the umbrella Lucidos RELEASE bumps (LUCIDOS_RELEASE is
     // baked in via include_str! in lib.rs).
     println!("cargo:rerun-if-changed=../../RELEASE");
     // Cargo.lock + git state feed the ENGINE_BUILD_ID diff hash below.
     println!("cargo:rerun-if-changed=../../Cargo.lock");
-    println!("cargo:rerun-if-changed=../../.git/HEAD");
-    println!("cargo:rerun-if-changed=../../.git/index");
+    for path in head_trigger_paths(project_root) {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
 
     check_migration_versions(&manifest_dir.join("migrations"));
 
@@ -164,12 +166,57 @@ fn git_short_head(project_root: &Path) -> Option<String> {
     }
 }
 
+/// The git files that change exactly when HEAD moves: HEAD itself (checkout,
+/// detached moves), the branch ref it names (commits), and `packed-refs`.
+/// Hand-synced with crates/lucidos-gateway/build.rs.
+///
+/// Git resolves each path. In a worktree `.git` is a file, so a literal
+/// `.git/HEAD` never exists and cargo reran the script on every build.
+/// The index is deliberately not watched: `git status` rewrites it with no
+/// HEAD move, and `rerun-if-changed=src` already covers uncommitted edits.
+///
+/// A branch ref is emitted even when packed, with no loose file. Cargo then
+/// reruns until the next commit writes one, which beats missing that commit.
+///
+/// Git answers relative to `project_root` when the path is inside the
+/// checkout. It stays relative, here to the package, so a shared target dir
+/// resolves it per checkout. A linked worktree's paths are absolute (ADR 0079).
+fn head_trigger_paths(project_root: &Path) -> Vec<PathBuf> {
+    let git = |args: &[&str]| -> Option<String> {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(project_root)
+            .output()
+            .ok()?;
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (out.status.success() && !s.is_empty()).then_some(s)
+    };
+    let git_path =
+        |name: &str| git(&["rev-parse", "--git-path", name]).map(|p| Path::new("../..").join(p));
+
+    let mut paths: Vec<PathBuf> = git_path("HEAD").into_iter().collect();
+    if let Some(branch_ref) = git(&["symbolic-ref", "-q", "HEAD"]) {
+        paths.extend(git_path(&branch_ref));
+    }
+    paths.extend(git_path("packed-refs").filter(|p| p.exists()));
+    paths
+}
+
 /// Uncommitted changes (staged + unstaged) to engine-relevant paths. `None` when
 /// git fails — the caller then treats the tree as clean rather than inventing a
 /// dirty marker. A byte-identical rebuild therefore yields the same id.
 fn engine_diff(project_root: &Path) -> Option<String> {
+    // `--no-optional-locks`: a plain `git diff` rewrites a stale index, and a
+    // build must not take the index lock under a concurrent git command.
     let out = Command::new("git")
-        .args(["diff", "HEAD", "--", "crates/lucidos-engine", "Cargo.lock"])
+        .args([
+            "--no-optional-locks",
+            "diff",
+            "HEAD",
+            "--",
+            "crates/lucidos-engine",
+            "Cargo.lock",
+        ])
         .current_dir(project_root)
         .output()
         .ok()?;

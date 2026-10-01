@@ -341,3 +341,7 @@ Create an entry with `./scripts/adr-new.sh`, never by hand. See
 - [0331: The thread title is display-only; rename lives in the thread menu](0331-thread-title-display-only-rename-in-menu.md)
 - [0332: An em dash with a space on both sides is allowed; the unspaced form and U+2015 stay banned](0332-spaced-em-dashes-are-allowed.md)
 - [0333: On a phone the thread title is its own menu button; the title row drops its pin and ⋯, the drawer keeps its pin](0333-mobile-thread-title-is-its-menu-button.md)
+- [0334: Two macOS defaults the desktop client overrides: a new window's position, and the service's exit timeout](0334-macos-defaults-the-desktop-client-overrides.md)
+- [0335: A backdrop dialog contains Tab; an anchored popover closes on a Tab from outside it](0335-overlay-tab-two-shapes.md)
+- [0336: The mobile dynamic bars glide on a compositor transition instead of tracking each scroll event](0336-dynamic-bars-glide.md)
+- [0337: Only the reader's finger moves the mobile dynamic bars; a reply's automatic scrolling holds them](0337-dynamic-bars-follow-the-finger.md)

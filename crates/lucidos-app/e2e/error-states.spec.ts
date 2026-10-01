@@ -149,15 +149,16 @@ test.describe('Resume after restart — boundary panels', () => {
       }, threadId);
       await navigateToApp(page);
 
-      // The abort boundary opens its own exchange whose initiator label is
-      // the engine label ("Lucidos Engine", with the Lucidos mark glyph). The
-      // Continue button sits in the initiator footer.
+      // The abort boundary opens its own exchange, drawn as a card with no
+      // actor header: only agent output wears one. The card's own button is
+      // Continue.
       const exchanges = page.locator('.chat-exchange:visible');
       await expect(exchanges).toHaveCount(2, { timeout: 10_000 });
       const abortExchange = exchanges.nth(1);
-      await expect(abortExchange.locator('.initiator-label')).toContainText('Lucidos Engine');
-      await expect(abortExchange.getByText('Response interrupted')).toBeVisible();
-      await expect(abortExchange.getByRole('button', { name: 'Continue' })).toBeVisible();
+      await expect(abortExchange.locator('.initiator-actor')).toHaveCount(0);
+      const card = abortExchange.locator('.event-row[data-kind="boundary"]');
+      await expect(card.locator('.event-row-subject')).toHaveText('Response interrupted');
+      await expect(card.locator('.event-row-actions').getByRole('button', { name: 'Continue' })).toBeVisible();
     } finally {
       psql([
         `DELETE FROM events WHERE aggregate_id = '${threadId}'`,
@@ -202,11 +203,10 @@ test.describe('Resume after restart — boundary panels', () => {
       const exchanges = page.locator('.chat-exchange:visible');
       await expect(exchanges).toHaveCount(2, { timeout: 10_000 });
       const abortExchange = exchanges.nth(1);
-      // Device-driven abort (you hit Restart) renders like the ResponseCanceled
-      // boundary: iconless, the action AS the label ("Paused by restart"), no
-      // "You" chip; who/what is in the timestamp popover.
-      await expect(abortExchange.locator('.initiator-icon')).toHaveCount(0);
-      await expect(abortExchange.locator('.initiator-label')).toContainText('Paused by restart');
+      // Device-driven abort (you hit Restart) renders as a card with no actor
+      // header, its cause as the state word; who/what is in the time popover.
+      await expect(abortExchange.locator('.initiator-actor')).toHaveCount(0);
+      await expect(abortExchange.locator('.event-row[data-kind="boundary"] .event-row-state')).toHaveText('Paused by restart');
       // And NO Continue button, which is the point of the "paused" wording: the
       // engine promised to resume this turn itself (ADR 0045), so offering a
       // Continue would invite the user to run it a second time.
@@ -269,11 +269,12 @@ test.describe('Resume after restart — boundary panels', () => {
       // The summary text must NOT say "engine restart" — this is a
       // user-clicked Continue, the engine was never restarted.
       const resumeExchange = exchanges.nth(2);
-      // The resume turn (you clicked Continue) renders like the cancel boundary:
-      // iconless, the action AS the label. It must read "Continued the response",
-      // NOT "...engine restart", and carry no "You" chip.
-      await expect(resumeExchange.locator('.initiator-icon')).toHaveCount(0);
-      await expect(resumeExchange.locator('.initiator-label')).toContainText('Continued the response');
+      // The resume turn (you clicked Continue) draws no header: a Resumed card
+      // opens its reply. Its state must read "You continued", NOT an engine
+      // restart.
+      await expect(resumeExchange.locator('.initiator-panel')).toHaveCount(0);
+      const resumeState = resumeExchange.locator('.event-row[data-kind="resume"] .event-row-state');
+      await expect(resumeState).toHaveText('You continued');
     } finally {
       psql([
         `DELETE FROM events WHERE aggregate_id = '${threadId}'`,
@@ -303,8 +304,8 @@ test.describe('Resume after restart — boundary panels', () => {
       branch: '',
       actor: { kind: 'device', device_id: 'd-test' },
     });
-    // Engine note text must include 2 bullet-style tool lines so the subline
-    // reads "Reminded the model about 2 prior tool calls".
+    // Engine note text must include 2 bullet-style tool lines so the resume
+    // card's Details count "2 prior tool calls".
     const noteText =
       '[Engine note — this is a rerun]\n' +
       'Your previous attempt at this turn was interrupted by an engine restart.\n' +
@@ -336,7 +337,9 @@ test.describe('Resume after restart — boundary panels', () => {
       const exchanges = page.locator('.chat-exchange:visible');
       await expect(exchanges).toHaveCount(3, { timeout: 10_000 });
       const resumeExchange = exchanges.nth(2);
-      await expect(resumeExchange.getByText('Reminded the model about 2 prior tool calls')).toBeVisible();
+      const card = resumeExchange.locator('.event-row[data-kind="resume"]');
+      await card.locator('.event-row-fold-toggle').click();
+      await expect(card.getByText('The engine reminded the model about 2 prior tool calls:')).toBeVisible();
     } finally {
       psql([
         `DELETE FROM events WHERE aggregate_id = '${threadId}'`,
@@ -405,7 +408,7 @@ test.describe('Question-parked thread preserved across restart', () => {
       // No restart/abort boundary anywhere in the thread.
       await expect(page.getByRole('button', { name: 'Continue' })).toHaveCount(0);
       await expect(page.getByText('Response interrupted')).toHaveCount(0);
-      await expect(page.locator('.initiator-label', { hasText: 'Paused by restart' })).toHaveCount(0);
+      await expect(page.locator('.event-row-state', { hasText: 'Paused by restart' })).toHaveCount(0);
     } finally {
       psql([
         `DELETE FROM events WHERE aggregate_id = '${threadId}'`,

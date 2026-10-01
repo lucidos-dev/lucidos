@@ -1,3 +1,4 @@
+import { tooltipWithShortcut } from '../../store/actions/keybindings';
 import { useSignal } from '@preact/signals';
 import { useEffect, useRef } from 'preact/hooks';
 import { chatModels, showToast } from '../../store/store';
@@ -134,7 +135,7 @@ export function LucidosControlMenu({ threadId, composeContext }: { threadId?: st
         // coding-agent control — e.g. the `.commands-btn:not(.lucidos-commands-btn)`
         // e2e selector — rely on it, so keep it on this button.
         class="icon-btn header-icon commands-btn lucidos-commands-btn"
-        data-tooltip={`${LUCIDOS_AGENT_LABEL} model`}
+        data-tooltip={tooltipWithShortcut(`${LUCIDOS_AGENT_LABEL} model`, 'openAgentMenu')}
         aria-label={`${LUCIDOS_AGENT_LABEL} model`}
         onMouseDown={keepFocusOnPress}
         onClick={() => {

@@ -297,10 +297,9 @@ Per `system-knowhow/js-sdk.md`:
 - **Names from before the theme rename.** *Look* became *theme*, and the
   light/dark `theme` preference became `theme-mode` (ADR 0316). The `theme-rename`
   scan finds the old names. Judge each hit:
-  - **stale**: `data-theme` in a selector or an attribute read. An app frame
-    still carries it for now, and it goes when its temporary measure ends
-    (`docs/temporary-measures.md` § Legacy `data-theme` in app frames).
-    Recommend `data-theme-mode`.
+  - **broken**: `data-theme` in a selector or an attribute read. An app frame
+    no longer carries it, so those styles never match. Recommend
+    `data-theme-mode`.
   - **broken**: `data-look-effects`, `data-look-parts`, the `look` or
     `look-effects` preference, or a `/looks` or `/look?id=` route. None of
     them exists any more. Recommend `data-theme-effects`, `data-theme-parts`,

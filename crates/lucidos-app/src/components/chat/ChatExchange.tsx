@@ -17,6 +17,7 @@ import { ChildCompletionRow, ChildMovedOutRow, ChildStoppedRow } from './ChildCo
 import { drawsResponseRow, liveStepInBody, responseBody, type BodyRow } from '../../store/event-rendering';
 import { Disclosure } from '../shared/Disclosure';
 import { statusLabel as getStatusLabel, isActive as isStatusActive, isTerminated } from '../../store/exchange-status';
+import type { ExchangeStatus } from '../../store/exchange-status';
 import { formatMessageTimestamp } from '../../utils/formatTime';
 import { renderMarkdown } from '../../utils/renderMarkdown';
 import { linkifyPaths } from '../../utils/linkifyPaths';
@@ -24,7 +25,8 @@ import { handleMarkdownLinkClick } from '../shared/markdownLinkClick';
 import { FormRequestRow } from './FormRequestRow';
 import { NO_SIDE_QUESTIONS, SideQuestionGroup, placeInBody } from './SideQuestionCard';
 import type { SideQuestion } from '../../store/sideQuestions';
-import { ChangeEventRow, CheckpointCard, ContinueButton, EventDeliveryBody, EventWaitRow, FileList, HeldMessageRow, GeneratedImage, InitiatorPanel, InlineStep, LivePartialBody, LiveUtteranceBody, MarkdownBlock, ResponsePanel, ResumeNoteBody, SpokenChip, SpokenReply, TriggerFiredBody, UserMessageBody, changeAccent, describeExecutor, turnControls } from './chat-exchange-parts';
+import { ChangeEventRow, CheckpointCard, ContinueButton, EventDeliveryBody, EventWaitRow, FileList, HeldMessageRow, GeneratedImage, InitiatorPanel, InlineStep, LivePartialBody, LiveUtteranceBody, MarkdownBlock, ResponsePanel, ResumeCard, SpokenChip, SpokenReply, TriggerFiredBody, UserMessageBody, changeAccent, describeExecutor, boundaryCard, turnControls } from './chat-exchange-parts';
+import type { BoundaryTurn } from './chat-exchange-parts';
 import { EditIcon, TrashIcon, PowerIcon, PersonIcon, ApiPlugIcon, TriggerFiredIcon, WarningIcon, ContinuedIcon } from '../shared/icons';
 import { useOnScreenInTranscript } from '../../hooks/useOnScreenInTranscript';
 import { engineReasonHeadline } from '../../utils/engineEventExplainers';
@@ -161,17 +163,25 @@ export function liveRowDrawsNoPanel(userEvent: StoredEvent): boolean {
 /**
  * Does this turn draw the panel naming who started it?
  *
- * Everything does, except a continuation fragment. Its boundary is older than
- * the page this client holds, so nothing loaded can name it. Its `userEvent` is
- * only its own first step, standing in for a key. Drawing that as an initiator
- * would put a tool call where the reader expects a person.
+ * Everything does, except a resume (see `isResumeTurn`) and a continuation
+ * fragment. A fragment's boundary is older than the page this client holds, so
+ * nothing loaded can name it. Its `userEvent` is only its own first step,
+ * standing in for a key. Drawing that as an initiator would put a tool call
+ * where the reader expects a person.
  *
  * The rows themselves still draw. The head of the turn arrives with the page
  * behind it, and the fold then merges the fragment into the real turn. See
  * `Exchange.continuationFragment`.
  */
 export function drawsInitiatorPanel(exchange: Exchange): boolean {
-  return exchange.continuationFragment !== true;
+  return exchange.continuationFragment !== true && !isResumeTurn(exchange);
+}
+
+/** A resume opens no header of its own. It is a card at the top of the reply it
+ *  resumed (`ResumeCard`), so the response panel draws even when that reply is
+ *  still empty. */
+function isResumeTurn(exchange: Exchange): boolean {
+  return exchange.userEvent.type === 'ContinuationStarted';
 }
 
 /** Which boundaries the reader owns, and so draw the right-aligned bubble.
@@ -252,7 +262,9 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
   // turn is blank, lighting up with its first drawn row. Turning steps OFF can
   // therefore unfold a step-only turn, which is right: it is showing nothing
   // either way.
-  const canCollapse = hasResponse || events.some((e) => drawsResponseRow(e, showSteps));
+  // A resume always draws its card (`ResumeCard`), so it always has a body.
+  const isResume = isResumeTurn(exchange);
+  const canCollapse = hasResponse || events.some((e) => drawsResponseRow(e, showSteps)) || isResume;
   const isCollapsed = canCollapse && collapsedExchanges.value.has(`${threadId}:${exchange.userSeq}`);
   // Narrower than `isCollapsed`, as `ResponsePanel` is: a headerless turn keeps
   // its body.
@@ -414,9 +426,19 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
 
   const responseTerminated = isTerminated(status) || exchange.questionOvertaken === true;
 
+  // Where this turn stands, for a card that asked for work, and the Continue an
+  // interrupted response's card offers.
+  const boundaryTurn = boundaryTurnOf(status);
   const initiator = useMemo(
-    () => describeInitiator(exchange, userMessageHtml, userImageHashes, threadId, responseTerminated, threadIsCC, threadCodingAgent, { description: proposedChangeDesc, fileCount: proposedChangeFileCount, summary: proposedChangeSummary }, { eventType: matchedEventType, eventId: matchedEventId, payloadJson: matchedPayloadJson }),
-    [exchange, userMessageHtml, userImageHashes, threadId, responseTerminated, threadIsCC, threadCodingAgent, proposedChangeDesc, proposedChangeFileCount, proposedChangeSummary, matchedEventType, matchedEventId, matchedPayloadJson],
+    () => withoutActorHeader(
+      describeInitiator(exchange, userMessageHtml, userImageHashes, threadId, responseTerminated, threadIsCC, threadCodingAgent, { description: proposedChangeDesc, fileCount: proposedChangeFileCount, summary: proposedChangeSummary }, { eventType: matchedEventType, eventId: matchedEventId, payloadJson: matchedPayloadJson }),
+      exchange.userEvent,
+      {
+        turn: boundaryTurn,
+        actions: exchange.userEvent.type === 'ResponseAborted' && isContinuableAbort ? <ContinueButton threadId={threadId} /> : undefined,
+      },
+    ),
+    [exchange, userMessageHtml, userImageHashes, threadId, responseTerminated, threadIsCC, threadCodingAgent, proposedChangeDesc, proposedChangeFileCount, proposedChangeSummary, matchedEventType, matchedEventId, matchedPayloadJson, boundaryTurn, isContinuableAbort],
   );
   const isChangePanel = isChangeLifecycleEvent(exchange.userEvent);
   // Card-less treatment. A human chat message renders as a right-aligned
@@ -430,7 +452,7 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
   // it gets a header naming who spoke. The talker's greeting is the card this
   // changes, the caller's own bubbles being chromeless already.
   const isSpeechOnly = isSpeechOnlyTurn(exchange);
-  const isChromeless = isUserMessageBubble || isChangePanel || isSpeechOnly;
+  const isChromeless = isUserMessageBubble || isChangePanel || isSpeechOnly || initiator.chromeless === true;
   // Every chipless turn is exempt from the fold, on report. A change turn's body
   // is a summary, a description and a file list; a user message is the reader's
   // own text. The control cost a row of chrome to fold a few short lines.
@@ -536,14 +558,10 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
   // only thing a status badge sits on. So with no reply yet, the panel would be
   // an empty box under the caller's bubble.
   const speechOnlyHasWords = !isSpeechOnly || canCollapse;
-  const showResponsePanel = (!isChangePanel || isChangeContinuation) && (!isAbortPanel || isTerminatedContinuation) && (!isCancelPanel || isTerminatedContinuation) && !isTurnlessPanel && !isUnansweredDivider && !isEmptyContinued && !isQueuedUserMessage && !isLiveRow && speechOnlyHasWords && (hasResponse || hasEvents || showStatus);
+  const showResponsePanel = isResume || (!isChangePanel || isChangeContinuation) && (!isAbortPanel || isTerminatedContinuation) && (!isCancelPanel || isTerminatedContinuation) && !isTurnlessPanel && !isUnansweredDivider && !isEmptyContinued && !isQueuedUserMessage && !isLiveRow && speechOnlyHasWords && (hasResponse || hasEvents || showStatus);
   // The panel draws its body only when it has one and is unfolded, which is
   // exactly when `bodyPieces` carries the cards.
   const bodyTakesCards = showResponsePanel && canCollapse && !bodyFolded;
-  // A change turn's Diff and Revert live inside its card (`ChangeEventRow`).
-  const initiatorActions = isAbortPanel && isContinuableAbort
-    ? <ContinueButton threadId={threadId} />
-    : undefined;
   const executor = describeExecutor(threadIsCC, threadCodingAgent);
 
   // Keyed by the row's index in the whole turn (`responseBody`). So no toggle,
@@ -642,7 +660,6 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
         onActorClick={initiator.actorClickable === false
           ? undefined
           : (e) => openInfoPanel('origin', e)}
-        actions={initiatorActions}
         // The same router the response body gets. This panel renders markdown
         // too, so its links owe the reader the same routing and the same
         // terminal guard.
@@ -688,6 +705,9 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
           {/* One keyed list for both shapes, so a card under streamed text
               stays mounted when the first row replaces that text. */}
           {[
+            // In `.response-content`, as every card in a body is, so it takes
+            // the same left inset as the cards and text around it.
+            ...(isResume ? [<div class="response-content" key="resume"><ResumeCard exchange={exchange} /></div>] : []),
             ...(hasEvents ? [] : [
               <div class="response-content markdown-content" key="streamed" onClick={handleLinkClick}>
                 <div dangerouslySetInnerHTML={{ __html: responseHtmlLinkified }} />
@@ -928,6 +948,9 @@ export interface InitiatorDescriptor {
    *  ChildThreadCompleted card, where the title-link replaces the popover's
    *  origin row. Defaults to true. */
   actorClickable?: boolean;
+  /** Drop the actor chip, as a user bubble and a change card do. Set by
+   *  `withoutActorHeader` on every turn the agent did not write. */
+  chromeless?: boolean;
 }
 
 /** Action label shared by the panel header and the route popover's Origin row. */
@@ -1029,6 +1052,34 @@ function youInitiator(rest: Partial<InitiatorDescriptor> = {}): InitiatorDescrip
  *  (hardening / merge-conflict detection, legacy bare CC prompt). */
 function engineInitiator(summary: string, details?: ComponentChildren): InitiatorDescriptor {
   return { variant: 'system', icon: <LucidosGlyph />, label: ENGINE_LABEL, summary, details };
+}
+
+/** Only agent output wears a header. A turn the agent did not write (the
+ *  engine's, the system's, or your own control press) draws chromeless, like a
+ *  change card: its time, which opens the route popover, above a card. A
+ *  starter that said only a line of text gets that line as its card.
+ *
+ *  Applied where a turn is drawn rather than inside `describeInitiator`, so the
+ *  descriptor keeps naming the actor and the summary for everything else. */
+function withoutActorHeader(
+  d: InitiatorDescriptor,
+  starter: StoredEvent,
+  card: { turn: BoundaryTurn; actions?: ComponentChildren },
+): InitiatorDescriptor {
+  const narrated = d.label === ENGINE_LABEL || d.label === SYSTEM_LABEL || d.icon === null;
+  if (!narrated) return d;
+  // An action descriptor carries its words as the label (`actionInitiator`).
+  const summary = d.summary ?? (d.icon === null ? d.label : undefined);
+  if (!summary) return { ...d, chromeless: true };
+  return { ...d, chromeless: true, summary: undefined, details: boundaryCard(starter, summary, { carried: d.details, ...card }) };
+}
+
+/** Where a turn stands, as a boundary card reports it. */
+function boundaryTurnOf(status: ExchangeStatus): BoundaryTurn {
+  if (isStatusActive(status) || status === 'awaiting-answer') return 'working';
+  if (status === 'done') return 'done';
+  if (status === 'queued' || status === 'held') return 'waiting';
+  return 'stopped';
 }
 
 /** Build a descriptor in the "Response canceled" style: no icon, the action
@@ -1155,19 +1206,11 @@ export function describeInitiator(
         details: <TriggerFiredBody event={ev} />,
       };
     case 'ContinuationStarted':
-      // ContinuationStarted carries an actor (device when triggered by Continue,
-      // engine if auto-resume returns). A device-driven continue is a user
-      // action → render it in the iconless ResponseCanceled style (action AS the
-      // label); engine auto-resume keeps the Lucidos-mark chip.
-      if (ev.actor?.kind === 'device') {
-        return actionInitiator(summary, <ResumeNoteBody exchange={exchange} />);
-      }
-      return {
-        variant: actorVariant(ev.actor),
-        ...actorInitiator(ev.actor),
-        summary,
-        details: <ResumeNoteBody exchange={exchange} />,
-      };
+      // Draws no panel (`drawsInitiatorPanel`): `ResumeCard` shows the resume.
+      // The descriptor still names who resumed, for the route popover. A
+      // device-driven continue carries the action as its label, like a cancel.
+      if (ev.actor?.kind === 'device') return actionInitiator(summary);
+      return { variant: actorVariant(ev.actor), ...actorInitiator(ev.actor), summary };
     case 'ResponseAborted':
       // Exchange boundary — let the actor drive the chip (engine for crashes,
       // device for restarts and user-triggered stale-settle cleanups). A

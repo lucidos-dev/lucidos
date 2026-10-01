@@ -773,7 +773,7 @@ impl LucidosEngine {
         // Auto-commit safe files (docs) if they're the only dirty files, then
         // reject if the workspace tree still has genuine uncommitted changes.
         //
-        // MERGE_MUTEX is held alongside workspace_repo_lock here: a concurrent
+        // MERGE_MUTEX is held alongside WORKSPACE_REPO_MUTEX here: a concurrent
         // apply's merge advances `refs/heads/main` via `ff_main_to`'s
         // `update-ref` and only afterwards resets the working tree via
         // `checkout -f main`. Between those two git calls the tree transiently
@@ -783,9 +783,8 @@ impl LucidosEngine {
         // error (regression caught by app_coding_agent_concurrent_apply). Taking
         // MERGE_MUTEX guarantees the gate only ever sees a settled tree — the
         // other apply's merge has either not started or finished its checkout.
-        // Lock order is always MERGE_MUTEX → workspace_repo_lock; no other site
-        // acquires both (merges take only MERGE_MUTEX, data writes take only
-        // workspace_repo_lock), so this can't deadlock.
+        // Lock order is always MERGE_MUTEX → WORKSPACE_REPO_MUTEX, here and in
+        // `ff_main_to`; data writes take only the second, so this can't deadlock.
         //
         // Both guards drop at the end of this block so neither is held across a
         // tier's Claude Code subprocess await — those merges happen in separate
@@ -861,6 +860,7 @@ impl LucidosEngine {
                                 &post_sha,
                                 &session.worktree_path,
                                 &repo_root,
+                                &change.branch_name,
                                 actor.clone(),
                             )
                             .await;

@@ -1,5 +1,6 @@
 import { isElementVisible } from './scrollState';
 import { touchActivated } from '../../utils/tapGesture';
+import type { RevealBarsDetail } from '../../hooks/useHideOnScroll';
 
 /** The currently focused prompt textarea, or null if focus is elsewhere.
  *  Reads document.activeElement directly rather than locating the visible
@@ -38,6 +39,19 @@ export function getVisiblePromptInput(): HTMLElement | null {
   return els.length > 0 ? els[els.length - 1] : null;
 }
 
+/** Open the composer's agent menu: the Lucidos model picker, or the coding
+ *  agent's control menu. It presses the row's own anchor, which never folds,
+ *  so the menu opens exactly as a click would open it. */
+export function openAgentMenu(): void {
+  const buttons = document.querySelectorAll<HTMLElement>('.prompt-actions-row .commands-btn');
+  for (const button of buttons) {
+    if (isElementVisible(button)) {
+      button.click();
+      return;
+    }
+  }
+}
+
 /**
  * Focus the prompt textarea. Must be called synchronously within a user
  * gesture (touch/click) — iOS Safari only opens the keyboard when focus()
@@ -49,14 +63,14 @@ export function getVisiblePromptInput(): HTMLElement | null {
  * elements, which permanently offsets the swipe track (the "half panel" bug).
  * preventScroll still opens the keyboard within the gesture window.
  *
- * With dynamic bars on, the prompt may sit slid away under a transform. The
- * reveal clears that transform synchronously, before the focus, since a
- * transformed prompt can keep iOS Safari from opening the keyboard.
+ * With dynamic bars on, the prompt may sit glided away under a `translate`.
+ * The instant reveal lands it before the focus, skipping the glide, since a
+ * translated prompt can keep iOS Safari from opening the keyboard.
  */
 export function focusPromptNow(): void {
   const el = getVisiblePromptInput();
   if (!el) return;
-  document.dispatchEvent(new Event('reveal-mobile-bars'));
+  document.dispatchEvent(new CustomEvent<RevealBarsDetail>('reveal-mobile-bars', { detail: { instant: true } }));
   el.focus({ preventScroll: true });
 }
 

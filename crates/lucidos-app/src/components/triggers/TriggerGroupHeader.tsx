@@ -8,39 +8,30 @@ import { deleteTriggerGroup, renameTriggerGroup } from '../../store/actions/trig
 import { useInlineRename } from '../../hooks/useInlineRename';
 import { EditIcon, TrashIcon } from '../shared/icons';
 import { PROSE_TEXT_ATTRS } from '../../utils/noAutofill';
+import { SectionHeader } from '../shared/SectionHeader';
 
 interface Props {
   group: TriggerGroup;
-}
-
-function Chevron({ collapsed }: { collapsed: boolean }) {
-  return <span class="trigger-group-chevron">{collapsed ? '▸' : '▾'}</span>;
 }
 
 /** Heading for the synthetic Ungrouped section: the same collapse toggle as a
  *  group's, with no rename or delete, since there is no group to act on. */
 export function UngroupedHeader({ count, collapsed }: { count: number; collapsed: boolean }) {
   return (
-    <div class={`trigger-group-header trigger-group-header-ungrouped${collapsed ? ' trigger-group-collapsed' : ''}`}>
-      <button
-        class="trigger-group-toggle"
-        type="button"
-        onClick={() => toggleTriggerSectionCollapsed(UNGROUPED_TRIGGER_SECTION_ID)}
-        aria-expanded={!collapsed}
-        data-tooltip={collapsed ? 'Expand' : 'Collapse'}
-      >
-        <Chevron collapsed={collapsed} />
-        <span class="trigger-group-name">Ungrouped</span>
-        <span class="trigger-group-count">({count})</span>
-      </button>
-    </div>
+    <SectionHeader
+      className="trigger-group-header trigger-group-header-ungrouped"
+      title="Ungrouped"
+      count={count}
+      collapsed={collapsed}
+      onToggle={() => toggleTriggerSectionCollapsed(UNGROUPED_TRIGGER_SECTION_ID)}
+    />
   );
 }
 
 /** Section header for one trigger group in the panel.
  *
- *  - Chevron toggles the per-device collapsed state (localStorage-backed).
- *  - Member-count badge shows how many triggers are assigned.
+ *  - The heading toggles the per-device collapsed state (localStorage-backed).
+ *  - The count shows how many triggers are assigned.
  *  - Inline rename: the rename button reveals an edit field over the name.
  *  - Delete: always live. A non-empty group is refused by the server, and the
  *    action handler surfaces that refusal as a toast.
@@ -58,17 +49,12 @@ export function TriggerGroupHeader({ group }: Props) {
   } = useInlineRename(group.name, (next) => renameTriggerGroup(group.id, next));
 
   return (
-    <div
-      class={`trigger-group-header${collapsed ? ' trigger-group-collapsed' : ''}${editing ? ' trigger-group-renaming' : ''}`}
-    >
-      <button
-        class="trigger-group-toggle"
-        type="button"
-        onClick={() => toggleTriggerSectionCollapsed(group.id)}
-        aria-expanded={!collapsed}
-        data-tooltip={collapsed ? 'Expand' : 'Collapse'}
-      >
-        <Chevron collapsed={collapsed} />
+    <SectionHeader
+      className={`trigger-group-header${editing ? ' trigger-group-renaming' : ''}`}
+      collapsed={collapsed}
+      onToggle={() => toggleTriggerSectionCollapsed(group.id)}
+      count={group.member_count}
+      title={<>
         {/* The field is MOUNTED whether or not we are editing, transparent and
             pointer-inert over the name until then. iOS opens the keyboard only
             for a focus() that happens inside the user's gesture, and a field
@@ -106,9 +92,8 @@ export function TriggerGroupHeader({ group }: Props) {
             }}
           />
         </span>
-        <span class="trigger-group-count">({group.member_count})</span>
-      </button>
-      <div class="trigger-group-actions">
+      </>}
+      actions={<>
         <button
           class="icon-btn row-icon trigger-group-rename"
           type="button"
@@ -134,7 +119,7 @@ export function TriggerGroupHeader({ group }: Props) {
         >
           <TrashIcon />
         </button>
-      </div>
-    </div>
+      </>}
+    />
   );
 }

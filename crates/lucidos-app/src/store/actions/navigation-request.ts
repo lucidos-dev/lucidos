@@ -8,7 +8,7 @@ import { focusThread, focusThreadOrBootstrap, unfocusThread } from './threads';
 import { getDeviceId } from './devices';
 import { formatThreadLabel } from './thread-label';
 import { pushNavState } from './navigation';
-import { revealContentPane } from './pane';
+import { holdFocusedPaneWhileTyping, releaseTypingHold, revealContentPane } from './pane';
 import { ensureFocusedComposeThread, updateCompose } from './compose';
 import { openEncodedRepoFilePreview } from './repositories';
 import { focusPromptNow } from '../../components/chat/promptFocus';
@@ -134,7 +134,7 @@ export function handleNavigationRequest(nav: {
   id?: string;
   event_id?: string;
   prompt?: string;
-}, opts?: { source?: string }): void {
+}, opts?: { source?: string }): Promise<unknown> | void {
   const navAppId = nav.app_id;
   switch (nav.target) {
     case 'files':
@@ -217,8 +217,7 @@ export function handleNavigationRequest(nav: {
       // live app as "App no longer exists" — swallowing the real cause.
       // openAppById re-scans disk on a cache miss before erroring, and its
       // miss toast names the app id + where the navigate came from.
-      void openAppById(navAppId, opts?.source, nav.fragment);
-      break;
+      return openAppById(navAppId, opts?.source, nav.fragment);
     case 'file': {
       // file_path existence is server-checked at preview time; the API surface
       // emits its own toast on miss. Up-front check is just for presence.
@@ -266,8 +265,7 @@ export function handleNavigationRequest(nav: {
       // re-fetches the source of truth on a cache miss before erroring, and
       // its miss toast names the trigger id + where the navigate came from.
       // (Mirrors the `app` branch above.)
-      void navigateToTrigger(nav.id, opts?.source);
-      break;
+      return navigateToTrigger(nav.id, opts?.source);
     case 'thread':
       // focusThreadOrBootstrap (not focusThread): the thread may live outside
       // the loaded window (old archived row, cross-workspace deep link). It
@@ -415,7 +413,12 @@ export function routeThreadNavigation(
     // Named in any "couldn't open" toast downstream, so the error says where
     // it came from instead of swallowing it.
     const source = fromApp ? 'an app' : formatThreadLabel(sourceThreadId);
-    handleNavigationRequest(nav, { source });
+    // The hold lives only as long as this navigation. One that lands no
+    // content must not leave it for the reader's own next reveal.
+    holdFocusedPaneWhileTyping();
+    const pending = handleNavigationRequest(nav, { source });
+    if (pending) void pending.then(releaseTypingHold, releaseTypingHold);
+    else releaseTypingHold();
     return;
   }
   const label = formatThreadLabel(sourceThreadId);

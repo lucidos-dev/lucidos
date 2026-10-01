@@ -794,36 +794,6 @@ pub fn commit_data_paths_removed(
     })
 }
 
-/// Open the workspace repo and commit files already moved on disk, each
-/// `(from, to)` pair `data/`-relative, as one commit. An old path that was
-/// never tracked is skipped, and its new path is still added. Leaves no
-/// uncommitted change behind, which an Apply would otherwise refuse.
-pub fn commit_data_paths_moved(
-    workspace_path: &std::path::Path,
-    moves: &[(String, String)],
-    message: &str,
-) -> Result<String, git2::Error> {
-    for (from, to) in moves {
-        if is_path_traversal(from) || is_path_traversal(to) {
-            return Err(git2::Error::from_str(&format!(
-                "Path traversal not allowed: {from} -> {to}"
-            )));
-        }
-    }
-    let repo = git2::Repository::open(workspace_path)?;
-    retry_while_repo_contended(|| {
-        let mut index = repo.index()?;
-        reset_index_to_head(&repo, &mut index)?;
-        for (from, to) in moves {
-            // `remove_path` errors on an untracked entry, which is fine here.
-            let _ = index.remove_path(std::path::Path::new(&format!("data/{from}")));
-            add_path_unless_ignored(&repo, &mut index, &format!("data/{to}"))?;
-        }
-        index.write()?;
-        commit_index_unless_unchanged(&repo, message)
-    })
-}
-
 /// Create a commit from the current index state.
 ///
 /// The parent is re-read from HEAD on every call, and the HEAD update libgit2
@@ -849,14 +819,13 @@ pub fn commit_index(repo: &git2::Repository, message: &str) -> Result<String, gi
 /// [`commit_index`], except that an index already identical to HEAD's tree
 /// reports HEAD's own sha instead of recording an empty commit.
 ///
-/// This is what makes the DELETE helpers and `commit_data_paths_moved` safe to
-/// retry. Each changes the working tree BEFORE the retry closure and stages the
-/// change inside it. A competing writer can therefore commit the
-/// same deletion in between. The retried attempt then resets onto that head,
-/// finds the path already untracked, and has nothing left to stage. Reporting an
-/// error there would deny a deletion that demonstrably happened, so this
-/// reports the head recording it instead. A path that was never tracked takes
-/// the same route.
+/// This is what makes the DELETE helpers safe to retry. Each changes the
+/// working tree BEFORE the retry closure and stages the change inside it. A
+/// competing writer can therefore commit the same deletion in between. The
+/// retried attempt then resets onto that head, finds the path already
+/// untracked, and has nothing left to stage. Reporting an error there would
+/// deny a deletion that demonstrably happened, so this reports the head
+/// recording it instead. A path that was never tracked takes the same route.
 ///
 /// Callers therefore stage the removal TOLERANTLY and let this decide, rather
 /// than propagating the staging error. `git2`'s `remove_path` errors on an

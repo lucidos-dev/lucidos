@@ -10,8 +10,8 @@ function exchangeWith(userEvent: Exchange['userEvent']): Exchange {
 interface AnyVNode extends VNode<{ children?: ComponentChildren; class?: string; [k: string]: unknown }> {}
 
 // Every initiator panel follows the same shape: `label` is WHO performed the
-// action, `summary` is WHAT was done. The popover surfaces extra origin info,
-// but the panel itself reads as "[icon] Lucidos Engine — Hardening required".
+// action, `summary` is WHAT was done. The route popover shows both, and a
+// turn the agent did not write draws them as a card rather than a header.
 describe('describeInitiator — label is WHO, summary is WHAT', () => {
   it('human-mode MessageReceived: label "You", no summary, user variant', () => {
     const ex = exchangeWith({

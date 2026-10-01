@@ -549,3 +549,61 @@ export function exitAppFullscreen(): boolean {
   }
   return false;
 }
+
+/** Fullscreen the open app, or leave fullscreen. The header's button and the
+ *  shortcut both run this. */
+export function toggleAppFullscreen(): void {
+  // Already fullscreen (native, or the CSS fallback): come back to the normal
+  // layout. Shared with the navigation that has to reveal something other
+  // than the app, so there is one definition of how to leave.
+  if (exitAppFullscreen()) return;
+
+  // Try native fullscreen on the app PANEL (not the iframe), fall back to CSS
+  // pseudo-fullscreen. The panel is the target because a natively fullscreen
+  // element is painted alone, and an iframe renders no DOM children: with the
+  // iframe fullscreen the host had nowhere to put its own modals and toasts,
+  // so an app's previewFile / confirm / prompt showed nothing. The panel can
+  // hold them, and OverlayLayer portals them in.
+  const frame = getVisibleAppFrame();
+  if (!frame) return;
+
+  // With no panel to go fullscreen INSIDE, the host has nowhere to paint its
+  // overlays. So take the CSS fallback rather than leave the button dead.
+  // Pseudo-fullscreen is a stacking question, and --z-app-fullscreen already
+  // puts the host's modals and toasts above it.
+  const panel = getVisibleAppPanel();
+  if (!panel) {
+    appPseudoFullscreen.value = true;
+    return;
+  }
+
+  const anyPanel = panel as unknown as Record<string, unknown>;
+  const request = (typeof anyPanel.requestFullscreen === 'function' && anyPanel.requestFullscreen.bind(panel))
+    || (typeof anyPanel.webkitRequestFullscreen === 'function' && anyPanel.webkitRequestFullscreen.bind(panel));
+
+  if (request) {
+    // `Promise.resolve` + try/catch, not a bare `.then`. The UNPREFIXED
+    // request returns a promise, but `webkitRequestFullscreen` returns void.
+    // On a prefixed-only engine, `.then` on that throws a TypeError at once,
+    // which takes the CSS fallback down with it and leaves the button dead.
+    // A prefixed engine reports a refusal through `webkitfullscreenerror`
+    // instead, and nothing here listens for it.
+    //
+    // Focus the frame, not the panel: fullscreen moves focus to the element
+    // that requested it, and the app is what the user is about to type into.
+    try {
+      Promise.resolve(request() as Promise<void> | undefined)
+        .then(() => frame.focus())
+        .catch(() => {
+          // Native request rejected (common on iOS), so use the CSS fallback.
+          appPseudoFullscreen.value = true;
+        });
+    } catch {
+      // Threw synchronously (a disallowed request): same fallback.
+      appPseudoFullscreen.value = true;
+    }
+  } else {
+    // Fullscreen API completely unavailable — CSS fallback
+    appPseudoFullscreen.value = true;
+  }
+}

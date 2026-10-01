@@ -489,14 +489,16 @@ impl GatewayService {
         let _ = self.gateway.wait();
         // A restart and a crash respawn run this same teardown, so record what
         // is being stopped for the next boot. See `record_workspaces_to_restore`.
+        // Recorded BEFORE the wait below: launchd may still kill this process
+        // during it, and a lost record leaves those workspaces stopped.
         let stopped = stop_workspace_engines(app_data);
+        let ids: Vec<String> = stopped.iter().map(|e| e.id.clone()).collect();
+        record_workspaces_to_restore(app_data, &ids);
         // The next service start must find these engines gone. One still
         // draining answers health, and the new gateway would route the window
         // to it seconds before it exits.
         #[cfg(unix)]
         finish_stopping_engines(&stopped, engine_exit_wait(started.elapsed()));
-        let ids: Vec<String> = stopped.into_iter().map(|e| e.id).collect();
-        record_workspaces_to_restore(app_data, &ids);
         // Last, after the engines that connect to it. A permanent shutdown must
         // never leave an orphaned `postgres` holding the port and its
         // postmaster.pid for the next app version to trip over.
@@ -509,8 +511,10 @@ impl GatewayService {
 const GATEWAY_STOP_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// How long launchd lets the service run after SIGTERM before it SIGKILLs it.
-/// The service plist sets no `ExitTimeOut`, so this is launchd's default.
-#[cfg(unix)]
+///
+/// Declared as the plist's `ExitTimeOut`, never left to launchd. Without it a
+/// `kickstart -k` or a `bootout` in the user's GUI domain kills the service
+/// about 5 s in, mid engine wait (ADR 0334).
 const LAUNCHD_EXIT_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// The part of [`LAUNCHD_EXIT_TIMEOUT`] the engine wait leaves for the rest:
@@ -570,27 +574,42 @@ fn finish_stopping_engines(engines: &[SignalledEngine], timeout: Duration) {
 
 /// Does `pid` run the bundled engine binary? `false` whenever that cannot be
 /// read, so an unknown process is never killed as an engine.
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn pid_runs_engine(pid: i32) -> bool {
+    pid_executable(pid).is_some_and(|exe| executable_is_engine(&exe))
+}
+
+/// Does `pid` provably run some program OTHER than the engine? `false` when the
+/// path cannot be read, which is not evidence of a reused pid.
+#[cfg(unix)]
+fn pid_runs_another_program(pid: i32) -> bool {
+    pid_executable(pid).is_some_and(|exe| !executable_is_engine(&exe))
+}
+
+/// The executable `pid` runs, or `None` when that cannot be read.
+#[cfg(target_os = "macos")]
+fn pid_executable(pid: i32) -> Option<PathBuf> {
     use std::os::unix::ffi::OsStrExt;
     let mut buf = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
     // SAFETY: the buffer is writable and its length is passed alongside it.
     let len = unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
-    len > 0 && executable_is_engine(Path::new(std::ffi::OsStr::from_bytes(&buf[..len as usize])))
+    (len > 0).then(|| PathBuf::from(std::ffi::OsStr::from_bytes(&buf[..len as usize])))
 }
 
 /// Linux twin of the macOS probe, through `/proc`.
 #[cfg(all(unix, not(target_os = "macos")))]
-fn pid_runs_engine(pid: i32) -> bool {
-    std::fs::read_link(format!("/proc/{pid}/exe"))
-        .map(|exe| executable_is_engine(&exe))
-        .unwrap_or(false)
+fn pid_executable(pid: i32) -> Option<PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/exe")).ok()
 }
 
-/// Is `exe` an engine binary, judged by its file name?
+/// Is `exe` an engine binary, judged by its file name? Linux's `/proc` appends
+/// ` (deleted)` once an update replaces the binary, and that is still the engine.
 #[cfg(unix)]
 fn executable_is_engine(exe: &Path) -> bool {
-    exe.file_name() == Some(std::ffi::OsStr::new(ENGINE_RESOURCE_NAME))
+    let Some(name) = exe.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    name.strip_suffix(" (deleted)").unwrap_or(name) == ENGINE_RESOURCE_NAME
 }
 
 /// Stop the embedded Postgres cluster cleanly on a permanent service shutdown.
@@ -642,6 +661,12 @@ struct SignalledEngine {
 /// A stale pidfile would otherwise make a restart "restore" a workspace nobody
 /// was running.
 ///
+/// **A pid that provably runs another program is never signalled.** A stopped
+/// workspace keeps its pidfile, and the OS reuses pids. SIGUSR1 terminates a
+/// process that does not handle it, so a bare signal could kill an unrelated
+/// app. An unreadable path still gets the signal: an engine whose binary an
+/// update just replaced may read that way, and it must still stop.
+///
 /// Signalling is not stopping. A signalled engine writes under its workspace
 /// dir until it exits, so a caller about to DELETE that tree waits the returned
 /// pids out first: see `wait_for_engines_to_exit`.
@@ -654,23 +679,20 @@ fn stop_workspace_engines(app_data: &Path) -> Vec<SignalledEngine> {
     for entry in entries.flatten() {
         let pidfile = entry.path().join(".lucidos/engine.pid");
         if let Some(pid) = read_engine_pid(&entry.path()) {
+            // SAFETY: signal 0 checks for the process's existence without
+            // delivering anything. `read_engine_pid` has already refused the
+            // pids that would broadcast.
             #[cfg(unix)]
-            {
-                // SAFETY: signal 0 checks for the process's existence without
-                // delivering anything; SIGUSR1 then asks a live engine to stop.
-                // A dead pid returns ESRCH from both. `read_engine_pid` has
-                // already refused the pids that would broadcast.
-                let alive = unsafe { libc::kill(pid, 0) } == 0;
+            if unsafe { libc::kill(pid, 0) } == 0 && !pid_runs_another_program(pid) {
+                // SAFETY: a positive, live pid not known to run anything else.
                 unsafe {
                     libc::kill(pid, libc::SIGUSR1);
                 }
-                if alive {
-                    if let Some(id) = entry.file_name().to_str() {
-                        stopped.push(SignalledEngine {
-                            id: id.to_string(),
-                            pid,
-                        });
-                    }
+                if let Some(id) = entry.file_name().to_str() {
+                    stopped.push(SignalledEngine {
+                        id: id.to_string(),
+                        pid,
+                    });
                 }
             }
             let _ = std::fs::remove_file(&pidfile);
@@ -906,7 +928,7 @@ fn announce_to_engines(
 /// Does this workspace's pidfile name a process that still exists?
 ///
 /// Through [`process_is_gone`], so an unanswerable probe reads as LIVE. That is
-/// the opposite default from the `alive` test in [`stop_workspace_engines`], and
+/// the opposite default from the engine test in [`stop_workspace_engines`], and
 /// deliberately: the two ask different questions. That one decides what it just
 /// stopped, where a false yes invents a workspace to restore. This one decides
 /// who to tell, where a false no costs a workspace its auto-resume and the POST
@@ -2069,6 +2091,8 @@ fn desired_service_plist(exe: &Path, app_data: &Path) -> String {
     <true/>
     <key>ThrottleInterval</key>
     <integer>10</integer>
+    <key>ExitTimeOut</key>
+    <integer>{exit_timeout}</integer>
     <key>ProcessType</key>
     <string>Interactive</string>
     <key>StandardOutPath</key>
@@ -2079,6 +2103,7 @@ fn desired_service_plist(exe: &Path, app_data: &Path) -> String {
 </plist>
 "#,
         label = SERVICE_AGENT_LABEL,
+        exit_timeout = LAUNCHD_EXIT_TIMEOUT.as_secs(),
         exe = xml_escape(exe),
         out = xml_escape(&out),
         err = xml_escape(&err),
@@ -5092,11 +5117,7 @@ mod tests {
     #[test]
     fn only_the_engines_that_were_alive_are_recorded() {
         let tmp = TempAppData::new("alive");
-        // A stand-in engine: our own child, which SIGUSR1 terminates by default.
-        let mut child = Command::new("/bin/sleep")
-            .arg("30")
-            .spawn()
-            .expect("spawn a stand-in engine");
+        let mut child = spawn_stand_in_engine(tmp.path());
         tmp.write_pidfile("live-ws", child.id());
         // A pid that cannot exist, since macOS caps pids well below this. It
         // stands in for a pidfile an engine left behind when it died.
@@ -5118,6 +5139,47 @@ mod tests {
             "the pidfile is cleared either way",
         );
         let _ = child.wait();
+    }
+
+    /// A stand-in engine: `sleep`, copied under the engine binary's name so it
+    /// does not read as another program. Our own child, which SIGUSR1 terminates.
+    #[cfg(unix)]
+    fn spawn_stand_in_engine(dir: &Path) -> std::process::Child {
+        let exe = dir.join(ENGINE_RESOURCE_NAME);
+        std::fs::copy("/bin/sleep", &exe).expect("copy sleep under the engine's name");
+        Command::new(&exe)
+            .arg("30")
+            .spawn()
+            .expect("spawn a stand-in engine")
+    }
+
+    // A stopped workspace keeps its pidfile, and the OS reuses pids. SIGUSR1
+    // terminates a process that does not handle it. So a pid that no longer
+    // runs the engine is neither signalled nor owed a restore.
+    #[cfg(unix)]
+    #[test]
+    fn a_reused_pid_is_not_signalled_as_an_engine() {
+        let tmp = TempAppData::new("reused");
+        let mut bystander = Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn an unrelated process");
+        tmp.write_pidfile("stopped-ws", bystander.id());
+
+        assert_eq!(stop_workspace_engines(tmp.path()), Vec::new());
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            matches!(bystander.try_wait(), Ok(None)),
+            "the unrelated process must still be running",
+        );
+        assert!(
+            !tmp.path()
+                .join("workspaces/stopped-ws/.lucidos/engine.pid")
+                .exists(),
+            "the stale pidfile is cleared",
+        );
+        let _ = bystander.kill();
+        let _ = bystander.wait();
     }
 
     #[cfg(target_os = "macos")]
@@ -5470,19 +5532,31 @@ mod tests {
         assert!(!executable_is_engine(Path::new(
             "/usr/bin/lucidos-engine-helper"
         )));
+        // Linux names an engine whose binary an update replaced this way.
+        assert!(executable_is_engine(Path::new(
+            "/opt/lucidos/lucidos-engine (deleted)"
+        )));
         // This test binary is alive and is not an engine; a missing pid is unknown.
         assert!(!pid_runs_engine(std::process::id() as i32));
         assert!(!pid_runs_engine(999_999));
+        // The stop's guard: only a readable, non-engine path counts as proof.
+        assert!(pid_runs_another_program(std::process::id() as i32));
+        assert!(!pid_runs_another_program(999_999));
     }
 
-    // The plist must not grow an `ExitTimeOut` the budget above does not know.
+    // launchd's own default killed the service about 5 s after SIGTERM, inside
+    // the engine wait, so the restore record and the Postgres stop never ran.
+    // The plist declares the budget the teardown is built around (ADR 0334).
     #[test]
-    fn the_service_plist_leaves_launchds_exit_timeout_at_its_default() {
+    fn the_service_plist_declares_the_exit_timeout_the_teardown_budgets() {
         let plist = desired_service_plist(
             Path::new("/Applications/Lucidos.app/Contents/MacOS/Lucidos"),
             Path::new("/Users/me/Library/Application Support/com.lucidos.app"),
         );
-        assert!(!plist.contains("ExitTimeOut"));
+        assert!(plist.contains(&format!(
+            "<key>ExitTimeOut</key>\n    <integer>{}</integer>",
+            LAUNCHD_EXIT_TIMEOUT.as_secs()
+        )));
     }
 
     #[cfg(target_os = "macos")]

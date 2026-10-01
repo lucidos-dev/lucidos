@@ -17,14 +17,10 @@ import { configure } from '../_fetch';
 const SHELL: BootOptions = {
   styleReset: true,
   durationScale: true,
-  adoptRenamedStorageKeys: true,
-  legacyThemeModeAttribute: false,
 };
 const IFRAME: BootOptions = {
   styleReset: false,
   durationScale: false,
-  adoptRenamedStorageKeys: false,
-  legacyThemeModeAttribute: true,
 };
 
 interface Recorded {
@@ -172,70 +168,6 @@ describe('an isolated app frame, served its values', () => {
     applyAppearanceBoot(IFRAME);
 
     expect(rec.attrs['data-theme-mode']).toBe('light');
-  });
-});
-
-describe('the legacy data-theme attribute', () => {
-  it('an app frame carries it beside data-theme-mode, for app styles written before the rename', () => {
-    setEnv({ served: { 'theme-mode': 'light' } });
-    applyAppearanceBoot(IFRAME);
-
-    expect(rec.attrs['data-theme-mode']).toBe('light');
-    expect(rec.attrs['data-theme']).toBe('light');
-  });
-
-  it('the shell never carries it', () => {
-    setEnv({ stored: { 'ws:myws:lucidos-theme-mode': 'dark' } });
-    applyAppearanceBoot(SHELL);
-
-    expect(rec.attrs['data-theme-mode']).toBe('dark');
-    expect(rec.attrs['data-theme']).toBeUndefined();
-  });
-});
-
-describe('storage keys renamed with the theme rename', () => {
-  it('the shell adopts the old mode key, so the first paint after an upgrade keeps the pick', () => {
-    setEnv({ prefersLight: true, stored: { 'ws:myws:lucidos-theme': 'dark' } });
-    applyAppearanceBoot(SHELL);
-
-    expect(rec.attrs['data-theme-mode']).toBe('dark');
-    expect(store['ws:myws:lucidos-theme-mode']).toBe('dark');
-    expect(store['ws:myws:lucidos-theme']).toBeUndefined();
-  });
-
-  it('a value already under the new name wins, and the old key still goes', () => {
-    setEnv({
-      stored: { 'ws:myws:lucidos-theme': 'dark', 'ws:myws:lucidos-theme-mode': 'light' },
-    });
-    applyAppearanceBoot(SHELL);
-
-    expect(rec.attrs['data-theme-mode']).toBe('light');
-    expect(store['ws:myws:lucidos-theme']).toBeUndefined();
-  });
-
-  it('the old effects key is adopted too, before first paint reads it', () => {
-    setEnv({ stored: { 'ws:myws:lucidos-look-effects': 'reduce' } });
-    applyAppearanceBoot(SHELL);
-
-    expect(rec.attrs['data-theme-effects']).toBe('reduce');
-    expect(store['ws:myws:lucidos-theme-effects']).toBe('reduce');
-    expect(store['ws:myws:lucidos-look-effects']).toBeUndefined();
-  });
-
-  it('the picker leaves the raw old key alone, since new workspaces seed from it', () => {
-    setEnv({ baseUrl: '/~', stored: { 'lucidos-theme': 'dark' } });
-    applyAppearanceBoot(SHELL);
-
-    expect(store['lucidos-theme']).toBe('dark');
-    expect(store['lucidos-theme-mode']).toBeUndefined();
-  });
-
-  it('an app frame leaves the shell-owned keys alone', () => {
-    setEnv({ stored: { 'ws:myws:lucidos-theme': 'dark' } });
-    applyAppearanceBoot(IFRAME);
-
-    expect(store['ws:myws:lucidos-theme']).toBe('dark');
-    expect(store['ws:myws:lucidos-theme-mode']).toBeUndefined();
   });
 });
 

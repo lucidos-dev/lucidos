@@ -216,7 +216,6 @@ fn oauth_client_request_attaches_supplied_endpoints_as_defaults() {
         userinfo_url: Some("https://openidconnect.googleapis.com/v1/userinfo".to_string()),
         userinfo_method: None,
         authorize_params: None,
-        scopes: Some("https://www.googleapis.com/auth/cloud-healthcare".to_string()),
         redirect_uri: Some("http://localhost:14981/oauth/callback".to_string()),
     };
     let req = oauth_client_request("ghealth", &overrides);
@@ -238,9 +237,10 @@ fn oauth_client_request_attaches_supplied_endpoints_as_defaults() {
         req["defaults"]["userinfo_url"],
         "https://openidconnect.googleapis.com/v1/userinfo"
     );
-    assert_eq!(
-        req["defaults"]["scopes"],
-        "https://www.googleapis.com/auth/cloud-healthcare"
+    // A client credential carries no scopes: each connection names its own.
+    assert!(
+        req["defaults"].get("scopes").is_none(),
+        "scopes must never pre-fill a client credential: {req}"
     );
     assert_eq!(
         req["defaults"]["redirect_uri"],
@@ -264,8 +264,8 @@ fn oauth_client_request_without_overrides_has_no_defaults_and_falls_back_base_ur
 
 #[test]
 fn oauth_client_request_partial_overrides_only_include_supplied_keys() {
-    // Only auth_url + token_url supplied — userinfo_url and scopes must be absent
-    // from `defaults`, not present-as-null.
+    // Only auth_url + token_url supplied. userinfo_url must be absent from
+    // `defaults`, not present-as-null.
     let overrides = OAuthClientOverrides {
         auth_url: Some("https://login.example.com/authorize".to_string()),
         token_url: Some("https://login.example.com/token".to_string()),
@@ -285,10 +285,6 @@ fn oauth_client_request_partial_overrides_only_include_supplied_keys() {
     assert!(
         !defaults.contains_key("userinfo_url"),
         "userinfo_url should be absent: {req}"
-    );
-    assert!(
-        !defaults.contains_key("scopes"),
-        "scopes should be absent: {req}"
     );
     // An absent redirect_uri is what selects the default loopback-IP callback,
     // so it must not be pre-filled as empty.
@@ -2227,10 +2223,7 @@ fn row(userinfo_method: Option<&str>) -> OAuthProviderRow {
 }
 
 #[test]
-fn from_registry_carries_every_endpoint_but_never_the_scopes() {
-    // Scopes are a property of what the connection is FOR, not of the provider,
-    // so the row must not supply them: the caller passing backup scopes and the
-    // caller passing a bare sign-in both go through here.
+fn from_registry_carries_every_endpoint() {
     let overrides = OAuthClientOverrides::from_registry(&row(Some("POST")));
     assert_eq!(
         overrides.auth_url.as_deref(),
@@ -2246,7 +2239,6 @@ fn from_registry_carries_every_endpoint_but_never_the_scopes() {
     );
     assert_eq!(overrides.userinfo_method.as_deref(), Some("POST"));
     assert_eq!(overrides.base_url.as_deref(), Some("https://api.acme.test"));
-    assert_eq!(overrides.scopes, None);
 }
 
 #[test]

@@ -625,18 +625,41 @@ pub(super) async fn follow_up_keeps_open_question(
     thread_id: Uuid,
     pre_emitted_origin: Option<super::PreEmittedOrigin>,
 ) -> bool {
-    if !pre_emitted_origin.is_some_and(|o| o.is_engine_reentry()) {
-        return false;
-    }
-    let session_is_live = agent_sessions
-        .lock()
-        .await
-        .get(&thread_id)
-        .is_some_and(|s| s.is_live());
-    session_is_live
+    reentry_reaches_live_session(agent_sessions, thread_id, pre_emitted_origin).await
         && crate::engine::agent_question::lookup_active_question_tool_use_id(pool, thread_id)
             .await
             .is_some()
+}
+
+/// Whether this input is an engine re-entry reaching a live coding-agent
+/// session. It sends no `CodingAgentPromptSent`, so it overtakes no open card:
+/// a question or a permission card stays answerable (ADR 0255, ADR 0256).
+pub(super) async fn reentry_reaches_live_session(
+    agent_sessions: &TokioMutex<HashMap<Uuid, AgentSession>>,
+    thread_id: Uuid,
+    pre_emitted_origin: Option<super::PreEmittedOrigin>,
+) -> bool {
+    if !pre_emitted_origin.is_some_and(|o| o.is_engine_reentry()) {
+        return false;
+    }
+    agent_sessions
+        .lock()
+        .await
+        .get(&thread_id)
+        .is_some_and(|s| s.is_live())
+}
+
+/// Whether a chat-lane follow-up denies the thread's open permission cards.
+///
+/// A person answers a card by writing instead. Any other input queues behind a
+/// live turn, whose loop still waits on the card, so it leaves the card to the
+/// user. Examples: a child's completion, a wait delivery, an agent follow-up.
+/// With no live turn nothing waits on the card, and any input clears it.
+pub(super) fn chat_follow_up_supersedes_cards(
+    mode: crate::engine::thread_events::ActorMode,
+    has_live_turn: bool,
+) -> bool {
+    mode == crate::engine::thread_events::ActorMode::Human || !has_live_turn
 }
 
 #[cfg(test)]

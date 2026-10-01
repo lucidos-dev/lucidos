@@ -57,6 +57,7 @@ const GLYPH_BADGES = [
   'thread-status-question-badge',   // the "?" on a thread waiting for an answer
   'app-store-status',               // a plugin's "Installed v1.2.3" / version pill
   'app-store-modified-chip',        // a plugin's "Modified" pill
+  'theme-card-badge',               // a theme card's "Custom" pill
 ];
 
 /** The two badges that wear `.badge` and draw only a dot. No glyph, so no cap
@@ -160,7 +161,7 @@ describe('the pill and the baseline sit on whole pixels', () => {
   it('never makes a pill taller than its design', () => {
     // The section count is exactly as tall as the header's line. One pixel
     // more grows the row and puts the label off the pixel grid, which
-    // `.list-section-title:has(> .section-count)` in drawer.css records.
+    // `.list-section-title:has(.section-count)` in section-header.css records.
     const box = shared!.props.get('--badge-box') ?? '';
     expect(box.endsWith(', var(--badge-floor))'), 'the clamp caps the box at the design').toBe(true);
     expect(shared!.props.get('height')).toBe('var(--badge-box)');
@@ -320,16 +321,16 @@ describe('the band the trim measures is the glyph the badge draws', () => {
   });
 });
 
-describe('a drawer section and its count share one cap band', () => {
-  const drawerCss: string = readFileSync(resolve(stylesDir, 'drawer.css'), 'utf-8');
-  const gated = cssRules(drawerCss).filter(r => r.atRules === '@supports (text-box-trim: trim-both)');
+describe('a section label and its count share one cap band', () => {
+  const sectionCss: string = readFileSync(resolve(stylesDir, 'section-header.css'), 'utf-8');
+  const gated = cssRules(sectionCss).filter(r => r.atRules === '@supports (text-box-trim: trim-both)');
 
   it('gives the label the same trim the count now has', () => {
     // The count sits at its pill's middle once trimmed. The label's caps ride
     // above its own line box's middle until it is trimmed too, and the flex row
     // centres both boxes on one axis. Trimming both is what puts the two cap
     // bands on the same line at any font and any ui-scale.
-    const label = gated.find(r => r.selector === '.drawer-section-label');
+    const label = gated.find(r => r.selector === '.section-label');
     expect(label?.props.get('text-box-trim')).toBe('trim-both');
     expect(label?.props.get('text-box-edge')).toBe('cap alphabetic');
     expect(label?.props.get('align-content')).toBe('center');
@@ -339,7 +340,7 @@ describe('a drawer section and its count share one cap band', () => {
     // The trim shrinks the CONTENT box, and `1lh` puts the element's own box
     // back. So the row is the same height collapsed and expanded, and the
     // shimmer still has the whole glyph to paint over.
-    const label = gated.find(r => r.selector === '.drawer-section-label');
+    const label = gated.find(r => r.selector === '.section-label');
     expect(label?.props.get('min-height')).toBe('1lh');
   });
 
@@ -348,10 +349,10 @@ describe('a drawer section and its count share one cap band', () => {
     // gate, because a browser without the trim still has the gap to correct.
     // It sits on the wrapper, so it moves both copies of the number.
     const retired = gated.find(r =>
-      r.selector === '.list-section-title > .section-count');
+      r.selector === '.list-section-title .section-count');
     expect(retired?.props.get('top')).toBe('0');
-    const base = cssRules(drawerCss).find(r =>
-      r.selector === '.list-section-title > .section-count'
+    const base = cssRules(sectionCss).find(r =>
+      r.selector === '.list-section-title .section-count'
       && r.atRules === '');
     expect(base?.props.get('top'), 'the untrimmed fallback keeps its lift').toBe('-0.0625rem');
   });

@@ -3,6 +3,12 @@
    (components/settings/ThemePicker.tsx), so every var() inside it resolves to
    that theme, not to the page's. */
 
+/* The skeleton's frame, drawn invisibly until the gallery loads, so the picker
+   holds its height from the first frame and under the skeleton. */
+.theme-carousel-reserve {
+    visibility: hidden;
+}
+
 .theme-carousel-frame {
     display: flex;
     flex-direction: column;
@@ -53,7 +59,7 @@
 
 /* On a phone the panes lay a touch strip over each screen edge, above the
    content (.edge-swipe-zone in mobile.css), to reach an app iframe's touches
-   first. The carousel is lifted over it, as .trigger-group-actions is, or the
+   first. The carousel is lifted over it, as .list-section-actions is, or the
    strip takes the first chip's taps, the left chevron's, and a swipe that
    starts at the edge. */
 @media (max-width: 768px) {
@@ -134,6 +140,23 @@
     flex-direction: row;
     justify-content: space-between;
     align-items: center;
+}
+
+/* A phone card is narrow enough that names wrap, and a grid row stretches to
+   its tallest card. So both lines are reserved, the skeleton's too, or one
+   wrapping name grows the strip as the cards replace the skeleton. */
+.theme-carousel-peek .theme-card-name {
+    min-height: 2lh;
+}
+
+/* A workspace theme's badge wraps above its mode label there, which can
+   outgrow those two lines. So the row reserves the taller of the two. The
+   factors are the line heights of the name, the badge and the label. */
+.theme-carousel-peek .theme-card-meta {
+    min-height: max(
+        2 * 1.3 * var(--font-size-sm),
+        1.4 * var(--font-size-2xs) + 0.25rem + var(--space-xs) + 1.3 * var(--font-size-2xs)
+    );
 }
 
 /* Fades the cards out at a side only where more of the strip waits past it.
@@ -226,10 +249,40 @@
     line-height: 1.3;
 }
 
+/* Reserves at least half the row for the name, so a single-mode workspace
+   theme's badge and its mode label together never crowd the name out on a
+   narrow card. */
+.theme-card-meta-trailing {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    flex-shrink: 0;
+    max-width: 50%;
+    align-items: baseline;
+    gap: var(--space-xs);
+}
+
 .theme-card-modes {
     flex-shrink: 0;
     font-size: var(--font-size-2xs);
+    line-height: 1.3;
     color: var(--text-muted);
+}
+
+/* Marks a theme the workspace defines, so it reads apart from a built-in one.
+   Styled like the App Store's status chip (pages.css): badges.css centres the
+   word on its cap band inside --badge-height. */
+.theme-card-badge {
+    flex: 0 0 auto;
+    padding: 0.125rem 0.5rem;
+    border-radius: var(--radius-round);
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+    font-size: var(--font-size-2xs);
+    font-family: inherit;
+    font-weight: 600;
+    line-height: 1.4;
+    --badge-height: calc(1lh + 0.25rem);
 }
 
 .theme-preview {

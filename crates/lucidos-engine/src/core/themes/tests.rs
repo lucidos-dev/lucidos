@@ -96,6 +96,9 @@ fn every_built_in_theme_has_its_family() {
         ("paper", Warm),
         ("minimal", Neutral),
         ("mono", Neutral),
+        ("ember", Warm),
+        ("harbour", Blue),
+        ("real-computer", Neutral),
     ] {
         assert_eq!(family(id), Some(expected), "{id}");
     }
@@ -1123,129 +1126,4 @@ fn a_theme_mode_value_is_never_a_theme_id() {
         assert!(err.to_string().contains("theme-mode"), "{err}");
     }
     assert!(validate_id("nord").is_ok());
-}
-
-#[test]
-fn the_legacy_looks_folder_moves_to_themes_without_overwriting() {
-    let dir = tempfile::tempdir().unwrap();
-    let data = dir.path().join("data");
-    std::fs::create_dir_all(data.join("looks")).unwrap();
-    std::fs::create_dir_all(data.join("themes")).unwrap();
-    std::fs::write(data.join("looks/harbour.json"), "old harbour").unwrap();
-    std::fs::write(data.join("looks/clash.json"), "old clash").unwrap();
-    std::fs::write(data.join("themes/clash.json"), "new clash").unwrap();
-
-    adopt_legacy_themes_dir(dir.path());
-
-    let read = |p: &str| std::fs::read_to_string(data.join(p)).unwrap();
-    assert_eq!(read("themes/harbour.json"), "old harbour");
-    assert_eq!(read("themes/clash.json"), "new clash", "the new file wins");
-    assert_eq!(
-        read("looks/clash.json"),
-        "old clash",
-        "the old one is kept, never lost"
-    );
-
-    // A rerun moves nothing twice and loses nothing.
-    adopt_legacy_themes_dir(dir.path());
-    assert_eq!(read("themes/harbour.json"), "old harbour");
-    assert_eq!(read("looks/clash.json"), "old clash");
-
-    // Once the clash is resolved by hand, the empty folder goes.
-    std::fs::remove_file(data.join("looks/clash.json")).unwrap();
-    adopt_legacy_themes_dir(dir.path());
-    assert!(!data.join("looks").exists());
-}
-
-/// The move is committed, so the workspace repo stays clean. An uncommitted
-/// rename made every Apply after the upgrade refuse to merge.
-#[test]
-fn the_legacy_looks_folder_move_leaves_the_workspace_repo_clean() {
-    let dir = tempfile::tempdir().unwrap();
-    let repo = git2::Repository::init(dir.path()).unwrap();
-    std::fs::create_dir_all(dir.path().join("data/looks")).unwrap();
-    std::fs::write(dir.path().join("data/looks/harbour.json"), "harbour").unwrap();
-    let mut index = repo.index().unwrap();
-    index
-        .add_path(std::path::Path::new("data/looks/harbour.json"))
-        .unwrap();
-    index.write().unwrap();
-    crate::core::commit_index(&repo, "seed").unwrap();
-
-    adopt_legacy_themes_dir(dir.path());
-
-    let statuses = repo.statuses(None).unwrap();
-    let dirty: Vec<String> = statuses
-        .iter()
-        .filter_map(|s| s.path().map(String::from))
-        .collect();
-    assert!(dirty.is_empty(), "the move must be committed: {dirty:?}");
-    let head = repo.head().unwrap().peel_to_tree().unwrap();
-    assert!(head
-        .get_path(std::path::Path::new("data/themes/harbour.json"))
-        .is_ok());
-    assert!(head
-        .get_path(std::path::Path::new("data/looks/harbour.json"))
-        .is_err());
-}
-
-#[test]
-fn no_legacy_folder_changes_nothing() {
-    let dir = tempfile::tempdir().unwrap();
-    adopt_legacy_themes_dir(dir.path());
-    assert!(!dir.path().join("data/themes").exists());
-}
-
-/// A boot that moved the files but died before committing leaves the rename
-/// uncommitted. The next boot finds it through git and commits it.
-#[test]
-fn a_move_an_earlier_boot_could_not_commit_is_committed_on_the_next() {
-    let dir = tempfile::tempdir().unwrap();
-    let repo = git2::Repository::init(dir.path()).unwrap();
-    std::fs::create_dir_all(dir.path().join("data/looks")).unwrap();
-    std::fs::write(dir.path().join("data/looks/harbour.json"), "harbour").unwrap();
-    let mut index = repo.index().unwrap();
-    index
-        .add_path(std::path::Path::new("data/looks/harbour.json"))
-        .unwrap();
-    index.write().unwrap();
-    crate::core::commit_index(&repo, "seed").unwrap();
-    std::fs::create_dir_all(dir.path().join("data/themes")).unwrap();
-    std::fs::rename(
-        dir.path().join("data/looks/harbour.json"),
-        dir.path().join("data/themes/harbour.json"),
-    )
-    .unwrap();
-    std::fs::remove_dir(dir.path().join("data/looks")).unwrap();
-
-    adopt_legacy_themes_dir(dir.path());
-
-    assert!(
-        repo.statuses(None).unwrap().is_empty(),
-        "the stranded move is committed"
-    );
-    let head = repo.head().unwrap().peel_to_tree().unwrap();
-    assert!(head
-        .get_path(std::path::Path::new("data/themes/harbour.json"))
-        .is_ok());
-}
-
-/// An old file git never tracked still lands in themes/ and is committed there.
-#[test]
-fn an_untracked_legacy_file_is_committed_under_themes() {
-    let dir = tempfile::tempdir().unwrap();
-    let repo = git2::Repository::init(dir.path()).unwrap();
-    std::fs::create_dir_all(dir.path().join("data/looks")).unwrap();
-    std::fs::write(dir.path().join("data/looks/loose.json"), "loose").unwrap();
-
-    adopt_legacy_themes_dir(dir.path());
-
-    assert!(
-        repo.statuses(None).unwrap().is_empty(),
-        "nothing is left uncommitted"
-    );
-    let head = repo.head().unwrap().peel_to_tree().unwrap();
-    assert!(head
-        .get_path(std::path::Path::new("data/themes/loose.json"))
-        .is_ok());
 }

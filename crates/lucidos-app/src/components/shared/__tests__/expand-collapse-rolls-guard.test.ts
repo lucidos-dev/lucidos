@@ -23,7 +23,7 @@ const SRC = resolve(here, '../../..'); // crates/lucidos-app/src
  *  the same file, and where. */
 const ROLLS_ELSEWHERE: Record<string, string> = {
   'components/drawer/ThreadDrawer.tsx': 'the drawer rolls its rows as FLIP copies (useFlipAnimation)',
-  'components/triggers/TriggerGroupHeader.tsx': "the group's members roll in TriggersView.tsx",
+  'components/shared/SectionHeader.tsx': 'each caller rolls its section body in a <Disclosure>',
   'components/layout/ThreadFilterButton.tsx': 'it swaps the drawer view under the navigation cover (ThreadFilterCover.tsx)',
 };
 

@@ -43,6 +43,23 @@ pub(super) fn starts_turn_after_terminal(
     emitted_terminal_event && (question_resumed || read_owed_input)
 }
 
+/// Whether the running turn already has its terminal event, so any further
+/// agent output is a straggler the run loop drops. The loop emits one itself
+/// (`emitted_terminal_event`), or a restart teardown or the stuck-session
+/// watchdog emits one from outside and sets `external_terminal`. Nothing clears
+/// that flag, because every setter is killing the session.
+///
+/// The external half matters on a restart. The teardown interrupts the agent,
+/// which reads the interrupt as a user rejection and may reply to it before it
+/// dies. That reply would land after "Paused by restart" as if the user had
+/// stopped it.
+pub(super) fn turn_has_terminal(
+    emitted_terminal_event: bool,
+    external_terminal: &std::sync::atomic::AtomicBool,
+) -> bool {
+    emitted_terminal_event || external_terminal.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// The session-side write for a turn that just reached its boundary. The run
 /// loop calls it under the `agent_sessions` lock, right after its own local
 /// `is_waiting` goes true.
@@ -381,20 +398,34 @@ pub(super) enum WorktreeRemoval {
 /// clicking Discard, and the branch is deleted alongside the tree.
 ///
 /// One question is still worth asking, and it is why this is a function rather
-/// than a bare `git worktree remove`: **is this tree actually ours?** Claude
-/// Code can `git checkout` inside its own worktree. A Discard aimed at the
-/// session's branch must not delete a tree now sitting on someone else's.
-/// `worktree_branch` is `None` for a detached HEAD or an unreadable one, and
-/// neither is a positive match. That is the "unknown never authorizes
-/// destruction" rule from `.claude/rules/rust.md`.
+/// than a bare `git worktree remove`: **is this tree actually ours?** That is
+/// [`foreign_worktree_reason`].
 pub(super) fn discarded_worktree_removal(
     worktree_branch: Option<&str>,
     session_branch: &str,
 ) -> WorktreeRemoval {
+    match foreign_worktree_reason(worktree_branch, session_branch) {
+        None => WorktreeRemoval::Remove,
+        Some(reason) => WorktreeRemoval::Keep(reason),
+    }
+}
+
+/// Why the session's worktree is not the session's to destroy, or `None` when
+/// it positively is: HEAD is on `session_branch`.
+///
+/// Claude Code can `git checkout` inside its own worktree. A removal or a
+/// `reset --hard` aimed at the session's branch must not land on a tree now
+/// sitting on another branch. `worktree_branch` is `None` for a detached HEAD
+/// or an unreadable one, and neither is a positive match. That is the "unknown
+/// never authorizes destruction" rule from `.claude/rules/rust.md`.
+pub(super) fn foreign_worktree_reason(
+    worktree_branch: Option<&str>,
+    session_branch: &str,
+) -> Option<&'static str> {
     match worktree_branch {
-        Some(b) if b == session_branch => WorktreeRemoval::Remove,
-        Some(_) => WorktreeRemoval::Keep("worktree is checked out on a different branch"),
-        None => WorktreeRemoval::Keep(
+        Some(b) if b == session_branch => None,
+        Some(_) => Some("worktree is checked out on a different branch"),
+        None => Some(
             "could not read which branch the worktree is on (detached HEAD, or git gave no answer)",
         ),
     }

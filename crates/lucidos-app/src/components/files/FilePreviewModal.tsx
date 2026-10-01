@@ -9,7 +9,6 @@ import { viewportIsMobile } from '../../utils/viewport';
 import { Overlay } from '../shared/Overlay';
 import { WrapTextIcon } from '../shared/icons';
 import { SurfaceHead } from '../shared/Surface';
-import { trapDialogTab } from '../shared/dialogFocusTrap';
 import { FilePreviewInline } from './FilePreviewInline';
 import { RepoFileContent, previewGitRef } from './RepoFilePreview';
 import { previewFilePath, previewFileName } from '../../utils/previewPath';
@@ -113,15 +112,6 @@ export function FilePreviewModal() {
     if (openedOver.current === undefined) return;
     if (showing !== openedOver.current) closeFilePreviewModal({ navigated: true });
   });
-
-  // Keep Tab inside the modal, same as the confirm/prompt dialogs.
-  const open = state !== null;
-  useEffect(() => {
-    if (!open) return;
-    const onKey = (e: KeyboardEvent) => trapDialogTab(e, panelRef.current);
-    document.addEventListener('keydown', onKey);
-    return () => document.removeEventListener('keydown', onKey);
-  }, [open]);
 
   if (!state) return null;
 

@@ -13,7 +13,7 @@ import { loadedOr, type Loadable } from '../../store/types';
 import { ListSkeletonOf, SkBlock, SkText } from '../shared/Skeleton';
 import { LoadingFade } from '../shared/LoadingFade';
 import { FileTypeIcon } from '../../utils/fileIcons';
-import { TreeNode, folderTreeSkeletonRow } from './FolderTree';
+import { TreeNode, folderTreeSkeletonRow, useRevealedFolderScroll } from './FolderTree';
 import { changeBadgeLabel } from './changeBadge';
 import { diffStats } from './diffStats';
 import { DiffSkeleton, DiffStatsInline, DiffView } from './DiffView';
@@ -241,9 +241,10 @@ function folderHasChanges(n: FolderNode, changedMap: Map<string, DiffFile>): boo
 function RepoFolderTree({ changedMap }: { changedMap: Map<string, DiffFile> }) {
   const paths = loadedOr(repoFiles.value, []);
   const tree = buildFolderTree(paths);
+  const treeRef = useRevealedFolderScroll();
 
   return (
-    <div class="folder-tree">
+    <div class="folder-tree" ref={treeRef}>
       <TreeNode
         node={tree}
         isExpanded={(path) => repoExpandedFolders.value.has(path)}

@@ -80,7 +80,7 @@ export function TriggersView() {
 
   return (
     <div class="content-view active">
-      <div class="list-rows" ref={listRef}>
+      <div class="list-rows list-rows-divided" ref={listRef}>
         <LoadingFade showSkeleton={showTriggersLoading} skeleton={<ListSkeletonOf fill containerClass="trigger-group-section" row={() => <TriggerItem />} />}>
           {triggersLoadable.status === 'loaded' ? (
             <TriggersLoaded

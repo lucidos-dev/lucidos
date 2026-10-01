@@ -1,0 +1,52 @@
+/* The one text-input look: every free-text field shares this box and this
+   focus ring. A component file adds only layout, padding and type size, never
+   its own background, border or focus.
+
+   Inside a .form-group, this rule skips two fields whose frame draws the box:
+   the Intent textarea (.prompt-box) and an editable dropdown's input. */
+.settings-text-input,
+.form-group input:where(:not([type="checkbox"], .dropdown-input)),
+.form-group textarea:where(:not(.prompt-textarea)),
+.repo-add-input,
+.oauth-provider-input,
+.allowlist-row-input,
+.device-name-input,
+.style-editor-instruction {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: calc(var(--radius-control) * 0.5);
+    color: var(--text-primary);
+    outline: none;
+    transition: border-color var(--duration-normal), box-shadow var(--duration-normal);
+}
+
+.settings-text-input::placeholder,
+.form-group input::placeholder,
+.form-group textarea::placeholder,
+.repo-add-input::placeholder,
+.oauth-provider-input::placeholder,
+.allowlist-row-input::placeholder,
+.device-name-input::placeholder,
+.style-editor-instruction::placeholder {
+    color: var(--text-muted);
+}
+
+/* Focus is the shared --focus-ring glow alone, as on .icon-btn. A 1px accent
+   border aliases unevenly under fractional UI scaling, so the border goes
+   transparent and the glow sits flush on the field. The transparent outline is
+   the forced-colors fallback, where box-shadow is stripped. Frames that wrap a
+   bare input (.input-with-action, .dropdown-input-wrap) light up the same way. */
+.settings-text-input:focus,
+.form-group input:where(:not([type="checkbox"], .dropdown-input)):focus,
+.form-group textarea:where(:not(.prompt-textarea)):focus,
+.repo-add-input:focus,
+.oauth-provider-input:focus,
+.allowlist-row-input:focus,
+.device-name-input:focus,
+.style-editor-instruction:focus,
+.input-with-action:focus-within,
+.dropdown-input-wrap:focus-within {
+    border-color: transparent;
+    outline: 0.125rem solid transparent;
+    box-shadow: var(--focus-ring);
+}

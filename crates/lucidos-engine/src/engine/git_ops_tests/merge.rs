@@ -642,6 +642,61 @@ async fn ff_main_to_cannot_publish_main_while_a_worktree_snapshot_holds_the_lock
     );
 }
 
+/// A targeted data write is a save and a `commit_data_path`, both under the
+/// workspace repo lock. A `checkout -f main` that resolved `main` before that
+/// commit rewrites the file to its old bytes after it, and the next
+/// `commit_all_dirty` records the revert. So `ff_main_to` must hold the
+/// workspace repo lock across publish AND sync, as it holds the snapshot's.
+#[tokio::test]
+async fn ff_main_to_cannot_publish_main_while_a_data_write_holds_the_repo_lock() {
+    let (_tmp, repo) = make_test_repo().await;
+
+    let _ = git_cmd(&["checkout", "-b", "feature"], &repo).await;
+    tokio::fs::write(repo.join("feature.txt"), "new feature")
+        .await
+        .unwrap();
+    let _ = git_cmd(&["add", "."], &repo).await;
+    let _ = git_cmd(&["commit", "-m", "add feature"], &repo).await;
+    let rev = |name: &'static str| {
+        let repo = repo.clone();
+        async move {
+            String::from_utf8_lossy(&git_cmd(&["rev-parse", name], &repo).await.unwrap().stdout)
+                .trim()
+                .to_string()
+        }
+    };
+    let main_sha = rev("main").await;
+    let feature_sha = rev("feature").await;
+    let _ = git_cmd(&["checkout", "main"], &repo).await;
+
+    // Stand in for a data write between its save and its commit.
+    let data_write_guard = WORKSPACE_REPO_MUTEX.lock().await;
+
+    let merge_repo = repo.clone();
+    let merge_branch = feature_sha.clone();
+    let merge_main = main_sha.clone();
+    let merging =
+        tokio::spawn(async move { ff_main_to(&merge_repo, &merge_branch, &merge_main).await });
+
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(
+        rev("main").await,
+        main_sha,
+        "main must not advance while a data write holds the workspace repo lock"
+    );
+
+    drop(data_write_guard);
+    merging
+        .await
+        .expect("merge task panicked")
+        .expect("ff_main_to should succeed once the data write releases the lock");
+    assert_eq!(
+        rev("main").await,
+        feature_sha,
+        "main must advance once the lock is free"
+    );
+}
+
 /// Regression (2026-08-03, same class as the two above): the exclusion above is
 /// only worth what its LIFETIME is worth, and it used to be held by the
 /// snapshot's caller around a `tokio::time::timeout`. `commit_all_dirty` does

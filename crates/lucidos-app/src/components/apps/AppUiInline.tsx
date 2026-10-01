@@ -11,6 +11,7 @@ import { setAppFrameHash, splitFrameSrc } from './iframeNav';
 import { APP_FRAME_SANDBOX, APP_FRAME_ALLOW } from './appFrameSandbox';
 import { EdgeSwipeZones } from '../layout/EdgeSwipeZones';
 import { pushKeybindingsToFrame } from '../../store/actions/app-keybindings';
+import { IframeTabExit } from '../shared/IframeTabExit';
 
 /** The load cover's CSS opacity transition at 1x (var(--duration-normal)). The
  *  cover lingers for this, scaled by the Animation speed slider, plus fixed
@@ -138,6 +139,7 @@ function AppFrame({ src }: { src: string }) {
           pushKeybindingsToFrame(e.currentTarget as HTMLIFrameElement);
         }}
       />
+      <IframeTabExit />
       {coverMounted && (
         <div class={`app-ui-cover${loaded ? ' is-clearing' : ''}`} aria-hidden="true" />
       )}

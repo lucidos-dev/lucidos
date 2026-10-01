@@ -2,7 +2,14 @@ import { useEffect } from 'preact/hooks';
 import { composeViewActive, mobileView, panelOverlay, preferences, type MobileView, type PanelOverlay } from '../store/store';
 import { opensSoftwareKeyboard, getRemPx } from '../utils/dom';
 import { afterPressSettles } from '../utils/pointerPress';
-import { isAnchorScroll, isNavigationScroll, isHeaderPinnedForScroll, onAnchorScroll } from '../components/chat/scrollState';
+import {
+  holdAcrossRelayout,
+  isAnchorScroll,
+  isCarryScroll,
+  isNavigationScroll,
+  isHeaderPinnedForScroll,
+  onRebasedScroll,
+} from '../components/chat/scrollState';
 import { isMobile } from '../utils/viewport';
 import { isRepaintNudging } from '../utils/webkitRepaint';
 import { isUserScrolling } from '../utils/scrollActivity';
@@ -37,17 +44,72 @@ export function spacerHeightPx(opts: {
   return opts.keyboardOpen && !opts.disabled ? opts.safeAreaTop : opts.cachedHeight;
 }
 
-/** How far the prompt sits below its resting place, in px: 0 is fully shown and
- *  `promptHeight` fully hidden. It follows the scroll delta like the header, but
- *  never hides further than the distance left to the bottom. So the live edge
- *  always shows it, the way the top of a thread always shows the header. */
-export function nextPromptOffsetPx(opts: {
-  offset: number;
-  delta: number;
+/** Whether a scroll event's delta counts toward the bars' intent. Only the
+ *  reader's own scroll does. Every write of ours re-bases instead, as does the
+ *  window a deep link pins (ADR 0337). */
+export function countsAsReaderScroll(opts: {
+  navigation: boolean;
+  headerPinned: boolean;
+}): boolean {
+  return !opts.headerPinned && !opts.navigation;
+}
+
+/** The `reveal-mobile-bars` event's detail. `instant` lands the prompt with no
+ *  glide, for a caller about to focus it: iOS Safari can refuse the keyboard
+ *  to a prompt still under a `translate`. */
+export interface RevealBarsDetail {
+  instant: boolean;
+}
+
+/** End any glide on `el` at once. The style flush with the transition off is
+ *  what lands it, and restoring the transition afterwards starts none. */
+export function landWithoutGlide(el: HTMLElement) {
+  el.style.transition = 'none';
+  void getComputedStyle(el).translate;
+  el.style.transition = '';
+}
+
+/** How far the reader must travel in one direction before the bars follow it,
+ *  in rem. Shorter travel is jitter, and must not flip them. */
+export const BARS_TRAVEL_REM = 0.75;
+
+/** Where the reader's scrolling says the bars belong. `travel` is the signed
+ *  distance moved since the direction last changed, down positive. */
+export interface BarsIntent {
+  away: boolean;
+  travel: number;
+}
+
+export const BARS_SHOWN: BarsIntent = { away: false, travel: 0 };
+
+/** Fold one scroll delta into the intent. It flips only once the travel in
+ *  the new direction reaches `thresholdPx`, so the bars never flicker. */
+export function nextBarsIntent(intent: BarsIntent, delta: number, thresholdPx: number): BarsIntent {
+  if (delta === 0) return intent;
+  const sameWay = Math.sign(delta) === Math.sign(intent.travel);
+  const travel = sameWay ? intent.travel + delta : delta;
+  if (travel >= thresholdPx) return { away: true, travel };
+  if (travel <= -thresholdPx) return { away: false, travel };
+  return { away: intent.away, travel };
+}
+
+/** The header and title bar's offset, in px: 0 shown, `-chromeHeight` away.
+ *  Within the chrome's own height of the top they stay shown, or the top of
+ *  the pane would show an empty band where they were. */
+export function headerOffsetPx(opts: { away: boolean; scrollTop: number; chromeHeight: number }): number {
+  return opts.away && opts.scrollTop > opts.chromeHeight ? -opts.chromeHeight : 0;
+}
+
+/** The prompt's offset below its resting place, in px: 0 shown,
+ *  `promptHeight` away. Within a prompt height of the bottom it stays shown,
+ *  so nothing at the live edge sits under it. */
+export function promptOffsetPx(opts: {
+  away: boolean;
   promptHeight: number;
   distanceToBottom: number;
 }): number {
-  return Math.max(0, Math.min(opts.promptHeight, opts.distanceToBottom, opts.offset + opts.delta));
+  const atEdge = opts.distanceToBottom <= opts.promptHeight;
+  return opts.away && !atEdge ? opts.promptHeight : 0;
 }
 
 /** Whether the prompt may be anywhere but fully shown. It stays shown while the
@@ -70,9 +132,17 @@ const SCROLL_SELECTORS: Record<string, string> = {
 };
 
 /**
- * Hides the fixed mobile header on scroll-down and reveals it on scroll-up,
- * tracking pixel-for-pixel in both directions (no CSS transitions). With
- * dynamic bars on, the thread pane's prompt slides down and back the same way.
+ * Dynamic bars: the mobile header, the thread's title bar and its prompt glide
+ * away on a scroll down and back on a scroll up.
+ *
+ * The scroll only decides WHERE they belong (`nextBarsIntent`). A CSS transition
+ * on `translate` moves them there, and the compositor runs it. Per-event motion
+ * trails an iOS scroll, whose events arrive late and stall while the main thread
+ * is busy (ADR 0336).
+ *
+ * No scroll but the reader's own moves them. A reply scrolling the thread holds
+ * them where they are (ADR 0337). Our own navigations, a pane swipe and the
+ * keyboard closing bring them back.
  *
  * Clamps scrollTop to [0, maxScroll] so iOS Safari elastic bounce at the
  * bottom/top doesn't move the header.
@@ -81,8 +151,12 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
   useEffect(() => {
     if (!isMobile()) return;
 
+    /** The delta baseline: the scroll position the last event was measured at. */
     let prevScrollTop = 0;
-    let headerOffset = 0; // 0 = fully visible, -cachedHeight = fully hidden
+    let intent = BARS_SHOWN;
+    /** The container's last measured position, which the edge rules read. */
+    let viewScrollTop = 0;
+    let distanceToBottomPx = Infinity;
     let cachedHeight = 0;
     // Header's padding-top (env(safe-area-inset-top)) in px. See updateHeaderVar.
     let cachedSafeAreaTop = 0;
@@ -95,20 +169,19 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
     let currentContainerPane: Element | null = null;
     let currentViewKey: string | null = null;
     let mutationRafId: number | null = null;
-    /** The pending next-frame re-base after an anchor write (`onAnchorScroll`). */
-    let anchorSettleRaf: number | null = null;
-    /** Where the last anchor write left this container, or -1 for none
+    /** The pending next-frame re-base after an anchor or carry write
+     *  (`onRebasedScroll`). */
+    let rebaseSettleRaf: number | null = null;
+    /** Where the last anchor or carry write left this container, or -1 for none
      *  outstanding. `onScroll` reads it to recognise that write's own event
      *  however late it lands. See the reveal in `onScroll`. */
-    let anchoredTop = -1;
+    let rebasedTop = -1;
     let keyboardOpen = false; // true while a prompt input is focused
     let disposed = false; // a deferred focusout must not write after cleanup
     let closePending = false; // a focusout is waiting for its press to click
     let disabled = false;
     // Mirrors `mobile_dynamic_bars`, and gates the prompt's overlay layout.
     let dynamicBars = false;
-    // Per-pane scroll state so each pane has independent header position
-    const paneState: Record<string, { headerOffset: number; prevScrollTop: number }> = {};
     let cachedRemSize = getRemPx();
     // Change-detection guard (avoid needless style invalidation on every scroll)
     let lastOffsetRem = 0;
@@ -118,14 +191,17 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
     let downChevronEl: HTMLElement | null = null;
     let promptResizeObserver: ResizeObserver | null = null;
     let promptHeight = 0;
-    let promptOffset = 0; // px below resting: 0 = shown, promptHeight = hidden
     let lastPromptOffsetRem = 0;
 
-    /** Clamp offset to [-(cachedHeight + titleBarHeight), 0].
-     *  The extended range lets the sticky title bar scroll out at the same
-     *  speed as the header. The `|| 0` prevents -0 from Math.max. */
-    function clampOffset(offset: number) {
-      return Math.min(0, Math.max(-(cachedHeight + titleBarHeight), offset)) || 0;
+    /** Bring every bar back, and start the direction afresh. */
+    function revealBars() {
+      intent = BARS_SHOWN;
+    }
+
+    /** Re-read the position the edge rules depend on. */
+    function measureContainer(container: Element) {
+      viewScrollTop = clampedScrollTop(container);
+      distanceToBottomPx = Math.max(0, container.scrollHeight - container.clientHeight) - viewScrollTop;
     }
 
     /** Set --mobile-header-height based on keyboard + pinned state.
@@ -178,14 +254,11 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
     }
 
     /** Bind the two elements that CONSUME `--mobile-header-offset`, so the
-     *  per-frame write can target them instead of `documentElement`.
+     *  offset write can target them instead of `documentElement`.
      *
      *  Custom properties inherit, so setting one on the root invalidates style
-     *  for every node in the document. This var is rewritten on essentially
-     *  every scroll frame and the transcript is the largest tree in the app, so
-     *  that was a whole-document style recalc per frame: the jank that survived
-     *  moving the var off `top` onto `transform` (which had only removed the
-     *  LAYOUT half). Writing it on the consumers narrows invalidation to two
+     *  for every node in the document, and the transcript is the largest tree
+     *  in the app. Writing it on the consumers narrows invalidation to two
      *  tiny subtrees. The CSS needs no change either way, since `var()` resolves
      *  a custom property from the element's own computed value.
      *
@@ -209,10 +282,8 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
       // just above the prompt, so it has to slide with it.
       const nextDownChevron = (container?.parentElement?.querySelector(':scope > .scroll-to-bottom') ?? null) as HTMLElement | null;
       if (nextTitleBar === titleBarEl && nextChevron === chevronEl && nextDownChevron === downChevronEl) return false;
-      // The outgoing elements keep their last value rather than being cleared.
-      // They are on their way out, and clearing would snap a still-visible title
-      // bar back to its resting position mid pane-swipe. `paneState` restores
-      // the real offset when the pane comes back.
+      // The outgoing elements keep their last value. A pane swipe has already
+      // revealed them (`attachListener`), so they glide in as they slide out.
       bindTitleBar(nextTitleBar);
       chevronEl = nextChevron;
       downChevronEl = nextDownChevron;
@@ -238,7 +309,6 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
 
     function refreshPromptHeight() {
       promptHeight = promptEl ? promptEl.getBoundingClientRect().height : 0;
-      promptOffset = Math.min(promptOffset, promptHeight);
       updatePromptHeightVar();
       applyTransform();
     }
@@ -250,7 +320,7 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
       if (next === promptEl) return;
       promptResizeObserver?.disconnect();
       promptResizeObserver = null;
-      if (promptEl) promptEl.style.transform = '';
+      if (promptEl) promptEl.style.translate = '';
       promptEl = next;
       lastPromptOffsetRem = NaN;
       if (next) {
@@ -260,32 +330,24 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
       refreshPromptHeight();
     }
 
-    /** How far `container` is from its bottom, iOS bounce clamped away. */
-    function distanceToBottom(container: Element): number {
-      const maxScroll = Math.max(0, container.scrollHeight - container.clientHeight);
-      return maxScroll - clampedScrollTop(container);
-    }
-
-    /** Shown again wherever the thread's end has come within a prompt's height,
-     *  whether the reader scrolled there or the content shrank to it. */
-    function clampPromptToBottom() {
-      if (currentViewKey !== 'thread' || !currentContainer) return;
-      promptOffset = Math.min(promptOffset, distanceToBottom(currentContainer));
-    }
-
+    /** Write where each bar belongs. Every bar reaches it through its CSS
+     *  transition on `translate` (styles/mobile.css), so this runs only when
+     *  the answer may have changed, never to animate. */
     function applyTransform() {
       if (headerRef.current) {
         // Disabled (app UI active) = always fully visible, regardless of scroll/keyboard
         // Keyboard open = always fully hidden, regardless of scroll state
-        const offset = disabled ? 0 : keyboardOpen ? -cachedHeight : headerOffset;
-        // Header transform is clamped to its own height — the extended range
-        // (headerHeight + titleBarHeight) only affects the CSS var for the
-        // sticky title bar, not the header element itself.
+        const offset = disabled ? 0 : keyboardOpen ? -cachedHeight : headerOffsetPx({
+          away: intent.away,
+          scrollTop: viewScrollTop,
+          chromeHeight: cachedHeight + titleBarHeight,
+        });
+        // The header moves by its own height at most. The title bar's extra
+        // height reaches only the CSS var, which carries it off-screen too.
         const headerTranslate = Math.max(-cachedHeight, offset);
-        headerRef.current.style.transform = headerTranslate !== 0
-          ? `translateY(${headerTranslate / cachedRemSize}rem)` : '';
-        // Expose full offset (including extended range) for the sticky thread
-        // title bar. Guarded to avoid needless style invalidation.
+        headerRef.current.style.translate = headerTranslate !== 0
+          ? `0 ${headerTranslate / cachedRemSize}rem` : '';
+        // Guarded to avoid needless style invalidation.
         const offsetRem = offset / cachedRemSize;
         if (offsetRem !== lastOffsetRem) {
           lastOffsetRem = offsetRem;
@@ -294,28 +356,31 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
           chevronEl?.style.setProperty('--mobile-header-offset', value);
         }
       }
-      const slides = promptCanSlide({ disabled, keyboardOpen, composeEmpty: composeViewActive.peek() });
-      const promptOffsetRem = (slides ? promptOffset : 0) / cachedRemSize;
+      const slides = currentViewKey === 'thread'
+        && promptCanSlide({ disabled, keyboardOpen, composeEmpty: composeViewActive.peek() });
+      const promptOffset = slides ? promptOffsetPx({
+        away: intent.away,
+        promptHeight,
+        distanceToBottom: distanceToBottomPx,
+      }) : 0;
+      const promptOffsetRem = promptOffset / cachedRemSize;
       if (promptOffsetRem !== lastPromptOffsetRem) {
         lastPromptOffsetRem = promptOffsetRem;
-        // A transform, never a layout property, and on the two consumers only.
-        if (promptEl) promptEl.style.transform = promptOffsetRem ? `translateY(${promptOffsetRem}rem)` : '';
+        // Never a layout property, and on the two consumers only.
+        if (promptEl) promptEl.style.translate = promptOffsetRem ? `0 ${promptOffsetRem}rem` : '';
         downChevronEl?.style.setProperty('--mobile-prompt-offset', `${promptOffsetRem}rem`);
       }
     }
 
-    /** Sync headerOffset to match a container's scroll position (keyboard dismiss).
-     *  The prompt stays shown: the reader was just typing into it. */
+    /** The keyboard closed: the reader was just typing, so every bar returns. */
     function syncToScroll(container: Element | null) {
       if (container) {
-        const scrollPos = Math.max(0, container.scrollTop);
-        headerOffset = clampOffset(-scrollPos);
-        prevScrollTop = scrollPos;
+        measureContainer(container);
+        prevScrollTop = viewScrollTop;
       } else {
-        headerOffset = 0;
         prevScrollTop = 0;
       }
-      promptOffset = 0;
+      revealBars();
       applyTransform();
     }
 
@@ -393,11 +458,11 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
 
       const scrollTop = clampedScrollTop(currentContainer);
 
-      // Within a pixel of where the last anchor write left us, which the 1px
+      // Within a pixel of where the last anchor or carry write left us, which the 1px
       // repaint nudge is allowed to spend. Anywhere else the reader has really
       // moved, so the stamp is spent and cannot mute a later reveal.
-      const atAnchoredTop = anchoredTop >= 0 && Math.abs(scrollTop - anchoredTop) <= 1;
-      if (!atAnchoredTop) anchoredTop = -1;
+      const atRebasedTop = rebasedTop >= 0 && Math.abs(scrollTop - rebasedTop) <= 1;
+      if (!atRebasedTop) rebasedTop = -1;
 
       // One of OUR OWN navigations is writing scrollTop frame by frame (a
       // chevron tap, turn-nav, a deep-link glide). Those scroll events are not
@@ -409,7 +474,7 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
       // An ANCHOR write is the exception, and it is the opposite request: the
       // app moved the container precisely so the reader's line would NOT move.
       // Revealing the chrome there covers that line with the header they had
-      // scrolled away, by up to a header plus a thread title. So the offset is
+      // scrolled away, by up to a header plus a thread title. So the intent is
       // kept and only the baseline re-taken, which is what makes the correction
       // invisible instead of a jump. See `markAnchorScroll`.
       // `isAnchorScroll` reads module state at EVENT time. Any later mark
@@ -417,15 +482,18 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
       // and takes the reveal. The POSITION answers it exactly. An event that
       // finds the container where the anchor write left it is that write's
       // own, whoever marked in between.
-      // The prompt answers to the same rule as the header: revealed by our own
-      // placements and held rides, and held still by an anchor write.
-      if (isNavigationScroll() || isHeaderPinnedForScroll()) {
+      // The follow's CARRY holds the bars too, through the same kind check and
+      // position stamp. A reply scrolling the thread is not the reader, and
+      // only their finger moves the bars (ADR 0337). The prompt shares every
+      // rule here.
+      const readerScroll = countsAsReaderScroll({
+        navigation: isNavigationScroll(),
+        headerPinned: isHeaderPinnedForScroll(),
+      });
+      if (!readerScroll) {
         prevScrollTop = scrollTop;
-        if (!isAnchorScroll() && !atAnchoredTop) {
-          headerOffset = 0;
-          promptOffset = 0;
-        }
-        clampPromptToBottom();
+        measureContainer(currentContainer);
+        if (!isAnchorScroll() && !isCarryScroll() && !atRebasedTop) revealBars();
         applyTransform();
         return;
       }
@@ -437,25 +505,16 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
         if (activePane === currentContainerPane) return;
       }
 
-      const delta = scrollTop - prevScrollTop;
-
-      headerOffset = clampOffset(headerOffset - delta);
-      if (currentViewKey === 'thread') {
-        promptOffset = nextPromptOffsetPx({
-          offset: promptOffset,
-          delta,
-          promptHeight,
-          distanceToBottom: distanceToBottom(currentContainer),
-        });
-      }
-      applyTransform();
+      intent = nextBarsIntent(intent, scrollTop - prevScrollTop, BARS_TRAVEL_REM * cachedRemSize);
       prevScrollTop = scrollTop;
+      measureContainer(currentContainer);
+      applyTransform();
     }
 
     /** iOS Safari sometimes misses focusout — when swiping scroll-snap panes,
      *  or when the focused input is removed mid-edit. syncToScroll re-applies
-     *  the transform; updateHeaderVar alone leaves the header stuck at
-     *  translateY(-cachedHeight) above the viewport. */
+     *  the offsets; updateHeaderVar alone leaves the header stuck a header
+     *  height above the viewport. */
     function recoverKeyboardState() {
       if (!keyboardOpen || closePending) return;
       const active = document.activeElement;
@@ -476,6 +535,13 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
       // every MutationObserver callback, even when container is unchanged.
       recoverKeyboardState();
 
+      // A pane swipe brings every bar back. It is written BEFORE the rebind
+      // below, so the outgoing title bar and prompt glide in as they leave.
+      if (container !== currentContainer) {
+        revealBars();
+        applyTransform();
+      }
+
       // Also before the early return: the title bar and chevron can be REPLACED
       // while the scroll container itself is reused (switching threads reuses
       // .thread-content). Now that the offset is written on those two elements
@@ -488,13 +554,9 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
       if (container === currentContainer) {
         // Nothing else changed, but freshly-bound elements need the current
         // offset written to them now. The container-change path below reaches
-        // its own applyTransform after restoring this pane's saved offset.
+        // its own applyTransform.
         if (rebound) applyTransform();
         return;
-      }
-
-      if (currentViewKey) {
-        paneState[currentViewKey] = { headerOffset, prevScrollTop };
       }
 
       if (currentContainer) {
@@ -505,35 +567,17 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
       currentContainerPane = container?.closest('.mobile-swipe-pane') ?? null;
       currentViewKey = view;
       // Stamped against the container we just left, so it says nothing here.
-      anchoredTop = -1;
+      rebasedTop = -1;
       refreshHeight();
       if (container) {
-        // Restore this pane's saved scroll state, or derive from scroll position
-        const saved = paneState[view];
-        if (saved) {
-          headerOffset = saved.headerOffset;
-          prevScrollTop = saved.prevScrollTop;
-        } else {
-          const scrollPos = Math.max(0, container.scrollTop);
-          headerOffset = clampOffset(-scrollPos);
-          prevScrollTop = scrollPos;
-        }
-        // Verify saved state matches actual scroll — if the container is
-        // near the top, the header+title must be visible regardless of saved state.
-        // Prevents stale negative offset from a different view leaking in.
-        const actualScroll = Math.max(0, container.scrollTop);
-        if (actualScroll < cachedHeight + titleBarHeight) {
-          headerOffset = clampOffset(-actualScroll);
-          prevScrollTop = actualScroll;
-        }
-        clampPromptToBottom();
+        measureContainer(container);
+        prevScrollTop = viewScrollTop;
         container.addEventListener('scroll', onScroll, { passive: true });
       } else {
-        // No scroll container — reset scroll-based offset. applyTransform
-        // still hides the header if keyboard is open (keyboardOpen flag).
-        headerOffset = 0;
+        // applyTransform still hides the header if the keyboard is open.
         prevScrollTop = 0;
-        if (view === 'thread') promptOffset = 0;
+        viewScrollTop = 0;
+        distanceToBottomPx = Infinity;
       }
       applyTransform();
     }
@@ -542,7 +586,7 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
     attachListener();
 
     // Hide header and collapse spacer when any prompt input gains focus.
-    // applyTransform checks keyboardOpen independently of headerOffset,
+    // applyTransform checks keyboardOpen independently of the intent,
     // so this can't race with attachListener or scroll updates.
     function onFocusIn(e: FocusEvent) {
       if (!opensSoftwareKeyboard(e.target)) return;
@@ -563,7 +607,7 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
       // so move content up by the same delta to stay visually anchored.
       if (currentContainer) {
         const delta = cachedHeight - cachedSafeAreaTop;
-        currentContainer.scrollTop = Math.max(0, currentContainer.scrollTop - delta);
+        holdAcrossRelayout(currentContainer as HTMLElement, Math.max(0, currentContainer.scrollTop - delta));
       }
       applyTransform();
     }
@@ -590,8 +634,10 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
         keyboardOpen = false;
         updateHeaderVar();
         // Mirror onFocusIn: spacer grows back, so add the same delta to scrollTop.
+        // This runs after a send's two landing calls, so an unmarked write
+        // would read as the reader and cancel the landing.
         if (currentContainer) {
-          currentContainer.scrollTop += cachedHeight - cachedSafeAreaTop;
+          holdAcrossRelayout(currentContainer as HTMLElement, currentContainer.scrollTop + cachedHeight - cachedSafeAreaTop);
         }
         syncToScroll(currentContainer);
       });
@@ -618,26 +664,12 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
         mutationRafId = null;
         attachListener();
         refreshHeight();
-        // Correct header if scroll position warrants more visibility
-        // than the current offset provides. attachListener() only runs
-        // this check when the container element changes, but content can
-        // shrink (e.g. steps collapsed, Claude Code session finished) without the
-        // container changing — leaving the header stuck hidden.
+        // Content can shrink under a still reader (steps collapsed, a session
+        // finished), bringing the top or the live edge within reach. Re-measure,
+        // so the edge rules show the bars there.
         if (currentContainer && cachedHeight > 0 && !keyboardOpen && !disabled) {
-          const actualScroll = Math.max(0, currentContainer.scrollTop);
-          if (actualScroll < cachedHeight + titleBarHeight) {
-            const corrected = clampOffset(-actualScroll);
-            if (headerOffset < corrected) {
-              headerOffset = corrected;
-              prevScrollTop = actualScroll;
-              applyTransform();
-            }
-          }
-          // The mirror at the bottom: a shrink that brings the thread's end
-          // within a prompt's height shows the prompt again.
-          const promptBefore = promptOffset;
-          clampPromptToBottom();
-          if (promptOffset !== promptBefore) applyTransform();
+          measureContainer(currentContainer);
+          applyTransform();
         }
       });
     });
@@ -686,11 +718,11 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
     // Reveal the header and the prompt on request: a change applied, discarded
     // or reverted, a deep link landing, or the prompt about to take focus. The
     // reader is often scrolled far down with both bars away.
-    function onRevealBars() {
-      headerOffset = 0;
-      promptOffset = 0;
-      prevScrollTop = currentContainer ? Math.max(0, currentContainer.scrollTop) : 0;
+    function onRevealBars(e: Event) {
+      revealBars();
+      prevScrollTop = currentContainer ? clampedScrollTop(currentContainer) : 0;
       applyTransform();
+      if (promptEl && (e as CustomEvent<RevealBarsDetail | null>).detail?.instant) landWithoutGlide(promptEl);
     }
     document.addEventListener('reveal-mobile-bars', onRevealBars);
 
@@ -721,11 +753,11 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
     }
     recomputeDisabled();
 
-    // The app re-based this container's offset to hold the reader on the
-    // content they were reading. Re-take the baseline HERE, not on the scroll
-    // event: on WebKit that event can arrive after the navigation window has
-    // closed, handing the header the whole jump. See `onAnchorScroll`. The
-    // offset is untouched, because nobody moved.
+    // The app re-based this container's offset without taking the reader
+    // anywhere: an anchor write, or the follow carrying them down a reply.
+    // Re-take the baseline HERE, not on the scroll event: on WebKit that event
+    // can arrive after the navigation window has closed, handing the header the
+    // whole jump. See `onRebasedScroll`. The intent is untouched.
     //
     // And AGAIN on the next frame, because the write is not the end of it. A
     // reveal that shrinks the transcript is still settling, and the browser's
@@ -733,16 +765,16 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
     // header spent it as a reveal of the full title and bar.
     // The baseline alone only settles the DELTA path. Stamp the position too,
     // so the navigation path can recognise this write's own event.
-    const unsubAnchor = onAnchorScroll((el) => {
+    const unsubRebased = onRebasedScroll((el) => {
       if (el !== currentContainer) return;
       prevScrollTop = clampedScrollTop(el);
-      anchoredTop = prevScrollTop;
-      if (anchorSettleRaf !== null) cancelAnimationFrame(anchorSettleRaf);
-      anchorSettleRaf = requestAnimationFrame(() => {
-        anchorSettleRaf = null;
+      rebasedTop = prevScrollTop;
+      if (rebaseSettleRaf !== null) cancelAnimationFrame(rebaseSettleRaf);
+      rebaseSettleRaf = requestAnimationFrame(() => {
+        rebaseSettleRaf = null;
         if (el !== currentContainer) return;
         prevScrollTop = clampedScrollTop(el);
-        anchoredTop = prevScrollTop;
+        rebasedTop = prevScrollTop;
       });
     });
 
@@ -757,7 +789,7 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
     // Entering or leaving the compose-empty view: its prompt never slides, and
     // the thread a first send lands on starts with the prompt shown.
     const unsubCompose = composeViewActive.subscribe(() => {
-      promptOffset = 0;
+      revealBars();
       applyTransform();
     });
 
@@ -773,22 +805,22 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
       window.visualViewport?.removeEventListener('resize', refreshHeight);
       if (coldStartPollId !== null) cancelAnimationFrame(coldStartPollId);
       if (mutationRafId !== null) cancelAnimationFrame(mutationRafId);
-      if (anchorSettleRaf !== null) cancelAnimationFrame(anchorSettleRaf);
+      if (rebaseSettleRaf !== null) cancelAnimationFrame(rebaseSettleRaf);
       observer.disconnect();
       headerResizeObserver.disconnect();
       if (titleBarResizeObserver) titleBarResizeObserver.disconnect();
-      unsubAnchor();
+      unsubRebased();
       unsub();
       unsubOverlay();
       unsubPrefs();
       unsubCompose();
       promptResizeObserver?.disconnect();
-      if (promptEl) promptEl.style.transform = '';
+      if (promptEl) promptEl.style.translate = '';
       downChevronEl?.style.removeProperty('--mobile-prompt-offset');
       document.documentElement.removeAttribute('data-mobile-dynamic-bars');
       document.documentElement.style.removeProperty('--mobile-prompt-height');
       if (headerRef.current) {
-        headerRef.current.style.transform = '';
+        headerRef.current.style.translate = '';
       }
       document.documentElement.style.removeProperty('--mobile-header-height');
       document.documentElement.style.removeProperty('--mobile-thread-title-height');

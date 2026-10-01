@@ -14,6 +14,7 @@ import {
   reauthorizationHint,
 } from '../credentials/providerConsoleHint';
 import {
+  PROVIDER_ACCESS,
   PROVIDER_SCOPES,
   backupAccessLine,
   oauthProviderFor,
@@ -265,6 +266,19 @@ export function backupHealthCardSkeleton(): VNode {
       <div class="backup-health-card" data-state="idle" aria-hidden="true">
         <SkText class="backup-health-line" w="12rem" />
         <SkText class="backup-health-line" w="15rem" />
+      </div>
+    </SkeletonProvider>
+  );
+}
+
+/** The access line under the Provider picker, as shimmer: its own box, three lines. */
+function backupProviderAccessSkeleton(): VNode {
+  return (
+    <SkeletonProvider>
+      <div class="backup-provider-access" aria-hidden="true">
+        <SkText as="div" w="100%" />
+        <SkText as="div" w="100%" />
+        <SkText as="div" w="60%" />
       </div>
     </SkeletonProvider>
   );
@@ -907,6 +921,13 @@ export function BackupSection() {
           <span class="error-text">Failed to load providers: {providersLoadable.error}</span>
         )}
       </div>
+      {/* Several lines of copy that land with the provider read, so its place is
+          held on the section's one gate like the controls around it. */}
+      <LoadingFade showSkeleton={showControlSkeleton} skeleton={backupProviderAccessSkeleton()}>
+        {PROVIDER_ACCESS[selectedProvider] && (
+          <p class="backup-provider-access">{PROVIDER_ACCESS[selectedProvider]}</p>
+        )}
+      </LoadingFade>
 
       {providerInfo && !providerInfo.connected && (
         // Still an error state (nothing uploads until an account is connected),

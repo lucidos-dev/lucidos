@@ -124,6 +124,23 @@ fn a_read_after_the_terminal_starts_a_turn() {
     );
 }
 
+/// A restart teardown emits the turn's terminal from outside the run loop. The
+/// agent then answers the interrupt as if the user had rejected its work, and
+/// the run loop drops that answer like any other straggler.
+#[test]
+fn an_external_terminal_ends_the_turn() {
+    use std::sync::atomic::AtomicBool;
+    assert!(
+        turn_has_terminal(false, &AtomicBool::new(true)),
+        "the teardown's terminal ends the turn the loop never ended itself"
+    );
+    assert!(turn_has_terminal(true, &AtomicBool::new(false)));
+    assert!(
+        !turn_has_terminal(false, &AtomicBool::new(false)),
+        "a live turn keeps its output"
+    );
+}
+
 #[test]
 fn reset_per_turn_flags_clears_all_flags() {
     let mut is_waiting = true;

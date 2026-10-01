@@ -714,10 +714,6 @@ pub struct LucidosEngine {
     /// Limits concurrent CC process startups to prevent CPU contention.
     /// Acquired before spawn_or_resume(), released after Init event.
     cc_startup_semaphore: Arc<tokio::sync::Semaphore>,
-    /// Backs `lock_workspace_repo()` — serializes mutations to the workspace
-    /// repo's working tree against `change_ops::apply_change`'s dirty check
-    /// so apply never observes a half-written file from a commit-in-flight.
-    workspace_repo_lock: Arc<tokio::sync::Mutex<()>>,
     /// MCP server manager — handles lifecycle, tool discovery, and tool calls
     pub mcp_manager: crate::mcp::McpManager,
     /// Pending CC permission prompts, deduped by `(thread, tool, input)` so

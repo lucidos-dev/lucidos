@@ -101,6 +101,14 @@
     margin-top: var(--space-md);
 }
 
+/* What the picked provider can reach. Read before connecting, so it sits
+   directly under the Provider row. */
+.backup-provider-access {
+    margin: 0 0 var(--space-sm);
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+}
+
 /* Explains when a non-manual schedule actually fires. Sits tight under the row
    it qualifies. */
 .backup-schedule-hint {

@@ -333,12 +333,12 @@ fn plugin_with_theme(name: &str, file: &str, body: &str) -> std::path::PathBuf {
 fn validates_tree_with_only_themes() {
     let dir = plugin_with_theme(
         "themes",
-        "harbour.json",
-        r##"{"name":"Harbour","dark":{"--accent":"#3aa3c9"}}"##,
+        "lagoon.json",
+        r##"{"name":"Lagoon","dark":{"--accent":"#3aa3c9"}}"##,
     );
     let (_, planned) = validate_tree(&dir).unwrap();
     let paths: Vec<&str> = planned.iter().map(|p| p.data_relative.as_str()).collect();
-    assert_eq!(paths, vec!["themes/harbour.json"]);
+    assert_eq!(paths, vec!["themes/lagoon.json"]);
     let _ = fs::remove_dir_all(&dir);
 }
 

@@ -3,7 +3,7 @@ import { useEffect, useMemo, useRef } from 'preact/hooks';
 import { answerThreadQuestion } from '../../store/actions/chat-claude-code';
 import { createTapGate } from '../../utils/tapGesture';
 import { renderMarkdown, renderMarkdownInline } from '../../utils/renderMarkdown';
-import { CHOICE_CARD_ROLE, handleChoiceCardKeyDown, seedChoiceCardFocus } from './choiceCardNav';
+import { CHOICE_CARD_ROLE, handAnsweredCardFocusToPrompt, handleChoiceCardKeyDown, seedChoiceCardFocus } from './choiceCardNav';
 import { UserImages } from './chat-exchange-parts';
 import { followAnsweredQuestion } from './scrollState';
 import type { AnswerKind, QuestionOption } from '../../store/thread-events';
@@ -195,6 +195,7 @@ export function QuestionBody({ threadId, toolUseId, question, options, multiSele
   }
 
   const onPick = async (optionId: string) => {
+    handAnsweredCardFocusToPrompt();
     localPending.value = { kind: 'Selected', option_id: optionId };
     // Answering is a send: keep the reader at the live edge while the agent
     // resumes, landing on what they just answered when they were not already

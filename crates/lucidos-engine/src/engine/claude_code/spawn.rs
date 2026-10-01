@@ -230,7 +230,8 @@ impl LucidosEngine {
     }
 
     /// Discard pending CC changes without ending the session.
-    /// Resets the worktree to main and re-enters idle state.
+    /// Resets the worktree to main, if it is still on the session's branch,
+    /// and re-enters idle state.
     ///
     /// `actor` is the user who clicked Discard — propagated to any
     /// `ChangeApplyFailed` emitted by the stale-session fallback so the
@@ -252,7 +253,12 @@ impl LucidosEngine {
             super::claim_for_discard(&mut guard, thread_id)?
         };
 
-        let super::DiscardTarget::Claimed { worktree, claimant } = target else {
+        let super::DiscardTarget::Claimed {
+            worktree,
+            branch,
+            claimant,
+        } = target
+        else {
             // No live session, so fall back to stale session handling.
             // discard=true because this is the user-clicked Discard
             // button: explicit user intent.
@@ -267,7 +273,8 @@ impl LucidosEngine {
 
         self.discard_open_changes_for_thread(thread_id, actor).await;
 
-        self.reset_worktree_and_idle(thread_id, &worktree).await;
+        self.reset_worktree_and_idle(thread_id, &worktree, &branch)
+            .await;
 
         claim.release().await;
 

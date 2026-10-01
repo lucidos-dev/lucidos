@@ -221,6 +221,44 @@ async fn a_held_message_can_be_released_only_once() {
     teardown_test_db(&db_name).await;
 }
 
+/// The store can refuse a release for a reason other than a lost race, such
+/// as a full disk. The claim must then end with the message still held.
+#[tokio::test]
+async fn a_release_the_store_keeps_refusing_ends_the_claim() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    seed_cc_thread(&bus, thread_id).await;
+    hold(&bus, thread_id, "first").await;
+    sqlx::query(
+        "CREATE FUNCTION refuse_release() RETURNS trigger AS $$ BEGIN \
+         IF NEW.event_type = 'HeldMessageReleased' THEN RAISE EXCEPTION 'refused'; END IF; \
+         RETURN NEW; END $$ LANGUAGE plpgsql",
+    )
+    .execute(&pool)
+    .await
+    .expect("create the refusing function");
+    sqlx::query(
+        "CREATE TRIGGER refuse_release BEFORE INSERT ON events \
+         FOR EACH ROW EXECUTE FUNCTION refuse_release()",
+    )
+    .execute(&pool)
+    .await
+    .expect("create the refusing trigger");
+
+    let claimed = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        claim_next_held_message(&bus, &pool, no_blobs(), thread_id),
+    )
+    .await
+    .expect("the claim must end, not retry the same message forever");
+    assert!(claimed.is_none(), "a refused release delivers nothing");
+    assert_eq!(count_releases(&pool, thread_id).await, 0);
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
 /// Cancel means stop, so it keeps the hold. Every other resolution releases.
 #[test]
 fn only_a_cancel_keeps_the_hold() {

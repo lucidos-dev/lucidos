@@ -68,14 +68,14 @@ describe('ChildCompletionRow', () => {
    *  trigger fire: all four report that something happened outside this thread,
    *  and they used to say it in four dialects. This pins that it is the shared
    *  row rather than a card of its own again. */
-  it('is an event row: verb-prefix, linked title, state word', () => {
+  it('is an event row: pill, linked title, state word', () => {
     const tree = ChildCompletionRow(baseProps);
     const row = findByClass(tree, 'event-row');
     expect(row).not.toBeNull();
     expect(row!.props['data-kind']).toBe('child');
     expect(row!.props['data-state']).toBe('success');
-    expect(vnodeText(row)).toContain('Child thread returned:');
-    expect(vnodeText(row)).toContain('Refactor the foo helper');
+    expect(vnodeText(findByClass(tree, 'event-row-subject'))).toBe('Child thread returned');
+    expect(vnodeText(findByClass(tree, 'event-row-meta'))).toContain('Refactor the foo helper');
     // The one event row that legitimately shows a verdict, because the verdict
     // it reports is the CHILD's outcome rather than the row's own.
     const pill = findByClass(tree, 'event-row-state');
@@ -135,15 +135,13 @@ describe('ChildCompletionRow', () => {
     expect(vnodeText(link)).toBe('Untitled thread');
   });
 
-  /** One fold, labelled by what it holds, the same as the delivery's `Payload` and
-   *  the trigger's `Prompt`. It was "Show summary", which is an instruction
-   *  where the other two are nouns. */
+  /** One fold, labelled Details like every other event card's. */
   it('renders agent summary inside a collapsed fold', () => {
     const tree = ChildCompletionRow(baseProps);
     const fold = findByType(tree, EventRowFoldView);
     expect(fold).not.toBeNull();
     expect(fold!.props.open).toBeUndefined();
-    expect(fold!.props.label).toBe('Summary');
+    expect(fold!.props.label).toBe('Details');
   });
 
   it('omits the disclosure when the agent summary is empty', () => {
@@ -152,17 +150,16 @@ describe('ChildCompletionRow', () => {
   });
 
   /** The four appear together in one stream, so each has to be distinguishable
-   *  from the other three. The verb carries the shape of what happened and the
-   *  state word carries the verdict, so `success` and `no_changes` share a verb
-   *  and are still told apart. */
+   *  from the other three. The pill says a child thread returned; the state word
+   *  carries the verdict, so each reads apart from the other three. */
   it.each([
-    { status: 'success' as const, prefix: 'Child thread returned:', word: 'Success', tone: 'good' },
-    { status: 'failure' as const, prefix: 'Child thread failed:', word: 'Failure', tone: 'bad' },
-    { status: 'no_changes' as const, prefix: 'Child thread returned:', word: 'No changes', tone: 'none' },
-    { status: 'canceled' as const, prefix: 'Child thread canceled:', word: 'Canceled', tone: 'halted' },
-  ])('status=$status: prefix "$prefix" with the word "$word"', ({ status, prefix, word, tone }) => {
+    { status: 'success' as const, word: 'Success', tone: 'good' },
+    { status: 'failure' as const, word: 'Failure', tone: 'bad' },
+    { status: 'no_changes' as const, word: 'No changes', tone: 'none' },
+    { status: 'canceled' as const, word: 'Canceled', tone: 'halted' },
+  ])('status=$status reads "$word"', ({ status, word, tone }) => {
     const tree = ChildCompletionRow({ ...baseProps, status });
-    expect(vnodeText(findByClass(tree, 'event-row-subject'))).toContain(prefix);
+    expect(vnodeText(findByClass(tree, 'event-row-subject'))).toBe('Child thread returned');
     const pill = findByClass(tree, 'event-row-state');
     expect(vnodeText(pill)).toBe(word);
     expect(pill!.props['data-tone']).toBe(tone);

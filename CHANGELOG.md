@@ -1,5 +1,55 @@
 # Changelog
 
+## v0.44.2 — 2026-10-01
+
+### Changed
+
+- Every composer and canvas toggle has a keyboard chord. Settings lists each chord with its mnemonic.
+- Ember, Harbour and Real computer are built-in themes.
+- Chat cards share one look. Engine, resume, trigger, child-thread and held cards read as a pill, a state and Details.
+- Only agent output wears a turn header. No turn wears a Lucidos Engine header.
+- A resume is a card inside the reply it resumed.
+- Work cards report their turn, and Continue sits in its card. Pills say what happened.
+- An interrupted response names its cause.
+- Each card status word keeps one colour.
+- All text inputs share one box and a glow-only focus ring.
+- The file preview shows markdown frontmatter as a properties card.
+- The path row in the file preview is a breadcrumb. Each folder opens the Files view at that folder.
+- A repeated plain toast counts on one card instead of stacking copies.
+- The theme picker badges workspace themes as Custom.
+- Drawer, Triggers, Changes and Thread queue share one section header and row hairline.
+- Every list panel header has 1rem of space above and below its label.
+- On mobile, the dynamic bars follow only the reader's finger, and they glide into place.
+- The whole panel header is a tap target.
+- Settings, Backup shows what each provider can reach, under the Provider picker. The Drive line describes the permission it needs.
+- The OAuth client form says that saving grants no access. The unused Default Scopes field is gone, and stored values are cleared.
+- Tab stays inside the thread after you enter it, and Tab routes through open overlays, app frames and previews.
+
+### Fixed
+
+- Diff and Apply shortcuts act only on the change row you see.
+- The prompt box takes typing after you open Side question over an empty box.
+- Question options are boxed again.
+- The marketplace Add form wraps on the pane width.
+- On mobile, the first send keeps the transcript on screen, and the keyboard closing after a send no longer cancels the landing.
+- On mobile, a short content view no longer scrolls its top behind the header.
+- On mobile, a data file's document, table or source scrolls in the pane, and the HTML frame and editor keep their full height.
+- The theme picker holds its height while the gallery loads.
+- A revealed folder in Files lands under the phone header. Landing on Files forgets the preview it left.
+- Recently applied in Changes loads more rows when it opens.
+- A restart-killed agent session no longer shows a reply to its own interrupt.
+- The desktop app gives its service teardown the time it needs, and a built window opens at its saved frame.
+- The Backup access line holds its place while the providers load.
+- A page the engine already served no longer bounces on a cold start.
+- A refused first send keeps its draft.
+- The scale panel responds to a pinch from its first paint.
+- A thread's knowhow is replayed after the store drops it.
+- Workspace merges hold the repository lock until the publish and tree sync finish.
+- A session worktree resets only while it is on the session branch.
+- The workspace list reports a failure as an error, not as an empty list.
+- Credentials for auth handshakes no longer carry loader-hook names (OpenSSL, glibc, macOS venv launcher) into the sandbox.
+- App documents stay off the gateway's credentialed routes.
+- The dompurify dependency is updated to 3.4.16 (GHSA-p98j-92pf-mc4p).
 ## v0.44.1 — 2026-09-30
 
 ### Fixed

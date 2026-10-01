@@ -863,6 +863,9 @@ export const threadSearchResults = signal<Loadable<import('../api/threads').Thre
 // --- Event-driven thread store ---
 export const threadMap = signal<Map<string, ThreadState>>(new Map());
 export const threadsLoaded = signal(false);
+/** The engine has served this page its thread list at least once. Unlike
+ *  `threadsLoaded`, which a send also sets, only a fetched list sets this. */
+export const threadListFetched = signal(false);
 /** The focused thread the client is WAITING for, or null. It is not in
  *  `threadMap` yet, and its absence is expected rather than stale.
  *
@@ -1320,6 +1323,9 @@ export function scopeToRepoId(scope: Scope): string | undefined {
 export const repoSource = signal<string | null>(null); // null = workspace, string = repo ID
 export const repoFiles = signal<Loadable<string[]>>({ status: 'not-loaded' });
 export const repoExpandedFolders = signal<Set<string>>(new Set());
+/** A folder the Files tree scrolls to once its row is drawn, then clears.
+ *  Set by `revealFolderInFiles`; either tree, workspace or repo, answers it. */
+export const revealedFolder = signal<string | null>(null);
 
 export interface DiffLine {
   type: 'context' | 'addition' | 'deletion';
@@ -1880,6 +1886,32 @@ export function expandTriggerSection(sectionId: string): void {
   persistCollapsedTriggerSections(next);
 }
 
+/** A list panel's collapsed sections, per device and localStorage-backed, like
+ *  the Triggers panel's above. */
+function collapsedSectionsStore<Id extends string>(key: string) {
+  const ids = signal<Set<string>>(restoreIdSet(key));
+  function toggle(id: Id): void {
+    const next = new Set(ids.value);
+    if (next.has(id)) next.delete(id);
+    else next.add(id);
+    ids.value = next;
+    persistIdSet(key, next);
+  }
+  return { ids, toggle };
+}
+
+export type ChangesSectionId = 'set-aside' | 'applied';
+export const {
+  ids: collapsedChangesSectionIds,
+  toggle: toggleChangesSectionCollapsed,
+} = collapsedSectionsStore<ChangesSectionId>('lucidos-collapsed-changes-sections');
+
+export type ThreadQueueSectionId = 'running' | 'queued';
+export const {
+  ids: collapsedThreadQueueSectionIds,
+  toggle: toggleThreadQueueSectionCollapsed,
+} = collapsedSectionsStore<ThreadQueueSectionId>('lucidos-collapsed-thread-queue-sections');
+
 /** A trigger id the Triggers panel should scroll to and mark once it renders.
  *  Set by `navigateToTrigger`, so a route to a trigger lands on its row rather
  *  than in the edit form. The row is where Run once, the pause toggle and the
@@ -2149,12 +2181,26 @@ export function showToast(rawMessage: string, type: ToastType = 'info', opts?: {
       return;
     }
   }
-  const id = ++toastIdCounter;
   // Freeze the toast over the pane focused right now, so a later focus switch
   // cannot make it jump panes. The drawer counts as the thread pane. The
   // keyed-update branch above deliberately does NOT touch `pane`, so an
   // in-place update keeps the toast where it first appeared.
   const pane = focusedPane.value === 'content' ? 'content' : 'thread';
+  // A plain toast repeated while its twin is up over the same pane counts on
+  // that card. A burst of identical failures (every lazy chunk of a stale
+  // build) would otherwise bury the screen in copies. A toast that acts never
+  // merges, since two cards with the same words may carry different handlers.
+  const plain = !key && !action && !secondaryAction && !onClick && !spinning && progress == null;
+  const twin = plain
+    ? toasts.value.find((t) => !t.key && !t.action && !t.secondaryAction && !t.onClick && !t.spinning
+        && t.progress == null && t.pane === pane && t.type === type && t.title === title && t.message === message)
+    : undefined;
+  if (twin) {
+    toasts.value = toasts.value.map((t) => t === twin ? { ...t, count: (t.count ?? 1) + 1, persistent } : t);
+    scheduleUnkeyedDismiss(twin.id, autoMs);
+    return;
+  }
+  const id = ++toastIdCounter;
   // Prepend, so the newest toast renders at the top of its pane's column and
   // pushes that pane's existing toasts down. Each column is pinned to the top
   // of the viewport, so array order runs top to bottom.
@@ -2163,11 +2209,18 @@ export function showToast(rawMessage: string, type: ToastType = 'info', opts?: {
     scheduleAutoDismiss(key, autoMs);
     return;
   }
-  if (autoMs !== undefined) {
-    setTimeout(() => {
-      toasts.value = toasts.value.filter((t) => t.id !== id);
-    }, autoMs);
-  }
+  scheduleUnkeyedDismiss(id, autoMs);
+}
+
+/** Pending auto-dismiss timers for unkeyed toasts, so a merged repeat can
+ *  restart its twin's window. */
+const unkeyedDismissTimers = new Map<number, ReturnType<typeof setTimeout>>();
+
+function scheduleUnkeyedDismiss(id: number, autoDismissMs: number | undefined): void {
+  clearTimeout(unkeyedDismissTimers.get(id));
+  unkeyedDismissTimers.delete(id);
+  if (autoDismissMs === undefined) return;
+  unkeyedDismissTimers.set(id, setTimeout(() => dismissToast(id), autoDismissMs));
 }
 
 function scheduleAutoDismiss(key: string, autoDismissMs: number | undefined): void {
@@ -2204,6 +2257,7 @@ export function removeToast(key: string): void {
 export function dismissToast(idOrKey: number | string) {
   if (typeof idOrKey !== 'string') {
     toasts.value = toasts.value.filter((t) => t.id !== idOrKey);
+    scheduleUnkeyedDismiss(idOrKey, undefined);
     return;
   }
   removeToast(idOrKey);

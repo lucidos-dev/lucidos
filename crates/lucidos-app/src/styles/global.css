@@ -18,6 +18,9 @@
    base class by source order (e.g. .send-cancel-morph vs .action-btn) keep
    winning. */
 @import './global/host-components.css';
+/* After host-components.css, so its focus ring replaces the editable
+   dropdown's there. */
+@import './global/text-input.css';
 @import './global/modal-overlay.css';
 /* Host only: every protected surface is shell DOM, never an app frame. */
 @import './global/protected-surface.css';

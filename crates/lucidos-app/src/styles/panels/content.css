@@ -105,7 +105,7 @@
    1.25rem strip lying over the right edge of every mobile pane. Any control
    pinned to a row's right edge sits under it, and a tap landing on the strip
    reaches neither the button nor `isInteractiveTarget`, so it is read as an edge
-   gesture and preventDefault()ed. `.trigger-group-actions` in mobile.css carries
+   gesture and preventDefault()ed. `.list-section-actions` in mobile.css carries
    the same lift and the full reasoning. It is unconditional here rather than
    inside the mobile query, since desktop has no strip and no competing layer,
    and one rule keeps this button's whole box in one place. The band already

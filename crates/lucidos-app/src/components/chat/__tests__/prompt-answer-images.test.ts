@@ -84,8 +84,16 @@ describe('a hold on Stop starts a side question', () => {
 
   it('puts /btw in the empty composer instead of asking', () => {
     expect(promptSource).toMatch(
-      /if \(holdSideQuestion\.kind === 'start-draft'\) \{\s*startedSideQuestionDraftRef\.current = true;\s*startSideQuestionDraft\(`\/\$\{SIDE_QUESTION_COMMAND\} `\);/,
+      /if \(holdSideQuestion\.kind === 'start-draft'\) \{\s*startedSideQuestionDraftRef\.current = true;\s*startEmptySideQuestion\(\);/,
     );
+    expect(promptSource).toMatch(/function startEmptySideQuestion\(\): void \{\s*startSideQuestionDraft\(`\/\$\{SIDE_QUESTION_COMMAND\} `\);/);
+  });
+
+  it('skips the pill for a mouse hold, so the box takes typing at once', () => {
+    expect(promptSource).toMatch(
+      /if \(holdSideQuestion\.kind === 'start-draft' && pressPointerTypeRef\.current === 'mouse'\) \{\s*startEmptySideQuestion\(\);\s*holdRefocusesComposerRef\.current = true;\s*return;\s*\}\s*sendHoldMenuOpener\.value = 'hold';/,
+    );
+    expect(promptSource).toMatch(/pressPointerTypeRef\.current = e\.pointerType;/);
   });
 
   it('marks the hold so its release does not also stop the turn', () => {
@@ -96,7 +104,8 @@ describe('a hold on Stop starts a side question', () => {
   });
 
   it('spends the tap gate, so a finger drifting under the pill is not a refused swipe', () => {
-    expect(promptSource).toMatch(/heldSendRef\.current = true;[^]*?morphGate\.spend\(\);\s*sendHoldMenuOpener\.value = 'hold';/);
+    // Before the branch, so a hold that starts the draft spends it too.
+    expect(promptSource).toMatch(/heldSendRef\.current = true;[^]*?morphGate\.spend\(\);[^]*?if \(holdSideQuestion\.kind === 'start-draft' &&[^]*?sendHoldMenuOpener\.value = 'hold';/);
     // What the spend buys: Stop's destructive lift reaches the hold mark.
     const gate = createTapGate();
     let served = 0;
@@ -123,12 +132,12 @@ describe('a hold on Stop starts a side question', () => {
 
   it('hands focus back to the composer when a mouse hold began mid-typing', () => {
     expect(promptSource).toMatch(
-      /typingAtPressRef\.current = e\.pointerType === 'mouse' && document\.activeElement === inputRef\.current;/,
+      /holdRefocusesComposerRef\.current = e\.pointerType === 'mouse' && document\.activeElement === inputRef\.current;/,
     );
-    expect(promptSource).toMatch(/sendHoldMenuOpener\.value = 'hold';\s*if \(typingAtPressRef\.current\) focusIfNeeded\(inputRef\.current\);/);
+    expect(promptSource).toMatch(/sendHoldMenuOpener\.value = 'hold';\s*if \(holdRefocusesComposerRef\.current\) focusIfNeeded\(inputRef\.current\);/);
     // Again after the release's click, which the `.action-btn` blur listener hears.
     expect(promptSource).toMatch(
-      /if \(typingAtPressRef\.current\) requestAnimationFrame\(\(\) => focusIfNeeded\(inputRef\.current\)\);\s*return;/,
+      /if \(holdRefocusesComposerRef\.current\) requestAnimationFrame\(\(\) => focusIfNeeded\(inputRef\.current\)\);\s*return;/,
     );
   });
 
@@ -186,9 +195,15 @@ describe('the Side question shortcut', () => {
     );
   });
 
+  it('starts the /btw draft over an empty box, so the user types straight on', () => {
+    expect(promptSource).toMatch(
+      /else if \(holdSideQuestion\.kind === 'start-draft'\) startEmptySideQuestion\(\);\s*else if \(sideQuestionBlocker === null\) sendHoldMenuOpener\.value = 'shortcut';/,
+    );
+  });
+
   it('shuts the open pill on a second press, as Escape does', () => {
     expect(promptSource).toMatch(
-      /promptSideQuestionRequested\.value = false;[^]*?if \(sendHoldMenuOpener\.peek\(\) !== null\) sendHoldMenuOpener\.value = null;\s*else if \(sideQuestionBlocker === null\)/,
+      /promptSideQuestionRequested\.value = false;[^]*?if \(sendHoldMenuOpener\.peek\(\) !== null\) sendHoldMenuOpener\.value = null;\s*else if \(holdSideQuestion\.kind === 'start-draft'\)/,
     );
   });
 

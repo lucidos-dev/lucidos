@@ -280,28 +280,31 @@ export function ThemePicker() {
   // A preference naming a theme that is gone paints the default
   // (refreshActiveTheme), so the picker checks the default too.
   const painted = themes?.find(theme => theme.id === active) ?? themes?.find(theme => theme.id === DEFAULT_THEME_ID);
+  // The loaded frame's rows: a chip line, the names row, then the cards.
+  const skeletonFrame = () => (
+    <div class="theme-carousel-frame">
+      <div class="pill-bar" aria-hidden="true">
+        <span class="pill-bar-btn">{'\u00a0'}</span>
+      </div>
+      <ListSkeletonOf
+        containerClass={stripClass}
+        count={6}
+        row={i => (
+          <>
+            {i === 0 && <span class="theme-family-name">{'\u00a0'}</span>}
+            <ThemeCard mode={mode} column={1 + Math.floor(i / maxRows)} row={2 + (i % maxRows)} />
+          </>
+        )}
+      />
+    </div>
+  );
   return (
-    <LoadingFade
-      showSkeleton={showSkeleton}
-      skeleton={
-        // The loaded frame's rows: a chip line, the names row, then the cards.
-        <div class="theme-carousel-frame">
-          <div class="pill-bar" aria-hidden="true">
-            <span class="pill-bar-btn">{'\u00a0'}</span>
-          </div>
-          <ListSkeletonOf
-            containerClass={stripClass}
-            count={6}
-            row={i => (
-              <>
-                {i === 0 && <span class="theme-family-name">{'\u00a0'}</span>}
-                <ThemeCard mode={mode} column={1 + Math.floor(i / maxRows)} row={2 + (i % maxRows)} />
-              </>
-            )}
-          />
-        </div>
-      }
-    >
+    <LoadingFade showSkeleton={showSkeleton} skeleton={skeletonFrame()}>
+      {gallery.status !== 'loaded' && (
+        // Holds the picker's box before the skeleton is due, so the rows below
+        // it do not jump when the skeleton or the cards arrive.
+        <div class="theme-carousel-reserve" aria-hidden="true">{skeletonFrame()}</div>
+      )}
       {gallery.status === 'loaded' && (
         <div class="theme-carousel-frame">
           <div class="pill-bar" role="group" aria-label="Theme family">
@@ -434,7 +437,10 @@ function ThemeCard({ theme, defaults, mode, selected = false, column, row, onCli
       </SkBlock>
       <span class="theme-card-meta" style={theme ? themeFontStyle(theme) : undefined}>
         <SkText class="theme-card-name" w="50%">{theme?.name}</SkText>
-        {label && <span class="theme-card-modes">{label}</span>}
+        <span class="theme-card-meta-trailing">
+          {theme?.source === 'workspace' && <span class="theme-card-badge">Custom</span>}
+          {label && <span class="theme-card-modes">{label}</span>}
+        </span>
       </span>
     </button>
   );

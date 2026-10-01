@@ -146,9 +146,9 @@ git ls-files '*.ts' '*.tsx' | xargs grep -l '@ts-expect-error' | grep -vE '\.tes
 (cd packages/lucidos-sdk && npx tsc --noEmit -p tsconfig.json); echo "SDK EXIT: $?"
 ```
 
-The currently-accepted categories, re-counted on 2026-09-30. Every Rust
+The currently-accepted categories, re-counted on 2026-10-01. Every Rust
 category and the `eslint-disable` sites were unchanged, and the cfg_attr
-grep printed nothing. `@ts-expect-error` rose 13 with the test suite.
+grep printed nothing. `@ts-expect-error` rose 3 with the test suite.
 
 **The first grep and the bare-allow audit both print one false hit.** It is
 `git_ops_tests/branch_queries.rs`, where `#[allow(dead_code)]` sits inside
@@ -192,8 +192,8 @@ Anything not on this list is fair game to remove and re-fix:
   (see `tauri.conf.json`), so the deprecated cross-version call is the
   correct one to keep.
 - **`// @ts-expect-error`, Node APIs available at runtime via Vitest, no
-  `@types/node` in project**, 821 sites across 284 files, every one of them
-  test-only code: 271 `*.test.ts`, eleven `*.test.tsx`
+  `@types/node` in project**, 824 sites across 285 files, every one of them
+  test-only code: 272 `*.test.ts`, eleven `*.test.tsx`
   (`components/changes/__tests__/bulk-row-layout.test.tsx`,
   `components/chat/__tests__/question-card.test.tsx`,
   `components/chat/__tests__/welcome-onboarding.test.tsx`,

@@ -227,4 +227,50 @@ test.describe('prompt textarea height survives the compose FLIP', () => {
     const m = await restored.evaluate((el: HTMLTextAreaElement) => ({ ch: el.clientHeight, sh: el.scrollHeight }));
     expect(m.ch, 'un-clipped after settling').toBeGreaterThanOrEqual(m.sh - 4);
   });
+
+  // The slide aims at where the prompt docks once the sent thread's (empty)
+  // draft is in the box. It must start where the multi-line draft's prompt
+  // was, rather than a draft's extra height below it.
+  test('leaving a multi-line draft for a sent thread slides from where the prompt was', async ({ page }) => {
+    test.skip(isMobileViewport(page), 'ThreadPane FLIP is desktop-only');
+
+    await navigateToApp(page);
+    await sendMessage(page, `Say exactly: "${uniqueMessage('flip-dst')}"`);
+    await waitForResponse(page);
+    const activeId = await page.locator('[data-role="prompt-input"]:visible').first().getAttribute('data-thread-id');
+    expect(activeId).toBeTruthy();
+
+    await newThread(page);
+    const draft = await waitForVisibleInput(page);
+    await draft.fill(Array.from({ length: 8 }, (_, i) => `leaving line ${i + 1}`).join('\n'));
+    expect(await draft.evaluate((el: HTMLTextAreaElement) => el.clientHeight), 'draft must be tall').toBeGreaterThan(120);
+    await openThreadDrawer(page);
+
+    // Click and sample in one page task, so the first sample is the first frame.
+    const run = await page.evaluate(async (id) => {
+      const prompt = () => Array.from(document.querySelectorAll<HTMLElement>('.prompt-area'))
+        .find((el) => el.offsetParent !== null)!;
+      const before = prompt().getBoundingClientRect().top;
+      const row = Array.from(document.querySelectorAll<HTMLElement>(`[data-thread-nav="${id}"]`))
+        .find((el) => el.getBoundingClientRect().height > 0);
+      if (!row) return null;
+      row.click();
+      const tops: number[] = [];
+      const start = performance.now();
+      await new Promise<void>((resolve) => {
+        function tick() {
+          tops.push(prompt().getBoundingClientRect().top);
+          if (performance.now() - start < 900) requestAnimationFrame(tick);
+          else resolve();
+        }
+        requestAnimationFrame(tick);
+      });
+      return { before, tops };
+    }, activeId);
+    expect(run, 'sent thread row must be clickable').not.toBeNull();
+    const { before, tops } = run!;
+    const settled = tops[tops.length - 1];
+    expect(settled - before, 'the prompt docks lower than the centered draft').toBeGreaterThan(40);
+    expect(Math.abs(tops[0] - before), `first frame starts at the draft's prompt (${JSON.stringify(tops.slice(0, 4))})`).toBeLessThanOrEqual(8);
+  });
 });

@@ -105,7 +105,7 @@ test.describe('side questions in a Claude Code thread', () => {
 
 /** A Lucidos Agent thread answers from its own model (the mock, in e2e). A
  *  hold on Send asks the draft as a side question, with no `/btw` typed, and a
- *  hold on Stop starts one. The release that ends a hold never also acts. */
+ *  mouse hold on Stop starts one. The release that ends a hold never also acts. */
 test.describe('side questions in a Lucidos Agent thread', () => {
   test.beforeEach(async ({ page }) => {
     await assertHealthy(page);
@@ -215,7 +215,8 @@ test.describe('side questions in a Lucidos Agent thread', () => {
   });
 
   // Stop shows only over an empty box, so its hold starts a `/btw` draft to
-  // finish. The release that ends the hold does not also stop the turn.
+  // finish, with no pill to press first. The release that ends the hold does
+  // not also stop the turn.
   test('holding Stop starts a side question and leaves the turn running', async ({ page }) => {
     const cancelPosts: string[] = [];
     page.on('request', (req) => {
@@ -236,13 +237,43 @@ test.describe('side questions in a Lucidos Agent thread', () => {
     await page.waitForTimeout(700);
     await page.mouse.up();
 
-    const ask = page.locator('[data-role="ask-side-question"]:visible');
-    await expect(ask).toBeVisible();
-    await ask.click();
-
     const input = await waitForVisibleInput(page, 15_000);
     await expect(input).toHaveValue('/btw ');
     await expect(input).toBeFocused();
+    await expect(page.locator('[data-role="ask-side-question"]:visible')).toHaveCount(0);
+    await page.keyboard.type('what');
+    await expect(input).toHaveValue('/btw what');
     expect(cancelPosts).toEqual([]);
+  });
+
+  // Over an empty box the shortcut starts the `/btw` draft too, so the box
+  // takes typing at once and Enter asks.
+  test('the Side question shortcut over an empty box lets the user type and ask', async ({ page }) => {
+    test.skip(isMobileViewport(page), 'Keyboard shortcuts are desktop only');
+    const chatPosts: string[] = [];
+    page.on('request', (req) => {
+      if (req.method() === 'POST' && /\/api\/v1\/chat\b/.test(req.url())) chatPosts.push(req.url());
+    });
+
+    await navigateToApp(page);
+    await newThread(page);
+    await sendMessage(page, `Write an extremely long and detailed essay about the history of bridges. Be as verbose as possible. Include: ${uniqueMessage('shortcut-empty')}`);
+    await waitForStreamingToStart(page, 5, 60_000);
+    const postsBefore = chatPosts.length;
+
+    const input = await waitForVisibleInput(page, 15_000);
+    await expect(input).toHaveValue('');
+    await input.focus();
+    await page.keyboard.press('Alt+Enter');
+    await expect(input).toHaveValue('/btw ');
+    await expect(input).toBeFocused();
+    await expect(page.locator('[data-role="ask-side-question"]:visible')).toHaveCount(0);
+    await page.keyboard.type('what are you writing about?');
+    await page.keyboard.press('Enter');
+
+    const card = page.locator('[data-role="side-question-card"]:visible').first();
+    await expect(card.locator('.side-question-question')).toHaveText('what are you writing about?');
+    await expect(input).toHaveValue('');
+    expect(chatPosts.length).toBe(postsBefore);
   });
 });

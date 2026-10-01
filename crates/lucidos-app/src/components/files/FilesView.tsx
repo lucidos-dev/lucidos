@@ -1,6 +1,6 @@
 import type { VNode } from 'preact';
 import { useEffect, useRef } from 'preact/hooks';
-import { artifacts, repositories, repoSource, repoFiles, repoDiff, repoViewMode, visibleWorkspaceName } from '../../store/store';
+import { artifacts, repositories, repoSource, repoFiles, repoDiff, repoViewMode, revealedFolder, visibleWorkspaceName } from '../../store/store';
 import { loadArtifacts, uploadFiles } from '../../store/actions/artifacts';
 import { loadRepositories } from '../../store/actions/chat';
 import { refreshRepositories } from '../../store/actions/repositoriesLoader';
@@ -30,6 +30,9 @@ export function FilesView() {
   useEffect(() => {
     if (repositories.value.status === 'not-loaded') void loadRepositories();
   }, []);
+  // A reveal belongs to this visit. Leaving before its tree drew (Back while a
+  // repo loads, or a failed load) must not scroll some later visit.
+  useEffect(() => () => { revealedFolder.value = null; }, []);
   usePanelRefresh('files', refreshFilesPanel);
   const repos = loadedOr(repositories.value, []);
 

@@ -23,7 +23,7 @@
 
 use axum::extract::{Path, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
-use axum::middleware::Next;
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -39,11 +39,16 @@ use crate::server::GatewayState;
 
 pub fn router() -> Router<GatewayState> {
     Router::new()
-        .route("/session", get(session))
         .route("/pairing-code", post(pairing_code))
-        .route("/pair", post(pair))
         .route("/devices", get(list_devices))
         .route("/devices/:id", axum::routing::delete(revoke_device))
+        // These mint, list and revoke credentials, so an app document must not
+        // reach them with the user's cookie. Covers only the routes above it.
+        .route_layer(middleware::from_fn(crate::control::control_authz))
+        // The two pre-auth calls a new device makes. Public anyway, so the
+        // gate would add nothing against a caller who skips the browser.
+        .route("/session", get(session))
+        .route("/pair", post(pair))
 }
 
 /// May this path be served with no credential at all?
@@ -1695,5 +1700,69 @@ mod tests {
         )
         .await;
         assert_eq!(handshake.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// One call through the real gateway router, holding a real credential.
+    async fn auth_plane_call(method: &str, path: &str, hdrs: &[(&str, &str)]) -> StatusCode {
+        use tower::ServiceExt as _;
+        let state = GatewayState::for_tests();
+        let mut builder = axum::extract::Request::builder()
+            .method(method)
+            .uri(path)
+            .header(auth::HEADER_LOCAL_TOKEN, "test-local-token");
+        for (k, v) in hdrs {
+            builder = builder.header(*k, *v);
+        }
+        crate::server::gateway_router(state)
+            .oneshot(builder.body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    const FROM_AN_APP_DOCUMENT: &[(&str, &str)] = &[
+        ("sec-fetch-site", "same-origin"),
+        ("referer", "https://localhost:5251/dev/app/habit-tracker/"),
+    ];
+
+    #[tokio::test]
+    async fn an_app_document_cannot_mint_list_or_revoke_credentials() {
+        // The caller authenticates, so `enforce` passes it, exactly as an app
+        // carrying the user's device cookie does. The document it came from is
+        // what refuses it.
+        for (method, path) in [
+            ("POST", "/~/api/v1/auth/pairing-code"),
+            ("GET", "/~/api/v1/auth/devices"),
+            ("DELETE", "/~/api/v1/auth/devices/no-such-device"),
+        ] {
+            assert_eq!(
+                auth_plane_call(method, path, FROM_AN_APP_DOCUMENT).await,
+                StatusCode::FORBIDDEN,
+                "{method} {path} must refuse an app document"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_picker_and_the_cli_still_reach_the_auth_plane() {
+        let from_the_picker = &[
+            ("sec-fetch-site", "same-origin"),
+            ("referer", "https://localhost:5251/~/"),
+        ];
+        // `lucidos pair` and the desktop shell send no fetch metadata at all.
+        for hdrs in [&from_the_picker[..], &[]] {
+            assert_eq!(
+                auth_plane_call("GET", "/~/api/v1/auth/devices", hdrs).await,
+                StatusCode::OK
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_pre_auth_calls_stay_outside_the_app_document_gate() {
+        assert_ne!(
+            auth_plane_call("GET", "/~/api/v1/auth/session", FROM_AN_APP_DOCUMENT).await,
+            StatusCode::FORBIDDEN
+        );
     }
 }

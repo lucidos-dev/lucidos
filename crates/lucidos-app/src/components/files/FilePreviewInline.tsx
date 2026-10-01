@@ -1,7 +1,7 @@
 import { useState, useEffect, useLayoutEffect, useMemo, useRef } from 'preact/hooks';
 import { filePreviewRevision, filePreviewSource, filePreviewWrap, filePreviewEditing, handshakeScriptsVersion, showToast } from '../../store/store';
 import { lucidos } from '@lucidos/sdk';
-import { renderMarkdown } from '../../utils/renderMarkdown';
+import { MarkdownDocument } from './MarkdownDocument';
 import { highlightFileLines } from '../../utils/syntaxHighlight';
 import { renderCsvTable } from '../../utils/csv';
 import { PreviewImage } from './PreviewImage';
@@ -41,8 +41,9 @@ import {
 } from './previewFrameBridge';
 import { PREVIEW_FRAME_ROLE } from '../../utils/previewFrameProtocol';
 import { artifactPreviewCapability, peekArtifactPreviewCapability } from '../../store/actions/frame-capability';
-import { allBindings } from '../../store/actions/keybindings';
+import { forwardableBindings } from '../../store/actions/keybindings';
 import { currentUiScale } from '../../store/actions/preferences';
+import { IframeTabExit } from '../shared/IframeTabExit';
 
 /** The bodies `TextContent` renders: everything reached by fetching the file as
  *  a string, rather than by pointing an element at its URL. */
@@ -128,7 +129,7 @@ export function FilePreviewInline({ path, layout, modal = false }: Props) {
         <HandshakeApprovalNotice path={path} />
         {body === 'editor' && <FileEditor path={path} url={url} />}
         {body === 'image' && <PreviewImage src={url} alt={path} />}
-        {body === 'pdf' && <iframe src={url} style="width:100%;height:100%;border:none;" onLoad={(e) => bridgePreviewIframeShortcuts(e.currentTarget)} />}
+        {body === 'pdf' && <><iframe src={url} style="width:100%;height:100%;border:none;" onLoad={(e) => bridgePreviewIframeShortcuts(e.currentTarget)} /><IframeTabExit /></>}
         {body === 'video' && <video src={url} controls style="max-width:100%;max-height:100%;" />}
         {body === 'audio' && <audio src={url} controls style="width:100%;" />}
         {/* Keyed by file, so the text kept on screen during a re-read is
@@ -447,13 +448,7 @@ function TextContent({ body, url, path, revision, servesPanel }: {
     // shell, and the whole workspace reloads. Same routing as the HTML preview,
     // minus the fragment arm (see `handlePreviewLinkClick`).
     if (body === 'markdown') {
-      return (
-        <div
-          class="response-content markdown-content"
-          onClick={(e) => handlePreviewLinkClick(e as unknown as MouseEvent, path)}
-          dangerouslySetInnerHTML={{ __html: renderMarkdown(content) }}
-        />
-      );
+      return <MarkdownDocument content={content} onClick={(e) => handlePreviewLinkClick(e, path)} />;
     }
     if (body === 'csv') return <div dangerouslySetInnerHTML={{ __html: renderCsvTable(content) }} />;
     if (body === 'slides') return <SlidesPreview content={content} />;
@@ -480,7 +475,7 @@ function HtmlPreviewFrame({ content, url, path, withCapability }: {
   content: string; url: string; path: string; withCapability: boolean;
 }) {
   const scale = currentUiScale();
-  const bindings = allBindings();
+  const bindings = forwardableBindings();
   const bindingsKey = JSON.stringify(bindings);
   const declaresOwnBase = documentDeclaresBase(content);
   // Keyed on the base, not the URL: the URL's revision stamp changes on every
@@ -511,18 +506,21 @@ function HtmlPreviewFrame({ content, url, path, withCapability }: {
   }, [nonce, path, declaresOwnBase]);
 
   return (
-    <iframe
-      ref={frameRef}
-      data-role={PREVIEW_FRAME_ROLE}
-      sandbox={ARTIFACT_PREVIEW_SANDBOX}
-      allow={ARTIFACT_PREVIEW_ALLOW}
-      srcDoc={srcDoc}
-      // `#fff` is functional rather than thematic, the token rule's second
-      // carve-out. An artifact is authored against a white page and usually
-      // sets no background. A themed canvas would put its black text on the
-      // dark surface and leave the document unreadable.
-      style="width:100%;height:100%;border:none;background:#fff;"
-    />
+    <>
+      <iframe
+        ref={frameRef}
+        data-role={PREVIEW_FRAME_ROLE}
+        sandbox={ARTIFACT_PREVIEW_SANDBOX}
+        allow={ARTIFACT_PREVIEW_ALLOW}
+        srcDoc={srcDoc}
+        // `#fff` is functional rather than thematic, the token rule's second
+        // carve-out. An artifact is authored against a white page and usually
+        // sets no background. A themed canvas would put its black text on the
+        // dark surface and leave the document unreadable.
+        style="width:100%;height:100%;border:none;background:#fff;"
+      />
+      <IframeTabExit />
+    </>
   );
 }
 

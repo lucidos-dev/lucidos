@@ -823,16 +823,15 @@ fn skip_if_vanished_only_swallows_not_found() {
 fn append_file_skips_vanished_file() {
     let tmp = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(tmp.path(), "content").unwrap();
-    let metadata = std::fs::metadata(tmp.path()).unwrap();
     let path = tmp.path().to_path_buf();
-    // File vanishes after metadata was captured but before append reads it.
+    // File vanishes after the walk listed it but before append reads it.
     drop(tmp);
 
     let mut buf: Vec<u8> = Vec::new();
     {
         let mut builder = tar::Builder::new(&mut buf);
         // Must NOT error — the vanished file is skipped.
-        append_file(&mut builder, &path, Path::new("gone.txt"), &metadata).unwrap();
+        append_file(&mut builder, &path, Path::new("gone.txt")).unwrap();
         builder.finish().unwrap();
     }
 
@@ -842,6 +841,72 @@ fn append_file_skips_vanished_file() {
         archive.entries().unwrap().count(),
         0,
         "vanished file should not appear in the archive"
+    );
+}
+
+#[test]
+fn exact_len_cuts_a_grown_source_and_zero_fills_a_shrunk_one() {
+    use std::io::Read;
+
+    let mut grown = ExactLen::new(&b"abcdef"[..], 3);
+    let mut out = Vec::new();
+    grown.read_to_end(&mut out).unwrap();
+    assert_eq!(out, b"abc");
+    assert_eq!(grown.padded, 0);
+
+    let mut shrunk = ExactLen::new(&b"abc"[..], 5);
+    let mut out = Vec::new();
+    shrunk.read_to_end(&mut out).unwrap();
+    assert_eq!(out, b"abc\0\0");
+    assert_eq!(shrunk.padded, 2);
+}
+
+/// A file written while the backup archives it must not misalign the entries
+/// after it. The header is sized from one stat, and the file then grows before
+/// its bytes are read. Copied raw, the extra bytes land where the next header
+/// belongs, and the restore fails on every entry that follows.
+#[test]
+fn a_file_that_grows_while_archived_keeps_the_archive_readable() {
+    use std::io::Read;
+
+    let dir = tempfile::tempdir().unwrap();
+    let growing = dir.path().join("growing.log");
+    let after = dir.path().join("after.txt");
+    std::fs::write(&growing, "first").unwrap();
+    std::fs::write(&after, "intact").unwrap();
+
+    let file = std::fs::File::open(&growing).unwrap();
+    let metadata = file.metadata().unwrap();
+    // The writer appends between the stat and the read.
+    std::fs::write(&growing, "first, and then a great deal more").unwrap();
+
+    let mut buf: Vec<u8> = Vec::new();
+    {
+        let mut builder = tar::Builder::new(&mut buf);
+        let mut header = header_for_file(&metadata);
+        let mut content = ExactLen::new(&file, metadata.len());
+        builder
+            .append_data(&mut header, Path::new("growing.log"), &mut content)
+            .unwrap();
+        append_file(&mut builder, &after, Path::new("after.txt")).unwrap();
+        builder.finish().unwrap();
+    }
+
+    let mut archive = tar::Archive::new(&buf[..]);
+    let mut entries: Vec<(String, String)> = Vec::new();
+    for entry in archive.entries().unwrap() {
+        let mut entry = entry.unwrap();
+        let name = entry.path().unwrap().display().to_string();
+        let mut body = String::new();
+        entry.read_to_string(&mut body).unwrap();
+        entries.push((name, body));
+    }
+    assert_eq!(
+        entries,
+        vec![
+            ("growing.log".to_string(), "first".to_string()),
+            ("after.txt".to_string(), "intact".to_string()),
+        ]
     );
 }
 

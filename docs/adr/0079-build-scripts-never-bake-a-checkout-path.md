@@ -69,6 +69,12 @@ repo also has an unrelated `build.rs` under `src/` that cargo never runs.
 - One more whole-tree gate in `/harden` Phase 4.5, costing milliseconds.
 - A crate that renames its script through `package.build` is not discovered.
   Parsing TOML to find it is deferred until a crate does that.
+- Rerun triggers cannot be fully path-independent. The engine and gateway
+  scripts watch HEAD and its branch ref, and keep those paths relative when
+  they lie inside the checkout. A linked worktree's git dir lies outside it,
+  so its triggers are absolute. Two linked worktrees sharing a target dir can
+  then skip a script rerun and bake the other's build id. ADR 0311 already
+  keeps engine-managed worktrees off a shared target dir.
 
 ## Alternatives considered
 

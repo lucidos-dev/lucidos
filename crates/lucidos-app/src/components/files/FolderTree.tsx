@@ -1,11 +1,13 @@
 import type { ComponentChildren } from 'preact';
-import { artifacts, expandedFolders } from '../../store/store';
+import { useEffect, useRef } from 'preact/hooks';
+import { artifacts, expandedFolders, revealedFolder } from '../../store/store';
 import { toggleFolder, buildFolderTree, openFilePreview } from '../../store/actions/artifacts';
 import type { FolderNode } from '../../store/actions/artifacts';
 import { FileTypeIcon, FolderIcon } from '../../utils/fileIcons';
 import { loadedOr } from '../../store/types';
 import { SkText, SkBlock } from '../shared/Skeleton';
 import { Disclosure } from '../shared/Disclosure';
+import { markNavigationScroll } from '../chat/scrollState';
 
 type FileEntry = { name: string; path: string };
 
@@ -54,12 +56,39 @@ export function folderTreeSkeletonRow(i: number) {
   return <TreeRowSkeleton kind={node.kind} depth={node.depth} />;
 }
 
+/** Scroll the content pane to the folder `revealFolderInFiles` asked for, then
+ *  clear the request. Returns the ref for the tree's root element.
+ *
+ *  The scroll waits a frame: the pane's scroll memory attaches in a PARENT
+ *  effect, which runs after this one and would otherwise reset the pane to the
+ *  top over it. The row lands under the pane's `::before` spacer, which is the
+ *  room a phone reserves for its fixed header, and is empty on desktop. */
+export function useRevealedFolderScroll() {
+  const treeRef = useRef<HTMLDivElement>(null);
+  const target = revealedFolder.value;
+  useEffect(() => {
+    if (!target) return;
+    const frame = requestAnimationFrame(() => {
+      revealedFolder.value = null;
+      const row = treeRef.current?.querySelector<HTMLElement>(`[data-path="${CSS.escape(target)}"]`);
+      const pane = row?.closest<HTMLElement>('.content-pane-body');
+      if (!row || !pane) return;
+      const headerRoom = parseFloat(getComputedStyle(pane, '::before').height) || 0;
+      const offset = row.getBoundingClientRect().top - pane.getBoundingClientRect().top;
+      markNavigationScroll(pane, pane.scrollTop + offset - headerRoom);
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [target]);
+  return treeRef;
+}
+
 export function FolderTree() {
   const paths = loadedOr(artifacts.value, []);
   const tree = buildFolderTree(paths);
+  const treeRef = useRevealedFolderScroll();
 
   return (
-    <div class="folder-tree">
+    <div class="folder-tree" ref={treeRef}>
       <TreeNode
         node={tree}
         isExpanded={(path) => expandedFolders.value.has(path)}
@@ -104,7 +133,7 @@ export function TreeNode({
 
         return (
           <div key={folderPath} class="folder-item">
-            <div class="folder-header" onClick={() => onToggle(folderPath)}>
+            <div class="folder-header" data-path={folderPath} onClick={() => onToggle(folderPath)}>
               <span class="folder-arrow">{expanded ? '\u25BC' : '\u25B6'}</span>
               <FolderIcon className="folder-icon" />
               <span class="folder-name">{folderName}</span>

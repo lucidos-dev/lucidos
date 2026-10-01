@@ -18,6 +18,7 @@ import { fileURLToPath } from 'node:url';
 // @ts-expect-error: same
 import { dirname, resolve } from 'node:path';
 import {
+  PROVIDER_ACCESS,
   PROVIDER_SCOPES,
   backupAccessLine,
   oauthProviderFor,
@@ -111,6 +112,38 @@ describe('Dropbox asks for what a backup actually does', () => {
     // Google's are full URLs; pasting that shape into a Dropbox authorize call
     // is rejected outright.
     for (const scope of scopes) expect(scope).not.toContain('://');
+  });
+});
+
+/** A tester skipped Drive backups because the page never said what access
+ *  Lucidos gets. The access line says it, and must stay true to the request. */
+describe('the access line under the Provider picker', () => {
+  it('covers exactly the registered providers', () => {
+    expect(Object.keys(PROVIDER_ACCESS).sort()).toEqual([...BACKUP_PROVIDER_IDS].sort());
+  });
+
+  it.each(BACKUP_PROVIDER_IDS)('%s names every scope it requests', (id) => {
+    for (const scope of PROVIDER_SCOPES[id].split(' ')) {
+      // Drive's scope is a URL; the line names it by its last segment.
+      expect(PROVIDER_ACCESS[id]).toContain(scope.split('/').pop());
+    }
+  });
+
+  it.each(BACKUP_PROVIDER_IDS)('%s says the archive is encrypted and how to revoke', (id) => {
+    expect(PROVIDER_ACCESS[id]).toContain('encrypted before upload');
+    expect(PROVIDER_ACCESS[id]).toContain('revoke access');
+  });
+
+  it('does not promise Dropbox stays in its app folder', () => {
+    // The user's own Dropbox app registration picks App folder or Full
+    // Dropbox. Lucidos cannot narrow it, so the line must say both.
+    expect(PROVIDER_ACCESS.dropbox).toContain('App folder');
+    expect(PROVIDER_ACCESS.dropbox).toContain('your whole Dropbox');
+  });
+
+  it('keeps Drive to the files Lucidos created', () => {
+    expect(PROVIDER_SCOPES.google_drive).toBe('https://www.googleapis.com/auth/drive.file');
+    expect(PROVIDER_ACCESS.google_drive).toContain('only the files it created');
   });
 });
 

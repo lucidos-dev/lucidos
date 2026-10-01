@@ -547,14 +547,24 @@ impl LucidosEngine {
         // question free-form path above, this does NOT consume the message —
         // the typed text still routes to CC below as a normal follow-up.
         if use_coding_agent == Some(true) && !is_new_thread && !user_message.is_empty() {
-            crate::engine::cc_permission::resolve_pending_permissions_as_superseded(
-                self.pool(),
-                &self.event_bus,
-                &self.pending_cc_permission,
+            // An engine re-entry on a live session overtakes no card, so the
+            // user can still approve the request it would deny.
+            if !super::super::process_helpers::reentry_reaches_live_session(
+                &self.agent_sessions,
                 thread_id,
-                origin.clone(),
+                pre_emitted_origin,
             )
-            .await;
+            .await
+            {
+                crate::engine::cc_permission::resolve_pending_permissions_as_superseded(
+                    self.pool(),
+                    &self.event_bus,
+                    &self.pending_cc_permission,
+                    thread_id,
+                    origin.clone(),
+                )
+                .await;
+            }
 
             // Question supersede, the same move for the question lane. Getting
             // here means the fast-path above did NOT consume this message as
@@ -628,7 +638,12 @@ impl LucidosEngine {
         // a new message instead of clicking resolves the card as denied (which
         // also unblocks the parked agentic loop). Chat-only — the command lane
         // never fires on a CC thread.
-        if use_coding_agent != Some(true) && !is_new_thread && !user_message.is_empty() {
+        let chat_follow_up =
+            use_coding_agent != Some(true) && !is_new_thread && !user_message.is_empty();
+        let has_live_turn = self.active_threads.lock().unwrap().contains_key(&thread_id);
+        if chat_follow_up
+            && super::super::process_helpers::chat_follow_up_supersedes_cards(mode, has_live_turn)
+        {
             crate::engine::command_permission::resolve_pending_command_permissions_as_superseded(
                 self.pool(),
                 &self.event_bus,
@@ -649,18 +664,18 @@ impl LucidosEngine {
                 origin.clone(),
             )
             .await;
-            // And for an open form: the user answered in words instead. Only a
-            // person does, so a child's completion or a wait delivery re-entering
-            // the thread leaves the form open.
-            if mode == ActorMode::Human {
-                crate::engine::form_requests::supersede_on_user_message(
-                    self.pool(),
-                    &self.event_bus,
-                    thread_id,
-                    origin.clone(),
-                )
-                .await;
-            }
+        }
+        // And for an open form: the user answered in words instead. Only a
+        // person does, so a child's completion or a wait delivery re-entering
+        // the thread leaves the form open.
+        if chat_follow_up && mode == ActorMode::Human {
+            crate::engine::form_requests::supersede_on_user_message(
+                self.pool(),
+                &self.event_bus,
+                thread_id,
+                origin.clone(),
+            )
+            .await;
         }
 
         // Fast-path for CC follow-ups: route via msg_tx BEFORE register_thread_queued

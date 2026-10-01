@@ -236,8 +236,8 @@ export function ThreadFilterPanel({ onClose }: { onClose: () => void }) {
           as a sentence down the page and the relationship is legible before the
           user discovers it by having a section dim on them. */}
       <div class="thread-filter-title" id="thread-filter-status-title">
-        <span class="drawer-section-icon"><StatusIcon size="0.875rem" /></span>
-        <span class="drawer-section-label">Status</span>
+        <span class="section-icon"><StatusIcon size="0.875rem" /></span>
+        <span class="section-label">Status</span>
       </div>
       {/* A radiogroup, not the menu these rows used to claim: they wore
           `menuitemradio`, which is only meaningful inside a `menu`, and the
@@ -405,8 +405,8 @@ export function ThreadFilterPanel({ onClose }: { onClose: () => void }) {
         class={`thread-filter-title${typeFilterOn ? ' thread-filter-title-active' : ''}${channelsDimmed ? ' thread-filter-title-dimmed' : ''}`}
         id="thread-filter-types-title"
       >
-        <span class="drawer-section-icon"><ThreadTypesIcon size="0.875rem" /></span>
-        <span class="drawer-section-label">By thread types</span>
+        <span class="section-icon"><ThreadTypesIcon size="0.875rem" /></span>
+        <span class="section-label">By thread types</span>
         {typeFilterOn && (
           <span class="thread-filter-title-check"><CheckIcon /></span>
         )}

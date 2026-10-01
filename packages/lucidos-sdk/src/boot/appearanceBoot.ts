@@ -36,9 +36,7 @@ import {
   MOTION_STORAGE_KEY,
   REDUCED_TRANSPARENCY_QUERY,
   REDUCED_MOTION_QUERY,
-  RENAMED_STORAGE_KEYS,
   STYLE_OVERRIDES_STORAGE_KEY,
-  LEGACY_THEME_MODE_ATTRIBUTE,
   THEME_MODE_ATTRIBUTE,
   THEME_MODE_KEY,
   THEME_MODE_STORAGE_KEY,
@@ -69,7 +67,7 @@ import {
   type ThemeMode,
 } from '../appearance';
 import { dataMountUrl } from '../_fetch';
-import { inWorkspace, wsLocalGet, wsLocalRemove, wsLocalSet } from '../_storage';
+import { wsLocalGet, wsLocalRemove } from '../_storage';
 import { registerFontsInUse } from '../fontFaces';
 
 export interface BootOptions {
@@ -88,18 +86,6 @@ export interface BootOptions {
    * inline value here would beat it.
    */
   durationScale: boolean;
-  /**
-   * Adopt each old storage key's value under its new name, once. Shell only:
-   * the shell owns these keys, and an app frame is seeded by the engine
-   * (docs/temporary-measures.md § Renamed appearance storage keys).
-   */
-  adoptRenamedStorageKeys: boolean;
-  /**
-   * Also paint the resolved mode as the legacy `data-theme`, for app styles
-   * written before the rename. App frames only (docs/temporary-measures.md
-   * § Legacy `data-theme` in app frames).
-   */
-  legacyThemeModeAttribute: boolean;
 }
 
 export interface BootResult {
@@ -159,8 +145,6 @@ export function applyAppearanceBoot(opts: BootOptions): BootResult {
   const d = document.documentElement;
   const served = servedPrefs();
 
-  if (opts.adoptRenamedStorageKeys) adoptRenamedStorageKeys();
-
   // Theme mode. Nothing saved means follow the OS.
   const raw = seeded(served, THEME_MODE_KEY, THEME_MODE_STORAGE_KEY);
   const mode = raw && (THEME_MODES as readonly string[]).includes(raw)
@@ -169,7 +153,6 @@ export function applyAppearanceBoot(opts: BootOptions): BootResult {
   const prefersLight = matchMedia('(prefers-color-scheme: light)').matches;
   const resolved = resolveThemeMode(mode, prefersLight);
   d.setAttribute(THEME_MODE_ATTRIBUTE, resolved);
-  if (opts.legacyThemeModeAttribute) d.setAttribute(LEGACY_THEME_MODE_ATTRIBUTE, resolved);
   // `?style-reset` is the way out of an unreadable theme as well as of the
   // overrides, so it drops the theme's cache too.
   const styleReset = opts.styleReset && styleResetRequested(location.search);
@@ -261,19 +244,4 @@ export function applyAppearanceBoot(opts: BootOptions): BootResult {
   }
 
   return { raw, mode, resolved, prefersLight, reducedMotion };
-}
-
-/** Move each renamed key's value to its new name, unless the new name already
- *  holds one. The old key is removed either way (docs/temporary-measures.md
- *  § Renamed appearance storage keys). */
-function adoptRenamedStorageKeys(): void {
-  // The picker has no workspace, and there the raw old key is the seed a new
-  // workspace copies from (`workspaceStorage.ts`), so it stays.
-  if (!inWorkspace()) return;
-  for (const [from, to] of RENAMED_STORAGE_KEYS) {
-    const old = wsLocalGet(from);
-    if (old === null) continue;
-    if (wsLocalGet(to) === null) wsLocalSet(to, old);
-    wsLocalRemove(from);
-  }
 }

@@ -87,9 +87,6 @@ waitForLucidos();
     const appFrame = page.frameLocator('#app-frame');
     await expect(appFrame.locator('#status')).toHaveText('applied');
     await expect(appFrame.locator('html')).toHaveAttribute('data-theme-mode', 'dark');
-    // App styles written before the rename key on `data-theme`, so a frame
-    // carries both (docs/temporary-measures.md § Legacy `data-theme` in app frames).
-    await expect(appFrame.locator('html')).toHaveAttribute('data-theme', 'dark');
 
     // Toggle to light — SSE event broadcast to all subscribers including the iframe.
     await request.put(`/api/v1/preferences?key=theme-mode`, {
@@ -98,7 +95,6 @@ waitForLucidos();
 
     // Live update inside the iframe — should land within seconds.
     await expect(appFrame.locator('html')).toHaveAttribute('data-theme-mode', 'light', { timeout: 5000 });
-    await expect(appFrame.locator('html')).toHaveAttribute('data-theme', 'light');
   });
 
   test('opt-in /api/v1/sdk-prefs.js serves the boot script, and seeds it per device', async ({ request }) => {
@@ -264,9 +260,6 @@ waitForLucidos();
     for (const value of iframeTransitions) {
       expect(value, `iframe data-theme-mode transitions: ${iframeTransitions.join(' → ')}`).toBe('light');
     }
-    // The legacy attribute is for app frames only. The shell never carries it.
-    await expect(appFrame.locator('html')).toHaveAttribute('data-theme', 'light');
-    await expect(page.locator('html')).not.toHaveAttribute('data-theme', /.*/);
   });
 });
 

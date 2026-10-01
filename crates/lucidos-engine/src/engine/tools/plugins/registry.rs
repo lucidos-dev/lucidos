@@ -191,8 +191,8 @@ impl InstalledRecord {
             .and_then(|v| v.as_str())
     }
     /// The files this install owns, at the paths they live at now. A plugin
-    /// installed before the theme rename recorded `looks/<id>.json`, which the
-    /// engine has since moved to `themes/` (docs/temporary-measures.md § Legacy
+    /// installed before the theme rename recorded `looks/<id>.json`, and that
+    /// file now lives in `themes/` (docs/temporary-measures.md § Legacy
     /// `data/looks/` folder). Every reader goes through here, so uninstall and
     /// update find the file where it is.
     pub(crate) fn files(&self) -> Vec<String> {
@@ -795,7 +795,7 @@ fn fetch_remote_manifest_blocking(
     plugins::parse_manifest(&text).map_err(|e| e.to_string())
 }
 
-/// Where a recorded data path lives now, after the theme rename's startup move.
+/// Where a recorded data path lives now that `looks/` became `themes/`.
 fn current_data_path(recorded: &str) -> String {
     let legacy = format!("{}/", crate::core::themes::LEGACY_THEMES_DIR);
     match recorded.strip_prefix(&legacy) {

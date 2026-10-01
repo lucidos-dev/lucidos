@@ -6,7 +6,7 @@ import {
   THEME_EFFECTS_STORAGE_KEY, THEME_KEY, THEME_SEED_KEY, THEME_STORAGE_KEY, MORE_CONTRAST_QUERY,
   MOTION_STORAGE_KEY, REDUCED_MOTION_QUERY, REDUCED_TRANSPARENCY_QUERY,
   FONT_BOLD_ATTRIBUTE, SYSTEM_THEME_MODE_SETTLE_MS, THEME_MODE_ATTRIBUTE, THEME_MODE_BG, THEME_MODE_KEY,
-  THEME_MODE_STORAGE_KEY, LEGACY_THEME_MODE_ATTRIBUTE, WORKSPACE_FONT_SEED_KEY,
+  THEME_MODE_STORAGE_KEY, WORKSPACE_FONT_SEED_KEY,
   fontBoldMark, fontEntry, isFontId, isWorkspaceFontId, themeBackground, themeEffectsAttribute, themeTokenNames,
   motionAttribute, parseThemeEffects, parseMotion, resolveReducedThemeEffects,
   parseResolvedTheme, parseStyleOverrides, parseUiScale, parseWorkspaceFont,
@@ -495,9 +495,6 @@ export const ui = {
     }
     const bg = themeBackground(themeTokens) ?? THEME_MODE_BG[mode];
     root.setAttribute(THEME_MODE_ATTRIBUTE, mode);
-    // For app styles written before the rename (docs/temporary-measures.md
-    // § Legacy `data-theme` in app frames).
-    root.setAttribute(LEGACY_THEME_MODE_ATTRIBUTE, mode);
     root.style.setProperty('--bg-primary', bg);
     // Mirrors sdk-prefs.js: keeps <html> covered before/after the iframe's
     // stylesheet applies its bg rule (iOS WKWebView underlying white).

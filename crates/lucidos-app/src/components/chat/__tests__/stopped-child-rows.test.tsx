@@ -76,9 +76,11 @@ describe('ChildStoppedRow', () => {
     const tree = ChildStoppedRow({ childThreadId: 'child-uuid', childThreadTitle: 'Fix the ticket' });
     const row = findByClass(tree, 'event-row');
     expect(row!.props['data-state']).toBe('stopped');
-    expect(vnodeText(row)).toContain('Child thread stopped:');
+    expect(vnodeText(findByClass(tree, 'event-row-subject'))).toBe('Child thread stopped');
     expect(vnodeText(row)).toContain('Fix the ticket');
     expect(vnodeText(findByClass(tree, 'event-row-state'))).toBe('Waiting for you');
+    // The same white "still in progress" tone a form request waiting on you wears.
+    expect(findByClass(tree, 'event-row-state')!.props['data-tone']).toBe('live');
 
     const link = findByClass(tree, 'accent-link')!;
     (link.props as unknown as { onClick: () => void }).onClick();
@@ -106,7 +108,7 @@ describe('ChildMovedOutRow', () => {
     const tree = ChildMovedOutRow({ childThreadId: 'child-uuid', childThreadTitle: 'Write the notes' });
     const row = findByClass(tree, 'event-row');
     expect(row!.props['data-state']).toBe('moved-out');
-    expect(vnodeText(row)).toContain('Child thread moved to top level:');
+    expect(vnodeText(findByClass(tree, 'event-row-subject'))).toBe('Child thread moved out');
     expect(vnodeText(row)).toContain('Write the notes');
     expect(vnodeText(findByClass(tree, 'event-row-state'))).toBe('No longer waiting');
 

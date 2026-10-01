@@ -6,7 +6,6 @@ import { useHidePanelWebviewWhile } from '../../hooks/useHidePanelWebviewWhile';
 import { DialogMessage } from './DialogMessage';
 import { Overlay } from './Overlay';
 import { SurfaceHead } from './Surface';
-import { trapDialogTab } from './dialogFocusTrap';
 import { progressFillWidth } from './progressBar';
 
 /** The modal for an operation that takes the workspace away and brings it back.
@@ -83,30 +82,16 @@ export function ProgressDialog() {
 
   useHidePanelWebviewWhile(state.visible);
 
-  // Take focus, and keep it. Without this the dialog declares `aria-modal`
-  // while focus stays on whatever button opened it. Enter then re-fires that
-  // button from behind the modal, and Tab walks the page underneath.
+  // Take focus. Without this the dialog declares `aria-modal` while focus
+  // stays on whatever button opened it, and Enter re-fires that button from
+  // behind the modal. With no Cancel the panel itself holds focus, and the
+  // overlay Tab rule keeps it there.
   useEffect(() => {
     if (!state.visible) return;
     const panel = panelRef.current;
     if (!panel) return;
     const cancelBtn = panel.querySelector<HTMLButtonElement>('[data-role="progress-cancel"]');
     (cancelBtn ?? panel).focus();
-
-    function handleKey(e: KeyboardEvent) {
-      if (e.key !== 'Tab') return;
-      const root = panelRef.current;
-      // No Cancel means nothing inside is tabbable, and `trapDialogTab` would
-      // let Tab fall through to the page. Swallow it instead, so focus cannot
-      // leave a modal the user has no way to answer yet.
-      if (!root?.querySelector('button:not([disabled])')) {
-        e.preventDefault();
-        return;
-      }
-      trapDialogTab(e, root);
-    }
-    document.addEventListener('keydown', handleKey);
-    return () => document.removeEventListener('keydown', handleKey);
     // Whether a Cancel EXISTS, never the object itself. Each phase builds a
     // fresh one. Depending on its identity would re-run this every tick and
     // yank focus back to the button several times per operation.

@@ -144,6 +144,39 @@ describe('SHORTCUT_DEFS registry invariants', () => {
   });
 });
 
+describe('the toggle shortcuts', () => {
+  it.each([
+    ['followLiveEdge', '⌃⇧L'],
+    ['toggleCall', '⌃⇧H'],
+    ['openAgentMenu', '⌃⇧G'],
+    ['showThreadDiff', '⌃⇧D'],
+    ['applyChange', '⌃⇧A'],
+    ['toggleAppFullscreen', '⌃⇧F'],
+    ['toggleSourceView', '⌃⇧S'],
+    ['toggleLineWrap', '⌃⇧B'],
+  ] as const)('%s defaults to %s on a Mac', (id, display) => {
+    expect(formatBinding(shortcutDef(id).defaultBinding, true)).toBe(display);
+  });
+
+  it('marks Apply and the voice call, and nothing else, host-only', () => {
+    expect(SHORTCUT_DEFS.filter((d) => d.hostOnly).map((d) => d.id)).toEqual(['toggleCall', 'applyChange']);
+  });
+});
+
+describe('mnemonics', () => {
+  it('name the letter the default chord actually uses', () => {
+    // "L for Live" over a default of D would teach the wrong key.
+    for (const def of SHORTCUT_DEFS) {
+      const letter = /^([A-Z0-9]) for /.exec(def.mnemonic ?? '')?.[1];
+      if (letter) expect(def.defaultBinding.key, def.id).toBe(letter.toLowerCase());
+    }
+  });
+
+  it('name no modifier glyph, since the page shows them on every platform', () => {
+    for (const def of SHORTCUT_DEFS) expect(def.mnemonic ?? '', def.id).not.toMatch(/[⌘⌃⌥⇧]|Ctrl|Cmd/);
+  });
+});
+
 describe('isBindableChord', () => {
   it('accepts modifier chords', () => {
     expect(isBindableChord({ mod: true, shift: false, alt: false, key: 'k' })).toBe(true);

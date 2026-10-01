@@ -252,7 +252,7 @@ describe('the prompt row survives the iOS keyboard dropping a click', () => {
     expect(findActivationBody('morphActivate')).toMatch(/morphMode === 'cancel',\s*\)$/);
     expect(findActivationBody('answerCancelActivate')).toMatch(/true,\s*\)$/);
     expect(findActivationBody('answerSubmitActivate')).not.toMatch(/destructive/);
-    expect(bannerSource).toMatch(/const activate = useTouchActivated\(\(\) => \{[\s\S]*?\n  \}\);/);
+    expect(bannerSource).toMatch(/const activate = useTouchActivated\(\(\) => openThreadDiff\(threadId\)\);/);
   });
 
   it('leaves the change-action banner Apply on click', () => {
@@ -271,7 +271,11 @@ describe('the prompt row survives the iOS keyboard dropping a click', () => {
     expect(submitFn, 'submit() not found').not.toBeNull();
     expect(multiFn, 'submitMultiAnswer() not found').not.toBeNull();
     expect(diffFn, 'DiffButton not found').not.toBeNull();
-    expect(diffFn![0]).toMatch(/blurPromptInputIfFocused\(\)/);
+    // Diff runs the opener every Diff entry point shares, and that blurs.
+    const openDiffFn = bannerSource.match(/function openThreadDiff\([\s\S]*?\n\}/);
+    expect(diffFn![0]).toMatch(/openThreadDiff\(threadId\)/);
+    expect(openDiffFn, 'openThreadDiff not found').not.toBeNull();
+    expect(openDiffFn![0]).toMatch(/blurPromptInputIfFocused\(\)/);
     // Optional on both, because a send no longer needs the textarea node. See
     // `resolveComposerText`.
     expect(submitFn![0]).toMatch(/if \(isMobile\(\)\) el\?\.blur\(\)/);

@@ -112,8 +112,8 @@ describe('non-control surfaces paint no focus ring', () => {
 });
 
 /** The boxes whose surface owns a Tab cycle that cannot name them. Chrome's
- *  promotion only ever added a stop nobody reaches on purpose. `trapDialogTab`
- *  wraps at the confirm dialog's two buttons and steps between them in between;
+ *  promotion only ever added a stop nobody reaches on purpose. The overlay Tab
+ *  rule wraps at the confirm dialog's two buttons and steps between them in between;
  *  `handleToastKeyDown` cycles a toast's buttons and links. */
 const TAB_EXCLUDED: ReadonlyArray<readonly [cls: string, source: string]> = [
   ['confirm-details', 'components/shared/ConfirmDialog.tsx'],

@@ -114,21 +114,6 @@ describe('turn header gutter', () => {
     expect(selectorTail).toContain(':not(.nav-focus-stuck)');
   });
 
-  // The action footer (Diff/Revert on a change card) is the panel's LAST child, so
-  // any padding-bottom here stacks on the panel's own bottom padding and shows up as
-  // an oversized BOTTOM gap under the nav focus marker — while the panel rule below
-  // normalizes every side to var(--turn-body-inset). Only the TOP padding (buttons ↔
-  // body) belongs on the footer; the bottom spacing is the panel's job. A shorthand
-  // that re-adds a bottom value (e.g. `0.5rem 0`) regresses the change card's
-  // four-side symmetry — exactly the "bottom gap is bigger than the others" report.
-  it('keeps the action footer from inflating the focus marker bottom gap', () => {
-    const footer = getBlock(responseCss, '.initiator-footer');
-    expect(footer).not.toBe('');
-    // 3-value shorthand = top / left-right / bottom, so `0.5rem 0 0` is
-    // top 0.5rem, left+right 0, bottom 0 — padding-bottom is explicitly 0.
-    expect(declarationValue(footer, 'padding')).toBe('0.5rem 0 0');
-  });
-
   // The nav focus marker washes the panel box edge to edge,
   // so the gap it shows on each side equals that side's padding. The horizontal
   // sides are symmetric in the base layout (left inset on the content, right

@@ -78,7 +78,7 @@ test.describe('Child-completion row', () => {
     return seeded;
   }
 
-  test('success: head reads "Child thread returned:" with a linked title and a good-toned state word; the agent summary lives behind a collapsed fold', async ({ page }) => {
+  test('success: a "Child thread returned" pill, a good-toned state word, the linked title on the facts line, and the summary behind a collapsed fold', async ({ page }) => {
     const { parentId, childId } = seed({
       status: 'success',
       title: 'Refactor the foo helper',
@@ -97,11 +97,11 @@ test.describe('Child-completion row', () => {
     await expect(panel.locator('.initiator-summary')).toHaveCount(0);
 
     const head = row.locator('.event-row-head');
-    await expect(head).toContainText('Child thread returned:');
+    await expect(head.locator('.event-row-subject')).toHaveText('Child thread returned');
     const state = head.locator('.event-row-state');
     await expect(state).toHaveText('Success');
     await expect(state).toHaveAttribute('data-tone', 'good');
-    const titleLink = head.locator(`button.accent-link[data-thread-id="${childId}"]`);
+    const titleLink = row.locator(`.event-row-meta button.accent-link[data-thread-id="${childId}"]`);
     await expect(titleLink).toHaveText('Refactor the foo helper');
 
     const fold = row.locator('.event-row-fold');
@@ -112,7 +112,7 @@ test.describe('Child-completion row', () => {
     await expect(foldBody).toContainText('Cleaned up the if/else ladder.');
   });
 
-  test('failure: bad-toned state word and a "failed" verb in the prefix', async ({ page }) => {
+  test('failure: the same pill with a bad-toned state word', async ({ page }) => {
     const { parentId } = seed({
       status: 'failure',
       title: 'Failing sidequest',
@@ -122,13 +122,13 @@ test.describe('Child-completion row', () => {
     const row = childRow(page);
     await expect(row).toBeVisible({ timeout: 10_000 });
     await expect(row).toHaveAttribute('data-state', 'failure');
-    await expect(row.locator('.event-row-head')).toContainText('Child thread failed:');
+    await expect(row.locator('.event-row-subject')).toHaveText('Child thread returned');
     const state = row.locator('.event-row-state');
     await expect(state).toHaveText('Failure');
     await expect(state).toHaveAttribute('data-tone', 'bad');
   });
 
-  test('no_changes: untinted state word and a "returned" verb in the prefix', async ({ page }) => {
+  test('no_changes: the same pill with an untinted state word', async ({ page }) => {
     const { parentId } = seed({
       status: 'no_changes',
       title: 'Sidequest with nothing to apply',
@@ -138,13 +138,13 @@ test.describe('Child-completion row', () => {
     const row = childRow(page);
     await expect(row).toBeVisible({ timeout: 10_000 });
     await expect(row).toHaveAttribute('data-state', 'no_changes');
-    await expect(row.locator('.event-row-head')).toContainText('Child thread returned:');
+    await expect(row.locator('.event-row-subject')).toHaveText('Child thread returned');
     const state = row.locator('.event-row-state');
     await expect(state).toHaveText('No changes');
     await expect(state).toHaveAttribute('data-tone', 'none');
   });
 
-  test('canceled: halted-toned state word and a "canceled" verb in the prefix; an empty summary hides the fold', async ({ page }) => {
+  test('canceled: the same pill with a halted-toned state word; an empty summary hides the fold', async ({ page }) => {
     const { parentId } = seed({
       status: 'canceled',
       title: 'Stopped sidequest',
@@ -154,7 +154,7 @@ test.describe('Child-completion row', () => {
     const row = childRow(page);
     await expect(row).toBeVisible({ timeout: 10_000 });
     await expect(row).toHaveAttribute('data-state', 'canceled');
-    await expect(row.locator('.event-row-head')).toContainText('Child thread canceled:');
+    await expect(row.locator('.event-row-subject')).toHaveText('Child thread returned');
     const state = row.locator('.event-row-state');
     await expect(state).toHaveText('Canceled');
     await expect(state).toHaveAttribute('data-tone', 'halted');
@@ -183,10 +183,12 @@ test.describe('Child-completion row', () => {
     await openParent(page, parentId);
     const row = childRow(page);
     await expect(row).toBeVisible({ timeout: 10_000 });
+    // The turn wears no actor header, and its time is plain text rather than
+    // the route-popover trigger: the title link is the way to the child.
     const panel = page.locator('.initiator-panel:visible:has(.event-row[data-role="child-completion"])').first();
-    const actor = panel.locator('.initiator-actor');
-    expect(await actor.evaluate(el => el.tagName)).toBe('SPAN');
-    await actor.click({ force: true });
+    await expect(panel.locator('.initiator-actor')).toHaveCount(0);
+    await expect(panel.locator('.initiator-timestamp-button')).toHaveCount(0);
+    await panel.locator('.initiator-timestamp').click({ force: true });
     await expect(page.locator('.message-route-panel:visible')).toHaveCount(0);
   });
 });

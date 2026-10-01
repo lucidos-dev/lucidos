@@ -17,6 +17,11 @@ export type ShortcutId =
   | 'askSideQuestion'
   | 'copyLastResponse'
   | 'renameThread'
+  | 'followLiveEdge'
+  | 'toggleCall'
+  | 'openAgentMenu'
+  | 'showThreadDiff'
+  | 'applyChange'
   | 'focusNewestToast'
   | 'openThreadActions'
   | 'toggleSubthreads'
@@ -33,6 +38,9 @@ export type ShortcutId =
   | 'narrowThreadDrawer'
   | 'widenThreadDrawer'
   | 'resetPaneLayout'
+  | 'toggleAppFullscreen'
+  | 'toggleSourceView'
+  | 'toggleLineWrap'
   | 'zoomIn'
   | 'zoomOut'
   | 'zoomReset';
@@ -55,6 +63,14 @@ export interface ShortcutDef {
   label: string;
   category: ShortcutCategory;
   defaultBinding: Binding;
+  /** How to remember the DEFAULT chord: a letter's word, or the app it is
+   *  borrowed from. Platform-neutral, so it names no modifier glyph. */
+  mnemonic?: string;
+  /** Runs only from a keydown on the host document. A chord forwarded from an
+   *  app frame or the HTML preview is refused, since that frame's own script
+   *  can forge one. Set on anything that acts beyond the screen: merging a
+   *  change, or opening the microphone. */
+  hostOnly?: boolean;
 }
 
 const B = (mod: boolean, shift: boolean, alt: boolean, key: string): Binding => ({ mod, shift, alt, key });
@@ -70,37 +86,45 @@ const B = (mod: boolean, shift: boolean, alt: boolean, key: string): Binding => 
  *  names the sides (Conversation / Canvas). Never surface the dev-only "pane
  *  group" here; it is defined in `docs/glossary.md` only. */
 export const SHORTCUT_DEFS: readonly ShortcutDef[] = [
-  { id: 'newThread', label: 'New thread', category: 'Navigation', defaultBinding: B(true, true, false, 'o') },
-  { id: 'closeThread', label: 'Close thread (cascade)', category: 'Navigation', defaultBinding: B(true, true, false, 'w') },
-  { id: 'searchEverywhere', label: 'Search everywhere', category: 'Navigation', defaultBinding: B(true, false, false, 'k') },
-  { id: 'searchFiles', label: 'Search files', category: 'Navigation', defaultBinding: B(true, false, false, 'p') },
-  { id: 'openSettings', label: 'Open settings', category: 'Navigation', defaultBinding: B(true, false, false, ',') },
-  { id: 'showShortcuts', label: 'Show keyboard shortcuts', category: 'Navigation', defaultBinding: B(true, false, false, '/') },
-  { id: 'openNotifications', label: 'Open notifications', category: 'Navigation', defaultBinding: B(true, true, false, 'i') },
-  { id: 'focusNewestToast', label: 'Focus newest toast', category: 'Navigation', defaultBinding: B(true, true, false, 'n') },
-  { id: 'openThreadActions', label: 'Open thread actions (highlighted drawer row)', category: 'Navigation', defaultBinding: B(true, true, false, 'm') },
-  { id: 'toggleSubthreads', label: 'Expand or collapse sub-threads (focused thread)', category: 'Navigation', defaultBinding: B(true, true, false, 'e') },
+  { id: 'newThread', label: 'New thread', category: 'Navigation', defaultBinding: B(true, true, false, 'o'), mnemonic: 'ChatGPT\'s new chat chord' },
+  { id: 'closeThread', label: 'Close thread (cascade)', category: 'Navigation', defaultBinding: B(true, true, false, 'w'), mnemonic: 'W, as in close window' },
+  { id: 'searchEverywhere', label: 'Search everywhere', category: 'Navigation', defaultBinding: B(true, false, false, 'k'), mnemonic: 'The search chord in Slack, Linear and Notion' },
+  { id: 'searchFiles', label: 'Search files', category: 'Navigation', defaultBinding: B(true, false, false, 'p'), mnemonic: 'Quick open in VS Code and Zed' },
+  { id: 'openSettings', label: 'Open settings', category: 'Navigation', defaultBinding: B(true, false, false, ','), mnemonic: 'Settings in every Mac app' },
+  { id: 'showShortcuts', label: 'Show keyboard shortcuts', category: 'Navigation', defaultBinding: B(true, false, false, '/'), mnemonic: 'The shortcut list in ChatGPT and Slack' },
+  { id: 'openNotifications', label: 'Open notifications', category: 'Navigation', defaultBinding: B(true, true, false, 'i'), mnemonic: 'I for Inbox' },
+  { id: 'focusNewestToast', label: 'Focus newest toast', category: 'Navigation', defaultBinding: B(true, true, false, 'n'), mnemonic: 'N for Notice' },
+  { id: 'openThreadActions', label: 'Open thread actions (highlighted drawer row)', category: 'Navigation', defaultBinding: B(true, true, false, 'm'), mnemonic: 'M for Menu' },
+  { id: 'toggleSubthreads', label: 'Expand or collapse sub-threads (focused thread)', category: 'Navigation', defaultBinding: B(true, true, false, 'e'), mnemonic: 'E for Expand' },
   { id: 'historyBack', label: 'Back (focused pane)', category: 'Navigation', defaultBinding: B(true, false, true, 'ArrowDown') },
   { id: 'historyForward', label: 'Forward (focused pane)', category: 'Navigation', defaultBinding: B(true, false, true, 'ArrowUp') },
   { id: 'prevTurnOrNotification', label: 'Previous turn (thread) or newer notification', category: 'Navigation', defaultBinding: B(true, false, false, 'ArrowUp') },
   { id: 'nextTurnOrNotification', label: 'Next turn (thread) or older notification', category: 'Navigation', defaultBinding: B(true, false, false, 'ArrowDown') },
-  { id: 'focusComposer', label: 'Focus the composer', category: 'Thread', defaultBinding: B(false, true, false, 'Escape') },
-  { id: 'stopThread', label: 'Stop the running thread', category: 'Thread', defaultBinding: B(true, false, false, '.') },
-  { id: 'askSideQuestion', label: 'Ask the draft as a side question', category: 'Thread', defaultBinding: B(false, false, true, 'Enter') },
-  { id: 'copyLastResponse', label: 'Copy last response', category: 'Thread', defaultBinding: B(true, true, false, 'c') },
-  { id: 'renameThread', label: 'Rename thread', category: 'Thread', defaultBinding: B(false, false, false, 'F2') },
-  { id: 'toggleThreadDrawer', label: 'Show or hide thread drawer', category: 'Panes', defaultBinding: B(true, true, false, '1') },
-  { id: 'toggleThreadPane', label: 'Focus or hide thread pane', category: 'Panes', defaultBinding: B(true, true, false, '2') },
-  { id: 'toggleContentPane', label: 'Focus or hide content pane', category: 'Panes', defaultBinding: B(true, true, false, '3') },
+  { id: 'focusComposer', label: 'Focus the composer', category: 'Thread', defaultBinding: B(false, true, false, 'Escape'), mnemonic: 'Focus input in ChatGPT' },
+  { id: 'stopThread', label: 'Stop the running thread', category: 'Thread', defaultBinding: B(true, false, false, '.'), mnemonic: 'The classic Mac Cancel' },
+  { id: 'askSideQuestion', label: 'Ask the draft as a side question', category: 'Thread', defaultBinding: B(false, false, true, 'Enter'), mnemonic: 'Alt for an aside' },
+  { id: 'copyLastResponse', label: 'Copy last response', category: 'Thread', defaultBinding: B(true, true, false, 'c'), mnemonic: 'C for Copy, as in ChatGPT' },
+  { id: 'renameThread', label: 'Rename thread', category: 'Thread', defaultBinding: B(false, false, false, 'F2'), mnemonic: 'Rename in Windows Explorer and VS Code' },
+  { id: 'followLiveEdge', label: 'Follow the live edge (arm or disarm)', category: 'Thread', defaultBinding: B(true, true, false, 'l'), mnemonic: 'L for Live' },
+  { id: 'toggleCall', label: 'Start or end a voice call', category: 'Thread', defaultBinding: B(true, true, false, 'h'), mnemonic: 'Slack\'s huddle chord', hostOnly: true },
+  { id: 'openAgentMenu', label: 'Open the agent menu (model and effort)', category: 'Thread', defaultBinding: B(true, true, false, 'g'), mnemonic: 'G for aGent' },
+  { id: 'showThreadDiff', label: 'Show what the thread changed', category: 'Thread', defaultBinding: B(true, true, false, 'd'), mnemonic: 'D for Diff' },
+  { id: 'applyChange', label: 'Apply the thread\'s change, or apply on settle', category: 'Thread', defaultBinding: B(true, true, false, 'a'), mnemonic: 'A for Apply', hostOnly: true },
+  { id: 'toggleThreadDrawer', label: 'Show or hide thread drawer', category: 'Panes', defaultBinding: B(true, true, false, '1'), mnemonic: 'Panes count 1, 2, 3 from the left' },
+  { id: 'toggleThreadPane', label: 'Focus or hide thread pane', category: 'Panes', defaultBinding: B(true, true, false, '2'), mnemonic: 'Panes count 1, 2, 3 from the left' },
+  { id: 'toggleContentPane', label: 'Focus or hide content pane', category: 'Panes', defaultBinding: B(true, true, false, '3'), mnemonic: 'Panes count 1, 2, 3 from the left' },
   { id: 'maximizePaneGroup', label: 'Maximize focused side (Conversation or Canvas)', category: 'Panes', defaultBinding: B(true, true, false, 'Enter') },
   { id: 'narrowThreadPane', label: 'Narrow thread pane', category: 'Panes', defaultBinding: B(true, false, true, 'ArrowLeft') },
   { id: 'widenThreadPane', label: 'Widen thread pane', category: 'Panes', defaultBinding: B(true, false, true, 'ArrowRight') },
   { id: 'narrowThreadDrawer', label: 'Narrow thread drawer', category: 'Panes', defaultBinding: B(true, true, true, 'ArrowLeft') },
   { id: 'widenThreadDrawer', label: 'Widen thread drawer', category: 'Panes', defaultBinding: B(true, true, true, 'ArrowRight') },
-  { id: 'resetPaneLayout', label: 'Reset pane layout', category: 'Panes', defaultBinding: B(true, false, true, '0') },
-  { id: 'zoomIn', label: 'Zoom in', category: 'View', defaultBinding: B(true, false, false, '=') },
-  { id: 'zoomOut', label: 'Zoom out', category: 'View', defaultBinding: B(true, false, false, '-') },
-  { id: 'zoomReset', label: 'Reset zoom', category: 'View', defaultBinding: B(true, false, false, '0') },
+  { id: 'resetPaneLayout', label: 'Reset pane layout', category: 'Panes', defaultBinding: B(true, false, true, '0'), mnemonic: '0, as in Reset zoom' },
+  { id: 'toggleAppFullscreen', label: 'Fullscreen the open app', category: 'View', defaultBinding: B(true, true, false, 'f'), mnemonic: 'F for Fullscreen' },
+  { id: 'toggleSourceView', label: 'Show source or rendered (file preview)', category: 'View', defaultBinding: B(true, true, false, 's'), mnemonic: 'S for Source' },
+  { id: 'toggleLineWrap', label: 'Wrap long lines (source view)', category: 'View', defaultBinding: B(true, true, false, 'b'), mnemonic: 'B for line Break' },
+  { id: 'zoomIn', label: 'Zoom in', category: 'View', defaultBinding: B(true, false, false, '='), mnemonic: 'Browser zoom' },
+  { id: 'zoomOut', label: 'Zoom out', category: 'View', defaultBinding: B(true, false, false, '-'), mnemonic: 'Browser zoom' },
+  { id: 'zoomReset', label: 'Reset zoom', category: 'View', defaultBinding: B(true, false, false, '0'), mnemonic: 'Browser zoom' },
 ] as const;
 
 export function shortcutDef(id: ShortcutId): ShortcutDef {

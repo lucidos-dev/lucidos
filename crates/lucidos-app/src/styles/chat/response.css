@@ -165,55 +165,6 @@
     padding: 0;
 }
 
-/* ContinuationStarted engine note — collapsed by default, expands inline when
-   the user clicks the subline. Sits inside an initiator-panel body so it
-   inherits the panel's padding; we only style the disclosure summary and
-   the expanded preformatted block. */
-.resume-note {
-    margin-top: 0.25rem;
-    font-size: var(--font-size-md);
-    color: var(--text-secondary);
-}
-
-.resume-note > summary {
-    cursor: pointer;
-    user-select: none;
-    color: var(--text-secondary);
-}
-
-@media (hover: hover) {
-    .resume-note > summary:hover {
-        color: var(--text-primary);
-    }
-}
-
-.resume-note-body {
-    margin: 0.375rem 0 0 0;
-    padding: 0.5rem 0.625rem;
-    border-left: 0.125rem solid var(--border-subtle, var(--border-color));
-    background: var(--bg-secondary);
-    white-space: pre-wrap;
-    font-size: var(--font-size-sm);
-    line-height: 1.4;
-    color: var(--text-secondary);
-}
-
-/* Action buttons (Diff/Revert) render in a footer at the bottom-right of the
-   turn — keeps the timestamp alone in the header's top-right slot.
-   padding-bottom MUST stay 0: the footer is the panel's last child, so any bottom
-   padding here stacks on top of the panel's own padding and shows up as an
-   oversized BOTTOM gap under the navigation focus marker — the marker's gap on
-   each side equals that side's total padding, and the .initiator-panel.nav-focus-stuck
-   rule below normalizes every side to var(--turn-body-inset). Only the TOP padding
-   (separating the buttons from the body above) belongs here; the bottom spacing is
-   the panel's job. Guarded by turn-header-gutter.test.ts. */
-.initiator-footer {
-    display: flex;
-    justify-content: flex-end;
-    gap: 0.5rem;
-    padding: 0.5rem 0 0;
-}
-
 /* Invisible stand-in for the Diff/Revert buttons of a ChangeApplied card
    while its Change row is still loading on first open. Occupies the exact
    button-row height so the real actions slot in without a vertical shift
@@ -1074,15 +1025,13 @@
     transform: translate(-55%, -65%) rotate(45deg);
 }
 
-/* A tinted option (picked, toggled, hovered) is a rounded card shaped like
-   `.user-bubble`. The list bleeds into the card's padding to leave a
-   `--space-md` margin at the card edges. Its text sits inset from the
-   question's column, so a tinted option never looks crammed. */
+/* Each option is its own boxed card inside the framed question card. The box
+   is the tap target made visible: a reader sees where one answer ends and the
+   next begins, rather than reading rows split by tint alone. */
 .question-options {
     display: flex;
     flex-direction: column;
     gap: var(--space-sm);
-    margin-inline: calc(var(--space-md) - var(--turn-surface-inset));
 }
 
 /* Two-column grid shared by the live button and the resolved-state row.
@@ -1099,10 +1048,10 @@
     row-gap: 0.25rem;
     align-items: start;
     width: 100%;
-    padding: var(--space-md) var(--space-lg);
-    background: transparent;
-    border: 0;
-    border-radius: calc(var(--radius-surface) * 1.2);
+    padding: var(--space-md) calc(var(--turn-surface-inset) - 1px);
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-control);
     color: var(--text-primary);
     text-align: left;
     white-space: normal;
@@ -1113,7 +1062,14 @@
     font-family: inherit;
     transition:
         background-color var(--duration-normal),
+        border-color var(--duration-normal),
         transform var(--duration-fast);
+}
+
+/* An answered recap row drops its border, like the user message bubble: the
+   picked one carries the accent tint, the rest read as dimmed. */
+.question-option-static {
+    border-color: transparent;
 }
 
 .question-option .question-option-indicator,
@@ -1147,24 +1103,22 @@
    `choiceCardNav`'s seed gates on `hasHoverPointer()`, the JS mirror of the
    media query, so the seed and the gated ring stay in lockstep.
 
-   The ring is inset, so it traces the option's own rounded card and stays
-   clear of its neighbours. The forced-colors outline takes a matching negative
-   offset for the same reason (see `.context-role-header:focus-visible`). */
+   The ring sits outside the option's box, in the gap between options, so it
+   never covers the box's own border. */
 .question-option:focus-visible {
     outline: 0.125rem solid transparent;
-    outline-offset: -0.125rem;
-    box-shadow: inset var(--focus-ring);
+    box-shadow: var(--focus-ring);
 }
 
 @media (hover: hover) {
     .question-option:focus {
         outline: 0.125rem solid transparent;
-        outline-offset: -0.125rem;
-        box-shadow: inset var(--focus-ring);
+        box-shadow: var(--focus-ring);
     }
 
     .question-option:hover {
         background: var(--picked-surface);
+        border-color: color-mix(in srgb, var(--accent) 50%, var(--border-color));
     }
 }
 
@@ -1231,6 +1185,7 @@
    the accent recipe touches one block. */
 .question-option-selected,
 .question-option[aria-pressed="true"] {
+    border-color: transparent;
     background: var(--picked-surface);
 }
 
@@ -1264,7 +1219,8 @@
 
 @media (hover: hover) {
     .question-body-terminated .question-option:disabled:hover {
-        background: transparent;
+        background: var(--bg-tertiary);
+        border-color: var(--border-color);
     }
 }
 
@@ -1504,10 +1460,6 @@
     font-size: var(--font-size-md);
     line-height: 1.5;
     padding: 0.375rem 0.625rem;
-    border: 1px solid var(--border-color);
-    border-radius: calc(var(--radius-control) * 0.75);
-    background: var(--bg-primary);
-    color: var(--text-primary);
     box-sizing: border-box;
 }
 

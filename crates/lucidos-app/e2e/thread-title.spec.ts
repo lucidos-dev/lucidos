@@ -132,16 +132,16 @@ test.describe('Thread title and rename: mobile', () => {
       }
     });
 
-    // Wait for header to hide (translateY should be negative)
+    // Wait for the header to glide off the top.
     await page.waitForFunction(() => {
       const header = document.querySelector('.app-header');
       if (!header) return false;
       return header.getBoundingClientRect().bottom <= 0;
     }, undefined, { timeout: 5_000 });
 
-    // The title bar is sticky inside the scroll container and scrolls out
-    // together with the header. Verify it is off-screen after full scroll.
-    const titleOffScreen = await page.evaluate(() => {
+    // The title bar is sticky inside the scroll container and glides out
+    // together with the header, on its own transition. Poll it off-screen.
+    await expect.poll(() => page.evaluate(() => {
       const els = document.querySelectorAll('.mobile-thread-title-row');
       for (const el of els) {
         const rect = el.getBoundingClientRect();
@@ -150,7 +150,6 @@ test.describe('Thread title and rename: mobile', () => {
         }
       }
       return true; // not rendered = off-screen
-    });
-    expect(titleOffScreen).toBe(true);
+    }), { timeout: 5_000 }).toBe(true);
   });
 });

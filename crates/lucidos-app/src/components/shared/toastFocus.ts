@@ -30,8 +30,8 @@ export function toastHasClose(
  *
  *  `overlayOpen` guards the exit. Focus can already be in a toast when an
  *  overlay opens, and the pane behind that overlay is not a valid Tab target:
- *  moving focus there would break the overlay's focus containment, the way
- *  `handlePaneTab` already yields to `data-overlay-open`. So while an overlay
+ *  moving focus there would break the overlay's focus containment
+ *  (`handleOverlayTab`). So while an overlay
  *  is open, Shift+Tab wraps backward within the toast instead of exiting.
  *
  *  It no longer follows that the toast is ON TOP of the overlay. A standing

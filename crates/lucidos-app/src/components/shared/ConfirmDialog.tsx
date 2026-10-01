@@ -4,7 +4,6 @@ import { useHidePanelWebviewWhile } from '../../hooks/useHidePanelWebviewWhile';
 import { DialogMessage } from './DialogMessage';
 import { Overlay } from './Overlay';
 import { SurfaceHead } from './Surface';
-import { trapDialogTab } from './dialogFocusTrap';
 import { dialogOwnsKey } from './dialogKeyScope';
 
 function resolve(value: boolean) {
@@ -37,9 +36,7 @@ export function ConfirmDialog() {
         if (target?.tagName === 'BUTTON' || target?.tagName === 'TEXTAREA') return;
         e.preventDefault();
         resolve(true);
-        return;
       }
-      trapDialogTab(e, dialogRef.current);
     }
     document.addEventListener('keydown', handleKey);
     return () => {
@@ -71,8 +68,8 @@ export function ConfirmDialog() {
         {state.details && (
           // `tabIndex={-1}`, so Chrome leaves the list out of the Tab order. A
           // long one overflows, and Chrome promotes an overflowing scroller
-          // with no focusable child to a Tab stop. `trapDialogTab` cycles the
-          // two buttons and never names it, so the promotion only ever painted
+          // with no focusable child to a Tab stop. The overlay Tab rule cycles
+          // the two buttons and never names it, so the promotion only ever painted
           // the browser's ring around the list. See `.confirm-details:focus`.
           <div class="confirm-details" tabIndex={-1}>
             {state.details.intro && <p class="confirm-details-intro">{state.details.intro}</p>}

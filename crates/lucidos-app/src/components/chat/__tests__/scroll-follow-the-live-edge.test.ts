@@ -25,11 +25,14 @@ import {
   honourAnchoredMutation,
   DRAWN_ROW_SELECTOR,
   followSurvivesScroll,
+  holdAcrossRelayout,
+  isCarryScroll,
   isNavigationScroll,
   markAnchorScroll,
   markNavigationScroll,
   markRevealScroll,
   makeScrollObservers,
+  onRebasedScroll,
   readerGestureForTest,
   resumeFollowingBottom,
   scrollToBottom,
@@ -2483,6 +2486,28 @@ describe('sending a message lands the reader on the live edge', () => {
     expect(el.scrollTop).toBe(2900); // the landing still happened
   });
 
+  it('is not cancelled by the mobile keyboard closing after both send calls', () => {
+    // A mobile send blurs the prompt. The header spacer grows back and the
+    // hide-on-scroll hook shifts scrollTop to hold the content still. That
+    // write waits for the tap to settle, so it lands after both send calls
+    // and nothing re-stamps the landing's position. Reported.
+    const el = makeEl({ scrollTop: 500, scrollHeight: 3000, panels: [{ top: 200, height: 120 }] });
+    const { onScroll, onResize } = makeScrollObservers(el);
+    setActiveScrollElement(el);
+
+    followSentMessage(); // PromptInput.submit
+    followSentMessage(); // addPendingMessage
+    holdAcrossRelayout(el, el.scrollTop + 44); // the keyboard-close compensation
+    onScroll();          // its own scroll event
+
+    el.addUserMessage({ top: 2900, height: 120 });
+    el.scrollHeight = 3400;
+    onResize();
+    vi.advanceTimersByTime(1500);
+
+    expect(el.scrollTop).toBe(2900); // the landing still happened
+  });
+
   it('a second call for the same send is a no-op refresh, not a second landing', () => {
     // PromptInput.submit and addPendingMessage both fire for one composer send.
     // The second keeps the first's baseline, so a render landing between them
@@ -4374,5 +4399,113 @@ describe('nothing but the chevron, a send and an answer arms it', () => {
 
     expect(found.resumeFollowingBottom).toEqual([ALLOWED_CALLER]);
     expect(found.onFollowRideStarted).toEqual([ALLOWED_CALLER]);
+  });
+});
+
+describe("the follow's carry holds the mobile dynamic bars", () => {
+  beforeEach(() => {
+    resetFollow();
+    vi.useFakeTimers();
+  });
+  afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); vi.unstubAllGlobals(); resetFollow(); });
+
+  /** An armed reader riding a live thread, settled on the live edge. */
+  function riding() {
+    const el = makeEl({ scrollTop: 100, scrollHeight: 3000, clientHeight: 500 });
+    const observers = makeScrollObservers(el);
+    setActiveScrollElement(el);
+    setFollowLiveEdge(true);
+    vi.advanceTimersByTime(1500);
+    observers.onScroll();
+    expect(el.scrollTop).toBe(2500);
+    return { el, ...observers };
+  }
+
+  it('marks the growth write a carry, which the bars hold for', () => {
+    const { el, onResize } = riding();
+    el.scrollHeight = 3400;
+    onResize();
+    expect(el.scrollTop).toBe(2900);
+    expect(isNavigationScroll()).toBe(true);
+    expect(isCarryScroll()).toBe(true);
+  });
+
+  it('keeps the arming glide and a resume held, so both still reveal the bars', () => {
+    const el = makeEl({ scrollTop: 100, scrollHeight: 3000, clientHeight: 500 });
+    makeScrollObservers(el);
+    setActiveScrollElement(el);
+    setFollowLiveEdge(true);
+    vi.advanceTimersByTime(100);        // mid-glide, a frame just written
+    expect(isNavigationScroll()).toBe(true);
+    expect(isCarryScroll()).toBe(false);
+    vi.advanceTimersByTime(1500);
+
+    stopFollowingBottom();
+    resumeFollowingBottom(el as unknown as HTMLElement);
+    expect(isNavigationScroll()).toBe(true);
+    expect(isCarryScroll()).toBe(false);
+  });
+
+  it("leaves a resume's kind alone for a carry in the same frame, so their one event still reveals", () => {
+    const el = makeEl({ scrollTop: 100, scrollHeight: 3000, clientHeight: 500 });
+    const { onResize } = makeScrollObservers(el);
+    setActiveScrollElement(el);
+    resumeFollowingBottom(el as unknown as HTMLElement);
+    el.scrollHeight = 3400;
+    onResize();
+    expect(el.scrollTop).toBe(2900);
+    expect(isNavigationScroll()).toBe(true);
+    expect(isCarryScroll()).toBe(false);
+
+    // Once the resume's event window has closed, the next round is a carry.
+    vi.advanceTimersByTime(100);
+    el.scrollHeight = 3800;
+    onResize();
+    expect(isCarryScroll()).toBe(true);
+  });
+
+  it('tells a delta consumer about a carry at the write, so a late event moves nothing', () => {
+    const rebased = vi.fn();
+    const unsubscribe = onRebasedScroll(rebased);
+    const { el, onResize } = riding();
+    rebased.mockClear();
+    el.scrollHeight = 3400;
+    onResize();
+    unsubscribe();
+    expect(rebased).toHaveBeenCalledWith(el);
+  });
+
+  it("does not tell it about a carry sharing a resume's event, which must still reveal", () => {
+    const el = makeEl({ scrollTop: 100, scrollHeight: 3000, clientHeight: 500 });
+    const { onResize } = makeScrollObservers(el);
+    setActiveScrollElement(el);
+    const rebased = vi.fn();
+    const unsubscribe = onRebasedScroll(rebased);
+    resumeFollowingBottom(el as unknown as HTMLElement);
+    el.scrollHeight = 3400;
+    onResize();
+    unsubscribe();
+    expect(rebased).not.toHaveBeenCalled();
+  });
+
+  it('marks a quiet thread\'s follow write a carry too, so a late resize holds the bars', () => {
+    const { el, onResize } = riding();
+    setTranscriptLive(false);
+    el.scrollHeight = 3400;
+    onResize();
+    expect(el.scrollTop).toBe(2900);
+    expect(isNavigationScroll()).toBe(true);
+    expect(isCarryScroll()).toBe(true);
+  });
+
+  it('reveals nothing when a ridden thread goes quiet', () => {
+    // Only the reader's finger moves the bars, so a finished reply leaves them.
+    const dispatchEvent = vi.fn();
+    vi.stubGlobal('document', { dispatchEvent });
+
+    riding();
+    setTranscriptLive(false);
+
+    expect(dispatchEvent.mock.calls.filter(([e]) => e.type === 'reveal-mobile-bars')).toHaveLength(0);
   });
 });

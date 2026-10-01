@@ -81,7 +81,7 @@ export function CredentialModal() {
   // whole `auth_value` from the form, so a form seeded only with the request's
   // `client_id` would drop every other stored field on save. A confidential
   // client would silently lose its `client_secret` and fail the token exchange.
-  // A provider the registry does not know would lose its endpoints, scopes and
+  // A provider the registry does not know would lose its endpoints and
   // redirect override too. The stored values win; the request fills only what
   // is genuinely missing (see `initialAuthUrl`).
   const targetedRow = form.request?.existing_credential_id;
@@ -270,7 +270,6 @@ function CredentialFormInner({
     initialFields.userinfoMethod || oauthDefaults?.userinfo_method || 'GET';
   const initialAuthorizeParams =
     initialFields.authorizeParams || oauthDefaults?.authorize_params || '';
-  const initialScopes = initialFields.scopes || oauthDefaults?.scopes || '';
   const initialRedirectUri = initialFields.redirectUri || oauthDefaults?.redirect_uri || '';
 
   const [selectedAuthType, setSelectedAuthType] = useState<AuthType>(initialAuthType);
@@ -363,7 +362,6 @@ function CredentialFormInner({
   const userinfoUrlRef = useRef<HTMLInputElement>(null);
   const [userinfoMethod, setUserinfoMethod] = useState<string>(initialUserinfoMethod);
   const authorizeParamsRef = useRef<HTMLInputElement>(null);
-  const scopesRef = useRef<HTMLInputElement>(null);
   const redirectUriRef = useRef<HTMLInputElement>(null);
   // Email server settings
   const emailAddressRef = useRef<HTMLInputElement>(null);
@@ -427,7 +425,6 @@ function CredentialFormInner({
       userinfoUrl: userinfoUrlRef.current?.value.trim() || '',
       userinfoMethod,
       authorizeParams: authorizeParamsRef.current?.value.trim() || '',
-      scopes: scopesRef.current?.value.trim() || '',
       redirectUri: redirectUriRef.current?.value.trim() || '',
     };
   }
@@ -688,6 +685,10 @@ function CredentialFormInner({
         {isOAuthClient ? (
           <>
             {repairNotice && <p class="credential-repair-notice">{repairNotice}</p>}
+            <p class="credential-grant-note">
+              Saving this grants no access. Access is granted only when you connect
+              an account and approve it on the provider's consent screen.
+            </p>
             {/* The one step this form cannot do for the user: the Client ID
                 only exists once an app is registered with the provider, and the
                 redirect URI has to be entered there character for character.
@@ -856,10 +857,6 @@ function CredentialFormInner({
                   defaultValue={initialAuthorizeParams}
                   placeholder="access_type=offline&prompt=consent"
                 />
-              </div>
-              <div class="form-group">
-                <label>Default Scopes <span class="form-hint">(optional, space-separated)</span></label>
-                <input ref={scopesRef} type="text" defaultValue={initialScopes} placeholder="read write user.read" />
               </div>
               <div class="form-group">
                 <FieldLabel

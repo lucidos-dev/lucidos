@@ -156,7 +156,7 @@ the incident itself, silently, at minute N.
 **Serialize on `MERGE_MUTEX` for the whole resolution.** It already serializes
 the git-level merge. Rejected because it is held across a coding-agent
 subprocess that can run for many minutes, and every data-API write takes the
-sibling `workspace_repo_lock` behind it; the existing code comments call out
+sibling `WORKSPACE_REPO_MUTEX` behind it; the existing code comments call out
 precisely why no tier holds it across an agent await.
 
 **Have the second apply wait for the resolution instead of refusing.** Rejected

@@ -1,13 +1,16 @@
 import { useEffect } from 'preact/hooks';
 import { unfocusThread } from '../store/actions/threads';
-import { focusPromptNow } from '../components/chat/promptFocus';
+import { focusPromptNow, openAgentMenu } from '../components/chat/promptFocus';
 import { searchEverywhereOpen, searchEverywhereAnchor, focusedPane, focusedThreadId, toggleExchangeCollapsed, toggleInitiatorCollapsed } from '../store/store';
 import { isTextInput, isThreadTranscript } from '../utils/dom';
 import { dismissTopOverlay, overlayStack } from '../store/overlayStack';
 import { nativeFullscreenElement } from '../store/appFullscreenHost';
 import { runCloseCascade } from '../store/actions/threadActions';
 import { matchShortcut } from '../store/actions/keybindings';
-import type { ShortcutId } from '../utils/shortcuts';
+import { shortcutDef, type ShortcutId } from '../utils/shortcuts';
+import { toggleFollowLiveEdge, pressCallToggleIfShown } from '../components/chat/PromptRowControls';
+import { showFocusedThreadDiff, applyFocusedThreadChange } from '../components/chat/WaitingBanner';
+import { toggleAppFullscreenIfShown, toggleSourceView, toggleLineWrap } from '../components/layout/ContentHeaderActions';
 import { isKnownAppFrame } from '../utils/appFrame';
 import { adjustUiScale, resetUiScale, scaleModalOpen, dismissScaleModal } from '../components/shared/scaleModalState';
 import { UI_SCALE_STEP } from '../store/actions/preferences';
@@ -21,11 +24,12 @@ import {
 import { switchMenuItem, openSettingsSubview } from '../store/actions/menu';
 import { openFileSearch } from '../components/files/fileSearchActions';
 import { focusNewestToast } from '../components/shared/Toast';
+import { handleOverlayTab } from '../components/shared/overlayFocus';
 import { promptRenameThread } from '../store/actions/threadRename';
 import { copyLastResponse } from '../components/chat/copyLastResponse';
 import { promptStopRequested, promptSideQuestionRequested } from '../components/chat/prompt-input-helpers';
 import { seedDrawerHighlight, openHighlightedThreadActions, toggleFocusedThreadFamily } from '../components/drawer/ThreadDrawer';
-import { handlePaneTab, reconcilePaneFocus } from '../components/layout/paneFocus';
+import { focusIntoPane, handlePaneTab, reconcilePaneFocus } from '../components/layout/paneFocus';
 import { historyBack, historyForward } from '../store/actions/focused-pane-history';
 import { stepThreadTurn, parseNavigatedTurn } from '../components/chat/scrollState';
 import { stepViewedNotification } from '../store/actions/notifications';
@@ -39,8 +43,8 @@ function startNewThread() {
 }
 
 /** Reveal the thread pane, then run `focus` once it is laid out. A collapsed
- *  pane holds its prompt at zero size, where focus would land on nothing the
- *  user can see. */
+ *  pane holds its prompt row at zero size, where a focus or a press would land
+ *  on nothing the user can see. */
 function focusInThreadPane(focus: () => void): void {
   revealThreadPane();
   requestAnimationFrame(focus);
@@ -108,6 +112,13 @@ const SHORTCUT_ACTIONS: Record<ShortcutId, () => void> = {
     const id = focusedThreadId.value;
     if (id) void promptRenameThread(id);
   },
+  followLiveEdge: toggleFollowLiveEdge,
+  toggleCall: pressCallToggleIfShown,
+  openAgentMenu: () => focusInThreadPane(openAgentMenu),
+  showThreadDiff: showFocusedThreadDiff,
+  // Never behind an open dialog: a second press while Apply's own confirm is
+  // up would stack another one.
+  applyChange: () => { if (overlayStack.value.length === 0) applyFocusedThreadChange(); },
   // Context-gated: no-ops unless the thread drawer is focused with a thread row
   // highlighted, then opens that row's ⋯ menu (the keyboard route to per-row
   // actions, since the drawer is a single tab stop).
@@ -121,8 +132,8 @@ const SHORTCUT_ACTIONS: Record<ShortcutId, () => void> = {
   // Step the open notification newer/older when the content pane holds one.
   // Otherwise step the transcript one turn (a .chat-exchange) up/down and land
   // focus in it, so continuous Arrow/Page scrolling follows.
-  prevTurnOrNotification: () => { if (!stepViewedNotification(-1)) stepThreadTurn(-1); },
-  nextTurnOrNotification: () => { if (!stepViewedNotification(1)) stepThreadTurn(1); },
+  prevTurnOrNotification: () => { if (!stepViewedNotification(-1)) focusIntoPane(stepThreadTurn(-1)); },
+  nextTurnOrNotification: () => { if (!stepViewedNotification(1)) focusIntoPane(stepThreadTurn(1)); },
   toggleThreadDrawer: () => { if (focusOrToggleThreadDrawer()) seedDrawerHighlight(); },
   toggleThreadPane,
   toggleContentPane,
@@ -132,6 +143,9 @@ const SHORTCUT_ACTIONS: Record<ShortcutId, () => void> = {
   narrowThreadDrawer: () => stepThreadDrawerWidth(-1),
   widenThreadDrawer: () => stepThreadDrawerWidth(1),
   resetPaneLayout,
+  toggleAppFullscreen: toggleAppFullscreenIfShown,
+  toggleSourceView,
+  toggleLineWrap,
   zoomIn: () => adjustUiScale(UI_SCALE_STEP),
   zoomOut: () => adjustUiScale(-UI_SCALE_STEP),
   zoomReset: () => resetUiScale(),
@@ -260,6 +274,9 @@ export function classifyChord(chord: ChordLike): ShortcutId | 'escape' | null {
 export function dispatchForwardedChord(chord: ChordLike): void {
   const result = classifyChord(chord);
   if (result === null) return;
+  // The frame's own script can post this message, so a host-only shortcut
+  // (Apply, the voice call) never runs from it.
+  if (result !== 'escape' && shortcutDef(result).hostOnly) return;
   focusedPane.value = 'content';
   if (result === 'escape') {
     // Focus is in the iframe, so activeElement is the <iframe>. The policy
@@ -341,11 +358,11 @@ export function useKeyboardShortcuts(): void {
         return;
       }
 
-      // Per-pane Tab trap: while focus is inside a pane (and no overlay is open),
-      // Tab/Shift+Tab cycle within that pane. Switch panes with the ⌘⇧ pane
-      // shortcuts or a click. Falls through to default Tab when focus is outside
-      // any pane or an overlay owns it.
+      // Tab: an open overlay routes it first. A dialog contains it, and a
+      // popover closes on a Tab from outside it. Then the per-pane Tab trap
+      // cycles the focused pane. A handler that already consumed it wins.
       if (e.key === 'Tab') {
+        if (e.defaultPrevented || handleOverlayTab(e)) return;
         if (handlePaneTab(e)) e.preventDefault();
         return;
       }

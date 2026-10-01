@@ -41,7 +41,7 @@ vi.mock('./navigation', () => ({ pushNavState, replaceNavState: vi.fn() }));
 // "Navigation that lands content must call revealContentPane()".
 const revealContentPane = vi.fn();
 const navigateToPane = vi.fn();
-vi.mock('./pane', () => ({ revealContentPane, navigateToPane }));
+vi.mock('./pane', () => ({ revealContentPane, navigateToPane, holdFocusedPaneWhileTyping: vi.fn(), releaseTypingHold: vi.fn() }));
 
 // The layout predicate the `new-chat` branch gates its overlay clear on: the
 // same one revealContentPane()/revealThreadPane() branch on. jsdom's viewport

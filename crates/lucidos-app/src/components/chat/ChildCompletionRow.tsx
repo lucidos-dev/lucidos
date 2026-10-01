@@ -1,7 +1,7 @@
 import { focusThreadOrBootstrap } from '../../store/actions/threads';
 import { threadMap } from '../../store/store';
 import { renderMarkdown } from '../../utils/renderMarkdown';
-import { eventRowBody } from './EventRow';
+import { eventNameChip, eventRowBody } from './EventRow';
 import type { EventRowTone } from './EventRow';
 import type { ChildCompletionStatus, SubThreadPendingChange } from '../../store/thread-events';
 
@@ -26,11 +26,11 @@ interface Props {
  *  The four appear together in one stream, so each has to be distinguishable
  *  from the other three. `canceled` is warm rather than the cool neutral, so it
  *  is not a near-twin of the untinted `no changes` word beside it. */
-const CHILD_STATE: Record<ChildCompletionStatus, { verb: string; label: string; tone: EventRowTone }> = {
-  success: { verb: 'returned', label: 'Success', tone: 'good' },
-  failure: { verb: 'failed', label: 'Failure', tone: 'bad' },
-  no_changes: { verb: 'returned', label: 'No changes', tone: 'none' },
-  canceled: { verb: 'canceled', label: 'Canceled', tone: 'halted' },
+const CHILD_STATE: Record<ChildCompletionStatus, { label: string; tone: EventRowTone }> = {
+  success: { label: 'Success', tone: 'good' },
+  failure: { label: 'Failure', tone: 'bad' },
+  no_changes: { label: 'No changes', tone: 'none' },
+  canceled: { label: 'Canceled', tone: 'halted' },
 };
 
 /** A link that opens `threadId`, labelled with its title. Routed through
@@ -58,7 +58,7 @@ export function threadLink(threadId: string, title: string | undefined | null) {
  *  chip is not clickable (see the `ChildThreadCompleted` arm of
  *  `describeInitiator`). */
 export function ChildCompletionRow(props: Props) {
-  const { verb, label, tone } = CHILD_STATE[props.status];
+  const { label, tone } = CHILD_STATE[props.status];
   const summaryHtml = props.summary.trim() ? renderMarkdown(props.summary) : '';
   const pending = props.pendingChangeIds?.length ?? 0;
   const below = props.subThreadPendingChanges?.length ?? 0;
@@ -66,15 +66,11 @@ export function ChildCompletionRow(props: Props) {
     kind: 'child',
     state: props.status,
     role: 'child-completion',
-    subject: (
-      <>
-        {`Child thread ${verb}: `}
-        {threadLink(props.childThreadId, props.childThreadTitle)}
-      </>
-    ),
+    subject: eventNameChip({ kind: 'chip', name: 'ChildThreadCompleted', sentenceStart: true }),
     stateLabel: label,
     tone,
     facts: [
+      { kind: 'node' as const, node: threadLink(props.childThreadId, props.childThreadTitle) },
       pending > 0
         ? { kind: 'text' as const, text: `${pending} pending change${pending === 1 ? '' : 's'}` }
         : null,
@@ -87,7 +83,7 @@ export function ChildCompletionRow(props: Props) {
     ],
     fold: summaryHtml
       ? {
-          label: 'Summary',
+          label: 'Details',
           body: (
             <div class="markdown-content" dangerouslySetInnerHTML={{ __html: summaryHtml }} />
           ),
@@ -109,7 +105,7 @@ function childStoppedState(childThreadId: string): { label: string; tone: EventR
   const child = threadMap.value.get(childThreadId);
   if (!child) return { label: 'Stopped', tone: 'halted' };
   return child.meta.isStoppedChild
-    ? { label: 'Waiting for you', tone: 'halted' }
+    ? { label: 'Waiting for you', tone: 'live' }
     : { label: 'No longer waiting', tone: 'none' };
 }
 
@@ -123,14 +119,10 @@ export function ChildStoppedRow(props: StoppedProps) {
     kind: 'child',
     state: 'stopped',
     role: 'child-stopped',
-    subject: (
-      <>
-        {'Child thread stopped: '}
-        {threadLink(props.childThreadId, props.childThreadTitle)}
-      </>
-    ),
+    subject: eventNameChip({ kind: 'chip', name: 'ChildThreadStopped', sentenceStart: true }),
     stateLabel: label,
     tone,
+    facts: [{ kind: 'node', node: threadLink(props.childThreadId, props.childThreadTitle) }],
   });
 }
 
@@ -142,12 +134,8 @@ export function ChildMovedOutRow(props: StoppedProps) {
     kind: 'child',
     state: 'moved-out',
     role: 'child-moved-out',
-    subject: (
-      <>
-        {'Child thread moved to top level: '}
-        {threadLink(props.childThreadId, props.childThreadTitle)}
-      </>
-    ),
+    subject: eventNameChip({ kind: 'chip', name: 'ChildThreadDetached', sentenceStart: true }),
+    facts: [{ kind: 'node', node: threadLink(props.childThreadId, props.childThreadTitle) }],
     stateLabel: 'No longer waiting',
     tone: 'none',
   });

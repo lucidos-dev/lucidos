@@ -85,9 +85,7 @@
     scrollbar-gutter: stable;
     overscroll-behavior: contain;
     /* Mirrors `.thread-drawer-list` exactly: the same always-reserved scroll
-       gutter, breathing room above the first section heading, a hair below the
-       last row. */
-    padding-top: var(--space-md);
+       gutter, and a hair below the last row. */
     padding-bottom: 0.25rem;
     visibility: hidden;
     pointer-events: none;
@@ -133,13 +131,13 @@
 }
 
 /* The panel's two section headings, "Status" and "By thread types". Deliberately
-   the drawer's own lifecycle headers' shape (`.thread-drawer .list-section-title`:
+   the list panels' section header shape (styles/section-header.css:
    uppercase, bold, primary, --font-size-md), because the panel is a view inside
    that pane and a heading has to read as a heading at a glance. The old caption
    was a muted --font-size-xs line, which let "View" and "Show" read as labels ON
    the rows under them rather than as a heading OVER them. Same padding as those
    headers too, so they start on the same x as a section heading in the list this
-   panel covers. The words wear their `.drawer-section-label` as well, whose
+   panel covers. The words wear their `.section-label` as well, whose
    cap-band trim puts the caps on the same y. */
 .thread-filter-title {
     /* Flex so each heading's leading icon, and the checkmark on "By thread
@@ -163,23 +161,23 @@
     text-transform: uppercase;
     letter-spacing: 0.05em;
     color: var(--text-primary);
-    padding: var(--space-sm) 1rem calc(var(--space-md) + var(--space-sm)) var(--drawer-row-inset);
+    padding: var(--section-header-pad) 1rem var(--section-header-pad) var(--drawer-row-inset);
 }
 
-/* The leading icon wears the drawer section headers' `.drawer-section-icon`
+/* The leading icon wears the section headers' `.section-icon`
    glyph and size. Their title row spaces the icon with a 0.25rem gap plus this
    0.25rem margin. This row's own 0.5rem gap already covers that, so the margin
    goes. It takes the heading's bright colour rather than their grey. The rows
    under it carry grey icons of the same size, and the heading must outrank them.
    The active rule below still wins, being later at equal specificity. */
-.thread-filter-title .drawer-section-icon {
+.thread-filter-title .section-icon {
     margin-right: 0;
     color: var(--text-primary);
 }
 
 /* A ticked "By thread types" takes the accent on its icon and checkmark, the
    same cue the active status row wears. Its words keep the heading colour. */
-.thread-filter-title-active .drawer-section-icon,
+.thread-filter-title-active .section-icon,
 .thread-filter-title-active .thread-filter-title-check {
     color: var(--accent);
 }
@@ -214,10 +212,9 @@
    between them carries the word, instead of leaving the user to infer the
    relationship from a section going grey on them. It sits INSIDE the radiogroup,
    dividing two branches of one single-select set rather than separating two
-   controls. Its top margin is the gap the drawer puts between two sections
-   (`.drawer-section + .drawer-section`); the horizontal inset matches the
-   section headings' trailing padding, so the hairline stops where their box
-   does rather than running to the pane edge. */
+   controls. Its top margin sets it off from the rows above. The horizontal
+   inset matches the section headings' trailing padding, so the hairline stops
+   where their box does rather than running to the pane edge. */
 .thread-filter-or {
     display: flex;
     align-items: center;
@@ -483,9 +480,8 @@
        full width up to it, so a selection sits flush against it. */
     overflow-y: scroll;
     scrollbar-gutter: stable;
-    /* Breathing room above the first section header so it isn't flush against
-       the "Threads" header chrome above the list. */
-    padding-top: var(--space-md);
+    /* The first section header's own top padding keeps it off the "Threads"
+       header chrome above the list. */
     padding-bottom: 0.25rem;
 }
 
@@ -538,27 +534,13 @@
     }
 }
 
-/* Each thread row carries a hairline divider on its own bottom edge (Apple
- * Messages / Twitter style) — the row separator rides the row, not the gap
- * below it. Drawn as a bottom-anchored `::after` (rather than `border-bottom`)
- * so both ends inset toward the row's text column: `left` is the row's
- * `padding-left` (`--thread-row-pad-left`) less a small 0.25rem nudge, so the
- * line starts just left of the thread-name text, and `right` reads the
- * drawer's `--thread-row-pad-right` so it stops at the content column. Neither end
- * runs flush to the drawer edge.
- * `--border-color` matches every other divider in the app. Scoped to
- * `.thread-drawer .thread-row` so it covers both wrapped rows (list / drafts)
- * AND the bare `SearchResultRow`. Each row's line tracks its own indented text
- * via `--thread-row-pad-left`. The hover override above keeps the hovered-row
- * background clear of this color so the two don't merge into one thick band. */
-.thread-drawer .thread-row::after {
-    content: '';
-    position: absolute;
-    left: calc(var(--thread-row-pad-left) - 0.25rem);
-    right: var(--thread-row-pad-right);
-    bottom: 0;
-    border-bottom: 1px solid var(--border-color);
-    pointer-events: none;
+/* Each thread row's hairline (styles/section-header.css) starts just left of
+ * its own title text, so a nested row's line tracks its indent. It stops at
+ * the content column. The hover override above keeps the hovered-row
+ * background clear of the line colour. */
+.thread-drawer .thread-row {
+    --row-hairline-left: calc(var(--thread-row-pad-left) - 0.25rem);
+    --row-hairline-right: var(--thread-row-pad-right);
 }
 
 /* x-position of the lifted-child accent bar: one indent step deeper per level,
@@ -705,32 +687,6 @@ html[data-theme-mode="light"] .family-disclosure {
     }
 }
 
-/* Count badge on a section header: the number of threads the section holds.
- * The accent-blue fill makes the count read as a pill. A drawer header draws
- * that pill only while the section is collapsed (see below). */
-.section-count-badge {
-    font-size: var(--font-size-2xs);
-    font-weight: 600;
-    line-height: 1rem;
-    /* The pill is as tall as its line. styles/badges.css rounds that to whole
-       pixels, which keeps the count centred. */
-    --badge-height: 1lh;
-    min-width: var(--badge-box, var(--badge-height));
-    padding: 0 0.3125rem;
-    text-align: center;
-    border-radius: calc(var(--radius-control) * 1.25);
-    color: var(--text-secondary);
-    --section-count-fill: color-mix(in srgb, var(--accent) 15%, transparent);
-    background: var(--section-count-fill);
-    font-variant-numeric: tabular-nums;
-}
-
-/* Dark mode: lift the accent share so the fill reads a touch bluer against the
- * darker row backgrounds (the 15% tint above looks washed out on dark). Light
- * mode keeps the base 15%, which stays distinct there already. */
-html[data-theme-mode="dark"] .section-count-badge {
-    --section-count-fill: color-mix(in srgb, var(--accent) 24%, transparent);
-}
 
 /* Focus is shown by the `bg-selected` fill alone — no leading accent bar.
  * The fill spans the full row width at every depth — nested rows are NOT
@@ -1185,24 +1141,22 @@ html[data-theme-mode="dark"] .thread-row .message-channel-tag.channel-error {
     pointer-events: none;
 }
 
-/* A collapsed section's divider, and the line that carries it while the rows
-   roll (useFlipAnimation's `carryHairline`). Both take the row divider's
-   insets, so the carried line lands on the divider exactly. */
-.thread-drawer .list-section-title-collapsible.collapsed::after,
+/* A collapsed section's hairline (styles/section-header.css), and the line
+   that carries it while the rows roll (useFlipAnimation's `carryHairline`).
+   Both take the row hairline's insets, so the carried line lands on it
+   exactly. */
+.thread-drawer .list-section-title-collapsible,
 .thread-drawer .flip-disclosure-hairline {
-    position: absolute;
-    left: calc(var(--drawer-row-inset) - 0.25rem);
-    right: var(--thread-row-pad-right);
-    border-bottom: 1px solid var(--border-color);
-    pointer-events: none;
+    --row-hairline-left: calc(var(--drawer-row-inset) - 0.25rem);
+    --row-hairline-right: var(--thread-row-pad-right);
 }
 
-/* The divider sits on the header's bottom edge, where the rows finish
-   rolling up. It rides the header, so it slides with it when a section above
-   toggles. */
-.thread-drawer .list-section-title-collapsible.collapsed::after {
-    content: '';
-    bottom: 0;
+.thread-drawer .flip-disclosure-hairline {
+    position: absolute;
+    left: var(--row-hairline-left);
+    right: var(--row-hairline-right);
+    border-bottom: 1px solid var(--border-color);
+    pointer-events: none;
 }
 
 /* The carried line narrows toward a nested closing row's indent by scaling,
@@ -1216,246 +1170,21 @@ html[data-theme-mode="dark"] .thread-row .message-channel-tag.channel-error {
     visibility: hidden;
 }
 
-/* Room between sections — the gap after a section's last thread, before the
-   next section's header. Adjacent-sibling so it never lands above the FIRST
-   section: the first section's breathing room comes from the list's own
-   `padding-top` above, not from this margin, while every later header gets its
-   gap from the section that precedes it. (Empty sections render `null`, so the
-   first rendered `.drawer-section` is genuinely the topmost one.) Restores the
-   inter-section separation that shrank when the header's top padding was
-   trimmed, without re-bloating the top header. */
-.drawer-section + .drawer-section {
-    margin-top: var(--space-md);
-}
-
-/* Flat section headers: drop the gray band that `.list-section-title` carries
-   in base.css (the divider lines are already gone globally). The uppercase,
-   letter-spaced label reads as a section marker on its own; the top padding
-   gives the header its own breathing room (the gap BETWEEN sections rides on
-   the `.drawer-section + .drawer-section` margin above, not on this padding).
-   To carry the section weight without a band, the label is the primary
-   (near-black) text color, bolder (700), and a touch larger (0.8125rem vs the
-   base 0.6875rem) than the base `.list-section-title`. `--text-primary`
-   (not literal black) keeps dark mode inverting correctly. Covers the
-   collapsible lifecycle headers plus the Drafts / Results headers, which all
-   render inside `.thread-drawer`. Left padding is the pane's content column
-   (`--drawer-row-inset`, which `.thread-row` also derives its `padding-left`
-   from) so the header label starts where the thread-name text starts, clearing
-   the absolutely-positioned status-dot column to its left. */
-.thread-drawer .list-section-title {
-    background: none;
-    /* The gap under the label equals the gap above it: the section margin (or
-       the list's padding-top) plus this top padding. Below, it runs to the first
-       row when open, and to the divider on this edge when collapsed. */
-    padding: var(--space-sm) 1rem calc(var(--space-md) + var(--space-sm)) var(--drawer-row-inset);
-    /* No right inset — matches `.thread-row` (which also runs full width). The
-       keyboard-highlight band painted on a focused header
-       (`.list-section-title-highlighted`) runs to the drawer's right edge (or up
-       to the scrollbar when the list overflows), lining up with a focused /
-       highlighted thread-row's background. Left already matches: neither carries
-       a left margin, so both bands start flush at the drawer's left edge. */
-    color: var(--text-primary);
-    font-weight: 700;
-    font-size: var(--font-size-md);
-    /* Lay out the section icon + label on one centered row for EVERY drawer
-       header — the collapsible lifecycle headers (Pinned/Current/Archive) and
-       the flat alternate-view headers (Drafts/Needs attention), which share the
-       `DrawerSectionHeader` markup. The `gap` lives here (not on the
-       collapsible-only selector) so the icon-to-label spacing is single-sourced
-       and can't differ per section; the icon-less Results header is unaffected
-       (single child). */
-    display: flex;
-    align-items: center;
-    gap: 0.25rem;
-}
-
-.list-section-title-collapsible {
-    cursor: pointer;
-    -webkit-user-select: none;
-    user-select: none;
-}
-
-/* Pin the header's line box to the count badge's own `line-height: 1rem`
-   (16px), so the label text and the badge share one cross-size. Otherwise
-   the badge is 1px taller than the bare 0.8125rem text line box (15px). The
-   row then grows to the badge, and `align-items: center` puts the icon and
-   label half a pixel off the grid in some sections but not others. */
-.list-section-title:has(> .section-count) {
-    line-height: 1rem;
-}
-
-/* The section count: the pill with its own small number, and an open copy
- * of the number one type step larger. Only one copy shows at a time, and
- * each one rests untransformed. Chromium draws a scaling glyph from a bitmap,
- * so a copy resting at a scale would stay soft until the scale ended. A
- * status-filter header never collapses, so it always shows the open copy. */
-.list-section-title > .section-count {
-    position: relative;
-    display: inline-flex;
-    /* A hand-tuned lift, and the block below retires it wherever it can. The
-       label's caps ride above its own line box's middle, by whatever the font's
-       ascent and descent are worth, while the count sits at its pill's middle.
-       This nudge stood in for that gap, and being a constant it was right at one
-       ui-scale and one font. */
-    top: -0.0625rem;
-    /* Extra room after the section name, on top of the flex `gap` (0.25rem),
-       so the name-to-count spacing differs from the icon-to-name gap. */
-    margin-left: 0.25rem;
-    /* The open copy's step, and how far the pill's number grows to meet it. */
-    --section-count-open-scale: 1.2;
-}
-
-.list-section-title > .section-count > .section-count-badge {
-    position: relative;
-    /* The pill moves to `::before`, so it can animate apart from the digits.
-       `isolation` keeps the layer above the header's own background and below
-       the digits. */
-    isolation: isolate;
-    background: none;
-    /* An open section draws its number with the open copy. This one grows
-       out of sight, so the pill it carries fades from the right place.
-       `visibility`, not a transparent colour, which forced colours repaint. */
-    visibility: hidden;
-    scale: var(--section-count-open-scale);
-    transition: scale var(--duration-slow) ease-out;
-}
-
-/* Collapsing, this number springs down from the open copy's size. */
-.list-section-title-collapsible.collapsed > .section-count > .section-count-badge {
-    visibility: visible;
-    scale: none;
-    transition: scale var(--duration-slow) cubic-bezier(0.34, 1.56, 0.64, 1);
-}
-
-/* An open section shows its rows, so its count is a bare number. A collapsed
- * one hides them, and the pill marks that. The pill shrinks away on open and
- * springs back on collapse. Reduced motion collapses both to a swap. */
-.list-section-title > .section-count > .section-count-badge::before {
-    content: '';
-    position: absolute;
-    inset: 0;
-    z-index: -1;
-    border-radius: inherit;
-    background: var(--section-count-fill);
-    /* Shown through the hidden badge, so it can still fade on open. */
-    visibility: visible;
-    opacity: 0;
-    transform: scale(0.5);
-    transition:
-        opacity var(--duration-normal) ease-out,
-        transform var(--duration-normal) ease-in;
-}
-
-.list-section-title-collapsible.collapsed > .section-count > .section-count-badge::before {
-    opacity: 1;
-    transform: scale(1);
-    transition:
-        opacity var(--duration-normal) ease-out,
-        transform var(--duration-slow) cubic-bezier(0.34, 1.56, 0.64, 1);
-}
-
-/* The open copy, over the pill's box. Opening, it grows from the pill's
-   number up to its own size, which it rests at. */
-.section-count-open {
-    position: absolute;
-    inset: 0;
-    align-content: center;
-    font-size: var(--font-size-sm);
-    font-weight: 600;
-    font-variant-numeric: tabular-nums;
-    line-height: 1rem;
-    letter-spacing: normal;
-    white-space: nowrap;
-    text-align: center;
-    color: var(--text-secondary);
-    transition: scale var(--duration-slow) ease-out;
-}
-
-.list-section-title-collapsible.collapsed > .section-count > .section-count-open {
-    visibility: hidden;
-    scale: calc(1 / var(--section-count-open-scale));
-    transition: none;
-}
-
-/* The label, its icon and its count on ONE cap band, derived instead of nudged.
- *
- * `styles/badges.css` trims the pill's line box to the cap band, so the digits
- * now sit exactly at the pill's middle. Give the label the same trim and its
- * caps sit exactly at the middle of ITS box, which the flex row centres on the
- * same axis. All three then coincide at any font and any ui-scale, and the
- * nudge above has nothing left to correct. The ICON is the third, and it was
- * off by the same gap: 1.24px at 200% ui-scale, now 0.08px.
- *
- * `min-height: 1lh` is what keeps this safe. The trim shrinks the CONTENT box
- * to the cap band; the min-height puts the element's own box back at the line
- * box it had, so the row is the same height collapsed and expanded (see the
- * jump this file documents above) and the shimmer still paints over the whole
- * glyph. Measured: the count went from 0.80px above the label's caps at 200%
- * ui-scale to 0.04px, on both engines, with every row height unchanged. */
-@supports (text-box-trim: trim-both) {
-    .drawer-section-label {
-        min-height: 1lh;
-        align-content: center;
-        text-box-trim: trim-both;
-        text-box-edge: cap alphabetic;
-    }
-
-    .list-section-title > .section-count {
-        top: 0;
-    }
-
-    /* Both copies grow from their baselines, each on a whole pixel. WebKit
-       repaints a scaling glyph every frame and snaps its baseline to the pixel
-       grid. A baseline that crosses pixel fractions mid-animation therefore
-       makes the number dip a pixel before it lands. The two baselines differ,
-       so the number takes that step once, on the frame the copies swap. */
-    .list-section-title > .section-count > .section-count-badge {
-        transform-origin: 50% calc(100% - var(--badge-baseline-inset));
-    }
-
-    /* Trimmed to its baseline, the open copy's bottom edge IS the baseline.
-       `bottom` puts its caps on the box's middle, rounded to a whole pixel.
-       Centring the trimmed line instead lands a pixel apart in the two
-       engines. */
-    .section-count-open {
-        top: auto;
-        bottom: round(50% - 0.5 * 1cap, 1px);
-        align-content: normal;
-        text-box-trim: trim-end;
-        text-box-edge: cap alphabetic;
-        transform-origin: 50% 100%;
-    }
-}
-
-/* Section header icon — sits left of the label, sharing the title's flex row.
-   Sized to the label cap-height and slightly dimmed so the text stays primary. */
-.drawer-section-icon {
-    display: inline-flex;
-    align-items: center;
-    color: var(--text-secondary);
-    flex: none;
-    margin-right: 0.25rem;
-}
-
-/* The Pinned heading's pin, lowered to balance its top-heavy head against the
-   label. A transform, so the row's height and the label stay put. */
-.drawer-section-icon-pin {
-    transform: translateY(0.0625rem);
-}
-
-@media (hover: hover) {
-    /* Flat headers carry no fill, so hover is a color-only cue — no band. */
-    .list-section-title-collapsible:hover {
-        color: var(--text-primary);
-    }
+/* Every drawer header (styles/section-header.css) starts its label on the
+   pane's content column, where the thread-name text starts. The collapsible
+   lifecycle headers and the Drafts / Needs attention / Results headers all
+   render inside `.thread-drawer`. */
+.thread-drawer {
+    --section-inset-left: var(--drawer-row-inset);
+    --section-inset-right: var(--thread-row-pad-right);
 }
 
 /* Keyboard highlight on a section header — the ←/→ tree nav lands here when a
    section is collapsed (or descended from / ascended to). Reads exactly like the
    thread-row keyboard highlight: the subtle --bg-secondary fill (not --bg-hover,
    which is dark enough to merge with the row divider into one band). Equal
-   specificity to the base `.thread-drawer .list-section-title { background: none }`
-   rule above, so source order (this rule is later) makes it win. */
+   specificity to the header rule's `background: none` in section-header.css,
+   which main.tsx imports before this sheet, so source order makes it win. */
 .thread-drawer .list-section-title-highlighted {
     background: var(--bg-secondary);
     border-radius: calc(var(--radius-control) * 0.5);

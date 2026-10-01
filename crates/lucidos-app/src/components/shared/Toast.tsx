@@ -301,6 +301,9 @@ function renderToast(t: ToastItem, entryDurationMs: number) {
             blurred whatever held focus, and the buttons are unaffected. */}
         <div class="toast-heading" tabIndex={-1}>
           {t.title ? <span class="toast-title">{linkifyText(t.title)}</span> : linkifyText(t.message)}
+          {t.count && (
+            <span class="label label-neutral toast-count">×{t.count}</span>
+          )}
         </div>
         {t.title && <div class="toast-text" tabIndex={-1}>{linkifyText(t.message)}</div>}
       </div>

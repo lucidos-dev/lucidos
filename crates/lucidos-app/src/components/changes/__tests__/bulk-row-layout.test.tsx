@@ -211,8 +211,8 @@ describe('the row action column', () => {
 });
 
 describe('the bulk row geometry', () => {
-  it('keeps the row on the change rows’ gutter', () => {
-    expect(rule('.changes-bulk-actions').props.get('padding')).toBe('0 var(--space-lg) var(--space-sm)');
+  it('keeps the row on the change rows’ gutter, its hairline a row’s distance below', () => {
+    expect(rule('.changes-bulk-actions').props.get('padding')).toBe('0 var(--space-lg) var(--space-md)');
   });
 
   it('packs the button line to the right', () => {

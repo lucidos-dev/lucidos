@@ -92,7 +92,7 @@ describe('claimSeedForCard', () => {
 });
 
 describe('shouldSeedChoiceFocus', () => {
-  const idle = { hoverPointer: true, promptHasText: false, activeIsIdle: true };
+  const idle = { hoverPointer: true, promptHasText: false, activeIsIdle: true, markerOnThreadPane: true };
 
   it('seeds when the user is idle at the bottom of the transcript on desktop', () => {
     expect(shouldSeedChoiceFocus(idle)).toBe(true);
@@ -119,16 +119,20 @@ describe('shouldSeedChoiceFocus', () => {
     expect(shouldSeedChoiceFocus({ ...idle, activeIsIdle: false })).toBe(false);
   });
 
+  it('never seeds while the focused-pane marker points at another pane', () => {
+    // The reader is working in the drawer or the content pane even when DOM
+    // focus fell to <body>, say after a confirm dialog closed. A seed there
+    // would take their keyboard, and the next Tab would leave the card.
+    expect(shouldSeedChoiceFocus({ ...idle, markerOnThreadPane: false })).toBe(false);
+  });
+
   it('asks nothing about the transcript position', () => {
-    // There used to be a fourth clause here, a position SIGNAL standing for
-    // "the reader has chosen to read history". It went with the bottom-pin that
-    // maintained it, and it is deliberately NOT carried over to
-    // `awayFromBottom`: nothing scrolls to a card now, so the card's own
-    // arrival puts the reader off the bottom and every card in a scrollable
-    // thread would decline its one chance at focus (`claimSeedForCard` latches
-    // the id on arrival). `seedChoiceCardFocus` asks `isElementOnScreen` about
-    // the CHOICE instead, which is the question that actually matters.
-    expect(Object.keys(idle)).toEqual(['hoverPointer', 'promptHasText', 'activeIsIdle']);
+    // No clause reads a position signal such as `awayFromBottom`. Nothing
+    // scrolls to a card, so its own arrival puts the reader off the bottom.
+    // Every card in a scrollable thread would then decline its one chance at
+    // focus, since `claimSeedForCard` latches the id on arrival.
+    // `seedChoiceCardFocus` asks `isElementOnScreen` about the CHOICE instead.
+    expect(Object.keys(idle)).toEqual(['hoverPointer', 'promptHasText', 'activeIsIdle', 'markerOnThreadPane']);
   });
 });
 

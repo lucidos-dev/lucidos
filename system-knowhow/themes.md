@@ -25,19 +25,22 @@ the carousel from the other mode, it asks first, then switches the device's
 `theme-mode` to the theme's mode. `set_preference` does not ask: set `theme-mode` too when
 the user wants to see the theme now.
 
+A workspace theme's card carries a "Custom" badge, so it reads apart from a
+built-in one.
+
 Built-in themes: `lucidos` (the default), `minimal`, `mono` (pure black or
 white), `amethyst`, `nord`, `catppuccin`, `rose-pine`, `gruvbox`, `solarized`,
-`tokyo-night`, `everforest`, and `paper` (light only). An unknown id shows the
-default.
+`tokyo-night`, `everforest`, `paper` (light only), `ember`, `harbour`, and
+`real-computer` (dark only). An unknown id shows the default.
 
 The picker groups themes by *family*, one section each, in this order:
 
 | Family | Section | Built-in themes |
 |---|---|---|
-| `blue` | Cool | Lucidos, Nord, Tokyo Night, Solarized |
+| `blue` | Cool | Lucidos, Nord, Tokyo Night, Solarized, Harbour |
 | `violet` | Violet | Amethyst, Catppuccin, Rosé Pine |
-| `warm` | Warm | Gruvbox, Everforest, Paper |
-| `neutral` | Neutral | Minimal, Mono |
+| `warm` | Warm | Gruvbox, Everforest, Paper, Ember |
+| `neutral` | Neutral | Minimal, Mono, Real computer |
 
 The `blue` section reads "Cool" because only Lucidos has a blue background.
 The others share a blue accent on slate, teal or indigo.

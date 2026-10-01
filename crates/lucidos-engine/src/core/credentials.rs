@@ -2431,6 +2431,97 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // 20260930204255_strip_oauth_client_default_scopes.sql
+    // -----------------------------------------------------------------------
+
+    /// The shipped file, so there is no second copy that can drift.
+    const STRIP_CLIENT_SCOPES: &str =
+        include_str!("../../migrations/20260930204255_strip_oauth_client_default_scopes.sql");
+
+    async fn auth_value_json(pool: &PgPool, service_name: &str) -> serde_json::Value {
+        let raw: String =
+            sqlx::query_scalar("SELECT auth_value FROM credentials WHERE service_name = $1")
+                .bind(service_name)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        serde_json::from_str(&raw).unwrap()
+    }
+
+    /// The key goes, and every other key of the client stays as it was.
+    #[tokio::test]
+    async fn strip_removes_only_the_scopes_key() {
+        let (pool, db) = setup_test_db().await;
+        insert_client(
+            &pool,
+            "google",
+            r#"{"client_id":"abc","client_secret":"s","auth_url":"https://a.test/auth","token_url":"https://a.test/token","scopes":"read write"}"#,
+        )
+        .await;
+
+        for _ in 0..2 {
+            sqlx::query(STRIP_CLIENT_SCOPES)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            auth_value_json(&pool, "google").await,
+            serde_json::json!({
+                "client_id": "abc",
+                "client_secret": "s",
+                "auth_url": "https://a.test/auth",
+                "token_url": "https://a.test/token",
+            })
+        );
+
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
+    /// Only rows carrying the key are rewritten. The rest stay byte for byte,
+    /// and a row that is not JSON cannot abort the migration and startup.
+    #[tokio::test]
+    async fn strip_leaves_other_rows_alone() {
+        let (pool, db) = setup_test_db().await;
+        insert_client(&pool, "broken", "not json at all").await;
+        let clean_client = r#"{"client_id":"abc", "token_url":"https://a.test/token"}"#;
+        insert_client(&pool, "clean", clean_client).await;
+        let api_key_value = r#"{"key":"k","scopes":"kept"}"#;
+        sqlx::query(
+            "INSERT INTO credentials (service_name, base_urls, auth_type, auth_value) \
+             VALUES ('other', ARRAY['https://api.other.test'], 'api_key', $1)",
+        )
+        .bind(api_key_value)
+        .execute(&pool)
+        .await
+        .expect("insert api key");
+
+        sqlx::query(STRIP_CLIENT_SCOPES)
+            .execute(&pool)
+            .await
+            .expect("a malformed row must not take the migration down");
+
+        let other: String =
+            sqlx::query_scalar("SELECT auth_value FROM credentials WHERE service_name = 'other'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(other, api_key_value);
+        let clean: (String, bool) = sqlx::query_as(
+            "SELECT auth_value, updated_at = created_at FROM credentials WHERE service_name = 'clean'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(clean, (clean_client.to_string(), true));
+
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
+    // -----------------------------------------------------------------------
     // 20260829132711_credential_scope_is_a_set.sql
     // -----------------------------------------------------------------------
 

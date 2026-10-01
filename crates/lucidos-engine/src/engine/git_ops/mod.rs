@@ -423,13 +423,28 @@ fn classify_git_answer(
 /// So no caller of `commit_all_dirty` may hold this lock: the callee takes it
 /// itself, and a caller holding it would queue behind its own snapshot.
 ///
-/// Lock ordering: [`merge::MERGE_MUTEX`] is always acquired FIRST where both are
-/// held (every `ff_main_to` caller wraps it), and nothing holding this lock ever
-/// takes `MERGE_MUTEX`, so the two cannot deadlock. Below it sits only the
+/// Lock ordering: [`merge::MERGE_MUTEX`], then [`WORKSPACE_REPO_MUTEX`], then
+/// this one, wherever more than one is held. Nothing holding this lock takes
+/// either of the other two, so they cannot deadlock. Below it sits only the
 /// `ArtifactManager` repo handle, taken inside the snapshot's closure and never
 /// in the other direction.
 pub(crate) static REPO_WORKTREE_MUTEX: std::sync::LazyLock<std::sync::Arc<tokio::sync::Mutex<()>>> =
     std::sync::LazyLock::new(|| std::sync::Arc::new(tokio::sync::Mutex::new(())));
+
+/// Held across every write+commit on the workspace repo (through
+/// `LucidosEngine::lock_workspace_repo`), across `apply_change`'s dirty check,
+/// and across `ff_main_to`'s publish and tree sync.
+///
+/// The last holder is what keeps a data write intact. The write saves a file,
+/// then commits that one path. A `checkout -f main` that resolved `main` before
+/// the commit rewrites the file to its old bytes after it, and the next
+/// `commit_all_dirty` records the revert. [`REPO_WORKTREE_MUTEX`] cannot close
+/// this: a targeted commit never takes it.
+///
+/// No holder may call `ff_main_to`: tokio's mutex is not re-entrant, so the
+/// merge would wait on its own caller.
+pub(crate) static WORKSPACE_REPO_MUTEX: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 /// [`REPO_WORKTREE_MUTEX`] as an OWNED guard, so it can be moved into a
 /// `spawn_blocking` closure and released when the blocking work actually

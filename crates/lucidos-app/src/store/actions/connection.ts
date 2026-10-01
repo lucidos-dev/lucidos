@@ -1,4 +1,4 @@
-import { connectionStatus, databaseReachable, dismissToast, removeToast, showToast, workspaceName, workspacePath, engineStartedAt, lucidosRelease, lucidosReleaseDirty, engineVersion, latestEngineVersion, latestTauriAppVersion, enginePackaged, llmConfigured, configuredProviders, updateAvailable, focusedThreadId, threadMap, engineRestarting, threadsLoaded, restartRequired, engineVersionReady, TOAST_AUTO_DISMISS_MS, THREAD_EVENTS_FETCH_CONCURRENCY } from '../store';
+import { connectionStatus, databaseReachable, dismissToast, removeToast, showToast, workspaceName, workspacePath, engineStartedAt, lucidosRelease, lucidosReleaseDirty, engineVersion, latestEngineVersion, latestTauriAppVersion, enginePackaged, llmConfigured, configuredProviders, updateAvailable, focusedThreadId, threadMap, engineRestarting, threadsLoaded, threadListFetched, restartRequired, engineVersionReady, TOAST_AUTO_DISMISS_MS, THREAD_EVENTS_FETCH_CONCURRENCY } from '../store';
 import { checkHealth, API_BASE } from '../../api/client';
 import type { HealthInfo } from '../../api/client';
 import { connectThreadEvents, disconnectThreadEvents } from './thread-sync';
@@ -43,13 +43,18 @@ const BOUNCE_GUARD_KEY = 'lucidos-picker-bounce';
  *  picker? Only when we have NEVER connected this session (so an established
  *  session that briefly drops is not yanked away mid-work), a picker is reachable
  *  (`null` on a legacy direct engine with no gateway), and we haven't already
- *  bounced (the one-shot). */
+ *  bounced (the one-shot).
+ *
+ *  `engineAnswered` is the engine having served the thread list. A page it served
+ *  it is not a stranded shell, even if every health probe since has failed: that
+ *  is an engine being replaced under it, and the reconnect path owns it. */
 export function shouldBounceToPicker(opts: {
   connectedEver: boolean;
+  engineAnswered: boolean;
   pickerHref: string | null;
   alreadyBounced: boolean;
 }): boolean {
-  return !opts.connectedEver && opts.pickerHref !== null && !opts.alreadyBounced;
+  return !opts.connectedEver && !opts.engineAnswered && opts.pickerHref !== null && !opts.alreadyBounced;
 }
 
 /** Cold-start recovery: if the very first connect never lands, return to the
@@ -67,7 +72,12 @@ export function bounceToPickerIfStranded(): void {
   } catch {
     /* storage off — treat as not-yet-bounced */
   }
-  if (!shouldBounceToPicker({ connectedEver: hasEverConnected, pickerHref, alreadyBounced })) return;
+  if (!shouldBounceToPicker({
+    connectedEver: hasEverConnected,
+    engineAnswered: threadListFetched.value,
+    pickerHref,
+    alreadyBounced,
+  })) return;
   try {
     sessionStorage.setItem(BOUNCE_GUARD_KEY, '1');
   } catch {

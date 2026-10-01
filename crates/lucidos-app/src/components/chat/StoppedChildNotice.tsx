@@ -32,7 +32,7 @@ export function StoppedChildNotice({ meta }: { meta: ThreadMeta }) {
           </>
         ),
         stateLabel: 'Waiting for you',
-        tone: 'halted',
+        tone: 'live',
         facts: [
           { kind: 'text', text: STOPPED_CHILD_CONTINUE },
           { kind: 'text', text: STOPPED_CHILD_SETTLE },

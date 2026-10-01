@@ -474,13 +474,13 @@ test.describe('Threads-header unified Filter control — desktop layout', () => 
       // heading's line height.
       const wordsOffset = (title: Element) => {
         const range = document.createRange();
-        range.selectNodeContents(title.querySelector('.drawer-section-label')!);
+        range.selectNodeContents(title.querySelector('.section-label')!);
         return range.getBoundingClientRect().top - title.getBoundingClientRect().top;
       };
       const listHeading = document.createElement('div');
       listHeading.className = 'list-section-title list-section-title-collapsible';
-      listHeading.innerHTML = '<span class="drawer-section-icon"></span>'
-        + '<span class="drawer-section-label">Pinned</span>'
+      listHeading.innerHTML = '<span class="section-icon"></span>'
+        + '<span class="section-label">Pinned</span>'
         + '<span class="section-count"><span class="section-count-badge">3</span>'
         + '<span class="section-count-open">3</span></span>';
       list.prepend(listHeading);

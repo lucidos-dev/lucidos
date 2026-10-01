@@ -279,6 +279,14 @@
     color: var(--accent-yellow);
 }
 
+/* Saving an OAuth client grants nothing; the consent screen does. Said before
+   the form, so no one reads Save as handing over access. */
+.credential-grant-note {
+    margin: 0 0 0.75rem 0;
+    font-size: var(--font-size-sm);
+    color: var(--text-secondary);
+}
+
 /* Where to get the Client ID: the provider's own app console, which is the one
    step this form cannot perform. Every value comes from the OAuth provider
    registry. */
@@ -665,17 +673,37 @@
 
 /* ===== Store tab (plugin catalog) + Marketplaces settings ===== */
 
-.app-store-marketplace-form {
-    display: grid;
-    grid-template-columns: minmax(14rem, 1fr) minmax(8rem, 14rem) auto;
+/* Wraps on the pane's width, not the viewport's: a narrow Canvas pane on a
+   wide screen must still fit. Name and Add wrap as one unit, so Add never
+   lands alone on a line. The button keeps its own height and width. */
+.app-store-marketplace-form,
+.app-store-marketplace-form-tail {
+    display: flex;
+    align-items: center;
     gap: 0.5rem;
     min-width: 0;
+}
+
+.app-store-marketplace-form {
+    flex-wrap: wrap;
     margin-bottom: 0.625rem;
 }
 
 .app-store-marketplace-form .settings-text-input {
+    flex: 1 1 auto;
     min-width: 0;
-    width: 100%;
+}
+
+.app-store-marketplace-form .app-store-source-input {
+    flex: 3 1 14rem;
+}
+
+.app-store-marketplace-form-tail {
+    flex: 1 1 14rem;
+}
+
+.app-store-marketplace-form .action-btn {
+    flex: none;
 }
 
 .app-store-empty {
@@ -977,12 +1005,6 @@
     margin-top: 0.625rem;
 }
 
-@media (max-width: 760px) {
-    .app-store-marketplace-form {
-        grid-template-columns: 1fr;
-    }
-}
-
 .form-group {
     margin-bottom: 1rem;
 }
@@ -995,27 +1017,13 @@
 }
 
 /* A checkbox keeps the shared control look (shared-components.css), not a
-   text field's box. `:where` adds no specificity, so overrides still win. */
+   text field's box. `:where` adds no specificity, so overrides still win. Box
+   and focus: global/text-input.css. */
 .form-group input:where(:not([type="checkbox"])) {
     width: 100%;
     padding: 0.625rem 0.75rem;
-    /* One step off the pane (--bg-primary) so the field reads as a crisp,
-       border-defined input rather than a flat gray block (--bg-tertiary). */
-    background: var(--bg-secondary);
-    border: 1px solid var(--border-color);
-    border-radius: calc(var(--radius-control) * 0.5);
-    color: var(--text-primary);
     font-family: var(--font-ui);
     font-size: var(--font-size-md);
-    outline: none;
-    transition: border-color var(--duration-normal), box-shadow var(--duration-normal);
-}
-
-.form-group input:where(:not([type="checkbox"])):focus {
-    /* App-standard accent glow (see .action-btn:focus-visible) — the field lights
-       up on focus instead of just swapping a border color. */
-    border-color: var(--accent);
-    box-shadow: var(--focus-ring);
 }
 
 .form-group .dropdown {
@@ -1059,10 +1067,6 @@
     border-radius: calc(var(--radius-control) * 0.5);
     font-size: var(--font-size-md);
     color: var(--text-primary);
-}
-
-.form-group input::placeholder {
-    color: var(--text-muted);
 }
 
 .form-group input:where(:not([type="checkbox"])):disabled {

@@ -8,8 +8,7 @@
 //! <link rel="stylesheet" href="/api/v1/sdk-iframe.css">
 //! ```
 //!
-//! The script sets `data-theme-mode` (and, for app styles written before the
-//! rename, the legacy `data-theme`), `--bg-primary`, `--font-ui` (and
+//! The script sets `data-theme-mode`, `--bg-primary`, `--font-ui` (and
 //! `--user-ui-scale` when set) on `<html>` synchronously, so first paint
 //! matches the user's preferences before any subsequent stylesheet evaluates.
 //! The seed it carries also holds the device's `autocorrect` switch, which the
@@ -341,10 +340,6 @@ mod tests {
     fn script_sets_data_theme_mode_and_bg_primary() {
         assert!(SDK_PREFS_JS.contains(r#"THEME_MODE_ATTRIBUTE = "data-theme-mode""#));
         assert!(SDK_PREFS_JS.contains("setAttribute(THEME_MODE_ATTRIBUTE, resolved)"));
-        // App styles written before the rename still key on `data-theme`
-        // (docs/temporary-measures.md § Legacy `data-theme` in app frames).
-        assert!(SDK_PREFS_JS.contains(r#"LEGACY_THEME_MODE_ATTRIBUTE = "data-theme""#));
-        assert!(SDK_PREFS_JS.contains("legacyThemeModeAttribute: true"));
         assert!(SDK_PREFS_JS.contains("setProperty(\"--bg-primary\""));
         assert!(SDK_PREFS_JS.contains("setProperty(\"--font-ui\""));
         assert!(SDK_PREFS_JS.contains("setProperty(\"--font-features-text\""));

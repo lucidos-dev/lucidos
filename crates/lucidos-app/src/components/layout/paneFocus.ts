@@ -1,7 +1,7 @@
 import { focusedPane, type FocusedPane } from '../../store/store';
 import { getVisiblePromptInput } from '../chat/promptFocus';
 import { isMobile } from '../../utils/viewport';
-import { isTextInput } from '../../utils/dom';
+import { focusIfNeeded, isTextInput } from '../../utils/dom';
 
 /** CSS container for each desktop pane. The drawer is a sibling of the split
  *  layout; the thread/content panes are its two halves — all disjoint subtrees,
@@ -12,31 +12,58 @@ const PANE_SELECTOR: Record<FocusedPane, string> = {
   content: '.pane-content',
 };
 
-/** Tabbable elements within a pane. Mirrors the set the dialog trap uses
- *  (`shared/dialogFocusTrap.ts`, which both centered dialogs share), plus
- *  `iframe` (an app content pane). Visibility-filtered so a `display:none`
- *  control (collapsed section, hidden layout copy) never becomes a tab stop.
- *  Every native-focusable term ALSO excludes `[tabindex="-1"]` so an element
- *  explicitly removed from the tab order (e.g. the thread drawer's mouse-only
- *  row buttons) is honored exactly as native Tab does — without this a
- *  `tabindex=-1` `<button>` would still match `button:not([disabled])` and the
- *  per-pane trap would keep cycling it, defeating the drawer's single-tab-stop. */
-const FOCUSABLE =
-  'a[href]:not([tabindex="-1"]), button:not([disabled]):not([tabindex="-1"]), input:not([disabled]):not([tabindex="-1"]), select:not([disabled]):not([tabindex="-1"]), textarea:not([disabled]):not([tabindex="-1"]), iframe:not([tabindex="-1"]), [tabindex]:not([tabindex="-1"])';
+/** Tabbable elements within a pane or an overlay panel: the native controls,
+ *  `iframe` (an app content pane), `summary`, media controls and
+ *  `contenteditable`. Every native-focusable term ALSO excludes
+ *  `[tabindex="-1"]` so an element explicitly removed from the tab order (e.g.
+ *  the thread drawer's mouse-only row buttons) is honored exactly as native Tab
+ *  does. Without it the per-pane trap would keep cycling a `tabindex=-1`
+ *  `<button>`, defeating the drawer's single tab stop. */
+const FOCUSABLE = [
+  'a[href]', 'button:not([disabled])', 'input:not([disabled])', 'select:not([disabled])',
+  'textarea:not([disabled])', 'iframe', 'summary', 'audio[controls]', 'video[controls]',
+  '[contenteditable]:not([contenteditable="false"])', '[tabindex]',
+].map((term) => `${term}:not([tabindex="-1"])`).join(', ');
 
-/** Tabbable elements within `container`. Excludes an `inert` descendant, or
- *  one inside an `inert` ancestor (the thread drawer's filter panel while
- *  closed, `ThreadFilterCover`). The browser already skips `inert` content on
- *  Tab and refuses to focus it, so this filter must agree. Exported for unit
+/** True when the browser would actually focus `el`: it has a box, no
+ *  `visibility: hidden` (a collapsed pane, the drawer list under the filter
+ *  panel), and no `inert` ancestor (a closed `ThreadFilterCover`). A candidate
+ *  the browser refuses turns the trap's Tab into a dead key. */
+function canTakeFocus(el: HTMLElement): boolean {
+  if (el.getClientRects().length === 0 || el.closest('[inert]')) return false;
+  if (typeof el.checkVisibility === 'function') return el.checkVisibility({ visibilityProperty: true });
+  return getComputedStyle(el).visibility !== 'hidden';
+}
+
+/** Tabbable elements within `container`, in DOM order. The container comes
+ *  first when it is a tab stop itself: the thread drawer is one (`tabindex=0`),
+ *  while `.pane-thread` / `.pane-content` are `tabindex=-1`. Exported for unit
  *  testing. */
 export function visibleFocusables(container: HTMLElement): HTMLElement[] {
-  return Array.from(container.querySelectorAll<HTMLElement>(FOCUSABLE)).filter(
-    (el) => el.getClientRects().length > 0 && !el.closest('[inert]'),
-  );
+  const self = container.matches(FOCUSABLE) ? [container] : [];
+  return [...self, ...container.querySelectorAll<HTMLElement>(FOCUSABLE)].filter(canTakeFocus);
 }
 
 export function paneContainer(pane: FocusedPane): HTMLElement | null {
   return document.querySelector<HTMLElement>(PANE_SELECTOR[pane]);
+}
+
+/** The pane whose container holds `el`, or null for the header, an overlay or a toast. */
+export function paneHolding(el: Element): FocusedPane | null {
+  const panes = Object.keys(PANE_SELECTOR) as FocusedPane[];
+  return panes.find((pane) => el.closest(PANE_SELECTOR[pane])) ?? null;
+}
+
+/** Focus `el` and move the focused-pane marker onto the pane holding it, so
+ *  the per-pane Tab trap cycles where focus actually is. Use it for a
+ *  programmatic focus that can cross panes, such as the thread-entry focus
+ *  after a drawer row click. A pointer needs none: `focusPane` marks the pane. */
+export function focusIntoPane(el: HTMLElement | null): void {
+  if (!el) return;
+  focusIfNeeded(el);
+  if (document.activeElement !== el) return;
+  const pane = paneHolding(el);
+  if (pane) focusedPane.value = pane;
 }
 
 /** The keyboard "surface" of each pane — the element that should hold DOM focus
@@ -247,7 +274,7 @@ export function focusFirstFocusableWithin(el: HTMLElement): void {
   });
 }
 
-/** Pure boundary logic for the per-pane Tab trap: given the count of tabbable
+/** Pure boundary logic for the pane and overlay Tab traps: given the count of tabbable
  *  elements, the active element's index among them, and whether Shift is held,
  *  return the index to WRAP to, or `null` when no wrap is needed (the browser's
  *  default Tab keeps focus inside the contiguous pane subtree). Forward Tab off
@@ -265,27 +292,60 @@ export function trapTargetIndex(
 }
 
 /** Pure target logic for the per-pane Tab trap, anchored on the FOCUSED pane.
- *  Given the count of tabbable elements in the focused pane, the active element's
- *  index among them, and whether Shift is held, return the index to focus, or
- *  `null` to fall through to the browser's default Tab.
+ *  Inputs: the pane's tabbable count, the active element's index among them,
+ *  Shift, and whether DOM focus sits inside the pane. It returns the index to
+ *  focus, or `null` to fall through to the browser's default Tab.
  *
- *  - `activeIndex < 0` — DOM focus is OUTSIDE the focused pane (on `<body>` after
- *    a signal-only pane click, on the `tabindex=-1` pane container, or in another
- *    pane). Pull focus IN: forward Tab → first element, Shift+Tab → last.
- *  - inside the focused pane — wrap at the boundaries via `trapTargetIndex`;
- *    `null` in-between lets the browser step through the contiguous subtree.
- *  - `count === 0` — nothing to focus → fall through.
+ *  - focus OUTSIDE the focused pane (on `<body>` after a signal-only pane
+ *    click, or in another pane): pull focus IN. Forward Tab lands on the first
+ *    element, Shift+Tab on the last.
+ *  - focus inside the pane on a listed element: wrap at the boundaries via
+ *    `trapTargetIndex`. `null` in-between lets the browser step through the
+ *    contiguous subtree.
+ *  - focus inside the pane on an element the list misses never reaches here:
+ *    `tabTargetWithin` steps it to its neighbour first.
+ *  - `count === 0`: nothing to focus, fall through.
  *
  *  This is what makes Tab respect the focused panel even when DOM focus never
- *  entered it (a click sets `focusedPane` signal-only — see `focusPane`). */
+ *  entered it (a click sets `focusedPane` signal-only, see `focusPane`). */
 export function paneTabTarget(
   count: number,
   activeIndex: number,
   shift: boolean,
+  activeInPane: boolean,
 ): number | null {
   if (count === 0) return null;
-  if (activeIndex < 0) return shift ? count - 1 : 0;
+  if (!activeInPane) return shift ? count - 1 : 0;
   return trapTargetIndex(count, activeIndex, shift);
+}
+
+/** The index one Tab press moves to within `container`, or `null` to let the
+ *  browser step. Shared by the pane trap and the overlay trap.
+ *
+ *  Focus can sit inside `container` on an element the list leaves out: a
+ *  `tabindex=-1` pane container a click focused, or a dialog body. Native Tab
+ *  from there can leave the container, so it steps to the listed neighbour in
+ *  document order instead, wrapping at the ends. */
+export function tabTargetWithin(
+  container: HTMLElement,
+  focusables: HTMLElement[],
+  active: Element | null,
+  shift: boolean,
+): number | null {
+  const activeIndex = active ? focusables.indexOf(active as HTMLElement) : -1;
+  const inside = !!active && container.contains(active);
+  if (inside && activeIndex < 0 && focusables.length > 0) return neighbourIndex(focusables, active!, shift);
+  return paneTabTarget(focusables.length, activeIndex, shift, inside);
+}
+
+function neighbourIndex(focusables: HTMLElement[], active: Element, shift: boolean): number {
+  const follows = (a: Node, b: Node) => (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
+  if (shift) {
+    for (let i = focusables.length - 1; i >= 0; i--) if (follows(focusables[i], active)) return i;
+    return focusables.length - 1;
+  }
+  const next = focusables.findIndex((el) => follows(active, el));
+  return next >= 0 ? next : 0;
 }
 
 /** True when `el` is an `<iframe>` living inside the content pane. A click inside
@@ -326,8 +386,8 @@ export function installContentPaneIframeFocusTracking(): () => void {
   return () => window.removeEventListener('blur', onBlur);
 }
 
-/** Per-pane Tab trap. While no overlay is open (overlays own their own Tab via
- *  `overlayStack`), Tab/Shift+Tab cycle within the FOCUSED pane — and move INTO
+/** Per-pane Tab trap. Runs after `handleOverlayTab`, so no open overlay owns
+ *  the key by now. Tab/Shift+Tab cycle within the FOCUSED pane, and move INTO
  *  it when DOM focus is currently elsewhere. Anchored on `focusedPane` (the
  *  user's intent), not `document.activeElement.closest()`: a pane click sets the
  *  focused pane signal-only and never moves DOM focus, so keying off the active
@@ -336,18 +396,12 @@ export function installContentPaneIframeFocusTracking(): () => void {
  *  when it moved focus (caller preventDefaults). Desktop-only. */
 export function handlePaneTab(e: KeyboardEvent): boolean {
   if (isMobile()) return false;
-  // Overlays (modals, popovers) manage their own focus/Escape — don't fight them.
-  if (document.documentElement.hasAttribute('data-overlay-open')) return false;
   const container = paneContainer(focusedPane.value);
   if (!container) return false; // focused pane not in the DOM → normal Tab
   const focusables = visibleFocusables(container);
-  const active = document.activeElement as HTMLElement | null;
-  const target = paneTabTarget(
-    focusables.length,
-    active ? focusables.indexOf(active) : -1,
-    e.shiftKey,
-  );
+  const target = tabTargetWithin(container, focusables, document.activeElement, e.shiftKey);
   if (target === null) return false;
   focusables[target].focus({ preventScroll: true });
-  return true;
+  // A focus the browser refused leaves the key to native Tab, never dead.
+  return document.activeElement === focusables[target];
 }

@@ -1421,7 +1421,13 @@ export async function sendCompose(
     if (current.text === '') restore.text = text;
     if (current.image_hashes.length === 0) restore.image_hashes = wireHashes;
     if (current.mode === null) restore.mode = mode;
-    if (Object.keys(restore).length > 0) patchDraft(threadId, restore);
+    if (Object.keys(restore).length === 0) return;
+    patchDraft(threadId, restore);
+    // The restored draft is unsent work again, and `cancelPendingPush` above
+    // dropped the write that would have stored its last keystrokes. Owe the
+    // engine that write, or a reload brings back the older text.
+    markLocallyEdited(threadId);
+    schedulePush(threadId);
   };
   try {
     // The chat POST needs the thread row to exist server-side, and on a
@@ -1463,8 +1469,8 @@ export async function sendCompose(
     // word could be the pre-send text. And ordering it after
     // `clearComposeSelection` keeps the write from carrying the draft's picks
     // back onto a row whose `compose_selection` the projection just set to
-    // NULL. A send that FAILS schedules nothing: it consumed no draft, so there
-    // is no stale write to out-order, and the restored text must stay put.
+    // NULL. A send that FAILS consumed no draft, so `rollBack` writes the
+    // restored text instead.
     pushClearedComposeAfterSend(threadId);
     return true;
   } catch (err) {

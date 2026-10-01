@@ -41,6 +41,11 @@ follow:
   database, and starts it again, because migrations and the pgvector setup run
   only at boot. Call `reset_e2e_database` **instead of**
   `ensure_workspace_running`, never before it.
+- **The reset also starts the workspace TREE committed.** With the engine
+  stopped, `settle_e2e_workspace_tree` commits whatever an earlier run left
+  uncommitted, such as a fixture a spec removed with a raw `rmSync`. Every apply
+  refuses a dirty tree, so without it those leftovers fail the next run's apply
+  tests. It commits and never discards.
 - **Registry-style seeded rows are shared state within a run.** A test that
   mutates one (a builtin's `context_window`, say) must restore it; the database is
   recreated per run, not per test.

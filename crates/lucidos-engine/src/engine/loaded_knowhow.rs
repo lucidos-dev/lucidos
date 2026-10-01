@@ -29,9 +29,49 @@ pub struct LoadedKnowhow {
     pub body: String,
 }
 
+/// How many threads keep their loaded set in memory. Past it, the thread used
+/// longest ago is dropped, and its next turn rebuilds the set from its events.
+const MAX_THREADS: usize = 256;
+
 #[derive(Default)]
 pub struct LoadedKnowhowStore {
-    inner: Arc<Mutex<BTreeMap<Uuid, BTreeMap<String, LoadedKnowhow>>>>,
+    inner: Arc<Mutex<Slots>>,
+}
+
+#[derive(Default)]
+struct Slots {
+    next_use: u64,
+    threads: BTreeMap<Uuid, Slot>,
+}
+
+#[derive(Default)]
+struct Slot {
+    last_use: u64,
+    /// Set once the thread's events were replayed into `docs`. A slot that
+    /// `insert` recreated after an eviction holds only the docs loaded since.
+    replayed: bool,
+    docs: BTreeMap<String, LoadedKnowhow>,
+}
+
+impl Slots {
+    /// The thread's slot, marked as used now. Drops the thread used longest
+    /// ago when this one is new and the store is full.
+    fn touch(&mut self, thread_id: Uuid) -> &mut Slot {
+        if !self.threads.contains_key(&thread_id) && self.threads.len() >= MAX_THREADS {
+            let oldest = self
+                .threads
+                .iter()
+                .min_by_key(|(_, slot)| slot.last_use)
+                .map(|(id, _)| *id);
+            if let Some(oldest) = oldest {
+                self.threads.remove(&oldest);
+            }
+        }
+        self.next_use += 1;
+        let slot = self.threads.entry(thread_id).or_default();
+        slot.last_use = self.next_use;
+        slot
+    }
 }
 
 impl LoadedKnowhowStore {
@@ -41,17 +81,25 @@ impl LoadedKnowhowStore {
 
     pub async fn insert(&self, thread_id: Uuid, doc: LoadedKnowhow) {
         let mut g = self.inner.lock().await;
-        g.entry(thread_id).or_default().insert(doc.id.clone(), doc);
+        g.touch(thread_id).docs.insert(doc.id.clone(), doc);
+    }
+
+    /// Whether this thread's events still have to be replayed into the store:
+    /// after a restart, after an eviction, or before its first replay.
+    pub async fn needs_replay(&self, thread_id: Uuid) -> bool {
+        let g = self.inner.lock().await;
+        !g.threads.get(&thread_id).is_some_and(|slot| slot.replayed)
     }
 
     /// Reader consumed by chat::process (engine restart recovery +
     /// user-message injection) and the resume-block builder (which stubs the
     /// body out of resume tool blocks).
     pub async fn for_thread(&self, thread_id: Uuid) -> Vec<LoadedKnowhow> {
-        let g = self.inner.lock().await;
-        g.get(&thread_id)
-            .map(|m| m.values().cloned().collect())
-            .unwrap_or_default()
+        let mut g = self.inner.lock().await;
+        if !g.threads.contains_key(&thread_id) {
+            return Vec::new();
+        }
+        g.touch(thread_id).docs.values().cloned().collect()
     }
 
     /// Replay a thread's `(ToolCalled, ToolResult)` pairs for `load_knowhow`
@@ -75,8 +123,7 @@ impl LoadedKnowhowStore {
     ///     producer in `engine/tools/apps.rs::load_knowhow_impl`.
     pub async fn recover_for_thread(&self, thread_id: Uuid, events: &[EventRow]) {
         let pairs = crate::core::store::collect_tool_pairs_chronological(events);
-        let mut g = self.inner.lock().await;
-        let slot = g.entry(thread_id).or_default();
+        let mut recovered = Vec::new();
         for pair in pairs {
             if pair.tool_name != crate::llm::tool_names::LOAD_KNOWHOW {
                 continue;
@@ -93,13 +140,20 @@ impl LoadedKnowhowStore {
             else {
                 continue;
             };
-            slot.insert(
-                id.to_string(),
-                LoadedKnowhow {
-                    id: id.to_string(),
-                    body: result,
-                },
-            );
+            recovered.push(LoadedKnowhow {
+                id: id.to_string(),
+                body: result,
+            });
+        }
+        // A thread that loaded nothing takes no slot.
+        if recovered.is_empty() {
+            return;
+        }
+        let mut g = self.inner.lock().await;
+        let slot = g.touch(thread_id);
+        slot.replayed = true;
+        for doc in recovered {
+            slot.docs.insert(doc.id.clone(), doc);
         }
     }
 }
@@ -176,6 +230,41 @@ mod tests {
         assert_eq!(out[0].body, "v2");
     }
 
+    fn doc(id: &str) -> LoadedKnowhow {
+        LoadedKnowhow {
+            id: id.into(),
+            body: "body".into(),
+        }
+    }
+
+    /// Every trigger fire is a new thread, so an unbounded store grows for the
+    /// engine's whole life. Past the cap the thread used longest ago goes, and
+    /// a read counts as a use.
+    #[tokio::test]
+    async fn the_store_keeps_at_most_max_threads_dropping_the_least_recent() {
+        let store = LoadedKnowhowStore::new();
+        let threads: Vec<Uuid> = (0..=MAX_THREADS).map(|_| Uuid::new_v4()).collect();
+        for &tid in &threads[..MAX_THREADS] {
+            store.insert(tid, doc("a")).await;
+        }
+        // Reading the first thread makes the second the least recent.
+        assert_eq!(store.for_thread(threads[0]).await.len(), 1);
+        store.insert(threads[MAX_THREADS], doc("a")).await;
+
+        assert_eq!(store.inner.lock().await.threads.len(), MAX_THREADS);
+        assert_eq!(store.for_thread(threads[0]).await.len(), 1);
+        assert!(store.for_thread(threads[1]).await.is_empty());
+        assert_eq!(store.for_thread(threads[MAX_THREADS]).await.len(), 1);
+    }
+
+    /// History loads on every turn of every thread, and most load no knowhow.
+    #[tokio::test]
+    async fn recovering_a_thread_with_no_knowhow_takes_no_slot() {
+        let store = LoadedKnowhowStore::new();
+        store.recover_for_thread(Uuid::new_v4(), &[]).await;
+        assert!(store.inner.lock().await.threads.is_empty());
+    }
+
     #[tokio::test]
     async fn other_threads_isolated() {
         let store = LoadedKnowhowStore::new();
@@ -191,6 +280,39 @@ mod tests {
             )
             .await;
         assert!(store.for_thread(t2).await.is_empty());
+    }
+
+    /// An eviction mid-turn, followed by a `load_knowhow`, recreates the slot
+    /// with only the new doc. The next turn must still replay the events.
+    #[tokio::test]
+    async fn a_slot_recreated_after_eviction_still_replays_its_events() {
+        let store = LoadedKnowhowStore::new();
+        let tid = Uuid::new_v4();
+        store.insert(tid, doc("beta")).await;
+        assert!(store.needs_replay(tid).await);
+
+        let events = vec![
+            make_event(
+                "ToolCalled",
+                json!({"name": "load_knowhow", "args": {"id": "alpha"}}),
+                0,
+            ),
+            make_event(
+                "ToolResult",
+                json!({"name": "load_knowhow", "result": "ALPHA BODY", "success": true}),
+                1,
+            ),
+        ];
+        store.recover_for_thread(tid, &events).await;
+
+        assert!(!store.needs_replay(tid).await);
+        let ids: Vec<String> = store
+            .for_thread(tid)
+            .await
+            .into_iter()
+            .map(|d| d.id)
+            .collect();
+        assert_eq!(ids, vec!["alpha".to_string(), "beta".to_string()]);
     }
 
     /// Engine restart loses the in-memory store. Recovery rebuilds it by

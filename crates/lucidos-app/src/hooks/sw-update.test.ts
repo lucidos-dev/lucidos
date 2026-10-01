@@ -302,6 +302,28 @@ describe('refreshClient', () => {
     expect(reload).toHaveBeenCalledTimes(1);
   });
 
+  // The UI stays locked until a reload. A probe that never answers (a stalled
+  // connection) must not hold that lock with no way out.
+  it('busts the shell cache and reloads when the refresh stalls past its deadline', async () => {
+    stubNavigator({
+      addEventListener: () => {},
+      getRegistration: () => new Promise(() => {}),
+    });
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(() => new Promise(() => {})) as unknown as typeof fetch;
+    const { del } = stubCaches(['lucidos-shell-stale']);
+    try {
+      refreshClient();
+      await vi.advanceTimersByTimeAsync(14_000);
+      expect(reload).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(del).toHaveBeenCalledWith('lucidos-shell-stale');
+      expect(reload).toHaveBeenCalledTimes(1);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   it('reloads when there is no service worker registration', async () => {
     stubNavigator({
       addEventListener: () => {},

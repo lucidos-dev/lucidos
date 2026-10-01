@@ -140,7 +140,7 @@ test.describe('Overlay dismiss and swallow (synthetic clicks)', () => {
 
     // The thread must NOT have been pinned: no Pinned section appears. Polled,
     // so a row that lands there late still fails the assertion.
-    await expect(page.locator('.drawer-section-label', { hasText: 'Pinned' }))
+    await expect(page.locator('.section-label', { hasText: 'Pinned' }))
       .toHaveCount(0, { timeout: 1_000 });
   });
 });

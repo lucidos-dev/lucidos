@@ -15,7 +15,8 @@ import {
   KEYBOARD_RESIZE_STEP_PX,
 } from '../../components/layout/splitHelpers';
 import { isMobile } from '../../utils/viewport';
-import { focusPaneMainControl, reconcilePaneFocus } from '../../components/layout/paneFocus';
+import { focusPaneMainControl, paneHolding, reconcilePaneFocus } from '../../components/layout/paneFocus';
+import { isTextInput } from '../../utils/dom';
 import { markNavigationStart } from '../../utils/navigationMarks';
 
 /** Set the focused pane AND move real DOM focus into it. Used by the keyboard
@@ -70,7 +71,9 @@ export function navigateToPane(view: MobileView) {
  *  (when it isn't already there) so the marker, native scroll keys, and shortcuts
  *  all point at the same pane — the focused-pane marker is kept in sync with real
  *  focus. Always call this after setting `panelOverlay.value` so a click on a content
- *  link is never silently absorbed when the pane is closed. */
+ *  link is never silently absorbed when the pane is closed. The one exception
+ *  to the marker move is an agent navigation while the reader types
+ *  (`holdFocusedPaneWhileTyping`). */
 export function revealContentPane() {
   if (isMobile()) {
     // `navigateToPane` stamps the mark for this one. Mobile reveals ARE pane
@@ -90,9 +93,34 @@ export function revealContentPane() {
     performance.now(),
     contentViewKey(activeMenuItem.value, panelOverlay.value, settingsSubview.value),
   );
-  focusedPane.value = 'content';
+  if (!takeTypingHold()) focusedPane.value = 'content';
   if (splitRatio.value >= 1) setSplitRatio(DEFAULT_SPLIT_RATIO);
   reconcilePaneFocus('content');
+}
+
+let typingHold: Element | null = null;
+
+/** Keep the focused-pane marker where the reader is typing, for the reveal
+ *  this agent navigation is about to make. The reveal's reconcile never pulls
+ *  focus off a field being edited. Moving the marker alone would split it from
+ *  focus, and the reader's next Tab would leave the prompt. A reader's own
+ *  navigation takes no hold, so their shortcut from the prompt still moves Tab. */
+export function holdFocusedPaneWhileTyping(): void {
+  const active = document.activeElement;
+  const pane = active && isTextInput(active) ? paneHolding(active) : null;
+  typingHold = pane !== null && pane !== 'content' ? active : null;
+}
+
+/** End the hold once its navigation settles, revealed or not. */
+export function releaseTypingHold(): void {
+  typingHold = null;
+}
+
+/** Spend the hold: true when the reader is still typing in the held field. */
+function takeTypingHold(): boolean {
+  const hold = typingHold;
+  typingHold = null;
+  return !!hold && hold === document.activeElement;
 }
 
 /** Mirror of `revealContentPane` for navigation that lands on a THREAD — an
@@ -230,6 +258,20 @@ export function showThreadList(): void {
   if (isMobile()) { navigateToPane('threads'); return; }
   threadDrawerOpen.value = true;
   if (splitRatio.value <= 0) setSplitRatio(DEFAULT_SPLIT_RATIO);
+}
+
+/** The divider double-click: a collapsed split (either side) returns to the
+ *  default ratio, and an open one collapses the Conversation side. The marker
+ *  leaves a pane that collapses, as `toggleThreadPane` does. A collapsed pane
+ *  is `visibility: hidden`, so a marker left on it turns every Tab dead. */
+export function toggleSplitFromDivider(): void {
+  const ratio = splitRatio.value;
+  if (ratio === 0 || ratio >= 1) {
+    setSplitRatio(DEFAULT_SPLIT_RATIO);
+    return;
+  }
+  setSplitRatio(0);
+  if (focusedPane.value !== 'content') focusPaneAndControl('content');
 }
 
 /** Collapse/expand the thread pane with two-stage focus → hide. Desktop: a

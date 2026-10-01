@@ -6,6 +6,7 @@ import { panelUrl, panelTitle, webviewInitialUrl, showToast } from '../../store/
 import { isMainFrameUrl } from '../../utils/urlFilter';
 import { errorDetail } from '../../utils/errorDetail';
 import { viewportIsMobile } from '../../utils/viewport';
+import { IframeTabExit } from '../shared/IframeTabExit';
 
 interface Props {
   url: string;
@@ -183,6 +184,7 @@ export function UrlPreviewInline({ url, layout }: Props) {
           sandbox="allow-scripts allow-same-origin allow-forms allow-popups"
           referrerpolicy="no-referrer"
         />
+        <IframeTabExit />
       </div>
     );
   }

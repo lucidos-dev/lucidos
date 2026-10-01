@@ -80,7 +80,7 @@ test.describe('Thread drawer — single keyboard focus (aria-activedescendant)',
     await expect(row.locator('button[aria-haspopup="menu"]')).toHaveAttribute('tabindex', '-1');
   });
 
-  test('focusing the drawer sets aria-activedescendant; ↓ moves it (= the highlight); Tab exits', async ({ page }) => {
+  test('focusing the drawer sets aria-activedescendant; ↓ moves it (= the highlight); Tab stays on it', async ({ page }) => {
     // Enough rows to overflow the list, because the Tab assertion below only
     // bites on a list that scrolls. Chromium hands a scroll container its own
     // tab stop once it has somewhere to scroll to, and two rows never did. That
@@ -124,22 +124,22 @@ test.describe('Thread drawer — single keyboard focus (aria-activedescendant)',
     // DOM focus never moved onto a row/button — it stays on the container.
     await expect(drawer).toBeFocused();
 
-    // Tab leaves the drawer entirely (it is a single tab stop) — no row button
-    // grabs focus.
+    // The drawer is the pane's single tab stop, and the per-pane Tab trap
+    // cycles the focused pane. So Tab wraps onto the drawer itself. No row
+    // button grabs focus, and focus stays in the pane the marker points at.
     //
-    // Names the node it stopped on rather than answering yes or no. `contains`
-    // is true of the drawer itself. A Tab that moved nothing would otherwise
-    // read as a row button stealing focus, and the two have different causes.
+    // Names the node it stopped on rather than answering yes or no, so a row
+    // button stealing focus and focus escaping the pane read differently.
     await page.keyboard.press('Tab');
     const stopped = await page.evaluate(() => {
       const d = document.querySelector('.thread-drawer:not(.thread-drawer-collapsed)');
       const a = document.activeElement;
       if (!d || !a || !d.contains(a)) return 'outside';
-      if (a === d) return 'the drawer itself (Tab moved nothing)';
+      if (a === d) return 'the drawer itself';
       const cls = typeof a.className === 'string' ? a.className : '';
       return `${a.tagName.toLowerCase()}${cls ? `.${cls.trim().split(/\s+/).join('.')}` : ''}`;
     });
-    expect(stopped).toBe('outside');
+    expect(stopped).toBe('the drawer itself');
   });
 
   test('the "Open thread actions" shortcut opens the highlighted row\'s ⋯ menu (with Pin)', async ({ page }) => {

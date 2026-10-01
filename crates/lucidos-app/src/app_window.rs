@@ -232,12 +232,11 @@ struct BuildGeometry {
 
 /// Where an extra window is born, given the frame its workspace remembers.
 ///
-/// A remembered frame goes to the BUILDER, not to `place_window` afterwards.
-/// tao creates the NSWindow at that content rect, so the window opens on the
-/// display the frame names. It carries that display's scale factor from its
-/// first frame, and wry computes the child webview's bounds from the same
-/// factor. Born on the primary and moved after, it changed scale with a resize
-/// still queued, and the page came out halved (ADR 0178).
+/// A remembered frame goes to the BUILDER, not to `place_window` afterwards, so
+/// the window is born at its size with no resize queued. Placed after a build
+/// at the default, it changed scale with that resize still queued, and the page
+/// came out halved (ADR 0178). AppKit still moves a window born off the primary
+/// display, which [`seat_at_birth`] undoes before the show (ADR 0334).
 ///
 /// No frame means the desk could not be read to choose one. That takes the
 /// declared default size and no position, which leaves macOS to centre it.
@@ -381,10 +380,10 @@ impl Birthplace {
 /// `desktop::gateway_capability` scopes IPC to), same title-bar style, same
 /// pre-paint tint and traffic-light placement.
 ///
-/// Every window is BUILT at the frame its [`Birthplace`] names, hidden, then
-/// shown. So it never appears at a default size and jumps. It is also born on
-/// the display the frame names, which keeps its page from rendering at half
-/// size (ADR 0178).
+/// Every window is BUILT at the frame its [`Birthplace`] names, hidden, seated
+/// at that frame, then shown. So it never appears at a default size and jumps,
+/// and never flashes on another display first (ADR 0178, and the AppKit fact in
+/// [`seat_at_birth`]).
 ///
 /// The show is `set_visible(true)`, which is `makeKeyAndOrderFront` on macOS. So
 /// a window opened by a click still arrives key, and needs no focus call of its
@@ -396,12 +395,13 @@ fn open_app_window(
 ) -> Result<(), String> {
     let counter = next_webview_label_counter();
     let label = format!("{APP_WINDOW_PREFIX}{counter}");
-    // A remembered frame is resolved against its display before the builder
-    // sees it, so a window left on the built-in is born there (ADR 0269). The
-    // clamp below judges what the builder placed.
+    // The frame is JUDGED before the window exists, as `main`'s is (ADR 0202).
+    // A remembered one is resolved against its display (ADR 0269) and clamped.
+    // A cascaded or fresh one is computed against the live desk already. No
+    // clamp follows the build: it would read the geometry AppKit invented.
     let frame = match birthplace {
         Birthplace::Remembered(remembered) => {
-            Some(window_restore::frame_to_build(app, &label, &remembered))
+            Some(window_restore::sanitized_frame(app, &label, &remembered))
         }
         Birthplace::Beside(source) => window_restore::new_window_frame(app, &label, source),
     };
@@ -432,12 +432,8 @@ fn open_app_window(
         .title_bar_style(tauri::TitleBarStyle::Overlay)
         .hidden_title(true);
     // A restored window is built HIDDEN and shown at the end, at its own frame
-    // rather than at the default and jumping.
-    //
-    // The BUILDER places it, not `place_window` afterwards. The two cannot
-    // drift. Both speak logical points, and tao routes each through the same
-    // `window_position` flip. `titleBarStyle: "Overlay"` makes the content rect
-    // the frame, so `inner_size` and `set_size` mean one thing.
+    // rather than at the default and jumping. `titleBarStyle: "Overlay"` makes
+    // the content rect the frame, so `inner_size` and `set_size` mean one thing.
     //
     // Hidden and placed are ONE decision, `geometry.position`, and the show
     // below reads the same one. Split across two tests, a window could be
@@ -448,13 +444,8 @@ fn open_app_window(
     };
     let placed = geometry.position.is_some();
     let window = builder.build().map_err(|e| format!("{e}"))?;
-    if placed {
-        // Same sanity pass `main` gets: a frame saved against a display that is
-        // no longer attached must not put a window somewhere unreachable. It
-        // judges real geometry here, because the builder applied the frame when
-        // it created the NSWindow. tao defers a SETTER to the main queue, so a
-        // clamp straight after one reads the geometry the window still has.
-        window_restore::clamp_restored_geometry(app, &label);
+    if let (true, Some(frame)) = (placed, frame) {
+        seat_at_birth(app, &window, frame);
     }
     // Tint the bar now, so it is not black for the moment before this window's
     // frontend boots and calls `set_titlebar_color`. `build()` has registered
@@ -486,6 +477,57 @@ fn open_app_window(
     window_persist::note_presented();
     Ok(())
 }
+
+/// Put a just-built window at the frame it was built for, before anything reads
+/// or shows it.
+///
+/// **AppKit re-homes a window born off the primary display** (ADR 0334). tao
+/// creates the NSWindow with no screen, and AppKit moves a content rect on
+/// another display as it initialises. A built-in frame at 1763,1473 read back
+/// as 643,-191, above every screen. tauri-runtime-wry queues a move back, but
+/// the show is synchronous and lands first, and a read before it sees the
+/// invented frame.
+///
+/// So the seat is synchronous, in this main-thread turn. Off the main thread
+/// the queued move still lands the window, one flash later.
+#[cfg(target_os = "macos")]
+fn seat_at_birth(
+    app: &tauri::AppHandle,
+    window: &tauri::WebviewWindow,
+    frame: window_restore::Rect,
+) {
+    let label = window.label();
+    if objc2::MainThreadMarker::new().is_none() {
+        eprintln!(
+            "[Tauri] {label} was built off the main thread: leaving its seat to the queued move"
+        );
+        return;
+    }
+    let Some(primary_height) = window_restore::primary_screen_height(app) else {
+        eprintln!(
+            "[Tauri] No primary display to seat {label} against: leaving it to the queued move"
+        );
+        return;
+    };
+    let ptr = match window.ns_window() {
+        Ok(ptr) if !ptr.is_null() => ptr,
+        _ => {
+            eprintln!("[Tauri] No NSWindow to seat {label}: leaving it to the queued move");
+            return;
+        }
+    };
+    // SAFETY: `ns_window` hands back this window's `NSWindow`, alive for the
+    // rest of this call, and the marker above proves this is the main thread.
+    let ns_window: &objc2_app_kit::NSWindow = unsafe { &*ptr.cast() };
+    let (x, y) = window_restore::appkit_top_left(frame, primary_height);
+    let mut top_left = ns_window.frame().origin;
+    top_left.x = x;
+    top_left.y = y;
+    ns_window.setFrameTopLeftPoint(top_left);
+}
+
+#[cfg(not(target_os = "macos"))]
+fn seat_at_birth(_: &tauri::AppHandle, _: &tauri::WebviewWindow, _: window_restore::Rect) {}
 
 /// The app window a New Window is opened FROM: the one it copies the URL of
 /// and cascades from.

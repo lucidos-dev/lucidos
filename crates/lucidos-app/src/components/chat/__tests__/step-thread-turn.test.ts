@@ -114,6 +114,16 @@ describe('stepThreadTurn — down chevron on the last turn', () => {
     expect(awayFromBottom.value).toBe(true); // chevron shown: there is content below
   });
 
+  it('returns the transcript it focused, so the caller can move the focused-pane marker', () => {
+    // The shortcut lands DOM focus in the transcript. Without the marker
+    // following it, the next Tab jumps into whichever pane held the marker.
+    const { el, turns } = makeContainer({ scrollTop: 0, scrollHeight: 2000, clientHeight: 500 });
+    turns.push(makeTurn(0, el), makeTurn(800, el));
+    setActiveScrollElement(el);
+
+    expect(stepThreadTurn(1)).toBe(el);
+  });
+
   it('reaching the last turn (landed one turn above) lands at the bottom with no chevron', () => {
     // Long thread, last turn near the end (content top 1520 of maxScroll 1500).
     // Sitting on the second-to-last turn (scrollTop 700) the down-jump picks the

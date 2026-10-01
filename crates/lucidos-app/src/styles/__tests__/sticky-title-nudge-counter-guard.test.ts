@@ -67,15 +67,17 @@ describe('the sticky thread title undoes the repaint nudge', () => {
     const rules = transformRules();
     expect(rules.length).toBeGreaterThan(0);
     for (const [path, rule] of rules) {
-      expect(rule.props.get('transform'), `${path}: ${rule.selector}`).toContain(`- var(${SHIFT_PROP}`);
+      expect(rule.props.get('transform'), `${path}: ${rule.selector}`).toContain(`calc(-1 * var(${SHIFT_PROP}`);
     }
   });
 
-  it('keeps the hide-on-scroll offset term in the same transform', () => {
-    // The counter is a second term, not a replacement: this is the one the
-    // header's hide-on-scroll drives, and the row rides it out of view on it.
+  it('keeps the hide-on-scroll offset on `translate`, apart from the counter', () => {
+    // The dynamic bars glide on a `translate` transition. The counter must stay
+    // instant, so it lives on `transform`, which the glide never animates.
     for (const [path, rule] of transformRules()) {
-      expect(rule.props.get('transform'), `${path}: ${rule.selector}`).toContain('var(--mobile-header-offset');
+      expect(rule.props.get('transform'), `${path}: ${rule.selector}`).not.toContain('--mobile-header-offset');
+      expect(rule.props.get('translate'), `${path}: ${rule.selector}`).toContain('var(--mobile-header-offset');
+      expect(rule.props.get('transition') ?? '', `${path}: ${rule.selector}`).not.toMatch(/(^|,)\s*transform\b/);
     }
   });
 

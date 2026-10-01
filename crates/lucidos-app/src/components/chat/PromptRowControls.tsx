@@ -1,8 +1,14 @@
 import { Fragment } from 'preact';
 import type { CodingAgent } from '../../api/types';
+import { tooltipWithShortcut } from '../../store/actions/keybindings';
+import { focusedThreadId, threadMap } from '../../store/store';
+import type { ThreadState } from '../../store/thread-events/thread-meta';
 import { renderHeaderAction, type HeaderActionSpec } from '../layout/headerActions';
 import { FollowLiveEdgeIcon } from '../shared/icons';
 import { callToggleAction } from './CallToggle';
+import { pressCallToggle } from '../../store/voice';
+import { resolveCodingAgent } from '../../store/composeSelections';
+import { effectiveCodingAgentBackend } from './promptToggleMode';
 import { CodingAgentControlMenu } from './CodingAgentControlMenu';
 import { LucidosControlMenu } from './LucidosControlMenu';
 import { followingLiveEdge, followLiveEdgeSeed, setFollowLiveEdge } from './scrollState';
@@ -108,9 +114,12 @@ export function followLiveEdgeAction(composeContext: boolean): HeaderActionSpec 
     key: 'follow-live-edge',
     dataRole: 'follow-live-edge',
     label: followOn ? 'Stop following the live edge' : 'Follow the live edge',
-    tooltip: followOn
-      ? 'Following the live edge. Click to stop, and stay where you are.'
-      : 'Follow the live edge: go to the newest content and stay with it as the agent writes.',
+    tooltip: tooltipWithShortcut(
+      followOn
+        ? 'Following the live edge. Click to stop, and stay where you are.'
+        : 'Follow the live edge: go to the newest content and stay with it as the agent writes.',
+      'followLiveEdge',
+    ),
     icon: () => <FollowLiveEdgeIcon armed={followOn} />,
     active: followOn,
     // The row paints each toggle from its own `data-role`, so this asks for the
@@ -118,4 +127,29 @@ export function followLiveEdgeAction(composeContext: boolean): HeaderActionSpec 
     activeClass: 'active',
     onClick: () => setFollowLiveEdge(!followOn),
   };
+}
+
+/** Compose context: a focused composing draft, or the fresh compose view with
+ *  no thread focused. Never an active thread. */
+export function isComposeContext(thread: ThreadState | undefined): boolean {
+  return !thread || thread.meta.state === 'composing';
+}
+
+function focusedThread(): ThreadState | undefined {
+  const id = focusedThreadId.value;
+  return id ? threadMap.value.get(id) : undefined;
+}
+
+/** The follow shortcut. It makes the press the toggle would make for the
+ *  focused thread, so the two never disagree about what they light. */
+export function toggleFollowLiveEdge(): void {
+  setFollowLiveEdge(!followLiveEdgeAction(isComposeContext(focusedThread())).active);
+}
+
+/** The call shortcut. It presses only where the composer draws the toggle,
+ *  which is the same gate `PromptInput` hands `promptRowToggles`. */
+export function pressCallToggleIfShown(): void {
+  const thread = focusedThread();
+  const codingAgent = effectiveCodingAgentBackend(thread, resolveCodingAgent(focusedThreadId.value));
+  if (callToggleAction(codingAgent === null)) pressCallToggle();
 }

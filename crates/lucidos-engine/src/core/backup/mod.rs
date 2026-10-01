@@ -1593,19 +1593,78 @@ fn skip_if_vanished<T>(path: &Path, result: std::io::Result<T>) -> Result<Option
     }
 }
 
+/// Yields exactly `len` bytes of `inner`: cut short if the source grew, and
+/// zero-filled if it shrank.
+///
+/// A tar header states its entry's size before the data. The tar crate copies
+/// whatever the reader yields and never checks it against that size. So a file
+/// written while it is archived misaligns every entry after it, and the backup
+/// reads as complete until a restore fails on it.
+struct ExactLen<R> {
+    inner: R,
+    remaining: u64,
+    /// Zero bytes written in place of data the source no longer had.
+    padded: u64,
+}
+
+impl<R> ExactLen<R> {
+    fn new(inner: R, len: u64) -> Self {
+        Self {
+            inner,
+            remaining: len,
+            padded: 0,
+        }
+    }
+}
+
+impl<R: std::io::Read> std::io::Read for ExactLen<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let want = buf
+            .len()
+            .min(usize::try_from(self.remaining).unwrap_or(usize::MAX));
+        if want == 0 {
+            return Ok(0);
+        }
+        let n = match self.inner.read(&mut buf[..want])? {
+            0 => {
+                buf[..want].fill(0);
+                self.padded += want as u64;
+                want
+            }
+            n => n,
+        };
+        self.remaining -= n as u64;
+        Ok(n)
+    }
+}
+
 /// Append a single file at `path` to the tar `builder` under archive path `archive_path`.
+///
+/// The size comes from the open handle, not from an earlier stat of the path. A
+/// file replaced by a rename in between would otherwise bring another length.
 fn append_file<W: std::io::Write>(
     builder: &mut tar::Builder<W>,
     path: &Path,
     archive_path: &Path,
-    metadata: &std::fs::Metadata,
 ) -> Result<(), BoxError> {
-    let mut header = header_for_file(metadata);
-    // The file may have vanished between the metadata check and now; skip it.
-    let Some(mut file) = skip_if_vanished(path, std::fs::File::open(path))? else {
+    // The file may have vanished since the walk listed it; skip it.
+    let Some(file) = skip_if_vanished(path, std::fs::File::open(path))? else {
         return Ok(());
     };
-    builder.append_data(&mut header, archive_path, &mut file)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Ok(());
+    }
+    let mut header = header_for_file(&metadata);
+    let mut content = ExactLen::new(&file, metadata.len());
+    builder.append_data(&mut header, archive_path, &mut content)?;
+    if content.padded > 0 {
+        crate::log!(
+            "[Backup] {} shrank while it was archived; zero-filled its last {} bytes",
+            path.display(),
+            content.padded
+        );
+    }
     Ok(())
 }
 
@@ -1645,18 +1704,14 @@ fn tar_and_compress(
             continue;
         };
         if metadata.is_file() {
-            append_file(&mut builder, &path, rel, &metadata)?;
+            append_file(&mut builder, &path, rel)?;
         }
     }
 
-    // Add the SQL dump at the archive root
-    let sql_metadata = std::fs::metadata(sql_dump)?;
-    append_file(
-        &mut builder,
-        sql_dump,
-        Path::new("lucidos_backup.dump"),
-        &sql_metadata,
-    )?;
+    // Add the SQL dump at the archive root. Unlike a workspace file, a missing
+    // dump is an error: the backup is worthless without it.
+    std::fs::metadata(sql_dump)?;
+    append_file(&mut builder, sql_dump, Path::new("lucidos_backup.dump"))?;
 
     let encoder = builder.into_inner()?;
     encoder.finish()?;

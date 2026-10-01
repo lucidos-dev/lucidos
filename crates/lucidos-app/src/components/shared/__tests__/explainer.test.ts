@@ -209,13 +209,12 @@ describe('Explainer: the popover is a named, focus-trapping dialog', () => {
     expect(source).toMatch(/panelProps=\{\{\s*'aria-label':\s*title\s*\}\}/);
   });
 
-  it('traps Tab inside the panel and restores focus to the icon on close', () => {
+  it('renders through <Overlay>, which owns its Tab containment and focus restore', () => {
     // A panel declaring aria-modal must not let the keyboard walk out into the
-    // UI behind it. Same two shared helpers as ConfirmDialog, not a re-derived
-    // trap.
-    expect(source).toMatch(/trapDialogTab\(e, panelRef\.current\)/);
-    expect(source).toMatch(/dialogOwnsKey\(e\.target, panelRef\.current\)/);
-    expect(source).toMatch(/opener\?\.focus\(\)/);
+    // UI behind it. `<Overlay>` routes Tab and hands focus back to the icon on
+    // close (overlayFocus.ts), so the popover carries no trap of its own.
+    expect(source).toMatch(/<Overlay\b/);
+    expect(source).not.toMatch(/addEventListener\('keydown'/);
   });
 });
 

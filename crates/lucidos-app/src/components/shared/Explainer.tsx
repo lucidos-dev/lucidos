@@ -4,8 +4,6 @@ import { useAnchoredPosition } from '../../hooks/useAnchoredPopover';
 import { InfoIcon } from './icons';
 import { Overlay } from './Overlay';
 import { SurfaceHead } from './Surface';
-import { trapDialogTab } from './dialogFocusTrap';
-import { dialogOwnsKey } from './dialogKeyScope';
 import { protectedClassFrom } from './protectedSurface';
 
 export interface ExplainerProps {
@@ -118,27 +116,6 @@ export function Explainer({ title, children }: ExplainerProps) {
   useEffect(() => {
     if (placed) panelRef.current?.querySelector<HTMLButtonElement>('[data-role="surface-close"]')?.focus();
   }, [placed]);
-
-  // Focus stays in the popover while open, and returns to the icon on close.
-  // Required by the `aria-modal` this panel declares: the UI behind is inert to
-  // the pointer, but without a trap the keyboard walks straight out into it.
-  // Same two shared helpers as `ConfirmDialog`. `dialogOwnsKey` keeps a
-  // stacked overlay's Tab from being answered here as well as by its own.
-  useEffect(() => {
-    if (!open) return;
-    const opener = anchor;
-    function handleKey(e: KeyboardEvent) {
-      if (!dialogOwnsKey(e.target, panelRef.current)) return;
-      trapDialogTab(e, panelRef.current);
-    }
-    document.addEventListener('keydown', handleKey);
-    return () => {
-      document.removeEventListener('keydown', handleKey);
-      // Escape and an outside click both leave focus nowhere useful; put it back
-      // on the control the reader was looking at.
-      opener?.focus();
-    };
-  }, [open, anchor]);
 
   const popover = (
     <Overlay

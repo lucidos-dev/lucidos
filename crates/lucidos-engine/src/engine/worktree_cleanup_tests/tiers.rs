@@ -973,3 +973,41 @@ async fn disk_that_recovers_during_tier_0_checks_keeps_the_worktree() {
         "the removal must re-check the gate after Tier 0's own checks"
     );
 }
+
+/// A session that starts while Tier 0 runs its checks keeps its tree.
+#[tokio::test]
+async fn a_session_that_starts_during_tier_0_checks_keeps_the_worktree() {
+    let (probe, _reading) = settable_probe(Some(12 * GB));
+    assert!(
+        tier_0_worktree_survives(probe, live_after_first_check()).await,
+        "Tier 0 must re-check liveness right before the removal"
+    );
+}
+
+/// A session that starts while Tier 2 runs its checks keeps its tree.
+#[tokio::test]
+async fn a_session_that_starts_during_tier_2_checks_keeps_the_worktree() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let (_tmp, root) = fresh_workspace().await;
+    let thread_id = Uuid::new_v4();
+    let worktree = add_worktree_for_thread(&root, thread_id, false).await;
+    insert_thread_summary(&pool, thread_id, false).await;
+    insert_old_event(&pool, thread_id, TIER_2_AGE).await;
+
+    let mut worker = make_worker_with_active(
+        pool.clone(),
+        Arc::new(bus),
+        root.clone(),
+        live_after_first_check(),
+    );
+    worker.free_soft_bytes = u64::MAX;
+    worker.run_once().await;
+
+    assert!(
+        worktree.exists(),
+        "Tier 2 must re-check liveness right before the removal"
+    );
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}

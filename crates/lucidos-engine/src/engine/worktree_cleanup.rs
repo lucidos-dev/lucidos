@@ -594,6 +594,10 @@ impl WorktreeCleanup {
         let pressure = self
             .reclaim_pressure(gate, DiskPressure::zero_info_grace)
             .await?;
+        // A session may have started in this tree meanwhile.
+        if self.active_threads.is_active(thread_id).await {
+            return None;
+        }
 
         let outcome = remove_worktree_and_optionally_delete_branch(
             worktree,
@@ -906,6 +910,10 @@ impl WorktreeCleanup {
 
         // The checks above may have waited minutes on the database or git.
         let pressure = self.reclaim_pressure(gate, |_| TIER_2_IDLE).await?;
+        // A session may have started in this tree meanwhile.
+        if self.active_threads.is_active(thread_id).await {
+            return None;
+        }
 
         let outcome = remove_worktree_and_optionally_delete_branch(
             worktree,

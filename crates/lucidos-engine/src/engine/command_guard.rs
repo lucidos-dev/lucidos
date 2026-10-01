@@ -1765,13 +1765,20 @@ fn next_non_flag_from(toks: &[&str], from: usize) -> usize {
 /// already falls through to the judge, so resolving these forms would newly
 /// SETTLE decorated commands as Safe.
 fn danger_head_candidates<'a>(toks: &'a [&'a str]) -> Vec<(String, &'a [&'a str])> {
-    // The grouping-token walk, from an arbitrary starting offset.
+    // The grouping-token walk, from an arbitrary starting offset. A shell
+    // keyword that opens a compound command is walked past too: the command
+    // after `do` or `then` runs exactly as a bare one would. So is `eval`, but
+    // only here: on `EXEC_WRAPPER_HEADS` the `-c` unwrap would also walk past
+    // it and discard a tail that `eval` parses again.
     fn resolve_head_at(toks: &[&str], from: usize) -> usize {
+        const COMPOUND_OPENERS: &[&str] = &[
+            "{", "(", "!", "if", "then", "else", "elif", "do", "while", "until", "eval",
+        ];
         let mut from = from;
         loop {
             let next = from + command_head_index(&toks[from..]);
             match toks.get(next) {
-                Some(&"{") | Some(&"(") => from = next + 1,
+                Some(tok) if COMPOUND_OPENERS.contains(tok) => from = next + 1,
                 _ => return next,
             }
         }
@@ -1868,7 +1875,14 @@ fn is_code_injecting_assignment(tok: &str) -> bool {
     // bash's append form assigns the same variable, so the `+` has to come off
     // before an exact-name comparison. Without it, an appended `PATH` sails
     // past the fast path while the plain one is refused.
-    let name = name.strip_suffix('+').unwrap_or(name);
+    is_code_injecting_env_name(name.strip_suffix('+').unwrap_or(name))
+}
+
+/// True when the variable `name` is one of [`CODE_INJECTING_ENV_NAMES`].
+///
+/// Also the floor for an environment the engine builds for untrusted code,
+/// where a caller chose the names (`api::proxy_script_runner`).
+pub(crate) fn is_code_injecting_env_name(name: &str) -> bool {
     if name.is_empty() || name.starts_with('-') {
         return false;
     }
@@ -3007,6 +3021,37 @@ mod tests {
             r"true && \rm -rf ~",
         ] {
             assert_settled(bash(cmd), RiskLane::Catastrophic, cmd);
+        }
+    }
+
+    /// The command after a compound-command keyword runs exactly as a bare one
+    /// would. Read as the command itself, `do` or `then` matched no danger
+    /// table, and the hard block let the line through.
+    #[test]
+    fn catastrophic_sees_past_a_shell_keyword() {
+        for cmd in [
+            "for i in 1; do rm -rf ~; done",
+            "if true; then rm -rf /; fi",
+            "if false; then :; else rm -rf ~; fi",
+            "while true; do rm -rf ~; done",
+            "until false; do rm -rf /; done",
+            "! rm -rf /",
+            "eval rm -rf ~",
+        ] {
+            assert_settled(bash(cmd), RiskLane::Catastrophic, cmd);
+        }
+    }
+
+    /// `eval` joins its words and parses them again, so a tail the outer
+    /// shell unescapes becomes a command. Unwrapping `eval bash -c` down to
+    /// its script would read that line as the harmless script alone.
+    #[test]
+    fn an_eval_wrapped_shell_is_never_unwrapped_to_its_script() {
+        for cmd in [
+            r"eval bash -c 'echo hi' \$\(rm -rf \~\)",
+            r"eval bash -c 'echo hi' $'\n'rm -rf \~",
+        ] {
+            assert_ne!(bash(cmd), StaticVerdict::Settled(RiskLane::Safe), "{cmd}");
         }
     }
 

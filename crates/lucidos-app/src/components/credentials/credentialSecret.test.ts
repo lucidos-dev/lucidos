@@ -17,15 +17,22 @@ describe('parseSecret', () => {
   it('extracts oauth_client fields including optional endpoints', () => {
     const f = parseSecret(
       'oauth_client',
-      '{"client_id":"id","client_secret":"sec","auth_url":"https://a","token_url":"https://t","userinfo_url":"https://u","scopes":"read write","redirect_uri":"http://localhost:14981/oauth/callback"}'
+      '{"client_id":"id","client_secret":"sec","auth_url":"https://a","token_url":"https://t","userinfo_url":"https://u","redirect_uri":"http://localhost:14981/oauth/callback"}'
     );
     expect(f.clientId).toBe('id');
     expect(f.clientSecret).toBe('sec');
     expect(f.authUrl).toBe('https://a');
     expect(f.tokenUrl).toBe('https://t');
     expect(f.userinfoUrl).toBe('https://u');
-    expect(f.scopes).toBe('read write');
     expect(f.redirectUri).toBe('http://localhost:14981/oauth/callback');
+  });
+
+  it('drops a stored scopes key when an old client is saved again', () => {
+    // The form once saved a "Default Scopes" value that no flow read. An old
+    // blob still edits cleanly, and the rebuilt one no longer carries it.
+    const old = '{"client_id":"id","token_url":"https://t","scopes":"read write"}';
+    const rebuilt = JSON.parse(buildSecret('oauth_client', parseSecret('oauth_client', old)));
+    expect(rebuilt).toEqual({ client_id: 'id', token_url: 'https://t' });
   });
 
   it('leaves clientSecret blank for a public-client credential', () => {

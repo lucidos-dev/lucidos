@@ -29,7 +29,6 @@ const src = (rel: string): string => readFileSync(resolve(here, rel), 'utf-8');
 const appSrc = src('../../../App.tsx');
 const layerSrc = src('../OverlayLayer.tsx');
 const appUiSrc = src('../../apps/AppUiInline.tsx');
-const headerSrc = src('../ContentHeaderActions.tsx');
 const appsActionsSrc = src('../../../store/actions/apps.ts');
 const startupSrc = src('../../../store/startup.ts');
 const modalCss = src('../../../styles/global/modal-overlay.css');
@@ -200,15 +199,15 @@ describe('native fullscreen is requested on the panel, not the iframe', () => {
   // an iframe has no DOM children, so no arrangement of the host's overlays can
   // be seen. The panel wraps the iframe and can hold them.
   it('binds the request to the panel', () => {
-    expect(headerSrc).toMatch(/const panel = getVisibleAppPanel\(\)/);
-    expect(headerSrc).toMatch(/anyPanel\.requestFullscreen[\s\S]{0,80}\.bind\(panel\)/);
-    expect(headerSrc).toMatch(/anyPanel\.webkitRequestFullscreen[\s\S]{0,80}\.bind\(panel\)/);
+    expect(appsActionsSrc).toMatch(/const panel = getVisibleAppPanel\(\)/);
+    expect(appsActionsSrc).toMatch(/anyPanel\.requestFullscreen[\s\S]{0,80}\.bind\(panel\)/);
+    expect(appsActionsSrc).toMatch(/anyPanel\.webkitRequestFullscreen[\s\S]{0,80}\.bind\(panel\)/);
   });
 
   // Fullscreen moves focus to the element that requested it; the app is what
   // the user is about to type into.
   it('still puts keyboard focus in the app frame', () => {
-    expect(headerSrc).toMatch(/then\(\(\) => frame\.focus\(\)\)/);
+    expect(appsActionsSrc).toMatch(/then\(\(\) => frame\.focus\(\)\)/);
   });
 
   // Derived from the visible frame rather than by a second query, so the two

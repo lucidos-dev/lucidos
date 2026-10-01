@@ -22,6 +22,10 @@ function theme(id: string, name: string, family?: ThemeFamily): Theme {
   return { id, source: 'built-in', name, family, modes: ['dark', 'light'], resolved: { dark: {}, light: {}, fonts: {}, workspace_fonts: [] } };
 }
 
+function workspaceTheme(id: string, name: string, family?: ThemeFamily): Theme {
+  return { ...theme(id, name, family), source: 'workspace' };
+}
+
 let host: HTMLDivElement;
 
 beforeEach(() => {
@@ -347,10 +351,17 @@ it('previews and checks the default when the picked theme is gone, since that is
   expect(checked()?.textContent).toContain('Lucidos');
 });
 
-it('draws no carousel until the themes load', () => {
-  themeGallery.value = { status: 'loading' };
+it('badges a workspace theme as Custom, and leaves a built-in theme unbadged', () => {
+  themeGallery.value = {
+    status: 'loaded',
+    data: {
+      themes: [theme(DEFAULT_THEME_ID, 'Lucidos', 'blue'), workspaceTheme('mine', 'Mine', 'blue')],
+      defaults: { dark: {}, light: {} },
+    },
+  };
   showPicker();
-  expect(host.querySelector('.theme-carousel')).toBeNull();
+  expect(card('Lucidos')?.querySelector('.theme-card-badge')).toBeNull();
+  expect(card('Mine')?.querySelector('.theme-card-badge')?.textContent).toBe('Custom');
 });
 
 it("names each theme in the font that theme suggests, not the page's", () => {
@@ -395,4 +406,17 @@ it('names a card in the workspace font its theme suggests, from the entry the th
   showPicker();
   const meta = checked()?.querySelector<HTMLElement>('.theme-card-meta');
   expect(meta?.style.getPropertyValue('--font-ui')).toBe(brand.stack);
+});
+
+it('holds its box while the gallery loads, before the skeleton is due', () => {
+  themeGallery.value = { status: 'loading' };
+  showPicker();
+  // No loader yet: the delay gate has not fired.
+  expect(host.querySelector('.loading-fade-skeleton')).toBeNull();
+  // The skeleton's own frame, drawn invisibly, so the rows below never jump.
+  const reserve = host.querySelector<HTMLElement>('.loading-fade-content .theme-carousel-reserve');
+  expect(reserve?.getAttribute('aria-hidden')).toBe('true');
+  expect(reserve?.querySelector('.pill-bar')).not.toBeNull();
+  expect(reserve?.querySelectorAll('.theme-carousel .theme-card')).toHaveLength(6);
+  expect(radios().filter(card => !card.closest('.theme-carousel-reserve'))).toHaveLength(0);
 });

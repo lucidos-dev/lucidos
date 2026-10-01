@@ -1,5 +1,5 @@
 /**
- * A drawer section header draws its count as a pill only while the section is
+ * A list panel's section header draws its count as a pill only while the section is
  * collapsed. An open section shows a bare number, one type step larger, drawn
  * by a second copy at that size. The pill is a `::before` layer, so it can
  * animate apart from the digits.
@@ -16,18 +16,18 @@ import { cssRules, rulesTargeting } from './css-rule-helpers';
 
 const here: string = dirname(fileURLToPath(import.meta.url));
 const sheet = (name: string): string => readFileSync(resolve(here, '..', name), 'utf-8');
-const rules = cssRules(sheet('drawer.css'));
+const rules = cssRules(sheet('section-header.css'));
 const TRIMMED = '@supports (text-box-trim: trim-both)';
 const rule = (selector: string, atRules = '') =>
   rules.find(r => r.selector === selector && r.atRules === atRules);
 
-const COUNT = '.list-section-title > .section-count';
-const BADGE = `${COUNT} > .section-count-badge`;
-const COLLAPSED_BADGE = '.list-section-title-collapsible.collapsed > .section-count > .section-count-badge';
+const COUNT = '.list-section-title .section-count';
+const BADGE = '.list-section-title .section-count-badge';
+const COLLAPSED_BADGE = '.list-section-title-collapsible.collapsed .section-count-badge';
 const PILL = `${BADGE}::before`;
 const COLLAPSED_PILL = `${COLLAPSED_BADGE}::before`;
 const OPEN = '.section-count-open';
-const COLLAPSED_OPEN = '.list-section-title-collapsible.collapsed > .section-count > .section-count-open';
+const COLLAPSED_OPEN = '.list-section-title-collapsible.collapsed .section-count-open';
 
 describe('section count pill', () => {
   it('moves the fill off the badge onto the pill layer', () => {
@@ -47,7 +47,7 @@ describe('section count pill', () => {
     expect(rule(COLLAPSED_BADGE)?.props.get('visibility')).toBe('visible');
     expect(rule(COLLAPSED_OPEN)?.props.get('visibility')).toBe('hidden');
     expect(rule(OPEN)?.props.has('visibility')).toBe(false);
-    for (const r of rulesTargeting(sheet('drawer.css'), 'section-count')) {
+    for (const r of rulesTargeting(sheet('section-header.css'), 'section-count')) {
       expect(r.props.get('color'), r.selector).not.toBe('transparent');
     }
   });
@@ -92,7 +92,7 @@ describe('section count pill', () => {
     // the pixel grid. A transitioned baseline therefore dips a pixel partway.
     // Only the scale animates, and it grows from the baseline.
     const numberRules = ['section-count-badge', 'section-count-open']
-      .flatMap(cls => rulesTargeting(sheet('drawer.css'), cls))
+      .flatMap(cls => rulesTargeting(sheet('section-header.css'), cls))
       .concat(rulesTargeting(sheet('badges.css'), 'section-count-badge'))
       .filter(r => !r.selector.includes('::'));
     expect(numberRules.length).toBeGreaterThan(0);

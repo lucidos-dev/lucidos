@@ -1,29 +1,94 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
 // @ts-expect-error: same
 import { dirname, resolve } from 'node:path';
 // @ts-expect-error: same
 import { fileURLToPath } from 'node:url';
-import { nextPromptOffsetPx, promptCanSlide, shouldKeepHeaderVisible, spacerHeightPx } from './useHideOnScroll';
+import {
+  BARS_SHOWN,
+  headerOffsetPx,
+  landWithoutGlide,
+  nextBarsIntent,
+  promptCanSlide,
+  promptOffsetPx,
+  shouldKeepHeaderVisible,
+  countsAsReaderScroll,
+  spacerHeightPx,
+  type BarsIntent,
+} from './useHideOnScroll';
 
-describe('nextPromptOffsetPx (dynamic bars)', () => {
+/** The travel threshold these tests use, in px. */
+const THRESHOLD = 12;
+
+describe('nextBarsIntent (dynamic bars)', () => {
+  function fold(deltas: number[], from: BarsIntent = BARS_SHOWN): BarsIntent {
+    return deltas.reduce((intent, delta) => nextBarsIntent(intent, delta, THRESHOLD), from);
+  }
+
+  it('sends the bars away after a threshold of travel down, and back after one up', () => {
+    const away = fold([THRESHOLD]);
+    expect(away.away).toBe(true);
+    expect(fold([-THRESHOLD], away).away).toBe(false);
+  });
+
+  it('adds up travel in one direction across events', () => {
+    expect(fold([5, 5]).away).toBe(false);
+    expect(fold([5, 5, 5]).away).toBe(true);
+  });
+
+  it('never flips on jitter, since a reversal starts the travel afresh', () => {
+    expect(fold([8, -8, 8, -8, 8]).away).toBe(false);
+    const away = fold([100]);
+    expect(fold([-8, 8, -8, 8, -8], away).away).toBe(true);
+  });
+
+  it('changes nothing for a zero delta', () => {
+    const away = fold([100]);
+    expect(nextBarsIntent(away, 0, THRESHOLD)).toBe(away);
+  });
+});
+
+describe('headerOffsetPx (dynamic bars)', () => {
+  const chromeHeight = 90;
+
+  it('moves the header and title bar their whole height away, or not at all', () => {
+    expect(headerOffsetPx({ away: true, scrollTop: 500, chromeHeight })).toBe(-chromeHeight);
+    expect(headerOffsetPx({ away: false, scrollTop: 500, chromeHeight })).toBe(0);
+  });
+
+  it('keeps them shown within their own height of the top', () => {
+    // Away there, the top of the pane would show an empty band where they were.
+    expect(headerOffsetPx({ away: true, scrollTop: 0, chromeHeight })).toBe(0);
+    expect(headerOffsetPx({ away: true, scrollTop: chromeHeight, chromeHeight })).toBe(0);
+    expect(headerOffsetPx({ away: true, scrollTop: chromeHeight + 1, chromeHeight })).toBe(-chromeHeight);
+  });
+});
+
+describe('promptOffsetPx (dynamic bars)', () => {
   const promptHeight = 80;
   const far = 10_000;
 
-  it('slides down with a scroll down and back with a scroll up, pixel for pixel', () => {
-    expect(nextPromptOffsetPx({ offset: 0, delta: 30, promptHeight, distanceToBottom: far })).toBe(30);
-    expect(nextPromptOffsetPx({ offset: 30, delta: -10, promptHeight, distanceToBottom: far })).toBe(20);
+  it('moves the prompt its whole height away, or not at all', () => {
+    expect(promptOffsetPx({ away: true, promptHeight, distanceToBottom: far })).toBe(promptHeight);
+    expect(promptOffsetPx({ away: false, promptHeight, distanceToBottom: far })).toBe(0);
   });
 
-  it('stops at fully hidden and at fully shown', () => {
-    expect(nextPromptOffsetPx({ offset: 70, delta: 50, promptHeight, distanceToBottom: far })).toBe(promptHeight);
-    expect(nextPromptOffsetPx({ offset: 10, delta: -50, promptHeight, distanceToBottom: far })).toBe(0);
+  it('keeps it shown within its own height of the bottom, whoever put the reader there', () => {
+    expect(promptOffsetPx({ away: true, promptHeight, distanceToBottom: promptHeight })).toBe(0);
+    expect(promptOffsetPx({ away: true, promptHeight, distanceToBottom: 0 })).toBe(0);
+    expect(promptOffsetPx({ away: true, promptHeight, distanceToBottom: promptHeight + 1 })).toBe(promptHeight);
+  });
+});
+
+describe('countsAsReaderScroll (dynamic bars)', () => {
+  it("counts the reader's own scroll", () => {
+    expect(countsAsReaderScroll({ navigation: false, headerPinned: false })).toBe(true);
   });
 
-  it('comes back in the last prompt-height of the thread, and is fully shown at the bottom', () => {
-    expect(nextPromptOffsetPx({ offset: promptHeight, delta: 10, promptHeight, distanceToBottom: 25 })).toBe(25);
-    expect(nextPromptOffsetPx({ offset: promptHeight, delta: 10, promptHeight, distanceToBottom: 0 })).toBe(0);
+  it('re-bases for every write of ours, and while a deep link pins the header', () => {
+    expect(countsAsReaderScroll({ navigation: true, headerPinned: false })).toBe(false);
+    expect(countsAsReaderScroll({ navigation: false, headerPinned: true })).toBe(false);
   });
 });
 
@@ -40,12 +105,9 @@ describe('promptCanSlide (dynamic bars)', () => {
 });
 
 describe('--mobile-header-offset stays off the document root', () => {
-  // The var is rewritten on essentially every scroll frame. Custom properties
-  // inherit, so writing it on `documentElement` invalidated style for every node
-  // in the document, and the thread transcript is the largest tree in the app:
-  // that was a whole-document style recalc per frame, and the jank that survived
-  // moving the var off `top` onto `transform` (which removed only the LAYOUT
-  // half). It is written on its two consumer elements instead.
+  // Custom properties inherit, so writing the var on `documentElement`
+  // invalidates style for every node in the document. The thread transcript is
+  // the largest tree in the app, so the var goes on its two consumers instead.
   //
   // A source scan rather than a behavioral test because the regression is about
   // WHICH element is written, and this suite has no DOM (the scroll logic is
@@ -70,38 +132,57 @@ describe('--mobile-header-offset stays off the document root', () => {
     expect(hookSource).toMatch(/chevronEl\?\.style\.setProperty\(\s*['"]--mobile-header-offset/);
   });
 
-  it('moves the down chevron with the prompt by transform, never by a layout property', () => {
-    // The offset changes every scroll frame. Only the prompt's HEIGHT, which
-    // moves on a resize, may reach `bottom`.
-    const mobileCss = readFileSync(
-      resolve(dirname(fileURLToPath(import.meta.url)), '../styles/mobile.css'),
-      'utf8',
-    );
+  const mobileCss = readFileSync(
+    resolve(dirname(fileURLToPath(import.meta.url)), '../styles/mobile.css'),
+    'utf8',
+  );
+
+  it('moves the down chevron with the prompt by translate, never by a layout property', () => {
+    // Only the prompt's HEIGHT, which moves on a resize, may reach `bottom`.
     const offsetUses = mobileCss.split('\n').filter((line: string) => line.includes('--mobile-prompt-offset'));
     expect(offsetUses.length).toBeGreaterThan(0);
-    for (const line of offsetUses) expect(line).toMatch(/^\s*transform: translateY\(var\(--mobile-prompt-offset/);
+    for (const line of offsetUses) expect(line).toMatch(/^\s*translate: 0 var\(--mobile-prompt-offset/);
   });
 
   it('keeps the prompt offset off the root too, on the prompt and the down chevron', () => {
-    // Same per-frame write, same reason (dynamic bars). The prompt takes a
-    // transform directly; the down chevron reads the var.
+    // The prompt takes a translate directly; the down chevron reads the var.
     expect(hookSource).not.toMatch(/documentElement\.style\.setProperty\(\s*['"]--mobile-prompt-offset/);
-    expect(hookSource).toMatch(/promptEl\.style\.transform = promptOffsetRem/);
+    expect(hookSource).toMatch(/promptEl\.style\.translate = promptOffsetRem/);
     expect(hookSource).toMatch(/downChevronEl\?\.style\.setProperty\(\s*['"]--mobile-prompt-offset/);
   });
 
+  it('moves every bar by `translate` alone, never by `transform`', () => {
+    // A `transform` write would bypass the glide, and on the title bar it would
+    // also carry the repaint-nudge counter into the transition.
+    expect(hookSource).not.toMatch(/\.style\.transform\s*=/);
+    expect(hookSource).toMatch(/headerRef\.current\.style\.translate = /);
+  });
+
   // The scroll-delta logic below is a hand-written MIRROR of the hook, so these
-  // two keep the mirror honest about the anchored-reveal behaviour it pins.
-  it('gates the navigation reveal on the anchor kind and the anchored position', () => {
-    // The prompt shares the gate: our own placements reveal it, anchor writes
-    // hold it where it was.
+  // keep the mirror honest about the behaviour it pins.
+  it('gates the navigation reveal on the anchor and carry kinds and the anchored position', () => {
+    // Our own placements reveal the bars. Anchor writes and the follow's carry
+    // hold them where they were: only the reader's finger moves them.
+    expect(hookSource).toMatch(/countsAsReaderScroll\(\{\s*navigation: isNavigationScroll\(\),\s*headerPinned:/);
+    expect(hookSource).toMatch(/if \(!isAnchorScroll\(\) && !isCarryScroll\(\) && !atRebasedTop\) revealBars\(\);/);
+  });
+
+  it('reveals on a pane swipe before it rebinds, so the outgoing bars glide in too', () => {
     expect(hookSource).toMatch(
-      /if \(!isAnchorScroll\(\) && !atAnchoredTop\) \{\s*headerOffset = 0;\s*promptOffset = 0;\s*\}/,
+      /if \(container !== currentContainer\) \{\s*revealBars\(\);\s*applyTransform\(\);\s*\}[\s\S]*?bindOffsetConsumers\(container\)/,
     );
   });
 
+  it('writes scrollTop only through holdAcrossRelayout, so a send landing survives the keyboard', () => {
+    // The keyboard compensation runs after a send's landing calls. A bare write
+    // reads as the reader scrolling and cancels the landing, so the reader never
+    // saw the message they just sent (scroll-follow-the-live-edge.test.ts).
+    expect(hookSource).not.toMatch(/\.scrollTop\s*[+-]?=(?!=)/);
+    expect(hookSource.match(/holdAcrossRelayout\(currentContainer/g) ?? []).toHaveLength(2);
+  });
+
   it('re-takes its baseline at the anchor write, not on the scroll event', () => {
-    expect(hookSource).toMatch(/onAnchorScroll\(\(el\) => \{[\s\S]*prevScrollTop = clampedScrollTop\(el\)/);
+    expect(hookSource).toMatch(/onRebasedScroll\(\(el\) => \{[\s\S]*prevScrollTop = clampedScrollTop\(el\)/);
   });
 
   it('re-takes it again on the settling frame, and cancels that frame on teardown', () => {
@@ -110,22 +191,85 @@ describe('--mobile-header-offset stays off the document root', () => {
     // the header spent that clamp as a full reveal over the line the correction
     // had just held. The mirror below models the synchronous half only, so the
     // frame is pinned here.
-    expect(hookSource).toMatch(/anchorSettleRaf = requestAnimationFrame\(\(\) => \{[\s\S]*prevScrollTop = clampedScrollTop\(el\)/);
-    expect(hookSource).toMatch(/if \(anchorSettleRaf !== null\) cancelAnimationFrame\(anchorSettleRaf\);[\s\S]*observer\.disconnect\(\)/);
+    expect(hookSource).toMatch(/rebaseSettleRaf = requestAnimationFrame\(\(\) => \{[\s\S]*prevScrollTop = clampedScrollTop\(el\)/);
+    expect(hookSource).toMatch(/if \(rebaseSettleRaf !== null\) cancelAnimationFrame\(rebaseSettleRaf\);[\s\S]*observer\.disconnect\(\)/);
   });
 
   it('keeps the offset off `top`, which would reinstate the forced layout', () => {
-    // The companion half of the fix, in CSS: both consumers take the offset on
-    // `transform` (composited) so the write cannot dirty layout. A `top` that
-    // reads the offset means the next scroll event's scrollTop read forces a
-    // synchronous style+layout flush of the whole transcript again.
-    const css = readFileSync(
-      resolve(dirname(fileURLToPath(import.meta.url)), '../styles/mobile.css'),
-      'utf8',
-    );
-    const offsetOnTop = css.match(/top:[^;]*--mobile-header-offset/g) ?? [];
+    // Both consumers take the offset on `translate` (composited) so the write
+    // cannot dirty layout. A `top` that reads it means the next scroll event's
+    // scrollTop read forces a style+layout flush of the whole transcript again.
+    const offsetOnTop = mobileCss.match(/top:[^;]*--mobile-header-offset/g) ?? [];
     expect(offsetOnTop).toHaveLength(0);
-    expect(css).toMatch(/transform:\s*translateY\([^;]*--mobile-header-offset/);
+    const offsetOnTransform = mobileCss.match(/transform:[^;]*--mobile-header-offset/g) ?? [];
+    expect(offsetOnTransform).toHaveLength(0);
+    expect(mobileCss.match(/translate:[^;]*--mobile-header-offset/g) ?? []).toHaveLength(2);
+  });
+});
+
+describe('the dynamic bars glide on a compositor transition', () => {
+  const read = (rel: string): string =>
+    readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), rel), 'utf8');
+  const mobileCss = read('../styles/mobile.css');
+  const inputCss = read('../styles/chat/input-messages.css');
+  const GLIDE = /translate var\(--bars-glide-duration, 0s\) ease/;
+
+  /** The `transition` value of the first rule whose selector ends in `selector`. */
+  function transitionOf(css: string, selector: string): string {
+    const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const rule = new RegExp(`${escaped}\\s*\\{([^}]*)\\}`).exec(css);
+    expect(rule, `no rule for ${selector}`).not.toBeNull();
+    return /transition:([^;]*);/.exec(rule![1])?.[1] ?? '';
+  }
+
+  it('gives every bar the glide on `translate`', () => {
+    expect(transitionOf(mobileCss, '.app-header')).toMatch(GLIDE);
+    expect(transitionOf(mobileCss, '.mobile-swipe-pane .mobile-thread-title-row')).toMatch(GLIDE);
+    expect(transitionOf(mobileCss, ':root[data-mobile-dynamic-bars] .thread-pane:not(.compose-empty) .prompt-area')).toMatch(GLIDE);
+    // Both chevrons, from their shared base rule.
+    expect(transitionOf(inputCss, '.scroll-to-top,\n.scroll-to-bottom')).toMatch(GLIDE);
+  });
+
+  it('runs the glide only while the bars are dynamic', () => {
+    // Pinned bars never move, so they keep no duration. The var is declared
+    // under the attribute alone, and every use falls back to 0s.
+    const declarations = [mobileCss, inputCss].join('\n').match(/--bars-glide-duration:[^;]*;/g) ?? [];
+    expect(declarations).toEqual(['--bars-glide-duration: var(--duration-slow);']);
+    expect(mobileCss).toMatch(/:root\[data-mobile-dynamic-bars\] \{\s*--bars-glide-duration: var\(--duration-slow\);\s*\}/);
+    const uses = [mobileCss, inputCss].join('\n').match(/var\(--bars-glide-duration[^)]*\)/g) ?? [];
+    for (const use of uses) expect(use).toBe('var(--bars-glide-duration, 0s)');
+  });
+});
+
+describe('a prompt about to take focus lands without its glide', () => {
+  // iOS Safari can refuse the keyboard to a prompt still under a `translate`.
+  // A plain reveal leaves it there for the whole glide, so focus must not wait.
+  const read = (rel: string): string =>
+    readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), rel), 'utf8');
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('flushes style with the transition off, then restores it', () => {
+    const el = { style: { transition: '' } } as unknown as HTMLElement;
+    const transitionAtFlush: string[] = [];
+    vi.stubGlobal('getComputedStyle', (target: HTMLElement) => {
+      transitionAtFlush.push(target.style.transition);
+      return { translate: 'none' };
+    });
+
+    landWithoutGlide(el);
+
+    expect(transitionAtFlush).toEqual(['none']);
+    expect(el.style.transition).toBe('');
+  });
+
+  it('is what the focus path asks for, before it focuses', () => {
+    expect(read('../components/chat/promptFocus.ts')).toMatch(
+      /new CustomEvent<RevealBarsDetail>\('reveal-mobile-bars', \{ detail: \{ instant: true \} \}\)\);\s*el\.focus\(/,
+    );
+    expect(read('useHideOnScroll.ts')).toMatch(/detail\?\.instant\) landWithoutGlide\(promptEl\);/);
   });
 });
 
@@ -137,26 +281,24 @@ function createScrollTracker(
   isRepaintNudging: () => boolean = () => false,
   isUserScrolling: () => boolean = () => false,
   isAnchorScroll: () => boolean = () => false,
+  isCarryScroll: () => boolean = () => false,
 ) {
   let prevScrollTop = 0;
-  let headerOffset = 0;
-  let anchoredTop = -1;
+  let viewScrollTop = 0;
+  let intent = BARS_SHOWN;
+  let rebasedTop = -1;
   const cachedHeight = 48;
   let currentPane: string | null = null;
-  let currentViewKey: string | null = null;
   let keyboardOpen = false;
   let disabled = false;
-  const paneState: Record<string, { headerOffset: number; prevScrollTop: number }> = {};
-
-  function clampOffset(offset: number) {
-    return Math.min(0, Math.max(-cachedHeight, offset)) || 0;
-  }
 
   function setCurrentPane(pane: string | null) {
     currentPane = pane;
   }
 
   function applyScrollDelta(scrollTop: number, scrollHeight: number, clientHeight: number) {
+    // The real handler returns first thing while the header is pinned.
+    if (disabled) return;
     // The iOS compositor-recovery nudge writes ±1px and puts it back a frame
     // later. Skip WITHOUT advancing prevScrollTop, so the round trip leaves the
     // baseline exactly where the user left it. A live drag overrides the window:
@@ -169,19 +311,19 @@ function createScrollTracker(
 
     // Within a pixel of where the last anchor write left us. Anywhere else the
     // reader has really moved, so the stamp is spent.
-    const atAnchoredTop = anchoredTop >= 0 && Math.abs(clamped - anchoredTop) <= 1;
-    if (!atAnchoredTop) anchoredTop = -1;
+    const atRebasedTop = rebasedTop >= 0 && Math.abs(clamped - rebasedTop) <= 1;
+    if (!atRebasedTop) rebasedTop = -1;
 
     // One of our own navigations is writing scrollTop frame by frame (a chevron
     // tap, turn-nav, a deep-link glide). Reset the header to visible rather than
     // hiding it on the way down: those scroll events are not the reader.
-    if (isNavigationScroll()) {
+    if (!countsAsReaderScroll({ navigation: isNavigationScroll(), headerPinned: false })) {
       prevScrollTop = clamped;
-      // An ANCHOR write is the exception: the app moved the container so the
-      // reader's own line would NOT move, so the chrome stays where they left
-      // it. Revealing it there covers that line. The kind is read from module
-      // state a later mark can overwrite, so the position answers it too.
-      if (!isAnchorScroll() && !atAnchoredTop) headerOffset = 0;
+      viewScrollTop = clamped;
+      // An ANCHOR write and the follow's CARRY hold the chrome where the reader
+      // left it: neither is a place they asked to go. The kind is read from
+      // module state a later mark can overwrite, so the position answers too.
+      if (!isAnchorScroll() && !isCarryScroll() && !atRebasedTop) intent = BARS_SHOWN;
       return;
     }
 
@@ -191,75 +333,52 @@ function createScrollTracker(
       if (active.pane === currentPane) return;
     }
 
-    const delta = clamped - prevScrollTop;
-    headerOffset = clampOffset(headerOffset - delta);
+    intent = nextBarsIntent(intent, clamped - prevScrollTop, THRESHOLD);
     prevScrollTop = clamped;
+    viewScrollTop = clamped;
   }
 
-  /** Switch to a new scroll container with per-pane state isolation.
-   *  Each pane remembers its own header offset independently. */
-  function switchContainer(containerScrollTop: number | null, viewKey?: string) {
-    if (currentViewKey) {
-      paneState[currentViewKey] = { headerOffset, prevScrollTop };
-    }
+  /** Switch to a new scroll container. A pane swipe reveals the bars. */
+  function switchContainer(containerScrollTop: number | null) {
     // Stamped against the container we just left, so it says nothing here.
-    anchoredTop = -1;
-
-    if (containerScrollTop !== null) {
-      const key = viewKey ?? `pane-${Object.keys(paneState).length}`;
-      currentViewKey = key;
-      const saved = paneState[key];
-      if (saved) {
-        headerOffset = saved.headerOffset;
-        prevScrollTop = saved.prevScrollTop;
-      } else {
-        const scrollPos = Math.max(0, containerScrollTop);
-        headerOffset = clampOffset(-scrollPos);
-        prevScrollTop = scrollPos;
-      }
-    } else {
-      currentViewKey = null;
-      headerOffset = 0;
-      prevScrollTop = 0;
-    }
+    rebasedTop = -1;
+    intent = BARS_SHOWN;
+    prevScrollTop = Math.max(0, containerScrollTop ?? 0);
+    viewScrollTop = prevScrollTop;
   }
 
-  /** The app re-based the container to hold the reader on the same content
-   *  (`onAnchorScroll`). Re-take the baseline at the write, so the scroll event
+  /** The app re-based the container without taking the reader anywhere, by an
+   *  anchor or carry write (`onRebasedScroll`). Re-take the baseline at the write, so the scroll event
    *  it fires carries a delta of zero whenever it lands, and stamp the position
    *  so the navigation path can recognise that event too. */
-  function rebaseAnchor(scrollTop: number, scrollHeight: number, clientHeight: number) {
+  function rebase(scrollTop: number, scrollHeight: number, clientHeight: number) {
     const maxScroll = Math.max(0, scrollHeight - clientHeight);
     prevScrollTop = Math.min(Math.max(0, scrollTop), maxScroll);
-    anchoredTop = prevScrollTop;
+    rebasedTop = prevScrollTop;
   }
 
-  /** Sync header to match container scroll position (used after keyboard dismiss). */
+  /** The keyboard closed: the reader was just typing, so the bars return. */
   function syncToScroll(containerScrollTop: number) {
-    const scrollPos = Math.max(0, containerScrollTop);
-    headerOffset = clampOffset(-scrollPos);
-    prevScrollTop = scrollPos;
+    prevScrollTop = Math.max(0, containerScrollTop);
+    viewScrollTop = prevScrollTop;
+    intent = BARS_SHOWN;
   }
 
-  /** Hide header when keyboard opens (input gains focus).
-   *  Matches real onFocusIn which sets headerOffset = -cachedHeight. */
+  /** The keyboard opens (input gains focus), which hides the header. */
   function onFocusIn(containerScrollTop: number) {
-    headerOffset = -cachedHeight;
+    keyboardOpen = true;
     prevScrollTop = Math.max(0, containerScrollTop);
   }
 
-  /** Correct header offset if scroll position warrants more visibility.
-   *  Called on DOM mutations when the container hasn't changed but
-   *  content may have shrunk (e.g. steps collapsed). */
+  /** Re-measure on a DOM mutation: content may have shrunk (e.g. steps
+   *  collapsed) under a still reader. */
   function correctForScrollPosition(containerScrollTop: number) {
-    const actualScroll = Math.max(0, containerScrollTop);
-    if (actualScroll < cachedHeight) {
-      const corrected = clampOffset(-actualScroll);
-      if (headerOffset < corrected) {
-        headerOffset = corrected;
-        prevScrollTop = actualScroll;
-      }
-    }
+    viewScrollTop = Math.max(0, containerScrollTop);
+  }
+
+  /** Where the header sits by scroll alone, keyboard and pin aside. */
+  function headerOffset(): number {
+    return headerOffsetPx({ away: intent.away, scrollTop: viewScrollTop, chromeHeight: cachedHeight });
   }
 
   /** Returns the effective header offset, accounting for keyboard and disabled state.
@@ -267,7 +386,7 @@ function createScrollTracker(
    *  When keyboard is open, always returns fully hidden (-cachedHeight). */
   function getEffectiveOffset(): number {
     if (disabled) return 0;
-    return keyboardOpen ? -cachedHeight : headerOffset;
+    return keyboardOpen ? -cachedHeight : headerOffset();
   }
 
   function setDisabled(value: boolean) {
@@ -289,7 +408,7 @@ function createScrollTracker(
 
   return {
     applyScrollDelta,
-    rebaseAnchor,
+    rebase,
     switchContainer,
     syncToScroll,
     onFocusIn,
@@ -297,7 +416,7 @@ function createScrollTracker(
     setCurrentPane,
     setKeyboardOpen,
     recoverKeyboardState,
-    get headerOffset() { return headerOffset; },
+    get headerOffset() { return headerOffset(); },
     get keyboardOpen() { return keyboardOpen; },
     get disabled() { return disabled; },
     getEffectiveOffset,
@@ -317,8 +436,8 @@ describe('useHideOnScroll keyboard suppression', () => {
 
   it('hides header on scroll-down when no input focused', () => {
     tracker.applyScrollDelta(0, 1000, 500);
-    tracker.applyScrollDelta(30, 1000, 500);
-    expect(tracker.headerOffset).toBe(-30);
+    tracker.applyScrollDelta(100, 1000, 500);
+    expect(tracker.headerOffset).toBe(-48);
   });
 
   it('ignores scroll when textarea has focus in same pane', () => {
@@ -331,37 +450,36 @@ describe('useHideOnScroll keyboard suppression', () => {
     expect(tracker.headerOffset).toBe(0);
   });
 
-  it('resumes scroll tracking after blur with header synced to scroll position', () => {
+  it('shows the bars after blur, then hides them on the next scroll down', () => {
     mockActive = { tagName: 'TEXTAREA', pane: 'threads' };
 
     tracker.applyScrollDelta(50, 1000, 500);
     expect(tracker.headerOffset).toBe(0);
 
-    // Blur: sync header to scroll position (keyboard dismissed)
+    // Blur: the keyboard closes, and the reader was just typing.
     mockActive = null;
     tracker.syncToScroll(50);
-    expect(tracker.headerOffset).toBe(-48); // fully hidden at scrollTop=50
+    expect(tracker.headerOffset).toBe(0);
 
     tracker.applyScrollDelta(80, 1000, 500);
-    expect(tracker.headerOffset).toBe(-48); // already fully hidden
+    expect(tracker.headerOffset).toBe(-48);
   });
 
   it('ignores scroll with input element focused in same pane', () => {
     mockActive = { tagName: 'INPUT', pane: 'threads' };
 
     tracker.applyScrollDelta(0, 1000, 500);
-    tracker.applyScrollDelta(30, 1000, 500);
+    tracker.applyScrollDelta(100, 1000, 500);
     expect(tracker.headerOffset).toBe(0);
   });
 
   it('hides header when input gains focus (keyboard opens)', () => {
-    // Header starts visible
-    expect(tracker.headerOffset).toBe(0);
+    expect(tracker.getEffectiveOffset()).toBe(0);
 
     // User taps input — keyboard opens, header hides to avoid
     // iOS position:fixed issues with software keyboard
     tracker.onFocusIn(0);
-    expect(tracker.headerOffset).toBe(-48); // fully hidden
+    expect(tracker.getEffectiveOffset()).toBe(-48);
   });
 
   it('allows scroll when textarea has focus in a DIFFERENT pane (iOS swipe)', () => {
@@ -372,64 +490,47 @@ describe('useHideOnScroll keyboard suppression', () => {
     mockActive = { tagName: 'TEXTAREA', pane: 'thread' };
 
     tracker.applyScrollDelta(0, 1000, 500);
-    tracker.applyScrollDelta(30, 1000, 500);
-    expect(tracker.headerOffset).toBe(-30); // header hides despite textarea focus
-  });
-
-  it('each pane has independent header scroll state', () => {
-    // Start in pane A, scroll down to hide header
-    tracker.switchContainer(0, 'threads');
-    tracker.applyScrollDelta(0, 1000, 500);
     tracker.applyScrollDelta(100, 1000, 500);
-    expect(tracker.headerOffset).toBe(-48); // fully hidden
-
-    // Switch to pane B at scrollTop=0 — header resets to visible (new pane, never scrolled)
-    tracker.switchContainer(0, 'thread');
-    expect(tracker.headerOffset).toBe(0); // NOT -48
-
-    // Switch back to pane A — header offset is restored to hidden
-    tracker.switchContainer(0, 'threads');
-    expect(tracker.headerOffset).toBe(-48); // restored from saved state
+    expect(tracker.headerOffset).toBe(-48); // header hides despite textarea focus
   });
 
-  it('reveals header when scrolling up in new container after switch', () => {
-    // Switch to pane with scroll position 200 (header hides to match)
-    tracker.switchContainer(200, 'thread');
+  it('reveals the bars on a pane swipe, and again on the swipe back', () => {
+    tracker.switchContainer(0);
+    tracker.applyScrollDelta(100, 1000, 500);
     expect(tracker.headerOffset).toBe(-48);
 
-    // Scroll up 30px — header partially reveals
-    tracker.applyScrollDelta(170, 1000, 500);
-    expect(tracker.headerOffset).toBe(-18); // -48 + 30 = -18
+    tracker.switchContainer(0);
+    expect(tracker.headerOffset).toBe(0);
+
+    // Back to a pane scrolled far down: shown, not the hidden state it left in.
+    tracker.switchContainer(400);
+    expect(tracker.headerOffset).toBe(0);
+  });
+
+  it('keeps the bars shown on arrival until the reader scrolls down', () => {
+    tracker.switchContainer(200);
+    expect(tracker.headerOffset).toBe(0);
+
+    tracker.applyScrollDelta(230, 1000, 500);
+    expect(tracker.headerOffset).toBe(-48);
+
+    tracker.applyScrollDelta(210, 1000, 500);
+    expect(tracker.headerOffset).toBe(0);
   });
 
   it('resets header when container disappears (null)', () => {
-    // Hide header
-    tracker.switchContainer(0, 'threads');
-    tracker.applyScrollDelta(0, 1000, 500);
+    tracker.switchContainer(0);
     tracker.applyScrollDelta(100, 1000, 500);
     expect(tracker.headerOffset).toBe(-48);
 
-    // Container removed from DOM (switchContainer with no scroll position)
-    // — header must reset to visible, not stay hidden
+    // Container removed from DOM — header must reset to visible, not stay hidden
     tracker.switchContainer(null);
     expect(tracker.headerOffset).toBe(0);
   });
 
-  it('hides header when switching to a scrolled-down container', () => {
-    // Header is visible (default)
-    expect(tracker.headerOffset).toBe(0);
-
-    // Switch to a container scrolled 200px down — header hides to match
-    tracker.switchContainer(200, 'content');
-    expect(tracker.headerOffset).toBe(-48); // fully hidden (200 > cachedHeight)
-  });
-
   it('keeps header visible when switching to a container at top', () => {
-    // Header is visible (default)
     expect(tracker.headerOffset).toBe(0);
-
-    // Switch to a container at scrollTop=0 — header stays visible
-    tracker.switchContainer(0, 'thread');
+    tracker.switchContainer(0);
     expect(tracker.headerOffset).toBe(0);
   });
 });
@@ -451,7 +552,7 @@ describe('useHideOnScroll during one of our own navigations', () => {
 
   it('resets the header to visible while a navigation is gliding', () => {
     const tracker = createScrollTracker(() => mockActive, () => navigating);
-    tracker.switchContainer(0, 'thread');
+    tracker.switchContainer(0);
 
     // User scrolls down — header hides
     tracker.applyScrollDelta(100, 2000, 500);
@@ -467,7 +568,7 @@ describe('useHideOnScroll during one of our own navigations', () => {
 
   it('resumes normal scroll tracking once the tween lands', () => {
     const tracker = createScrollTracker(() => mockActive, () => navigating);
-    tracker.switchContainer(0, 'thread');
+    tracker.switchContainer(0);
 
     navigating = true;
     tracker.applyScrollDelta(1500, 2000, 500); // scrollTop=1500, maxScroll=1500
@@ -476,16 +577,16 @@ describe('useHideOnScroll during one of our own navigations', () => {
     navigating = false; // the tween finished
 
     // User scrolls up a bit, then back down — header hides on the down scroll
-    tracker.applyScrollDelta(1470, 2000, 500); // scroll up 30px → header stays 0
-    tracker.applyScrollDelta(1500, 2000, 500); // scroll down 30px → header -30
-    expect(tracker.headerOffset).toBe(-30);
+    tracker.applyScrollDelta(1470, 2000, 500); // scroll up 30px → header stays shown
+    tracker.applyScrollDelta(1500, 2000, 500); // scroll down 30px → header away
+    expect(tracker.headerOffset).toBe(-48);
   });
 
   it('keeps the header visible across a multi-frame glide', () => {
     const tracker = createScrollTracker(() => mockActive, () => navigating);
 
     navigating = true;
-    tracker.switchContainer(0, 'thread');
+    tracker.switchContainer(0);
 
     // Each frame of the tween fires a scroll event.
     tracker.applyScrollDelta(500, 1000, 500);
@@ -499,7 +600,59 @@ describe('useHideOnScroll during one of our own navigations', () => {
     // User scrolls up then down — header hides on down scroll
     tracker.applyScrollDelta(1470, 2000, 500);
     tracker.applyScrollDelta(1500, 2000, 500);
-    expect(tracker.headerOffset).toBe(-30);
+    expect(tracker.headerOffset).toBe(-48);
+  });
+});
+
+describe("useHideOnScroll under the standing follow's carry", () => {
+  // The ride writes the live edge on every growth round. Only the reader's
+  // finger moves the bars. So a carry leaves them where they were, shown or
+  // away, and the next finger delta starts from where the carry left off.
+  let carrying = false;
+  beforeEach(() => { carrying = false; });
+
+  function trackerUnderRide() {
+    return createScrollTracker(() => null, () => carrying, () => false, () => false, () => false, () => carrying);
+  }
+
+  it('keeps shown bars shown as the ride carries the reader down', () => {
+    const tracker = trackerUnderRide();
+    tracker.switchContainer(1000);
+    carrying = true;
+    tracker.applyScrollDelta(1100, 3000, 500);
+    tracker.applyScrollDelta(1400, 3000, 500);
+    expect(tracker.headerOffset).toBe(0);
+  });
+
+  it('keeps away bars away as the ride carries the reader down', () => {
+    const tracker = trackerUnderRide();
+    tracker.switchContainer(1000);
+    tracker.applyScrollDelta(1100, 3000, 500);
+    expect(tracker.headerOffset).toBe(-48);
+    carrying = true;
+    tracker.applyScrollDelta(1400, 3000, 500);
+    expect(tracker.headerOffset).toBe(-48);
+  });
+
+  it('ignores a carry whose scroll event lands after the navigation window', () => {
+    // A heavy render can delay the event past the window, so the kind check
+    // alone answers "the reader". The re-base at the write zeroes its delta.
+    const tracker = trackerUnderRide();
+    tracker.switchContainer(1000);
+    tracker.rebase(1400, 3000, 500);
+    tracker.applyScrollDelta(1400, 3000, 500);
+    expect(tracker.headerOffset).toBe(0);
+  });
+
+  it("measures the reader's next scroll from where the carry left them", () => {
+    const tracker = trackerUnderRide();
+    tracker.switchContainer(1000);
+    carrying = true;
+    tracker.applyScrollDelta(1400, 3000, 500);
+    carrying = false;
+    // A small nudge down after a 400px carry: under the threshold, so nothing.
+    tracker.applyScrollDelta(1405, 3000, 500);
+    expect(tracker.headerOffset).toBe(0);
   });
 });
 
@@ -550,7 +703,7 @@ describe('useHideOnScroll iOS repaint nudge suppression', () => {
     // hidden, neither leg clamps), the -1px leg still revealed a pixel of header
     // for a frame before the restore took it back.
     const tracker = trackerWithNudge();
-    tracker.switchContainer(0, 'thread');
+    tracker.switchContainer(0);
     tracker.applyScrollDelta(400, 2000, 500);
     expect(tracker.headerOffset).toBe(-48); // fully hidden
 
@@ -568,7 +721,7 @@ describe('useHideOnScroll iOS repaint nudge suppression', () => {
     // flips 0 to -1 on every nudge after that. At the ~200ms streaming repaint
     // throttle that is a steady 1px shake with no user input at all.
     const tracker = trackerWithNudge();
-    tracker.switchContainer(0, 'thread');
+    tracker.switchContainer(0);
     tracker.applyScrollDelta(400, 2000, 500); // hide the header
     tracker.applyScrollDelta(300, 2000, 500); // scroll up 100 to reveal it fully
     expect(tracker.headerOffset).toBe(0);
@@ -584,7 +737,7 @@ describe('useHideOnScroll iOS repaint nudge suppression', () => {
     // alone defers that distance to the next event; advancing it would drop the
     // movement on the floor and leave the header out of sync with the content.
     const tracker = trackerWithNudge();
-    tracker.switchContainer(0, 'thread');
+    tracker.switchContainer(0);
     tracker.applyScrollDelta(400, 2000, 500);
     tracker.applyScrollDelta(300, 2000, 500); // header fully visible at 300
     expect(tracker.headerOffset).toBe(0);
@@ -599,11 +752,11 @@ describe('useHideOnScroll iOS repaint nudge suppression', () => {
 
   it('still tracks a real scroll once the window closes', () => {
     const tracker = trackerWithNudge();
-    tracker.switchContainer(0, 'thread');
+    tracker.switchContainer(0);
     nudgeRoundTrip(tracker, 1);
 
-    tracker.applyScrollDelta(30, 2000, 500);
-    expect(tracker.headerOffset).toBe(-30);
+    tracker.applyScrollDelta(100, 2000, 500);
+    expect(tracker.headerOffset).toBe(-48);
   });
 
   it('never suppresses a live drag, even inside the nudge window', () => {
@@ -613,19 +766,19 @@ describe('useHideOnScroll iOS repaint nudge suppression', () => {
     // is module-global, so a repaint of a DIFFERENT pane must not be able to
     // freeze this pane's header mid-gesture.
     const tracker = trackerWithNudge();
-    tracker.switchContainer(0, 'thread');
+    tracker.switchContainer(0);
 
     nudging = true;      // a nudge landed a moment ago (on some container)
     userScrolling = true; // ...and the user is now dragging
-    tracker.applyScrollDelta(30, 2000, 500);
+    tracker.applyScrollDelta(100, 2000, 500);
 
-    expect(tracker.headerOffset).toBe(-30); // tracked the finger, not suppressed
+    expect(tracker.headerOffset).toBe(-48); // followed the finger, not suppressed
   });
 
   it('suppresses again once the drag window lapses', () => {
     // The bypass must not latch: at rest is exactly where the shake lives.
     const tracker = trackerWithNudge();
-    tracker.switchContainer(0, 'thread');
+    tracker.switchContainer(0);
     userScrolling = true;
     tracker.applyScrollDelta(400, 2000, 500);
     expect(tracker.headerOffset).toBe(-48);
@@ -648,7 +801,7 @@ describe('useHideOnScroll DOM mutation correction', () => {
   });
 
   it('recovers header when content shrinks and scrollTop drops near top', () => {
-    tracker.switchContainer(0, 'thread');
+    tracker.switchContainer(0);
 
     // User scrolls down — header hides
     tracker.applyScrollDelta(0, 1000, 500);
@@ -662,16 +815,18 @@ describe('useHideOnScroll DOM mutation correction', () => {
   });
 
   it('recovers header after keyboard dismiss when content is short', () => {
-    tracker.switchContainer(0, 'thread');
+    tracker.switchContainer(0);
 
     // User scrolls to bottom
     tracker.applyScrollDelta(0, 1000, 500);
     tracker.applyScrollDelta(500, 1000, 500);
     expect(tracker.headerOffset).toBe(-48);
 
-    // Keyboard dismiss sets header based on scroll position
+    // Keyboard dismiss brings the bars back: the reader was just typing
     tracker.syncToScroll(500);
-    expect(tracker.headerOffset).toBe(-48); // still hidden (scrollPos > cachedHeight)
+    expect(tracker.headerOffset).toBe(0);
+    tracker.applyScrollDelta(600, 1500, 500);
+    expect(tracker.headerOffset).toBe(-48);
 
     // Content re-renders shorter, scrollTop now 0. DOM mutation fires.
     tracker.correctForScrollPosition(0);
@@ -679,7 +834,7 @@ describe('useHideOnScroll DOM mutation correction', () => {
   });
 
   it('does not force header visible when user is scrolled past header height', () => {
-    tracker.switchContainer(0, 'thread');
+    tracker.switchContainer(0);
 
     // User scrolls down past header height
     tracker.applyScrollDelta(0, 2000, 500);
@@ -691,8 +846,8 @@ describe('useHideOnScroll DOM mutation correction', () => {
     expect(tracker.headerOffset).toBe(-48);
   });
 
-  it('partially recovers header when scrollTop is between 0 and cachedHeight', () => {
-    tracker.switchContainer(0, 'thread');
+  it('shows the header once a shrink brings the scroll within its height', () => {
+    tracker.switchContainer(0);
 
     // Hide header fully
     tracker.applyScrollDelta(0, 1000, 500);
@@ -701,7 +856,7 @@ describe('useHideOnScroll DOM mutation correction', () => {
 
     // Content shrinks, scrollTop settles at 20 (within header height)
     tracker.correctForScrollPosition(20);
-    expect(tracker.headerOffset).toBe(-20); // partially visible
+    expect(tracker.headerOffset).toBe(0);
   });
 });
 
@@ -767,7 +922,7 @@ describe('useHideOnScroll stale keyboard recovery', () => {
   });
 
   it('header stays permanently hidden when keyboardOpen is stale (iOS swipe bug)', () => {
-    tracker.switchContainer(0, 'thread');
+    tracker.switchContainer(0);
 
     // User focuses prompt input — keyboard opens, header hides
     tracker.setKeyboardOpen(true);
@@ -776,7 +931,7 @@ describe('useHideOnScroll stale keyboard recovery', () => {
 
     // User swipes to threads pane — iOS Safari doesn't fire focusout
     // keyboardOpen stays true (no blur event)
-    tracker.switchContainer(0, 'threads');
+    tracker.switchContainer(0);
 
     // Without recovery: header is STILL hidden because keyboardOpen overrides
     expect(tracker.keyboardOpen).toBe(true);
@@ -786,19 +941,19 @@ describe('useHideOnScroll stale keyboard recovery', () => {
     tracker.applyScrollDelta(0, 1000, 500);
     tracker.applyScrollDelta(50, 1000, 500);
     tracker.applyScrollDelta(20, 1000, 500); // scroll back up 30px
-    // headerOffset moved to -18 from scroll delta, but getEffectiveOffset
-    // ignores it because keyboardOpen is true
-    expect(tracker.headerOffset).toBe(-18);
+    // The scroll brought the header back, but getEffectiveOffset ignores it
+    // because keyboardOpen is true
+    expect(tracker.headerOffset).toBe(0);
     expect(tracker.getEffectiveOffset()).toBe(-48); // BUG: still stuck
 
     // FIX: recoverKeyboardState detects no text input focused, resets flag
     tracker.recoverKeyboardState(false); // no text input focused
     expect(tracker.keyboardOpen).toBe(false);
-    expect(tracker.getEffectiveOffset()).toBe(-18); // recovered!
+    expect(tracker.getEffectiveOffset()).toBe(0); // recovered!
   });
 
   it('does not reset keyboardOpen when text input is still focused', () => {
-    tracker.switchContainer(0, 'thread');
+    tracker.switchContainer(0);
     tracker.setKeyboardOpen(true);
     tracker.onFocusIn(0);
 
@@ -809,12 +964,12 @@ describe('useHideOnScroll stale keyboard recovery', () => {
   });
 
   it('recovers header on pane switch when focusout was missed', () => {
-    tracker.switchContainer(0, 'thread');
+    tracker.switchContainer(0);
     tracker.setKeyboardOpen(true);
     tracker.onFocusIn(0);
 
     // Swipe to threads — iOS misses focusout, but no input is focused
-    tracker.switchContainer(0, 'threads');
+    tracker.switchContainer(0);
     tracker.recoverKeyboardState(false);
 
     // Header should be fully visible at scrollTop=0
@@ -834,7 +989,7 @@ describe('useHideOnScroll app UI disabled mode', () => {
   });
 
   it('returns 0 (fully visible) when disabled, even if header was hidden by scroll', () => {
-    tracker.switchContainer(0, 'content');
+    tracker.switchContainer(0);
 
     // Scroll down to hide header
     tracker.applyScrollDelta(0, 1000, 500);
@@ -848,7 +1003,7 @@ describe('useHideOnScroll app UI disabled mode', () => {
   });
 
   it('ignores scroll events while disabled (effective offset stays 0)', () => {
-    tracker.switchContainer(0, 'content');
+    tracker.switchContainer(0);
     tracker.setDisabled(true);
 
     // Scroll happens inside iframe (propagated to parent or native jitter)
@@ -860,8 +1015,8 @@ describe('useHideOnScroll app UI disabled mode', () => {
     expect(tracker.getEffectiveOffset()).toBe(0);
   });
 
-  it('re-enables scroll tracking when disabled is cleared', () => {
-    tracker.switchContainer(0, 'content');
+  it('picks the scroll back up where it was when disabled is cleared', () => {
+    tracker.switchContainer(0);
 
     // Disable for app UI
     tracker.setDisabled(true);
@@ -869,14 +1024,15 @@ describe('useHideOnScroll app UI disabled mode', () => {
     tracker.applyScrollDelta(100, 1000, 500);
     expect(tracker.getEffectiveOffset()).toBe(0);
 
-    // App UI closed — re-enable
+    // App UI closed — re-enable. Nothing accumulated while pinned.
     tracker.setDisabled(false);
-    // Header should reflect the scroll state that accumulated
+    expect(tracker.getEffectiveOffset()).toBe(0);
+    tracker.applyScrollDelta(200, 1000, 500);
     expect(tracker.getEffectiveOffset()).toBe(-48);
   });
 
   it('disabled takes priority over keyboard state', () => {
-    tracker.switchContainer(0, 'content');
+    tracker.switchContainer(0);
     tracker.setKeyboardOpen(true);
     tracker.setDisabled(true);
 
@@ -885,7 +1041,7 @@ describe('useHideOnScroll app UI disabled mode', () => {
   });
 
   it('clears stale keyboard state when entering disabled mode', () => {
-    tracker.switchContainer(0, 'content');
+    tracker.switchContainer(0);
 
     // Keyboard open (iOS may miss focusout when navigating to app UI)
     tracker.setKeyboardOpen(true);
@@ -988,24 +1144,23 @@ describe('useHideOnScroll keyboard open compensation respects safe-area', () => 
 
 /**
  * Spec for the recovery contract: flipping keyboardOpen alone isn't enough —
- * the visual header.style.transform must be re-applied or the header stays
+ * the visual header.style.translate must be re-applied or the header stays
  * stuck at the keyboard-open offset, invisible above the viewport.
  */
 function createTransformTracker() {
   const cachedHeight = 48;
   let keyboardOpen = false;
-  let headerOffset = 0;
-  // Mirror of header.style.transform — only updated when applyTransform runs.
+  let away = true;
+  // Mirror of header.style.translate — only updated when applyTransform runs.
   let appliedOffset: number | null = null;
 
-  const clampOffset = (o: number) => Math.min(0, Math.max(-cachedHeight, o)) || 0;
-
   function applyTransform() {
-    appliedOffset = keyboardOpen ? -cachedHeight : headerOffset;
+    appliedOffset = keyboardOpen ? -cachedHeight : away ? -cachedHeight : 0;
   }
 
-  function syncToScroll(scrollTop: number) {
-    headerOffset = clampOffset(-Math.max(0, scrollTop));
+  /** The keyboard closed: the bars return, wherever the reader is. */
+  function syncToScroll() {
+    away = false;
     applyTransform();
   }
 
@@ -1014,11 +1169,11 @@ function createTransformTracker() {
     applyTransform();
   }
 
-  function recoverKeyboardState(isInputFocused: boolean, scrollTop: number) {
+  function recoverKeyboardState(isInputFocused: boolean) {
     if (!keyboardOpen) return;
     if (isInputFocused) return;
     keyboardOpen = false;
-    syncToScroll(scrollTop);
+    syncToScroll();
   }
 
   return {
@@ -1100,25 +1255,26 @@ describe('spacerHeightPx', () => {
 });
 
 describe('useHideOnScroll recovery re-applies header transform', () => {
-  it('restores header at scrollTop=0 (iOS missed focusout, user at top)', () => {
+  it('restores the header when iOS missed the focusout', () => {
     const t = createTransformTracker();
 
     t.onFocusIn();
     expect(t.appliedOffset).toBe(-48);
 
-    t.recoverKeyboardState(false, 0);
+    t.recoverKeyboardState(false);
 
     expect(t.keyboardOpen).toBe(false);
     expect(t.appliedOffset).toBe(0);
   });
 
-  it('keeps header hidden when scrolled past it after recovery', () => {
+  it('shows the header after recovery, even scrolled far down', () => {
+    // The scroll had sent the bars away before the keyboard opened.
     const t = createTransformTracker();
 
     t.onFocusIn();
-    t.recoverKeyboardState(false, 100);
+    t.recoverKeyboardState(false);
 
-    expect(t.appliedOffset).toBe(-48);
+    expect(t.appliedOffset).toBe(0);
   });
 
   it('leaves transform untouched when an input is still focused', () => {
@@ -1126,7 +1282,7 @@ describe('useHideOnScroll recovery re-applies header transform', () => {
 
     t.onFocusIn();
     const before = t.appliedOffset;
-    t.recoverKeyboardState(true, 0);
+    t.recoverKeyboardState(true);
 
     expect(t.keyboardOpen).toBe(true);
     expect(t.appliedOffset).toBe(before);
@@ -1169,7 +1325,7 @@ describe('useHideOnScroll across an anchored reveal correction', () => {
 
   it('keeps the header hidden when the correction scrolls the reader up', () => {
     const t = tracker();
-    t.switchContainer(0, 'thread');
+    t.switchContainer(0);
     t.applyScrollDelta(3000, 12000, 800);
     expect(t.headerOffset).toBe(-48);
 
@@ -1184,7 +1340,7 @@ describe('useHideOnScroll across an anchored reveal correction', () => {
 
   it('still reveals the header for a navigation that is not an anchor', () => {
     const t = tracker();
-    t.switchContainer(0, 'thread');
+    t.switchContainer(0);
     t.applyScrollDelta(3000, 12000, 800);
     expect(t.headerOffset).toBe(-48);
 
@@ -1198,11 +1354,11 @@ describe('useHideOnScroll across an anchored reveal correction', () => {
     // The scroll event arrives after the navigation window closed, so the flag
     // above says nothing. The re-base is what makes the delta zero.
     const t = tracker();
-    t.switchContainer(0, 'thread');
+    t.switchContainer(0);
     t.applyScrollDelta(3000, 12000, 800);
     expect(t.headerOffset).toBe(-48);
 
-    t.rebaseAnchor(2060, 8000, 800);
+    t.rebase(2060, 8000, 800);
     t.applyScrollDelta(2060, 8000, 800);
 
     expect(t.headerOffset).toBe(-48);
@@ -1210,14 +1366,17 @@ describe('useHideOnScroll across an anchored reveal correction', () => {
 
   it('reads the reader own scroll after the re-base from the new baseline', () => {
     const t = tracker();
-    t.switchContainer(0, 'thread');
+    t.switchContainer(0);
     t.applyScrollDelta(3000, 12000, 800);
 
-    t.rebaseAnchor(2060, 8000, 800);
-    // The reader now scrolls UP 30px of their own accord, which reveals 30px.
-    t.applyScrollDelta(2030, 8000, 800);
+    t.rebase(2060, 8000, 800);
+    // A small move of the reader's own reads as small. Against the old baseline
+    // it would read as 934px up, and reveal.
+    t.applyScrollDelta(2066, 8000, 800);
+    expect(t.headerOffset).toBe(-48);
 
-    expect(t.headerOffset).toBe(-18);
+    t.applyScrollDelta(2030, 8000, 800);
+    expect(t.headerOffset).toBe(0);
   });
 
   it('keeps the header hidden when a later mark has stolen the anchor kind', () => {
@@ -1226,11 +1385,11 @@ describe('useHideOnScroll across an anchored reveal correction', () => {
     // Something marked after the anchor write, so the flag says placement. Only
     // the POSITION still knows: the container sits where the anchor left it.
     const t = tracker();
-    t.switchContainer(0, 'thread');
+    t.switchContainer(0);
     t.applyScrollDelta(3000, 12000, 800);
     expect(t.headerOffset).toBe(-48);
 
-    t.rebaseAnchor(2060, 8000, 800);
+    t.rebase(2060, 8000, 800);
     navigating = true;
     anchoring = false;
     t.applyScrollDelta(2060, 8000, 800);
@@ -1240,10 +1399,10 @@ describe('useHideOnScroll across an anchored reveal correction', () => {
 
   it('spends the 1px repaint nudge without reading it as the reader moving', () => {
     const t = tracker();
-    t.switchContainer(0, 'thread');
+    t.switchContainer(0);
     t.applyScrollDelta(3000, 12000, 800);
 
-    t.rebaseAnchor(2060, 8000, 800);
+    t.rebase(2060, 8000, 800);
     navigating = true;
     t.applyScrollDelta(2059, 8000, 800);
 
@@ -1254,10 +1413,10 @@ describe('useHideOnScroll across an anchored reveal correction', () => {
     // The stamp must not outlive the position it was taken at. The next chevron
     // tap would find the header stuck wherever the reader left it.
     const t = tracker();
-    t.switchContainer(0, 'thread');
+    t.switchContainer(0);
     t.applyScrollDelta(3000, 12000, 800);
 
-    t.rebaseAnchor(2060, 8000, 800);
+    t.rebase(2060, 8000, 800);
     navigating = true;
     t.applyScrollDelta(400, 8000, 800);
 
@@ -1266,10 +1425,10 @@ describe('useHideOnScroll across an anchored reveal correction', () => {
 
   it('spends the stamp once the reader scrolls off the anchored position', () => {
     const t = tracker();
-    t.switchContainer(0, 'thread');
+    t.switchContainer(0);
     t.applyScrollDelta(3000, 12000, 800);
 
-    t.rebaseAnchor(2060, 8000, 800);
+    t.rebase(2060, 8000, 800);
     t.applyScrollDelta(2400, 8000, 800); // the reader moves, of their own accord
     navigating = true;
     t.applyScrollDelta(2060, 8000, 800); // a navigation happens to come back

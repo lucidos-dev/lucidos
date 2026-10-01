@@ -347,21 +347,12 @@
     }
 }
 
-/* Text/password input for settings rows (Providers credential form). */
+/* Text/password input for settings rows. Box and focus: global/text-input.css. */
 .settings-text-input {
-    background: var(--bg-tertiary);
-    border: 1px solid var(--border-color);
-    border-radius: calc(var(--radius-control) * 0.5);
     padding: 0.25rem 0.5rem;
     font-family: var(--font-ui);
     font-size: var(--font-size-md);
-    color: var(--text-primary);
     min-width: 14rem;
-}
-
-.settings-text-input:focus {
-    outline: none;
-    border-color: var(--accent);
 }
 
 /* Muted help text under a settings group (e.g. the Providers note). */

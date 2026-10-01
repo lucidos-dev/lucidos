@@ -134,6 +134,11 @@ export function wasEngineVersionDismissed(versionId: string): boolean {
  *  it doesn't pre-empt the swap and reload stale content. */
 const REFRESH_SWAP_TIMEOUT_MS = 4000;
 
+/** Deadline (ms) for the whole refresh. The UI stays locked until a reload,
+ *  so a stalled `/sw.js` probe or `reg.update()` must not hold it forever:
+ *  past this, bust the cached shell and reload anyway. */
+const REFRESH_DEADLINE_MS = 15_000;
+
 /** Delete the `lucidos-shell-*` caches (the cache-first content-hashed
  *  `/assets/*` bundles plus the offline navigation-shell fallback, both written
  *  by public/sw.js) so the next reload refetches them from the network. The shell
@@ -244,8 +249,12 @@ export function refreshClient(): void {
     if (reloaded) return;
     reloaded = true;
     if (swapTimer !== null) clearTimeout(swapTimer);
+    clearTimeout(deadlineTimer);
     window.location.reload();
   };
+  const deadlineTimer = setTimeout(() => {
+    void bustShellCaches().finally(reloadOnce);
+  }, REFRESH_DEADLINE_MS);
   navigator.serviceWorker.addEventListener('controllerchange', reloadOnce, { once: true });
   getServedBuildId()
     .then(async (served) => {

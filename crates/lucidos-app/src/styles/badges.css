@@ -43,7 +43,8 @@
 .ws-picker-badge,
 .thread-status-question-badge,
 .app-store-status,
-.app-store-modified-chip {
+.app-store-modified-chip,
+.theme-card-badge {
     letter-spacing: normal;
 }
 
@@ -96,7 +97,8 @@
     .ws-picker-badge,
     .thread-status-question-badge,
     .app-store-status,
-    .app-store-modified-chip {
+    .app-store-modified-chip,
+    .theme-card-badge {
         display: inline-block;
         text-align: center;
         align-content: end;

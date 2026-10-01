@@ -907,6 +907,10 @@ export interface ToastItem {
    *  the toast layer. A toast on a timer may not be lowered: it would vanish
    *  behind the modal and the reader would never learn what it said. */
   persistent?: boolean;
+  /** How many times this plain toast was raised while it was up, from 2.
+   *  Absent on a toast raised once. `showToast` merges a repeat into the card
+   *  already showing rather than stacking a copy. */
+  count?: number;
 }
 
 // Credential request from SSE (engine needs credentials)
@@ -924,10 +928,10 @@ export interface CredentialRequest {
   auth_type?: AuthType;
   prompt?: string;
   /** Pre-fill values for `oauth_client` requests. The agent supplies these from
-   *  the `oauth-providers` system-knowhow (auth/token/userinfo URLs + default
-   *  scopes) so the modal pre-fills them. Absence — or a missing field —
-   *  signals "not pre-filled": the modal auto-expands its endpoint section so
-   *  the user fills the URLs in by hand. */
+   *  the `oauth-providers` system-knowhow (auth/token/userinfo URLs) so the
+   *  modal pre-fills them. Absence, or a missing field, signals "not
+   *  pre-filled": the modal auto-expands its endpoint section so the user
+   *  fills the URLs in by hand. */
   defaults?: {
     auth_url?: string;
     token_url?: string;
@@ -938,7 +942,6 @@ export interface CredentialRequest {
     /** Extra authorization-URL parameters, `key=value&key=value`. Absent means
      *  the engine's default (`access_type=offline&prompt=consent`). */
     authorize_params?: string;
-    scopes?: string;
     /** Loopback callback URI to register with the provider. Absent means the
      *  engine's default (`http://127.0.0.1:14981/oauth/callback`). */
     redirect_uri?: string;

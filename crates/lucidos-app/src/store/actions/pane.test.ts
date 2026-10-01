@@ -10,6 +10,7 @@ import { minDrawerWidth, minThreadPanePx, minContentPanePx } from '../paneMinimu
 import {
   navigateToPane, checkPaneConsistency, toggleThreads, focusPane, revealContentPane, revealThreadPane,
   toggleThreadPane, toggleContentPane, stepThreadPaneWidth, stepThreadDrawerWidth, resetPaneLayout,
+  toggleSplitFromDivider,
 } from './pane';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -278,6 +279,37 @@ describe('toggleThreadPane / toggleContentPane (two-stage focus → hide)', () =
     expect(splitRatio.value).toBe(0.5);
     expect(focusedPane.value).toBe('thread'); // unchanged on mobile
     expect(checkPaneConsistency()).toBeNull();
+  });
+});
+
+describe('toggleSplitFromDivider (divider double-click)', () => {
+  beforeEach(() => {
+    resetState(); // focusedPane = 'thread'
+    (globalThis as any).innerWidth = 1024;
+    splitRatio.value = 0.5;
+  });
+  afterEach(() => vi.restoreAllMocks());
+
+  it('collapsing the thread pane moves the marker off it, so Tab still works', () => {
+    // A collapsed pane is visibility: hidden. A marker left on it made every
+    // Tab a dead key.
+    toggleSplitFromDivider();
+    expect(splitRatio.value).toBe(0);
+    expect(focusedPane.value).toBe('content');
+  });
+
+  it('collapsing from the drawer moves the marker too, since the drawer hides with it', () => {
+    focusedPane.value = 'drawer';
+    toggleSplitFromDivider();
+    expect(focusedPane.value).toBe('content');
+  });
+
+  it('expanding a collapsed split restores the default ratio and leaves the marker', () => {
+    splitRatio.value = 0;
+    focusedPane.value = 'content';
+    toggleSplitFromDivider();
+    expect(splitRatio.value).toBe(DEFAULT_SPLIT_RATIO);
+    expect(focusedPane.value).toBe('content');
   });
 });
 

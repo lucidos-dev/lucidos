@@ -698,6 +698,11 @@
     font-weight: 600;
 }
 
+/* How many times a plain toast was raised while it was up (`showToast`). */
+.toast-count {
+    margin-left: var(--space-sm);
+}
+
 /* The whole card takes the tap (`toastTap`). Only a card that ACTS shows the
    pointer and underlines its message on hover. The underline sits on the
    message: set on the card, it would also reach the text of its buttons. */

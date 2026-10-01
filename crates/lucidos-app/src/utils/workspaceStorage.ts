@@ -74,8 +74,6 @@ export const GLOBAL_KEYS: ReadonlySet<string> = new Set([
  * seeding it would re-share the identity, defeating per-workspace scoping.
  */
 const APPEARANCE_SEED_KEYS: readonly string[] = [
-  // The pre-rename mode key. The boot script then moves it to
-  // `lucidos-theme-mode` (docs/temporary-measures.md § Renamed appearance storage keys).
   'lucidos-theme',
   'lucidos-font-family',
   'lucidos-ui-scale',

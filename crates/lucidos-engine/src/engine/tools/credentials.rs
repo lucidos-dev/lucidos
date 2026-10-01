@@ -35,7 +35,7 @@ pub(crate) fn credential_request_payload(
 }
 
 /// Build the enveloped credential-request payload, optionally attaching an
-/// oauth `defaults` block (endpoint URLs + scopes the modal pre-fills) and an
+/// oauth `defaults` block (endpoint URLs the modal pre-fills) and an
 /// `env_var_name` the modal pre-fills into its custom-env-var-name field. An empty
 /// `defaults` map omits the block entirely, so the modal treats it as a custom
 /// provider and expands the endpoint section for manual entry. A `None`/blank
@@ -302,7 +302,7 @@ fn requested_service_name(service_name: &str, auth_type: &str) -> String {
     }
 }
 
-/// Collect the optional oauth endpoint + scopes args an agent passes (looked up
+/// Collect the optional oauth endpoint args an agent passes (looked up
 /// from `system-knowhow/oauth-providers.md`) into a `defaults` map. Blank/absent
 /// args are dropped so they never pre-fill an empty field.
 fn oauth_defaults_from_args(
@@ -315,7 +315,6 @@ fn oauth_defaults_from_args(
         "userinfo_url",
         "userinfo_method",
         "authorize_params",
-        "scopes",
         "redirect_uri",
     ] {
         if let Some(v) = args[key].as_str().map(str::trim).filter(|s| !s.is_empty()) {
@@ -570,8 +569,7 @@ impl LucidosEngine {
                 {
                     // No client credentials yet — open the modal. Forward any
                     // endpoints the agent looked up in the oauth-providers knowhow
-                    // (so a derived name like "ghealth" pre-fills Google's URLs),
-                    // and seed the default scopes from the requested scopes.
+                    // (so a derived name like "ghealth" pre-fills Google's URLs).
                     let str_arg = |key: &str| {
                         args[key]
                             .as_str()
@@ -599,7 +597,6 @@ impl LucidosEngine {
                         userinfo_url: str_arg("userinfo_url").or(from_row.userinfo_url),
                         userinfo_method: str_arg("userinfo_method").or(from_row.userinfo_method),
                         authorize_params: str_arg("authorize_params").or(from_row.authorize_params),
-                        scopes: Some(scopes.to_string()),
                         redirect_uri: str_arg("redirect_uri").or(from_row.redirect_uri),
                     };
                     return Ok(credential_request_envelope(oauth::oauth_client_request(

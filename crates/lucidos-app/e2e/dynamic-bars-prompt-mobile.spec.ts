@@ -11,7 +11,7 @@ import {
   waitForResponse,
 } from './helpers';
 
-/** Dynamic bars move the prompt as well as the header: it slides down on a
+/** Dynamic bars move the prompt as well as the header: it glides down on a
  *  scroll down, comes back on a scroll up, and is fully shown at the end of the
  *  thread. With the bars pinned it never moves. `hooks/useHideOnScroll.ts`. */
 
@@ -86,7 +86,7 @@ test.describe('Dynamic bars: the prompt', () => {
     await disableMobileDynamicBars(page);
   });
 
-  test('slides away on scroll down, returns on scroll up, and shows at the end', async ({ page }) => {
+  test('glides away on scroll down, returns on scroll up, and shows at the end', async ({ page }) => {
     await enableMobileDynamicBars(page);
     await tallThreadAtTop(page);
     expect(await promptHiddenPx(page)).toBeLessThanOrEqual(1);
@@ -128,9 +128,9 @@ test.describe('Dynamic bars: the prompt', () => {
 
     const after = await page.evaluate((sel) => {
       const el = document.querySelector<HTMLElement>(sel)!;
-      return { top: el.getBoundingClientRect().top, transform: el.style.transform, position: getComputedStyle(el).position };
+      return { top: el.getBoundingClientRect().top, translate: el.style.translate, position: getComputedStyle(el).position };
     }, PROMPT);
-    expect(after.transform).toBe('');
+    expect(after.translate).toBe('');
     expect(after.position).not.toBe('absolute');
     expect(after.top).toBeCloseTo(before, 0);
   });

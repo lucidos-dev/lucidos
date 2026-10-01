@@ -289,7 +289,7 @@ An *event* the workspace itself emits via the `emit_event` LLM tool or `lucidos 
 See also: `system-knowhow/thread-events.md` § "Today the scheduler uses a blocklist", `.claude/rules/rust.md` § "Apps — Event APIs".
 
 ### Dynamic bars
-On a phone, the header and the prompt slide away as you scroll down a thread. They come back as you scroll up, following your finger. The prompt also comes back near the end of the thread, and stays in place while you type. Off by default, so both bars stay visible. Set in Settings > Appearance & Behavior > Mobile, or through the `mobile_dynamic_bars` preference.
+On a phone, the header, the thread title and the prompt glide away as you scroll down a thread. They glide back as you scroll up, or when you swipe to another pane. The header comes back near the top of the thread, the prompt near the end, and the prompt stays in place while you type. A reply never moves them: while the follow toggle carries you through one, the bars stay where you left them. Off by default, so they stay visible. Set in Settings > Appearance & Behavior > Mobile, or through the `mobile_dynamic_bars` preference.
 
 ### Endpoint catalog
 The knowhow half of a *derived proxy entry*: a `data/knowhow/<name>-api.md` file cataloguing the endpoints observed on a site. Each one carries its params, response shape and quirks. The `apis.json` entry beside it is pure transport, so it says nothing about which paths exist. Without the catalog the LLM knows only that a proxy exists, so a derivation emitting one and not the other has failed. Never records the user's own rows, only field names and types.
@@ -1316,7 +1316,7 @@ A *thread* driven by a *coding agent* (Claude Code or Codex) inside an isolated 
 See also: `system-knowhow/coding-agent-events.md`.
 
 ### Side question
-A quick question put to a thread by typing `/btw <question>` in its composer, or by holding Send and choosing "Side question". Holding Stop during a turn and choosing it puts `/btw ` in the empty composer to finish. Pressing ⌥↵ (Alt+Enter) and then Enter asks one too. It may carry images. The thread's agent answers from the thread's full context, beside any running turn, with no tools: a Claude Code thread asks a copy of its session, a Lucidos Agent thread asks its own model once. The answer shows on a card at the moment it was asked, and later output draws below it.
+A quick question put to a thread by typing `/btw <question>` in its composer, or by holding Send and choosing "Side question". During a turn, holding Stop or pressing ⌥↵ (Alt+Enter) puts `/btw ` in the empty composer to finish (a touch hold shows "Side question" first). Over a typed draft, pressing ⌥↵ and then Enter asks one too. It may carry images. The thread's agent answers from the thread's full context, beside any running turn, with no tools: a Claude Code thread asks a copy of its session, a Lucidos Agent thread asks its own model once. The answer shows on a card at the moment it was asked, and later output draws below it.
 
 Kept as events **no agent ever sees** (ADR 0320), the card survives reloads and shows on every device. A tap on its head folds it to one line, and a second tap unfolds it. Codex threads refuse side questions.
 See also: `system-knowhow/coding-agent-events.md` § Side questions are recorded, and hidden from every agent.

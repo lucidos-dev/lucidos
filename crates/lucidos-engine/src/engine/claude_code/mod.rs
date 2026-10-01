@@ -600,6 +600,9 @@ pub(crate) enum DiscardTarget {
     /// The session, claimed for this Discard. Release it with `claimant`.
     Claimed {
         worktree: PathBuf,
+        /// The branch the reset may rewind. The worktree is reset only while
+        /// it is still checked out on it.
+        branch: String,
         claimant: tokio::sync::mpsc::UnboundedSender<crate::engine::AgentUserInput>,
     },
 }
@@ -610,8 +613,9 @@ pub(crate) enum DiscardTarget {
 /// change claim until then. An apply cannot claim the session under it, and
 /// it cannot start under an apply or under a stop that is ending the session.
 ///
-/// A missing session and a session with no worktree stay distinct: the second
-/// reports an error, and never falls through to the stale-session teardown.
+/// A missing session and a session with no worktree or branch stay distinct:
+/// the second reports an error, and never falls through to the stale-session
+/// teardown.
 pub(crate) fn claim_for_discard(
     sessions: &mut HashMap<Uuid, crate::engine::AgentSession>,
     thread_id: Uuid,
@@ -629,9 +633,14 @@ pub(crate) fn claim_for_discard(
         .worktree_path
         .clone()
         .ok_or("No worktree for this session")?;
+    let branch = session
+        .branch_name
+        .clone()
+        .ok_or("No branch for this session")?;
     session.change_claim = Some(crate::engine::types::ChangeClaim::Discard);
     Ok(DiscardTarget::Claimed {
         worktree,
+        branch,
         claimant: session.msg_tx.clone(),
     })
 }

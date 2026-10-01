@@ -1,6 +1,8 @@
 import { hasHoverPointer } from '../../utils/platform';
 import { isElementOnScreen, isElementVisible, markRevealScroll } from './scrollState';
 import { getVisiblePromptInput } from './promptFocus';
+import { focusedPane } from '../../store/store';
+import { focusIntoPane } from '../layout/paneFocus';
 
 /** Keyboard navigation for **choice cards**: a live user question card or a live
  *  permission card (see `docs/glossary.md`). Both park the thread on
@@ -68,7 +70,8 @@ export function nextChoiceIndex(
  *  steal focus from something the user is doing, mirroring `focusIfNeeded` and
  *  `shouldReconcilePaneFocus`: a touch-only device has no keyboard to serve, a
  *  non-empty prompt means they are composing a free-text answer, a non-idle
- *  active element means they are using some other control. Whether the card is
+ *  active element means they are using some other control, and a focused-pane
+ *  marker on another pane means they are working there. Whether the card is
  *  actually on screen is asked separately and precisely, by `isElementOnScreen`
  *  in `seedChoiceCardFocus`. Pure, for unit testing.
  *
@@ -83,8 +86,9 @@ export function shouldSeedChoiceFocus(opts: {
   hoverPointer: boolean;
   promptHasText: boolean;
   activeIsIdle: boolean;
+  markerOnThreadPane: boolean;
 }): boolean {
-  return opts.hoverPointer && !opts.promptHasText && opts.activeIsIdle;
+  return opts.hoverPointer && !opts.promptHasText && opts.activeIsIdle && opts.markerOnThreadPane;
 }
 
 function choiceButtons(root: HTMLElement): HTMLElement[] {
@@ -159,6 +163,17 @@ export function handleChoiceCardKeyDown(e: KeyboardEvent, root: HTMLElement | nu
   markRevealScroll();
 }
 
+/** Hand focus to the prompt when the card being answered holds it. Answering
+ *  swaps the live choices for the answered body, so the focused option
+ *  unmounts and the next Tab would restart at the pane's first control. Call
+ *  before the optimistic state change. Keyboard devices only, since on a phone
+ *  it would raise the keyboard. */
+export function handAnsweredCardFocusToPrompt(): void {
+  const active = document.activeElement as HTMLElement | null;
+  if (!hasHoverPointer() || !active?.closest(CHOICE_CARD_SELECTOR)) return;
+  focusIntoPane(getVisiblePromptInput());
+}
+
 /** Card ids whose arrival moment has already passed. See `claimSeedForCard`. */
 const seededCards = new Set<string>();
 
@@ -212,6 +227,7 @@ export function seedChoiceCardFocus(root: HTMLElement | null, cardId: string): v
     hoverPointer: hasHoverPointer(),
     promptHasText: promptHasText(),
     activeIsIdle: activeElementIsIdle(),
+    markerOnThreadPane: focusedPane.value === 'thread',
   })) return;
   const choice = defaultChoice(root);
   if (choice && isElementOnScreen(choice)) choice.focus({ preventScroll: true });

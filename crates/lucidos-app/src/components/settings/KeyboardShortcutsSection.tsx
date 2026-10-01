@@ -59,6 +59,10 @@ export function KeyboardShortcutsSection() {
               <div class="list-row" key={def.id}>
                 <div class="list-row-info">
                   <span class="title">{def.label}</span>
+                  {/* It explains the default chord, so a rebound one hides it. */}
+                  {def.mnemonic && !isCustomized(def.id) && (
+                    <span class="list-row-details" data-role="shortcut-mnemonic">{def.mnemonic}</span>
+                  )}
                 </div>
                 <div class="list-row-actions shortcut-row-actions">
                   <button

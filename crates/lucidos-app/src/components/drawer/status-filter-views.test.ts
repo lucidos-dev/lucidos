@@ -75,7 +75,7 @@ describe('status-filter view header count', () => {
         for (const [name, body] of topLevelFunctions(SOURCE)) {
             if (!body.includes('<EmptyFilteredView')) continue;
             views.push(name);
-            if (!/<DrawerSectionHeader\b[^>]*\bcount=\{/.test(body)) missingCount.push(name);
+            if (!/<SectionHeaderContent\b[^>]*\bcount=\{/.test(body)) missingCount.push(name);
         }
 
         expect(views.length).toBe(4);
@@ -86,8 +86,7 @@ describe('status-filter view header count', () => {
         const fns = topLevelFunctions(SOURCE);
         // One copy of the count markup, in the shared header, so the status and
         // lifecycle headers cannot drift apart.
-        expect(fns.get('DrawerSectionHeader')).toContain('section-count-open');
-        expect(fns.get('DrawerSectionTitle')).not.toContain('section-count');
-        expect(fns.get('DrawerSectionTitle')).toMatch(/<DrawerSectionHeader\b[^>]*\bcount=\{count\}/);
+        expect(SOURCE).not.toContain('section-count');
+        expect(fns.get('DrawerSectionTitle')).toMatch(/<SectionHeaderContent\b[^>]*\bcount=\{count\}/);
     });
 });

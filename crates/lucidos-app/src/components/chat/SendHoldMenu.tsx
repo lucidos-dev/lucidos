@@ -17,6 +17,8 @@ export const SEND_HOLD_SLIDE_SLACK_MS = 50;
  *  press or a right-click on either opens it, and so does the Side question
  *  shortcut. From Send it asks the composer's contents as a side question,
  *  with no `/btw` typed. From Stop the box is empty, so it starts a `/btw`.
+ *  Only a touch hold opens it on Stop: a mouse or the shortcut starts the
+ *  `/btw` at once, since the open pill would keep the box from taking typing.
  *
  *  Send is the pill's other half, so it is the overlay's `anchor`: a tap on it
  *  sends and shuts the pill, rather than only dismissing it. Anywhere else

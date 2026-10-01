@@ -146,13 +146,16 @@ async fn has_unreleased_held_messages(
 ///
 /// One at a time, so a crash mid-release strands at most the message it was
 /// on. The unique index refuses a release that lost a race; the loop then moves
-/// to the next message, so no message is delivered twice.
+/// to the next message, so no message is delivered twice. A refused message
+/// that is still unreleased on the re-read was not a lost race, so it stays
+/// held and the loop ends.
 pub(crate) async fn claim_next_held_message(
     bus: &EventBus,
     pool: &sqlx::PgPool,
     workspace: &Path,
     thread_id: Uuid,
 ) -> Option<HeldMessage> {
+    let mut refused: Option<Uuid> = None;
     loop {
         let oldest = match unreleased_held_messages(pool, workspace, thread_id).await {
             Ok(held) => held.into_iter().next()?,
@@ -165,6 +168,14 @@ pub(crate) async fn claim_next_held_message(
                 return None;
             }
         };
+        if refused == Some(oldest.id) {
+            crate::log!(
+                "[HeldMessages] release of {} on thread {} keeps failing; it stays held",
+                oldest.id,
+                thread_id
+            );
+            return None;
+        }
         let released = bus
             .emit(BusEvent::Thread {
                 thread_id,
@@ -179,12 +190,15 @@ pub(crate) async fn claim_next_held_message(
             .await;
         match released {
             Ok(_) => return Some(oldest),
-            Err(e) => crate::log!(
-                "[HeldMessages] release of {} on thread {} refused: {}",
-                oldest.id,
-                thread_id,
-                e
-            ),
+            Err(e) => {
+                crate::log!(
+                    "[HeldMessages] release of {} on thread {} refused: {}",
+                    oldest.id,
+                    thread_id,
+                    e
+                );
+                refused = Some(oldest.id);
+            }
         }
     }
 }

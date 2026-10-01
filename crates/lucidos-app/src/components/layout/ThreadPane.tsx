@@ -147,8 +147,13 @@ export function ThreadPane() {
   return (
     <div class={`thread-pane${isComposeEmpty ? ' compose-empty' : ''}`} data-drop-zone="attach">
       <div class="thread-pane-body">
-        {tid && !isComposingDraft ? <div class="thread-view-clip"><ThreadView /></div> : <CreateThreadView />}
-        <div class="prompt-area" ref={promptRef}>
+        {/* The prompt keeps its node through the compose-to-thread swap, since
+            useHideOnScroll measures that node. The keys stop the diff pairing
+            the thread view's div with the prompt's div by tag. */}
+        {tid && !isComposingDraft
+          ? <div key="thread" class="thread-view-clip"><ThreadView /></div>
+          : <CreateThreadView key="compose" />}
+        <div key="prompt" class="prompt-area" ref={promptRef}>
           <PromptInput />
         </div>
       </div>

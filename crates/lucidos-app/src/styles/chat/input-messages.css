@@ -582,9 +582,11 @@
 }
 
 /* The --space-lg gutter matches the .list-row change rows below, so the right
-   edge lines up with their content. */
+   edge lines up with their content. The bottom padding matches a divided
+   row's, so the hairline sits as far below the buttons as it does below a
+   row. */
 .changes-bulk-actions {
-    padding: 0 var(--space-lg) var(--space-sm);
+    padding: 0 var(--space-lg) var(--space-md);
 }
 
 /* Never wraps. Packed right, so the apply side holds the right edge with or
@@ -1087,8 +1089,10 @@
     justify-content: center;
     opacity: 0;
     pointer-events: none;
+    /* `translate` glides with the mobile dynamic bars (styles/mobile.css). */
     transition: opacity var(--duration-normal), background-color var(--duration-fast),
-        color var(--duration-fast), border-color var(--duration-fast);
+        color var(--duration-fast), border-color var(--duration-fast),
+        translate var(--bars-glide-duration, 0s) ease;
     z-index: calc(var(--z-float) + 1);
     box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2);
 }

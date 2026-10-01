@@ -459,13 +459,22 @@
 
     /* ─── Mobile header: fixed, direction-aware hide on scroll ─── */
 
+    /* Dynamic bars glide. hooks/useHideOnScroll.ts writes where each bar
+       belongs, on `translate`, and this transition carries it there on the
+       compositor (ADR 0336). Every bar lists `translate` at this duration,
+       which is 0s while the bars are pinned. */
+    :root[data-mobile-dynamic-bars] {
+        --bars-glide-duration: var(--duration-slow);
+    }
+
     .app-header {
         position: fixed !important;
         top: 0;
         left: 0;
         right: 0;
         z-index: 100;
-        will-change: transform;
+        will-change: translate;
+        transition: translate var(--bars-glide-duration, 0s) ease;
         background: var(--header-gradient);
         padding-top: env(safe-area-inset-top, 0px);
         /* The inline inset belongs to the ROWS here, not to this column.
@@ -684,7 +693,7 @@
        context, so its children are lifted with it and could not be lifted past
        it. Pinned by e2e/trigger-group-actions-edge-mobile.spec.ts, which
        hit-tests the button's outer edge rather than tapping its centre. */
-    .trigger-group-actions {
+    .list-section-actions {
         position: relative;
         z-index: 2;
     }
@@ -805,43 +814,37 @@
          * ::after fade below dissolves the content, kept out of the box so it
          * adds no at-rest gap. */
         background: var(--bg-primary);
-        transition: background-color var(--duration-normal) ease;
+        transition: background-color var(--duration-normal) ease,
+            translate var(--bars-glide-duration, 0s) ease;
         -webkit-user-select: none;
         user-select: none;
         flex-shrink: 0;
         position: sticky;
         /* Tracks the header's bottom edge via CSS vars from useHideOnScroll.
            The offset extends past -headerHeight by titleHeight so the title
-           bar scrolls fully off-screen at the same speed as the header.
+           bar leaves the screen together with the header.
 
-           The live offset rides `transform`, NOT `top`. useHideOnScroll rewrites
-           --mobile-header-offset on essentially every scroll frame; feeding a
-           LAYOUT property meant each write dirtied layout, so the very next
-           scroll event's `scrollTop` read forced a synchronous style+layout flush
-           of the whole transcript. That read/write pair, once per scroll event on
-           the largest DOM in the app, is why hide-on-scroll janked on the thread
-           while staying smooth on the threads drawer and the content pane, which
-           hold far fewer nodes and no consumer of this var at all. A transform is
-           composited, so the write no longer invalidates layout.
+           The offset rides `translate`, NOT `top`. A LAYOUT property would make
+           the next scroll event's `scrollTop` read flush style and layout for
+           the whole transcript, the largest DOM in the app. `translate` is
+           composited, and it is what the dynamic bars glide on.
 
            Safe as a transform here because it makes this row the containing block
            for any `position: fixed` descendant: the only one is the ⋯ menu, which
            already portals to <body> for exactly this reason (see OverflowMenu).
 
-           Equivalent at rest and in motion: the row only unsticks at scrollTop 0,
-           where the offset is 0, so the translate is never applied to a row
-           sitting in normal flow.
+           The row unsticks only near the top, where the header shows and the
+           offset is 0. So the translate never moves a row in normal flow.
 
-           The second term undoes the iOS repaint nudge's compensation. That
-           compensation cancels a scroll this sticky row never took, so it
-           displaces the row a pixel per toggle. utils/webkitRepaint.ts publishes
-           the shift here, on this element alone. Why, and why the two terms
-           simply add:
+           `transform` undoes the iOS repaint nudge's compensation, which cancels
+           a scroll this sticky row never took. It stays off `translate` so the
+           glide never animates it. utils/webkitRepaint.ts publishes the shift
+           here, on this element alone. Why the two simply add:
            docs/plans/2026-08-16-the-sticky-title-undoes-the-repaint-nudge-compensation.md */
         top: var(--mobile-header-height, 3rem);
-        transform: translateY(calc(
-            var(--mobile-header-offset, 0rem) - var(--repaint-nudge-shift, 0px)
-        ));
+        translate: 0 var(--mobile-header-offset, 0rem);
+        transform: translateY(calc(-1 * var(--repaint-nudge-shift, 0px)));
+        will-change: translate;
         z-index: 2;
         /* Stretch to full width, cancelling .thread-content's horizontal padding
            (the same token the transcript pads with, so the two can't drift) */
@@ -1040,7 +1043,20 @@
         /* The transcript's spacer also carries the scroll anchor's sub-pixel
            rest, as the desktop padding-top does (ADR 0286). Only
            `.thread-content` sets the variable, so it is 0 on the rest. */
-        height: calc(var(--mobile-header-height, calc(2.75rem + env(safe-area-inset-top, 0px))) + var(--anchor-subpixel, 0px));
+        height: calc(var(--app-header-bottom) + var(--anchor-subpixel, 0px));
+    }
+
+    /* A view that fills the pane fills what the spacer leaves. At the full
+       pane height it would overflow by the spacer, and even a short view would
+       scroll its top up behind the header. The URL preview is positioned rather than
+       in flow, so it starts where the spacer ends. The frame's selector must
+       not outrank the flowing repo preview's `height: auto` further down. */
+    .mobile-swipe-pane .content-pane-body > .content-view.active,
+    .mobile-swipe-pane .content-pane-body > .file-preview-frame {
+        height: calc(100% - var(--app-header-bottom));
+    }
+    .mobile-swipe-pane .content-pane-body > .url-preview-inline {
+        top: var(--app-header-bottom);
     }
 
     /* The pull arrow drops from under the overlaid header, where the pane's
@@ -1086,6 +1102,18 @@
     .mobile-swipe-pane .file-preview-frame:has(.diff-view, .rendered-diff, .repo-file-content, .repo-file-rendered) .diff-view {
         overflow-x: clip;
         overflow-y: visible;
+    }
+
+    /* A data file's text body (a document, a table, source) flows the same way.
+       The HTML frame, the editor and the media keep their definite height,
+       under their skeletons too, which draw the same text classes. The
+       wide-line pan of `.file-preview-content` stays, as the repo's does. */
+    .mobile-swipe-pane .file-preview-frame:has(.file-preview-content .loading-fade-content :is(.markdown-content, .csv-table, .line-numbered)),
+    .mobile-swipe-pane .file-preview-frame:has(.file-preview-content .loading-fade-content :is(.markdown-content, .csv-table, .line-numbered)) :is(.file-preview-inline, .file-preview-fade) {
+        height: auto;
+    }
+    .mobile-swipe-pane .file-preview-frame:has(.file-preview-content .loading-fade-content :is(.markdown-content, .csv-table, .line-numbered)) .file-preview-fade {
+        grid-template-rows: auto;
     }
 
     /* The ::before spacer replaces padding-top, so zero out the base padding-top
@@ -1157,11 +1185,11 @@
        with the prompt box, so both chevrons keep the same distance to
        their neighboring chrome.
 
-       Split into a static `top` plus a `transform` for the live offset, for the
+       Split into a static `top` plus a `translate` for the live offset, for the
        reason spelled out on .mobile-thread-title-row above: --mobile-header-offset
-       is rewritten on essentially every scroll frame, so it must never reach a
-       layout property. Keeping BOTH of this var's consumers transform-only makes
-       that a property of the var rather than a rule-by-rule habit.
+       must never reach a layout property. Keeping BOTH of this var's consumers on
+       `translate` makes that a property of the var rather than a habit, and
+       lets the chevron glide with the bars.
 
        Algebraically identical to the max() nest it replaces, via
        max(A, B + x) == B + max(A - B, x) with
@@ -1172,10 +1200,10 @@
        0.75rem terms cancel). */
     .mobile-swipe-pane .scroll-to-top {
         top: calc(var(--mobile-header-height, 3rem) + var(--mobile-thread-title-height, 2.75rem) + 0.75rem);
-        transform: translateY(max(
+        translate: 0 max(
             calc(env(safe-area-inset-top, 0px) - var(--mobile-header-height, 3rem) - var(--mobile-thread-title-height, 2.75rem)),
             max(var(--mobile-header-offset, 0rem), calc(-1 * var(--mobile-header-height, 3rem)))
-        ));
+        );
     }
 
     /* ─── The transcript's own scroll indicator ─── */
@@ -1417,10 +1445,10 @@
     /* Dynamic bars: the prompt overlays the transcript's bottom so it can slide
        away, the shape the fixed header already has at the top. The transcript
        reserves the prompt's height as bottom padding. The down chevron sits
-       above the prompt and rides its offset, as a transform only, because the
-       offset changes on every scroll frame. hooks/useHideOnScroll.ts sets the
-       attribute and all three vars. Pinned bars and the compose-empty view keep
-       the in-flow prompt. */
+       above the prompt and rides its offset. Both glide on `translate`, never a
+       layout property. hooks/useHideOnScroll.ts sets the attribute and all
+       three vars. Pinned bars and the compose-empty view keep the in-flow
+       prompt. */
     :root[data-mobile-dynamic-bars] .thread-pane:not(.compose-empty) .thread-pane-body {
         position: relative;
     }
@@ -1433,6 +1461,7 @@
         right: 0;
         bottom: 0;
         z-index: 3;
+        transition: translate var(--bars-glide-duration, 0s) ease;
     }
 
     :root[data-mobile-dynamic-bars] .mobile-swipe-pane .thread-pane:not(.compose-empty) .thread-content {
@@ -1441,7 +1470,7 @@
 
     :root[data-mobile-dynamic-bars] .mobile-swipe-pane .thread-pane:not(.compose-empty) .scroll-to-bottom {
         bottom: calc(0.75rem + var(--mobile-prompt-height, 0rem));
-        transform: translateY(var(--mobile-prompt-offset, 0rem));
+        translate: 0 var(--mobile-prompt-offset, 0rem);
     }
 
     /* The welcome floats in the middle of the free space instead of docking on

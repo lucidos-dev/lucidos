@@ -176,6 +176,40 @@ sys.path = [_d for _d in sys.path if _d not in _writable]
 exec(compile(_src, _p, 'exec'), {'__file__': _p, '__name__': '__main__'})
 ";
 
+/// Name prefixes that make `python3` or a library it loads read a planted
+/// file, on top of the shell-level ones in `engine::command_guard`.
+const INTERPRETER_HOOK_PREFIXES: &[&str] = &[
+    // Every one steers the interpreter: search path, home, startup file.
+    "PYTHON",
+    // macOS CPython picks the virtual environment it starts in from this.
+    "__PYVENV_LAUNCHER__",
+    // `ssl` and `hashlib` start OpenSSL, whose config can load a module.
+    "OPENSSL_",
+    // glibc loads a charset converter from here during locale setup.
+    "GCONV_PATH",
+    "LOCPATH",
+];
+
+/// Whether a credential may set `name` in a handshake script's environment.
+///
+/// A credential's custom env var name is checked for shape only, so it can
+/// name a loader hook. That hook would run a planted file inside an approved
+/// script, which is the bypass ADR 0144 exists to close.
+///
+/// A credential may not shadow a runtime name either. Its own `PATH` picks
+/// which `python3` runs, and its own `HOME` picks the user site-packages.
+///
+/// The shape is checked again here, not trusted from the write path. A name
+/// holding `=` would compare unequal to `PATH` and still set it in the child.
+fn credential_may_set(name: &str) -> bool {
+    crate::core::environment_variables::is_valid_name(name)
+        && !RUNTIME_ENV_ALLOWLIST.contains(&name)
+        && !INTERPRETER_HOOK_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+        && !crate::engine::command_guard::is_code_injecting_env_name(name)
+}
+
 /// Spawn `cmd`, feed `source` to its stdin, and collect the output.
 ///
 /// Split out so the timeout above wraps the whole exchange. The child is
@@ -266,7 +300,6 @@ pub async fn run_handshake_script(
     // credentials its own pipeline layer was granted. Inheriting the engine's
     // environment handed it the database password, every other provider's key
     // and every subprocess-origin credential. No handshake needs any of them.
-    // Injected last, so a credential always wins a name collision.
     cmd.env_clear();
     for name in RUNTIME_ENV_ALLOWLIST {
         if let Some(value) = std::env::var_os(name) {
@@ -274,7 +307,15 @@ pub async fn run_handshake_script(
         }
     }
     for (k, v) in env_vars {
-        cmd.env(k, v);
+        if credential_may_set(&k) {
+            cmd.env(k, v);
+        } else {
+            crate::log!(
+                "[Proxy] dropped credential env var {} from handshake {}: it would steer the interpreter or loader",
+                k,
+                rel_key
+            );
+        }
     }
     cmd.kill_on_drop(true);
     cmd.stdin(std::process::Stdio::piped());
@@ -647,6 +688,77 @@ print(json.dumps({"headers": {"X-Ran": "real"}, "expires_in": 60}))
             names.contains(&"x-ran") && !names.contains(&"x-pwned"),
             "a planted json.py took over the import: {names:?}"
         );
+    }
+
+    /// A credential's custom env var name is the user's to pick, so it can
+    /// name a loader hook. Through one, a planted module outside the scrubbed
+    /// directories would still shadow the stdlib inside an approved script.
+    #[tokio::test]
+    async fn a_credential_named_after_a_loader_hook_cannot_plant_a_module() {
+        let tmp = tempfile::tempdir().unwrap();
+        let planted = tmp.path().join("data/planted");
+        std::fs::create_dir_all(&planted).unwrap();
+        std::fs::write(
+            planted.join("json.py"),
+            "def dumps(_x):\n    return '{\"headers\": {\"X-Pwned\": \"yes\"}, \"expires_in\": 60}'\n",
+        )
+        .unwrap();
+        let rel = write_script(
+            tmp.path(),
+            "uses-json.py",
+            r#"
+import json
+print(json.dumps({"headers": {"X-Ran": "real"}, "expires_in": 60}))
+"#,
+        );
+        let out = run_handshake_script(
+            tmp.path(),
+            &rel,
+            vec![(
+                "PYTHONPATH".to_string(),
+                planted.to_string_lossy().into_owned(),
+            )],
+        )
+        .await
+        .expect("the real stdlib json must still import");
+        let names: Vec<&str> = out.headers.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(
+            names.contains(&"x-ran") && !names.contains(&"x-pwned"),
+            "a credential named PYTHONPATH planted json.py: {names:?}"
+        );
+    }
+
+    #[test]
+    fn a_credential_may_set_only_names_that_hook_nothing() {
+        for hook in [
+            "PYTHONPATH",
+            "PYTHONHOME",
+            "PYTHONSTARTUP",
+            "PYTHONUSERBASE",
+            "__PYVENV_LAUNCHER__",
+            "OPENSSL_CONF",
+            "OPENSSL_MODULES",
+            "GCONV_PATH",
+            "LOCPATH",
+            "LD_PRELOAD",
+            "LD_LIBRARY_PATH",
+            "DYLD_INSERT_LIBRARIES",
+            "PATH",
+            "HOME",
+            "PATH=/planted",
+            "",
+        ] {
+            assert!(
+                !credential_may_set(hook),
+                "{hook} must not reach the script"
+            );
+        }
+        for ordinary in ["CRED_SVC", "CRED_SVC_PASSWORD", "OAUTH_TOKEN", "API_KEY"] {
+            assert!(
+                credential_may_set(ordinary),
+                "{ordinary} must reach the script"
+            );
+        }
     }
 
     #[tokio::test]

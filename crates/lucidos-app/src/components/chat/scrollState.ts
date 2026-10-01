@@ -198,17 +198,22 @@ let _navScrollEl: HTMLElement | null = null;
  *  `isWhereWeLastScrolledIt`. */
 let _navScrollTop: number | null = null;
 /** WHICH KIND of write our own last one was. Every one of them marks a
- *  navigation, so the mobile header, the render-window expansion and the mobile
- *  scroll indicator all stand down for it. What the kind adds is what a consumer
- *  may do INSTEAD of acting on the scroll:
+ *  navigation, so the render-window expansion and the mobile scroll indicator
+ *  stand down for it. What the kind adds is what a consumer may do INSTEAD of
+ *  acting on the scroll:
  *
  *  - `placement`: the app took the reader somewhere they asked to go, a chevron
  *    tap, a deep link or a saved-position restore. The mobile header reveals for
  *    one, because `.chat-exchange`'s `scroll-margin-top` clears a VISIBLE header
  *    and a half-hidden one would cover the landing.
- *  - `held`: the app is keeping a rider on the live edge (`markHeldScroll`). The
- *    header reveals for these too, and the platform-scroll correction must NOT
- *    read one as somebody placing the reader: see `isPlacementScroll`.
+ *  - `held`: the app is taking a reader TO the live edge: a ride's or a
+ *    landing's glide, a snap, a resume (`markHeldScroll`). The header reveals
+ *    for these too, and the platform-scroll correction must NOT read one as
+ *    somebody placing the reader: see `isPlacementScroll`.
+ *  - `carry`: the standing follow keeping a rider ON the live edge as the
+ *    thread moves under them (`markCarryScroll`). Held in every respect but
+ *    one: the mobile bars stay exactly where they are, since only the reader's
+ *    finger moves them (`isCarryScroll`).
  *  - `anchor`: the app moved the container to keep the reader on the SAME
  *    content while the layout changed under them (`markAnchorScroll`). Nobody
  *    has been taken anywhere, so the chrome must stay exactly where the reader
@@ -216,8 +221,11 @@ let _navScrollTop: number | null = null;
  *
  *  One field rather than a flag per consumer, so a write carrying two kinds at
  *  once is not expressible. */
-type NavScrollKind = 'placement' | 'held' | 'anchor';
+type NavScrollKind = 'placement' | 'held' | 'carry' | 'anchor';
 let _navScrollKind: NavScrollKind = 'placement';
+/** When our last write of any kind but `carry` happened. `markCarryScroll`
+ *  reads it: a carry inside that write's event window leaves its kind alone. */
+let _uncarriedWriteAt = -Infinity;
 
 /** How long after a navigation's last write its scroll event may still arrive.
  *  A `scrollTop` write does not dispatch its event synchronously: the browser
@@ -236,6 +244,7 @@ const NAV_SCROLL_EVENT_WINDOW_MS = 64;
  *  reader asking for older turns. */
 export function markNavigationScroll(el: HTMLElement, top: number) {
   _navScrollAt = nowMs();
+  _uncarriedWriteAt = _navScrollAt;
   _navScrollEl = el;
   // A PLACEMENT unless `markHeldScroll` or `markAnchorScroll` says otherwise
   // once this returns. Reset here rather than left alone, so the kind always
@@ -266,32 +275,33 @@ export function markAnchorScroll(el: HTMLElement, top: number): void {
   markNavigationScroll(el, top);
   if (_shiftTweenStart && el === resolveTarget()) _shiftTweenStart(el.scrollTop - before);
   _navScrollKind = 'anchor';
-  for (const listener of _anchorScrollListeners) listener(el);
+  for (const listener of _rebasedScrollListeners) listener(el);
 }
 
 /* ── Telling a DELTA consumer the offset was re-based ────────────────────────
- *  `isAnchorScroll` answers a scroll event, and only one arriving inside
- *  `NAV_SCROLL_EVENT_WINDOW_MS`. That is enough for a consumer reading a
- *  POSITION: a late event finds the container settled and reads the same answer
- *  either way.
+ *  Two writes move the container without taking the reader anywhere: an anchor
+ *  write and the follow's carry. `isAnchorScroll` and `isCarryScroll` answer a
+ *  scroll event, and only one arriving inside `NAV_SCROLL_EVENT_WINDOW_MS`.
+ *  That is enough for a consumer reading a POSITION: a late event finds the
+ *  container settled and reads the same answer either way.
  *
  *  It is not enough for one reading a DELTA. The mobile hide-on-scroll header
- *  is the one, and it turns every unattributed pixel into chrome sliding. A
- *  correction moves the container hundreds of pixels at once, and a late event
+ *  is the one, and it turns every unattributed pixel into chrome sliding. Either
+ *  write can move the container hundreds of pixels at once, and a late event
  *  hands the header the whole jump.
  *
  *  Whether the event is late is a race, and a large programmatic jump loses it
  *  on WebKit under load. So a delta consumer is told SYNCHRONOUSLY, at the
  *  write, and re-takes its baseline there. The event then carries a delta of
  *  zero whenever it lands, and the window stops deciding anything. */
-const _anchorScrollListeners = new Set<(el: HTMLElement) => void>();
+const _rebasedScrollListeners = new Set<(el: HTMLElement) => void>();
 
 /** Subscribe to the re-base above; returns the unsubscribe. Fires with the
  *  container AFTER the write, so a listener reading `scrollTop` sees where the
  *  browser actually settled it. */
-export function onAnchorScroll(listener: (el: HTMLElement) => void): () => void {
-  _anchorScrollListeners.add(listener);
-  return () => { _anchorScrollListeners.delete(listener); };
+export function onRebasedScroll(listener: (el: HTMLElement) => void): () => void {
+  _rebasedScrollListeners.add(listener);
+  return () => { _rebasedScrollListeners.delete(listener); };
 }
 
 /** Record that the app just REVEALED something, so the scroll the platform is
@@ -386,7 +396,7 @@ function forgetNavigationStamp(el: HTMLElement): void {
  *  edge. A history fold's hold lands there on a deep link into a long thread,
  *  and must not park the ride short of the question. */
 function isPlacementScroll(el: HTMLElement): boolean {
-  if (_navScrollKind === 'held') return false;
+  if (_navScrollKind === 'held' || _navScrollKind === 'carry') return false;
   if (_navScrollKind === 'anchor' && rideGlideInFlight()) return false;
   return isNavigationScroll(el);
 }
@@ -399,6 +409,14 @@ function isPlacementScroll(el: HTMLElement): boolean {
  *  is active rather than one container. */
 export function isAnchorScroll(el?: HTMLElement | null): boolean {
   return _navScrollKind === 'anchor' && isNavigationScroll(el);
+}
+
+/** Was this scroll event the standing follow carrying a rider down the live
+ *  edge, i.e. a `markCarryScroll` write? Read by the mobile dynamic bars, which
+ *  hold where they are for it. Takes no element by default, like
+ *  `isAnchorScroll`. */
+export function isCarryScroll(el?: HTMLElement | null): boolean {
+  return _navScrollKind === 'carry' && isNavigationScroll(el);
 }
 
 /** Is a navigation OTHER than the caller's own anchor correction driving `el`?
@@ -829,6 +847,24 @@ function markHeldScroll(el: HTMLElement, top: number) {
   rideSettlesOnTheEdge();
 }
 
+/** A held write by a rider already ON the live edge, keeping them there while
+ *  the transcript moves under them. `keepTheLiveEdge` and `settleTheRide` are
+ *  its two callers. A write taking the reader to the edge stays `held`, so a
+ *  glide, a snap and a resume keep revealing the mobile bars.
+ *
+ *  A carry landing in the same frame as such a write shares its ONE scroll
+ *  event. Stamped `carry`, that event would hold the bars the other write
+ *  reveals, leaving them away on a thread open. So the carry stays `held`
+ *  until the other write's event window has closed. */
+function markCarryScroll(el: HTMLElement, top: number) {
+  const uncarriedAt = _uncarriedWriteAt;
+  markHeldScroll(el, top);
+  _uncarriedWriteAt = uncarriedAt;
+  if (nowMs() - uncarriedAt < NAV_SCROLL_EVENT_WINDOW_MS) return;
+  _navScrollKind = 'carry';
+  for (const listener of _rebasedScrollListeners) listener(el);
+}
+
 /** Arm the standing follow at the position the caller's own scroll just reached,
  *  so the trailing scroll event of that scroll cannot retire the request it just
  *  made. Two callers and no more: `setFollowLiveEdge` (the toggle) and
@@ -1080,8 +1116,8 @@ function landingInFlight(): boolean {
 
 /** Carry the held stamp onto a scroll THE APP just wrote to hold the reader on
  *  the same content while the layout moved under them. Two writers, and they are
- *  the same act on either side of the DOM/layout line: `restoreAfterReflow` for
- *  a pane resize, `withScrollAnchor` for a toggle. Neither is the reader
+ *  the same act on either side of the DOM/layout line: `holdAcrossRelayout` for
+ *  a layout change, `withScrollAnchor` for a toggle. Neither is the reader
  *  scrolling, so the scroll event each fires must not cancel a pending landing.
  *  Whether the follow survives is decided by position instead, in
  *  `honourAnchoredMutation`.
@@ -1091,6 +1127,16 @@ function landingInFlight(): boolean {
  *  nobody asked for. */
 function carryHeldScroll(el: HTMLElement): void {
   if (_heldEl === el) holdPosition(el);
+}
+
+/** Write `top` to hold the reader on the same content while the layout moved
+ *  under them. Two callers: `restoreAfterReflow` for a pane resize, and the
+ *  mobile header's keyboard compensation (`useHideOnScroll`). An anchor write,
+ *  so the mobile bars stay put, and it carries the held stamp, so a send's
+ *  landing survives it. */
+export function holdAcrossRelayout(el: HTMLElement, top: number): void {
+  markAnchorScroll(el, top);
+  carryHeldScroll(el);
 }
 
 /** What the transcript owes the reader after the APP mutated it and corrected
@@ -2050,7 +2096,7 @@ function keepTheLiveEdge(el: HTMLElement): boolean {
   if (_follow.value !== 'riding') return false;
   if (_scrollAnimRaf !== null || hasPendingEventScroll()) return false;
   if (isAnchorScroll(el)) return false;
-  markHeldScroll(el, liveEdgeTop(el));
+  markCarryScroll(el, liveEdgeTop(el));
   return true;
 }
 
@@ -2260,7 +2306,7 @@ function settleTheRide(): void {
   if (!isWhereWeHeldIt(el)) return;
   const edge = liveEdgeTop(el);
   const short = Math.round(edge - el.scrollTop);
-  markHeldScroll(el, edge);
+  markCarryScroll(el, edge);
   // ONE correction, never a loop. The write above asked the question again on
   // its way through `markHeldScroll`, and the check's own write is not a site
   // this exists for.
@@ -3294,20 +3340,22 @@ export function pickTurnTarget(
  *
  *  A no-op when no transcript has a box, or when there is no turn in
  *  `direction`. Desktop moves DOM focus into the focusable container, so the
- *  native scroll keys follow the jump. */
-export function stepThreadTurn(direction: 1 | -1): void {
+ *  native scroll keys follow the jump. Returns the transcript it focused, so the
+ *  caller can move the focused-pane marker with it. */
+export function stepThreadTurn(direction: 1 | -1): HTMLElement | null {
   const el = resolveTarget();
-  if (!el) return;
+  if (!el) return null;
 
   // Land focus in the transcript FIRST, so continuous Arrow and Page scrolling
   // follows. Even with no turn to jump to in this direction, pressing the
   // shortcut parks focus on the scroll region to keep reading. Desktop only,
   // since mobile navigates panes and a chord has no mobile path. `preventScroll`
   // so the focus move does not fight the animation below.
-  if (!isMobile()) el.focus({ preventScroll: true });
+  const focused = isMobile() ? null : el;
+  focused?.focus({ preventScroll: true });
 
   const turns = Array.from(el.querySelectorAll<HTMLElement>(TURN_SELECTOR)).filter(isElementVisible);
-  if (turns.length === 0) return;
+  if (turns.length === 0) return focused;
   // The shared landing line, the same one a deep link rests on. All turns share
   // the CSS rule, so read it off the first one.
   const gap = turnLandingClearancePx(turns[0]);
@@ -3327,7 +3375,7 @@ export function stepThreadTurn(direction: 1 | -1): void {
   const markedTurn = navFocusElement()?.closest?.(TURN_SELECTOR) as HTMLElement | null;
   const anchorIdx = markedTurn ? turns.indexOf(markedTurn) : -1;
   const idx = pickTurnTarget(anchorIdx, tops, el.scrollTop + gap, direction, TURN_NAV_THRESHOLD_SLACK_PX);
-  if (idx === null) return; // at the end in this direction; focus already moved
+  if (idx === null) return focused; // at the end in this direction; focus already moved
   const turn = turns[idx];
 
   // We ARE jumping now, and a deliberate jump supersedes any in-flight deep-link
@@ -3369,9 +3417,10 @@ export function stepThreadTurn(direction: 1 | -1): void {
   if (isReducedMotion()) {
     cancelScrollAnim();
     markNavigationScroll(el, Math.max(0, targetOf(el)));
-    return;
+    return focused;
   }
   animateScroll(targetOf);
+  return focused;
 }
 
 /** Which collapse store a `.chat-exchange` toggle targets. `response` folds the
@@ -3565,11 +3614,9 @@ export function makeScrollObservers(el: HTMLElement) {
     // An ANCHOR write, which is what keeps the mobile header still across it.
     // Unmarked, a wide reflow slid the chrome by its own delta and covered the
     // line this exists to hold. Same act as `withScrollAnchor`'s correction.
-    markAnchorScroll(el, el.scrollTop + shift);
-    // The app holding the reader on the same content, not the reader taking
-    // over. The growth branch usually re-stamps a line later, but not while it
-    // stands down for a tween or a pending landing. See `carryHeldScroll`.
-    carryHeldScroll(el);
+    // The growth branch usually re-stamps a line later, but not while it stands
+    // down for a tween or a pending landing, hence the carried stamp.
+    holdAcrossRelayout(el, el.scrollTop + shift);
   }
 
   // Scroll events. Whoever moved the container, the answer is the same:

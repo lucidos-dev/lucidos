@@ -64,10 +64,18 @@ describe('the file preview column', () => {
 });
 
 describe('the path row', () => {
-  it('breaks a path anywhere, since a path offers no break opportunity of its own', () => {
-    // The row exists to show a whole path; ordinary wrapping would find no
-    // space in `system-knowhow/workspace-audit.md` and run it out of the pane.
+  it('can still break a folder or name wider than the whole row', () => {
     expect(soleRule('file-preview-path').props.get('overflow-wrap')).toBe('anywhere');
+  });
+
+  it('wraps between crumbs, never between a folder and its separator', () => {
+    expect(soleRule('file-preview-path-crumb').props.get('white-space')).toBe('nowrap');
+  });
+
+  it('moves the file name to the next line whole, rather than breaking it at a hyphen', () => {
+    const name = soleRule('file-preview-path-name').props;
+    expect(name.get('display')).toBe('inline-block');
+    expect(name.get('max-width')).toBe('100%');
   });
 
   it('takes the content pane structural gutter from the spacing scale', () => {

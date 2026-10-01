@@ -156,21 +156,23 @@ export function MarketplacesSection() {
           aria-label="Marketplace git URL"
           disabled={saving}
         />
-        {/* A display name is prose, unlike the URL beside it: the keyboard's
-            own capitalization is what a name wants, and an autocapitalized URL
-            is a broken one. */}
-        <input
-          class="settings-text-input app-store-name-input"
-          value={name}
-          {...PROSE_TEXT_ATTRS}
-          onInput={(e) => setName((e.currentTarget as HTMLInputElement).value)}
-          placeholder="Name"
-          aria-label="Marketplace name"
-          disabled={saving}
-        />
-        <button class="action-btn" type="submit" disabled={saving || !source.trim()}>
-          Add
-        </button>
+        <div class="app-store-marketplace-form-tail">
+          {/* A display name is prose, unlike the URL beside it: the keyboard's
+              own capitalization is what a name wants, and an autocapitalized URL
+              is a broken one. */}
+          <input
+            class="settings-text-input app-store-name-input"
+            value={name}
+            {...PROSE_TEXT_ATTRS}
+            onInput={(e) => setName((e.currentTarget as HTMLInputElement).value)}
+            placeholder="Name"
+            aria-label="Marketplace name"
+            disabled={saving}
+          />
+          <button class="action-btn" type="submit" disabled={saving || !source.trim()}>
+            Add
+          </button>
+        </div>
       </form>
 
       {loadable.status === 'failed' ? (

@@ -11,6 +11,12 @@ import type { OverflowMenuContext } from '../shared/OverflowMenu';
 import { useTouchActivated } from '../../hooks/useTouchActivated';
 import { blurPromptInputIfFocused } from './promptFocus';
 import { PROTECTED_SURFACE } from '../shared/protectedSurface';
+import { tooltipWithShortcut } from '../../store/actions/keybindings';
+import { getDraft } from '../../store/composeDrafts';
+import { hasInFlightUploads } from '../../store/pendingUploads';
+import { composeHasContent } from './prompt-input-helpers';
+
+const DIFF_TOOLTIP = 'Show what this thread changed';
 
 /** The close-set kinds the banner renders. Two other kinds come from the same
  *  selector and live elsewhere, so both are excluded. Discard-draft is a
@@ -238,14 +244,60 @@ function diffAction(threadId: string): HeaderActionSpec {
     key: 'thread-diff',
     dataRole: 'thread-diff',
     label: 'Diff',
-    tooltip: 'Show what this thread changed',
+    tooltip: tooltipWithShortcut(DIFF_TOOLTIP, 'showThreadDiff'),
     icon: () => <DiffIcon />,
     render: (attrs) => <DiffButton threadId={threadId} attrs={attrs} />,
-    onClick: () => {
-      blurPromptInputIfFocused();
-      void viewThreadCcDiff(threadId);
-    },
+    onClick: () => openThreadDiff(threadId),
   };
+}
+
+/** Open a thread's branch diff, dropping the keyboard first. Every Diff entry
+ *  point runs this: the button, its folded row and the shortcut. */
+function openThreadDiff(threadId: string): void {
+  blurPromptInputIfFocused();
+  void viewThreadCcDiff(threadId);
+}
+
+/** The banner the composer row draws, or null when it draws the standalone
+ *  pair instead: mid-turn, or with a draft in the composer, since Send then
+ *  takes the banner's place. The composer and the shortcuts both decide here. */
+export function composerBannerState(waitingState: WaitingState | null, hasContent: boolean): BannerState | null {
+  return !hasContent && waitingState && waitingState.type !== 'canceling' ? waitingState : null;
+}
+
+/** The focused composer's banner state, read the way `PromptInput` reads it. */
+function focusedComposerBannerState(): BannerState | null {
+  const id = focusedThreadId.value;
+  const draft = getDraft(id);
+  const hasContent = composeHasContent(draft.text, draft.image_hashes.length, hasInFlightUploads(id));
+  return composerBannerState(getWaitingState(), hasContent);
+}
+
+/** The Diff shortcut. It opens the focused thread's diff only when the
+ *  composer row draws a Diff button. */
+export function showFocusedThreadDiff(): void {
+  const banner = focusedComposerBannerState();
+  const members = banner ? getBannerActions(banner) : getStandaloneActions();
+  const id = focusedThreadId.value;
+  if (id && members.some((m) => m.key === 'thread-diff')) openThreadDiff(id);
+}
+
+/** The Apply shortcut: the Apply the composer row draws, or its standing apply.
+ *
+ *  A busy banner (an apply, discard or archive in flight) draws neither, so the
+ *  press does nothing. A press already arming the standing apply is dropped,
+ *  as the button drops it. */
+export function applyFocusedThreadChange(): void {
+  const banner = focusedComposerBannerState();
+  if (banner) {
+    if (banner.type === 'actions' && !banner.isArchiving) {
+      void banner.actions.find((a) => a.kind === 'apply')?.invoke();
+    }
+    return;
+  }
+  const id = focusedThreadId.value;
+  if (!id || armingStandingApplyThreadIds.value.has(id)) return;
+  void resolveThreadActions(id).find((a) => a.kind === 'apply_when_settled')?.invoke();
 }
 
 /** Bring a set-aside change back to pending, from its own thread. */
@@ -357,7 +409,7 @@ function ChangeActionSplitButton({
     <SplitButton
       primaryLabel={primary.label}
       primaryClassName="action-btn action-btn-confirm"
-      primaryTooltip={primary.tooltip}
+      primaryTooltip={tooltipWithShortcut(primary.tooltip ?? primary.label, 'applyChange')}
       onPrimary={() => void primary.invoke()}
       caretClassName="action-btn action-btn-confirm"
       caretAriaLabel="More change actions"
@@ -390,17 +442,14 @@ function ChangeActionSplitButton({
  *  `installActionBtnBlurListener` fires for an `.action-btn`, which this no
  *  longer is, and a touch-activated face suppresses the click it listens on. */
 export function DiffButton({ threadId, attrs }: { threadId: string; attrs?: Record<string, string> }) {
-  const activate = useTouchActivated(() => {
-    blurPromptInputIfFocused();
-    void viewThreadCcDiff(threadId);
-  });
+  const activate = useTouchActivated(() => openThreadDiff(threadId));
   return (
     <button
       {...attrs}
       class="icon-btn header-icon"
       data-role="thread-diff"
       aria-label="Diff"
-      data-tooltip="Show what this thread changed"
+      data-tooltip={tooltipWithShortcut(DIFF_TOOLTIP, 'showThreadDiff')}
       data-tooltip-longpress=""
       onTouchEnd={activate.onTouchEnd}
       onClick={activate.onClick}
@@ -452,7 +501,7 @@ export function StandingApplyButton({
       data-role="standing-apply"
       aria-pressed={armed}
       aria-label={action.label}
-      data-tooltip={action.tooltip}
+      data-tooltip={tooltipWithShortcut(action.tooltip ?? action.label, 'applyChange')}
       data-tooltip-longpress=""
       onClick={() => {
         if (busy) return;

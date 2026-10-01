@@ -104,7 +104,7 @@ test.describe('Trigger groups — create / delete', () => {
     // Create — empty group lands with a (0) badge.
     await createGroup(page, groupName);
     const section = groupSection(page, groupName);
-    await expect(section.locator('.trigger-group-count')).toHaveText('(0)');
+    await expect(section.locator('.section-count-open')).toHaveText('0');
 
     // Delete: an empty group's delete icon is enabled; confirm removes the section.
     const deleteBtn = section.locator('.trigger-group-delete');
@@ -155,7 +155,7 @@ test.describe('Trigger groups — create / delete', () => {
     const sectionB = groupSection(page, groupB);
     await expect(sectionB.locator('.trigger-row .list-row-name', { hasText: triggerName }))
       .toBeVisible({ timeout: 10_000 });
-    await expect(sectionB.locator('.trigger-group-count')).toHaveText('(1)', { timeout: 10_000 });
+    await expect(sectionB.locator('.section-count-open')).toHaveText('1', { timeout: 10_000 });
     const deleteWhileFull = sectionB.locator('.trigger-group-delete');
     await expect(deleteWhileFull).toBeEnabled();
     await expect(deleteWhileFull).toHaveAttribute('data-tooltip', 'Move triggers out first');
@@ -168,7 +168,7 @@ test.describe('Trigger groups — create / delete', () => {
     await expect(page.locator('.toast', { hasText: 'Move or delete the 1 trigger' }))
       .toBeVisible({ timeout: 10_000 });
     await expect(sectionB).toHaveCount(1);
-    await expect(sectionB.locator('.trigger-group-count')).toHaveText('(1)');
+    await expect(sectionB.locator('.section-count-open')).toHaveText('1');
 
     // 4. Empty the group by deleting its member trigger.
     await clearToasts(page);
@@ -180,7 +180,7 @@ test.describe('Trigger groups — create / delete', () => {
       .toHaveCount(0, { timeout: 10_000 });
 
     // Badge back to (0); delete re-enabled.
-    await expect(sectionB.locator('.trigger-group-count')).toHaveText('(0)', { timeout: 10_000 });
+    await expect(sectionB.locator('.section-count-open')).toHaveText('0', { timeout: 10_000 });
     const deleteB = sectionB.locator('.trigger-group-delete');
     await expect(deleteB).toBeEnabled();
 

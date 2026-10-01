@@ -437,7 +437,9 @@ The split is deliberately this narrow. It keyed on `AbortCause::is_transient()` 
 
 That guard matters far more for a coding agent than for the *Lucidos Agent*, and the two channels visibly disagreed until it was applied uniformly. A chat turn's loop emits nothing after its own terminator. A coding-agent turn emits four more things, because the subprocess outlives the terminal event.
 
-An interruption (engine restart, watchdog kill) emits `ResponseAborted` while the agent is still alive. `external_terminal_emitted` suppresses only the duplicate *terminal*, not the drain, so the final `CodingAgentTextStreamed` / `CodingAgentToolResult` land milliseconds later. Then comes the `ChangeProposed` the agent commits on its way out, then `CodingAgentIdled` and `SessionEnded`. Before the guard covered all four, that trailing traffic walked an interrupted coding-agent thread from `failed` back to `idle` and the dot vanished. An interrupted Lucidos Agent thread kept it. Backend-agnostic: the drain lives in the shared `agent_session` layer, so Claude Code and Codex behave identically.
+An interruption (engine restart, watchdog kill) emits `ResponseAborted` while the agent is still alive. `external_terminal_emitted` then suppresses the duplicate *terminal* and drops the agent's further text, thoughts, tool calls and tool results. That includes any reply to the restart's interrupt, which Claude Code reports to the model as a user rejection. Only text the agent streamed before the interruption can still land, as a `CodingAgentTextStreamed` milliseconds later.
+
+Then comes the `ChangeProposed` the agent commits on its way out, then `CodingAgentIdled` and `SessionEnded`. Before the guard covered all four, that trailing traffic walked an interrupted coding-agent thread from `failed` back to `idle` and the dot vanished. An interrupted Lucidos Agent thread kept it. Backend-agnostic: the drain lives in the shared `agent_session` layer, so Claude Code and Codex behave identically.
 
 `ResponseFailed` and `CodingAgentIdled` are both triggerable today. The cleanest wiring for "notify me when a coding agent errors" is:
 

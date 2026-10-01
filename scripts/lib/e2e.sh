@@ -861,6 +861,27 @@ stop_e2e_engine() {
     rm -f "$ENGINE_PIDFILE"
 }
 
+# ── settle_e2e_workspace_tree ─────────────────────────────────────────────
+# The workspace TREE starts committed for the same reason the database starts
+# empty: a run must not inherit the last one's state. Browser specs remove the
+# fixtures the engine committed with a raw rmSync. Every apply refuses a dirty
+# tree, so those leftovers fail the next run's apply tests. Committing records
+# them and destroys nothing. Call it with the engine stopped, so nothing else
+# writes the tree. Only the workspace's own repo is touched, never a parent one.
+settle_e2e_workspace_tree() {
+    local ws="$E2E_WORKSPACE" top
+    top="$(git -C "$ws" rev-parse --show-toplevel 2>/dev/null)" || return 0
+    [ "$(cd "$top" && pwd -P)" = "$(cd "$ws" && pwd -P)" ] || return 0
+    [ -n "$(git -C "$ws" status --porcelain 2>/dev/null)" ] || return 0
+    echo "Committing what an earlier run left uncommitted in the e2e workspace..."
+    if ! git -C "$ws" add -A ||
+        ! git -C "$ws" -c user.name=Lucidos -c user.email=lucidos@local \
+            commit -q -m "e2e: settle the tree an earlier run left behind"; then
+        echo "WARNING: could not commit the e2e workspace tree; apply tests may refuse it as dirty." >&2
+    fi
+    return 0
+}
+
 # ── reset_e2e_database ──────────────────────────────────────────────────
 # Bring the e2e database up EXACTLY like a brand-new workspace's: drop it,
 # recreate it, and boot the engine on it so sqlx runs the ENTIRE migration chain
@@ -890,6 +911,7 @@ reset_e2e_database() {
     setup_postgres
 
     stop_e2e_engine
+    settle_e2e_workspace_tree
 
     local db
     db="$(workspace_database_name)"

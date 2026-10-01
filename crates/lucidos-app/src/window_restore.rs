@@ -752,22 +752,6 @@ fn resolve_logged(remembered: &RememberedFrame, displays: &Displays, label: &str
     resolved
 }
 
-/// The frame to BUILD a window at, for a workspace the record remembers.
-///
-/// Resolved against the desk and not judged, because the window does not exist
-/// yet. [`clamp_restored_geometry`] judges it once the builder has placed it.
-/// An unreadable desk gives back the raw frame.
-pub(crate) fn frame_to_build(
-    app: &tauri::AppHandle,
-    label: &str,
-    remembered: &RememberedFrame,
-) -> Rect {
-    match policy_and_displays(app, label) {
-        Some((_, displays)) => resolve_logged(remembered, &displays, label),
-        None => remembered.frame,
-    }
-}
-
 /// The frame a new window cascades from, when `window` can be one.
 ///
 /// `None` for a fullscreen window, whose frame is the whole screen and no
@@ -849,14 +833,16 @@ pub(crate) fn sanitized_frame(
 ///
 /// For a window whose geometry the client did NOT choose. Every caller runs
 /// just before it reaches the screen, which is the rule (ADR 0193): the startup
-/// show when no frame is remembered, `reopen_client`, `open_app_window`, and
-/// `front_window` for one brought forward that is not up yet. NOT `setup`,
+/// show when no frame is remembered, `reopen_client`, and `front_window` for
+/// one brought forward that is not up yet. NOT `setup`,
 /// where tao's deferred setters have not landed and the read is of the geometry
 /// the window was born at.
 ///
 /// Where the client DOES choose the frame, [`sanitized_frame`] judges it first
 /// and this never runs. Clamping after a placement would read the geometry the
-/// placement has not replaced yet.
+/// placement has not replaced yet. That includes a window BUILT at its frame:
+/// AppKit re-homes one born off the primary display, so a read straight after
+/// the build sees a frame nobody chose (see `app_window::seat_at_birth`).
 ///
 /// A window already ON screen is not a caller, and `front_window` gates on that
 /// for the reason its own comment gives.
@@ -968,6 +954,25 @@ pub(crate) fn live_frame(window: &tauri::Window) -> Option<Rect> {
         return None;
     };
     Some(Rect::from_physical(position, size, scale))
+}
+
+/// The height of the primary display's whole screen, in points, or `None` when
+/// it cannot be read.
+///
+/// AppKit measures a window's y UP from the primary's bottom edge, and this
+/// module measures it DOWN from the primary's top edge. This height is the
+/// whole difference between the two.
+pub(crate) fn primary_screen_height(app: &tauri::AppHandle) -> Option<i64> {
+    let primary = app.primary_monitor().ok().flatten()?;
+    let height = panel_points(&primary).frame.height;
+    (height > 0).then_some(height)
+}
+
+/// The point AppKit's `setFrameTopLeftPoint:` takes to put `frame` where it
+/// says. The same flip tao's `window_position` makes, so a seat and a tao move
+/// agree on where a frame is.
+pub(crate) fn appkit_top_left(frame: Rect, primary_screen_height: i64) -> (f64, f64) {
+    (frame.x as f64, (primary_screen_height - frame.y) as f64)
 }
 
 /// A monitor as the clamp sees it: its name, its usable frame and its whole
@@ -1244,6 +1249,39 @@ mod tests {
                 "scale {scale}"
             );
         }
+    }
+
+    // ── Seating a window in AppKit's space (ADR 0334) ────────────────────────
+
+    // The reported desk: a 1440-tall primary, the built-in below it. AppKit
+    // measures up from the primary's bottom edge, so the built-in's top edge
+    // is y=0 there and its bottom is -1117. A restored window fills it exactly.
+    #[test]
+    fn a_built_in_frame_seats_on_the_built_in() {
+        let frame = Rect {
+            x: 1763,
+            y: 1473,
+            width: 1728,
+            height: 1084,
+        };
+        let (x, top) = appkit_top_left(frame, 1440);
+        assert_eq!((x, top), (1763.0, -33.0));
+        assert_eq!(
+            top - frame.height as f64,
+            -1117.0,
+            "bottom on the built-in's"
+        );
+    }
+
+    #[test]
+    fn a_primary_frame_seats_under_the_primary_top_edge() {
+        let frame = Rect {
+            x: 0,
+            y: 30,
+            width: 1280,
+            height: 1410,
+        };
+        assert_eq!(appkit_top_left(frame, 1440), (0.0, 1410.0));
     }
 
     // ── Which frames are the client's rather than the user's (ADR 0215) ──────

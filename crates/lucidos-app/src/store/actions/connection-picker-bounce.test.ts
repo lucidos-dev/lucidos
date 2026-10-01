@@ -10,20 +10,29 @@
 import { describe, it, expect } from 'vitest';
 import { shouldBounceToPicker } from './connection';
 
+const stranded = { connectedEver: false, engineAnswered: false, pickerHref: '/~/?pick', alreadyBounced: false };
+
 describe('shouldBounceToPicker', () => {
   it('bounces on a cold boot that never connected, with a reachable picker', () => {
-    expect(shouldBounceToPicker({ connectedEver: false, pickerHref: '/~/?pick', alreadyBounced: false })).toBe(true);
+    expect(shouldBounceToPicker(stranded)).toBe(true);
   });
 
   it('does NOT bounce once we have connected this session (no mid-work yank)', () => {
-    expect(shouldBounceToPicker({ connectedEver: true, pickerHref: '/~/?pick', alreadyBounced: false })).toBe(false);
+    expect(shouldBounceToPicker({ ...stranded, connectedEver: true })).toBe(false);
+  });
+
+  // An update swapped the engine under a loaded page: its threads came from the
+  // old engine, and every health probe after that failed until the new one was
+  // up. That is a restart, not a stranded shell.
+  it('does NOT bounce a page its engine already served, whatever health says', () => {
+    expect(shouldBounceToPicker({ ...stranded, engineAnswered: true })).toBe(false);
   });
 
   it('does NOT bounce when there is no picker (legacy direct engine, href null)', () => {
-    expect(shouldBounceToPicker({ connectedEver: false, pickerHref: null, alreadyBounced: false })).toBe(false);
+    expect(shouldBounceToPicker({ ...stranded, pickerHref: null })).toBe(false);
   });
 
   it('does NOT bounce again once it has bounced (one-shot, loop-safe)', () => {
-    expect(shouldBounceToPicker({ connectedEver: false, pickerHref: '/~/?pick', alreadyBounced: true })).toBe(false);
+    expect(shouldBounceToPicker({ ...stranded, alreadyBounced: true })).toBe(false);
   });
 });

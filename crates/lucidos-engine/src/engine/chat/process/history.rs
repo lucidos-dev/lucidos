@@ -134,10 +134,8 @@ impl LucidosEngine {
                     // Engine restart loses the per-thread loaded-knowhow set,
                     // which is in memory only. Replaying this thread's
                     // load_knowhow results keeps the dedupe below working after
-                    // a cold start. Idempotent, so only the empty slot needs
-                    // it: the warm path was populated on the prior turn.
-                    let docs_empty = self.loaded_knowhow.for_thread(thread_id).await.is_empty();
-                    if docs_empty {
+                    // a cold start, and after the store evicted this thread.
+                    if self.loaded_knowhow.needs_replay(thread_id).await {
                         self.loaded_knowhow
                             .recover_for_thread(thread_id, &events)
                             .await;

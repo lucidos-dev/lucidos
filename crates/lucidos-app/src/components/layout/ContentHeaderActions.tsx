@@ -7,7 +7,7 @@ import { sideBySideDiffAvailable } from '../../store/diffBody';
 import { wrapToggleAvailable } from '../../store/previewWrap';
 import { closeUrl, openLocalFile, openUrlOutsideApp } from '../../store/actions/artifacts';
 import { previewDiskPath } from '../../utils/previewPath';
-import { getAppFrameSrc, getVisibleAppFrame, getVisibleAppPanel, exitAppFullscreen, exitPseudoFullscreen, toggleAppSearch, popOutApp } from '../../store/actions/apps';
+import { getAppFrameSrc, exitPseudoFullscreen, toggleAppSearch, popOutApp, toggleAppFullscreen } from '../../store/actions/apps';
 import { panelRefreshAvailable, runPanelRefresh } from '../../store/panelRefresh';
 import { DIFF_REFRESH_PINNED, panelRefreshLive } from './RefreshIndicator';
 import { nativeFullscreenElement } from '../../store/appFullscreenHost';
@@ -139,6 +139,46 @@ export function mobileRefreshActionShown(overlay: PanelOverlay, available: boole
   return predatesPull && panelRefreshLive(overlay, available);
 }
 
+/** What a file preview's header offers, decided once for the header and the
+ *  shortcuts. Editing hides the view toggles, since they would fight the draft. */
+function filePreviewOffers(path: string) {
+  const ext = path.split('.').pop()?.toLowerCase() || '';
+  const repo = parseRepoPath(path);
+  // Repo HTML has no rendered view (it shows as source — see REPO_RENDERABLE_EXTS),
+  // so the source/rendered toggle is suppressed for it.
+  const hasRendered = (repo ? REPO_RENDERABLE_EXTS : RENDERABLE_EXTS).includes(ext);
+  // Repo files are read at a git ref (not the live workspace), so they're not
+  // inline-editable; only data files under a mutable prefix are.
+  const editable = !repo && isEditableDataFile(path);
+  const editing = filePreviewEditing.value && editable;
+  return { isDiff: repo?.mode === 'diff', hasRendered, editable, editing };
+}
+
+/** The open file preview's offers, or null when the pane shows no preview. */
+function openFilePreviewOffers(): ReturnType<typeof filePreviewOffers> | null {
+  const overlay = panelOverlay.value;
+  return overlay?.type === 'file-preview' ? filePreviewOffers(overlay.path) : null;
+}
+
+/** Flips source and rendered, where the header offers it. The header button
+ *  and the shortcut both run this. */
+export function toggleSourceView(): void {
+  const offers = openFilePreviewOffers();
+  if (offers && !offers.editing && offers.hasRendered) filePreviewSource.value = !filePreviewSource.value;
+}
+
+/** Flips line wrapping, where the header offers it. The header button and
+ *  the shortcut both run this. */
+export function toggleLineWrap(): void {
+  const offers = openFilePreviewOffers();
+  if (offers && !offers.editing && wrapToggleAvailable.value) filePreviewWrap.value = !filePreviewWrap.value;
+}
+
+/** The fullscreen shortcut: the header's own toggle, offered over an app. */
+export function toggleAppFullscreenIfShown(): void {
+  if (panelOverlay.value?.type === 'app-ui') toggleAppFullscreen();
+}
+
 interface Props {
   /** Which header this copy belongs to. Both are mounted at once and only one
    *  is visible, and the two collapse completely differently (see the render
@@ -182,63 +222,6 @@ export function ContentHeaderActions({ layout }: Props) {
 
   const isFullscreen = isNativeFullscreen || isPseudo;
 
-  function toggleFullscreen() {
-    // Already fullscreen (native, or the CSS fallback): come back to the normal
-    // layout. Shared with the navigation that has to reveal something other
-    // than the app, so there is one definition of how to leave.
-    if (exitAppFullscreen()) return;
-
-    // Try native fullscreen on the app PANEL (not the iframe), fall back to CSS
-    // pseudo-fullscreen. The panel is the target because a natively fullscreen
-    // element is painted alone, and an iframe renders no DOM children: with the
-    // iframe fullscreen the host had nowhere to put its own modals and toasts,
-    // so an app's previewFile / confirm / prompt showed nothing. The panel can
-    // hold them, and OverlayLayer portals them in.
-    const frame = getVisibleAppFrame();
-    if (!frame) return;
-
-    // No panel to go fullscreen INSIDE means the host would have nowhere to
-    // paint its overlays there, so take the CSS fallback rather than leaving the
-    // button dead: pseudo-fullscreen is a stacking question, and
-    // --z-app-fullscreen already puts the host's modals and toasts above it.
-    const panel = getVisibleAppPanel();
-    if (!panel) {
-      appPseudoFullscreen.value = true;
-      return;
-    }
-
-    const anyPanel = panel as unknown as Record<string, unknown>;
-    const request = (typeof anyPanel.requestFullscreen === 'function' && anyPanel.requestFullscreen.bind(panel))
-      || (typeof anyPanel.webkitRequestFullscreen === 'function' && anyPanel.webkitRequestFullscreen.bind(panel));
-
-    if (request) {
-      // `Promise.resolve` + try/catch, not a bare `.then`: the UNPREFIXED
-      // request returns a promise, but `webkitRequestFullscreen` returns void,
-      // so calling `.then` on the result throws a TypeError synchronously on a
-      // prefixed-only engine, inside the click handler, taking the CSS fallback
-      // in the catch down with it and leaving the button dead. (A prefixed
-      // engine reports failure through `webkitfullscreenerror` instead, which
-      // this does not observe; the user's next press still falls back.)
-      //
-      // Focus the frame, not the panel: fullscreen moves focus to the element
-      // that requested it, and the app is what the user is about to type into.
-      try {
-        Promise.resolve(request() as Promise<void> | undefined)
-          .then(() => frame.focus())
-          .catch(() => {
-            // Native request rejected (common on iOS), so use the CSS fallback.
-            appPseudoFullscreen.value = true;
-          });
-      } catch {
-        // Threw synchronously (a disallowed request): same fallback.
-        appPseudoFullscreen.value = true;
-      }
-    } else {
-      // Fullscreen API completely unavailable — CSS fallback
-      appPseudoFullscreen.value = true;
-    }
-  }
-
   // ── Build ordered action list — each key claimed exactly once ──
   const actions: HeaderActionSpec[] = [];
   const claimed = new Set<string>();
@@ -264,11 +247,13 @@ export function ContentHeaderActions({ layout }: Props) {
   if (overlay?.type === 'app-ui') {
     const popout = appPopoutAction();
     if (popout) addAction(popout);
+    const label = isFullscreen ? 'Exit fullscreen' : 'Fullscreen';
     addAction({
       key: 'fullscreen',
-      label: isFullscreen ? 'Exit fullscreen' : 'Fullscreen',
+      label,
+      tooltip: tooltipWithShortcut(label, 'toggleAppFullscreen'),
       icon: () => (isFullscreen ? <ExitFullscreenIcon /> : <FullscreenIcon />),
-      onClick: toggleFullscreen,
+      onClick: toggleAppFullscreen,
       extraClass: 'app-fullscreen',
     });
   } else if (overlay?.type === 'url-preview') {
@@ -282,16 +267,7 @@ export function ContentHeaderActions({ layout }: Props) {
       onClick: closeUrl,
     });
   } else if (overlay?.type === 'file-preview') {
-    const ext = overlay.path.split('.').pop()?.toLowerCase() || '';
-    const repo = parseRepoPath(overlay.path);
-    const isDiff = repo?.mode === 'diff';
-    // Repo HTML has no rendered view (it shows as source — see REPO_RENDERABLE_EXTS),
-    // so the source/rendered toggle is suppressed for it.
-    const hasRendered = (repo ? REPO_RENDERABLE_EXTS : RENDERABLE_EXTS).includes(ext);
-    // Repo files are read at a git ref (not the live workspace), so they're not
-    // inline-editable; only data files under a mutable prefix are.
-    const editable = !repo && isEditableDataFile(overlay.path);
-    const editing = filePreviewEditing.value && editable;
+    const { isDiff, hasRendered, editable, editing } = filePreviewOffers(overlay.path);
 
     // While editing, Save/Cancel live in the editor body (FilePreviewInline) and
     // refresh/source-toggle would fight the draft — so the header drops them and
@@ -334,11 +310,13 @@ export function ContentHeaderActions({ layout }: Props) {
       }
       if (hasRendered) {
         const isSource = filePreviewSource.value;
+        const label = isSource ? 'Show rendered' : 'Show source';
         addAction({
           key: 'source-toggle',
-          label: isSource ? 'Show rendered' : 'Show source',
+          label,
+          tooltip: tooltipWithShortcut(label, 'toggleSourceView'),
           icon: () => (isSource ? <EyeIcon /> : <CodeIcon />),
-          onClick: () => { filePreviewSource.value = !isSource; },
+          onClick: toggleSourceView,
         });
       }
       // Only over the line-numbered source view, the one body wrapping acts on
@@ -347,11 +325,13 @@ export function ContentHeaderActions({ layout }: Props) {
       // pinned-gutter pan is the other half of the same choice.
       if (wrapToggleAvailable.value) {
         const wrapOn = filePreviewWrap.value;
+        const label = wrapOn ? 'Stop wrapping long lines' : 'Wrap long lines';
         addAction({
           key: 'wrap-toggle',
-          label: wrapOn ? 'Stop wrapping long lines' : 'Wrap long lines',
+          label,
+          tooltip: tooltipWithShortcut(label, 'toggleLineWrap'),
           icon: () => <WrapTextIcon />,
-          onClick: () => { filePreviewWrap.value = !wrapOn; },
+          onClick: toggleLineWrap,
           active: wrapOn,
           extraClass: 'file-preview-wrap-toggle',
         });

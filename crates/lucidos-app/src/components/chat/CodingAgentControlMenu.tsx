@@ -1,3 +1,4 @@
+import { tooltipWithShortcut } from '../../store/actions/keybindings';
 import { Fragment } from 'preact';
 import { useSignal, useSignalEffect, signal, untracked } from '@preact/signals';
 import { useEffect, useRef } from 'preact/hooks';
@@ -696,7 +697,7 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
           disabled={...} caused intermittent UX issues during Claude Code session startup races. */}
       <button
         class={`icon-btn header-icon commands-btn${hasAnyCommands(controlCommands.value, effectiveBuiltinCommands, effectiveSkillCommands) ? ' commands-btn-active' : ''}`}
-        data-tooltip={`${menuLabel} controls`}
+        data-tooltip={tooltipWithShortcut(`${menuLabel} controls`, 'openAgentMenu')}
         aria-label={`${menuLabel} controls`}
         onMouseDown={keepFocusOnPress}
         onClick={() => {

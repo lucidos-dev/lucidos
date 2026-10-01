@@ -40,7 +40,7 @@ import { CheckIcon, ChevronRightIcon, CloseIcon } from '../shared/icons';
 /** Which of the four surfaces this is. Carried as `data-kind` for tests and
  *  for any kind-specific CSS; the row's LOOK never branches on it, which is
  *  what keeps the four coherent. */
-export type EventRowKind = 'wait' | 'delivery' | 'child' | 'trigger' | 'held' | 'form' | 'change';
+export type EventRowKind = 'wait' | 'delivery' | 'child' | 'trigger' | 'held' | 'form' | 'change' | 'resume' | 'boundary';
 
 /** How the state WORD is tinted. The tint groups the word, it never replaces
  *  it: every state is legible as text, so the row survives a colourblind reader
@@ -67,7 +67,9 @@ const VERDICT_GLYPH: Partial<Record<EventRowTone, () => preact.JSX.Element>> = {
 export type EventRowFact =
   | EventRowChip
   | { kind: 'text'; text: string }
-  | { kind: 'glue'; text: string };
+  | { kind: 'glue'; text: string }
+  /** Markup the row cannot spell as text, such as a link to a thread. */
+  | { kind: 'node'; node: ComponentChildren };
 
 /** The event-type chip, optionally the row's jump. */
 export interface EventRowChip {
@@ -75,6 +77,10 @@ export interface EventRowChip {
   /** The raw event type. The chip shows it in plain words (`plainEventName`)
    *  and keeps the raw type on its tooltip. */
   name: string;
+  /** Words for the chip in place of the event's plain name, when the event's
+   *  own reason says more (a hardening reminder reads "hardening missing"). The
+   *  raw type stays on the tooltip. */
+  label?: string;
   /** The chip opens a sentence, so its plain name takes a capital. */
   sentenceStart?: boolean;
   /** A quiet qualifier after the name ("matching only", "6 conditions"). Styled
@@ -242,6 +248,8 @@ function renderFact(fact: EventRowFact, i: number): ComponentChildren {
       return <span key={`g${i}`} class="event-row-glue">{fact.text}</span>;
     case 'text':
       return <span key={`t${i}`}>{fact.text}</span>;
+    case 'node':
+      return <span key={`n${i}`}>{fact.node}</span>;
   }
 }
 
@@ -262,7 +270,7 @@ function renderFact(fact: EventRowFact, i: number): ComponentChildren {
  *  it is reachable by keyboard and announces itself. Its accessible name says
  *  what pressing it does, because the visible text says only what the event IS. */
 export function eventNameChip(chip: EventRowChip, key?: string): ComponentChildren {
-  const plain = plainEventName(chip.name);
+  const plain = chip.label ?? plainEventName(chip.name);
   const text = chip.sentenceStart ? plain.charAt(0).toUpperCase() + plain.slice(1) : plain;
   // The space is real text so a copied chip reads "coding agent stopped working 6 conditions".
   const note = chip.note && [' ', <span key="note" class="event-name-note">{chip.note}</span>];

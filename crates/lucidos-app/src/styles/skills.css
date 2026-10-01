@@ -176,62 +176,6 @@
 .trigger-group-members {
     display: flex;
     flex-direction: column;
-    gap: 0.125rem;
-}
-
-/* A group heading is a bold title over a hairline, on the shared 1rem gutter:
-   its chevron lines up with the trigger text below it, and the space above it
-   sets one section off from the next. No fill, so the triggers stay the
-   loudest thing on the panel. */
-.trigger-group-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: var(--space-sm);
-    margin: var(--space-xl) var(--space-lg) var(--space-xs);
-    padding-bottom: var(--space-xs);
-    border-bottom: 1px solid var(--border-color);
-    user-select: none;
-    /* Sets the size the name and the inline rename input inherit. Without it
-       they fell through to the root (18px on mobile, 16px on desktop), making a
-       group heading the largest text on the panel, above the trigger titles it
-       heads. The count and chevron keep their own smaller tokens. */
-    font-size: var(--font-size-md);
-}
-
-.trigger-group-section:first-child .trigger-group-header {
-    margin-top: 0;
-}
-
-/* The synthetic Ungrouped heading has a toggle but no action buttons. This is
-   the height those buttons give a real heading, so both headings match. */
-.trigger-group-header-ungrouped {
-    min-height: calc(2.25rem + var(--space-xs));
-}
-
-.trigger-group-toggle {
-    flex: 1;
-    display: flex;
-    align-items: center;
-    gap: 0.375rem;
-    background: none;
-    border: none;
-    padding: 0;
-    cursor: pointer;
-    text-align: left;
-    color: inherit;
-    font: inherit;
-    /* `font` resets font-feature-settings to initial; keep inheriting it
-       so a Fira Code user does not get ligatures back here. */
-    font-feature-settings: inherit;
-    min-width: 0;
-}
-
-.trigger-group-chevron {
-    color: var(--text-muted);
-    font-size: var(--font-size-2xs);
-    width: 0.75rem;
-    flex-shrink: 0;
 }
 
 /* Holds the name and the rename field in one box so the field can sit exactly
@@ -245,13 +189,17 @@
     min-width: 0;
 }
 
+.trigger-group-renaming .section-label,
 .trigger-group-renaming .trigger-group-name-slot {
     flex: 1;
+    min-width: 0;
+}
+
+.trigger-group-header .section-label {
+    min-width: 0;
 }
 
 .trigger-group-name {
-    font-weight: 600;
-    color: var(--text-primary);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -267,7 +215,7 @@
     border: 1px solid var(--accent);
     border-radius: calc(var(--radius-control) * 0.375);
     padding: 0.125rem 0.25rem;
-    /* Same text size and weight as the .trigger-group-name span it replaces (the
+    /* Same text size and weight as the section label it replaces (the
        input's own border and padding still make the header a few px taller while
        renaming). Spelled out rather than `font: inherit`, which the rule used to
        carry: the shorthand was declared after font-weight and reset it back to
@@ -275,7 +223,7 @@
        which sets no size of its own. */
     font-family: inherit;
     font-size: var(--font-size-md);
-    font-weight: 600;
+    font-weight: 700;
     min-width: 0;
     flex: 1;
 }
@@ -296,41 +244,27 @@
 
 /* The idle create field, same bargain a row down: clipped to nothing so the
    panel looks unchanged, while the input inside keeps a real box to focus.
-   Both classes, so it outranks the open row's margin declared further down. */
+   Both classes, so it outranks the open row's padding declared further down. */
 .trigger-group-create-row.trigger-group-create-idle {
     height: 0;
-    margin-top: 0;
     padding-top: 0;
     padding-bottom: 0;
-    border-bottom-width: 0;
     overflow: hidden;
     opacity: 0;
     pointer-events: none;
-}
-
-.trigger-group-count {
-    color: var(--text-muted);
-    font-size: var(--font-size-sm);
-    font-weight: 400;
-}
-
-.trigger-group-actions {
-    display: flex;
-    gap: 0.25rem;
-    flex-shrink: 0;
 }
 
 /* With a pointer, rename and delete wait until the heading is hovered or holds
    focus, so a list of groups reads as titles rather than a column of icons.
    Touch has no hover to reveal them, so there they always show. */
 @media (hover: hover) {
-    .trigger-group-actions {
+    .trigger-group-header .list-section-actions {
         opacity: 0;
         transition: opacity var(--duration-fast);
     }
 
-    .trigger-group-header:hover .trigger-group-actions,
-    .trigger-group-header:focus-within .trigger-group-actions {
+    .trigger-group-header:hover .list-section-actions,
+    .trigger-group-header:focus-within .list-section-actions {
         opacity: 1;
     }
 }
@@ -375,12 +309,9 @@
 
 .trigger-group-create-row {
     display: flex;
-    /* The same box as `.trigger-group-header` above: this is that heading with
-       a name field in it and nothing yet to head, so an edge that differs
-       reads as a box that moved. */
-    margin: var(--space-xl) var(--space-lg) 0;
-    padding-bottom: var(--space-xs);
-    border-bottom: 1px solid var(--border-color);
+    /* The section header's box. This is a heading with a name field in it,
+       so an edge that differs reads as a box that moved. */
+    padding: var(--section-header-pad) var(--section-inset-right) var(--section-header-pad) var(--section-inset-left);
 }
 
 .trigger-group-create-row > .trigger-group-name-input {
@@ -422,29 +353,14 @@
     padding: var(--space-lg);
 }
 
+/* Box and focus: global/text-input.css. */
 .form-group textarea {
     width: 100%;
     padding: 0.625rem 0.75rem;
-    /* Matches .form-group input — crisp border-defined field, not a gray block. */
-    background: var(--bg-secondary);
-    border: 1px solid var(--border-color);
-    border-radius: calc(var(--radius-control) * 0.5);
-    color: var(--text-primary);
     font-family: var(--font-ui);
     font-size: var(--font-size-md);
-    outline: none;
-    transition: border-color var(--duration-normal), box-shadow var(--duration-normal);
     resize: vertical;
     min-height: 5rem;
-}
-
-.form-group textarea:focus {
-    border-color: var(--accent);
-    box-shadow: var(--focus-ring);
-}
-
-.form-group textarea::placeholder {
-    color: var(--text-muted);
 }
 
 .form-group .auto-textarea {
@@ -520,10 +436,11 @@
     min-width: 0;
 }
 
-/* Add row where the button sits INSIDE the field's frame: the wrapper owns the
-   border/background/focus ring (same shape as .dropdown-input-wrap) and the
-   input is bare, so the button keeps its own natural height instead of being
-   stretched to the field's by a sibling flex row. */
+/* Add row where the button sits INSIDE the field's frame. The wrapper owns the
+   border, background and focus ring, like .dropdown-input-wrap, and the input
+   is bare. So the button keeps its natural height, never stretched to the
+   field's by a sibling flex row. The ring is the text-input one
+   (global/text-input.css). */
 .input-with-action {
     display: flex;
     align-items: center;
@@ -532,13 +449,6 @@
     border: 1px solid var(--border-color);
     border-radius: calc(var(--radius-control) * 0.5);
     transition: border-color var(--duration-normal), box-shadow var(--duration-normal);
-}
-
-.input-with-action:focus-within {
-    /* Matches .form-group input:focus, except the whole frame lights up rather
-       than the borderless field inside it. */
-    border-color: var(--accent);
-    box-shadow: var(--focus-ring);
 }
 
 /* Prefixed to outrank `.form-group input` (pages.css) on specificity rather

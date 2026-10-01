@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'preact/hooks';
+import { useLayoutEffect, useRef } from 'preact/hooks';
 import {
   UI_SCALE_MIN,
   UI_SCALE_MAX,
@@ -30,7 +30,11 @@ export function ScaleModal() {
   // Ctrl/meta wheel zooms the UI instead of the page. `createWheelZoom` owns
   // the rest: it banks DISTANCE, so a trackpad pinch stops being one step per
   // event, and it spends at most one step per frame.
-  useEffect(() => {
+  //
+  // A layout effect, so the listener exists before the panel's first paint.
+  // The panel mounts only while open, and a passive effect runs after paint:
+  // a pinch in that gap would fall through to the browser's own zoom.
+  useLayoutEffect(() => {
     const zoom = createWheelZoom(dir => adjustUiScale(dir * UI_SCALE_STEP));
     function handleWheel(e: WheelEvent) {
       if (!(e.metaKey || e.ctrlKey)) return;

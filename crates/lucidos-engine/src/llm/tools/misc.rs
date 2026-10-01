@@ -286,10 +286,6 @@ pub(super) fn request_credential_tools() -> Vec<ToolDefinition> {
                         "enum": crate::core::AuthType::agent_requestable_values(),
                         "description": "Default api_key. 'password' is username plus password, injected as Basic auth. 'secret' is signed with rather than sent: no base_url, no host, read by scripts as CRED_<NAME>. PREFER connect_oauth_account over 'oauth_client', which does the same modal plus the authorize in one call. For 'oauth_client', load_knowhow('system-knowhow/oauth-providers') first and pass its endpoints below."
                     },
-                    "scopes": {
-                        "type": "string",
-                        "description": "oauth_client: space-separated, pre-fills the modal."
-                    },
                     "env_var_name": {
                         "type": "string",
                         "description": "Extra env var name for the secret, alongside the default CRED_<NAME>. Must match [A-Z_][A-Z0-9_]* and not clobber an engine-owned name. Single-value auth types only."

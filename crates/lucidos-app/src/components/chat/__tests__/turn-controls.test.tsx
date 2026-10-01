@@ -368,7 +368,6 @@ describe('the fold rolls', () => {
     collapsible: true,
     collapsed,
     onToggle: noop,
-    actions: 'Diff',
   });
 
   it.each([
@@ -381,10 +380,5 @@ describe('the fold rolls', () => {
       expect(findByClass(rolls[0].props.children, bodyClass)).not.toBeNull();
       expect(rolls[0].props.open).toBe(!collapsed);
     }
-  });
-
-  it('rolls the initiator footer with its body', () => {
-    const [body] = disclosures(initiator(false));
-    expect(findByClass(body.props.children, 'initiator-footer')).not.toBeNull();
   });
 });

@@ -163,27 +163,19 @@
     border-radius: calc(var(--radius-surface) * 2 / 3);
 }
 
+/* Box and focus: global/text-input.css. */
 .repo-add-input {
     width: 100%;
     min-width: 0;
-    background: var(--bg-primary);
-    border: 1px solid var(--border-color);
-    border-radius: calc(var(--radius-control) * 0.5);
-    color: var(--text-primary);
     font-family: var(--font-ui);
     font-size: var(--font-size-md);
     padding: 0.4375rem 0.625rem;
-    outline: none;
-    transition: border-color var(--duration-fast), box-shadow var(--duration-fast);
 }
 
-.repo-add-input::placeholder {
-    color: var(--text-muted);
-}
-
-.repo-add-input:focus {
-    border-color: var(--accent);
-    box-shadow: 0 0 0 0.1875rem color-mix(in srgb, var(--accent) 20%, transparent);
+/* The card is --bg-secondary, the shared field fill, so its fields step down
+   to the pane colour to stand out from it. */
+.repo-add-card .repo-add-input {
+    background: var(--bg-primary);
 }
 
 .repo-add-path-row {

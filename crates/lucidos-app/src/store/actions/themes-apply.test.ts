@@ -130,7 +130,9 @@ describe('the active theme', () => {
     await refreshActiveTheme('old', true);
     await refreshActiveTheme('old', true);
 
-    expect(toasts.value.filter(t => t.message.includes('no longer passes validation'))).toHaveLength(2);
+    const warnings = toasts.value.filter(t => t.message.includes('no longer passes validation'));
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0].count).toBe(2);
   });
 
   it('never lays a reserved name or an out-of-reach shadow inline, even handed a map directly', () => {

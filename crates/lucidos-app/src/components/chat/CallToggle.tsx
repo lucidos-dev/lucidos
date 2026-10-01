@@ -47,6 +47,7 @@ import type { CallPhase } from '../../voice/callState';
 import { pressCallToggle, voiceCall } from '../../store/voice';
 import { preferences } from '../../store/store';
 import { voiceEnabled } from '../../store/actions/preferences';
+import { tooltipWithShortcut } from '../../store/actions/keybindings';
 
 /**
  * What the button is CALLED in each phase, which is what a press DOES.
@@ -72,6 +73,11 @@ const TOOLTIP: Record<CallPhase, string> = {
   speaking: 'Lucidos is speaking. Press to end the call',
   ending: 'Ending the call',
 };
+
+/** The tooltip with the shortcut named, in every phase a press acts in. */
+function tooltipFor(phase: CallPhase): string {
+  return phase === 'ending' ? TOOLTIP.ending : tooltipWithShortcut(TOOLTIP[phase], 'toggleCall');
+}
 
 /**
  * How long a connect may run before the control stops claiming progress.
@@ -137,7 +143,7 @@ export function CallToggle({ available = true, attrs }: { available?: boolean; a
         aria-pressed={on}
         aria-disabled={dead}
         aria-label={PRESS_NAME[phase]}
-        data-tooltip={waiting ? WAITING_TOOLTIP : TOOLTIP[phase]}
+        data-tooltip={waiting ? WAITING_TOOLTIP : tooltipFor(phase)}
         onPointerDown={press.onPointerDown}
         onPointerMove={press.onPointerMove}
         onPointerUp={press.onPointerUp}
@@ -178,7 +184,7 @@ export function callToggleAction(available: boolean): HeaderActionSpec | null {
     key: 'call-toggle',
     dataRole: 'call-toggle',
     label: PRESS_NAME[call.phase],
-    tooltip: TOOLTIP[call.phase],
+    tooltip: tooltipFor(call.phase),
     icon: () => <CallIcon />,
     // The on-call state, which the row paints and a menu row cannot. Folded,
     // `aria-checked` is the only channel left saying a call is up, and that is

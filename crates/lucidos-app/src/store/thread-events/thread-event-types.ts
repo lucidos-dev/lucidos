@@ -203,6 +203,27 @@ export function responseAbortedSummary(
   return isSwitchTeardownAbort(actor, cause) ? 'Paused by restart' : 'Response interrupted';
 }
 
+/** What stopped the response, as the short state word beside an interrupted
+ *  turn's "Response interrupted" pill. The pill already says it was
+ *  interrupted, so the word names the cause. */
+const ABORT_CAUSE_STATE: Record<AbortCause, string> = {
+  engine_shutdown: 'Engine stopped',
+  safety_net: 'Looked stuck',
+  recovery_after_restart: 'After restart',
+  process_killed: 'Process killed',
+  stale_settle: 'Settled',
+  session_dropped: 'Session dropped',
+  unknown: 'Cause unknown',
+};
+
+export function responseAbortedState(
+  actor: MessageOrigin | undefined,
+  cause: AbortCause | undefined,
+): string {
+  if (isSwitchTeardownAbort(actor, cause)) return 'Paused by restart';
+  return ABORT_CAUSE_STATE[cause ?? 'unknown'];
+}
+
 /** True when this event is **the user pressing Stop waiting** on a live *thread
  *  subscription*, as opposed to any of the other ways one ends.
  *
@@ -371,6 +392,17 @@ export function continuationStartedSummary(
     return 'Resumed after the model connection dropped';
   }
   return originMode(actor) === 'human' ? 'Continued the response' : 'Resumed after engine restart';
+}
+
+/** The same four causes as `continuationStartedSummary`, as the short state
+ *  word a resume card carries beside its "Resumed" pill. */
+export function continuationCause(
+  reason: string | undefined,
+  actor: MessageOrigin | undefined,
+): string {
+  if (reason === CONTINUATION_AUTO_RECOVERY_REASON) return 'Stopped responding';
+  if (reason === CONTINUATION_AUTO_RESUME_AFTER_API_ERROR_REASON) return 'Connection dropped';
+  return originMode(actor) === 'human' ? 'You continued' : 'After restart';
 }
 
 /** One live *event wait* on a thread, projected into `meta.liveEventWaits` from

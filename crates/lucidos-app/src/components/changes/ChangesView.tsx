@@ -1,6 +1,6 @@
 import { useRef, useCallback, useEffect } from 'preact/hooks';
 import { useSignal } from '@preact/signals';
-import { changes, appliedChanges, setAsideChanges, findChangeById, threadMap, effectiveThreadStatus, isMidTurn, changesHasMore, changesLoadingMore, busyChangeIds, applyAllInProgress, showConfirm, standingApplyThreadIds, armingStandingApplySweep, disarmingAllStandingApply, settlingThreadCount } from '../../store/store';
+import { changes, appliedChanges, setAsideChanges, findChangeById, threadMap, effectiveThreadStatus, isMidTurn, changesHasMore, changesLoadingMore, busyChangeIds, applyAllInProgress, showConfirm, standingApplyThreadIds, armingStandingApplySweep, disarmingAllStandingApply, settlingThreadCount, collapsedChangesSectionIds, toggleChangesSectionCollapsed } from '../../store/store';
 import { applySingleChange, discardSingleChange, setAsideSingleChange, bringBackSingleChange, applyAllChanges, discardAllChanges, revertChange, loadMoreChanges, armStandingApply, disarmStandingApply, disarmAllStandingApplies, refreshChangesState, APPLY_NEW_VERSION_TOOLTIP } from '../../store/actions/chat-changes';
 import { APPLY_INCOMPLETE_CONFIRM } from '../../store/actions/threadActions';
 import { viewChangeDiff } from '../../store/actions/repositories';
@@ -15,6 +15,8 @@ import { ListSkeletonOf, useSkeleton, SkText, SkBlock } from '../shared/Skeleton
 import { LoadingFade } from '../shared/LoadingFade';
 import { CommitList } from '../shared/CommitList';
 import { SplitButton } from '../shared/SplitButton';
+import { SectionHeader } from '../shared/SectionHeader';
+import { Disclosure } from '../shared/Disclosure';
 import { EventRowFoldView } from '../chat/EventRow';
 import { changeCommitList, changeHeadline } from '../../store/changeHeadline';
 
@@ -407,6 +409,8 @@ export function ChangesView() {
   const hasMore = changesHasMore.value;
   const loadingMore = changesLoadingMore.value;
   const showLoadingMore = useDelayedFlag(loadingMore);
+  const setAsideCollapsed = collapsedChangesSectionIds.value.has('set-aside');
+  const appliedCollapsed = collapsedChangesSectionIds.value.has('applied');
 
   // Infinite scroll: observe a sentinel at the bottom of the applied list. The
   // real scroll container is the ancestor `.content-pane-body` (it scrolls,
@@ -415,10 +419,12 @@ export function ChangesView() {
   // (scroll events don't bubble). Rooting the observer at `.content-pane-body`
   // (mirrors NotificationsView) loads the next page as the sentinel comes into
   // view. `loadMoreChanges` self-guards against concurrent calls and the
-  // no-more-pages case, so a stray intersection is harmless.
+  // no-more-pages case, so a stray intersection is harmless. The sentinel
+  // lives in the collapsible Recently applied section, so it re-observes
+  // whenever that section opens and mounts a fresh one.
   useEffect(() => {
     const sentinel = sentinelRef.current;
-    if (!sentinel || !hasMore) return;
+    if (!sentinel || !hasMore || appliedCollapsed) return;
     const observer = new IntersectionObserver(
       (entries) => {
         if (entries[0]?.isIntersecting) void loadMoreChanges();
@@ -427,7 +433,7 @@ export function ChangesView() {
     );
     observer.observe(sentinel);
     return () => observer.disconnect();
-  }, [hasMore]);
+  }, [hasMore, appliedCollapsed]);
 
   // Both signals load and update in lockstep (refreshChangesState and the
   // ChangesUpdated SSE both set them together), so failure on one ≈ failure
@@ -452,7 +458,7 @@ export function ChangesView() {
     setAsideLoadable.status === 'loaded';
 
   return (
-    <div class="panel-content protected-surface">
+    <div class="panel-content protected-surface list-rows-divided">
       <LoadingFade showSkeleton={showLoading} skeleton={<ListSkeletonOf fill containerClass="list-rows" row={() => <ChangeRow />} />}>
         {allLoaded ? (() => {
           const pending = pendingLoadable.data;
@@ -566,63 +572,77 @@ export function ChangesView() {
           })}
           {setAside.length > 0 && (
             <>
-              <div class="list-section-title">Set aside</div>
-              {setAside.map(change => (
-                <SetAsideRow
-                  key={change.id}
-                  change={change}
-                  busy={busyIds.value.has(change.id)}
-                  onBringBack={() => guardedAction(change.id, bringBackSingleChange)}
-                  onDiscard={() => guardedAction(change.id, discardSingleChange)}
-                />
-              ))}
+              <SectionHeader
+                title="Set aside"
+                count={setAside.length}
+                collapsed={setAsideCollapsed}
+                onToggle={() => toggleChangesSectionCollapsed('set-aside')}
+              />
+              <Disclosure open={!setAsideCollapsed}>
+                {setAside.map(change => (
+                  <SetAsideRow
+                    key={change.id}
+                    change={change}
+                    busy={busyIds.value.has(change.id)}
+                    onBringBack={() => guardedAction(change.id, bringBackSingleChange)}
+                    onDiscard={() => guardedAction(change.id, discardSingleChange)}
+                  />
+                ))}
+              </Disclosure>
             </>
           )}
           {applied.length > 0 && (
             <>
-              <div class="list-section-title">Recently Applied</div>
-              {applied.map(change => (
-                <div
-                  class={`list-row change-row${change.thread_id ? ' clickable' : ''}`}
-                  key={change.id}
-                  style="opacity: 0.7"
-                  onClick={change.thread_id ? () => openChangeThread(change) : undefined}
-                >
-                  <div class="list-row-info">
-                    {change.thread_title && <span class="list-row-label">{change.thread_title}</span>}
-                    <ChangeHeadline change={change} />
-                    <span class="list-row-details">
-                      {formatFileCount(change.file_count)}
-                      {change.requires_restart && ' · Requires engine restart'}
-                      {change.resolved_at && ` · ${formatTimeAgo(new Date(change.resolved_at))}`}
-                    </span>
+              <SectionHeader
+                title="Recently applied"
+                count={applied.length}
+                collapsed={appliedCollapsed}
+                onToggle={() => toggleChangesSectionCollapsed('applied')}
+              />
+              <Disclosure open={!appliedCollapsed}>
+                {applied.map(change => (
+                  <div
+                    class={`list-row change-row${change.thread_id ? ' clickable' : ''}`}
+                    key={change.id}
+                    style="opacity: 0.7"
+                    onClick={change.thread_id ? () => openChangeThread(change) : undefined}
+                  >
+                    <div class="list-row-info">
+                      {change.thread_title && <span class="list-row-label">{change.thread_title}</span>}
+                      <ChangeHeadline change={change} />
+                      <span class="list-row-details">
+                        {formatFileCount(change.file_count)}
+                        {change.requires_restart && ' · Requires engine restart'}
+                        {change.resolved_at && ` · ${formatTimeAgo(new Date(change.resolved_at))}`}
+                      </span>
+                    </div>
+                    <div class="list-row-actions">
+                      {change.pre_merge_sha && (
+                        <button class="action-btn" onClick={(e) => { e.stopPropagation(); void viewChangeDiff(change); }}>Diff</button>
+                      )}
+                      {change.status === 'applied' ? (
+                        <button class="action-btn action-btn-danger change-row-primary" disabled={busyIds.value.has(change.id)} onClick={async (e) => {
+                          e.stopPropagation();
+                          if (await showConfirm('Revert this change? Any later applied changes that touch the same files may conflict.', 'Revert', { variant: 'default' })) {
+                            guardedAction(change.id, revertChange);
+                          }
+                        }}>Revert</button>
+                      ) : (
+                        <span class="list-row-details" style="font-size: var(--font-size-md)">Reverted</span>
+                      )}
+                    </div>
                   </div>
-                  <div class="list-row-actions">
-                    {change.pre_merge_sha && (
-                      <button class="action-btn" onClick={(e) => { e.stopPropagation(); void viewChangeDiff(change); }}>Diff</button>
-                    )}
-                    {change.status === 'applied' ? (
-                      <button class="action-btn action-btn-danger change-row-primary" disabled={busyIds.value.has(change.id)} onClick={async (e) => {
-                        e.stopPropagation();
-                        if (await showConfirm('Revert this change? Any later applied changes that touch the same files may conflict.', 'Revert', { variant: 'default' })) {
-                          guardedAction(change.id, revertChange);
-                        }
-                      }}>Revert</button>
-                    ) : (
-                      <span class="list-row-details" style="font-size: var(--font-size-md)">Reverted</span>
-                    )}
+                ))}
+                {/* The next page's rows, drawn above the sentinel that asked for them. */}
+                <LoadingFade showSkeleton={showLoadingMore} skeleton={<ListSkeletonOf count={2} containerClass="list-rows" row={() => <ChangeRow />} />}>
+                  {null}
+                </LoadingFade>
+                {hasMore && (
+                  <div ref={sentinelRef} class="dropdown-panel-loading-more" style="opacity: 0.4">
+                    {!loadingMore && 'Scroll for more'}
                   </div>
-                </div>
-              ))}
-              {/* The next page's rows, drawn above the sentinel that asked for them. */}
-              <LoadingFade showSkeleton={showLoadingMore} skeleton={<ListSkeletonOf count={2} containerClass="list-rows" row={() => <ChangeRow />} />}>
-                {null}
-              </LoadingFade>
-              {hasMore && (
-                <div ref={sentinelRef} class="dropdown-panel-loading-more" style="opacity: 0.4">
-                  {!loadingMore && 'Scroll for more'}
-                </div>
-              )}
+                )}
+              </Disclosure>
             </>
           )}
             </>

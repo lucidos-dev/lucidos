@@ -7,15 +7,16 @@ import { ensureEventTargetResolved, eventHasTarget, jumpableEventId, showEventWh
 import { viewChangeDiff } from '../../store/actions/repositories';
 import { checkpointDiffModal, contextViewer, eventConditionDoor, findChangeById, lazyChanges, openImagePopupFromGroup, showToast, stepDetailModal } from '../../store/store';
 import { prefetchStepDetail } from '../../store/stepDetailCache';
-import { LUCIDOS_AGENT_LABEL, eventWaitStoppedSummary, groupSubscriptions, isThinking, resumeEngineNote, stepStatus, subscriptionFilterNote, waitingFor } from '../../store/thread-events';
+import { LUCIDOS_AGENT_LABEL, continuationCause, eventWaitStoppedSummary, plainEventName, responseAbortedState, groupSubscriptions, isThinking, resumeEngineNote, stepStatus, subscriptionFilterNote, waitingFor } from '../../store/thread-events';
 import { LucidosGlyph } from '../shared/LucidosMark';
 import { BlobImage } from '../shared/BlobImage';
 import { CommitList } from '../shared/CommitList';
 import { Disclosure } from '../shared/Disclosure';
-import type { ChangeLifecycleType, EventSubscription, EventWaitCancelCause, Exchange, SubscriptionGroup } from '../../store/thread-events';
+import type { AbortCause, CancelCause, ChangeLifecycleType, EngineReason, EventSubscription, EventWaitCancelCause, Exchange, MessageOrigin, StoredEvent, SubscriptionGroup } from '../../store/thread-events';
 import type { Loadable, ResponseEvent, StepOutcome } from '../../store/types';
 import type { CodingAgent } from '../../api/types';
 import { HEARING_YOU } from '../../voice/callState';
+import { describeAbortCause, describeCancelCause, describeContinuationReason, describeEngineReason } from '../../utils/engineEventExplainers';
 import { errorDetail } from '../../utils/errorDetail';
 import { formatFileCount } from '../../utils/formatFileCount';
 import { formatMessageTimestamp, formatShortDate, formatShortTime, isSameDayInUserTz } from '../../utils/formatTime';
@@ -214,21 +215,148 @@ export function ContinueButton({ threadId }: { threadId: string }) {
   );
 }
 
-/** Render the engine note for a ContinuationStarted exchange — a one-line
- *  subline followed by a `<details>` expansion showing the full injected text.
- *  Returns null when no engine note is present (e.g. CC resume path). */
-export function ResumeNoteBody({ exchange }: { exchange: Exchange }) {
+/** Why the engine acted, for a starter whose row predates its `origin`. */
+const ENGINE_REASON_BY_TYPE: Partial<Record<string, EngineReason>> = {
+  MissingHardeningDetected: { kind: 'missing_hardening' },
+  MergeConflictDetected: { kind: 'merge_conflict' },
+};
+
+/** What a cancel's state word says, by what the user did. */
+const CANCEL_STATE: Partial<Record<CancelCause, string>> = {
+  user_stop: 'You stopped it',
+  user_action: 'Stopped by an action',
+  superseded_by_followup: 'Replaced',
+};
+
+interface BoundaryStarter {
+  type: string;
+  origin?: MessageOrigin;
+  actor?: MessageOrigin;
+  cause?: string;
+  tool?: string;
+}
+
+/** Where the turn a boundary card opened stands. A card that asked for work
+ *  (hardening, a merge, a prompt) reports it, as a held message reports its
+ *  delivery. */
+export type BoundaryTurn = 'waiting' | 'working' | 'done' | 'stopped';
+
+/** What the engine asked for, in words, when its reason says more than the
+ *  event's own name. */
+const REASON_PILL: Partial<Record<EngineReason['kind'], string>> = {
+  missing_hardening: 'hardening missing',
+  harden_retrigger: 'hardening missing',
+  merge_conflict: 'merge conflict',
+  stale_session: 'stale session cleaned up',
+  orphan_recovery: 'picked up after a restart',
+  archived_branch_work: 'work set aside',
+  plugin_setup: 'plugin setup',
+  plugin_upstream_proposal: 'plugin change offered',
+};
+
+/** The live word a work card shows while its turn runs. */
+const WORKING_STATE: Partial<Record<string, string>> = {
+  MissingHardeningDetected: 'Running hardening',
+  MergeConflictDetected: 'Resolving',
+  UserPromptInjected: 'Agent working',
+  CodingAgentPromptSent: 'Agent working',
+};
+
+/** A work card's state, from where its turn stands. */
+function workState(type: string, turn: BoundaryTurn) {
+  switch (turn) {
+    case 'working': return { state: WORKING_STATE[type], tone: 'live' as const };
+    case 'done': return { state: 'Done', tone: 'good' as const };
+    case 'stopped': return { state: 'Stopped', tone: 'halted' as const };
+    case 'waiting': return { state: 'Queued', tone: 'arrived' as const };
+  }
+}
+
+/** A boundary card's state, tone, explanation and the one fact it adds. */
+function boundaryCardParts(ev: BoundaryStarter, summary: string, pill: string, turn: BoundaryTurn) {
+  const reason = ev.origin?.kind === 'engine' ? ev.origin.reason : ENGINE_REASON_BY_TYPE[ev.type];
+  const why = reason ? describeEngineReason(reason) : null;
+  // A summary that says more than the pill does stays, as a fact.
+  const fact = summary.toLowerCase() !== pill ? summary : undefined;
+  switch (ev.type) {
+    case 'ResponseAborted':
+      return { state: responseAbortedState(ev.actor, ev.cause as AbortCause), tone: 'halted' as const, why: describeAbortCause(ev.cause as AbortCause) };
+    case 'ResponseCanceled':
+      // A follow-up that replaced the reply lapsed it, as a replaced form does.
+      return { state: CANCEL_STATE[ev.cause as CancelCause], tone: ev.cause === 'superseded_by_followup' ? 'lapsed' as const : 'halted' as const, why: describeCancelCause(ev.cause as CancelCause) };
+    case 'EventWaitCanceled':
+      return { state: 'You stopped it', tone: 'halted' as const, fact };
+    case 'McpConsentRequested':
+      return { state: 'Requested', tone: 'live' as const, fact: ev.tool };
+    case 'MissingHardeningDetected':
+    case 'MergeConflictDetected':
+    case 'UserPromptInjected':
+    case 'CodingAgentPromptSent':
+      return { ...workState(ev.type, turn), why };
+    default:
+      return { tone: 'arrived' as const, why, fact };
+  }
+}
+
+/** A turn the agent did not write (the engine, the system or your own control
+ *  press), as the card every other event row is: the event as a pill, its
+ *  state, the one fact it adds, and Details. Details explains why it happened,
+ *  then holds what the starter carried (a file list, a prompt). `actions` is a
+ *  button the card owns, such as an interrupted response's Continue. */
+export function boundaryCard(event: StoredEvent, summary: string, opts: {
+  carried?: ComponentChildren;
+  actions?: ComponentChildren;
+  turn: BoundaryTurn;
+}) {
+  const ev = event as BoundaryStarter;
+  const reason = ev.origin?.kind === 'engine' ? ev.origin.reason : undefined;
+  const pill = (reason && REASON_PILL[reason.kind]) ?? plainEventName(ev.type);
+  const { state, tone, why, fact } = { why: null, fact: undefined, ...boundaryCardParts(ev, summary, pill, opts.turn) };
+  return eventRowBody({
+    kind: 'boundary',
+    role: 'boundary-card',
+    subject: eventNameChip({ kind: 'chip', name: ev.type, label: pill, sentenceStart: true }),
+    stateLabel: state,
+    tone,
+    facts: [fact ? { kind: 'text', text: fact } : null],
+    fold: why || opts.carried ? {
+      label: 'Details',
+      body: <>{why && <p>{why}</p>}{opts.carried}</>,
+    } : undefined,
+    actions: opts.actions,
+  });
+}
+
+/** The card that opens a resumed turn, inside the reply it resumed. It reads
+ *  like every other event row: the event, its cause as the state word, and a
+ *  Details fold. The fold explains the cause, then shows the engine's note to
+ *  the model when there is one (a coding-agent resume carries none). */
+export function ResumeCard({ exchange }: { exchange: Exchange }) {
+  const ev = exchange.userEvent as { reason?: string; actor?: MessageOrigin };
   const note = resumeEngineNote(exchange);
-  if (!note) return null;
-  const subline = note.toolCount > 0
-    ? `Reminded the model about ${note.toolCount} prior tool call${note.toolCount === 1 ? '' : 's'}`
-    : 'Reminded the model that no actions had completed';
-  return (
-    <details class="resume-note">
-      <summary>{subline}</summary>
-      <pre class="resume-note-body">{note.text}</pre>
-    </details>
-  );
+  return eventRowBody({
+    kind: 'resume',
+    role: 'resume',
+    subject: eventNameChip({ kind: 'chip', name: 'ContinuationStarted', sentenceStart: true }),
+    stateLabel: continuationCause(ev.reason, ev.actor),
+    tone: 'arrived',
+    fold: {
+      label: 'Details',
+      body: (
+        <>
+          <p>{describeContinuationReason(ev.reason) ?? describeEngineReason({ kind: 'continuation_started' })}</p>
+          {note && (
+            <>
+              <p>{note.toolCount > 0
+                ? `The engine reminded the model about ${note.toolCount} prior tool call${note.toolCount === 1 ? '' : 's'}:`
+                : 'The engine reminded the model that no actions had completed:'}</p>
+              <pre class="event-row-fold-pre">{note.text}</pre>
+            </>
+          )}
+        </>
+      ),
+    },
+  });
 }
 
 /** The body of an event-delivery exchange: the event a *thread subscription*
@@ -413,11 +541,11 @@ export function triggerFiredBody({
     // A trigger with no recorded name says only that one fired. It never falls
     // back to `trigger_id`: that is a uuid, and no screen in Lucidos is
     // labelled with one.
-    subject: name ? `Trigger fired: ${name}` : 'Trigger fired',
-    stateLabel: 'Fired',
+    subject: eventNameChip({ kind: 'chip', name: 'TriggerStarted', sentenceStart: true }),
+    stateLabel: invocation?.kind === 'Schedule' ? 'Scheduled' : invocation?.kind === 'Event' ? 'On event' : 'Fired',
     tone: 'arrived',
     facts: [
-      invocation?.kind === 'Schedule' ? { kind: 'text' as const, text: 'scheduled' } : null,
+      name ? { kind: 'text' as const, text: name } : null,
       invocation?.kind === 'Event'
         ? {
             kind: 'chip' as const,
@@ -429,7 +557,7 @@ export function triggerFiredBody({
         : null,
     ],
     fold: event.prompt
-      ? { label: 'Prompt', body: <MarkdownBlock html={renderMarkdown(event.prompt)} /> }
+      ? { label: 'Details', body: <MarkdownBlock html={renderMarkdown(event.prompt)} /> }
       : undefined,
   });
 }
@@ -504,7 +632,6 @@ interface InitiatorPanelProps {
   initiator: InitiatorDescriptor;
   timestamp: string;
   onActorClick?: (e: MouseEvent) => void;
-  actions?: ComponentChildren;
   collapsible: boolean;
   collapsed: boolean;
   onToggle?: (e: MouseEvent) => void;
@@ -535,7 +662,7 @@ function ActorChipBody({ initiator }: { initiator: InitiatorDescriptor }) {
   );
 }
 
-export function InitiatorPanel({ initiator, timestamp, onActorClick, actions, collapsible, collapsed, onToggle, onBodyClick, bubble = false, chromeless = false }: InitiatorPanelProps) {
+export function InitiatorPanel({ initiator, timestamp, onActorClick, collapsible, collapsed, onToggle, onBodyClick, bubble = false, chromeless = false }: InitiatorPanelProps) {
   const accentClass = initiator.accent ? ` initiator-panel-${initiator.accent}` : '';
   const hasBody = !!initiator.summary || !!initiator.details;
 
@@ -594,15 +721,12 @@ export function InitiatorPanel({ initiator, timestamp, onActorClick, actions, co
           )}
         </span>
       </div>
-      {(hasBody || actions) && (
+      {hasBody && (
         <Disclosure open={!collapsed}>
-          {hasBody && (
-            <div class="initiator-body" onClick={onBodyClick}>
-              {initiator.summary && <div class="initiator-summary">{initiator.summary}</div>}
-              {bubble ? <div class="user-bubble">{initiator.details}</div> : initiator.details}
-            </div>
-          )}
-          {actions && <div class="initiator-footer">{actions}</div>}
+          <div class="initiator-body" onClick={onBodyClick}>
+            {initiator.summary && <div class="initiator-summary">{initiator.summary}</div>}
+            {bubble ? <div class="user-bubble">{initiator.details}</div> : initiator.details}
+          </div>
         </Disclosure>
       )}
     </div>
@@ -1231,10 +1355,11 @@ export function HeldMessageRow({ event }: { event: Extract<ResponseEvent, { type
     kind: 'held',
     state: event.released ? 'released' : 'held',
     role: 'held-message-row',
-    subject: `Message from ${event.sender}`,
+    subject: eventNameChip({ kind: 'chip', name: 'MessageHeld', sentenceStart: true }),
     stateLabel: event.released ? HELD_MESSAGE_DELIVERED : HELD_UNTIL_REPLY,
     tone: event.released ? 'arrived' : 'live',
-    fold: { label: 'Message', body: event.text },
+    facts: [{ kind: 'text', text: `from ${event.sender}` }],
+    fold: { label: 'Details', body: event.text },
   });
 }
 

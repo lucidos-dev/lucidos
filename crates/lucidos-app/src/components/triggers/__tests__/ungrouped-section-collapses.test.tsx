@@ -35,7 +35,7 @@ describe('the Ungrouped section', () => {
   let host: HTMLElement;
   const row = () => host.querySelector('.trigger-row[data-trigger-id="loose"]');
   const toggle = () =>
-    host.querySelector<HTMLButtonElement>('.trigger-group-header-ungrouped .trigger-group-toggle');
+    host.querySelector<HTMLButtonElement>('.trigger-group-header-ungrouped .list-section-toggle');
 
   beforeEach(() => {
     localStorage.clear();

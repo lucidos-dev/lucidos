@@ -714,7 +714,6 @@ impl LucidosEngine {
 
         // Migrate legacy prompts/ directories to intents/ (idempotent)
         crate::core::migrate_prompts_to_intents(&workspace_path);
-        crate::core::themes::adopt_legacy_themes_dir(&workspace_path);
 
         // Single shared connection pool for the entire engine
         let pool = sqlx::postgres::PgPoolOptions::new()
@@ -1368,7 +1367,6 @@ impl LucidosEngine {
             follow_up_order: Default::default(),
             cc_spawn_coalesce: agent_session::CcSpawnCoalescer::new(),
             cc_startup_semaphore: Arc::new(tokio::sync::Semaphore::new(2)),
-            workspace_repo_lock: Arc::new(tokio::sync::Mutex::new(())),
             mcp_manager,
             pending_cc_permission: Arc::new(std::sync::Mutex::new(
                 cc_permission::PermissionState::default(),

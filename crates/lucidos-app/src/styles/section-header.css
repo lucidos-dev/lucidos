@@ -1,0 +1,319 @@
+/* ===== Section headers and row hairlines for the list panels =====
+ *
+ * One look for every list panel's sections: the thread drawer, Triggers,
+ * Changes and Thread queue. The label is bold and uppercase with no band and
+ * no caret, and the count turns into a pill when the section collapses.
+ * Markup: components/shared/SectionHeader.tsx.
+ *
+ * Host-only. Apps keep the `.list-section-title` base in
+ * shared-components.css. These rules key on the collapsible modifier or the
+ * drawer, so an app header never matches them. */
+
+/* A panel moves its content column with these. The drawer's is narrower than
+   the 1rem content-pane gutter, and a nested thread row indents further.
+   Every header takes the same room above and below its label, and that room
+   is what sets one section off from the row before it. */
+:root {
+    --section-inset-left: var(--space-lg);
+    --section-inset-right: var(--space-lg);
+    --section-header-pad: var(--space-lg);
+}
+
+:is(.thread-drawer .list-section-title, .list-section-title-collapsible) {
+    background: none;
+    /* Below the label, the gap runs to the first row when open, and to the
+       hairline on this edge when collapsed. */
+    padding: var(--section-header-pad) var(--section-inset-right) var(--section-header-pad) var(--section-inset-left);
+    color: var(--text-primary);
+    font-weight: 700;
+    font-size: var(--font-size-md);
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+}
+
+/* A panel header (SectionHeader) hands its padding to its toggle, so the whole
+   header left of the actions is the tap target. The toggle lays out the icon,
+   label and count as the drawer's header div does. */
+.list-section-title-collapsible:has(> .list-section-toggle) {
+    padding-top: 0;
+    padding-bottom: 0;
+    padding-left: 0;
+}
+
+.list-section-toggle {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+    padding: var(--section-header-pad) 0 var(--section-header-pad) var(--section-inset-left);
+    border: none;
+    background: none;
+    color: inherit;
+    font-weight: inherit;
+    /* The UA stylesheet's `font` shorthand resets a button's line height, and
+       the label's cap-band trim centres on this line. */
+    line-height: inherit;
+    letter-spacing: inherit;
+    text-transform: inherit;
+    text-align: left;
+    cursor: pointer;
+}
+
+/* One line tall whatever it holds, so a header with actions stands as tall as
+   one without. It takes the toggle's vertical padding, so a 2.25rem icon
+   button overflows into it, centred on the label's line. */
+.list-section-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+    flex-shrink: 0;
+    box-sizing: content-box;
+    height: 1lh;
+    padding: var(--section-header-pad) 0;
+    /* Uppercase is the label's, not the actions'. */
+    text-transform: none;
+    letter-spacing: normal;
+}
+
+.list-section-title-collapsible {
+    cursor: pointer;
+    -webkit-user-select: none;
+    user-select: none;
+}
+
+/* Count badge on a section header: how many items the section holds.
+ * The accent-blue fill makes the count read as a pill. A header draws that
+ * pill only while its section is collapsed (see below). */
+.section-count-badge {
+    font-size: var(--font-size-2xs);
+    font-weight: 600;
+    line-height: 1rem;
+    /* The pill is as tall as its line. styles/badges.css rounds that to whole
+       pixels, which keeps the count centred. */
+    --badge-height: 1lh;
+    min-width: var(--badge-box, var(--badge-height));
+    padding: 0 0.3125rem;
+    text-align: center;
+    border-radius: calc(var(--radius-control) * 1.25);
+    color: var(--text-secondary);
+    --section-count-fill: color-mix(in srgb, var(--accent) 15%, transparent);
+    background: var(--section-count-fill);
+    font-variant-numeric: tabular-nums;
+}
+
+/* Dark mode: lift the accent share so the fill reads a touch bluer against the
+ * darker row backgrounds (the 15% tint above looks washed out on dark). Light
+ * mode keeps the base 15%, which stays distinct there already. */
+html[data-theme-mode="dark"] .section-count-badge {
+    --section-count-fill: color-mix(in srgb, var(--accent) 24%, transparent);
+}
+
+/* Pin the header's line box to the count badge's own `line-height: 1rem`
+   (16px), so the label text and the badge share one cross-size. Otherwise
+   the badge is 1px taller than the bare 0.8125rem text line box (15px). The
+   row then grows to the badge, and `align-items: center` puts the icon and
+   label half a pixel off the grid in some sections but not others. */
+.list-section-title:has(.section-count) {
+    line-height: 1rem;
+}
+
+/* The section count: the pill with its own small number, and an open copy
+ * of the number one type step larger. Only one copy shows at a time, and
+ * each one rests untransformed. Chromium draws a scaling glyph from a bitmap,
+ * so a copy resting at a scale would stay soft until the scale ended. A
+ * status-filter header never collapses, so it always shows the open copy. */
+.list-section-title .section-count {
+    position: relative;
+    display: inline-flex;
+    /* A hand-tuned lift, and the block below retires it wherever it can. The
+       label's caps ride above its own line box's middle, by whatever the font's
+       ascent and descent are worth, while the count sits at its pill's middle.
+       This nudge stood in for that gap, and being a constant it was right at one
+       ui-scale and one font. */
+    top: -0.0625rem;
+    /* Extra room after the section name, on top of the flex `gap` (0.25rem),
+       so the name-to-count spacing differs from the icon-to-name gap. */
+    margin-left: 0.25rem;
+    /* The open copy's step, and how far the pill's number grows to meet it. */
+    --section-count-open-scale: 1.2;
+}
+
+.list-section-title .section-count-badge {
+    position: relative;
+    /* The pill moves to `::before`, so it can animate apart from the digits.
+       `isolation` keeps the layer above the header's own background and below
+       the digits. */
+    isolation: isolate;
+    background: none;
+    /* An open section draws its number with the open copy. This one grows
+       out of sight, so the pill it carries fades from the right place.
+       `visibility`, not a transparent colour, which forced colours repaint. */
+    visibility: hidden;
+    scale: var(--section-count-open-scale);
+    transition: scale var(--duration-slow) ease-out;
+}
+
+/* Collapsing, this number springs down from the open copy's size. */
+.list-section-title-collapsible.collapsed .section-count-badge {
+    visibility: visible;
+    scale: none;
+    transition: scale var(--duration-slow) cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+/* An open section shows its rows, so its count is a bare number. A collapsed
+ * one hides them, and the pill marks that. The pill shrinks away on open and
+ * springs back on collapse. Reduced motion collapses both to a swap. */
+.list-section-title .section-count-badge::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    z-index: -1;
+    border-radius: inherit;
+    background: var(--section-count-fill);
+    /* Shown through the hidden badge, so it can still fade on open. */
+    visibility: visible;
+    opacity: 0;
+    transform: scale(0.5);
+    transition:
+        opacity var(--duration-normal) ease-out,
+        transform var(--duration-normal) ease-in;
+}
+
+.list-section-title-collapsible.collapsed .section-count-badge::before {
+    opacity: 1;
+    transform: scale(1);
+    transition:
+        opacity var(--duration-normal) ease-out,
+        transform var(--duration-slow) cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+/* The open copy, over the pill's box. Opening, it grows from the pill's
+   number up to its own size, which it rests at. */
+.section-count-open {
+    position: absolute;
+    inset: 0;
+    align-content: center;
+    font-size: var(--font-size-sm);
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    line-height: 1rem;
+    letter-spacing: normal;
+    white-space: nowrap;
+    text-align: center;
+    color: var(--text-secondary);
+    transition: scale var(--duration-slow) ease-out;
+}
+
+.list-section-title-collapsible.collapsed .section-count-open {
+    visibility: hidden;
+    scale: calc(1 / var(--section-count-open-scale));
+    transition: none;
+}
+
+/* The label, its icon and its count on ONE cap band, derived instead of nudged.
+ *
+ * `styles/badges.css` trims the pill's line box to the cap band, so the digits
+ * now sit exactly at the pill's middle. Give the label the same trim and its
+ * caps sit exactly at the middle of ITS box, which the flex row centres on the
+ * same axis. All three then coincide at any font and any ui-scale, and the
+ * nudge above has nothing left to correct. The ICON is the third, and it was
+ * off by the same gap: 1.24px at 200% ui-scale, now 0.08px.
+ *
+ * `min-height: 1lh` is what keeps this safe. The trim shrinks the CONTENT box
+ * to the cap band; the min-height puts the element's own box back at the line
+ * box it had, so the row is the same height collapsed and expanded (the
+ * line-height pin above) and the shimmer still paints over the whole
+ * glyph. Measured: the count went from 0.80px above the label's caps at 200%
+ * ui-scale to 0.04px, on both engines, with every row height unchanged. */
+@supports (text-box-trim: trim-both) {
+    .section-label {
+        min-height: 1lh;
+        align-content: center;
+        text-box-trim: trim-both;
+        text-box-edge: cap alphabetic;
+    }
+
+    .list-section-title .section-count {
+        top: 0;
+    }
+
+    /* Both copies grow from their baselines, each on a whole pixel. WebKit
+       repaints a scaling glyph every frame and snaps its baseline to the pixel
+       grid. A baseline that crosses pixel fractions mid-animation therefore
+       makes the number dip a pixel before it lands. The two baselines differ,
+       so the number takes that step once, on the frame the copies swap. */
+    .list-section-title .section-count-badge {
+        transform-origin: 50% calc(100% - var(--badge-baseline-inset));
+    }
+
+    /* Trimmed to its baseline, the open copy's bottom edge IS the baseline.
+       `bottom` puts its caps on the box's middle, rounded to a whole pixel.
+       Centring the trimmed line instead lands a pixel apart in the two
+       engines. */
+    .section-count-open {
+        top: auto;
+        bottom: round(50% - 0.5 * 1cap, 1px);
+        align-content: normal;
+        text-box-trim: trim-end;
+        text-box-edge: cap alphabetic;
+        transform-origin: 50% 100%;
+    }
+}
+
+/* Section header icon — sits left of the label, sharing the title's flex row.
+   Sized to the label cap-height and slightly dimmed so the text stays primary. */
+.section-icon {
+    display: inline-flex;
+    align-items: center;
+    color: var(--text-secondary);
+    flex: none;
+    margin-right: 0.25rem;
+}
+
+/* The Pinned heading's pin, lowered to balance its top-heavy head against the
+   label. A transform, so the row's height and the label stay put. */
+.section-icon-pin {
+    transform: translateY(0.0625rem);
+}
+
+@media (hover: hover) {
+    /* Flat headers carry no fill, so hover is a color-only cue — no band. */
+    .list-section-title-collapsible:hover {
+        color: var(--text-primary);
+    }
+}
+
+/* ── Hairlines ─────────────────────────────────────────────────────────── */
+
+/* Each row carries a hairline on its own bottom edge, inset to the panel's
+   content column at both ends. A collapsed header carries the same line,
+   where its rows finish rolling up. Drawn as `::after` rather than a border,
+   so neither end runs to the pane edge. The drawer sets the insets per row,
+   since a nested thread's line starts at its own indent. */
+.list-rows-divided .list-row,
+.list-rows-divided .changes-bulk-actions,
+.list-section-title-collapsible {
+    position: relative;
+}
+
+.list-rows-divided .list-row::after,
+.list-rows-divided .changes-bulk-actions::after,
+.thread-drawer .thread-row::after,
+.list-section-title-collapsible.collapsed::after {
+    content: '';
+    position: absolute;
+    left: var(--row-hairline-left, var(--section-inset-left));
+    right: var(--row-hairline-right, var(--section-inset-right));
+    bottom: 0;
+    border-bottom: 1px solid var(--border-color);
+    pointer-events: none;
+}
+
+/* A divided list spaces its rows by padding, so the line sits midway between
+   two rows' content rather than hard under one. */
+.list-rows-divided .list-row {
+    padding-top: var(--space-md);
+    padding-bottom: var(--space-md);
+}

@@ -91,11 +91,11 @@ pub(crate) async fn ff_main_to(
         return Err("Cannot fast-forward: could not resolve the branch and main revisions".into());
     }
 
-    // Held across the ref move AND the working-tree sync below, so no
-    // `commit_all_dirty` can snapshot the repo root while main is published but
-    // the tree has not caught up. See REPO_WORKTREE_MUTEX for the failure it
-    // prevents; MERGE_MUTEX (already held by every caller) is always the outer
-    // lock, so the pair cannot deadlock.
+    // Both held across the ref move AND the working-tree sync below. The first
+    // keeps a data write's save and commit wholly before or after them, the
+    // second keeps out a `commit_all_dirty` snapshot. Each lock's doc names the
+    // failure it prevents and the order all three are taken in.
+    let _repo_guard = WORKSPACE_REPO_MUTEX.lock().await;
     let _worktree_guard = REPO_WORKTREE_MUTEX.lock().await;
 
     // Verify ff-ability: main must be an ancestor of the branch
@@ -601,9 +601,11 @@ pub(crate) async fn detect_origin_default_branch(repo_root: &Path) -> Option<Str
             }
         }
         Some(_) => {
-            // Not on the default branch -- update the local ref directly (local-only, no network)
-            let local_ref = format!("refs/heads/{}", local_branch);
-            match git_cmd(&["update-ref", &local_ref, &remote_ref], repo_root).await {
+            // Not on the default branch. A local fetch moves the ref only on a
+            // fast-forward, so unpushed local commits are never rewound. It
+            // also refuses a branch checked out in another worktree.
+            let refspec = format!("refs/remotes/{remote_ref}:refs/heads/{local_branch}");
+            match git_cmd(&["fetch", ".", &refspec], repo_root).await {
                 Ok(o) if o.status.success() => log!(
                     "[Changes] Updated local {} to match {}",
                     local_branch,
@@ -618,13 +620,10 @@ pub(crate) async fn detect_origin_default_branch(repo_root: &Path) -> Option<Str
             }
         }
         None => {
-            // git could not say which branch the repo root is on. The two arms
-            // above are not interchangeable: the update-ref one moves
-            // refs/heads/<default> with no old-value guard, so running it while
-            // we are in fact standing on that branch rewrites the ref under a
-            // live checkout and the whole tree reads as uncommitted. Leave the
-            // local ref alone; worktrees branch from a slightly older base,
-            // which both arms already treat as an acceptable outcome.
+            // git could not say which branch the repo root is on, so neither
+            // arm above is known to fit. Leave the local ref alone; worktrees
+            // branch from a slightly older base, which both arms already treat
+            // as an acceptable outcome.
             log!(
                 "[Changes] Could not read the current branch; leaving local {} alone (worktree will branch from {})",
                 local_branch,

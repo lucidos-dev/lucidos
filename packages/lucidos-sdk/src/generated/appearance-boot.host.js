@@ -874,7 +874,6 @@
   var THEME_MODE_KEY = "theme-mode";
   var THEME_MODE_STORAGE_KEY = "lucidos-theme-mode";
   var THEME_MODE_ATTRIBUTE = "data-theme-mode";
-  var LEGACY_THEME_MODE_ATTRIBUTE = "data-theme";
   var DEFAULT_THEME_MODE = "system";
   var THEME_MODE_BG = {
     light: "#ffffff",
@@ -1158,11 +1157,6 @@
   }
   var THEME_STORAGE_KEY = "lucidos-theme-resolved";
   var THEME_SEED_KEY = "theme_resolved";
-  var RENAMED_STORAGE_KEYS = [
-    ["lucidos-theme", THEME_MODE_STORAGE_KEY],
-    ["lucidos-look", THEME_STORAGE_KEY],
-    ["lucidos-look-effects", THEME_EFFECTS_STORAGE_KEY]
-  ];
   var EMPTY_THEME = { dark: {}, light: {}, fonts: {}, workspace_fonts: [] };
   function parseResolvedTheme(raw) {
     return sanitizeResolvedTheme(parseJson(raw));
@@ -1293,9 +1287,6 @@
     const seg = base.replace(/^\/+|\/+$/g, "");
     return seg === "" || seg === "~" ? null : seg;
   }
-  function inWorkspace() {
-    return workspaceSlug() !== null;
-  }
   function nsKey(key) {
     const slug = workspaceSlug();
     return slug ? `ws:${slug}:${key}` : key;
@@ -1308,10 +1299,6 @@
     var _a;
     return (_a = mirror.get(mirrorKey(key, session))) != null ? _a : null;
   }
-  function bridgedSet(key, value, session) {
-    mirror.set(mirrorKey(key, session), value);
-    tellHost("storage.set", { key, value, session });
-  }
   function bridgedRemove(key, session) {
     mirror.delete(mirrorKey(key, session));
     tellHost("storage.remove", { key, session });
@@ -1322,13 +1309,6 @@
       return localStorage.getItem(nsKey(key));
     } catch (e) {
       return null;
-    }
-  }
-  function wsLocalSet(key, value) {
-    if (isBridged()) return bridgedSet(nsKey(key), value, false);
-    try {
-      localStorage.setItem(nsKey(key), value);
-    } catch (e) {
     }
   }
   function wsLocalRemove(key) {
@@ -1436,13 +1416,11 @@ ${face.path}`;
     var _a;
     const d = document.documentElement;
     const served = servedPrefs();
-    if (opts.adoptRenamedStorageKeys) adoptRenamedStorageKeys();
     const raw = seeded(served, THEME_MODE_KEY, THEME_MODE_STORAGE_KEY);
     const mode = raw && THEME_MODES.includes(raw) ? raw : DEFAULT_THEME_MODE;
     const prefersLight = matchMedia("(prefers-color-scheme: light)").matches;
     const resolved = resolveThemeMode(mode, prefersLight);
     d.setAttribute(THEME_MODE_ATTRIBUTE, resolved);
-    if (opts.legacyThemeModeAttribute) d.setAttribute(LEGACY_THEME_MODE_ATTRIBUTE, resolved);
     const styleReset = opts.styleReset && styleResetRequested(location.search);
     if (styleReset) wsLocalRemove(THEME_STORAGE_KEY);
     const theme = parseResolvedTheme(seeded(served, THEME_SEED_KEY, THEME_STORAGE_KEY));
@@ -1498,23 +1476,12 @@ ${face.path}`;
     }
     return { raw, mode, resolved, prefersLight, reducedMotion };
   }
-  function adoptRenamedStorageKeys() {
-    if (!inWorkspace()) return;
-    for (const [from, to] of RENAMED_STORAGE_KEYS) {
-      const old = wsLocalGet(from);
-      if (old === null) continue;
-      if (wsLocalGet(to) === null) wsLocalSet(to, old);
-      wsLocalRemove(from);
-    }
-  }
 
   // src/boot/host.ts
   var SPLASH_BACKGROUND = "#145eb9 radial-gradient(125% 125% at 30% 22%, #2d83e0 0%, #0a4ea8 100%) no-repeat fixed";
   var boot = applyAppearanceBoot({
     styleReset: true,
-    durationScale: true,
-    adoptRenamedStorageKeys: true,
-    legacyThemeModeAttribute: false
+    durationScale: true
   });
   document.documentElement.style.background = SPLASH_BACKGROUND;
   try {

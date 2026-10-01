@@ -66,7 +66,7 @@ interface Probe {
   hit: Box;
   /** What a tap N px off each side of the circle reaches, keyed `side+N`. */
   offsets: Record<string, string>;
-  transform: string;
+  translate: string;
 }
 
 /** Name whatever a tap at (x, y) would reach. */
@@ -109,7 +109,7 @@ async function probe(page: Page, sel: string, offsets: number[]): Promise<Probe 
       out[`above+${d}`] = describe(cx, box.top - d);
       out[`below+${d}`] = describe(cx, box.bottom + d);
     }
-    return { box, glyph: rect(svg), hit, offsets: out, transform: getComputedStyle(btn).transform };
+    return { box, glyph: rect(svg), hit, offsets: out, translate: getComputedStyle(btn).translate };
   }, { sel, offsets, describeSrc: DESCRIBE });
 }
 
@@ -213,7 +213,7 @@ test.describe('The floating scroll chevrons take a near miss', () => {
         const p = (await probe(page, c.sel, [...offsets, (16 * rootPx) / 16]))!;
         const where = `${c.name} at ${scale}`;
         console.log(`[${info.project.name}] ${where}: visible ${fmt(p.box)}, glyph ${fmt(p.glyph)}, `
-          + `hit ${fmt(p.hit)}, transform ${p.transform}\n  ${JSON.stringify(p.offsets)}`);
+          + `hit ${fmt(p.hit)}, translate ${p.translate}\n  ${JSON.stringify(p.offsets)}`);
 
         // The circle kept its size and its inset from the pane's right edge,
         // with the glyph centred in it.
@@ -357,14 +357,14 @@ test.describe('The floating scroll chevrons take a near miss', () => {
     await page.evaluate((sel) => {
       const header = document.querySelector('.app-header') as HTMLElement;
       const height = header.getBoundingClientRect().height;
-      header.style.transform = `translateY(${-height}px)`;
+      header.style.translate = `0 ${-height}px`;
       for (const el of [document.querySelector(sel), document.querySelector('.mobile-swipe-pane .mobile-thread-title-row')]) {
         (el as HTMLElement).style.setProperty('--mobile-header-offset', `${-height}px`);
       }
     }, up);
     await expect.poll(async () => (await probe(page, up, []))!.box.top).toBeLessThan(resting.box.top - 10);
     const hidden = (await probe(page, up, NEAR_MISSES))!;
-    expect(hidden.transform, 'the header offset never reached the chevron').not.toBe(resting.transform);
+    expect(hidden.translate, 'the header offset never reached the chevron').not.toBe(resting.translate);
     const target = 44;
     expect(hidden.hit.right - hidden.hit.left).toBeGreaterThanOrEqual(target);
     expect(hidden.hit.bottom - hidden.hit.top).toBeGreaterThanOrEqual(target);

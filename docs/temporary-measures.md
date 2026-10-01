@@ -2823,7 +2823,10 @@ event that retires it.
 - **Removal condition:** three releases have shipped since the one carrying
   the audit check. Then delete the constant, the option, the second
   `setAttribute`, their tests and the js-sdk sentence. Keep the audit check.
-- **Status:** active
+- **Status:** `removed` 2026-10-01. v0.41.0 carried the audit check, and six
+  releases followed it (v0.41.1 to v0.44.1). The constant, the boot option, the
+  second `setAttribute`, their tests, the e2e and `sdk_prefs.rs` asserts and the
+  js-sdk sentence are gone. The audit now reports `data-theme` as broken.
 
 ### Renamed appearance storage keys
 
@@ -2844,32 +2847,34 @@ event that retires it.
   delete the list, the function, its boot option and its tests, and drop the
   seed comment in `workspaceStorage.ts` (the seed itself stays). A device that
   skipped all three paints one default frame, then its preferences load.
-- **Status:** active
+- **Status:** `removed` 2026-10-01. v0.41.0 carried the rename, and six
+  releases followed it (v0.41.1 to v0.44.1). The list, the function, its boot
+  option, its tests and the seed comment are gone; the seed stays.
 
 ### Legacy `data/looks/` folder
 
 - **Added:** 2026-09-28
-- **Lives in:** `LEGACY_THEMES_DIR`, `adopt_legacy_themes_dir` and its two
-  halves in `crates/lucidos-engine/src/core/themes/mod.rs`, plus
-  `commit_data_paths_moved` in `crates/lucidos-engine/src/core/mod.rs`. The
-  move runs once at startup, from `engine_impl/construction.rs`. Tests: the
-  legacy folder cases in `core/themes/tests.rs`. The plugin refusal hint for a `looks/` folder
-  (`core/plugins.rs`, `UnexpectedTopLevelEntry`) reads the same constant.
-  `current_data_path` in `engine/tools/plugins/registry.rs` reads it too, so a
-  plugin installed before the rename still owns its moved files.
+- **Lives in:** `current_data_path` in `engine/tools/plugins/registry.rs`,
+  which reads `LEGACY_THEMES_DIR` from
+  `crates/lucidos-engine/src/core/themes/mod.rs`. The plugin refusal hint for a
+  `looks/` folder (`core/plugins.rs`, `UnexpectedTopLevelEntry`) reads the same
+  constant and stays for good.
 - **What it is:** workspace themes lived in `data/looks/` before *look* became
-  *theme*. At startup the engine moves each file into `data/themes/`, never
-  over a file already there, and commits the move. It removes the old folder
-  once it is empty. An uncommitted move made the next Apply refuse to merge.
-- **Impermanent because:** only a workspace that has not booted since the
-  rename still has the old folder, and one boot moves it.
-- **Removal condition:** three releases have shipped since the rename. Then
-  delete the function, its halves, `commit_data_paths_moved`, the call and
-  their tests. Keep the plugin hint, which
-  costs one match arm and tells a plugin author what to rename. Keep
-  `current_data_path` until no workspace holds a `PluginInstalled` record with
-  a `looks/` path, which the workspace audit can check per workspace.
-- **Status:** active
+  *theme*, and a startup move carried each file into `data/themes/`. A plugin
+  installed before the rename still records `looks/<id>.json`, so
+  `current_data_path` maps that record to `themes/`, and uninstall and update
+  find the file.
+- **Impermanent because:** only a plugin install record written before the
+  rename carries a `looks/` path.
+- **Removal condition:** no workspace holds a `PluginInstalled` record with a
+  `looks/` path, which the workspace audit can check per workspace. Then delete
+  `current_data_path` and its call. Keep the plugin hint, which costs one match
+  arm and tells a plugin author what to rename.
+- **History:** the startup move itself (`adopt_legacy_themes_dir`, its halves,
+  `commit_data_paths_moved`, the startup call and five tests) was removed
+  2026-10-01. Its condition was three releases since the rename: v0.41.0
+  carried it, and v0.41.1 to v0.44.1 followed.
+- **Status:** active, for `current_data_path` only.
 
 ### Defensive double-write of tables into `init_schema`
 

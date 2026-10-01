@@ -69,7 +69,7 @@ describe('the follow toggle is always shown', () => {
     const block = toggleBlock();
     expect(block).toMatch(/active: followOn,/);
     expect(block).toMatch(/label: followOn \?/);
-    expect(block).toMatch(/tooltip: followOn$/m);
+    expect(block).toMatch(/tooltip: tooltipWithShortcut\(\n\s*followOn$/m);
     expect(block).toMatch(/onClick: \(\) => setFollowLiveEdge\(!followOn\),/);
   });
 

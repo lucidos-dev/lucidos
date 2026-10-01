@@ -2,6 +2,7 @@ import { useRef, useLayoutEffect } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
 import type { ComponentChildren, RefObject, JSX } from 'preact';
 import { useDismissOnOutside } from '../../hooks/useAnchoredPopover';
+import { overlayModalAttrs, useOverlayFocus } from './overlayFocus';
 import {
   overlayStack,
   overlayStackDepth,
@@ -149,6 +150,9 @@ export interface OverlayProps {
  *     capture-phase dispatcher in `useKeyboardShortcuts` pops the top entry and
  *     `stopPropagation`s, which also shadows the hook's own (bubble-phase)
  *     Escape so `onClose` fires exactly once.
+ *  4. **Keyboard focus**: a dialog contains Tab. It takes focus on
+ *     open and hands it back on close. An anchored popover closes on a Tab
+ *     from outside it (`overlayFocus.ts`).
  *
  *  Positioning stays with the caller (CSS via `overlayClass`/`panelClass` for
  *  modals, `panelStyle` for anchored popovers) — only the contract is
@@ -230,6 +234,12 @@ export function Overlay({
   // shell with the anchor not yet exempted from it.
   useLayoutEffect(() => markAnchorInteractive(open ? anchor : null), [open, anchor]);
 
+  // Keyboard focus: into a dialog on open, back to the opener on close. The
+  // document Tab branch routes Tab itself through `handleOverlayTab`. An
+  // `aria-modal` panel is a dialog even without a backdrop (`Explainer`).
+  const modal = backdrop || !!ariaModal;
+  useOverlayFocus(open, panelRef, modal, anchor);
+
   if (!open) {
     if (!keepMounted) return null;
     // Mirror the open structure so the hidden element matches what reappears:
@@ -259,6 +269,7 @@ export function Overlay({
       // top overlay). Every selector is presence-only (`[data-overlay-panel]`),
       // so the value is free.
       data-overlay-panel={idRef.current}
+      {...overlayModalAttrs(modal)}
     >
       {children}
     </div>

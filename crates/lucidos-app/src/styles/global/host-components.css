@@ -1362,14 +1362,10 @@ html[data-theme-mode="dark"] .split-button.open::before {
     background: var(--bg-secondary);
     border: 1px solid var(--border-color);
     border-radius: calc(var(--radius-control) * 0.75);
-    transition: border-color var(--duration-normal);
+    transition: border-color var(--duration-normal), box-shadow var(--duration-normal);
 }
 
-.dropdown-input-wrap:focus-within {
-    /* Shared --focus-ring — matches .action-btn / .icon-btn. */
-    outline: 0.125rem solid transparent;
-    box-shadow: var(--focus-ring);
-}
+/* Its focus ring is the text-input one, in text-input.css. */
 
 .dropdown-input-wrap .dropdown-chevron {
     padding: 0 0.5rem 0 0;

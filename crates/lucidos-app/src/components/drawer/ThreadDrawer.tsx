@@ -17,6 +17,7 @@ import { PinThreadButton } from '../shared/PinThreadButton';
 import { ThreadOverflowMenu } from '../shared/ThreadOverflowMenu';
 import { DraftOverflowMenu } from '../shared/DraftOverflowMenu';
 import { ListSkeletonOf, useSkeleton, SkText, SkBlock } from '../shared/Skeleton';
+import { SectionHeaderContent } from '../shared/SectionHeader';
 import { LoadableError } from '../shared/LoadableError';
 import { LoadingFade } from '../shared/LoadingFade';
 import type { ThreadState, ThreadStatus } from '../../store/thread-events';
@@ -54,7 +55,7 @@ function formatCreatedTimestamp(createdAt: string | undefined): string {
 // The pin's heavy head sits in the top of its box, so centred on the label it
 // reads high. This heading lowers it. The pin buttons keep the plain glyph.
 function SectionPinIcon({ size }: { size?: string }) {
-    return <PinIcon size={size} className="drawer-section-icon-pin" />;
+    return <PinIcon size={size} className="section-icon-pin" />;
 }
 
 // Per-section header display: label + icon. The `'saved'` section reads "Pinned"
@@ -1117,33 +1118,6 @@ export function sentinelInView(sentinel: { top: number; bottom: number }, root: 
     return sentinel.top < root.bottom && sentinel.bottom > root.top;
 }
 
-/** Shared icon, label and count for EVERY drawer section header: the
- *  collapsible lifecycle headers (Pinned/Current/Archive via `DrawerSection`)
- *  and the flat alternate-view headers (Drafts/Needs attention/Review/Running/
- *  Results). Keeping the markup in one place means the spacing (owned by the
- *  `.thread-drawer .list-section-title` gap) and the count's look are identical
- *  everywhere. Results passes no count, so it draws none. */
-function DrawerSectionHeader({ Icon, title, count, hasRunning }: { Icon?: ComponentType<{ size?: string }>; title: string; count?: number; hasRunning?: boolean }) {
-    return (
-        <>
-            {Icon && <span class="drawer-section-icon"><Icon size="0.875rem" /></span>}
-            {/* Section label shimmers (AI running-text) while the section
-                holds a running thread; otherwise it's a plain label. Uses the
-                INVERTED shimmer here — the bold label rests at full strength and
-                a muted band sweeps across (the standard dim-base + bright-sweep
-                read as "dimmed" against this header's weight; the in-thread
-                step/status shimmer keeps the standard direction). */}
-            <span class={`drawer-section-label${hasRunning ? ' running-shimmer running-shimmer-invert' : ''}`}>{title}</span>
-            {count !== undefined && (
-                <span class="section-count">
-                    <span class="section-count-badge">{count}</span>
-                    <span class="section-count-open">{count}</span>
-                </span>
-            )}
-        </>
-    );
-}
-
 function DrawerSection({ sectionKey, title, Icon, count, hasRunning, children }: { sectionKey: string; title: string; Icon?: ComponentType<{ size?: string }>; count: number; hasRunning?: boolean; children: ComponentChildren }) {
     const collapsed = collapsedSections.value.has(sectionKey);
     return (
@@ -1171,7 +1145,7 @@ function DrawerSectionTitle({ sectionKey, title, Icon, count, hasRunning, collap
              role="treeitem"
              aria-selected={highlighted}
              aria-expanded={!collapsed}>
-            <DrawerSectionHeader Icon={Icon} title={title} count={count} hasRunning={hasRunning} />
+            <SectionHeaderContent Icon={Icon} title={title} count={count} running={hasRunning} />
         </div>
     );
 }
@@ -1679,7 +1653,7 @@ function DraftsList() {
     return (
         <div>
             <div class="list-section-title">
-                <DrawerSectionHeader Icon={DraftsIcon} title="Drafts" count={drafts.length} />
+                <SectionHeaderContent Icon={DraftsIcon} title="Drafts" count={drafts.length} />
             </div>
             {drafts.map(t => t.meta.state === 'composing'
                 ? <ComposingThreadRow key={t.meta.id} thread={t} />
@@ -1711,7 +1685,7 @@ function AttentionList() {
     return (
         <div>
             <div class="list-section-title">
-                <DrawerSectionHeader Icon={AttentionIcon} title="Needs attention" count={threads.length} />
+                <SectionHeaderContent Icon={AttentionIcon} title="Needs attention" count={threads.length} />
             </div>
             {threads.map(t => <ThreadRow key={t.meta.id} threadId={t.meta.id} status={effectiveThreadStatus(t)} />)}
             <FilteredViewFooter />
@@ -1739,7 +1713,7 @@ function ReviewList() {
     return (
         <div>
             <div class="list-section-title">
-                <DrawerSectionHeader title="Review" count={threads.length} />
+                <SectionHeaderContent title="Review" count={threads.length} />
             </div>
             {threads.map(t => <ThreadRow key={t.meta.id} threadId={t.meta.id} status={effectiveThreadStatus(t)} />)}
             <FilteredViewFooter />
@@ -1772,7 +1746,7 @@ function RunningList() {
                     returned), so the header always shimmers — the same "live"
                     affordance the lifecycle sections show while they hold a
                     running thread. */}
-                <DrawerSectionHeader Icon={RunningIcon} title="Running" count={threads.length} hasRunning />
+                <SectionHeaderContent Icon={RunningIcon} title="Running" count={threads.length} running />
             </div>
             {threads.map(t => <ThreadRow key={t.meta.id} threadId={t.meta.id} status={effectiveThreadStatus(t)} />)}
             <FilteredViewFooter />
@@ -1802,7 +1776,7 @@ function SearchResults() {
                 ) : (
                     <div>
                         <div class="list-section-title">
-                            <DrawerSectionHeader title="Results" />
+                            <SectionHeaderContent title="Results" />
                         </div>
                         {loadable.data.map((r: ThreadSearchResult) => (
                             <SearchResultRow key={r.thread_id} result={r} />

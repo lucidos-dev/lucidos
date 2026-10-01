@@ -49,13 +49,6 @@ export const THEME_MODE_STORAGE_KEY = 'lucidos-theme-mode';
 /** The attribute every surface paints the resolved mode on. */
 export const THEME_MODE_ATTRIBUTE = 'data-theme-mode';
 
-/**
- * The attribute an app frame also carries, for app styles written before the
- * rename. Iframe realm only, never the shell (docs/temporary-measures.md §
- * Legacy `data-theme` in app frames).
- */
-export const LEGACY_THEME_MODE_ATTRIBUTE = 'data-theme';
-
 /** What an unset `theme-mode` preference means: follow the OS light/dark
  *  setting. A device that explicitly picked light or dark keeps its pick. */
 export const DEFAULT_THEME_MODE: ThemeMode = 'system';
@@ -710,17 +703,6 @@ export const THEME_STORAGE_KEY = 'lucidos-theme-resolved';
 
 /** The seed key the engine prepends for an app frame (`api/sdk_prefs.rs`). */
 export const THEME_SEED_KEY = 'theme_resolved';
-
-/**
- * Storage keys renamed with the theme rename, old name first. The shell's boot
- * script adopts each old value once (docs/temporary-measures.md § Renamed
- * appearance storage keys).
- */
-export const RENAMED_STORAGE_KEYS: ReadonlyArray<readonly [string, string]> = [
-  ['lucidos-theme', THEME_MODE_STORAGE_KEY],
-  ['lucidos-look', THEME_STORAGE_KEY],
-  ['lucidos-look-effects', THEME_EFFECTS_STORAGE_KEY],
-];
 
 /** The fonts a theme suggests: catalog ids and well-formed workspace font ids
  *  survive parsing. Neither kind makes a third-party request (ADR 0303, ADR

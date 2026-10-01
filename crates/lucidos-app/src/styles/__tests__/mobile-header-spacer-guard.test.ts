@@ -40,7 +40,18 @@ describe('mobile fixed-header spacer', () => {
   it('the spacer group exists at the mobile layout line and reserves the header height', () => {
     expect(spacerRule, 'no rule carries .thread-drawer-list::before').toBeDefined();
     expect(spacerRule!.atRules).toContain('@media (max-width: 768px)');
-    expect(spacerRule!.props.get('height')).toContain('var(--mobile-header-height');
+    expect(spacerRule!.props.get('height')).toContain('var(--app-header-bottom)');
+  });
+
+  // A view that fills the pane gives the spacer's room back. Otherwise it
+  // overflows by one header height and scrolls its top up behind the header.
+  it('a pane-filling view takes the pane height less the spacer', () => {
+    const fill = cssRules(mobileCss).find(r =>
+      r.selector.includes('.content-pane-body > .content-view.active'),
+    );
+    expect(fill, 'no rule sizes the pane-filling views').toBeDefined();
+    expect(fill!.selector).toContain('.content-pane-body > .file-preview-frame');
+    expect(fill!.props.get('height')).toBe('calc(100% - var(--app-header-bottom))');
   });
 
   /**

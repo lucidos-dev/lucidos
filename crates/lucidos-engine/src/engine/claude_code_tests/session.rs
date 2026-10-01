@@ -535,12 +535,19 @@ fn an_in_session_discard_holds_the_claim_an_apply_needs() {
     let (msg_tx, _msg_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut session = make_test_session(msg_tx, true);
     session.worktree_path = Some(std::path::PathBuf::from("/tmp/lucidos-test/wt"));
+    session.branch_name = Some("lucidos-claude-code-repo-lucidos-discard".into());
     let mut sessions = std::collections::HashMap::from([(thread_id, session)]);
 
-    let Ok(DiscardTarget::Claimed { claimant, .. }) = claim_for_discard(&mut sessions, thread_id)
+    let Ok(DiscardTarget::Claimed {
+        branch, claimant, ..
+    }) = claim_for_discard(&mut sessions, thread_id)
     else {
         panic!("a live session with a worktree is claimed for the Discard");
     };
+    assert_eq!(
+        branch, "lucidos-claude-code-repo-lucidos-discard",
+        "the reset is gated on the session's own branch"
+    );
     assert_eq!(
         decide_in_place_merge_claim(sessions.get(&thread_id)),
         InPlaceMergeClaim::Claimed(crate::engine::types::ChangeClaim::Discard),
@@ -564,8 +571,8 @@ fn an_in_session_discard_holds_the_claim_an_apply_needs() {
 }
 
 /// A Discard landing while a stop is ending the session would reset the tree
-/// under finalize. A missing session and a session with no worktree stay
-/// distinct: only the first takes the stale-session teardown.
+/// under finalize. A missing session and a session with no worktree or branch
+/// stay distinct: only the first takes the stale-session teardown.
 #[test]
 fn an_in_session_discard_refuses_a_stopping_session_and_a_missing_worktree() {
     use super::{claim_for_discard, DiscardTarget, SESSION_STOPPING_MESSAGE};
@@ -587,8 +594,22 @@ fn an_in_session_discard_refuses_a_stopping_session_and_a_missing_worktree() {
         Some("No worktree for this session")
     );
 
+    sessions.get_mut(&thread_id).unwrap().worktree_path =
+        Some(std::path::PathBuf::from("/tmp/lucidos-test/wt"));
+    assert_eq!(
+        claim_for_discard(&mut sessions, thread_id)
+            .err()
+            .map(|e| e.to_string())
+            .as_deref(),
+        Some("No branch for this session"),
+        "without a branch the reset has nothing to check the worktree against"
+    );
+    assert_eq!(
+        sessions[&thread_id].change_claim, None,
+        "a refused Discard leaves no claim behind"
+    );
+
     let session = sessions.get_mut(&thread_id).unwrap();
-    session.worktree_path = Some(std::path::PathBuf::from("/tmp/lucidos-test/wt"));
     session.pending_stop = Some(crate::engine::StopReason::Apply);
     assert_eq!(
         claim_for_discard(&mut sessions, thread_id)

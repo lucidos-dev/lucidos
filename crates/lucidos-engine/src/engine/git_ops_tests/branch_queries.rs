@@ -30,6 +30,79 @@ async fn detect_origin_returns_none_for_repo_without_remote() {
     );
 }
 
+/// Run git in `dir`, asserting success, and return its trimmed stdout.
+fn git_ok(dir: &std::path::Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// A clone of a fresh bare origin, with one pushed commit on `main`.
+fn clone_with_origin() -> (tempfile::TempDir, std::path::PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let work = tmp.path().join("work");
+    git_ok(
+        tmp.path(),
+        &["init", "--bare", "--initial-branch=main", "origin.git"],
+    );
+    git_ok(tmp.path(), &["clone", "-q", "origin.git", "work"]);
+    git_ok(&work, &["config", "user.email", "test@example.com"]);
+    git_ok(&work, &["config", "user.name", "Test"]);
+    git_ok(&work, &["commit", "-q", "--allow-empty", "-m", "base"]);
+    git_ok(&work, &["branch", "-M", "main"]);
+    git_ok(&work, &["push", "-q", "-u", "origin", "main"]);
+    (tmp, work)
+}
+
+/// Standing on another branch, a spawn must never rewind a local default
+/// branch that holds commits origin lacks.
+#[tokio::test]
+async fn detect_origin_keeps_unpushed_commits_on_the_local_default_branch() {
+    let (_tmp, work) = clone_with_origin();
+    git_ok(&work, &["commit", "-q", "--allow-empty", "-m", "unpushed"]);
+    let local_main = git_ok(&work, &["rev-parse", "refs/heads/main"]);
+    git_ok(&work, &["checkout", "-q", "-b", "feature"]);
+
+    assert_eq!(
+        detect_origin_default_branch(&work).await.as_deref(),
+        Some("origin/main")
+    );
+    assert_eq!(
+        git_ok(&work, &["rev-parse", "refs/heads/main"]),
+        local_main,
+        "the unpushed commit must stay on local main"
+    );
+}
+
+/// The control: a local default branch that is merely behind origin still
+/// fast-forwards.
+#[tokio::test]
+async fn detect_origin_fast_forwards_a_local_default_branch_that_is_behind() {
+    let (tmp, work) = clone_with_origin();
+    git_ok(tmp.path(), &["clone", "-q", "origin.git", "other"]);
+    let other = tmp.path().join("other");
+    git_ok(&other, &["config", "user.email", "test@example.com"]);
+    git_ok(&other, &["config", "user.name", "Test"]);
+    git_ok(&other, &["commit", "-q", "--allow-empty", "-m", "newer"]);
+    git_ok(&other, &["push", "-q", "origin", "main"]);
+    let origin_main = git_ok(&other, &["rev-parse", "HEAD"]);
+    git_ok(&work, &["checkout", "-q", "-b", "feature"]);
+
+    detect_origin_default_branch(&work).await;
+    assert_eq!(
+        git_ok(&work, &["rev-parse", "refs/heads/main"]),
+        origin_main
+    );
+}
+
 #[tokio::test]
 async fn worktree_creation_succeeds_for_repo_without_remote() {
     // Create a temporary git repo with no remotes

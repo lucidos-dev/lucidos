@@ -160,9 +160,8 @@ test.describe('Message route panel', () => {
       await navigateToApp(page);
       await assertHealthy(page);
 
-      // Engine-origin MessageReceived is variant 'system' → it keeps its actor
-      // chip (not a chromeless user bubble), so the origin badge is the chip.
-      const badge = page.locator('.initiator-actor:visible').first();
+      // An engine-seeded message draws no actor header; its time opens the popover.
+      const badge = page.locator('.initiator-timestamp-button:visible').first();
       await expect(badge).toBeVisible();
       await badge.click();
 
@@ -217,7 +216,8 @@ test.describe('Message route panel', () => {
       await navigateToApp(page);
       await assertHealthy(page);
 
-      const badge = page.locator('.initiator-actor:visible').first();
+      // An engine-seeded message draws no actor header; its time opens the popover.
+      const badge = page.locator('.initiator-timestamp-button:visible').first();
       await expect(badge).toBeVisible();
       await badge.click();
 

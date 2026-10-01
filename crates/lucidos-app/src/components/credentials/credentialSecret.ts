@@ -23,7 +23,6 @@ export interface CredentialFields {
    *  provider's own spelling of "issue a refresh token" goes, e.g. Dropbox's
    *  `token_access_type=offline`. */
   authorizeParams: string;
-  scopes: string;
   /** Blank means the default loopback callback URI. */
   redirectUri: string;
 }
@@ -40,7 +39,6 @@ export function emptyFields(): CredentialFields {
     userinfoUrl: '',
     userinfoMethod: '',
     authorizeParams: '',
-    scopes: '',
     redirectUri: '',
   };
 }
@@ -60,7 +58,6 @@ export function parseSecret(authType: AuthType, authValue: string): CredentialFi
     f.userinfoUrl = pick(p, 'userinfo_url');
     f.userinfoMethod = pick(p, 'userinfo_method');
     f.authorizeParams = pick(p, 'authorize_params');
-    f.scopes = pick(p, 'scopes');
     f.redirectUri = pick(p, 'redirect_uri');
   } else if (authType === 'password') {
     const p = safeJson(authValue);
@@ -90,7 +87,6 @@ export function buildSecret(authType: AuthType, f: CredentialFields): string {
       !f.userinfoUrl &&
       !f.userinfoMethod &&
       !f.authorizeParams &&
-      !f.scopes &&
       !f.redirectUri
     ) {
       return '';
@@ -110,7 +106,6 @@ export function buildSecret(authType: AuthType, f: CredentialFields): string {
       blob.userinfo_method = f.userinfoMethod.toUpperCase();
     }
     if (f.authorizeParams) blob.authorize_params = f.authorizeParams;
-    if (f.scopes) blob.scopes = f.scopes;
     if (f.redirectUri) blob.redirect_uri = f.redirectUri;
     return JSON.stringify(blob);
   }

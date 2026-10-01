@@ -213,7 +213,7 @@ describe('rowForService', () => {
  * against a blank form would write back only what the request happened to seed.
  * A confidential client would lose its `client_secret` and start failing the
  * token exchange; a provider the registry does not know would lose its
- * endpoints, scopes and redirect override too. A widening would wipe the very
+ * endpoints and redirect override too. A widening would wipe the very
  * secret it exists to avoid retyping. All of it is silent at save time.
  *
  * Source-scan because the failure is in which component renders, and mounting
@@ -326,5 +326,26 @@ describe('reauthorizationHint', () => {
     const consoleOnly: KnownOAuthProvider = { ...withHint, permissions_hint: undefined };
     expect(reauthorizationHint([hintOnly], 'acme', true)).toBe(hintOnly);
     expect(reauthorizationHint([consoleOnly], 'acme', true)).toBe(consoleOnly);
+  });
+});
+
+/**
+ * A tester read saving an OAuth client as handing Lucidos access. It does not:
+ * saving writes one credential row, and access comes only from the consent
+ * screen. The form also lost its Default Scopes field, which no flow ever read.
+ */
+describe('the OAuth client form says what saving does', () => {
+  const source = readFileSync(
+    resolve(dirname(fileURLToPath(import.meta.url)), '../CredentialModal.tsx'),
+    'utf8',
+  );
+
+  it('says saving grants no access', () => {
+    expect(source).toContain('Saving this grants no access.');
+  });
+
+  it('offers no scopes field', () => {
+    expect(source).not.toContain('Default Scopes');
+    expect(source).not.toContain('scopesRef');
   });
 });
