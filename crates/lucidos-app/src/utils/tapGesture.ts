@@ -1,3 +1,5 @@
+import { LONG_PRESS_DELAY_MS } from '../hooks/useLongPress';
+
 // Movement during a press that is treated as a scroll instead of a tap.
 // 8 px matches the swipe direction-lock threshold in `swipe.ts`.
 // Exported for `deadPressProbe`, which asks the same question of a cancelled
@@ -141,10 +143,54 @@ export function takePressOutcome(withinMs: number, now: number = Date.now()): Pr
   return press.outcome;
 }
 
+/** Did an overlay dismiss swallow a gesture at or after `since`? A peek, so the
+ *  observer that takes the outcome still reads it. */
+function swallowedSince(since: number): boolean {
+  return lastPress !== null && lastPress.outcome === 'swallowed' && lastPress.at >= since;
+}
+
 /** All the touch path needs off the event. Structural, like `TapPointer` above,
  *  so the helper unit-tests without a DOM. */
 export interface TouchEventLike {
   preventDefault(): void;
+}
+
+/** One contact as the cancel path reads it, in screen space (see `TapPointer`). */
+interface TouchContact {
+  identifier: number;
+  screenX: number;
+  screenY: number;
+}
+
+/** What the cancel path reads off `touchstart`, `touchmove` and `touchcancel`.
+ *  `touches` is every contact still on the glass, on this element or not. */
+export interface TouchPressLike {
+  changedTouches: ArrayLike<TouchContact>;
+  touches: ArrayLike<unknown>;
+}
+
+function contactOf(e: TouchPressLike, identifier: number): TouchContact | null {
+  for (let i = 0; i < e.changedTouches.length; i++) {
+    if (e.changedTouches[i].identifier === identifier) return e.changedTouches[i];
+  }
+  return null;
+}
+
+/** Was a press the system cancelled still a tap the user meant?
+ *
+ *  One finger, start to cancel, that stayed within the tap threshold and was
+ *  not held past a long press. A scroll, a pinch or a hold fails one of the
+ *  three, and the system is entitled to take those. */
+export function cancelledPressWasATap(p: {
+  heldMs: number;
+  movedPx: number;
+  fingers: number;
+  fingersLeft: number;
+}): boolean {
+  return p.fingers <= 1
+    && p.fingersLeft === 0
+    && p.movedPx <= TAP_MOVE_THRESHOLD_PX
+    && p.heldMs <= LONG_PRESS_DELAY_MS;
 }
 
 /** A `createTapGate` as an activation sees it. Both halves travel together
@@ -211,6 +257,11 @@ export interface TouchActivateOptions {
  *  A DESTRUCTIVE face is the exception and asks the gate, so a scroll cannot
  *  fire it. See `opts.destructive`.
  *
+ *  **A constructive face also serves a tap the system CANCELLED.** iOS can take
+ *  a press that barely moved, as when the button sits in the home-indicator
+ *  strip, and no click follows a `touchcancel`. `onTouchStart` and
+ *  `onTouchMove` measure the press so `cancelledPressWasATap` can rule on it.
+ *
  *  `composeHandlers` in `promptFocus.ts` wraps this with focus-first. A local
  *  copy of the repair lives in `FileSearchModal.tsx`. */
 export function touchActivated(action: () => void, opts: TouchActivateOptions = {}) {
@@ -218,8 +269,67 @@ export function touchActivated(action: () => void, opts: TouchActivateOptions = 
   const destructive = opts.destructive ?? (() => false);
   const clock = opts.now ?? Date.now;
   let lastTouchAt: number | null = null;
+  let press: {
+    identifier: number;
+    startX: number;
+    startY: number;
+    at: number;
+    movedPx: number;
+    fingers: number;
+  } | null = null;
+  /** Fold this event's position of the press's own finger into its travel. */
+  function travel(e: TouchPressLike): void {
+    if (!press) return;
+    const t = contactOf(e, press.identifier);
+    if (!t) return;
+    press.movedPx = Math.max(
+      press.movedPx,
+      Math.abs(t.screenX - press.startX),
+      Math.abs(t.screenY - press.startY),
+    );
+  }
   return {
+    onTouchStart(e: TouchPressLike): void {
+      const t = e.changedTouches[0];
+      press = t ? {
+        identifier: t.identifier,
+        startX: t.screenX,
+        startY: t.screenY,
+        at: clock(),
+        movedPx: 0,
+        fingers: e.touches.length,
+      } : null;
+    },
+    onTouchMove(e: TouchPressLike): void {
+      if (!press) return;
+      press.fingers = Math.max(press.fingers, e.touches.length);
+      travel(e);
+    },
+    onTouchCancel(e: TouchPressLike): void {
+      // The browser can take a scroll with no `touchmove` delivered first, so
+      // the cancel's own position counts too.
+      travel(e);
+      const p = press;
+      press = null;
+      if (!p || !contactOf(e, p.identifier)) return;
+      if (!enabled() || destructive()) return;
+      // A tap outside an open overlay only dismisses it (see `installPairedSwallow`).
+      if (swallowedSince(p.at)) return;
+      const tap = cancelledPressWasATap({
+        heldMs: clock() - p.at,
+        movedPx: p.movedPx,
+        fingers: p.fingers,
+        fingersLeft: e.touches.length,
+      });
+      if (!tap) return;
+      // No click follows a cancel, so no twin window opens. The pointer cancel
+      // marked the gate aborted, which stops only a destructive face.
+      opts.gate?.spend();
+      notePressOutcome('served');
+      action();
+    },
     onTouchEnd(e: TouchEventLike): void {
+      press = null;
       if (!enabled()) return;
       // Cancel and record the twin BEFORE the gate rules, so a refused press
       // cannot return as a click. `pass()` consumes the press, so that click

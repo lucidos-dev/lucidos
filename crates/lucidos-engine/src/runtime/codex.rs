@@ -512,10 +512,6 @@ fn build_codex_turn_command(
     for (k, v) in &config.env {
         cmd.env(k, v);
     }
-    // Own process group so a group-wide signal to the engine can't truncate
-    // the turn — same isolation CC gets. (Codex's env is baked from a probe,
-    // so this Command attribute must be set on the real command directly.)
-    super::spawn_env::isolate_in_process_group(&mut cmd);
     cmd
 }
 
@@ -878,7 +874,7 @@ async fn run_turn(
         &prompt,
         &image_paths,
     );
-    let mut child = match cmd.spawn() {
+    let mut child = match super::spawn_env::spawn_below_engine(&mut cmd) {
         Ok(c) => c,
         Err(e) => {
             log!("[Codex] failed to spawn codex CLI: {}", e);
@@ -964,7 +960,7 @@ async fn run_turn(
 
     // Reap the child: clean exit path lets it finish; interrupt/shutdown kill it.
     let wait_result = if interrupted || shutdown {
-        // The child is its own process-group leader (`isolate_in_process_group`
+        // The child is its own process-group leader (`spawn_below_engine`
         // at spawn), so `start_kill` signals ONLY the leader: everything the
         // Codex turn spawned (cargo/rustc, a Playwright runner and its browsers)
         // survives as an orphan burning CPU. Tear the whole group down first,

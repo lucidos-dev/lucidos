@@ -23,7 +23,7 @@ import { fileURLToPath } from 'node:url';
 // @ts-expect-error: same
 import { dirname, resolve } from 'node:path';
 import type { ComponentChildren, VNode } from 'preact';
-import { eventDeliveryBody, eventWaitRowBody, triggerFiredBody } from '../chat-exchange-parts';
+import { boundaryCard, eventDeliveryBody, eventWaitRowBody, triggerFiredBody } from '../chat-exchange-parts';
 import { formatDeliveredPayload } from '../CreateThreadView';
 import { EventConditionModal } from '../EventConditionModal';
 import { EventRowFoldView } from '../EventRow';
@@ -37,7 +37,7 @@ import {
 import { eventConditionModal } from '../../../store/store';
 import { isExchangeStartEvent } from '../../../store/thread-events';
 import { responseBody } from '../../../store/event-rendering';
-import type { EventWaitSummary, Exchange } from '../../../store/thread-events';
+import type { EventWaitSummary, Exchange, StoredEvent } from '../../../store/thread-events';
 import type { ResponseEvent } from '../../../store/types';
 import { formatMessageTimestamp } from '../../../utils/formatTime';
 
@@ -174,7 +174,7 @@ describe('EventWaitRow', () => {
    *  so a live pill carries the deadline instead of repeating the verb. */
   it.each([
     ['waiting', /^Until /, 'live'],
-    ['matched', /^✓$/, 'arrived'],
+    ['matched', /^Arrived$/, 'arrived'],
     ['timed_out', /^Gave up at /, 'lapsed'],
     ['canceled', /^Stopped$/, 'halted'],
   ] as const)('reports the %s state as %s', (state, words, tone) => {
@@ -205,8 +205,8 @@ describe('EventWaitRow', () => {
       const stamp = (e: string) =>
         vnodeText(findByClass(step(wait_({ state: 'matched', matched_at: e })), 'event-row-state'));
 
-      expect(stamp(at(-60 * 1000))).toMatch(/^✓ \d{2}:\d{2}$/);
-      expect(stamp(at(-36 * 60 * 60 * 1000))).toMatch(/^✓ \w{3} \d{1,2} \d{2}:\d{2}$/);
+      expect(stamp(at(-60 * 1000))).toMatch(/^Arrived \d{2}:\d{2}$/);
+      expect(stamp(at(-36 * 60 * 60 * 1000))).toMatch(/^Arrived \w{3} \d{1,2} \d{2}:\d{2}$/);
     } finally {
       vi.useRealTimers();
     }
@@ -293,15 +293,16 @@ describe('EventWaitRow', () => {
     expect(findByClass(tree, 'event-row-sep')).toBeNull();
   });
 
-  /** **The chip shows plain words and keeps the raw type on its tooltip.** A
-   *  reader who needs the exact event to subscribe to can still find it. */
-  it('shows the plain name with the raw type on the tooltip', () => {
+  /** **The chip shows plain words, and its tooltip says what they mean.** The
+   *  raw type is tech speak, so it lives in the route popover's Technical
+   *  details instead. */
+  it('shows the plain name with its meaning on the tooltip', () => {
     const chip = findByClass(step(wait_()), 'event-name');
     expect(vnodeText(chip)).toBe('change proposed');
-    expect(chip?.props['data-tooltip']).toBe('ChangeProposed');
+    expect(chip?.props['data-tooltip']).toBe('An agent offered a change for you to apply.');
   });
 
-  /** **"matching only" says a filter exists and nothing about what it says**, and
+  /** **"with a condition" says a condition exists and nothing about what it says**, and
    *  the raw operator JSON is far too wide for a facts line. So the chip is the
    *  door to it: pressing one opens the condition in a modal. Before that, the
    *  row could report that a watch was narrowed and no surface could say how. */
@@ -309,11 +310,11 @@ describe('EventWaitRow', () => {
     const condition = { 'workflow_run.event': 'completed' };
     const tree = step(wait_({ subscriptions: [{ event_type: 'GithubWorkflowRunStateChanged', condition }] }));
     const chip = findByClass(tree, 'event-name-link');
-    expect(vnodeText(chip)).toBe('github workflow run state changed matching only');
-    expect(vnodeText(findByClass(chip, 'event-name-note'))).toBe('matching only');
-    // The accessible name carries the raw type and says pressing it opens the
-    // condition rather than jumping to an event.
-    expect(chip?.props['aria-label']).toBe('GithubWorkflowRunStateChanged · show the condition');
+    expect(vnodeText(chip)).toBe('github workflow run state changed with a condition');
+    expect(vnodeText(findByClass(chip, 'event-name-note'))).toBe('with a condition');
+    // The accessible name says pressing it opens the condition rather than
+    // jumping to an event.
+    expect(chip?.props['aria-label']).toBe('github workflow run state changed · show the condition');
     (chip?.props.onClick as () => void)();
     expect(eventConditionModal.value).toEqual({
       eventType: 'GithubWorkflowRunStateChanged',
@@ -332,7 +333,7 @@ describe('EventWaitRow', () => {
     const chip = findByClass(tree, 'event-name-link');
     expect(vnodeText(chip)).toBe('coding agent stopped working 6 conditions');
     expect(vnodeText(findByClass(tree, 'event-row-meta'))).toBe('watching forcoding agent stopped working 6 conditions');
-    expect(chip?.props['aria-label']).toBe('CodingAgentIdled · show the 6 conditions');
+    expect(chip?.props['aria-label']).toBe('coding agent stopped working · show the 6 conditions');
     (chip?.props.onClick as () => void)();
     expect(eventConditionModal.value).toEqual({ eventType: 'CodingAgentIdled', conditions });
   });
@@ -595,7 +596,7 @@ describe('eventDeliveryBody', () => {
     expect(String(el?.props.class)).toContain('event-row');
     expect(el?.props['data-kind']).toBe('delivery');
     expect(vnodeText(findByClass(tree, 'event-name'))).toBe('Change proposed');
-    expect(findByClass(tree, 'event-name')?.props['data-tooltip']).toBe('ChangeProposed');
+    expect(findByClass(tree, 'event-name')?.props['data-tooltip']).toBe('An agent offered a change for you to apply.');
     expect(vnodeText(findByClass(tree, 'event-row-state'))).toBe('Arrived');
   });
 
@@ -633,6 +634,14 @@ describe('eventDeliveryBody', () => {
     // No leading word boundary: `vnodeText` joins text nodes with no spaces,
     // so "14:00wakes on" would slip past a `\bwake`.
     for (const tree of surfaces) expect(vnodeText(tree)).not.toMatch(/wok|wake/i);
+    // The re-entry anchor's own card, tooltip and folded story included.
+    for (const outcome of ['delivered', 'expired'] as const) {
+      const anchor = {
+        type: 'UserPromptInjected', text: 'x', mode: 'agent',
+        origin: { kind: 'engine', reason: { kind: 'event_wait', outcome, watched: ['ChangeProposed'], wait_reason: 'r' } },
+      } as StoredEvent;
+      expect(JSON.stringify(boundaryCard(anchor, '', { turn: 'done', carried: 'x' }))).not.toMatch(/wok|wake/i);
+    }
   });
 
   /** **This card owns the jump**, moved here from the arming card on
@@ -682,7 +691,7 @@ describe('eventDeliveryBody', () => {
 
     expect(jump?.type).toBe('button');
     expect(jump?.props.type).toBe('button');
-    expect(jump?.props['aria-label']).toBe('ChangeProposed · go to the event');
+    expect(jump?.props['aria-label']).toBe('Change proposed · go to the event');
   });
 
   /** Resolving the matched event's owning thread is a network round-trip in
@@ -799,7 +808,7 @@ describe('triggerFiredBody', () => {
 
     expect(jump?.type).toBe('button');
     expect(vnodeText(jump)).toBe('change applied');
-    expect(jump?.props['aria-label']).toBe('ChangeApplied · go to the event');
+    expect(jump?.props['aria-label']).toBe('change applied · go to the event');
     expect(vnodeText(tree)).not.toContain('Go to event');
   });
 

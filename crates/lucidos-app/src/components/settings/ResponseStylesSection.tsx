@@ -350,7 +350,6 @@ function StyleEditorModal({
     <Overlay
       open
       onClose={onDone}
-      overlayClass="style-editor-overlay"
       panelClass="surface surface-raised style-editor-modal"
       panelRole="dialog"
       ariaModal

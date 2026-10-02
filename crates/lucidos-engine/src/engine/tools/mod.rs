@@ -1075,8 +1075,8 @@ impl LucidosEngine {
     /// LLM tool: take a *standing apply* back. The off for the two arms above,
     /// so the prompt can undo what it armed (philosophy rule 2).
     ///
-    /// `thread_id` names one thread. Omitted, it cancels every arm here, which
-    /// is what the Changes panel's own off does.
+    /// `thread_id` names one thread. Omitted, it cancels every arm here: the
+    /// workspace-wide off.
     ///
     /// It asks the gate the arm asks. Taking an apply back acts on the same
     /// thread's apply, so a caller that could not have armed here may not

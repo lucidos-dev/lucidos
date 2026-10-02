@@ -193,8 +193,8 @@ async fn an_arm_refuses_a_repo_lucidos_never_applies_into() {
     );
 }
 
-/// The workspace-scope off, which the Changes panel's toggle presses. It takes
-/// back every arm here, whether a sweep set it or the owner armed one change.
+/// The workspace-scope off, for the prompt and the CLI. It takes back every arm
+/// here, whether a sweep set it or the owner armed one change.
 ///
 /// Both threads must leave `standing_apply_thread_ids`, because that payload is
 /// the only armed signal any surface reads.

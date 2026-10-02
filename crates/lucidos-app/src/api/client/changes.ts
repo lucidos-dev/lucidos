@@ -110,10 +110,6 @@ export interface ChangesState {
    *  sweep arms a thread that has proposed nothing yet, and its prompt row
    *  still renders the armed state. Absent on an older payload. */
   standing_apply_thread_ids?: string[];
-  /** Coding-agent threads still settling, so a sweep has something to arm.
-   *  The Changes panel offers "Apply all on settle" off this. It cannot derive it:
-   *  `threadMap` holds only the loaded window. Absent on an older payload. */
-  settling_thread_count?: number;
   /** How long hardening and conflict resolution usually take here. Absent on
    *  an older payload. */
   apply_estimates?: ApplyEstimates;
@@ -185,11 +181,7 @@ export interface ApplyAllResult {
   status?: ApplyStatus;
   /** Engine-assigned batch id, present whenever a batch was started. */
   batch_id?: string;
-  /** How many changes the batch holds. Exactly `0` means no batch started, so
-   *  the call only armed: with nothing appliable now, the sweep IS the action
-   *  and nothing will arrive later to clear the optimistic busy flag. Absent on
-   *  an older payload, which reads as "a batch started" and leaves the flag to
-   *  the ApplyAllBatchCompleted event. */
+  /** How many changes the batch holds. */
   batch_size?: number;
   /** Set when the first change stopped at a conflict — same shape as ApplyChangeResult. */
   conflict_thread_id?: string;
@@ -198,19 +190,11 @@ export interface ApplyAllResult {
   review_thread_id?: string;
   applied?: number;
   failed?: number;
-  /** How many threads the sweep armed, when "Apply all on settle" was
-   *  pressed. */
-  armed?: number;
 }
 
-/** Apply every pending change whose thread has settled.
- *
- *  With `keepGoing`, it also arms a *standing apply* on every thread still
- *  working, so each one applies as it lands. That is the whole action when
- *  nothing is pending, and the button reads "Apply all on settle" there. */
-export async function applyAllChanges(keepGoing = false): Promise<ApplyAllResult> {
-  const qs = keepGoing ? '?keep_going=true' : '';
-  return json(`${API}/changes/apply-all${qs}`, { method: 'POST' }, APPLY_TIMEOUT_MS);
+/** Apply every pending change whose thread has settled. */
+export async function applyAllChanges(): Promise<ApplyAllResult> {
+  return json(`${API}/changes/apply-all`, { method: 'POST' }, APPLY_TIMEOUT_MS);
 }
 
 /** Arm a standing apply: the thread's change applies once it settles.
@@ -231,16 +215,6 @@ export async function armStandingApply(
 /** Take the instruction back. */
 export async function disarmStandingApply(threadId: string): Promise<{ message: string }> {
   return json(`${API}/standing-applies/${encodeURIComponent(threadId)}`, { method: 'DELETE' });
-}
-
-/** Take back every standing apply in the workspace: the Changes panel's own
- *  off. It drops a single arm as readily as a swept one, because that panel
- *  draws one armed state for the whole workspace.
- *
- *  Nothing armed answers `{ disarmed: 0 }` rather than an error. It stops no
- *  running Apply All batch: `cancelApplyAllChanges` is that button. */
-export async function disarmAllStandingApplies(): Promise<{ disarmed: number }> {
-  return json(`${API}/standing-applies`, { method: 'DELETE' });
 }
 
 /** Cancel the running Apply All batch — stops the driver, interrupts the
@@ -289,8 +263,9 @@ export async function getThreadCcDiff(threadId: string): Promise<ThreadCcDiff> {
 }
 
 /** URL of the full "after" version of a file in a change. Served with a
- *  content-type inferred from the extension, so a binary-media preview can
- *  point an <img>/<video>/<audio>/<iframe> `src` at it. */
+ *  content-type inferred from the extension, so a media preview can point an
+ *  <img>/<video>/<audio>/<iframe> `src` at it. An HTML, SVG or XML body comes
+ *  sandboxed with script off, as `repoFileUrl` does. */
 export function changeFileUrl(changeId: string, path: string): string {
   const params = new URLSearchParams({ path });
   return `${API}/changes/${encodeURIComponent(changeId)}/file?${params}`;

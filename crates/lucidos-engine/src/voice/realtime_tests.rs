@@ -594,6 +594,44 @@ fn an_error_frame_names_what_went_wrong() {
     );
 }
 
+/// A barge-in cancel that lost the race to the reply's own end keeps the call
+/// up. The provider answers it with an error frame, but the session is fine.
+#[test]
+fn a_cancel_that_found_no_reply_is_not_a_failure() {
+    let frame = serde_json::json!({
+        "type": "error",
+        "event_id": "event_1",
+        "error": {
+            "type": "invalid_request_error",
+            "code": "response_cancel_not_active",
+            "message": "Cancellation failed: no active response found",
+            "param": null,
+            "event_id": null
+        }
+    });
+    assert_eq!(map_event(&frame), vec![]);
+}
+
+/// Only that one code is spared. Any other error under the same type still
+/// ends the call, because a fatal one swallowed is worse than a loud teardown.
+#[test]
+fn another_invalid_request_error_still_ends_the_call() {
+    let frame = serde_json::json!({
+        "type": "error",
+        "error": {
+            "type": "invalid_request_error",
+            "code": "invalid_value",
+            "message": "Invalid value: 'pcm17'"
+        }
+    });
+    assert_eq!(
+        map_event(&frame),
+        vec![VoiceEvent::Failed {
+            message: "Invalid value: 'pcm17'".to_string()
+        }]
+    );
+}
+
 /// A caller starting to speak is NOT an interruption. `speech_started` fires on
 /// every utterance, including the first word of a call with nothing playing.
 /// Mapping it would report the talker cut off on every turn.

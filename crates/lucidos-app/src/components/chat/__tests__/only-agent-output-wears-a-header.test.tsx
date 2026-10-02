@@ -62,12 +62,14 @@ describe('a turn the agent did not write', () => {
     mount(starter({ type: 'MissingHardeningDetected', origin: ENGINE('missing_hardening') }));
     expect(host.querySelector('.initiator-summary')).toBeNull();
     const card = host.querySelector('.initiator-body .event-row[data-kind="boundary"]');
-    expect(card?.querySelector('.event-row-subject .event-name')?.textContent).toBe('Hardening missing');
+    expect(card?.querySelector('.event-row-subject .event-name')?.textContent).toBe('Hardening needed');
     expect(card?.querySelector('.event-row-state')?.textContent).toBe('Done');
     const toggle = card?.querySelector<HTMLButtonElement>('.event-row-fold-toggle');
     expect(toggle?.textContent).toBe('Details');
     act(() => { toggle!.click(); });
-    expect(card?.textContent).toContain('Hardening (`/harden`) must run before changes are applied');
+    expect(card?.textContent).toContain('Changes must pass hardening, an automatic review and test run, before they are applied.');
+    // Plain text, so markdown would show raw: the explainer carries none.
+    expect(card?.textContent).not.toContain('`');
   });
 
   it('folds what the starter carried under Details', () => {
@@ -114,10 +116,63 @@ describe('a turn the agent did not write', () => {
     expect(host.querySelector('.event-row[data-kind="boundary"] .event-row-state')?.textContent).toBe('Done');
   });
 
+  // The reported card: "Prompt to the agent", a raw `UserPromptInjected`
+  // tooltip, and the model's instructions as the only explanation. It now
+  // tells the story, and the model's words sit one fold deeper.
+  it('tells a timed-out wait as a story, with the model\'s words folded deeper', () => {
+    mount(starter({
+      type: 'UserPromptInjected',
+      text: 'A subscription you registered has timed out.\n\nTimed out. Report what you were waiting for.',
+      mode: 'agent',
+      origin: {
+        kind: 'engine',
+        reason: { kind: 'event_wait', outcome: 'expired', watched: ['BenchSlotReleased'], wait_reason: 'waiting for the bench slot' },
+      },
+    }));
+    const card = host.querySelector('.event-row[data-kind="boundary"]');
+    const pill = card?.querySelector('.event-row-subject .event-name');
+    expect(pill?.textContent).toBe('Wait timed out');
+    expect(pill?.getAttribute('data-tooltip')).toBe('Lucidos told the agent its wait ran out of time.');
+    expect(card?.querySelector('.event-row-meta')?.textContent).toBe('bench slot released');
+    expect(card?.textContent).not.toContain('UserPromptInjected');
+    expect(card?.textContent).not.toMatch(/prompt to the agent/i);
+
+    act(() => { card!.querySelector<HTMLButtonElement>('.event-row-fold-toggle')!.click(); });
+    expect(card?.textContent).toContain(
+      'The agent asked Lucidos to tell it when “bench slot released” happened, because: waiting for the bench slot.',
+    );
+    const toggles = card!.querySelectorAll<HTMLButtonElement>('.event-row-fold-toggle');
+    expect(toggles[1]?.textContent).toBe('What the agent was told');
+    expect(toggles[1]?.getAttribute('aria-expanded')).toBe('false');
+  });
+
+  // An older row has no origin, so its frozen opening sentence names it.
+  it('names an older timed-out wait by its shape', () => {
+    mount(starter({ type: 'UserPromptInjected', text: 'A subscription you registered has timed out.\n\nTimed out.', mode: 'agent' }));
+    const card = host.querySelector('.event-row[data-kind="boundary"]');
+    expect(card?.querySelector('.event-row-subject')?.textContent).toBe('Wait timed out');
+    expect(card?.querySelector('.event-row-meta')).toBeNull();
+  });
+
+  // A delivery whose matched event scrolled out of the loaded window has no
+  // structured card to draw, so it falls back to this one: still a story.
+  it('names an older arrival whose matched event is not loaded', () => {
+    mount(starter({
+      type: 'UserPromptInjected',
+      text: 'An event you subscribed to has arrived (you were waiting because: x).\n\n{}',
+      mode: 'agent',
+      delivered_event_id: 'evt-gone',
+    }));
+    const card = host.querySelector('.event-row[data-kind="boundary"]');
+    expect(card?.querySelector('.event-row-subject')?.textContent).toBe('Event arrived');
+    act(() => { card!.querySelector<HTMLButtonElement>('.event-row-fold-toggle')!.click(); });
+    expect(card?.textContent).toContain('It happened, so Lucidos told the agent.');
+  });
+
   it('names an auto-prompt by what the engine asked for', () => {
     mount(starter({ type: 'UserPromptInjected', text: 'Run /harden before finishing.', mode: 'engine', origin: ENGINE('harden_retrigger') }));
     const card = host.querySelector('.event-row[data-kind="boundary"]');
-    expect(card?.querySelector('.event-row-subject')?.textContent).toBe('Hardening missing');
+    expect(card?.querySelector('.event-row-subject')?.textContent).toBe('Hardening needed');
   });
 
   it('puts an interrupted response\'s Continue inside its card', () => {

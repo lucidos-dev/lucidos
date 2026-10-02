@@ -264,25 +264,6 @@ impl LucidosEngine {
             .write_or_log(write, trigger_id, payload, actor, module)
             .await;
     }
-
-    /// `TriggerRegistryWriter::write_created_minting_slug`, logging a failure
-    /// the way `emit_trigger_write_or_log` does.
-    pub(crate) async fn emit_trigger_created_minting_slug(
-        &self,
-        trigger_id: &str,
-        payload: Value,
-        name: &str,
-        actor: Option<MessageOrigin>,
-        module: &str,
-    ) {
-        if let Err(e) = self
-            .trigger_registry_writer()
-            .write_created_minting_slug(trigger_id, payload, name, actor)
-            .await
-        {
-            crate::log!("{} Failed to emit TriggerCreated: {}", module, e);
-        }
-    }
 }
 
 #[cfg(test)]

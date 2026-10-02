@@ -62,7 +62,7 @@
    first. The carousel is lifted over it, as .list-section-actions is, or the
    strip takes the first chip's taps, the left chevron's, and a swipe that
    starts at the edge. */
-@media (max-width: 768px) {
+@media (--phone-layout) {
     .theme-carousel-frame {
         position: relative;
         z-index: 2;

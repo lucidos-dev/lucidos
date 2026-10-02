@@ -1581,6 +1581,10 @@ mod tests {
 
     const STUB_SERVER: &str = r#"#!/bin/sh
 echo $$ > "$STUB_PID_FILE"
+if [ -n "$STUB_GRANDCHILD_PID_FILE" ]; then
+  sleep 300 </dev/null >/dev/null 2>&1 &
+  echo $! > "$STUB_GRANDCHILD_PID_FILE"
+fi
 while IFS= read -r line; do
   id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
   case "$line" in
@@ -1615,6 +1619,7 @@ done
         env: HashMap<String, String>,
         pid_file: std::path::PathBuf,
         call_started_file: std::path::PathBuf,
+        grandchild_pid_file: std::path::PathBuf,
     }
 
     impl StubServer {
@@ -1629,6 +1634,7 @@ done
             }
             let pid_file = dir.path().join("stub.pid");
             let call_started_file = dir.path().join("call-started");
+            let grandchild_pid_file = dir.path().join("grandchild.pid");
             let env = HashMap::from([
                 (
                     "STUB_TOOLS".to_string(),
@@ -1646,7 +1652,37 @@ done
                 env,
                 pid_file,
                 call_started_file,
+                grandchild_pid_file,
             }
+        }
+
+        /// Start a long `sleep` beside the server, the shape of an `npx` or
+        /// `uvx` launcher whose interpreter outlives a kill aimed at it alone.
+        fn spawns_a_grandchild(mut self) -> Self {
+            self.env.insert(
+                "STUB_GRANDCHILD_PID_FILE".to_string(),
+                self.grandchild_pid_file.display().to_string(),
+            );
+            self
+        }
+
+        /// Block until the grandchild is gone. On timeout it is killed before
+        /// the panic, so a failing run leaves no `sleep` behind. Only ever the
+        /// pid this stub itself wrote, and only while it is still running.
+        async fn await_grandchild_stop(&self) {
+            let pid = std::fs::read_to_string(&self.grandchild_pid_file)
+                .expect("the stub wrote its grandchild's pid");
+            let pid = pid.trim().to_string();
+            for _ in 0..250 {
+                if pid_has_stopped(&pid) {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            let _ = std::process::Command::new("kill")
+                .args(["-KILL", pid.as_str()])
+                .status();
+            panic!("the server's grandchild {pid} outlived the stop");
         }
 
         /// Sleep before answering every `tools/call`, so another server can be
@@ -1703,7 +1739,7 @@ done
         }
 
         /// Block until the process is gone, which `Drop for McpClient` sees to
-        /// with `start_kill` on every path that abandons a client.
+        /// with a group kill on every path that abandons a client.
         async fn await_exit(&self) {
             for _ in 0..150 {
                 if !self.is_alive() {
@@ -2396,6 +2432,39 @@ done
         assert!(empty_status.tools.is_empty());
 
         crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    /// Stop reaches everything the server started, not only the server.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stopping_a_server_stops_the_processes_it_started() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let stub = StubServer::new(&[]).spawns_a_grandchild();
+        let (manager, _bus) = manager_with(&pool, "stub", &stub).await;
+        manager.start_server("stub").await.unwrap();
+
+        manager.stop_server("stub").await.unwrap();
+
+        stub.await_exit().await;
+        stub.await_grandchild_stop().await;
+
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    /// An abandoned client takes the whole process group with it too, since
+    /// `Drop` is the only teardown on a failed start.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_a_client_stops_the_processes_its_server_started() {
+        let stub = StubServer::new(&[]).spawns_a_grandchild();
+        let client = McpClient::connect("stub", &stub.command, &[], &stub.env, ActorMode::Agent)
+            .await
+            .unwrap();
+
+        drop(client);
+
+        stub.await_exit().await;
+        stub.await_grandchild_stop().await;
     }
 
     /// A tool with no usable wire name is never offered, so it costs nothing

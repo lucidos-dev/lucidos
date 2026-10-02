@@ -11,3 +11,14 @@ export function progressFillWidth(fraction: number): string {
   if (!Number.isFinite(fraction)) return '0%';
   return `${Math.min(1, Math.max(0, fraction)) * 100}%`;
 }
+
+/** A determinate `.progress-bar` for a long job: a backup, a cleanup pass.
+ *  Draws nothing while `total` is unknown (0), rather than an empty track. */
+export function ProgressBar({ done, total }: { done: number; total: number }) {
+  if (total <= 0) return null;
+  return (
+    <div class="progress-bar">
+      <div class="progress-bar-fill" style={{ width: progressFillWidth(done / total) }} />
+    </div>
+  );
+}

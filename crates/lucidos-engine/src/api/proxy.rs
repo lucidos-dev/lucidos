@@ -491,10 +491,127 @@ pub fn should_strip_request_header(name: &HeaderName) -> bool {
         )
 }
 
-/// Headers to strip from the *upstream* response before returning to client.
-/// Just hop-by-hop — Set-Cookie etc. are fine to pass through.
-fn should_strip_response_header(name: &str) -> bool {
-    is_hop_by_hop(name)
+/// Does an *upstream* response header reach the caller?
+///
+/// An allowlist, because the engine serves the response from the Lucidos
+/// origin. The browser acts on many headers there: `Set-Cookie`,
+/// `Clear-Site-Data`, HSTS, a CSP, CORS, `Alt-Svc`, `WWW-Authenticate`.
+/// Forwarded, any upstream could rewrite state or policy for the whole app,
+/// the gateway's device cookie included. Browsers keep adding such headers,
+/// so the engine drops an unknown name.
+///
+/// Three families pass:
+/// - Standard representation, caching, range, paging and retry headers.
+/// - `x-` extension headers. Browsers stopped minting `x-` names (RFC 6648).
+///   The engine refuses the legacy ones browsers still read, our own
+///   namespace, and the forwarding pair the gateway owns.
+/// - The vendor prefixes of the builtin model providers, whose rate-limit
+///   headers a caller reads.
+fn forwards_response_header(name: &str) -> bool {
+    let standard = matches!(
+        name,
+        "accept-patch"
+            | "accept-post"
+            | "accept-ranges"
+            | "age"
+            | "allow"
+            | "cache-control"
+            | "content-digest"
+            | "content-disposition"
+            | "content-encoding"
+            | "content-language"
+            | "content-length"
+            | "content-location"
+            | "content-range"
+            | "content-type"
+            | "date"
+            | "deprecation"
+            | "digest"
+            | "etag"
+            | "expires"
+            | "last-modified"
+            | "link"
+            | "location"
+            | "pragma"
+            | "ratelimit"
+            | "ratelimit-limit"
+            | "ratelimit-policy"
+            | "ratelimit-remaining"
+            | "ratelimit-reset"
+            | "repr-digest"
+            | "request-id"
+            | "retry-after"
+            | "server"
+            | "sunset"
+            | "traceparent"
+            | "tracestate"
+            | "vary"
+            | "warning"
+    );
+    let browser_reads_it = matches!(
+        name,
+        "x-content-security-policy"
+            | "x-content-security-policy-report-only"
+            | "x-content-type-options"
+            | "x-dns-prefetch-control"
+            | "x-download-options"
+            | "x-frame-options"
+            | "x-permitted-cross-domain-policies"
+            | "x-ua-compatible"
+            | "x-webkit-csp"
+            | "x-webkit-csp-report-only"
+            | "x-xss-protection"
+    );
+    let ours = name.starts_with("x-lucidos-") || name.starts_with("x-forwarded-");
+    let extension = name.starts_with("x-") && !browser_reads_it && !ours;
+    let provider = ["anthropic-", "openai-"]
+        .iter()
+        .any(|prefix| name.starts_with(prefix));
+    standard || extension || provider
+}
+
+/// The CSP an upstream document renders under: an opaque origin, no script.
+///
+/// Stricter than [`crate::api::file_response::DOCUMENT_SANDBOX_CSP`], which
+/// serves the user's own files. An upstream page is somebody else's, so
+/// nothing in it runs, and it cannot reach the engine's storage or cookies.
+pub(super) const PROXIED_DOCUMENT_CSP: &str = "sandbox";
+
+/// The engine's own headers on every proxied response.
+///
+/// `nosniff` keeps a browser from reading HTML or script into a body typed as
+/// something else. A body typed as a document gets the sandbox, and so does
+/// an untyped one. Navigating to a proxy URL then never runs upstream code.
+fn confine_proxied_response(headers: &mut HeaderMap) {
+    headers.insert(
+        axum::http::header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    if may_render_as_document(headers) {
+        headers.insert(
+            axum::http::header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static(PROXIED_DOCUMENT_CSP),
+        );
+    }
+}
+
+/// Could a browser render this body as a document that runs script?
+///
+/// Read the type the way a browser does. Fetch's "extract a MIME type" joins
+/// every `Content-Type` value and splits on commas, so any piece can win. A
+/// type the engine cannot read counts as no type.
+fn may_render_as_document(headers: &HeaderMap) -> bool {
+    let mut types = Vec::new();
+    for value in headers.get_all(axum::http::header::CONTENT_TYPE) {
+        let Ok(value) = value.to_str() else {
+            return true;
+        };
+        types.extend(value.split(',').filter(|t| !t.trim().is_empty()));
+    }
+    types.is_empty()
+        || types
+            .into_iter()
+            .any(crate::api::file_response::is_active_document)
 }
 
 /// Build a copy of `headers` with stripped headers removed.
@@ -1313,15 +1430,15 @@ pub async fn forward_request(
                     return (status, format!("{what}: {safe_e}")).into_response();
                 }
             };
-            let mut response = Response::builder().status(status);
+            let mut response = Response::new(Body::from(resp_body));
+            *response.status_mut() = status;
             for (name, value) in &resp_headers {
-                if !should_strip_response_header(name.as_str()) {
-                    response = response.header(name, value);
+                if forwards_response_header(name.as_str()) {
+                    response.headers_mut().append(name, value.clone());
                 }
             }
+            confine_proxied_response(response.headers_mut());
             response
-                .body(Body::from(resp_body))
-                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
         }
         Err(e) => {
             // `reqwest::Error`'s Display and Debug impls embed the request URL,

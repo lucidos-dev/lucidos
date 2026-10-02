@@ -77,6 +77,25 @@ makes the slow final approach read as smooth instead of stepping whole pixels.
 - Pace is tuned by two knobs, `SCROLL_MAX_MS` and `SCROLL_PX_PER_MS`. Lower them
   to make every navigation faster.
 
+## Amendment: a submit's glide has its own pace
+
+"One tween" now means one function with two paces, each a floor and a curve. A
+navigation keeps the one above: the chevrons, turn stepping, a deep link and the
+follow toggle. A SUBMIT's glide moves at `SEND_PACE`, a 450 ms floor and
+easeInOutCubic. That covers every landing glide, for all five submits (ADR
+0080). It also covers a rider's glide to the turn their submit created.
+
+The front-loaded curve exists so a scroll reacts instantly to a TAP. A submit
+already reacted at the tap, in the composer or on the card. Its glide is a
+short distance, so it always sat on the 240 ms floor and threw the turn into
+view. That was reported from a phone as landing too fast.
+
+The same report covers a reader riding the live edge. The follow carries a rider
+by snapping, which is right for a streaming reply. Their own submitted turn
+arriving now glides once at the send pace (`glideToSubmittedTurn`). A card
+answered while riding records no arrival, since its turn is already on screen.
+Every other growth round snaps as before.
+
 ## Alternatives considered
 
 **Native `scrollIntoView({behavior: 'smooth'})` for the deep link.** What it

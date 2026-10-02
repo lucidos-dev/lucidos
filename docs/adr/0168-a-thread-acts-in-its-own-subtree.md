@@ -159,6 +159,11 @@ that is ADR 0169. Clause 4 is not enforceable until it lands.
   *Amended:* the checkbox became its own **Apply all on settle** button beside
   Apply All. The owner found a checkbox that changed what Apply All does hard
   to read. Two buttons say the two choices outright.
+  *Amended again:* the Changes panel splits pending changes into **Ready** and
+  **Not finished**, each with its own buttons. Not finished's **Apply all on
+  settle** arms only the settling changes it lists, so a press there never
+  applies anything in Ready. The sweep itself stays, as the prompt's and the
+  CLI's form.
 - **A single change gains a standing apply.** That is the selection, and it is
   not redundant beside the sweep. The owner may have two threads running, one
   wanted in this release and one not, and a sweep cannot tell them apart.

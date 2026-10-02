@@ -12,10 +12,11 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { _setBridgedForTesting } from './_bridge';
 
 const asked: string[] = [];
+/** What the mocked engine answers the next request with. */
+let answer: unknown = { preferences: {} };
 
 vi.mock('./_fetch', () => ({
-  request: (path: string) => { asked.push(path); return Promise.resolve({ preferences: {} }); },
-  requestVoid: (path: string) => { asked.push(path); return Promise.resolve(); },
+  request: (path: string) => { asked.push(path); return Promise.resolve(answer); },
 }));
 
 vi.mock('./_storage', () => ({
@@ -27,6 +28,7 @@ let storedId: string | null = null;
 beforeEach(() => {
   asked.length = 0;
   storedId = null;
+  answer = { preferences: {} };
 });
 
 afterEach(() => {
@@ -67,5 +69,22 @@ describe('preferences.get scoping', () => {
     const { preferences } = await import('./preferences');
     await preferences.get(null);
     expect(asked[0]).toBe('/preferences');
+  });
+});
+
+describe('preferences.set', () => {
+  // The engine refuses a value it will not store with a 200 and
+  // `{success: false}`, so the body decides.
+  it('rejects with the engine reason when the write is refused', async () => {
+    answer = { success: false, error: 'Failed to set preference: unknown timezone' };
+    const { preferences } = await import('./preferences');
+    await expect(preferences.set('timezone', 'Not/AZone')).rejects.toThrow('unknown timezone');
+  });
+
+  it('resolves when the engine stored the value', async () => {
+    answer = { success: true };
+    const { preferences } = await import('./preferences');
+    await expect(preferences.set('theme-mode', 'dark')).resolves.toBeUndefined();
+    expect(asked[0]).toBe('/preferences?key=theme-mode');
   });
 });

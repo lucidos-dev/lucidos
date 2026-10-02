@@ -74,8 +74,8 @@ export function threadHeaderActions(): HeaderActionSpec[] {
       // header rendering alone, which is how the two are told apart here.
       const el = e.currentTarget as HTMLElement;
       searchEverywhereAnchor.value = el.classList.contains('icon-btn') ? el : null;
-      searchEverywhereOpen.value = !searchEverywhereOpen.value;
       focusSearchInput();
+      searchEverywhereOpen.value = !searchEverywhereOpen.value;
     },
     extraClass: 'search-everywhere-btn',
   });

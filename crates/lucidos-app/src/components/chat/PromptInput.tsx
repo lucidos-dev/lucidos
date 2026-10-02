@@ -48,7 +48,7 @@ import { focusIntoPane } from '../layout/paneFocus';
 import { syncTextareaValue, shouldSkipSyncWhileEditing, resolveEmptyDraftSync, promptOverrideSyncSeq, promptOverrideReplacesDraft } from './promptValueSync';
 import { reportDraftClobbered } from './deadKeystrokeProbe';
 import { effectiveCodingAgentBackend, effectiveSendMode } from './promptToggleMode';
-import { resizeTextarea, remeasureTextarea, isTextareaHeightAnimating, useFontMetricsResize, useWidthRemeasure, animateTextareaHeightFrom } from './promptResize';
+import { resizeTextarea, remeasureTextarea, isTextareaHeightAnimating, useFontMetricsResize, useWidthRemeasure, animateTextareaHeightFrom, easeEmptiedTextarea, remeasureTextareaForPlaceholder } from './promptResize';
 import { isMobile } from '../../utils/viewport';
 import { cameraIsAvailable } from '../../utils/platform';
 import { isReducedMotion } from '../../utils/motion';
@@ -211,6 +211,13 @@ function CameraCapture() {
       </div>
     </Overlay>
   );
+}
+
+/** The camera dialog, for App's overlay layer. Rendered inside the prompt it
+ *  would take the prompt's box for its full-screen backdrop, since the
+ *  prompt's `will-change: translate` contains `position: fixed` descendants. */
+export function CameraCaptureSlot() {
+  return cameraOpen.value ? <CameraCapture /> : null;
 }
 
 /** The WIP app preview toggle, or null on a thread that has nothing to preview.
@@ -592,7 +599,10 @@ export function PromptInput() {
     // needs no clear anyway: its box is not mounted, and arriving at it later is
     // a thread switch, which syncs from the draft this send just emptied.
     const el = inputRef.current;
-    if (el && el.dataset.threadId === threadId) writeComposerValue(el, '');
+    if (el && el.dataset.threadId === threadId) {
+      writeComposerValue(el, '');
+      easeEmptiedTextarea(el);
+    }
     return beginSend(threadId, thread, msg, currentImages, intent);
   }
 
@@ -670,12 +680,12 @@ export function PromptInput() {
     // collapse defers to the ThreadPane FLIP, so a tall draft shrinks *and*
     // slides into the docked state together rather than snapping short first.
     // The FLIP consumes this flag and owns the reset in every path, so it
-    // cannot stick tall. A docked follow-up send resets immediately.
+    // cannot stick tall. A docked follow-up send eases down on its own.
     const inComposeLayout = !threadId || thread?.meta.state === 'composing';
     if (inComposeLayout) {
       promptSendCollapsing.value = true;
     } else if (el) {
-      el.style.height = 'auto';
+      easeEmptiedTextarea(el);
     }
     // Show the reader what they just wrote being picked up. That rests them on
     // the live edge, armed or not (ADR 0080). It covers a typed ANSWER too,
@@ -720,7 +730,7 @@ export function PromptInput() {
     const el = inputRef.current;
     if (el && el.dataset.threadId === threadId) {
       writeComposerValue(el, '');
-      el.style.height = 'auto';
+      easeEmptiedTextarea(el);
     }
     const hashes = images.map((image) => image.hash);
     // Before the draft clear, so the thumbnails keep their session blob URLs.
@@ -913,16 +923,12 @@ export function PromptInput() {
   // longest of the three. A narrowed pane or a large UI scale wraps it where
   // the follow-up one does not, so the box grows to it and back.
   //
-  // Except while the compose FLIP is easing the height. That animation inverts:
-  // it parks the box at the height it came from, then transitions to the target
-  // it already rests at. Writing the target here would land the box on it
-  // before the transition starts, and the ease would play over zero distance.
-  // Its target already accounts for the new placeholder, since the switch
-  // effect above runs first.
+  // A height ease in flight is re-aimed rather than overwritten, so it never
+  // ends in a snap. See `remeasureTextareaForPlaceholder`.
   const placeholder = promptPlaceholder(!!focusedThreadId.value, answeringQuestionCard);
   useEffect(() => {
     const el = inputRef.current;
-    if (el && !isTextareaHeightAnimating(el)) remeasureTextarea(el);
+    if (el) remeasureTextareaForPlaceholder(el);
   }, [placeholder]);
   const pendingMultiQ = pendingQ?.multiSelect ? pendingQ : null;
   const multiSelectedIds = pendingMultiQ ? getMultiSelectedIds(pendingMultiQ.toolUseId) : [];
@@ -1220,7 +1226,7 @@ export function PromptInput() {
     followAnsweredQuestion(pendingMultiQ.toolUseId);
     if (el) {
       writeComposerValue(el, '');
-      el.style.height = 'auto';
+      easeEmptiedTextarea(el);
     }
     // Before the draft clear, so the thumbnails keep their session blob URLs.
     if (imageHashes.length > 0) markHashesAsSent(imageHashes);
@@ -1356,6 +1362,9 @@ export function PromptInput() {
       onPointerDown={e => morphGate.down(e)}
       onPointerMove={e => morphGate.move(e)}
       onPointerCancel={() => morphGate.cancel()}
+      onTouchStart={answerSubmitActivate.onTouchStart}
+      onTouchMove={answerSubmitActivate.onTouchMove}
+      onTouchCancel={answerSubmitActivate.onTouchCancel}
       onTouchEnd={answerSubmitActivate.onTouchEnd}
       onClick={answerSubmitActivate.onClick}
       aria-label="Submit answer"
@@ -1406,6 +1415,7 @@ export function PromptInput() {
       class={
         'action-btn send-cancel-morph send-cancel-round'
         + (morphMode === 'placeholder' ? ' morph-placeholder' : '')
+        + (morphMode === 'cancel' && cancelSettling ? ' morph-settling' : '')
         + (sendHoldMenuShown ? ' split-open' : '')
       }
       ref={setSendButtonEl}
@@ -1429,6 +1439,9 @@ export function PromptInput() {
         morphGate.cancel();
       }}
       onContextMenu={canAskFromHold ? sendHold.onContextMenu : undefined}
+      onTouchStart={morphActivate.onTouchStart}
+      onTouchMove={morphActivate.onTouchMove}
+      onTouchCancel={morphActivate.onTouchCancel}
       onTouchEnd={morphActivate.onTouchEnd}
       // A key press is never a hold's release. A right-click leaves the mark
       // with no click to spend it, and Send takes its own clicks while the
@@ -1735,7 +1748,6 @@ export function PromptInput() {
           panel has to outlive that. Both portal, so this is placement only. */}
       <TodoPanelSlot />
       <WaitingPanelHost />
-      {cameraOpen.value && <CameraCapture />}
     </div>
   );
 }

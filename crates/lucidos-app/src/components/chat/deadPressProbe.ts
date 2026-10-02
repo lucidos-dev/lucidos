@@ -204,7 +204,8 @@ export function deadPressReport(f: DeadPressFacts): string | null {
     + `ran.` + tail;
 }
 
-/** The system took the gesture, so no path ran and no click followed.
+/** The system took the gesture, no path served it, and no click followed.
+ *  The caller asks only about a press nobody claimed.
  *
  *  Silent when the finger moved, because a cancelled scroll is the platform
  *  working. Only a stationary press that the system still took is the fault
@@ -1803,26 +1804,32 @@ export function installDeadPressProbe(): void {
     press.observer?.disconnect();
     if (press.liftDeadline !== null) { clearTimeout(press.liftDeadline); press.liftDeadline = null; }
     const heldMs = Date.now() - press.armedAt;
-    const report = canceledPressReport({
-      face: press.face,
-      movedPx: press.movedPx,
-      alone: pressWasAlone({ fingers: press.fingers, fingersAtLift: e.touches.length }),
-      heldMs,
-      viewport: press.at.viewport,
-    });
-    recordPress({
-      face: press.face,
-      verdict: 'canceled',
-      movedPx: press.movedPx,
-      fingers: press.fingers,
-      fingersAtLift: e.touches.length,
-      heldMs,
-      toasted: warnUnlessThreadAction(report, press.threadAction),
-      rowRect: press.rowRect,
-      faceRect: press.faceRect,
-      screenOff: press.screenOff,
-      at: press.at,
-    });
+    const fingersAtLift = e.touches.length;
+    // A task later, as at the lift: a constructive face serves a cancelled tap
+    // from its own listener, which runs after this capture one.
+    setTimeout(() => {
+      const outcome = takePressOutcome(Date.now() - press.armedAt);
+      const report = outcome !== null ? null : canceledPressReport({
+        face: press.face,
+        movedPx: press.movedPx,
+        alone: pressWasAlone({ fingers: press.fingers, fingersAtLift }),
+        heldMs,
+        viewport: press.at.viewport,
+      });
+      recordPress({
+        face: press.face,
+        verdict: outcome ?? 'canceled',
+        movedPx: press.movedPx,
+        fingers: press.fingers,
+        fingersAtLift,
+        heldMs,
+        toasted: warnUnlessThreadAction(report, press.threadAction),
+        rowRect: press.rowRect,
+        faceRect: press.faceRect,
+        screenOff: press.screenOff,
+        at: press.at,
+      });
+    }, 0);
   }, { capture: true, passive: true });
 
   // Only the PRESSED face settles its own press. Settling on any click let one

@@ -176,14 +176,62 @@ export function renderQuestion(
   const space = summary.indexOf(' ');
   const arg = space === -1 ? null : summary.slice(space + 1);
   return arg ? (
-    <>
-      The coding agent wants to use the <strong>{toolName}</strong> tool on <code>{arg}</code>. Allow?
-    </>
+    <>The coding agent wants to {toolAction(toolName, true)} <code>{arg}</code>. Allow?</>
   ) : (
-    <>
-      The coding agent wants to use the <strong>{toolName}</strong> tool. Allow?
-    </>
+    <>The coding agent wants to {toolAction(toolName, false)}. Allow?</>
   );
+}
+
+/** What using a tool does, as the verb phrase after "wants to": the form that
+ *  takes the tool's argument, then the form that stands alone. A raw tool name
+ *  is the agent's vocabulary, not the reader's. */
+const TOOL_ACTIONS: Record<string, [string, string]> = {
+  ExitPlanMode: ['stop planning and start work on its plan', 'stop planning and start work on its plan'],
+  Read: ['read', 'read a file'],
+  Edit: ['edit', 'edit a file'],
+  MultiEdit: ['edit', 'edit a file'],
+  Write: ['write', 'write a file'],
+  NotebookEdit: ['edit the notebook', 'edit a notebook'],
+  Glob: ['list files matching', 'list files'],
+  Grep: ['search files for', 'search files'],
+  WebFetch: ['fetch the web page', 'fetch a web page'],
+  WebSearch: ['search the web for', 'search the web'],
+  Skill: ['use the skill', 'use a skill'],
+  Task: ['hand a task to a helper agent:', 'hand a task to a helper agent'],
+  Agent: ['hand a task to a helper agent:', 'hand a task to a helper agent'],
+};
+
+function toolAction(toolName: string, withArg: boolean): ComponentChildren {
+  const known = TOOL_ACTIONS[toolName];
+  if (known) return withArg ? known[0] : known[1];
+  const on = withArg ? ' on' : '';
+  const mcp = /^mcp__(.+?)__(.+)$/.exec(toolName);
+  if (mcp) return <>use the <strong>{mcp[2]}</strong> tool from <strong>{mcp[1]}</strong>{on}</>;
+  return <>use the <strong>{toolName}</strong> tool{on}</>;
+}
+
+/** An "Always allow" grant in words: `Bash(git:*)` reads "git commands". The
+ *  pattern is the allowlist's syntax, which the reader never types. */
+export function grantLabel(pattern: string): ComponentChildren {
+  const m = /^(\w+)\((.+?):\*\)$/.exec(pattern);
+  if (m?.[1] === 'Bash') return <>Always allow <code>{m[2]}</code> commands</>;
+  if (m?.[1] === 'Skill') return <>Always allow skills from <code>{m[2]}</code></>;
+  return <>Always allow <code>{pattern}</code></>;
+}
+
+/** `grantLabel` as plain text, for an accessible name. */
+export function grantText(pattern: string): string {
+  const m = /^(\w+)\((.+?):\*\)$/.exec(pattern);
+  if (m?.[1] === 'Bash') return `Always allow ${m[2]} commands`;
+  if (m?.[1] === 'Skill') return `Always allow skills from ${m[2]}`;
+  return `Always allow ${pattern}`;
+}
+
+/** A coding-agent tool named for a sentence: a tool-server tool by its own
+ *  name and its server's, never the joined `mcp__server__tool` id. */
+function toolText(toolName: string): string {
+  const mcp = /^mcp__(.+?)__(.+)$/.exec(toolName);
+  return mcp ? `The ${mcp[2]} tool from ${mcp[1]}` : `The ${toolName} tool`;
 }
 
 /** Mirrors the engine's `derive_allow_pattern` for the narrow scope: returns
@@ -332,13 +380,17 @@ export const BROAD_ALLOW_INEFFECTIVE: ReadonlySet<string> = new Set([
 
 export type PermissionChoice = 'deny' | 'allow' | 'session' | 'narrow' | 'broad';
 
-/** Recovery-emitted orphan resolutions arrive with `allowed: false` and no
- *  scope — those map to `'deny'`, which marks the Deny button as the
- *  surviving outcome even though the user never clicked. */
+/** Which button a resolved card marks as picked, or `null` when nobody pressed
+ *  one. A card the engine settled was not pressed: it expired, a restart
+ *  closed it, or Lucidos allowed it on its own. So it marks none, and the note
+ *  under the card says what happened. A verdict with no engine reason is a
+ *  click, including an old refusal from before reasons, which reads as Deny. */
 export function resolvedChoice(resolved: {
   allowed: boolean;
   persist_scope?: AllowScope;
-}): PermissionChoice {
+  reason?: string;
+}): PermissionChoice | null {
+  if (engineResolutionNote(resolved)) return null;
   if (!resolved.allowed) return 'deny';
   return resolved.persist_scope ?? 'allow';
 }
@@ -347,13 +399,35 @@ export function resolvedChoice(resolved: {
  *  engine's `cc_permission.rs`, `command_permission.rs` and `mcp_permission.rs`. */
 const USER_DENIAL_REASON = 'User denied';
 
-/** What a card the ENGINE resolved says under its buttons: the first sentence
- *  of its reason. `null` for a user click, whose picked button says it all. */
+/** The engine's resolution reasons, by their opening words, in plain words.
+ *  The engine's own text is written for the agent, which reads it too, so the
+ *  card translates rather than the engine rewording. Mirrors the `*_REASON`
+ *  constants in `cc_permission.rs`, `command_permission.rs`,
+ *  `mcp_permission.rs` and the orphan sweep in `agent_recovery/has_diff.rs`. */
+export const PLAIN_RESOLUTION_NOTES: [string, string][] = [
+  ['Interrupted by an engine restart', 'Closed when Lucidos restarted. Nobody denied it.'],
+  ['Superseded by a new message', 'Closed because you sent a new message instead.'],
+  ['Canceled by user', 'Closed because you stopped the reply.'],
+  ['Coding agent session ended before answering', 'Closed because the agent finished its turn before anyone answered.'],
+  ['Coding agent terminated before answering', 'Closed because the agent stopped before anyone answered.'],
+  ['Auto-allowed: file write inside', 'Allowed by Lucidos: the agent was writing a file in its own working copy.'],
+  ['Auto-allowed: the command guard', 'Allowed by Lucidos: its command check judged this safe to run.'],
+  ['Auto-allowed: benign in-workspace operation', 'Allowed by Lucidos: a harmless step in a trigger run with nobody to ask.'],
+  ['Auto-allowed: covered by the trigger', 'Allowed by Lucidos: the trigger was given permission for this kind of action.'],
+  ['Auto-denied: catastrophic operation', 'Refused by Lucidos: this is never allowed in a run with nobody to ask.'],
+  ['Auto-denied: this coding-agent session runs unattended', 'Refused by Lucidos: its command check could not confirm this was safe, and nobody was there to ask.'],
+];
+
+/** What a card the ENGINE resolved says under its buttons, in plain words.
+ *  `null` for a user click, whose picked button says it all. A reason with no
+ *  translation shows its first sentence, so a new one is never silent. */
 export function engineResolutionNote(
   resolved: { allowed: boolean; reason?: string } | null | undefined,
 ): string | null {
   const reason = resolved?.reason?.trim();
   if (!reason || reason === USER_DENIAL_REASON) return null;
+  const plain = PLAIN_RESOLUTION_NOTES.find(([opening]) => reason.startsWith(opening));
+  if (plain) return plain[1];
   const end = reason.search(/\.\s/);
   return end === -1 ? reason : reason.slice(0, end + 1);
 }
@@ -489,6 +563,7 @@ function PermissionBodyShell({
 function usePermissionDecide(
   requestId: string,
   resolve: (id: string, allowed: boolean, persist?: AllowScope) => Promise<void>,
+  broadGrant: () => string,
 ) {
   const pending = useSignal<{ allowed: boolean; persist_scope?: AllowScope } | null>(null);
   const decide = async (allowed: boolean, persist?: AllowScope) => {
@@ -501,8 +576,8 @@ function usePermissionDecide(
     // button's own tap and must not wait on the round trip. See `followSubmit`.
     followResolvedPermission(requestId);
     if (allowed && persist === 'broad') {
-      // Coarse trust granted — let the user feel the weight of it.
-      showToast('You only live once', 'info');
+      // Coarse trust granted, so say exactly how much.
+      showToast(`${broadGrant()} is now allowed without asking, in this workspace.`, 'info');
     }
     try {
       await resolve(requestId, allowed, persist);
@@ -519,7 +594,11 @@ function usePermissionDecide(
  *  override; SSE swaps in `resolved` once the paired
  *  `CodingAgentPermissionResolved` event arrives. */
 export function PermissionBody({ event, resolved, terminated }: PermissionBodyProps) {
-  const { pending, decide } = usePermissionDecide(event.request_id, resolveCodingAgentPermission);
+  const { pending, decide } = usePermissionDecide(
+    event.request_id,
+    resolveCodingAgentPermission,
+    () => toolText(event.tool_name),
+  );
 
   const effective = resolved ?? pending.value;
 
@@ -535,7 +614,7 @@ export function PermissionBody({ event, resolved, terminated }: PermissionBodyPr
   const session = sessionLabel(event.tool_name, event.input);
 
   const selected = effective ? resolvedChoice(effective) : null;
-  const answered = selected !== null;
+  const answered = effective !== null && effective !== undefined;
 
   const buttons: ButtonSpec[] = [
     {
@@ -562,8 +641,8 @@ export function PermissionBody({ event, resolved, terminated }: PermissionBodyPr
     ...(narrow ? [{
       choice: 'narrow' as const,
       btnClass: 'action-btn action-btn-secondary',
-      label: <>Always allow <code>{narrow}</code></>,
-      ariaLabel: `Always allow ${narrow}`,
+      label: grantLabel(narrow),
+      ariaLabel: grantText(narrow),
       onClick: () => void decide(true, 'narrow'),
     }] : []),
     ...(showBroad ? [{
@@ -765,11 +844,15 @@ export function commandHead(command: string): string | null {
 
 /** Body of a `CommandPermissionRequested` divider exchange. */
 export function CommandPermissionBody({ event, resolved, terminated }: CommandPermissionBodyProps) {
-  const { pending, decide } = usePermissionDecide(event.request_id, resolveCommandPermission);
+  const { pending, decide } = usePermissionDecide(
+    event.request_id,
+    resolveCommandPermission,
+    () => (BASH_TOOLS.has(event.tool_name) ? 'Any shell command' : 'Any Python'),
+  );
 
   const effective = resolved ?? pending.value;
   const selected = effective ? resolvedChoice(effective) : null;
-  const answered = selected !== null;
+  const answered = effective !== null && effective !== undefined;
 
   const isBash = BASH_TOOLS.has(event.tool_name);
   const head = isBash ? commandHead(event.command) : null;
@@ -802,8 +885,8 @@ export function CommandPermissionBody({ event, resolved, terminated }: CommandPe
     ...(narrow ? [{
       choice: 'narrow' as const,
       btnClass: 'action-btn action-btn-secondary',
-      label: <>Always allow <code>{narrow}</code></>,
-      ariaLabel: `Always allow ${narrow}`,
+      label: grantLabel(narrow),
+      ariaLabel: grantText(narrow),
       onClick: () => void decide(true, 'narrow'),
     }] : []),
     {
@@ -864,11 +947,15 @@ interface McpPermissionBodyProps {
 
 /** Body of an `McpPermissionRequested` divider exchange. */
 export function McpPermissionBody({ event, resolved, terminated }: McpPermissionBodyProps) {
-  const { pending, decide } = usePermissionDecide(event.request_id, resolveMcpPermission);
+  const { pending, decide } = usePermissionDecide(
+    event.request_id,
+    resolveMcpPermission,
+    () => `Any tool on ${event.server_name}`,
+  );
 
   const effective = resolved ?? pending.value;
   const selected = effective ? resolvedChoice(effective) : null;
-  const answered = selected !== null;
+  const answered = effective !== null && effective !== undefined;
 
   const buttons: ButtonSpec[] = [
     {
@@ -882,7 +969,7 @@ export function McpPermissionBody({ event, resolved, terminated }: McpPermission
       choice: 'allow',
       btnClass: 'action-btn action-btn-confirm',
       label: 'Allow once',
-      ariaLabel: 'Allow this MCP tool call once',
+      ariaLabel: 'Allow this tool call once',
       onClick: () => void decide(true),
     },
     {
@@ -930,7 +1017,8 @@ export function renderMcpQuestion(serverName: string, toolName: string, argsSumm
   const showArgs = trimmed.length > 0 && trimmed !== '{}';
   return (
     <>
-      The Lucidos Agent wants to call <strong>{toolName}</strong> on <strong>{serverName}</strong>. Allow?
+      The Lucidos Agent wants to use the <strong>{toolName}</strong> tool from <strong>{serverName}</strong>
+      {showArgs ? ', with exactly these inputs' : ''}. Allow?
       {showArgs && <pre class="permission-mcp-args"><code>{trimmed}</code></pre>}
     </>
   );

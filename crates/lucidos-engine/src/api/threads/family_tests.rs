@@ -417,6 +417,46 @@ fn expect_reject(
 
 // ── Tests ─────────────────────────────────────────────────────────────
 
+/// The snapshot must hold a row lock on every member until the caller's
+/// transaction ends. A second writer to a descendant's row has to wait, or a
+/// sub-thread can start a turn between the gate and the cascade.
+#[tokio::test]
+async fn load_family_locks_every_member_row() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+
+    let parent_id = spawn_idle_parent(&bus).await;
+    let child_id = spawn_child(&bus, &pool, parent_id, true).await;
+
+    let mut holder = pool.begin().await.unwrap();
+    let family = load_family(&mut holder, parent_id).await.unwrap();
+    assert_eq!(
+        every_member(&family),
+        vec![parent_id, child_id],
+        "the snapshot lists the parent first"
+    );
+
+    let mut writer = pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL lock_timeout = '200ms'")
+        .execute(&mut *writer)
+        .await
+        .unwrap();
+    let update = "UPDATE thread_summaries SET status = 'running' WHERE thread_id = $1";
+    let blocked = sqlx::query(update)
+        .bind(child_id)
+        .execute(&mut *writer)
+        .await;
+    assert!(
+        blocked.is_err(),
+        "a write to a locked descendant must wait for the snapshot's transaction"
+    );
+    writer.rollback().await.unwrap();
+    holder.rollback().await.unwrap();
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
 #[tokio::test]
 async fn archive_with_no_descendants_archives_parent() {
     let (pool, db_name) = setup_test_db().await;

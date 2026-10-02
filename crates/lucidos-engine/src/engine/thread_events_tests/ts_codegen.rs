@@ -37,6 +37,7 @@ const TYPE_SOURCES: &[(&str, &str)] = &[
     ("EngineReason", "engine/thread_events/actor.rs"),
     ("MessageOrigin", "engine/thread_events/actor.rs"),
     ("PluginSetupOccasion", "engine/thread_events/actor.rs"),
+    ("EventWaitOutcome", "engine/thread_events/actor.rs"),
     ("ThreadDirection", "engine/thread_events/actor.rs"),
     ("AbortCause", "engine/thread_events/cause.rs"),
     ("CancelCause", "engine/thread_events/cause.rs"),

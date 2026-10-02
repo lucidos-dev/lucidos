@@ -379,14 +379,57 @@ pub(super) async fn coding_agent_diff_refresh(
     }
 }
 
+/// Whether this caller may write the hardening marker or the plan marker,
+/// which the Harden and Apply gates read.
+///
+/// Two credentials qualify, and each proves a process on this machine:
+///
+///  * a verified thread-bound origin token. That is `lucidos` run from a
+///    coding-agent session or from an engine-spawned script.
+///  * the machine-local token, on a hop that did not come through the gateway
+///    proxy. That is `lucidos` run from the user's own shell, and the e2e suite.
+///
+/// The proxy check is load-bearing. The gateway adds its own local token to
+/// every request it proxies. Without the check, a paired device or any page on
+/// the gateway origin would qualify. A device id alone qualifies nobody: any
+/// caller on the loopback port can register one.
+fn may_write_markers(headers: &HeaderMap) -> bool {
+    use crate::api::actor::{subprocess_origin, SubprocessOrigin};
+    if matches!(
+        subprocess_origin(headers),
+        SubprocessOrigin::Subprocess { .. }
+    ) {
+        return true;
+    }
+    !crate::api::base_path::arrived_through_gateway_proxy(headers)
+        && crate::api::local_auth::is_local_process(headers)
+}
+
+/// The 403 for a caller [`may_write_markers`] refuses, or `None` to proceed.
+fn marker_write_refusal(headers: &HeaderMap) -> Option<axum::response::Response> {
+    (!may_write_markers(headers)).then(|| {
+        (
+            StatusCode::FORBIDDEN,
+            "the hardening and plan markers are written by the `lucidos` CLI from a \
+             Lucidos-spawned process or a local shell, never by a plain loopback or \
+             gateway caller",
+        )
+            .into_response()
+    })
+}
+
 /// POST /api/v1/internal/mark-hardened, invoked by `lucidos hardened mark`,
 /// which `/harden` Phase 5 runs once every phase completes. Replaces
 /// the prior worktree-keyed file marker, which was lost when stale-session
 /// recovery removed the worktree before the apply check ran.
 pub(super) async fn mark_hardened(
+    headers: HeaderMap,
     State(state): State<AppState>,
     Json(body): Json<MarkHardenedRequest>,
 ) -> impl IntoResponse {
+    if let Some(refusal) = marker_write_refusal(&headers) {
+        return refusal;
+    }
     let repo_root = std::path::PathBuf::from(&body.repo_root);
     match state
         .engine
@@ -455,10 +498,14 @@ pub(super) struct MarkPlannedRequest {
 /// caller is an agent that can fix the call, so the body has to say how. A 500
 /// reads as an engine fault and gets retried unchanged.
 pub(super) async fn mark_planned(
+    headers: HeaderMap,
     State(state): State<AppState>,
     Json(body): Json<MarkPlannedRequest>,
 ) -> impl IntoResponse {
     use crate::engine::git_ops::{validate_plan_files, PlanMarkerKind};
+    if let Some(refusal) = marker_write_refusal(&headers) {
+        return refusal;
+    }
     let repo_root = std::path::PathBuf::from(&body.repo_root);
     // Strict on the WRITE path. The lenient `parse` reads an unknown value as
     // `planned`, which on a write would record "a human approved this" for a
@@ -569,9 +616,13 @@ struct ApprovePlanResponse {
 /// pass. Idempotent: re-approving an already-`planned` (or `simple`) branch is a
 /// no-op that reports `approved: false`.
 pub(super) async fn approve_plan(
+    headers: HeaderMap,
     State(state): State<AppState>,
     Json(body): Json<ApprovePlanRequest>,
 ) -> impl IntoResponse {
+    if let Some(refusal) = marker_write_refusal(&headers) {
+        return refusal;
+    }
     let repo_root = std::path::PathBuf::from(&body.repo_root);
     match state
         .engine
@@ -977,6 +1028,90 @@ mod tests {
                 "{tool} must NOT short-circuit the permission gate"
             );
         }
+    }
+
+    fn marker_headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (name, value) in pairs {
+            h.insert(*name, value.parse().expect("header value"));
+        }
+        h
+    }
+
+    fn minted_origin_token(thread_id: Option<Uuid>) -> String {
+        crate::api::actor::init_agent_origin_secret("internal-marker-test-secret".to_string());
+        crate::api::actor::mint_agent_origin_token(thread_id, 0, None)
+            .expect("secret installed at least once")
+    }
+
+    /// A request on the engine port with no Lucidos credential must not write a
+    /// marker. A device id is no credential here, because any loopback caller
+    /// can register one.
+    #[test]
+    fn a_plain_loopback_caller_cannot_write_a_marker() {
+        crate::api::local_auth::publish_test_local_token();
+        assert!(!may_write_markers(&HeaderMap::new()));
+        assert!(!may_write_markers(&marker_headers(&[(
+            crate::api::actor::HEADER_DEVICE_ID,
+            "self-registered-device",
+        )])));
+        assert!(marker_write_refusal(&HeaderMap::new())
+            .is_some_and(|r| r.status() == StatusCode::FORBIDDEN));
+    }
+
+    #[test]
+    fn a_forged_origin_token_or_wrong_local_token_is_refused() {
+        crate::api::local_auth::publish_test_local_token();
+        let token = minted_origin_token(Some(Uuid::new_v4()));
+        let (prefix, _mac) = token.rsplit_once('.').expect("minted token has a mac");
+        let forged = format!("{prefix}.{}", "0".repeat(64));
+        assert!(!may_write_markers(&marker_headers(&[(
+            crate::api::actor::HEADER_AGENT_ORIGIN_TOKEN,
+            &forged,
+        )])));
+        assert!(!may_write_markers(&marker_headers(&[(
+            lucidos_local_token::HEADER_LOCAL_TOKEN,
+            "not-the-machine-token",
+        )])));
+    }
+
+    /// `lucidos` from a coding-agent session carries a thread-bound token, and
+    /// from an engine-spawned script a thread-less one. Both are subprocesses.
+    #[test]
+    fn a_lucidos_spawned_process_may_write_a_marker() {
+        for thread in [Some(Uuid::new_v4()), None] {
+            let token = minted_origin_token(thread);
+            assert!(
+                may_write_markers(&marker_headers(&[(
+                    crate::api::actor::HEADER_AGENT_ORIGIN_TOKEN,
+                    &token,
+                )])),
+                "a minted origin token for thread {thread:?} must qualify"
+            );
+        }
+    }
+
+    /// The local shell and the e2e suite hold the machine-local token and reach
+    /// the engine port directly.
+    #[test]
+    fn a_local_process_on_the_direct_hop_may_write_a_marker() {
+        let local = crate::api::local_auth::publish_test_local_token();
+        assert!(may_write_markers(&marker_headers(&[(
+            lucidos_local_token::HEADER_LOCAL_TOKEN,
+            local,
+        )])));
+    }
+
+    /// The gateway adds its own local token and the device it authenticated to
+    /// every proxied request. That shape is a browser, so it must not qualify.
+    #[test]
+    fn a_request_through_the_gateway_proxy_cannot_write_a_marker() {
+        let local = crate::api::local_auth::publish_test_local_token();
+        assert!(!may_write_markers(&marker_headers(&[
+            (lucidos_local_token::HEADER_LOCAL_TOKEN, local),
+            (crate::api::actor::HEADER_DEVICE_ID, "paired-phone"),
+            ("x-forwarded-prefix", "/dev/"),
+        ])));
     }
 
     fn entry(category: &str, message: &str, data: serde_json::Value) -> ClientLogRequest {

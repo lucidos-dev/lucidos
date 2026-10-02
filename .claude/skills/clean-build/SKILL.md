@@ -146,9 +146,12 @@ git ls-files '*.ts' '*.tsx' | xargs grep -l '@ts-expect-error' | grep -vE '\.tes
 (cd packages/lucidos-sdk && npx tsc --noEmit -p tsconfig.json); echo "SDK EXIT: $?"
 ```
 
-The currently-accepted categories, re-counted on 2026-10-01. Every Rust
-category and the `eslint-disable` sites were unchanged, and the cfg_attr
-grep printed nothing. `@ts-expect-error` rose 3 with the test suite.
+The currently-accepted categories, re-counted again later on 2026-10-01.
+Every Rust category was unchanged, and the cfg_attr grep printed nothing.
+`@ts-expect-error` rose 15 with the test suite. A tenth `eslint-disable`
+site had landed with no reason above it, and the cold-start one sat a line
+above the call it names. That run gave both a reason line and moved the
+second onto its call.
 
 **The first grep and the bare-allow audit both print one false hit.** It is
 `git_ops_tests/branch_queries.rs`, where `#[allow(dead_code)]` sits inside
@@ -192,8 +195,8 @@ Anything not on this list is fair game to remove and re-fix:
   (see `tauri.conf.json`), so the deprecated cross-version call is the
   correct one to keep.
 - **`// @ts-expect-error`, Node APIs available at runtime via Vitest, no
-  `@types/node` in project**, 824 sites across 285 files, every one of them
-  test-only code: 272 `*.test.ts`, eleven `*.test.tsx`
+  `@types/node` in project**, 839 sites across 290 files, every one of them
+  test-only code: 277 `*.test.ts`, eleven `*.test.tsx`
   (`components/changes/__tests__/bulk-row-layout.test.tsx`,
   `components/chat/__tests__/question-card.test.tsx`,
   `components/chat/__tests__/welcome-onboarding.test.tsx`,
@@ -221,7 +224,7 @@ Anything not on this list is fair game to remove and re-fix:
   leftover the snippet prints is still test-only code. The helpers are why
   that says test-only code rather than a test file: each lives under
   `__tests__/` and only test files import it.
-- **`// eslint-disable-next-line`**, 9 sites across 5 files and 5 rules:
+- **`// eslint-disable-next-line`**, 10 sites across 6 files and 5 rules:
   `react-hooks/exhaustive-deps` in `hooks/useLoadableFetch.ts` (the deps
   list is intentionally narrow), `no-console` five times in
   `utils/perfProbe.ts` (permanent console-based perf instrumentation,
@@ -229,9 +232,10 @@ Anything not on this list is fair game to remove and re-fix:
   in `sw.test.ts` (the test evaluates service-worker source through `new
   Function`), `@typescript-eslint/no-explicit-any` in
   `components/chat/__tests__/prompt-vdom-keys.test.ts` (a `VNode<any>`
-  alias for VDOM-key assertions), and `no-new-func` in
-  `__tests__/cold-start-fast-path.test.ts`, which runs the inline
-  cold-start program through `new Function` the way `sw.test.ts` runs the
+  alias for VDOM-key assertions), and `no-new-func` twice, in
+  `__tests__/cold-start-fast-path.test.ts` and
+  `__tests__/history-bounce.test.ts`. Each runs an inline `<head>` script
+  from `index.html` through `new Function`, the way `sw.test.ts` runs the
   service worker. **No eslint config ships in this repo**,
   so phase 5 always skips and none of these suppress anything today. They
   are kept rather than deleted because each would be correct the moment a

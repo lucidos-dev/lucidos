@@ -673,12 +673,12 @@
    (--co + --ddo is the leading edge, --divider-x is the divider), so this reads
    the same geometry rather than restating it, and slides with the divider for
    free. Those properties exist only inside this breakpoint, which is also why
-   the rule is scoped to it: below 769px the calc would be invalid and the base
-   viewport centring is what mobile wants anyway.
+   the rule is scoped to it: on the phone layout the calc would be invalid and
+   the base viewport centring is what the phone wants anyway.
    The panel is `position: fixed` and portaled to <body>, so the percentages in
    --divider-x resolve against the viewport, which is exactly the width the
    full-bleed header measured them against. */
-@media (min-width: 769px) {
+@media (--desktop-layout) {
     .brand-menu {
         left: calc((var(--co) + var(--ddo) + var(--divider-x)) / 2);
     }

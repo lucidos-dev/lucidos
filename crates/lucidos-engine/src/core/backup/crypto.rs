@@ -180,52 +180,76 @@ pub fn load_key_file(path: &Path) -> Result<Option<Vec<u8>>, BoxError> {
     }
 }
 
-/// Save a key to a file as base64.
+/// Write a key to `path` as base64, only if no file is there yet. Returns
+/// `false` when another writer got there first, leaving its key untouched.
 ///
-/// Owner-only on Unix, from the moment the file exists. This one file decrypts
-/// every cloud backup the workspace has ever uploaded, and a default umask
-/// would leave it world-readable.
-///
-/// The mode rides on the `open` rather than a `set_permissions` after the
-/// write. Chmodding second leaves the key at `0644` for a window on a shared
-/// host, and permanently if the engine is killed between the two calls:
-/// nothing on the read path ever re-applies the mode.
-pub fn save_key_file(path: &Path, key: &[u8]) -> Result<(), BoxError> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+/// The key goes to a temp file beside `path`, then links into place without
+/// clobbering, so a reader never sees a half-written key. This one file
+/// decrypts every backup the workspace uploads. `NamedTempFile` creates it
+/// `0600` on the open, so it is never readable by others, not even briefly.
+fn create_key_file_exclusive(path: &Path, key: &[u8]) -> Result<bool, BoxError> {
+    let dir = path
+        .parent()
+        .ok_or("backup key path has no parent directory")?;
+    std::fs::create_dir_all(dir)?;
+    let mut temp = tempfile::NamedTempFile::new_in(dir)?;
+    temp.write_all(key_to_base64(key).as_bytes())?;
+    temp.as_file().sync_all()?;
+    match temp.persist_noclobber(path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        // The directory took the temp file, so the link itself is what failed.
+        // exFAT and FAT on macOS reject the no-clobber rename with `ENOTSUP`.
+        Err(_) => create_key_file_in_place(path, key),
     }
+}
+
+/// Create the key file with `O_EXCL`, for filesystems that cannot link
+/// without clobbering. It still never overwrites a key. A concurrent reader
+/// can see the file before the write lands, and then fails on a short key.
+fn create_key_file_in_place(path: &Path, key: &[u8]) -> Result<bool, BoxError> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)?;
-        // `mode` applies only when THIS call creates the file, so an existing
-        // key left world-readable by an older engine keeps its mode. Re-apply
-        // it, rather than trusting the file we are about to overwrite.
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        file.write_all(key_to_base64(key).as_bytes())?;
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+        Err(e) => return Err(e.into()),
+    };
+    let written = file
+        .write_all(key_to_base64(key).as_bytes())
+        .and_then(|()| file.sync_all());
+    if let Err(e) = written {
+        // An empty key file would fail every later backup until removed.
+        let _ = std::fs::remove_file(path);
+        return Err(e.into());
     }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, key_to_base64(key))?;
-    }
-    Ok(())
+    Ok(true)
 }
 
 /// Load the backup key from the workspace, auto-generating one if it doesn't exist.
+///
+/// No caller ever returns a key that is not on disk, and at most one reports
+/// it as new. A caller that kept a key it failed to persist would encrypt
+/// backups nobody can restore. Concurrent callers on a keyless workspace all
+/// get the one key, except where `create_key_file_in_place` lets one fail.
 pub fn ensure_key(workspace: &std::path::Path) -> Result<(Vec<u8>, bool), BoxError> {
     let key_path = super::key_file_path(workspace);
+    if let Some(key) = load_key_file(&key_path)? {
+        return Ok((key, false));
+    }
+    let key = generate_key();
+    if create_key_file_exclusive(&key_path, &key)? {
+        return Ok((key, true));
+    }
     match load_key_file(&key_path)? {
-        Some(key) => Ok((key, false)),
-        None => {
-            let key = generate_key();
-            save_key_file(&key_path, &key)?;
-            Ok((key, true))
-        }
+        Some(winner) => Ok((winner, false)),
+        None => Err(format!(
+            "backup key path {} exists but holds no readable key",
+            key_path.display()
+        )
+        .into()),
     }
 }
 
@@ -407,47 +431,13 @@ mod tests {
     }
 
     #[test]
-    fn test_load_save_key_file() {
+    fn test_load_key_file_absent_and_present() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("backup.key");
-
-        // File doesn't exist yet
         assert!(load_key_file(&path).unwrap().is_none());
 
-        // Save and load
         let key = generate_key();
-        save_key_file(&path, &key).unwrap();
-
-        let loaded = load_key_file(&path).unwrap().unwrap();
-        assert_eq!(key, loaded);
-    }
-
-    /// The saved key is owner-only, fresh and on rewrite. This one file
-    /// decrypts every cloud backup the workspace has ever uploaded.
-    #[cfg(unix)]
-    #[test]
-    fn a_saved_key_is_owner_only() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("nested/backup.key");
-        save_key_file(&path, &generate_key()).unwrap();
-        assert_eq!(
-            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            0o600,
-            "a fresh key file must be owner-only"
-        );
-
-        // A key an older engine left world-readable is narrowed on rewrite,
-        // because `mode` on the open applies only to a file this call creates.
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        let key = generate_key();
-        save_key_file(&path, &key).unwrap();
-        assert_eq!(
-            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            0o600,
-            "rewriting an exposed key file must narrow it"
-        );
+        std::fs::write(&path, key_to_base64(&key)).unwrap();
         assert_eq!(load_key_file(&path).unwrap().unwrap(), key);
     }
 
@@ -455,29 +445,72 @@ mod tests {
     ///
     /// No runtime assertion can see the difference: both shapes end at `0600`.
     /// What differs is the mode the file exists at in between, which under the
-    /// usual `022` umask is `0644`. An engine killed in that window leaves it
-    /// there for good, since nothing on the read path re-applies the mode. So
-    /// the shape is pinned at the source, as `lucidos-installs` pins its own.
-    #[cfg(unix)]
+    /// usual `022` umask is `0644`. So this test pins both writers at the
+    /// source: each sets `0600` on the open, and neither writes or chmods.
     #[test]
     fn the_key_file_is_created_owner_only_rather_than_chmodded_afterwards() {
         let source = include_str!("crypto.rs");
-        let body = source
-            .split_once("pub fn save_key_file")
-            .expect("save_key_file must be declared here")
-            .1;
-        let unix_arm = body
-            .split_once("#[cfg(not(unix))]")
-            .expect("save_key_file must keep both platform arms")
-            .0;
-        assert!(
-            unix_arm.contains(".mode(0o600)"),
-            "the unix arm must set the mode on the open: {unix_arm}"
-        );
-        assert!(
-            !unix_arm.contains("fs::write("),
-            "a plain write creates the key at the umask's mode first: {unix_arm}"
-        );
+        let body_of = |name: &str| {
+            source
+                .split_once(&format!("fn {name}("))
+                .unwrap_or_else(|| panic!("{name} must be declared here"))
+                .1
+                .split_once("\n}\n")
+                .unwrap_or_else(|| panic!("{name} must have a body"))
+                .0
+        };
+        let writers = [
+            ("create_key_file_exclusive", "NamedTempFile::new_in("),
+            ("create_key_file_in_place", "mode(&mut options, 0o600)"),
+        ];
+        for (name, owner_only_open) in writers {
+            let body = body_of(name);
+            assert!(
+                body.contains(owner_only_open),
+                "{name} must open the key owner-only: {body}"
+            );
+            for banned in ["fs::write(", "set_permissions("] {
+                assert!(
+                    !body.contains(banned),
+                    "{name}: {banned} creates the key at the umask's mode first"
+                );
+            }
+        }
+    }
+
+    /// The fallback for filesystems without a no-clobber link still lets
+    /// exactly one concurrent writer create the key, owner-only.
+    #[test]
+    fn the_in_place_fallback_lets_exactly_one_writer_create_the_key() {
+        const WRITERS: usize = 16;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("backup.key");
+        let barrier = std::sync::Barrier::new(WRITERS);
+        let results: Vec<(Vec<u8>, bool)> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..WRITERS)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let key = generate_key();
+                        barrier.wait();
+                        let created = create_key_file_in_place(&path, &key).unwrap();
+                        (key, created)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        let winners: Vec<_> = results.iter().filter(|(_, created)| *created).collect();
+        assert_eq!(winners.len(), 1, "exactly one writer may create the key");
+        assert_eq!(load_key_file(&path).unwrap().unwrap(), winners[0].0);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
     }
 
     /// The scheduled backup (and the manual path) rely on `ensure_key` to never
@@ -510,6 +543,74 @@ mod tests {
         let (key2, is_new2) = ensure_key(workspace.path()).unwrap();
         assert!(!is_new2, "second ensure_key must reuse the existing key");
         assert_eq!(key, key2);
+    }
+
+    /// `POST /backup/key` and a backup run can both reach `ensure_key` on a
+    /// workspace with no key. Each caller must get the key that stays on disk.
+    /// A caller holding a losing key would upload a backup nothing can decrypt.
+    #[test]
+    fn concurrent_ensure_key_calls_all_return_the_persisted_key() {
+        const CALLERS: usize = 16;
+        for _ in 0..50 {
+            let workspace = tempfile::tempdir().unwrap();
+            let barrier = std::sync::Barrier::new(CALLERS);
+            let results: Vec<(Vec<u8>, bool)> = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..CALLERS)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            barrier.wait();
+                            ensure_key(workspace.path()).unwrap()
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+
+            let persisted = load_key_file(&crate::core::backup::key_file_path(workspace.path()))
+                .unwrap()
+                .expect("a key must be on disk");
+            for (key, _) in &results {
+                assert_eq!(key, &persisted, "a caller got a key that is not on disk");
+            }
+            let minted = results.iter().filter(|(_, is_new)| *is_new).count();
+            assert_eq!(minted, 1, "exactly one caller may report a new key");
+        }
+    }
+
+    /// A key path that exists but reads as missing, such as a dangling
+    /// symlink, refuses the link and yields no key. `ensure_key` must fail
+    /// rather than retry forever on a request thread.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_key_fails_on_a_key_path_that_exists_but_cannot_be_read() {
+        let workspace = tempfile::tempdir().unwrap();
+        let key_path = crate::core::backup::key_file_path(workspace.path());
+        std::fs::create_dir_all(key_path.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(workspace.path().join("missing"), &key_path).unwrap();
+
+        let err = ensure_key(workspace.path()).unwrap_err();
+        assert!(err.to_string().contains("holds no readable key"), "{err}");
+    }
+
+    /// The key `ensure_key` mints is owner-only, and no temp file stays behind.
+    #[cfg(unix)]
+    #[test]
+    fn a_minted_key_is_owner_only_and_leaves_no_temp_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let key_path = crate::core::backup::key_file_path(workspace.path());
+        ensure_key(workspace.path()).unwrap();
+        assert_eq!(
+            std::fs::metadata(&key_path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "a minted key file must be owner-only"
+        );
+        let entries: Vec<_> = std::fs::read_dir(key_path.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![key_path.file_name().unwrap().to_owned()]);
     }
 
     /// `key_exists` is the read-only counterpart to `ensure_key`: it reports

@@ -44,9 +44,9 @@ What each piece does — include only what you need:
 | `<script src="/api/v1/sdk-prefs.js"></script>` | Synchronous prefs script. Sets `data-theme-mode`, `--bg-primary`, and `--font-ui` on `<html>` (plus `--user-ui-scale` when the user has set one) *before* any subsequent stylesheet evaluates. The engine resolves this device's theme mode, theme, font and scale and serves them inside the script, so an app frame needs no access to the shell's storage. It stamps `?device=` onto this one `src` to know whose to serve, and adds nothing to your document. The same script carries the device's Autocorrect switch, so `sdk.js` knows it before any field can take focus, and sets `data-motion` (§ Reduced motion), `data-theme-effects` (§ Theme parts) and `data-font-bold` (§ Theme variables). Eliminates the flash-of-default-theme between iframe load and `applyPreferences()`. **Place as early in `<head>` as possible: before `sdk-iframe.css`, before any other `<link rel="stylesheet">`, and before any inline `<style>` that reads theme vars.** Inlining `--bg-primary` directly (not just `data-theme-mode`) is what makes the body's `background: var(--bg-primary, …)` paint correctly even when stylesheets are loaded asynchronously (JS-injected, dynamic `import()`, dev-mode bundlers like Vite that ship CSS as JS modules). | App doesn't use `sdk-iframe.css` (no FOUC to fix) |
 | `<link rel="stylesheet" href="/api/v1/sdk-iframe.css">` | Theme tokens (`--bg-primary`, `--accent`, etc.), dark/light variables, default body/input/scrollbar styling, **and Lucidos's shared component classes** (`.action-btn` + `.action-btn-confirm`/`.action-btn-danger`, `.button-group`, `.icon-btn`, `.label`, `.title`, `.segmented-control`/`.segmented-btn`, `.list-row*`, `.markdown-content`, `.progress-bar`, `.empty-state`, `.accent-link`). Use these class names and the app's buttons/lists/etc. render identically to the host shell. The body is set to `--font-size-sm`, the step chat prose renders at, so text you do not size yourself reads at the size of the chat beside it. Inputs and buttons are set to `--font-ui` at `--font-size-md`, the host's step for labels and controls. Neither is the root font-size: the root is the user's UI scale, and `1rem` is `--font-size-xl`, a section heading. Text that names no size at all would come out two steps larger than body, which is why the defaults exist. | App ships its own complete stylesheet and doesn't want Lucidos theming |
 | `<script src="/api/v1/sdk-iframe-audio.js"></script>` | Monkey-patches `AudioContext` so app code reuses a gesture-unlocked instance, survives iOS PWA background cycles. **Must be in `<head>` before any code that creates an `AudioContext`.** | App doesn't play audio |
-| `<script src="/api/v1/sdk.js"></script>` | The `lucidos.*` API. Also installs iframe-only side effects, none of which needs a call from you: a link interceptor (`target="_blank"` links resolve in-frame; external `http(s)://` links route through `lucidos.ui.openExternal()`); a keyboard-shortcut forwarder (host shortcuts like focus/hide a pane, narrow/widen, new thread, search, and Escape keep working while the app has focus, because iframe keydowns otherwise never reach the host; Apply and the voice call are the exceptions and never run from an app, since an app's own script could send their chords; a chord bound to a host shortcut has its browser default cancelled, so ⌘P opens file search rather than printing; your own handlers still receive that key, already marked `defaultPrevented`, so a handler that skips such events stands down for it); per-app scroll memory (the app returns to where the user left it after an app switch or a reload); pull to refresh (a pull past the top reloads the app, see § Pull to refresh); the Lucidos **tooltip** on any `data-tooltip` element (see § Tooltips, under lucidos.ui); and the device's **Autocorrect switch** plus a key-code guard on your text fields (see § Text fields and autocorrect). Only modifier-bearing chords, Escape and the F-keys are forwarded; plain typing stays in the app, and so does Ctrl with a bare letter in a text field on a Mac, where it edits text. | App doesn't use `lucidos.*` |
+| `<script src="/api/v1/sdk.js"></script>` | The `lucidos.*` API. Also installs iframe-only side effects, none of which needs a call from you: a link interceptor (`target="_blank"` links resolve in-frame; external `http(s)://` links route through `lucidos.ui.openExternal()`); a keyboard-shortcut forwarder (host shortcuts like focus/hide a pane, narrow/widen, new thread, search, and Escape keep working while the app has focus, because iframe keydowns otherwise never reach the host; Apply and the voice call are the exceptions and never run from an app, since an app's own script could send their chords; a chord bound to a host shortcut has its browser default cancelled, so ⌘P opens file search rather than printing; your own handlers still receive that key, already marked `defaultPrevented`, so a handler that skips such events stands down for it); per-app scroll memory (the app returns to where the user left it after an app switch or a reload); pull to refresh (a pull past the top reloads the app, see § Pull to refresh); the pane swipe (a sideways drag moves between Lucidos panes, see § Pane swipe); the Lucidos **tooltip** on any `data-tooltip` element (see § Tooltips, under lucidos.ui); and the device's **Autocorrect switch** plus a key-code guard on your text fields (see § Text fields and autocorrect). Only modifier-bearing chords, Escape and the F-keys are forwarded; plain typing stays in the app, and so does Ctrl with a bare letter in a text field on a Mac, where it edits text. | App doesn't use `lucidos.*` |
 | `lucidos.ui.applyPreferences()` | Reads the user's theme mode/theme/font/scale (resolving a `system` preference to the live OS light/dark) and sets `data-theme-mode`, `data-font-bold` and CSS vars on `<html>`. Pairs with `sdk-iframe.css` to apply the right palette. | **Don't skip if you include `sdk-iframe.css`**: without it the app ignores the user's light/system setting and stays on the default dark palette. Skip only when opting out of Lucidos theming entirely. |
-| `lucidos.ui.watchPreferences()` | Re-applies preferences live: when the user changes one (SSE `PreferencesChanged`), when the active theme's file or plugin changes, and, under a `system` preference, when the OS light/dark appearance flips. The OS half watches `prefers-color-scheme` and the frame's own resume, on every platform, matching the host shell | Static apps that have opted out of Lucidos theming |
+| `lucidos.ui.watchPreferences()` | Re-applies preferences live: when the user changes one (SSE `PreferencesChanged`), when the active theme's file or plugin changes, and, under a `system` preference, when the OS light/dark appearance flips. The OS half watches `prefers-color-scheme` and the frame's own resume, on every platform, matching the host shell. Inside the host shell the app also repaints as the shell does, mid-drag included (§ lucidos.ui) | Static apps that have opted out of Lucidos theming |
 
 **Inherit the theme by default.** A normal app includes the theme assets, calls `applyPreferences()` + `watchPreferences()`, and styles with the theme variables (below). It then follows the user's theme and light/dark appearance like the rest of Lucidos. Theme integration is *technically* opt-in, because the engine never auto-injects these tags. An app that omits both `<script src="/api/v1/sdk-prefs.js">` and `<link rel="stylesheet" href="/api/v1/sdk-iframe.css">` gets no `data-theme-mode` attribute, no CSS variables, and no Lucidos default styling.
 
@@ -257,6 +257,27 @@ of a gesture that is not a pull:
 A drag that starts on a claimed element is never a pull. That covers a map, a
 drawing surface or a drag handle built on Pointer Events, which never cancel
 the touch.
+
+### Pane swipe
+
+**A sideways drag anywhere in your app swipes between Lucidos panes, with no
+code from you.** On the phone layout, `sdk.js` watches for a mostly sideways
+drag and posts it to Lucidos. Lucidos moves the panes as it does over a thread.
+It ignores the drag on the desktop layout and while your app is fullscreen.
+
+Vertical scrolling stays native. Once a drag has locked sideways, `sdk.js`
+cancels its `touchmove` events so the page does not drift under the swipe. It
+stays out of the way of a drag that is not a pane swipe:
+
+- a drag on a range input, or inside an element that scrolls sideways;
+- a drag while a text field has focus;
+- a second finger, such as a pinch.
+
+**To own a sideways drag yourself, claim it.** Either of these works:
+
+- call `preventDefault()` on the `touchstart` or `touchmove`;
+- give the element a `touch-action` that keeps the sideways pan, such as
+  `touch-action: pan-y` on a carousel or `none` on a canvas.
 
 ### Theme variables
 
@@ -708,6 +729,14 @@ interface ProxyClient {
 ```
 
 `fetch` returns the raw `Response` so the caller picks how to read the body (`.json()`, `.text()`, `.blob()`, …). The auth header is added server-side; do not set `Authorization` from the iframe.
+
+**The upstream cannot act on the Lucidos origin.** The engine serves the response from its own origin, so it passes only the headers a caller reads:
+
+- content, caching and range headers, `Location`, `Link` and `Retry-After`
+- the `RateLimit-*` family, `Request-Id` and any `x-` header
+- the `anthropic-` and `openai-` families of the builtin providers
+
+The engine drops everything else. That covers `Set-Cookie`, `Clear-Site-Data`, `Strict-Transport-Security`, a CSP, CORS headers, `Alt-Svc` and `WWW-Authenticate`, and any other vendor header. Every response carries `X-Content-Type-Options: nosniff`. An HTML, XML or untyped one also carries `Content-Security-Policy: sandbox`, so a proxy URL opened in a tab never runs upstream script.
 
 **A response is buffered, so it does not stream.** The engine reads the whole upstream body before it answers, from a frame and from a standalone tab alike. A token stream therefore arrives complete rather than as it is generated. Render the finished answer.
 
@@ -1248,6 +1277,9 @@ local-model chat goes (`local_base_url`).
 The engine's own bookkeeping, such as the Web Push keypair in `vapid_keys`, is
 not a setting. `get()` leaves it out, and `set()` refuses it.
 
+Every refusal rejects the promise with the engine's reason. That includes a
+value the engine will not store, such as a malformed timezone.
+
 ### Types
 
 ```ts
@@ -1604,6 +1636,8 @@ it reaches more than 2rem past its box. Nothing is required of an app beyond
 calling `applyPreferences()`.
 
 `watchPreferences()` subscribes to live preference changes (SSE `PreferencesChanged`) and re-applies them automatically. It also re-fetches the active theme when its file is written or deleted (`DataFileWritten`, `DataFileEdited`, `DataFileDeleted`) and when a plugin is installed or uninstalled. Call it once alongside `applyPreferences()` so the app reacts without a reload. That covers a light/dark toggle, an OS appearance change under a `system` preference, and a value retuned from the Style Remote. It also covers a flip of the device's Autocorrect switch (§ Text fields and autocorrect, under Setup).
+
+**Inside the host shell, the app repaints with it.** The shell pushes what it painted to every watching app frame, in the same task, with no request. So a scale drag, a zoom gesture or a theme switch moves the app with the shell rather than after the save. The push covers theme mode, theme, font, UI scale, style overrides, motion and theme effects. From the first push on, it owns the app's appearance, and `PreferencesChanged` then re-reads only the external-link target and Autocorrect. A popped-out app tab has no shell around it, so it follows changes through `PreferencesChanged` as above.
 
 Under a `system` preference the OS appearance is watched two ways, because neither alone is enough on every client. The `prefers-color-scheme` media query covers a flip while the app is on screen. The frame's resume (`visibilitychange`, `focus`, `pageshow`) covers one announced while it was not. That is the normal case in an installed iOS PWA, which is resumed rather than reloaded. Both are sampled a moment after the event and only re-apply when the resolved theme actually moved, so a wake that changed nothing costs nothing. Your app needs to do none of this: it is inside `watchPreferences()`.
 
@@ -2251,9 +2285,28 @@ lucidos.sse.disconnect();
 
 ```ts
 lucidos.utils.timeAgo(iso: string): string      // "5m ago", "2d ago", "just now"
-lucidos.utils.escapeHtml(str: string): string    // HTML-escape
-lucidos.utils.formatDate(iso: string): string    // Locale-formatted date string
+lucidos.utils.escapeHtml(str: string): string        // Escape for text position only
+lucidos.utils.escapeHtmlAttr(str: string): string    // Escape for an attribute value
+lucidos.utils.formatDate(iso: string): string        // Locale-formatted date string
 ```
+
+### Escaping: which helper goes where
+
+The two escapers are separate on purpose. Pick by where the value lands in the markup:
+
+| The value lands… | Use | Example |
+|---|---|---|
+| Between tags, as text | `escapeHtml` | `` `<td>${lucidos.utils.escapeHtml(name)}</td>` `` |
+| Inside a quoted attribute value | `escapeHtmlAttr` | `` `<a title="${lucidos.utils.escapeHtmlAttr(name)}">` `` |
+| In an unquoted attribute, a `<script>`, a `style`, or an `on*` handler | Neither | Set it from code instead |
+
+**Never use `escapeHtml` inside an attribute.** It escapes `&`, `<` and `>` but leaves `"` and `'` raw. A value carrying a quote closes the attribute and adds its own, such as `onmouseover`. That is script running with your app's full authority: data writes, proxy calls and OAuth tokens. An app rendering third-party content, such as a feed or a mailbox, is exposed.
+
+`escapeHtmlAttr` escapes all five characters, so it is also safe in text position. Quote the attribute either way: no escaper makes an unquoted value safe.
+
+**A URL attribute needs more than escaping.** `escapeHtmlAttr` keeps a value inside `href` or `src`, but a `javascript:` URL still runs there. Check the scheme first, or set the link from code.
+
+**Building from code needs neither.** `el.textContent = value` and `el.setAttribute('title', value)` never parse the value as markup.
 
 ## App UI Pattern
 

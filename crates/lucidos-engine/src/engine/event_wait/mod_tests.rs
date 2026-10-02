@@ -2212,6 +2212,68 @@ async fn an_expiry_anchor_carries_no_delivery_link() {
     teardown_test_db(&db_name).await;
 }
 
+/// A re-entry says who wrote it and why, so the transcript can explain it. The
+/// prose the model reads stays exactly as it was.
+#[tokio::test]
+async fn a_reentry_anchor_names_the_engine_and_the_wait() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let waits = LiveWaits::new();
+
+    let anchor_of = |id: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_as::<_, (Value, String, String)>(
+                "SELECT payload->'origin', payload->>'mode', payload->>'text' \
+                 FROM events WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+
+    let thread_id = Uuid::new_v4();
+    let on = vec![
+        sub("CodingAgentIdled", Some(json!({"session": "a"}))),
+        sub("CodingAgentIdled", Some(json!({"session": "b"}))),
+        sub("ChangeProposed", None),
+    ];
+    let expiring = emit_subscribe(&bus, thread_id, on.clone()).await;
+    let delivering = emit_subscribe(&bus, thread_id, on).await;
+    rebuild_live_waits(&pool, &waits).await.unwrap();
+
+    let wait = waits.take(expiring).await.unwrap();
+    let reentry = emit_expiry(&bus, &wait, &[]).await.unwrap();
+    let (origin, mode, text) = anchor_of(reentry.anchor_event_id).await;
+    assert_eq!(
+        origin,
+        json!({"kind": "engine", "reason": {
+            "kind": "event_wait",
+            "outcome": "expired",
+            "watched": ["CodingAgentIdled", "ChangeProposed"],
+            "wait_reason": "waiting for a change",
+        }})
+    );
+    assert_eq!(mode, "agent");
+    assert_eq!(text, expiry_reentry_text(&wait, &[]));
+
+    let wait = waits.take(delivering).await.unwrap();
+    let reentry = emit_delivery(&bus, &wait, Uuid::new_v4(), "ChangeProposed", &json!({}), 2)
+        .await
+        .unwrap();
+    let (origin, _, text) = anchor_of(reentry.anchor_event_id).await;
+    assert_eq!(origin["reason"]["outcome"], "delivered");
+    assert_eq!(
+        text,
+        delivery_reentry_text("ChangeProposed", &json!({}), &wait.reason)
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
 /// Seed a `thread_summaries` row, then subscribe + resolve, leaving the anchor
 /// as the thread's last word. That is the crash shape
 /// `refire_unresolved_wait_reentries` exists for: the resolution is persisted (so

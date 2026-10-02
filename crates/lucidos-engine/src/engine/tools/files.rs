@@ -1120,11 +1120,20 @@ pub(crate) fn read_text_from_zip(
             inner_path, size, max_uncompressed
         ));
     }
-    let mut buf = String::new();
-    entry
-        .read_to_string(&mut buf)
+    // The header size above is whatever the archive claims, and a zip bomb
+    // lies. So the cap also bounds what the decompressor may actually produce.
+    let mut bytes = Vec::new();
+    (&mut entry)
+        .take(max_uncompressed.saturating_add(1))
+        .read_to_end(&mut bytes)
         .map_err(|e| format!("read entry '{}': {}", inner_path, e))?;
-    Ok(buf)
+    if bytes.len() as u64 > max_uncompressed {
+        return Err(format!(
+            "zip entry '{}' too large: it decompresses past the cap of {} bytes",
+            inner_path, max_uncompressed
+        ));
+    }
+    String::from_utf8(bytes).map_err(|e| format!("read entry '{}': {}", inner_path, e))
 }
 
 /// If `inner_path` looks like a binary file by extension, return a clear short-circuit

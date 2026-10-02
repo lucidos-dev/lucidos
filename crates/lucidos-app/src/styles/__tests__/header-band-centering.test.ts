@@ -31,7 +31,7 @@ const shellCss = styles('panels/shell.css');
 const drawerCss = styles('drawer.css');
 const shellRules = cssRules(shellCss);
 
-const DESKTOP = '@media (min-width: 769px)';
+const DESKTOP = '@media (--desktop-layout)';
 
 /** The one desktop rule with this exact selector. Exactly one, because
  *  `.threads-header` also has a base rule outside the media query and a first
@@ -411,7 +411,7 @@ describe('the threads header clips sideways only, on both builds', () => {
     const clip = desktopRule('.threads-header').props.get('clip-path') ?? '';
     const [, top, right, bottom] = /^inset\((-?[\d.]+(?:rem)?) (-?[\d.]+(?:rem)?) (-?[\d.]+(?:rem)?) /
       .exec(clip) ?? [];
-    const ring = shellRules.find(r => r.selector === '.app-header .icon-btn:focus-visible');
+    const ring = shellRules.find(r => selectorList(r.selector).includes('.app-header .icon-btn:focus-visible'));
     const band = parseFloat(/0 0 0 ([\d.]+)rem/.exec(ring?.props.get('--focus-ring') ?? '')?.[1] ?? 'NaN');
     for (const edge of [top, bottom]) {
       expect(-parseFloat(edge), `clip ${clip} cuts the ${band}rem focus ring`).toBeGreaterThanOrEqual(band);
@@ -483,7 +483,7 @@ describe('both desktop builds show one bar of the same height', () => {
 
   it('no mobile viewport is touched', () => {
     // The base token in global/base.css carries the notch's
-    // env(safe-area-inset-top); every override here drops it, so one escaping
+    // var(--safe-area-top); every override here drops it, so one escaping
     // the desktop media query would cut the inset off an iPhone header.
     for (const rule of shellRules) {
       if (rule.props.get('--app-header-height') === undefined) continue;

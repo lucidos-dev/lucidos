@@ -17,6 +17,7 @@ import { pushThreadNavState } from './thread-navigation';
 import { currentPerfBaseline } from '../../utils/renderPhaseTimers';
 import { markThreadOpenStart } from '../../utils/threadOpenMarks';
 import { errorDetail } from '../../utils/errorDetail';
+import { pruneRecents } from './entityReferences';
 
 // ---------------------------------------------------------------------------
 // Thread CRUD
@@ -142,18 +143,11 @@ export function focusThread(threadId: string, options?: FocusThreadOptions): voi
   // were still arriving. The message is a VERDICT about what the thread holds.
   // The calls above started that load, so the deadline used to race a fetch
   // this function had just issued. See `DeepLinkOptions.stillArriving`.
-  const stillArriving = () => threadEventsStillArriving(threadId);
   if (targetEventId) {
-    scrollToEventAndPulse(targetEventId, {
-      stillArriving,
-      onUnresolved: () => showToast(
-        'That event is not shown in this thread.',
-        'warning',
-      ),
-    });
+    landOnEvent(threadId, targetEventId);
   } else if (targetChangeId) {
     scrollToChangeAndPulse(targetChangeId, {
-      stillArriving,
+      stillArriving: () => threadEventsStillArriving(threadId),
       onUnresolved: () => showToast(
         'That change is not shown in this thread.',
         'warning',
@@ -162,6 +156,19 @@ export function focusThread(threadId: string, options?: FocusThreadOptions): voi
   }
 
   // No auto-read — user must explicitly click Archive, Apply, or Discard.
+}
+
+/** Scroll the open thread to `eventId` and pulse it, or say why it can't.
+ *  `focusThread`'s event deep link, and the late landing of a Needs attention
+ *  open whose target was only known once the events arrived. */
+export function landOnEvent(threadId: string, eventId: string): void {
+  scrollToEventAndPulse(eventId, {
+    stillArriving: () => threadEventsStillArriving(threadId),
+    onUnresolved: () => showToast(
+      'That event is not shown in this thread.',
+      'warning',
+    ),
+  });
 }
 
 /** Focus a thread the engine has just spawned for us, naming the id it returned.
@@ -244,6 +251,9 @@ export async function focusThreadOrBootstrapResult(
   }
   if (!found) {
     releaseAwait(threadId, previousFocus);
+    // The engine's answer, so unlike a `threadMap` miss it proves the thread
+    // is gone. It covers a delete whose `ThreadsDeleted` frame this page missed.
+    pruneRecents(threadId, 'threads');
     return { kind: 'not-found' };
   }
   // Clear BEFORE focusing: the thread is in the map now, so ThreadView needs no

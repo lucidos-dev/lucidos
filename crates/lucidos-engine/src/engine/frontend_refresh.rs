@@ -729,8 +729,11 @@ impl LucidosEngine {
         );
     }
 
+    /// Advance the served client to a peer's newer `dist/`. A pinned engine
+    /// never does: a newer client is a newer version, and it raises the
+    /// Refresh toast.
     async fn sync_served_frontend_if_safe(self: &Arc<Self>) {
-        if crate::runtime::is_packaged() {
+        if !self.newer_version_visible() {
             return;
         }
         let (Some(handle), Some(source)) = (

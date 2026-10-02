@@ -5,7 +5,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 // @ts-expect-error — same
 import { fileURLToPath } from 'node:url';
-import { computeAppHeight, heldBandPx, keyboardBandPx } from '../MobileSwipeContainer';
+import { computeAppHeight, heldBandPx, keyboardBandMemory, keyboardBandPx } from '../MobileSwipeContainer';
 
 // iOS PWA suspend/resume frequently dismisses the on-screen keyboard without
 // firing a fresh visualViewport `resize` event. The vv.resize handler is the
@@ -240,6 +240,29 @@ describe('keyboardBandPx', () => {
 // Lowering the band takes padding out from under a reader who may be scrolled
 // into it. The browser then clamps scrollTop and the content jumps, which is
 // how a mobile Save press lost its release to the layout moving under it.
+describe('keyboardBandMemory', () => {
+  const portrait = { width: 390, height: 844 };
+  const landscape = { width: 844, height: 390 };
+
+  it('reserves the widest band seen in this orientation', () => {
+    const memory = keyboardBandMemory();
+    memory.note(300, portrait);
+    memory.note(336, portrait);
+    memory.note(0, portrait);
+    expect(memory.reserve(portrait)).toBe(336);
+  });
+
+  it('never reserves a portrait keyboard on a landscape screen', () => {
+    const memory = keyboardBandMemory();
+    memory.note(336, portrait);
+    // Nothing measured sideways yet: the assumed fraction of the short side.
+    expect(memory.reserve(landscape)).toBe(Math.round(390 * 0.45));
+    memory.note(200, landscape);
+    expect(memory.reserve(landscape)).toBe(200);
+    expect(memory.reserve(portrait)).toBe(336);
+  });
+});
+
 describe('heldBandPx', () => {
   // The measured case: a 365px band, scrolled to 513 of a 513 maximum.
   const intoTheBand = { paddingPx: 365, scrollTop: 513, scrollHeight: 1325, clientHeight: 812 };

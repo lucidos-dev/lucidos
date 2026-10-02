@@ -3,6 +3,8 @@ import { signal } from '@preact/signals-core';
 
 const backupProgress = signal<{ phase: string; progress: number; total: number } | null>(null);
 const backupStatusVersion = signal(0);
+const recommendedCleanupProgress = signal<{ done: number; total: number } | null>(null);
+const diskUsageVersion = signal(0);
 const showToast = vi.fn();
 const dismissToast = vi.fn();
 const openBackupSettings = vi.fn();
@@ -22,6 +24,8 @@ vi.mock('../store', () => ({
   backupProgress,
   backupStatusVersion,
   backupPreferencesVersion: signal(0),
+  recommendedCleanupProgress,
+  diskUsageVersion,
   recoveryProgress: signal(null),
   panelOverlay: signal(null),
   showConfirm: vi.fn(),
@@ -129,6 +133,55 @@ describe('handleGlobalEvent — Backup terminal events', () => {
 
     expect(dismissToast).toHaveBeenCalledExactlyOnceWith('backup-failed');
     expect(openBackupSettings).toHaveBeenCalledOnce();
+  });
+});
+
+// The pass outlives its HTTP request, so these events are its only report.
+describe('handleGlobalEvent: the recommended cleanup', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    recommendedCleanupProgress.value = null;
+    diskUsageVersion.value = 0;
+  });
+
+  it('RecommendedCleanupStarted shows a running pass before its count is known', () => {
+    handleGlobalEvent('RecommendedCleanupStarted', {});
+    expect(recommendedCleanupProgress.value).toEqual({ done: 0, total: 0 });
+    expect(showToast).not.toHaveBeenCalled();
+  });
+
+  it('RecommendedCleanupProgress moves the bar', () => {
+    handleGlobalEvent('RecommendedCleanupStarted', {});
+    handleGlobalEvent('RecommendedCleanupProgress', { done: 12, total: 105 });
+    expect(recommendedCleanupProgress.value).toEqual({ done: 12, total: 105 });
+  });
+
+  it('RecommendedCleanupCompleted ends the pass, toasts what it freed, and re-reads the page', () => {
+    recommendedCleanupProgress.value = { done: 105, total: 105 };
+    handleGlobalEvent('RecommendedCleanupCompleted', {
+      removed_count: 86,
+      cleaned_count: 1,
+      freed_bytes: 79_300_000_000,
+    });
+
+    expect(recommendedCleanupProgress.value).toBeNull();
+    expect(diskUsageVersion.value).toBe(1);
+    expect(showToast).toHaveBeenCalledExactlyOnceWith(
+      'Freed 73.9 GB: removed 86 finished worktrees and cleared build artifacts in 1 worktree',
+      'success',
+    );
+  });
+
+  it('RecommendedCleanupFailed ends the pass, toasts the error, and re-reads the page', () => {
+    recommendedCleanupProgress.value = { done: 3, total: 105 };
+    handleGlobalEvent('RecommendedCleanupFailed', { error: 'The recommended cleanup stopped: panic' });
+
+    expect(recommendedCleanupProgress.value).toBeNull();
+    expect(diskUsageVersion.value).toBe(1);
+    expect(showToast).toHaveBeenCalledExactlyOnceWith(
+      'Cleanup failed: The recommended cleanup stopped: panic',
+      'error',
+    );
   });
 });
 

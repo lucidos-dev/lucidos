@@ -14,6 +14,7 @@ import { deviceIdHeader } from '../../utils/deviceIdHeader';
 import { replaceDocument } from '../../utils/documentNavigation';
 import { landingHash, type WorkspaceLanding } from '../../utils/workspaceLanding';
 import { gatewayErrorReason } from './gatewayError';
+import type { AppUpdateProgress } from '../../utils/tauri';
 
 const CONTROL = '/~/api/v1/control';
 
@@ -175,6 +176,46 @@ export interface GatewayStatus {
   /** The machine's release check (ADR 0108). Absent on an older gateway, which
    *  the frontend reads as "no offer" rather than as "up to date". */
   release_check?: ReleaseCheck;
+  /** The update relay to the desktop client (ADR 0338). Absent on an older
+   *  gateway, which the frontend reads as "no client to relay to". */
+  update_relay?: UpdateRelay;
+}
+
+/** The update relay's state. Mirrors `update_relay::UpdateRelay::snapshot`. */
+export interface UpdateRelay {
+  /** The desktop client, or `null` when none has sent a heartbeat lately. */
+  client: DesktopClient | null;
+  /** The newest request, or `null` when there is none, or it expired or died. */
+  request: UpdateRelayRequest | null;
+}
+
+export interface DesktopClient {
+  version: string;
+  /** Why an unattended install could not run there, or `null` when it could. */
+  blocker: string | null;
+}
+
+export interface UpdateRelayRequest {
+  id: string;
+  version: string;
+  /** `requested` waits for the client to claim it. `ended` is over without a
+   *  restart, and its `progress` says how. */
+  state: 'requested' | 'running' | 'ended';
+  /** The client's latest progress frame, exactly as its own dialog reads it. */
+  progress: AppUpdateProgress | null;
+}
+
+/** A request the relay accepted. */
+export interface UpdateRelayTicket {
+  id: string;
+  version: string;
+}
+
+/** Ask the desktop client to install the newest published release (ADR 0338).
+ *  Rejects with the gateway's reason when it cannot: no client, a blocker, no
+ *  newer release, or a run already under way. */
+export async function requestUpdateRelay(): Promise<UpdateRelayTicket> {
+  return controlJson<UpdateRelayTicket>('/update-relay', { method: 'POST' });
 }
 
 /** How this install takes an update, from the gateway's read of its own

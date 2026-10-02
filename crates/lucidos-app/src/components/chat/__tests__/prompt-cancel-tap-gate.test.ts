@@ -163,6 +163,14 @@ describe('post-submit cancel settle window is wired', () => {
     expect(promptSource).toMatch(/morphMode === 'cancel' \? cancelSettling/);
   });
 
+  // The guard is invisible. Wearing the disabled dim, the Stop blinked to 40%
+  // a beat after the send and brightened again when the window closed.
+  it('keeps the settling Stop at full strength', () => {
+    expect(findMorphButton()).toMatch(/morphMode === 'cancel' && cancelSettling \? ' morph-settling'/);
+    const hostCss = readFileSync(resolve(here, '../../../styles/global/host-components.css'), 'utf-8');
+    expect(hostCss).toMatch(/\.send-cancel-morph\.morph-settling:disabled\s*\{\s*opacity:\s*1;\s*\}/);
+  });
+
   it('disables the answer-control lone Cancel while settling', () => {
     expect(promptSource).toMatch(/disabled=\{cancelSettling\}/);
   });

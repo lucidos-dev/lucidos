@@ -3,6 +3,7 @@ import { lucidos } from './index';
 import { installScrollMemory } from './scroll';
 import { installKeyboardForwarding } from './keyboardForward';
 import { installAppPullToRefresh } from './pullToRefresh';
+import { installAppPaneSwipe } from './paneSwipe';
 import { installTooltips } from './tooltip';
 import { primeDevicePreferences } from './ui';
 import { installAutocorrectStamp } from './autocorrectStamp';
@@ -67,6 +68,9 @@ if (typeof document !== 'undefined') {
   // A pull past the top of the app asks the host to refresh it, as the header's
   // Refresh does. The frame captures every touch, so only the SDK can see it.
   installAppPullToRefresh();
+  // A sideways drag anywhere in the app swipes the host's panes, as it does
+  // over the transcript. Same reason: only the SDK can see the frame's touches.
+  installAppPaneSwipe();
 
   document.addEventListener('click', (e: MouseEvent) => {
     const target = e.target as Element | null;

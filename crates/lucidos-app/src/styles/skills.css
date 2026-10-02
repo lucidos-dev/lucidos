@@ -50,7 +50,7 @@
    (mobile.css), so the actions already have a full-width line of their own under
    the info and a stack there would just spend three rows of a phone screen on
    what fits in one. */
-@media (min-width: 769px) {
+@media (--desktop-layout) {
     @container trigger-row (max-width: 28rem) {
         .trigger-row .list-row-actions {
             flex-direction: column;
@@ -209,11 +209,8 @@
     display: none;
 }
 
+/* Box and focus: global/text-input.css. */
 .trigger-group-name-input {
-    color: var(--text-primary);
-    background: var(--bg-primary);
-    border: 1px solid var(--accent);
-    border-radius: calc(var(--radius-control) * 0.375);
     padding: 0.125rem 0.25rem;
     /* Same text size and weight as the section label it replaces (the
        input's own border and padding still make the header a few px taller while

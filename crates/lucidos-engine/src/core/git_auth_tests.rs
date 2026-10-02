@@ -1,6 +1,6 @@
 //! Tests for the shared git credential helper.
 //!
-//! Nothing here reaches a network. The store-backed tests use the disposable
+//! Nothing here reaches past loopback. The store-backed tests use the disposable
 //! database `setup_test_db` provisions; everything else is pure.
 
 use super::*;
@@ -509,14 +509,10 @@ fn an_ssh_auth_failure_is_recognised_too() {
     assert!(message.contains("Authentication required"), "{message}");
 }
 
-/// A local clone must stay deep. libgit2's local transport rejects a shallow
-/// fetch, so a `depth(1)` leaking onto this path fails the clone outright.
-#[test]
-fn a_local_clone_stays_deep_and_still_succeeds() {
-    let scratch = tempfile::TempDir::new().unwrap();
-    let origin = scratch.path().join("origin");
-    let repo = git2::Repository::init(&origin).unwrap();
-    std::fs::write(origin.join("README.md"), "hello").unwrap();
+/// A one-commit repository at `dir`, as a `file://` URL to clone.
+fn seeded_origin(dir: &Path) -> String {
+    let repo = git2::Repository::init(dir).unwrap();
+    std::fs::write(dir.join("README.md"), "hello").unwrap();
     let mut index = repo.index().unwrap();
     index
         .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
@@ -526,16 +522,178 @@ fn a_local_clone_stays_deep_and_still_succeeds() {
     let sig = git2::Signature::now("Lucidos Test", "test@example.com").unwrap();
     repo.commit(Some("HEAD"), &sig, &sig, "seed", &tree, &[])
         .unwrap();
-    drop(tree);
-    drop(index);
-    drop(repo);
+    format!("file://{}", dir.display())
+}
 
-    let url = format!("file://{}", origin.display());
+/// The names in `dir`, sorted, so a test can see a leftover staging directory.
+fn entries(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// A local clone must stay deep. libgit2's local transport rejects a shallow
+/// fetch, so a `depth(1)` leaking onto this path fails the clone outright.
+#[test]
+fn a_local_clone_stays_deep_and_still_succeeds() {
+    let scratch = tempfile::TempDir::new().unwrap();
+    let url = seeded_origin(&scratch.path().join("origin"));
     let target = scratch.path().join("clone");
     let cloned =
         shallow_clone(&url, None, &target, &GitCredentials::none()).expect("local clone succeeds");
     drop(cloned);
     assert!(target.join("README.md").is_file());
+}
+
+/// A loopback "remote" that accepts every connection and never answers, the
+/// shape of a hung git host. No progress callback ever fires against it.
+fn silent_remote() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for stream in listener.incoming() {
+            held.extend(stream);
+        }
+    });
+    format!("http://127.0.0.1:{port}/example-repo.git")
+}
+
+/// Regression: the `git_clone` tool ran the clone on its tokio worker with no
+/// bound, so a hung remote pinned that worker for good. Here a pinned worker
+/// starves the ticker and never returns. The watchdog then fails the test
+/// instead of hanging it.
+#[test]
+fn a_bounded_clone_of_a_silent_remote_times_out_without_pinning_the_runtime() {
+    let url = silent_remote();
+    let scratch = tempfile::TempDir::new().unwrap();
+    let target = scratch.path().join("clone");
+    let (done, outcome) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = rt.block_on(async {
+            let ticks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counter = ticks.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            });
+            let started = Instant::now();
+            let result = shallow_clone_within(
+                &url,
+                None,
+                &target,
+                &GitCredentials::none(),
+                Duration::from_secs(1),
+            )
+            .await;
+            let ticks = ticks.load(std::sync::atomic::Ordering::Relaxed);
+            (result, ticks, started.elapsed())
+        });
+        // The abandoned clone thread is still blocked on the silent socket.
+        rt.shutdown_background();
+        let _ = done.send(result);
+    });
+
+    let (result, ticks, elapsed) = outcome
+        .recv_timeout(Duration::from_secs(20))
+        .expect("the clone pinned the runtime past its one-second limit");
+    let message = result.expect_err("a silent remote must not produce a clone");
+    assert!(message.contains("timed out after 1s"), "{message}");
+    assert!(elapsed < Duration::from_secs(10), "took {elapsed:?}");
+    assert!(ticks >= 5, "the runtime made {ticks} ticks while cloning");
+}
+
+#[tokio::test]
+async fn a_bounded_clone_lands_at_its_target_and_leaves_no_staging_behind() {
+    let scratch = tempfile::TempDir::new().unwrap();
+    let url = seeded_origin(&scratch.path().join("origin"));
+    let target = scratch.path().join("clone");
+    let limit = Duration::from_secs(30);
+    shallow_clone_within(&url, None, &target, &GitCredentials::none(), limit)
+        .await
+        .expect("local clone succeeds");
+    assert!(target.join("README.md").is_file());
+    assert_eq!(entries(scratch.path()), ["clone", "origin"]);
+}
+
+#[tokio::test]
+async fn a_failed_bounded_clone_leaves_nothing_behind() {
+    let scratch = tempfile::TempDir::new().unwrap();
+    let url = format!("file://{}", scratch.path().join("no-such-repo").display());
+    let target = scratch.path().join("clone");
+    let limit = Duration::from_secs(30);
+    let result = shallow_clone_within(&url, None, &target, &GitCredentials::none(), limit).await;
+    assert!(result.is_err());
+    assert!(
+        entries(scratch.path()).is_empty(),
+        "{:?}",
+        entries(scratch.path())
+    );
+}
+
+/// A clone that outlives its caller must not delete what took its place, so the
+/// clone never writes `into` until it moves there whole.
+#[tokio::test]
+async fn a_bounded_clone_never_replaces_or_removes_an_existing_target() {
+    let scratch = tempfile::TempDir::new().unwrap();
+    let url = seeded_origin(&scratch.path().join("origin"));
+    let existing = scratch.path().join("existing");
+    std::fs::create_dir_all(&existing).unwrap();
+    std::fs::write(existing.join("keep.txt"), "user data").unwrap();
+    let limit = Duration::from_secs(30);
+    let result = shallow_clone_within(&url, None, &existing, &GitCredentials::none(), limit).await;
+    assert!(result.is_err());
+    assert_eq!(entries(&existing), ["keep.txt"]);
+    assert_eq!(entries(scratch.path()), ["existing", "origin"]);
+}
+
+/// A cancelled tool call drops the future mid-clone. The clone must not land
+/// afterwards, with nobody left to use or remove it.
+#[test]
+fn a_cancelled_bounded_clone_never_lands() {
+    let scratch = tempfile::TempDir::new().unwrap();
+    let url = seeded_origin(&scratch.path().join("origin"));
+    let target = scratch.path().join("clone");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let (credentials, limit) = (GitCredentials::none(), Duration::from_secs(30));
+        let clone = shallow_clone_within(&url, None, &target, &credentials, limit);
+        // Polls once, which starts the clone, then drops it.
+        let polled = tokio::time::timeout(Duration::ZERO, clone).await;
+        assert!(polled.is_err(), "the clone cannot finish in one poll");
+    });
+    // Dropping the runtime waits for the clone thread to finish.
+    drop(rt);
+    assert_eq!(entries(scratch.path()), ["origin"]);
+}
+
+/// A silent socket must end on its own, or the thread the caller abandoned at
+/// its deadline stays blocked on it for good.
+#[test]
+fn a_clone_bounds_how_long_a_socket_may_stay_silent() {
+    let scratch = tempfile::TempDir::new().unwrap();
+    let url = seeded_origin(&scratch.path().join("origin"));
+    drop(shallow_clone(
+        &url,
+        None,
+        &scratch.path().join("clone"),
+        &GitCredentials::none(),
+    ));
+    // SAFETY: a read of the global `bound_idle_sockets` wrote once.
+    let timeout = unsafe { git2::opts::get_server_timeout_in_milliseconds() }.unwrap();
+    assert_eq!(timeout, SERVER_IDLE_TIMEOUT_MS);
 }
 
 /// The credential store is the only home for a git secret. An env read here

@@ -21,20 +21,25 @@ vi.mock('../../api/threads', () => ({ fetchEventLocation }));
 const ensureThreadByIdInMap = vi.hoisted(() => vi.fn(async () => true));
 const loadThreadEvents = vi.hoisted(() => vi.fn(async () => {}));
 const ensureWholeThreadLoaded = vi.hoisted(() => vi.fn(async () => {}));
+/** Set per test: the real check reads fetch claims this suite never makes. */
+const threadEventsStillArriving = vi.hoisted(() => vi.fn((_threadId: string) => false));
 vi.mock('./thread-loading', () => ({
   ensureThreadByIdInMap,
   ensureWholeThreadLoaded,
   loadThreadEvents,
+  threadEventsStillArriving,
 }));
 
 const focusThread = vi.hoisted(() => vi.fn());
-vi.mock('./threads', () => ({ focusThread }));
+const landOnEvent = vi.hoisted(() => vi.fn());
+vi.mock('./threads', () => ({ focusThread, landOnEvent }));
 
 const {
   _resetEventTargetCacheForTesting,
   ensureEventTargetResolved,
   eventHasTarget,
   jumpableEventId,
+  openAttentionThread,
   resolveEventTarget,
   showEventWhereItLives,
 } = await import('./event-navigation');
@@ -75,7 +80,14 @@ function resetAll(): void {
   ensureThreadByIdInMap.mockReset().mockResolvedValue(true);
   loadThreadEvents.mockReset().mockResolvedValue(undefined);
   ensureWholeThreadLoaded.mockReset().mockResolvedValue(undefined);
+  // The real rule's first-load half: a thread with neither events nor a failed
+  // load is still arriving.
+  threadEventsStillArriving.mockReset().mockImplementation((id: string) => {
+    const t = threadMap.value.get(id);
+    return !!t && !t.eventsLoaded && !t.eventsLoadFailed;
+  });
   focusThread.mockReset();
+  landOnEvent.mockReset();
   _resetEventTargetCacheForTesting();
 }
 
@@ -522,6 +534,119 @@ describe('eventHasTarget', () => {
     await settle();
     expect(eventHasTarget('flaky-1')).toBe(true);
     expect(fetchEventLocation).toHaveBeenCalledTimes(2);
+  });
+});
+
+/** A tap in the Needs attention view lands on what waits for the user, not on
+ *  the saved reading position. */
+describe('openAttentionThread', () => {
+  beforeEach(resetAll);
+
+  /** A thread parked on a question: one ordinary turn, then the open question. */
+  function waitingThread(): ThreadState {
+    const events = new Map<number, unknown>([
+      [1, { type: 'MessageReceived', content: 'go', _eventId: 'start-1', created: '2026-08-06T10:00:00Z' }],
+      [2, { type: 'UserQuestionAsked', tool_use_id: 'tu-1', question: 'Which?', _eventId: 'q-1', created: '2026-08-06T10:00:01Z' }],
+    ]);
+    return {
+      meta: { id: 'waiting', status: 'waiting_for_user_answer' },
+      events,
+      pendingUserMessages: [],
+      eventsLoaded: true,
+    } as unknown as ThreadState;
+  }
+
+  it('lands on the open question at once when the events are loaded', () => {
+    threadMap.value = new Map([['waiting', waitingThread()]]);
+
+    openAttentionThread('waiting');
+
+    expect(focusThread).toHaveBeenCalledWith('waiting');
+    expect(landOnEvent).toHaveBeenCalledWith('waiting', 'q-1');
+  });
+
+  /** An iOS PWA wake leaves every thread loaded but stale, and a question asked
+   *  while the app slept is only in the catch-up. Landing on the loaded events
+   *  would pick the older turn. */
+  it('waits out a catch-up refresh before choosing where to land', async () => {
+    const stale = waitingThread();
+    stale.events.delete(2);
+    threadMap.value = new Map([['waiting', stale]]);
+    let refreshing = true;
+    threadEventsStillArriving.mockImplementation(() => refreshing);
+
+    openAttentionThread('waiting');
+    focusedThreadId.value = 'waiting';
+    await settle();
+    expect(landOnEvent).not.toHaveBeenCalled();
+
+    // The refresh writes the map, then releases its claim.
+    threadMap.value = new Map([['waiting', waitingThread()]]);
+    refreshing = false;
+    await vi.waitFor(() => expect(landOnEvent).toHaveBeenCalledWith('waiting', 'q-1'));
+  });
+
+  /** The tap must not wait on the network. The thread opens at once, and the
+   *  landing follows the events. */
+  it('opens at once and lands once the events arrive', async () => {
+    threadMap.value = new Map([
+      ['waiting', { ...waitingThread(), events: new Map(), eventsLoaded: false } as unknown as ThreadState],
+    ]);
+
+    openAttentionThread('waiting');
+    expect(focusThread).toHaveBeenCalledWith('waiting');
+    focusedThreadId.value = 'waiting';
+
+    threadMap.value = new Map([['waiting', waitingThread()]]);
+    await vi.waitFor(() => expect(landOnEvent).toHaveBeenCalledWith('waiting', 'q-1'));
+  });
+
+  /** Turns after the question can push it behind the newest page. */
+  it('loads older history when the waiting card is not on the loaded page', async () => {
+    const paged = waitingThread();
+    paged.events.delete(2);
+    paged.hasOlderEvents = true;
+    threadMap.value = new Map([['waiting', paged]]);
+    ensureWholeThreadLoaded.mockImplementation(async () => {
+      threadMap.value = new Map([['waiting', waitingThread()]]);
+    });
+
+    focusedThreadId.value = 'waiting';
+    openAttentionThread('waiting');
+
+    await vi.waitFor(() => expect(landOnEvent).toHaveBeenCalledWith('waiting', 'q-1'));
+    expect(ensureWholeThreadLoaded).toHaveBeenCalledWith('waiting');
+  });
+
+  /** A catch-up that outran the deadline says nothing about the target, so the
+   *  thread stays put rather than land on an older turn. */
+  it('does not land when the events are still arriving at the deadline', async () => {
+    vi.useFakeTimers();
+    try {
+      threadMap.value = new Map([['waiting', waitingThread()]]);
+      threadEventsStillArriving.mockImplementation(() => true);
+
+      focusedThreadId.value = 'waiting';
+      openAttentionThread('waiting');
+      await vi.runAllTimersAsync();
+
+      expect(landOnEvent).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('skips the late landing when the user opened another thread meanwhile', async () => {
+    threadMap.value = new Map([
+      ['waiting', { ...waitingThread(), events: new Map(), eventsLoaded: false } as unknown as ThreadState],
+    ]);
+
+    openAttentionThread('waiting');
+    focusedThreadId.value = 'elsewhere';
+    threadMap.value = new Map([['waiting', waitingThread()]]);
+    await settle();
+
+    expect(landOnEvent).not.toHaveBeenCalled();
   });
 });
 

@@ -177,16 +177,16 @@ test.describe('theme parts', () => {
 
     await setPreference(page, 'theme-effects', 'reduce');
     await expect(page.locator('html')).toHaveAttribute('data-theme-effects', 'reduce');
+    // The composer's border and shadow ease (previews.css), so every read waits
+    // for the resting value rather than catching one mid-transition.
     for (const [selector, prop] of [
       [CHUNK, 'text-shadow'], ['#lp-icon', 'filter'], ['#lp-box', 'box-shadow'],
       ['#lp-textarea', 'text-shadow'], ['#lp-title', 'text-shadow'],
     ]) {
-      expect(await style(page, selector, prop), `${selector} ${prop}`).toBe('none');
+      await expect.poll(() => style(page, selector, prop), { message: `${selector} ${prop}` }).toBe('none');
     }
     expect(await style(page, CHUNK, 'color')).toBe('rgb(204, 51, 102)');
     expect(await style(page, CHUNK, 'letter-spacing')).toBe(spacing);
-    // The composer border eases to the theme's colour (previews.css), so wait
-    // for it to settle before reading the resting value.
     await expect.poll(() => style(page, '#lp-box', 'border-color')).toBe('rgb(51, 255, 51)');
 
     // A live toggle repaints without re-applying the theme.

@@ -2,18 +2,22 @@ import type { ComponentChildren } from 'preact';
 import { signal } from '@preact/signals';
 import { useEffect, useState } from 'preact/hooks';
 import { API, ApiError, mutatingFetch, throwIfNotOk } from '../../api/client';
-import { showConfirm, showToast } from '../../store/store';
+import { diskUsageVersion, recommendedCleanupProgress, showConfirm, showToast } from '../../store/store';
 import { focusThreadOrBootstrap } from '../../store/actions/threads';
 import { setLoadingIfFresh, toFailed, type Loadable } from '../../store/types';
 import { useDelayedFlag } from '../../hooks/useDelayedLoading';
 import { usePanelRefresh } from '../../hooks/usePanelRefresh';
+import { useVersionedRefresh } from '../../hooks/useVersionedRefresh';
 import { LoadableError } from '../shared/LoadableError';
 import { LoadingFade } from '../shared/LoadingFade';
 import { ListSkeletonOf, SkBlock, SkText, SkeletonProvider, useSkeleton } from '../shared/Skeleton';
 import { Explainer } from '../shared/Explainer';
+import { Disclosure } from '../shared/Disclosure';
+import { ProgressBar } from '../shared/progressBar';
 import { errorDetail } from '../../utils/errorDetail';
 import { formatTimeAgo } from '../../utils/formatTime';
 import { formatBytes } from '../../utils/formatBytes';
+import { countOf } from '../../utils/recommendedCleanup';
 
 export interface WorktreeRow {
   thread_id: string;
@@ -41,6 +45,7 @@ interface DiskSummary {
   workspace_data_bytes: number;
   soft_threshold_bytes: number;
   hard_threshold_bytes: number;
+  recommended_cleanup_running: boolean;
 }
 
 const inventory = signal<Loadable<WorktreeRow[]>>({ status: 'not-loaded' });
@@ -53,7 +58,11 @@ async function loadSummary(): Promise<void> {
   try {
     const res = await fetch(`${API}/disk-usage/summary`);
     await throwIfNotOk(res);
-    summary.value = { status: 'loaded', data: (await res.json()) as DiskSummary };
+    const data = (await res.json()) as DiskSummary;
+    summary.value = { status: 'loaded', data };
+    // Keep a known count; only a pass the engine no longer runs drops the cue.
+    if (!data.recommended_cleanup_running) recommendedCleanupProgress.value = null;
+    else recommendedCleanupProgress.value ??= { done: 0, total: 0 };
   } catch (e) {
     summary.value = toFailed(e);
   }
@@ -104,22 +113,16 @@ export async function removeUnlessDirty(threadId: string): Promise<CleanupResult
   }
 }
 
-interface RecommendedCleanupResult {
-  removed_count: number;
-  cleaned_count: number;
-  freed_bytes: number;
-}
-
-/** The recommended cleanup over every worktree. The engine decides, per tree,
- *  what is safe at the moment it acts. */
-export async function runRecommendedCleanup(): Promise<RecommendedCleanupResult> {
+/** Starts the recommended cleanup over every worktree. The engine decides, per
+ *  tree, what is safe at the moment it acts, and reports the outcome over SSE
+ *  as `RecommendedCleanupCompleted` or `RecommendedCleanupFailed`. */
+export async function startRecommendedCleanup(): Promise<void> {
   const res = await mutatingFetch(`${API}/disk-usage/cleanup`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ action: 'recommended' }),
   });
   await throwIfNotOk(res);
-  return res.json();
 }
 
 export interface RecommendedCleanupEstimate {
@@ -144,10 +147,6 @@ export function estimateRecommendedCleanup(rows: WorktreeRow[]): RecommendedClea
     }
   }
   return estimate;
-}
-
-function countOf(n: number, noun: string): string {
-  return `${n} ${noun}${n === 1 ? '' : 's'}`;
 }
 
 /** One sentence naming what the recommended cleanup touches. */
@@ -279,17 +278,23 @@ function KeyRow({
   );
 }
 
+/** The running line under the "Free up space" card. */
+export function cleanupProgressLine({ done, total }: { done: number; total: number }): string {
+  return total > 0
+    ? `Cleanup in progress: ${done} of ${countOf(total, 'worktree')}`
+    : 'Cleanup in progress';
+}
+
 /** The "Free up space" card. With no `rows` its figure shimmers. */
 function RecommendedCleanupCard({
   rows,
   skeleton,
-  onDone,
 }: {
   rows: WorktreeRow[] | null;
   skeleton: boolean;
-  onDone: () => Promise<void>;
 }) {
-  const [busy, setBusy] = useState(false);
+  const progress = recommendedCleanupProgress.value;
+  const busy = progress !== null;
   const estimate = rows ? estimateRecommendedCleanup(rows) : null;
   const nothingToFree = estimate?.bytes === 0;
 
@@ -302,19 +307,16 @@ function RecommendedCleanupCard({
     ))) {
       return;
     }
-    setBusy(true);
+    recommendedCleanupProgress.value ??= { done: 0, total: 0 };
     try {
-      const result = await runRecommendedCleanup();
-      const done = [
-        result.removed_count > 0 && `removed ${countOf(result.removed_count, 'finished worktree')}`,
-        result.cleaned_count > 0 && `cleared build artifacts in ${countOf(result.cleaned_count, 'worktree')}`,
-      ].filter(Boolean).join(' and ');
-      showToast(`Freed ${formatBytes(result.freed_bytes)}${done ? `: ${done}` : ''}`, 'success');
-      await onDone();
+      await startRecommendedCleanup();
     } catch (e) {
+      if (e instanceof ApiError && e.httpCode === 409) {
+        showToast('A cleanup is already running. Its result arrives here when it finishes.', 'info');
+        return;
+      }
+      recommendedCleanupProgress.value = null;
       showToast(`Cleanup failed: ${errorDetail(e)}`, 'error');
-    } finally {
-      setBusy(false);
     }
   }
 
@@ -338,6 +340,15 @@ function RecommendedCleanupCard({
           {busy ? 'Freeing…' : `Free ${formatBytes(estimate.bytes)}`}
         </button>
       )}
+      {/* Drawn like the Backup page's running state: a line, then the bar. */}
+      <Disclosure open={busy} class="disk-usage-reclaim-progress">
+        {progress && (
+          <>
+            <span class="disk-usage-reclaim-progress-line">{cleanupProgressLine(progress)}</span>
+            <ProgressBar done={progress.done} total={progress.total} />
+          </>
+        )}
+      </Disclosure>
     </div>
   );
 }
@@ -481,12 +492,15 @@ export function DiskUsagePage() {
   // still clears on its own read.
   const gate = useDelayedFlag(inventoryPending || summaryPending);
 
+  // The summary is read on every open, since a pass that ended while the page
+  // was closed leaves the running cue stale. `loadInventory` reads it too.
   useEffect(() => {
     if (diskUsageLoadOwed(loadable)) void loadInventory();
-    if (diskUsageLoadOwed(summaryLoadable)) void loadSummary();
+    else void loadSummary();
   }, []);
   // Re-reads the worktrees, then the summary, keeping both on screen meanwhile.
   usePanelRefresh('disk usage', loadInventory);
+  useVersionedRefresh(diskUsageVersion.value, false, () => void loadInventory());
 
   if (loadable.status === 'failed') {
     return (
@@ -586,7 +600,7 @@ export function DiskUsagePage() {
       </div>
 
       <div class="settings-section">
-        <RecommendedCleanupCard rows={rows} skeleton={inventorySkeleton} onDone={loadInventory} />
+        <RecommendedCleanupCard rows={rows} skeleton={inventorySkeleton} />
       </div>
 
       <div class="settings-section">

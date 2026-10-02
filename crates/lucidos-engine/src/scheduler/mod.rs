@@ -906,6 +906,8 @@ impl SchedulerManager {
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         crate::log!("[Scheduler] EventBus subscriber lagged by {} events", n);
+                        rearm_after_lag(&trigger_configs, &tracked_tasks, &engine, &shutdown_flag)
+                            .await;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         crate::log!("[Scheduler] EventBus closed, stopping trigger subscriber");
@@ -1272,8 +1274,8 @@ pub(crate) async fn reload_backup_schedule(
 
 mod task_runner;
 use task_runner::{
-    check_task_health_and_restart, handle_domain_event, handle_trigger_event, register_and_track,
-    TrackedTask,
+    check_task_health_and_restart, handle_domain_event, handle_trigger_event, rearm_after_lag,
+    register_and_track, TrackedTask,
 };
 
 /// Apply a trigger-group lifecycle event to the in-memory registry. Groups

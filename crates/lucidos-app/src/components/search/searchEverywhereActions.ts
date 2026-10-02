@@ -1,5 +1,6 @@
 import { searchEverywhereOpen } from '../../store/store';
 import type { FocusedPane } from '../../store/store';
+import { holdSoftwareKeyboard } from '../../utils/softwareKeyboard';
 
 /** The pane a selected search result navigates into — used to move real DOM
  *  focus there after navigating (see `handleSelect` in `SearchEverywhere`).
@@ -19,14 +20,9 @@ export function searchResultIconCategory(item: { category: string; id: string })
   return item.category === 'menu' ? item.id : item.category;
 }
 
-/** iOS keyboard nudge: focus a hidden input within the user-gesture call stack
- *  so the keyboard opens before the SearchEverywhere modal mounts. The modal's
- *  own input takes focus once Preact renders it. No-op when already open. */
+/** Open the keyboard before the SearchEverywhere modal mounts its input. Call
+ *  it from the tap that opens the modal. No-op when already open. */
 export function focusSearchInput(): void {
   if (searchEverywhereOpen.value) return;
-  const proxy = document.createElement('input');
-  proxy.style.cssText = 'position:fixed;top:-9999px;left:0;opacity:0;width:1px;height:1px;';
-  document.body.appendChild(proxy);
-  proxy.focus();
-  setTimeout(() => proxy.remove(), 500);
+  holdSoftwareKeyboard();
 }

@@ -65,7 +65,7 @@ const INLINE_PADDING_PROPS = [
  *  `prop: value` pairs in source order. Empty when nothing there pads it. */
 function mobileInlinePadding(className: string): string[] {
   return rulesTargeting(mobileCss, className)
-    .filter(rule => rule.atRules.includes('max-width: 768px'))
+    .filter(rule => rule.atRules.includes('(--phone-layout)'))
     .flatMap(rule => INLINE_PADDING_PROPS
       .filter(prop => rule.props.has(prop))
       .map(prop => `${prop}: ${rule.props.get(prop)}`));
@@ -194,9 +194,10 @@ describe('the mobile header hands its inline inset to its rows', () => {
   });
 
   it('pads each pane section instead, which is the row the inset was for', () => {
+    // Plus the side inset, which clears a phone in landscape of the island.
     for (const section of MOBILE_HEADER_SECTIONS) {
       expect(mobileInlinePadding(section.slice(1)), `${section} takes the wrong inset`)
-        .toEqual(['padding-inline: var(--header-padding-x)']);
+        .toEqual(['padding-inline: calc(var(--header-padding-x) + var(--phone-side-inset))']);
     }
     // One grouped rule, so the three cannot drift apart.
     const grouped = rulesTargeting(mobileCss, 'mobile-thread-header')

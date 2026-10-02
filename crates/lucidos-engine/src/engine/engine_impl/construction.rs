@@ -447,6 +447,19 @@ impl LucidosEngine {
                                     ),
                                 }
                             }
+                            // A follow-up that reached the resumed session as
+                            // it went idle comes back as an orphan. Dropping
+                            // it leaves the user's message unanswered.
+                            if let Ok(res) = result {
+                                if !res.orphaned_injections.is_empty() {
+                                    crate::api::chat::process_orphan_chain(
+                                        engine.clone(),
+                                        thread_id,
+                                        res.orphaned_injections,
+                                    )
+                                    .await;
+                                }
+                            }
                         }
                     }
                 });
@@ -1240,6 +1253,15 @@ impl LucidosEngine {
             capacity_policy,
         ));
 
+        let version_tracking = crate::engine::engine_version::VersionTracking::from_env();
+        if version_tracking == crate::engine::engine_version::VersionTracking::PinnedToBuild {
+            crate::log!(
+                "[Rebuild] engine version pinned to {} ({}): newer commits neither rebuild nor announce this engine",
+                crate::ENGINE_BUILD_ID,
+                crate::engine::engine_version::PIN_ENGINE_VERSION_ENV
+            );
+        }
+
         Ok(Self {
             artifact_manager,
             event_store,
@@ -1266,6 +1288,7 @@ impl LucidosEngine {
             backup_in_progress: AtomicBool::new(false),
             database_health: Default::default(),
             build_state: std::sync::RwLock::new(crate::engine::engine_version::BuildState::Idle),
+            version_tracking,
             update_check: std::sync::Mutex::new(Default::default()),
             source_behind_cache: std::sync::Mutex::new(Default::default()),
             disk_direction_cache: std::sync::Mutex::new(Default::default()),

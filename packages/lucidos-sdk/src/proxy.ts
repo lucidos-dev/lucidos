@@ -32,7 +32,9 @@ import {
  * Cookie/Origin/Referer/Host, so the upstream never sees the engine's browser
  * session. It strips every `x-lucidos-*` header and the two `x-forwarded-*`
  * ones the gateway owns with them, so no Lucidos credential travels either.
- * The credential value never reaches the iframe.
+ * The credential value never reaches the iframe. On the way back it passes
+ * only allowlisted upstream headers, so no `Set-Cookie` or policy header from
+ * the upstream lands on the Lucidos origin.
  */
 export interface ProxyClient {
   /** Make a request to the configured backend. Returns the raw `Response`

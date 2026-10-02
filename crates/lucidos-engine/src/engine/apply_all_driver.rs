@@ -220,9 +220,8 @@ impl LucidosEngine {
         // would merge a branch the coding agent is still committing on, racing
         // the session's next proposal (real thread 76b4ee76).
         //
-        // "Apply all on settle" is what the sweep answers those
-        // dropped changes with: not applied now, applied when their thread
-        // lands.
+        // The sweep answers those dropped changes: not applied now, applied
+        // when their thread lands.
         let live_filtered =
             crate::core::changes::drop_unsettled_thread_changes(self.pool(), all_pending).await?;
         let unsettled = total_pending - live_filtered.len();

@@ -1307,8 +1307,7 @@ impl Call<'_> {
     ///
     /// **Once per reply.** The gate opens on a run of loud frames, so a caller
     /// talking through a reply raises several edges. The second cancel says
-    /// nothing the first did not, and on a provider that refuses one for a
-    /// reply already cancelled it costs the call.
+    /// nothing the first did not, and Realtime answers it with an error frame.
     ///
     /// Nothing at all while the talker is quiet. There is no reply to cut, and
     /// the caller speaking on their own floor is an utterance rather than an

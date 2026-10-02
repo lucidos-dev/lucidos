@@ -73,8 +73,8 @@ test.describe('CC permission prompt — Allow / Deny flow', () => {
       // one place the coding agent's name is shortened (`describeExecutor`).
       await expect(panel.locator('.initiator-label')).toHaveText('Claude');
       const body = panel.locator('.initiator-body .permission-body').first();
-      await expect(body).toContainText(/Edit/);
-      await expect(body).toContainText(`/tmp/cc-perm-e2e-${suffix}.txt`);
+      // The card says what the tool does, in words, not the tool's name.
+      await expect(body).toContainText(`wants to edit /tmp/cc-perm-e2e-${suffix}.txt`);
 
       await body.locator('button', { hasText: /^Allow once$/ }).click();
 

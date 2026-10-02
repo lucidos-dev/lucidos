@@ -115,8 +115,12 @@ html {
        carry the SAME left inset and the SAME right inset, or the composer box
        stops lining up with the turn content it sits under. A step off the
        --space-* scale below (the thread pane's own gutter, one step tighter than
-       the content pane's --space-lg), named for the coupling it carries. */
-    --thread-pane-gutter: var(--space-md);
+       the content pane's --space-lg), named for the coupling it carries.
+       Plus the side inset below. */
+    --thread-pane-gutter: calc(var(--space-md) + var(--phone-side-inset));
+    /* What every pane keeps clear at each side. 0 here; the phone layout
+       (mobile.css) sets it to clear the Dynamic Island and rounded corners. */
+    --phone-side-inset: 0px;
     /* Width the platform reserves for a classic (layout-consuming) scrollbar,
        published in px at boot by utils/scrollbarGutter.ts and re-measured when
        the UI scale changes (our ::-webkit-scrollbar width is rem-sized). It is
@@ -130,10 +134,18 @@ html {
        doesn't shift when it grows past one screen), and every sibling that must
        line up with the transcript adds it to its own right inset. */
     --scrollbar-gutter-width: 0px;
+    /* The safe-area insets. Read these, never env() directly: an iOS home-screen
+       app can lose its env() insets mid-session, and utils/safeAreaFloor.ts
+       restores them through the --safe-area-floor-* vars. That floor arm is a
+       temporary measure (docs/temporary-measures.md, "Safe-area floor"). */
+    --safe-area-top: max(env(safe-area-inset-top, 0px), var(--safe-area-floor-top, 0px));
+    --safe-area-right: max(env(safe-area-inset-right, 0px), var(--safe-area-floor-right, 0px));
+    --safe-area-bottom: max(env(safe-area-inset-bottom, 0px), var(--safe-area-floor-bottom, 0px));
+    --safe-area-left: max(env(safe-area-inset-left, 0px), var(--safe-area-floor-left, 0px));
     /* Height of the desktop app header (.app-header, panels/shell.css): the
        2.5rem .pane-header bar plus its 0.25rem top padding plus the safe-area
        inset the header reserves. */
-    --app-header-height: calc(2.5rem + 0.25rem + env(safe-area-inset-top, 0px));
+    --app-header-height: calc(2.5rem + 0.25rem + var(--safe-area-top));
     /* Viewport y of the app header's BOTTOM edge. Every position:fixed element
        that must sit below the header anchors to this, because a fixed element's
        top is measured from the viewport rather than from the header's flex slot.

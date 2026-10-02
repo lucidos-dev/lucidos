@@ -4,7 +4,10 @@ import {
   remeasureTextarea,
   isTextareaHeightAnimating,
   animateTextareaHeightFrom,
+  easeEmptiedTextarea,
+  remeasureTextareaForPlaceholder,
 } from '../promptResize';
+import { motionPreference } from '../../../utils/motion';
 
 /**
  * Creates a mock textarea with configurable layout properties.
@@ -379,5 +382,104 @@ describe('isTextareaHeightAnimating', () => {
     const { el } = animatingTextarea();
     animateTextareaHeightFrom(el, '120px');
     expect(isTextareaHeightAnimating(el)).toBe(false);
+  });
+});
+
+// A send empties the box. Snapping it short drops the docked prompt and, on a
+// phone, the transcript's bottom padding in one frame. So it eases instead.
+describe('easeEmptiedTextarea', () => {
+  const frames: Array<() => void> = [];
+  const origRaf = globalThis.requestAnimationFrame;
+  const origCancelRaf = globalThis.cancelAnimationFrame;
+
+  afterEach(() => {
+    frames.length = 0;
+    globalThis.requestAnimationFrame = origRaf;
+    globalThis.cancelAnimationFrame = origCancelRaf;
+    motionPreference.value = 'system';
+    vi.useRealTimers();
+  });
+
+  /** A box tall with a draft, which a send has just emptied. */
+  function emptiedBox() {
+    globalThis.requestAnimationFrame = ((cb: FrameRequestCallback) => {
+      frames.push(() => cb(0));
+      return frames.length;
+    }) as typeof globalThis.requestAnimationFrame;
+    globalThis.cancelAnimationFrame = (() => {}) as typeof globalThis.cancelAnimationFrame;
+    const content = { height: 120 };
+    const el = createMockTextarea({ minHeight: 44, maxHeight: 400, contentHeight: 0, value: '' });
+    Object.defineProperty(el, 'scrollHeight', {
+      get: () => Math.max(content.height, Math.min(Math.max(parseInt(el.style.height) || 0, 44), 400)),
+    });
+    Object.assign(el, { addEventListener() {}, removeEventListener() {} });
+    content.height = 120;
+    resizeTextarea(el);
+    expect(el.style.height).toBe('120px');
+    content.height = 44;
+    return { el, content };
+  }
+
+  it('parks the box at its old height and eases it to the empty one', () => {
+    const { el } = emptiedBox();
+    easeEmptiedTextarea(el);
+    expect(el.style.height).toBe('120px');
+    expect(isTextareaHeightAnimating(el)).toBe(true);
+    frames.shift()?.();
+    frames.shift()?.();
+    expect(el.style.transition).toContain('height');
+    expect(el.style.height).toBe('44px');
+  });
+
+  it('snaps under reduced motion', () => {
+    motionPreference.value = 'reduce';
+    const { el } = emptiedBox();
+    easeEmptiedTextarea(el);
+    expect(el.style.height).toBe('44px');
+    expect(isTextareaHeightAnimating(el)).toBe(false);
+  });
+
+  // A typed answer swaps the placeholder on the render after the send, so
+  // mid-ease. The target the ease measured is the old placeholder's.
+  it('re-aims an ease in flight at the new placeholder height', () => {
+    const { el, content } = emptiedBox();
+    easeEmptiedTextarea(el);
+    frames.shift()?.();
+    frames.shift()?.();
+    const computed = vi.spyOn(globalThis, 'getComputedStyle')
+      .mockReturnValue({ height: '80px' } as CSSStyleDeclaration);
+    content.height = 30;
+    remeasureTextareaForPlaceholder(el);
+    computed.mockRestore();
+    // Parked where the ease had reached, still easing, now toward the new floor.
+    expect(el.style.height).toBe('80px');
+    expect(isTextareaHeightAnimating(el)).toBe(true);
+    frames.shift()?.();
+    frames.shift()?.();
+    expect(el.style.height).toBe('44px');
+  });
+
+  it('just re-measures with no ease in flight', () => {
+    const { el } = emptiedBox();
+    remeasureTextareaForPlaceholder(el);
+    expect(el.style.height).toBe('44px');
+    expect(isTextareaHeightAnimating(el)).toBe(false);
+  });
+
+  // The ease's last frame writes its own target. A box that grew under the
+  // reader's typing in the meantime would snap back short.
+  it('gives way to a height the typing writes during the ease', () => {
+    vi.useFakeTimers();
+    const { el, content } = emptiedBox();
+    easeEmptiedTextarea(el);
+    frames.shift()?.();
+    frames.shift()?.();
+    el.value = 'a\nb\nc';
+    content.height = 90;
+    Object.defineProperty(el, 'clientHeight', { get: () => 44 });
+    resizeTextarea(el);
+    expect(isTextareaHeightAnimating(el)).toBe(false);
+    vi.advanceTimersByTime(1_000);
+    expect(el.style.height).toBe('90px');
   });
 });

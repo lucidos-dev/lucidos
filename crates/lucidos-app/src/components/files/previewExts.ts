@@ -15,8 +15,8 @@ export const REPO_RENDERABLE_EXTS = RENDERABLE_EXTS.filter(e => e !== 'html' && 
 
 // Binary-media extensions both file viewers render via a URL-pointed element
 // (<img>/<video>/<audio>/<iframe>), never by fetching the bytes as text. SVG is
-// deliberately NOT here — it's XML, so it gets the rich/source text path
-// (RENDERABLE_EXTS) and only FilePreviewInline shows it as an <img> by default.
+// not here because it is XML with a Source view (RENDERABLE_EXTS). Both viewers
+// still show a rendered SVG as an <img> pointed at its engine URL.
 export const IMAGE_EXTS = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'ico', 'bmp'];
 // .ogg is treated as audio (Vorbis/Opus is by far the most common modern usage);
 // .ogv is the video variant. Listing 'ogg' in both video and audio caused

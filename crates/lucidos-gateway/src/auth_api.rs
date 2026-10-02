@@ -345,7 +345,10 @@ pub async fn enforce(State(state): State<GatewayState>, mut req: Request, next: 
             }
             return response;
         }
-        Authorization::LocalProcess => return next.run(req).await,
+        Authorization::LocalProcess => {
+            req.extensions_mut().insert(auth::AuthenticatedLocalProcess);
+            return next.run(req).await;
+        }
         Authorization::Unauthorized => {}
     }
     state.log_device_refusal(req.headers());

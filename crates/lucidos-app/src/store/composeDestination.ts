@@ -46,7 +46,7 @@ export const REGISTER_REPO_OPTION_VALUE = '__register-repo';
 
 /** The Lucidos Agent's consequence blurb — single source for the picker
  *  option description and the caption (which adds the period). */
-export const LUCIDOS_AGENT_BLURB = 'Chat, research, and create apps & triggers — can hand off to a coding agent';
+export const LUCIDOS_AGENT_BLURB = 'Chat, research, build and refine apps & triggers, and hand off to a coding agent';
 
 /** Derive the current destination from the channel + scope state. The mode
  *  side comes from `effectiveSendMode` (caller resolves it — composing drafts

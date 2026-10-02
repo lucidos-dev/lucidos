@@ -487,7 +487,9 @@ export function withScrollAnchor(anchor: Element | null | undefined, fn: () => v
   // stands. The other half is read after the mutation, in `targetNow`.
   const held = anchor as HTMLElement;
   const offsetBefore = contentOffsetTop(container, held);
-  const scrollBefore = container.scrollTop;
+  // Settled, because a press can land inside a repaint nudge's frame. The nudge
+  // moves `offsetBefore`'s two readings together, so only this one needs it.
+  const scrollBefore = settledScrollTop(container);
   const overflowBefore = container.style.overflow;
   const pressedAt = nowMs();
   let restored = false;

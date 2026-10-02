@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { SwipeTouch } from '../MobileSwipeContainer';
+import { SwipeTouch } from '@lucidos/pane-swipe';
 import { PANE_INDEX } from '../../../store/store';
 import type { MobileView } from '../../../store/store';
 

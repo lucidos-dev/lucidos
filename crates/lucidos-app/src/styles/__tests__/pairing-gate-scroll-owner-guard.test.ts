@@ -2,7 +2,7 @@
  * The pairing gate scrolls itself, and its column starts at the top when it is
  * too tall to fit.
  *
- * `mobile.css` sets `html { overflow: hidden }` under 768px, so a phone
+ * `mobile.css` sets `html { overflow: hidden }` on the phone layout, so a phone
  * document does not scroll. Every full-screen surface therefore owns its own
  * scroll container: `.ws-picker` already did, `.pairing-gate` did not, and its
  * install recipe was clipped with no way to reach the rest.
@@ -62,7 +62,7 @@ describe('pairing gate scroll ownership', () => {
     const padding = settled('pairing-gate', 'padding') ?? '';
     for (const side of ['top', 'right', 'bottom', 'left']) {
       expect(padding, `the ${side} gutter ignores the safe area`).toContain(
-        `env(safe-area-inset-${side}`,
+        `var(--safe-area-${side})`,
       );
     }
   });

@@ -11,6 +11,7 @@ import { setAppFrameHash, splitFrameSrc } from './iframeNav';
 import { APP_FRAME_SANDBOX, APP_FRAME_ALLOW } from './appFrameSandbox';
 import { EdgeSwipeZones } from '../layout/EdgeSwipeZones';
 import { pushKeybindingsToFrame } from '../../store/actions/app-keybindings';
+import { pushAppearanceToFrame } from '../../store/actions/app-appearance';
 import { IframeTabExit } from '../shared/IframeTabExit';
 
 /** The load cover's CSS opacity transition at 1x (var(--duration-normal)). The
@@ -137,6 +138,7 @@ function AppFrame({ src }: { src: string }) {
         onLoad={(e) => {
           setLoaded(true);
           pushKeybindingsToFrame(e.currentTarget as HTMLIFrameElement);
+          pushAppearanceToFrame(e.currentTarget as HTMLIFrameElement);
         }}
       />
       <IframeTabExit />

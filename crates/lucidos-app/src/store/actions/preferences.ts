@@ -25,8 +25,8 @@ import {
   EMPTY_THEME, FONT_PREFERENCES, THEME_EFFECTS_PREFS, THEME_EFFECTS_STORAGE_KEY,
   THEME_KEY, THEME_STORAGE_KEY, MOTION_PREFS,
   MOTION_STORAGE_KEY, SYSTEM_THEME_MODE_SETTLE_MS, THEME_MODES, THEME_MODE_ATTRIBUTE, THEME_MODE_BG,
-  THEME_MODE_KEY, THEME_MODE_STORAGE_KEY, UI_SCALE_DEFAULT,
-  FONT_BOLD_ATTRIBUTE, WORKSPACE_FONT_STORAGE_KEY,
+  THEME_MODE_KEY, THEME_MODE_STORAGE_KEY, UI_SCALE_DEFAULT, UI_SCALE_STORAGE_KEY,
+  FONT_BOLD_ATTRIBUTE, FONT_FAMILY_STORAGE_KEY, WORKSPACE_FONT_STORAGE_KEY,
   clampUiScale, fontBoldMark, isWorkspaceFontId, themeBackground, themeTokenNames, parseResolvedTheme,
   parseUiScale, parseWorkspaceFont, replaceInlineTokens, resolveFont, resolveThemeMode,
   sanitizeResolvedTheme,
@@ -72,6 +72,10 @@ let lastAppliedThemeMode: ThemeMode = currentThemeMode();
 export const paintedThemeMode = signal<ResolvedThemeMode>(
   document.documentElement.getAttribute(THEME_MODE_ATTRIBUTE) === 'light' ? 'light' : 'dark',
 );
+/** Bumped by every paint of scale, theme mode, theme, font or style overrides,
+ *  after it writes the mirror the appearance boot script reads. App frames
+ *  repaint off it (`app-appearance.ts`). */
+export const appearanceVersion = signal(0);
 
 // --- Generic helpers ---
 
@@ -118,8 +122,7 @@ function cacheServedValue(key: string, storageKey: string, validValues: readonly
 // "Failed to save <key> preference: request cancelled", never retried, and left
 // the device showing a value the server never received.
 
-/** A preference write the engine has not accepted yet. Parked once an immediate
- *  re-send has also failed transiently, and flushed on the next page resume.
+/** A preference write the engine has not accepted yet.
  *
  *  `seq` is the write's position in the global request order, used to spot one
  *  that a newer value for the same key has superseded. `PUT /preferences?key=<k>`
@@ -132,11 +135,26 @@ interface PendingPreferenceWrite {
   seq: number;
 }
 
+/** Writes parked once an immediate re-send has also failed transiently, and
+ *  flushed on the next page resume. */
 const pendingPreferenceWrites = new Map<string, PendingPreferenceWrite>();
 let writeSeq = 0;
 
 /** The newest `seq` requested per key, in-flight ones included. */
 const latestWriteSeq = new Map<string, number>();
+
+/** The newest write requested per key, until the engine answers it. A refetch
+ *  that lands before the answer still holds the old value, so `loadPreferences`
+ *  lays these back over it. */
+const unansweredWrites = new Map<string, PendingPreferenceWrite>();
+
+/** The `seq` of the last write the engine refused, per key. A refetch drops a
+ *  write it saw unanswered once the engine has refused it. */
+const refusedWriteSeq = new Map<string, number>();
+
+function writeValues(writes: Iterable<[string, PendingPreferenceWrite]>): Record<string, string> {
+  return Object.fromEntries([...writes].map(([key, write]) => [key, write.value]));
+}
 
 /** The tail of each key's delivery chain. Two writes to the same key must never
  *  be in flight at once: the engine applies them in ARRIVAL order, so an older
@@ -187,8 +205,9 @@ const writeFailures = createFailureCounter(3, () => {
  *  is reachable: the unreachable banner has to be retracted whichever way the
  *  queue drained, or it keeps insisting nothing is getting through while the
  *  rejection card next to it says otherwise. */
-function settleDelivered(key: string): void {
+function settleDelivered(key: string, write: PendingPreferenceWrite): void {
   pendingPreferenceWrites.delete(key);
+  if (unansweredWrites.get(key)?.seq === write.seq) unansweredWrites.delete(key);
   writeFailures.recordSuccess();
   if (pendingPreferenceWrites.size === 0) removeToast(PREFERENCE_UNREACHABLE_TOAST);
 }
@@ -226,7 +245,8 @@ async function deliverNow(key: string, write: PendingPreferenceWrite): Promise<v
       // The engine ANSWERED and refused. No retry can change that, and the user
       // is owed the reason. It also proves the engine is reachable, so this key
       // stops being owed a re-send and the unreachable count resets.
-      settleDelivered(key);
+      settleDelivered(key, write);
+      refusedWriteSeq.set(key, write.seq);
       showToast(`Failed to save ${key} preference: ${errorDetail(e)}`, 'error', {
         key: PREFERENCE_REJECTED_TOAST,
       });
@@ -234,7 +254,7 @@ async function deliverNow(key: string, write: PendingPreferenceWrite): Promise<v
     }
     // Kept OUT of the try: a throw from the bookkeeping below is not a failed
     // save, and catching it here would report one.
-    settleDelivered(key);
+    settleDelivered(key, write);
     return;
   }
   // Both attempts were cancelled, timed out, or dropped in transit. Park the
@@ -264,6 +284,8 @@ export function _pendingPreferenceKeysForTesting(): string[] {
 export function _resetPendingPreferenceWritesForTesting(): void {
   pendingPreferenceWrites.clear();
   latestWriteSeq.clear();
+  unansweredWrites.clear();
+  refusedWriteSeq.clear();
   deliveryChains.clear();
   writeFailures.recordSuccess();
 }
@@ -281,11 +303,12 @@ export async function savePreference(
       data: { ...preferences.value.data, [key]: value },
     };
   }
-  const seq = ++writeSeq;
+  const write = { value, deviceScoped, seq: ++writeSeq };
   // Claim the key BEFORE queueing, so any write already in flight or waiting its
   // turn can see it has been superseded and stand down.
-  latestWriteSeq.set(key, seq);
-  await deliverOrPark(key, { value, deviceScoped, seq });
+  latestWriteSeq.set(key, write.seq);
+  unansweredWrites.set(key, write);
+  await deliverOrPark(key, write);
 }
 
 // --- UI scale ---
@@ -335,7 +358,7 @@ function scheduleScaleMeasurements(): void {
 
 export function applyUiScale(scale: number): void {
   const clamped = clampUiScale(scale);
-  localStorage.setItem('lucidos-ui-scale', String(clamped));
+  localStorage.setItem(UI_SCALE_STORAGE_KEY, String(clamped));
   document.documentElement.style.setProperty('--user-ui-scale', `${clamped}%`);
   // It leads the measurement rather than trailing it, because an override may
   // retune the type scale the two quantities are measured against.
@@ -344,6 +367,7 @@ export function applyUiScale(scale: number): void {
   // The macOS traffic lights are centred on the header bar, whose height this
   // just changed, and nothing here tells the shell: `watchTitlebarBand` observes
   // the rendered band and pushes for every mover, this one included.
+  appearanceVersion.value++;
 }
 
 export function currentUiScale(): number {
@@ -355,8 +379,26 @@ export function currentUiScale(): number {
   return parseUiScale(raw) ?? UI_SCALE_DEFAULT;
 }
 
+/** A scale painted ahead of its save. The scale panel saves once a gesture
+ *  settles, and a refetch before then must keep painting this one. */
+let previewedUiScale: number | null = null;
+
+/** Paint a scale the user is still choosing, without saving it. */
+export function previewUiScale(scale: number): void {
+  previewedUiScale = clampUiScale(scale);
+  applyUiScale(previewedUiScale);
+}
+
+/** Drop a preview that will not be saved, and paint the saved scale again. */
+export function cancelUiScalePreview(): void {
+  const previewed = previewedUiScale;
+  previewedUiScale = null;
+  if (previewed !== null && previewed !== currentUiScale()) applyUiScale(currentUiScale());
+}
+
 export function setUiScale(scale: number): Promise<void> {
   const clamped = clampUiScale(scale);
+  previewedUiScale = null;
   return savePreference('ui-scale', String(clamped), () => applyUiScale(clamped), true);
 }
 
@@ -456,6 +498,7 @@ export function applyThemeMode(mode: ThemeMode): void {
   // This just wrote --bg-primary and the theme inline and swapped the token
   // block wholesale, so any override of a themed token goes back on top.
   reapplyStyleOverrides();
+  appearanceVersion.value++;
 }
 
 // --- Theme (a named set of token values, docs/plans/2026-09-26-looks.md) ---
@@ -719,7 +762,7 @@ function knownWorkspaceFonts(): WorkspaceFont[] {
 export function applyFontFamily(preference: FontPreference): void {
   const known = knownWorkspaceFonts();
   const font = resolveFont(preference, activeTheme.fonts, known);
-  localStorage.setItem('lucidos-font-family', preference);
+  localStorage.setItem(FONT_FAMILY_STORAGE_KEY, preference);
   if (font.workspaceFont) {
     localStorage.setItem(WORKSPACE_FONT_STORAGE_KEY, JSON.stringify(font.workspaceFont));
   } else if (workspaceFontList.value.status === 'loaded') {
@@ -734,6 +777,7 @@ export function applyFontFamily(preference: FontPreference): void {
   document.documentElement.setAttribute(FONT_BOLD_ATTRIBUTE, fontBoldMark(font));
   // This just wrote --font-ui and the two feature properties inline.
   reapplyStyleOverrides();
+  appearanceVersion.value++;
 }
 
 /** The device's font preference, which may be `theme`. The default and the
@@ -792,6 +836,7 @@ export function applyStyleOverrides(map: Record<string, string>): void {
     root.style, appliedOverrideNames, valid, activeTheme[paintedThemeMode.value],
   );
   localStorage.setItem(STYLE_OVERRIDES_STORAGE_KEY, serializeStyleOverrides(map));
+  appearanceVersion.value++;
   // A retuned --font-size-* or spacing token moves the root font size's
   // consumers. So the remote owes the same two derived measurements a scale
   // change does, through the same frame coalescer: it can write on every
@@ -1166,12 +1211,22 @@ export function setTimezone(timezone: string): Promise<void> {
 // leave a fetch hanging across an iOS suspension, with nothing to await
 // ever settling. The resume that exists to recover from exactly that
 // would then be stuck behind it forever. So every call issues its own
-// fetch. Only the newest ISSUED call's outcome is applied. An older one
-// landing after a newer one was issued is silently discarded.
+// fetch. Only the newest ISSUED call's outcome is applied.
+//
+// An older call resolves with the newest one rather than early. Callers chain
+// work on the promise (startup re-derives the update surfaces), and that work
+// must find the preferences loaded. Waiting forward never waits on a hung
+// fetch for long: the next resume issues a newer call, and the chain moves on.
 let preferencesLoadSeq = 0;
+let newestPreferencesLoad: Promise<void> = Promise.resolve();
 
-export async function loadPreferences(): Promise<void> {
-  const mySeq = ++preferencesLoadSeq;
+export function loadPreferences(): Promise<void> {
+  const load = loadPreferencesAs(++preferencesLoadSeq);
+  newestPreferencesLoad = load;
+  return load;
+}
+
+async function loadPreferencesAs(mySeq: number): Promise<void> {
   // Only flip to 'loading' on the first fetch — refetches (e.g. after an SSE
   // PreferencesChanged) keep showing existing data through the network round
   // trip and swap atomically when the response lands. Without this guard,
@@ -1181,6 +1236,9 @@ export async function loadPreferences(): Promise<void> {
     preferences.value = { status: 'loading' };
   }
   try {
+    // Taken before the read: a write the engine accepts while it is out is
+    // newer than its answer.
+    const unansweredAtStart = [...unansweredWrites];
     // Retry a transient rejection before flipping to `failed`, same as
     // `loadRepositories` (repositoriesLoader.ts). Nothing re-triggers this
     // load once it fails (SSE only re-fires an already-`loaded` value): a
@@ -1189,9 +1247,16 @@ export async function loadPreferences(): Promise<void> {
     const res = await retryTransientRead(() => getPreferences(getDeviceId()));
     // A newer call was issued while this one was in flight: its outcome
     // wins, so applying this stale one would overwrite fresher data.
-    if (mySeq !== preferencesLoadSeq) return;
-    preferences.value = { status: 'loaded', data: res.preferences };
-    applyUiScale(currentUiScale());
+    if (mySeq !== preferencesLoadSeq) return newestPreferencesLoad;
+    preferences.value = {
+      status: 'loaded',
+      data: {
+        ...res.preferences,
+        ...writeValues(unansweredAtStart.filter(([key, write]) => refusedWriteSeq.get(key) !== write.seq)),
+        ...writeValues(unansweredWrites),
+      },
+    };
+    applyUiScale(previewedUiScale ?? currentUiScale());
     const t = currentThemeMode();
     if (t !== lastAppliedThemeMode) applyThemeMode(t);
     applyFontFamily(currentFontFamily());
@@ -1213,7 +1278,7 @@ export async function loadPreferences(): Promise<void> {
     // is allowed to override, so the overrides go on top of them.
     applyStyleOverridesFromPreferences();
   } catch (e) {
-    if (mySeq !== preferencesLoadSeq) return;
+    if (mySeq !== preferencesLoadSeq) return newestPreferencesLoad;
     // A failed REFETCH keeps the loaded preferences rather than blanking every
     // setting to its default. SSE only re-fires an already-`loaded` value, so a
     // flip to `failed` would never recover until a page reload. Only a first

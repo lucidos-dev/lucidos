@@ -7,21 +7,21 @@ import { ensureEventTargetResolved, eventHasTarget, jumpableEventId, showEventWh
 import { viewChangeDiff } from '../../store/actions/repositories';
 import { checkpointDiffModal, contextViewer, eventConditionDoor, findChangeById, lazyChanges, openImagePopupFromGroup, showToast, stepDetailModal } from '../../store/store';
 import { prefetchStepDetail } from '../../store/stepDetailCache';
-import { LUCIDOS_AGENT_LABEL, continuationCause, eventWaitStoppedSummary, plainEventName, responseAbortedState, groupSubscriptions, isThinking, resumeEngineNote, stepStatus, subscriptionFilterNote, waitingFor } from '../../store/thread-events';
+import { LUCIDOS_AGENT_LABEL, continuationCause, eventWaitStoppedSummary, plainEventName, responseAbortedState, starterEngineReason, groupSubscriptions, isThinking, resumeEngineNote, stepStatus, subscriptionFilterNote, waitingFor } from '../../store/thread-events';
 import { LucidosGlyph } from '../shared/LucidosMark';
 import { BlobImage } from '../shared/BlobImage';
 import { CommitList } from '../shared/CommitList';
 import { Disclosure } from '../shared/Disclosure';
-import type { AbortCause, CancelCause, ChangeLifecycleType, EngineReason, EventSubscription, EventWaitCancelCause, Exchange, MessageOrigin, StoredEvent, SubscriptionGroup } from '../../store/thread-events';
+import type { AbortCause, CancelCause, ChangeLifecycleType, EngineReason, EventSubscription, EventWaitReason, EventWaitCancelCause, Exchange, MessageOrigin, StoredEvent, SubscriptionGroup } from '../../store/thread-events';
 import type { Loadable, ResponseEvent, StepOutcome } from '../../store/types';
 import type { CodingAgent } from '../../api/types';
 import { HEARING_YOU } from '../../voice/callState';
-import { describeAbortCause, describeCancelCause, describeContinuationReason, describeEngineReason } from '../../utils/engineEventExplainers';
+import { describeAbortCause, describeCancelCause, describeContinuationReason, describeEngineReason, describeWatchedEvents } from '../../utils/engineEventExplainers';
 import { errorDetail } from '../../utils/errorDetail';
 import { formatFileCount } from '../../utils/formatFileCount';
 import { formatMessageTimestamp, formatShortDate, formatShortTime, isSameDayInUserTz } from '../../utils/formatTime';
 import { renderMarkdown } from '../../utils/renderMarkdown';
-import { eventNameChip, eventRowBody } from './EventRow';
+import { EventRowFoldView, eventNameChip, eventRowBody } from './EventRow';
 import type { EventRowChip, EventRowFact, EventRowTone } from './EventRow';
 import { followContinuedThread } from './scrollState';
 import { contextPercent, formatTokens } from '../../utils/formatTokens';
@@ -215,16 +215,10 @@ export function ContinueButton({ threadId }: { threadId: string }) {
   );
 }
 
-/** Why the engine acted, for a starter whose row predates its `origin`. */
-const ENGINE_REASON_BY_TYPE: Partial<Record<string, EngineReason>> = {
-  MissingHardeningDetected: { kind: 'missing_hardening' },
-  MergeConflictDetected: { kind: 'merge_conflict' },
-};
-
 /** What a cancel's state word says, by what the user did. */
 const CANCEL_STATE: Partial<Record<CancelCause, string>> = {
   user_stop: 'You stopped it',
-  user_action: 'Stopped by an action',
+  user_action: 'Stopped by apply, discard or archive',
   superseded_by_followup: 'Replaced',
 };
 
@@ -244,15 +238,29 @@ export type BoundaryTurn = 'waiting' | 'working' | 'done' | 'stopped';
 /** What the engine asked for, in words, when its reason says more than the
  *  event's own name. */
 const REASON_PILL: Partial<Record<EngineReason['kind'], string>> = {
-  missing_hardening: 'hardening missing',
-  harden_retrigger: 'hardening missing',
+  missing_hardening: 'hardening needed',
+  harden_retrigger: 'hardening needed',
   merge_conflict: 'merge conflict',
-  stale_session: 'stale session cleaned up',
+  stale_session: 'stopped agent tidied up',
   orphan_recovery: 'picked up after a restart',
   archived_branch_work: 'work set aside',
   plugin_setup: 'plugin setup',
   plugin_upstream_proposal: 'plugin change offered',
+  scheduler: 'scheduled message',
 };
+
+/** A wait re-entry's pill and chip tooltip, by how the wait ended. */
+const WAIT_REENTRY: Record<EventWaitReason['outcome'], { pill: string; meaning: string }> = {
+  delivered: {
+    pill: 'event arrived',
+    meaning: 'Lucidos told the agent the event it was waiting for happened.',
+  },
+  expired: {
+    pill: 'wait timed out',
+    meaning: 'Lucidos told the agent its wait ran out of time.',
+  },
+};
+
 
 /** The live word a work card shows while its turn runs. */
 const WORKING_STATE: Partial<Record<string, string>> = {
@@ -273,8 +281,13 @@ function workState(type: string, turn: BoundaryTurn) {
 }
 
 /** A boundary card's state, tone, explanation and the one fact it adds. */
-function boundaryCardParts(ev: BoundaryStarter, summary: string, pill: string, turn: BoundaryTurn) {
-  const reason = ev.origin?.kind === 'engine' ? ev.origin.reason : ENGINE_REASON_BY_TYPE[ev.type];
+function boundaryCardParts(
+  ev: BoundaryStarter,
+  reason: EngineReason | undefined,
+  summary: string,
+  pill: string,
+  turn: BoundaryTurn,
+) {
   const why = reason ? describeEngineReason(reason) : null;
   // A summary that says more than the pill does stays, as a fact.
   const fact = summary.toLowerCase() !== pill ? summary : undefined;
@@ -309,9 +322,17 @@ export function boundaryCard(event: StoredEvent, summary: string, opts: {
   turn: BoundaryTurn;
 }) {
   const ev = event as BoundaryStarter;
-  const reason = ev.origin?.kind === 'engine' ? ev.origin.reason : undefined;
-  const pill = (reason && REASON_PILL[reason.kind]) ?? plainEventName(ev.type);
-  const { state, tone, why, fact } = { why: null, fact: undefined, ...boundaryCardParts(ev, summary, pill, opts.turn) };
+  const reason = starterEngineReason(event);
+  if (reason?.kind === 'event_wait') return waitReentryCard(reason, opts);
+  // Clearing a stuck reply interrupted nothing, so it does not wear that name.
+  const pill = ev.type === 'ResponseAborted' && ev.cause === 'stale_settle'
+    ? 'stuck reply cleared'
+    : (reason && REASON_PILL[reason.kind]) ?? plainEventName(ev.type);
+  const { state, tone, why, fact } = {
+    why: null,
+    fact: undefined,
+    ...boundaryCardParts(ev, reason, summary, pill, opts.turn),
+  };
   return eventRowBody({
     kind: 'boundary',
     role: 'boundary-card',
@@ -327,10 +348,37 @@ export function boundaryCard(event: StoredEvent, summary: string, opts: {
   });
 }
 
+/** An *event wait* re-entry, told as a story: what happened as the pill, what
+ *  the agent waited for as the fact, and why Lucidos spoke up in Details. The
+ *  words the model read sit one fold deeper, since they are written for it. */
+function waitReentryCard(reason: EventWaitReason, opts: { carried?: ComponentChildren; turn: BoundaryTurn }) {
+  const { pill, meaning } = WAIT_REENTRY[reason.outcome];
+  const waitedFor = describeWatchedEvents(reason.watched);
+  const { state, tone } = workState('UserPromptInjected', opts.turn);
+  return eventRowBody({
+    kind: 'boundary',
+    role: 'boundary-card',
+    subject: eventNameChip({ kind: 'chip', name: 'UserPromptInjected', label: pill, meaning, sentenceStart: true }),
+    stateLabel: state,
+    tone,
+    facts: [waitedFor ? { kind: 'text', text: waitedFor } : null],
+    fold: {
+      label: 'Details',
+      body: (
+        <>
+          <p>{describeEngineReason(reason)}</p>
+          {opts.carried && <EventRowFoldView label="What the agent was told" body={opts.carried} />}
+        </>
+      ),
+    },
+  });
+}
+
 /** The card that opens a resumed turn, inside the reply it resumed. It reads
  *  like every other event row: the event, its cause as the state word, and a
- *  Details fold. The fold explains the cause, then shows the engine's note to
- *  the model when there is one (a coding-agent resume carries none). */
+ *  Details fold. The fold explains the cause, then folds the engine's note to
+ *  the model one level deeper when there is one (a coding-agent resume carries
+ *  none). */
 export function ResumeCard({ exchange }: { exchange: Exchange }) {
   const ev = exchange.userEvent as { reason?: string; actor?: MessageOrigin };
   const note = resumeEngineNote(exchange);
@@ -348,9 +396,9 @@ export function ResumeCard({ exchange }: { exchange: Exchange }) {
           {note && (
             <>
               <p>{note.toolCount > 0
-                ? `The engine reminded the model about ${note.toolCount} prior tool call${note.toolCount === 1 ? '' : 's'}:`
-                : 'The engine reminded the model that no actions had completed:'}</p>
-              <pre class="event-row-fold-pre">{note.text}</pre>
+                ? `Lucidos reminded the agent of the ${note.toolCount} step${note.toolCount === 1 ? '' : 's'} it had already taken.`
+                : 'Lucidos told the agent that none of its steps had finished.'}</p>
+              <EventRowFoldView label="What the agent was told" pre body={note.text} />
             </>
           )}
         </>
@@ -872,7 +920,7 @@ export function ResponsePanel({
             type="button"
             class="response-executor"
             onClick={onExecutorClick}
-            aria-label="Show executor info"
+            aria-label="Show who answered"
           >
             <span class="response-executor-icon">{executor.icon}</span>
             <span class="response-executor-label">{executor.label}</span>
@@ -1109,7 +1157,7 @@ const EVENT_WAIT_ROW_TONE: Record<EventWaitState, EventRowTone> = {
 
 /** The state word, which says the outcome once. The headline already says
  *  "Waiting", so a live state gives the deadline instead. A delivered one
- *  gives a check and when it was done. */
+ *  says when it arrived. */
 function eventWaitStateLabel(state: EventWaitState, expiresAt: string, matchedAt?: string): string {
   const deadline = waitMoment(expiresAt);
   switch (state) {
@@ -1117,7 +1165,7 @@ function eventWaitStateLabel(state: EventWaitState, expiresAt: string, matchedAt
       return deadline ? `Until ${deadline}` : 'Waiting';
     case 'matched': {
       const done = waitMoment(matchedAt);
-      return done ? `✓ ${done}` : '✓';
+      return done ? `Arrived ${done}` : 'Arrived';
     }
     case 'timed_out':
       return deadline ? `Gave up at ${deadline}` : 'Gave up';

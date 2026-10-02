@@ -469,10 +469,9 @@ impl BackgroundBashRegistry {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
-        crate::runtime::spawn_env::isolate_in_process_group(&mut cmd);
         crate::core::apply_to_subprocess_env(&mut cmd, env);
 
-        let mut child = cmd.spawn()?;
+        let mut child = crate::runtime::spawn_env::spawn_below_engine(&mut cmd)?;
         // Read now: `id()` goes `None` once the child is reaped, and the group
         // signals below must never outlive the reap.
         let pid = child.id();
@@ -1429,7 +1428,9 @@ mod tests {
             .spawn(&command, timeout_secs, dir, &[], thread_id, None)
             .await
             .expect("spawn");
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        // Generous because the full engine suite saturates every core, and a
+        // shell spawn there can take many seconds.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         loop {
             if let Some(pid) = std::fs::read_to_string(&pidfile)
                 .ok()

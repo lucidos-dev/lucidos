@@ -842,6 +842,18 @@ fn foreign_aside_dir_name(base: &str, major: u16, ts: &str) -> String {
 /// graceful (`-m fast`) → immediate (`-m immediate`) → kill the recorded PID →
 /// remove the stale lock file. Every fallback is logged; never a broad kill.
 fn stop_cluster_robustly(bin: &Path, lib: &Path, data: &Path) {
+    // An unclean stop (a crash, a power loss) leaves `postmaster.pid` behind,
+    // and after a reboot its pid may belong to an unrelated app. `pg_ctl` and
+    // the fallback below would both signal it, so drop the lock instead.
+    if let Some(exe) = postmaster_pid_runs_another_program(data) {
+        crate::log!(
+            "[Gateway] {} names a pid now running {}, so it is stale; removing it",
+            data.join("postmaster.pid").display(),
+            exe.display()
+        );
+        remove_stale_lock(data);
+        return;
+    }
     if pg_ctl(bin, lib, data, &["-m", "fast", "-w", "stop"]).is_ok() {
         return;
     }
@@ -858,13 +870,29 @@ fn stop_cluster_robustly(bin: &Path, lib: &Path, data: &Path) {
         );
         kill_pid_graceful_then_force(pid);
     }
-    // Remove the stale lock so a fresh start isn't blocked by it.
+    remove_stale_lock(data);
+}
+
+/// Remove a stale `postmaster.pid`, so a fresh start is not blocked by it.
+fn remove_stale_lock(data: &Path) {
     let lock = data.join("postmaster.pid");
     if lock.exists() {
         if let Err(e) = std::fs::remove_file(&lock) {
             crate::log!("[Gateway] could not remove stale {}: {}", lock.display(), e);
         }
     }
+}
+
+/// The program `postmaster.pid` names, when that is provably not Postgres.
+#[cfg(unix)]
+fn postmaster_pid_runs_another_program(data: &Path) -> Option<PathBuf> {
+    let pid = u32::try_from(read_postmaster_pid(data)?).ok()?;
+    crate::stack::other_program_at_pid(crate::stack::single_process_pid(pid)?, "postgres")
+}
+
+#[cfg(not(unix))]
+fn postmaster_pid_runs_another_program(_data: &Path) -> Option<PathBuf> {
+    None
 }
 
 /// The embedded cluster's data directory, shared by every workspace.
@@ -887,6 +915,11 @@ pub(crate) fn read_postmaster_pid(data: &Path) -> Option<i32> {
 /// the given PID (read from this cluster's postmaster.pid); never a broad kill.
 #[cfg(unix)]
 fn kill_pid_graceful_then_force(pid: i32) {
+    // A corrupt lock naming 0 or a negative pid would make `kill` signal a
+    // whole process group, or every process this user owns.
+    if pid <= 0 {
+        return;
+    }
     // SAFETY: kill with a valid signal; a dead/foreign pid just returns ESRCH/EPERM.
     unsafe {
         libc::kill(pid as libc::pid_t, libc::SIGTERM);

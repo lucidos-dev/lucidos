@@ -329,7 +329,7 @@ describe('waitingPanelBody', () => {
   });
 });
 
-/** **The panel says "(matching only)" too, so it owes the same answer as the
+/** **The panel says "(with a condition)" too, so it owes the same answer as the
  *  transcript.** Both go through `eventConditionDoor`, which is what keeps one
  *  affordance from acquiring two behaviours.
  *
@@ -344,13 +344,13 @@ describe('the panel subscription line', () => {
 
   const CONDITION = { 'workflow_run.event': 'completed' };
 
-  it('reads as one joined line whether or not an entry is filtered', () => {
+  it('reads as one joined line whether or not an entry is with a condition', () => {
     const text = vnodeToText(subscriptionLine([
       { event_type: 'GithubWorkflowRunStateChanged', condition: CONDITION },
       { event_type: 'ChangeProposed' },
     ]));
     expect(text).toContain('watching for ');
-    expect(text).toContain('github workflow run state changed (matching only)');
+    expect(text).toContain('github workflow run state changed (with a condition)');
     expect(text).toContain(' or ');
     expect(text).toContain('change proposed');
   });
@@ -363,7 +363,7 @@ describe('the panel subscription line', () => {
     expect(button.type).toBe('button');
     // The same accessible name the transcript chip carries, because both come
     // from the one door.
-    expect(button.props['aria-label']).toBe('GithubWorkflowRunStateChanged · show the condition');
+    expect(button.props['aria-label']).toBe('github workflow run state changed · show the condition');
     button.props.onClick();
     expect(waitingPanelCondition.value).toEqual({
       eventType: 'GithubWorkflowRunStateChanged',
@@ -373,13 +373,13 @@ describe('the panel subscription line', () => {
     expect(eventConditionModal.value).toBeNull();
   });
 
-  /** An entry with no condition promises nothing, so it must offer no door. It
-   *  keeps its raw type on the tooltip, as the transcript chip does. */
+  /** An entry with no condition promises nothing, so it must offer no door. Its
+   *  tooltip says what the event means, as the transcript chip's does. */
   it('leaves an unfiltered entry as plain text', () => {
     const line = subscriptionLine([{ event_type: 'ChangeProposed' }]);
     expect((line[1] as VNode).type).toBe('span');
     expect(vnodeToText(line)).toBe(
-      '<span>watching for </span><span data-tooltip="ChangeProposed">change proposed</span>',
+      '<span>watching for </span><span data-tooltip="An agent offered a change for you to apply.">change proposed</span>',
     );
   });
 });

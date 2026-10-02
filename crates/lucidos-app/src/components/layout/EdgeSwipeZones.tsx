@@ -6,18 +6,15 @@
  *  low-level job: be the topmost thing at the screen edge, ABOVE any app iframe,
  *  so a touch there reaches the host document instead of the frame.
  *
- *  That job pays off twice:
+ *  So `MobileSwipeContainer`'s touchstart handler sees an edge touch and can
+ *  `preventDefault()` it. That is the only way to suppress WebKit's native
+ *  back/forward gesture in the standalone iOS PWA, since no CSS opt-out exists.
+ *  See `shouldSuppressEdgeNavigation`. A pane swipe over an app needs no strip:
+ *  the SDK posts drags from inside the frame (`app-swipe-bridge.ts`).
  *
- *   - Inside a swipe pane, an iframe captures every touch it covers, so these
- *     strips are the only place a pane swipe over an app can begin.
- *   - Anywhere, they are what lets `MobileSwipeContainer`'s touchstart handler
- *     see an edge touch at all and `preventDefault()` it, which is the only way
- *     to suppress WebKit's native back/forward gesture in the standalone iOS PWA
- *     (no CSS opt-out for it exists). See `shouldSuppressEdgeNavigation`.
- *
- *  The second reason is why they are also mounted inside a pseudo-fullscreen app
- *  overlay, which covers the panes' own strips. Being mounted does NOT imply a
- *  pane swipe is available: `shouldStartPaneSwipe` turns that off while an app is
+ *  That is why they are also mounted inside a pseudo-fullscreen app overlay,
+ *  which covers the panes' own strips. Being mounted does NOT imply a pane swipe
+ *  is available: `shouldStartPaneSwipe` turns that off while an app is
  *  fullscreen, and the strips stay purely for the suppression.
  *
  *  Their widths are mirrored by `EDGE_NAV_GUARD_LEFT_REM` /

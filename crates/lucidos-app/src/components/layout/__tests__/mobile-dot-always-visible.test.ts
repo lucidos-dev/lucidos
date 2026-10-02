@@ -70,7 +70,7 @@ describe('MobileDotIndicator: centred under the row, and still tappable', () => 
   // NOT `ruleBody`: `.mobile-dot-indicator` has a base `display: none` rule
   // outside the media query, and a first-textual-match reads that one.
   const rule = cssRules(mobileCss).find(
-    r => r.selector === '.mobile-dot-indicator' && r.atRules === '@media (max-width: 768px)',
+    r => r.selector === '.mobile-dot-indicator' && r.atRules === '@media (--phone-layout)',
   );
   const band = () => {
     expect(rule, 'the mobile .mobile-dot-indicator rule').toBeDefined();
@@ -111,7 +111,7 @@ describe('MobileDotIndicator: centred under the row, and still tappable', () => 
     // edge landed on the band and did nothing. Only the dots are targets.
     expect(band().props.get('pointer-events')).toBe('none');
     const dot = cssRules(mobileCss).find(
-      r => r.selector === '.mobile-dot' && r.atRules === '@media (max-width: 768px)',
+      r => r.selector === '.mobile-dot' && r.atRules === '@media (--phone-layout)',
     );
     expect(dot?.props.get('pointer-events')).toBe('auto');
   });

@@ -1355,6 +1355,10 @@ pub fn launch(app: &AppHandle, nudge_rx: std::sync::mpsc::Receiver<()>) {
     #[cfg(not(target_os = "macos"))]
     drop(nudge_rx); // dock badge is macOS-only; no consumer elsewhere
 
+    // The update relay's heartbeat (ADR 0338). Its own thread, like the badge
+    // above, so it runs whichever page the hidden window shows.
+    crate::update_relay::start(app.clone(), engine_port());
+
     let handle = app.clone();
     std::thread::spawn(move || {
         // First, before the service plist is written: from a disk image or a
@@ -3221,14 +3225,22 @@ fn http_ok(port: u16, path: &str) -> bool {
 
 /// Like [`http_ok`] but returns the response body on a 200 (else `None`). The
 /// desktop client deliberately has no reqwest dependency, so this minimal raw
-/// HTTP/1.0 request serves both the dock-badge poll and the pairing mint.
+/// HTTP/1.0 request serves the dock-badge poll, the pairing mint and the update
+/// relay's heartbeat.
 ///
 /// It attaches the machine-local token, which is how this process proves it is
 /// local. That is the whole reason the calls come through here rather than
 /// through the page: a browser cannot read a mode 0600 file, and a loopback
 /// peer address proves nothing, since `tailscale serve` proxies remote requests
 /// from that same address.
-pub(crate) fn gateway_body(port: u16, method: &str, path: &str) -> Option<String> {
+///
+/// `json` is a request body, sent as `application/json`.
+pub(crate) fn gateway_body(
+    port: u16,
+    method: &str,
+    path: &str,
+    json: Option<&str>,
+) -> Option<String> {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
     let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
     let credential = match lucidos_local_token::read() {
@@ -3236,13 +3248,17 @@ pub(crate) fn gateway_body(port: u16, method: &str, path: &str) -> Option<String
         None => String::new(),
     };
     // A bodyless POST still needs a length, or the server waits for one.
-    let length = if method == "GET" {
-        String::new()
-    } else {
-        "Content-Length: 0\r\n".to_string()
+    let content = match json {
+        Some(body) => format!(
+            "Content-Type: application/json\r\nContent-Length: {}\r\n",
+            body.len()
+        ),
+        None if method == "GET" => String::new(),
+        None => "Content-Length: 0\r\n".to_string(),
     };
     let req = format!(
-        "{method} {path} HTTP/1.0\r\nHost: 127.0.0.1\r\n{credential}{length}Connection: close\r\n\r\n"
+        "{method} {path} HTTP/1.0\r\nHost: 127.0.0.1\r\n{credential}{content}Connection: close\r\n\r\n{}",
+        json.unwrap_or_default()
     );
     stream.write_all(req.as_bytes()).ok()?;
     let mut buf = String::new();
@@ -3266,7 +3282,7 @@ pub(crate) fn gateway_body(port: u16, method: &str, path: &str) -> Option<String
 /// a flicker where a stale tick overwrites a freshly nudged value.
 #[cfg(target_os = "macos")]
 fn fetch_unread_total(port: u16) -> Option<u64> {
-    let body = gateway_body(port, "GET", "/~/api/v1/control/unread-total")?;
+    let body = gateway_body(port, "GET", "/~/api/v1/control/unread-total", None)?;
     parse_unread_total(&body)
 }
 

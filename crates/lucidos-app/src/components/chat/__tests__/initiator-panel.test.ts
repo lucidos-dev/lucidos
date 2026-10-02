@@ -64,9 +64,9 @@ describe('describeInitiator — label is WHO, summary is WHAT', () => {
     expect(desc.summary).toBe('Plugin update: ⏰ Habit Tracker 0.1.3 → 0.1.4');
   });
 
-  it('agent-mode MessageReceived with no sender on record: summary "Forwarded message"', () => {
+  it('agent-mode MessageReceived with no sender on record: summary "Message from an agent"', () => {
     const ex = exchangeWith({ type: 'MessageReceived', text: 'x', mode: 'agent', channel: 'chat' });
-    expect(describeInitiator(ex, '<p>x</p>', [], 'tid').summary).toBe('Forwarded message');
+    expect(describeInitiator(ex, '<p>x</p>', [], 'tid').summary).toBe('Message from an agent');
   });
 
   it('a delivered held message names its sender and says it waited (ADR 0256)', () => {
@@ -257,27 +257,27 @@ describe('describeInitiator — label is WHO, summary is WHAT', () => {
     expect(desc.summary).toBeUndefined();
   });
 
-  it('MissingHardeningDetected: label is engine, summary "Hardening required"', () => {
+  it('MissingHardeningDetected: label is engine, summary "Hardening needed"', () => {
     const ex = exchangeWith({ type: 'MissingHardeningDetected' });
     const desc = describeInitiator(ex, '', [], 'tid');
     expect(desc.label).toBe(ENGINE_LABEL);
-    expect(desc.summary).toBe('Hardening required');
+    expect(desc.summary).toBe('Hardening needed');
     expect(desc.variant).toBe('system');
   });
 
-  it('MergeConflictDetected: label is engine, summary "Merging changes from main"', () => {
+  it('MergeConflictDetected: label is engine, summary "Merge conflict"', () => {
     const ex = exchangeWith({ type: 'MergeConflictDetected', files: ['a.rs', 'b.rs'] });
     const desc = describeInitiator(ex, '', [], 'tid');
     expect(desc.label).toBe(ENGINE_LABEL);
-    expect(desc.summary).toBe('Merging changes from main');
+    expect(desc.summary).toBe('Merge conflict');
     expect(desc.variant).toBe('system');
   });
 
-  it('UserPromptInjected (no origin): label is engine, summary "Auto-prompt sent"', () => {
+  it('UserPromptInjected (no origin): label is engine, summary "Message from Lucidos"', () => {
     const ex = exchangeWith({ type: 'UserPromptInjected', text: 'do X' });
     const desc = describeInitiator(ex, '<p>do X</p>', [], 'tid');
     expect(desc.label).toBe(ENGINE_LABEL);
-    expect(desc.summary).toBe('Auto-prompt sent');
+    expect(desc.summary).toBe('Message from Lucidos');
     expect(desc.variant).toBe('system');
   });
 
@@ -327,8 +327,32 @@ describe('describeInitiator — label is WHO, summary is WHAT', () => {
       delivered_event_id: 'evt-gone',
     });
     const desc = describeInitiator(ex, '<p>raw json</p>', [], 'tid');
-    expect(desc.summary).toBe('Auto-prompt sent');
+    expect(desc.summary).toBe('Event arrived');
     expect(desc.details).toBeDefined();
+  });
+
+  /** The reported card: a wait that timed out read "Auto-prompt sent", with
+   *  nothing to say where the words came from. An older row carries no origin,
+   *  so its frozen opening sentence identifies it. */
+  it('UserPromptInjected (timed-out wait, older row): summary "Wait timed out"', () => {
+    const ex = exchangeWith({
+      type: 'UserPromptInjected',
+      text: 'A subscription you registered has timed out.\n\nTimed out. Nothing matching X happened.',
+      mode: 'agent',
+    });
+    expect(describeInitiator(ex, '<p>x</p>', [], 'tid').summary).toBe('Wait timed out');
+  });
+
+  it('UserPromptInjected (timed-out wait, engine origin): summary "Wait timed out"', () => {
+    const ex = exchangeWith({
+      type: 'UserPromptInjected',
+      text: 'anything',
+      mode: 'agent',
+      origin: { kind: 'engine', reason: { kind: 'event_wait', outcome: 'expired', watched: ['X'], wait_reason: 'r' } },
+    });
+    const desc = describeInitiator(ex, '<p>x</p>', [], 'tid');
+    expect(desc.label).toBe(ENGINE_LABEL);
+    expect(desc.summary).toBe('Wait timed out');
   });
 
   // Regression: a child→parent callback emits UserPromptInjected with
@@ -475,7 +499,7 @@ describe('describeInitiator — label is WHO, summary is WHAT', () => {
 // the action AS the label, attribution in the popover. Only the device-owner
 // case is affected — engine/system-driven variants keep their chip.
 describe('describeInitiator — user control turns render iconless (ResponseCanceled style)', () => {
-  it('UserPromptInjected (device origin): iconless label "Auto-prompt sent", injected body kept', () => {
+  it('UserPromptInjected (device origin): iconless label names it as your message, injected body kept', () => {
     const ex = exchangeWith({
       type: 'UserPromptInjected',
       text: 'do X',
@@ -483,7 +507,7 @@ describe('describeInitiator — user control turns render iconless (ResponseCanc
     });
     const desc = describeInitiator(ex, '<p>do X</p>', [], 'tid');
     expect(desc.icon).toBeNull();
-    expect(desc.label).toBe('Auto-prompt sent');
+    expect(desc.label).toBe('Your message, read while the agent worked');
     expect(desc.summary).toBeUndefined();
     expect(desc.details).toBeDefined();
   });

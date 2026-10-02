@@ -1396,6 +1396,29 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
+    /// The user started Disk Usage's recommended cleanup. PERSISTED. The pass
+    /// runs past any HTTP request, so it ends in exactly one
+    /// `RecommendedCleanupCompleted` or `RecommendedCleanupFailed`.
+    RecommendedCleanupStarted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    /// How many of its worktrees a recommended cleanup has dealt with.
+    /// TRANSIENT, one per worktree, like `BackupProgress`.
+    RecommendedCleanupProgress {
+        done: u32,
+        total: u32,
+    },
+    /// The recommended cleanup finished. PERSISTED.
+    RecommendedCleanupCompleted {
+        removed_count: u32,
+        cleaned_count: u32,
+        freed_bytes: u64,
+    },
+    /// The recommended cleanup stopped before it finished. PERSISTED.
+    RecommendedCleanupFailed {
+        error: String,
+    },
 }
 
 impl SystemEvent {
@@ -1519,6 +1542,9 @@ impl SystemEvent {
         "ProxyConfigRejected",
         "ThreadsDeleted",
         "MemoryCorrected",
+        "RecommendedCleanupStarted",
+        "RecommendedCleanupCompleted",
+        "RecommendedCleanupFailed",
     ];
 
     /// Whether this event writes a row to the `events` table.
@@ -1661,6 +1687,10 @@ impl SystemEvent {
             Self::ThreadQueueCompleted { .. } => "ThreadQueueCompleted",
             Self::ThreadQueueChanged {} => "ThreadQueueChanged",
             Self::CapacityPolicyChanged { .. } => "CapacityPolicyChanged",
+            Self::RecommendedCleanupStarted { .. } => "RecommendedCleanupStarted",
+            Self::RecommendedCleanupProgress { .. } => "RecommendedCleanupProgress",
+            Self::RecommendedCleanupCompleted { .. } => "RecommendedCleanupCompleted",
+            Self::RecommendedCleanupFailed { .. } => "RecommendedCleanupFailed",
         }
     }
 
@@ -1804,6 +1834,10 @@ impl SystemEvent {
         "ThreadQueueCompleted",
         "ThreadQueueChanged",
         "CapacityPolicyChanged",
+        "RecommendedCleanupStarted",
+        "RecommendedCleanupProgress",
+        "RecommendedCleanupCompleted",
+        "RecommendedCleanupFailed",
         "ThreadEvent",
     ];
 
@@ -1833,6 +1867,10 @@ impl SystemEvent {
             | Self::ProxyConfigRejected { .. }
             | Self::ThreadsDeleted { .. }
             | Self::RecoveryProgress { .. }
+            | Self::RecommendedCleanupStarted { .. }
+            | Self::RecommendedCleanupProgress { .. }
+            | Self::RecommendedCleanupCompleted { .. }
+            | Self::RecommendedCleanupFailed { .. }
             | Self::Toast { .. } => "ops",
             Self::ArtifactImported { .. }
             | Self::ArtifactCreated { .. }

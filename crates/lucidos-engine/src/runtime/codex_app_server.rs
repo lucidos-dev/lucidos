@@ -207,11 +207,7 @@ fn spawn_app_server_child(config: &CodexConfig) -> std::io::Result<tokio::proces
     for (k, v) in &config.env {
         cmd.env(k, v);
     }
-    // Own process group so a group-wide signal to the engine can't kill the
-    // app-server child — same isolation CC gets. (Codex's env is baked from a
-    // probe, so this Command attribute must be set on the real command.)
-    super::spawn_env::isolate_in_process_group(&mut cmd);
-    cmd.spawn()
+    super::spawn_env::spawn_below_engine(&mut cmd)
 }
 
 /// Drive one persistent app-server session. See module docs for the contract.
@@ -695,7 +691,7 @@ pub(super) async fn app_server_driver_task(
 
     // Reap the child. The persistent process has no clean-exit path of its
     // own, so the driver kills it on wind-down (a no-op if it already died).
-    // It is its own process-group leader (`isolate_in_process_group` at spawn),
+    // It is its own process-group leader (`spawn_below_engine` at spawn),
     // so signalling only the leader would orphan everything the session
     // spawned; tear the group down first, as the CC driver does.
     //

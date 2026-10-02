@@ -5,6 +5,8 @@
 //! shows an in-app toast whose action calls
 //! [`install_app_update_and_restart`]. That installs the new signed bundle and
 //! restarts the WHOLE stack: the launchd background service AND the GUI client.
+//! A session that cannot install asks for the same run through the update
+//! relay (`update_relay`, ADR 0338).
 //!
 //! **The client comes back frontmost**, via
 //! `desktop::schedule_relaunch_after_exit` rather than `app.restart()`. ADR 0072
@@ -86,49 +88,61 @@ struct AppUpdateProgress {
     phase: AppUpdatePhase,
 }
 
-/// Announce a phase to the page. Best-effort by design: the last frames race
-/// the client teardown, and a frame that fails to reach a webview must never
-/// fail an update.
-fn emit(app: &AppHandle, version: Option<&str>, phase: AppUpdatePhase) {
-    let _ = app.emit(
-        PROGRESS_EVENT,
-        AppUpdateProgress {
+/// Where a run's progress frames go. Every frame reaches the client's own
+/// webviews. A relayed run also hands each one to the update relay, which
+/// carries it to the session that asked (ADR 0338).
+#[derive(Clone)]
+struct Narrator {
+    app: AppHandle,
+    relay: Option<crate::update_relay::RelayTag>,
+}
+
+impl Narrator {
+    /// Announce a phase. Best-effort by design: the last frames race the
+    /// client teardown, and a frame that fails to reach a webview must never
+    /// fail an update.
+    fn emit(&self, version: Option<&str>, phase: AppUpdatePhase) {
+        let frame = AppUpdateProgress {
             version: version.map(str::to_string),
             phase,
-        },
-    );
-}
+        };
+        if let Some(relay) = &self.relay {
+            relay.publish(&frame);
+        }
+        let _ = self.app.emit(PROGRESS_EVENT, frame);
+    }
 
-/// Announce a terminal failure AND return it as the command's error string.
-/// Both halves matter: the event gives the page a terminal phase even if the
-/// rejection races the teardown, and the string is what the `catch` reports.
-///
-/// `phase` picks WHICH terminal phase carries the message. Ordinary failures go
-/// through [`fail`]; the bundle-swap case has its own phase because the page has
-/// to narrate it differently.
-fn fail_as(
-    app: &AppHandle,
-    version: Option<&str>,
-    phase: fn(String) -> AppUpdatePhase,
-    message: String,
-) -> String {
-    emit(app, version, phase(message.clone()));
-    message
-}
+    /// Announce a terminal failure AND return it as the run's error string.
+    /// Both halves matter: the event gives the page a terminal phase even if
+    /// the rejection races the teardown, and the string is what the `catch`
+    /// reports.
+    ///
+    /// `phase` picks WHICH terminal phase carries the message. Ordinary
+    /// failures go through [`Self::fail`]; the bundle-swap case has its own
+    /// phase because the page has to narrate it differently.
+    fn fail_as(
+        &self,
+        version: Option<&str>,
+        phase: fn(String) -> AppUpdatePhase,
+        message: String,
+    ) -> String {
+        self.emit(version, phase(message.clone()));
+        message
+    }
 
-/// [`fail_as`] with the ordinary [`AppUpdatePhase::Failed`].
-fn fail(app: &AppHandle, version: Option<&str>, message: String) -> String {
-    fail_as(
-        app,
-        version,
-        |message| AppUpdatePhase::Failed { message },
-        message,
-    )
+    /// [`Self::fail_as`] with the ordinary [`AppUpdatePhase::Failed`].
+    fn fail(&self, version: Option<&str>, message: String) -> String {
+        self.fail_as(
+            version,
+            |message| AppUpdatePhase::Failed { message },
+            message,
+        )
+    }
 }
 
 /// A failed run, carrying the version it failed on when we had got far enough to
-/// know one. Kept separate from the plain error string so the single [`fail`]
-/// callsite can attribute the failure.
+/// know one. Kept separate from the plain error string so the single
+/// [`Narrator::fail`] callsite can attribute the failure.
 struct UpdateFailure {
     version: Option<String>,
     message: String,
@@ -232,7 +246,8 @@ enum Phase {
 }
 
 /// The single in-flight app-update run. Managed state (`lib.rs`), shared by
-/// [`install_app_update_and_restart`] and [`cancel_app_update`].
+/// [`run_app_update`] and [`cancel_app_update`]. A local click and a relayed
+/// request therefore compete for one slot.
 #[derive(Default)]
 pub struct AppUpdateRun(Mutex<Phase>);
 
@@ -377,7 +392,7 @@ pub async fn check_app_update(app: AppHandle) -> Result<Option<AppUpdateOffer>, 
 /// failures as a value rather than emitting them itself: an aborted task never
 /// gets to run cleanup, so the single terminal-phase emit lives in the caller.
 async fn check_and_download(
-    app: &AppHandle,
+    narrator: &Narrator,
     updater: Updater,
 ) -> Result<(Update, Vec<u8>), UpdateFailure> {
     let update = updater
@@ -389,8 +404,7 @@ async fn check_and_download(
 
     // Announce the phase flip before the first chunk lands: on a slow link the
     // first chunk can be seconds away, and until then "Checking…" would be a lie.
-    emit(
-        app,
+    narrator.emit(
         Some(&version),
         AppUpdatePhase::Downloading {
             downloaded: 0,
@@ -409,8 +423,7 @@ async fn check_and_download(
                     .unwrap_or_else(|e| e.into_inner())
                     .chunk(chunk as u64, total);
                 if let Some(frame) = frame {
-                    emit(
-                        app,
+                    narrator.emit(
                         Some(&version),
                         AppUpdatePhase::Downloading {
                             downloaded: frame.downloaded,
@@ -424,8 +437,7 @@ async fn check_and_download(
                 // `download` — so this hook is where `verifying` belongs.
                 let frame = tracker.lock().unwrap_or_else(|e| e.into_inner()).finish();
                 if let Some(frame) = frame {
-                    emit(
-                        app,
+                    narrator.emit(
                         Some(&version),
                         AppUpdatePhase::Downloading {
                             downloaded: frame.downloaded,
@@ -433,7 +445,7 @@ async fn check_and_download(
                         },
                     );
                 }
-                emit(app, Some(&version), AppUpdatePhase::Verifying);
+                narrator.emit(Some(&version), AppUpdatePhase::Verifying);
             },
         )
         .await
@@ -563,6 +575,43 @@ fn update_blocker() -> Option<String> {
     None
 }
 
+/// Why an update could not run with nobody at the Mac, or `None` when it can.
+/// The relay reports it in every heartbeat and re-checks it before a relayed
+/// run (ADR 0338).
+///
+/// Fails closed on a bundle it cannot find, unlike [`update_blocker`]: an
+/// unattended install that stalls on a prompt is worse than one refused.
+#[cfg(target_os = "macos")]
+pub(crate) fn remote_install_blocker() -> Option<String> {
+    use crate::bundle_location;
+
+    let writable = bundle_location::bundle_path()
+        .map(|bundle| bundle_location::writable_in_place(&bundle))
+        .unwrap_or(false);
+    bundle_location::remote_install_blocker(update_blocker(), writable)
+}
+
+/// No packaged shape elsewhere, so nothing to block.
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn remote_install_blocker() -> Option<String> {
+    None
+}
+
+/// Which blocker stops this run, given whether the update relay asked for it.
+/// The two checks are passed in, so a test can prove the choice without a real
+/// bundle.
+fn run_blocker(
+    relayed: bool,
+    local: fn() -> Option<String>,
+    remote: fn() -> Option<String>,
+) -> Option<String> {
+    if relayed {
+        remote()
+    } else {
+        local()
+    }
+}
+
 /// The user-facing [`AppUpdatePhase::BundleSwapFailed`] message.
 ///
 /// Both callers compose through here so the recovery advice cannot drift apart,
@@ -585,39 +634,65 @@ fn bundle_swap_message(fault: &str, install_error: Option<&str>) -> String {
     )
 }
 
-/// Install the available update and restart EVERYTHING onto the new version:
-/// swap the bundle, restart the launchd background service so it runs the NEW
-/// binaries, then relaunch the GUI client. Never returns on success.
-///
-/// Ordering is load-bearing: install first, then the service restart, then the
-/// never-returning relaunch. The service restart is best-effort, since a
-/// failure is logged and the service picks the new binary up on its next start.
+/// Install the available update and restart EVERYTHING onto the new version.
+/// The desktop window's Update & Restart control lands here.
 #[tauri::command]
 pub async fn install_app_update_and_restart(
     app: AppHandle,
     run: State<'_, AppUpdateRun>,
 ) -> Result<(), String> {
+    run_app_update(app, &run, None).await
+}
+
+/// One update run: swap the bundle, restart the launchd background service so
+/// it runs the NEW binaries, then relaunch the GUI client. Never returns on
+/// success. `relay` is set when the update relay asked for this run.
+///
+/// Ordering is load-bearing: install first, then the service restart, then the
+/// never-returning relaunch. The service restart is best-effort, since a
+/// failure is logged and the service picks the new binary up on its next start.
+pub(crate) async fn run_app_update(
+    app: AppHandle,
+    run: &AppUpdateRun,
+    relay: Option<crate::update_relay::RelayTag>,
+) -> Result<(), String> {
     if tauri::is_dev() {
         return Err("Updates are only available in a packaged build".to_string());
     }
+    let narrator = Narrator { app, relay };
     if !run.begin() {
         // Deliberately no `failed` emit: that would replace the RUNNING update's
-        // narration with an error about this duplicate request.
-        return Err("An update is already in progress".to_string());
+        // narration with an error about this duplicate request. A relayed one
+        // still owes its requester an answer, through the relay alone.
+        let busy = "An update is already in progress".to_string();
+        if let Some(relay) = &narrator.relay {
+            relay.publish(&AppUpdateProgress {
+                version: None,
+                phase: AppUpdatePhase::Failed {
+                    message: busy.clone(),
+                },
+            });
+        }
+        return Err(busy);
     }
 
-    emit(&app, None, AppUpdatePhase::Checking);
+    narrator.emit(None, AppUpdatePhase::Checking);
     // Before the download, not after it: from a disk image or another disk the
-    // plugin's first rename fails with EXDEV, once ~100 MB are already in.
-    if let Some(blocker) = update_blocker() {
+    // plugin's first rename fails with EXDEV, once ~100 MB are already in. A
+    // relayed run also refuses what would wait on a prompt nobody can answer.
+    if let Some(blocker) = run_blocker(
+        narrator.relay.is_some(),
+        update_blocker,
+        remote_install_blocker,
+    ) {
         run.release();
-        return Err(fail(&app, None, blocker));
+        return Err(narrator.fail(None, blocker));
     }
-    let updater = match app.updater() {
+    let updater = match narrator.app.updater() {
         Ok(updater) => updater,
         Err(e) => {
             run.release();
-            return Err(fail(&app, None, e.to_string()));
+            return Err(narrator.fail(None, e.to_string()));
         }
     };
 
@@ -625,7 +700,7 @@ pub async fn install_app_update_and_restart(
     // them. The result comes back over a channel, and a CLOSED channel is the
     // cancellation signal: aborting drops the task, which drops the sender.
     let (tx, mut rx) = tauri::async_runtime::channel(1);
-    let emitter = app.clone();
+    let emitter = narrator.clone();
     let task = tauri::async_runtime::spawn(async move {
         let result = check_and_download(&emitter, updater).await;
         let _ = tx.send(result).await;
@@ -636,7 +711,7 @@ pub async fn install_app_update_and_restart(
         // Aborted mid-download: the bytes are discarded and nothing on disk
         // changed. `cancel` already returned the slot to Idle — see
         // `AppUpdateRun::release`.
-        emit(&app, None, AppUpdatePhase::Cancelled);
+        narrator.emit(None, AppUpdatePhase::Cancelled);
         return Ok(());
     };
     if !run.commit() {
@@ -644,7 +719,7 @@ pub async fn install_app_update_and_restart(
         // task being scheduled, so the buffered result arrived anyway. The
         // cancel was accepted; installing now would override it silently.
         let version = result.ok().map(|(update, _)| update.version);
-        emit(&app, version.as_deref(), AppUpdatePhase::Cancelled);
+        narrator.emit(version.as_deref(), AppUpdatePhase::Cancelled);
         return Ok(());
     }
 
@@ -658,12 +733,12 @@ pub async fn install_app_update_and_restart(
         Ok(downloaded) => downloaded,
         Err(e) => {
             run.release();
-            return Err(fail(&app, e.version.as_deref(), e.message));
+            return Err(narrator.fail(e.version.as_deref(), e.message));
         }
     };
     let version = update.version.clone();
 
-    emit(&app, Some(&version), AppUpdatePhase::Installing);
+    narrator.emit(Some(&version), AppUpdatePhase::Installing);
     // `Update::install` is synchronous, so it goes to a blocking thread rather
     // than stalling an async runtime worker the progress IPC also rides on.
     let installed = tauri::async_runtime::spawn_blocking(move || update.install(bytes)).await;
@@ -671,7 +746,7 @@ pub async fn install_app_update_and_restart(
         Ok(outcome) => outcome,
         Err(e) => {
             run.release();
-            return Err(fail(&app, Some(&version), format!("install task: {e}")));
+            return Err(narrator.fail(Some(&version), format!("install task: {e}")));
         }
     };
     // BOTH outcomes have to ask the same question. The destructive case arrives
@@ -681,9 +756,8 @@ pub async fn install_app_update_and_restart(
         run.release();
         let e = e.to_string();
         return Err(match installed_bundle_fault() {
-            None => fail(&app, Some(&version), e),
-            Some(fault) => fail_as(
-                &app,
+            None => narrator.fail(Some(&version), e),
+            Some(fault) => narrator.fail_as(
                 Some(&version),
                 |message| AppUpdatePhase::BundleSwapFailed { message },
                 bundle_swap_message(&fault, Some(&e)),
@@ -700,8 +774,7 @@ pub async fn install_app_update_and_restart(
     // both paths. See ADR 0073.
     if let Some(fault) = installed_bundle_fault() {
         run.release();
-        return Err(fail_as(
-            &app,
+        return Err(narrator.fail_as(
             Some(&version),
             |message| AppUpdatePhase::BundleSwapFailed { message },
             bundle_swap_message(&fault, None),
@@ -716,22 +789,22 @@ pub async fn install_app_update_and_restart(
     //
     // New bytes are on disk. Restart the whole background service onto them
     // BEFORE relaunching the client, which never returns.
-    emit(&app, Some(&version), AppUpdatePhase::RestartingServices);
+    narrator.emit(Some(&version), AppUpdatePhase::RestartingServices);
     if let Err(e) = crate::desktop::restart_service() {
         eprintln!("[updater] background service restart failed: {e}");
     }
     // Relaunch the client onto its new bytes. Never returns. Through
     // LaunchServices when we can, so the updated client comes up in front
     // rather than behind everything. See ADR 0072.
-    emit(&app, Some(&version), AppUpdatePhase::Relaunching);
+    narrator.emit(Some(&version), AppUpdatePhase::Relaunching);
     match crate::desktop::schedule_relaunch_after_exit() {
         // This command runs on the async runtime, so the exit is marshalled to
         // the main thread. It does not return, so `app.restart()` cannot also
         // run and bring up a second client.
-        Ok(()) => crate::exit_after_relaunch_scheduled(&app),
+        Ok(()) => crate::exit_after_relaunch_scheduled(&narrator.app),
         Err(e) => {
             eprintln!("[updater] no LaunchServices relaunch ({e}); respawning directly");
-            app.restart()
+            narrator.app.restart()
         }
     }
 }
@@ -1026,6 +1099,20 @@ mod tests {
         std::fs::create_dir_all(&nested).expect("create a non-/Applications location");
         let bundle = write_bundle(&nested, 0o755);
         assert_eq!(installed_bundle_verdict(&bundle), BundleVerdict::Runnable);
+    }
+
+    // A relayed run has nobody at the Mac, so it must refuse what would wait on
+    // an admin prompt. A local click keeps the local check (ADR 0338).
+    #[test]
+    fn a_relayed_run_takes_the_remote_blocker_and_a_click_the_local_one() {
+        let local = || Some("local".to_string());
+        let remote = || Some("needs an administrator password".to_string());
+        assert_eq!(
+            run_blocker(true, local, remote).as_deref(),
+            Some("needs an administrator password")
+        );
+        assert_eq!(run_blocker(false, local, remote).as_deref(), Some("local"));
+        assert_eq!(run_blocker(true, local, || None), None);
     }
 
     // The message is the whole user-visible product of this check, so its wording

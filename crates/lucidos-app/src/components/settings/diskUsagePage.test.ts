@@ -13,6 +13,7 @@ import { fileURLToPath } from 'node:url';
 // @ts-expect-error: same
 import { dirname, resolve } from 'node:path';
 import {
+  cleanupProgressLine,
   describeEstimate,
   diskUsageLoadOwed,
   estimateRecommendedCleanup,
@@ -129,5 +130,16 @@ describe('the recommended cleanup estimate', () => {
       .toMatch(/^Removes 2 finished worktrees\. /);
     expect(describeEstimate({ removeCount: 1, cleanCount: 3, bytes: 1 }))
       .toMatch(/^Removes 1 finished worktree and clears build artifacts in 3 worktrees\. /);
+  });
+});
+
+describe('the running cleanup line', () => {
+  it('says only that a pass runs until its count is known', () => {
+    expect(cleanupProgressLine({ done: 0, total: 0 })).toBe('Cleanup in progress');
+  });
+
+  it('counts the worktrees dealt with so far', () => {
+    expect(cleanupProgressLine({ done: 12, total: 105 })).toBe('Cleanup in progress: 12 of 105 worktrees');
+    expect(cleanupProgressLine({ done: 0, total: 1 })).toBe('Cleanup in progress: 0 of 1 worktree');
   });
 });

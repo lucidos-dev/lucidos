@@ -8,7 +8,7 @@
  * fixed side would be wrong for one of them.
  *
  * Desktop is always `left`: the panel is positioned to emerge from the split
- * divider rather than from a viewport edge (`@media (min-width: 769px)` in
+ * divider rather than from a viewport edge (`@media (--desktop-layout)` in
  * mobile.css), so an anchor sitting right of the viewport middle (a wide
  * Conversation side pushes the content header's hamburger there) must NOT flip
  * it. The `.drawer-right` CSS is scoped to the mobile breakpoint for the same

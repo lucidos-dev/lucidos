@@ -16,7 +16,7 @@ import { ConnectionBanner } from './ConnectionBanner';
 import { IngressBanner } from './IngressBanner';
 import { WebhookRefusalBanner } from './WebhookRefusalBanner';
 import { SlownessBanner } from './SlownessBanner';
-import { SwipeTouch } from '../../utils/swipe';
+import { SwipeTouch } from '@lucidos/pane-swipe';
 import { HamburgerButton, ContentBackButton, ContentForwardButton } from './ContentNav';
 import { ContentHeaderActions } from './ContentHeaderActions';
 import { ContentRefreshButton } from './RefreshIndicator';

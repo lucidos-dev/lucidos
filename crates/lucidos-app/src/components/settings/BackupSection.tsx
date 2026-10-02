@@ -26,6 +26,7 @@ import { formatTimeAgo } from '../../utils/formatTime';
 import { formatBytes } from '../../utils/formatBytes';
 import { copyToClipboard } from '../../utils/clipboard';
 import { Dropdown, DropdownSkeleton } from '../shared/Dropdown';
+import { ProgressBar } from '../shared/progressBar';
 import { Explainer } from '../shared/Explainer';
 import { LoadingFade } from '../shared/LoadingFade';
 import { SkeletonProvider, SkText } from '../shared/Skeleton';
@@ -103,18 +104,6 @@ function askLucidosToSetUpBackups(): void {
 
 type LiveProgress = { phase: string; progress: number; total: number } | null;
 
-/** Progress-bar fill for the health card's running state. Null when total is
- *  unknown (0) so the bar doesn't render a 0%/NaN width. */
-function progressBarFill(progress: { progress: number; total: number }): VNode | null {
-  if (progress.total <= 0) return null;
-  const pct = Math.round((progress.progress / progress.total) * 100);
-  return (
-    <div class="progress-bar">
-      <div class="progress-bar-fill" style={`width: ${pct}%`} />
-    </div>
-  );
-}
-
 /** Escalating wording for how long it's been since a good cloud backup. */
 function staleMessage(ageSeconds: number | null): string {
   if (ageSeconds == null) return 'No cloud backup found — your data is not backed up';
@@ -182,7 +171,7 @@ export function backupHealthCard(props: {
     return (
       <div class="backup-health-card" data-state="running">
         <span class="backup-health-line">Backup in progress — {phase}</span>
-        {liveProgress && progressBarFill(liveProgress)}
+        {liveProgress && <ProgressBar done={liveProgress.progress} total={liveProgress.total} />}
       </div>
     );
   }

@@ -54,7 +54,22 @@ CMD=(cargo test --locked -p lucidos-e2e --test api)
 [ -n "$FILTER" ] && CMD+=("$FILTER")
 [ ${#CARGO_ARGS[@]} -gt 0 ] && CMD+=("--" "${CARGO_ARGS[@]}")
 
-"${CMD[@]}"
+TREE_BEFORE="$(e2e_workspace_tree_status)" || {
+    echo "ERROR: could not read the e2e workspace tree at $E2E_WORKSPACE" >&2
+    exit 1
+}
+
+TESTS_RC=0
+"${CMD[@]}" || TESTS_RC=$?
+
+# A test that leaves the workspace tree dirty fails every later apply, so the
+# run fails here, naming what was left, rather than in some other test. It runs
+# after a failed test run too: a test that panics is the likeliest to strand a
+# fixture. The test failure still decides the exit code.
+TREE_RC=0
+assert_e2e_workspace_tree_clean "$TREE_BEFORE" || TREE_RC=$?
+[ "$TESTS_RC" -eq 0 ] || exit "$TESTS_RC"
+[ "$TREE_RC" -eq 0 ] || exit "$TREE_RC"
 
 # The gateway chain test, which is the only one that puts a real gateway in
 # front of a real engine. It lives in lucidos-gateway rather than lucidos-e2e

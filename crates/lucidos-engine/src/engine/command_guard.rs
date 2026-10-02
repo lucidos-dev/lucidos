@@ -1879,10 +1879,7 @@ fn is_code_injecting_assignment(tok: &str) -> bool {
 }
 
 /// True when the variable `name` is one of [`CODE_INJECTING_ENV_NAMES`].
-///
-/// Also the floor for an environment the engine builds for untrusted code,
-/// where a caller chose the names (`api::proxy_script_runner`).
-pub(crate) fn is_code_injecting_env_name(name: &str) -> bool {
+fn is_code_injecting_env_name(name: &str) -> bool {
     if name.is_empty() || name.starts_with('-') {
         return false;
     }

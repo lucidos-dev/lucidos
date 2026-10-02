@@ -1,10 +1,10 @@
 // @vitest-environment jsdom
 /**
- * **The Changes panel bulk row is one line of buttons.**
+ * **Each Changes panel section draws its own bulk row, one line of buttons.**
  *
- * Discard All sits at the left edge and the apply side at the right edge:
- * "Apply all on settle", then Apply All. The line never wraps, and its
- * buttons share it equally at one height.
+ * Ready comes first: Discard All at the left edge, Apply All at the right.
+ * Not finished comes second, with "Apply all on settle" alone at the right.
+ * A line never wraps, and its buttons share it equally at one height.
  *
  * Rendered for the structure, scanned for the geometry: jsdom lays nothing
  * out, so the CSS scan is what pins the two ends and the no-wrap.
@@ -37,9 +37,6 @@ import {
   applyAllInProgress,
   standingApplyThreadIds,
   armingStandingApplyThreadIds,
-  armingStandingApplySweep,
-  disarmingAllStandingApply,
-  settlingThreadCount,
 } from '../../../store/store';
 import type { Change } from '../../../api/client';
 import { cssRules, rulesTargeting, styleSheetPaths } from '../../../styles/__tests__/css-rule-helpers';
@@ -77,12 +74,13 @@ function makeChange(over: Partial<Change> = {}): Change {
 let host: HTMLDivElement;
 
 beforeEach(() => {
-  // One change ready now, one still settling: every member of the row draws.
+  // Two changes ready now, one still settling: every bulk button draws.
   changes.value = {
     status: 'loaded',
     data: [
       makeChange({ id: 'ready', thread_id: 'thread-ready' }),
       makeChange({ id: 'settling', thread_id: 'thread-settling', thread_unsettled: true, thread_settling: true }),
+      makeChange({ id: 'ready-2', thread_id: 'thread-ready-2' }),
     ],
   };
   appliedChanges.value = { status: 'loaded', data: [] };
@@ -92,9 +90,6 @@ beforeEach(() => {
   applyAllInProgress.value = false;
   standingApplyThreadIds.value = new Set();
   armingStandingApplyThreadIds.value = new Set();
-  armingStandingApplySweep.value = false;
-  disarmingAllStandingApply.value = false;
-  settlingThreadCount.value = 1;
   host = document.createElement('div');
   document.body.appendChild(host);
 });
@@ -104,14 +99,12 @@ afterEach(() => {
   host.remove();
 });
 
-function bulkRow(): HTMLElement {
-  const row = host.querySelector<HTMLElement>('.changes-bulk-actions');
-  if (!row) throw new Error('no bulk row drawn');
-  return row;
+function bulkRows(): HTMLElement[] {
+  return [...host.querySelectorAll<HTMLElement>('.changes-bulk-actions')];
 }
 
-function buttonLine(): HTMLElement {
-  const line = bulkRow().querySelector<HTMLElement>(':scope > .changes-bulk-buttons');
+function buttonLine(row: HTMLElement): HTMLElement {
+  const line = row.querySelector<HTMLElement>(':scope > .changes-bulk-buttons');
   if (!line) throw new Error('the bulk row has no button line');
   return line;
 }
@@ -126,12 +119,35 @@ function rule(selector: string) {
   return found!;
 }
 
-describe('the bulk row structure', () => {
-  it('draws three buttons on one line when a change is ready and a thread settles', () => {
+describe('the two sections', () => {
+  it('draws Ready first and Not finished second, each with its own bulk row', () => {
     render(<ChangesView />, host);
-    expect([...bulkRow().children].map((l) => l.className)).toEqual(['changes-bulk-buttons']);
-    expect(labels(buttonLine())).toEqual(['Discard All', 'Apply all on settle', 'Apply All']);
-    expect(bulkRow().querySelector('input')).toBeNull();
+    const titles = [...host.querySelectorAll('.list-section-title .section-label')].map((t) => t.textContent);
+    expect(titles).toEqual(['Ready', 'Not finished']);
+    expect(bulkRows().map((row) => labels(buttonLine(row)))).toEqual([
+      ['Discard All', 'Apply All'],
+      ['Apply all on settle'],
+    ]);
+  });
+
+  it('lists each change under its own section', () => {
+    render(<ChangesView />, host);
+    const [ready, notFinished] = [...host.querySelectorAll('.list-section-title')];
+    const between = (a: Element, b: Element | null) => {
+      const out: string[] = [];
+      for (let el = a.nextElementSibling; el && el !== b; el = el.nextElementSibling) {
+        out.push(...[...el.querySelectorAll('.list-row-label')].map((l) => l.textContent ?? ''));
+      }
+      return out;
+    };
+    expect(between(ready, notFinished)).toHaveLength(2);
+    expect(between(notFinished, null)).toHaveLength(1);
+  });
+
+  // Discard never reaches a thread still working.
+  it('never draws Discard All in Not finished', () => {
+    render(<ChangesView />, host);
+    expect(labels(buttonLine(bulkRows()[1]))).not.toContain('Discard All');
   });
 
   it('draws the armed face alone when nothing else can act', () => {
@@ -141,8 +157,7 @@ describe('the bulk row structure', () => {
     };
     standingApplyThreadIds.value = new Set(['thread-1']);
     render(<ChangesView />, host);
-    expect([...bulkRow().children].map((l) => l.className)).toEqual(['changes-bulk-buttons']);
-    expect(labels(buttonLine())).toEqual(['✓ Applying all on settle']);
+    expect(bulkRows().map((row) => labels(buttonLine(row)))).toEqual([['✓ Applying all on settle']]);
   });
 });
 
@@ -160,7 +175,6 @@ describe('the set-aside row', () => {
 
   beforeEach(() => {
     changes.value = { status: 'loaded', data: [] };
-    settlingThreadCount.value = 0;
     setAsideChanges.value = {
       status: 'loaded',
       data: [makeChange({ id: 'aside', thread_id: null, status: 'set_aside' as Change['status'] })],
@@ -184,7 +198,7 @@ describe('the row action column', () => {
     };
     render(<ChangesView />, host);
     const rows = [...host.querySelectorAll('.change-row .list-row-actions')];
-    expect(rows).toHaveLength(3);
+    expect(rows).toHaveLength(4);
     for (const actions of rows) {
       const [diff, primary] = [...actions.children];
       expect(diff.textContent).toBe('Diff');
@@ -225,9 +239,8 @@ describe('the bulk row geometry', () => {
     expect(rule('.changes-bulk-buttons > .action-btn-danger').props.get('margin-right')).toBe('auto');
   });
 
-  // A change ready and a thread settling draws three buttons, more than a phone
-  // fits at their natural width. Each takes an equal share and wraps inside it,
-  // and the line stretches them all to the tallest one.
+  // Each takes an equal share and wraps inside it on a narrow phone, and the
+  // line stretches them all to the tallest one.
   it('gives every button an equal share, one height, and a wrapping label', () => {
     const button = rule('.changes-bulk-buttons > .action-btn').props;
     expect(button.get('flex')).toBe('1 1 0');
@@ -235,7 +248,7 @@ describe('the bulk row geometry', () => {
     expect(rule('.changes-bulk-buttons').props.get('align-items')).toBe('stretch');
   });
 
-  // Uncapped, a wide desktop pane would stretch each button across a third of it.
+  // Uncapped, a wide desktop pane would stretch each button across half of it.
   it('caps each share so a wide pane keeps the buttons button-sized', () => {
     expect(rule('.changes-bulk-buttons > .action-btn').props.get('max-width')).toBe('10rem');
   });

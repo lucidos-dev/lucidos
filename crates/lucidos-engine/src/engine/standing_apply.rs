@@ -180,8 +180,7 @@ pub enum DisarmScope {
     /// Only what a sweep armed. Apply All Cancel means "stop applying", and an
     /// arm the owner set on one change is not part of that press.
     Sweep,
-    /// Every arm here. The Changes panel's own off: that surface draws one
-    /// armed state for the whole workspace, so its off has to mean the same.
+    /// Every arm here: the workspace-wide off, for the prompt and the CLI.
     All,
 }
 
@@ -622,21 +621,6 @@ async fn read_armed_change(pool: &sqlx::PgPool, arm: &StandingApply) -> Option<A
     }
 }
 
-/// How many threads a sweep would arm right now.
-///
-/// `GET /api/v1/changes` carries it so the Changes panel can offer "Apply as
-/// they settle" with nothing pending. The panel cannot derive it: its thread
-/// map holds only the loaded window.
-pub(crate) async fn count_sweep_candidates(pool: &sqlx::PgPool) -> Result<i64, sqlx::Error> {
-    sqlx::query_scalar(&format!(
-        "SELECT count(*) FROM thread_summaries \
-          WHERE is_coding_agent = TRUE AND {settling} AND {LUCIDOS_APPLIES_SQL}",
-        settling = &*SETTLING_THREAD_SQL,
-    ))
-    .fetch_one(pool)
-    .await
-}
-
 /// Refuse a thread whose repo Lucidos never applies into.
 ///
 /// Same shape as [`check_binding`] and for the same reason: the instruction
@@ -888,7 +872,7 @@ impl LucidosEngine {
     ///
     /// One loop for both bulk disarms, because they differ only in which rows
     /// they read. Apply All Cancel takes [`DisarmScope::Sweep`], and the
-    /// Changes panel's off takes [`DisarmScope::All`].
+    /// workspace-wide off takes [`DisarmScope::All`].
     ///
     /// A scope holding nothing answers 0 rather than failing. An off switch
     /// pressed on an already-off state gave the owner what they asked for. A
@@ -1569,7 +1553,6 @@ mod db_tests {
             .map(|(id, _)| id)
             .collect();
         assert_eq!(swept, vec![watching]);
-        assert_eq!(count_sweep_candidates(&pool).await.expect("count"), 1);
         teardown_test_db(&db).await;
     }
 
@@ -1801,11 +1784,6 @@ mod db_tests {
         let candidates = read_sweep_candidates(&pool).await.expect("sweep read");
         let ids: Vec<Uuid> = candidates.iter().map(|(id, _)| *id).collect();
         assert_eq!(ids, vec![lucidos]);
-        assert_eq!(
-            count_sweep_candidates(&pool).await.expect("sweep count"),
-            1,
-            "the count the panel offers its sweep from must agree with the sweep"
-        );
         teardown_test_db(&db).await;
     }
 
@@ -1899,7 +1877,6 @@ mod db_tests {
     }
 
     /// The workspace-scope off takes back a single arm as well as a swept one.
-    /// The Changes panel draws ONE armed state, so its off has to mean that.
     #[tokio::test]
     async fn the_workspace_scope_off_covers_both_kinds_of_arm() {
         let (pool, db) = setup_test_db().await;

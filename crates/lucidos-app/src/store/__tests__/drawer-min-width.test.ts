@@ -231,7 +231,7 @@ describe('the TS mirror of the row still matches the CSS', () => {
   // hand them back as a resolved length, so the sum is a copy. These are the
   // drift checks that make the copy safe.
   const rules = cssRules(shellCss);
-  const DESKTOP = '@media (min-width: 769px)';
+  const DESKTOP = '@media (--desktop-layout)';
   const desktopRoot = rules.find(r => r.selector === ':root' && r.atRules === DESKTOP);
   const paneHeader = rules.find(r => r.selector === '.pane-header');
 

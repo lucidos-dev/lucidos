@@ -155,6 +155,10 @@ describe('ui.watchPreferences: live theme reaction wiring', () => {
   let attrs: Record<string, string>;
   let originalGetAttribute: unknown;
   let originalSetAttribute: unknown;
+  /** `vi.resetModules()` leaves an earlier case's bridge listening on
+   *  `window`, so each case removes the message listeners it added. */
+  let messageListeners: EventListenerOrEventListenerObject[];
+  let origAddEventListener: typeof window.addEventListener;
 
   function setVisibility(state: 'visible' | 'hidden'): void {
     (document as { visibilityState: string }).visibilityState = state;
@@ -172,6 +176,12 @@ describe('ui.watchPreferences: live theme reaction wiring', () => {
   beforeEach(() => {
     vi.resetModules();
     vi.useFakeTimers();
+    messageListeners = [];
+    origAddEventListener = window.addEventListener;
+    window.addEventListener = ((type: string, listener: EventListenerOrEventListenerObject, options?: boolean | AddEventListenerOptions) => {
+      if (type === 'message') messageListeners.push(listener);
+      Reflect.apply(origAddEventListener, window, [type, listener, options]);
+    }) as typeof window.addEventListener;
     sseOn = vi.fn();
     sseConnect = vi.fn();
     getMock = vi.fn().mockResolvedValue({ 'theme-mode': 'system' });
@@ -213,6 +223,8 @@ describe('ui.watchPreferences: live theme reaction wiring', () => {
   });
 
   afterEach(() => {
+    window.addEventListener = origAddEventListener;
+    for (const listener of messageListeners) window.removeEventListener('message', listener);
     vi.doUnmock('./sse');
     vi.doUnmock('./preferences');
     (globalThis as { matchMedia?: unknown }).matchMedia = origMatchMedia;
@@ -366,6 +378,124 @@ describe('ui.watchPreferences: live theme reaction wiring', () => {
     getMock.mockResolvedValue({ 'theme-mode': 'system', 'theme-effects': 'reduce' });
     await watchingOnSystem();
     expect(attrs['data-theme-effects']).toBe('reduce');
+  });
+
+  describe('the shell pushes what it painted', () => {
+    // This jsdom drops custom properties, so the writes are recorded instead.
+    let props: Record<string, string>;
+    const style = () => ({ getPropertyValue: (name: string) => props[name] ?? '' });
+    const THEME = JSON.stringify({ light: { '--accent': '#123456' }, dark: { '--accent': '#654321' } });
+
+    const shell = { postMessage: () => {} };
+    let origParent: unknown;
+
+    /** The shell's push, as `_bridge.ts` receives it: from the parent window. */
+    function pushAppearance(data: unknown, source: unknown = shell): void {
+      const push = new Event('message');
+      Object.assign(push, { source, data: { type: 'lucidos:bridge:push', channel: 'appearance', data } });
+      window.dispatchEvent(push);
+    }
+
+    beforeEach(() => {
+      props = {};
+      const inline = document.documentElement.style as unknown as Record<string, unknown>;
+      inline.setProperty = (name: string, value: string) => { props[name] = value; };
+      inline.removeProperty = (name: string) => { delete props[name]; };
+      origParent = (window as unknown as { parent: unknown }).parent;
+      (window as unknown as { parent: unknown }).parent = shell;
+    });
+
+    afterEach(() => {
+      (window as unknown as { parent: unknown }).parent = origParent;
+      const inline = document.documentElement.style as unknown as Record<string, unknown>;
+      delete inline.setProperty;
+      delete inline.removeProperty;
+    });
+
+    it('repaints scale, theme mode, theme and motion with no fetch', async () => {
+      await watchingOnSystem();
+
+      pushAppearance({ 'theme-mode': 'light', 'ui-scale': '150', theme_resolved: THEME, motion: 'reduce' });
+
+      expect(attrs['data-theme-mode']).toBe('light');
+      expect(style().getPropertyValue('--user-ui-scale')).toBe('150%');
+      expect(style().getPropertyValue('--accent')).toBe('#123456');
+      expect(attrs['data-motion']).toBe('reduce');
+      expect(getMock).not.toHaveBeenCalled();
+    });
+
+    it('leaves an app that never called watchPreferences() alone', async () => {
+      const { ui: freshUi } = await import('./ui');
+      await freshUi.applyPreferences();
+
+      pushAppearance({ 'theme-mode': 'light', 'ui-scale': '150' });
+
+      expect(style().getPropertyValue('--user-ui-scale')).toBe('');
+    });
+
+    it('ignores a push from any window but the shell', async () => {
+      await watchingOnSystem();
+
+      pushAppearance({ 'ui-scale': '150' }, { postMessage: () => {} });
+
+      expect(style().getPropertyValue('--user-ui-scale')).toBe('');
+    });
+
+    it('runs a pushed style override through the same gate as the seed', async () => {
+      await watchingOnSystem();
+
+      pushAppearance({
+        'ui-scale': '125',
+        style_overrides: JSON.stringify({ '--user-ui-scale': '5%', '--accent': 'red' }),
+      });
+
+      expect(style().getPropertyValue('--user-ui-scale')).toBe('125%');
+      expect(style().getPropertyValue('--accent')).toBe('red');
+    });
+
+    it('never lets a late fetch paint over a newer push', async () => {
+      const { ui: freshUi } = await import('./ui');
+      freshUi.watchPreferences();
+      let answer: (prefs: Record<string, string>) => void = () => {};
+      getMock.mockReturnValue(new Promise((resolve) => { answer = resolve; }));
+      const applying = freshUi.applyPreferences();
+
+      pushAppearance({ 'ui-scale': '150' });
+      answer({ 'ui-scale': '100' });
+      await applying;
+
+      expect(style().getPropertyValue('--user-ui-scale')).toBe('150%');
+    });
+
+    it('still follows Autocorrect on PreferencesChanged, and keeps the pushed look', async () => {
+      const applyAutocorrect = vi.fn();
+      vi.doMock('./autocorrectStamp', () => ({ applyAutocorrectPreference: applyAutocorrect }));
+      await watchingOnSystem();
+      pushAppearance({ 'ui-scale': '150' });
+
+      getMock.mockResolvedValue({ 'ui-scale': '100', autocorrect: 'false' });
+      const onPreferencesChanged = sseOn.mock.calls.find(([type]) => type === 'PreferencesChanged')![1];
+      onPreferencesChanged({ key: 'autocorrect' });
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(applyAutocorrect).toHaveBeenLastCalledWith(expect.objectContaining({ autocorrect: 'false' }));
+      expect(style().getPropertyValue('--user-ui-scale')).toBe('150%');
+      vi.doUnmock('./autocorrectStamp');
+    });
+
+    it('follows an OS flip from the last push, with no fetch', async () => {
+      await watchingOnSystem();
+      pushAppearance({ 'theme-mode': 'system', theme_resolved: THEME });
+      expect(attrs['data-theme-mode']).toBe('dark');
+
+      mqLight = true;
+      mqChangeListeners[0]();
+      vi.advanceTimersByTime(500);
+
+      expect(attrs['data-theme-mode']).toBe('light');
+      expect(style().getPropertyValue('--accent')).toBe('#123456');
+      expect(getMock).not.toHaveBeenCalled();
+    });
   });
 });
 
@@ -551,6 +681,24 @@ describe('lucidos.ui.prompt', () => {
     const p = ui.prompt({ message: 'Name?' });
     replyToLastPrompt(null);
     await expect(p).resolves.toBeNull();
+  });
+
+  // The host answers when the reader presses OK, however long they type. A
+  // deadline here resolved null under a dialog still open, and the text the
+  // reader then submitted reached nothing.
+  it('waits for the reader, however long they take', async () => {
+    vi.useFakeTimers();
+    try {
+      const p = ui.prompt({ message: 'Describe the change', multiline: true });
+      let settled = false;
+      void p.then(() => { settled = true; });
+      await vi.advanceTimersByTimeAsync(5 * 60_000);
+      expect(settled).toBe(false);
+      replyToLastPrompt('a long answer');
+      await expect(p).resolves.toBe('a long answer');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('rejects when message is empty/non-string, without posting', async () => {

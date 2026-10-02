@@ -305,7 +305,7 @@ test.describe('Resume after restart — boundary panels', () => {
       actor: { kind: 'device', device_id: 'd-test' },
     });
     // Engine note text must include 2 bullet-style tool lines so the resume
-    // card's Details count "2 prior tool calls".
+    // card's Details count "2 steps".
     const noteText =
       '[Engine note — this is a rerun]\n' +
       'Your previous attempt at this turn was interrupted by an engine restart.\n' +
@@ -339,7 +339,7 @@ test.describe('Resume after restart — boundary panels', () => {
       const resumeExchange = exchanges.nth(2);
       const card = resumeExchange.locator('.event-row[data-kind="resume"]');
       await card.locator('.event-row-fold-toggle').click();
-      await expect(card.getByText('The engine reminded the model about 2 prior tool calls:')).toBeVisible();
+      await expect(card.getByText('Lucidos reminded the agent of the 2 steps it had already taken.')).toBeVisible();
     } finally {
       psql([
         `DELETE FROM events WHERE aggregate_id = '${threadId}'`,

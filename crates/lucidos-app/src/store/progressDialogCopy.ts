@@ -95,10 +95,11 @@ export function restartDialogState(newVersion: boolean): ProgressDialogState {
  *
  *  `onCancel` is passed in rather than imported, which is what keeps this module
  *  free of the updater. It is offered only while the narration says abandoning
- *  the run can still work. */
+ *  the run can still work, and never when `onCancel` is `null`: a run relayed
+ *  to the desktop app can be stopped only there. */
 export function appUpdateDialogState(
   frame: AppUpdateRunning,
-  onCancel: () => void,
+  onCancel: (() => void) | null,
 ): ProgressDialogState {
   const narration = appUpdateNarration(frame);
   return {
@@ -106,6 +107,6 @@ export function appUpdateDialogState(
     title: 'Updating Lucidos',
     message: narration.message,
     progress: narration.progress,
-    cancel: narration.cancellable ? { label: 'Cancel', onClick: onCancel } : undefined,
+    cancel: narration.cancellable && onCancel ? { label: 'Cancel', onClick: onCancel } : undefined,
   };
 }

@@ -6,13 +6,13 @@ import { loadedOr } from '../../store/types';
 import type { ResponseEvent, App } from '../../store/types';
 import type { CodingAgent } from '../../api/types';
 import type { Exchange, ReadMarker, StoredEvent, ThreadEvent, MessageOrigin, ResolvedPermission } from '../../store/thread-events';
-import { ENGINE_LABEL, SYSTEM_LABEL, API_CALLER_LABEL, LUCIDOS_AGENT_LABEL, abortPromisesAutoResume, exchangeUserMessage, exchangeUserImageHashes, exchangeTimestamp, exchangeResponseTimestamp, messageReadTimestamp, exchangeResponseText, exchangeEngineLimitDetail, exchangeSteps, exchangeResponseEvents, exchangeStatus, exchangeError, exchangeStarterId, dividerBodyIsSuppressed, hasRenderableResponseContent, isEmptyContinuedExchange, questionDividerResolution, changePanelHasContinuation, findCommandPermissionResolution, findMcpPermissionResolution, findPermissionResolution, findQuestionAnswer, isChangeLifecycleEvent, isLivePartialRow, isLiveReplyRow, isLiveUtteranceRow, isSpeechOnlyTurn, turnBodyFolded, modeToInitiator, originMode, continuationStartedSummary, responseAbortedSummary, eventWaitStoppedSummary, isTurnlessBoundary, agentMessageSender, RESPONSE_CANCELED_SUMMARY } from '../../store/thread-events';
+import { ENGINE_LABEL, SYSTEM_LABEL, API_CALLER_LABEL, LUCIDOS_AGENT_LABEL, abortPromisesAutoResume, exchangeUserMessage, exchangeUserImageHashes, exchangeTimestamp, exchangeResponseTimestamp, messageReadTimestamp, exchangeResponseText, exchangeEngineLimitDetail, exchangeSteps, exchangeResponseEvents, exchangeStatus, exchangeError, exchangeStarterId, dividerBodyIsSuppressed, hasRenderableResponseContent, isEmptyContinuedExchange, questionDividerResolution, changePanelHasContinuation, findCommandPermissionResolution, findMcpPermissionResolution, findPermissionResolution, findQuestionAnswer, isChangeLifecycleEvent, isLivePartialRow, isLiveReplyRow, isLiveUtteranceRow, isSpeechOnlyTurn, turnBodyFolded, modeToInitiator, originMode, continuationStartedSummary, responseAbortedSummary, eventWaitStoppedSummary, isTurnlessBoundary, agentMessageSender, waitReentryReason, RESPONSE_CANCELED_SUMMARY } from '../../store/thread-events';
 import { LucidosGlyph } from '../shared/LucidosMark';
 import { artifacts, appsList, stepsExpanded, detailsExpanded, collapsedExchanges, toggleExchangeCollapsed, expandExchange, collapsedInitiators, toggleInitiatorCollapsed, toggleMessageRoutePanel } from '../../store/store';
 import { editQueuedMessage, removeQueuedMessage } from '../../store/actions/chat';
 import { withScrollAnchor } from './CreateThreadView';
 import { QuestionBody } from './QuestionCard';
-import { CommandPermissionBody, McpPermissionBody, PermissionBody } from './PermissionCard';
+import { CommandPermissionBody, McpPermissionBody, PermissionBody, engineResolutionNote } from './PermissionCard';
 import { ChildCompletionRow, ChildMovedOutRow, ChildStoppedRow } from './ChildCompletionRow';
 import { drawsResponseRow, liveStepInBody, responseBody, type BodyRow } from '../../store/event-rendering';
 import { Disclosure } from '../shared/Disclosure';
@@ -623,7 +623,7 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
     // Ungated: an open one is how the user reaches a form they closed or
     // never saw, and a resolved one records how the request ended.
     if (evt.type === 'form_request') return <FormRequestRow key={`fr${k}`} row={evt} threadId={threadId} />;
-    if (evt.type === 'empty') return <div key={`e${k}`} class="response-empty-note">{'The model returned an empty response.'}</div>;
+    if (evt.type === 'empty') return <div key={`e${k}`} class="response-empty-note">{'The agent finished without writing a reply. Ask it to sum up what it did.'}</div>;
     return null;
   }
 
@@ -681,7 +681,7 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
           headerless={isSpeechOnly}
           hasBody={canCollapse}
           status={showStatus && shouldShowResponseStatusBadge(exchange.userEvent, statusClass) ? (
-            <span class={`exchange-status-label exchange-status-${statusClass}`}>
+            <span class={`exchange-status-label exchange-status-${statusClass}`} data-tooltip={sl.tooltip}>
               {/* The active status label — Working / Requesting / Canceling —
                   shimmers as the AI running-text affordance, which replaces the
                   spinner (no mini-spinner in the 'working' state). Suppressed
@@ -722,9 +722,10 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
               ))),
           ]}
           {isEngineLimit && (
-            <div class="exchange-engine-limit" role="status">
-              <strong>Per-turn cap reached</strong>
-              <p>{engineLimitDetail}</p>
+            <div class="exchange-engine-limit" role="status" onClick={handleLinkClick}>
+              <strong>{engineLimitHeading(engineLimitDetail)}</strong>
+              {/* Markdown, so the Settings link in the engine's text is a link. */}
+              <div dangerouslySetInnerHTML={{ __html: linkifyPaths(renderMarkdown(engineLimitDetail), artifactPaths, apps) }} />
             </div>
           )}
         </ResponsePanel>
@@ -747,12 +748,23 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
         // `data-change-id`. Inline steps are NOT stamped, since the "Show
         // steps" toggle can hide them and an id there resolves only sometimes.
         <div class="exchange-error" data-event-id={error.eventId || undefined}>
-          <strong>Event stream error</strong>
+          <strong>The reply failed</strong>
           <p>{error.message}</p>
+          <p>Send a message to try again.</p>
         </div>
       )}
     </div>
   );
+}
+
+/** How the engine's tool-call cap message opens (`tool_call_cap_message` in
+ *  `agentic_loop/helpers.rs`), once its `[ENGINE-LIMIT]` prefix is cut. */
+export const TOOL_CALL_CAP_OPENING = 'Per-turn limit';
+
+/** The turn-limit card's heading. The engine writes two limit messages, and
+ *  only the tool-call one means a cap the user set was reached. */
+function engineLimitHeading(detail: string): string {
+  return detail.startsWith(TOOL_CALL_CAP_OPENING) ? 'Tool-call limit reached' : 'Lucidos ended this turn';
 }
 
 /** Are two mark sets the same? Absent and empty are one state: a resolution
@@ -910,7 +922,7 @@ export function shouldShowResponseStatusBadge(
 //
 // Every panel reads as "[icon] WHO — WHAT": the label is the initiator's name
 // (Lucidos Engine, You, trigger name) and the summary is a one-line action
-// description (Hardening required, Change applied, Auto-prompt sent). Rich
+// description (Hardening needed, Change applied, Wait timed out). Rich
 // payloads (message text, change description, file list) go in `details`.
 // Click the actor to open the route popover for finer origin info.
 // ---------------------------------------------------------------------------
@@ -967,15 +979,15 @@ function initiatorSummary(exchange: Exchange): string {
     case 'ResponseAborted':            return responseAbortedSummary(ev.actor, ev.cause);
     // ResponseCanceled carries its text as the header label (RESPONSE_CANCELED_SUMMARY),
     // not as a summary line — see its describeInitiator arm.
-    case 'MissingHardeningDetected': return 'Hardening required';
-    case 'MergeConflictDetected':    return 'Merging changes from main';
-    case 'CodingAgentPromptSent':    return 'Engine-injected prompt';
+    case 'MissingHardeningDetected': return 'Hardening needed';
+    case 'MergeConflictDetected':    return 'Merge conflict';
+    case 'CodingAgentPromptSent':    return 'Instructions from Lucidos';
     // No summary line: the change event row carries the description and a state badge.
     case 'ChangeApplied':
     case 'ChangeDiscarded':
     case 'ChangeReverted':
     case 'ChangeApplyFailed':        return '';
-    case 'UserPromptInjected':       return 'Auto-prompt sent';
+    case 'UserPromptInjected':       return injectedMessageSummary(ev);
     case 'EventWaitCanceled':        return eventWaitStoppedSummary(ev.reason);
     case 'MessageReceived': {
       if (ev.origin?.kind === 'api') return 'API message';
@@ -985,7 +997,7 @@ function initiatorSummary(exchange: Exchange): string {
       if (headline) return `${headline.label}: ${headline.value}`;
       // The chip says only "Lucidos Agent", so the summary names the sender.
       const sender = agentMessageSender(ev.origin);
-      const said = sender ? `Message from ${sender}` : 'Forwarded message';
+      const said = sender ? `Message from ${sender}` : 'Message from an agent';
       return exchange.releasedFromHold ? `${said}, held until you replied` : said;
     }
     // Divider exchanges — the body component carries the question/permission
@@ -998,6 +1010,15 @@ function initiatorSummary(exchange: Exchange): string {
     case 'ChildThreadDetached':          return '';
     default:                         return '';
   }
+}
+
+/** Who handed the running agent these words, and why, in one line. */
+function injectedMessageSummary(ev: Extract<StoredEvent, { type: 'UserPromptInjected' }>): string {
+  const reentry = waitReentryReason(ev);
+  if (reentry) return reentry.outcome === 'expired' ? 'Wait timed out' : 'Event arrived';
+  if (ev.origin?.kind === 'device') return 'Your message, read while the agent worked';
+  const sender = agentMessageSender(ev.origin);
+  return sender ? `Message from ${sender}` : 'Message from Lucidos';
 }
 
 /** Pick the panel variant for an event whose actor IS the initiator (forwarded
@@ -1104,7 +1125,8 @@ type DividerTerminalKind = 'canceled' | 'superseded' | 'dropped';
  *  initiator header. The header describes what happened to the PROMPT, never
  *  the turn:
  *
- *  - "Answered" or "Resolved" when the user responded.
+ *  - "Answered" or "Resolved" when the user responded, and who settled it
+ *    when Lucidos did (`permissionResolvedLabel`).
  *  - "Canceled" (✕) when they dismissed it.
  *  - "Unanswered" or "Unresolved" when the turn ended for any other reason.
  *  - "Needs your answer" while pending.
@@ -1135,6 +1157,14 @@ type PermissionVerdict = Pick<ResolvedPermission, 'allowed' | 'reason' | 'persis
 
 function permissionVerdict(step: PermissionVerdict | undefined): PermissionVerdict | undefined {
   return step && { allowed: step.allowed, reason: step.reason, persist_scope: step.persist_scope };
+}
+
+/** A resolved permission card's header word. A card nobody answered must not
+ *  read as answered: one Lucidos allowed says so, and one closed unanswered
+ *  says Closed, with the note under it saying why. */
+function permissionResolvedLabel(verdict: PermissionVerdict | undefined): string {
+  if (!verdict || !engineResolutionNote(verdict)) return 'Resolved';
+  return verdict.allowed ? 'Allowed by Lucidos' : 'Closed';
 }
 
 export function describeInitiator(
@@ -1441,7 +1471,7 @@ export function describeInitiator(
         variant: 'lucidos',
         icon: agent.icon,
         label: agent.label,
-        status: dividerStatus(!!resolvedStep, 'Resolved', 'Unresolved', responseTerminated ? 'dropped' : null),
+        status: dividerStatus(!!resolvedStep, permissionResolvedLabel(resolved), 'Unresolved', responseTerminated ? 'dropped' : null),
         details: (
           <PermissionBody
             event={{
@@ -1466,7 +1496,7 @@ export function describeInitiator(
         variant: 'lucidos',
         icon: agent.icon,
         label: agent.label,
-        status: dividerStatus(!!resolvedStep, 'Resolved', 'Unresolved', responseTerminated ? 'dropped' : null),
+        status: dividerStatus(!!resolvedStep, permissionResolvedLabel(resolved), 'Unresolved', responseTerminated ? 'dropped' : null),
         details: (
           <CommandPermissionBody
             event={{
@@ -1491,7 +1521,7 @@ export function describeInitiator(
         variant: 'lucidos',
         icon: agent.icon,
         label: agent.label,
-        status: dividerStatus(!!resolvedStep, 'Resolved', 'Unresolved', responseTerminated ? 'dropped' : null),
+        status: dividerStatus(!!resolvedStep, permissionResolvedLabel(resolved), 'Unresolved', responseTerminated ? 'dropped' : null),
         details: (
           <McpPermissionBody
             event={{

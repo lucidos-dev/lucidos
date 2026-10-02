@@ -38,6 +38,25 @@ pub fn path_is_in_cc_worktree(path: &Path) -> bool {
         .any(|w| w[0] == ".lucidos" && w[1] == "worktrees")
 }
 
+/// The per-user cache root every Lucidos engine on this machine shares:
+/// `$XDG_CACHE_HOME/lucidos`, else `$HOME/.cache/lucidos`. An empty value reads
+/// as unset. `None` when neither is usable, as under a bare service manager.
+pub fn user_cache_root_from(xdg_cache_home: Option<&str>, home: Option<&str>) -> Option<PathBuf> {
+    let base = match xdg_cache_home.filter(|d| !d.is_empty()) {
+        Some(dir) => PathBuf::from(dir),
+        None => Path::new(home.filter(|h| !h.is_empty())?).join(".cache"),
+    };
+    Some(base.join("lucidos"))
+}
+
+/// [`user_cache_root_from`] over this process's environment.
+pub fn user_cache_root() -> Option<PathBuf> {
+    user_cache_root_from(
+        std::env::var("XDG_CACHE_HOME").ok().as_deref(),
+        std::env::var("HOME").ok().as_deref(),
+    )
+}
+
 /// Resolve the Lucidos repo root from the running binary's path.
 /// Cached for the process lifetime; called from polled handlers (`health`).
 pub fn repo_root() -> Result<PathBuf, BoxError> {

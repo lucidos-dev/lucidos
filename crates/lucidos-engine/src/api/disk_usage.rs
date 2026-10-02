@@ -14,6 +14,8 @@
 //!   runs the recommended cleanup over every worktree: a finished worktree is
 //!   removed, every other one loses its build artifacts, and live or pinned
 //!   threads are skipped (`engine::worktree_cleanup::run_recommended_cleanup`).
+//!   It answers 202 at once and reports through `RecommendedCleanupStarted`,
+//!   then `RecommendedCleanupCompleted` or `RecommendedCleanupFailed`.
 //!   One pass runs at a time; a second request gets a 409.
 //! - `POST /api/v1/disk-usage/worktrees/:thread_id/cleanup` with body
 //!   `{ "tier": 1 | 2 | 3 }`:
@@ -23,6 +25,9 @@
 //!     worktrees so we don't silently drop uncommitted edits.
 //!   - **Tier 3** is the same as Tier 2 but allows removing dirty
 //!     worktrees — the UI gates this behind an explicit confirmation.
+//!
+//!   Tiers 2 and 3 take the `thread_reach` Discard gate, so an agent can
+//!   remove only its own subtree's worktrees unless the owner stands behind it.
 //!
 //! On successful cleanup the endpoint emits `WorktreeCleaned` so the rest
 //! of the system (status badges, threshold accounting) sees the same
@@ -35,11 +40,11 @@ use axum::{
     Json, Router,
 };
 use serde::Deserialize;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use uuid::Uuid;
 
 use super::AppState;
-use crate::engine::event_bus::BusEvent;
+use crate::engine::event_bus::{BusEvent, SystemEvent};
 use crate::engine::git_ops::worktrees_dir;
 use crate::engine::thread_events::{EventMeta, ThreadEvent};
 use crate::engine::worktree_cleanup::{
@@ -76,55 +81,116 @@ pub enum BulkCleanupAction {
     Recommended,
 }
 
-/// Set while a recommended pass runs, so a double tap or a second device
-/// cannot start another pass over the same trees.
-static RECOMMENDED_CLEANUP_RUNNING: AtomicBool = AtomicBool::new(false);
+/// Where the one recommended pass stands. Idle is the only state that may start
+/// a pass, so a double tap or a second device cannot run two over the same trees.
+static RECOMMENDED_CLEANUP_STATE: AtomicU8 = AtomicU8::new(PASS_IDLE);
+const PASS_IDLE: u8 = 0;
+/// The pass is walking worktrees. The summary reports only this as running.
+const PASS_RUNNING: u8 = 1;
+/// The pass has ended and its terminal event is going out. A page re-reading
+/// the summary on that event must see it finished. A new pass waits for the
+/// event too, or the stale event would clear the new pass's cue.
+const PASS_REPORTING: u8 = 2;
 
-/// Clears [`RECOMMENDED_CLEANUP_RUNNING`] when the pass ends, panics included.
+/// The one running pass. Dropping it returns the state to idle, panics included.
 struct RunningPass;
 
-impl Drop for RunningPass {
-    fn drop(&mut self) {
-        RECOMMENDED_CLEANUP_RUNNING.store(false, Ordering::SeqCst);
+impl RunningPass {
+    fn try_start() -> Option<Self> {
+        RECOMMENDED_CLEANUP_STATE
+            .compare_exchange(PASS_IDLE, PASS_RUNNING, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()
+            .map(|_| Self)
+    }
+
+    fn reporting(&self) {
+        RECOMMENDED_CLEANUP_STATE.store(PASS_REPORTING, Ordering::SeqCst);
     }
 }
 
-/// POST /api/v1/disk-usage/cleanup: the recommended cleanup over every worktree.
+impl Drop for RunningPass {
+    fn drop(&mut self) {
+        RECOMMENDED_CLEANUP_STATE.store(PASS_IDLE, Ordering::SeqCst);
+    }
+}
+
+fn recommended_cleanup_running() -> bool {
+    RECOMMENDED_CLEANUP_STATE.load(Ordering::SeqCst) == PASS_RUNNING
+}
+
+/// POST /api/v1/disk-usage/cleanup: starts the recommended cleanup over every
+/// worktree and returns 202 at once.
+///
+/// A pass takes seconds per worktree, so a large one runs for minutes. WebKit
+/// drops a request that answers nothing for about a minute, so the outcome
+/// arrives as `RecommendedCleanupCompleted` or `RecommendedCleanupFailed`.
 pub(super) async fn cleanup_all(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(req): Json<BulkCleanupRequest>,
-) -> Result<Json<RecommendedCleanupOutcome>, (StatusCode, String)> {
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, String)> {
     let BulkCleanupAction::Recommended = req.action;
     let actor = super::actor::user_actor(&headers, None);
-    if RECOMMENDED_CLEANUP_RUNNING.swap(true, Ordering::SeqCst) {
+    let Some(running) = RunningPass::try_start() else {
         return Err((
             StatusCode::CONFLICT,
             "A recommended cleanup is already running. Wait for it to finish.".to_string(),
         ));
-    }
-    let running = RunningPass;
+    };
     let engine = state.engine.clone();
-    // A spawned task, so a closed tab cannot stop the pass between worktrees.
-    let pass = tokio::spawn(async move {
-        let _running = running;
-        let active_threads = engine.worktree_cleanup_active_threads();
-        run_recommended_cleanup(
-            engine.pool(),
-            &engine.event_bus,
-            engine.workspace_path(),
-            active_threads.as_ref(),
-            actor,
+    engine
+        .event_bus
+        .emit_or_log(
+            BusEvent::System(SystemEvent::RecommendedCleanupStarted {
+                actor: actor.clone(),
+            }),
+            "[DiskUsage] RecommendedCleanupStarted",
         )
-        .await
+        .await;
+    tokio::spawn(async move {
+        let pass_engine = engine.clone();
+        let pass = tokio::spawn(async move {
+            let active_threads = pass_engine.worktree_cleanup_active_threads();
+            run_recommended_cleanup(
+                pass_engine.pool(),
+                &pass_engine.event_bus,
+                pass_engine.workspace_path(),
+                active_threads.as_ref(),
+                actor,
+            )
+            .await
+        });
+        let ended = recommended_cleanup_ended(pass.await);
+        running.reporting();
+        engine
+            .event_bus
+            .emit_or_log(
+                BusEvent::System(ended),
+                "[DiskUsage] recommended cleanup ended",
+            )
+            .await;
+        drop(running);
     });
-    let outcome = pass.await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Recommended cleanup failed: {e}"),
-        )
-    })?;
-    Ok(Json(outcome))
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "status": "started" })),
+    ))
+}
+
+/// The one event that ends a pass. A panicked pass still reports, as a failure.
+fn recommended_cleanup_ended(
+    pass: Result<RecommendedCleanupOutcome, tokio::task::JoinError>,
+) -> SystemEvent {
+    match pass {
+        Ok(outcome) => SystemEvent::RecommendedCleanupCompleted {
+            removed_count: outcome.removed_count,
+            cleaned_count: outcome.cleaned_count,
+            freed_bytes: outcome.freed_bytes,
+        },
+        Err(e) => SystemEvent::RecommendedCleanupFailed {
+            error: format!("The recommended cleanup stopped: {e}"),
+        },
+    }
 }
 
 /// Body for `POST /api/v1/disk-usage/worktrees/:thread_id/cleanup`.
@@ -144,6 +210,18 @@ pub(super) async fn cleanup_worktree(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let thread_uuid = Uuid::parse_str(&thread_id)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid thread_id: {}", e)))?;
+    // Removing a worktree discards the thread's work, so tiers 2 and 3 take the
+    // Discard gate before the disk is read. Tier 1 strips only regenerable output.
+    if matches!(req.tier, 2 | 3) {
+        super::thread_reach::refuse_without_authority(
+            &state.pool,
+            &headers,
+            Some(thread_uuid),
+            super::thread_reach::ThreadReachVerb::Discard,
+        )
+        .await
+        .map_err(|e| (e.status_code(), e.to_string()))?;
+    }
     let actor = super::actor::user_actor(&headers, None);
     let worktree = deterministic_worktree_for(state.engine.workspace_path(), thread_uuid);
     if !worktree.exists() {
@@ -295,6 +373,7 @@ pub(super) async fn summary(
         "workspace_data_bytes": workspace_data_bytes,
         "soft_threshold_bytes": FREE_DISK_SOFT_BYTES,
         "hard_threshold_bytes": FREE_DISK_HARD_BYTES,
+        "recommended_cleanup_running": recommended_cleanup_running(),
     })))
 }
 
@@ -335,6 +414,64 @@ mod tests {
         );
     }
 
+    /// One test walks the whole cycle: the state is a process-wide static.
+    #[test]
+    fn a_pass_reads_finished_while_it_reports_and_blocks_a_new_one_until_done() {
+        let pass = super::RunningPass::try_start().expect("idle at the start");
+        assert!(super::recommended_cleanup_running());
+        assert!(
+            super::RunningPass::try_start().is_none(),
+            "one pass at a time"
+        );
+
+        pass.reporting();
+        assert!(
+            !super::recommended_cleanup_running(),
+            "a summary read on the terminal event sees the pass finished"
+        );
+        assert!(
+            super::RunningPass::try_start().is_none(),
+            "no new pass until the terminal event is out"
+        );
+
+        drop(pass);
+        let next = super::RunningPass::try_start().expect("idle once the pass reported");
+        drop(next);
+    }
+
+    #[tokio::test]
+    async fn a_finished_pass_reports_its_outcome() {
+        let pass = tokio::spawn(async {
+            super::RecommendedCleanupOutcome {
+                removed_count: 3,
+                cleaned_count: 2,
+                freed_bytes: 1024,
+            }
+        });
+        match super::recommended_cleanup_ended(pass.await) {
+            super::SystemEvent::RecommendedCleanupCompleted {
+                removed_count,
+                cleaned_count,
+                freed_bytes,
+            } => assert_eq!((removed_count, cleaned_count, freed_bytes), (3, 2, 1024)),
+            other => panic!("expected RecommendedCleanupCompleted, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_panicked_pass_still_reports_as_a_failure() {
+        fn walk_that_blows_up() -> super::RecommendedCleanupOutcome {
+            panic!("worktree walk blew up")
+        }
+        let pass = tokio::spawn(async { walk_that_blows_up() });
+        match super::recommended_cleanup_ended(pass.await) {
+            super::SystemEvent::RecommendedCleanupFailed { error } => {
+                assert!(error.contains("stopped"), "{error}")
+            }
+            other => panic!("expected RecommendedCleanupFailed, got {other:?}"),
+        }
+    }
+
     /// The liveness gate runs BEFORE the tier match, so every tier is covered.
     ///
     /// A gate inside one tier arm leaves the other two destroying a live
@@ -356,6 +493,31 @@ mod tests {
             gate < tiers,
             "the live-session refusal must come before the tier match, or tier 1 \
              still strips a running build's artifacts"
+        );
+    }
+
+    /// Tiers 2 and 3 remove another thread's worktree, so they take the reach
+    /// gate before the handler reads the disk. A gate after the dirty check
+    /// would still tell an out-of-reach agent whether the tree holds edits.
+    #[test]
+    fn the_cleanup_handler_asks_the_reach_gate_before_it_removes_anything() {
+        let src = production_src();
+        let at = src
+            .find("pub(super) async fn cleanup_worktree")
+            .expect("cleanup_worktree is still here");
+        let body = &src[at..];
+        let gate = body
+            .find("refuse_without_authority(")
+            .expect("cleanup_worktree must ask the thread_reach gate");
+        for later in ["worktree.exists()", "is_worktree_dirty(", "match req.tier"] {
+            let at = body
+                .find(later)
+                .unwrap_or_else(|| panic!("cleanup_worktree still calls {later}"));
+            assert!(gate < at, "the reach gate must come before {later}");
+        }
+        assert!(
+            body.contains("ThreadReachVerb::Discard"),
+            "removing a worktree discards its changes, so it asks as Discard"
         );
     }
 }

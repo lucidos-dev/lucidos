@@ -7,6 +7,7 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   BARS_SHOWN,
+  chromeOffsetPx,
   headerOffsetPx,
   landWithoutGlide,
   nextBarsIntent,
@@ -14,9 +15,12 @@ import {
   promptOffsetPx,
   shouldKeepHeaderVisible,
   countsAsReaderScroll,
+  revealsBars,
   spacerHeightPx,
+  titleBarOffsetPx,
   type BarsIntent,
 } from './useHideOnScroll';
+import type { NavScrollKind } from '../components/chat/scrollState';
 
 /** The travel threshold these tests use, in px. */
 const THRESHOLD = 12;
@@ -65,19 +69,141 @@ describe('headerOffsetPx (dynamic bars)', () => {
   });
 });
 
+describe('chromeOffsetPx (dynamic bars)', () => {
+  const headerHeight = 110;
+  const safeAreaTop = 47;
+  const titleBarHeight = 40;
+  const base = { disabled: false, keyboardOpen: false, away: false, scrollTop: 500, headerHeight, titleBarHeight };
+
+  it('sends the title bar away with the header while the keyboard is up', () => {
+    expect(chromeOffsetPx({ ...base, keyboardOpen: true })).toBe(-(headerHeight + titleBarHeight));
+  });
+
+  // The sticky title bar sits at `top: spacer`, moved by this offset. The
+  // keyboard close grows the spacer back in one frame, while the offset glides
+  // back to 0 from where the keyboard left it. So the glide's first frame puts
+  // the title at `headerHeight + offset`, and it must still be off screen there.
+  it('keeps the title bar off screen on the first frame of the keyboard close', () => {
+    const offset = chromeOffsetPx({ ...base, keyboardOpen: true });
+    expect(headerHeight + offset + titleBarHeight).toBeLessThanOrEqual(0);
+    // While the keys are up the spacer is only the safe area.
+    expect(safeAreaTop + offset + titleBarHeight).toBeLessThanOrEqual(0);
+  });
+
+  it('follows the scroll with the keyboard down, and pins wins over both', () => {
+    expect(chromeOffsetPx({ ...base, away: true })).toBe(-(headerHeight + titleBarHeight));
+    expect(chromeOffsetPx(base)).toBe(0);
+    expect(chromeOffsetPx({ ...base, disabled: true, keyboardOpen: true, away: true })).toBe(0);
+  });
+});
+
+describe('titleBarOffsetPx (dynamic bars)', () => {
+  const headerHeight = 110;
+  const titleBarHeight = 40;
+  const chrome = headerHeight + titleBarHeight;
+  const elsewhere = { onThreadPane: false, headerHeight, titleBarHeight };
+  const hookSource = readFileSync(
+    resolve(dirname(fileURLToPath(import.meta.url)), 'useHideOnScroll.ts'),
+    'utf8',
+  );
+
+  it('takes the chrome offset on its own pane', () => {
+    for (const chromeOffset of [0, -chrome]) {
+      expect(titleBarOffsetPx({ ...elsewhere, onThreadPane: true, chromeOffset, threadScrollTop: 0 })).toBe(chromeOffset);
+    }
+  });
+
+  // The reported bug: scrolling the threads list sent the header away, but the
+  // thread's title bar stayed where it last rested. A swipe back slid it in under
+  // no header, with the transcript showing through the band above it.
+  it('goes off screen with the header on another pane, over a scrolled transcript', () => {
+    // There the chrome is the header alone, so the offset is its height. The
+    // title bar must still clear the screen by its own height too.
+    const offset = titleBarOffsetPx({ ...elsewhere, chromeOffset: -headerHeight, threadScrollTop: 500 });
+    expect(headerHeight + offset + titleBarHeight).toBeLessThanOrEqual(0);
+  });
+
+  it('stays shown until the transcript can reach the band above it', () => {
+    // The transcript rises into that band once it scrolls past the bar's own
+    // height. Short of that the band is empty, and a hidden bar leaves one too.
+    expect(titleBarOffsetPx({ ...elsewhere, chromeOffset: -headerHeight, threadScrollTop: 0 })).toBe(0);
+    expect(titleBarOffsetPx({ ...elsewhere, chromeOffset: -headerHeight, threadScrollTop: titleBarHeight })).toBe(0);
+    expect(titleBarOffsetPx({ ...elsewhere, chromeOffset: -headerHeight, threadScrollTop: titleBarHeight + 1 })).toBe(-chrome);
+  });
+
+  it('stays shown whenever the header is shown', () => {
+    expect(titleBarOffsetPx({ ...elsewhere, chromeOffset: 0, threadScrollTop: 500 })).toBe(0);
+  });
+
+  it('is bound from the thread pane, not from the current pane', () => {
+    expect(hookSource).toMatch(
+      /const nextTitleBar = document\.querySelector<HTMLElement>\(`\$\{SCROLL_SELECTORS\.thread\} \.mobile-thread-title-row`\)/,
+    );
+    expect(hookSource).not.toMatch(/container\?\.querySelector\('\.mobile-thread-title-row'\)/);
+  });
+
+  it('lands a freshly bound title bar instead of gliding it from its resting place', () => {
+    expect(hookSource).toMatch(/titleBarFresh = el !== null;/);
+    expect(hookSource).toMatch(/if \(titleBarEl && titleBarFresh\) landWithoutGlide\(titleBarEl\);/);
+  });
+
+  it('re-applies the offset when the title bar resizes', () => {
+    // A title that wraps while away would otherwise peek out by the difference.
+    expect(hookSource).toMatch(
+      /new ResizeObserver\(\(\) => \{\s*updateTitleBarHeightVar\(\);\s*applyTransform\(\);\s*\}\)/,
+    );
+  });
+});
+
 describe('promptOffsetPx (dynamic bars)', () => {
   const promptHeight = 80;
   const far = 10_000;
+  const onPane = { onThreadPane: true, chromeOffset: 0, promptHeight };
+  const elsewhere = { onThreadPane: false, away: false, promptHeight };
+  const hookSource = readFileSync(
+    resolve(dirname(fileURLToPath(import.meta.url)), 'useHideOnScroll.ts'),
+    'utf8',
+  );
 
   it('moves the prompt its whole height away, or not at all', () => {
-    expect(promptOffsetPx({ away: true, promptHeight, distanceToBottom: far })).toBe(promptHeight);
-    expect(promptOffsetPx({ away: false, promptHeight, distanceToBottom: far })).toBe(0);
+    expect(promptOffsetPx({ ...onPane, away: true, distanceToBottom: far })).toBe(promptHeight);
+    expect(promptOffsetPx({ ...onPane, away: false, distanceToBottom: far })).toBe(0);
+  });
+
+  it('follows the reader on its own pane, even where the header stays shown', () => {
+    // Near the top the header stays shown, but the prompt has no empty band there.
+    expect(promptOffsetPx({ ...onPane, away: true, chromeOffset: 0, distanceToBottom: far })).toBe(promptHeight);
   });
 
   it('keeps it shown within its own height of the bottom, whoever put the reader there', () => {
-    expect(promptOffsetPx({ away: true, promptHeight, distanceToBottom: promptHeight })).toBe(0);
-    expect(promptOffsetPx({ away: true, promptHeight, distanceToBottom: 0 })).toBe(0);
-    expect(promptOffsetPx({ away: true, promptHeight, distanceToBottom: promptHeight + 1 })).toBe(promptHeight);
+    expect(promptOffsetPx({ ...onPane, away: true, distanceToBottom: promptHeight })).toBe(0);
+    expect(promptOffsetPx({ ...onPane, away: true, distanceToBottom: 0 })).toBe(0);
+    expect(promptOffsetPx({ ...onPane, away: true, distanceToBottom: promptHeight + 1 })).toBe(promptHeight);
+  });
+
+  it('goes away with the header on another pane, so the two glide back together', () => {
+    expect(promptOffsetPx({ ...elsewhere, chromeOffset: -110, distanceToBottom: far })).toBe(promptHeight);
+    expect(promptOffsetPx({ ...elsewhere, chromeOffset: 0, distanceToBottom: far })).toBe(0);
+  });
+
+  it('ignores the intent off its pane, which belongs to the current pane', () => {
+    expect(promptOffsetPx({ ...elsewhere, away: true, chromeOffset: 0, distanceToBottom: far })).toBe(0);
+  });
+
+  it('stays shown off its pane over a transcript at its live edge', () => {
+    // Away there, a swipe back would show the empty band it rests over.
+    expect(promptOffsetPx({ ...elsewhere, chromeOffset: -110, distanceToBottom: promptHeight })).toBe(0);
+  });
+
+  it('measures the thread transcript, not the current pane, while off its pane', () => {
+    expect(hookSource).toMatch(/threadScroller = document\.querySelector\(SCROLL_SELECTORS\.thread\)/);
+    expect(hookSource).toMatch(
+      /if \(!onThreadPane && offset < 0\) \{\s*threadScrollTop = threadScroller \? clampedScrollTop\(threadScroller\) : 0;\s*threadDistanceToBottom = threadScroller \? distanceToBottom\(threadScroller, threadScrollTop\) : 0;/,
+    );
+  });
+
+  it('binds the down chevron from the thread pane, so it rides the prompt on every pane', () => {
+    expect(hookSource).toMatch(/threadScroller\?\.parentElement\?\.querySelector\(':scope > \.scroll-to-bottom'\)/);
   });
 });
 
@@ -89,6 +215,23 @@ describe('countsAsReaderScroll (dynamic bars)', () => {
   it('re-bases for every write of ours, and while a deep link pins the header', () => {
     expect(countsAsReaderScroll({ navigation: true, headerPinned: false })).toBe(false);
     expect(countsAsReaderScroll({ navigation: false, headerPinned: true })).toBe(false);
+  });
+});
+
+describe('revealsBars (dynamic bars)', () => {
+  it('brings the bars back for a write that takes the reader somewhere', () => {
+    expect(revealsBars({ kind: 'placement', moved: true })).toBe(true);
+    expect(revealsBars({ kind: 'held', moved: true })).toBe(true);
+  });
+
+  it('leaves them for an anchor write and the follow carrying a reply', () => {
+    expect(revealsBars({ kind: 'anchor', moved: true })).toBe(false);
+    expect(revealsBars({ kind: 'carry', moved: true })).toBe(false);
+  });
+
+  it('leaves them for a write that moved nothing, like a tap focusing a control', () => {
+    expect(revealsBars({ kind: 'placement', moved: false })).toBe(false);
+    expect(revealsBars({ kind: 'held', moved: false })).toBe(false);
   });
 });
 
@@ -181,8 +324,14 @@ describe('--mobile-header-offset stays off the document root', () => {
     expect(hookSource.match(/holdAcrossRelayout\(currentContainer/g) ?? []).toHaveLength(2);
   });
 
-  it('re-takes its baseline at the anchor write, not on the scroll event', () => {
-    expect(hookSource).toMatch(/onRebasedScroll\(\(el\) => \{[\s\S]*prevScrollTop = clampedScrollTop\(el\)/);
+  it('re-takes its baseline at every write of ours, not on the scroll event', () => {
+    expect(hookSource).toMatch(/onRebasedScroll\(\(el, kind\) => \{[\s\S]*prevScrollTop = clampedScrollTop\(el\)/);
+  });
+
+  it('decides the bars at the write, from its kind', () => {
+    expect(hookSource).toMatch(
+      /onRebasedScroll\(\(el, kind\) => \{[\s\S]*?const moved = Math\.abs\(top - prevScrollTop\) > 1;\s*prevScrollTop = top;[\s\S]*?if \(revealsBars\(\{ kind, moved \}\)\) \{\s*revealBars\(\);/,
+    );
   });
 
   it('re-takes it again on the settling frame, and cancels that frame on teardown', () => {
@@ -214,13 +363,25 @@ describe('the dynamic bars glide on a compositor transition', () => {
   const inputCss = read('../styles/chat/input-messages.css');
   const GLIDE = /translate var\(--bars-glide-duration, 0s\) ease/;
 
-  /** The `transition` value of the first rule whose selector ends in `selector`. */
-  function transitionOf(css: string, selector: string): string {
+  /** The `property` value of the first rule whose selector ends in `selector`. */
+  function declarationOf(css: string, selector: string, property: string): string {
     const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const rule = new RegExp(`${escaped}\\s*\\{([^}]*)\\}`).exec(css);
     expect(rule, `no rule for ${selector}`).not.toBeNull();
-    return /transition:([^;]*);/.exec(rule![1])?.[1] ?? '';
+    return new RegExp(`(?:^|[;\\s])${property}:([^;]*);`).exec(rule![1])?.[1] ?? '';
   }
+  const transitionOf = (css: string, selector: string) => declarationOf(css, selector, 'transition');
+
+  it('gives every bar its layer from the start, the prompt included', () => {
+    // Without one, WebKit builds the layer as the glide begins and drops a frame.
+    for (const selector of [
+      '.app-header',
+      '.mobile-swipe-pane .mobile-thread-title-row',
+      ':root[data-mobile-dynamic-bars] .thread-pane:not(.compose-empty) .prompt-area',
+    ]) {
+      expect(declarationOf(mobileCss, selector, 'will-change').trim()).toBe('translate');
+    }
+  });
 
   it('gives every bar the glide on `translate`', () => {
     expect(transitionOf(mobileCss, '.app-header')).toMatch(GLIDE);
@@ -347,14 +508,20 @@ function createScrollTracker(
     viewScrollTop = prevScrollTop;
   }
 
-  /** The app re-based the container without taking the reader anywhere, by an
-   *  anchor or carry write (`onRebasedScroll`). Re-take the baseline at the write, so the scroll event
-   *  it fires carries a delta of zero whenever it lands, and stamp the position
-   *  so the navigation path can recognise that event too. */
-  function rebase(scrollTop: number, scrollHeight: number, clientHeight: number) {
+  /** One of our own writes moved the container (`onRebasedScroll`). Re-take
+   *  the baseline at the write, so the scroll event it fires carries a delta of
+   *  zero whenever it lands. Stamp the position so the navigation path can
+   *  recognise that event too. A placement or held write also reveals. */
+  function rebase(scrollTop: number, scrollHeight: number, clientHeight: number, kind: NavScrollKind = 'carry') {
     const maxScroll = Math.max(0, scrollHeight - clientHeight);
-    prevScrollTop = Math.min(Math.max(0, scrollTop), maxScroll);
-    rebasedTop = prevScrollTop;
+    const top = Math.min(Math.max(0, scrollTop), maxScroll);
+    const moved = Math.abs(top - prevScrollTop) > 1;
+    prevScrollTop = top;
+    rebasedTop = top;
+    if (revealsBars({ kind, moved })) {
+      intent = BARS_SHOWN;
+      viewScrollTop = top;
+    }
   }
 
   /** The keyboard closed: the reader was just typing, so the bars return. */
@@ -600,6 +767,45 @@ describe('useHideOnScroll during one of our own navigations', () => {
     // User scrolls up then down — header hides on down scroll
     tracker.applyScrollDelta(1470, 2000, 500);
     tracker.applyScrollDelta(1500, 2000, 500);
+    expect(tracker.headerOffset).toBe(-48);
+  });
+});
+
+describe('useHideOnScroll as a thread opens at its saved place', () => {
+  // The transcript container is reused across threads. Opening one writes its
+  // saved place, often thousands of pixels from where the last thread sat. On
+  // an iPhone that heavy render delivers the write's scroll event after the
+  // navigation window, so the event alone reads as the reader scrolling down.
+  it('keeps the bars shown however late the placement event lands', () => {
+    const tracker = createScrollTracker(() => null);
+    tracker.switchContainer(100);
+    tracker.rebase(2500, 4000, 800, 'placement');
+    tracker.applyScrollDelta(2500, 4000, 800);
+    expect(tracker.headerOffset).toBe(0);
+  });
+
+  it('brings away bars back at the write', () => {
+    const tracker = createScrollTracker(() => null);
+    tracker.switchContainer(0);
+    tracker.applyScrollDelta(300, 4000, 800);
+    expect(tracker.headerOffset).toBe(-48);
+    tracker.rebase(2500, 4000, 800, 'placement');
+    expect(tracker.headerOffset).toBe(0);
+  });
+
+  it('keeps away bars away when a tap focuses a control already on screen', () => {
+    const tracker = createScrollTracker(() => null);
+    tracker.switchContainer(0);
+    tracker.applyScrollDelta(300, 4000, 800);
+    tracker.rebase(300, 4000, 800, 'placement');
+    expect(tracker.headerOffset).toBe(-48);
+  });
+
+  it("measures the reader's next scroll from the placement", () => {
+    const tracker = createScrollTracker(() => null);
+    tracker.switchContainer(100);
+    tracker.rebase(2500, 4000, 800, 'held');
+    tracker.applyScrollDelta(2530, 4000, 800);
     expect(tracker.headerOffset).toBe(-48);
   });
 });

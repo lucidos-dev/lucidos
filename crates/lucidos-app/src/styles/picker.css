@@ -1042,7 +1042,7 @@
    the workspace rows above them. Shrink-to-fit is a desktop affordance here;
    at this width the shell IS the column, so anything narrower reads as
    unfinished. */
-@media (max-width: 768px) {
+@media (--phone-layout) {
   .ws-picker-footer-actions {
     flex-direction: column;
     align-items: stretch;
@@ -1213,7 +1213,7 @@
    first: this is where a new phone lands after the gateway redirects it. */
 
 /* The gate scrolls itself, the way `.ws-picker` above does. `mobile.css` sets
-   `html { overflow: hidden }` under 768px, to hold the composer still when the
+   `html { overflow: hidden }` on the phone layout, to hold the composer still when the
    iOS keyboard opens, so a phone document does not scroll at all. A gate
    leaning on document scroll is therefore simply clipped, and the install
    recipe is the tallest thing it draws.
@@ -1227,9 +1227,9 @@
   inset: 0;
   display: flex;
   overflow-y: auto;
-  padding: calc(1.5rem + env(safe-area-inset-top, 0px))
-    calc(1.5rem + env(safe-area-inset-right, 0px)) calc(1.5rem + env(safe-area-inset-bottom, 0px))
-    calc(1.5rem + env(safe-area-inset-left, 0px));
+  padding: calc(1.5rem + var(--safe-area-top))
+    calc(1.5rem + var(--safe-area-right)) calc(1.5rem + var(--safe-area-bottom))
+    calc(1.5rem + var(--safe-area-left));
 }
 
 /* A column on the page, not a card. Nothing shares this screen, so a border
@@ -1278,13 +1278,10 @@
   opacity: 0.7;
 }
 
+/* Box and focus: global/text-input.css. */
 .pairing-input {
   padding: 0.625rem 0.75rem;
   margin-bottom: 0.5rem;
-  border: 1px solid var(--border-color);
-  border-radius: var(--radius-control);
-  background: var(--bg-secondary);
-  color: var(--text-primary);
   /* 1rem, so iOS Safari does not zoom the page when the field takes focus. */
   font-size: var(--font-size-xl);
 }

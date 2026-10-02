@@ -25,12 +25,16 @@
 use serde::Deserialize;
 use serde_json::Value;
 use std::io::Read;
+use std::path::{Component, Path};
 
 use crate::workspace::BoxError;
 
 #[derive(Debug, Deserialize)]
 struct HookPayload {
     tool_input: Value,
+    /// The session's working directory, which Claude Code sends on every hook.
+    #[serde(default)]
+    cwd: Option<String>,
 }
 
 /// Parse `"[N]"` or `"[N, M]"` (with arbitrary whitespace). Returns
@@ -99,11 +103,38 @@ pub(crate) fn coerce(mut input: Value) -> (Value, bool) {
     (input, mutated)
 }
 
-pub(crate) fn build_hook_output(coerced_input: &Value) -> String {
+/// The permission decision that carries the corrected input.
+///
+/// `allow` skips Claude Code's own permission check, so it is only safe for
+/// a read Claude Code would have allowed anyway: one inside the working
+/// directory. Anything else gets `ask`. Otherwise a string `offset` would read
+/// any file on the machine with no card, which a prompt injection can send.
+fn permission_decision(input: &Value, cwd: Option<&str>) -> &'static str {
+    let inside = match (input.get("file_path").and_then(Value::as_str), cwd) {
+        (Some(file), Some(cwd)) => path_is_inside(Path::new(file), Path::new(cwd)),
+        _ => false,
+    };
+    if inside {
+        "allow"
+    } else {
+        "ask"
+    }
+}
+
+/// Is `path` lexically under `root`? A `..` anywhere answers no, because a
+/// lexical prefix test cannot see where it leads.
+fn path_is_inside(path: &Path, root: &Path) -> bool {
+    let full = root.join(path);
+    root.is_absolute()
+        && !full.components().any(|c| c == Component::ParentDir)
+        && full.starts_with(root)
+}
+
+pub(crate) fn build_hook_output(coerced_input: &Value, cwd: Option<&str>) -> String {
     serde_json::json!({
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
-            "permissionDecision": "allow",
+            "permissionDecision": permission_decision(coerced_input, cwd),
             "updatedInput": coerced_input,
         }
     })
@@ -125,7 +156,7 @@ pub(crate) fn run() -> Result<(), BoxError> {
     };
     let (coerced, mutated) = coerce(payload.tool_input);
     if mutated {
-        println!("{}", build_hook_output(&coerced));
+        println!("{}", build_hook_output(&coerced, payload.cwd.as_deref()));
     }
     Ok(())
 }
@@ -214,11 +245,34 @@ mod tests {
     #[test]
     fn build_hook_output_uses_documented_envelope() {
         let coerced = json!({"file_path": "/tmp/x", "offset": 16384});
-        let out = build_hook_output(&coerced);
+        let out = build_hook_output(&coerced, Some("/tmp"));
         let parsed: Value = serde_json::from_str(&out).expect("valid JSON");
         assert_eq!(parsed["hookSpecificOutput"]["hookEventName"], "PreToolUse");
         assert_eq!(parsed["hookSpecificOutput"]["permissionDecision"], "allow");
         assert_eq!(parsed["hookSpecificOutput"]["updatedInput"], coerced);
+    }
+
+    #[test]
+    fn a_coerced_read_outside_the_working_directory_asks() {
+        // `allow` skips the permission card, so fixing a type must not also
+        // approve a read the session would have been asked about.
+        let decision = |file: &str, cwd: Option<&str>| {
+            let input = json!({"file_path": file, "offset": 1});
+            let out: Value = serde_json::from_str(&build_hook_output(&input, cwd)).unwrap();
+            out["hookSpecificOutput"]["permissionDecision"].clone()
+        };
+        assert_eq!(decision("/home/u/.ssh/id_rsa", Some("/home/u/wt")), "ask");
+        assert_eq!(
+            decision("/home/u/wt/../.ssh/id_rsa", Some("/home/u/wt")),
+            "ask"
+        );
+        assert_eq!(decision("/home/u/wtx/notes.md", Some("/home/u/wt")), "ask");
+        assert_eq!(decision("/home/u/wt/src/main.rs", None), "ask");
+        assert_eq!(
+            decision("/home/u/wt/src/main.rs", Some("/home/u/wt")),
+            "allow"
+        );
+        assert_eq!(decision("src/main.rs", Some("/home/u/wt")), "allow");
     }
 
     #[test]
@@ -311,7 +365,7 @@ mod tests {
         let (coerced, mutated) = coerce(raw);
         assert!(mutated);
         let envelope: Value =
-            serde_json::from_str(&build_hook_output(&coerced)).expect("valid JSON");
+            serde_json::from_str(&build_hook_output(&coerced, Some("/x"))).expect("valid JSON");
         assert!(
             envelope["hookSpecificOutput"]["updatedInput"]["offset"].is_number(),
             "envelope.updatedInput.offset must be a JSON number — that is the whole point of this hook",

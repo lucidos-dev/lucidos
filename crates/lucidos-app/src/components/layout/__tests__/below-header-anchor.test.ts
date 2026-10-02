@@ -97,17 +97,17 @@ describe('below-header anchor (--app-header-bottom)', () => {
 
   it('the desktop drawer backdrop shares the anchor instead of restating it', () => {
     expect(decl(block(mobileCss, '.drawer-backdrop {'), 'top')).toBe('var(--app-header-bottom)');
-    const desktop = block(mobileCss, '@media (min-width: 769px)');
+    const desktop = block(mobileCss, '@media (--desktop-layout)');
     expect(decl(block(desktop, '.drawer-backdrop {'), 'top')).toBeNull();
   });
 
   it('the mobile layout redefines the anchor from its measured header height', () => {
     // The mobile header is fixed at the viewport top (it overlays the title-bar
     // band rather than sitting below it), so the anchor is its own height,
-    // measured live by useHideOnScroll. Must be redefined at the same 768px line
+    // measured live by useHideOnScroll. Must be redefined at the phone layout line
     // the mobile header layout switches at, not the 600px cosmetic breakpoint.
     const mobileRoot = decl(
-      block(block(mobileCss, '@media (max-width: 768px)'), ':root'),
+      block(block(mobileCss, '@media (--phone-layout)'), ':root'),
       '--app-header-bottom',
     );
     expect(mobileRoot).toContain('var(--mobile-header-height');

@@ -233,14 +233,16 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   pid recycling.** The function (`runtime/spawn_env.rs`) signals a process
   *group* (`-pid`), sleeps the grace, then signals again — and a fresh reviewer
   may worry the pid (= pgid) could be recycled during the `sleep().await` and
-  the second signal hit an unrelated group. It can't, at the one call site
-  (`claude_code.rs` `driver_task` teardown): the call is gated by
-  `if !child_reaped`, and the `tokio::process::Child` handle is held on the
-  stack across the whole grace — `child.wait()`/`try_wait()` run only *after*
-  the function returns. The group leader (the engine's direct child) therefore
+  the second signal hit an unrelated group. It can't: every call site gates on
+  an unreaped child (`if !child_reaped` in the CC and Codex drivers, `Child::id()`
+  in `McpClient::shutdown`). The `tokio::process::Child` handle is held across
+  the whole grace, and `child.wait()`/`try_wait()` run only *after* the
+  function returns. The group leader (the engine's direct child) therefore
   stays an unreaped zombie for the entire grace, so its pid cannot be recycled
-  before the SIGKILL. Re-flag only if a caller starts reaping the child before
-  or during the call. (`runtime/spawn_env.rs`, `runtime/claude_code.rs`.)
+  before the SIGKILL.
+
+  Re-flag only if a caller starts reaping the child before or during the call.
+  (`runtime/spawn_env.rs`, `runtime/claude_code.rs`, `mcp/client.rs`.)
 
 - **The API-drop auto-resume cannot reset its own budget, so it cannot loop
   forever.** `api_error_auto_resumes_spent` (`agent_session/resume.rs`) counts
@@ -801,8 +803,9 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   spawned server is orphaned. Codex flagged exactly this on the branch that
   made a failed `tools/list` fail the connect.
 
-  `impl Drop for McpClient` calls `child.start_kill()`, so every abandoned
-  client SIGKILLs its process, and tokio's orphan reaper collects it. That is
+  `impl Drop for McpClient` SIGKILLs the server's whole process group, so every
+  abandoned client takes its descendants with it. Tokio's orphan reaper then
+  collects the server. That is
   the whole reason `shutdown` exists as a separate method: it is the *graceful*
   path, which also waits, not the only path that kills. Pinned by
   `a_failed_tools_list_is_a_start_failure_not_an_empty_server`, which blocks on
@@ -2710,12 +2713,14 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   press to rule on. A report of a real dead keyboard activation does it too.
 
 - **`useHideOnScroll`'s `rebasedTop` stamp has no explicit expiry, and must not
-  grow one.** A reviewer sees a stamp set on an anchor write and never
+  grow one.** A reviewer sees a stamp set on each of our writes and never
   `-1`-ed on a timer, and reads it as state that outlives its event: a later
   navigation landing at the same offset would be misread as the old anchor, so
   the header would stay hidden instead of revealing.
 
-  It cannot. The stamp is spent by POSITION, on any scroll event landing more
+  It cannot. A later navigation is itself a write of ours, so it re-stamps the
+  offset and reveals the bars at the write (`onRebasedScroll`). The stamp is
+  also spent by POSITION, on any scroll event landing more
   than a pixel away, and again when the container changes. A scroll event fires
   only when `scrollTop` actually changes. An event AT the stamped offset
   therefore means the container moved away and back inside one coalesced frame.

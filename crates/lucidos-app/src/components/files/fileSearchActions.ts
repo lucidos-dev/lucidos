@@ -1,12 +1,10 @@
 import { fileSearchOpen, fileSearchAnchor } from '../../store/store';
+import { holdSoftwareKeyboard } from '../../utils/softwareKeyboard';
 
-/** Open the file search modal and grab focus from the user-gesture call stack
- *  so iOS opens the keyboard. The real input only mounts after this render
- *  (the closed overlay renders a bare hidden shell with no input), so we focus
- *  a throwaway proxy input now to hold the keyboard open within the gesture
- *  window; the panel's own auto-focus takes over once Preact mounts the real
- *  input. (The `if (input)` fast-path stays as a harmless guard in case a real
- *  input is ever already present.)
+/** Open the file search modal, with the keyboard up on iOS. A closed modal
+ *  has no input yet, so `holdSoftwareKeyboard` keeps the keyboard until the
+ *  panel focuses it. An open one (the shortcut again) refocuses its own input.
+ *  Call it from the opening tap.
  *
  *  `anchor` is the toggle button that opened the modal; it's recorded so
  *  `<Overlay>` can exempt it from the outside-pointerdown dismiss. */
@@ -14,15 +12,8 @@ export function openFileSearch(anchor?: HTMLElement | null): void {
   fileSearchAnchor.value = anchor ?? null;
   fileSearchOpen.value = true;
   const input = document.querySelector<HTMLInputElement>('[data-role="file-search-input"]');
-  if (input) {
-    input.focus({ preventScroll: true });
-    return;
-  }
-  const proxy = document.createElement('input');
-  proxy.style.cssText = 'position:fixed;top:-9999px;left:0;opacity:0;width:1px;height:1px;';
-  document.body.appendChild(proxy);
-  proxy.focus({ preventScroll: true });
-  setTimeout(() => proxy.remove(), 500);
+  if (input) input.focus({ preventScroll: true });
+  else holdSoftwareKeyboard();
 }
 
 /** Close the file search modal. State (query, selection) lives in the modal's

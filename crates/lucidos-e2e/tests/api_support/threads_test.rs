@@ -156,6 +156,29 @@ async fn disk_usage_worktrees_returns_inventory_shape() {
     }
 }
 
+/// The summary says whether a recommended cleanup is running. That flag is
+/// how a reloaded page learns about a pass whose terminal event it missed.
+#[tokio::test]
+async fn disk_usage_summary_says_whether_a_cleanup_is_running() {
+    let client = user_client().await;
+    let url = format!("{}/api/v1/disk-usage/summary", base_url());
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .expect("Disk usage summary request failed");
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.expect("Invalid JSON");
+    assert!(
+        body["recommended_cleanup_running"].is_boolean(),
+        "recommended_cleanup_running is boolean: {body}"
+    );
+    assert!(
+        body["workspace_data_bytes"].is_u64(),
+        "workspace_data_bytes is integer"
+    );
+}
+
 /// The bulk cleanup route is mounted and refuses an unknown action before it
 /// touches anything. A real pass is not run here: it would reclaim worktrees
 /// other e2e tests share this workspace with.

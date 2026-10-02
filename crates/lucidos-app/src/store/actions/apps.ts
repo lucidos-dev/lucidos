@@ -183,10 +183,15 @@ export async function openAppById(
     const refreshed = appsList.value;
     if (refreshed.status === 'loaded') {
       app = refreshed.data.find((s) => s.id === appId);
-    } else if (refreshed.status === 'failed' && snapshot.status === 'loaded') {
+    } else {
       // Retry failed transiently — restore the prior loaded data so one bad
       // click doesn't strip cached apps from every other surface in the UI.
-      appsList.value = snapshot;
+      if (refreshed.status === 'failed' && snapshot.status === 'loaded') appsList.value = snapshot;
+      // The re-scan never answered, so only the stale cache says the app is
+      // missing. That is no verdict: say the check failed, not that it's gone.
+      const reason = refreshed.status === 'failed' ? `: ${refreshed.error}` : '';
+      showToast(`Couldn't open app "${appId}"${from}: the app list failed to reload${reason}`, 'error');
+      return;
     }
   }
   if (app) {

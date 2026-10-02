@@ -1,10 +1,14 @@
+import { userAgentDeviceLabel } from './deviceLabel';
+
 /**
  * What to call a device: the one rule every screen names a device by.
  *
  * The name someone typed on the Devices row wins. Then the pairing label, the
- * name the device got when it paired ("Safari on iPhone"). Only with neither is
- * it `device-` and the first eight characters of its id, never the whole id: a
- * 36-character uuid is unreadable, and as a row heading it wraps.
+ * name the device got when it paired ("Safari on iPhone"). Then the browser and
+ * machine its user-agent names, with the short id so two alike stay apart
+ * ("Chrome on Mac (109371a3)"). Last it is `device-` and the first eight
+ * characters of its id, never the whole id: a 36-character uuid is unreadable,
+ * and as a row heading it wraps.
  *
  * The engine's `friendly_device_name` applies the same order, so the agent and
  * every screen agree. Never build a device name anywhere else;
@@ -17,11 +21,16 @@ export interface DeviceNameSources {
   name?: string | null;
   /** The pairing label: the gateway's when it answered, else the engine's copy. */
   pairingLabel?: string | null;
+  /** The user-agent the device registered with, from the engine's device row. */
+  userAgent?: string | null;
 }
 
-export function deviceFriendlyName({ id, name, pairingLabel }: DeviceNameSources): string {
+export function deviceFriendlyName({ id, name, pairingLabel, userAgent }: DeviceNameSources): string {
   const chosen = [name, pairingLabel].find((n) => n != null && n.trim() !== '');
-  return chosen ?? `device-${id.slice(0, 8)}`;
+  if (chosen) return chosen;
+  const short = id.slice(0, 8);
+  const fromUserAgent = userAgentDeviceLabel(userAgent);
+  return fromUserAgent ? `${fromUserAgent} (${short})` : `device-${short}`;
 }
 
 /**
@@ -35,12 +44,13 @@ export function deviceFriendlyName({ id, name, pairingLabel }: DeviceNameSources
  */
 export function deviceName(
   id: string,
-  device?: { name: string | null; pairing_label: string | null },
+  device?: { name: string | null; pairing_label: string | null; user_agent?: string | null },
   paired?: { label: string },
 ): string {
   return deviceFriendlyName({
     id,
     name: device?.name,
     pairingLabel: paired?.label || device?.pairing_label,
+    userAgent: device?.user_agent,
   });
 }

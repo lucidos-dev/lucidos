@@ -54,7 +54,7 @@
     z-index: var(--z-app-fullscreen);
     background: var(--bg-primary);
     height: auto;
-    padding: env(safe-area-inset-top, 0px) env(safe-area-inset-right, 0px) env(safe-area-inset-bottom, 0px) env(safe-area-inset-left, 0px);
+    padding: var(--safe-area-top) var(--safe-area-right) var(--safe-area-bottom) var(--safe-area-left);
 }
 
 /* Native fullscreen (the Fullscreen API path). It is requested on this panel
@@ -86,8 +86,8 @@
 
 .pseudo-fullscreen-exit {
     position: absolute;
-    top: calc(env(safe-area-inset-top, 0px) + 0.5rem);
-    right: calc(env(safe-area-inset-right, 0px) + 0.5rem);
+    top: calc(var(--safe-area-top) + 0.5rem);
+    right: calc(var(--safe-area-right) + 0.5rem);
     /* Above the `.edge-swipe-zone` guards this overlay also carries, which
        rank 1: the right strip is 1.25rem wide and the button sits 0.5rem in,
        so they overlap. At equal z-index the winner would be whichever renders
@@ -393,6 +393,7 @@
     min-width: 7.5ch;
 }
 
+/* Box and focus: global/text-input.css. */
 .file-editor-textarea {
     flex: 1;
     width: 100%;
@@ -403,15 +404,6 @@
     line-height: 1.5;
     tab-size: 2;
     padding: 0.5rem 0.625rem;
-    background: var(--bg-primary);
-    border: 1px solid var(--border-color);
-    border-radius: calc(var(--radius-control) * 0.75);
-    color: var(--text-primary);
-    outline: none;
-}
-
-.file-editor-textarea:focus {
-    border-color: var(--accent);
 }
 
 /* --- Slides preview (.slides files) --- */
@@ -850,11 +842,6 @@
     padding: 0.125rem 0.5rem;
     font-size: var(--font-size-sm);
     font-family: var(--font-ui);
-    background: var(--bg-primary);
-    border: 1px solid var(--accent);
-    border-radius: calc(var(--radius-control) * 0.5);
-    color: var(--text-primary);
-    outline: none;
 }
 
 
@@ -866,11 +853,17 @@
        (chat/input-messages.css `.prompt-row .prompt-textarea`). */
     border: var(--prompt-box-border-width) solid color-mix(in srgb, var(--border-color) 50%, transparent);
     border-radius: calc(var(--radius-surface) * 4 / 3);
-    transition: border-color var(--duration-emphasis) ease;
+    transition: border-color var(--duration-emphasis) ease, box-shadow var(--duration-normal);
 }
 
+/* The text-input focus (global/text-input.css): the shared --focus-ring glow
+   alone. The border goes transparent but keeps its width, so the composer's
+   text stays on the card content edge. The transparent outline is the
+   forced-colors fallback. */
 .prompt-box:focus-within {
-    border-color: var(--accent);
+    border-color: transparent;
+    outline: 0.125rem solid transparent;
+    box-shadow: var(--focus-ring);
 }
 
 /* The shared shell of the two .prompt-box surfaces: the chat composer and the
@@ -941,8 +934,8 @@
    which let "Model", "Effort" and "Repository" each set a different value
    offset and left the value column visibly ragged.
 
-   `display: contents` on a row lets its label + value join the section's grid
-   (same idiom as `.thread-info-rows` in host-components.css). A row therefore
+   `display: contents` on a row lets its label + value join the section's
+   grid. A row therefore
    contributes EXACTLY two grid items: a third would push every row below it one
    cell along, so a multi-part value brings its own `.route-value-group` box
    rather than adding a sibling. Pinned by MessageRoutePanel.test.ts. Anything
@@ -1075,4 +1068,19 @@
     font-size: var(--font-size-sm);
     color: var(--text-muted);
     line-height: 1.4;
+}
+
+/* Technical details: the ids and machine names, folded at the foot of a
+   section. Its rows are `.route-row`s too, so the fold body gives them the
+   same two-column grid the section does. */
+.message-route-panel .route-technical {
+    margin-top: var(--space-sm);
+}
+
+.message-route-panel .route-technical .event-row-fold-body {
+    display: grid;
+    grid-template-columns: max-content minmax(0, 1fr);
+    align-items: baseline;
+    column-gap: var(--space-sm);
+    row-gap: 0.125rem;
 }

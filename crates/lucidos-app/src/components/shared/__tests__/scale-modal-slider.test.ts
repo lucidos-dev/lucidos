@@ -1,7 +1,9 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { preferences } from '../../../store/store';
-import { setPreference } from '../../../api/client';
-import { UI_SCALE_MAX, UI_SCALE_STEP } from '../../../store/actions/preferences';
+import { getPreferences, setPreference } from '../../../api/client';
+import {
+  UI_SCALE_MAX, UI_SCALE_STEP, loadPreferences, _resetPendingPreferenceWritesForTesting,
+} from '../../../store/actions/preferences';
 import {
   scaleModalOpen,
   previewScale,
@@ -23,6 +25,7 @@ import {
 vi.mock('../../../api/client', () => ({
   getPreferences: vi.fn(),
   setPreference: vi.fn().mockResolvedValue(undefined),
+  retryTransientRead: (read: () => Promise<unknown>) => read(),
   isTransientFetchError: (err: unknown) => err instanceof DOMException
     && (err.name === 'AbortError' || err.name === 'TimeoutError'),
 }));
@@ -203,6 +206,69 @@ describe('scale write coalescing', () => {
     dismissScaleModal();
     await settle();
     expect(setPreferenceMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+/**
+ * Regression: a zoom step forwarded out of an app frame snapped back, then
+ * reached its scale 500 ms later. The panel took focus from the frame, and the
+ * window `focus` ran the resume sync. Its `loadPreferences` painted the engine's
+ * scale over the one the debounced save had not sent yet. Any refetch in that
+ * window did the same.
+ */
+describe('a preferences refetch keeps the scale on screen', () => {
+  const settle = () => Promise.resolve().then(() => {}).then(() => {});
+  const getPreferencesMock = vi.mocked(getPreferences);
+
+  beforeEach(() => {
+    _resetScaleTimersForTesting();
+    _resetPendingPreferenceWritesForTesting();
+    setPreferenceMock.mockClear();
+    vi.useFakeTimers();
+    preferences.value = { status: 'loaded', data: { 'ui-scale': '100' } };
+    getPreferencesMock.mockResolvedValue({ preferences: { 'ui-scale': '100' } });
+    scaleModalOpen.value = false;
+    previewScale.value = 100;
+  });
+
+  afterEach(() => {
+    _resetScaleTimersForTesting();
+    _resetPendingPreferenceWritesForTesting();
+    vi.useRealTimers();
+  });
+
+  it('while the save waits out its debounce', async () => {
+    adjustUiScale(UI_SCALE_STEP);
+    await loadPreferences();
+    expect(localStorage.getItem('lucidos-ui-scale')).toBe('112.5');
+  });
+
+  it('while the save is in flight', async () => {
+    let accept: () => void = () => {};
+    setPreferenceMock.mockImplementationOnce(() => new Promise((resolve) => {
+      accept = () => resolve({ success: true });
+    }));
+    adjustUiScale(UI_SCALE_STEP);
+    vi.advanceTimersByTime(500);
+    await settle();
+    expect(setPreferenceMock).toHaveBeenCalledTimes(1);
+
+    await loadPreferences();
+    expect(localStorage.getItem('lucidos-ui-scale')).toBe('112.5');
+
+    // Accepted, so the engine's answer is the truth again: another device may
+    // change the scale after this one.
+    accept();
+    await settle();
+    await loadPreferences();
+    expect(localStorage.getItem('lucidos-ui-scale')).toBe('100');
+  });
+
+  it('but a cancelled step lets the stored scale back', async () => {
+    adjustUiScale(UI_SCALE_STEP);
+    closeScaleModal();
+    await loadPreferences();
+    expect(localStorage.getItem('lucidos-ui-scale')).toBe('100');
   });
 });
 

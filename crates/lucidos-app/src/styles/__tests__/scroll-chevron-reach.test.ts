@@ -77,7 +77,7 @@ describe('the scroll chevrons reach past their circle on touch', () => {
     expect(rule(chevronCss, REACH, TOUCH).has('z-index')).toBe(false);
     expect(rule(chevronCss, '.scroll-to-top, .scroll-to-bottom').get('z-index')).toBe('calc(var(--z-float) + 1)');
     const zFloat = Number(rule(baseCss, ':root').get('--z-float'));
-    const transcriptZ = Number(rule(mobileCss, '.mobile-swipe-pane .thread-content', '@media (max-width: 768px)').get('z-index'));
+    const transcriptZ = Number(rule(mobileCss, '.mobile-swipe-pane .thread-content', '@media (--phone-layout)').get('z-index'));
     expect(zFloat + 1).toBeGreaterThan(transcriptZ);
   });
 
@@ -85,7 +85,7 @@ describe('the scroll chevrons reach past their circle on touch', () => {
     // The up chevron sits a gap below the title bar and the down chevron a gap
     // above the composer. A longer reach would take their taps.
     const downGap = rem(rule(chevronCss, '.scroll-to-bottom').get('bottom'));
-    const upTop = rule(mobileCss, '.mobile-swipe-pane .scroll-to-top', '@media (max-width: 768px)').get('top') ?? '';
+    const upTop = rule(mobileCss, '.mobile-swipe-pane .scroll-to-top', '@media (--phone-layout)').get('top') ?? '';
     const upGap = rem(/\+ ([\d.]+rem)\)$/.exec(upTop)?.[1]);
     expect(reach()).toBeLessThanOrEqual(downGap);
     expect(reach()).toBeLessThanOrEqual(upGap);

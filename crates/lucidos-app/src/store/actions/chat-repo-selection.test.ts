@@ -72,7 +72,7 @@ import {
   type Scope,
 } from '../store';
 import { composeDraftContextName, LUCIDOS_SOURCE_REPO_NAME } from '../composeDestination';
-import { threadContextName } from '../../components/drawer/threadRowInfo';
+import { threadContextName } from '../../components/drawer/threadContextName';
 import { sendMessage } from './chat';
 import { sendCompose } from './compose';
 import { patchComposeSelection, _resetComposeSelectionsForTesting } from '../composeSelections';
@@ -379,8 +379,7 @@ describe('promotion keeps the destination chip the draft was already showing', (
     expect(draftChip).toBe('habit-tracker');
     expect(chipAfterSend(draftId)).toBe(draftChip);
     // The app id names a folder, not a repository. Writing it to repoName would
-    // make the chip right by accident and the Info row's "Repository" wrong on
-    // purpose.
+    // make the chip right only by accident.
     expect(threadMap.value.get(draftId)!.meta.repoName).toBeUndefined();
   });
 

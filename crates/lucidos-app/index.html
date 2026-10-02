@@ -42,6 +42,37 @@
     <link rel="apple-touch-startup-image" media="(device-width: 430px) and (device-height: 932px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" href="splash/splash-1290x2796.png">
     <link rel="apple-touch-startup-image" media="(device-width: 440px) and (device-height: 956px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" href="splash/splash-1320x2868.png">
     <!--
+      History bounce: the installed iOS app never rests on a page it reached by
+      going back. It steps forward again, onto the page the user was on.
+
+      Every iOS notification tap loads a new document, so the page before it
+      stays one entry back (temporary measure "Cross-document notification-tap
+      reload on iOS"). A swipe from the left edge is iOS's back gesture, and the
+      edge guard cannot catch every touch (`utils/documentNavigation.ts`). Without
+      this step, a stray swipe strands the user on that stale page's boot splash.
+
+      `navigator.standalone` is true only in a Safari web app (an iOS home-screen
+      app, or a macOS Dock one). Neither can leave by going back, and every back
+      target is a stale Lucidos page. A browser tab and an Android install keep
+      their back. The flag stands the picker's cold-start redirect down, which
+      would otherwise replace the pending step.
+    -->
+    <script>
+      (function () {
+        try {
+          if (navigator.standalone !== true) return;
+          var bounce = function () {
+            if (window.navigation && !window.navigation.canGoForward) return;
+            window.lucidosHistoryBounce = true;
+            history.forward();
+          };
+          var entry = performance.getEntriesByType('navigation')[0];
+          if (entry && entry.type === 'back_forward') bounce();
+          addEventListener('pageshow', function (e) { if (e.persisted) bounce(); });
+        } catch (e) { /* a missing API leaves the page where it is */ }
+      })();
+    </script>
+    <!--
       PWA cold-start fast path (the load-bearing smoothness fix). When the picker
       (server-stamped <base href="/~/">) would auto-open the last workspace, do the
       redirect HERE — in <head>, before the bundle loads and before anything
@@ -74,6 +105,7 @@
         try {
           var base = document.querySelector('base');
           if (!base || base.getAttribute('href') !== '/~/') return;
+          if (window.lucidosHistoryBounce) return;
           // The pairing screen is the picker document, served in place at the
           // url asked for (gateway `serve_pairing_shell`). So it wears the base
           // this redirect keys on, and redirecting lands right back on it. The
@@ -170,6 +202,9 @@
       swaps wording ("opening your workspace" → "opening") at the seam. (The
       picker-LIST render path is the exception — it clears the status, since you're
       choosing a workspace there, not opening one; see the body script below.)
+      The gateway splash lifts this baked text too (proxy.rs `app_status_text`).
+      It crossfades to it before it reloads into this document, so that seam
+      is byte-identical as well.
       src/utils/bootSplash.ts updates the text; it fades the whole splash out once
       the app is ready. The mark geometry mirrors
       scripts/generate-brand-icons.mjs / components/shared/LucidosMark.tsx

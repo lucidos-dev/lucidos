@@ -2,10 +2,10 @@
 /** A permission card the engine resolved says so, rather than posing as a click.
  *
  *  The engine resolves a card itself in several cases: an unattended deny, a
- *  session that ended, a message that superseded it, a restart. Each one marks
- *  Deny as the surviving choice. Without the reason on screen, the user reads
- *  a Deny they never pressed. A real Deny click carries the user-click reason
- *  and draws no note, since the picked button already says it.
+ *  session that ended, a message that superseded it, a restart. None of those
+ *  is a Deny the user pressed, so no button reads as picked, and a note in
+ *  plain words says what happened. A real Deny click carries the user-click
+ *  reason and draws no note, since the picked button already says it.
  */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { render } from 'preact';
@@ -36,17 +36,20 @@ function note(): string | null {
 }
 
 describe('engineResolutionNote', () => {
-  it('names the first sentence of an engine reason', () => {
+  it('says a known engine reason in plain words', () => {
     expect(engineResolutionNote({ allowed: false, reason: UNATTENDED })).toBe(
-      "Auto-denied: this coding-agent session runs unattended, and the command guard's static pass " +
-        'refused to settle this request as safe.',
+      'Refused by Lucidos: its command check could not confirm this was safe, and nobody was there to ask.',
+    );
+    expect(engineResolutionNote({ allowed: false, reason: 'Superseded by a new message' })).toBe(
+      'Closed because you sent a new message instead.',
     );
   });
 
-  it('keeps a reason that is one sentence whole', () => {
-    expect(engineResolutionNote({ allowed: false, reason: 'Superseded by a new message' })).toBe(
-      'Superseded by a new message',
-    );
+  // A reason the card has no words for yet is never silent.
+  it('falls back to the first sentence of a reason it cannot translate', () => {
+    expect(engineResolutionNote({ allowed: false, reason: 'A new reason. With more after it.' }))
+      .toBe('A new reason.');
+    expect(engineResolutionNote({ allowed: false, reason: 'One sentence' })).toBe('One sentence');
   });
 
   it('draws nothing for a user click, or for no reason at all', () => {
@@ -65,9 +68,15 @@ describe('the coding-agent card', () => {
     summary: "Bash sed -i '' 's#a#b#' notes.md",
   };
 
-  it('shows why the engine denied it', () => {
+  it('shows why the engine denied it, and marks no button as pressed', () => {
     render(<PermissionBody event={event} resolved={{ allowed: false, reason: UNATTENDED }} />, host);
-    expect(note()).toContain('runs unattended');
+    expect(note()).toContain('nobody was there to ask');
+    expect(host.querySelector('.permission-btn-picked')).toBeNull();
+  });
+
+  it('still marks Deny when the user pressed it', () => {
+    render(<PermissionBody event={event} resolved={{ allowed: false, reason: 'User denied' }} />, host);
+    expect(host.querySelector('.permission-btn-picked')?.textContent).toContain('Deny');
   });
 
   it('shows no note after the user pressed Deny', () => {
@@ -85,6 +94,6 @@ describe('the command-guard card', () => {
       />,
       host,
     );
-    expect(note()).toBe('Superseded by a new message');
+    expect(note()).toBe('Closed because you sent a new message instead.');
   });
 });

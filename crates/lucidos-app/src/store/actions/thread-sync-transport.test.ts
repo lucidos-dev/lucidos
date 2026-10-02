@@ -49,6 +49,8 @@ vi.mock('@lucidos/event-stream', async (importOriginal) => ({
 
 const threadMap = signal(new Map<string, { meta: { id: string }; eventsLoaded: boolean }>());
 const focusedThreadId = signal<string | null>(null);
+const recommendedCleanupProgress = signal<{ done: number; total: number } | null>(null);
+const diskUsageVersion = signal(0);
 vi.mock('../store', () => ({
   threadMap,
   focusedThreadId,
@@ -62,6 +64,8 @@ vi.mock('../store', () => ({
   codingAgentSessionVersion: signal(0),
   memoryRebuildProgress: signal(null),
   backupProgress: signal(null),
+  recommendedCleanupProgress,
+  diskUsageVersion,
   recoveryProgress: signal(null),
   panelOverlay: signal(null),
   showConfirm: vi.fn(),
@@ -81,7 +85,8 @@ vi.mock('../thread-events', () => ({
 const loadUnreadNotifications = vi.fn(async () => {});
 vi.mock('./notifications', () => ({ handleNotificationSSE: vi.fn(), loadUnreadNotifications }));
 vi.mock('./chat-changes', () => ({ addRestartGroup: vi.fn() }));
-vi.mock('./preferences', () => ({ loadPreferences: vi.fn() }));
+const loadPreferences = vi.fn(async () => {});
+vi.mock('./preferences', () => ({ loadPreferences }));
 const refreshArtifacts = vi.fn();
 vi.mock('./artifacts', () => ({
   loadArtifacts: vi.fn(),
@@ -210,6 +215,21 @@ describe('the shell attaching to a transport', () => {
     expect(syncClientUpdateFromBuild).toHaveBeenCalledTimes(1);
   });
 
+  it('drops a stale cleanup cue and has Disk Usage re-read on the open that follows an error', () => {
+    // A RecommendedCleanupCompleted sent during the gap is never replayed, so
+    // the cue would read "Freeing…" for good. The page's summary re-sets it.
+    connectThreadEvents();
+    opened?.handlers.onOpen();
+    recommendedCleanupProgress.value = { done: 4, total: 10 };
+    const before = diskUsageVersion.value;
+
+    opened?.handlers.onError();
+    opened?.handlers.onOpen();
+
+    expect(recommendedCleanupProgress.value).toBeNull();
+    expect(diskUsageVersion.value).toBe(before + 1);
+  });
+
   it('refreshes the Files list on EVERY open, the first one included', () => {
     // A file written before an open was announced to nobody. The first open
     // counts: the page's first listing can finish before it.
@@ -234,6 +254,19 @@ describe('the shell attaching to a transport', () => {
     opened?.handlers.onError();
     opened?.handlers.onOpen();
     expect(loadUnreadNotifications).toHaveBeenCalledTimes(2);
+  });
+
+  it('reads the preferences on EVERY open, the first one included', () => {
+    // A preference written before an open reaches the page only here. The
+    // first open counts: the startup read can finish before it.
+    connectThreadEvents();
+    expect(loadPreferences).not.toHaveBeenCalled();
+    opened?.handlers.onOpen();
+    expect(loadPreferences).toHaveBeenCalledTimes(1);
+
+    opened?.handlers.onError();
+    opened?.handlers.onOpen();
+    expect(loadPreferences).toHaveBeenCalledTimes(2);
   });
 
   it('reads the open form requests on EVERY open, the first one included', () => {

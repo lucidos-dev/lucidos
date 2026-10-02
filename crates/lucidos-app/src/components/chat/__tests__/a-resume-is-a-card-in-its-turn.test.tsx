@@ -70,7 +70,7 @@ describe('a resume turn', () => {
     const toggle = host.querySelector<HTMLButtonElement>('.event-row[data-kind="resume"] .event-row-fold-toggle');
     expect(toggle?.textContent).toBe('Details');
     act(() => { toggle!.click(); });
-    expect(host.querySelector('.event-row[data-kind="resume"]')?.textContent).toContain('You clicked Continue on the interrupted response');
+    expect(host.querySelector('.event-row[data-kind="resume"]')?.textContent).toContain('You pressed Continue on the stopped reply');
   });
 
   it('names you when you pressed Continue', () => {

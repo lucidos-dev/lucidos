@@ -421,7 +421,7 @@ describe('a deleted repository stops being the compose target', () => {
 describe('destinationCaption', () => {
   it('Lucidos Agent advertises the hand-off', () => {
     expect(destinationCaption({ kind: 'lucidos-agent' }))
-      .toBe('Chat, research, and create apps & triggers — can hand off to a coding agent.');
+      .toBe('Chat, research, build and refine apps & triggers, and hand off to a coding agent.');
   });
 
   it('Lucidos source promises a reviewable change', () => {

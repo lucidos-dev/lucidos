@@ -17,7 +17,10 @@ use crate::core::credentials::{
 };
 use git2::{Cred, CredentialType, FetchOptions, RemoteCallbacks};
 use sqlx::PgPool;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Once};
+use std::time::{Duration, Instant};
 
 /// One way to authenticate. Declared in the order sources are offered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -430,28 +433,156 @@ fn authenticated_callbacks(credentials: GitCredentials) -> RemoteCallbacks<'stat
     callbacks
 }
 
-/// `FetchOptions` that authenticate a clone.
-fn authenticated_fetch_options(credentials: &GitCredentials) -> FetchOptions<'static> {
+/// `FetchOptions` that authenticate a clone, aborting it once `deadline` passes.
+fn authenticated_fetch_options(
+    credentials: &GitCredentials,
+    deadline: Option<Instant>,
+) -> FetchOptions<'static> {
+    let mut callbacks = authenticated_callbacks(credentials.clone());
+    if let Some(deadline) = deadline {
+        callbacks.sideband_progress(move |_| Instant::now() < deadline);
+        callbacks.transfer_progress(move |_| Instant::now() < deadline);
+    }
     let mut opts = FetchOptions::new();
-    opts.remote_callbacks(authenticated_callbacks(credentials.clone()));
+    opts.remote_callbacks(callbacks);
     opts
 }
 
-/// Clone `url` into `into`, presenting credentials when the remote asks.
+/// Clone `url` into `into`, with no bound on how long the fetch takes.
 ///
-/// Every engine clone goes through here, so no site can forget the callbacks
-/// or the error mapping. The depth is 1 except for a local `file://` URL:
-/// libgit2's local transport rejects a shallow fetch, and a local clone costs
-/// no bandwidth to make deep.
+/// An async caller wants [`shallow_clone_within`] instead.
 pub fn shallow_clone(
     url: &str,
     branch: Option<&str>,
     into: &Path,
     credentials: &GitCredentials,
 ) -> Result<git2::Repository, String> {
+    clone_repo(url, branch, into, credentials, None)
+}
+
+/// Clone like [`shallow_clone`], but on a blocking thread, giving up after `limit`.
+///
+/// A clone is a blocking network fetch, so an async caller must never run it on
+/// a tokio worker. libgit2 clones in-process, so no child exists to kill at the
+/// deadline. Three bounds stand in for that: the progress callbacks abort the
+/// transfer, [`SERVER_IDLE_TIMEOUT_MS`] ends a silent socket, and the caller
+/// stops waiting.
+///
+/// The clone lands in a staging sibling of `into` that only this call writes.
+/// It moves into place only while the caller still waits for it. A clone that
+/// outlives its caller removes its own staging directory and never touches `into`.
+pub async fn shallow_clone_within(
+    url: &str,
+    branch: Option<&str>,
+    into: &Path,
+    credentials: &GitCredentials,
+    limit: Duration,
+) -> Result<(), String> {
+    let deadline = Instant::now() + limit;
+    // Whoever sets this first decides the outcome: the clone thread by moving
+    // the clone into place, or the caller by giving up on it.
+    let settled = Arc::new(AtomicBool::new(false));
+    let mut clone = {
+        let (url, branch) = (url.to_string(), branch.map(str::to_string));
+        let (into, credentials) = (into.to_path_buf(), credentials.clone());
+        let settled = settled.clone();
+        tokio::task::spawn_blocking(move || {
+            let staging = staging_dir(&into);
+            let cloned = clone_repo(
+                &url,
+                branch.as_deref(),
+                &staging,
+                &credentials,
+                Some(deadline),
+            );
+            let result = match cloned.map(drop) {
+                Ok(()) if !settled.swap(true, Ordering::SeqCst) => std::fs::rename(&staging, &into)
+                    .map_err(|e| {
+                        format!(
+                            "git clone finished but could not move into {}: {e}",
+                            crate::core::home_path::abbreviate(&into)
+                        )
+                    }),
+                Err(e) if Instant::now() < deadline => Err(e),
+                _ => Err(clone_timed_out(&url, limit)),
+            };
+            if result.is_err() {
+                let _ = std::fs::remove_dir_all(&staging);
+            }
+            result
+        })
+    };
+    let _give_up = GiveUpOnDrop(settled.clone());
+    let joined = match tokio::time::timeout_at(deadline.into(), &mut clone).await {
+        Ok(joined) => joined,
+        // The clone won the race and is moving into place, so its result stands.
+        Err(_) if settled.swap(true, Ordering::SeqCst) => clone.await,
+        Err(_) => return Err(clone_timed_out(url, limit)),
+    };
+    joined.unwrap_or_else(|e| Err(format!("git clone failed: {e}")))
+}
+
+/// Gives up on a clone once its caller stops waiting for any reason, including
+/// a cancelled tool call that drops the future mid-clone.
+struct GiveUpOnDrop(Arc<AtomicBool>);
+
+impl Drop for GiveUpOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+/// A sibling of `into` that only one clone writes.
+fn staging_dir(into: &Path) -> PathBuf {
+    let name = into.file_name().unwrap_or_default().to_string_lossy();
+    into.with_file_name(format!(".{name}.clone-{}", uuid::Uuid::new_v4()))
+}
+
+fn clone_timed_out(url: &str, limit: Duration) -> String {
+    format!(
+        "git clone of {} timed out after {}s. The remote stopped answering, or the \
+         repository is too large to fetch in that time.",
+        redacted(url),
+        limit.as_secs()
+    )
+}
+
+/// How long a clone's socket may stay silent before libgit2 gives up on it.
+///
+/// No progress callback fires while a socket waits, so without this a remote
+/// that stops answering blocks its cloning thread for good. A git server sends
+/// progress or keepalive packets while it prepares a pack, so a healthy clone
+/// never goes this long without a byte.
+const SERVER_IDLE_TIMEOUT_MS: i32 = 120_000;
+
+fn bound_idle_sockets() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        // SAFETY: libgit2 reads this global only when a clone opens a socket.
+        // Every engine clone calls this first, and `call_once` holds them all
+        // until the write is done, so no read races it.
+        let set = unsafe { git2::opts::set_server_timeout_in_milliseconds(SERVER_IDLE_TIMEOUT_MS) };
+        if let Err(e) = set {
+            log!("[GitAuth] could not bound idle clone sockets: {}", e);
+        }
+    });
+}
+
+/// Every engine clone goes through here, so no site can forget the callbacks,
+/// the idle bound or the error mapping. The depth is 1 except for a local
+/// `file://` URL: libgit2's local transport rejects a shallow fetch, and a
+/// local clone costs no bandwidth to make deep.
+fn clone_repo(
+    url: &str,
+    branch: Option<&str>,
+    into: &Path,
+    credentials: &GitCredentials,
+    deadline: Option<Instant>,
+) -> Result<git2::Repository, String> {
+    bound_idle_sockets();
     let offered = credentials.for_url(url).map(|c| c.service_name.clone());
     let mut builder = git2::build::RepoBuilder::new();
-    let mut fetch_opts = authenticated_fetch_options(credentials);
+    let mut fetch_opts = authenticated_fetch_options(credentials, deadline);
     if !is_local_url(url) {
         fetch_opts.depth(1);
     }

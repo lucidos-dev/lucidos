@@ -416,7 +416,7 @@ pub(crate) async fn thread_is_external_repo(
 /// behind by the merge (build artifacts excluded by .gitignore are preserved).
 ///
 /// If the worktree has uncommitted changes (rare after a successful merge —
-/// usually means the user edited files between `auto_commit_worktree` and the
+/// usually means the user edited files between the pre-merge commit and the
 /// reset), refuse to reset and surface the dirty paths so the caller can fail
 /// the apply explicitly. Silent reset would discard user work.
 ///

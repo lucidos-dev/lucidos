@@ -2,7 +2,8 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
 import type { AppUpdateProgress, AppUpdateRunning } from '../../utils/tauri';
-import type { ReleaseCheck, ReleaseOffer } from '../../api/client/control';
+import type { UpdateRelay, ReleaseCheck, ReleaseOffer } from '../../api/client/control';
+import type { RelayedUpdate } from '../store';
 import type { UpdateRoute } from './app-update';
 // The real copy module, not a mock: these tests are about what the user reads,
 // and it is pure, so there is nothing to stub.
@@ -20,6 +21,8 @@ const mocks = vi.hoisted(() => ({
   openWhatsNew: vi.fn(),
   openSettingsSubview: vi.fn(),
   requestUpdateCheck: vi.fn(),
+  getGatewayStatus: vi.fn(),
+  requestUpdateRelay: vi.fn(),
 }));
 
 /** What the gateway's `release_check` object looks like. Defaults describe an
@@ -57,6 +60,10 @@ const storeSignals = vi.hoisted(() => ({
   // The shadowed check reads it, and it is the only signal available when a
   // gateway is too old to carry `release_check` at all.
   lucidosRelease: { value: null as string | null },
+  // The update relay (ADR 0338): what the gateway says of the desktop app, and
+  // the request this session is watching.
+  updateRelay: { value: null as UpdateRelay | null },
+  relayedUpdate: { value: null as RelayedUpdate | null },
 }));
 
 /** What `check_app_update` resolves to. Notes default to absent, which is the
@@ -67,7 +74,7 @@ function offer(version: string, notes: string | null = null) {
 
 /** Every route. A case added to the union with no label fails here, rather than
  *  shipping a button with no words on it. */
-const ROUTES: UpdateRoute[] = ['install', 'check', 'guide', 'desktop'];
+const ROUTES: UpdateRoute[] = ['install', 'relay', 'check', 'guide', 'desktop'];
 
 vi.mock('../../utils/platform', () => ({
   isTauri: mocks.isTauri,
@@ -81,7 +88,11 @@ vi.mock('./menu', () => ({
   openWhatsNew: mocks.openWhatsNew,
   openSettingsSubview: mocks.openSettingsSubview,
 }));
-vi.mock('../../api/client/control', () => ({ requestUpdateCheck: mocks.requestUpdateCheck }));
+vi.mock('../../api/client/control', () => ({
+  requestUpdateCheck: mocks.requestUpdateCheck,
+  getGatewayStatus: mocks.getGatewayStatus,
+  requestUpdateRelay: mocks.requestUpdateRelay,
+}));
 vi.mock('../../utils/tauri', () => ({
   checkAppUpdate: mocks.checkAppUpdate,
   installAppUpdateAndRestart: mocks.installAppUpdateAndRestart,
@@ -100,6 +111,8 @@ vi.mock('../store', () => ({
   releaseCheck: storeSignals.releaseCheck,
   settingsScrollTarget: storeSignals.settingsScrollTarget,
   lucidosRelease: storeSignals.lucidosRelease,
+  updateRelay: storeSignals.updateRelay,
+  relayedUpdate: storeSignals.relayedUpdate,
 }));
 
 const {
@@ -116,6 +129,7 @@ const {
   stopAppUpdateProgress,
   updateControlLabel,
   updateRoute,
+  relayUpdateToDesktop,
 } = await import('./app-update');
 // The read lives a layer up, and is exercised here because the actions above
 // all branch on it. It reads the same mocked signals.
@@ -163,6 +177,12 @@ beforeEach(() => {
   storeSignals.appUpdateCheckInFlight.value = false;
   storeSignals.appUpdateProgress.value = null;
   storeSignals.releaseCheck.value = null;
+  storeSignals.updateRelay.value = null;
+  storeSignals.relayedUpdate.value = null;
+  localStorage.clear();
+  mocks.getGatewayStatus.mockReset();
+  mocks.getGatewayStatus.mockResolvedValue({ build_id: 'b', update_available: false });
+  mocks.requestUpdateRelay.mockReset();
   storeSignals.settingsScrollTarget.value = null;
   storeSignals.lucidosRelease.value = null;
   delete (globalThis as { __LUCIDOS_APP_VERSION__?: string }).__LUCIDOS_APP_VERSION__;
@@ -299,6 +319,12 @@ describe('update progress narration', () => {
     expect(dialog.message).toContain('Downloading Lucidos 2026.7.30');
     expect(dialog.progress).toBeCloseTo(0.25);
     expect(dialog.cancel!.label).toBe('Cancel');
+  });
+
+  // A relayed run can be stopped only from the Mac's own window (ADR 0338).
+  it('offers no cancel for a run relayed to the desktop app', () => {
+    const frame = { version: '2026.7.30', phase: 'downloading' as const, downloaded: 50, total: 200 };
+    expect(appUpdateDialogState(frame, null).cancel).toBeUndefined();
   });
 
   it('raises no toast for a running frame, and clears the offer behind it', () => {
@@ -1104,6 +1130,103 @@ describe('updateRoute', () => {
         }
       }
     }
+  });
+});
+
+/** A desktop app attached to the gateway, on `version`, with `blocker`. */
+function attachedClient(version = '1.2.3', blocker: string | null = null): UpdateRelay {
+  return { client: { version, blocker }, request: null };
+}
+
+describe('the relay route (ADR 0338)', () => {
+  beforeEach(() => {
+    mocks.isTauri.mockReturnValue(false);
+    storeSignals.releaseCheck.value = releaseCheckOf({ version: '9.50.0', install: 'desktop-app' });
+  });
+
+  it('lets a phone ask the desktop app when one is attached and unblocked', () => {
+    mocks.thisDeviceIsMobile.mockReturnValue(true);
+    storeSignals.updateRelay.value = attachedClient();
+    expect(updateRoute()).toBe('relay');
+  });
+
+  it('lets a desktop browser ask the same way', () => {
+    storeSignals.updateRelay.value = attachedClient();
+    expect(updateRoute()).toBe('relay');
+  });
+
+  // The route stays total (ADR 0142): every state without a working relay keeps
+  // the answer it had before.
+  it('keeps the old answer with no client, a blocked one, or an old gateway', () => {
+    for (const desktop of [null, { client: null, request: null }, attachedClient('1.2.3', 'needs a password')]) {
+      storeSignals.updateRelay.value = desktop;
+      mocks.thisDeviceIsMobile.mockReturnValue(true);
+      expect(updateRoute()).toBe('desktop');
+      mocks.thisDeviceIsMobile.mockReturnValue(false);
+      expect(updateRoute()).toBe('guide');
+    }
+  });
+
+  it('offers no relay to a client already on the newest release', () => {
+    storeSignals.updateRelay.value = attachedClient('9.50.0');
+    expect(updateRoute()).toBe('guide');
+  });
+
+  // What's New names releases the gateway has not reached yet. The gateway
+  // refuses a request for one, so the relay is not offered for it.
+  it('needs a release the gateway knows, not one the caller asserts', () => {
+    storeSignals.releaseCheck.value = releaseCheckOf(null);
+    storeSignals.updateRelay.value = attachedClient();
+    expect(updateRoute(true)).toBe('guide');
+  });
+
+  it('never replaces an install the session can run itself', () => {
+    mocks.isTauri.mockReturnValue(true);
+    storeSignals.updateRelay.value = attachedClient();
+    expect(updateRoute()).toBe('install');
+  });
+
+  it('labels the button for the machine it acts on', () => {
+    expect(updateControlLabel('relay', false)).toBe('Update Desktop App');
+  });
+
+  it('asks the gateway, opens the dialog, and remembers the request', async () => {
+    storeSignals.updateRelay.value = attachedClient();
+    mocks.requestUpdateRelay.mockResolvedValue({ id: 'r-1', version: '9.50.0' });
+    await followUpdateRoute('relay');
+    expect(mocks.requestUpdateRelay).toHaveBeenCalledTimes(1);
+    expect(storeSignals.appUpdateProgress.value).toEqual({ version: '9.50.0', phase: 'checking' });
+    expect(storeSignals.relayedUpdate.value).toMatchObject({ id: 'r-1', version: '9.50.0', fromVersion: '1.2.3' });
+  });
+
+  it('says why when the gateway refuses', async () => {
+    mocks.requestUpdateRelay.mockRejectedValue(new Error('the desktop app is not running on this machine'));
+    await relayUpdateToDesktop();
+    expect(lastToast()).toMatchObject({
+      message: "Couldn't update the desktop app: the desktop app is not running on this machine",
+      type: 'error',
+    });
+    expect(storeSignals.appUpdateProgress.value).toBeNull();
+    expect(storeSignals.relayedUpdate.value).toBeNull();
+  });
+
+  it('asks once while a request is already being watched', async () => {
+    storeSignals.relayedUpdate.value = { id: 'r-0', version: '9.50.0', fromVersion: '1.2.3', since: 0 };
+    await relayUpdateToDesktop();
+    expect(mocks.requestUpdateRelay).not.toHaveBeenCalled();
+  });
+
+  it('reads the relay state with the release check, for a session that cannot install', async () => {
+    mocks.requestUpdateCheck.mockResolvedValue(releaseCheckOf({ version: '9.50.0', install: 'desktop-app' }));
+    mocks.getGatewayStatus.mockResolvedValue({ build_id: 'b', update_available: false, update_relay: attachedClient() });
+    await refreshReleaseCheck();
+    expect(storeSignals.updateRelay.value).toEqual(attachedClient());
+  });
+
+  it('leaves the relay state alone in a client that installs itself', async () => {
+    mocks.isTauri.mockReturnValue(true);
+    await refreshReleaseCheck();
+    expect(mocks.getGatewayStatus).not.toHaveBeenCalled();
   });
 });
 

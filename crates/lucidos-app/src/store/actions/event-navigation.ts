@@ -2,11 +2,12 @@ import { effect, signal } from '@preact/signals';
 import { ApiError } from '../../api/client';
 import { fetchEventLocation } from '../../api/threads';
 import { EVENT_RESOLVE_DEADLINE_MS } from '../../components/chat/scrollState';
-import { UNANCHORABLE_ASYNC_EVENTS, computeExchanges, deepLinkAnchorForEvent } from '../thread-events';
-import { showToast, threadMap, focusedThreadId } from '../store';
+import { UNANCHORABLE_ASYNC_EVENTS, attentionTarget, computeExchanges, deepLinkAnchorForEvent } from '../thread-events';
+import type { AttentionTarget } from '../thread-events';
+import { showToast, threadMap, focusedThreadId, effectiveThreadStatus } from '../store';
 import { errorDetail } from '../../utils/errorDetail';
-import { ensureThreadByIdInMap, ensureWholeThreadLoaded, loadThreadEvents } from './thread-loading';
-import { focusThread } from './threads';
+import { ensureThreadByIdInMap, ensureWholeThreadLoaded, loadThreadEvents, threadEventsStillArriving } from './thread-loading';
+import { focusThread, landOnEvent } from './threads';
 
 /** A workspace domain event belongs to no conversation, so there is no
  *  transcript to open. A real answer, not a failure. */
@@ -340,8 +341,55 @@ export async function showEventWhereItLives(eventId: string): Promise<void> {
   }
 }
 
-/** Resolve once `threadId`'s events are in the store, it has given up loading
- *  them, or the wait times out.
+/** Open a thread from the Needs attention view, landing on what waits for the
+ *  user (`attentionEventId`) rather than on the saved reading position.
+ *
+ *  The target comes from the thread's events, so the thread opens at once and
+ *  lands as soon as nothing more is arriving. A slow load never delays the tap.
+ *
+ *  A loaded thread can still be behind. An iOS PWA wake marks every thread
+ *  stale, and `focusThread` starts the catch-up. A question asked while the app
+ *  slept is in that catch-up, so landing before it would pick an older turn.
+ *
+ *  A late landing is skipped if the user has opened another thread meanwhile. */
+export function openAttentionThread(threadId: string): void {
+  focusThread(threadId);
+  landOnAttention(threadId).catch(err => {
+    showToast(`Could not open what needs your attention: ${errorDetail(err)}`, 'error');
+  });
+}
+
+/** Lands in the same task as the focus when nothing has to be awaited, so the
+ *  saved reading position is never painted first. */
+async function landOnAttention(threadId: string): Promise<void> {
+  const stillOpen = () => focusedThreadId.value === threadId;
+  if (threadEventsStillArriving(threadId)) {
+    await awaitThreadEvents(threadId);
+    // A catch-up that outran the deadline leaves the target unknown. The open
+    // thread stays where it is rather than land on an older turn.
+    if (!stillOpen() || threadEventsStillArriving(threadId)) return;
+  }
+  let target = attentionTargetIn(threadId);
+  // A paged thread holds only its newest page. Turns that came after the card
+  // can push it behind that page.
+  if (target?.kind === 'card-not-loaded' && threadMap.value.get(threadId)?.hasOlderEvents) {
+    await ensureWholeThreadLoaded(threadId);
+    if (!stillOpen()) return;
+    target = attentionTargetIn(threadId);
+  }
+  const eventId = target?.kind === 'card-not-loaded' ? target.newestTurnId : target?.eventId;
+  if (eventId) landOnEvent(threadId, eventId);
+}
+
+function attentionTargetIn(threadId: string): AttentionTarget | null {
+  const thread = threadMap.value.get(threadId);
+  if (!thread?.eventsLoaded) return null;
+  return attentionTarget(computeExchanges(thread), effectiveThreadStatus(thread));
+}
+
+/** Resolve once nothing more of `threadId`'s events is on its way: the first
+ *  load and any catch-up refresh have landed, or the load gave up, or the wait
+ *  timed out.
  *
  *  Awaiting `loadThreadEvents` alone is NOT enough, and the gap is exactly where
  *  this feature would break. That function does not join an in-flight load: it
@@ -358,8 +406,7 @@ export async function showEventWhereItLives(eventId: string): Promise<void> {
  *  `scrollToEventAndPulse` owns the reporting from there. */
 async function awaitThreadEvents(threadId: string): Promise<void> {
   await loadThreadEvents(threadId);
-  const settledAlready = threadMap.value.get(threadId)?.eventsLoaded;
-  if (settledAlready) return;
+  if (!threadEventsStillArriving(threadId)) return;
   await new Promise<void>(resolve => {
     let dispose: (() => void) | undefined;
     let settled = false;
@@ -367,18 +414,18 @@ async function awaitThreadEvents(threadId: string): Promise<void> {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      // Undefined when the effect settled on its own first synchronous run;
-      // the `if (settled)` below disposes it once the assignment lands.
       dispose?.();
       resolve();
     };
     const timer = setTimeout(finish, EVENT_RESOLVE_DEADLINE_MS);
     dispose = effect(() => {
-      const thread = threadMap.value.get(threadId);
-      // A failed load settles too: waiting out the full deadline for events
-      // that are not coming just delays the navigation.
-      if (thread?.eventsLoaded || thread?.eventsLoadFailed) finish();
+      // Subscribes to every flush. A load or refresh releases its claim right
+      // AFTER it writes the map, so the question is asked once that has run.
+      // A failed load settles too, since nothing more is coming for it.
+      void threadMap.value;
+      queueMicrotask(() => {
+        if (!threadEventsStillArriving(threadId)) finish();
+      });
     });
-    if (settled) dispose();
   });
 }

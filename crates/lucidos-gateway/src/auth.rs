@@ -118,6 +118,12 @@ pub enum Authorization {
     Unauthorized,
 }
 
+/// Stamped onto a request that proved the machine-local token, by
+/// [`crate::auth_api::enforce`]. A route that only this machine's processes may
+/// call requires it, because a paired device holds no such stamp.
+#[derive(Debug, Clone, Copy)]
+pub struct AuthenticatedLocalProcess;
+
 /// The device [`crate::auth_api::enforce`] resolved, stamped onto the request
 /// for the proxy to forward.
 ///

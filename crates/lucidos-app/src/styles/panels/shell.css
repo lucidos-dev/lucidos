@@ -76,7 +76,9 @@
     display: flex;
     align-items: center;
     gap: var(--space-md);
-    padding: var(--space-sm) var(--space-lg);
+    /* The wash runs edge to edge, and the side inset keeps the text and
+       buttons clear of the Dynamic Island on a phone in landscape. */
+    padding: var(--space-sm) calc(var(--space-lg) + var(--phone-side-inset));
     border-bottom: 1px solid var(--border-color);
     font-size: var(--font-size-sm);
     color: var(--text-primary);
@@ -247,7 +249,7 @@
 
    Stacked, the shared --space-md gap reads as a hole between the sentence and
    its own button, so the row gap alone is tighter. */
-@media (max-width: 768px) {
+@media (--phone-layout) {
     .ingress-banner,
     .refusal-banner {
         flex-wrap: wrap;
@@ -392,7 +394,7 @@
    anything anchored below the header (--app-header-bottom) tracks it instead of
    restating the geometry. */
 .app-header {
-    padding-top: calc(0.25rem + env(safe-area-inset-top, 0px));
+    padding-top: calc(0.25rem + var(--safe-area-top));
     height: var(--app-header-height);
 }
 
@@ -463,7 +465,7 @@
 }
 
 /* Focused-pane header wash — desktop-only; positioned + revealed inside the
-   min-width:769px block below. Hidden by default so it never takes a flex slot
+   (--desktop-layout) block below. Hidden by default so it never takes a flex slot
    in the mobile header. */
 .header-focus-wash {
     display: none;
@@ -659,7 +661,7 @@
     display: contents;
 }
 
-@media (max-width: 768px) {
+@media (--phone-layout) {
     .desktop-header {
         display: none !important;
     }
@@ -710,8 +712,8 @@
    value an actual length again.
 
    OUTSIDE the media query on purpose, and not by choice: `@property` is not a
-   conditional rule and may not be nested in one. The consequence is that below
-   769px, where the block below does not run, the reserve resolves to this
+   conditional rule and may not be nested in one. The consequence is that on
+   the phone layout, where the block below does not run, the reserve resolves to this
    initial value instead of to nothing. That is the same 80px the JS fallback
    restates for exactly that viewport, so the drawer floor is unchanged; and no
    CSS rule reads the reserve outside `[data-titlebar-overlay]`, which the suite
@@ -729,7 +731,7 @@
 }
 
 /* Desktop: position burger, brand, and panel title to track the split layout */
-@media (min-width: 769px) {
+@media (--desktop-layout) {
     /* Compute the divider x-position accounting for thread drawer offset.
        --content-offset: thread drawer width (0px when closed, 300px when open)
        --split-ratio: chat fraction of split layout (0–1)
@@ -862,8 +864,8 @@
            of them is centred on the bar, so under 40px they start touching its
            edges. 48px leaves 6px around them.
 
-           Inside the desktop media query on purpose: the base token carries an
-           env(safe-area-inset-top) term for the iOS notch, and mobile keeps it
+           Inside the desktop media query on purpose: the base token carries a
+           var(--safe-area-top) term for the iOS notch, and mobile keeps it
            untouched. No desktop viewport has a notch, so these drop it. */
         --desktop-bar-height: 3rem;
         --app-header-height: var(--desktop-bar-height);
@@ -1853,7 +1855,7 @@
     flex-shrink: 0;
 }
 
-@media (min-width: 769px) {
+@media (--desktop-layout) {
     /* Collapsing a pane fades its header regions out while their left/width
        transitions slide them to zero — display:none here popped them out at
        the start of the pane animation. The drawer toggle is deliberately NOT in
@@ -1990,7 +1992,7 @@
 
 /* Slightly smaller on mobile — the badge rides a tighter header bar there, so
    trim the base .badge box + the spinner glyph a notch. */
-@media (max-width: 768px) {
+@media (--phone-layout) {
     /* The base .badge derives its width, height and line box from this. */
     .brand-badge {
         font-size: var(--font-size-3xs);
@@ -2040,10 +2042,11 @@
     background: color-mix(in srgb, var(--header-fg) var(--header-control-veil), transparent);
 }
 
-.app-header .icon-btn:focus-visible {
-    /* Recolor the shared ring to the header foreground — the accent ring is
-       low-contrast on the blue header bar. The .icon-btn rule reads this
-       overridden --focus-ring for its box-shadow. */
+.app-header .icon-btn:focus-visible,
+.app-header .panel-url-input {
+    /* Recolor the shared ring to the header foreground: the accent ring is
+       low-contrast on the blue header bar. The .icon-btn and text-input
+       focus rules read this overridden --focus-ring for their box-shadow. */
     --focus-ring: 0 0 0 0.1875rem color-mix(in srgb, var(--header-fg) 55%, transparent);
 }
 

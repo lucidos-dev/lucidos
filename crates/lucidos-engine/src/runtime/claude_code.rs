@@ -521,7 +521,11 @@ pub async fn ask_side_question(
     }
     let settings =
         crate::engine::cc_settings::write_cc_side_question_settings(args.workspace_path).await?;
-    let child = build_side_question_command(&args, lucidos_cli_dir(), &settings).spawn()?;
+    let child = super::spawn_env::spawn_below_engine(&mut build_side_question_command(
+        &args,
+        lucidos_cli_dir(),
+        &settings,
+    ))?;
     ask_side_question_of(child, &side_question_message(question, images), deadline).await
 }
 
@@ -657,7 +661,7 @@ pub async fn probe_cc_models(
         std::time::Duration::from_secs(10),
     )
     .await;
-    let models = probe_models_of(cmd.spawn()?, deadline).await?;
+    let models = probe_models_of(super::spawn_env::spawn_below_engine(&mut cmd)?, deadline).await?;
     Ok(super::cc_model_discovery::CcModelCache {
         cc_version,
         discovered_at: chrono::Utc::now(),
@@ -852,7 +856,7 @@ impl AgentRuntime for ClaudeCodeRuntime {
 
         let mut cmd = build_command(&args, cli_dir);
         let stream_state = CcStreamState::with_notes_relayed(relays_vertex_calls(&cmd));
-        let mut child = cmd.spawn()?;
+        let mut child = super::spawn_env::spawn_below_engine(&mut cmd)?;
         let stdin = child.stdin.take().ok_or("Failed to capture stdin")?;
         let stdout = child.stdout.take().ok_or("Failed to capture stdout")?;
         let stderr = child.stderr.take().ok_or("Failed to capture stderr")?;
@@ -1061,7 +1065,7 @@ fn build_command_with_settings(
         cmd.arg("--append-system-prompt").arg(prompt);
     }
     // Agent-independent Lucidos env contract (workspace, host protection,
-    // PG*, subprocess origin, spawn metadata, RUSTC_WRAPPER, PATH) — shared
+    // PG*, subprocess origin, spawn metadata, compile env, PATH), shared
     // with every other AgentRuntime via `spawn_env::apply_lucidos_env`.
     apply_lucidos_env(&mut cmd, args, cli_dir, "ClaudeCode");
     // Push CC's own byte-idle streaming deadline out past the engine's
@@ -1109,11 +1113,6 @@ fn build_command_with_settings(
     // Engine-owned, so it goes AFTER `apply_lucidos_env`. A workspace value
     // then becomes the relay's upstream instead of bypassing the relay.
     stamp_vertex_relay(&mut cmd, args, super::vertex_relay::port());
-    // Root-cause fix for the stray-SIGTERM truncation bug: give CC its OWN
-    // process group so a group-wide signal to the engine never reaches it.
-    // The engine ignores SIGTERM but CC's Node runtime does not (exit=143).
-    // See `spawn_env::isolate_in_process_group`.
-    crate::runtime::spawn_env::isolate_in_process_group(&mut cmd);
     // The engine permission handler waits indefinitely for the user, matching
     // `AskUserQuestion`. CC has TWO separate MCP timeouts that both have to be
     // lifted, otherwise whichever is shorter forces a retry that surfaces a
@@ -1414,8 +1413,9 @@ pub(crate) fn format_exit_status(
 /// detached `driver_task`, off the cancel UX path, so the wait costs no
 /// interactive latency. See `spawn_env::graceful_kill_child_process_group`.
 ///
-/// Shared with both Codex drivers and the background-task registry, which tear
-/// down the same way and reap the same browsers. Tuning this upward is the
+/// Shared with both Codex drivers, the background-task registry and MCP server
+/// shutdown, which tear down the same way and reap the same browsers. An MCP
+/// Stop waits this grace out in the foreground. Tuning this upward is the
 /// documented answer to a fresh pile-up, and a caller holding its own literal
 /// would sit out that fix.
 pub(crate) const GROUP_TEARDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(3);

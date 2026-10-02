@@ -1,5 +1,5 @@
 import { useRef } from 'preact/hooks';
-import { activeMenuItem, panelOverlay, pinnedApps, appsList, changes, appliedChanges } from '../../store/store';
+import { activeMenuItem, panelOverlay, pinnedApps, appsList, changes, appliedChanges, actionableChangeCount } from '../../store/store';
 import { switchMenuItem } from '../../store/actions/menu';
 import { openUrl } from '../../store/actions/artifacts';
 import { revealContentPane } from '../../store/actions/pane';
@@ -81,22 +81,16 @@ export function Drawer() {
 
   if (!isOpen) return null;
 
-  // Badge count: only the `loaded` signal contributes a real number. While
-  // the changes Loadable is not-loaded / loading / failed, hide the badge
-  // entirely rather than render `0` (which would look like "nothing to
-  // review" during a DB outage). Reuses the existing `changeCount > 0`
-  // gate below — `null` falls through it cleanly.
-  const changesLoadable = changes.value;
-  const changeCount: number | null =
-    changesLoadable.status === 'loaded' ? changesLoadable.data.length : null;
+  const changeBadge = actionableChangeCount.value;
 
   // Only surface the Changes entry when the user actually has changes to see —
   // pending OR applied/reverted history. Most users never make changes to
   // Lucidos, so this keeps the drawer uncluttered for them. Keep it visible
   // while the Changes view is the active menu item so a user viewing it isn't
   // stranded when the last change clears.
+  const changesLoadable = changes.value;
   const appliedLoadable = appliedChanges.value;
-  const hasPendingChanges = changeCount !== null && changeCount > 0;
+  const hasPendingChanges = changesLoadable.status === 'loaded' && changesLoadable.data.length > 0;
   const hasAppliedChanges =
     appliedLoadable.status === 'loaded' && appliedLoadable.data.length > 0;
   const showChanges =
@@ -189,8 +183,8 @@ export function Drawer() {
             }}
           >
             {MENU_ITEM_LABELS.changes}
-            {changeCount !== null && changeCount > 0 && (
-              <span class="drawer-badge">{changeCount > 99 ? '99+' : changeCount}</span>
+            {changeBadge !== null && changeBadge > 0 && (
+              <span class="drawer-badge">{changeBadge > 99 ? '99+' : changeBadge}</span>
             )}
           </div>
         )}

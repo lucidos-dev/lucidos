@@ -16,7 +16,7 @@ import { toFailed } from '../types';
 import { errorDetail } from '../../utils/errorDetail';
 import { postClientLog } from '../../utils/liveness';
 import { isComposeFocusedHere } from '../../components/chat/promptFocus';
-import { pendingComposePuts, composeEditedAt, composePutSettledAt, hasUnsentLocalDraft, clearSupersededDraft, noteServerDraft, noteComposeEpoch, noteServerComposeMode } from './compose';
+import { pendingComposePuts, composeEditedAt, composeSentAt, composePutSettledAt, hasUnsentLocalDraft, clearSupersededDraft, noteServerDraft, noteComposeEpoch, noteServerComposeMode } from './compose';
 
 /** Buffer for batched compose draft writes during loadAllThreads. Hundreds of
  *  threads through the upsertThread loop land in ONE signal write. `null`
@@ -242,10 +242,17 @@ export function upsertThread(
     //   3. A local edit happened AFTER this GET went out, so the response is
     //      stale with respect to compose by definition.
     //
-    // The lifecycle marker takes the same version guard as `status` above.
-    // A GET fired before the send lands after it, still saying `composing`.
-    // `ThreadPane` would then swap the transcript back for the compose view.
-    if (summaryIsCurrent) existing.meta.state = info.state;
+    // `>=` because both timestamps come from `Date.now()`, at 1ms resolution.
+    // A request fired in the same millisecond as the edit can race ahead of
+    // the edit's PUT and would otherwise pass the guard.
+    const lastLocalChange = Math.max(composeEditedAt.get(info.thread_id) ?? 0, composeSentAt.get(info.thread_id) ?? 0);
+    const editedSinceRequest = lastLocalChange >= requestStartedAt;
+    // The lifecycle marker takes the version guard of `status` above, AND the
+    // local-edit guard. A GET fired before a send lands after it, still saying
+    // `composing`, and often at the SAME version: nothing has raised it until
+    // the send's `MessageReceived` arrives. `ThreadPane` would then swap the
+    // transcript back for the compose view. `sendCompose` stamps `composeSentAt`.
+    if (summaryIsCurrent && !editedSinceRequest) existing.meta.state = info.state;
     const isFocusedThread = info.thread_id === focusedThreadId.value;
     // An EMPTY server snapshot genuinely means the shared draft was sent or
     // discarded by somebody, since the backend clears compose_text on those
@@ -258,10 +265,6 @@ export function upsertThread(
     // keeps the focus guard, so a background refresh cannot move the cursor.
     const snapshotIsEmpty = composeSnapshotIsEmpty(info);
     const userIsTypingHere = isFocusedThread && isComposeFocusedHere(info.thread_id) && !snapshotIsEmpty;
-    // `>=` because both timestamps come from `Date.now()`, at 1ms resolution.
-    // A request fired in the same millisecond as the edit can race ahead of
-    // the edit's PUT and would otherwise pass the guard.
-    const editedSinceRequest = (composeEditedAt.get(info.thread_id) ?? 0) >= requestStartedAt;
     // The inverse-order hole. The edit predates this GET, so
     // `editedSinceRequest` is false, but the debounced PUT settled at or after
     // the GET went out. The server snapshot in this response was therefore

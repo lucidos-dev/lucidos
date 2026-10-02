@@ -5,7 +5,6 @@ import {
   executorExtras,
   resolveThreadLinkTitle,
   renderChannelSection,
-  renderAuditSection,
   renderEngineExplainerSection,
   renderExecutorSection,
   renderInitiatorRow,
@@ -323,13 +322,14 @@ describe('resolveThreadLinkTitle', () => {
     expect(result).toBe('Cached title from API');
   });
 
-  it('falls back to UUID only when no source has a title', () => {
+  // A uuid is not a name. The id itself is in Technical details.
+  it('falls back to "Untitled thread", never the id, when no source has a title', () => {
     const result = resolveThreadLinkTitle(
       { kind: 'thread_link', thread_id: parentId, mode: 'agent' },
       undefined,
       liveTitle(undefined),
     );
-    expect(result).toBe(parentId);
+    expect(result).toBe('Untitled thread');
   });
 
   it('respects an explicit title stamped on the origin (spawn-time fallback when threadMap lacks parent)', () => {
@@ -545,9 +545,11 @@ describe('renderChannelSection', () => {
     const node = renderChannelSection({ kind: 'device', device_id: 'd1' });
     expect(JSON.stringify(node)).toContain('Chrome on Mac');
   });
-  it('api origin renders user-agent', () => {
-    const node = renderChannelSection({ kind: 'api', user_agent: 'MyApp/1.0', mode: 'agent' });
-    expect(JSON.stringify(node)).toContain('MyApp/1.0');
+  // The raw user-agent is machine words: it lives in Technical details.
+  it('api origin names an outside app in words, not by its user-agent', () => {
+    const s = JSON.stringify(renderChannelSection({ kind: 'api', user_agent: 'MyApp/1.0', mode: 'agent' }));
+    expect(s).toContain('An app or script outside Lucidos');
+    expect(s).not.toContain('MyApp/1.0');
   });
   it('api origin with source_thread_id renders deep-link to spawning thread', () => {
     // The subprocess-origin path: `source_thread_id` set after the engine
@@ -560,12 +562,11 @@ describe('renderChannelSection', () => {
       (tid) => tid === 'src-thread' ? 'Spawning thread title' : undefined,
     );
     const s = JSON.stringify(node);
-    expect(s).toContain('curl/8.7.1');
+    expect(s).toContain('A script run by the agent in');
     expect(s).toContain('Spawning thread title');
   });
-  it('api origin with source_thread_id falls back to short id when no title resolver', () => {
-    // When `getLiveTitle` returns undefined we still want a visible link —
-    // a `thread <short>` placeholder so the popover is never blank.
+  it('api origin with source_thread_id falls back to "Untitled thread" when no title resolves', () => {
+    // The link is never blank, and never an id.
     const node = renderChannelSection({
       kind: 'api',
       user_agent: 'curl/8.7.1',
@@ -573,8 +574,8 @@ describe('renderChannelSection', () => {
       source_thread_id: '12345678-abcd-...',
     });
     const s = JSON.stringify(node);
-    expect(s).toContain('curl/8.7.1');
-    expect(s).toContain('thread 12345678');
+    expect(s).toContain('Untitled thread');
+    expect(s).not.toContain('12345678');
   });
   it('workspace origin renders workspace name', () => {
     const node = renderChannelSection({
@@ -582,10 +583,10 @@ describe('renderChannelSection', () => {
     });
     expect(JSON.stringify(node)).toContain('myws');
   });
-  it('workspace origin with thread_id renders a thread link (short id when title unresolved)', () => {
-    // No getLiveTitle and an empty current-workspace name (the test default) →
-    // treated as local with no resolvable title → `thread <short>` placeholder
-    // so the link is never blank.
+  it('workspace origin with thread_id renders a thread link ("Untitled thread" when title unresolved)', () => {
+    // No getLiveTitle and an empty current-workspace name (the test default):
+    // treated as local with no resolvable title, so the link reads
+    // "Untitled thread" rather than a blank or an id.
     const node = renderChannelSection({
       kind: 'workspace',
       workspace: 'myws',
@@ -594,7 +595,8 @@ describe('renderChannelSection', () => {
     });
     const s = JSON.stringify(node);
     expect(s).toContain('myws');
-    expect(s).toContain('thread 12345678');
+    expect(s).toContain('Untitled thread');
+    expect(s).not.toContain('12345678');
   });
   it('workspace origin renders the live thread name when the source thread is local', () => {
     // workspaceName defaults to '' in tests → the origin is treated as local →
@@ -620,39 +622,67 @@ describe('renderChannelSection', () => {
   });
 });
 
-describe('renderAuditSection', () => {
-  it('workspace origin renders the event id but not the thread id (thread id is a channel link)', () => {
-    const node = renderAuditSection({
-      kind: 'workspace', workspace: 'p', thread_id: 'tid', event_id: 'eid', mode: 'agent',
+/** The section with its Technical details fold cut out, so a test can say a
+ *  raw id appears there and nowhere else. */
+function withoutTechnical(node: ComponentChildren): { body: string; technical: string } {
+  let technical = '';
+  const strip = (n: ComponentChildren): ComponentChildren => {
+    if (Array.isArray(n)) return n.map(strip);
+    if (!n || typeof n !== 'object') return n;
+    const v = n as VNode<{ children?: ComponentChildren; 'data-role'?: string }>;
+    if (v.props?.['data-role'] === 'route-technical') {
+      technical += JSON.stringify(v);
+      return null;
+    }
+    return { ...v, props: { ...v.props, children: strip(v.props?.children) } } as VNode;
+  };
+  return { body: JSON.stringify(strip(node)), technical };
+}
+
+describe('Technical details', () => {
+  const section = (userEvent: StoredEvent) =>
+    withoutTechnical(renderOriginSection(exch(userEvent), undefined, () => undefined));
+
+  it('holds the raw event type, which no other line of the panel shows', () => {
+    const { body, technical } = section({ type: 'UserPromptInjected', text: 'x', mode: 'human', origin: { kind: 'device', device_id: 'd1' } });
+    expect(technical).toContain('Event type');
+    expect(technical).toContain('UserPromptInjected');
+    expect(body).not.toContain('UserPromptInjected');
+  });
+
+  it('holds the ids and client strings an origin carried, and only there', () => {
+    const { body, technical } = section({
+      type: 'MessageReceived', text: 'hi', mode: 'human',
+      origin: { kind: 'workspace', workspace: 'myws', thread_id: 'tid-1', event_id: 'eid-1', user_agent: 'curl/8.7.1' },
     });
-    const s = JSON.stringify(node);
-    expect(s).toContain('eid');
-    expect(s).not.toContain('tid');
+    for (const raw of ['tid-1', 'eid-1', 'curl/8.7.1']) {
+      expect(technical).toContain(raw);
+      expect(body).not.toContain(raw);
+    }
   });
-  it('workspace origin with only a thread id renders nothing (thread id moved to the channel)', () => {
-    const node = renderAuditSection({
-      kind: 'workspace', workspace: 'p', thread_id: 'tid', mode: 'agent',
-    });
-    expect(node).toBeNull();
-  });
-  it('parent_thread origin without spawning_event_id renders nothing', () => {
-    const node = renderAuditSection({ kind: 'thread_link', thread_id: 't', mode: 'agent' });
-    expect(node).toBeNull();
-  });
-  it('device/api/v1/engine origin renders nothing', () => {
-    expect(renderAuditSection({ kind: 'device', device_id: 'd' })).toBeNull();
-    expect(renderAuditSection({ kind: 'api' })).toBeNull();
-    expect(renderAuditSection({ kind: 'engine', reason: { kind: 'session_recovered' } })).toBeNull();
+
+  it('holds a fired trigger\'s event id, and names its event in words above', () => {
+    const { body, technical } = withoutTechnical(renderOriginSection(exch({
+      type: 'TriggerStarted', trigger_id: 'trig-1', trigger_name: 'Nightly',
+      invocation: { kind: 'Event', event_type: 'ChangeApplied', event_id: 'evt-9' },
+    }), undefined, () => undefined));
+    expect(body).toContain('change applied');
+    expect(body).not.toContain('evt-9');
+    expect(body).not.toContain('trig-1');
+    expect(technical).toContain('evt-9');
   });
 });
 
 describe('renderEngineExplainerSection', () => {
   it('session_recovered renders explainer text', () => {
     const node = renderEngineExplainerSection({ kind: 'session_recovered' });
-    expect(JSON.stringify(node)).toMatch(/auto-resumed/i);
+    expect(JSON.stringify(node)).toMatch(/picked it back up/i);
   });
-  it('scheduler renders nothing (trigger renderer handles it)', () => {
-    expect(renderEngineExplainerSection({ kind: 'scheduler', trigger_id: 't' })).toBeNull();
+  // A scheduled message used to show no reason at all, and its turn read
+  // "Forwarded message". The trigger's name is the reason.
+  it('scheduler names its trigger', () => {
+    const node = renderEngineExplainerSection({ kind: 'scheduler', trigger_id: 't', trigger_name: 'Nightly' });
+    expect(JSON.stringify(node)).toContain('“Nightly” ran on its schedule');
   });
 });
 
@@ -699,7 +729,7 @@ describe('renderOriginSection', () => {
     // No event-level reason to be precise about, so it falls through to the
     // generic engine explanation rather than inventing a specific cause.
     expect(s).not.toContain('Why this resumed');
-    expect(s).toContain('Why the engine acted');
+    expect(s).toContain('Why Lucidos acted');
     expect(s).not.toContain('Unknown');
   });
 
@@ -713,8 +743,8 @@ describe('renderOriginSection', () => {
       branch: '',
       origin: { kind: 'engine', reason: { kind: 'continuation_started' } },
     });
-    expect(s).toContain('Why the engine acted');
-    expect(s).toMatch(/auto-resumed/i);
+    expect(s).toContain('Why Lucidos acted');
+    expect(s).toMatch(/picked it back up/i);
   });
 
   // The generic fallback is reached by chat and trigger resumes too, so it must
@@ -735,13 +765,13 @@ describe('renderOriginSection', () => {
     });
     expect(s).toContain('iOS Safari PWA');
     expect(s).not.toContain('Lucidos Engine');
-    expect(s).toMatch(/You clicked Continue/);
+    expect(s).toMatch(/You pressed Continue/);
   });
 
   it('names the engine on a legacy MergeConflictDetected that predates the origin field', () => {
     const s = origin({ type: 'MergeConflictDetected', files: ['a.rs'] });
     expect(s).toContain('Lucidos Engine');
-    expect(s).toContain('Why the engine acted');
+    expect(s).toContain('Why Lucidos acted');
     expect(s).not.toContain('Unknown');
   });
 
@@ -753,8 +783,67 @@ describe('renderOriginSection', () => {
     expect(s).not.toContain('Unknown');
   });
 
-  it('still falls back to Unknown for a genuinely unattributed event', () => {
-    expect(origin({ type: 'MessageReceived', text: 'hi', mode: 'human' })).toContain('Unknown');
+  // The second reported card: a bare "Unknown". Nothing was recorded, so the
+  // panel says that in words and claims no cause it cannot prove.
+  it('says "Not recorded", never a bare Unknown, for a genuinely unattributed event', () => {
+    const s = origin({ type: 'MessageReceived', text: 'hi', mode: 'human' });
+    expect(s).toContain('Not recorded');
+    expect(s).toContain('Lucidos did not record who started this turn.');
+    expect(s).not.toContain('Unknown');
+  });
+
+  // An abort a person caused (a restart, a button that cleared a stuck reply)
+  // still says why it stopped. It used to show only the device.
+  it('explains why a device-attributed abort stopped', () => {
+    seedDevice('d1', 'My MacBook');
+    const s = origin({ type: 'ResponseAborted', cause: 'stale_settle', actor: { kind: 'device', device_id: 'd1' } });
+    expect(s).toContain('Stopped from');
+    expect(s).toContain('My MacBook');
+    expect(s).toContain('Why the response stopped');
+  });
+
+  it('labels the device that answered a question "Answered on", not "Device"', () => {
+    seedDevice('d1', 'My iPhone');
+    const asked: StoredEvent = { type: 'UserQuestionAsked', tool_use_id: 'tu-1', cc_session_id: 's', question: 'q', options: [] };
+    const answered: StoredEvent = {
+      type: 'UserQuestionAnswered', tool_use_id: 'tu-1', answer: { kind: 'Selected', option_id: 'a' },
+      actor: { kind: 'device', device_id: 'd1' },
+    };
+    const s = JSON.stringify(renderOriginSection(exch(asked, [{ seq: 2, event: answered }]), undefined, () => undefined));
+    expect(s).toContain('Answered on');
+    expect(s).toContain('My iPhone');
+  });
+});
+
+describe('an event wait re-entry says where its words came from', () => {
+  const origin = (userEvent: StoredEvent): string =>
+    JSON.stringify(renderOriginSection(exch(userEvent), undefined, () => undefined));
+
+  it('names the engine, what the agent waited for, and the story', () => {
+    const s = origin({
+      type: 'UserPromptInjected', text: 'A subscription you registered has timed out.', mode: 'agent',
+      origin: { kind: 'engine', reason: { kind: 'event_wait', outcome: 'expired', watched: ['BenchSlotReleased'], wait_reason: 'the bench slot' } },
+    });
+    expect(s).toContain('Issued by');
+    expect(s).toContain('Lucidos Engine');
+    expect(s).toContain('Waited for');
+    expect(s).toContain('bench slot released');
+    expect(s).toContain('Why Lucidos acted');
+    expect(s).toMatch(/Nothing happened before its deadline/);
+    expect(s).not.toContain('Unknown');
+  });
+
+  // Rows from before the engine stamped an origin: every delivery and expiry
+  // in a real workspace read "Unknown" here.
+  it.each([
+    { type: 'UserPromptInjected', text: 'A subscription you registered has timed out.\n\nTimed out.', mode: 'agent' },
+    { type: 'UserPromptInjected', text: 'An event you subscribed to has arrived (you were waiting because: x).', mode: 'agent', delivered_event_id: 'e1' },
+  ] as StoredEvent[])('an older re-entry anchor still names the engine and why', (userEvent) => {
+    const s = origin(userEvent);
+    expect(s).toContain('Lucidos Engine');
+    expect(s).toContain('The agent asked Lucidos to tell it');
+    expect(s).not.toContain('Unknown');
+    expect(s).not.toContain('Not recorded');
   });
 });
 
@@ -766,6 +855,7 @@ const EVERY_ENGINE_REASON: { [K in EngineReason['kind']]: Extract<EngineReason, 
   orphan_recovery: { kind: 'orphan_recovery' },
   scheduler: { kind: 'scheduler', trigger_id: 't1', trigger_name: 'nightly' },
   harden_retrigger: { kind: 'harden_retrigger' },
+  event_wait: { kind: 'event_wait', outcome: 'delivered', watched: ['ChangeProposed'], wait_reason: 'a change' },
   stale_session: { kind: 'stale_session' },
   archived_branch_work: { kind: 'archived_branch_work' },
   merge_conflict: { kind: 'merge_conflict' },
@@ -815,8 +905,8 @@ describe('the popover never reads Unknown for engine-authored work', () => {
     const s = origin({ type: 'MessageReceived', text: 'Set up X again.', mode });
     expect(s).toContain('Issued by');
     expect(s).toContain('Lucidos Engine');
-    expect(s).toContain('Why the engine acted');
-    expect(s).toMatch(/not known/);
+    expect(s).toContain('Why Lucidos acted');
+    expect(s).toMatch(/did not record why/);
     expect(s).not.toContain('Unknown');
   });
 });
@@ -880,7 +970,7 @@ describe('renderInitiatorRow', () => {
     expect(s).toContain('Claude Code');
   });
 
-  it('discloses Claude Code (permission gate) for CodingAgentPermissionRequest', () => {
+  it('discloses Claude Code asking permission for CodingAgentPermissionRequest', () => {
     const node = renderInitiatorRow({
       type: 'CodingAgentPermissionRequest',
       request_id: 'r1',
@@ -891,7 +981,7 @@ describe('renderInitiatorRow', () => {
     });
     const s = JSON.stringify(node);
     expect(s).toContain('Asked by');
-    expect(s).toContain('Claude Code (permission gate)');
+    expect(s).toContain('Claude Code, asking your permission');
   });
 
   it('names Codex, not Claude Code, on a Codex thread', () => {
@@ -910,14 +1000,14 @@ describe('renderInitiatorRow', () => {
       question: 'q',
       options: [],
     }, 'codex');
-    expect(JSON.stringify(permission)).toContain('Codex (permission gate)');
+    expect(JSON.stringify(permission)).toContain('Codex, asking your permission');
     expect(JSON.stringify(question)).toContain('Codex');
     expect(JSON.stringify(question)).not.toContain('Claude Code');
   });
 
   it('discloses Lucidos as the asker for McpConsentRequested', () => {
     const node = renderInitiatorRow({ type: 'McpConsentRequested', tool: 'fs.read', args: {} });
-    expect(JSON.stringify(node)).toContain('Lucidos (tool consent)');
+    expect(JSON.stringify(node)).toContain('Lucidos, asking before a tool is first used');
   });
 
   it('returns null for non-divider event types (their initiator is implied)', () => {
@@ -1055,10 +1145,11 @@ describe('route rows contribute exactly two grid cells', () => {
       codingAgentFolder: 'data/apps/habit-tracker',
     } as unknown as ThreadMeta;
 
-    // Model, Effort, Context, Repository, App, Branch, Session.
+    // Model, Effort, Context, Repository, App, Branch. The session id is in
+    // Technical details, whose fold body brings its own grid.
     expectTwoCellRows(
       renderExecutorSection(exchange, events, meta, 'claude-opus-5[1m]', 'xhigh'),
-      7,
+      6,
     );
   });
 });

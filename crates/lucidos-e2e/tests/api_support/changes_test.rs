@@ -1,6 +1,6 @@
 use crate::support::{
     base_url, commit_on_new_branch, db_url, git, git_in, http_client, insert_session_started,
-    seed_cc_thread_summary, user_client, workspace_path,
+    local_process_client, seed_cc_thread_summary, user_client, workspace_path,
 };
 use serde_json::json;
 use uuid::Uuid;
@@ -327,7 +327,7 @@ async fn apply_now_announces_a_refused_apply_once() {
 /// `planned-state` wire contract the cc-plan-gate hook depends on.
 #[tokio::test]
 async fn plan_marker_proposed_then_approved_round_trip() {
-    let client = user_client().await;
+    let client = local_process_client();
     let ws = workspace_path();
     let repo_root = ws.to_str().unwrap();
 
@@ -419,7 +419,7 @@ async fn plan_marker_proposed_then_approved_round_trip() {
 /// retry unchanged.
 #[tokio::test]
 async fn bounded_security_fix_satisfies_the_gate_and_refuses_an_unenforceable_bound() {
-    let client = user_client().await;
+    let client = local_process_client();
     let ws = workspace_path();
     let repo_root = ws.to_str().unwrap();
 
@@ -511,6 +511,77 @@ async fn bounded_security_fix_satisfies_the_gate_and_refuses_an_unenforceable_bo
         .execute(&pool)
         .await;
     pool.close().await;
+}
+
+/// The Harden and Apply gates read these markers. So a caller that merely
+/// reaches the engine port must not write them. A device id is no credential
+/// here: any loopback caller can register one, as `user_client` does. Nor is
+/// the gateway's proxied shape, which carries the machine-local token and a
+/// forwarded prefix.
+#[tokio::test]
+async fn a_plain_loopback_caller_cannot_write_a_marker() {
+    let device_only = user_client().await;
+    let local = local_process_client();
+    let ws = workspace_path();
+    let repo_root = ws.to_str().unwrap();
+    let suffix = Uuid::new_v4().as_simple().to_string()[..8].to_string();
+    let branch = format!("e2e-test/marker-guard-{}", suffix);
+
+    let writes = [
+        (
+            "mark-hardened",
+            json!({ "repo_root": repo_root, "branch_name": branch, "head_sha": "deadbeef" }),
+        ),
+        (
+            "mark-planned",
+            json!({
+                "repo_root": repo_root,
+                "branch_name": branch,
+                "head_sha": "deadbeef",
+                "state": "acknowledged_simple",
+                "reason": "forged from the loopback port",
+            }),
+        ),
+        (
+            "approve-plan",
+            json!({ "repo_root": repo_root, "branch_name": branch }),
+        ),
+    ];
+    for (route, body) in &writes {
+        let url = format!("{}/api/v1/internal/{}", base_url(), route);
+        let plain = device_only
+            .post(&url)
+            .json(body)
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("{route} POST failed: {e}"));
+        assert_eq!(
+            plain.status(),
+            403,
+            "{route} must refuse a device-only caller"
+        );
+        let proxied = local
+            .post(&url)
+            .header("x-forwarded-prefix", "/e2e-test/")
+            .json(body)
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("{route} POST failed: {e}"));
+        assert_eq!(
+            proxied.status(),
+            403,
+            "{route} must refuse a request that came through the gateway proxy"
+        );
+    }
+
+    assert_eq!(
+        marker_state(&local, "planned-state", repo_root, &branch).await,
+        "MISSING"
+    );
+    assert_eq!(
+        marker_state(&local, "hardened-state", repo_root, &branch).await,
+        "MISSING"
+    );
 }
 
 /// Sequential apply of two changes must both succeed.
@@ -869,7 +940,7 @@ async fn a_parents_commits_after_an_apply_come_back_as_a_new_change() {
     )
     .await;
     let head = String::from_utf8(git_in(&wt_dir, &["rev-parse", "HEAD"]).stdout).unwrap();
-    let mark = client
+    let mark = local_process_client()
         .post(format!("{}/api/v1/internal/mark-hardened", base_url()))
         .json(&json!({ "repo_root": repo_root, "branch_name": branch, "head_sha": head.trim() }))
         .send()

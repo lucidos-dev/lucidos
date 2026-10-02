@@ -47,11 +47,13 @@ interface Env {
   slug?: string | null;
   search?: string;
   hash?: string;
+  /** Has the history bounce script above already stepped forward? */
+  bouncing?: boolean;
 }
 
 /** Run the fast path against `env` and answer the URL it replaced with, if any. */
 function run(env: Env): string | null {
-  const { base = '/~/', pairingMeta = false, slug = 'demo', search = '', hash = '' } = env;
+  const { base = '/~/', pairingMeta = false, slug = 'demo', search = '', hash = '', bouncing = false } = env;
   let replaced: string | null = null;
   const document = {
     querySelector(selector: string) {
@@ -62,11 +64,14 @@ function run(env: Env): string | null {
   };
   const localStorage = { getItem: () => slug };
   const location = { search, hash, replace: (url: string) => void (replaced = url) };
+  const window = bouncing ? { lucidosHistoryBounce: true } : {};
+  // The script under test is inline HTML, so only `new Function` can run it.
   // eslint-disable-next-line no-new-func
-  new Function('document', 'localStorage', 'location', fastPathSource())(
+  new Function('document', 'localStorage', 'location', 'window', fastPathSource())(
     document,
     localStorage,
     location,
+    window,
   );
   return replaced;
 }
@@ -92,6 +97,12 @@ describe('picker cold-start fast path', () => {
   it('stands down for the escape and for the pairing shell', () => {
     expect(run({ search: '?pick' })).toBeNull();
     expect(run({ pairingMeta: true })).toBeNull();
+  });
+
+  it('stands down while the history bounce steps forward', () => {
+    // A redirect scheduled now would win over the pending step forward, and
+    // replace the stale picker entry with a second copy of the workspace.
+    expect(run({ bouncing: true })).toBeNull();
   });
 
   it('does nothing off the picker, or with nothing remembered', () => {

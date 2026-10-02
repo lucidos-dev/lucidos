@@ -14,7 +14,9 @@
 //! 3. An event-only trigger is refused and pointed at emitting its event. A
 //!    payload-less fire is a shape it has never had.
 
-use crate::support::{base_url, unique_marker, user_client, workspace_path};
+use crate::support::{
+    base_url, remove_data_fixtures, unique_marker, user_client, write_data_fixture,
+};
 use serde_json::json;
 use std::time::{Duration, Instant};
 
@@ -33,14 +35,10 @@ const NEVER_SOON_CRON: &str = "0 0 3 1 1 *";
 /// Create a trigger and return its id.
 ///
 /// **`run` is an intent unless the test actually fires the trigger.** A script
-/// trigger needs a `.py` under `data/triggers/<slug>/`, and `data/` is
-/// git-tracked, so the file leaves the e2e workspace's working tree dirty from
-/// the moment it is written until the engine's post-run auto-commit picks it
-/// up. A trigger that never fires never gets that auto-commit, so the dirt
-/// lasts the whole test, and the concurrently-running apply tests fail with
-/// "Cannot merge: the repository has uncommitted changes". The three refusal
-/// tests below never reach execution, so they carry an intent they will never
-/// run and touch no files at all.
+/// trigger needs a `.py` fixture under `data/triggers/<slug>/`, which the test
+/// must write and later remove. The refusal tests below never reach execution,
+/// so they carry an intent they will never run and own no files at all. The
+/// engine's own `trigger.toml` is gitignored, so it never dirties the tree.
 async fn create_trigger(
     client: &reqwest::Client,
     name: &str,
@@ -117,92 +115,13 @@ async fn try_run_trigger(client: &reqwest::Client, id: &str) -> Result<serde_jso
         .map_err(|e| format!("invalid JSON from /triggers/run: {e}"))
 }
 
-/// Delete a trigger that owns no files on disk. Best-effort: a failed cleanup
-/// must not fail the assertion the test exists for.
+/// Delete a trigger. Best-effort: a failed cleanup must not fail the assertion
+/// the test exists for.
 async fn delete_trigger(client: &reqwest::Client, id: &str) {
     let _ = client
         .delete(format!("{}/api/v1/triggers?id={}", base_url(), id))
         .send()
         .await;
-}
-
-/// How long `cleanup_fired_trigger` keeps watching its path after removing it.
-const CLEANUP_SETTLE: Duration = Duration::from_secs(15);
-
-/// Delete a trigger that HAS FIRED AND remove its directory, committing the
-/// removal so the e2e workspace's working tree is left clean (the engine
-/// auto-commits dirty `data/` files after a run, so both the probe script and
-/// the trigger's own `trigger.toml` are tracked by now). A dirty tree fails
-/// every concurrent apply test with "Cannot merge: the repository has
-/// uncommitted changes", so this is load-bearing, not tidiness. Best-effort
-/// throughout.
-///
-/// Firing is what makes this necessary, not the trigger's kind: a trigger that
-/// is only ever refused leaves its definition untracked and `delete_trigger`
-/// alone suffices for it.
-///
-/// **One commit is not enough, and neither is "commit until it reads clean".**
-/// The engine's auto-commit (`commit_dirty_logged` in `engine_impl/scripts.rs`)
-/// is `commit_all_dirty`, which stages ALL of `data/` inside one blocking
-/// closure and is fired by every script run, `run_python` and coding-agent turn
-/// in this parallel suite. So a commit belonging to some OTHER test can have
-/// staged this trigger's files BEFORE the removal below and commit them AFTER
-/// it, writing the path back into HEAD while it is gone from the worktree. That
-/// is an unstaged deletion, which is exactly the dirty tree this exists to
-/// prevent, and it is what left `data/triggers/run-probe-*/scripts/run.py`
-/// behind an engine "Script task output" commit on 2026-08-07. A clean read is
-/// therefore not a terminal state: the path can go dirty again after it, so the
-/// loop watches for the whole window rather than exiting on the first (or the
-/// second) clean read.
-///
-/// The window is a ceiling, not a sleep: it costs nothing but polling, and each
-/// test is its own async task, so it overlaps the rest of the suite.
-async fn cleanup_fired_trigger(client: &reqwest::Client, id: &str, slug: &str) {
-    delete_trigger(client, id).await;
-    {
-        // Removing the dir is a working-tree change, so it takes the same guard
-        // the creation did; see `workspace_tree_lock`. Scoped to the removal
-        // alone: each commit below takes its own exclusive guard. Holding one
-        // across the poll would pin every other tree writer behind a
-        // fifteen-second guard (tokio's RwLock is write-preferring, so one
-        // queued snapshot would stall them all) to protect nothing.
-        let _tree = crate::support::workspace_tree_lock().read().await;
-        let _ = std::fs::remove_dir_all(workspace_path().join("data/triggers").join(slug));
-    }
-    let pathspec = format!("data/triggers/{}", slug);
-    let deadline = Instant::now() + CLEANUP_SETTLE;
-    while Instant::now() < deadline {
-        let dirty = std::process::Command::new("git")
-            .current_dir(workspace_path())
-            .args(["status", "--porcelain", "--", &pathspec])
-            .output()
-            .map(|o| !o.stdout.is_empty())
-            // A `git status` that would not run says nothing about the tree, so
-            // treat it as dirty and keep trying rather than declaring victory.
-            .unwrap_or(true);
-        if dirty {
-            // Pathspec form: commits the working-tree state of exactly this
-            // path, so a concurrent test's staged changes are never swept in.
-            // The failure this retries past is an unlucky one: the command
-            // exits non-zero for a lost `index.lock` and for "nothing to
-            // commit" alike, so the exit code cannot tell them apart and the
-            // next poll is what settles it. The commit itself takes the guard
-            // exclusively, like every commit a test runs in the workspace.
-            let _tree = crate::support::workspace_tree_lock().write().await;
-            let _ = std::process::Command::new("git")
-                .current_dir(workspace_path())
-                .args([
-                    "commit",
-                    "-q",
-                    "-m",
-                    "e2e: remove off-schedule-run probe trigger",
-                    "--",
-                    &pathspec,
-                ])
-                .output();
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
 }
 
 /// The thread a trigger's most recent fire ran on, plus every terminator on it
@@ -348,24 +267,23 @@ async fn run_fires_a_cron_trigger_and_records_last_run() {
     let client = user_client().await;
     let slug = unique_marker("run-probe");
     let name = format!("Run probe {}", slug);
-    // The one test that actually fires, so the one that needs a real script on
-    // disk (a script run needs no LLM provider). The engine auto-commits it
-    // after the run; `cleanup_script_trigger` commits its removal.
-    let trigger_dir = workspace_path().join("data/triggers").join(&slug);
+    // A test that fires needs a real script on disk (a script run needs no LLM
+    // provider). It lands committed, and so does its removal.
+    let script = format!("triggers/{}/scripts/run.py", slug);
     {
         // The moment this file appears in the shared working tree is one the
         // command-checkpoint test must not be mid-snapshot for; see
-        // `workspace_tree_lock`. Only the appearance needs the guard: a file
-        // present across both of its images cancels out of the diff.
+        // `workspace_tree_lock`.
         let _tree = crate::support::workspace_tree_lock().read().await;
-        std::fs::create_dir_all(trigger_dir.join("scripts")).expect("create scripts dir");
-        std::fs::write(trigger_dir.join("scripts/run.py"), PROBE_SCRIPT).expect("write script");
+        write_data_fixture(&client, &script, PROBE_SCRIPT)
+            .await
+            .expect("write the probe script");
     }
     let id = create_trigger(
         &client,
         &name,
         &slug,
-        json!({ "type": "script", "path": format!("triggers/{}/scripts/run.py", slug) }),
+        json!({ "type": "script", "path": script }),
         json!({ "cron_expressions": [NEVER_SOON_CRON] }),
     )
     .await;
@@ -383,11 +301,11 @@ async fn run_fires_a_cron_trigger_and_records_last_run() {
     let run = run_trigger_with_a_free_slot(&client, &id).await;
 
     let last_run = wait_for_last_run(&client, &name, Duration::from_secs(45)).await;
-    cleanup_fired_trigger(&client, &id, &slug).await;
+    delete_trigger(&client, &id).await;
+    remove_data_fixtures(&client, &format!("triggers/{slug}"), &[script]).await;
 
-    // Unwrapped only after cleanup: a panic before it strands the probe script
-    // and the trigger's definition in the shared working tree, which is the
-    // dirty tree that fails every concurrent apply test.
+    // Unwrapped only after cleanup: a panic before it strands a live trigger
+    // and its probe script in the shared workspace.
     let resp = run.expect("off-schedule run request");
     assert_eq!(resp["success"], true, "run refused: {resp}");
     assert_eq!(
@@ -431,23 +349,17 @@ async fn a_fired_trigger_turn_emits_exactly_one_terminator() {
     // default `LUCIDOS_MODEL=mock` the reply is fixed text and no tool runs; the
     // wording keeps a real provider to one turn too, if someone runs the suite
     // against one.
-    let id = {
-        // Creating the trigger writes `data/triggers/<slug>/trigger.toml` into
-        // the shared working tree, and this trigger FIRES, so the engine's
-        // post-run auto-commit tracks it. See `workspace_tree_lock`.
-        let _tree = crate::support::workspace_tree_lock().read().await;
-        create_trigger(
-            &client,
-            &name,
-            &slug,
-            json!({
-                "type": "intent",
-                "intent": "Reply with one short sentence confirming you ran. Call no tools.",
-            }),
-            json!({ "cron_expressions": [NEVER_SOON_CRON] }),
-        )
-        .await
-    };
+    let id = create_trigger(
+        &client,
+        &name,
+        &slug,
+        json!({
+            "type": "intent",
+            "intent": "Reply with one short sentence confirming you ran. Call no tools.",
+        }),
+        json!({ "cron_expressions": [NEVER_SOON_CRON] }),
+    )
+    .await;
 
     let run = run_trigger_with_a_free_slot(&client, &id).await;
 
@@ -458,15 +370,11 @@ async fn a_fired_trigger_turn_emits_exactly_one_terminator() {
     let last_run = wait_for_last_run(&client, &name, Duration::from_secs(90)).await;
     let probe = read_turn_terminators(&id).await;
 
-    // No tree guard here: `cleanup_fired_trigger` takes its own, and tokio's
-    // RwLock is write-preferring, so re-entering `read()` while already holding
-    // one deadlocks the moment the snapshot test is queued for `write()`.
-    cleanup_fired_trigger(&client, &id, &slug).await;
+    delete_trigger(&client, &id).await;
 
     // Everything above hands its failure back as a value, and every unwrap waits
-    // until here, because this trigger's definition is in the shared working
-    // tree until `cleanup_fired_trigger` has run: a panic before it strands the
-    // definition and fails every concurrent apply test with a dirty tree.
+    // until here: a panic before the delete strands a live cron trigger in the
+    // shared workspace.
     let run = run.expect("off-schedule run request");
     let (thread_id, terminators) = probe.expect("read the fired turn's terminators");
 

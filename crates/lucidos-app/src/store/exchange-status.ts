@@ -43,11 +43,12 @@ export function isTerminated(status: ExchangeStatus): boolean {
  *  callback queued behind the answer. */
 export const HELD_UNTIL_REPLY = 'Held until you reply';
 
-/** Map status to a UI label and CSS class. */
+/** Map status to a UI label, a CSS class, and for a turn that ended badly a
+ *  tooltip saying what happened. A one-word badge cannot say it alone. */
 export function statusLabel(
   status: ExchangeStatus,
   hasSteps: boolean,
-): { label: string; className: string } {
+): { label: string; className: string; tooltip?: string } {
   switch (status) {
     case 'queued':
       return { label: 'Queued', className: 'queued' };
@@ -65,12 +66,16 @@ export function statusLabel(
     case 'done':
       return { label: 'Done', className: 'done' };
     case 'interrupted':
-      return { label: 'Done', className: 'done' };
+      return {
+        label: 'Done',
+        className: 'done',
+        tooltip: 'A newer turn started before this reply finished. The work carried on below.',
+      };
     case 'canceled':
-      return { label: 'Canceled', className: 'canceled' };
+      return { label: 'Canceled', className: 'canceled', tooltip: 'You stopped this reply.' };
     case 'error':
-      return { label: 'Error', className: 'error' };
+      return { label: 'Error', className: 'error', tooltip: 'This reply failed. The note below says why.' };
     case 'aborted':
-      return { label: 'Aborted', className: 'aborted' };
+      return { label: 'Aborted', className: 'aborted', tooltip: 'Lucidos stopped this reply. The next card says why.' };
   }
 }

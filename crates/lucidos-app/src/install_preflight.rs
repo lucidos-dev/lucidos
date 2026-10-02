@@ -115,7 +115,7 @@ pub fn take_notice(app_data: &Path, port: u16, app_version: &str) -> Option<Conf
 /// `None` covers a gateway too old to carry the field and one that did not
 /// answer. Both mean "unknown", which the notice renders by saying nothing.
 fn serving_release(port: u16) -> Option<String> {
-    let body = crate::desktop::gateway_body(port, "GET", "/~/api/v1/health")?;
+    let body = crate::desktop::gateway_body(port, "GET", "/~/api/v1/health", None)?;
     parse_release(&body)
 }
 

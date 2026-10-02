@@ -44,11 +44,11 @@ const CANCEL_CAUSES = Object.keys(CANCEL_CAUSE_FLAGS) as CancelCause[];
 describe('describeEngineReason', () => {
   it('returns explainer for session_recovered', () => {
     expect(describeEngineReason({ kind: 'session_recovered' }))
-      .toMatch(/auto-resumed/i);
+      .toMatch(/picked it back up/i);
   });
   it('returns explainer for orphan_recovery', () => {
     expect(describeEngineReason({ kind: 'orphan_recovery' }))
-      .toMatch(/orphaned/i);
+      .toMatch(/restarted.*offered it as a change, marked unfinished/i);
   });
   it('returns explainer for harden_retrigger', () => {
     expect(describeEngineReason({ kind: 'harden_retrigger' }))
@@ -56,15 +56,15 @@ describe('describeEngineReason', () => {
   });
   it('returns explainer for stale_session', () => {
     expect(describeEngineReason({ kind: 'stale_session' }))
-      .toMatch(/stale/i);
+      .toMatch(/stopped running.*offered its work/i);
   });
   it('returns explainer for archived_branch_work', () => {
     expect(describeEngineReason({ kind: 'archived_branch_work' }))
-      .toMatch(/set that work aside/i);
+      .toMatch(/set it aside/i);
   });
   it('returns explainer for merge_conflict', () => {
     expect(describeEngineReason({ kind: 'merge_conflict' }))
-      .toMatch(/conflict/i);
+      .toMatch(/merge conflict/i);
   });
   it('returns explainer for missing_hardening', () => {
     expect(describeEngineReason({ kind: 'missing_hardening' }))
@@ -79,21 +79,79 @@ describe('describeEngineReason', () => {
     }))
       .toMatch(/browser-learning.*Core/i);
   });
-  it('returns null for scheduler (handled by trigger renderer)', () => {
-    expect(describeEngineReason({ kind: 'scheduler', trigger_id: 't' }))
-      .toBeNull();
+  it('names the trigger behind a scheduled message, and never its id', () => {
+    expect(describeEngineReason({ kind: 'scheduler', trigger_id: 't-1', trigger_name: 'Nightly digest' }))
+      .toMatch(/“Nightly digest” ran on its schedule/);
+    const unnamed = describeEngineReason({ kind: 'scheduler', trigger_id: 't-1' });
+    expect(unnamed).toMatch(/A trigger ran on its schedule/);
+    expect(unnamed).not.toContain('t-1');
+  });
+
+  // The reported card: an expired wait read "Prompt to the agent" with no
+  // story. The explainer says who asked, for what, why, and what happened.
+  it('tells a timed-out wait as a story', () => {
+    const text = describeEngineReason({
+      kind: 'event_wait',
+      outcome: 'expired',
+      watched: ['BenchSlotReleased'],
+      wait_reason: 'waiting for the bench slot',
+    });
+    expect(text).toBe(
+      'The agent asked Lucidos to tell it when “bench slot released” happened, because: '
+      + 'waiting for the bench slot. Nothing happened before its deadline, so Lucidos told '
+      + 'the agent, to report back.',
+    );
+  });
+
+  it('tells an arrived wait, naming every watched event in plain words', () => {
+    const text = describeEngineReason({
+      kind: 'event_wait',
+      outcome: 'delivered',
+      watched: ['ChangeProposed', 'CodingAgentIdled'],
+      wait_reason: 'the child to finish',
+    });
+    expect(text).toMatch(/“change proposed or coding agent stopped working” happened/);
+    expect(text).toMatch(/It happened, so Lucidos told the agent/);
+  });
+
+  // An older row infers only the outcome. No blank clause may print.
+  it('drops the clauses an older re-entry did not record', () => {
+    const text = describeEngineReason({ kind: 'event_wait', outcome: 'expired', watched: [], wait_reason: '' });
+    expect(text).toBe(
+      'The agent asked Lucidos to tell it when an event happened. Nothing happened before '
+      + 'its deadline, so Lucidos told the agent, to report back.',
+    );
+  });
+});
+
+/** Words a reader cannot act on. None may reach an explainer (plan invariant 9). */
+const ENGINE_INTERNALS = /marker|orphan|safety net|event loop|Thread Queue|driver task|ContinuationRequested|`|session/i;
+
+describe('every explainer is plain', () => {
+  it('names no engine internal and carries no markdown', () => {
+    const texts = [
+      ...ABORT_CAUSES.map(describeAbortCause),
+      ...CANCEL_CAUSES.map(describeCancelCause),
+      ...(['continuation_started', 'session_recovered', 'orphan_recovery', 'harden_retrigger',
+        'stale_session', 'archived_branch_work', 'merge_conflict', 'missing_hardening'] as const)
+        .map(kind => describeEngineReason({ kind })),
+    ];
+    for (const text of texts) expect(text).not.toMatch(ENGINE_INTERNALS);
+  });
+
+  it('never names one agent product for every thread', () => {
+    for (const cause of CANCEL_CAUSES) expect(describeCancelCause(cause)).not.toMatch(/Claude Code|Codex/);
+    for (const cause of ABORT_CAUSES) expect(describeAbortCause(cause)).not.toMatch(/Claude Code|Codex/);
   });
 });
 
 describe('describeAbortCause', () => {
-  it('explains safety_net as a non-watchdog event-loop crash now that the watchdog auto-resumes', () => {
-    // The 10-min watchdog path used to land here too — now it emits
-    // ContinuationRequested{auto_recovery_after_hang} and the user never sees
-    // safety_net for the hung-API-call case. The remaining cases are
-    // genuine Claude Code session / driver failures.
+  // The two remaining safety nets: the agent's turn ended without a reply, or
+  // another job waited on the thread for a minute.
+  it('explains safety_net by its two cases, in plain words', () => {
     const text = describeAbortCause('safety_net');
-    expect(text).toMatch(/crash|driver|event loop/i);
-    expect(text).toMatch(/auto-resume|ContinuationRequested/i);
+    expect(text).toMatch(/stopped without finishing/i);
+    expect(text).toMatch(/waited a minute/i);
   });
   it('mentions shutdown for engine_shutdown', () => {
     expect(describeAbortCause('engine_shutdown')).toMatch(/shut down|restarted/i);
@@ -110,15 +168,15 @@ describe('describeAbortCause', () => {
     expect(text).toMatch(/Continue/);
     expect(text).not.toMatch(/could not be resumed/i);
   });
-  it('mentions the session for process_killed', () => {
-    expect(describeAbortCause('process_killed')).toMatch(/session/i);
+  it('says the agent crashed for process_killed', () => {
+    expect(describeAbortCause('process_killed')).toMatch(/ended unexpectedly/i);
   });
-  it('mentions cleanup for stale_settle', () => {
-    expect(describeAbortCause('stale_settle')).toMatch(/clean|stuck/i);
+  it('says nothing was lost for stale_settle', () => {
+    expect(describeAbortCause('stale_settle')).toMatch(/nothing was working on it.*No work was lost/i);
   });
   it('falls back for unknown / undefined', () => {
-    expect(describeAbortCause('unknown')).toMatch(/cause not recorded/i);
-    expect(describeAbortCause(undefined)).toMatch(/cause not recorded/i);
+    expect(describeAbortCause('unknown')).toMatch(/did not record why/i);
+    expect(describeAbortCause(undefined)).toMatch(/did not record why/i);
   });
   it('returns a non-empty string for every AbortCause variant', () => {
     for (const cause of ABORT_CAUSES) {
@@ -144,7 +202,7 @@ describe('describeContinuationReason', () => {
   });
 
   it('attributes a user-clicked Continue to the user', () => {
-    expect(describeContinuationReason(CONTINUATION_USER_CLICKED_REASON)).toMatch(/^You clicked Continue/);
+    expect(describeContinuationReason(CONTINUATION_USER_CLICKED_REASON)).toMatch(/^You pressed Continue/);
   });
 
   // An upstream drop is a LOCAL interruption too: the engine resumed one
@@ -197,8 +255,8 @@ describe('describeCancelCause', () => {
     expect(describeCancelCause('user_action')).toMatch(/appl|discard|archiv/i);
   });
   it('falls back for unknown / undefined', () => {
-    expect(describeCancelCause('unknown')).toMatch(/cause not recorded/i);
-    expect(describeCancelCause(undefined)).toMatch(/cause not recorded/i);
+    expect(describeCancelCause('unknown')).toMatch(/did not record how/i);
+    expect(describeCancelCause(undefined)).toMatch(/did not record how/i);
   });
   it('attributes every cause to the user ("You")', () => {
     for (const cause of CANCEL_CAUSES) {

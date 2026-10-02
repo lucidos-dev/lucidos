@@ -4,7 +4,7 @@ vi.mock('../../store/actions/threads', () => ({
   focusThreadOrBootstrap: vi.fn(),
 }));
 
-import { openChangeThread, applyBlockedReason, changeRowActions, rowActionClass, rowActionLayout, bulkApplyState, THREAD_UNSETTLED_TIP } from './ChangesView';
+import { openChangeThread, applyBlockedReason, changeRowActions, rowActionClass, rowActionLayout, pendingSections, THREAD_UNSETTLED_TIP } from './ChangesView';
 import { focusThreadOrBootstrap } from '../../store/actions/threads';
 import type { Change } from '../../api/client';
 
@@ -154,75 +154,60 @@ describe('rowActionLayout', () => {
   });
 });
 
-describe('bulkApplyState: Apply All, and the sweep beside it', () => {
-  const settled = makeChange({ id: 'a' });
-  const working = makeChange({ id: 'b', thread_unsettled: true });
+describe('pendingSections: Ready, then Not finished', () => {
+  const settled = makeChange({ id: 'a', thread_id: 't-a' });
+  const settling = makeChange({ id: 'b', thread_id: 't-b', thread_unsettled: true, thread_settling: true });
+  const parked = makeChange({ id: 'c', thread_id: 't-c', thread_unsettled: true, thread_settling: false });
+  const resolving = makeChange({
+    id: 'd', thread_id: 't-d', thread_unsettled: true, thread_settling: true, resolving_conflict: true,
+  });
+  const none = new Set<string>();
 
-  it('offers nothing for a lone settled change with nothing working', () => {
-    expect(bulkApplyState([settled], 0, 0).show).toBe(false);
+  it('puts every change in exactly one section, split on whether its thread finished', () => {
+    const s = pendingSections([settled, settling, parked, resolving], none);
+    expect(s.ready.map((c) => c.id)).toEqual(['a']);
+    expect(s.notFinished.map((c) => c.id)).toEqual(['b', 'c', 'd']);
+  });
+
+  // A question card never settles by itself, so the change is not ready either.
+  it('never counts a parked thread as ready', () => {
+    expect(pendingSections([parked], none).ready).toEqual([]);
   });
 
   it('never counts incomplete work as appliable in bulk', () => {
-    const stopped = makeChange({ id: 'c', incomplete: true });
-    expect(bulkApplyState([stopped], 0, 0).canApplyNow).toBe(false);
-    expect(bulkApplyState([stopped, settled], 0, 0).canApplyNow).toBe(true);
+    const stopped = makeChange({ id: 'e', incomplete: true });
+    expect(pendingSections([stopped], none).canApplyNow).toBe(false);
+    expect(pendingSections([stopped, settled], none).canApplyNow).toBe(true);
   });
 
-  it('offers Discard All, the sweep and Apply All when both are true', () => {
-    const state = bulkApplyState([settled, working], 1, 0);
-    expect(state).toEqual({
-      show: true,
-      canApplyNow: true,
-      offerSweep: true,
-      armed: false,
-      showApplyAll: true,
-      showDiscardAll: true,
-    });
+  it('keeps Discard All to Ready, and to more than one change there', () => {
+    expect(pendingSections([settled, settling], none).showDiscardAll).toBe(false);
+    const other = makeChange({ id: 'f', thread_id: 't-f' });
+    expect(pendingSections([settled, other, settling], none).showDiscardAll).toBe(true);
   });
 
-  it('offers the sweep alone when nothing can be applied now', () => {
-    const state = bulkApplyState([working], 2, 0);
-    expect(state).toMatchObject({ show: true, canApplyNow: false, offerSweep: true, showApplyAll: false });
+  // Incomplete work alone offers nothing to apply in bulk, until a batch runs.
+  it('offers Apply All while something is ready, or a batch still runs', () => {
+    const stopped = makeChange({ id: 'h', incomplete: true });
+    expect(pendingSections([settled], none).showApplyAll).toBe(true);
+    expect(pendingSections([stopped], none).showApplyAll).toBe(false);
+    expect(pendingSections([stopped], none, true).showApplyAll).toBe(true);
   });
 
-  // The sweep's own request sets the in-flight flag too. Drawing Apply All's
-  // "Applying..." for it would flash a faded pill beside the toggle.
-  it('keeps Apply All hidden while the sweep alone is in flight', () => {
-    expect(bulkApplyState([working], 1, 0, true).showApplyAll).toBe(false);
+  // A parked arm drops at once, and a conflict being resolved already applies.
+  it('arms only the settling changes, never a parked or resolving one', () => {
+    expect(pendingSections([settling, parked, resolving], none).armable.map((c) => c.id)).toEqual(['b']);
   });
 
-  it('keeps Apply All drawn while a batch runs with nothing left to sweep', () => {
-    expect(bulkApplyState([settled, working], 0, 0, true).showApplyAll).toBe(true);
-    expect(bulkApplyState([settled], 1, 0).showApplyAll).toBe(true);
+  it('wears the cancel face only once every armable change is armed', () => {
+    const other = makeChange({ id: 'g', thread_id: 't-g', thread_unsettled: true, thread_settling: true });
+    expect(pendingSections([settling, other], new Set(['t-b'])).armed).toBe(false);
+    expect(pendingSections([settling, other], new Set(['t-b', 't-g'])).armed).toBe(true);
   });
 
-  it('offers the sweep with no pending changes at all', () => {
-    expect(bulkApplyState([], 3, 0)).toMatchObject({ show: true, offerSweep: true });
-  });
-
-  it('offers nothing with no pending changes and nothing working', () => {
-    expect(bulkApplyState([], 0, 0).show).toBe(false);
-  });
-
-  it('keeps Discard All to the multi-change case it has always had', () => {
-    expect(bulkApplyState([settled], 1, 0).showDiscardAll).toBe(false);
-    expect(bulkApplyState([settled, working], 0, 0).showDiscardAll).toBe(true);
-  });
-
-  // The bug this replaced: the sweep control had one face, so a press could
-  // only ever re-arm.
-  it('flips the sweep to its cancel face once anything is armed', () => {
-    const state = bulkApplyState([working], 2, 1);
-    expect(state).toMatchObject({ show: true, offerSweep: true, armed: true });
-  });
-
-  it('keeps Apply All beside the armed toggle while a change is ready', () => {
-    const state = bulkApplyState([settled, working], 1, 1);
-    expect(state).toMatchObject({ armed: true, canApplyNow: true, offerSweep: true });
-  });
-
-  it('keeps the off reachable after the last thread stops working', () => {
-    const state = bulkApplyState([], 0, 1);
-    expect(state).toMatchObject({ show: true, offerSweep: true, armed: true });
+  // An arm on a thread outside the section is not this control's to show.
+  it('ignores arms on threads it does not list', () => {
+    expect(pendingSections([settling], new Set(['elsewhere'])).armed).toBe(false);
+    expect(pendingSections([], new Set(['elsewhere'])).armed).toBe(false);
   });
 });

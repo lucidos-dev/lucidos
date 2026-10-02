@@ -98,6 +98,24 @@ pub enum EngineReason {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         confirmed_on_device_id: Option<String>,
     },
+    /// An *event wait* the agent set ended, so the engine re-entered its
+    /// thread to say how. `watched` and `wait_reason` copy the `EventWaitStarted`,
+    /// which is routinely outside the loaded window by the time this renders.
+    EventWait {
+        outcome: EventWaitOutcome,
+        watched: Vec<String>,
+        wait_reason: String,
+    },
+}
+
+/// How an event wait ended, as the re-entry it caused reports it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EventWaitOutcome {
+    /// A watched event happened.
+    Delivered,
+    /// The deadline passed first.
+    Expired,
 }
 
 /// Why a plugin setup thread runs: a first install, or an update that changed
@@ -189,6 +207,12 @@ fn default_thread_direction_parent() -> ThreadDirection {
 /// - `Workspace { mode, .. }`   ⇒ `mode == carried mode`
 /// - `ThreadLink { mode, .. }`  ⇒ `mode == carried mode`
 /// - `Engine { .. }`            ⇒ `mode == ActorMode::Engine` (intrinsic)
+///
+/// One injection breaks the last line on purpose: an event-wait re-entry
+/// (`event_wait::emit_resolution`) pairs an `Engine` origin with
+/// `ActorMode::Agent`. Its origin says the engine wrote the words. Its mode
+/// says they answer the agent's own subscription, and `held_deliveries` keys
+/// on that mode to hold a re-entry behind an open question.
 ///
 /// Workspace caller_* body fields are display hints only — they are user-controllable
 /// (any HTTP client can send them) and MUST NOT be used for authorization.

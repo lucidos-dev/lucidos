@@ -1,6 +1,9 @@
 # 0190: A phone's update route is a toast, not the Maintenance page
 
-- **Status**: Accepted
+- **Status**: Accepted (the "one answer on a phone" decision and the rejection
+  of a remote install are superseded by
+  [0338](0338-phone-update-relays-through-the-desktop-app.md); the suppressed
+  toast and badge stand)
 - **Date**: 2026-09-16
 
 ## Context

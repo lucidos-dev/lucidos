@@ -40,7 +40,9 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::core::event_subscription::{is_subscribable, matchable_payload, EventSubscription};
-use crate::engine::thread_events::{EventMeta, ThreadEvent};
+use crate::engine::thread_events::{
+    EngineReason, EventMeta, EventWaitOutcome, MessageOrigin, ThreadEvent,
+};
 
 /// One live wait, as reconstructed from its `EventWaitStarted`.
 ///
@@ -831,8 +833,9 @@ async fn emit_resolution(
         wait.thread_id,
         ThreadEvent::UserPromptInjected {
             text: text.clone(),
+            // Agent mode with an engine origin, by design: see `MessageOrigin`.
             mode: crate::engine::thread_events::ActorMode::Agent,
-            origin: None,
+            origin: Some(reentry_origin(wait, resolution_is_delivery)),
             injected_message_id: None,
             // The prose in `text` stays exactly as the model needs it. This is
             // the same delivery addressed to the client instead, so it can name
@@ -845,6 +848,26 @@ async fn emit_resolution(
     Ok(WaitReentry {
         anchor_event_id,
         text,
+    })
+}
+
+/// Who wrote a re-entry anchor and why: the engine, closing a wait the agent
+/// set. Each watched event type is named once, in the order the agent wrote.
+fn reentry_origin(wait: &LiveWait, delivered: bool) -> MessageOrigin {
+    let mut watched: Vec<String> = Vec::new();
+    for sub in &wait.on {
+        if !watched.contains(&sub.event_type) {
+            watched.push(sub.event_type.clone());
+        }
+    }
+    MessageOrigin::engine(EngineReason::EventWait {
+        outcome: if delivered {
+            EventWaitOutcome::Delivered
+        } else {
+            EventWaitOutcome::Expired
+        },
+        watched,
+        wait_reason: wait.reason.clone(),
     })
 }
 

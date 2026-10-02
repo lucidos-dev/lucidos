@@ -44,7 +44,7 @@ const stylesDir: string = resolve(here, '..');
 const shellCss: string = readFileSync(resolve(stylesDir, 'panels/shell.css'), 'utf-8');
 const shellRules = cssRules(shellCss);
 
-const DESKTOP = '@media (min-width: 769px)';
+const DESKTOP = '@media (--desktop-layout)';
 
 function desktopRule(selector: string): CssRule {
   const found = shellRules.filter(r => r.selector === selector && r.atRules === DESKTOP);

@@ -38,7 +38,7 @@
 /* On a phone it takes the header palette width, so it matches the Lucidos
    menu and the composer's model menu beside it. The component centres it in
    the pane ('container-center'). */
-@media (max-width: 768px) {
+@media (--phone-layout) {
     .waiting-panel {
         width: min(var(--header-surface-width), var(--anchored-popover-fit));
         min-width: 0;

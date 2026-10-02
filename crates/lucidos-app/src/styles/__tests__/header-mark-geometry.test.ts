@@ -28,7 +28,7 @@ const switcherSource: string = readFileSync(
   'utf-8',
 );
 
-const MOBILE = '@media (max-width: 768px)';
+const MOBILE = '@media (--phone-layout)';
 
 /** The `:root` declarations mobile.css makes at one scope. The sheet has two
  *  such blocks, one inside the mobile breakpoint and one outside. A
@@ -696,7 +696,7 @@ describe('the nav reserve is the widest edge cluster, and no wider', () => {
   it('names a box declared for every width, or the clamp goes invalid', () => {
     // --header-nav-cluster-width sits at an unscoped :root, so a box declared
     // only inside the mobile breakpoint leaves the clamp nothing to substitute
-    // above 768px. An invalid custom property drops the cluster's width, and it
+    // on the desktop layout. An invalid custom property drops the cluster's width, and it
     // does it in silence: no browser warning, no failing measurement.
     expect(
       mobileRoot('').get('--mobile-header-icon-box'),

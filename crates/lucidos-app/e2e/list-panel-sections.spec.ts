@@ -57,7 +57,6 @@ const CHANGES_STATE = {
   apply_all_in_progress: false,
   apply_all_batch: null,
   standing_apply_thread_ids: [] as string[],
-  settling_thread_count: 0,
 };
 
 function trigger(id: string, name: string, groupId?: string) {
@@ -183,7 +182,7 @@ test.describe('list panel sections', () => {
     await settle(page);
 
     const panel = '.panel-content.list-rows-divided';
-    expectDrawerLook(await headerLooks(page, panel), ['Set aside', 'Recently applied']);
+    expectDrawerLook(await headerLooks(page, panel), ['Ready', 'Set aside', 'Recently applied']);
     expectInset(await hairlines(page, panel, '.list-row'), 'a change row');
     expectInset(await hairlines(page, panel, '.changes-bulk-actions'), 'the button row');
     await page.locator(panel).first().screenshot({ path: test.info().outputPath('changes.png') });

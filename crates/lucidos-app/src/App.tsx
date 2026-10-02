@@ -40,6 +40,7 @@ import {
 import { scaleModalOpen } from './components/shared/scaleModalState';
 import { releaseNoticeModalOpen } from './store/releaseNotices';
 import { viewportIsMobile } from './utils/viewport';
+import { CameraCaptureSlot } from './components/chat/PromptInput';
 
 const FileSearchModal = lazyComponent(() => import('./components/files/FileSearchModal').then(m => m.FileSearchModal));
 const ImagePopup = lazyComponent(() => import('./components/shared/ImagePopup').then(m => m.ImagePopup));
@@ -162,6 +163,7 @@ export function App() {
         <ScaleModalSlot />
         <ReleaseNoticeSlot />
         <SearchEverywhereSlot />
+        <CameraCaptureSlot />
       </OverlayLayer>
       <DropZone />
       <UiBlockingOverlay />

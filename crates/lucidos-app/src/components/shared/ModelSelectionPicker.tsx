@@ -91,9 +91,9 @@ export function pickerKeyAction(key: string): 'choose' | 'next' | 'prev' | null 
  *  and a blinking caret.
  *
  *  A touch device always has it, because a box that waits to be typed into is
- *  a box a finger can never reach. `touch` is the capability, NOT the mobile
- *  width breakpoint: a phone held in landscape is over 768px wide and has no
- *  more keyboard than it had upright.
+ *  a box a finger can never reach. `touch` is the capability, NOT the phone
+ *  layout: a tablet gets the desktop split and has no more keyboard than a
+ *  phone.
  *
  *  A host opened mid-typing (`keyboard`, the keyboard handoff) has it too, so
  *  the box is there to take the keystrokes. */

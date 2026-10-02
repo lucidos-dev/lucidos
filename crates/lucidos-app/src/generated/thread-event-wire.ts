@@ -281,6 +281,15 @@ export type EngineReason =
       patch_path: string;
       confirmed_on_device_id?: string;
     }
+  /** An *event wait* the agent set ended, so the engine re-entered its
+   *  thread to say how. `watched` and `wait_reason` copy the `EventWaitStarted`,
+   *  which is routinely outside the loaded window by the time this renders. */
+  | {
+      kind: 'event_wait';
+      outcome: EventWaitOutcome;
+      watched: string[];
+      wait_reason: string;
+    }
   /** The pre-rename name for `continuation_started`, carried by rows written before the rename. */
   | { kind: 'session_recovered' };
 
@@ -305,6 +314,11 @@ export type EventWaitCancelCause =
   | 'thread_discarded'
   | 'thread_canceled'
   | 'unknown';
+
+/** How an event wait ended, as the re-entry it caused reports it. */
+export type EventWaitOutcome =
+  | 'delivered'
+  | 'expired';
 
 /** How a *form request* was closed. Carried by `FormRequestResolved`.
  *  Full reasoning is on the Rust variant. */

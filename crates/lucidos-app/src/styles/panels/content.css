@@ -235,11 +235,11 @@
  * That puts the button partly under `.edge-swipe-zone`, the transparent 1.25rem
  * strip on the pane's right edge. The z-index lifts it clear, as
  * `.notification-row-detail-btn` above does and for the same reason. */
-@media (max-width: 768px) {
+@media (--phone-layout) {
     .notification-detail-header {
         padding-right: max(
             calc(0.625rem + (var(--mobile-header-icon-box) - var(--mobile-header-glyph-box)) / 2),
-            env(safe-area-inset-right, 0px)
+            var(--safe-area-right)
         );
     }
 
@@ -981,13 +981,6 @@
 .repo-preview-fade {
     height: 100%;
     grid-template-rows: 100%;
-}
-
-/* Image/media variant: a definite height so a contained image's max-height:100%
-   still fits the pane once the padding wrapper is in place. */
-.repo-file-rendered-media {
-    height: 100%;
-    box-sizing: border-box;
 }
 
 /* --- File search modal --- */

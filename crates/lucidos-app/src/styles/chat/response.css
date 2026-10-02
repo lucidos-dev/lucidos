@@ -243,8 +243,8 @@
         footprint (safe-area inset + top inset + diameter) plus --nav-focus-reach so
         the focus-marker glow clears it too. Without this the element (and its
         highlight) tucked right under the chevron with no room, the reported
-        regression. The env(safe-area-inset-top) term MIRRORS the chevron's own top
-        (max(--scroll-chevron-top, env(safe-area-inset-top) + --scroll-chevron-top)
+        regression. The var(--safe-area-top) term MIRRORS the chevron's own top
+        (max(--scroll-chevron-top, var(--safe-area-top) + --scroll-chevron-top)
         == env + inset on desktop, since env >= 0): on a viewport-fit / notched
         device at desktop width (e.g. iPad landscape PWA) the chevron rides down by
         the notch, so the clearance must too — omitting it would let the element
@@ -252,13 +252,13 @@
    Both branches add +0.5rem breathing room. Computed from the chevron's OWN
    variables (base.css) so moving/resizing it keeps this clearance in lockstep.
    Matches the mask's min-width breakpoint. */
-@media (min-width: 769px) {
+@media (--desktop-layout) {
     .chat-exchange,
     .chat-exchange [data-event-id],
     [data-side-question-id] {
         scroll-margin-top: max(
             calc(var(--thread-top-fade) + var(--deep-link-focus-gap) + 0.5rem),
-            calc(env(safe-area-inset-top, 0px) + var(--scroll-chevron-top) + var(--scroll-chevron-size) + var(--nav-focus-reach) + 0.5rem)
+            calc(var(--safe-area-top) + var(--scroll-chevron-top) + var(--scroll-chevron-size) + var(--nav-focus-reach) + 0.5rem)
         );
     }
 }
@@ -301,7 +301,7 @@
    glow blooming just beyond it) clears the header stack too (same reason as the
    desktop base above). The event lands below all four, exactly under the thread
    title header with its whole highlight visible. */
-@media (max-width: 768px) {
+@media (--phone-layout) {
     .chat-exchange,
     .chat-exchange [data-event-id],
     [data-side-question-id] {
@@ -1559,7 +1559,7 @@
     margin-left: 0;
 }
 
-@media (max-width: 768px) {
+@media (--phone-layout) {
     .copyable-block-multi .copy-btn,
     .code-block-copy-btn {
         padding: 0.25rem;

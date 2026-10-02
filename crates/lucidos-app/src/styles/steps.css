@@ -474,7 +474,7 @@
    cap: below the mobile breakpoint it is 90vw, and the words pushed the role
    labels into three and four wrapped lines. The rows are compact everywhere
    under there, which is what the tree already is. */
-@media (max-width: 768px) {
+@media (--phone-layout) {
     .context-unit {
         display: none;
     }
@@ -518,8 +518,8 @@
    centered would re-center on every toggle and visibly dance. Each gap clears
    its safe-area inset, or on an iPhone the head slides under the status bar. */
 .step-detail-overlay {
-    --step-detail-gap-top: max(5vh, calc(env(safe-area-inset-top, 0px) + var(--space-lg)));
-    --step-detail-gap-bottom: max(5vh, calc(env(safe-area-inset-bottom, 0px) + var(--space-lg)));
+    --step-detail-gap-top: max(5vh, calc(var(--safe-area-top) + var(--space-lg)));
+    --step-detail-gap-bottom: max(5vh, calc(var(--safe-area-bottom) + var(--space-lg)));
     align-items: flex-start;
     padding-top: var(--step-detail-gap-top);
 }

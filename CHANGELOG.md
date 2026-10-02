@@ -1,5 +1,39 @@
 # Changelog
 
+## v0.45.0 - 2026-10-02
+
+### Added
+- A phone can ask the desktop app to update itself. Open What's New on the phone and the running desktop app installs the new version.
+- Apps repaint with the shell. The shell pushes its theme, scale and font to every open app frame as it paints, and the SDK applies them.
+- A pane swipe starts anywhere over an app, including a natively fullscreen one.
+- The Changes panel splits pending changes into Ready and Not finished. The badge counts only changes ready to act on.
+- A Needs attention row opens on the exact event that needs attention.
+- The recommended disk cleanup shows progress, like backup does.
+- On a phone, the composer is frosted and the transcript scrolls under it. A phone in landscape clears the Dynamic Island and rounded corners.
+- A wake-up from an event wait names the engine and the wait that caused it.
+- `lucidos.utils.escapeHtmlAttr` escapes text for use inside an HTML attribute.
+
+### Changed
+- Agent sessions and background tasks run below the engine, and agent compiles use their own sccache daemon.
+- Permission cards, waits and device names use plain words, and say where a turn came from.
+- The Lucidos Agent caption says build and refine.
+- Each MCP server runs in its own process group, and stopping it stops the whole group.
+- Inputs, dialogs and the composer share one soft focus ring.
+
+### Fixed
+- Documents served by the repo and change file routes are sandboxed, and the repo SVG preview renders from a sandboxed engine URL.
+- App proxy responses carry only allowlisted upstream headers. A document hidden behind a second content type is sandboxed.
+- A handshake script receives only well-formed CRED_* and OAUTH_* names.
+- Gate-marker endpoints refuse a plain loopback caller.
+- Critical and high defects from the project-wide harden are fixed, including the apply commit check.
+- Backup key creation no longer clobbers a key, and fails instead of retrying forever when the key path is unreadable.
+- Preference saves and refetches no longer lose or revert a newer write, and the stream re-reads preferences on every open.
+- Search no longer keeps a recent for a deleted thread.
+- A bounded git clone runs off the worker thread, times out, and stops when its caller cancels.
+- A barge-in cancel with no reply no longer drops a voice call.
+- Disk cleanup closes both end races and gates worktree removal on the Discard check.
+- Phone layout fixes: header icons take a 44px tap, title bars and bars follow the layout after rotation, the safe-area insets survive a relaunch or a phone call, modals centre above the keyboard, and Send runs a tap that iOS cancels.
+- The compose destination dropdown matches the prompt box width.
 ## v0.44.2 — 2026-10-01
 
 ### Changed

@@ -151,6 +151,9 @@ impl McpClient {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        // Its own group, so a stop reaches what an `npx`/`uvx` launcher forks,
+        // and a signal to the engine's group never reaches the server.
+        crate::runtime::spawn_env::isolate_in_process_group(&mut cmd);
 
         // Augment PATH with common interpreter / package-manager bin dirs so a
         // user-configured server like `npx` / `uvx` / `node` resolves even if
@@ -470,7 +473,7 @@ impl McpClient {
                     // So the stream cannot be resynchronised. The process is
                     // killed rather than left to answer the next call with the
                     // tail of the one that broke it.
-                    let _ = self.child.start_kill();
+                    self.kill_now();
                     return Err(format!(
                         "MCP server '{}' sent more than {} bytes with no newline. That breaks \
                          JSON-RPC framing, so the frame was refused and the connection closed. \
@@ -531,8 +534,20 @@ impl McpClient {
         matches!(self.child.try_wait(), Ok(Some(_)))
     }
 
-    /// Kill the server process.
+    /// Kill the server and every process it started, giving them a grace to
+    /// clean up first.
+    ///
+    /// The server leads its own process group, so signalling the group reaches
+    /// its descendants. `Child::id` answers `None` once the child is reaped,
+    /// which is exactly when its pid may be recycled and must not be signalled.
     pub async fn shutdown(&mut self) {
+        if let Some(pid) = self.child.id() {
+            crate::runtime::spawn_env::graceful_kill_child_process_group(
+                pid,
+                crate::runtime::claude_code::GROUP_TEARDOWN_GRACE,
+            )
+            .await;
+        }
         let _ = self.child.start_kill();
         match tokio::time::timeout(std::time::Duration::from_secs(3), self.child.wait()).await {
             Ok(_) => {}
@@ -541,11 +556,20 @@ impl McpClient {
             }
         }
     }
+
+    /// SIGKILL the server's whole process group, for a caller that cannot
+    /// await the grace. Same reaping guard as [`Self::shutdown`].
+    fn kill_now(&mut self) {
+        if let Some(pid) = self.child.id() {
+            crate::runtime::spawn_env::kill_child_process_group_now(pid);
+        }
+        let _ = self.child.start_kill();
+    }
 }
 
 impl Drop for McpClient {
     fn drop(&mut self) {
-        let _ = self.child.start_kill();
+        self.kill_now();
     }
 }
 

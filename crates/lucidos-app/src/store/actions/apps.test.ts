@@ -361,6 +361,21 @@ describe('openAppById', () => {
     expect(errors[0].message).toMatch(/no longer exists/i);
   });
 
+  it('never calls an app gone when the re-scan failed, and keeps the cached list', async () => {
+    appsList.value = { status: 'loaded', data: [notesApp] };
+    mockListAppsApi.mockRejectedValue(new Error('boom'));
+
+    const { openAppById } = await import('./apps');
+    await openAppById('trip-planner-2026');
+
+    expect(panelOverlay.value).toBeNull();
+    expect(appsList.value).toEqual({ status: 'loaded', data: [notesApp] });
+    const errors = toasts.value.filter((t) => t.type === 'error');
+    expect(errors).toHaveLength(1);
+    expect(errors[0].message).toMatch(/trip-planner-2026/);
+    expect(errors[0].message).not.toMatch(/no longer exists/i);
+  });
+
   it('opens the app when found', async () => {
     appsList.value = { status: 'loaded', data: [notesApp] };
 

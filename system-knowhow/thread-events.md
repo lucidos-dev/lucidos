@@ -157,7 +157,7 @@ Some variants (`ChangeApplied`, `ChangeDiscarded`, `ChangeReverted`, `ChangeAppl
 
 ### Engine origins: `origin.kind == "engine"`
 
-When the engine itself writes a message or prompt, the event carries `origin: { "kind": "engine", "reason": { "kind": … } }` and `mode: "engine"`. The reason says why. Two of them seed a whole thread, and name what the engine acted on:
+When the engine itself writes a message or prompt, the event carries `origin: { "kind": "engine", "reason": { "kind": … } }` and `mode: "engine"`. The reason says why. An event-wait re-entry anchor is the one exception: it keeps `mode: "agent"`, see § The re-entry anchor. Two of them seed a whole thread, and name what the engine acted on:
 
 | `reason.kind` | When | Fields |
 |---|---|---|
@@ -166,7 +166,7 @@ When the engine itself writes a message or prompt, the event carries `origin: { 
 
 The engine wrote the words, so the engine is the origin, never the user's device. The device that confirmed rides beside it as `confirmed_on_device_id`, the id only. `from_version` is absent when the prior install record names no version.
 
-The other reasons are `continuation_started`, `orphan_recovery`, `scheduler` (with `trigger_id`, optional `trigger_name`), `harden_retrigger`, `stale_session`, `archived_branch_work`, `merge_conflict` and `missing_hardening`. `archived_branch_work` marks a change the engine set aside from an archived thread's unproposed branch work. `plugin_auto_update` is historical and no longer written.
+The other reasons are `continuation_started`, `orphan_recovery`, `scheduler` (with `trigger_id`, optional `trigger_name`), `harden_retrigger`, `stale_session`, `archived_branch_work`, `merge_conflict`, `missing_hardening` and `event_wait`. `archived_branch_work` marks a change the engine set aside from an archived thread's unproposed branch work. `plugin_auto_update` is historical and no longer written.
 
 Every thread the engine spawns carries an origin or a parent link, so a thread's first message always says who started it. A row written before that shows no origin at all.
 
@@ -196,7 +196,7 @@ These fire on chat threads (`channel = chat`) and on trigger-driven runs (`chann
 | `ToolResult` | The result returned to the chat agentic loop for a prior `ToolCalled`. Carries `result: String`, `images`, `success: bool` (default true), and `tool_called_event_id: Uuid`, the id of the `ToolCalled` it answers. **Pair a result with its call by that id, never by position**: a parallel batch of reads answers in completion order, so a result can land before an earlier call's. Only legacy rows lack the id. **Inline image bytes are stubbed out of `result`**, so a tool that returned an image persists something like `[image image/png, 641.2 KB omitted, not embedded in event]` or `[screenshot image/png, 1.5 MB omitted, not embedded in event]` followed by the page DOM. The model that made the call saw the actual image; the stub exists only because a megabyte of base64 per row made heavy threads unloadable. Reading one back via `query_events` means the image was shown and not persisted, never that it failed or was withheld. | per-action | yes | yes (use condition) |
 | `BackgroundBashStarted` | A long-running task was spawned via `run_bash_background` (shell command), a coding agent's `lucidos background-task run` (the same, in its worktree), OR `run_python_background` (venv-rooted Python script: the engine wraps it as `bash -o pipefail -c "<venv-python> <script>"` and routes it through the same registry). The `command` field captures the exact shell invocation. Paired with a later `BackgroundBashCompleted`. | per-action | yes | yes |
 | `BackgroundBashCompleted` | The task ended: natural exit, signal death, watchdog timeout, `bash_kill`, or the engine going away under it. Carries `exit_code: Option<i32>` (set **only** for a normal exit), `signal: Option<i32>` (set only for a signal death; omitted otherwise), `stdout`, `stderr`, `timed_out: bool`, `killed: bool`, `abandoned: bool`. Both `exit_code` and `signal` null means the status was unavailable. Never read that as success. `abandoned: true` is the engine-stop case, written by the teardown emit or the boot sweep, and it is NOT `killed` (which means `bash_kill`). Every started task on a live thread reaches exactly one of these, so a subscription on it is not left waiting on an event nobody will send. The audit-trail counterpart of `Started`. Emitting it does NOT evict the in-memory registry entry: a completed task stays drainable for a few minutes so a `bash_output` landing at the completion instant still gets the final tail, and `bash_output` falls back to this row only once that window closes. Same shape whether the spawning tool was `run_bash_background` or `run_python_background`. | per-action | yes | yes |
-| `ResponseGenerated` | The chat agentic loop terminated with an assistant response. The chat-mode terminator. Carries `text` (`#[serde(skip_serializing_if = "is_empty_str")]`), `images`, `model`, `reasoning_effort`. **`text` may be empty**: when a turn ends on a clean, model-decided stop with no text and no tool calls (a *benign empty completion* — e.g. Gemini `finishReason: STOP` after successful tool calls), the loop emits an empty `ResponseGenerated` rather than `ResponseFailed`, so the thread completes Idle instead of showing a red error. The UI renders a neutral "model returned an empty response" note for an empty-bodied completion. See `classify_empty_completion` (`agentic_loop/helpers.rs`) for the benign-vs-failure split. | one-per-turn | yes | yes |
+| `ResponseGenerated` | The chat agentic loop terminated with an assistant response. The chat-mode terminator. Carries `text` (`#[serde(skip_serializing_if = "is_empty_str")]`), `images`, `model`, `reasoning_effort`. **`text` may be empty**: when a turn ends on a clean, model-decided stop with no text and no tool calls (a *benign empty completion* — e.g. Gemini `finishReason: STOP` after successful tool calls), the loop emits an empty `ResponseGenerated` rather than `ResponseFailed`, so the thread completes Idle instead of showing a red error. The UI renders a neutral note for an empty-bodied completion, saying the agent finished without writing a reply. See `classify_empty_completion` (`agentic_loop/helpers.rs`) for the benign-vs-failure split. | one-per-turn | yes | yes |
 | `ResponseCanceled` | User clicked Cancel, clicked Apply / Discard / Archive on a still-running session, or posted a follow-up that interrupted a mid-turn Codex turn. Carries `cause: CancelCause` (`UserStop` / `UserAction` / `SupersededByFollowup` / `Unknown`). Always emit via `thread_events::emit_response_canceled` — it's idempotent against pre-emitted terminators (the `/api/v1/restart` race). | one-per-turn | yes | yes |
 | `ResponseAborted` | System-driven termination — engine shutdown, safety net (non-watchdog), recovery sweep, OS signal, stale-projection settle. Carries `cause: AbortCause` (`EngineShutdown` / `SafetyNet` / `RecoveryAfterRestart` / `ProcessKilled` / `StaleSettle` / `SessionDropped` / `Unknown`). Always emit via `thread_events::emit_response_aborted`. Note: when a hung-subprocess watchdog interrupts a coding agent (vs a crash or driver death), the engine emits `ContinuationRequested{auto_recovery_after_hang}` instead of `ResponseAborted{SafetyNet}` so the thread auto-resumes without user intervention. Two watchdogs can fire that path — see the `ContinuationRequested` row below. | one-per-turn | yes | yes |
 | `ResponseFailed` | Hard failure mid-turn: upstream API error, panic, OOM-killed bash, empty assistant text on a non-cancel turn (`agent_session::lifecycle::classify_result` triggers this for coding-agent threads too). Carries `error: String`. An empty chat completion lands here only for a *genuine* failure: output **truncated**, **blocked** by a safety classifier, **dropped** (billed but nothing parsed; Anthropic-only), or an **unrecognised** stop reason. A clean model-decided empty stop is benign and emits an empty `ResponseGenerated` instead (see that row). A reply a safety classifier stops **partway** also lands here, and its streamed `TextStreamed` text stays on screen with no `ResponseGenerated` after it. `classify_empty_completion` and `normalize_finish_reason` (`agentic_loop/helpers.rs`) classify every provider and thread type the same way. | one-per-turn | yes | yes |
@@ -324,6 +324,20 @@ A memory correction belongs to no thread, so `MemoryCorrected` is a
 | Event | When it fires | Volume | Persisted | Triggerable |
 |---|---|---|---|---|
 | `MemoryCorrected` | The agent corrected a long-term memory at the user's word, through the `memory` tool's `correct` or `correct_by_id` action. Carries `search_query`, `wrong_fact`, `removed` (each deleted entry's `summary`, `entities` and `source`), an optional `correction` (the fact that replaces it), and `recorded_at`. Every memory rebuild replays it, which is what keeps a corrected fact from coming back. | per-action (rare) | yes | yes |
+
+### Freeing disk space reports as `SystemEvent`s
+
+The *recommended cleanup* behind Disk Usage's "Free up space" button walks
+every worktree, so its report belongs to no thread. Its four events are
+**`SystemEvent`s** on aggregate `ops` with `aggregate_id` `global`. Each tree
+it touches still gets its own `WorktreeCleaned` thread event.
+
+| Event | When it fires | Volume | Persisted | Triggerable |
+|---|---|---|---|---|
+| `RecommendedCleanupStarted` | The user started a pass. Carries optional `actor`. | per-action (rare) | yes | yes |
+| `RecommendedCleanupProgress` | After each worktree the pass deals with, skipped ones included. Carries `done` and `total`. A transient frame like `BackupProgress`: subscribe to the terminal events instead. | per-worktree | no | no |
+| `RecommendedCleanupCompleted` | The pass finished. Carries `removed_count` (finished worktrees removed), `cleaned_count` (worktrees whose build artifacts were cleared) and `freed_bytes`. | per-action (rare) | yes | yes |
+| `RecommendedCleanupFailed` | The pass stopped before it finished. Carries `error`. | per-action (rare) | yes | yes |
 
 ## Changes (per-thread coding-agent change proposals)
 
@@ -513,6 +527,12 @@ pretty-printed JSON, so the id points at the row already holding the same facts
 as fields (`event_type`, `payload`) and the transcript names the event with its
 payload folded away. An *expiry* leaves the field unset: it has no payload to
 point at.
+
+Both carry `origin: { kind: "engine", reason: { kind: "event_wait", outcome,
+watched, wait_reason } }`, with `mode: "agent"`. `outcome` is `delivered` or `expired`. `watched`
+names each event type the wait watched, once. `wait_reason` is the reason the
+agent gave when it subscribed. The transcript reads these to say who wrote the
+prompt and why. Rows written before the field existed carry no `origin`.
 
 Worth knowing when reading a transcript, and load-bearing on restart: a
 resolution followed *only* by its anchor is one whose turn never ran, which is

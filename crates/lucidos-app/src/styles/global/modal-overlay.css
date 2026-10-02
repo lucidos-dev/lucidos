@@ -1,7 +1,15 @@
-/* ─── Shared modal overlay base ─── */
+/* ─── Shared modal overlay base ───
+
+   Bounded to the VISUAL viewport, so a modal centres in what is on screen.
+   iOS never shrinks the layout viewport for the keyboard
+   (`interactive-widget=resizes-visual` in index.html), so `inset: 0` alone
+   centred the panel with its buttons under the keys. MobileSwipeContainer
+   publishes `--app-height`; desktop takes the 100dvh fallback. */
 .modal-overlay {
     position: fixed;
     inset: 0;
+    bottom: auto;
+    height: var(--app-height, 100dvh);
     background: var(--scrim);
     z-index: var(--z-modal);
     display: flex;

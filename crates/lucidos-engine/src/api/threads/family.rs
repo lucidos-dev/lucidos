@@ -81,28 +81,40 @@ pub(in crate::api) enum FamilyDecision {
 /// Lock parent plus every descendant inside a transaction, so no state can flip
 /// between validation and the cascade. The caller owns the transaction, so the
 /// lock is released by its own commit or rollback.
+///
+/// The lock names the base table (`FOR UPDATE OF t`). Postgres skips a WITH
+/// query that a bare `FOR UPDATE` reaches, so locking the recursive CTE itself
+/// locks no row at all.
+///
+/// Rows are locked deepest first, the order `lock_edge_for_detach` uses, so the
+/// two cannot deadlock. They are returned parent first, in family order.
 pub(in crate::api) async fn load_family(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     thread_uuid: Uuid,
 ) -> Result<Vec<FamilyRow>, sqlx::Error> {
     sqlx::query_as::<_, FamilyRow>(
         "WITH RECURSIVE family AS (
-            SELECT thread_id, parent_thread_id, is_coding_agent, status,
-                   archive_state, coding_agent_proposed,
-                   coding_agent_is_external_repo, is_saved
+            SELECT thread_id, 0 AS level
             FROM thread_summaries
             WHERE thread_id = $1
             UNION ALL
-            SELECT t.thread_id, t.parent_thread_id, t.is_coding_agent, t.status,
-                   t.archive_state, t.coding_agent_proposed,
-                   t.coding_agent_is_external_repo, t.is_saved
+            SELECT t.thread_id, f.level + 1
             FROM thread_summaries t
             JOIN family f ON t.parent_thread_id = f.thread_id
+        ),
+        locked AS MATERIALIZED (
+            SELECT t.thread_id, t.is_coding_agent, t.status, t.archive_state,
+                   t.coding_agent_proposed, t.coding_agent_is_external_repo,
+                   t.is_saved, f.level
+            FROM thread_summaries t
+            JOIN family f ON f.thread_id = t.thread_id
+            ORDER BY t.depth DESC, t.thread_id
+            FOR UPDATE OF t
         )
         SELECT thread_id, is_coding_agent, status, archive_state,
                coding_agent_proposed, coding_agent_is_external_repo, is_saved
-        FROM family
-        FOR UPDATE",
+        FROM locked
+        ORDER BY level, thread_id",
     )
     .bind(thread_uuid)
     .fetch_all(&mut **tx)

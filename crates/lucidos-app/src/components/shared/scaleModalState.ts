@@ -1,6 +1,7 @@
 import { signal } from '@preact/signals';
 import {
-  applyUiScale,
+  previewUiScale,
+  cancelUiScalePreview,
   setUiScale,
   currentUiScale,
   clampUiScale,
@@ -92,6 +93,7 @@ function cancelLinger() {
 export function _resetScaleTimersForTesting(): void {
   cancelScheduledSave();
   cancelLinger();
+  cancelUiScalePreview();
 }
 
 export function openScaleModal() {
@@ -112,8 +114,7 @@ export function closeScaleModal() {
     return;
   }
   cancelScheduledSave();
-  const saved = currentUiScale();
-  if (previewScale.value !== saved) applyUiScale(saved);
+  cancelUiScalePreview();
 }
 
 export function dismissScaleModal() {
@@ -124,6 +125,7 @@ export function dismissScaleModal() {
   // with nothing left to say, and writing unconditionally spent a second
   // identical PUT on most zooms.
   if (previewScale.value !== currentUiScale()) void setUiScale(previewScale.value);
+  else cancelUiScalePreview();
   scaleModalOpen.value = false;
 }
 
@@ -137,7 +139,7 @@ function applyScaleChange(next: number) {
     return;
   }
   previewScale.value = next;
-  applyUiScale(next);
+  previewUiScale(next);
   if (scaleModalOpen.value) renewScaleModalLinger();
   else {
     scaleModalOpen.value = true;
@@ -164,7 +166,7 @@ export function previewSliderValue(val: number) {
   const clamped = clampUiScale(val);
   if (clamped === previewScale.value) return;
   previewScale.value = clamped;
-  applyUiScale(clamped);
+  previewUiScale(clamped);
   // Keep an armed save pointed at what the user can see: a debounce that fires
   // mid-drag must not persist a value they have already moved past.
   if (scheduled) scheduled = { ...scheduled, value: clamped };
@@ -181,7 +183,7 @@ export function commitSliderValue(val: number) {
   // than waiting out the debounce.
   if (clamped !== previewScale.value) {
     previewScale.value = clamped;
-    applyUiScale(clamped);
+    previewUiScale(clamped);
   }
   scheduleSave(clamped, true);
 }

@@ -9,7 +9,7 @@ function close() {
 }
 
 /** The `condition` on one *event subscription*, opened from the transcript
- *  row's "matching only" chip through `eventConditionDoor`.
+ *  row's "with a condition" chip through `eventConditionDoor`.
  *
  *  That door exists because the note it carries states that a filter is in
  *  play and nothing about what the filter says. That was deliberate: the raw

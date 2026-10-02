@@ -23,6 +23,13 @@ _E2E_PROJECT_DIR="$(dirname "$_E2E_SCRIPTS_DIR")"
 # dist/ forever. This opt-in is the sanctioned exception, not a workaround.
 export LUCIDOS_ALLOW_WORKTREE_STACK=1
 
+# Pin the e2e engine to the build it runs. A dev engine treats a newer HEAD as
+# a new version: self-heal rebuilds it and the page raises a version toast. A
+# commit landing in the checkout mid-run did both, failing unrelated specs.
+# Pinned, it also keeps the client it booted with, so a rebuilt dist/ raises no
+# Refresh toast. The engine reads this once at boot (`VersionTracking`).
+export LUCIDOS_PIN_ENGINE_VERSION=1
+
 # Test THIS checkout's engine-shipped knowhow, not whichever one the binary
 # happens to sit under.
 #
@@ -880,6 +887,43 @@ settle_e2e_workspace_tree() {
         echo "WARNING: could not commit the e2e workspace tree; apply tests may refuse it as dirty." >&2
     fi
     return 0
+}
+
+# ── e2e_workspace_tree_status / assert_e2e_workspace_tree_clean ───────────
+# A run must leave the e2e workspace tree as clean as it found it. Every apply
+# refuses a dirty tree, so a test that leaves dirt behind fails another test,
+# in this run or the next, far from its cause.
+#
+# Take e2e_workspace_tree_status before the tests and pass it to the assertion
+# after them. Only entries the run ADDED fail it, so the assertion never blames
+# a --no-reset run for dirt it started with. The engine may still be finishing a
+# post-run auto-commit when the last test returns, so the assertion waits up to
+# its settle window (seconds, default 20) before it fails.
+e2e_workspace_tree_status() {
+    local out
+    out="$(git -C "$E2E_WORKSPACE" status --porcelain --untracked-files=all)" || return 1
+    [ -z "$out" ] || printf '%s\n' "$out" | LC_ALL=C sort
+}
+
+assert_e2e_workspace_tree_clean() {
+    local before="$1" settle="${2:-20}" now added waited=0
+    while :; do
+        # A status that would not run is unknown, never clean.
+        if ! now="$(e2e_workspace_tree_status)"; then
+            echo "ERROR: could not read the e2e workspace tree at $E2E_WORKSPACE" >&2
+            return 1
+        fi
+        added="$(LC_ALL=C comm -13 <(printf '%s\n' "$before") <(printf '%s\n' "$now") | sed '/^$/d')"
+        [ -z "$added" ] && return 0
+        [ "$waited" -ge "$settle" ] && break
+        sleep 1
+        waited=$((waited + 1))
+    done
+    echo "ERROR: this run left the e2e workspace tree dirty ($E2E_WORKSPACE):" >&2
+    printf '%s\n' "$added" | sed 's/^/  /' >&2
+    echo "Every apply refuses a dirty tree. The test that wrote these must commit or" >&2
+    echo "remove them, through the data API (PUT / DELETE /api/v1/data/<path>)." >&2
+    return 1
 }
 
 # ── reset_e2e_database ──────────────────────────────────────────────────

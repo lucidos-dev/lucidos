@@ -95,7 +95,14 @@ describe('repoPreviewBody', () => {
   it('renders the self-contained types', () => {
     expect(readRepo('README.md')).toBe('markdown');
     expect(readRepo('data/rows.csv')).toBe('csv');
-    expect(readRepo('assets/logo.svg')).toBe('svg');
+  });
+
+  // A blob of the fetched SVG text would share the shell's origin, so "Open
+  // image in new tab" would run its script as the shell. The media path points
+  // the image at the engine URL, which serves it sandboxed.
+  it('renders an SVG as an image from the engine URL, and its source on request', () => {
+    expect(readRepo('assets/logo.svg')).toBe('image');
+    expect(readRepo('assets/logo.svg', true)).toBe('source');
   });
 
   // Repo HTML is application source under review, not a document. A live

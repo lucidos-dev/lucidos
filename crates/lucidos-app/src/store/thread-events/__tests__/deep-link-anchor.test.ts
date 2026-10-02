@@ -5,7 +5,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 // @ts-expect-error: same
 import { dirname, resolve } from 'node:path';
-import { deepLinkAnchorForEvent, stampedEventIds } from '../exchange-render';
+import { attentionTarget, deepLinkAnchorForEvent, stampedEventIds } from '../exchange-render';
 import type { Exchange } from '../exchange';
 import type { StoredEvent } from '../thread-event-types';
 
@@ -150,5 +150,60 @@ describe('stampedEventIds', () => {
       // The failure card: the `ResponseFailed`'s own id (`exchangeError`).
       'error.eventId || undefined',
     ]);
+  });
+});
+
+/** Where opening a thread from Needs attention lands. */
+describe('attentionTarget', () => {
+  function question(id: string, toolUseId: string, answered = false): Exchange {
+    return {
+      userEvent: evt('UserQuestionAsked', id, { tool_use_id: toolUseId }),
+      userSeq: ++seq,
+      steps: answered
+        ? [{ seq: ++seq, event: evt('UserQuestionAnswered', `${id}-answer`, { tool_use_id: toolUseId }) }]
+        : [],
+    } as unknown as Exchange;
+  }
+
+  it('lands on the open question while the thread waits on the user', () => {
+    const exchanges = [exchange('start-1'), question('q-1', 'tu-1'), exchange('start-2')];
+    expect(attentionTarget(exchanges, 'waiting_for_user_answer')).toEqual({ kind: 'card', eventId: 'q-1' });
+  });
+
+  it('skips an answered question for the open one', () => {
+    const exchanges = [question('q-old', 'tu-old', true), question('q-new', 'tu-new')];
+    expect(attentionTarget(exchanges, 'waiting_for_user_answer')).toEqual({ kind: 'card', eventId: 'q-new' });
+  });
+
+  it('lands on the newest failure card when the thread failed', () => {
+    const exchanges = [
+      exchange('start-1', [['ResponseFailed', 'fail-old']]),
+      exchange('start-2', [['ResponseFailed', 'fail-new']]),
+    ];
+    expect(attentionTarget(exchanges, 'failed')).toEqual({ kind: 'card', eventId: 'fail-new' });
+  });
+
+  /** History must not win: an old unanswered question or failure card stays in
+   *  the transcript after the thread moved on. */
+  it('ignores a card that does not match the status, and lands on the newest turn', () => {
+    const exchanges = [
+      question('q-stale', 'tu-stale'),
+      exchange('start-1', [['ResponseFailed', 'fail-old']]),
+      exchange('start-2'),
+    ];
+    expect(attentionTarget(exchanges, 'idle')).toEqual({ kind: 'turn', eventId: 'start-2' });
+  });
+
+  /** The card may be older than the loaded page, which the caller can fetch. */
+  it('reports a card the loaded exchanges do not hold, with the newest turn as fallback', () => {
+    expect(attentionTarget([exchange('start-1'), exchange('start-2')], 'failed'))
+      .toEqual({ kind: 'card-not-loaded', newestTurnId: 'start-2' });
+  });
+
+  it('carries no id when no turn has one', () => {
+    const stray = exchange('unused');
+    (stray.userEvent as { _eventId?: string })._eventId = undefined;
+    expect(attentionTarget([stray], 'idle')).toEqual({ kind: 'turn', eventId: null });
+    expect(attentionTarget([], 'failed')).toEqual({ kind: 'card-not-loaded', newestTurnId: null });
   });
 });

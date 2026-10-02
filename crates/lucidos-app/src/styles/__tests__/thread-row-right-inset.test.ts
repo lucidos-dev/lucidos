@@ -35,7 +35,7 @@ function ruleFor(sel: string, atRules: string, prop?: string) {
   return found[0];
 }
 
-const MOBILE = '@media (max-width: 768px)';
+const MOBILE = '@media (--phone-layout)';
 const VAR = '--thread-row-pad-right';
 
 describe('the thread row right inset', () => {

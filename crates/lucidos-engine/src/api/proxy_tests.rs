@@ -1299,6 +1299,214 @@ async fn forward_request_does_not_auto_follow_30x() {
     );
 }
 
+// ---- Response header policy --------------------------------------------
+
+/// Spawn an upstream that answers once with `headers` on a `200`.
+async fn spawn_upstream_with_headers(headers: &'static [(&'static str, &'static str)]) -> String {
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let shutdown_from_handler = shutdown.clone();
+    let app = Router::new().fallback(any(move || {
+        let shutdown = shutdown_from_handler.clone();
+        async move {
+            shutdown.notify_one();
+            let mut resp = "upstream body".into_response();
+            resp.headers_mut().clear();
+            for (n, v) in headers {
+                resp.headers_mut()
+                    .append(name(n), HeaderValue::from_static(v));
+            }
+            resp
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                shutdown.notified().await;
+            })
+            .await
+            .unwrap();
+    });
+    format!("http://{}", addr)
+}
+
+/// Forward one GET to an upstream answering with `headers`.
+async fn proxied_with(headers: &'static [(&'static str, &'static str)]) -> Response {
+    let url = format!("{}/x", spawn_upstream_with_headers(headers).await);
+    forward_request(
+        Method::GET,
+        &url,
+        &url,
+        HeaderMap::new(),
+        Vec::new(),
+        Bytes::new(),
+        Transport::Verified,
+        TEST_TIMEOUT,
+    )
+    .await
+}
+
+fn header_values(resp: &Response, header: &str) -> Vec<String> {
+    resp.headers()
+        .get_all(header)
+        .iter()
+        .map(|v| v.to_str().unwrap().to_string())
+        .collect()
+}
+
+/// Every header here changes state or policy for the whole Lucidos origin,
+/// or speaks for the engine. The gateway's device credential is a cookie, so
+/// `Set-Cookie` and `Clear-Site-Data` alone can plant or wipe it.
+const ORIGIN_SCOPED_RESPONSE_HEADERS: &[(&str, &str)] = &[
+    ("set-cookie", "lucidos_device_x=attacker; Path=/"),
+    ("set-cookie", "theme=dark; Path=/"),
+    ("set-cookie2", "legacy=1"),
+    ("clear-site-data", "\"cookies\", \"storage\""),
+    (
+        "strict-transport-security",
+        "max-age=63072000; includeSubDomains",
+    ),
+    ("content-security-policy", "script-src *"),
+    ("content-security-policy-report-only", "default-src 'none'"),
+    ("service-worker-allowed", "/"),
+    ("public-key-pins", "pin-sha256=\"AAAA\"; max-age=1"),
+    (
+        "public-key-pins-report-only",
+        "pin-sha256=\"AAAA\"; max-age=1",
+    ),
+    ("expect-ct", "max-age=86400, enforce"),
+    ("alt-svc", "h3=\":443\"; ma=2592000"),
+    ("access-control-allow-origin", "*"),
+    ("access-control-allow-credentials", "true"),
+    ("access-control-expose-headers", "*"),
+    ("timing-allow-origin", "*"),
+    ("www-authenticate", "Basic realm=\"Lucidos\""),
+    ("permissions-policy", "camera=*"),
+    ("feature-policy", "camera *"),
+    ("document-policy", "force-load-at-top"),
+    ("cross-origin-opener-policy", "unsafe-none"),
+    ("cross-origin-embedder-policy", "require-corp"),
+    ("cross-origin-resource-policy", "cross-origin"),
+    ("origin-agent-cluster", "?1"),
+    ("origin-trial", "token"),
+    ("accept-ch", "Sec-CH-UA-Model"),
+    ("critical-ch", "Sec-CH-UA-Model"),
+    ("nel", "{\"report_to\":\"default\",\"max_age\":31536000}"),
+    ("report-to", "{\"group\":\"default\"}"),
+    (
+        "reporting-endpoints",
+        "default=\"https://attacker.invalid/r\"",
+    ),
+    ("refresh", "0; url=https://attacker.invalid/"),
+    ("set-login", "logged-in"),
+    ("sec-session-registration", "(ES256); path=\"/r\""),
+    ("speculation-rules", "\"/rules.json\""),
+    ("x-frame-options", "ALLOWALL"),
+    ("x-xss-protection", "0"),
+    ("x-content-security-policy", "script-src *"),
+    ("x-webkit-csp", "script-src *"),
+    ("x-dns-prefetch-control", "on"),
+    ("x-permitted-cross-domain-policies", "all"),
+    ("x-lucidos-local-token", "forged"),
+    ("x-forwarded-host", "attacker.invalid"),
+];
+
+#[tokio::test]
+async fn origin_scoped_upstream_headers_never_reach_the_lucidos_origin() {
+    let resp = proxied_with(ORIGIN_SCOPED_RESPONSE_HEADERS).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    for (header, value) in ORIGIN_SCOPED_RESPONSE_HEADERS {
+        // By value, since the engine sets a CSP of its own on this untyped body.
+        assert!(
+            !header_values(&resp, header).contains(&value.to_string()),
+            "the proxy forwarded the upstream's {header}"
+        );
+    }
+    assert_eq!(body_text(resp).await, "upstream body");
+}
+
+/// What a caller reads off an API response, including the vendor families the
+/// builtin model providers answer with.
+const API_RESPONSE_HEADERS: &[(&str, &str)] = &[
+    ("content-type", "application/json"),
+    ("content-language", "en"),
+    ("content-disposition", "attachment; filename=\"export.csv\""),
+    ("cache-control", "no-cache"),
+    ("etag", "\"v1\""),
+    ("last-modified", "Wed, 21 Oct 2026 07:28:00 GMT"),
+    ("vary", "Accept"),
+    ("location", "/v1/items/42"),
+    (
+        "link",
+        "<https://api.example.com/items?page=2>; rel=\"next\"",
+    ),
+    ("retry-after", "30"),
+    ("ratelimit-remaining", "10"),
+    ("request-id", "req_123"),
+    ("x-request-id", "abc"),
+    ("x-ratelimit-remaining", "99"),
+    ("x-total-count", "1234"),
+    ("anthropic-ratelimit-requests-remaining", "49"),
+    ("openai-processing-ms", "120"),
+];
+
+#[tokio::test]
+async fn api_response_headers_still_reach_the_caller() {
+    let resp = proxied_with(API_RESPONSE_HEADERS).await;
+    for (header, value) in API_RESPONSE_HEADERS {
+        assert_eq!(
+            header_values(&resp, header),
+            vec![value.to_string()],
+            "the proxy dropped or rewrote {header}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn every_proxied_response_refuses_mime_sniffing() {
+    let resp = proxied_with(&[("content-type", "application/json")]).await;
+    assert_eq!(header_values(&resp, "x-content-type-options"), ["nosniff"]);
+    assert!(header_values(&resp, "content-security-policy").is_empty());
+}
+
+#[tokio::test]
+async fn an_upstream_document_renders_sandboxed_without_script() {
+    const DOCUMENTS: &[&[(&str, &str)]] = &[
+        &[
+            ("content-type", "text/html; charset=utf-8"),
+            ("content-security-policy", "script-src *"),
+        ],
+        &[("content-type", "image/svg+xml")],
+        &[("content-type", "application/xml")],
+        // A browser joins every value and lets the last valid type win.
+        &[
+            ("content-type", "application/json"),
+            ("content-type", "text/html"),
+        ],
+        &[("content-type", "application/json, text/html")],
+    ];
+    for headers in DOCUMENTS {
+        let resp = proxied_with(headers).await;
+        assert_eq!(
+            header_values(&resp, "content-security-policy"),
+            [PROXIED_DOCUMENT_CSP],
+            "{headers:?} must render in an opaque origin with no script"
+        );
+        assert_eq!(header_values(&resp, "x-content-type-options"), ["nosniff"]);
+    }
+}
+
+#[tokio::test]
+async fn an_untyped_upstream_body_is_sandboxed_too() {
+    // With no type, a browser navigating to the URL may sniff HTML from it.
+    let resp = proxied_with(&[]).await;
+    assert_eq!(
+        header_values(&resp, "content-security-policy"),
+        [PROXIED_DOCUMENT_CSP]
+    );
+}
+
 /// Spawn an upstream that answers the first request with `status` plus
 /// `Location`, then records the second. The loop's own hop is what these tests
 /// are about, where [`spawn_redirecting_upstream`] stops after the first.

@@ -61,7 +61,6 @@ describe('every surface takes its corner and shadow from a token', () => {
     [css.mark, '.brand-menu'],
     [css.host, '.dropdown-menu'],
     [css.host, '.thread-overflow-menu'],
-    [css.host, '.thread-info-popover'],
     [css.input, '.control-dropdown'],
     [css.input, '.image-attach-menu'],
     [css.input, '.camera-container'],
@@ -83,7 +82,6 @@ describe('menus wear the shared box instead of a copy of it', () => {
   const menus: [string, string][] = [
     [css.mark, '.brand-menu'],
     [css.host, '.thread-overflow-menu'],
-    [css.host, '.thread-info-popover'],
     [css.host, '.dropdown-menu'],
     [css.input, '.control-dropdown'],
     [css.input, '.image-attach-menu'],
@@ -103,7 +101,6 @@ describe('menus wear the shared box instead of a copy of it', () => {
   it.each([
     ['../../components/layout/HeaderMark.tsx', 'surface-box', 'brand-menu'],
     ['../../components/shared/OverflowMenu.tsx', 'surface-box', 'thread-overflow-menu'],
-    ['../../components/shared/OverflowMenu.tsx', 'surface', 'thread-info-popover'],
     ['../../components/shared/Dropdown.tsx', 'surface-box', 'dropdown-menu'],
     ['../../components/shared/ModelSelectionField.tsx', 'surface-box', 'dropdown-menu'],
     ['../../components/shared/NavChevron.tsx', 'surface-box', 'dropdown-menu'],
@@ -201,7 +198,7 @@ describe('the header palettes are one shape, over their own pane', () => {
     expect(desktop[0].props.get('max-width')).not.toMatch(/--header-surface-width/);
     expect(desktop[0].props.get('max-width')).toMatch(/^min\(\d+(\.\d+)?rem,/);
     const last = modal[modal.length - 1];
-    expect(last.atRules).toBe('@media (max-width: 768px)');
+    expect(last.atRules).toBe('@media (--phone-layout)');
     expect(last.props.get('max-width')).toMatch(/^min\(var\(--header-surface-width\),/);
   });
 

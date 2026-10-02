@@ -169,6 +169,115 @@ pub fn workspace_tree_lock() -> &'static tokio::sync::RwLock<()> {
     &LOCK
 }
 
+/// Write a fixture file under `data/` through `PUT /api/v1/data/<rel>`, the
+/// normal data-write path.
+///
+/// The engine writes the file and commits it in one step, under the same repo
+/// lock the apply's dirty-tree gate takes. So the fixture is never an
+/// uncommitted file that another test's apply can refuse. The file still
+/// appears in the tree, so callers hold a `workspace_tree_lock` read guard
+/// across this call.
+pub async fn write_data_fixture(
+    client: &reqwest::Client,
+    rel: &str,
+    body: &str,
+) -> Result<(), String> {
+    let resp = client
+        .put(format!("{}/api/v1/data/{}", base_url(), rel))
+        .header("Content-Type", "text/plain")
+        .body(body.to_string())
+        .send()
+        .await
+        .map_err(|e| format!("PUT /api/v1/data/{rel} failed: {e}"))?;
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    let body = resp.text().await.unwrap_or_default();
+    Err(format!("PUT /api/v1/data/{rel} returned {status}: {body}"))
+}
+
+/// How long `remove_data_fixtures` keeps watching its path after the deletes.
+const FIXTURE_CLEANUP_SETTLE: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Delete committed fixtures under `data/<dir>/` and leave that path clean in
+/// git. `files` are `data/`-relative. Best-effort: a failed cleanup must not
+/// fail the assertion its test exists for.
+///
+/// Each file goes through `DELETE /api/v1/data/<rel>`, which removes it and
+/// commits the removal in one step under the engine's repo lock. So the
+/// deletion never sits uncommitted for a concurrent apply to refuse. A file
+/// that never appeared, such as output of a script that never ran, fails its
+/// delete harmlessly.
+///
+/// **A committed delete is not yet a terminal state.** The engine's
+/// auto-commit (`commit_all_dirty`) stages ALL of `data/`, and every script run
+/// in this parallel suite fires one. One that staged a fixture BEFORE the delete
+/// and commits AFTER it writes the path back into HEAD while it is gone from
+/// disk. So this watches the path for the whole window and commits any dirt
+/// under the exclusive guard. The window is a ceiling, not a sleep. The watch
+/// goes once the engine race is fixed (`docs/temporary-measures.md`, "The e2e
+/// fixture cleanup watches for a deleted path coming back").
+pub async fn remove_data_fixtures(client: &reqwest::Client, dir: &str, files: &[String]) {
+    {
+        // The files disappear from the tree; see `workspace_tree_lock`. Scoped
+        // to the deletes, because holding a guard across the watch below would
+        // queue every other tree writer behind it to protect nothing.
+        let _tree = workspace_tree_lock().read().await;
+        for rel in files {
+            let _ = client
+                .delete(format!("{}/api/v1/data/{}", base_url(), rel))
+                .send()
+                .await;
+        }
+        // Git tracks no directories, so dropping the emptied ones changes no
+        // tracked state. A directory that still holds a file stays.
+        remove_empty_dirs(&workspace_path().join("data").join(dir));
+    }
+    let pathspec = format!("data/{dir}");
+    let deadline = std::time::Instant::now() + FIXTURE_CLEANUP_SETTLE;
+    while std::time::Instant::now() < deadline {
+        let dirty = std::process::Command::new("git")
+            .current_dir(workspace_path())
+            .args(["status", "--porcelain", "--", &pathspec])
+            .output()
+            .map(|o| !o.stdout.is_empty())
+            // A `git status` that would not run says nothing about the tree, so
+            // treat it as dirty and keep trying rather than declaring victory.
+            .unwrap_or(true);
+        if dirty {
+            // The exit code cannot tell a lost `index.lock` from "nothing to
+            // commit", so the next poll is what settles it.
+            let _tree = workspace_tree_lock().write().await;
+            let _ = std::process::Command::new("git")
+                .current_dir(workspace_path())
+                .args([
+                    "commit",
+                    "-q",
+                    "-m",
+                    &format!("e2e: remove fixtures under {pathspec}"),
+                    "--",
+                    &pathspec,
+                ])
+                .output();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+}
+
+/// Remove `dir` and every directory under it that holds no file.
+fn remove_empty_dirs(dir: &Path) {
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                remove_empty_dirs(&entry.path());
+            }
+        }
+    }
+    // `remove_dir` refuses a directory that is not empty, which is the prune.
+    let _ = fs::remove_dir(dir);
+}
+
 /// Held by every test that writes `data/config/apis.json`.
 ///
 /// It is one file per workspace, and each such test writes it whole and
@@ -311,6 +420,30 @@ pub async fn user_client() -> reqwest::Client {
         .default_headers(headers)
         .build()
         .expect("Failed to build device-attributed HTTP client")
+}
+
+/// An HTTP client that speaks as a process on this machine, the way `lucidos`
+/// run from a shell does: every request carries the machine-local token.
+///
+/// The marker writes (`mark-hardened`, `mark-planned`, `approve-plan`)
+/// refuse a caller holding only a device id. A test of those routes takes this
+/// client, and a test of the refusal takes [`user_client`].
+pub fn local_process_client() -> reqwest::Client {
+    let token = lucidos_local_token::read().unwrap_or_else(|| {
+        panic!(
+            "no machine-local token at {:?}; the engine mints one at boot",
+            lucidos_local_token::path()
+        )
+    });
+    let mut value = reqwest::header::HeaderValue::from_str(&token).expect("local token header");
+    value.set_sensitive(true);
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(lucidos_local_token::HEADER_LOCAL_TOKEN, value);
+    reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .default_headers(headers)
+        .build()
+        .expect("Failed to build local-process HTTP client")
 }
 
 /// Run a git command in the e2e workspace, asserting success.

@@ -405,14 +405,20 @@ function downloadTarget(
 
 /** An href is percent-encoded and `lucidos.data.url` encodes again, so a
  *  `Q3%20summary.csv` would be fetched as `Q3%2520summary.csv`. A malformed
- *  escape is kept as written. */
+ *  escape is kept as written.
+ *
+ *  The path's dot segments were already collapsed, so a segment that decodes
+ *  to `.`, `..` or a separator is kept as written too. Decoded, `%2e%2e` would
+ *  walk the shell's credentialed download out of `/data/`. */
 function decodeSegments(path: string): string {
   return path.split('/').map((segment) => {
+    let decoded: string;
     try {
-      return decodeURIComponent(segment);
+      decoded = decodeURIComponent(segment);
     } catch {
       return segment;
     }
+    return decoded === '.' || decoded === '..' || /[/\\]/.test(decoded) ? segment : decoded;
   }).join('/');
 }
 

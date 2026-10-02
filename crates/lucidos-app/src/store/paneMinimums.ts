@@ -41,7 +41,7 @@ const DRAWER_ROW_TITLE_REM = 4.5;
 /** The row's own trailing padding, in rem: `.threads-header`'s `0.5rem`. */
 const DRAWER_ROW_PAD_REM = 0.5;
 /** Fallback for the traffic-lights reserve if the property cannot be read (it
- *  is declared inside the desktop media query, so a sub-769px viewport reports
+ *  is declared inside the desktop media query, so the phone layout reports
  *  nothing). Kept in step with `--titlebar-lights-reserve` in shell.css, which
  *  no longer states it directly: it is `--titlebar-lights-x` (10px, stamped by
  *  the shell from the constant it places the cluster with) plus the cluster's
@@ -105,7 +105,7 @@ export function computeMinDrawerWidth(remPx: number, leadPx: number): number {
 
 /** The lead both derived floors are sized around, read from CSS rather than
  *  restated, with the literal as the fallback. The property is declared inside
- *  the desktop media query, so a viewport under 769px (or a test harness with no
+ *  the desktop media query, so the phone layout (or a test harness with no
  *  layout engine) reports nothing. */
 function titlebarLightsReservePx(): number {
   const reserve = parseFloat(

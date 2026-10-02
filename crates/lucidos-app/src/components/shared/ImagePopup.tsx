@@ -20,7 +20,7 @@ import {
   type ImageLayout,
 } from '../../utils/pinchGesture';
 import { isTextInput } from '../../utils/dom';
-import { SwipeTouch } from '../../utils/swipe';
+import { SwipeTouch } from '@lucidos/pane-swipe';
 
 // How far past the fitted view a gesture zooms, raised per image so full size
 // always fits under it (see `zoomRange` below).

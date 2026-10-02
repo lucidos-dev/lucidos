@@ -10,18 +10,6 @@
     color: var(--text-muted);
 }
 
-/* The scrim spans the LAYOUT viewport, which iOS never shrinks for the
-   keyboard (`interactive-widget=resizes-visual` in index.html). A panel
-   centred in that lands its lower half, Save included, under the keys the user
-   is typing with. `--app-height` is the VISUAL viewport, published by
-   MobileSwipeContainer, so bounding the scrim to it centres the panel in what
-   is on screen. Desktop has no such publisher and takes the 100dvh fallback,
-   which is what `inset: 0` already gave it. */
-.modal-overlay.style-editor-overlay {
-    bottom: auto;
-    height: var(--app-height, 100dvh);
-}
-
 /* An instruction runs to 1,000 characters. So the panel takes all the width
    bar a hairline of scrim, and all the height the visual viewport has.
 
@@ -34,7 +22,7 @@
        at each end. Named because the mobile rule below reuses it whole. */
     --style-editor-room: calc(
         var(--app-height, 100dvh) - var(--space-lg) * 2
-        - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px)
+        - var(--safe-area-top) - var(--safe-area-bottom)
     );
     /* The head carries its own insets; everything under it takes the surface
        inset as side margins (below), so the panel pads only its foot. */
@@ -75,7 +63,7 @@
    instruction needs three times the lines, and the ceiling above would clip
    it. Take the whole screen instead: that ceiling protects a big monitor, and
    a phone has no spare height to protect. */
-@media (max-width: 768px) {
+@media (--phone-layout) {
     .style-editor-modal {
         height: var(--style-editor-room);
     }

@@ -920,3 +920,54 @@ export function sanitizeWorkspaceFonts(value: unknown): WorkspaceFont[] {
 export function parseWorkspaceFont(raw: string | null | undefined): WorkspaceFont | null {
   return sanitizeWorkspaceFont(parseJson(raw));
 }
+
+// --- The appearance push ---
+//
+// The shell pushes what it painted to each watching app frame, on the app
+// bridge. The app then repaints with the shell, rather than a debounced save
+// and two round trips later. The payload has the shape of the engine's
+// first-paint seed, filled from the mirrors the shell writes for its
+// appearance boot script on each paint.
+
+/** The app bridge channel the push travels on. */
+export const APPEARANCE_CHANNEL = 'appearance';
+
+/** Workspace-scoped mirrors the shell writes on each paint. */
+export const FONT_FAMILY_STORAGE_KEY = 'lucidos-font-family';
+export const UI_SCALE_STORAGE_KEY = 'lucidos-ui-scale';
+
+/** Each push key, and the mirror its value comes from. A push key is the
+ *  preference key, or the seed key for a value the engine resolves. */
+const APPEARANCE_PUSH_SOURCES: ReadonlyArray<readonly [string, string]> = [
+  [THEME_MODE_KEY, THEME_MODE_STORAGE_KEY],
+  [THEME_SEED_KEY, THEME_STORAGE_KEY],
+  ['font-family', FONT_FAMILY_STORAGE_KEY],
+  [WORKSPACE_FONT_SEED_KEY, WORKSPACE_FONT_STORAGE_KEY],
+  ['ui-scale', UI_SCALE_STORAGE_KEY],
+  ['style_overrides', STYLE_OVERRIDES_STORAGE_KEY],
+  ['motion', MOTION_STORAGE_KEY],
+  ['theme-effects', THEME_EFFECTS_STORAGE_KEY],
+];
+
+/** What the shell painted, read from its mirrors. Raw strings: the frame runs
+ *  each through the parser it runs on the engine seed. */
+export function readAppearancePush(get: (key: string) => string | null): Record<string, string> {
+  const push: Record<string, string> = {};
+  for (const [key, storageKey] of APPEARANCE_PUSH_SOURCES) {
+    const value = get(storageKey);
+    if (value !== null) push[key] = value;
+  }
+  return push;
+}
+
+/** A push as it arrives: only the known keys, and only string values. */
+export function sanitizeAppearancePush(value: unknown): Record<string, string> | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const raw = value as Record<string, unknown>;
+  const push: Record<string, string> = {};
+  for (const [key] of APPEARANCE_PUSH_SOURCES) {
+    const entry = raw[key];
+    if (typeof entry === 'string') push[key] = entry;
+  }
+  return push;
+}

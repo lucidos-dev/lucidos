@@ -3,26 +3,28 @@ import {
   CONTINUATION_AUTO_RESUME_AFTER_API_ERROR_REASON,
   CONTINUATION_AUTO_RESUME_AFTER_SWITCH_REASON,
   CONTINUATION_USER_CLICKED_REASON,
+  plainEventName,
   type AbortCause,
   type CancelCause,
   type EngineReason,
+  type EventWaitReason,
 } from '../store/thread-events';
 
-/** Why a user-driven `ResponseCanceled` fired, for the Initiator info popover.
+/** Why a user-driven `ResponseCanceled` fired, for the route popover.
  *  Mirrors Rust's `CancelCause` doc comments. The heading ("Why the response
  *  stopped") is owned by the renderer; every branch returns a non-empty string
  *  so the row never silently drops. */
 export function describeCancelCause(cause: CancelCause | undefined): string {
   switch (cause) {
     case 'user_stop':
-      return 'You clicked Cancel on the running response.';
+      return 'You pressed Cancel while the reply was running.';
     case 'user_action':
-      return 'You applied, discarded, or archived a still-running Claude Code session — the action stopped the current turn first.';
+      return 'You applied, discarded or archived this thread while the agent was still working, so Lucidos stopped the agent first.';
     case 'superseded_by_followup':
-      return 'You posted a follow-up while Codex was mid-turn — the engine interrupted that turn and ran your follow-up next, preserving partial work.';
+      return 'You sent a follow-up while the agent was working. Lucidos stopped that reply and answered your follow-up next. Work already done is kept.';
     case 'unknown':
     case undefined:
-      return 'You canceled the response (cause not recorded).';
+      return 'You stopped the reply. Lucidos did not record how.';
   }
 }
 
@@ -34,9 +36,9 @@ export function describeCancelCause(cause: CancelCause | undefined): string {
 export function describeAbortCause(cause: AbortCause | undefined): string {
   switch (cause) {
     case 'safety_net':
-      return 'One of two engine safety nets fired. Either a Claude Code event loop ended without a clean response (usually a session crash or driver task death), or the Thread Queue evicted a turn that had held its thread for 60 seconds while something else was waiting to run on it. (The 10-minute hung-session watchdog used to land here too, but now auto-resumes the session via ContinuationRequested instead.)';
+      return 'The agent stopped without finishing its reply, or another job had waited a minute for this thread. Lucidos stopped the reply so the thread was not stuck.';
     case 'engine_shutdown':
-      return 'The engine shut down (or restarted) while this turn was in flight.';
+      return 'Lucidos stopped or restarted while the agent was working.';
     case 'recovery_after_restart':
       // Not "could not be resumed": it can be, and the button to do it is
       // right there. Two emit sites, both a deliberate hold, which is why the
@@ -44,16 +46,16 @@ export function describeAbortCause(cause: AbortCause | undefined): string {
       // live process and never learns what killed the last one; the boot floor
       // (`settle_unresumed_switch_threads`) withdraws a switch's resume promise
       // it could not keep. See docs/glossary.md § Cause-gated resume.
-      return 'The engine restarted and found this turn still marked as running, and is not going to resume it: either it cannot tell what stopped the last run, or a resume it did intend never happened. It holds the turn here rather than re-run work that may be what brought the engine down. Continue picks it back up.';
+      return 'Lucidos restarted and found this reply still marked as running. It did not restart the reply on its own, because that work may be what stopped Lucidos. Continue picks it back up.';
     case 'process_killed':
-      return 'The Claude Code session was killed (crash, signal, or out-of-memory).';
+      return 'The agent’s process ended unexpectedly: it crashed, ran out of memory, or was closed from outside Lucidos.';
     case 'stale_settle':
-      return 'The engine cleaned up a stuck response state — no live work was running.';
+      return 'This reply was still marked as running, but nothing was working on it. Lucidos cleared the mark. No work was lost.';
     case 'session_dropped':
-      return 'Whatever started this session was cancelled while it was still running, so the session went down with it — most often a request whose client disconnected. The work stopped where it was; start it again to continue.';
+      return 'Whatever started the agent went away while it was working, most often a closed connection. The agent stopped where it was. Send a message to carry on.';
     case 'unknown':
     case undefined:
-      return 'The response was interrupted by the system (cause not recorded).';
+      return 'Lucidos stopped the reply. It did not record why.';
   }
 }
 
@@ -70,56 +72,83 @@ export function describeAbortCause(cause: AbortCause | undefined): string {
 export function describeContinuationReason(reason: string | undefined): string | null {
   switch (reason) {
     case CONTINUATION_USER_CLICKED_REASON:
-      return 'You clicked Continue on the interrupted response, and the engine picked the session back up where it stopped.';
+      return 'You pressed Continue on the stopped reply, and Lucidos picked it back up where it stopped.';
     case CONTINUATION_AUTO_RECOVERY_REASON:
-      return 'The agent session stopped responding, or a stray signal killed it. Nothing restarted: the engine relaunched that one session and carried on.';
+      return 'The agent stopped responding, or a stray signal closed it. Nothing restarted: Lucidos started that one agent again and carried on.';
     case CONTINUATION_AUTO_RESUME_AFTER_SWITCH_REASON:
-      return 'You chose Switch on the new version, which stopped this response mid-flight. The engine resumed it automatically once the new version was up.';
+      return 'You chose Switch on the new version, which stopped this reply. Lucidos picked it back up once the new version was running.';
     case CONTINUATION_AUTO_RESUME_AFTER_API_ERROR_REASON:
-      return 'The connection to the model dropped part-way through the response above, so that turn failed incomplete. Nothing restarted: the engine picked the session back up and carried on. It will do this a few times in a row at most, then leave the failure standing.';
+      return 'The connection to the model dropped part-way through the reply above, so it stopped unfinished. Nothing restarted: Lucidos picked the reply back up. It does this a few times in a row at most, then leaves the failure standing.';
     default:
       return null;
   }
 }
 
-/** Why the engine acted, for the route popover. Returns null for `scheduler`
- *  because that variant has its own richer renderer (links to the trigger).
- *  The popover heading ("Why the engine acted") is owned by the renderer. */
-export function describeEngineReason(reason: EngineReason): string | null {
+/** Why the engine acted, in plain words, for the route popover and a boundary
+ *  card's Details. The heading ("Why Lucidos acted") is owned by the renderer. */
+export function describeEngineReason(reason: EngineReason): string {
   switch (reason.kind) {
     case 'continuation_started':
     case 'session_recovered':
       // Deliberately channel-agnostic: this is the fallback a resume boundary
       // lands on when it recorded no finer `reason`, and `ContinuationStarted`
       // is emitted on chat and trigger threads too, not just coding-agent ones.
-      return 'A response still running when the engine stopped is auto-resumed once the engine is back. This event marks the resume.';
+      return 'Lucidos stopped while this reply was running, and picked it back up once it was running again.';
     case 'orphan_recovery':
-      return 'After a restart, the engine resumes orphaned threads where work was in flight.';
+      return 'Lucidos restarted while the agent was working. It kept the work it found and offered it as a change, marked unfinished.';
     case 'harden_retrigger':
-      return 'The engine re-triggers `/harden` when the hardening marker is missing or stale, so changes aren’t applied unhardened.';
+      return `${REVIEW_RULE} That check was missing or out of date, so Lucidos asked the agent to run it again.`;
     case 'stale_session':
-      return 'The engine cleans up Claude Code sessions that became stale (process gone, marker missing). This event marks the cleanup.';
+      return 'The agent behind this thread had stopped running. Lucidos tidied up after it and offered its work as a change.';
     case 'archived_branch_work':
-      return 'This thread was archived with work on its branch that no change carried. The engine set that work aside so it is not lost. Bring it back from the Changes panel to apply it.';
+      return 'This thread was archived with work that was never offered as a change. Lucidos set it aside so it is not lost. Bring it back from the Changes panel to apply it.';
     case 'merge_conflict':
-      return 'The engine detected a conflict when merging changes from main into your branch. We need to resolve it before applying.';
+      return 'Your changes conflict with newer changes in the project: a merge conflict. Lucidos asked the agent to resolve it before your changes can be applied.';
     case 'missing_hardening':
-      return 'Hardening (`/harden`) must run before changes are applied. The engine queues it automatically when the marker is missing.';
+      return `${REVIEW_RULE} It had not run yet, so Lucidos asked the agent to run it.`;
     case 'plugin_auto_update':
-      return `The engine found a newer version of ${reason.plugin_id} in ${reason.marketplace_name} and updated the installed plugin.`;
+      return `Lucidos found a newer version of ${reason.plugin_id} in ${reason.marketplace_name} and updated the installed plugin.`;
     case 'plugin_setup':
       return describePluginSetup(reason);
     case 'plugin_upstream_proposal':
-      return `You asked to offer your local changes to ${reason.plugin_name} to its author. The engine saved them as a patch and started this thread so the Lucidos Agent can propose it upstream.`;
+      return `You asked to offer your local changes to ${reason.plugin_name} to its author. Lucidos saved them as a patch and started this thread so the Lucidos Agent can propose it upstream.`;
     case 'scheduler':
-      return null;
+      return reason.trigger_name
+        ? `The trigger “${reason.trigger_name}” ran on its schedule and sent this message.`
+        : 'A trigger ran on its schedule and sent this message.';
+    case 'event_wait':
+      return describeEventWait(reason);
   }
+}
+
+/** The rule every hardening explainer starts from. */
+const REVIEW_RULE = 'Changes must pass hardening, an automatic review and test run, before they are applied.';
+
+/** What a wait watched, in plain words: "a change proposed or a coding agent
+ *  stopped working". Empty when the row recorded nothing. */
+export function describeWatchedEvents(watched: readonly string[]): string {
+  return watched.map(plainEventName).join(' or ');
+}
+
+/** The story of a wait re-entry. A legacy row infers only the outcome, so its
+ *  `watched` and `wait_reason` are empty, and each clause drops out rather
+ *  than printing a blank. */
+function describeEventWait({ outcome, watched, wait_reason }: EventWaitReason): string {
+  const what = describeWatchedEvents(watched);
+  const asked = what
+    ? `The agent asked Lucidos to tell it when “${what}” happened`
+    : 'The agent asked Lucidos to tell it when an event happened';
+  const because = wait_reason ? `, because: ${wait_reason}.` : '.';
+  const ending = outcome === 'expired'
+    ? ' Nothing happened before its deadline, so Lucidos told the agent, to report back.'
+    : ' It happened, so Lucidos told the agent.';
+  return `${asked}${because}${ending}`;
 }
 
 type PluginSetupReason = Extract<EngineReason, { kind: 'plugin_setup' }>;
 
 function describePluginSetup({ plugin_name: name, version, occasion }: PluginSetupReason): string {
-  const handOff = 'The engine started this thread so the Lucidos Agent can walk you through it.';
+  const handOff = 'Lucidos started this thread so the Lucidos Agent can walk you through it.';
   if (occasion.kind === 'fresh_install') {
     return `You installed ${name}, and its setup needs your input. ${handOff}`;
   }
@@ -140,6 +169,12 @@ export function engineReasonHeadline(reason: EngineReason): { label: string; val
     }
     case 'plugin_upstream_proposal':
       return { label: 'Plugin patch', value: `${reason.plugin_name} ${reason.version}` };
+    case 'scheduler':
+      return reason.trigger_name ? { label: 'Trigger', value: reason.trigger_name } : null;
+    case 'event_wait': {
+      const what = describeWatchedEvents(reason.watched);
+      return what ? { label: 'Waited for', value: what } : null;
+    }
     default:
       return null;
   }
@@ -157,8 +192,7 @@ export function engineReasonConfirmingDevice(reason: EngineReason): string | und
   }
 }
 
-/** Why the engine acted, for an engine-seeded message that recorded no origin
- *  at all. Rows written before the engine stamped one land here, such as an
- *  early plugin setup seed. Says so rather than inventing a cause. */
+/** Why the engine acted, for an engine-written message that recorded no
+ *  origin at all. Says so rather than inventing a cause. */
 export const UNRECORDED_ENGINE_SEED_EXPLAINER =
-  'Lucidos wrote this message itself, not you. It was sent before Lucidos recorded why, so the reason is not known.';
+  'Lucidos wrote this message itself, not you. It did not record why.';

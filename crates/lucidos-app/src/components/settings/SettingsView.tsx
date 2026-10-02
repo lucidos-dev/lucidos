@@ -1466,7 +1466,7 @@ export function SettingsView() {
           </div>
         )}
         {/* The mobile header (and its hide-on-scroll behavior) only exists at the
-            ≤768px breakpoint, so this toggle does nothing observable on desktop.
+            phone layout, so this toggle does nothing observable on desktop.
             Gate the whole section on the reactive viewport signal: it appears /
             disappears live as the viewport crosses the breakpoint. The preference
             is global, so it's set from a mobile-width viewport where its effect is

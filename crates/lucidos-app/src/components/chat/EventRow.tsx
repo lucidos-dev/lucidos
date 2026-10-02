@@ -1,6 +1,6 @@
 import type { ComponentChildren } from 'preact';
 import { useState } from 'preact/hooks';
-import { plainEventName } from '../../store/thread-events';
+import { plainEventMeaning, plainEventName } from '../../store/thread-events';
 import { Disclosure } from '../shared/Disclosure';
 import { CheckIcon, ChevronRightIcon, CloseIcon } from '../shared/icons';
 
@@ -74,16 +74,18 @@ export type EventRowFact =
 /** The event-type chip, optionally the row's jump. */
 export interface EventRowChip {
   kind: 'chip';
-  /** The raw event type. The chip shows it in plain words (`plainEventName`)
-   *  and keeps the raw type on its tooltip. */
+  /** The raw event type. The chip shows it in plain words (`plainEventName`),
+   *  and its tooltip says what the event means (`plainEventMeaning`). */
   name: string;
   /** Words for the chip in place of the event's plain name, when the event's
-   *  own reason says more (a hardening reminder reads "hardening missing"). The
-   *  raw type stays on the tooltip. */
+   *  own reason says more (a hardening reminder reads "hardening needed"). */
   label?: string;
+  /** The tooltip in place of the event type's meaning, for a chip whose
+   *  `label` names something more specific than the type. */
+  meaning?: string;
   /** The chip opens a sentence, so its plain name takes a capital. */
   sentenceStart?: boolean;
-  /** A quiet qualifier after the name ("matching only", "6 conditions"). Styled
+  /** A quiet qualifier after the name ("with a condition", "6 conditions"). Styled
    *  apart from the name so the event type still reads as one token. */
   note?: string;
   /** Makes the chip ITSELF the link to the event it names. Absent whenever the
@@ -263,8 +265,10 @@ function renderFact(fact: EventRowFact, i: number): ComponentChildren {
  *  same reason: there is no jsdom in the test infra, so the tests walk the vnode
  *  tree these return, and a component vnode is opaque to that walk.
  *
- *  The visible text is the plain name. The raw type leads the tooltip, so a
- *  reader who needs the exact event to subscribe to can still find it.
+ *  The visible text is the plain name, and the tooltip says what it means. The
+ *  raw type is not on the chip. A turn's route popover lists it under Technical
+ *  details, with the types a re-entry's wait watched, and a filtered watch's
+ *  condition view names it too.
  *
  *  With `onClick` it is a real `<button>`, not a `<code>` carrying a handler, so
  *  it is reachable by keyboard and announces itself. Its accessible name says
@@ -275,9 +279,11 @@ export function eventNameChip(chip: EventRowChip, key?: string): ComponentChildr
   // The space is real text so a copied chip reads "coding agent stopped working 6 conditions".
   const note = chip.note && [' ', <span key="note" class="event-name-note">{chip.note}</span>];
   if (!chip.onClick) {
-    return <code key={key} class="event-name" data-tooltip={chip.name}>{text}{note}</code>;
+    const meaning = chip.meaning ?? plainEventMeaning(chip.name);
+    return <code key={key} class="event-name" data-tooltip={meaning}>{text}{note}</code>;
   }
-  const label = chip.action ?? `${chip.name} · go to the event`;
+  // Starts with the visible words, so a voice user can say what they see.
+  const label = chip.action ?? `${text} · go to the event`;
   return (
     <button
       key={key}

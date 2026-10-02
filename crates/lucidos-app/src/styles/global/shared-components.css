@@ -1330,7 +1330,7 @@ html[data-font-bold="none"] .markdown-content :is(strong, b) {
 
 #tooltip-text.tooltip-rows .tt-dot-running { background: var(--accent); }
 #tooltip-text.tooltip-rows .tt-dot-changes { background: var(--accent-green); }
-/* Neutral state, not a caution. Mirrors .thread-info-dot-waiting. The fallback
+/* Neutral state, not a caution. The fallback
    carries the app iframe: --accent-notable is host-only on purpose (see the
    engine's sdk_iframe.css), so an app renders the muted dot instead. */
 #tooltip-text.tooltip-rows .tt-dot-waiting { background: var(--accent-notable, var(--text-muted)); }

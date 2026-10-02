@@ -77,7 +77,6 @@ pub(super) async fn list_changes(
         client_update_r,
         restart_groups_r,
         apply_all_r,
-        settling_r,
         apply_estimates_r,
     ) = tokio::join!(
         crate::core::changes::list_pending_for_readers(
@@ -99,7 +98,6 @@ pub(super) async fn list_changes(
         proj.restart_groups_since(state.started_at),
         sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM apply_all_batches)")
             .fetch_one(pool),
-        crate::engine::standing_apply::count_sweep_candidates(pool),
         state.engine.apply_estimates.current(pool),
     );
     let pending = pending_r.map_err(ApiError::db)?;
@@ -108,7 +106,6 @@ pub(super) async fn list_changes(
     let client_update = client_update_r.map_err(ApiError::db)?;
     let mut restart_groups = restart_groups_r.map_err(ApiError::db)?;
     let apply_all_in_progress = apply_all_r.map_err(ApiError::db)?;
-    let settling_thread_count = settling_r.map_err(ApiError::db)?;
     let apply_estimates = apply_estimates_r.map_err(ApiError::db)?;
     let has_more_applied = applied.len() as i64 > limit;
     if has_more_applied {
@@ -140,10 +137,6 @@ pub(super) async fn list_changes(
         // sweep arms a thread that has proposed nothing yet, and the prompt row
         // still has to render its armed state.
         "standing_apply_thread_ids": state.engine.armed_standing_apply_threads(),
-        // Coding-agent threads still settling, so a sweep has something to arm.
-        // The panel offers "Apply all on settle" off this, and cannot derive
-        // it: its thread map holds only the loaded window.
-        "settling_thread_count": settling_thread_count,
         // How long hardening and conflict resolution usually take here, for
         // the apply toasts. Each is null until enough runs exist.
         "apply_estimates": apply_estimates,
@@ -537,9 +530,8 @@ pub(super) async fn disarm_standing_apply(
 
 /// DELETE /api/v1/standing-applies: take back every standing apply here.
 ///
-/// The workspace-scope off, which the Changes panel's "Apply all on settle"
-/// toggle presses. It drops a single arm as readily as a swept one. That panel
-/// draws ONE armed state for the workspace, so its off has to mean the same.
+/// The workspace-scope off, for the prompt and the CLI. It drops a single arm
+/// as readily as a swept one.
 ///
 /// Nothing armed answers 0 rather than 404. This is an off switch, and the
 /// owner pressing it on an already-off state got what they asked for. The
@@ -567,8 +559,8 @@ pub(super) async fn disarm_all_standing_applies(
 /// Query for `POST /api/v1/changes/apply-all`.
 #[derive(serde::Deserialize, Default)]
 pub(super) struct ApplyAllQuery {
-    /// "Apply all on settle": arm every thread still settling, so its change
-    /// applies when it lands.
+    /// The sweep: also arm every thread still settling, so its change applies
+    /// when it lands.
     #[serde(default)]
     keep_going: bool,
 }
@@ -588,7 +580,7 @@ pub(super) fn empty_apply_all_refusal(total_pending: usize, unsettled: usize) ->
     }
 }
 
-/// What "Apply all on settle" says once it has armed. Pure.
+/// What the sweep says once it has armed. Pure.
 pub(super) fn apply_all_on_settle_message(armed: usize) -> String {
     match armed {
         0 => "No thread is still settling, so there is nothing to apply as it settles.".into(),
@@ -634,7 +626,7 @@ pub(super) async fn apply_all_changes(
         ApplyAllOutcome::Started { .. } => (0, 0, 0),
     };
     if let ApplyAllOutcome::NothingToApply { .. } = outcome {
-        // Asked for the sweep, arming IS the action: "Apply all on settle".
+        // Asked for the sweep, arming IS the action.
         if !query.keep_going {
             return Err(ApiError::bad_request(empty_apply_all_refusal(
                 total_pending,

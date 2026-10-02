@@ -337,6 +337,29 @@ describe('loadPreferences — no flash when refetching after PreferencesChanged'
     expect(preferences.value.status).toBe('loaded');
   });
 
+  it('a superseded call resolves only once the newest call has loaded', async () => {
+    // Startup chains work on its own call, and the stream's first open issues
+    // a newer one. The older GET can land first, and its caller must still
+    // find the preferences loaded.
+    const replies: Array<(v: { preferences: Record<string, string> }) => void> = [];
+    vi.spyOn(apiClient, 'getPreferences').mockImplementation(
+      () => new Promise(resolve => { replies.push(resolve); }),
+    );
+    let statusWhenStartupResumed: string | null = null;
+    const startup = loadPreferences().then(() => { statusWhenStartupResumed = preferences.value.status; });
+    const onOpen = loadPreferences();
+    await vi.waitFor(() => expect(replies).toHaveLength(2));
+
+    replies[0]({ preferences: { 'theme-mode': 'light' } });
+    await Promise.resolve();
+    expect(statusWhenStartupResumed).toBeNull();
+
+    replies[1]({ preferences: { 'theme-mode': 'dark' } });
+    await Promise.all([startup, onOpen]);
+    expect(statusWhenStartupResumed).toBe('loaded');
+    expect(preferences.value).toEqual({ status: 'loaded', data: { 'theme-mode': 'dark' } });
+  });
+
   it('still flips to "loading" on the very first call', async () => {
     vi.spyOn(apiClient, 'getPreferences').mockImplementation(async () => {
       // Capture the synchronous state after invocation.
@@ -1312,6 +1335,88 @@ describe('preference writes survive an iOS PWA suspend', () => {
   });
 });
 
+describe('a refetch during a write keeps what the user chose', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    _resetPendingPreferenceWritesForTesting();
+    toasts.value = [];
+    preferences.value = { status: 'loaded', data: { 'theme-mode': 'dark' } };
+    vi.spyOn(apiClient, 'getPreferences').mockResolvedValue({ preferences: { 'theme-mode': 'dark' } });
+  });
+
+  afterEach(() => {
+    _resetPendingPreferenceWritesForTesting();
+    toasts.value = [];
+  });
+
+  /** A write the engine answers only when the test says so. */
+  function heldWrite(): { answer: (outcome: 'accept' | 'refuse') => void } {
+    let answer: (outcome: 'accept' | 'refuse') => void = () => {};
+    vi.spyOn(apiClient, 'setPreference').mockImplementation(() => new Promise((resolve, reject) => {
+      answer = (outcome) => (outcome === 'accept' ? resolve({ success: true }) : reject(new Error('refused')));
+    }));
+    return { answer: (outcome) => answer(outcome) };
+  }
+
+  it('until the engine accepts it', async () => {
+    const write = heldWrite();
+    const saved = savePreference('theme-mode', 'light');
+
+    await loadPreferences();
+    expect(preferences.value).toEqual({ status: 'loaded', data: { 'theme-mode': 'light' } });
+
+    write.answer('accept');
+    await saved;
+    await loadPreferences();
+    expect(preferences.value).toEqual({ status: 'loaded', data: { 'theme-mode': 'dark' } });
+  });
+
+  it('when the refetch started before the engine accepted it', async () => {
+    const write = heldWrite();
+    const saved = savePreference('theme-mode', 'light');
+    let answerRead: () => void = () => {};
+    vi.spyOn(apiClient, 'getPreferences').mockImplementationOnce(() => new Promise((resolve) => {
+      answerRead = () => resolve({ preferences: { 'theme-mode': 'dark' } });
+    }));
+    const loaded = loadPreferences();
+    await vi.waitFor(() => expect(apiClient.setPreference).toHaveBeenCalled());
+
+    write.answer('accept');
+    await saved;
+    answerRead();
+    await loaded;
+    expect(preferences.value).toEqual({ status: 'loaded', data: { 'theme-mode': 'light' } });
+  });
+
+  it('but not one the engine refused while the refetch was out', async () => {
+    const write = heldWrite();
+    const saved = savePreference('theme-mode', 'light');
+    let answerRead: () => void = () => {};
+    vi.spyOn(apiClient, 'getPreferences').mockImplementationOnce(() => new Promise((resolve) => {
+      answerRead = () => resolve({ preferences: { 'theme-mode': 'dark' } });
+    }));
+    const loaded = loadPreferences();
+    await vi.waitFor(() => expect(apiClient.setPreference).toHaveBeenCalled());
+
+    write.answer('refuse');
+    await saved;
+    answerRead();
+    await loaded;
+    expect(preferences.value).toEqual({ status: 'loaded', data: { 'theme-mode': 'dark' } });
+  });
+
+  it('until the engine refuses it', async () => {
+    const write = heldWrite();
+    const saved = savePreference('theme-mode', 'light');
+    await vi.waitFor(() => expect(apiClient.setPreference).toHaveBeenCalled());
+    write.answer('refuse');
+    await saved;
+
+    await loadPreferences();
+    expect(preferences.value).toEqual({ status: 'loaded', data: { 'theme-mode': 'dark' } });
+  });
+});
+
 /**
  * `PUT /preferences?key=<k>` is applied in ARRIVAL order, so two overlapping
  * writes to one key are a lost-update race the local bookkeeping cannot see:
@@ -1368,6 +1473,28 @@ describe('concurrent writes to one preference key', () => {
     ]);
 
     expect(sent).toEqual(['150']);
+    expect(_pendingPreferenceKeysForTesting()).toEqual([]);
+  });
+
+  it('a parked write queued behind a newer one that landed stands down', async () => {
+    const sent: string[] = [];
+    let acceptNewer: () => void = () => {};
+    vi.spyOn(apiClient, 'setPreference').mockImplementation((_k, v) => {
+      sent.push(v);
+      if (v === '112.5') return Promise.reject(cancelled());
+      return new Promise<ApiResult>((resolve) => { acceptNewer = () => resolve({ success: true }); });
+    });
+    await savePreference('ui-scale', '112.5', undefined, true);
+    expect(_pendingPreferenceKeysForTesting()).toEqual(['ui-scale']);
+
+    const newer = savePreference('ui-scale', '150', undefined, true);
+    await vi.waitFor(() => expect(sent).toContain('150'));
+    // The resume flush queues the parked write behind the newer one.
+    const flushed = flushPendingPreferenceWrites();
+    acceptNewer();
+    await Promise.all([newer, flushed]);
+
+    expect(sent).toEqual(['112.5', '112.5', '150']);
     expect(_pendingPreferenceKeysForTesting()).toEqual([]);
   });
 

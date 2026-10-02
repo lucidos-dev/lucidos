@@ -828,7 +828,7 @@ describe('abortPromisesAutoResume', () => {
    *  than to any verdict. */
   it('never reads a device-attributed stale_settle as a switch', () => {
     expect(isSwitchTeardownAbort(device, 'stale_settle')).toBe(false);
-    expect(responseAbortedSummary(device, 'stale_settle')).toBe('Settled stuck response');
+    expect(responseAbortedSummary(device, 'stale_settle')).toBe('Stuck reply cleared');
   });
 
   /** The two predicates answer different questions and differ by exactly the

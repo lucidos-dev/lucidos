@@ -11,8 +11,8 @@
  * Two things nothing else in the gate can see, which is why this scan exists.
  * `tsc` never reads CSS, and `vite build` fails only on syntax, so a selector
  * that matches no element builds perfectly clean. The token matters as much as
- * the colour, too. `--accent-notable` is the neutral tone a Waiting STATUS
- * wears in the Info popover. Reach for it here and the armed control would
+ * the colour, too. `--accent-notable` is the neutral tone a waiting STATUS
+ * wears. Reach for it here and the armed control would
  * speak in the status dot's voice.
  */
 import { describe, it, expect } from 'vitest';

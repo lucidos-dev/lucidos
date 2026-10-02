@@ -39,7 +39,7 @@ describe('mobile fixed-header spacer', () => {
 
   it('the spacer group exists at the mobile layout line and reserves the header height', () => {
     expect(spacerRule, 'no rule carries .thread-drawer-list::before').toBeDefined();
-    expect(spacerRule!.atRules).toContain('@media (max-width: 768px)');
+    expect(spacerRule!.atRules).toContain('@media (--phone-layout)');
     expect(spacerRule!.props.get('height')).toContain('var(--app-header-bottom)');
   });
 

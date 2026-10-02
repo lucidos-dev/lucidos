@@ -974,6 +974,10 @@ pub fn credential_env_vars(credentials: Vec<Credential>) -> Vec<(String, String)
 /// The `CRED_*` variables for ONE credential, with no type filtering. See
 /// [`credential_env_vars`] for the shape per auth type and for why the
 /// list-taking version skips `oauth_client` while this one does not.
+///
+/// The custom alias is still emitted here. The handshake runner drops it,
+/// because a handshake script gets only `CRED_*` and `OAUTH_*` names
+/// (`api::proxy_script_runner`).
 pub fn credential_env_vars_for(cred: Credential) -> Vec<(String, String)> {
     let mut env_vars = Vec::new();
     {

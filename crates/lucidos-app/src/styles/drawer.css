@@ -882,9 +882,7 @@ html[data-theme-mode="dark"] .thread-row .message-channel-tag.channel-error {
  * across UI scales. Once wrapped, the chip is pinned to its WIDEST line by
  * ContextChip (ThreadDrawer.tsx) — CSS can't shrink a constrained box to the
  * longest line of wrapped text, so the JS measures the line boxes and sets an
- * explicit width, removing the dead space beside the shorter lines. The detail
- * times live behind the row's ⋯ menu (see threadRowInfo.ts), so the chips are
- * type + name only. */
+ * explicit width, removing the dead space beside the shorter lines. */
 .thread-row-context {
     max-width: 7rem;
     white-space: normal;
@@ -994,7 +992,7 @@ html[data-theme-mode="dark"] .thread-row .message-channel-tag.channel-error {
     display: none;
 }
 
-@media (min-width: 769px) {
+@media (--desktop-layout) {
     .thread-row-actions {
         gap: 0.125rem;
     }
@@ -1010,7 +1008,7 @@ html[data-theme-mode="dark"] .thread-row .message-channel-tag.channel-error {
     }
 }
 
-@media (max-width: 768px) {
+@media (--phone-layout) {
     .thread-row-actions .icon-btn.header-icon {
         width: 1.75rem;
         height: 1.5rem;
@@ -1340,10 +1338,10 @@ html[data-theme-mode="dark"] .thread-row .message-channel-tag.channel-error {
 }
 
 /* Mobile: overlay below app header with slide animation */
-@media (max-width: 768px) {
+@media (--phone-layout) {
     .thread-drawer {
         position: fixed;
-        top: var(--mobile-header-height, calc(2.75rem + env(safe-area-inset-top, 0px)));
+        top: var(--mobile-header-height, calc(2.75rem + var(--safe-area-top)));
         left: 0;
         bottom: 0;
         width: 100% !important;

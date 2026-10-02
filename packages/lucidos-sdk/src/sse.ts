@@ -32,10 +32,20 @@ function targets() {
   return eventStreamTargets(apiBase());
 }
 
+/** Run every listener for one event type, each on its own.
+ *
+ *  A listener that throws must not cost the others their frame, the SDK's own
+ *  theme listener among them. Its error is rethrown on a fresh task, so it
+ *  still reaches the console as uncaught rather than vanishing. */
 function dispatch(eventType: string, data: unknown, raw: SseEvent) {
   const set = listeners.get(eventType);
-  if (set) {
-    for (const cb of set) cb(data, raw);
+  if (!set) return;
+  for (const cb of set) {
+    try {
+      cb(data, raw);
+    } catch (err) {
+      setTimeout(() => { throw err; });
+    }
   }
 }
 
@@ -45,28 +55,31 @@ function dispatch(eventType: string, data: unknown, raw: SseEvent) {
  *  land here identically, which is what makes them indistinguishable to a
  *  listener. `eventStream.test.ts` pins the relay half of that. */
 function handleFrame(data: string): void {
+  let parsed: SseEvent | null;
   try {
-    const parsed = JSON.parse(data) as SseEvent;
-    const outerType = parsed?.type;
-    if (!outerType) return;
+    parsed = JSON.parse(data) as SseEvent | null;
+  } catch {
+    return; // malformed SSE data
+  }
+  const outerType = parsed?.type;
+  if (!parsed || !outerType) return;
 
-    if (outerType === 'ThreadEvent') {
-      // Thread events: { type: "ThreadEvent", data: { thread_id, event: { type, ... } } }
-      const threadEvent = parsed as SseThreadEvent;
-      const innerType = threadEvent.data?.event?.type;
-      if (innerType) {
-        dispatch(innerType, threadEvent.data, parsed);
-      }
-      // Also dispatch to "ThreadEvent" listeners (for generic thread watchers)
-      dispatch('ThreadEvent', threadEvent.data, parsed);
-    } else {
-      // System events: { type: "NotificationCreated", data: { ... } }
-      dispatch(outerType, parsed.data ?? parsed, parsed);
+  if (outerType === 'ThreadEvent') {
+    // Thread events: { type: "ThreadEvent", data: { thread_id, event: { type, ... } } }
+    const threadEvent = parsed as SseThreadEvent;
+    const innerType = threadEvent.data?.event?.type;
+    if (innerType) {
+      dispatch(innerType, threadEvent.data, parsed);
     }
+    // Also dispatch to "ThreadEvent" listeners (for generic thread watchers)
+    dispatch('ThreadEvent', threadEvent.data, parsed);
+  } else {
+    // System events: { type: "NotificationCreated", data: { ... } }
+    dispatch(outerType, parsed.data ?? parsed, parsed);
+  }
 
-    // Wildcard listeners get the full raw envelope
-    dispatch('*', parsed, parsed);
-  } catch { /* malformed SSE data */ }
+  // Wildcard listeners get the full raw envelope
+  dispatch('*', parsed, parsed);
 }
 
 export const sse = {

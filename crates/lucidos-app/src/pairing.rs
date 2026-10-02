@@ -44,7 +44,7 @@ pub struct MintedCode {
 #[tauri::command]
 pub fn mint_pairing_code() -> Result<MintedCode, String> {
     let port = crate::desktop::engine_port();
-    let body = crate::desktop::gateway_body(port, "POST", PAIRING_CODE_PATH)
+    let body = crate::desktop::gateway_body(port, "POST", PAIRING_CODE_PATH, None)
         .ok_or_else(|| format!("the gateway on port {port} did not mint a pairing code"))?;
     parse_minted_code(&body).ok_or_else(|| "the gateway returned no pairing code".to_string())
 }

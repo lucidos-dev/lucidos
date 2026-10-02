@@ -20,10 +20,10 @@ vi.hoisted(() => {
 });
 
 vi.mock('../../api/threads', () => ({
-  fetchThreadEvents: vi.fn().mockResolvedValue([]),
+  fetchThreadEvents: vi.fn().mockResolvedValue({ events: [], currentAggregate: null }),
 }));
 
-import { seedSuggestion, clearSupersededDraft, composeEditedAt, discardCompose, ensureFocusedComposeThread, flushUndeliveredComposeDrafts, pendingComposePuts, prefillCompose, sendCompose, sendFollowup, startSetupInterview, updateCompose, applyRemoteCompose, _composeEpochForTesting, _resetUndeliveredComposeDraftsForTesting, _undeliveredComposeDraftsForTesting } from './compose';
+import { seedSuggestion, clearSupersededDraft, composeEditedAt, discardCompose, hasUnsentLocalDraft, ensureFocusedComposeThread, flushUndeliveredComposeDrafts, pendingComposePuts, prefillCompose, sendCompose, sendFollowup, startSetupInterview, updateCompose, applyRemoteCompose, _composeEpochForTesting, _resetUndeliveredComposeDraftsForTesting, _undeliveredComposeDraftsForTesting } from './compose';
 import { focusThread, unfocusThread } from './threads';
 import { connectionStatus, confirmState, focusedThreadId, focusedPane, inputMode, threadMap, selectedScope, FOCUSED_THREAD_KEY, toasts } from '../store';
 import { promptOverrideSyncSeq, promptOverrideReplacesDraft } from '../../components/chat/promptValueSync';
@@ -1859,6 +1859,21 @@ describe('a send leaves the engine holding an empty draft', () => {
     const texts = composePutTexts();
     expect(texts.length).toBeGreaterThan(0);
     expect(texts[texts.length - 1]).toBe('');
+  });
+
+  /** A send is not authorship. `hasUnsentLocalDraft` reads the edit stamp as
+   *  "this device wrote the draft". A send that set it left the next remote
+   *  draft unclearable here, a ghost of text already sent. */
+  it('sendCompose does not mark the next remote draft as this device\'s own', async () => {
+    composeEditedAt.delete('t-1');
+    threadMap.value = new Map([['t-1', makeThread({ id: 't-1', state: 'composing', composeText: 'from the phone' })]]);
+
+    await sendCompose('t-1', {});
+    await vi.runAllTimersAsync();
+    setDraft('t-1', { ...getDraft('t-1'), text: 'the next draft, typed on the phone' });
+
+    expect(composeEditedAt.has('t-1')).toBe(false);
+    expect(hasUnsentLocalDraft('t-1')).toBe(false);
   });
 
   it('sendFollowup writes the cleared draft after the send', async () => {

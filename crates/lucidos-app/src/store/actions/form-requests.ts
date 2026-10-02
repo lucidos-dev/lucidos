@@ -153,8 +153,20 @@ export function describeFormRequest(event: FormRequestEvent): string {
       const name = payloadField(event, 'plugin_name') ?? payloadField(event, 'plugin_id');
       return name ? `uninstall panel for ${name}` : 'plugin uninstall panel';
     }
-    case 'OAuthAuthorizationRequested':
-      return 'authorization page';
+    case 'OAuthAuthorizationRequested': {
+      const host = urlHost(payloadField(event, 'url'));
+      return host ? `sign-in page on ${host}` : 'sign-in page';
+    }
+  }
+}
+
+/** The site a sign-in page lives on, which is what the reader recognises. */
+function urlHost(url: string | undefined): string | undefined {
+  if (!url) return undefined;
+  try {
+    return new URL(url).host || undefined;
+  } catch {
+    return undefined;
   }
 }
 

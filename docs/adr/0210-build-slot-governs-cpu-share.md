@@ -131,6 +131,11 @@ export and the "deliberately not its own process group" decision.
   so a build that is slower than the last one says why.
 - **A build that bypasses the wrapper is still ungoverned**, exactly as ADR
   0070 left it. A bare `cargo build` typed directly gets the whole machine.
+  Inside a coding-agent session it still runs at nice +5, because ADR 0341
+  lowers the whole agent tree. A slotted build there lands at 15.
+- **The nice never reached `rustc` through the shared sccache daemon.** The
+  daemon runs each compile at its own priority, not its client's. ADR 0343
+  gives agents their own daemon, which an agent always starts.
 
 ## Alternatives considered
 

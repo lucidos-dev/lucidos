@@ -272,6 +272,8 @@ struct GatewayInner {
     release_check: release_check::ReleaseCheck,
     /// The machine's one slowness watch (ADRs 0274, 0283).
     slowness: slowness::Slowness,
+    /// The update relay to the desktop client (ADR 0338).
+    update_relay: crate::update_relay::UpdateRelay,
 }
 
 /// Where a running engine's pid comes from, for the slowness attribution.
@@ -369,6 +371,7 @@ impl GatewayState {
                     config_path: None,
                 }),
                 slowness: slowness::Slowness::default(),
+                update_relay: crate::update_relay::UpdateRelay::default(),
             }),
         }
     }
@@ -1003,6 +1006,11 @@ impl GatewayState {
     /// the supervisor and the sampler loop.
     pub fn slowness(&self) -> &slowness::Slowness {
         &self.inner.slowness
+    }
+
+    /// The update relay to the desktop client (ADR 0338).
+    pub fn update_relay(&self) -> &crate::update_relay::UpdateRelay {
+        &self.inner.update_relay
     }
 
     /// How to find each RUNNING engine's pid, for [`Self::lucidos_roots`]: the
@@ -1869,8 +1877,27 @@ impl GatewayState {
         key_b64: &str,
     ) -> Result<(), String> {
         let resolved_dir = ws.resolve_dir(self.app_data());
-        std::fs::create_dir_all(resolved_dir.join("data"))
-            .map_err(|e| format!("create workspace dir: {e}"))?;
+        // Created exclusively, because every failure below deletes this tree.
+        // The id is free in the registry, not on disk: a delete whose move to
+        // trash failed leaves its data at exactly this address.
+        if let Some(parent) = resolved_dir.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("create workspaces dir: {e}"))?;
+        }
+        std::fs::create_dir(&resolved_dir).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                format!(
+                    "{} already exists and may hold a workspace's files. Move it aside, \
+                     or restore under a different name.",
+                    resolved_dir.display()
+                )
+            } else {
+                format!("create workspace dir: {e}")
+            }
+        })?;
+        if let Err(e) = std::fs::create_dir_all(resolved_dir.join("data")) {
+            self.cleanup_failed_restore(&resolved_dir, None);
+            return Err(format!("create workspace dir: {e}"));
+        }
 
         // Provision Postgres ONCE and reuse its URL for BOTH the CLI restore
         // and the engine server. Re-provisioning would, on the embedded
@@ -2016,8 +2043,8 @@ impl GatewayState {
 
     /// Tear down a half-provisioned restore: stop the Postgres this attempt
     /// provisioned and remove the freshly-created workspace dir. Only ever
-    /// touches state THIS attempt created, because the id is freshly allocated
-    /// and the registry entry is committed only after a successful restore.
+    /// touches state THIS attempt created: `run_restore` creates the dir
+    /// exclusively, and commits the registry entry only after a successful restore.
     fn cleanup_failed_restore(&self, resolved_dir: &Path, pg: Option<&PgHandle>) {
         if let Some(pg) = pg {
             pg.teardown();
@@ -3053,6 +3080,7 @@ pub async fn run() -> Result<(), BoxError> {
                     &release_check::Deployment::from_env(packaged, exe_path, release_app_data),
                 ),
                 slowness: slowness::Slowness::default(),
+                update_relay: crate::update_relay::UpdateRelay::default(),
             }),
         };
     crate::log!("[Gateway] build id: {}", GATEWAY_BUILD_ID);
@@ -4423,6 +4451,31 @@ mod tests {
             .expect("spawn sleep")
     }
 
+    /// A stand-in engine that a pidfile reclaim recognises: `sleep`, copied to a
+    /// file named like the engine binary. Copied rather than linked, because both
+    /// platforms report a symlinked executable by its target's name.
+    #[cfg(unix)]
+    fn spawn_stand_in_engine_binary(dir: &Path) -> std::process::Child {
+        let sleep = ["/bin/sleep", "/usr/bin/sleep"]
+            .into_iter()
+            .map(Path::new)
+            .find(|p| p.is_file())
+            .expect("a sleep binary");
+        let engine = dir.join("lucidos-engine");
+        std::fs::copy(sleep, &engine).expect("copy sleep");
+        // Linux refuses to exec a file another thread's fork still holds open
+        // for writing, which a parallel test run can briefly cause.
+        for _ in 0..50 {
+            match std::process::Command::new(&engine).arg("30").spawn() {
+                Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                spawned => return spawned.expect("spawn the stand-in engine"),
+            }
+        }
+        panic!("the stand-in engine stayed busy");
+    }
+
     /// We hold the `Child`, so the wait rides it.
     #[cfg(unix)]
     #[test]
@@ -4450,7 +4503,7 @@ mod tests {
     #[test]
     fn stopping_a_re_adopted_engine_reaps_it_too() {
         let dir = reap_scratch_dir("readopted");
-        let child = spawn_stand_in_engine();
+        let child = spawn_stand_in_engine_binary(&dir);
         let pid = child.id();
         std::fs::write(dir.join(".lucidos/engine.pid"), pid.to_string()).unwrap();
         // Exactly what `execv` does to the handle: dropped without a wait,
@@ -4494,6 +4547,57 @@ mod tests {
             started.elapsed() < Duration::from_secs(5),
             "reclaiming a pid that is not our child must not block: took {:?}",
             started.elapsed()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A delete whose move to trash failed leaves the data at the address,
+    /// unregistered. A restore under the same name must refuse it rather than
+    /// write into it, because a failed restore deletes the tree it ran in.
+    #[tokio::test]
+    async fn a_restore_never_runs_in_a_directory_it_did_not_create() {
+        let root = tempfile::tempdir().unwrap();
+        let state = GatewayState::for_tests_with_static_dir(Some(root.path().to_path_buf()));
+        let ws = Workspace::gateway_provisioned("myws".into(), "myws".into(), 5000);
+        let leftover = ws
+            .resolve_dir(state.app_data())
+            .join("data/artifacts/notes.md");
+        std::fs::create_dir_all(leftover.parent().unwrap()).unwrap();
+        std::fs::write(&leftover, "keep me").unwrap();
+
+        let refused = state
+            .run_restore(ws, &root.path().join("archive.enc"), "a-wrong-key")
+            .await;
+
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|e| e.contains("already exists")),
+            "{refused:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&leftover).unwrap(), "keep me");
+    }
+
+    /// A stopped workspace keeps its pidfile, and the OS reuses pids. A
+    /// lazy-start days later must not SIGUSR1 whatever app now holds that pid,
+    /// because the default disposition terminates it.
+    #[cfg(unix)]
+    #[test]
+    fn reclaiming_a_pid_reused_by_another_program_leaves_it_running() {
+        let dir = reap_scratch_dir("reused");
+        let mut bystander = spawn_stand_in_engine();
+        std::fs::write(dir.join(".lucidos/engine.pid"), bystander.id().to_string()).unwrap();
+
+        stack::reclaim_stale_engine(&dir);
+
+        // Long enough for a delivered SIGUSR1 to have terminated it.
+        std::thread::sleep(Duration::from_millis(200));
+        let survived = matches!(bystander.try_wait(), Ok(None));
+        let _ = bystander.kill();
+        let _ = bystander.wait();
+        assert!(
+            survived,
+            "a pidfile reclaim killed a process that is not the engine"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

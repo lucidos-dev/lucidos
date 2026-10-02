@@ -23,15 +23,16 @@ vi.mock('../../../store/actions/repositories', () => ({
   viewThreadCcDiff: vi.fn(),
 }));
 
-// Only the workspace-scope disarm is replaced, so every other action keeps its
-// real identity and the module's own constants still resolve.
-const { disarmAll } = vi.hoisted(() => ({ disarmAll: vi.fn() }));
+// Only the section's bulk arm and disarm are replaced, so every other action
+// keeps its real identity and the module's own constants still resolve.
+const { armSection, disarmSection } = vi.hoisted(() => ({ armSection: vi.fn(), disarmSection: vi.fn() }));
 vi.mock('../../../store/actions/chat-changes', async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
-  disarmAllStandingApplies: disarmAll,
+  armStandingApplies: armSection,
+  disarmStandingApplies: disarmSection,
 }));
 
-import { ChangesView, SWEEP_TIP } from '../ChangesView';
+import { ChangesView, SETTLE_ALL_TIP } from '../ChangesView';
 import { getStandaloneActions } from '../../chat/WaitingBanner';
 import {
   changes,
@@ -42,9 +43,6 @@ import {
   applyAllInProgress,
   standingApplyThreadIds,
   armingStandingApplyThreadIds,
-  armingStandingApplySweep,
-  disarmingAllStandingApply,
-  settlingThreadCount,
   threadMap,
   focusedThreadId,
 } from '../../../store/store';
@@ -135,10 +133,8 @@ beforeEach(() => {
   applyAllInProgress.value = false;
   standingApplyThreadIds.value = new Set();
   armingStandingApplyThreadIds.value = new Set();
-  armingStandingApplySweep.value = false;
-  disarmingAllStandingApply.value = false;
-  settlingThreadCount.value = 1;
-  disarmAll.mockClear();
+  armSection.mockClear();
+  disarmSection.mockClear();
   threadMap.value = new Map([[THREAD, makeThread()]]);
   focusedThreadId.value = THREAD;
   host = document.createElement('div');
@@ -187,7 +183,6 @@ describe('the Changes panel row', () => {
       status: 'loaded',
       data: [makeChange({ thread_unsettled: true, thread_settling: false })],
     };
-    settlingThreadCount.value = 0; // nothing to sweep, so no bulk row either
     render(<ChangesView />, host);
     expect(actionLabels()).toEqual(['Diff']);
     expect(host.textContent).toContain('The thread has not finished');
@@ -220,42 +215,40 @@ describe('the Changes panel row', () => {
   });
 });
 
-/** The bulk control is the surface the bug was reported on: one green face that
- *  could only ever re-arm, with no off anywhere. It is a toggle now, wearing the
- *  shape the row and the prompt-row icon already wear. */
-describe('the Changes panel bulk control', () => {
-  // The toggle is the one control here carrying a pressed state. Naming it that
-  // way cannot pick up Discard All or Apply All beside it.
+/** The Not finished section's bulk control is a toggle, wearing the shape the
+ *  row and the prompt-row icon already wear. It reaches only the changes it
+ *  lists. */
+describe('the Not finished bulk control', () => {
+  // The toggle is the one control here carrying a pressed state.
   function bulkButton(): HTMLButtonElement {
     const btn = host.querySelector<HTMLButtonElement>('.changes-bulk-actions button[aria-pressed]');
     if (!btn) throw new Error('the bulk row draws no standing-apply toggle');
     return btn;
   }
 
-  it('offers the arm while nothing is armed', () => {
+  it('offers the arm while nothing is armed, and arms the listed change', () => {
     render(<ChangesView />, host);
     expect(bulkButton().textContent).toBe('Apply all on settle');
     expect(bulkButton().getAttribute('aria-pressed')).toBe('false');
+    bulkButton().click();
+    expect(armSection.mock.calls[0][0].map((c: Change) => c.thread_id)).toEqual([THREAD]);
   });
 
-  it('shows the armed face and cancels on click, rather than re-arming', () => {
-    standingApplyThreadIds.value = new Set([THREAD]);
+  it('shows the armed face and cancels only its own arms on click', () => {
+    standingApplyThreadIds.value = new Set([THREAD, 'elsewhere']);
     render(<ChangesView />, host);
     expect(bulkButton().textContent).toBe('✓ Applying all on settle');
     expect(bulkButton().getAttribute('aria-pressed')).toBe('true');
     bulkButton().click();
-    expect(disarmAll).toHaveBeenCalledTimes(1);
+    expect(disarmSection).toHaveBeenCalledWith([THREAD]);
   });
 
-  // Two faces, never a third. It arms, so it has no progress of its own to
-  // report: a press lands on the armed face. Apply All's "Applying..." belongs
-  // to a batch this press never starts.
-  it('keeps its own face and its tooltip while the arm is in flight', () => {
+  it('keeps its face, its tooltip and its press while an Apply All runs', () => {
     applyAllInProgress.value = true;
     render(<ChangesView />, host);
     expect(bulkButton().textContent).toBe('Apply all on settle');
     expect(bulkButton().disabled).toBe(false);
-    expect(bulkButton().getAttribute('data-tooltip')).toBe(SWEEP_TIP);
+    expect(bulkButton().getAttribute('data-tooltip')).toBe(SETTLE_ALL_TIP);
   });
 
   it('keeps the armed face live while a batch runs, so the off is reachable', () => {
@@ -266,29 +259,14 @@ describe('the Changes panel bulk control', () => {
     expect(disabledActionButtons()).not.toContain('✓ Applying all on settle');
   });
 
-  it('lands on the armed face the moment the sweep is pressed', () => {
-    applyAllInProgress.value = true;
-    armingStandingApplySweep.value = true;
+  // A parked thread cannot be armed, so the control has nothing to offer.
+  it('draws no toggle when nothing in the section can be armed', () => {
+    changes.value = {
+      status: 'loaded',
+      data: [makeChange({ thread_unsettled: true, thread_settling: false })],
+    };
     render(<ChangesView />, host);
-    expect(bulkButton().textContent).toBe('✓ Applying all on settle');
-  });
-
-  // A cancel pressed mid-sweep waits for the sweep, whose arm frames land in
-  // that wait. The panel the owner pressed must not flick back to armed.
-  it('holds the unarmed face while a cancel is pending, whatever arms land', () => {
-    standingApplyThreadIds.value = new Set([THREAD]);
-    disarmingAllStandingApply.value = true;
-    render(<ChangesView />, host);
-    expect(bulkButton().textContent).toBe('Apply all on settle');
-    expect(actionLabels()).toContain('Apply on settle');
-  });
-
-  it('keeps the off drawn after the last thread stops working', () => {
-    changes.value = { status: 'loaded', data: [] };
-    settlingThreadCount.value = 0;
-    standingApplyThreadIds.value = new Set([THREAD]);
-    render(<ChangesView />, host);
-    expect(bulkButton().textContent).toBe('✓ Applying all on settle');
+    expect(host.querySelector('.changes-bulk-actions')).toBeNull();
   });
 });
 

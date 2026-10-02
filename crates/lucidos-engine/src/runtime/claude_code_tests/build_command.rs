@@ -843,33 +843,37 @@ fn build_command_forwards_host_protection_env_vars() {
 }
 
 #[test]
-fn build_command_gates_rustc_wrapper_on_sccache_presence() {
+fn build_command_carries_the_agent_compile_env() {
     // RUSTC_WRAPPER must ALWAYS be set — to "sccache" when it's on PATH, else to
     // "" (empty). The empty value is load-bearing: the Lucidos repo's tracked
     // .cargo/config.toml sets `build.rustc-wrapper = "sccache"`, and cargo falls
-    // back to that config when RUSTC_WRAPPER is merely unset; only an explicit
-    // empty value forces a plain build on a host without sccache. Leaving it
-    // unset (the original bug) would still hard-fail Lucidos-repo builds. Pin the
-    // wiring by comparing against the same predicate build_command consults, so
-    // the assertion is deterministic whether or not the test host has sccache.
+    // back to that config when RUSTC_WRAPPER is merely unset. The SCCACHE_*
+    // values route agent compiles to the agents' own daemon (ADR 0343).
+    // Other tests move HOME and XDG_CACHE_HOME, so this reads the built env
+    // once and checks its shape. The helper's own tests pin the exact values.
     let thread_id = uuid::Uuid::new_v4();
     let p = std::path::Path::new("/tmp");
     let cmd = build_command(&test_spawn_args(p, p, thread_id), None);
     let env = collect_envs(&cmd);
-    let wrapper = env.get(std::ffi::OsStr::new("RUSTC_WRAPPER")).expect(
-        "RUSTC_WRAPPER must always be set (sccache, or empty to override .cargo/config.toml)",
-    );
-    let expected =
-        if crate::runtime::spawn_env::sccache_on_path(std::env::var_os("PATH").as_deref()) {
-            std::ffi::OsString::from("sccache")
-        } else {
-            std::ffi::OsString::from("")
-        };
+    let var = |key: &str| {
+        env.get(std::ffi::OsStr::new(key))
+            .map(|v| v.to_string_lossy().into_owned())
+    };
+    let sccache = crate::runtime::spawn_env::sccache_on_path(std::env::var_os("PATH").as_deref());
     assert_eq!(
-        wrapper.as_os_str(),
-        expected.as_os_str(),
+        var("RUSTC_WRAPPER").as_deref(),
+        Some(if sccache { "sccache" } else { "" }),
         "RUSTC_WRAPPER must be \"sccache\" when on PATH, else \"\" to disable the .cargo/config.toml fallback"
     );
+    match (var("SCCACHE_SERVER_PORT"), var("SCCACHE_DIR")) {
+        (None, None) => {}
+        (Some(port), Some(dir)) => {
+            assert!(sccache, "an agents' daemon is named only with sccache");
+            assert_eq!(port, "4227");
+            assert!(dir.ends_with("sccache-agents"), "{dir}");
+        }
+        other => panic!("the port and the cache dir come as a pair: {other:?}"),
+    }
 }
 
 #[test]

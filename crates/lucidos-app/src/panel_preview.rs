@@ -209,6 +209,17 @@ pub(crate) fn close_owned_by(app: &tauri::AppHandle, window_label: &str) {
     }
 }
 
+/// May a previewed page hand this scheme to the OS opener?
+///
+/// The page is untrusted remote content, and the opener launches whatever a
+/// URL names: a `file:` app, a share, a registered app scheme. So only the
+/// schemes that reach a browser, a mail client or a dialer pass. Mirrors
+/// `OS_OPENER_WEB_SCHEMES` in `store/actions/artifacts.ts`, whose confirm this
+/// path has no page to show.
+fn os_opener_hands_to_a_browser(scheme: &str) -> bool {
+    matches!(scheme, "http" | "https" | "mailto" | "tel")
+}
+
 /// The box a preview fills, as the calling page measured it. One type for both
 /// commands that place a preview, so the two cannot drift on what they take.
 #[derive(serde::Deserialize)]
@@ -263,7 +274,9 @@ pub(crate) fn create_panel_webview(
             // The one site with nowhere to report to: a previewed page asked for
             // a window from inside the delegate, so there is no promise to reject
             // and no toast to raise. Log rather than discard.
-            if let Err(e) = crate::open_in_default_browser(url.as_str()) {
+            if !os_opener_hands_to_a_browser(url.scheme()) {
+                eprintln!("[Tauri] a previewed page asked to open {url}; refused");
+            } else if let Err(e) = crate::open_in_default_browser(url.as_str()) {
                 eprintln!("[Tauri] {url}: {e}");
             }
             tauri::webview::NewWindowResponse::Deny
@@ -541,6 +554,18 @@ pub(crate) fn __panel_content_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A hostile previewed page must not launch a program through a new-window
+    /// request, which no confirm stands in front of.
+    #[test]
+    fn a_previewed_page_opens_only_web_schemes_outside_the_app() {
+        for scheme in ["http", "https", "mailto", "tel"] {
+            assert!(os_opener_hands_to_a_browser(scheme), "{scheme}");
+        }
+        for scheme in ["file", "smb", "x-apple.systempreferences", "vnc", "ssh", ""] {
+            assert!(!os_opener_hands_to_a_browser(scheme), "{scheme}");
+        }
+    }
 
     /// A preview belongs to the page that asked for it, and only that page's
     /// navigation or destroy ends it.

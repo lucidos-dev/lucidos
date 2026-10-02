@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from 'preact/hooks';
-import { searchEverywhereOpen, searchEverywhereAnchor, appsList, artifacts, triggers, threadMap, settingsScrollTarget, focusedPane } from '../../store/store';
+import { searchEverywhereOpen, searchEverywhereAnchor, appsList, artifacts, triggers, settingsScrollTarget, focusedPane } from '../../store/store';
 import { Overlay } from '../shared/Overlay';
 import { searchEverywhere, type SearchCategory, type SearchResultItem, type ServerSearchCategory } from '../../api/client';
 import { focusThreadOrBootstrap } from '../../store/actions/threads';
@@ -117,7 +117,10 @@ function validateRecents(recents: SearchResultItem[]): SearchResultItem[] {
         return trigs.data.some(t => t.id === item.id);
       }
       case 'threads':
-        return threadMap.value.has(item.id);
+        // This filter keeps every thread recent: `threadMap` holds only the
+        // loaded window, and nothing on a cold start, so a miss proves nothing.
+        // `dropDeletedThreads` and a not-found tap prune it instead.
+        return true;
       case 'settings':
         // Recents are persisted verbatim, so an id retired by a Settings
         // restructure outlives the build that had it. `handleSelect` does

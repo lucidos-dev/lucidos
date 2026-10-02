@@ -64,8 +64,15 @@ describe('every file preview renders its image through PreviewImage', () => {
     expect(inlineSource).toMatch(/<PreviewImage\s/);
   });
 
+  // A rendered SVG takes the binary image's path, so one site serves both.
   it('the repository preview does, for a binary image and for a rendered SVG', () => {
-    expect(repoSource.match(/<PreviewImage\s/g) ?? []).toHaveLength(2);
+    expect(repoSource.match(/<PreviewImage\s/g) ?? []).toHaveLength(1);
+  });
+
+  // A blob URL shares the shell's origin, so opening that image in a new tab
+  // would run an SVG's script as the shell. The engine URL is sandboxed.
+  it('the repository preview never builds a same-origin blob URL for an image', () => {
+    expect(repoSource).not.toMatch(/createObjectURL/);
   });
 
   it('neither keeps a bare clickable <img>, which would drop the popup', () => {

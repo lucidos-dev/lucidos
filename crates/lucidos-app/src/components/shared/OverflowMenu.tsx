@@ -4,8 +4,7 @@ import { Overlay } from './Overlay';
 import { useAnchoredPosition, pointAnchor, type AnchorAlign, type AnchorBox, type ViewportPoint } from '../../hooks/useAnchoredPopover';
 import { useLongPress } from '../../hooks/useLongPress';
 import { viewportIsMobile } from '../../utils/viewport';
-import { MoreIcon, InfoIcon } from './icons';
-import type { TooltipRow } from '../drawer/threadRowInfo';
+import { MoreIcon } from './icons';
 
 /** What counts as a row for roving focus and for the keyboard-open focus. */
 const MENU_ITEM_ROLES = '[role="menuitem"], [role="menuitemradio"], [role="menuitemcheckbox"]';
@@ -65,12 +64,12 @@ interface Placement {
   align: AnchorAlign;
 }
 
-/** Generic ⋯ overflow menu: a trigger button, an anchored menu popover, and an
- *  optional secondary Info popover — the whole dismiss/Escape/inert contract via
- *  the central <Overlay>, `portal`ed + `position: fixed` so it escapes the
- *  drawer's scroll/overflow clipping and any transformed header ancestor. The
- *  shared shell behind ThreadOverflowMenu (started threads) and DraftOverflowMenu
- *  (compose drafts); each supplies its own `items` and `infoRows`.
+/** Generic ⋯ overflow menu: a trigger button and an anchored menu popover, with
+ *  the whole dismiss/Escape/inert contract via the central <Overlay>, `portal`ed
+ *  + `position: fixed` so it escapes the drawer's scroll/overflow clipping and
+ *  any transformed header ancestor. The shared shell behind ThreadOverflowMenu
+ *  (started threads) and DraftOverflowMenu (compose drafts); each supplies its
+ *  own `items`.
  *
  *  **`hostOpener` lets the host open the same menu from a gesture.** A desktop
  *  drawer row's right-click opens it at the pointer, beside a drawn ⋯ (ADR
@@ -90,16 +89,15 @@ interface Placement {
  *  action, and hands focus back to the opener on close so list-nav resumes; a
  *  pointer-open leaves focus where it was.
  *
- *  **Signal gating.** `items` is invoked ONLY while the menu is open and
- *  `infoRows` ONLY while a popover is open, so a closed menu subscribes to no
- *  hot signals — preserving the drawer's per-row render budget across the many
- *  rows that each mount one of these.
+ *  **Signal gating.** `items` is invoked ONLY while the menu is open. A closed
+ *  menu then subscribes to no hot signals. That keeps the drawer's per-row
+ *  render budget across the many rows that each mount one of these.
  *
  *  `stopPropagation` guards a host whose container has its own click handler
  *  (the drawer row's focus-thread `onClick`) — toggling the menu or running an
  *  item must not also fire it.
  */
-export function OverflowMenu({ ariaLabel, stopPropagation, extraClass, triggerAttrs, onOpen, tabIndex, hostOpener, face, items, infoRows }: MenuOpening & {
+export function OverflowMenu({ ariaLabel, stopPropagation, extraClass, triggerAttrs, onOpen, tabIndex, hostOpener, face, items }: MenuOpening & {
   ariaLabel: string;
   stopPropagation?: boolean;
   extraClass?: string;
@@ -119,24 +117,16 @@ export function OverflowMenu({ ariaLabel, stopPropagation, extraClass, triggerAt
    *  "Open thread actions" shortcut). Default undefined → natively tabbable.
    *  Ignored when no trigger is drawn. */
   tabIndex?: number;
-  /** Custom items, rendered above the auto-appended Info row. Invoked only while
-   *  the menu is open. */
+  /** The menu's items. Invoked only while the menu is open. */
   items: (ctx: OverflowMenuContext) => ComponentChildren;
-  /** Structured Info rows; a null/empty result omits the Info item + popover
-   *  (e.g. an unhydrated search hit with no live meta). Invoked only while a
-   *  popover is open. */
-  infoRows?: () => TooltipRow[] | null;
 }) {
   const triggerRef = useRef<HTMLButtonElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
-  const infoRef = useRef<HTMLDivElement>(null);
   const drawsDots = !face && (hostOpener?.trigger ?? true);
   const drawsTrigger = drawsDots || !!face;
   // Null when closed. `useAnchoredPosition` reacts to `box` changes via its
-  // effect deps, so no separate `open` flag is needed. The menu and the Info
-  // popover are mutually exclusive: opening one closes the other.
+  // effect deps, so no separate `open` flag is needed.
   const [menu, setMenu] = useState<Placement | null>(null);
-  const [info, setInfo] = useState<Placement | null>(null);
   // Whether the LAST open was keyboard-driven (Enter/Space on the trigger or the
   // shortcut's synthetic `trigger.click()`, both `e.detail === 0`). Drives the
   // focus-into-menu on open and the focus-restore on close.
@@ -145,9 +135,7 @@ export function OverflowMenu({ ariaLabel, stopPropagation, extraClass, triggerAt
   // header trigger), restored on close so list-nav resumes.
   const lastFocusedRef = useRef<HTMLElement | null>(null);
   const open = menu !== null;
-  const infoOpen = info !== null;
   const pos = useAnchoredPosition(menu?.box ?? null, menuRef, undefined, menu?.align);
-  const infoPos = useAnchoredPosition(info?.box ?? null, infoRef, undefined, info?.align);
 
   // Right-align to the ⋯ trigger. It sits at the far right of its row. A
   // left-start panel would run off-screen, and the clamp would then strand it
@@ -170,10 +158,8 @@ export function OverflowMenu({ ariaLabel, stopPropagation, extraClass, triggerAt
       if (prev && document.body.contains(prev)) prev.focus();
     }
   };
-  const closeInfo = () => setInfo(null);
   const toggle = (e: MouseEvent) => {
     if (stopPropagation) e.stopPropagation();
-    closeInfo();
     if (open) { close(); return; }
     const trigger = triggerRef.current;
     if (!trigger) return;
@@ -199,7 +185,6 @@ export function OverflowMenu({ ariaLabel, stopPropagation, extraClass, triggerAt
   // first frame. Cleared on unmount, so a row scrolled out of the list cannot
   // be opened through a stale handle.
   const openFromGesture = (el: HTMLElement, at?: ViewportPoint) => {
-    closeInfo();
     onOpen?.();
     setOpenedViaKeyboard(false);
     lastFocusedRef.current = null;
@@ -236,10 +221,6 @@ export function OverflowMenu({ ariaLabel, stopPropagation, extraClass, triggerAt
     if (!panel || panel.contains(document.activeElement)) return;
     panel.querySelector<HTMLElement>(MENU_ITEM_ROLES)?.focus();
   }, [open, openedViaKeyboard, pos]);
-
-  // Info rows drive both the Info menu item's presence and the Info popover body.
-  // Read ONLY while a popover is open so a closed menu subscribes to no signals.
-  const rows = (open || infoOpen) && infoRows ? infoRows() : null;
 
   // The Overlay's anchor is the element that re-activates the overlay through
   // its OWN handler, exempt from the outside-pointerdown dismiss. That is the ⋯
@@ -287,42 +268,6 @@ export function OverflowMenu({ ariaLabel, stopPropagation, extraClass, triggerAt
           : { visibility: 'hidden' }}
       >
         {menu && items({ run, anchor: menu.anchor })}
-        {rows && (
-          <>
-            <div class="thread-overflow-divider" role="separator" />
-            {/* Info takes the menu's place, wherever the menu opened. */}
-            <button type="button" class="thread-overflow-item" role="menuitem" onClick={run(() => setInfo(menu))}>
-              <InfoIcon />
-              Info
-            </button>
-          </>
-        )}
-      </Overlay>
-      <Overlay
-        open={infoOpen}
-        onClose={closeInfo}
-        anchor={overlayAnchor}
-        backdrop={false}
-        portal
-        panelClass="surface thread-info-popover"
-        panelRef={infoRef}
-        panelStyle={infoPos
-          ? { position: 'fixed', top: `${infoPos.top}px`, left: `${infoPos.left}px` }
-          : { visibility: 'hidden' }}
-      >
-        {rows && (
-          <div class="thread-info-rows">
-            {rows.map((r) => (
-              <div class="thread-info-row" key={r.label}>
-                <span class="thread-info-label">{r.label}</span>
-                <span class="thread-info-value">
-                  {r.tone && <span class={`thread-info-dot thread-info-dot-${r.tone}`} />}
-                  {r.value}
-                </span>
-              </div>
-            ))}
-          </div>
-        )}
       </Overlay>
     </>
   );

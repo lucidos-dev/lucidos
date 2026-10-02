@@ -9,6 +9,7 @@ import { askGatewaySession } from './vite/gatewaySession';
 import { entryChunkBudget } from './vite/entryChunkBudget';
 import { shellChunkPreload } from './vite/shellChunkPreload';
 import { inlineBootScript } from './vite/inlineBootScript';
+import { layoutMediaPlugin } from './vite/layoutMediaPlugin';
 
 const VITE_PORT = parseInt(process.env.VITE_PORT || '5173');
 
@@ -291,6 +292,7 @@ export default defineConfig({
     buildIdVirtualModule(), suppressMergeReload(), inlineAppearanceBoot(), syncPublicDir(),
     stampServiceWorker(), preact(), entryChunkBudget(), shellChunkPreload(), atomicDistPublish(),
   ],
+  css: { postcss: { plugins: [layoutMediaPlugin()] } },
   build: {
     // The entry chunk is the data layer and startup: store, actions, event
     // stream, API client. The UI is the shell chunk, which loads beside it
@@ -370,6 +372,11 @@ export default defineConfig({
       // for the same reason as the five above.
       // Mirrored in tsconfig.json `paths` so tsc resolves it too.
       '@lucidos/pull-to-refresh': resolve(__dirname, '../../packages/lucidos-sdk/src/pullToRefresh.ts'),
+      // The pane swipe, shared so a drag on the swipe container and a drag
+      // inside an app frame lock and commit by one rule. Reached WITHOUT the
+      // barrel, for the same reason as the six above.
+      // Mirrored in tsconfig.json `paths` so tsc resolves it too.
+      '@lucidos/pane-swipe': resolve(__dirname, '../../packages/lucidos-sdk/src/paneSwipe.ts'),
     },
   },
   server: {

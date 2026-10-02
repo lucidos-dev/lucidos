@@ -38,6 +38,8 @@ import { applySummaryVersion, type ThreadAggregate, type ThreadState } from '../
 import type { ThreadSummary } from '../../api/threads';
 import { focusedThreadId, threadMap } from '../store';
 import { upsertThread, refreshThreadEvents } from './thread-loading';
+import { composeSentAt } from './compose';
+import { getDraft } from '../composeDrafts';
 
 vi.mock('../../api/threads', () => ({
   fetchThreads: vi.fn(),
@@ -145,6 +147,23 @@ describe('upsertThread: the version guard (loadAllThreads path)', () => {
     const map = new Map([['t1', liveThread({ meta: { id: 't1', state: 'active' } as ThreadState['meta'] })]]);
     upsertThread(map, summary({ state: 'composing', summary_version: LIVE - 1 }), false);
     expect(map.get('t1')!.meta.state).toBe('active');
+  });
+
+  /** The same race at an EQUAL version, which is the common one: nothing
+   *  raises the version until the send's `MessageReceived` lands. The send's
+   *  own stamp is what makes the snapshot stale. Unguarded, the composer came
+   *  back holding the sent text, ready to be sent twice. */
+  it('does not send a just-sent draft back to composing on a same-version GET from before the send', () => {
+    const requestStartedAt = Date.now() - 50;
+    const map = new Map([['t1', liveThread({ meta: { id: 't1', state: 'active' } as ThreadState['meta'] })]]);
+    composeSentAt.set('t1', Date.now());
+    try {
+      upsertThread(map, summary({ state: 'composing', summary_version: LIVE, compose_text: 'hello' }), false, requestStartedAt);
+      expect(map.get('t1')!.meta.state).toBe('active');
+      expect(getDraft('t1').text).toBe('');
+    } finally {
+      composeSentAt.delete('t1');
+    }
   });
 
   /** The guard must stay one-sided. A fresh snapshot is still what rescues an

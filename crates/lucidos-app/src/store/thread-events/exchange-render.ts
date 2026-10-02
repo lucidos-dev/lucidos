@@ -1,8 +1,9 @@
 import { SESSION_END_REASONS } from '../../generated/thread-lifecycle';
+import type { ThreadStatus } from '../../generated/thread-lifecycle';
 import { hasVisibleText, isMeaningfulText, mergeAdjacentTextEvents } from '../event-rendering';
 import { AWAIT_EVENT_TOOL } from './event-waits';
 import { describeCCTool, describeEngineTool, exchangeHasCCContent, exchangeResponseText, exchangeUserMessage, fullCommandForCCTool, fullCommandForEngineTool } from './exchange';
-import { TERMINAL_EVENT_TYPES, UNANCHORABLE_ASYNC_EVENTS, VOICE_ONLY_STEP_TYPES, exchangeHoldsNoTurn, isCallBoundary, isLiveCallRow, isLiveReplyRow, isLiveUtteranceRow, isSettledLiveUtterance, isUningestedMessage, isWaitingTypedMessage, toolUseIdOf } from './exchange-grouping';
+import { TERMINAL_EVENT_TYPES, UNANCHORABLE_ASYNC_EVENTS, VOICE_ONLY_STEP_TYPES, dividerStillAwaitsUser, exchangeHoldsNoTurn, isCallBoundary, isLiveCallRow, isLiveReplyRow, isLiveUtteranceRow, isSettledLiveUtterance, isUningestedMessage, isWaitingTypedMessage, toolUseIdOf } from './exchange-grouping';
 import { IDLE_ENGINE_RESTART_INTERRUPT_REASON, isEngineDownAbort, isSwitchTeardownAbort, isTurnlessBoundary, isUserStoppedWait } from './thread-event-types';
 import type { ExchangeStatus } from '../exchange-status';
 import type { ContextAssembledData, ContextCapture, ContextSection, ResponseEvent, Step, StepOutcome } from '../types';
@@ -1417,6 +1418,48 @@ export function stampedEventIds(exchange: Exchange): string[] {
 export function exchangeStarterId(exchange: Exchange): string | undefined {
   if (exchange.continuationFragment) return undefined;
   return exchange.userEvent._eventId;
+}
+
+/** Where opening a thread from Needs attention lands.
+ *
+ *  - `card`: the thing waiting on the user, as a `data-event-id`.
+ *  - `card-not-loaded`: the status names a card, and the loaded exchanges do
+ *    not hold it. It may be older than the loaded page.
+ *  - `turn`: no card applies, so the newest turn. A stopped child lands on the
+ *    turn that stopped, and an open form sits inside that turn. */
+export type AttentionTarget =
+  | { kind: 'card'; eventId: string }
+  | { kind: 'card-not-loaded'; newestTurnId: string | null }
+  | { kind: 'turn'; eventId: string | null };
+
+/** Pick the {@link AttentionTarget}. Newest first, so the live request wins.
+ *
+ *  - Waiting on the user: the open question or permission card.
+ *  - Failed: the failure card.
+ *
+ *  Each card is gated on its own status, because an older canceled question
+ *  or a failure the user moved past stays in the history. */
+export function attentionTarget(exchanges: Exchange[], status: ThreadStatus): AttentionTarget {
+  const newestTurnId = newestStarterId(exchanges);
+  const awaitsUser = status === 'waiting_for_user_answer';
+  const failed = status === 'failed';
+  if (!awaitsUser && !failed) return { kind: 'turn', eventId: newestTurnId };
+  for (let i = exchanges.length - 1; i >= 0; i--) {
+    const ex = exchanges[i];
+    const card = awaitsUser
+      ? (dividerStillAwaitsUser(ex) ? exchangeStarterId(ex) : undefined)
+      : exchangeError(ex)?.eventId;
+    if (card) return { kind: 'card', eventId: card };
+  }
+  return { kind: 'card-not-loaded', newestTurnId };
+}
+
+function newestStarterId(exchanges: Exchange[]): string | null {
+  for (let i = exchanges.length - 1; i >= 0; i--) {
+    const starter = exchangeStarterId(exchanges[i]);
+    if (starter) return starter;
+  }
+  return null;
 }
 
 /** The `data-event-id` a deep-link to `eventId` should target within

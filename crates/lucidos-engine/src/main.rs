@@ -133,8 +133,9 @@ async fn shutdown_signal(
 /// it, once per restart. The Chrome and Vite sweeps beside the call site cover
 /// their children for the same reason.
 ///
-/// Concurrent, because one stop waits up to 3 s on its own child. Run in turn,
-/// a few wedged servers would spend the whole shutdown budget.
+/// Concurrent, because one stop waits out a 3 s grace for the server's process
+/// group, then up to 3 s more on the server itself. Run in turn, a few servers
+/// would spend the whole shutdown budget.
 async fn shutdown_mcp_servers(engine: &SharedEngine) {
     let running: Vec<String> = match engine.mcp_manager.list_servers().await {
         Ok(servers) => servers

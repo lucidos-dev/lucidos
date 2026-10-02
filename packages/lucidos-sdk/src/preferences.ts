@@ -1,4 +1,4 @@
-import { request, requestVoid } from './_fetch';
+import { request } from './_fetch';
 import { assertString } from './_validate';
 import { isBridged } from './_bridge';
 import { wsDeviceId } from './_storage';
@@ -49,13 +49,25 @@ export const preferences = {
       .then(r => r.preferences);
   },
 
+  /**
+   * A refused write REJECTS. The engine answers a value it will not store (a
+   * malformed timezone, a bad backup cron) with `200 {success: false, error}`,
+   * not a 4xx, so the body decides.
+   */
   set(key: string, value: string, deviceId?: string): Promise<void> {
     assertString('key', key);
     assertString('value', value);
-    return requestVoid(`/preferences?key=${encodeURIComponent(key)}`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ value, device_id: deviceId }),
+    return request<{ success?: boolean; error?: string } | null>(
+      `/preferences?key=${encodeURIComponent(key)}`,
+      {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ value, device_id: deviceId }),
+      },
+    ).then((result) => {
+      if (result?.success === false) {
+        throw new Error(result.error || `the engine refused the '${key}' preference`);
+      }
     });
   },
 };

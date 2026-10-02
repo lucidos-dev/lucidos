@@ -186,7 +186,7 @@ describe('describeWaitSubscription', () => {
     const text = describeWaitSubscription([
       { event_type: 'ChangeProposed', condition: { file_count: { $gt: 0 } } },
     ]);
-    expect(text).toBe('change proposed (matching only)');
+    expect(text).toBe('change proposed (with a condition)');
     expect(text).not.toContain('$gt');
   });
 

@@ -51,76 +51,93 @@ pub(crate) async fn run_recommended_cleanup(
             return RecommendedCleanupOutcome::default();
         }
     };
+    let worktrees: Vec<(PathBuf, String)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let worktree = entry.path();
+            let short = worktree
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(parse_thread_short)?;
+            is_safe_subpath(&dir, &worktree).then_some((worktree, short))
+        })
+        .collect();
+    let total = u32::try_from(worktrees.len()).unwrap_or(u32::MAX);
     let changes = crate::core::changes_projection::ChangesProjection::new(pool.clone());
     let mut outcome = RecommendedCleanupOutcome::default();
-    for entry in entries.flatten() {
-        let worktree = entry.path();
-        let Some(short) = worktree
-            .file_name()
-            .and_then(|n| n.to_str())
-            .and_then(parse_thread_short)
-        else {
-            continue;
-        };
-        if !is_safe_subpath(&dir, &worktree) {
-            continue;
-        }
-        let ShortThreadLookup::Found(thread_id) = lookup_thread_by_short(pool, &short).await else {
-            continue;
-        };
-        let Some(action) =
-            recommended_action(pool, &changes, active_threads, thread_id, &worktree).await
-        else {
-            continue;
-        };
-        // The checks above can wait on git and the database.
-        if active_threads.is_active(thread_id).await {
-            continue;
-        }
-        let (tier, freed_bytes, branch_deleted) = match action {
-            RecommendedAction::Remove => {
-                let Some(removed) = remove_worktree_and_optionally_delete_branch(
-                    &worktree,
-                    None,
-                    BranchDisposal::WhenMerged,
-                )
-                .await
-                else {
-                    continue;
-                };
-                outcome.removed_count += 1;
-                (0, removed.freed_bytes, removed.branch_deleted)
+    emit_progress(bus, 0, total).await;
+    for (done, (worktree, short)) in (1..).zip(worktrees) {
+        // Every worktree counts toward progress, so a skip breaks out of the
+        // block rather than continuing the loop past the progress frame.
+        'tree: {
+            let ShortThreadLookup::Found(thread_id) = lookup_thread_by_short(pool, &short).await
+            else {
+                break 'tree;
+            };
+            let Some(action) =
+                recommended_action(pool, &changes, active_threads, thread_id, &worktree).await
+            else {
+                break 'tree;
+            };
+            // The checks above can wait on git and the database.
+            if active_threads.is_active(thread_id).await {
+                break 'tree;
             }
-            RecommendedAction::StripArtifacts => {
-                let Some(freed) = prune_build_artifacts(&worktree).await else {
-                    continue;
-                };
-                outcome.cleaned_count += 1;
-                (1, freed, false)
-            }
-        };
-        outcome.freed_bytes = outcome.freed_bytes.saturating_add(freed_bytes);
-        log!(
-            "[WorktreeCleanup] recommended: tier-{} freed {} bytes for thread {}",
-            tier,
-            freed_bytes,
-            thread_id
-        );
-        bus.emit_or_log(
-            BusEvent::Thread {
-                thread_id,
-                event: ThreadEvent::WorktreeCleaned {
-                    tier,
-                    freed_bytes,
-                    branch_deleted,
+            let (tier, freed_bytes, branch_deleted) = match action {
+                RecommendedAction::Remove => {
+                    let Some(removed) = remove_worktree_and_optionally_delete_branch(
+                        &worktree,
+                        None,
+                        BranchDisposal::WhenMerged,
+                    )
+                    .await
+                    else {
+                        break 'tree;
+                    };
+                    outcome.removed_count += 1;
+                    (0, removed.freed_bytes, removed.branch_deleted)
+                }
+                RecommendedAction::StripArtifacts => {
+                    let Some(freed) = prune_build_artifacts(&worktree).await else {
+                        break 'tree;
+                    };
+                    outcome.cleaned_count += 1;
+                    (1, freed, false)
+                }
+            };
+            outcome.freed_bytes = outcome.freed_bytes.saturating_add(freed_bytes);
+            log!(
+                "[WorktreeCleanup] recommended: tier-{} freed {} bytes for thread {}",
+                tier,
+                freed_bytes,
+                thread_id
+            );
+            bus.emit_or_log(
+                BusEvent::Thread {
+                    thread_id,
+                    event: ThreadEvent::WorktreeCleaned {
+                        tier,
+                        freed_bytes,
+                        branch_deleted,
+                    },
+                    meta: EventMeta::with_actor(actor.clone()),
                 },
-                meta: EventMeta::with_actor(actor.clone()),
-            },
-            "[WorktreeCleanup] recommended WorktreeCleaned",
-        )
-        .await;
+                "[WorktreeCleanup] recommended WorktreeCleaned",
+            )
+            .await;
+        }
+        emit_progress(bus, done, total).await;
     }
     outcome
+}
+
+/// A transient frame: how many of the pass's worktrees it has dealt with.
+async fn emit_progress(bus: &EventBus, done: u32, total: u32) {
+    bus.emit_or_log(
+        BusEvent::System(SystemEvent::RecommendedCleanupProgress { done, total }),
+        "[WorktreeCleanup] RecommendedCleanupProgress",
+    )
+    .await;
 }
 
 /// `None` leaves the worktree alone: live, pinned, stranded, or a pin lookup

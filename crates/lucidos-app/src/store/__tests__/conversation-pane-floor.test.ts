@@ -36,7 +36,7 @@ const shellCss: string = readFileSync(
   resolve(here, '../../styles/panels/shell.css'), 'utf-8',
 );
 
-const DESKTOP = '@media (min-width: 769px)';
+const DESKTOP = '@media (--desktop-layout)';
 const desktopRoot = cssRules(shellCss).find(
   r => r.selector === ':root' && r.atRules === DESKTOP,
 );

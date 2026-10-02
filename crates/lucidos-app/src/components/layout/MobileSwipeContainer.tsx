@@ -10,7 +10,9 @@ import {
   getRemPx,
   viewportIsKeyboardShrunk,
 } from '../../utils/dom';
-import { SwipeTouch } from '../../utils/swipe';
+import { SwipeTouch } from '@lucidos/pane-swipe';
+import { parseAppSwipeMessage } from '../../store/actions/app-swipe-bridge';
+import { nativeFullscreenElement } from '../../store/appFullscreenHost';
 import {
   noteKeyboardClosed,
   notePolledViewport,
@@ -21,8 +23,6 @@ import { onPerfEnabledChange, perfRecordingOn } from '../../utils/perfQueue';
 import { reportNavigation } from '../../utils/navigationMarks';
 import { useFocusedFieldVisible } from '../../hooks/useFocusedFieldVisible';
 
-export { SwipeTouch } from '../../utils/swipe';
-
 // Rubber band factor at edges (0 = no movement, 1 = full movement)
 const RUBBER_BAND = 0.3;
 
@@ -30,9 +30,8 @@ const RUBBER_BAND = 0.3;
  *  navigation swipe and suppressed, in REM. It must cover the whole
  *  `.edge-swipe-left` zone, which mobile.css authors at this same 2.5rem.
  *
- *  Over an app iframe the ONLY place a pane swipe can begin is that edge zone:
- *  the iframe captures every other touch. So an app-to-thread back-swipe is
- *  forced to start there every time. A guard narrower than the zone leaves a
+ *  Over an app iframe, a back-swipe from the screen edge lands on that zone,
+ *  since the zone sits above the frame. A guard narrower than the zone leaves a
  *  band that reaches the in-app handler with no preventDefault(). WebKit's
  *  native pop then takes the PWA out to the workspace gateway picker.
  *
@@ -219,6 +218,28 @@ export function heldBandPx(args: {
  *  over-reserving costs only scrollable slack nobody scrolls into. */
 const ASSUMED_KEYBOARD_FRACTION = 0.45;
 
+/** The widest band measured this session, so a focus can reserve the slack
+ *  before the keys have animated in. iOS picks between scrolling the container
+ *  and offsetting the viewport at FOCUS time. Slack arriving with the first
+ *  resize arrives too late to change that decision.
+ *
+ *  Kept per orientation, since the phone layout survives a rotation. A
+ *  portrait keyboard is most of a landscape screen. */
+export function keyboardBandMemory() {
+  const widest = { portrait: 0, landscape: 0 };
+  const orientationOf = (v: { width: number; height: number }) =>
+    (v.width > v.height ? 'landscape' : 'portrait');
+  return {
+    note(bandPx: number, viewport: { width: number; height: number }) {
+      const key = orientationOf(viewport);
+      if (bandPx > widest[key]) widest[key] = bandPx;
+    },
+    reserve(viewport: { width: number; height: number }): number {
+      return widest[orientationOf(viewport)] || Math.round(viewport.height * ASSUMED_KEYBOARD_FRACTION);
+    },
+  };
+}
+
 /** How often the gated viewport poll reads the keyboard's state.
  *  The composer probe's scheduled cadence, which the ledger shows still
  *  running throughout a wedge. */
@@ -359,13 +380,57 @@ export function MobileSwipeContainer() {
     wasPseudoFullscreen.current = isPseudo;
   }, [appPseudoFullscreen.value]);
 
+  // ── Drag and release, shared by host touches and app-frame drags ───────
+
+  /** Follow a live sideways drag `dx` px from where it locked. */
+  const dragTrack = useCallback((dx: number) => {
+    const container = containerRef.current;
+    const track = trackRef.current;
+    if (!container || !track) return;
+
+    const paneWidth = container.offsetWidth;
+    const baseOffset = -PANE_INDEX[mobileView.value] * paneWidth;
+    let offset = baseOffset + dx;
+
+    // Rubber band at edges
+    const minOffset = -(PANE_COUNT - 1) * paneWidth;
+    if (offset > 0) {
+      offset = offset * RUBBER_BAND;
+    } else if (offset < minOffset) {
+      offset = minOffset + (offset - minOffset) * RUBBER_BAND;
+    }
+
+    track.style.transform = `translateX(${offset}px)`;
+  }, []);
+
+  /** End a drag: move `paneDelta` panes, or snap back to the current one. */
+  const releaseTrack = useCallback((paneDelta: number) => {
+    const container = containerRef.current;
+    const track = trackRef.current;
+    if (!container || !track) return;
+
+    const target = resolveSwipePane(paneDelta);
+    if (target) {
+      // Pane change: navigateToPane updates the signal, useLayoutEffect
+      // handles the transform + transition re-enable before paint.
+      navigateToPane(target);
+    } else {
+      // Snap back: signal unchanged, handle transform directly.
+      track.style.transition = '';
+      track.style.transform = `translateX(${-PANE_INDEX[mobileView.value] * container.offsetWidth}px)`;
+    }
+  }, []);
+
   // ── Touch event handlers ───────────────────────────────────────────────
 
   const touchTargetScrollable = useRef(false);
+  /** The app-frame drag being followed, if any. See the message effect below. */
+  const frameDrag = useRef<{ source: MessageEventSource | null; following: boolean } | null>(null);
 
   const onTouchStart = useCallback((e: TouchEvent) => {
     const t = e.touches[0];
     const target = e.target as Element;
+    frameDrag.current = null;
 
     const textInputFocused = isTextInput(document.activeElement);
     // Don't hijack touches on horizontally-scrollable children (e.g., code blocks)
@@ -413,47 +478,14 @@ export function MobileSwipeContainer() {
     if (dx === null) return;
 
     e.preventDefault();
-
-    const container = containerRef.current;
-    const track = trackRef.current;
-    if (!container || !track) return;
-
-    const paneWidth = container.offsetWidth;
-    const baseOffset = -PANE_INDEX[mobileView.value] * paneWidth;
-    let offset = baseOffset + dx;
-
-    // Rubber band at edges
-    const minOffset = -(PANE_COUNT - 1) * paneWidth;
-    if (offset > 0) {
-      offset = offset * RUBBER_BAND;
-    } else if (offset < minOffset) {
-      offset = minOffset + (offset - minOffset) * RUBBER_BAND;
-    }
-
-    track.style.transform = `translateX(${offset}px)`;
-  }, []);
+    dragTrack(dx);
+  }, [dragTrack]);
 
   const onTouchEnd = useCallback(() => {
     if (touchTargetScrollable.current) return;
-
-    const container = containerRef.current;
-    const track = trackRef.current;
-    if (!container || !track) return;
-
-    const paneWidth = container.offsetWidth;
-    const paneDelta = touch.current.end(paneWidth);
-    const target = resolveSwipePane(paneDelta);
-
-    if (target) {
-      // Pane change: navigateToPane updates the signal, useLayoutEffect
-      // handles the transform + transition re-enable before paint.
-      navigateToPane(target);
-    } else {
-      // Snap back: signal unchanged, handle transform directly.
-      track.style.transition = '';
-      track.style.transform = `translateX(${-PANE_INDEX[mobileView.value] * paneWidth}px)`;
-    }
-  }, []);
+    const paneWidth = containerRef.current?.offsetWidth ?? 0;
+    releaseTrack(touch.current.end(paneWidth));
+  }, [releaseTrack]);
 
   useEffect(() => {
     const el = containerRef.current;
@@ -471,6 +503,40 @@ export function MobileSwipeContainer() {
       el.removeEventListener('touchcancel', onTouchEnd);
     };
   }, [onTouchStart, onTouchMove, onTouchEnd]);
+
+  // A drag inside an app frame. The frame captures its touches, so the SDK
+  // tracks them and posts the drag up (`app-swipe-bridge.ts`). The frame has
+  // already locked the drag horizontal, so the host's only gates are its own.
+  //
+  // A natively fullscreen app counts as fullscreen here too. A host touch can
+  // never reach the container then, but a frame drag can.
+  //
+  // A frame that went away mid-drag never sends its release. A drag from a
+  // different frame is therefore gated afresh, and a host touch clears it.
+  useEffect(() => {
+    const onMessage = (e: MessageEvent) => {
+      const message = parseAppSwipeMessage(e);
+      if (!message) return;
+      const drag = frameDrag.current;
+      if (message.kind === 'release') {
+        if (drag?.following) releaseTrack(message.paneDelta);
+        frameDrag.current = null;
+        return;
+      }
+      if (drag?.source !== e.source) {
+        const following = shouldStartPaneSwipe({
+          textInputFocused: isTextInput(document.activeElement),
+          targetScrollable: false,
+          appFullscreen: appPseudoFullscreen.value || nativeFullscreenElement() !== null,
+        });
+        frameDrag.current = { source: e.source, following };
+        if (following && trackRef.current) trackRef.current.style.transition = 'none';
+      }
+      if (frameDrag.current?.following) dragTrack(message.dx);
+    };
+    window.addEventListener('message', onMessage);
+    return () => window.removeEventListener('message', onMessage);
+  }, [dragTrack, releaseTrack]);
 
   // ── Keyboard-active: block accidental taps on other elements ─────────
 
@@ -562,11 +628,8 @@ export function MobileSwipeContainer() {
       activeElementOpensKeyboard: opensSoftwareKeyboard(document.activeElement),
     });
 
-    // The widest band measured this session, so a focus can reserve the slack
-    // before the keys have animated in. iOS picks between scrolling the
-    // container and offsetting the viewport at FOCUS time. Slack arriving with
-    // the first resize arrives too late to change that decision.
-    let seenBand = 0;
+    const bandMemory = keyboardBandMemory();
+    const layoutViewport = () => ({ width: window.innerWidth, height: window.innerHeight });
     let lastSetBand = -1;
     // Each scroller's band hold (`heldBandPx`): the content height it anchors,
     // and the scroll listener and mutation observer that re-measure it.
@@ -629,13 +692,13 @@ export function MobileSwipeContainer() {
         innerHeight: window.innerHeight,
         activeElementOpensKeyboard: opensSoftwareKeyboard(document.activeElement),
       });
-      if (band > seenBand) seenBand = band;
+      bandMemory.note(band, layoutViewport());
       setBand(band);
     };
     /** Reserve the slack now, on the best figure available. */
     const armBand = (e: FocusEvent) => {
       if (!opensSoftwareKeyboard(e.target)) return;
-      setBand(seenBand || Math.round(window.innerHeight * ASSUMED_KEYBOARD_FRACTION));
+      setBand(bandMemory.reserve(layoutViewport()));
     };
 
     /** The last height ANY observer here acted on. See the poll below, whose

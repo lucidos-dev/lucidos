@@ -5,6 +5,7 @@ import {
   inputTouchesProtectedPath,
   narrowPattern,
   permissionButtonState,
+  grantLabel,
   renderQuestion,
   resolvedChoice,
   sessionLabel,
@@ -41,11 +42,18 @@ describe('BROAD_ALLOW_INEFFECTIVE', () => {
 });
 
 describe('renderQuestion', () => {
-  it('frames the tool name as <strong> and the path as <code>', () => {
+  it('says what a known tool does, and frames the path as <code>', () => {
     const text = vnodeToText(renderQuestion('Edit', 'Edit /Users/me/.claude/skills/x.md'));
-    expect(text).toContain('the <strong>Edit</strong> tool');
-    expect(text).toContain('on <code>/Users/me/.claude/skills/x.md</code>');
+    expect(text).toContain('wants to edit <code>/Users/me/.claude/skills/x.md</code>');
+    expect(text).not.toContain('Edit</strong>');
     expect(text).toContain('Allow?');
+  });
+
+  it('names an unknown tool as a tool, and a tool-server tool by tool and server', () => {
+    expect(vnodeToText(renderQuestion('Frobnicate', 'Frobnicate x'))).toContain('use the <strong>Frobnicate</strong> tool on <code>x</code>');
+    const mcp = vnodeToText(renderQuestion('mcp__slack__post_message', 'mcp__slack__post_message'));
+    expect(mcp).toContain('use the <strong>post_message</strong> tool from <strong>slack</strong>.');
+    expect(mcp).not.toContain('mcp__');
   });
 
   it('attributes the request to "the coding agent", not a specific backend', () => {
@@ -59,17 +67,16 @@ describe('renderQuestion', () => {
     expect(text).not.toContain('Claude Code');
   });
 
-  it('omits the "on <arg>" clause when the summary has no argument', () => {
+  it('omits the argument when the summary has none', () => {
     const text = vnodeToText(renderQuestion('ExitPlanMode', 'ExitPlanMode'));
-    expect(text).toContain('the <strong>ExitPlanMode</strong> tool');
+    expect(text).toContain('wants to stop planning and start work on its plan. Allow?');
     expect(text).not.toContain('<code>');
-    expect(text).toContain('Allow?');
+    expect(text).not.toContain('ExitPlanMode');
   });
 
   it('strips the leading category for Skill summaries (e.g. "skill meta:trace" → "meta:trace")', () => {
     const text = vnodeToText(renderQuestion('Skill', 'skill meta:trace'));
-    expect(text).toContain('the <strong>Skill</strong> tool');
-    expect(text).toContain('on <code>meta:trace</code>');
+    expect(text).toContain('wants to use the skill <code>meta:trace</code>');
   });
 });
 
@@ -385,11 +392,16 @@ describe('permissionButtonState', () => {
 });
 
 describe('resolvedChoice', () => {
-  it('maps a deny to "deny" regardless of scope', () => {
+  it('maps the user\'s own Deny, or an old reasonless refusal, to "deny"', () => {
+    expect(resolvedChoice({ allowed: false, reason: 'User denied' })).toBe('deny');
     expect(resolvedChoice({ allowed: false })).toBe('deny');
-    // Recovery-emitted orphans arrive as `allowed: false` with a reason but
-    // no scope — still "deny" so the answered card marks the Deny button.
-    expect(resolvedChoice({ allowed: false, reason: 'orphan' } as { allowed: boolean })).toBe('deny');
+  });
+
+  // An orphan sweep, a restart or a superseding message closed it. Nobody
+  // pressed Deny, so no button may read as pressed (plan invariant 11).
+  it('marks no choice on a refusal the engine wrote', () => {
+    expect(resolvedChoice({ allowed: false, reason: 'Coding agent terminated before answering: request expired' })).toBeNull();
+    expect(resolvedChoice({ allowed: false, reason: 'Superseded by a new message' })).toBeNull();
   });
 
   it('maps allow + no scope to "allow" (the bare Allow-once button)', () => {
@@ -400,5 +412,19 @@ describe('resolvedChoice', () => {
     expect(resolvedChoice({ allowed: true, persist_scope: 'session' })).toBe('session');
     expect(resolvedChoice({ allowed: true, persist_scope: 'narrow' })).toBe('narrow');
     expect(resolvedChoice({ allowed: true, persist_scope: 'broad' })).toBe('broad');
+  });
+});
+
+/** An "Always allow" button used to show the allowlist's own syntax,
+ *  `Bash(git:*)`, which the reader never types. */
+describe('grantLabel', () => {
+  it('reads a command grant as the command, in words', () => {
+    expect(vnodeToText(grantLabel('Bash(git:*)'))).toBe('Always allow <code>git</code> commands');
+  });
+  it('reads a skill grant as the plugin it covers', () => {
+    expect(vnodeToText(grantLabel('Skill(meta:*)'))).toBe('Always allow skills from <code>meta</code>');
+  });
+  it('keeps a pattern it has no words for, rather than inventing some', () => {
+    expect(vnodeToText(grantLabel('Read(/tmp/**)'))).toBe('Always allow <code>Read(/tmp/**)</code>');
   });
 });

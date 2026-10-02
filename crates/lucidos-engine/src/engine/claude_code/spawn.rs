@@ -409,7 +409,7 @@ impl LucidosEngine {
                 .await;
 
             match result {
-                Ok(ref res) => {
+                Ok(res) => {
                     if res.proposed_change {
                         if res.auto_apply {
                             engine
@@ -418,6 +418,17 @@ impl LucidosEngine {
                         }
 
                         engine.broadcast_changes_updated().await;
+                    }
+                    // Drain the orphan chain, as every other spawn site does. A
+                    // follow-up that reached the session as it went idle comes
+                    // back here, and dropping it leaves the message unanswered.
+                    if !res.orphaned_injections.is_empty() {
+                        crate::api::chat::process_orphan_chain(
+                            engine.clone(),
+                            res.thread_id,
+                            res.orphaned_injections,
+                        )
+                        .await;
                     }
                 }
                 Err(e) => {

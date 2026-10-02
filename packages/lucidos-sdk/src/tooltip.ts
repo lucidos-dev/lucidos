@@ -273,8 +273,11 @@ export function installTooltips(options: TooltipOptions = {}): () => void {
 
     safeAreaProbe = document.createElement('div');
     safeAreaProbe.setAttribute('aria-hidden', 'true');
+    // The host defines --safe-area-top (styles/global/base.css), floored after
+    // iOS drops its insets. An app iframe has no such token and reads env().
     safeAreaProbe.style.cssText =
-      'position:fixed;top:0;left:0;width:0;height:0;visibility:hidden;pointer-events:none;padding-top:env(safe-area-inset-top,0px);';
+      'position:fixed;top:0;left:0;width:0;height:0;visibility:hidden;pointer-events:none;'
+      + 'padding-top:var(--safe-area-top, env(safe-area-inset-top,0px));';
     document.body.appendChild(safeAreaProbe);
   }
 
@@ -290,7 +293,7 @@ export function installTooltips(options: TooltipOptions = {}): () => void {
     safeAreaProbe = null;
   }
 
-  /** env(safe-area-inset-top) in px, measured off the hidden probe. It reads 0
+  /** The top safe-area inset in px, measured off the hidden probe. It reads 0
    *  on a device without a notch, and inside an app iframe. */
   function readSafeAreaTop(): number {
     if (!safeAreaProbe) return 0;

@@ -1,10 +1,10 @@
 use super::*;
 use crate::engine::agent_session::InPlaceMergeStart;
 use crate::engine::git_ops::{
-    auto_commit_safe_files_if_dirty, auto_commit_worktree, bounded_fix_refusal_for,
-    branch_changed_files_checked, branch_head_sha, catchup_and_ff_to_main, commits_in_range,
-    ff_main_to, files_have_client_update, find_branch_merge_in_main, find_worktree_for_branch,
-    git_ran_ok, has_branch_commits, is_harden_marker_present, push_main_in_background,
+    auto_commit_safe_files_if_dirty, bounded_fix_refusal_for, branch_changed_files_checked,
+    branch_head_sha, catchup_and_ff_to_main, commit_worktree_or_err, commits_in_range, ff_main_to,
+    files_have_client_update, find_branch_merge_in_main, find_worktree_for_branch, git_ran_ok,
+    has_branch_commits, is_harden_marker_present, push_main_in_background,
     recover_no_commits_branch, worktree_add, worktree_dirty_files, worktrees_dir, BoundedFixInputs,
     NoCommitsRecovery, PlanMarkerState, WorktreeLookup, MERGE_MUTEX,
 };
@@ -825,12 +825,25 @@ impl LucidosEngine {
                         thread_id
                     );
 
-                    // Auto-commit any uncommitted work before merging.
-                    auto_commit_worktree(
+                    // A commit that does not land fails the apply before `main`
+                    // moves, as in Tier 2. A live agent can hold `index.lock`,
+                    // and merging anyway publishes only the committed part.
+                    if let Err(e) = commit_worktree_or_err(
                         &session.worktree_path,
                         "Coding agent changes (pre-merge auto-commit)",
                     )
-                    .await;
+                    .await
+                    {
+                        self.clear_change_claim(thread_id, &session.msg_tx).await;
+                        let msg = format!(
+                            "Could not commit the uncommitted work in {} before merging: {e}. \
+                             The change is still pending; try applying again.",
+                            session.worktree_path.display()
+                        );
+                        self.emit_apply_failed(thread_id, change_id, &msg, actor.clone())
+                            .await;
+                        return Err(msg.into());
+                    }
 
                     // Fast path: clean fast-forward — finalize synchronously.
                     if let Ok((pre_sha, post_sha)) = catchup_and_ff_to_main(
@@ -948,9 +961,21 @@ impl LucidosEngine {
                 return Err(msg.into());
             }
             if let WorktreeLookup::Found(wt_path) = lookup {
-                // Auto-commit any uncommitted CC work before merging
-                auto_commit_worktree(&wt_path, "Coding agent changes (pre-merge auto-commit)")
-                    .await;
+                // A commit that does not land fails the apply before `main`
+                // moves. Merging anyway publishes only the committed part, and
+                // the reset below then refuses the dirty tree after the fact.
+                if let Err(e) =
+                    commit_worktree_or_err(&wt_path, "Coding agent changes (pre-merge auto-commit)")
+                        .await
+                {
+                    let msg = format!(
+                        "Could not commit the uncommitted work in {} before merging: {e}",
+                        wt_path.display()
+                    );
+                    self.emit_apply_failed(thread_id, change_id, &msg, actor.clone())
+                        .await;
+                    return Err(msg.into());
+                }
 
                 // Fast path: try ff directly
                 match catchup_and_ff_to_main(&repo_root, &wt_path, &change.branch_name).await {

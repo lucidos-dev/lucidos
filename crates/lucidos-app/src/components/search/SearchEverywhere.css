@@ -49,12 +49,7 @@
 
 /* Must stay BELOW the base rule: it has the same specificity, so source order
    is the only thing that lets it win. */
-@media (max-width: 768px) {
-    .modal-overlay.search-everywhere-overlay {
-        bottom: auto;
-        height: var(--app-height, 100dvh);
-    }
-
+@media (--phone-layout) {
     /* A phone has no room to spare, so here it takes the shared header width. */
     .search-everywhere-modal {
         max-width: min(var(--header-surface-width), var(--pane-fit, 100%));

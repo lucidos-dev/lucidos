@@ -60,7 +60,12 @@ struct SeenDeviceRow {
 impl From<SeenDeviceRow> for SeenDevice {
     fn from(row: SeenDeviceRow) -> Self {
         Self {
-            label: friendly_device_name(row.name.as_deref(), row.pairing_label.as_deref(), &row.id),
+            label: friendly_device_name(
+                row.name.as_deref(),
+                row.pairing_label.as_deref(),
+                row.user_agent.as_deref(),
+                &row.id,
+            ),
             details: row.user_agent.as_deref().map(parse_user_agent),
             id: row.id,
             seen_secs_ago: row.seen_secs_ago,
@@ -165,20 +170,26 @@ impl DeviceStore {
     /// Always answers. A device with no row, or a failed read, gets the short-id
     /// name, since a label is display metadata and must never fail an action.
     pub async fn friendly_name(pool: &PgPool, id: &str) -> String {
-        let row: Option<(Option<String>, Option<String>)> =
-            match sqlx::query_as("SELECT name, pairing_label FROM devices WHERE id = $1")
-                .bind(id)
-                .fetch_optional(pool)
-                .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    log!("[Devices] friendly_name({}) failed: {}", id, e);
-                    None
-                }
-            };
-        let (name, pairing_label) = row.unwrap_or_default();
-        friendly_device_name(name.as_deref(), pairing_label.as_deref(), id)
+        let row: Option<(Option<String>, Option<String>, Option<String>)> = match sqlx::query_as(
+            "SELECT name, pairing_label, user_agent FROM devices WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                log!("[Devices] friendly_name({}) failed: {}", id, e);
+                None
+            }
+        };
+        let (name, pairing_label, user_agent) = row.unwrap_or_default();
+        friendly_device_name(
+            name.as_deref(),
+            pairing_label.as_deref(),
+            user_agent.as_deref(),
+            id,
+        )
     }
 
     /// Build a rich tooltip string for a device: name + user agent summary.
@@ -196,8 +207,12 @@ impl DeviceStore {
             }
         };
         let device = device?;
-        let name =
-            friendly_device_name(device.name.as_deref(), device.pairing_label.as_deref(), id);
+        let name = friendly_device_name(
+            device.name.as_deref(),
+            device.pairing_label.as_deref(),
+            device.user_agent.as_deref(),
+            id,
+        );
         let ua = device.user_agent.as_deref().map(parse_user_agent);
         match ua {
             Some(parsed) => Some(format!("{}\n{}", name, parsed)),
@@ -567,13 +582,15 @@ impl DeviceStore {
 
 /// What to call a device: the one rule every engine surface names it by.
 ///
-/// The typed name wins, then the pairing label, then `device-` and the first
-/// eight characters of the id. The frontend's `deviceFriendlyName` applies the
-/// same order, so a device is called one thing on every screen. Never build a
-/// device name anywhere else.
+/// The order: the typed name, then the pairing label, then the browser and
+/// machine the user-agent names. That last one carries the short id, as in
+/// "Chrome on Mac (109371a3)". Failing all three, it is `device-` and the id. The frontend's `deviceFriendlyName`
+/// applies the same order, so a device is called one thing on every screen.
+/// Never build a device name anywhere else.
 pub(crate) fn friendly_device_name(
     name: Option<&str>,
     pairing_label: Option<&str>,
+    user_agent: Option<&str>,
     id: &str,
 ) -> String {
     if let Some(n) = [name, pairing_label]
@@ -584,7 +601,61 @@ pub(crate) fn friendly_device_name(
         return n.to_string();
     }
     let short = &id[..id.floor_char_boundary(8)];
-    format!("device-{}", short)
+    match user_agent.and_then(user_agent_device_label) {
+        Some(label) => format!("{label} ({short})"),
+        None => format!("device-{short}"),
+    }
+}
+
+/// A name read off a device's stored user-agent, for a device nobody named.
+/// Mirrors `userAgentDeviceLabel` and `suggestDeviceLabel` in the frontend's
+/// `utils/deviceLabel.ts`: Chromium forks are asked about before Chrome, and
+/// Safari last, since every browser above it also says Safari.
+fn user_agent_device_label(ua: &str) -> Option<String> {
+    let has = |token: &str| ua.contains(token);
+    let platform = if has("iPhone") {
+        Some("iPhone")
+    } else if has("iPad") {
+        Some("iPad")
+    } else if has("Android") {
+        Some("Android")
+    } else if has("CrOS") {
+        Some("Chromebook")
+    } else if has("Macintosh") || has("Mac OS X") {
+        Some("Mac")
+    } else if has("Windows") {
+        Some("Windows")
+    } else if has("Linux") {
+        Some("Linux")
+    } else {
+        None
+    };
+    if has(DESKTOP_APP_UA_TOKEN) {
+        return Some(match platform {
+            Some(p) => format!("Lucidos app on {p}"),
+            None => "Lucidos app".to_string(),
+        });
+    }
+    let browser = if ["Edg/", "EdgA/", "EdgiOS/", "Edge/"].iter().any(|t| has(t)) {
+        Some("Edge")
+    } else if has("OPR/") || has("Opera/") || has("Opera ") {
+        Some("Opera")
+    } else if has("SamsungBrowser/") {
+        Some("Samsung Internet")
+    } else if has("Firefox/") || has("FxiOS/") {
+        Some("Firefox")
+    } else if has("CriOS/") || has("Chrome/") || has("Chromium/") {
+        Some("Chrome")
+    } else if has("Safari/") {
+        Some("Safari")
+    } else {
+        None
+    };
+    match (browser, platform) {
+        (Some(b), Some(p)) => Some(format!("{b} on {p}")),
+        (Some(one), None) | (None, Some(one)) => Some(one.to_string()),
+        (None, None) => None,
+    }
 }
 
 /// Product token the Tauri native desktop client appends to its registered
@@ -681,20 +752,72 @@ mod tests {
     fn friendly_device_name_prefers_the_typed_name_then_the_pairing_label() {
         let id = "ab2c03f77d715bce";
         assert_eq!(
-            friendly_device_name(Some("My iPhone"), Some("Safari on iPhone"), id),
+            friendly_device_name(Some("My iPhone"), Some("Safari on iPhone"), None, id),
             "My iPhone"
         );
         assert_eq!(
-            friendly_device_name(None, Some("Safari on iPhone"), id),
+            friendly_device_name(None, Some("Safari on iPhone"), None, id),
             "Safari on iPhone"
         );
         assert_eq!(
-            friendly_device_name(Some("  "), Some("Safari on iPhone"), id),
+            friendly_device_name(Some("  "), Some("Safari on iPhone"), None, id),
             "Safari on iPhone",
             "a blank typed name is no name"
         );
-        assert_eq!(friendly_device_name(None, None, id), "device-ab2c03f7");
-        assert_eq!(friendly_device_name(None, Some(""), id), "device-ab2c03f7");
+        assert_eq!(
+            friendly_device_name(None, None, None, id),
+            "device-ab2c03f7"
+        );
+        assert_eq!(
+            friendly_device_name(None, Some(""), None, id),
+            "device-ab2c03f7"
+        );
+    }
+
+    /// A device nobody named and nothing paired is called by what its
+    /// user-agent says, with the short id so two alike stay apart.
+    #[test]
+    fn friendly_device_name_falls_back_to_the_user_agent_before_the_id() {
+        let id = "109371a3-ee53-42fa-b34b-c168237467b7";
+        let name = |ua: &str| friendly_device_name(None, None, Some(ua), id);
+        assert_eq!(
+            name(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
+                  (KHTML, like Gecko) Chrome/153.0.8010.12 Safari/537.36"
+            ),
+            "Chrome on Mac (109371a3)"
+        );
+        assert_eq!(
+            name(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+                  (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0"
+            ),
+            "Edge on Windows (109371a3)",
+            "a Chromium fork is named before the Chrome it carries"
+        );
+        assert_eq!(
+            name(
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 \
+                  (KHTML, like Gecko) CriOS/130.0 Mobile/15E148 Safari/604.1"
+            ),
+            "Chrome on iPhone (109371a3)"
+        );
+        assert_eq!(
+            name(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 \
+                  (KHTML, like Gecko) Version/18.0 Safari/605.1.15 Lucidos-Desktop"
+            ),
+            "Lucidos app on Mac (109371a3)"
+        );
+        assert_eq!(
+            name("curl/8.7.1"),
+            "device-109371a3",
+            "a user-agent naming no browser and no machine says nothing"
+        );
+        assert_eq!(
+            friendly_device_name(Some("My MacBook"), None, Some("Chrome/1"), id),
+            "My MacBook"
+        );
     }
 
     /// A paired device nobody renamed is called by its pairing label, and a
@@ -804,8 +927,8 @@ mod tests {
             "the heartbeat is the newer record"
         );
         assert_eq!(
-            seen[1].label, "device-phone",
-            "an unnamed device gets its short id"
+            seen[1].label, "Safari on iPhone (phone)",
+            "an unnamed device is called by its browser and machine"
         );
         assert!(!seen[1].visible_now);
         assert!(seen[1].seen_secs_ago >= 86_000);

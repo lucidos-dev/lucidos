@@ -654,6 +654,42 @@ fn read_text_from_zip_rejects_oversized_entry() {
     );
 }
 
+/// A zip bomb lies in its header. Here the entry claims 10 bytes and inflates
+/// to 1000, so only a cap on the decompressed output can refuse it.
+#[test]
+fn read_text_from_zip_refuses_an_entry_whose_header_understates_its_size() {
+    use std::io::Write as _;
+    let dir = tempfile::tempdir().unwrap();
+    let zip_path = dir.path().join("bomb.zip");
+    let file = std::fs::File::create(&zip_path).unwrap();
+    let mut zw = zip::ZipWriter::new(file);
+    let opts = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    zw.start_file("bomb.txt", opts).unwrap();
+    zw.write_all(&[b'a'; 1000]).unwrap();
+    zw.finish().unwrap();
+
+    // Overwrite the uncompressed size in the local header (offset 22) and the
+    // central directory header (offset 24).
+    let mut raw = std::fs::read(&zip_path).unwrap();
+    let mut patch = |signature: &[u8; 4], offset: usize| {
+        let at = raw
+            .windows(4)
+            .position(|w| w == signature)
+            .expect("zip header present");
+        raw[at + offset..at + offset + 4].copy_from_slice(&10u32.to_le_bytes());
+    };
+    patch(b"PK\x03\x04", 22);
+    patch(b"PK\x01\x02", 24);
+    std::fs::write(&zip_path, &raw).unwrap();
+
+    let err = read_text_from_zip(&zip_path, "bomb.txt", 100).unwrap_err();
+    assert!(
+        err.contains("too large"),
+        "an entry inflating past the cap must be refused, got: {err}"
+    );
+}
+
 // --- line_window_from_args -------------------------------------------
 
 #[test]

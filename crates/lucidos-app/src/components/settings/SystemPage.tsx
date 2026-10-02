@@ -17,6 +17,7 @@ import {
   showToast,
   updateAvailable,
   visibleWorkspaceName,
+  relayedUpdate,
   workspacePath,
 } from '../../store/store';
 import { confirmAndRestartEngine } from '../../store/actions/chat-changes';
@@ -28,6 +29,7 @@ import {
   sessionCanInstall,
   shadowedEngine,
   updateControlLabel,
+  updateRoute,
   type UpdateRoute,
 } from '../../store/actions/app-update';
 import { updateGuidance } from './updateGuidance';
@@ -139,18 +141,19 @@ export function SystemPage({ panel }: { panel: SystemPanel }) {
   // Shared with the Lucidos menu's identity row, which names the same thing.
   const clientVersion = clientVersionLabel();
   // This page is where `updateRoute`'s `guide` SENDS people, so its own control
-  // is install-or-check and never a third thing pointing back here. Both the
+  // is install, relay or check, and never a fourth thing pointing back here. Both the
   // label and the click read this one route, so they cannot disagree.
   const offeredVersion = packagedUpdateVersion();
   const canInstallHere = canInstallUpdateHere();
   const canCheckHere = canCheckForUpdatesHere();
   // A phone can neither install nor usefully check (ADR 0190), so it gets no
-  // button. The subtraction lands HERE, never on `canCheckHere`, which stays a
-  // capability. `updateGuidance` reads that to reason about the INSTALL. A
-  // phone answering "cannot check" makes it claim a desktop app on a machine
-  // that may have none.
-  const offersUpdateControl = (canInstallHere || canCheckHere) && !thisDeviceIsMobile();
-  const pageRoute: UpdateRoute = canInstallHere ? 'install' : 'check';
+  // button, unless the desktop app can take the update for it (ADR 0338). The
+  // subtraction lands HERE, never on `canCheckHere`, which stays a capability.
+  // `updateGuidance` reads that to reason about the INSTALL. A phone answering
+  // "cannot check" makes it claim a desktop app on a machine that may have none.
+  const relay = updateRoute() === 'relay';
+  const offersUpdateControl = relay || ((canInstallHere || canCheckHere) && !thisDeviceIsMobile());
+  const pageRoute: UpdateRoute = relay ? 'relay' : canInstallHere ? 'install' : 'check';
   const tauriHasUpdate = !!offeredVersion;
   const check = releaseCheck.value;
   // How this install takes an update, as the gateway read it from its own
@@ -417,7 +420,7 @@ export function SystemPage({ panel }: { panel: SystemPanel }) {
                 writes, so folding the two together would let a mid-run refresh
                 take the Cancel away from an install still downloading. */}
             {updateNarration
-              ? (updateNarration.cancellable
+              ? (updateNarration.cancellable && !relayedUpdate.value
                   ? <button
                       class="action-btn action-btn-danger"
                       onClick={() => {

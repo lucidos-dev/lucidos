@@ -88,6 +88,47 @@ pub fn update_blocker(location: &BundleLocation, same_device_as_temp: bool) -> O
     })
 }
 
+/// Why an update could not run with nobody at the Mac, or `None` when it can
+/// (ADR 0338). `install_blocker` is [`update_blocker`]'s answer.
+///
+/// It adds the one case a local click survives and a relayed install does not.
+/// The plugin moves the bundle out of its folder, and when it may not, it asks
+/// for an admin password. A person at the desk can answer that, and an empty
+/// desk leaves the install hanging.
+pub fn remote_install_blocker(
+    install_blocker: Option<String>,
+    writable_in_place: bool,
+) -> Option<String> {
+    install_blocker.or_else(|| {
+        (!writable_in_place).then(|| {
+            "Updating Lucidos here needs an administrator password, so it can only be done \
+             at this Mac."
+                .to_string()
+        })
+    })
+}
+
+/// Can this user move `bundle` out of its folder without asking anyone? Moving
+/// a directory to another parent needs write access to both the bundle and the
+/// folder it sits in. Fails closed: an answer we cannot read is a no.
+pub fn writable_in_place(bundle: &Path) -> bool {
+    bundle
+        .parent()
+        .is_some_and(|parent| user_may_write(parent) && user_may_write(bundle))
+}
+
+/// `access(W_OK)`, which asks with this process's real user rather than
+/// guessing from mode bits.
+fn user_may_write(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+
+    let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: `c_path` is a valid NUL-terminated string that outlives the call.
+    unsafe { libc::access(c_path.as_ptr(), libc::W_OK) == 0 }
+}
+
 /// The bundle this process runs from, derived the way `tauri-plugin-updater`
 /// derives the path it swaps: its own `extract_path_from_executable` over
 /// `current_exe()`. `lib.rs` registers the plugin with no override, so the two
@@ -244,5 +285,55 @@ mod tests {
     #[test]
     fn the_temp_dir_is_on_a_writable_volume() {
         assert_eq!(is_read_only_volume(&std::env::temp_dir()), Some(false));
+    }
+
+    #[test]
+    fn a_bundle_this_user_can_move_has_no_remote_blocker() {
+        assert_eq!(remote_install_blocker(None, true), None);
+    }
+
+    // The admin-password case: fine for a click at the desk, a hang for a
+    // relayed install with nobody there.
+    #[test]
+    fn a_bundle_this_user_cannot_move_blocks_a_remote_install() {
+        let message = remote_install_blocker(None, false).unwrap_or_default();
+        assert!(message.contains("administrator password"), "{message}");
+    }
+
+    // The local blocker is the more specific answer, so it wins.
+    #[test]
+    fn the_install_blocker_wins_over_the_writability_check() {
+        let local = update_blocker(&BundleLocation::ReadOnlyVolume, true);
+        assert_eq!(remote_install_blocker(local.clone(), false), local);
+    }
+
+    #[test]
+    fn a_bundle_in_a_folder_this_user_owns_is_writable_in_place() {
+        let tmp = TempDir::new("writable");
+        let bundle = tmp.path().join("Lucidos.app");
+        std::fs::create_dir_all(&bundle).expect("create the bundle");
+        assert!(writable_in_place(&bundle));
+    }
+
+    #[test]
+    fn a_bundle_in_a_read_only_folder_is_not_writable_in_place() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new("read-only-parent");
+        let parent = tmp.path().join("Applications");
+        let bundle = parent.join("Lucidos.app");
+        std::fs::create_dir_all(&bundle).expect("create the bundle");
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o555))
+            .expect("make the folder read-only");
+        let writable = writable_in_place(&bundle);
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755))
+            .expect("restore the folder so the temp dir can be removed");
+        assert!(!writable);
+    }
+
+    #[test]
+    fn a_missing_bundle_is_not_writable_in_place() {
+        let tmp = TempDir::new("missing-bundle");
+        assert!(!writable_in_place(&tmp.path().join("Lucidos.app")));
     }
 }

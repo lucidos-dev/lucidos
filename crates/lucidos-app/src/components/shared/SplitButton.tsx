@@ -85,6 +85,9 @@ export function SplitButton(props: SplitButtonProps) {
         data-tooltip={props.primaryTooltip}
         aria-label={props.primaryAriaLabel}
         disabled={props.primaryDisabled}
+        onTouchStart={primaryActivate.onTouchStart}
+        onTouchMove={primaryActivate.onTouchMove}
+        onTouchCancel={primaryActivate.onTouchCancel}
         onTouchEnd={primaryActivate.onTouchEnd}
         onClick={primaryActivate.onClick}
       >

@@ -151,15 +151,15 @@ describe('event row contract', () => {
     }
   });
 
-  /** **The phone half.** The subject may break anywhere, so its min-content is
-   *  one letter. With the state fixed beside it, a phone-width pane squeezed it
-   *  to one letter per line. The head wraps instead, and the subject keeps a
-   *  basis, so the state drops to a line of its own at the far edge. */
-  it('wraps the state below a subject that has no room', () => {
-    const head = block('.event-row-head');
-    expect(head).toContain('flex-wrap: wrap');
-    expect(block('.event-row-subject')).toMatch(/flex:\s*1 1 \d+(\.\d+)?rem/);
-    expect(block('.event-row-state')).toContain('margin-left: auto');
+  /** **The phone half.** The head never wraps: a state dropped to its own line
+   *  floated mid-card, under nothing. The state is capped instead, so a long
+   *  one wraps inside its own column and the subject keeps the rest. */
+  it('keeps the state on the top line on a narrow pane', () => {
+    expect(block('.event-row-head')).not.toContain('flex-wrap');
+    expect(block('.event-row-subject')).toContain('flex: 1 1 0');
+    const state = block('.event-row-state');
+    expect(state).toMatch(/max-width:\s*\d+%/);
+    expect(state).toContain('text-align: right');
   });
 
   /** The time is a line of its own ABOVE the card, right-aligned, where a user

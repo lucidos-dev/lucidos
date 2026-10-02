@@ -218,9 +218,20 @@
 
 /* On mobile the row stacks (mobile.css). The two small buttons sit under the
    fields, left-aligned with them, rather than floating at the far edge. */
-@media (max-width: 768px) {
+@media (--phone-layout) {
     .disk-usage-row .list-row-actions {
         align-self: flex-start;
         justify-content: flex-start;
     }
+}
+
+/* A running pass: the Backup page's running line and bar, across the card. */
+.disk-usage-reclaim-progress {
+    flex: 1 0 100%;
+}
+
+.disk-usage-reclaim-progress-line {
+    display: block;
+    margin-bottom: var(--space-xs);
+    color: var(--text-primary);
 }

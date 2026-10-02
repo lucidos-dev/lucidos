@@ -45,6 +45,14 @@ impl ApiError {
         }
     }
 
+    /// 403, for a caller that proved a credential this route does not accept.
+    pub fn forbidden(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            message: message.into(),
+        }
+    }
+
     /// 409 — used by the restore flow when the derived/requested workspace name
     /// collides with an existing one (the picker then asks for a different name)
     /// or when a restore is already in progress.

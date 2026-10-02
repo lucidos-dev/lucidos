@@ -156,7 +156,7 @@
        the details list scrolls inside. `--app-height` is set by
        MobileSwipeContainer so iOS Safari shrinks correctly when the
        keyboard opens (raw `100vh` does not). */
-    max-height: calc(var(--app-height, 100dvh) - 4rem - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px));
+    max-height: calc(var(--app-height, 100dvh) - 4rem - var(--safe-area-top) - var(--safe-area-bottom));
     display: flex;
     flex-direction: column;
 }
@@ -199,8 +199,8 @@
     margin-bottom: var(--space-md);
 }
 
-/* Text input for the prompt dialog (PromptDialog) — themed to match the
-   confirm modal it shares its chrome with. */
+/* Text input for the prompt dialog (PromptDialog). Box and focus:
+   global/text-input.css. */
 .prompt-input {
     width: 100%;
     box-sizing: border-box;
@@ -208,19 +208,6 @@
     padding: 0.5rem 0.625rem;
     font-family: inherit;
     font-size: var(--font-size-md);
-    color: var(--text-primary);
-    background: var(--bg-primary);
-    border: 1px solid var(--border-color);
-    border-radius: var(--radius-control);
-}
-
-.prompt-input:focus {
-    outline: none;
-    border-color: var(--accent);
-}
-
-.prompt-input::placeholder {
-    color: var(--text-secondary);
 }
 
 .prompt-textarea {
@@ -350,7 +337,7 @@
    correctly when the keyboard opens (raw `100vh` does not). */
 .file-preview-modal {
     width: min(60rem, 92vw);
-    height: min(45rem, calc(var(--app-height, 100dvh) - 4rem - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px)));
+    height: min(45rem, calc(var(--app-height, 100dvh) - 4rem - var(--safe-area-top) - var(--safe-area-bottom)));
     display: flex;
     flex-direction: column;
     overflow: hidden;
@@ -435,7 +422,7 @@
        keyboard is open and the header has slid off. It is inert on desktop and
        on any device without a top inset, where env() resolves to 0. */
     top: max(
-        calc(env(safe-area-inset-top, 0px) + 0.5rem),
+        calc(var(--safe-area-top) + 0.5rem),
         calc(var(--app-header-bottom) + 0.5rem)
     );
     left: 0;
@@ -485,7 +472,7 @@
    header focus wash uses, so a column tracks its pane through a divider drag.
    The percentages inside those vars resolve against .toast-container, which
    spans the viewport exactly as the header does. */
-@media (min-width: 769px) {
+@media (--desktop-layout) {
     .toast-column {
         position: absolute;
         top: 0;
@@ -552,7 +539,7 @@
        in global/anchored-popover.css. */
     max-height: min(
         14rem,
-        calc(var(--app-height, 100dvh) - 6rem - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px))
+        calc(var(--app-height, 100dvh) - 6rem - var(--safe-area-top) - var(--safe-area-bottom))
     );
     color: var(--text-primary);
     font-size: var(--font-size-md);
@@ -894,8 +881,8 @@
    corner still eats the edge a full-bleed bar runs to. */
 .toast-container[data-toast-placement="top-bleed"],
 .toast-container[data-toast-placement="bottom-bleed"] {
-    left: env(safe-area-inset-left, 0px);
-    right: env(safe-area-inset-right, 0px);
+    left: var(--safe-area-left);
+    right: var(--safe-area-right);
 }
 
 .toast-container[data-toast-placement="top-bleed"] .toast-column,
@@ -918,7 +905,7 @@
    over the prompt input, which is exactly what the comparison is for. */
 .toast-container[data-toast-placement="bottom-bleed"] {
     top: auto;
-    bottom: env(safe-area-inset-bottom, 0px);
+    bottom: var(--safe-area-bottom);
 }
 
 .toast-container[data-toast-placement="bottom-bleed"] .toast-column {
@@ -937,12 +924,12 @@
    composer, with the keyboard over it the moment the user types. So mobile
    keeps the base top placement. That breakpoint split is what Material and
    Carbon both call for, rather than an inconsistency between the two. */
-@media (min-width: 769px) {
+@media (--desktop-layout) {
     .toast-container[data-toast-placement="bottom-right"] {
         top: auto;
         left: auto;
-        bottom: max(1rem, env(safe-area-inset-bottom, 0px));
-        right: max(1rem, env(safe-area-inset-right, 0px));
+        bottom: max(1rem, var(--safe-area-bottom));
+        right: max(1rem, var(--safe-area-right));
         /* The container IS the toast's width here, so .toast fills it below.
            Sizing the box rather than the toast is what puts the toast's right
            edge exactly on the inset above. */
@@ -1536,8 +1523,8 @@
         align-items: center;
         justify-content: center;
         position: fixed;
-        top: max(3.5rem, calc(1rem + env(safe-area-inset-top, 0px)));
-        right: calc(1rem + env(safe-area-inset-right, 0px));
+        top: max(3.5rem, calc(1rem + var(--safe-area-top)));
+        right: calc(1rem + var(--safe-area-right));
         width: 3rem;
         height: 3rem;
         border-radius: var(--radius-round);
@@ -1560,15 +1547,15 @@
     }
 
     .image-popup-counter {
-        bottom: max(1rem, calc(0.5rem + env(safe-area-inset-bottom, 0px)));
+        bottom: max(1rem, calc(0.5rem + var(--safe-area-bottom)));
     }
 
     /* Same bottom line as the counter, clear of the home indicator. Pinch is
        the natural gesture here, but the controls stay: they are the only way
        to reach full size in one move. */
     .image-popup-zoom {
-        right: calc(1rem + env(safe-area-inset-right, 0px));
-        bottom: max(1rem, calc(0.5rem + env(safe-area-inset-bottom, 0px)));
+        right: calc(1rem + var(--safe-area-right));
+        bottom: max(1rem, calc(0.5rem + var(--safe-area-bottom)));
     }
 }
 

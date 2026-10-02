@@ -645,7 +645,8 @@ export async function listRepoFiles(repoId: string, gitRef?: string): Promise<st
 
 /** URL of a repo file's raw bytes at `gitRef` (default HEAD). The engine serves
  *  it with a content-type inferred from the extension, so this is safe to point
- *  an <img>/<video>/<audio>/<iframe> `src` at for binary-media previews. */
+ *  an <img>/<video>/<audio>/<iframe> `src` at for media previews. An HTML, SVG
+ *  or XML body comes sandboxed with script off, so a frame never runs one. */
 export function repoFileUrl(repoId: string, path: string, gitRef?: string): string {
   const params = new URLSearchParams({ path });
   if (gitRef) params.set('ref', gitRef);

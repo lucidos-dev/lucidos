@@ -5,7 +5,9 @@
 //!   else.
 //! - Script reads creds from env vars (`CRED_<NAME>_USERNAME` /
 //!   `CRED_<NAME>_PASSWORD` for password creds; `CRED_<NAME>` for others).
-//! - Those creds plus [`RUNTIME_ENV_ALLOWLIST`] are the script's WHOLE
+//! - Only `CRED_*` and `OAUTH_*` names reach it, never a credential's custom
+//!   alias. See [`is_handshake_secret_name`].
+//! - Those secrets plus [`RUNTIME_ENV_ALLOWLIST`] are the script's WHOLE
 //!   environment. It inherits nothing else from the engine.
 //! - Script prints exactly one JSON object to stdout:
 //!   `{"headers": {"<name>": "<value>", ...}, "expires_in": <seconds>}`.
@@ -176,38 +178,32 @@ sys.path = [_d for _d in sys.path if _d not in _writable]
 exec(compile(_src, _p, 'exec'), {'__file__': _p, '__name__': '__main__'})
 ";
 
-/// Name prefixes that make `python3` or a library it loads read a planted
-/// file, on top of the shell-level ones in `engine::command_guard`.
-const INTERPRETER_HOOK_PREFIXES: &[&str] = &[
-    // Every one steers the interpreter: search path, home, startup file.
-    "PYTHON",
-    // macOS CPython picks the virtual environment it starts in from this.
-    "__PYVENV_LAUNCHER__",
-    // `ssl` and `hashlib` start OpenSSL, whose config can load a module.
-    "OPENSSL_",
-    // glibc loads a charset converter from here during locale setup.
-    "GCONV_PATH",
-    "LOCPATH",
-];
+/// The namespaces of the canonical secret names: `CRED_<NAME>*` from
+/// `core::credentials`, `OAUTH_<PROVIDER>_*` from `core::oauth`.
+const SECRET_NAME_PREFIXES: &[&str] = &["CRED_", "OAUTH_"];
 
-/// Whether a credential may set `name` in a handshake script's environment.
+/// Whether the pipeline layer may set `name` in a handshake script's
+/// environment.
 ///
-/// A credential's custom env var name is checked for shape only, so it can
-/// name a loader hook. That hook would run a planted file inside an approved
-/// script, which is the bypass ADR 0144 exists to close.
+/// **An allowlist, never a blocklist.** The user picks a credential's custom
+/// env var name. So it can name a loader hook (`PYTHONPATH`), a proxy
+/// (`HTTPS_PROXY`) or a CA bundle. A hook runs a planted file inside an
+/// approved script, which is the bypass ADR 0144 exists to close. Why no
+/// blocklist: ADR 0339.
 ///
-/// A credential may not shadow a runtime name either. Its own `PATH` picks
-/// which `python3` runs, and its own `HOME` picks the user site-packages.
-///
-/// The shape is checked again here, not trusted from the write path. A name
-/// holding `=` would compare unequal to `PATH` and still set it in the child.
-fn credential_may_set(name: &str) -> bool {
-    crate::core::environment_variables::is_valid_name(name)
-        && !RUNTIME_ENV_ALLOWLIST.contains(&name)
-        && !INTERPRETER_HOOK_PREFIXES
-            .iter()
-            .any(|prefix| name.starts_with(prefix))
-        && !crate::engine::command_guard::is_code_injecting_env_name(name)
+/// So a name passes only as a prefix above plus a non-empty `[A-Z0-9_]` tail,
+/// the exact shape `core::env_var_segment` produces. A custom alias never
+/// passes: the credential write path refuses both prefixes for one.
+fn is_handshake_secret_name(name: &str) -> bool {
+    SECRET_NAME_PREFIXES
+        .iter()
+        .filter_map(|prefix| name.strip_prefix(prefix))
+        .any(|tail| {
+            !tail.is_empty()
+                && tail
+                    .bytes()
+                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+        })
 }
 
 /// Spawn `cmd`, feed `source` to its stdin, and collect the output.
@@ -282,16 +278,20 @@ pub async fn run_handshake_script(
         return Err(RunError::NotApproved(rel_key));
     }
 
-    // Collect the secret env values (CRED_*/OAUTH_*) so any that the script
-    // echoes to stderr (a traceback dumping os.environ, a debug print) is
-    // scrubbed out of the error we surface to the caller / logs — a script's
-    // stderr is returned verbatim in the 502, and these env vars carry live
-    // credentials and OAuth tokens.
-    let secret_values: Vec<String> = env_vars
-        .iter()
-        .filter(|(k, _)| k.starts_with("CRED_") || k.starts_with("OAUTH_"))
-        .map(|(_, v)| v.clone())
-        .collect();
+    let (secrets, dropped): (Vec<_>, Vec<_>) = env_vars
+        .into_iter()
+        .partition(|(name, _)| is_handshake_secret_name(name));
+    for (name, _) in &dropped {
+        crate::log!(
+            "[Proxy] dropped env var {} from handshake {}: a handshake script gets only CRED_* and OAUTH_* names",
+            name,
+            rel_key
+        );
+    }
+    // A script's stderr goes verbatim into the 502 and the logs. So any secret
+    // it echoes there (a traceback dumping os.environ, a debug print) is
+    // scrubbed out first.
+    let secret_values: Vec<String> = secrets.iter().map(|(_, v)| v.clone()).collect();
 
     let mut cmd = Command::new("python3");
     cmd.arg("-c").arg(RUN_CHECKED_SOURCE).arg(&script_abs);
@@ -306,17 +306,7 @@ pub async fn run_handshake_script(
             cmd.env(name, value);
         }
     }
-    for (k, v) in env_vars {
-        if credential_may_set(&k) {
-            cmd.env(k, v);
-        } else {
-            crate::log!(
-                "[Proxy] dropped credential env var {} from handshake {}: it would steer the interpreter or loader",
-                k,
-                rel_key
-            );
-        }
-    }
+    cmd.envs(secrets);
     cmd.kill_on_drop(true);
     cmd.stdin(std::process::Stdio::piped());
     cmd.stdout(std::process::Stdio::piped());
@@ -728,35 +718,97 @@ print(json.dumps({"headers": {"X-Ran": "real"}, "expires_in": 60}))
         );
     }
 
+    /// A blocklist only stops the names someone thought of. A custom alias can
+    /// name a proxy or a CA bundle that steers the script's own traffic. So
+    /// only the canonical secret names may arrive.
+    #[tokio::test]
+    async fn a_custom_alias_never_reaches_the_script() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rel = write_script(
+            tmp.path(),
+            "alias-dump.py",
+            r#"
+import os, json
+print(json.dumps({
+    "headers": {"X-Env-Names": ",".join(sorted(os.environ))},
+    "expires_in": 60,
+}))
+"#,
+        );
+        let granted = |name: &str| (name.to_string(), "granted-value".to_string());
+        let out = run_handshake_script(
+            tmp.path(),
+            &rel,
+            vec![
+                granted("GITHUB_TOKEN"),
+                granted("HTTPS_PROXY"),
+                granted("REQUESTS_CA_BUNDLE"),
+                granted("CRED_SVC"),
+                granted("OAUTH_GOOGLE_ACCESS_TOKEN"),
+            ],
+        )
+        .await
+        .unwrap();
+        let names = out
+            .headers
+            .iter()
+            .find(|(n, _)| n.as_str() == "x-env-names")
+            .map(|(_, v)| v.to_str().unwrap().to_string())
+            .expect("the script reports its own environment");
+        let seen: Vec<&str> = names.split(',').collect();
+        for alias in ["GITHUB_TOKEN", "HTTPS_PROXY", "REQUESTS_CA_BUNDLE"] {
+            assert!(
+                !seen.contains(&alias),
+                "{alias} reached the handshake script: {seen:?}"
+            );
+        }
+        for canonical in ["CRED_SVC", "OAUTH_GOOGLE_ACCESS_TOKEN"] {
+            assert!(
+                seen.contains(&canonical),
+                "{canonical} must reach the script: {seen:?}"
+            );
+        }
+    }
+
     #[test]
-    fn a_credential_may_set_only_names_that_hook_nothing() {
-        for hook in [
+    fn only_well_formed_cred_and_oauth_names_are_handshake_secrets() {
+        for refused in [
             "PYTHONPATH",
-            "PYTHONHOME",
             "PYTHONSTARTUP",
-            "PYTHONUSERBASE",
             "__PYVENV_LAUNCHER__",
             "OPENSSL_CONF",
-            "OPENSSL_MODULES",
-            "GCONV_PATH",
-            "LOCPATH",
             "LD_PRELOAD",
-            "LD_LIBRARY_PATH",
             "DYLD_INSERT_LIBRARIES",
             "PATH",
             "HOME",
-            "PATH=/planted",
+            "GITHUB_TOKEN",
+            "HTTPS_PROXY",
+            "API_KEY",
+            "CRED_",
+            "OAUTH_",
+            "CRED_svc",
+            "cred_SVC",
+            "XCRED_SVC",
+            "CRED_SVC-X",
+            "CRED_SVC=PATH",
+            "CRED_SV\u{c9}",
             "",
         ] {
             assert!(
-                !credential_may_set(hook),
-                "{hook} must not reach the script"
+                !is_handshake_secret_name(refused),
+                "{refused:?} must not reach the script"
             );
         }
-        for ordinary in ["CRED_SVC", "CRED_SVC_PASSWORD", "OAUTH_TOKEN", "API_KEY"] {
+        for accepted in [
+            "CRED_SVC",
+            "CRED_SVC_PASSWORD",
+            "CRED_2FA",
+            "OAUTH_GOOGLE_ACCESS_TOKEN",
+            "OAUTH_GOOGLE_EMAIL",
+        ] {
             assert!(
-                credential_may_set(ordinary),
-                "{ordinary} must reach the script"
+                is_handshake_secret_name(accepted),
+                "{accepted} must reach the script"
             );
         }
     }

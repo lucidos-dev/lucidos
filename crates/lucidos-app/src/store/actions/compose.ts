@@ -246,6 +246,12 @@ export const pendingComposePuts = new Set<string>();
  *  legitimate refresh capturing a request time after the last local edit. */
 export const composeEditedAt = new Map<string, number>();
 
+/** Per-thread time of the last send from this device (Date.now()). A thread
+ *  read that went out before it still says `composing` and holds the sent
+ *  text, so `upsertThread` applies neither. Kept apart from `composeEditedAt`,
+ *  which also means "this device wrote the draft" to `hasUnsentLocalDraft`. */
+export const composeSentAt = new Map<string, number>();
+
 /** Per-thread timestamp of the last compose PUT settling (Date.now()), stamped
  *  in pushNow's finally. Closes the inverse of the `composeEditedAt` hole: an
  *  edit made BEFORE a stale GET started, whose debounced PUT settled only
@@ -965,6 +971,7 @@ export function forgetComposeState(threadId: string): void {
   composeEpoch.delete(threadId);
   composeEditedAt.delete(threadId);
   composeEditWatermark.delete(threadId);
+  composeSentAt.delete(threadId);
   serverDraft.delete(threadId);
 }
 
@@ -1408,6 +1415,7 @@ export async function sendCompose(
   // Must run before the draft clear — see `markHashesAsSent`.
   if (wireHashes.length > 0) markHashesAsSent(wireHashes);
   clearDraft(threadId);
+  composeSentAt.set(threadId, Date.now());
   lastSyncedImageHashes.delete(threadId);
   const shouldFocus = opts.focus ?? true;
   if (shouldFocus) setFocusedThread(threadId);

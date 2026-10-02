@@ -11,7 +11,7 @@
 
 import { useEffect, useRef } from 'preact/hooks';
 import type { RefObject } from 'preact';
-import { scaledDurationMs } from '../../utils/motion';
+import { isReducedMotion, scaledDurationMs } from '../../utils/motion';
 
 /** The textarea's height ease on a compose-draft switch, at 1x. It rides the
  *  Animation speed slider, and so does the safety net that outlives it. */
@@ -95,6 +95,7 @@ export function resizeTextarea(el: HTMLTextAreaElement): boolean {
   // Paste / autocomplete: text jumped by more than one character.
   // Collapse to 0 so scrollHeight is measured fresh, not against stale height.
   if (prevLen >= 0 && curLen - prevLen > 1) {
+    abandonHeightAnimation(el);
     el.style.height = '0';
     return applyHeight(el, el.scrollHeight, prevHeight, curLen);
   }
@@ -108,6 +109,10 @@ export function resizeTextarea(el: HTMLTextAreaElement): boolean {
     if (cached) cached.len = curLen;
     return false;
   }
+
+  // Every path below writes a height for the new value, which makes an
+  // in-flight ease's target wrong. Its last frame would snap the box back.
+  abandonHeightAnimation(el);
 
   // Growth: content overflows — grow without collapsing.
   if (scrollH > clientH) {
@@ -246,6 +251,35 @@ export function animateTextareaHeightFrom(el: HTMLTextAreaElement, fromHeight: s
       timer = setTimeout(finish, scaledDurationMs(HEIGHT_EASE_MS) + HEIGHT_EASE_SLACK_MS);
     });
   });
+}
+
+/** Ease a box the composer just emptied down to the height it now needs.
+ *
+ *  A send, a side question and a typed answer each empty the box. A snap drops
+ *  everything docked above it in one frame. On a phone the transcript's bottom
+ *  padding follows the prompt, so the whole thread jumps with it. */
+export function easeEmptiedTextarea(el: HTMLTextAreaElement): void {
+  const fromHeight = el.style.height;
+  remeasureTextarea(el);
+  if (!isReducedMotion()) animateTextareaHeightFrom(el, fromHeight);
+}
+
+/** Re-measure for a new placeholder, re-aiming an ease already under way.
+ *
+ *  A typed answer empties the box, and its placeholder swaps on the render
+ *  after. The ease's target was measured with the old placeholder. Standing
+ *  down would strand the box at that height. Writing the new one straight away
+ *  would end the ease in a snap. So it eases on from where it is now. */
+export function remeasureTextareaForPlaceholder(el: HTMLTextAreaElement): void {
+  if (!isTextareaHeightAnimating(el)) {
+    remeasureTextarea(el);
+    return;
+  }
+  // The resolved height follows box-sizing, as the inline height does.
+  const current = getComputedStyle(el).height;
+  abandonHeightAnimation(el);
+  remeasureTextarea(el);
+  animateTextareaHeightFrom(el, current);
 }
 
 /** Watch one box and re-measure it on a WIDTH change. Returns the teardown.

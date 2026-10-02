@@ -1,6 +1,6 @@
 use axum::{
     extract::{Query, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
     Json, Router,
@@ -195,8 +195,19 @@ pub async fn get_repo_file(
     .await
 }
 
+/// The CSP a repository document renders under: an opaque origin, no script.
+///
+/// Stricter than [`super::file_response::DOCUMENT_SANDBOX_CSP`], which serves
+/// the user's own files. A repo file is whatever its authors committed, and the
+/// preview reads it as text, so nothing needs it to run.
+const REPO_DOCUMENT_CSP: &str = "sandbox";
+
 /// Run `git show {ref}:{path}` and return the file body with a content-type
 /// inferred from the extension. Validates path-traversal and dangerous refs.
+///
+/// The body is served on the shell's origin, so a link straight to it must
+/// not run script there. `nosniff` holds every type to its declared one, and
+/// an active document gets the sandbox.
 async fn git_show_file(repo_root: &std::path::Path, git_ref: &str, path: &str) -> Response {
     if super::is_path_traversal(path) {
         return (StatusCode::BAD_REQUEST, "Invalid path").into_response();
@@ -217,7 +228,19 @@ async fn git_show_file(repo_root: &std::path::Path, git_ref: &str, path: &str) -
 
     let ext = path.rsplit('.').next().unwrap_or("").to_lowercase();
     let content_type = super::content_type_for_ext(&ext);
-    ([(header::CONTENT_TYPE, content_type)], output.stdout).into_response()
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    if super::file_response::is_active_document(content_type) {
+        headers.insert(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static(REPO_DOCUMENT_CSP),
+        );
+    }
+    (headers, output.stdout).into_response()
 }
 
 #[derive(Deserialize)]

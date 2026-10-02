@@ -30,7 +30,7 @@ const here: string = dirname(fileURLToPath(import.meta.url));
 const shellCss = readFileSync(resolve(here, '../panels/shell.css'), 'utf-8');
 
 /** The sheet's mobile breakpoint, as `cssRules` reports the at-rule. */
-const MOBILE = '@media (max-width: 768px)';
+const MOBILE = '@media (--phone-layout)';
 
 /** The one rule that styles `className` below the mobile breakpoint. Asserting
  *  there is exactly one is half the point: a second copy would be the drift. */
@@ -42,7 +42,7 @@ function stackRule(className: string): CssRule {
 
 /** Every rule styling `className` OUTSIDE the mobile breakpoint. */
 function desktopRules(className: string): CssRule[] {
-  return rulesTargeting(shellCss, className).filter(r => !r.atRules.includes('max-width: 768px'));
+  return rulesTargeting(shellCss, className).filter(r => !r.atRules.includes('(--phone-layout)'));
 }
 
 describe('the webhook bars stack on a phone', () => {

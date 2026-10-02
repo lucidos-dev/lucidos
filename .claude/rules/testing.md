@@ -88,7 +88,14 @@ Tests in `crates/lucidos-e2e/tests/api_support/` (workspace member crate `lucido
 
 **When to write:** New endpoints, changed responses, error handling, SSE.
 
-`e2e-api.sh` runs one more thing afterwards: the **gateway chain test**
+**A run must leave the workspace tree as clean as it found it.** Every apply
+refuses a dirty tree, so `e2e-api.sh` fails a run that leaves an uncommitted
+change behind, and names the paths. It checks after a failed test run too. A
+test that needs a fixture file under `data/` writes it with `write_data_fixture`
+and removes it with `remove_data_fixtures` (both in `api_support/mod.rs`). Both
+go through `PUT` / `DELETE /api/v1/data`, which commit in the same step.
+
+`e2e-api.sh` also runs the **gateway chain test**
 (`crates/lucidos-gateway/src/chain_tests.rs`), the only test that puts a real
 gateway in front of a real engine. It binds the gateway's own router to a free
 port and routes `/e2e-test/` at the session's engine. It then asks for an app's

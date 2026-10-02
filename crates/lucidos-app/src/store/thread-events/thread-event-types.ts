@@ -189,8 +189,8 @@ export function isSwitchTeardownAbort(
 }
 
 /** Summary text for a `ResponseAborted` event. `stale_settle` (engine cleanup
- *  of a stuck projection on a user button click) reads "Settled stuck
- *  response" — distinct from a real abort because no live response existed.
+ *  of a stuck projection on a user button click) reads "Stuck reply cleared",
+ *  distinct from a real abort because no live response existed.
  *  The user's own switch reads "Paused by restart", matching the `paused` thread
  *  status the same abort leaves behind (the turn is parked, not lost, and
  *  resumes on its own). Anything else is an interruption nobody promised to
@@ -199,7 +199,7 @@ export function responseAbortedSummary(
   actor: MessageOrigin | undefined,
   cause: AbortCause | undefined,
 ): string {
-  if (cause === 'stale_settle') return 'Settled stuck response';
+  if (cause === 'stale_settle') return 'Stuck reply cleared';
   return isSwitchTeardownAbort(actor, cause) ? 'Paused by restart' : 'Response interrupted';
 }
 
@@ -207,13 +207,13 @@ export function responseAbortedSummary(
  *  turn's "Response interrupted" pill. The pill already says it was
  *  interrupted, so the word names the cause. */
 const ABORT_CAUSE_STATE: Record<AbortCause, string> = {
-  engine_shutdown: 'Engine stopped',
+  engine_shutdown: 'Lucidos stopped',
   safety_net: 'Looked stuck',
   recovery_after_restart: 'After restart',
-  process_killed: 'Process killed',
-  stale_settle: 'Settled',
-  session_dropped: 'Session dropped',
-  unknown: 'Cause unknown',
+  process_killed: 'Agent stopped unexpectedly',
+  stale_settle: 'Nothing was running',
+  session_dropped: 'Its caller went away',
+  unknown: 'Reason not recorded',
 };
 
 export function responseAbortedState(

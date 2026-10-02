@@ -104,11 +104,11 @@ describe('ChildStoppedRow', () => {
 describe('ChildMovedOutRow', () => {
   /** The former parent's row for a child moved to top level (ADR 0278): it
    *  names the child, links to it, and says nothing more is coming. */
-  it('says the child moved out and the parent no longer waits, with a link to it', () => {
+  it('says the child moved to top level and the parent no longer waits, with a link to it', () => {
     const tree = ChildMovedOutRow({ childThreadId: 'child-uuid', childThreadTitle: 'Write the notes' });
     const row = findByClass(tree, 'event-row');
     expect(row!.props['data-state']).toBe('moved-out');
-    expect(vnodeText(findByClass(tree, 'event-row-subject'))).toBe('Child thread moved out');
+    expect(vnodeText(findByClass(tree, 'event-row-subject'))).toBe('Child thread moved to top level');
     expect(vnodeText(row)).toContain('Write the notes');
     expect(vnodeText(findByClass(tree, 'event-row-state'))).toBe('No longer waiting');
 

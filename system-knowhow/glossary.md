@@ -306,6 +306,8 @@ Contrast with *Lucidos Engine*, the actor chip on work the engine did without th
 ### Environment variable
 A user-managed, **non-secret** `NAME=value` pair (Settings → System → Environment variables) that Lucidos injects as a real environment variable into every subprocess it spawns — `run_bash`, `run_python`, background tasks, scheduled scripts, *triggers*, and *coding agent* sessions — e.g. `CLAUDE_CODE_USE_VERTEX`, `LUCIDOS_REPO`, build flags, default model names. Stored DB-backed (the `environment_variables` table), editable in Settings or by the *Lucidos Agent* via the grouped `env_vars` tool (`list` / `set` / `delete`; `set_environment_variable` is a back-compat alias for `set`), and applied per-spawn so a change takes effect on the next tool call / agent turn with no engine restart. Deliberately distinct from a *credential*: env vars are non-secret (they appear in tool-call payloads, logs, and the *event* store — that's the point), whereas credentials hold secrets and feed the proxy auth pipeline. Names must be uppercase letters/digits/underscores (not starting with a digit) and may not clobber engine-owned names (`CRED_*`, `OAUTH_*`, `PG*`, `PATH`, internal `LUCIDOS_*`); engine-owned vars always win a collision. A credential can also be given a custom env var name so its secret injects as e.g. `GITHUB_TOKEN` **in addition to** the default `CRED_<NAME>` (an extra alias, so existing `CRED_<NAME>` references keep working).
 
+An auth handshake script never gets that custom name. It receives only `CRED_*` and `OAUTH_*` names.
+
 The store has a second consumer, and it is the one an engine restart applies to. The engine copies every pair into its own process environment once at startup. So a variable the engine itself reads, rather than a subprocess, picks up a change only on the next engine start.
 
 <!--gloss-event-start-->
@@ -557,7 +559,7 @@ See also: `system-knowhow/orchestrating-sub-threads.md`.
 ### Device
 One browser storage container that has met Lucidos. Listed in **Settings → Devices**, one row each, whichever way it arrived. A device is what a push notification is sent to, what a device-scoped *preference* applies to, and who an actor chip credits.
 
-A device has one name everywhere: the name you typed on its row, else its *pairing label*, else `device-` and the start of its id. See `system-knowhow/remote-access.md` § What a device is called.
+A device has one name everywhere. It is the name you typed on its row, else its *pairing label*, else its browser and machine, as in "Chrome on Mac (109371a3)". Failing all three, it is `device-` and the start of its id. See `system-knowhow/remote-access.md` § What a device is called.
 
 **Per browser means per browser, and on iOS that includes the home-screen app.** iOS gives it a storage container of its own, so it is a separate device from Safari on the same phone.
 
@@ -569,7 +571,7 @@ Either half can be missing, and neither is an error. A device paired from anothe
 See also: *paired device*, *pairing code*, *preference*, *active device*.
 
 ### Pairing label
-The name a device got when it paired, such as "Safari on iPhone". The pairing screen suggests it from the browser, and the person at the device may type their own. It is fixed until you revoke the device and pair it again. Every *workspace* knows it: the *workspace gateway* passes it along with each request. A device has one name everywhere, the name typed on its **Devices** row, else its pairing label, else `device-` and the start of its id.
+The name a device got when it paired, such as "Safari on iPhone". The pairing screen suggests it from the browser, and the person at the device may type their own. It is fixed until you revoke the device and pair it again. Every *workspace* knows it: the *workspace gateway* passes it along with each request. A device has one name everywhere: the name typed on its **Devices** row, else its pairing label, else its browser and machine, else `device-` and its id's start.
 See also: *device*, *paired device*, `system-knowhow/remote-access.md` § What a device is called.
 
 ### Paired device
@@ -643,6 +645,9 @@ What differs is what the host can paint. A natively fullscreen element is painte
 Dragging down past the top of a *content pane* view on a touch screen to re-read what it shows. A scroll up that reaches the top and keeps going counts too. An arrow drops with the finger and blends into the accent colour, fully there once letting go would refresh. There it stops dropping but keeps turning while the finger pulls. A refresh icon then spins beside the header's menu button until the new data replaces the old, then turns into a check. On desktop the same refresh is the header's Refresh button.
 
 What a refresh re-reads is the view's own business. Disk Usage re-measures its worktrees, the Plugins panel checks every marketplace again, and an *app* reloads as its header Refresh does. Views that update live, such as the thread list, have nothing to pull. Inside an app the SDK sees the pull, and an app can opt out (`system-knowhow/js-sdk.md` § Pull to refresh).
+
+### Pane swipe
+On a phone, a sideways drag that moves between the three panes: the *thread drawer*, the *thread pane* and the *content pane*. A short fast flick or a drag past a third of the screen moves one pane; anything less springs back. It works anywhere, over an open *app* too, except while an app is fullscreen. Inside an app the SDK sees the drag. An app keeps its own sideways gestures, such as a carousel or a slider (`system-knowhow/js-sdk.md` § Pane swipe).
 
 ### PresenceCheck
 The transient SSE event the *Lucidos Engine* broadcasts on every `NotificationCreated` to ask every connected page for its live presence. A **pure pong trigger** — it carries `notification_id`, `event_id` (so the pong can report `event_in_viewport`), a `deadline_ms` the page reads off the payload (set by `scheduler::push::DEADLINE_MS`, currently 2 s — sized to cover an iOS PWA's first packet after Tailscale wake-from-idle, where Tailscale's userspace WireGuard renegotiation pushes the round-trip into the 1100–1800 ms band), and `sent_at_ms`. It carries NO toast content: the in-app toast is driven separately by *NotificationToastRequested*, so it can no longer race the push decision. Each page answers with a *PresencePong*. The engine collects pongs up to the deadline and uses them to decide whether to send an *OS surface* push. Skipped entirely only when nobody is reachable — no page holds an open SSE connection AND no device has pinged visible within `PRESENCE_STALE_AFTER` (120 s, `core::device_presence`). The live SSE-connection count is the primary gate (`engine.sse_connections`); the heartbeat candidates are secondary (`expected_pong_count` in `scheduler::push`). The SSE count is what makes this robust — iOS suspends the 30 s heartbeat while a PWA is foregrounded, so the heartbeat row goes stale even though the page is connected and would pong; gating on the open connection lets the active page still suppress the push. See `system-knowhow/notifications.md` §3.
@@ -795,7 +800,7 @@ The control on the prompt bar showing what the open *thread* is currently waitin
 
 One control covers both because the **Waiting** status already merges them. Either way the thread is not finished, and something else will re-open it. A sub-thread row links rather than stops: ending one is done on the sub-thread itself. A thread with a proposed change that waits only on sub-threads reads **Changes to review** instead, because its change can be applied.
 
-Each subscription reads **watching for** and the event in plain words ("background job finished"), with the exact event type on its tooltip. An event watched under a `condition` says **(matching only)**, and tapping that opens the condition itself. The transcript's own record of the wait opens the same thing.
+Each subscription reads **watching for** and the event in plain words ("background job finished"), with what it means on its tooltip. An event watched under a `condition` says **(with a condition)**, and tapping that opens the condition itself, exact event type included. The transcript's own record of the wait opens the same thing.
 
 Its subscriptions section is headed **EVENTS**, since a person waits for things to happen rather than for subscriptions. A *trigger subscription* belongs to a trigger and never appears on a thread screen, so the only species listed here is the thread one.
 
@@ -1054,6 +1059,8 @@ Opening the panel reads the published changelog, so a release newer than your ow
 
 A release the updater is **offering** sits above that list, and carries the control to get it. With no offer, that control sits on the newest release ahead of you: the published changelog reaches this panel before the update check does. On the desktop app the control is **Update & Restart**, and that row wears no chip: the button already says the release is there. A browser or a phone has no updater to run. There the row keeps its **Available** or **Newer** chip and offers **How to Update**, which opens the page answering for your kind of install.
 
+One exception: when the desktop app is open on the Mac that runs the workspace, a browser or phone gets **Update Desktop App** instead. The desktop app then installs the release and restarts Lucidos, while your phone shows the progress. It works only where nobody needs to be at the Mac. So it is not offered from the disk image, or from a folder that needs an administrator password.
+
 Its notes come from somewhere else. A version offered to you is by definition newer than the copy of Lucidos showing it. So its notes are not in that binary's history: they arrive with the update check. That is why the offer's notes appear only where a real update is pending, and why nothing falls back to the installed list. Doing so would show what your CURRENT version contains, under the heading of the one you were about to install.
 
 Three ways in, all of them places the question comes up. The Lucidos menu's version row opens it (tap the Lucidos mark in the header). That row carries a dot while this device has not read the notes for the release it runs. The update notice on Settings > System > Overview links here too. So does the update toast, next to Update & restart. The dot is per device, so one workspace tells you once on your laptop and once on your phone.
@@ -1223,12 +1230,12 @@ The engine emits `ApplyAllBatchStarted` with the full change-id list and the act
 
 While the batch runs, its line in the Lucidos menu offers **Cancel** (`POST /api/v1/changes/apply-all/cancel`). The engine then stops advancing to further members and interrupts the in-flight *hardening* or merge session, and every parked resolution. It marks the remaining members `failed` with "Apply All canceled", so the batch resolves and `ApplyAllBatchCompleted` still fires. Already-applied members stay applied. The rest return to pending (best-effort for an in-progress merge that already landed). A single *Apply* that woke a *hardening* or merge session can likewise be canceled from its *coding-agent thread* (the thread's Cancel button).
 
-**The button beside it is the sweep.** **Apply all on settle** applies what is ready now and adds a *standing apply* to every *settling* thread whose change Lucidos applies. Each one then applies as it lands, rather than waiting for you. An *external-repo coding-agent thread* is passed over, having no change to apply. It draws whenever a thread is still settling, so the Changes panel can show three buttons: Discard All, Apply all on settle, and Apply All. The batch's **Cancel**, in the Lucidos menu, takes the whole sweep back with it.
+**The sweep is the prompt's form.** Ask Lucidos to apply everything as it settles, and it applies what is ready now. It also adds a *standing apply* to every *settling* thread whose change Lucidos applies, even one with no change yet. An *external-repo coding-agent thread* is passed over, having no change to apply. The batch's **Cancel**, in the Lucidos menu, takes the whole sweep back with it. The Changes panel does not press the sweep: its **Apply all on settle** arms only the changes it lists (*standing apply*).
 
 ### Standing apply
 The owner's instruction to *Apply* a *change* once its thread finishes. Pressed while the thread is still settling, carried out by the engine later (ADR 0168 clause 5). It is what the Apply button becomes on a thread that has not settled: a control that cannot act is replaced by the one that can, so nothing on either surface renders disabled.
 
-Two forms. **Apply on settle** arms one change, from the thread's own prompt row or its row in the Changes panel. **Apply all on settle**, the button beside *Apply All*, arms every *settling* thread. Both read the same rule and both are one-shot.
+Two forms. **Apply on settle** arms one change, from the thread's own prompt row or its row in the Changes panel. **Apply all on settle**, atop the Changes panel's **Not finished** section, arms each *settling* change listed there and touches nothing in **Ready**. Both read the same rule and both are one-shot. The *sweep* is the prompt's form: it applies what is ready and arms every settling thread, even one with no change yet (*Apply All*).
 
 It goes wherever *Apply* goes, and nowhere else. An *external-repo coding-agent thread* is never offered one: Lucidos does not merge into that repo, and the thread proposes no *change* to arm. So its prompt row draws no flag, the sweep passes it over, and the engine refuses an arm anything else asks for.
 
@@ -1236,7 +1243,7 @@ A change whose *Apply* hit merge conflicts is not offered one either. Its thread
 
 It always ends. The change applies the moment the thread finishes, once the agent has saved its last edits. A thread waiting on an *event wait* keeps the instruction, because the wait ends by itself and the thread finishes after it wakes. A thread parked on a question, whose turn failed, or whose session stopped before the turn finished settling never settles by itself. The instruction is then dropped and reported, rather than left waiting. It acts only on the change it was armed for, so a second change the thread proposes afterwards is untouched.
 
-Cancel it from the same control you armed it with. Every control is a toggle, and they all show one state. In the **Changes panel** a change's row reads **✓ Applying on settle** once armed. The bulk control above it reads **✓ Applying all on settle**, and cancels every standing apply here. On the **thread's own prompt row** it is a flag icon, filled once armed; its tooltip says the same thing.
+Cancel it from the same control you armed it with. Every control is a toggle, and they all show one state. In the **Changes panel** a change's row reads **✓ Applying on settle** once armed. The bulk control atop Not finished reads **✓ Applying all on settle** once every change it lists is armed, and a press cancels those arms. On the **thread's own prompt row** it is a flag icon, filled once armed; its tooltip says the same thing.
 
 Cancelling stops what has not started. A change already merging or hardening finishes, and nothing already applied is undone. Stopping a running *Apply All* is its own Cancel, on its line in the Lucidos menu.
 
@@ -1252,6 +1259,8 @@ It routes through `interrupt_agent` (`POST /api/v1/claude-code/stop`, default `S
 
 ### Change
 A *coding-agent*-proposed set of file edits shown as a pending branch in the UI. It is resolved by *Apply* or Discard, or kept for later with **Set aside**. Apply is a non-disruptive merge into main; an engine-affecting change then surfaces *New version available / Switch to new version*. Lifecycle events: `ChangeProposed`, `ChangeApplied`, `ChangeDiscarded`, `ChangeSetAside`, `ChangeBroughtBack`. Stored as a row in the `changes` table. Internal (Lucidos-repo) coding-agent threads produce changes; *external-repo coding-agent threads* skip this flow.
+
+The Changes panel lists pending changes in two sections. **Ready** comes first: changes whose thread has finished, with **Discard All** and **Apply All**. **Not finished** comes second: changes whose thread is *settling* or parked on a question, with **Apply all on settle**. Discard All never reaches Not finished. Below them sit **Set aside** and **Recently applied**.
 
 A change's `status` is one of five values: `pending` (awaiting Apply or Discard), `set_aside` (a *set-aside change*), `applied`, `discarded`, or `reverted` (applied, then undone). No other value exists.
 

@@ -40,7 +40,7 @@ describe('per-pane toast columns', () => {
   });
 
   it('gives each pane its own column, spanning that pane', () => {
-    const desktop = componentsCss.indexOf('@media (min-width: 769px)', componentsCss.indexOf('.toast-container {'));
+    const desktop = componentsCss.indexOf('@media (--desktop-layout)', componentsCss.indexOf('.toast-container {'));
     expect(desktop).toBeGreaterThan(0);
     expect(decl(block(componentsCss, '.toast-column {', desktop), 'position')).toBe('absolute');
 
@@ -66,7 +66,7 @@ describe('per-pane toast columns', () => {
   it('tracks the panes 1:1 during a divider drag', () => {
     // The column eases its geometry like the header regions, so it must join
     // their resize kill list or it visibly lags the pointer mid-drag.
-    expect(decl(block(componentsCss, '.toast-column {', componentsCss.indexOf('@media (min-width: 769px)', componentsCss.indexOf('.toast-container {'))), 'transition'))
+    expect(decl(block(componentsCss, '.toast-column {', componentsCss.indexOf('@media (--desktop-layout)', componentsCss.indexOf('.toast-container {'))), 'transition'))
       .toContain('var(--duration-slow)');
     expect(shellCss).toContain(':root[data-pane-resizing] .toast-column,');
   });

@@ -454,6 +454,9 @@ pub struct LucidosEngine {
     /// `GET /api/v1/engine/version-status`. Idle in packaged (no source rebuild).
     /// See `engine/engine_version.rs`.
     build_state: std::sync::RwLock<engine_version::BuildState>,
+    /// Whether newer builds of the checkout count as new versions, or this
+    /// engine stays pinned to its own (the e2e engine). Fixed at construction.
+    version_tracking: engine_version::VersionTracking,
     /// Memoized "is a newer engine binary on disk?" verdict, keyed by the running
     /// binary's last-seen mtime, so a polling client doesn't fork
     /// `current_exe --build-id` every tick (mirrors the gateway's `UpdateCheck`).

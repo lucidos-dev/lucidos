@@ -64,6 +64,9 @@ export function SendHoldMenu({ anchor, leaving, onAskSideQuestion, onClosed }: {
           type="button"
           class="action-btn"
           data-role="ask-side-question"
+          onTouchStart={activate.onTouchStart}
+          onTouchMove={activate.onTouchMove}
+          onTouchCancel={activate.onTouchCancel}
           onTouchEnd={activate.onTouchEnd}
           onClick={activate.onClick}
         >

@@ -45,6 +45,10 @@ pub fn router() -> Router<GatewayState> {
         // `/gateway/status`, which the picker hits every 2s and which must
         // never wait on an outbound request.
         .route("/gateway/check-updates", post(gateway_check_updates))
+        // The update relay (ADR 0338). The desktop client beats here, and a
+        // session that cannot install asks it to.
+        .route("/desktop-client/heartbeat", post(desktop_client_heartbeat))
+        .route("/update-relay", post(request_update_relay))
         // Is Lucidos slow, and why (ADRs 0274, 0283)? The cached answer only,
         // since every workspace window polls it.
         .route("/slowness", get(slowness_status))
@@ -481,7 +485,57 @@ async fn gateway_status(State(state): State<GatewayState>) -> Json<Value> {
         "update_available": state.gateway_update_available().await,
         "packaged": state.packaged(),
         "release_check": state.release_check().snapshot(),
+        "update_relay": state.update_relay().snapshot(std::time::Instant::now()),
     }))
+}
+
+/// POST /~/api/v1/control/desktop-client/heartbeat: the desktop client says it
+/// is running, and learns of a pending update request.
+///
+/// The machine-local token only. A paired device holds full control-plane
+/// authority, but posing as the client would let it fake an attached client.
+async fn desktop_client_heartbeat(
+    State(state): State<GatewayState>,
+    local: Option<Extension<auth::AuthenticatedLocalProcess>>,
+    Json(beat): Json<crate::update_relay::Heartbeat>,
+) -> Result<Json<Value>, ApiError> {
+    if local.is_none() {
+        return Err(ApiError::forbidden(
+            "only the desktop app on this machine can send a heartbeat",
+        ));
+    }
+    let request = state
+        .update_relay()
+        .heartbeat(beat, std::time::Instant::now());
+    Ok(Json(json!({ "request": request })))
+}
+
+/// POST /~/api/v1/control/update-relay: ask the desktop client to install the
+/// newest published release. 200 with the ticket, or 409 saying why not.
+///
+/// Not 202, though the run is asynchronous: the frontend's control client
+/// reads every 202 as bodyless, and the requester needs the ticket.
+///
+/// Any caller the control plane already admits may ask, a paired phone
+/// included: it can already restart and delete workspaces (ADR 0338).
+async fn request_update_relay(
+    State(state): State<GatewayState>,
+    device: Option<Extension<auth::AuthenticatedDevice>>,
+) -> Result<Json<crate::update_relay::Ticket>, ApiError> {
+    let latest = state.release_check().latest_version();
+    let ticket = state
+        .update_relay()
+        .request(latest.as_deref(), std::time::Instant::now())
+        .map_err(|refusal| ApiError::conflict(refusal.message()))?;
+    let by = device
+        .as_deref()
+        .map_or("a local process", |d| d.label.as_str());
+    crate::log!(
+        "[Gateway] desktop update {} to {} requested by {by}",
+        ticket.id,
+        ticket.version
+    );
+    Ok(Json(ticket))
 }
 
 /// GET /~/api/v1/control/slowness: the sampler's last answer. It never
@@ -1018,6 +1072,9 @@ mod authz_tests {
         ("GET", "/~/api/v1/control/workspace-location?name=dev"),
         // A read that names the apps this user runs.
         ("GET", "/~/api/v1/control/slowness"),
+        // The update relay (ADR 0338). A fake heartbeat would fake a client.
+        ("POST", "/~/api/v1/control/desktop-client/heartbeat"),
+        ("POST", "/~/api/v1/control/update-relay"),
     ];
 
     async fn control_call(
@@ -1205,6 +1262,132 @@ mod authz_tests {
                 ("sec-fetch-site", "same-origin"),
                 ("referer", "https://localhost:5251/dev/app/habit-tracker/"),
             ],
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    // ── The update relay (ADR 0338) ─────────────────────────────────────────
+
+    /// A state holding one paired phone, and the cookie that proves it.
+    fn state_with_phone(dir: &std::path::Path) -> (crate::server::GatewayState, String) {
+        let state = crate::server::GatewayState::for_tests_with_static_dir(Some(dir.to_path_buf()));
+        state
+            .write_paired_devices_for_test(|paired| {
+                paired.devices.push(auth::PairedDevice {
+                    id: "device-1".into(),
+                    label: "My iPhone".into(),
+                    credential_digest: auth::digest("cred-phone"),
+                    paired_at: "2020-01-01T00:00:00Z".into(),
+                    last_seen_at: None,
+                });
+            })
+            .unwrap();
+        let cookie = format!("{}=cred-phone", state.device_cookie_name());
+        (state, cookie)
+    }
+
+    async fn relay_call(
+        state: &crate::server::GatewayState,
+        path: &str,
+        hdrs: &[(&str, &str)],
+        body: Value,
+    ) -> (StatusCode, Value) {
+        use tower::ServiceExt as _;
+        let mut builder = axum::extract::Request::builder()
+            .method("POST")
+            .uri(path)
+            .header(header::CONTENT_TYPE, "application/json");
+        for (k, v) in hdrs {
+            builder = builder.header(*k, *v);
+        }
+        let response = crate::server::gateway_router(state.clone())
+            .oneshot(
+                builder
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    const HEARTBEAT: &str = "/~/api/v1/control/desktop-client/heartbeat";
+    const REQUEST: &str = "/~/api/v1/control/update-relay";
+
+    #[tokio::test]
+    async fn only_the_local_token_can_send_a_heartbeat() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, cookie) = state_with_phone(dir.path());
+        let beat = json!({ "version": "1.0.0" });
+
+        let (status, _) = relay_call(&state, HEARTBEAT, &[("cookie", &cookie)], beat.clone()).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a phone must not pose as the client"
+        );
+        assert_eq!(
+            state.update_relay().snapshot(std::time::Instant::now())["client"],
+            Value::Null
+        );
+
+        let local = [(auth::HEADER_LOCAL_TOKEN, "test-local-token")];
+        let (status, body) = relay_call(&state, HEARTBEAT, &local, beat).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, json!({ "request": null }));
+        assert_eq!(
+            state.update_relay().snapshot(std::time::Instant::now())["client"]["version"],
+            "1.0.0"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_paired_phone_needs_nothing_more_to_ask() {
+        // The phone already holds full control-plane authority, so the request
+        // reaches the relay. With no client attached, the relay says so.
+        let dir = tempfile::tempdir().unwrap();
+        let (state, cookie) = state_with_phone(dir.path());
+        let (status, body) = relay_call(
+            &state,
+            REQUEST,
+            &[
+                ("cookie", &cookie),
+                ("sec-fetch-site", "same-origin"),
+                ("origin", "https://localhost:5251"),
+                ("host", "localhost:5251"),
+            ],
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            body["error"],
+            "the desktop app is not running on this machine"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cross_origin_page_cannot_ask_for_an_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, cookie) = state_with_phone(dir.path());
+        let (status, _) = relay_call(
+            &state,
+            REQUEST,
+            &[
+                ("cookie", &cookie),
+                ("sec-fetch-site", "cross-site"),
+                ("origin", "https://evil.example"),
+                ("host", "localhost:5251"),
+            ],
+            Value::Null,
         )
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);

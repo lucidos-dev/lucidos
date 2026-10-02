@@ -18,7 +18,8 @@ mod session;
 mod todo;
 
 pub use actor::{
-    ActorMode, AgentParticipant, EngineReason, MessageOrigin, PluginSetupOccasion, ThreadDirection,
+    ActorMode, AgentParticipant, EngineReason, EventWaitOutcome, MessageOrigin,
+    PluginSetupOccasion, ThreadDirection,
 };
 pub use cause::{AbortCause, CancelCause, EventWaitCancelCause};
 pub use channel::{EventChannel, TriggerInvocation};

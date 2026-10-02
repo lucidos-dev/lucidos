@@ -473,6 +473,50 @@ pub struct DiskDirectionCache {
     is_strict_ancestor: Option<bool>,
 }
 
+/// The variable that pins an engine to the build it runs. Only
+/// `scripts/lib/e2e.sh` sets it, so a commit landing in the checkout mid-run
+/// cannot rebuild the e2e engine or raise a version toast over its specs.
+pub const PIN_ENGINE_VERSION_ENV: &str = "LUCIDOS_PIN_ENGINE_VERSION";
+
+/// Does this dev engine look past its own build for a newer version?
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VersionTracking {
+    /// A newer HEAD or on-disk binary is a new version, and self-heal rebuilds
+    /// toward it. Every engine but the e2e one.
+    FollowCheckout,
+    /// The build this engine runs is the newest it will ever report. Nothing
+    /// newer surfaces, and self-heal never rebuilds.
+    PinnedToBuild,
+}
+
+impl VersionTracking {
+    /// Read [`PIN_ENGINE_VERSION_ENV`]. Once, at construction: a run is pinned
+    /// for its whole life or not at all.
+    pub fn from_env() -> Self {
+        Self::from_flag(std::env::var_os(PIN_ENGINE_VERSION_ENV).as_deref())
+    }
+
+    /// Only `1` pins, the convention `LUCIDOS_PACKAGED` uses. Anything else
+    /// follows the checkout, so a stray value can never freeze a dev engine.
+    fn from_flag(flag: Option<&std::ffi::OsStr>) -> Self {
+        if flag.is_some_and(|v| v == "1") {
+            VersionTracking::PinnedToBuild
+        } else {
+            VersionTracking::FollowCheckout
+        }
+    }
+}
+
+/// May an engine report a version newer than the one it runs?
+///
+/// The one gate three probes share: [`LucidosEngine::source_behind_head`]
+/// (which also drives self-heal), the on-disk binary check, and the
+/// served-frontend peer sync. Packaged engines learn of new versions from the
+/// release updater instead, so they answer no too.
+fn newer_version_visible(tracking: VersionTracking, packaged: bool) -> bool {
+    tracking == VersionTracking::FollowCheckout && !packaged
+}
+
 /// Per-HEAD self-heal attempt bookkeeping (see
 /// [`LucidosEngine::self_heal_engine_version_if_needed`]). `head` is the HEAD
 /// the attempts were counted for; when HEAD moves the counter resets.
@@ -806,6 +850,11 @@ impl LucidosEngine {
         actuated
     }
 
+    /// [`newer_version_visible`] for this engine.
+    pub(crate) fn newer_version_visible(&self) -> bool {
+        newer_version_visible(self.version_tracking, crate::runtime::is_packaged())
+    }
+
     /// Current background-rebuild state.
     pub fn build_state(&self) -> BuildState {
         self.build_state.read().unwrap().clone()
@@ -881,6 +930,9 @@ impl LucidosEngine {
     /// read. `version_status` then reports the id and the verdict from ONE
     /// read, so they cannot straddle an mtime change and disagree.
     async fn disk_id_is_upgrade(&self, disk: Option<&str>) -> bool {
+        if !self.newer_version_visible() {
+            return false;
+        }
         let Some(disk) = disk else {
             return false; // packaged or unreadable: nothing to switch onto
         };
@@ -950,8 +1002,11 @@ impl LucidosEngine {
     /// engine running a commit that HEAD is an ancestor of is not behind
     /// anything. Claiming otherwise pins a permanent pending-version toast and a
     /// self-heal build storm on a workspace that is already current.
+    ///
+    /// Always false for a pinned engine, which is what keeps self-heal from
+    /// rebuilding it: see [`VersionTracking::PinnedToBuild`].
     pub async fn source_behind_head(&self) -> bool {
-        if crate::runtime::is_packaged() {
+        if !self.newer_version_visible() {
             return false;
         }
         {
@@ -2120,12 +2175,12 @@ mod tests {
         acquire_engine_build_lock_waiting, build_id_commit, classify_build_failure,
         classify_commit_subject, classify_pending_commits, commit_is_strict_ancestor,
         compatible_served_commit, disk_upgrade_verdict, engine_build_command,
-        engine_build_lock_path, group_commit_subjects, lock_held_at, no_restart_between,
-        open_teardown, pending_commits_since, queued_behind, rebuild_is_wedged,
+        engine_build_lock_path, group_commit_subjects, lock_held_at, newer_version_visible,
+        no_restart_between, open_teardown, pending_commits_since, queued_behind, rebuild_is_wedged,
         run_capturing_output, self_heal_is_wedged, source_state_word, stash_first_restart_actor,
         try_lock_file, unrecognized_build_failure, wants_pending_commits, BuildFailure,
         BuildOutput, BuildProcessGroupGuard, BuildState, CommitGroupKind, QueuedBuild,
-        BUILD_FAILURE_SUMMARY_CAP, BUILD_OUTPUT_HEAD_CAP, BUILD_OUTPUT_TAIL_CAP,
+        VersionTracking, BUILD_FAILURE_SUMMARY_CAP, BUILD_OUTPUT_HEAD_CAP, BUILD_OUTPUT_TAIL_CAP,
         COMMIT_GROUP_ORDER, PENDING_COMMIT_DESCRIPTION_CAP, UNLABELLED_HOLDER,
     };
     use crate::engine::thread_events::MessageOrigin;
@@ -3028,6 +3083,73 @@ ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 51
         assert_eq!(no_restart_between("0123456789ab", "HEAD", &dir).await, None);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn only_the_value_one_pins_the_engine_version() {
+        use std::ffi::OsStr;
+        assert_eq!(
+            VersionTracking::from_flag(Some(OsStr::new("1"))),
+            VersionTracking::PinnedToBuild
+        );
+        for unpinned in [None, Some(""), Some("0"), Some("true"), Some("yes")] {
+            assert_eq!(
+                VersionTracking::from_flag(unpinned.map(OsStr::new)),
+                VersionTracking::FollowCheckout,
+                "{unpinned:?} must leave a dev engine following its checkout"
+            );
+        }
+    }
+
+    /// The e2e engine's regression: a commit landing mid-run made it rebuild
+    /// itself and raise a version toast over unrelated specs.
+    #[test]
+    fn a_pinned_engine_never_sees_a_newer_version() {
+        assert!(!newer_version_visible(
+            VersionTracking::PinnedToBuild,
+            false
+        ));
+        assert!(newer_version_visible(
+            VersionTracking::FollowCheckout,
+            false
+        ));
+        assert!(!newer_version_visible(
+            VersionTracking::FollowCheckout,
+            true
+        ));
+        assert!(!newer_version_visible(VersionTracking::PinnedToBuild, true));
+    }
+
+    /// The gate only pins anything if every probe asks it first. Self-heal and
+    /// the pending toast read `source_behind_head`, the Switch reads the disk
+    /// probe, and the peer sync raises the Refresh toast. A probe that skips
+    /// the gate re-opens a mid-run rebuild or toast.
+    #[test]
+    fn every_newer_version_probe_asks_the_gate_first() {
+        // Split so this test's own source is not a match.
+        let gate = concat!("if !self.newer_version", "_visible() {");
+        for (src, probe) in [
+            (
+                include_str!("engine_version.rs"),
+                "pub async fn source_behind_head(&self) -> bool {",
+            ),
+            (
+                include_str!("engine_version.rs"),
+                "async fn disk_id_is_upgrade(&self, disk: Option<&str>) -> bool {",
+            ),
+            (
+                include_str!("frontend_refresh.rs"),
+                "async fn sync_served_frontend_if_safe(self: &Arc<Self>) {",
+            ),
+        ] {
+            let start = src.find(probe).expect("probe exists") + probe.len();
+            let first_line = src[start..]
+                .lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty())
+                .expect("probe has a body");
+            assert_eq!(first_line, gate, "{probe} must ask the pin gate first");
+        }
     }
 
     /// A DIFFERENT on-disk binary is an update only when it is not provably

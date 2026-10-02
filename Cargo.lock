@@ -4289,6 +4289,7 @@ dependencies = [
  "futures",
  "image",
  "lucidos-engine",
+ "lucidos-local-token",
  "reqwest 0.12.28",
  "serde_json",
  "sha2",

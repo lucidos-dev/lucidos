@@ -203,12 +203,13 @@ interface RepoFileContentProps {
   revision?: number;
 }
 
-/** Dispatches a repo file to the right preview. Binary-media files (images,
- *  video, audio, pdf) are pointed at the file URL via a media element — the
- *  engine serves them with a content-type from the extension. Everything else
- *  (source, markdown, csv, svg, and any extensionless/unknown-but-textual file)
- *  goes through the text path, which fetches the body as a string. Fetching a
- *  PNG as text was the bug: it rendered the raw bytes line-numbered.
+/** Dispatches a repo file to the right preview. Media files (images including
+ *  a rendered SVG, video, audio, pdf) are pointed at the file URL via a media
+ *  element. The engine serves them with a content-type from the extension.
+ *  Everything else (source, markdown, csv, and any extensionless or unknown
+ *  textual file) goes through the text path, which fetches the body as a
+ *  string. Fetching a PNG as text was the bug: it rendered the raw bytes
+ *  line-numbered.
  *
  *  Exported because the file preview modal renders the same content over an app
  *  without navigating to the Files panel (see `FilePreviewModal`). It is the
@@ -245,7 +246,7 @@ function RepoImage({ src, path }: { src: string; path: string }) {
   return <PreviewImage src={src} alt={path} onError={() => setFailed(true)} />;
 }
 
-function RepoFileText({ repoId, path, changeId, gitRef, revision, body }: RepoFileContentProps & { body: 'markdown' | 'csv' | 'svg' | 'source' }) {
+function RepoFileText({ repoId, path, changeId, gitRef, revision, body }: RepoFileContentProps & { body: 'markdown' | 'csv' | 'source' }) {
   // With a Lucidos/app change row, fetch the end state via /changes/:id/file —
   // the correct ref for both pending (branch) and applied (post_merge_sha). Without
   // one (external-repo CC), fall back to the branch ref. Mirrors RenderedDiff.
@@ -272,19 +273,10 @@ function RepoFileText({ repoId, path, changeId, gitRef, revision, body }: RepoFi
   const content = loadable.status === 'loaded' ? loadable.data : null;
   const isCode = CODE_EXTS.includes(ext);
 
-  // What this string IS depends on `body`, which is why it cannot be named for
-  // HTML: csv renders to markup, and svg renders to an object URL an `<img src>`
-  // loads. Only the branch that produced it may say which.
-  const renderedBody = useMemo(() => {
-    if (!content) return null;
-    if (body === 'csv') return renderCsvTable(content);
-    if (body === 'svg') return URL.createObjectURL(new Blob([content], { type: 'image/svg+xml' }));
-    return null;
-  }, [content, body]);
-
-  useEffect(() => {
-    if (renderedBody && body === 'svg') return () => URL.revokeObjectURL(renderedBody);
-  }, [renderedBody, body]);
+  const csvHtml = useMemo(
+    () => (content && body === 'csv' ? renderCsvTable(content) : null),
+    [content, body],
+  );
 
   const rows = useMemo(
     () => fileRows(content ? (isCode ? highlightFileLines(content, ext) : content.split('\n').map(escapeHtml)) : []),
@@ -314,10 +306,7 @@ function RepoFileText({ repoId, path, changeId, gitRef, revision, body }: RepoFi
     // `.repo-file-rendered` insets the content to match the rendered diff
     // (.rendered-diff), so toggling between them keeps the same gutter.
     if (body === 'markdown') return <div class="repo-file-rendered"><MarkdownDocument content={content!} /></div>;
-    if (body === 'csv') return <div class="repo-file-rendered" dangerouslySetInnerHTML={{ __html: renderedBody! }} />;
-    // The media variant keeps a definite height so the image's max-height:100%
-    // still fits the pane (the bare padding wrapper would leave it unconstrained).
-    if (body === 'svg') return <div class="repo-file-rendered repo-file-rendered-media"><PreviewImage src={renderedBody!} alt={path} /></div>;
+    if (body === 'csv') return <div class="repo-file-rendered" dangerouslySetInnerHTML={{ __html: csvHtml! }} />;
 
     return (
       <div class="repo-file-content">

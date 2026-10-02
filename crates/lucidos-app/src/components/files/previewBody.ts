@@ -29,7 +29,7 @@ export type DataPreviewBody =
 /** Which body the repository-file preview renders (`RepoFileContent`). */
 export type RepoPreviewBody =
   | 'image' | 'pdf' | 'video' | 'audio'
-  | 'markdown' | 'csv' | 'svg' | 'source';
+  | 'markdown' | 'csv' | 'source';
 
 /** The body a workspace data file previews as.
  *
@@ -76,7 +76,11 @@ export function dataPreviewBody(
  *
  *  `slides` is in `REPO_RENDERABLE_EXTS` but has no repo renderer, so it falls
  *  through to source. That is the existing behaviour, kept rather than fixed
- *  here: changing it is a preview feature, not a wrapping fix. */
+ *  here: changing it is a preview feature, not a wrapping fix.
+ *
+ *  A rendered SVG is an image pointed at the engine URL, never a blob of the
+ *  fetched text. A blob URL shares the shell's origin, so opening the image in
+ *  a new tab would run its script as the shell. The engine URL is sandboxed. */
 export function repoPreviewBody(
   path: string,
   opts: { sourceToggle: boolean },
@@ -89,7 +93,7 @@ export function repoPreviewBody(
   if (rendered) {
     if (ext === 'md') return 'markdown';
     if (ext === 'csv') return 'csv';
-    if (ext === 'svg') return 'svg';
+    if (ext === 'svg') return 'image';
   }
   return 'source';
 }

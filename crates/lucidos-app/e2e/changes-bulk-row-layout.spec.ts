@@ -1,13 +1,15 @@
 /**
- * The Changes panel bulk row is one line of buttons at every pane width.
+ * Each Changes panel section's bulk row is one line of buttons at every pane
+ * width.
  *
- * Discard All at the left edge, "Apply all on settle", then Apply All at the
- * right edge. The unit test (`components/changes/__tests__/bulk-row-layout`)
- * pins the markup and the CSS. Only a real layout shows the two ends, the
- * no-wrap, and the right edge meeting the change rows below.
+ * Ready: Discard All at the left edge, Apply All at the right edge. Not
+ * finished: "Apply all on settle" alone at the right edge. The unit test
+ * (`components/changes/__tests__/bulk-row-layout`) pins the markup and the
+ * CSS. Only a real layout shows the two ends, the no-wrap, and the right edge
+ * meeting the change rows below.
  *
- * The one `/changes` read is mocked, so every member of the row draws: one
- * change ready now, one whose thread is still settling.
+ * The one `/changes` read is mocked, so every bulk button draws: two changes
+ * ready now, one whose thread is still settling.
  */
 import { test, expect, type Locator, type Page } from './fixtures';
 import { assertHealthy, gotoWithRetry } from './helpers';
@@ -38,9 +40,13 @@ function change(id: string, over: Record<string, unknown> = {}) {
 }
 
 const CHANGES_STATE = {
-  pending: [change('ready'), change('settling', { thread_unsettled: true, thread_settling: true })],
+  pending: [
+    change('ready'),
+    change('ready-2'),
+    change('settling', { thread_unsettled: true, thread_settling: true }),
+  ],
   applied: [],
-  total_pending: 2,
+  total_pending: 3,
   restart_required: false,
   restart_groups: [],
   client_update_available: false,
@@ -48,14 +54,13 @@ const CHANGES_STATE = {
   apply_all_in_progress: false,
   apply_all_batch: null,
   standing_apply_thread_ids: [] as string[],
-  settling_thread_count: 1,
 };
 
-/** The same three buttons with the sweep armed, so the toggle wears its
+/** The same rows with the settling change armed, so the toggle wears its
  *  longer cancel face. */
 const ARMED_STATE = { ...CHANGES_STATE, standing_apply_thread_ids: ['thread-settling'] };
 
-async function openChanges(page: Page, state: typeof CHANGES_STATE): Promise<Locator> {
+async function openChanges(page: Page, state: typeof CHANGES_STATE): Promise<Locator[]> {
   await page.route('**/api/v1/changes*', (route) =>
     route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(state) }));
   await page.addInitScript(() => {
@@ -63,12 +68,12 @@ async function openChanges(page: Page, state: typeof CHANGES_STATE): Promise<Loc
     localStorage.setItem('lucidos-mobile-view', 'content');
   });
   await gotoWithRetry(page, '/');
-  const row = page.locator('.changes-bulk-actions:visible');
-  await expect(row).toBeVisible({ timeout: 15_000 });
+  const rows = page.locator('.changes-bulk-actions:visible');
+  await expect(rows).toHaveCount(2, { timeout: 15_000 });
   // The boot splash is an opaque overlay that clears once layout settles. A
   // box measured or shot under it can still move, or shows only the splash.
   await expect(page.locator('.boot-splash')).toHaveCount(0, { timeout: 30_000 });
-  return row;
+  return rows.all();
 }
 
 async function box(locator: Locator) {
@@ -77,23 +82,21 @@ async function box(locator: Locator) {
   return { left: b.x, right: b.x + b.width, top: b.y, bottom: b.y + b.height, width: b.width };
 }
 
-/** The button line's claims: Discard All and Apply All on the two ends, and
- *  every button on one line inside the gutter. */
-async function expectButtonLine(row: Locator) {
+/** A button line's claims: every button on one line inside the gutter, none
+ *  clipped, and the last one on the right edge. Returns that right edge. */
+async function expectButtonLine(row: Locator): Promise<number> {
   const rowBox = await box(row);
   const pad = await row.evaluate((el) => {
     const s = getComputedStyle(el);
     return { left: parseFloat(s.paddingLeft), right: parseFloat(s.paddingRight) };
   });
-  const discard = await box(row.getByRole('button', { name: 'Discard All', exact: true }));
-  const apply = await box(row.getByRole('button', { name: 'Apply All', exact: true }));
-  expect(discard.left).toBeCloseTo(rowBox.left + pad.left, 0);
-  expect(apply.right).toBeCloseTo(rowBox.right - pad.right, 0);
-  // One line, centred, and no label clipped by a squeezed button.
-  const discardMiddle = (discard.top + discard.bottom) / 2;
-  for (const button of await row.locator('.changes-bulk-buttons > button').all()) {
+  const buttons = await row.locator('.changes-bulk-buttons > button').all();
+  const last = await box(buttons[buttons.length - 1]);
+  expect(last.right).toBeCloseTo(rowBox.right - pad.right, 0);
+  const middle = (last.top + last.bottom) / 2;
+  for (const button of buttons) {
     const b = await box(button);
-    expect((b.top + b.bottom) / 2).toBeCloseTo(discardMiddle, 0);
+    expect((b.top + b.bottom) / 2).toBeCloseTo(middle, 0);
     // The text's own box against the content box: scrollWidth would count the
     // mobile touch target, which extends past the button on purpose.
     const clipped = await button.evaluate((el) => {
@@ -105,17 +108,26 @@ async function expectButtonLine(row: Locator) {
     });
     expect(clipped, `"${await button.textContent()}" is clipped`).toBe(false);
   }
-  return { rowBox, pad, apply };
+  return last.right;
 }
 
 /** Every geometry claim the layout makes, measured at the current width. */
-async function expectLayout(page: Page, row: Locator): Promise<void> {
-  await expect(row.locator('.changes-bulk-buttons > button')).toHaveCount(3);
-  const { apply } = await expectButtonLine(row);
+async function expectLayout(page: Page, [ready, notFinished]: Locator[]): Promise<void> {
+  await expect(ready.locator('.changes-bulk-buttons > button')).toHaveText(['Discard All', 'Apply All']);
+  await expect(notFinished.locator('.changes-bulk-buttons > button')).toHaveCount(1);
+  const readyRight = await expectButtonLine(ready);
+  const notFinishedRight = await expectButtonLine(notFinished);
 
-  // The right edge meets the change rows' own action buttons below.
+  // Discard All holds the left edge of Ready's line.
+  const readyBox = await box(ready);
+  const padLeft = await ready.evaluate((el) => parseFloat(getComputedStyle(el).paddingLeft));
+  const discard = await box(ready.getByRole('button', { name: 'Discard All', exact: true }));
+  expect(discard.left).toBeCloseTo(readyBox.left + padLeft, 0);
+
+  // Both right edges meet the change rows' own action buttons below.
   const rowAction = await box(page.locator('.list-row:visible .list-row-actions').first());
-  expect(apply.right).toBeCloseTo(rowAction.right, 0);
+  expect(readyRight).toBeCloseTo(rowAction.right, 0);
+  expect(notFinishedRight).toBeCloseTo(rowAction.right, 0);
 }
 
 const WIDTHS = [
@@ -135,19 +147,19 @@ test.describe('Changes panel bulk row', () => {
   });
 
   for (const w of WIDTHS) {
-    test(`three buttons fit a ${w.name} pane`, async ({ page, isMobile }, testInfo) => {
+    test(`both sections' bulk rows fit a ${w.name} pane`, async ({ page, isMobile }, testInfo) => {
       test.skip(isMobile !== w.mobile, `${w.name} belongs to the ${w.mobile ? 'mobile' : 'desktop'} layout`);
       await page.setViewportSize(w.viewport);
-      const row = await openChanges(page, CHANGES_STATE);
-      await expectLayout(page, row);
+      const rows = await openChanges(page, CHANGES_STATE);
+      await expectLayout(page, rows);
       await screenshot(page, testInfo.outputPath(`changes-bulk-row-${w.name}.png`));
     });
 
-    test(`the armed three-button line fits a ${w.name} pane`, async ({ page, isMobile }, testInfo) => {
+    test(`the armed toggle fits a ${w.name} pane`, async ({ page, isMobile }, testInfo) => {
       test.skip(isMobile !== w.mobile, `${w.name} belongs to the ${w.mobile ? 'mobile' : 'desktop'} layout`);
       await page.setViewportSize(w.viewport);
-      const row = await openChanges(page, ARMED_STATE);
-      await expectLayout(page, row);
+      const rows = await openChanges(page, ARMED_STATE);
+      await expectLayout(page, rows);
       await screenshot(page, testInfo.outputPath(`changes-bulk-row-armed-${w.name}.png`));
     });
   }

@@ -17,6 +17,7 @@ import {
   awaitedSubject,
   formatRemaining,
   groupSubscriptions,
+  plainEventMeaning,
   secondsRemaining,
   waitSubscriptionLabel,
 } from '../../store/thread-events';
@@ -486,7 +487,7 @@ export function subscriptionLine(on: EventSubscription[]): ComponentChildren[] {
           {label}
         </button>
       ) : (
-        <span key={`sub${i}`} data-tooltip={g.event_type}>{label}</span>
+        <span key={`sub${i}`} data-tooltip={plainEventMeaning(g.event_type)}>{label}</span>
       ),
     ];
   });

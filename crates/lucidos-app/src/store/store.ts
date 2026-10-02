@@ -39,17 +39,18 @@ import type { AppUpdateRunning } from '../utils/tauri';
 import { cancelAppUpdate } from '../utils/tauri';
 import { documentTitle } from '../utils/windowTitle';
 import { errorDetail } from '../utils/errorDetail';
+import { holdSoftwareKeyboard } from '../utils/softwareKeyboard';
 import { restartDialogState, appUpdateDialogState } from './progressDialogCopy';
 import { clampToastText } from '../components/shared/toastMessage';
 import type { SubscriptionGroup, ThreadState, ThreadStatus, Exchange } from './thread-events';
-import { computeExchanges, isExcludedFromSections } from './thread-events';
+import { computeExchanges, isExcludedFromSections, plainEventName } from './thread-events';
 import { getThreadEventsBump } from './threadActivity';
 import { DEFAULT_CHAT_MODEL } from './models';
 import { displaySection, EVENT_CHANNELS } from '../generated/thread-lifecycle';
 import type { EventChannel, ArchiveState, DisplaySection } from '../generated/thread-lifecycle';
 import { resetContentScroll } from '../hooks/useScrollMemory';
 import type { Change, ChangelogRelease, CodingAgentModelValue, CodingAgentReasoningEffort, PendingCommits, ReleaseNoticeView } from '../api/client';
-import type { ReleaseCheck } from '../api/client/control';
+import type { UpdateRelay, ReleaseCheck } from '../api/client/control';
 import type { ApplyEstimates } from '../api/client/changes';
 import type { EnvironmentVariable, ModelInfo, ResponseStyle } from '../api/types';
 import { markSwUpdateDismissed, markEngineVersionDismissed } from '../hooks/sw-update';
@@ -507,6 +508,25 @@ export const latestTauriAppNotes = signal<string | null>(null);
  *  The check itself is machine-global and lives in the gateway, so this is one
  *  answer shared by every open window rather than a per-window poll. */
 export const releaseCheck = signal<ReleaseCheck | null>(null);
+/** The update relay's state on the gateway (ADR 0338), or `null` when unread.
+ *  Only a session that cannot install reads it, so a Tauri client leaves it
+ *  null. An older gateway omits the field, which reads the same: no relay. */
+export const updateRelay = signal<UpdateRelay | null>(null);
+/** A relayed update this session asked for and is watching. */
+export interface RelayedUpdate {
+  /** The relay's ticket id, which the gateway's progress frames carry. */
+  id: string;
+  /** The release the gateway named when it accepted the request. */
+  version: string;
+  /** The version running when the request went out. A different one after the
+   *  service restart is what proves the update landed. */
+  fromVersion: string;
+  /** When the request went out, as epoch ms. Bounds the wait. */
+  since: number;
+}
+/** The relayed update in flight from this session, or `null`. Mirrored to
+ *  localStorage, because the service restart can reload this page mid-run. */
+export const relayedUpdate = signal<RelayedUpdate | null>(null);
 /** Why the last packaged app-update check failed, or `null` when it succeeded
  *  or has not run. Rendered in System > Overview so a failing check is
  *  DIAGNOSABLE instead of silent. Swallowed, it makes a stranded install
@@ -1504,21 +1524,9 @@ export const applyEstimates = signal<ApplyEstimates>(NO_APPLY_ESTIMATES);
  *  armed state, and kept live by the StandingApplyArmed, StandingApplyFired and
  *  StandingApplyDropped SSE events. */
 export const standingApplyThreadIds = signal<Set<string>>(new Set());
-/** Coding-agent threads still settling, so an Apply All sweep has something
- *  to arm. Served by `GET /api/v1/changes`, because the panel cannot derive it:
- *  `threadMap` holds only the loaded window. */
-export const settlingThreadCount = signal(0);
 /** Threads whose arm or disarm request is in flight, so a second tap can't fire
  *  a duplicate. */
 export const armingStandingApplyThreadIds = signal<Set<string>>(new Set());
-/** An "Apply all on settle" sweep request is in flight. The Changes panel draws the
- *  armed face from the press, since the client cannot name the threads it arms. */
-export const armingStandingApplySweep = signal(false);
-/** The workspace-scope disarm is in flight, so a second tap can't fire a
- *  duplicate. The handler reads it to drop that tap, and the Changes panel to
- *  hold its faces unarmed. It never draws a control disabled: ADR 0168 keeps
- *  the explaining tooltip reachable. */
-export const disarmingAllStandingApply = signal(false);
 /** Thread IDs where archive is in progress (prevents duplicate API calls). */
 export const archivingThreadIds = signal<Set<string>>(new Set());
 /** Thread IDs whose change discard is in progress: hides Apply, shows "Discard...". */
@@ -1591,6 +1599,15 @@ export function findChangeById(id: string): Change | undefined {
   const lazy = lazyChanges.value.get(id);
   return lazy?.status === 'loaded' ? lazy.data : undefined;
 }
+/** Pending changes the reader can act on now, because their thread has settled.
+ *  A change still waiting on its thread is the standing apply's business, so it
+ *  raises no badge. `null` until the list loads: a cold load or an outage must
+ *  not draw a `0`. */
+export const actionableChangeCount = computed<number | null>(() => {
+  const loadable = changes.value;
+  if (loadable.status !== 'loaded') return null;
+  return loadable.data.filter((c) => !c.thread_unsettled).length;
+});
 /** Every change id currently being applied: the single source of truth,
  *  combining `applyingChangeIds` and `applyingNowThreadIds`. */
 export const busyChangeIds = computed(() => {
@@ -1900,7 +1917,7 @@ function collapsedSectionsStore<Id extends string>(key: string) {
   return { ids, toggle };
 }
 
-export type ChangesSectionId = 'set-aside' | 'applied';
+export type ChangesSectionId = 'ready' | 'not-finished' | 'set-aside' | 'applied';
 export const {
   ids: collapsedChangesSectionIds,
   toggle: toggleChangesSectionCollapsed,
@@ -2074,7 +2091,13 @@ async function requestAppUpdateCancel(): Promise<void> {
 export const activeProgressDialog = computed<ProgressDialogState>(() => {
   if (engineRestarting.value) return restartDialogState(engineRestartNewVersion.value);
   const frame = appUpdateProgress.value;
-  if (frame) return appUpdateDialogState(frame, () => { void requestAppUpdateCancel(); });
+  // A relayed run has no cancel here: only the Mac's own window can stop it.
+  if (frame) {
+    return appUpdateDialogState(
+      frame,
+      relayedUpdate.value ? null : () => { void requestAppUpdateCancel(); },
+    );
+  }
   return progressDialog.value;
 });
 
@@ -2318,7 +2341,8 @@ export function showConfirm(
 
 /** Show a text-input modal. Resolves the entered string on OK, or `null` on
  *  Cancel, Escape or a backdrop click. Like {@link showConfirm}, a second call
- *  replaces a visible prompt and never queues, and the prior resolves `null`. */
+ *  replaces a visible prompt and never queues, and the prior resolves `null`.
+ *  Call it synchronously from a tap, so the keyboard opens with the dialog. */
 export function showPrompt(
   message: string,
   options?: {
@@ -2332,6 +2356,7 @@ export function showPrompt(
 ): Promise<string | null> {
   const prior = promptState.peek();
   if (prior.visible) prior.resolve?.(null);
+  holdSoftwareKeyboard();
 
   return new Promise((resolve) => {
     promptState.value = {
@@ -2387,13 +2412,13 @@ export const eventConditionModal = signal<EventConditionModalState | null>(null)
  *
  *  **Both PRESSABLE surfaces go through here**: the transcript row's chip and
  *  the waiting panel's line. (The archive confirmation prints the same
- *  "(matching only)" label into a plain string and offers no door.) They must
+ *  "(with a condition)" label into a plain string and offers no door.) They must
  *  open the same thing under the same accessible name, and each must be
  *  pressable exactly when its label carries a condition note. Two copies of
  *  that rule is how the two drift apart.
  *
- *  The label leads with the raw event type: it is the tooltip over a chip that
- *  shows the plain name, and the one place the exact type is still on screen.
+ *  The label is the tooltip and accessible name of the chip that opens it. The
+ *  exact type and the condition itself are inside, for a reader who drills in.
  *
  *  The panel is a backdrop-less popover and the modal is a top-anchored sheet.
  *  So opening one from the other STACKS on `overlayStack` rather than replacing
@@ -2407,10 +2432,11 @@ export function eventConditionDoor(
   const { event_type: eventType, conditions } = g;
   if (conditions.length === 0) return null;
   const condition = { eventType, conditions };
+  const plainName = plainEventName(eventType);
   return {
     label: conditions.length === 1
-      ? `${eventType} · show the condition`
-      : `${eventType} · show the ${conditions.length} conditions`,
+      ? `${plainName} · show the condition`
+      : `${plainName} · show the ${conditions.length} conditions`,
     // A popover drills in on `condition` instead, since it never opens a second
     // layer. `open` is the modal, for the transcript chip.
     condition,
@@ -2437,6 +2463,16 @@ export const backupProgress = signal<{ phase: string; progress: number; total: n
  *  BackupFailed). BackupSection re-fetches `/backup/status` when this changes
  *  so the health card reflects the new last-run outcome. */
 export const backupStatusVersion = signal(0);
+
+/** How far Disk Usage's recommended cleanup has got. `null` = no pass running;
+ *  `total` 0 = running, count not known yet. Mirrors `backupProgress`: set by
+ *  the Free tap, `RecommendedCleanupStarted` and `RecommendedCleanupProgress`,
+ *  cleared by the terminal event, and re-read from `/disk-usage/summary`. */
+export const recommendedCleanupProgress = signal<{ done: number; total: number } | null>(null);
+
+/** Bumped when a recommended cleanup ends, and on an SSE reconnect. The Disk
+ *  Usage page re-reads its figures on it. */
+export const diskUsageVersion = signal(0);
 
 /** Bumped when a `PreferencesChanged` carries one of the three keys the Backup
  *  page renders: `backup_provider`, `backup_schedule`, `backup_retention`.

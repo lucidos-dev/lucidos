@@ -5,6 +5,7 @@ use crate::engine::event_bus::{BusEvent, SystemEvent};
 use crate::memory::MemorySource;
 use chrono::Utc;
 use std::path::Path;
+use std::time::Duration;
 use uuid::Uuid;
 
 /// Standard refusal text when `git_clone` is called without a destination, or
@@ -22,6 +23,9 @@ const GIT_CLONE_DESTINATION_REQUIRED: &str =
      under data/artifacts/. For bulk reference corpora the user wants to keep \
      but not in the workspace, use `lucidos data-store add <name> <source-dir>` \
      to move into ~/.lucidos/data/<name>/.";
+
+/// How long one `git_clone` call may spend fetching before it gives up.
+const GIT_CLONE_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Where a `git_clone` invocation should land. Decided by parsing the
 /// LLM-provided `destination` parameter. Variants carry the resolved
@@ -424,8 +428,8 @@ impl LucidosEngine {
                     })
                     .unwrap_or_default();
 
-                // Both routes below clone the same URL, and the clone itself is
-                // synchronous, so its credentials are resolved out here.
+                // Both routes below clone the same URL, so this resolves its
+                // credentials once, out here.
                 let credentials =
                     crate::core::git_auth::GitCredentials::resolve_one(&self.pool, url).await;
 
@@ -448,15 +452,15 @@ impl LucidosEngine {
                             ));
                         }
                         log!(@git_clone, "Cloning {} to {:?} (.lucidos/tmp/)", url, target);
-                        // The repo drops at the end of this statement: git2
-                        // types are not Send, and there is async work below.
-                        if let Err(e) = crate::core::git_auth::shallow_clone(
+                        if let Err(e) = crate::core::git_auth::shallow_clone_within(
                             url,
                             branch.as_deref(),
                             &target,
                             &credentials,
-                        ) {
-                            let _ = std::fs::remove_dir_all(&target);
+                            GIT_CLONE_TIMEOUT,
+                        )
+                        .await
+                        {
                             // `e` already names the clone and the fix.
                             return Ok(format!("Error: {}", e));
                         }
@@ -469,20 +473,19 @@ impl LucidosEngine {
                     GitCloneRoute::Artifacts(sub) => sub,
                 };
 
-                // Clone to temp directory - wrapped in block so git2 objects are dropped before async ops
                 let temp_dir =
                     std::env::temp_dir().join(format!("lucidos_clone_{}", Uuid::new_v4()));
                 log!(@git_clone, "Cloning {} to {:?}", url, temp_dir);
 
-                // The repo drops at the end of this statement: git2 types are
-                // not Send, and there is async work below.
-                if let Err(e) = crate::core::git_auth::shallow_clone(
+                if let Err(e) = crate::core::git_auth::shallow_clone_within(
                     url,
                     branch.as_deref(),
                     &temp_dir,
                     &credentials,
-                ) {
-                    let _ = std::fs::remove_dir_all(&temp_dir);
+                    GIT_CLONE_TIMEOUT,
+                )
+                .await
+                {
                     // `e` already names the clone and the fix.
                     return Ok(format!("Error: {}", e));
                 }

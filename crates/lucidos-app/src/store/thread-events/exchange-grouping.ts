@@ -572,7 +572,7 @@ function boundaryTakesTheTurn(type: string, previous: Exchange): boolean {
  *  `McpConsentRequested` has no resolution event in the ThreadEvent union, so it
  *  can never be observed as resolved and stays parked. Add the resolution arm
  *  here if one is ever introduced. */
-function dividerStillAwaitsUser(exchange: Exchange): boolean {
+export function dividerStillAwaitsUser(exchange: Exchange): boolean {
   const userEvent = exchange.userEvent;
   switch (userEvent.type) {
     case 'UserQuestionAsked':

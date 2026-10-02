@@ -312,8 +312,8 @@ export function installPairedSwallow(arming?: Event): void {
     done = true;
     document.removeEventListener('touchend', swallow, true);
     document.removeEventListener('click', swallow, true);
-    document.removeEventListener('touchcancel', teardown, true);
-    document.removeEventListener('pointercancel', teardown, true);
+    document.removeEventListener('touchcancel', claimCancel, true);
+    document.removeEventListener('pointercancel', claimCancel, true);
     document.removeEventListener('pointerdown', onNewGesture, true);
     clearTimeout(fuse);
   }
@@ -324,6 +324,13 @@ export function installPairedSwallow(arming?: Event): void {
     notePressOutcome('swallowed');
     e.stopPropagation();
     e.preventDefault();
+    teardown();
+  }
+  /** A cancel ends the gesture, and a constructive face would serve it. Naming
+   *  the swallow stops that, so the dismissing tap still only dismisses. It
+   *  does not stop propagation: the swipe and scroll trackers reset on it. */
+  function claimCancel() {
+    notePressOutcome('swallowed');
     teardown();
   }
   /** The bound on the arm, and the reason it is a gesture rather than a target
@@ -352,8 +359,8 @@ export function installPairedSwallow(arming?: Event): void {
   }
   document.addEventListener('touchend', swallow, { capture: true, passive: false });
   document.addEventListener('click', swallow, true);
-  document.addEventListener('touchcancel', teardown, { capture: true });
-  document.addEventListener('pointercancel', teardown, { capture: true });
+  document.addEventListener('touchcancel', claimCancel, { capture: true });
+  document.addEventListener('pointercancel', claimCancel, { capture: true });
   document.addEventListener('pointerdown', onNewGesture, { capture: true });
   // Backstop for a page nobody touches again, not the bound. A reflexive
   // second tap arrives long inside it, and `onNewGesture` catches that one.

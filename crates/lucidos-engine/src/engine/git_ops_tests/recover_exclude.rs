@@ -87,6 +87,43 @@ async fn recover_no_commits_branch_auto_commits_dirty_worktree() {
     );
 }
 
+/// An auto-commit that fails must fail the recovery. With no declared files
+/// the next arm is `LegitimateNoOp`, which resolves the change as applied
+/// while the work is still sitting uncommitted in the worktree.
+#[cfg(unix)]
+#[tokio::test]
+async fn recover_no_commits_branch_errors_when_the_auto_commit_fails() {
+    let (_tmp, repo) = make_test_repo().await;
+    make_empty_branch(&repo, "claude-code/hooked").await;
+    let wt = repo.join("wt-hooked");
+    let add_result = git_cmd(
+        &[
+            "worktree",
+            "add",
+            wt.to_str().unwrap(),
+            "claude-code/hooked",
+        ],
+        &repo,
+    )
+    .await
+    .unwrap();
+    assert!(add_result.status.success());
+    tokio::fs::write(wt.join("draft.tsx"), "const x = 1;")
+        .await
+        .unwrap();
+    install_failing_pre_commit_hook(&repo).await;
+
+    let err = recover_no_commits_branch(&repo, "claude-code/hooked", &[])
+        .await
+        .expect_err("a failed auto-commit must not resolve as a no-op")
+        .to_string();
+    assert!(err.contains("pre-commit hook blocked commit"), "{err}");
+    assert!(
+        wt.join("draft.tsx").exists(),
+        "the uncommitted work must survive"
+    );
+}
+
 /// Branch with no commits + clean worktree on disk + non-empty `change.files`
 /// is still corrupted (the worktree had nothing to commit) — must error.
 #[tokio::test]
@@ -670,6 +707,58 @@ async fn commit_worktree_or_err_commits_dirty_worktree() {
         String::from_utf8_lossy(&log.stdout).contains("test commit"),
         "commit message must land in git log: {}",
         String::from_utf8_lossy(&log.stdout)
+    );
+}
+
+/// Edits inside a submodule cannot be committed from the superproject, and
+/// that state never changes on its own. Counting them as uncommitted work
+/// refused every Apply on the worktree, the wedge 70c9aaa87e backed out of.
+#[tokio::test]
+async fn commit_worktree_or_err_ignores_a_dirty_submodule() {
+    let (_tmp, repo) = make_test_repo().await;
+    let (_sub_tmp, sub_origin) = make_test_repo().await;
+    let added = git_cmd(
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            &sub_origin.to_string_lossy(),
+            "sub",
+        ],
+        &repo,
+    )
+    .await
+    .unwrap();
+    assert!(
+        added.status.success(),
+        "{}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+    let committed = git_cmd(&["commit", "-qm", "add submodule"], &repo)
+        .await
+        .unwrap();
+    assert!(committed.status.success());
+
+    tokio::fs::write(repo.join("sub/inside.txt"), "edited in the submodule")
+        .await
+        .unwrap();
+    tokio::fs::write(repo.join("top.txt"), "edited in the superproject")
+        .await
+        .unwrap();
+
+    let result = commit_worktree_or_err(&repo, "apply").await;
+    assert_eq!(
+        result,
+        Ok(true),
+        "the superproject edit commits and the submodule is left alone"
+    );
+    let left = git_cmd(&["status", "--porcelain", "--", "top.txt"], &repo)
+        .await
+        .unwrap();
+    assert!(
+        left.stdout.is_empty(),
+        "the superproject edit must be committed"
     );
 }
 

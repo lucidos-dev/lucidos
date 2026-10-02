@@ -25,6 +25,22 @@ pub(super) struct TrackedTask {
     pub(super) handle: JoinHandle<()>,
     pub(super) task_name: String,
     pub(super) cancel_token: CancellationToken,
+    /// The cron expressions and timezone this runner was spawned with. The
+    /// runner never re-reads them, so [`rearm_after_lag`] compares these with
+    /// the registry to find a runner an unseen update left on its old schedule.
+    pub(super) schedule: Vec<String>,
+    pub(super) timezone: String,
+}
+
+/// Track `task` under `task_id`, cancelling any runner it displaces.
+///
+/// Two paths can arm one trigger in the same instant: the health monitor's
+/// restart and an event or lag repair. A displaced runner left uncancelled
+/// would keep firing beside its replacement.
+fn track(tracked: &mut HashMap<uuid::Uuid, TrackedTask>, task_id: uuid::Uuid, task: TrackedTask) {
+    if let Some(displaced) = tracked.insert(task_id, task) {
+        displaced.cancel_token.cancel();
+    }
 }
 
 /// Spawn a task runner that executes on schedule.
@@ -587,13 +603,97 @@ pub(super) async fn register_and_track(
         trigger_configs.clone(),
     );
     let mut tracked = tracked_tasks.write().await;
-    tracked.insert(
+    track(
+        &mut tracked,
         task_uuid,
         TrackedTask {
             handle,
             task_name: config.name.clone(),
             cancel_token,
+            schedule: config.schedule.clone(),
+            timezone: config.timezone.clone(),
         },
+    );
+}
+
+/// What [`rearm_after_lag`] does with one trigger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LagRepair {
+    /// Nothing was missed, or the trigger is not this repair's to arm.
+    Leave,
+    /// A live trigger with no runner: a create or resume went unseen.
+    Arm,
+    /// A runner still on the schedule it was spawned with: an update went unseen.
+    Rearm,
+}
+
+/// Decide the repair for `config`, given the runner tracked for it, if any.
+///
+/// A paused or deleted trigger needs none: its runner reads the registry
+/// before every fire and exits by itself. A finished runner belongs to the
+/// health monitor, and a dead schedule was untracked by it on purpose.
+fn lag_repair(config: &TriggerConfig, tracked: Option<&TrackedTask>) -> LagRepair {
+    if config.paused || config.schedule.is_empty() || config.schedule_error().is_some() {
+        return LagRepair::Leave;
+    }
+    match tracked {
+        None => LagRepair::Arm,
+        Some(task) if task.handle.is_finished() => LagRepair::Leave,
+        Some(task) if task.schedule == config.schedule && task.timezone == config.timezone => {
+            LagRepair::Leave
+        }
+        Some(_) => LagRepair::Rearm,
+    }
+}
+
+/// Re-arm cron runners from the registry after the bus subscriber lagged.
+///
+/// A lagged subscriber skipped events, and the bus contract says it must then
+/// reconcile from state (`EventBus` § Post-commit subscriber contract). An
+/// unseen create left a live trigger with no runner. An unseen update left one
+/// firing on its old schedule. Both fail silently until the engine restarts.
+pub(super) async fn rearm_after_lag(
+    trigger_configs: &Arc<std::sync::RwLock<HashMap<String, TriggerConfig>>>,
+    tracked_tasks: &Arc<RwLock<HashMap<uuid::Uuid, TrackedTask>>>,
+    engine: &SharedEngine,
+    shutdown_flag: &Arc<AtomicBool>,
+) {
+    // Read under the write lock for the reason `handle_trigger_event` gives.
+    let configs: Vec<TriggerConfig> = {
+        let _applied = engine.trigger_write_lock.lock().await;
+        let snapshot: Vec<TriggerConfig> =
+            trigger_configs.read().unwrap().values().cloned().collect();
+        snapshot
+    };
+    let mut repaired = 0usize;
+    for config in &configs {
+        let task_uuid = trigger_id_to_uuid(&config.id);
+        let repair = lag_repair(config, tracked_tasks.read().await.get(&task_uuid));
+        match repair {
+            LagRepair::Leave => continue,
+            LagRepair::Arm => {}
+            LagRepair::Rearm => cancel_tracked_task(tracked_tasks, task_uuid).await,
+        }
+        register_and_track(
+            config,
+            tracked_tasks,
+            engine,
+            shutdown_flag,
+            trigger_configs,
+        )
+        .await;
+        repaired += 1;
+        crate::log!(
+            "[Scheduler] Lag repair: {:?} trigger '{}' ({})",
+            repair,
+            config.name,
+            config.id
+        );
+    }
+    crate::log!(
+        "[Scheduler] Lag repair checked {} trigger(s), re-armed {}",
+        configs.len(),
+        repaired
     );
 }
 
@@ -982,8 +1082,8 @@ pub(super) async fn check_task_health_and_restart(
         let (handle, cancel_token) = spawn_task_runner(
             trigger_id,
             task_name.clone(),
-            schedule,
-            timezone,
+            schedule.clone(),
+            timezone.clone(),
             engine.clone(),
             shutdown_flag.clone(),
             trigger_configs.clone(),
@@ -992,12 +1092,15 @@ pub(super) async fn check_task_health_and_restart(
         // Track the new handle
         {
             let mut tracked_write = tracked.write().await;
-            tracked_write.insert(
+            track(
+                &mut tracked_write,
                 task_id,
                 TrackedTask {
                     handle,
                     task_name: task_name.clone(),
                     cancel_token,
+                    schedule,
+                    timezone,
                 },
             );
         }
@@ -1034,6 +1137,8 @@ mod tests {
                 handle,
                 task_name: task_name.to_string(),
                 cancel_token,
+                schedule: vec![],
+                timezone: String::new(),
             },
         );
         (task_id, observed)
@@ -1145,6 +1250,81 @@ mod tests {
             finished_runner_action(&scheduled_trigger(&[], false)),
             FinishedRunner::Leave
         );
+    }
+
+    // ── What a lagged subscriber repairs ────────────────────────────────────
+
+    /// A runner armed with `schedule`, still sleeping, or already finished.
+    async fn runner_on(schedule: &[&str], finished: bool) -> TrackedTask {
+        let handle = if finished {
+            let handle = tokio::spawn(async {});
+            while !handle.is_finished() {
+                tokio::task::yield_now().await;
+            }
+            handle
+        } else {
+            tokio::spawn(std::future::pending::<()>())
+        };
+        TrackedTask {
+            handle,
+            task_name: "Nightly".to_string(),
+            cancel_token: CancellationToken::new(),
+            schedule: schedule.iter().map(|s| s.to_string()).collect(),
+            timezone: "UTC".to_string(),
+        }
+    }
+
+    /// An unseen create leaves a live trigger with no runner, so it never fires.
+    #[tokio::test]
+    async fn a_live_trigger_with_no_runner_is_armed() {
+        let config = scheduled_trigger(&["0 0 8 * * *"], false);
+        assert_eq!(lag_repair(&config, None), LagRepair::Arm);
+    }
+
+    /// An unseen update leaves the runner firing on the schedule it replaced.
+    #[tokio::test]
+    async fn a_runner_on_a_replaced_schedule_is_rearmed() {
+        let config = scheduled_trigger(&["0 0 9 * * *"], false);
+        let runner = runner_on(&["0 0 8 * * *"], false).await;
+        assert_eq!(lag_repair(&config, Some(&runner)), LagRepair::Rearm);
+        runner.handle.abort();
+    }
+
+    /// A runner already on the current schedule may be mid-run, and re-arming
+    /// it would cancel that run for nothing.
+    #[tokio::test]
+    async fn a_runner_on_the_current_schedule_is_left_running() {
+        let config = scheduled_trigger(&["0 0 8 * * *"], false);
+        let runner = runner_on(&["0 0 8 * * *"], false).await;
+        assert_eq!(lag_repair(&config, Some(&runner)), LagRepair::Leave);
+        runner.handle.abort();
+    }
+
+    /// The repair arms only live schedules, and never a finished runner.
+    #[tokio::test]
+    async fn the_repair_leaves_what_others_own() {
+        let paused = scheduled_trigger(&["0 0 8 * * *"], true);
+        assert_eq!(lag_repair(&paused, None), LagRepair::Leave);
+        let dead = scheduled_trigger(&["0 0 9 31 2 *"], false);
+        assert_eq!(lag_repair(&dead, None), LagRepair::Leave);
+        let finished = runner_on(&["0 0 8 * * *"], true).await;
+        let moved = scheduled_trigger(&["0 0 9 * * *"], false);
+        assert_eq!(lag_repair(&moved, Some(&finished)), LagRepair::Leave);
+    }
+
+    /// Two paths arming one trigger at once must leave one runner, not two.
+    #[tokio::test]
+    async fn tracking_over_a_runner_cancels_it() {
+        let mut tracked = HashMap::new();
+        let id = uuid::Uuid::new_v4();
+        let first = runner_on(&["0 0 8 * * *"], false).await;
+        let first_token = first.cancel_token.clone();
+        track(&mut tracked, id, first);
+        track(&mut tracked, id, runner_on(&["0 0 8 * * *"], false).await);
+        assert!(first_token.is_cancelled(), "the displaced runner must stop");
+        for (_, task) in tracked.drain() {
+            task.handle.abort();
+        }
     }
 
     // ── Missed-slot catch-up decision ───────────────────────────────────────

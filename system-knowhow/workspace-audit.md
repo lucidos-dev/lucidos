@@ -112,6 +112,7 @@ for calling a category clean.
 | `url-mutation` | the frame writing its own session-history URL | 2 |
 | `theme-rename` | names from before *look* became *theme* | 2 |
 | `hand-rolled-ui` | a control the app draws itself that the SDK provides | 2 |
+| `attr-escape` | a text-only escaper writing into an attribute value | 2 |
 | `tap-strings` | the retired `tap` string forms | 1 |
 | `removed-flags` | CLI flags and tool args that were removed | 7 |
 | `removed-fields` | thread-summary fields the engine no longer sends | 7 |
@@ -153,6 +154,8 @@ scan url-mutation "history\.(replaceState|pushState)|location\.(href|assign|repl
 scan theme-rename "data-theme([^-]|\$)|data-look-|look-effects|lucidos-look|/looks?[/?'\"\`]|preferences\.(set|get)\(['\"](look|theme)['\"]" $inc --include=*.css apps
 
 scan hand-rolled-ui "(^|[^.[:alnum:]_])(alert|confirm|prompt)\(|window\.(alert|confirm|prompt)\(|function[[:space:]]+(toast|showToast|snackbar)[[:space:]]*\(|class=[\"'][^\"']*(toast|snackbar)|^[[:space:]]*\.(toast|snackbar)[[:space:]{.,:]|<select[[:space:]>]|[[:space:]]title=[\"']|role=[\"']switch|(toggle|switch)[[:alnum:]_-]*(thumb|knob)|^[[:space:]]*\.[[:alnum:]_-]*(spinner|loader|badge|chip|pill|tabs?)[[:space:]{.,:]|role=[\"']tab[\"']" $inc --include=*.css --exclude-dir=tests apps
+
+scan attr-escape "=[[:space:]]*[\"'](\\\$\{|[\"'][[:space:]]*\+)[^}]*escapeHtml\(" $inc apps
 
 scan tap-strings "\"tap\"[[:space:]]*:[[:space:]]*\"(modal|none|open_app|open_thread)\"|tap:[[:space:]]*'(modal|none|open_app|open_thread)'|kind:[[:space:]]*'none'" $all
 
@@ -293,6 +296,17 @@ Per `system-knowhow/js-sdk.md`:
   **A separate `app.js`, `style.css` or image is NOT a finding.** The engine gives each framed document a short-lived pass to its own files. Do not flag one, and do not recommend inlining. The same holds for the app's own `@font-face` and its own `<script type="module">`: the engine grants both across the frame's opaque origin, the module behind the gateway every install runs ([ADR 0289](https://github.com/lucidos-dev/lucidos/blob/main/docs/adr/0289-app-frames-load-fonts-and-modules-across-origins.md)).
 
   An app opened in its own browser tab is a top-level document and keeps all of this. Never report one as unaffected on that basis: the same app is reachable both ways, and the frame is the usual one.
+
+- **A text-only escaper writing into an attribute value.** The `attr-escape`
+  scan finds `escapeHtml(...)` spliced into a quoted attribute, as in
+  `` `<a title="${lucidos.utils.escapeHtml(x)}">` ``. That helper leaves `"`
+  and `'` raw, so a quote in the value breaks out and runs script with the
+  app's full authority. Severity: **broken**. The remedy is
+  `lucidos.utils.escapeHtmlAttr`. Reference: `system-knowhow/js-sdk.md`
+  § "Escaping: which helper goes where".
+
+  Read the call site first. An app may define its own `escapeHtml` that also
+  escapes both quotes, and that one is correct.
 
 - **Names from before the theme rename.** *Look* became *theme*, and the
   light/dark `theme` preference became `theme-mode` (ADR 0316). The `theme-rename`

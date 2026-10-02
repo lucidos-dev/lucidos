@@ -1,3 +1,5 @@
+import { DESKTOP_APP_UA_TOKEN } from './platform';
+
 /**
  * A name to offer for the device being paired, read off the browser.
  *
@@ -68,4 +70,17 @@ export function suggestDeviceLabelHere(): string | null {
     userAgent: navigator.userAgent ?? '',
     maxTouchPoints: navigator.maxTouchPoints ?? 0,
   });
+}
+
+/** A name read off a device's STORED user-agent, for a device nobody named.
+ *  The desktop app says so rather than claiming the Safari it is built on. No
+ *  touch count is stored, so an iPad in desktop mode reads as a Mac. The
+ *  engine's `user_agent_device_label` is the same rule. */
+export function userAgentDeviceLabel(ua: string | null | undefined): string | null {
+  if (!ua) return null;
+  if (ua.includes(DESKTOP_APP_UA_TOKEN)) {
+    const platform = platformName({ userAgent: ua, maxTouchPoints: 0 });
+    return platform ? `Lucidos app on ${platform}` : 'Lucidos app';
+  }
+  return suggestDeviceLabel({ userAgent: ua, maxTouchPoints: 0 });
 }

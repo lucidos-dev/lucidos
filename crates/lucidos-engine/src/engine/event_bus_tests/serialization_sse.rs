@@ -675,6 +675,14 @@ fn reserved_type_names_match_event_type() {
             actor: None,
         },
         NotificationsAllRead { actor: None },
+        RecommendedCleanupStarted { actor: None },
+        RecommendedCleanupProgress { done: 0, total: 0 },
+        RecommendedCleanupCompleted {
+            removed_count: 0,
+            cleaned_count: 0,
+            freed_bytes: 0,
+        },
+        RecommendedCleanupFailed { error: "e".into() },
         PreferencesChanged {
             key: "k".into(),
             value: None,

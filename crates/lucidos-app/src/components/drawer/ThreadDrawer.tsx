@@ -11,6 +11,7 @@ import { threadFilterPanelOpen, setThreadFilterPaneVisible, closeThreadFilterPan
 import { ThreadFilterCover } from './ThreadFilterCover';
 import { focusPane, showThreadList } from '../../store/actions/pane';
 import { focusThread } from '../../store/actions/threads';
+import { openAttentionThread } from '../../store/actions/event-navigation';
 import { loadOlderThreads, reloadAfterFilterChange, filterChangedSinceLoad, ensureThreadInMap, loadThreadEvents } from '../../store/actions/thread-loading';
 import { ThreadStatusIcon, visualStatusFor, type VisualStatus } from '../shared/ThreadStatusIcon';
 import { PinThreadButton } from '../shared/PinThreadButton';
@@ -24,7 +25,7 @@ import type { ThreadState, ThreadStatus } from '../../store/thread-events';
 import { getDraft } from '../../store/composeDrafts';
 import type { DisplaySection } from '../../generated/thread-lifecycle';
 import { formatThreadChannelLabel } from '../../utils/formatChannel';
-import { threadContextName, type ThreadContextFields } from './threadRowInfo';
+import { threadContextName, type ThreadContextFields } from './threadContextName';
 import { threadDisplayTitle } from '../../utils/threadTitle';
 import { formatMessageTimestamp } from '../../utils/formatTime';
 import { useFlipTransitions, type FlipSection } from '../../hooks/useFlipAnimation';
@@ -159,11 +160,13 @@ export function selectHighlighted() {
     }
     const id = key;
     const searchResult = threadSearchResults.value;
-    if (threadSearchQuery.value.trim().length > 0 && searchResult.status === 'loaded') {
+    const searching = threadSearchQuery.value.trim().length > 0;
+    if (searching && searchResult.status === 'loaded') {
         const match = searchResult.data.find((r: ThreadSearchResult) => r.thread_id === id);
         if (match) void ensureThreadInMap(match);
     }
-    focusThread(id);
+    if (!searching && drawerView.value === 'attention') openAttentionThread(id);
+    else focusThread(id);
 }
 
 /** Open the highlighted thread row's overflow (⋯) menu: the keyboard route to
@@ -1247,10 +1250,6 @@ export function ComposingThreadRow({ thread, depth = 0 }: { thread: ThreadState;
     const draftMenu = (
         <DraftOverflowMenu
             threadId={thread.meta.id}
-            mode={draftMode}
-            scope={draftScope}
-            contextName={contextName}
-            createdAt={thread.meta.createdAt}
             stopPropagation
             extraClass="thread-row-action"
             tabIndex={-1}
@@ -1260,8 +1259,6 @@ export function ComposingThreadRow({ thread, depth = 0 }: { thread: ThreadState;
 
     return (
         <div data-flip-id={thread.meta.id} style={depthStyle(depth)} class={depth > 0 ? 'thread-row-wrap is-nested' : 'thread-row-wrap'}>
-            {/* The draft's structured details (Status / Type / Created) live behind
-                the ⋯ menu's Info item now, not a row tooltip — see DraftOverflowMenu. */}
             <div class={classes.join(' ')}
                  id={navKeyDomId(thread.meta.id)}
                  data-thread-nav={thread.meta.id}
@@ -1427,9 +1424,6 @@ function ThreadRowContentImpl(props: Partial<ThreadRowContentProps>) {
                  // itself never takes DOM focus. Omitted on skeleton rows (no id).
                  role={props.id ? 'treeitem' : undefined}
                  aria-selected={props.id ? (props.isHighlighted ?? false) : undefined}
-                 // The thread's structured details live behind the ⋯ menu's Info
-                 // item, not a row tooltip. See ThreadOverflowMenu.
-                 //
                  // Prefetch on press-in. pointerdown fires before the tap's
                  // click, so the event load starts earlier and content is often
                  // ready by the time focusThread switches the view.
@@ -1533,7 +1527,7 @@ const ThreadRowContent = memo(ThreadRowContentImpl, (prev, next) =>
     && prev.isCollapsed === next.isCollapsed
 );
 
-export function ThreadRow({ threadId, status, depth = 0, isLiftedParent, isResponsibleChild, isArchivedSubThread, enableFamilyToggle }: {
+export function ThreadRow({ threadId, status, depth = 0, isLiftedParent, isResponsibleChild, isArchivedSubThread, enableFamilyToggle, onOpen = focusThread }: {
     threadId: string;
     status: ThreadStatus;
     depth?: number;
@@ -1544,6 +1538,9 @@ export function ThreadRow({ threadId, status, depth = 0, isLiftedParent, isRespo
      *  sub-threads. Only the nested ThreadList sets it — search / drafts render
      *  flat lists where collapsing nothing visible would be a no-op. */
     enableFamilyToggle?: boolean;
+    /** What a tap on the row does. Needs attention lands on the waiting event
+     *  (`openAttentionThread`); every other list opens the thread as it was. */
+    onOpen?: (threadId: string) => void;
 }) {
     // Signal reads stay here so each row's subscription set is narrow. The row
     // re-renders on several signals, but the memo on ThreadRowContent below
@@ -1588,7 +1585,7 @@ export function ThreadRow({ threadId, status, depth = 0, isLiftedParent, isRespo
             collapsible={hasFamily}
             isCollapsed={isCollapsed}
             onToggleFamily={() => toggleFamilyCollapse(meta.id)}
-            onClick={() => focusThread(meta.id)}
+            onClick={() => onOpen(meta.id)}
         />
     );
 }
@@ -1687,7 +1684,7 @@ function AttentionList() {
             <div class="list-section-title">
                 <SectionHeaderContent Icon={AttentionIcon} title="Needs attention" count={threads.length} />
             </div>
-            {threads.map(t => <ThreadRow key={t.meta.id} threadId={t.meta.id} status={effectiveThreadStatus(t)} />)}
+            {threads.map(t => <ThreadRow key={t.meta.id} threadId={t.meta.id} status={effectiveThreadStatus(t)} onOpen={openAttentionThread} />)}
             <FilteredViewFooter />
         </div>
     );
@@ -1800,9 +1797,7 @@ function SearchResultRow({ result }: { result: ThreadSearchResult }) {
     const isHighlighted = highlightedKey.value === result.thread_id;
     // The context name works whether or not the hit is hydrated into
     // `threadMap`. ThreadMeta is structurally a ThreadContextFields, and the
-    // result's snake-case fields map onto the same shape. The richer details
-    // live behind the ⋯ menu's Info item, which reads the live meta itself, so
-    // an unhydrated hit omits that item.
+    // result's snake-case fields map onto the same shape.
     const ctxFields: ThreadContextFields = liveThread?.meta ?? {
         channel: result.channel,
         triggerName: result.trigger_name,

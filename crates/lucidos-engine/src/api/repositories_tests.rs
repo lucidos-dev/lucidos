@@ -816,3 +816,82 @@ async fn resolve_diff_worktree_prefers_the_running_session_over_the_last_idle() 
     pool.close().await;
     crate::test_support::teardown_test_db(&db_name).await;
 }
+
+// -------------------- git_show_file confinement --------------------
+
+/// A repo on `main` with one commit holding `files`.
+async fn repo_with_files(files: &[&str]) -> (tempfile::TempDir, std::path::PathBuf) {
+    use crate::engine::git_ops::git_cmd;
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().to_path_buf();
+    let _ = git_cmd(&["init"], &repo).await;
+    let _ = git_cmd(&["checkout", "-b", "main"], &repo).await;
+    let _ = git_cmd(&["config", "user.email", "test@test.test"], &repo).await;
+    let _ = git_cmd(&["config", "user.name", "test"], &repo).await;
+    for file in files {
+        tokio::fs::write(repo.join(file), "body").await.unwrap();
+    }
+    let _ = git_cmd(&["add", "."], &repo).await;
+    let _ = git_cmd(&["commit", "-m", "initial"], &repo).await;
+    (tmp, repo)
+}
+
+fn header_of(response: &Response, name: header::HeaderName) -> Option<String> {
+    response
+        .headers()
+        .get(name)
+        .map(|v| v.to_str().unwrap().to_string())
+}
+
+/// The repo file route and the change file route both answer through
+/// `git_show_file`, on the shell's own origin. A repo holds whatever its
+/// authors committed, so a document in it must never run as the shell.
+#[tokio::test]
+async fn git_show_file_sandboxes_documents_that_can_run_script() {
+    let active = [
+        "page.html",
+        "page.htm",
+        "page.xhtml",
+        "logo.svg",
+        "feed.xml",
+    ];
+    let (_tmp, repo) = repo_with_files(&active).await;
+
+    for path in active {
+        let response = super::git_show_file(&repo, "main", path).await;
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        assert_eq!(
+            header_of(&response, header::CONTENT_SECURITY_POLICY).as_deref(),
+            Some("sandbox"),
+            "{path} must render at an opaque origin with script off"
+        );
+        assert_eq!(
+            header_of(&response, header::X_CONTENT_TYPE_OPTIONS).as_deref(),
+            Some("nosniff"),
+            "{path}"
+        );
+    }
+}
+
+/// `nosniff` covers every type, so a text or binary body is never read as a
+/// document. Only an active document needs the sandbox on top.
+#[tokio::test]
+async fn git_show_file_sends_nosniff_on_every_type() {
+    let inert = ["notes.txt", "Makefile", "image.png", "spec.pdf", "main.rs"];
+    let (_tmp, repo) = repo_with_files(&inert).await;
+
+    for path in inert {
+        let response = super::git_show_file(&repo, "main", path).await;
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        assert_eq!(
+            header_of(&response, header::X_CONTENT_TYPE_OPTIONS).as_deref(),
+            Some("nosniff"),
+            "{path}"
+        );
+        assert_eq!(
+            header_of(&response, header::CONTENT_SECURITY_POLICY),
+            None,
+            "{path} renders inline as before, so a PDF preview keeps working"
+        );
+    }
+}

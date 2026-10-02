@@ -34,7 +34,7 @@ const shellCss = styles('panels/shell.css');
 const shellRules = cssRules(shellCss);
 const appHeader = component('layout/AppHeader.tsx');
 
-const DESKTOP = '@media (min-width: 769px)';
+const DESKTOP = '@media (--desktop-layout)';
 
 /** The one desktop rule with this exact selector. */
 function desktopRule(selector: string): CssRule {
@@ -170,7 +170,7 @@ describe('a Conversation-pane collapse shrinks it away', () => {
     const clip = desktopRule('.thread-toggle-slot').props.get('clip-path') ?? '';
     const slack = -parseFloat(/^inset\((-[\d.]+)rem\)$/.exec(clip)?.[1] ?? 'NaN');
     // The header's own ring band, read where the header recolours it.
-    const ring = shellRules.find(r => r.selector === '.app-header .icon-btn:focus-visible');
+    const ring = shellRules.find(r => selectorList(r.selector).includes('.app-header .icon-btn:focus-visible'));
     const band = parseFloat(/0 0 0 ([\d.]+)rem/.exec(ring?.props.get('--focus-ring') ?? '')?.[1] ?? 'NaN');
     expect(band, 'the header focus ring is no longer a rem band').toBeGreaterThan(0);
     expect(slack, `clip ${clip} cuts the ${band}rem focus ring`).toBeGreaterThanOrEqual(band);

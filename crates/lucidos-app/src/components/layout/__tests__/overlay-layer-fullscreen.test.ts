@@ -127,6 +127,9 @@ describe('the overlay group is wired through the layer', () => {
       'ConfirmDialog', 'PromptDialog', 'FilePreviewModalSlot', 'Toast',
       'SearchEverywhereSlot', 'ScaleModalSlot', 'FileSearchModalSlot',
       'ImagePopupSlot', 'MessageRoutePanelSlot', 'StepDetailModalSlot',
+      // The prompt contains fixed descendants (`will-change: translate`), so
+      // a backdrop modal drawn inside it would shrink to the prompt's box.
+      'CameraCaptureSlot',
     ]) {
       expect(group).toContain(`<${slot} />`);
     }

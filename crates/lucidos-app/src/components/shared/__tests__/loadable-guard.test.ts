@@ -45,6 +45,7 @@ const READ_EXEMPT: Record<string, Exemption> = {
   'store/actions/event-navigation.ts': { tag: 'returns-value', why: 'looks up the thread owning an event for a jump' },
   'store/actions/form-requests.ts': { tag: 'best-effort', why: 'offers an open form request on each stream open' },
   'store/actions/slowness.ts': { tag: 'best-effort', why: 'a slowness banner that is simply absent when unmeasurable' },
+  'store/actions/update-relay.ts': { tag: 'best-effort', why: 'update relay status rides the release check; a watch has its own give-up bound' },
   'store/actions/workspace-label.ts': { tag: 'best-effort', why: 'startup probe for the display name, with a fallback' },
 };
 

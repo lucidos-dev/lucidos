@@ -7,7 +7,6 @@ import {
   lazyChanges,
   applyAllInProgress,
   standingApplyThreadIds,
-  armingStandingApplySweep,
   toasts,
 } from '../store';
 
@@ -15,7 +14,6 @@ const mockGetChangeById = vi.fn();
 const mockApplyAll = vi.fn();
 const mockArm = vi.fn();
 const mockDisarm = vi.fn();
-const mockDisarmAll = vi.fn();
 const mockFetchChanges = vi.fn();
 
 vi.mock(import('../../api/client'), async (importOriginal) => {
@@ -26,7 +24,6 @@ vi.mock(import('../../api/client'), async (importOriginal) => {
     applyAllChanges: (...args: Parameters<typeof actual.applyAllChanges>) => mockApplyAll(...args),
     armStandingApply: (...args: Parameters<typeof actual.armStandingApply>) => mockArm(...args),
     disarmStandingApply: (...args: Parameters<typeof actual.disarmStandingApply>) => mockDisarm(...args),
-    disarmAllStandingApplies: () => mockDisarmAll(),
     fetchChanges: (...args: Parameters<typeof actual.fetchChanges>) => mockFetchChanges(...args),
   };
 });
@@ -37,7 +34,8 @@ const {
   applyAllChanges,
   armStandingApply,
   disarmStandingApply,
-  disarmAllStandingApplies,
+  armStandingApplies,
+  disarmStandingApplies,
   refreshChangesState,
 } = await import('./chat-changes');
 
@@ -81,7 +79,6 @@ beforeEach(() => {
   lazyChanges.value = new Map();
   applyAllInProgress.value = false;
   standingApplyThreadIds.value = new Set();
-  armingStandingApplySweep.value = false;
   toasts.value = [];
 });
 
@@ -122,55 +119,53 @@ describe('the standing apply toggles on the press', () => {
     await disarming;
     expect(standingApplyThreadIds.value.has('t1')).toBe(false);
   });
+});
 
-  it('clears every flag at once on the workspace off, and restores them if it fails', async () => {
-    standingApplyThreadIds.value = new Set(['t1', 't2']);
-    const request = deferred<{ disarmed: number }>();
-    mockDisarmAll.mockReturnValue(request.promise);
+/** The Not finished section's bulk control arms and disarms only the changes
+ *  it lists, one bound arm each, never the workspace-wide sweep. */
+describe('a section of standing applies', () => {
+  it('arms each listed change, bound to that change', async () => {
+    mockArm.mockResolvedValue({ message: 'armed' });
 
-    const disarming = disarmAllStandingApplies();
-    expect(standingApplyThreadIds.value.size).toBe(0);
+    await armStandingApplies([
+      makeChange('c1', { status: 'pending', thread_id: 't1' }),
+      makeChange('c2', { status: 'pending', thread_id: 't2' }),
+    ]);
 
-    request.reject(new ApiError(500, 'database is down'));
-    await disarming;
+    expect(mockArm.mock.calls).toEqual([['t1', 'c1'], ['t2', 'c2']]);
+    expect(mockApplyAll).not.toHaveBeenCalled();
     expect([...standingApplyThreadIds.value].sort()).toEqual(['t1', 't2']);
-    expect(toasts.value[0].type).toBe('error');
   });
 
-  it('marks the sweep armed while its request is in flight', async () => {
-    const request = deferred<{ batch_size: number; armed: number; message: string }>();
-    mockApplyAll.mockReturnValue(request.promise);
+  it('disarms only the named threads', async () => {
+    standingApplyThreadIds.value = new Set(['t1', 't2', 'elsewhere']);
+    mockDisarm.mockResolvedValue({ message: 'canceled' });
 
-    const sweeping = applyAllChanges(true);
-    expect(armingStandingApplySweep.value).toBe(true);
+    await disarmStandingApplies(['t1', 't2']);
 
-    request.resolve({ batch_size: 0, armed: 2, message: 'armed' });
-    await sweeping;
-    expect(armingStandingApplySweep.value).toBe(false);
+    expect(mockDisarm.mock.calls).toEqual([['t1'], ['t2']]);
+    expect([...standingApplyThreadIds.value]).toEqual(['elsewhere']);
   });
 
-  it('holds a cancel pressed mid-sweep until the sweep has armed', async () => {
-    const sweep = deferred<{ batch_size: number; armed: number; message: string }>();
-    mockApplyAll.mockReturnValue(sweep.promise);
-    mockDisarmAll.mockResolvedValue({ disarmed: 2 });
+  // A per-thread disarm drops a tap while that thread's arm is in flight. So
+  // the section's cancel waits for the section's arms, or it is lost.
+  it('holds a cancel pressed mid-arm until the arms have landed', async () => {
+    const slow = deferred<{ message: string }>();
+    mockArm.mockResolvedValueOnce({ message: 'armed' }).mockReturnValueOnce(slow.promise);
+    mockDisarm.mockResolvedValue({ message: 'canceled' });
 
-    const sweeping = applyAllChanges(true);
-    const canceling = disarmAllStandingApplies();
-    expect(armingStandingApplySweep.value).toBe(false);
+    const arming = armStandingApplies([
+      makeChange('c1', { status: 'pending', thread_id: 't1' }),
+      makeChange('c2', { status: 'pending', thread_id: 't2' }),
+    ]);
+    const canceling = disarmStandingApplies(['t1', 't2']);
     await Promise.resolve();
-    expect(mockDisarmAll).not.toHaveBeenCalled();
+    expect(mockDisarm).not.toHaveBeenCalled();
 
-    sweep.resolve({ batch_size: 0, armed: 2, message: 'armed' });
-    await Promise.all([sweeping, canceling]);
-    expect(mockDisarmAll).toHaveBeenCalledTimes(1);
-  });
-
-  it('does not mark a plain Apply All as a sweep', async () => {
-    mockApplyAll.mockReturnValue(deferred().promise);
-
-    void applyAllChanges(false);
-
-    expect(armingStandingApplySweep.value).toBe(false);
+    slow.resolve({ message: 'armed' });
+    await Promise.all([arming, canceling]);
+    expect(mockDisarm.mock.calls).toEqual([['t1'], ['t2']]);
+    expect(standingApplyThreadIds.value.size).toBe(0);
   });
 });
 
@@ -199,27 +194,17 @@ describe('disarmStandingApply', () => {
   });
 });
 
-/** "Apply all on settle" presses this and is never disabled, because it arms
- *  rather than applies and so wears no in-flight face. The single flight has to
- *  live in the action instead. */
 describe('applyAllChanges', () => {
   it('drops a second press while the first is in flight', async () => {
-    mockApplyAll.mockResolvedValue({ batch_size: 0, armed: 2, message: 'armed' });
+    const request = deferred<{ batch_size: number }>();
+    mockApplyAll.mockReturnValue(request.promise);
 
-    const first = applyAllChanges(true);
-    await applyAllChanges(true);
+    const first = applyAllChanges();
+    await applyAllChanges();
+    request.reject(new ApiError(400, 'No pending changes'));
     await first;
 
     expect(mockApplyAll).toHaveBeenCalledTimes(1);
-  });
-
-  it('takes the next press once the arm has landed', async () => {
-    mockApplyAll.mockResolvedValue({ batch_size: 0, armed: 1, message: 'armed' });
-
-    await applyAllChanges(true);
-    await applyAllChanges(true);
-
-    expect(mockApplyAll).toHaveBeenCalledTimes(2);
   });
 });
 

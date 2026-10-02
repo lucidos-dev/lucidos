@@ -451,6 +451,9 @@ export function DiffButton({ threadId, attrs }: { threadId: string; attrs?: Reco
       aria-label="Diff"
       data-tooltip={tooltipWithShortcut(DIFF_TOOLTIP, 'showThreadDiff')}
       data-tooltip-longpress=""
+      onTouchStart={activate.onTouchStart}
+      onTouchMove={activate.onTouchMove}
+      onTouchCancel={activate.onTouchCancel}
       onTouchEnd={activate.onTouchEnd}
       onClick={activate.onClick}
     >

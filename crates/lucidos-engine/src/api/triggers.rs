@@ -495,10 +495,15 @@ pub(super) async fn create_trigger(
         Ok(a) => Some(a),
         Err(e) => return ApiResult::err(e.message),
     };
-    state
+    if let Err(e) = state
         .engine
-        .emit_trigger_created_minting_slug(&trigger_id_str, payload, name, actor, "[Triggers]")
-        .await;
+        .trigger_registry_writer()
+        .write_created_minting_slug(&trigger_id_str, payload, name, actor)
+        .await
+    {
+        log!("[Triggers] TriggerCreated emit failed: {}", e);
+        return ApiResult::err(format!("Failed to create trigger: {e}"));
+    }
 
     ApiResult::ok_for_trigger(
         Some(CronPreview::from_validated(&validated)),
@@ -682,16 +687,19 @@ pub(super) async fn update_trigger(
     // decide whether to refuse, so a subscriber-only apply lets a trigger the
     // user just paused take a real off-schedule fire.
     let actor = crate::api::actor::user_actor(&headers, None);
-    state
+    if let Err(e) = state
         .engine
-        .emit_trigger_write_or_log(
+        .emit_trigger_write(
             TriggerWrite::Updated,
             &trigger_id_str,
             update_payload,
             actor,
-            "[Triggers]",
         )
-        .await;
+        .await
+    {
+        log!("[Triggers] TriggerUpdated emit failed: {}", e);
+        return ApiResult::err(format!("Failed to update trigger: {e}"));
+    }
 
     // Only an update that actually rewrote the schedule has a preview to report;
     // one that only renamed the trigger says nothing about its cron.
@@ -721,16 +729,19 @@ pub(super) async fn delete_trigger(
     }
 
     let actor = crate::api::actor::user_actor(&headers, None);
-    state
+    if let Err(e) = state
         .engine
-        .emit_trigger_write_or_log(
+        .emit_trigger_write(
             TriggerWrite::Deleted,
             &task_id,
             serde_json::json!({ "trigger_id": &task_id }),
             actor,
-            "[Triggers]",
         )
-        .await;
+        .await
+    {
+        log!("[Triggers] TriggerDeleted emit failed: {}", e);
+        return ApiResult::err(format!("Failed to delete trigger: {e}"));
+    }
 
     ApiResult::ok()
 }

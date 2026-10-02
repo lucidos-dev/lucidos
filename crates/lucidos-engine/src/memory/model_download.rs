@@ -39,10 +39,10 @@ const DEFAULT_CACHE_DIR: &str = ".fastembed_cache";
 /// fastembed's default hub endpoint when `HF_ENDPOINT` is unset.
 const DEFAULT_ENDPOINT: &str = "https://huggingface.co";
 
-/// Sub-path under the per-user cache root holding the shared model cache. The
-/// same path `scripts/e2e-embedder.sh` and `scripts/e2e-packaged.sh` already
-/// seed, so an e2e run and the dev workspaces warm one copy between them.
-const SHARED_CACHE_SUBPATH: &str = "lucidos/fastembed";
+/// Directory under [`crate::paths::user_cache_root_from`] holding the shared
+/// model cache. `scripts/e2e-embedder.sh` and `scripts/e2e-packaged.sh` seed
+/// the same path, so an e2e run and the dev workspaces warm one copy.
+const SHARED_CACHE_DIR_NAME: &str = "fastembed";
 
 /// The tokenizer/config files `fastembed::common::load_tokenizer_hf_hub` reads
 /// on top of the model's own `model_file` + `additional_files`. Listed here
@@ -237,11 +237,8 @@ pub fn cache_dir() -> PathBuf {
 /// `None` when neither is usable (no `HOME` under a bare service manager), which
 /// leaves the CWD-relative default in place rather than inventing a path.
 fn shared_cache_dir_from(xdg_cache_home: Option<&str>, home: Option<&str>) -> Option<PathBuf> {
-    let root = match xdg_cache_home.filter(|d| !d.is_empty()) {
-        Some(dir) => PathBuf::from(dir),
-        None => Path::new(home.filter(|h| !h.is_empty())?).join(".cache"),
-    };
-    Some(root.join(SHARED_CACHE_SUBPATH))
+    crate::paths::user_cache_root_from(xdg_cache_home, home)
+        .map(|root| root.join(SHARED_CACHE_DIR_NAME))
 }
 
 /// Point this process's model cache at the shared per-user directory, unless

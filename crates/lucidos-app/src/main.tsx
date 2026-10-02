@@ -17,6 +17,7 @@ import { installNativeContextMenuPolicy } from './utils/nativeContextMenu';
 import { installNoKeyCodeText } from './utils/noKeyCodeText';
 import { installStrayFileDropGuard } from './utils/strayFileDrop';
 import { publishScrollbarGutter } from './utils/scrollbarGutter';
+import { installSafeAreaFloor } from './utils/safeAreaFloor';
 import { isTouchDevice } from './utils/viewport';
 import { isIOSPwa, isTauri, isTauriPreGatewayEntry } from './utils/platform';
 import { invoke, windowReadyToShow } from './utils/tauri';
@@ -78,6 +79,7 @@ if (isTouchDevice()) {
 if (isIOSPwa()) {
   document.documentElement.classList.add('ios-pwa');
 }
+installSafeAreaFloor();
 
 installActionBtnBlurListener();
 // Three diagnostics, not features: the composer's buttons, its textarea and the

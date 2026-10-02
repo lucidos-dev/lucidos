@@ -1,7 +1,7 @@
 import { useRef, useCallback, useEffect } from 'preact/hooks';
 import { useSignal } from '@preact/signals';
-import { changes, appliedChanges, setAsideChanges, findChangeById, threadMap, effectiveThreadStatus, isMidTurn, changesHasMore, changesLoadingMore, busyChangeIds, applyAllInProgress, showConfirm, standingApplyThreadIds, armingStandingApplySweep, disarmingAllStandingApply, settlingThreadCount, collapsedChangesSectionIds, toggleChangesSectionCollapsed } from '../../store/store';
-import { applySingleChange, discardSingleChange, setAsideSingleChange, bringBackSingleChange, applyAllChanges, discardAllChanges, revertChange, loadMoreChanges, armStandingApply, disarmStandingApply, disarmAllStandingApplies, refreshChangesState, APPLY_NEW_VERSION_TOOLTIP } from '../../store/actions/chat-changes';
+import { changes, appliedChanges, setAsideChanges, findChangeById, threadMap, effectiveThreadStatus, isMidTurn, changesHasMore, changesLoadingMore, busyChangeIds, applyAllInProgress, showConfirm, standingApplyThreadIds, collapsedChangesSectionIds, toggleChangesSectionCollapsed } from '../../store/store';
+import { applySingleChange, discardSingleChange, setAsideSingleChange, bringBackSingleChange, applyAllChanges, discardAllChanges, revertChange, loadMoreChanges, armStandingApply, disarmStandingApply, armStandingApplies, disarmStandingApplies, refreshChangesState, APPLY_NEW_VERSION_TOOLTIP } from '../../store/actions/chat-changes';
 import { APPLY_INCOMPLETE_CONFIRM } from '../../store/actions/threadActions';
 import { viewChangeDiff } from '../../store/actions/repositories';
 import { focusThreadOrBootstrap } from '../../store/actions/threads';
@@ -324,56 +324,52 @@ function SetAsideRow({ change, busy, onBringBack, onDiscard }: {
   );
 }
 
-export const SWEEP_TIP =
-  'Apply every change that is ready, and each one still settling the moment its thread finishes.';
+export const SETTLE_ALL_TIP =
+  'Apply each change here the moment its thread finishes.';
 
-export const SWEEP_ARMED_TIP =
-  'Armed. Each change applies the moment its thread finishes. Click to cancel every standing apply here. Anything already applying keeps going.';
+export const SETTLE_ALL_ARMED_TIP =
+  'Armed. Each change here applies the moment its thread finishes. Click to cancel. Anything already applying keeps going.';
 
-/** What the bulk row offers, given the pending list, how many threads are still
- *  working, and how many carry a *standing apply*.
+/** How the pending list splits into its two sections, and what each section's
+ *  bulk row offers. Pure, so the answer is testable without a render.
  *
- *  Up to three buttons: Discard All, "Apply all on settle" and Apply All. The
- *  sweep is a TOGGLE: armed, the same control cancels (ADR 0168). Everything
- *  falls out of three questions. Is there something to apply now, something to
- *  arm, and is anything armed already?
- *
- *  Pure, so the answer is testable without a render. */
-export interface BulkApplyState {
-  show: boolean;
-  /** At least one pending change the server would apply right now. */
+ *  **Ready** holds changes whose thread has finished. Its row offers Discard
+ *  All and Apply All. **Not finished** holds the rest: a thread settling, or
+ *  parked on a question. Its row offers only "Apply all on settle", a TOGGLE
+ *  over the settling changes it lists (ADR 0168). Discard never reaches it. */
+export interface PendingSections {
+  ready: Change[];
+  notFinished: Change[];
+  /** At least one Ready change the server would apply right now. */
   canApplyNow: boolean;
-  /** Threads are working, or something is armed, so the sweep toggle draws. */
-  offerSweep: boolean;
-  /** Something is armed, so the sweep control wears its cancel face. */
-  armed: boolean;
-  /** Something to apply now, or a batch running with no sweep to offer. The
-   *  sweep's own request also sets the in-flight flag, and must not draw
-   *  Apply All's "Applying..." beside the toggle. */
+  /** Something to apply now, or a batch still running. */
   showApplyAll: boolean;
   showDiscardAll: boolean;
+  /** The settling changes "Apply all on settle" arms. A parked thread's arm
+   *  would drop at once, and a merge being resolved is already applying. */
+  armable: Change[];
+  /** Every armable change is armed, so the toggle wears its cancel face. */
+  armed: boolean;
 }
 
-export function bulkApplyState(
+export function pendingSections(
   pending: Change[],
-  workingThreads: number,
-  armedThreads: number,
+  armedThreadIds: ReadonlySet<string>,
   applyAllRunning = false,
-): BulkApplyState {
+): PendingSections {
+  const ready = pending.filter((c) => !c.thread_unsettled);
+  const notFinished = pending.filter((c) => c.thread_unsettled);
   // Apply All passes incomplete work over, as the engine's batch does.
-  const canApplyNow = pending.some((c) => !applyBlockedReason(c) && !c.incomplete);
-  const armed = armedThreads > 0;
-  // Armed with nothing left working still draws the control, or the last arm
-  // would be unreachable in the window before it fires.
-  const offerSweep = workingThreads > 0 || armed;
-  const showDiscardAll = pending.length > 1;
+  const canApplyNow = ready.some((c) => !applyBlockedReason(c) && !c.incomplete);
+  const armable = notFinished.filter((c) => c.thread_settling && !c.resolving_conflict && c.thread_id);
   return {
-    show: showDiscardAll || offerSweep,
+    ready,
+    notFinished,
     canApplyNow,
-    offerSweep,
-    armed,
-    showApplyAll: canApplyNow || (applyAllRunning && !offerSweep),
-    showDiscardAll,
+    showApplyAll: canApplyNow || applyAllRunning,
+    showDiscardAll: ready.length > 1,
+    armable,
+    armed: armable.length > 0 && armable.every((c) => armedThreadIds.has(c.thread_id!)),
   };
 }
 
@@ -409,6 +405,8 @@ export function ChangesView() {
   const hasMore = changesHasMore.value;
   const loadingMore = changesLoadingMore.value;
   const showLoadingMore = useDelayedFlag(loadingMore);
+  const readyCollapsed = collapsedChangesSectionIds.value.has('ready');
+  const notFinishedCollapsed = collapsedChangesSectionIds.value.has('not-finished');
   const setAsideCollapsed = collapsedChangesSectionIds.value.has('set-aside');
   const appliedCollapsed = collapsedChangesSectionIds.value.has('applied');
 
@@ -464,83 +462,9 @@ export function ChangesView() {
           const pending = pendingLoadable.data;
           const applied = appliedLoadable.data;
           const setAside = setAsideLoadable.data;
-          // A pending cancel holds every face unarmed. It waits for an
-          // in-flight sweep, whose arm frames would otherwise flick them back.
-          const cancelingAll = disarmingAllStandingApply.value;
-          const armedThreads = cancelingAll
-            ? 0
-            : standingApplyThreadIds.value.size || (armingStandingApplySweep.value ? 1 : 0);
-          const bulk = bulkApplyState(pending, settlingThreadCount.value, armedThreads, applyAllInProgress.value);
-          const bulkRow = bulk.show ? (
-            <div class="changes-bulk-actions">
-              <div class="changes-bulk-buttons">
-                {/* Discard All skips changes whose thread is still working
-                    (server-side too); disable the button when none are eligible. */}
-                {bulk.showDiscardAll && (
-                  <button class="action-btn action-btn-danger" disabled={applyAllInProgress.value || !pending.some(c => !c.thread_unsettled)} onClick={() => void discardAllChanges()}>Discard All</button>
-                )}
-                {/* The sweep, as ONE control with two faces. Armed it loses the
-                    green and cancels on click, the shape the per-change row and
-                    the prompt-row flag icon already wear, so all three surfaces
-                    read one state and all three can turn it off.
-
-                    TWO faces, never a third. This control ARMS, so it has no
-                    progress of its own to report: a press lands on the armed
-                    face at once, and the `StandingApplyArmed` events hold it
-                    there. Apply All's "Applying..." belongs to a batch this
-                    press never starts, and wearing it flashes a narrower, faded
-                    pill on the way.
-
-                    Neither face is disabled, even mid-batch. Cancelling an
-                    instruction is not the batch, and a faded control takes its
-                    explaining tooltip with it (ADR 0168). A second press while
-                    the request is in flight is dropped by the action. */}
-                {bulk.offerSweep && (
-                  bulk.armed ? (
-                    <button
-                      class="action-btn"
-                      aria-pressed
-                      data-tooltip={SWEEP_ARMED_TIP}
-                      onClick={() => void disarmAllStandingApplies()}
-                    >
-                      ✓ Applying all on settle
-                    </button>
-                  ) : (
-                    <button
-                      class="action-btn action-btn-confirm"
-                      aria-pressed={false}
-                      data-tooltip={SWEEP_TIP}
-                      onClick={() => void applyAllChanges(true)}
-                    >
-                      Apply all on settle
-                    </button>
-                  )
-                )}
-                {/* Apply All never lights up for a batch the server would reject:
-                    enablement reads the same rule the per-row control and the
-                    server use. With nothing appliable now the sweep toggle is
-                    the whole action, so this is not drawn at all. */}
-                {bulk.showApplyAll && (
-                  <button
-                    class="action-btn action-btn-confirm"
-                    disabled={applyAllInProgress.value || !bulk.canApplyNow}
-                    onClick={() => void applyAllChanges(false)}
-                  >
-                    {applyAllInProgress.value ? 'Applying...' : 'Apply All'}
-                  </button>
-                )}
-              </div>
-            </div>
-          ) : null;
-          return pending.length === 0 && applied.length === 0 && setAside.length === 0 ? (
-            <>
-              {bulkRow}
-              <div class="empty-state">No changes</div>
-            </>
-          ) : (
-            <>
-              {bulkRow}
-          {pending.map(change => {
+          const armedThreadIds = standingApplyThreadIds.value;
+          const sections = pendingSections(pending, armedThreadIds, applyAllInProgress.value);
+          const renderRow = (change: Change) => {
             const busy =
               busyIds.value.has(change.id) ||
               busyChangeIds.value.has(change.id) ||
@@ -549,7 +473,7 @@ export function ChangesView() {
             // doing so races (or yanks the worktree from) the live coding-agent
             // session. The server refuses it too (guard_change_action). What the
             // row offers instead is the standing apply.
-            const armed = !cancelingAll && !!change.thread_id && standingApplyThreadIds.value.has(change.thread_id);
+            const armed = !!change.thread_id && armedThreadIds.has(change.thread_id);
             return (
               <ChangeRow
                 key={change.id}
@@ -569,7 +493,91 @@ export function ChangesView() {
                 }}
               />
             );
-          })}
+          };
+          return pending.length === 0 && applied.length === 0 && setAside.length === 0 ? (
+            <div class="empty-state">No changes</div>
+          ) : (
+            <>
+          {sections.ready.length > 0 && (
+            <>
+              <SectionHeader
+                title="Ready"
+                count={sections.ready.length}
+                collapsed={readyCollapsed}
+                onToggle={() => toggleChangesSectionCollapsed('ready')}
+              />
+              <Disclosure open={!readyCollapsed}>
+                {(sections.showDiscardAll || sections.showApplyAll) && (
+                  <div class="changes-bulk-actions">
+                    <div class="changes-bulk-buttons">
+                      {sections.showDiscardAll && (
+                        <button class="action-btn action-btn-danger" disabled={applyAllInProgress.value} onClick={() => void discardAllChanges()}>Discard All</button>
+                      )}
+                      {/* Apply All never lights up for a batch the server would
+                          reject: enablement reads the same rule the per-row
+                          control and the server use. */}
+                      {sections.showApplyAll && (
+                        <button
+                          class="action-btn action-btn-confirm"
+                          disabled={applyAllInProgress.value || !sections.canApplyNow}
+                          onClick={() => void applyAllChanges()}
+                        >
+                          {applyAllInProgress.value ? 'Applying...' : 'Apply All'}
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                )}
+                {sections.ready.map(renderRow)}
+              </Disclosure>
+            </>
+          )}
+          {sections.notFinished.length > 0 && (
+            <>
+              <SectionHeader
+                title="Not finished"
+                count={sections.notFinished.length}
+                collapsed={notFinishedCollapsed}
+                onToggle={() => toggleChangesSectionCollapsed('not-finished')}
+              />
+              <Disclosure open={!notFinishedCollapsed}>
+                {/* ONE control with two faces. Armed it loses the green and
+                    cancels on click, the shape the per-change row and the
+                    prompt-row flag icon already wear, so all three surfaces read
+                    one state and all three can turn it off. Neither face is
+                    disabled: a faded control takes its explaining tooltip with
+                    it (ADR 0168). */}
+                {sections.armable.length > 0 && (
+                  <div class="changes-bulk-actions">
+                    <div class="changes-bulk-buttons">
+                      {sections.armed ? (
+                        <button
+                          class="action-btn"
+                          aria-pressed
+                          data-tooltip={SETTLE_ALL_ARMED_TIP}
+                          onClick={() => void disarmStandingApplies(sections.armable.map((c) => c.thread_id!))}
+                        >
+                          ✓ Applying all on settle
+                        </button>
+                      ) : (
+                        <button
+                          class="action-btn action-btn-confirm"
+                          aria-pressed={false}
+                          data-tooltip={SETTLE_ALL_TIP}
+                          onClick={() => void armStandingApplies(
+                            sections.armable.filter((c) => !armedThreadIds.has(c.thread_id!)),
+                          )}
+                        >
+                          Apply all on settle
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                )}
+                {sections.notFinished.map(renderRow)}
+              </Disclosure>
+            </>
+          )}
           {setAside.length > 0 && (
             <>
               <SectionHeader

@@ -15,7 +15,7 @@
    The JS catch-all in MobileSwipeContainer handles remaining cases.
    NOTE: Do NOT add height constraints (100%, 100dvh) on html — that
    causes a black gap at the bottom on iOS Safari PWA (see ba317430). */
-@media (max-width: 768px) {
+@media (--phone-layout) {
     html {
         overflow: hidden;
     }
@@ -27,10 +27,10 @@
        --mobile-header-height by useHideOnScroll (it varies with the safe-area
        inset, and drops to the inset alone while the keyboard pushes the header
        off); the fallback covers the frames before the first measurement.
-       Redefined at the 768px layout line, not the 600px cosmetic one, so the
+       Redefined at the phone layout line, not the 600px cosmetic one, so the
        anchor flips exactly when the header layout it describes does. */
     :root {
-        --app-header-bottom: var(--mobile-header-height, calc(2.75rem + env(safe-area-inset-top, 0px)));
+        --app-header-bottom: var(--mobile-header-height, calc(2.75rem + var(--safe-area-top)));
         /* The one height every mobile header row takes, whichever pane it
            belongs to (see .mobile-header-row). The value is the tallest control
            any of them carries, the Lucidos mark's tap target. */
@@ -47,6 +47,11 @@
            them. */
         --mobile-dot-size: 0.3125rem;
         --mobile-dot-gap: 0.375rem;
+        /* What every pane keeps clear at each side: 0 upright, and the Dynamic
+           Island and rounded corners in landscape. The larger of the two
+           insets on both sides, so the column stays centred on a phone whose
+           cutout is on one side only. Backgrounds still run edge to edge. */
+        --phone-side-inset: max(var(--safe-area-left), var(--safe-area-right));
     }
 
     /* iOS long-press near container edges auto-selects the nearest block
@@ -114,7 +119,7 @@
 .drawer::after {
     content: '';
     flex-shrink: 0;
-    height: env(safe-area-inset-bottom, 0px);
+    height: var(--safe-area-bottom);
     min-height: 0.5rem;
 }
 
@@ -148,12 +153,12 @@
 
 /* Right-edge variant. The drawer emerges from under the hamburger that opened
    it (drawerSideFor in Drawer.tsx), which on the mobile thread pane header sits
-   at the row's trailing edge. Scoped to the mobile breakpoint (isMobile() is the
-   same 768px line) so the class can never fight the desktop block below, which
+   at the row's trailing edge. Scoped to the phone layout (isMobile() reads the
+   same definition) so the class can never fight the desktop block below, which
    positions the panel against the split divider rather than a viewport edge.
    Only the animation NAME is overridden, so the duration / easing / fill of the
    base shorthands above still apply. */
-@media (max-width: 768px) {
+@media (--phone-layout) {
     .drawer.drawer-right {
         left: auto;
         right: 0;
@@ -170,7 +175,7 @@
        LEFT, which is the drawer's open edge only in the left variant. Mirror it
        so a landscape notch can't clip a row against the right edge either. */
     .drawer.drawer-right .drawer-item {
-        padding-right: max(1.5rem, env(safe-area-inset-right, 0px));
+        padding-right: max(1.5rem, var(--safe-area-right));
     }
 }
 
@@ -186,7 +191,7 @@
 }
 
 .drawer-item {
-    padding: 0.875rem 1.5rem 0.875rem max(2.5rem, env(safe-area-inset-left, 0px));
+    padding: 0.875rem 1.5rem 0.875rem max(2.5rem, var(--safe-area-left));
     font-size: var(--font-size-md);
     color: var(--text-secondary);
     cursor: pointer;
@@ -227,7 +232,7 @@
 }
 
 /* Desktop: drawer emerges from the split divider, scoped to panel area */
-@media (min-width: 769px) {
+@media (--desktop-layout) {
     .drawer-backdrop {
         /* `top` comes from the shared --app-header-bottom anchor on the base
            rule; only the left edge is desktop-specific (the drawer emerges from
@@ -256,7 +261,7 @@
     }
 
     .drawer-item {
-        padding-left: max(0.75rem, env(safe-area-inset-left, 0px));
+        padding-left: max(0.75rem, var(--safe-area-left));
     }
 
     .prompt-row .prompt-textarea {
@@ -403,8 +408,8 @@
         /* Keep the --space-lg (1rem) content-pane gutter on mobile too (so the
            toggle stays aligned with the .notification-item rows), widened only
            where the notch's safe-area inset exceeds it. */
-        padding-left: max(var(--space-lg), env(safe-area-inset-left, 0px));
-        padding-right: max(var(--space-lg), env(safe-area-inset-right, 0px));
+        padding-left: max(var(--space-lg), var(--safe-area-left));
+        padding-right: max(var(--space-lg), var(--safe-area-right));
     }
 
     .confirm-dialog {
@@ -419,8 +424,8 @@
         height: 100%;
         border: none;
         border-radius: 0;
-        padding-top: env(safe-area-inset-top, 0px);
-        padding-bottom: env(safe-area-inset-bottom, 0px);
+        padding-top: var(--safe-area-top);
+        padding-bottom: var(--safe-area-bottom);
         box-sizing: border-box;
     }
 
@@ -429,8 +434,8 @@
            the shared --app-header-bottom anchor on the base rule, which the
            mobile :root above resolves to this header's measured height. Only the
            side insets are phone-specific. */
-        left: max(0.75rem, env(safe-area-inset-left, 0px));
-        right: max(0.75rem, env(safe-area-inset-right, 0px));
+        left: max(0.75rem, var(--safe-area-left));
+        right: max(0.75rem, var(--safe-area-right));
     }
 
     .toast {
@@ -449,7 +454,7 @@
 
 
 /* ─── Mobile split layout override ─── */
-@media (max-width: 768px) {
+@media (--phone-layout) {
     /* Use --app-height (set by visualViewport JS) instead of 100dvh.
        iOS Safari does NOT shrink dvh/vh when the keyboard opens —
        visualViewport.height is the only reliable signal. */
@@ -476,7 +481,7 @@
         will-change: translate;
         transition: translate var(--bars-glide-duration, 0s) ease;
         background: var(--header-gradient);
-        padding-top: env(safe-area-inset-top, 0px);
+        padding-top: var(--safe-area-top);
         /* The inline inset belongs to the ROWS here, not to this column.
            `.pane-header` pads the desktop bar, where the header IS one row of
            controls. This header is a column, and the app-shell banners at its
@@ -521,7 +526,7 @@
     .mobile-threads-header,
     .mobile-thread-header,
     .mobile-content-header {
-        padding-inline: var(--header-padding-x);
+        padding-inline: calc(var(--header-padding-x) + var(--phone-side-inset));
     }
 
     /* Row inside each mobile header (icons + title).
@@ -617,6 +622,19 @@
     .mobile-header-row .icon-btn.header-icon {
         width: var(--mobile-header-icon-box);
         height: var(--mobile-header-icon-box);
+    }
+
+    /* Each icon takes a tap the full --header-nav-hit-target tall, so a thumb
+       landing short of a glyph at the screen top still hits it. The button box
+       stays put, because the row's reserves place it.
+       The reach stays inside the button's own width. The content row's actions
+       sit flush against the forward chevron and are raised over it, so a
+       sideways reach would cover the chevron's own button. The nav chevrons
+       carry their own wider reach (styles/header-mark.css). */
+    .mobile-header-row .icon-btn.header-icon:not(.nav-chevron)::before {
+        content: '';
+        position: absolute;
+        inset: calc((var(--mobile-header-icon-box) - var(--header-nav-hit-target)) / 2) 0;
     }
 
     /* A panel refresh (MobileRefreshIndicator), in the leading slot the edge
@@ -806,7 +824,7 @@
          * action icons land in the same slot as the mobile header above.
          * Symmetric 0.5rem top/bottom: just the title's own padding, with no
          * extra gap before the first message. */
-        padding: 0.5rem 0.625rem 0.5rem 1rem;
+        padding: 0.5rem calc(0.625rem + var(--phone-side-inset)) 0.5rem calc(1rem + var(--phone-side-inset));
         /* Opaque, so content scrolling under the sticky bar is covered. On the
          * page colour at the top of the thread; once content slides under it,
          * the faint --bg-secondary band fades in. Without the band the title
@@ -847,7 +865,11 @@
         will-change: translate;
         z-index: 2;
         /* Stretch to full width, cancelling .thread-content's horizontal padding
-           (the same token the transcript pads with, so the two can't drift) */
+           (the same token the transcript pads with, so the two can't drift).
+           That token carries the side inset, so the band reaches both edges
+           and the padding above adds the inset back for the title. Uncapped,
+           unlike the turns, or a phone in landscape stops the band short. */
+        max-width: none;
         margin-left: calc(-1 * var(--thread-pane-gutter));
         margin-right: calc(-1 * var(--thread-pane-gutter));
         /* No margin-bottom — the title's 0.5rem bottom padding is the only space
@@ -893,7 +915,7 @@
 /* When a textarea is focused on mobile, block pointer-events on
    everything except the prompt area so stray taps can't select threads,
    tabs, or other UI elements while the keyboard is open. */
-@media (max-width: 768px) {
+@media (--phone-layout) {
     :root[data-keyboard-active] .app-header {
         pointer-events: none;
     }
@@ -965,7 +987,7 @@
     display: none;
 }
 
-@media (max-width: 768px) {
+@media (--phone-layout) {
     .mobile-swipe-wrapper {
         display: flex;
         flex-direction: column;
@@ -1065,6 +1087,13 @@
         --pull-refresh-top: var(--app-header-bottom);
     }
 
+    /* The thread pane takes the side inset through --thread-pane-gutter, so its
+       title band can still reach the edges. These two take it whole. */
+    .mobile-swipe-pane .content-pane,
+    .mobile-swipe-pane > .mobile-threads-pane {
+        padding-inline: var(--phone-side-inset);
+    }
+
     /* The inline form (trigger/credential/app/plugin editors) sits INSIDE the
        .content-pane-body scroll container, which already carries the ::before
        header spacer above. Its desktop `height: 100%` + own `overflow-y: auto`
@@ -1076,7 +1105,7 @@
     .mobile-swipe-pane .inline-form {
         height: auto;
         overflow-y: visible;
-        padding-bottom: calc(1rem + env(safe-area-inset-bottom, 0px));
+        padding-bottom: calc(1rem + var(--safe-area-bottom));
     }
 
     /* The repo preview (a diff, the rendered diff, the whole file) flows in the
@@ -1201,7 +1230,7 @@
     .mobile-swipe-pane .scroll-to-top {
         top: calc(var(--mobile-header-height, 3rem) + var(--mobile-thread-title-height, 2.75rem) + 0.75rem);
         translate: 0 max(
-            calc(env(safe-area-inset-top, 0px) - var(--mobile-header-height, 3rem) - var(--mobile-thread-title-height, 2.75rem)),
+            calc(var(--safe-area-top) - var(--mobile-header-height, 3rem) - var(--mobile-thread-title-height, 2.75rem)),
             max(var(--mobile-header-offset, 0rem), calc(-1 * var(--mobile-header-height, 3rem)))
         );
     }
@@ -1461,7 +1490,24 @@
         right: 0;
         bottom: 0;
         z-index: 3;
+        /* A layer from the start, as the header has: WebKit otherwise builds it
+           as the glide begins and drops that first frame. */
+        will-change: translate;
         transition: translate var(--bars-glide-duration, 0s) ease;
+        /* Frosted glass: the transcript scrolls on under the box instead of
+           dissolving above it. Only the bottom padding strip stays opaque, so
+           no sharp text shows below the box. The stop is that padding (0.5rem). */
+        background: linear-gradient(to top, var(--bg-primary) 0.5rem, transparent 0.5rem);
+    }
+
+    :root[data-mobile-dynamic-bars] .thread-pane:not(.compose-empty) .prompt-area::before {
+        display: none;
+    }
+
+    :root[data-mobile-dynamic-bars] .thread-pane:not(.compose-empty) .prompt-area .prompt-box {
+        background-color: color-mix(in srgb, var(--composer-background-color) 70%, transparent);
+        -webkit-backdrop-filter: blur(0.75rem) saturate(140%);
+        backdrop-filter: blur(0.75rem) saturate(140%);
     }
 
     :root[data-mobile-dynamic-bars] .mobile-swipe-pane .thread-pane:not(.compose-empty) .thread-content {
@@ -1496,17 +1542,6 @@
         justify-content: center;
         justify-content: safe center;
     }
-
-    /* File search overlay starts below the mobile header. max() ensures it
-       never goes behind the dynamic island — when keyboard opens, the header
-       hides and --mobile-header-height drops to 0. */
-    .file-search-overlay {
-        top: max(
-            var(--mobile-header-height, calc(2.75rem + env(safe-area-inset-top, 0px))),
-            env(safe-area-inset-top, 0px)
-        );
-        padding-top: var(--header-surface-gap);
-    }
 }
 
 /* ─── Mobile dot indicator (inside header) ─── */
@@ -1515,7 +1550,7 @@
     display: none;
 }
 
-@media (max-width: 768px) {
+@media (--phone-layout) {
     .mobile-dot-indicator {
         display: flex;
         justify-content: center;
@@ -1603,7 +1638,7 @@
    appears frozen. When pseudo-fullscreen is active, drop the transform on all
    three so the overlay's position:fixed resolves against the real viewport.
    Also hide the header and dot indicator. */
-@media (max-width: 768px) {
+@media (--phone-layout) {
     :root[data-pseudo-fullscreen] .app-header {
         display: none !important;
     }
@@ -1640,43 +1675,4 @@
 
 :root[data-motion="reduce"] .mobile-swipe-track {
     transition: none;
-}
-
-/* ─── Phone in landscape ─── */
-/* Rotation is ignored: a phone held sideways is not an error state, so there
-   is no lock screen and the layout just follows the viewport it lands in.
-   Most phones are wider than the 768px line in landscape and therefore get the
-   desktop split, which suits the wide content (diffs, previews, images) people
-   rotate to read in the first place. A full-screen "Please rotate your device
-   to portrait" overlay used to sit here instead.
-
-   Detection: orientation:landscape + max-height:500px catches all phones
-   (height in landscape is ~300-450px) without triggering on tablets
-   (height ≥768px in landscape) or short desktop windows (orientation
-   is normally portrait or square at typical desktop heights).
-
-   Two things the width-gated mobile blocks above can no longer supply, since a
-   landscape phone sits on the far side of that gate:
-     - The notch / rounded-corner insets. `viewport-fit=cover` (index.html)
-       extends the layout under the cutout, and only landscape has non-zero
-       left/right insets, so the shell reserves them here rather than letting
-       the pane edges clip. Accepted cost: the shell's content box no longer
-       starts at x=0, but `--divider-x` (panels/shell.css) carries a `100%`
-       term that a position:fixed consumer resolves against the whole
-       viewport, so the desktop drawer scrim and the toast centering land up
-       to one inset off the divider they track. Cosmetic, and only here;
-       rebasing --divider-x on a shell-width variable would rework the whole
-       header positioning system for it.
-     - `html { overflow: hidden }`, which keeps iOS from scrolling the document
-       out from under the prompt when the keyboard opens. */
-@media (orientation: landscape) and (max-height: 500px) and (hover: none) and (pointer: coarse) {
-    html {
-        overflow: hidden;
-    }
-
-    .app-shell {
-        padding-left: env(safe-area-inset-left, 0px);
-        padding-right: env(safe-area-inset-right, 0px);
-        padding-bottom: env(safe-area-inset-bottom, 0px);
-    }
 }

@@ -23,10 +23,15 @@ const poller = proxySource
 /** What a fetched page says, standing in for its HTML. The fake DOMParser reads it. */
 interface Page {
   splash: boolean;
+  /** HTTP success. Defaults to true for the app and false for a splash, which is a 503. */
+  ok?: boolean;
   poll?: string;
   escape?: boolean;
   label?: string;
 }
+
+/** The status the app document bakes, which the gateway stamps as `data-ready-label`. */
+const READY = 'Opening your workspace…';
 
 function runPoller(opts: { poll?: string | null; escape?: boolean; motion?: string } = {}) {
   if (!poller) throw new Error('SPLASH_POLLER not found in proxy.rs');
@@ -35,8 +40,12 @@ function runPoller(opts: { poll?: string | null; escape?: boolean; motion?: stri
     textContent: 'Starting engine…',
     classList: { add: (c: string) => statusClasses.add(c), remove: (c: string) => statusClasses.delete(c) },
   };
+  const attributes: Record<string, string | null> = {
+    'data-poll-secs': opts.poll === undefined ? '2' : opts.poll,
+    'data-ready-label': READY,
+  };
   const splash = {
-    getAttribute: () => (opts.poll === undefined ? '2' : opts.poll),
+    getAttribute: (name: string) => attributes[name] ?? null,
     querySelector: (sel: string) =>
       sel === '.boot-splash-status' ? status : sel === '.boot-splash-escape' && opts.escape ? {} : null,
   };
@@ -50,6 +59,7 @@ function runPoller(opts: { poll?: string | null; escape?: boolean; motion?: stri
     const next = responses.shift() ?? new Error('no response queued');
     if (next instanceof Error) return Promise.reject(next);
     return Promise.resolve({
+      ok: next.ok ?? !next.splash,
       headers: { get: (name: string) => (name === 'x-lucidos-boot-splash' && next.splash ? '1' : null) },
       text: () => Promise.resolve(JSON.stringify(next)),
     });
@@ -110,12 +120,32 @@ describe('gateway boot splash poller', () => {
     expect(page.swapping()).toBe(false);
   });
 
-  it('reloads once the engine answers with the app', async () => {
+  // The app document opens on its own baked status. Reloading straight from a
+  // boot phase would snap the words at the seam, the one status change on
+  // either surface that did not crossfade. So the old words fade out, the
+  // app's fade in, and only then does the page reload into identical text.
+  it("crossfades to the app's own status, then reloads into the app", async () => {
     vi.useFakeTimers();
     const page = runPoller();
     page.queue({ splash: false });
     await vi.advanceTimersByTimeAsync(2000);
+    expect(page.swapping()).toBe(true);
+    expect(page.location.reload).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(150);
+    expect(page.status.textContent).toBe(READY);
+    expect(page.swapping()).toBe(false);
+    expect(page.location.reload).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(300);
     expect(page.location.reload).toHaveBeenCalledOnce();
+  });
+
+  it('reloads at once on an answer that is neither the app nor a splash', async () => {
+    vi.useFakeTimers();
+    const page = runPoller();
+    page.queue({ splash: false, ok: false });
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(page.location.reload).toHaveBeenCalledOnce();
+    expect(page.status.textContent).toBe('Starting engine…');
   });
 
   it('reloads into the stalled or failed page rather than borrowing its label', async () => {
@@ -138,7 +168,7 @@ describe('gateway boot splash poller', () => {
     page.queue(new Error('offline'), { splash: false });
     await vi.advanceTimersByTimeAsync(2000);
     expect(page.location.reload).not.toHaveBeenCalled();
-    await vi.advanceTimersByTimeAsync(2000);
+    await vi.advanceTimersByTimeAsync(2000 + 450);
     expect(page.location.reload).toHaveBeenCalledOnce();
   });
 
@@ -157,5 +187,15 @@ describe('gateway boot splash poller', () => {
     await vi.advanceTimersByTimeAsync(2000);
     await vi.advanceTimersByTimeAsync(1);
     expect(page.status.textContent).toBe('Recovering sessions…');
+  });
+
+  it('hands over to the app without waiting under reduced motion', async () => {
+    vi.useFakeTimers();
+    const page = runPoller({ motion: 'reduce' });
+    page.queue({ splash: false });
+    await vi.advanceTimersByTimeAsync(2000);
+    await vi.advanceTimersByTimeAsync(5);
+    expect(page.status.textContent).toBe(READY);
+    expect(page.location.reload).toHaveBeenCalledOnce();
   });
 });

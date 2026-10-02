@@ -52,6 +52,10 @@ const LIVE_TRANSCRIBE_MODEL: &str = "gpt-live-transcribe";
 /// stalled caller into unbounded memory.
 const EVENT_QUEUE: usize = 64;
 
+/// The error code the provider sends for a `response.cancel` with no reply in
+/// flight. [`error_events`] says why it is the one error a call survives.
+const CANCEL_FOUND_NO_REPLY: &str = "response_cancel_not_active";
+
 /// A talker reached over OpenAI's Realtime API.
 pub struct RealtimeProvider {
     api_key: String,
@@ -391,15 +395,35 @@ pub fn map_event(value: &Value) -> Vec<VoiceEvent> {
         }
         "response.function_call_arguments.done" => tool_call(value),
         "response.done" => done_events(value),
-        "error" => vec![VoiceEvent::Failed {
-            message: value
-                .pointer("/error/message")
-                .and_then(Value::as_str)
-                .unwrap_or("the talker reported an error with no message")
-                .to_string(),
-        }],
+        "error" => error_events(value),
         _ => vec![],
     }
+}
+
+/// What one provider error means to the call.
+///
+/// A failure, with one exception: a cancel that found no reply to cut. A
+/// barge-in races the reply's own end, so the provider can finish first and
+/// then refuse the cancel. The session is untouched, and ending the call there
+/// hangs up on a caller who only interrupted.
+///
+/// **The exception is one code, never a class.** Its type also covers a
+/// rejected session payload, and swallowing that leaves the caller in silence.
+fn error_events(value: &Value) -> Vec<VoiceEvent> {
+    let message = value
+        .pointer("/error/message")
+        .and_then(Value::as_str)
+        .unwrap_or("the talker reported an error with no message");
+    if value.pointer("/error/code").and_then(Value::as_str) == Some(CANCEL_FOUND_NO_REPLY) {
+        log!(
+            "[Voice] A cancel arrived after the reply ended: {}",
+            message
+        );
+        return vec![];
+    }
+    vec![VoiceEvent::Failed {
+        message: message.to_string(),
+    }]
 }
 
 /// One finished tool call, as the seam's own event.

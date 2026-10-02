@@ -11,9 +11,11 @@
 //! the 2026-07-29 `notary-verdict-watch` trigger read a default instead of the
 //! user's recorded DMG approval, withheld a release publish, and said so.
 
-use crate::support::{base_url, unique_marker, user_client, workspace_path};
+use crate::support::{
+    base_url, remove_data_fixtures, unique_marker, user_client, workspace_path, write_data_fixture,
+};
 use serde_json::json;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 /// Reads its sibling `../state/marker.json` the ordinary way and writes the
@@ -37,23 +39,32 @@ with open(os.path.join(_STATE, "result.json"), "w") as f:
 print("ok")
 "#;
 
-/// Async only so it can take the shared-tree read guard: these files appearing
-/// in the working tree must not land mid-snapshot for the command-checkpoint
-/// test (see `workspace_tree_lock`).
-async fn write_probe_trigger(slug: &str) -> PathBuf {
+/// The probe's files, `data/`-relative: the two it is given, then the one its
+/// run writes.
+fn probe_files(slug: &str) -> [String; 3] {
+    ["scripts/run.py", "state/marker.json", "state/result.json"]
+        .map(|f| format!("triggers/{slug}/{f}"))
+}
+
+/// Write the script and its sibling state through the data API, so both land
+/// committed. Holds the shared-tree read guard: these files appearing must not
+/// land mid-snapshot for the command-checkpoint test (see
+/// `workspace_tree_lock`).
+async fn write_probe_trigger(client: &reqwest::Client, slug: &str) {
+    let [script, marker, _] = probe_files(slug);
     let _tree = crate::support::workspace_tree_lock().read().await;
-    let trigger_dir = workspace_path().join("data/triggers").join(slug);
-    std::fs::create_dir_all(trigger_dir.join("scripts")).expect("create scripts dir");
-    std::fs::create_dir_all(trigger_dir.join("state")).expect("create state dir");
-    std::fs::write(trigger_dir.join("scripts/run.py"), PROBE_SCRIPT).expect("write script");
-    std::fs::write(
-        trigger_dir.join("state/marker.json"),
+    write_data_fixture(client, &script, PROBE_SCRIPT)
+        .await
+        .expect("write the probe script");
+    write_data_fixture(
+        client,
+        &marker,
         // A sentinel, deliberately NOT a real release version: a literal equal to
         // RELEASE would trip version_sources_test.sh's unmanaged-literal scan.
         r#"{"approved_version": "0.0.0-fixture"}"#,
     )
-    .expect("write marker");
-    trigger_dir
+    .await
+    .expect("write the marker");
 }
 
 async fn find_trigger_id(client: &reqwest::Client, name: &str) -> Option<String> {
@@ -70,32 +81,6 @@ async fn find_trigger_id(client: &reqwest::Client, name: &str) -> Option<String>
         .iter()
         .find(|t| t["name"] == name)
         .and_then(|t| t["id"].as_str().map(str::to_string))
-}
-
-/// Remove the probe trigger's directory AND commit the removal. The engine
-/// auto-commits dirty `data/` files after every script run, so the probe files
-/// are tracked by the time we get here — deleting them without committing
-/// would leave the e2e workspace's working tree dirty for every later test.
-/// Best-effort: the engine may hold `index.lock` for another run's auto-commit,
-/// and a failed cleanup must not fail the assertion this test exists for.
-async fn remove_and_commit(trigger_dir: &Path, slug: &str) {
-    // Exclusive, because this commits in the workspace itself.
-    let _tree = crate::support::workspace_tree_lock().write().await;
-    let _ = std::fs::remove_dir_all(trigger_dir);
-    let pathspec = format!("data/triggers/{}", slug);
-    // Pathspec form: commits the working-tree state of exactly these paths,
-    // so a concurrent test's staged changes are never swept in.
-    let _ = std::process::Command::new("git")
-        .current_dir(workspace_path())
-        .args([
-            "commit",
-            "-q",
-            "-m",
-            "e2e: remove in-place probe trigger",
-            "--",
-            &pathspec,
-        ])
-        .output();
 }
 
 async fn wait_for_file(path: &Path, timeout: Duration) -> Option<String> {
@@ -117,7 +102,8 @@ async fn script_trigger_runs_in_place_and_reaches_its_sibling_state_dir() {
     let name = format!("In-place probe {}", slug);
     let event_type = format!("E2eInPlaceProbe{}", slug.replace('-', ""));
 
-    let trigger_dir = write_probe_trigger(&slug).await;
+    let files = probe_files(&slug);
+    write_probe_trigger(&client, &slug).await;
 
     let created: serde_json::Value = client
         .post(format!("{}/api/v1/triggers", base_url()))
@@ -127,7 +113,7 @@ async fn script_trigger_runs_in_place_and_reaches_its_sibling_state_dir() {
             "on": [{ "event_type": event_type }],
             "run": {
                 "type": "script",
-                "path": format!("triggers/{}/scripts/run.py", slug),
+                "path": files[0],
             },
         }))
         .send()
@@ -149,11 +135,7 @@ async fn script_trigger_runs_in_place_and_reaches_its_sibling_state_dir() {
         .expect("Invalid JSON");
     assert_eq!(resp["success"], true, "emit failed: {resp}");
 
-    let result = wait_for_file(
-        &trigger_dir.join("state/result.json"),
-        Duration::from_secs(45),
-    )
-    .await;
+    let result = wait_for_file(&ws.join("data").join(&files[2]), Duration::from_secs(45)).await;
 
     // Tear down before asserting so a failure doesn't leave a live trigger
     // pointed at files the cleanup removes.
@@ -165,7 +147,7 @@ async fn script_trigger_runs_in_place_and_reaches_its_sibling_state_dir() {
             .send()
             .await;
     }
-    remove_and_commit(&trigger_dir, &slug).await;
+    remove_data_fixtures(&client, &format!("triggers/{slug}"), &files).await;
     let _ = std::fs::remove_dir_all(&phantom);
 
     assert!(

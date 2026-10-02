@@ -42,26 +42,23 @@
     -webkit-user-select: text;
 }
 
-/* Subject and state on ONE line. The state is pushed to the far edge and sits
-   on the subject's first baseline, so a subject that wraps to three lines
-   still reports its verdict where the reading starts.
-
-   On a pane too narrow for the subject's basis beside the state (a phone), the
-   state wraps onto a line of its own instead. Without the wrap the subject,
-   which may break between any two letters, shrank to one letter per line. */
+/* Subject and state on ONE line, at every width. The state sits on the
+   subject's first baseline, so a subject that wraps to three lines still
+   reports its verdict where the reading starts. The head must not wrap: a
+   state dropped to a line of its own floats mid-card, under nothing. */
 .event-row-head {
     display: flex;
-    flex-wrap: wrap;
     align-items: baseline;
-    gap: var(--space-xs) var(--space-sm);
+    gap: var(--space-sm);
 }
 
-/* Pushed to the far edge, on the subject's line or on its own. It rides the
-   head's baseline alignment, which in flex is the FIRST baseline. So it stays
-   level with the subject's opening line, however far the subject wraps. */
+/* At the far edge, capped so the subject always keeps over half the line. A
+   state longer than the cap wraps inside its own column, right-aligned. */
 .event-row-state {
     flex: 0 0 auto;
+    max-width: 45%;
     margin-left: auto;
+    text-align: right;
 }
 
 /* ABOVE the card, right-aligned, in the muted stamp a user bubble carries
@@ -90,11 +87,9 @@
    is answering. `overflow-wrap` rather than `word-break`, so an ordinary
    sentence still breaks at its spaces and only an unbroken token is split. */
 .event-row-subject {
-    /* The only child that gives: the state word is fixed-size, so
-       a long subject shrinks itself and wraps rather than pushing the state off
-       the card's right edge. The basis is the floor it shrinks to before the
-       head wraps the state below it instead. */
-    flex: 1 1 12rem;
+    /* Takes whatever the state leaves, and wraps inside it. The state's cap
+       keeps that share from shrinking to one letter per line. */
+    flex: 1 1 0;
     min-width: 0;
     color: var(--text-primary);
     overflow-wrap: anywhere;
@@ -209,7 +204,8 @@
     /* A flex box drops the space text node between name and note, so the gap
        stands in for it. */
     gap: 0.4em;
-    padding: 0.0625rem 0.375rem;
+    --event-name-h-pad: 0.375rem;
+    padding: 0.0625rem var(--event-name-h-pad);
     /* Transparent, so the link variant's outline costs no layout shift. */
     border: 1px solid transparent;
     border-radius: calc(var(--radius-control) * 0.625);
@@ -217,6 +213,16 @@
     color: var(--text-secondary);
     font-family: var(--font-mono);
     font-size: var(--font-size-xs);
+}
+
+/* A badge header: a row whose subject IS the event-type chip, with nothing
+   leading it ("Child thread returned", a trigger fire, a boundary event). The
+   chip's own padding and border inset its label text past where the facts
+   and fold rows below start flush. Pull the chip left by that same inset so
+   its label lines up with them on one left edge instead of sitting indented
+   above it. */
+.event-row-subject > .event-name:first-child {
+    margin-left: calc(-1px - var(--event-name-h-pad));
 }
 
 /* "filtered" / "6 filters": a qualifier, so it recedes behind the name in
@@ -318,4 +324,17 @@
 
 .event-row-fold-body {
     font-size: var(--font-size-sm);
+}
+
+/* A fold inside a fold (a re-entry's "What the agent was told") already sits on
+   the outer body's fill. A second fill on the same colour would vanish, so the
+   inner body drops its box and reads as text under its own toggle. */
+.event-row-fold-body .event-row-fold {
+    margin-top: var(--space-sm);
+}
+
+.event-row-fold-body .event-row-fold-pre,
+.event-row-fold-body .event-row-fold-body {
+    padding: 0;
+    background: none;
 }

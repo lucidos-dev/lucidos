@@ -3,7 +3,8 @@
    its own background, border or focus.
 
    Inside a .form-group, this rule skips two fields whose frame draws the box:
-   the Intent textarea (.prompt-box) and an editable dropdown's input. */
+   the Intent textarea (.prompt-box, whose frame wears the same focus ring)
+   and an editable dropdown's input. */
 .settings-text-input,
 .form-group input:where(:not([type="checkbox"], .dropdown-input)),
 .form-group textarea:where(:not(.prompt-textarea)),
@@ -11,7 +12,14 @@
 .oauth-provider-input,
 .allowlist-row-input,
 .device-name-input,
-.style-editor-instruction {
+.style-editor-instruction,
+.app-store-marketplace-name-input,
+.trigger-group-name-input,
+.dir-picker-path-input,
+.panel-url-input,
+.prompt-input,
+.file-editor-textarea,
+.pairing-input {
     background: var(--bg-secondary);
     border: 1px solid var(--border-color);
     border-radius: calc(var(--radius-control) * 0.5);
@@ -27,7 +35,14 @@
 .oauth-provider-input::placeholder,
 .allowlist-row-input::placeholder,
 .device-name-input::placeholder,
-.style-editor-instruction::placeholder {
+.style-editor-instruction::placeholder,
+.app-store-marketplace-name-input::placeholder,
+.trigger-group-name-input::placeholder,
+.dir-picker-path-input::placeholder,
+.panel-url-input::placeholder,
+.prompt-input::placeholder,
+.file-editor-textarea::placeholder,
+.pairing-input::placeholder {
     color: var(--text-muted);
 }
 
@@ -44,6 +59,13 @@
 .allowlist-row-input:focus,
 .device-name-input:focus,
 .style-editor-instruction:focus,
+.app-store-marketplace-name-input:focus,
+.trigger-group-name-input:focus,
+.dir-picker-path-input:focus,
+.panel-url-input:focus,
+.prompt-input:focus,
+.file-editor-textarea:focus,
+.pairing-input:focus,
 .input-with-action:focus-within,
 .dropdown-input-wrap:focus-within {
     border-color: transparent;

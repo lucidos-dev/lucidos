@@ -31,8 +31,8 @@ use super::lucidos_cli::path_with_prefixes;
 ///   `LUCIDOS_THREAD_ID`) — see `api::actor::subprocess_origin_env_vars`.
 /// - `LUCIDOS_EVENT_ID` / `LUCIDOS_REPO` / `LUCIDOS_SESSION_KIND` spawn
 ///   metadata consumed by `lucidos spawn-thread` and `cc-stop-reminder`.
-/// - `RUSTC_WRAPPER` — sccache when present on PATH, explicitly empty
-///   otherwise (see `sccache_on_path` for why empty ≠ unset).
+/// - The compile env from `agent_compile_env`: `RUSTC_WRAPPER` (sccache when
+///   on PATH, explicitly empty otherwise) and the agents' own sccache daemon.
 /// - `PATH` prefixed with the `lucidos` CLI dir when one was found, AND the
 ///   bundled Postgres bin dir (`LUCIDOS_PG_BIN_DIR`) when set — a packaged
 ///   build's `psql` lives there, not on the service manager's minimal PATH,
@@ -101,11 +101,10 @@ pub(super) fn apply_lucidos_env(
     // unset: the Lucidos repo's tracked .cargo/config.toml sets
     // `build.rustc-wrapper = "sccache"`, which cargo falls back to when
     // RUSTC_WRAPPER is unset — only an explicit empty value overrides it to
-    // a plain (uncached) build. See `sccache_on_path`.
-    cmd.env(
-        "RUSTC_WRAPPER",
-        rustc_wrapper_for_path(std::env::var_os("PATH").as_deref()),
-    );
+    // a plain (uncached) build. See `sccache_on_path` and `agent_compile_env`.
+    for (key, value) in agent_compile_env() {
+        cmd.env(key, value);
+    }
     let prefixes = agent_path_prefixes(
         cli_dir,
         std::env::var_os("LUCIDOS_PG_BIN_DIR").map(std::path::PathBuf::from),
@@ -193,10 +192,14 @@ pub(super) fn resolve_binary_override(
 /// child in its own group is the root-cause fix: a signal delivered to the
 /// engine's process group can never reach a process in a different group.
 ///
-/// Coding-agent spawns are the original caller. The dev background engine build
-/// (`engine::engine_version::run_engine_build`) uses it for the other half of the
-/// same contract: a group is the only handle that reaches the `cargo` GRANDCHILD
-/// when a coalescing Apply supersedes the build.
+/// Coding-agent spawns and background tasks reach it through
+/// [`spawn_below_engine`]. Three callers use it directly and keep the engine's
+/// priority. One is the dev background engine build
+/// (`engine::engine_version::run_engine_build`). Its group is the only handle
+/// that reaches the `cargo` GRANDCHILD when a coalescing Apply supersedes it
+/// (ADR 0304). The others are the Vite preview (`engine::frontend_preview`)
+/// and MCP servers (`mcp::client`), whose `npx`/`uvx` launchers fork the real
+/// server as a grandchild.
 ///
 /// `process_group(0)` makes the child the leader of a fresh group
 /// (`pgid == child pid`). It is applied via `POSIX_SPAWN_SETPGROUP` — no
@@ -210,6 +213,54 @@ pub(crate) fn isolate_in_process_group(cmd: &mut tokio::process::Command) {
 
 #[cfg(not(unix))]
 pub(crate) fn isolate_in_process_group(_cmd: &mut tokio::process::Command) {}
+
+/// How far below the engine an agent's process tree runs. A build slot inside
+/// the tree adds its own +10 on top, so agent builds land at 15 (ADR 0341).
+#[cfg(unix)]
+const BELOW_ENGINE_NICE: i32 = 5;
+
+/// The weakest priority a process can hold. The kernel clamps past it anyway.
+#[cfg(unix)]
+const MAX_NICE: i32 = 19;
+
+/// Spawn `cmd` as its own process group, then lower that group below the
+/// engine, so the engine keeps answering clients while agents build (ADR 0341).
+///
+/// Agent sessions, side questions, model probes and background tasks spawn
+/// through here. The engine's own Apply rebuild must not: the user waits on it
+/// (ADR 0304).
+///
+/// The renice runs in the parent after spawn, because a `pre_exec` hook would
+/// cost the `posix_spawn` path. It names the group, not the pid: Linux nice is
+/// per thread, and the group reaches every thread and process present. A
+/// failed renice is logged and the child returned, never a failed spawn.
+pub(crate) fn spawn_below_engine(
+    cmd: &mut tokio::process::Command,
+) -> std::io::Result<tokio::process::Child> {
+    isolate_in_process_group(cmd);
+    let child = cmd.spawn()?;
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        if let Err(e) = lower_group_below_engine(pid) {
+            crate::log!("[SpawnEnv] Could not lower priority of process group {pid}: {e}");
+        }
+    }
+    Ok(child)
+}
+
+#[cfg(unix)]
+fn lower_group_below_engine(pgid: u32) -> std::io::Result<()> {
+    // SAFETY: getpriority takes no pointers. PRIO_PROCESS with who = 0 names
+    // this process, which always exists, so a -1 is a real nice value.
+    let engine_nice = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
+    let target = (engine_nice + BELOW_ENGINE_NICE).min(MAX_NICE);
+    // SAFETY: setpriority takes no pointers and only adjusts scheduling state.
+    if unsafe { libc::setpriority(libc::PRIO_PGRP, pgid, target) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
 
 /// The `kill(2)` first argument for a child's process group, or `None` when
 /// there is no group safe to name.
@@ -283,12 +334,12 @@ pub(super) fn signal_child_process_group(_pid: u32, _signal: i32) {}
 /// `wait()` the pid (hence the group id) can be recycled and signalling a
 /// recycled group would hit unrelated processes (see `signal_child_process_group`).
 #[cfg(unix)]
-pub(super) async fn graceful_kill_child_process_group(pid: u32, grace: std::time::Duration) {
+pub(crate) async fn graceful_kill_child_process_group(pid: u32, grace: std::time::Duration) {
     graceful_kill_child_process_group_or_sooner(pid, grace, std::future::pending()).await;
 }
 
 #[cfg(not(unix))]
-pub(super) async fn graceful_kill_child_process_group(_pid: u32, _grace: std::time::Duration) {}
+pub(crate) async fn graceful_kill_child_process_group(_pid: u32, _grace: std::time::Duration) {}
 
 /// [`graceful_kill_child_process_group`], with a grace that `sooner` can cut
 /// short. The background-task registry needs it: an engine teardown arriving
@@ -415,16 +466,44 @@ pub(super) fn sccache_on_path(path_var: Option<&std::ffi::OsStr>) -> bool {
     find_on_path(std::ffi::OsStr::new(&exe), path_var).is_some()
 }
 
-/// The `RUSTC_WRAPPER` a Lucidos-spawned build gets: `sccache` when it is on
-/// PATH, else empty. Empty, never unset: see the note in `apply_lucidos_env`.
-/// Shared by the agent spawn and a coding agent's background task, so a build
-/// behaves the same in both.
-pub(crate) fn rustc_wrapper_for_path(path_var: Option<&std::ffi::OsStr>) -> &'static str {
-    if sccache_on_path(path_var) {
-        "sccache"
-    } else {
-        ""
+/// Port of the agents' own sccache daemon. The default daemon on 4226 is left
+/// to the Apply rebuild and to terminals (ADR 0343).
+const AGENT_SCCACHE_PORT: &str = "4227";
+
+/// Directory under [`crate::paths::user_cache_root`] holding the agents' cache.
+/// Two daemons never share one disk cache: sccache does not lock it.
+const AGENT_SCCACHE_DIR_NAME: &str = "sccache-agents";
+
+/// The compile env a coding agent's builds get. The agent spawn and an agent's
+/// background task both take it, so a build behaves the same in both.
+///
+/// With `sccache` on PATH, builds go to the agents' own daemon. That daemon
+/// inherits the priority of the agent that starts it, so agent `rustc` runs
+/// below the engine (ADR 0343). Without `sccache`, `RUSTC_WRAPPER` is empty,
+/// never unset: see the note in `apply_lucidos_env`. Without a cache root, the
+/// wrapper goes alone, to the default daemon.
+pub(crate) fn agent_compile_env_from(
+    path_var: Option<&std::ffi::OsStr>,
+    cache_root: Option<&Path>,
+) -> Vec<(&'static str, String)> {
+    if !sccache_on_path(path_var) {
+        return vec![("RUSTC_WRAPPER", String::new())];
     }
+    let mut env = vec![("RUSTC_WRAPPER", "sccache".to_string())];
+    if let Some(root) = cache_root {
+        let dir = root.join(AGENT_SCCACHE_DIR_NAME);
+        env.push(("SCCACHE_SERVER_PORT", AGENT_SCCACHE_PORT.to_string()));
+        env.push(("SCCACHE_DIR", dir.to_string_lossy().into_owned()));
+    }
+    env
+}
+
+/// [`agent_compile_env_from`] over the engine's own PATH and cache root.
+pub(crate) fn agent_compile_env() -> Vec<(&'static str, String)> {
+    agent_compile_env_from(
+        std::env::var_os("PATH").as_deref(),
+        crate::paths::user_cache_root().as_deref(),
+    )
 }
 
 #[cfg(test)]
@@ -565,20 +644,51 @@ mod tests {
         );
     }
 
-    #[test]
-    fn rustc_wrapper_is_empty_rather_than_unset_without_sccache() {
-        let tmp = tempfile::TempDir::new().expect("tempdir");
-        let path_var = std::env::join_paths([tmp.path()]).expect("join_paths");
-        assert_eq!(rustc_wrapper_for_path(Some(path_var.as_os_str())), "");
+    fn path_with_fake_sccache(dir: &Path) -> std::ffi::OsString {
         std::fs::write(
-            tmp.path()
-                .join(format!("sccache{}", std::env::consts::EXE_SUFFIX)),
+            dir.join(format!("sccache{}", std::env::consts::EXE_SUFFIX)),
             b"#!/bin/sh\nexit 0\n",
         )
         .expect("write fake sccache");
+        std::env::join_paths([dir]).expect("join_paths")
+    }
+
+    #[test]
+    fn without_sccache_the_wrapper_is_empty_and_no_daemon_is_named() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let path_var = std::env::join_paths([tmp.path()]).expect("join_paths");
         assert_eq!(
-            rustc_wrapper_for_path(Some(path_var.as_os_str())),
-            "sccache"
+            agent_compile_env_from(Some(&path_var), Some(Path::new("/tmp/cache"))),
+            vec![("RUSTC_WRAPPER", String::new())],
+        );
+    }
+
+    /// The daemon an agent starts inherits the agent's lower priority. Only
+    /// its own port keeps the Apply rebuild off it (ADR 0343).
+    #[test]
+    fn with_sccache_agents_compile_through_their_own_daemon_and_cache() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let path_var = path_with_fake_sccache(tmp.path());
+        assert_eq!(
+            agent_compile_env_from(Some(&path_var), Some(Path::new("/tmp/cache/lucidos"))),
+            vec![
+                ("RUSTC_WRAPPER", "sccache".to_string()),
+                ("SCCACHE_SERVER_PORT", "4227".to_string()),
+                (
+                    "SCCACHE_DIR",
+                    "/tmp/cache/lucidos/sccache-agents".to_string()
+                ),
+            ],
+        );
+    }
+
+    #[test]
+    fn with_no_cache_root_the_wrapper_goes_alone() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let path_var = path_with_fake_sccache(tmp.path());
+        assert_eq!(
+            agent_compile_env_from(Some(&path_var), None),
+            vec![("RUSTC_WRAPPER", "sccache".to_string())],
         );
     }
 
@@ -671,6 +781,77 @@ mod tests {
 
         let _ = child.start_kill();
         let _ = child.wait().await;
+    }
+
+    // ── Running below the engine (ADR 0341) ────────────────────────────────
+
+    #[cfg(unix)]
+    fn nice_of(pid: u32) -> i32 {
+        // SAFETY: getpriority takes no pointers and only reads process state.
+        unsafe { libc::getpriority(libc::PRIO_PROCESS, pid) }
+    }
+
+    #[cfg(unix)]
+    fn below_engine() -> i32 {
+        (nice_of(0) + BELOW_ENGINE_NICE).min(MAX_NICE)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_child_spawned_below_the_engine_leads_its_group_at_lower_priority() {
+        let mut cmd = tokio::process::Command::new("sleep");
+        cmd.arg("60").kill_on_drop(true);
+        let mut child = spawn_below_engine(&mut cmd).expect("spawn");
+        let pid = child.id().expect("child has a pid");
+
+        assert_eq!(pgid_of(pid), pid as i32, "the renice names this group");
+        assert_eq!(nice_of(pid), below_engine());
+
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+    }
+
+    /// The renice must reach what the agent spawns, not just the agent: a
+    /// `make lint` under a session is the load this exists for.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_grandchild_runs_below_the_engine_too() {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.args(["-c", "sleep 60 & echo $!; wait"])
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = spawn_below_engine(&mut cmd).expect("spawn");
+        let pgid = child.id().expect("child has a pid");
+        let mut line = String::new();
+        BufReader::new(child.stdout.take().expect("piped stdout"))
+            .read_line(&mut line)
+            .await
+            .expect("read grandchild pid");
+        let grandchild: u32 = line.trim().parse().expect("grandchild pid");
+        let grandchild_nice = nice_of(grandchild);
+        signal_child_process_group(pgid, KILL_SIGNAL);
+        let _ = child.wait().await;
+
+        assert_eq!(grandchild_nice, below_engine());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lowering_a_group_that_is_gone_is_an_error_not_a_panic() {
+        let mut child = tokio::process::Command::new("true")
+            .process_group(0)
+            .spawn()
+            .expect("spawn");
+        let pid = child.id().expect("child has a pid");
+        let _ = child.wait().await;
+
+        assert!(lower_group_below_engine(pid).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_missing_binary_still_fails_the_spawn() {
+        let mut cmd = tokio::process::Command::new("/nonexistent/lucidos-test-binary");
+        assert!(spawn_below_engine(&mut cmd).is_err());
     }
 
     /// The end-to-end property: a SIGTERM delivered to the engine's process

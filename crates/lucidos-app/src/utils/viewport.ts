@@ -1,10 +1,13 @@
 import { signal } from '@preact/signals';
+import { PHONE_LAYOUT_QUERY, isPhoneLayout } from './layoutMedia';
 
-/** Mobile breakpoint in px — matches @media (max-width: 768px) in CSS. */
-const MOBILE_BREAKPOINT = 768;
-
-/** Non-reactive boolean read — does not subscribe the caller. */
-export const isMobile = (): boolean => window.innerWidth <= MOBILE_BREAKPOINT;
+/** Whether the viewport gets the phone layout (`@media (--phone-layout)` in
+ *  CSS, utils/layoutMedia.ts). Non-reactive: does not subscribe the caller. */
+export const isMobile = (): boolean => isPhoneLayout({
+  width: window.innerWidth,
+  height: window.innerHeight,
+  coarsePointer: hasCoarsePointer(),
+});
 
 /** True when the device exposes touch input. Inclusive OR so any touch
  *  indicator counts — used by the body `.is-touch` class which controls
@@ -31,8 +34,8 @@ export const isMobileOrTouch = (): boolean =>
  *  when the viewport crosses the mobile breakpoint. */
 export const viewportIsMobile = signal(isMobile());
 
-/** Re-derive from the live `window.innerWidth`. Cheap: peeks + compares, and
- *  only writes (waking subscribers) when the breakpoint side actually flips. */
+/** Re-derive from the live viewport. Cheap: peeks + compares, and only writes
+ *  (waking subscribers) when the layout side actually flips. */
 const syncViewportIsMobile = () => {
   const next = isMobile();
   if (next !== viewportIsMobile.peek()) viewportIsMobile.value = next;
@@ -63,9 +66,12 @@ if (typeof document !== 'undefined' && typeof document.addEventListener === 'fun
 }
 // visualViewport.resize is the most reliable "viewport changed" signal on iOS.
 // It also fires on keyboard show/hide, but syncViewportIsMobile reads the LAYOUT
-// viewport (window.innerWidth), which the keyboard doesn't shrink — so no
-// spurious breakpoint flip.
+// viewport (innerWidth and innerHeight), which the keyboard does not shrink
+// under `interactive-widget=resizes-visual` (index.html), so no spurious flip.
 window.visualViewport?.addEventListener('resize', syncViewportIsMobile);
+// The CSS query itself, which also flips with no resize at all: a convertible
+// handing its primary pointer between finger and trackpad.
+window.matchMedia?.(PHONE_LAYOUT_QUERY).addEventListener?.('change', syncViewportIsMobile);
 
 /** `true` when the event with the given `data-event-id` is currently in
  *  the visible viewport on this device. Filters dual-mount copies so a

@@ -53,6 +53,7 @@ const GATED_HANDLERS: &[(&str, &str, &str)] = &[
     ("claude_code.rs", CLAUDE_CODE_RS, "claude_code_discard"),
     ("claude_code.rs", CLAUDE_CODE_RS, "claude_code_interrupt"),
     ("claude_code.rs", CLAUDE_CODE_RS, "claude_code_control"),
+    ("disk_usage.rs", DISK_USAGE_RS, "cleanup_worktree"),
     ("threads/actions.rs", ACTIONS_RS, "answer_thread_question"),
     ("threads/actions.rs", ACTIONS_RS, "continue_thread"),
     ("threads/archive.rs", ARCHIVE_RS, "archive_thread"),
@@ -80,6 +81,7 @@ const GATED_HANDLERS: &[(&str, &str, &str)] = &[
 const CHANGES_RS: &str = include_str!("changes.rs");
 const CHAT_RS: &str = include_str!("chat.rs");
 const CLAUDE_CODE_RS: &str = include_str!("claude_code.rs");
+const DISK_USAGE_RS: &str = include_str!("disk_usage.rs");
 const ACTIONS_RS: &str = include_str!("threads/actions.rs");
 const ARCHIVE_RS: &str = include_str!("threads/archive.rs");
 const TOOLS_RS: &str = include_str!("../engine/tools/mod.rs");

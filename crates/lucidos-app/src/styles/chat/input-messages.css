@@ -27,21 +27,32 @@
     pointer-events: none;
 }
 
+/* .input-toggles-wrapper's align-items: flex-start sizes every child to its
+   own content width, so the row needs its own stretch to reach the wrapper's
+   full width, the same width .prompt-box resolves to as the wrapper's sibling. */
 .compose-destination-row {
     display: flex;
     align-items: center;
     gap: 0.375rem;
+    width: 100%;
     max-width: 100%;
+    align-self: stretch;
 }
 
+/* Grows to fill the row, so its outer edge lands on .prompt-box's edge below
+   it. The coding-agent chip beside it keeps its own content width
+   (.compose-coding-agent-chip's flex-shrink: 0), so it is this picker that
+   absorbs the row's full width. */
 .compose-destination-row .compose-destination-picker {
     margin-bottom: 0;
-    flex-shrink: 1;
+    flex: 1 1 auto;
     min-width: 0;
 }
 
 .compose-destination-row .compose-destination-picker .dropdown-trigger {
+    width: 100%;
     min-width: 0;
+    justify-content: space-between;
 }
 
 .compose-destination-row .compose-destination-picker .dropdown-sizer > * {
@@ -349,10 +360,9 @@
  * only while the thread is parked on a subscription or on a sub-thread, so its
  * presence IS the on-state and there is no second state to tell apart.
  *
- * The token is `--accent`, deliberately, and not the `--accent-notable` a
- * Waiting thread wears in the Info popover. That one is the neutral tone of a
- * STATUS, and the status dot keeps it. This is the armed thing behind the
- * status, so it reads with the row's other live modes. */
+ * The token is `--accent`, deliberately, and not `--accent-notable`, the
+ * neutral tone this palette keeps for a waiting STATUS. This is the armed thing
+ * behind the status, so it reads with the row's other live modes. */
 .prompt-actions-row .icon-btn.header-icon[data-role="waiting-indicator"] {
     color: var(--accent);
 }
@@ -589,7 +599,7 @@
     padding: 0 var(--space-lg) var(--space-md);
 }
 
-/* Never wraps. Packed right, so the apply side holds the right edge with or
+/* Never wraps. Packed right, so the apply button holds the right edge with or
    without Discard All, whose auto margin takes it to the left edge. Stretched,
    so a label that wraps makes every button taller, not just its own. */
 .changes-bulk-buttons {
@@ -600,8 +610,7 @@
 }
 
 /* Equal shares of the line, capped so a wide pane keeps them button-sized. On a
-   phone three do not fit at their natural width, so a long label wraps inside
-   its share rather than being clipped. */
+   narrow phone a long label wraps inside its share rather than being clipped. */
 .changes-bulk-buttons > .action-btn {
     flex: 1 1 0;
     max-width: 10rem;
@@ -737,7 +746,7 @@
 /* On a phone the panel takes the header palette width, so a long skill name
    cannot stretch it to the screen edges. The menus centre it in the pane
    ('container-center'). */
-@media (max-width: 768px) {
+@media (--phone-layout) {
     .control-dropdown {
         width: var(--header-surface-width);
     }
@@ -896,7 +905,8 @@
 }
 
 /* Camera capture overlay: an `overlayClass` on a backdrop <Overlay>, so
-   `.modal-overlay` already supplies the fixed full-screen box and the centring.
+   `.modal-overlay` already supplies the fixed box on the visible viewport and
+   the centring.
    A darker backdrop is the only thing that differs.
    It also carried `z-index: 500`, and this sheet loads after global.css, so
    that beat `--z-modal` on source order: the camera drew BELOW the floating
@@ -1074,7 +1084,7 @@
 .scroll-to-top,
 .scroll-to-bottom {
     position: absolute;
-    right: 1.125rem;
+    right: calc(1.125rem + var(--phone-side-inset));
     width: var(--scroll-chevron-size);
     height: var(--scroll-chevron-size);
     border-radius: var(--radius-round);
@@ -1103,7 +1113,7 @@
     height: var(--scroll-chevron-glyph);
 }
 
-.scroll-to-top { top: max(calc(env(safe-area-inset-top, 0px) + 0.75rem), calc(var(--mobile-header-height, 0rem) + 0.25rem)); }
+.scroll-to-top { top: max(calc(var(--safe-area-top) + 0.75rem), calc(var(--mobile-header-height, 0rem) + 0.25rem)); }
 .scroll-to-bottom { bottom: 0.75rem; }
 
 .scroll-to-top.visible,
@@ -1126,7 +1136,7 @@
     }
 }
 
-@media (min-width: 769px) {
+@media (--desktop-layout) {
     /* Keep the chevrons INSIDE the centered transcript, a fixed margin in from its
        right edge — never floating out in the gutter. The scroll container is
        full-width but its content is capped at --content-max-width and centered
@@ -1173,7 +1183,7 @@
 }
 
 @media (hover: hover) {
-    .scroll-to-top { top: max(var(--scroll-chevron-top), calc(env(safe-area-inset-top, 0px) + var(--scroll-chevron-top))); }
+    .scroll-to-top { top: max(var(--scroll-chevron-top), calc(var(--safe-area-top) + var(--scroll-chevron-top))); }
     .scroll-to-top:hover,
     .scroll-to-bottom:hover {
         opacity: 1;
@@ -1412,7 +1422,7 @@ html[data-theme-mode="dark"] .thread-status-question-badge::after {
    status a universal symbol states outright instead of leaving to a color the
    user has to learn. Deliberately NOT the failed red, because nothing failed and
    the engine resumes the turn on its own within seconds. --accent-notable is the
-   same neutral in-between tone the Info popover's Waiting dot uses. */
+   palette's neutral tone for an in-between state. */
 .thread-status-paused-icon {
     display: inline-flex;
     align-items: center;

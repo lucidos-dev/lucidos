@@ -452,6 +452,13 @@ impl ReleaseCheck {
         }
     }
 
+    /// The newest published version, when the last answer named one later
+    /// than ours.
+    pub fn latest_version(&self) -> Option<String> {
+        let st = self.state.lock().unwrap();
+        st.latest.as_ref().map(|release| release.version.clone())
+    }
+
     /// The current preference, re-read from disk on every call.
     ///
     /// Re-read rather than cached so turning the check off in Settings takes

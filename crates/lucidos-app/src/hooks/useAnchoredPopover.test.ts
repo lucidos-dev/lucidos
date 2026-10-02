@@ -1286,6 +1286,17 @@ describe('installPairedSwallow', () => {
     expect(touch.stopPropagation).not.toHaveBeenCalled();
   });
 
+  it.each(['touchcancel', 'pointercancel'])('a %s names the swallow, so no button serves the press', (type) => {
+    // A constructive face serves a tap the system cancels. A dismissing tap
+    // must still only close the overlay, so the cancel is claimed. It still
+    // propagates: the swipe and scroll trackers reset on it.
+    takePressOutcome(1000);
+    installPairedSwallow();
+    const cancel = dispatch(type);
+    expect(takePressOutcome(1000)).toBe('swallowed');
+    expect(cancel.stopPropagation).not.toHaveBeenCalled();
+  });
+
   // The arm belongs to ONE gesture. Its paired event can strand: a touchend
   // dispatched to a node the dismiss REMOVED never reaches document, and no
   // cancel fires. A stranded arm that survives eats the user's next tap, which

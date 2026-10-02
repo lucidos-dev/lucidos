@@ -33,9 +33,9 @@ test.describe('Message route panel', () => {
 
     // The frontend always sends x-lucidos-device-id (auto-generated in
     // localStorage on first call), so origin is Device. The popover names it
-    // from the devices list: "device-<short id>" until the device has a name.
+    // on a "Sent from" row, from the devices list.
     const originSection = panel.locator('.route-section').first();
-    await expect(originSection).toContainText(/API client|device-|Workspace/);
+    await expect(originSection).toContainText(/Sent from|Sent by|Workspace/);
 
     // Outside-click dismisses the panel.
     await page.locator('.app-shell').click({ position: { x: 5, y: 5 } });
@@ -168,10 +168,10 @@ test.describe('Message route panel', () => {
       const panel = page.locator('.message-route-panel');
       await expect(panel).toBeVisible();
       const originSection = panel.locator('.route-section').first();
-      // Engine origins now render the explainer ("why the engine acted" + body)
-      // instead of the old "Engine · Auto-resumed after restart" single-line label.
-      await expect(originSection).toContainText('Why the engine acted');
-      await expect(originSection).toContainText(/auto-resumed/i);
+      // An engine origin renders its explainer: a "Why Lucidos acted" heading
+      // over a plain sentence.
+      await expect(originSection).toContainText('Why Lucidos acted');
+      await expect(originSection).toContainText(/picked it back up/i);
     } finally {
       psql([
         `DELETE FROM events WHERE aggregate_id = '${threadId}'`,
@@ -225,7 +225,7 @@ test.describe('Message route panel', () => {
       await expect(originSection).toContainText('Lucidos Engine');
       await expect(originSection).toContainText('Plugin update');
       await expect(originSection).toContainText('Habit Tracker 0.1.3 → 0.1.4');
-      await expect(originSection).toContainText('Why the engine acted');
+      await expect(originSection).toContainText('Why Lucidos acted');
       await expect(originSection).not.toContainText('Unknown');
     } finally {
       psql([

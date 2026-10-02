@@ -80,7 +80,7 @@ export function getRemPx(): number {
 let safeAreaProbe: HTMLElement | null = null;
 
 /** The top safe area in px: the band the status bar and the Dynamic Island
- *  draw over. Script cannot read `env()`, so a hidden probe resolves it as
+ *  draw over. Script cannot read the inset, so a hidden probe resolves it as
  *  padding. 0 where there is no inset, or no DOM. */
 export function safeAreaTopPx(): number {
   if (typeof document === 'undefined' || !document.body) return 0;
@@ -88,7 +88,7 @@ export function safeAreaTopPx(): number {
     safeAreaProbe = document.createElement('div');
     safeAreaProbe.setAttribute('aria-hidden', 'true');
     safeAreaProbe.style.cssText =
-      'position:fixed;top:0;left:0;visibility:hidden;pointer-events:none;padding-top:env(safe-area-inset-top, 0px)';
+      'position:fixed;top:0;left:0;visibility:hidden;pointer-events:none;padding-top:var(--safe-area-top)';
     document.body.appendChild(safeAreaProbe);
   }
   return parseFloat(getComputedStyle(safeAreaProbe).paddingTop) || 0;

@@ -15,6 +15,10 @@
  * on the back stack and each hole in it becomes a silent teleport into that
  * workspace. The plan has the full reasoning:
  * `docs/plans/2026-08-21-workspace-navigation-never-pushes-history.md`.
+ *
+ * One push is not ours to replace: an iOS notification tap loads a new
+ * document. The *history bounce* in `index.html` covers it, by stepping the
+ * installed iOS app forward off any page it reached by going back.
  */
 
 // Leaving the app entirely is a different job, and `utils/openExternalUrl.ts`

@@ -1248,7 +1248,7 @@ $ lucidos changes apply fbcc4a3a-2c14-4d5b-8d1a-9e84d4c9d4ec
 
 > **Neither reaches a repo Lucidos does not apply into.** An *external-repo coding-agent thread* proposes no *change* at all, so `apply_when_settled` refuses one and the `apply_as_they_settle` sweep passes it over. That work is reviewed and pushed from the repo itself.
 
-> **Taking one back:** `cancel_standing_apply` is the off for both. With a `thread_id` it cancels that thread's instruction. Without one it cancels every standing apply in the workspace, which is what the Changes panel's own off does. It stops future applies only: a change already merging or hardening keeps going, and nothing already applied is reverted. Cancelling a running Apply All batch is a different action.
+> **Taking one back:** `cancel_standing_apply` is the off for both. With a `thread_id` it cancels that thread's instruction. Without one it cancels every standing apply in the workspace. The Changes panel's Not finished toggle cancels only the changes it lists. It stops future applies only: a change already merging or hardening keeps going, and nothing already applied is reverted. Cancelling a running Apply All batch is a different action.
 
 > **Setting a change aside:** `set_aside` keeps a pending change for later, out of Review and Apply All, and lets its thread be archived. `bring_back` returns it to pending. Neither loses the branch. `set_aside` is refused where Discard is, and `apply` refuses a set-aside change until it is brought back. LLM-only, with no CLI form.
 
@@ -1336,7 +1336,7 @@ and the full workflow.
 
 ### `lucidos hardened mark` / `lucidos hardened query` / `lucidos hardened sha`
 
-Record or read the hardening marker (see *Hardening* in the glossary): the HEAD SHA the last `/harden` run covered on a *Lucidos-source* coding-agent branch. All three resolve repo_root and branch from `$PWD`'s git worktree. They wrap `POST /api/v1/internal/mark-hardened` and `GET /api/v1/internal/hardened-state`.
+Record or read the hardening marker (see *Hardening* in the glossary): the HEAD SHA the last `/harden` run covered on a *Lucidos-source* coding-agent branch. All three resolve repo_root and branch from `$PWD`'s git worktree. They wrap `POST /api/v1/internal/mark-hardened` and `GET /api/v1/internal/hardened-state`. `mark` must run from a Lucidos-spawned process (a coding-agent session or an engine-spawned script) or from a shell on the machine holding the machine-local token. The engine refuses anyone else with 403, including a request that came through the gateway.
 
 ```bash
 lucidos hardened mark    # /harden Phase 5: record HEAD as hardened
@@ -1349,6 +1349,8 @@ lucidos hardened sha     # the recorded SHA, fresh or stale; exit 1 when MISSING
 ### `lucidos planned mark (--plan <path> | --simple "<reason>" | --security-fix "<reason>" --files <csv>)` / `lucidos planned approve` / `lucidos planned state`
 
 Record, approve, or query the *plan marker* — the durable enforcement that the `implementation-plan` skill ran AND the human approved its plan (or that a local fix was acknowledged) before a *Lucidos-source* coding-agent branch is edited and applied. A **gate-satisfying** marker MUST exist on the branch or Claude Code's first source edit is blocked (the `cc-plan-gate` PreToolUse hook) and Apply is refused (the engine's plan floor). Wraps `POST /api/v1/internal/mark-planned` / `POST /api/v1/internal/approve-plan` / `GET /api/v1/internal/planned-state`.
+
+`mark` and `approve` accept the same callers as `hardened mark`, and refuse anyone else with 403.
 
 ```bash
 # Complex work: the implementation-plan skill writes the plan, then records this for you.
@@ -1455,6 +1457,8 @@ $ lucidos knowhow read system-knowhow/building-an-app
 ### `lucidos proxy <name> [path] [-X METHOD] [-H "Hdr: val"] [-d body | --data-stdin] [-i] [--fail]`
 
 Call a backend configured in `data/config/apis.json` through the engine. The engine resolves the credential from the workspace's credential store and injects the configured auth header. It strips `Cookie`/`Origin`/`Referer`/`Host` from the forwarded request. It strips every `x-lucidos-*` header and the two `x-forwarded-*` ones the gateway owns with them, so no Lucidos credential reaches the upstream. **The credential value never reaches the script**: not in `argv`, env vars, the request line, nor any log.
+
+The response comes back with an allowlisted set of upstream headers, the same for every caller. `Set-Cookie` and the other headers a browser acts on never arrive, so `--include` cannot read a login cookie. A cookie login belongs in a `script_handshake`, which makes its own requests. The full list is in `system-knowhow/js-sdk.md` § `lucidos.proxy`.
 
 **This is the preferred way for scripts to call external APIs.** The previous pattern — `curl -H "Authorization: Bearer $CRED_FOO" ...` with `$CRED_FOO` injected into the script's environment — leaks the secret into process args and shell history. Configure the API in `data/config/apis.json` once, then use `lucidos proxy` everywhere.
 

@@ -23,6 +23,7 @@ path = "src/lib.rs"
 # `target/<profile>/lucidos-engine`. That silently swapped a dev workspace onto
 # an engine with the push transport stubbed out (2026-07-26; ADR 0022).
 lucidos-engine = { path = "../lucidos-engine" }
+lucidos-local-token = { path = "../lucidos-local-token" }
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "multipart"] }
 serde_json = "1"

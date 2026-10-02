@@ -157,7 +157,7 @@ pub(super) const DOCUMENT_SANDBOX_CSP: &str =
 /// HTML, and every XML flavour. An XML document runs a `<script>` in the XHTML
 /// namespace, and SVG is XML. An image tag never runs one, so an `<img>` of an
 /// SVG is unaffected by the header either way.
-fn is_active_document(content_type: &str) -> bool {
+pub(super) fn is_active_document(content_type: &str) -> bool {
     let essence = content_type
         .split(';')
         .next()

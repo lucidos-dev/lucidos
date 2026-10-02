@@ -3,8 +3,8 @@ use crate::engine::change_ops::{
     branch_is_hardened, now_epoch_millis, MergeOwnership, MERGE_OWNED_BY_RESOLVER_MESSAGE,
 };
 use crate::engine::git_ops::{
-    auto_commit_preserving_marker, auto_commit_safe_files_if_dirty, auto_commit_worktree,
-    branch_changed_files, branch_head_sha, catchup_and_ff_to_main, commits_in_range,
+    auto_commit_preserving_marker, auto_commit_safe_files_if_dirty, branch_changed_files,
+    branch_head_sha, catchup_and_ff_to_main, commit_worktree_or_err, commits_in_range,
     default_local_branch, describe_branch_changes, files_have_client_update, files_require_restart,
     git_answer_when_ok, git_cmd, git_ran_ok, has_branch_commits, push_main_in_background,
     resolution_merged_main, worktree_current_branch,
@@ -949,12 +949,14 @@ impl LucidosEngine {
             );
         }
 
-        // Auto-commit any leftover changes
-        auto_commit_worktree(
+        // A leftover edit that fails to commit fails the apply before `main`
+        // moves. Fast-forwarding anyway publishes only the committed part.
+        commit_worktree_or_err(
             worktree_path,
             "Coding agent changes (post-merge auto-commit)",
         )
-        .await;
+        .await
+        .map_err(|e| format!("Could not commit the leftover merge edits: {e}"))?;
 
         catchup_and_ff_to_main(repo_root, worktree_path, branch_name)
             .await

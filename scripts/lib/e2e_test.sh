@@ -638,6 +638,37 @@ test_source_honors_pinned_workspace() {
     fi
 }
 
+# ── engine version pin ────────────────────────────────────────────────
+# Without the pin, a commit landing in the checkout mid-run made the e2e engine
+# rebuild itself and raise a version toast over unrelated specs.
+test_source_pins_the_engine_version_for_the_engine_it_starts() {
+    echo "test: sourcing e2e.sh exports the engine version pin to child processes"
+    local got
+    # Scrubbed first, so an inherited value cannot pass this. `env` lists only
+    # what a child process would inherit, so a bare assignment fails too.
+    got=$(
+        unset LUCIDOS_PIN_ENGINE_VERSION
+        # shellcheck source=e2e.sh
+        source "$SCRIPT_DIR/e2e.sh" >/dev/null 2>&1
+        env | sed -n 's/^LUCIDOS_PIN_ENGINE_VERSION=//p'
+    )
+    if [ "$got" = "1" ]; then
+        pass "LUCIDOS_PIN_ENGINE_VERSION=1 reaches the engine"
+    else
+        fail "expected LUCIDOS_PIN_ENGINE_VERSION=1 in the engine's environment, got '$got'"
+    fi
+}
+
+test_the_engine_reads_the_variable_the_script_sets() {
+    echo "test: the engine's pin variable is the one e2e.sh exports"
+    local src="$SCRIPT_DIR/../../crates/lucidos-engine/src/engine/engine_version.rs"
+    if grep -q 'PIN_ENGINE_VERSION_ENV: &str = "LUCIDOS_PIN_ENGINE_VERSION";' "$src"; then
+        pass "engine_version.rs reads LUCIDOS_PIN_ENGINE_VERSION"
+    else
+        fail "engine_version.rs no longer reads LUCIDOS_PIN_ENGINE_VERSION, so the e2e pin is inert"
+    fi
+}
+
 # ── playwright_file_filter ────────────────────────────────────────────
 test_playwright_filter_anchors_the_basename() {
     echo "test: playwright_file_filter anchors and escapes a spec name"
@@ -892,7 +923,110 @@ test_totals_refuse_an_empty_log() {
     fi
 }
 
+# ── assert_e2e_workspace_tree_clean ───────────────────────────────────
+# Each test points E2E_WORKSPACE at a throwaway repo of its own, so the real
+# e2e workspace is never read.
+new_tree_repo() {
+    local repo="$SANDBOX/tree-$1"
+    rm -rf "$repo"
+    git init -q "$repo"
+    git -C "$repo" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
+    echo "$repo"
+}
+
+test_tree_assert_passes_a_run_that_leaves_nothing() {
+    echo "test: assert_e2e_workspace_tree_clean passes a run that leaves nothing"
+    local E2E_WORKSPACE before
+    E2E_WORKSPACE="$(new_tree_repo clean)"
+    before="$(e2e_workspace_tree_status)"
+    if assert_e2e_workspace_tree_clean "$before" 0 >/dev/null 2>&1; then
+        pass "clean before and after passes"
+    else
+        fail "a clean tree failed the assertion"
+    fi
+}
+
+test_tree_assert_fails_on_a_left_behind_file() {
+    echo "test: assert_e2e_workspace_tree_clean fails on what a run leaves behind"
+    local E2E_WORKSPACE before out="$SANDBOX/tree-dirty.out" rc=0
+    E2E_WORKSPACE="$(new_tree_repo dirty)"
+    before="$(e2e_workspace_tree_status)"
+    mkdir -p "$E2E_WORKSPACE/data/triggers/probe"
+    echo x > "$E2E_WORKSPACE/data/triggers/probe/run.py"
+    assert_e2e_workspace_tree_clean "$before" 0 > "$out" 2>&1 || rc=$?
+    if [ "$rc" -ne 0 ] && grep -q "data/triggers/probe/run.py" "$out"; then
+        pass "a left-behind file fails and is named"
+    else
+        fail "rc=$rc, expected a failure naming the file"; cat "$out"
+    fi
+}
+
+test_tree_assert_fails_on_an_uncommitted_delete() {
+    echo "test: assert_e2e_workspace_tree_clean fails on a deletion left uncommitted"
+    local E2E_WORKSPACE before rc=0
+    E2E_WORKSPACE="$(new_tree_repo deleted)"
+    echo x > "$E2E_WORKSPACE/fixture.py"
+    git -C "$E2E_WORKSPACE" add fixture.py
+    git -C "$E2E_WORKSPACE" -c user.name=t -c user.email=t@t commit -q -m fixture
+    before="$(e2e_workspace_tree_status)"
+    rm "$E2E_WORKSPACE/fixture.py"
+    assert_e2e_workspace_tree_clean "$before" 0 >/dev/null 2>&1 || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        pass "an unstaged deletion fails"
+    else
+        fail "an unstaged deletion passed"
+    fi
+}
+
+test_tree_assert_does_not_blame_a_run_for_its_start() {
+    echo "test: assert_e2e_workspace_tree_clean ignores dirt that predates the run"
+    local E2E_WORKSPACE before
+    E2E_WORKSPACE="$(new_tree_repo predates)"
+    echo x > "$E2E_WORKSPACE/left-by-an-earlier-run.txt"
+    before="$(e2e_workspace_tree_status)"
+    if assert_e2e_workspace_tree_clean "$before" 0 >/dev/null 2>&1; then
+        pass "pre-existing dirt is not this run's"
+    else
+        fail "dirt from before the run failed it"
+    fi
+}
+
+test_tree_assert_waits_out_a_late_commit() {
+    echo "test: assert_e2e_workspace_tree_clean waits for a commit still landing"
+    local E2E_WORKSPACE before rc=0 committer
+    E2E_WORKSPACE="$(new_tree_repo late)"
+    before="$(e2e_workspace_tree_status)"
+    echo x > "$E2E_WORKSPACE/late.txt"
+    (
+        sleep 1
+        git -C "$E2E_WORKSPACE" add late.txt
+        git -C "$E2E_WORKSPACE" -c user.name=t -c user.email=t@t commit -q -m late
+    ) &
+    committer=$!
+    assert_e2e_workspace_tree_clean "$before" 5 >/dev/null 2>&1 || rc=$?
+    wait "$committer"
+    if [ "$rc" -eq 0 ]; then
+        pass "a commit landing inside the settle window passes"
+    else
+        fail "failed before the late commit could land"
+    fi
+}
+
+test_tree_assert_refuses_an_unreadable_tree() {
+    echo "test: assert_e2e_workspace_tree_clean treats an unreadable tree as a failure"
+    local E2E_WORKSPACE="$SANDBOX/tree-not-a-repo" rc=0
+    mkdir -p "$E2E_WORKSPACE"
+    assert_e2e_workspace_tree_clean "" 0 >/dev/null 2>&1 || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        pass "a status that would not run is not clean"
+    else
+        fail "an unreadable tree passed as clean"
+    fi
+}
+
 test_source_honors_pinned_workspace
+test_source_pins_the_engine_version_for_the_engine_it_starts
+test_the_engine_reads_the_variable_the_script_sets
 test_playwright_filter_anchors_the_basename
 test_playwright_filter_escapes_regex_metacharacters
 test_playwright_filter_does_not_match_a_longer_sibling
@@ -926,6 +1060,12 @@ test_totals_refuse_an_empty_log
 test_no_sourced_lib_leaks_a_loop_variable
 test_ensure_workspace_running_does_not_leak_loop_index
 test_ensure_workspace_running_builds_the_frontend_before_the_engine
+test_tree_assert_passes_a_run_that_leaves_nothing
+test_tree_assert_fails_on_a_left_behind_file
+test_tree_assert_fails_on_an_uncommitted_delete
+test_tree_assert_does_not_blame_a_run_for_its_start
+test_tree_assert_waits_out_a_late_commit
+test_tree_assert_refuses_an_unreadable_tree
 
 echo ""
 echo "Passed: $PASS  Failed: $FAIL"

@@ -626,6 +626,15 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   The long silences were mostly typing time. The keyboard close was the
   reporter's recovery, not the trigger. The one relayout "success" landed in the
   same second as a keyboard close.
+- **What the twenty-second report found: iOS cancelled a near-still tap.** The
+  first `canceled` line in the ledger: Send, keyboard down, 6px in 77ms. The
+  button sat in the bottom 34pt home-indicator strip, since the phone composer
+  carries no bottom safe-area padding. No click follows a `touchcancel`.
+
+  A constructive face now serves such a tap (`cancelledPressWasATap` in
+  `utils/tapGesture.ts`). That is a fix, not part of this probe, so the removal
+  keeps it. The probe's cancel arm now rules a task later, so a served cancel
+  logs `served` and raises no toast.
 - **Status:** `active` for the quiet period the removal condition names, now
   that the cause is known.
 - **Neither relayout survives the removal.** They answered a stale-layout theory
@@ -1001,6 +1010,28 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   or `Artifact*` construction, and that the tripwire still passes.
 - **Status:** open
 
+### The e2e fixture cleanup watches for a deleted path coming back
+
+- **Added:** 2026-10-01
+- **Lives in:** `remove_data_fixtures` in
+  `crates/lucidos-e2e/tests/api_support/mod.rs`: the settle-window loop after
+  the `DELETE /api/v1/data` calls, which commits any dirt under the fixture
+  path with `git commit -- <pathspec>`.
+- **Impermanent because:** `ArtifactManager::commit_all_dirty`
+  (`crates/lucidos-engine/src/core/artifacts.rs`) stages `data/` on the HEAD it
+  read first, but `commit_index` takes the parent from HEAD at commit time. A
+  single-path commit landing in between (a data-API delete, say) is silently
+  reverted: the deleted file goes back into HEAD while it stays gone from disk,
+  so the tree reads dirty and the next apply refuses it. The loop papers over
+  that lost update for the e2e suite only. It reaches users the same way,
+  whenever a script or coding-agent auto-commit races a data write.
+- **Removal / resolution condition:** Make every `commit_*` helper commit onto
+  the HEAD its index was reset to, so a moved HEAD fails the compare-and-swap
+  and `retry_while_repo_contended` re-stages. Add an engine test where a delete
+  lands between `commit_all_dirty`'s staging and its commit, and asserts HEAD
+  keeps the deletion. Then drop the loop and keep only the deletes.
+- **Status:** open
+
 ### iOS-PWA liveness diagnostic
 
 - **Added:** 2026-05-18
@@ -1273,6 +1304,37 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
 - **Status:** active
 - **Investigation:** n/a (the cause is known and upstream; nothing is being
   chased here, only waited on)
+
+### Safe-area floor
+
+- **Added:** 2026-10-01
+- **Lives in:** `crates/lucidos-app/src/utils/safeAreaFloor.ts`, installed from
+  `main.tsx`, plus the `max(…, var(--safe-area-floor-*))` arm of the four
+  `--safe-area-*` tokens in `styles/global/base.css`.
+- **Scope note:** the `--safe-area-*` tokens themselves are **permanent**. Every
+  stylesheet reads the insets through them, and
+  `styles/__tests__/safe-area-token-guard.test.ts` keeps it that way. Only the
+  floor that feeds them is the workaround.
+- **Impermanent because:** an installed iOS PWA can lose its insets after a
+  full-screen interruption such as a phone call, when WebKit resolves
+  `env(safe-area-inset-*)` to 0. The header sits under the clock and the prompt
+  under the home indicator (reported on an iPhone PWA). It was seen again with a
+  Maps Live Activity in the Dynamic Island, and the loss may outlast a
+  relaunch. CSS cannot override `env()`, so the floor re-publishes the last
+  real reading. It keeps that reading per viewport shape in the workspace's
+  `lucidos-safe-area-insets` storage key, and it also covers a loss of the top
+  alone. This is an upstream bug, and the floor has no purpose once WebKit
+  keeps the insets.
+- **Removal / resolution condition:** when an installed iOS PWA keeps its
+  insets across a phone call and across a Live Activity on the oldest iOS we
+  support. Verify on a real device, since no emulator reproduces it. Install the
+  PWA, take a call, return, start Maps navigation, then force-quit and relaunch
+  the PWA. With the floor disabled, the header must clear the status bar. Then
+  delete `safeAreaFloor.ts`, its test and its install call, and reduce each
+  token to its bare `env()`. Keep the tokens and the guard test. The stored key
+  can stay behind, since nothing else reads it.
+- **Status:** active
+- **Investigation:** n/a (the cause is upstream; nothing is being chased)
 
 ### CC byte-idle deadline raised past the engine watchdog
 

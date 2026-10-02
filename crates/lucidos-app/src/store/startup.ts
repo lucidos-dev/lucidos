@@ -29,7 +29,7 @@ import { loadAllThreads, loadFilterFacets } from './actions/thread-loading';
 import { refreshPushSubscription, recoverServiceWorker } from './actions/push';
 import { setupNativePushTapRouting } from './actions/native-push';
 import { startDevicePresenceTracking } from './actions/device-presence';
-import { startAppUpdateProgress, stopAppUpdateProgress, refreshReleaseCheck } from './actions/app-update';
+import { startAppUpdateProgress, stopAppUpdateProgress, refreshReleaseCheck, resumeUpdateRelay } from './actions/app-update';
 import { startEngineUpdateChecks, stopEngineUpdateChecks, checkEngineVersion } from './actions/engine-update';
 import { refreshSlowness, startSlownessChecks, stopSlownessChecks } from './actions/slowness';
 import {
@@ -804,6 +804,9 @@ export function startClient(): () => void {
   // Read the machine's release answer at startup, so opening the app after a
   // gap shows a fresh one rather than waiting out the gateway's backstop.
   void refreshReleaseCheck();
+  // A relayed update this page asked for before a reload (ADR 0338). The
+  // service restart it causes is what reloads the page, mid-run.
+  resumeUpdateRelay();
 
   // Dev: poll the engine version-status so a background rebuild (kicked off by
   // Apply) surfaces "New version available → Switch to new version" once ready.

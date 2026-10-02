@@ -346,7 +346,19 @@ describe('the press ledger keeps every press it watched', () => {
     faces = [apply, send];
     fire('touchstart', touch(apply, 290, 420));
     fire('touchcancel', touch(apply, 290, 420));
+    vi.advanceTimersByTime(0);
     expect(verdicts()).toEqual(['canceled']);
+    expect(showToast).not.toHaveBeenCalled();
+  });
+
+  it('logs a cancelled tap the touch path served as served, and does not toast', () => {
+    // Send's touch path runs a cancelled tap. The probe's capture listener sees
+    // the cancel before the button's own listener, so it rules a task later.
+    fire('touchstart', touch(send, 350, 420));
+    fire('touchcancel', touch(send, 350, 420));
+    notePressOutcome('served');
+    vi.advanceTimersByTime(0);
+    expect(verdicts()).toEqual(['served']);
     expect(showToast).not.toHaveBeenCalled();
   });
 
@@ -366,6 +378,7 @@ describe('the press ledger keeps every press it watched', () => {
   it('still toasts a cancelled tap on Send', () => {
     fire('touchstart', touch(send, 350, 420));
     fire('touchcancel', touch(send, 350, 420));
+    vi.advanceTimersByTime(0);
     expect(showToast).toHaveBeenCalledWith(
       expect.stringContaining('the system cancelled the touch'),
       'warning',

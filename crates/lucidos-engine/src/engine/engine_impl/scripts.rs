@@ -97,7 +97,7 @@ impl LucidosEngine {
     ///
     /// **No `CRED_*` or `OAUTH_*`.** A coding agent's shell never holds the
     /// workspace's secrets. A task it starts through the engine must not
-    /// either, or the route would hand them over. `RUSTC_WRAPPER` follows the
+    /// either, or the route would hand them over. The compile env follows the
     /// agent's rule, so a build that works in its shell works here too.
     pub(crate) async fn build_agent_task_env_vars(&self, thread_id: Uuid) -> Vec<(String, String)> {
         let depth =
@@ -105,11 +105,11 @@ impl LucidosEngine {
         let mut env_vars = self
             .build_env_without_secrets(Some(thread_id), depth, None)
             .await;
-        env_vars.push((
-            "RUSTC_WRAPPER".to_string(),
-            crate::runtime::spawn_env::rustc_wrapper_for_path(std::env::var_os("PATH").as_deref())
-                .to_string(),
-        ));
+        env_vars.extend(
+            crate::runtime::spawn_env::agent_compile_env()
+                .into_iter()
+                .map(|(key, value)| (key.to_string(), value)),
+        );
         env_vars
     }
 

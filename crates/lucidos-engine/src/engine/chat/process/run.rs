@@ -437,10 +437,12 @@ impl LucidosEngine {
         // `ImageDescribed { model, .. }` naming the model that described it.
         // That is the `model_image_description` preference, or the
         // extractor's default when the preference is empty or "default".
+        // A coding agent reads the images itself and its lane never consumes
+        // this handle, so spawning for it would pay for a discarded call.
         let mut description_handle = if let (Some(imgs), Some(ref extractor)) =
             (user_images, &self.extractor)
         {
-            if !imgs.is_empty() {
+            if !imgs.is_empty() && use_coding_agent != Some(true) {
                 let purpose = crate::engine::ContextPurpose::ImageDescribe;
                 let call = crate::engine::aux_purpose::AuxCall::resolve(&self.pool, purpose).await;
                 match extractor.provider_for_model(call.model(), call.attempt_timeout()) {

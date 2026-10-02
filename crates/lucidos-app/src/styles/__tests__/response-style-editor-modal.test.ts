@@ -54,11 +54,8 @@ describe('the response style modal shows as much instruction as it can', () => {
     expect(decl(panel, 'height')).toContain('var(--style-editor-room)');
     expect(decl(panel, 'max-height'), 'a max-height sizes to content instead')
       .toBeNull();
-
-    // And the scrim it is centred in is bounded the same way, or the panel is
-    // centred in a viewport half of which is keyboard.
-    expect(decl(block(css, '.modal-overlay.style-editor-overlay {'), 'height'))
-      .toContain('--app-height');
+    // The scrim it centres in is bounded the same way, by the base
+    // `.modal-overlay` (modal-overlay-visible-viewport.test.ts).
   });
 
   /** The desktop ceiling is the one number a phone must not inherit: a narrow

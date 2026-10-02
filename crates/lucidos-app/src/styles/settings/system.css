@@ -88,7 +88,7 @@
    instead. Values still share one edge WITHIN a block, which is what the reader
    scans; only the alignment BETWEEN two stacked blocks is given up, and that
    one is invisible on a screen you scroll a block at a time. */
-@media (max-width: 768px) {
+@media (--phone-layout) {
     .system-info-list {
         grid-template-columns: max-content minmax(0, 1fr);
     }

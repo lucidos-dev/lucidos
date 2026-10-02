@@ -8,7 +8,7 @@
  *  viewport. Each header composes them itself. */
 import { closeDrawer } from './Drawer';
 import { drawerOpen, drawerClosing, openDrawer } from './drawerState';
-import { webviewHasHistory } from '../../store/store';
+import { webviewHasHistory, actionableChangeCount } from '../../store/store';
 import { canGoBack, canGoForward, navBack, navForward, navHistory, navGoTo } from '../../store/actions/navigation';
 import type { NavEntry } from '../../store/actions/navigation';
 import { navEntryTitle, navEntryCategory } from './headerHelpers';
@@ -29,8 +29,13 @@ export function HamburgerButton() {
   // this button speaks the sentence in its own name (see
   // `SystemAttentionBadge`).
   const news = systemAttentionBadge();
+  // It also leads to Changes, so it carries the drawer row's count. The count
+  // takes the corner over the dot, and the label still says both.
+  const changeCount = actionableChangeCount.value ?? 0;
+  const changeNews = changeCount === 0 ? null
+    : changeCount === 1 ? '1 change ready' : `${changeCount} changes ready`;
   const action = isOpen ? 'Close menu' : 'Open menu';
-  const label = news ? `${action} · ${news}` : action;
+  const label = [action, changeNews, news].filter(Boolean).join(' · ');
 
   return (
     <button
@@ -43,7 +48,10 @@ export function HamburgerButton() {
       data-tooltip={label}
     >
       {isOpen ? <CloseIcon /> : <MenuIcon />}
-      <SystemAttentionBadge placement="corner" label={news} />
+      {changeCount > 0 && (
+        <span class="badge" aria-hidden="true">{changeCount > 99 ? '99+' : changeCount}</span>
+      )}
+      <SystemAttentionBadge placement="corner" label={changeCount > 0 ? null : news} />
     </button>
   );
 }

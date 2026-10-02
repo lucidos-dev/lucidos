@@ -1,5 +1,8 @@
 import { describe, it, expect, vi } from 'vitest';
-import { createTapGate, touchActivated, takePressOutcome } from './tapGesture';
+import {
+  createTapGate, touchActivated, takePressOutcome, notePressOutcome, TAP_MOVE_THRESHOLD_PX,
+} from './tapGesture';
+import { LONG_PRESS_DELAY_MS } from '../hooks/useLongPress';
 
 /** A pointer carrying BOTH coordinate spaces, so a test can move one and hold
  *  the other still. That is the whole distinction the gate rests on. */
@@ -281,6 +284,113 @@ describe('touchActivated takes every press it is given', () => {
     expect(action).not.toHaveBeenCalled();
     expect(touch.preventDefault).not.toHaveBeenCalled();
     handlers.onClick();
+    expect(action).toHaveBeenCalledTimes(1);
+  });
+});
+
+/** A touch the way the cancel path reads it: one finger, its screen position,
+ *  and every contact still on the glass. */
+function contact(screenX: number, screenY: number, fingersDown: number) {
+  const point = { identifier: 0, screenX, screenY };
+  return { changedTouches: [point], touches: new Array(fingersDown).fill(point) };
+}
+
+/** The first `canceled` line in the ledger. iOS took a press on Send that
+ *  moved 6px in 77ms, with the button in the home-indicator strip. No click
+ *  follows a `touchcancel`, so the draft stayed put and the user tapped again. */
+describe('touchActivated serves a tap the system cancelled', () => {
+  function cancelledTap(moveTo: number, heldMs: number, opts: Parameters<typeof harness>[0] = {}) {
+    const h = harness(opts);
+    h.handlers.onTouchStart(contact(100, 800, 1));
+    h.handlers.onTouchMove(contact(100, 800 - moveTo, 1));
+    h.advance(heldMs);
+    h.handlers.onTouchCancel(contact(100, 800 - moveTo, 0));
+    return h;
+  }
+
+  it('runs the action for a short press that barely moved', () => {
+    const { action } = cancelledTap(6, 77);
+    expect(action).toHaveBeenCalledTimes(1);
+  });
+
+  it('claims the press, so the probe does not call it dead', () => {
+    takePressOutcome(0);
+    cancelledTap(6, 77);
+    expect(takePressOutcome(1_000)).toBe('served');
+  });
+
+  it('leaves a cancelled scroll alone', () => {
+    const { action } = cancelledTap(TAP_MOVE_THRESHOLD_PX + 1, 77);
+    expect(action).not.toHaveBeenCalled();
+  });
+
+  it('leaves a cancelled hold alone', () => {
+    const { action } = cancelledTap(0, LONG_PRESS_DELAY_MS + 1);
+    expect(action).not.toHaveBeenCalled();
+  });
+
+  it('leaves a cancelled pinch alone', () => {
+    const { action, handlers } = harness();
+    handlers.onTouchStart(contact(100, 800, 2));
+    handlers.onTouchCancel(contact(100, 800, 0));
+    expect(action).not.toHaveBeenCalled();
+  });
+
+  it('never fires a destructive face on a cancel', () => {
+    // A scroll that began on Cancel must not abort a live turn.
+    const { action } = cancelledTap(0, 50, { destructive: () => true });
+    expect(action).not.toHaveBeenCalled();
+  });
+
+  it('stays down while the touch path is disabled', () => {
+    const { action } = cancelledTap(0, 50, { enabled: () => false });
+    expect(action).not.toHaveBeenCalled();
+  });
+
+  it('spends the gate, which the cancel left aborted', () => {
+    const gate = { pass: vi.fn(() => true), spend: vi.fn(), aborted: () => true };
+    const { action } = cancelledTap(0, 50, { gate });
+    expect(gate.spend).toHaveBeenCalledTimes(1);
+    expect(action).toHaveBeenCalledTimes(1);
+  });
+
+  it('counts the travel the cancel event itself reports', () => {
+    // The browser can take a scroll with no `touchmove` delivered first.
+    const { action, handlers } = harness();
+    handlers.onTouchStart(contact(100, 800, 1));
+    handlers.onTouchCancel(contact(100, 800 - TAP_MOVE_THRESHOLD_PX - 1, 0));
+    expect(action).not.toHaveBeenCalled();
+  });
+
+  it('never runs a press an overlay dismiss swallowed', () => {
+    // A tap outside an open overlay only closes it, cancelled or not.
+    takePressOutcome(0);
+    const { action, handlers } = harness();
+    handlers.onTouchStart(contact(100, 800, 1));
+    notePressOutcome('swallowed', 1_000);
+    handlers.onTouchCancel(contact(100, 800, 0));
+    expect(action).not.toHaveBeenCalled();
+    expect(takePressOutcome(Number.POSITIVE_INFINITY)).toBe('swallowed');
+  });
+
+  it('serves a click that follows a served cancel', () => {
+    // No click follows a `touchcancel`, so there is no twin to ignore.
+    const { action, handlers } = cancelledTap(0, 50);
+    handlers.onClick();
+    expect(action).toHaveBeenCalledTimes(2);
+  });
+
+  it('serves a cancel only for a press it saw start', () => {
+    const { action, handlers } = harness();
+    handlers.onTouchCancel(contact(100, 800, 0));
+    expect(action).not.toHaveBeenCalled();
+  });
+
+  it('forgets a press once its lift arrives', () => {
+    const { action, handlers, touch } = harness();
+    handlers.onTouchStart(contact(100, 800, 1));
+    handlers.onTouchEnd(touch);
+    handlers.onTouchCancel(contact(100, 800, 0));
     expect(action).toHaveBeenCalledTimes(1);
   });
 });

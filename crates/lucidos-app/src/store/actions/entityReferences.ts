@@ -493,7 +493,8 @@ function handleThreadTitleEvent(data: Record<string, unknown>): void {
   patchRecentsMetadata(threadId, 'threads', title);
 }
 
-function pruneRecents(id: string, category: string): void {
+/** Drop one Search Everywhere recent, for an entity the source of truth deleted. */
+export function pruneRecents(id: string, category: string): void {
   try {
     const raw = localStorage.getItem(RECENTS_KEY);
     if (!raw) return;

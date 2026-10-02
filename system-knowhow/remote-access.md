@@ -740,7 +740,9 @@ That *pairing label* is fixed: revoke and pair again to change it. The name on t
 then on.
 
 **One rule names a device everywhere**: the typed name, else the pairing label,
-else `device-` plus the first eight characters of its id. The Devices row, a
+else the browser and machine its user-agent names plus the start of its id, as
+in "Chrome on Mac (109371a3)". Failing all three, it is `device-` plus the
+first eight characters of its id. The Devices row, a
 message's Origin popover, an actor chip, and the agent's list of your devices
 all follow it. The gateway passes the pairing label to the workspace on every
 request, so the workspace knows it without asking. A device reached straight on

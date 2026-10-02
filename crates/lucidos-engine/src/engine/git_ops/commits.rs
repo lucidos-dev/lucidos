@@ -514,19 +514,6 @@ pub(crate) async fn proposal_files_for_branch(
     }
 }
 
-/// Auto-commit uncommitted changes in a worktree with a generic message.
-///
-/// `or_unknown(true)`: when git cannot say whether there is anything to commit,
-/// try anyway. A commit attempt against a clean tree is a no-op that git
-/// refuses harmlessly, whereas skipping it leaves the user's edits uncommitted
-/// on the strength of a question that was never answered.
-pub(crate) async fn auto_commit_worktree(worktree_path: &Path, message: &str) {
-    let has_changes = worktree_dirtiness(worktree_path).await.or_unknown(true);
-    if has_changes {
-        stage_and_commit_logged(worktree_path, message).await;
-    }
-}
-
 /// Why a git call did not succeed, or `None` when it did.
 ///
 /// Local rather than [`git_ran_ok`] because it keeps STDOUT: `git commit`
@@ -546,11 +533,11 @@ async fn git_failure_reason(args: &[&str], dir: &Path) -> Option<String> {
 
 /// Stage everything and commit, logging a failure instead of returning it.
 ///
-/// Shared by the two fire-and-forget auto-commit helpers, neither of which has
-/// anywhere to hand an error back. A dropped commit costs the user the edits
-/// their coding agent left uncommitted, so the failure has to reach the log.
-/// The `or_unknown(true)` probe above expects a clean tree sometimes, and git
-/// reports that as a non-zero exit, so that one arm stays quiet.
+/// For [`auto_commit_preserving_marker`], which has nowhere to hand an error
+/// back. A dropped commit costs the user the edits their coding agent left
+/// uncommitted, so the failure has to reach the log. Its `or_unknown(true)`
+/// probe expects a clean tree sometimes, and git reports that as a non-zero
+/// exit, so that one arm stays quiet.
 ///
 /// A failed `add` still commits. `git add -A` reports per-path errors and
 /// exits non-zero while having staged everything it could, so returning early
@@ -575,46 +562,66 @@ async fn stage_and_commit_logged(worktree_path: &Path, message: &str) {
     }
 }
 
-/// Stage all changes and commit them with `message`, propagating failures.
+/// Stage all changes and commit them with `message`, then confirm it landed.
 ///
-/// Mirrors `auto_commit_worktree` but returns `Err` when `git status`,
-/// `git add`, or `git commit` exits non-zero (or fails to spawn). Use this
-/// when the caller relies on the commit having actually landed — e.g. the
-/// apply-now CC iteration loop, where a silently-dropped commit would lose a
-/// real CC change.
+/// Every apply path commits through this before it merges, because merging
+/// past a dropped commit publishes only part of the change. `Err` means work
+/// is still uncommitted, or git could not say.
 ///
-/// Returns `Ok(true)` when a commit was made, `Ok(false)` when the worktree
-/// was clean (nothing to commit).
+/// Neither exit code answers that, so this tries both writes and re-reads
+/// `git status`, as `auto_commit_safe_files_if_dirty` does. `git add -A` exits
+/// non-zero after staging all it could. `git commit` does too when a sibling
+/// apply committed first. Trusting either code refuses Apply forever on a
+/// state that never changes.
+///
+/// A dirty submodule's own content is not counted: the superproject cannot
+/// commit it, so counting it would refuse every Apply on that worktree.
+///
+/// `Ok(false)` when the worktree was already clean.
 pub(crate) async fn commit_worktree_or_err(
     worktree_path: &Path,
     message: &str,
 ) -> Result<bool, String> {
-    let status = git_cmd(&["status", "--porcelain"], worktree_path).await?;
+    if uncommitted_paths(worktree_path).await?.is_empty() {
+        return Ok(false);
+    }
+    let add = git_failure_reason(&["add", "-A"], worktree_path).await;
+    let commit = git_failure_reason(&["commit", "-m", message], worktree_path).await;
+    let left = uncommitted_paths(worktree_path).await?;
+    if left.is_empty() {
+        return Ok(true);
+    }
+    let reasons: Vec<String> = [("git add -A", add), ("git commit", commit)]
+        .into_iter()
+        .filter_map(|(step, reason)| reason.map(|r| format!("{step}: {}", r.trim())))
+        .collect();
+    Err(format!(
+        "{} path(s) still uncommitted ({}). {}",
+        left.len(),
+        left.iter().take(5).cloned().collect::<Vec<_>>().join(", "),
+        reasons.join("; ")
+    ))
+}
+
+/// The porcelain lines `commit_worktree_or_err` must commit, or `Err` when
+/// `git status` cannot answer.
+async fn uncommitted_paths(worktree_path: &Path) -> Result<Vec<String>, String> {
+    let status = git_cmd(
+        &["status", "--porcelain", "--ignore-submodules=dirty"],
+        worktree_path,
+    )
+    .await?;
     if !status.status.success() {
         return Err(format!(
             "git status --porcelain failed: {}",
             String::from_utf8_lossy(&status.stderr).trim()
         ));
     }
-    if status.stdout.is_empty() {
-        return Ok(false);
-    }
-    let add = git_cmd(&["add", "-A"], worktree_path).await?;
-    if !add.status.success() {
-        return Err(format!(
-            "git add -A failed: {}",
-            String::from_utf8_lossy(&add.stderr).trim()
-        ));
-    }
-    let commit = git_cmd(&["commit", "-m", message], worktree_path).await?;
-    if !commit.status.success() {
-        return Err(format!(
-            "git commit -m \"{}\" failed: {}",
-            message,
-            String::from_utf8_lossy(&commit.stderr).trim()
-        ));
-    }
-    Ok(true)
+    Ok(String::from_utf8_lossy(&status.stdout)
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(str::to_string)
+        .collect())
 }
 
 /// Repo-relative paths that are dirty in `worktree_path`, from
@@ -790,10 +797,10 @@ pub(crate) async fn main_history_touches_files(repo_root: &Path, change_files: &
 ///
 /// The branch ref is NOT deleted by this function; the caller decides.
 ///
-/// A worktree lookup that could not run errors out. Skipping the auto-commit
-/// leaves real edits uncommitted. The `LegitimateNoOp` and `AlreadyApplied`
-/// arms below then let the caller delete the branch and report the change
-/// applied.
+/// A worktree lookup that could not run errors out, and so does an auto-commit
+/// that fails. Either way the edits stay uncommitted. The `LegitimateNoOp` and
+/// `AlreadyApplied` arms below would then let the caller delete the branch and
+/// report the change applied.
 pub(crate) async fn recover_no_commits_branch(
     repo_root: &Path,
     branch_name: &str,
@@ -801,7 +808,14 @@ pub(crate) async fn recover_no_commits_branch(
 ) -> Result<NoCommitsRecovery, Box<dyn std::error::Error + Send + Sync>> {
     match find_worktree_for_branch(repo_root, branch_name).await {
         WorktreeLookup::Found(wt) => {
-            auto_commit_worktree(&wt, "Coding agent changes (pre-apply auto-commit)").await;
+            commit_worktree_or_err(&wt, "Coding agent changes (pre-apply auto-commit)")
+                .await
+                .map_err(|e| {
+                    format!(
+                        "Could not commit the uncommitted work in {} before applying: {e}",
+                        wt.display()
+                    )
+                })?;
         }
         WorktreeLookup::NotFound => {}
         WorktreeLookup::Unknown => {

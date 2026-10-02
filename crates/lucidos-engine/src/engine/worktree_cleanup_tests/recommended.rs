@@ -320,3 +320,43 @@ async fn an_artifact_directory_holding_tracked_files_is_not_prunable() {
         vec!["target"]
     );
 }
+
+/// Progress counts every worktree, a skipped one included, so the bar reaches
+/// its end even when the pass touches nothing.
+#[tokio::test]
+async fn progress_counts_a_skipped_worktree_too() {
+    use crate::engine::event_bus::{BusEvent, EmittedEvent, SystemEvent};
+    use tokio_stream::{wrappers::BroadcastStream, StreamExt};
+
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let (_tmp, root) = fresh_workspace().await;
+    let thread_id = Uuid::new_v4();
+    add_worktree_at_main_for_thread(&root, thread_id).await;
+    insert_thread_summary(&pool, thread_id, false).await;
+
+    let rx = bus.subscribe();
+    let probe = active_threads(&[thread_id]);
+    let result = run_recommended_cleanup(&pool, &bus, &root, probe.as_ref(), None).await;
+    assert_eq!(
+        result.removed_count + result.cleaned_count,
+        0,
+        "a live tree is skipped"
+    );
+
+    let mut stream = BroadcastStream::new(rx);
+    let mut frames = Vec::new();
+    let until = tokio::time::Instant::now() + Duration::from_millis(200);
+    while let Ok(Some(item)) = tokio::time::timeout_at(until, stream.next()).await {
+        if let Ok(EmittedEvent {
+            typed: BusEvent::System(SystemEvent::RecommendedCleanupProgress { done, total }),
+            ..
+        }) = item
+        {
+            frames.push((done, total));
+        }
+    }
+    assert_eq!(frames, vec![(0, 1), (1, 1)]);
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}

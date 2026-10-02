@@ -532,13 +532,33 @@ pub fn reap_forked_pid(_pid: u32) {}
 /// The teardown path for an engine the gateway holds no [`Child`] for, and the
 /// reap is not optional: see [`reap_forked_pid`] for why such an engine is so
 /// often still a child of this process. Best-effort throughout.
+///
+/// **A pid that provably runs another program is never signalled or waited
+/// on.** The engine leaves its pidfile behind when it stops, and the OS reuses
+/// pids. SIGUSR1 terminates a process that does not handle it, so a lazy-start
+/// days after a stop would kill whatever unrelated app now holds that pid.
 pub fn reclaim_stale_engine(resolved_dir: &Path) {
     #[cfg(unix)]
     if let Some(pid) = read_pidfile(resolved_dir) {
-        // SAFETY: kill with a valid signal number; an invalid/dead pid just
-        // returns ESRCH which we ignore.
+        let Some(signal_pid) = single_process_pid(pid) else {
+            crate::log!(
+                "[Gateway] ignoring pidfile in {} naming pid {pid}, which is no single process",
+                resolved_dir.display()
+            );
+            return;
+        };
+        if let Some(exe) = other_program_at_pid(signal_pid, ENGINE_EXECUTABLE_NAME) {
+            crate::log!(
+                "[Gateway] pidfile in {} names pid {pid}, now running {}; not signalling it",
+                resolved_dir.display(),
+                exe.display()
+            );
+            return;
+        }
+        // SAFETY: kill with a valid signal number on a positive pid that is
+        // not known to run anything but the engine. A dead pid returns ESRCH.
         unsafe {
-            libc::kill(pid as libc::pid_t, libc::SIGUSR1);
+            libc::kill(signal_pid, libc::SIGUSR1);
         }
         // Started BEFORE the sleep, so the wait is already in place when the
         // engine exits. The very next spawn overwrites the pidfile, so this is
@@ -549,6 +569,56 @@ pub fn reclaim_stale_engine(resolved_dir: &Path) {
     }
     #[cfg(not(unix))]
     let _ = resolved_dir;
+}
+
+/// `pid` as a `kill` target naming exactly one process. Strictly positive:
+/// `kill` reads 0 as "my whole process group", and a negative pid as a group or
+/// a broadcast.
+#[cfg(unix)]
+pub(crate) fn single_process_pid(pid: u32) -> Option<libc::pid_t> {
+    libc::pid_t::try_from(pid).ok().filter(|p| *p > 0)
+}
+
+/// The engine's executable file name, as every launcher spells it.
+#[cfg(unix)]
+const ENGINE_EXECUTABLE_NAME: &str = "lucidos-engine";
+
+/// The executable `pid` runs, when that is provably some program other than
+/// one named `expected`. This is the guard before signalling a pid read from a
+/// file, since the OS reuses the pid of a process that has exited.
+///
+/// `None` when the path cannot be read, which is not evidence of reuse: a
+/// zombie reads that way.
+#[cfg(unix)]
+pub(crate) fn other_program_at_pid(pid: libc::pid_t, expected: &str) -> Option<PathBuf> {
+    pid_executable(pid).filter(|exe| !executable_is_named(exe, expected))
+}
+
+/// Is `exe` the program named `expected`, judged by its file name? Linux's
+/// `/proc` appends ` (deleted)` once an update replaces the binary, and that is
+/// still the same program.
+#[cfg(unix)]
+fn executable_is_named(exe: &Path, expected: &str) -> bool {
+    let Some(name) = exe.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    name.strip_suffix(" (deleted)").unwrap_or(name) == expected
+}
+
+/// The executable `pid` runs, or `None` when that cannot be read.
+#[cfg(target_os = "macos")]
+fn pid_executable(pid: libc::pid_t) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut buf = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    // SAFETY: the buffer is writable and its length is passed alongside it.
+    let len = unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
+    (len > 0).then(|| PathBuf::from(std::ffi::OsStr::from_bytes(&buf[..len as usize])))
+}
+
+/// Linux twin of the macOS probe, through `/proc`.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn pid_executable(pid: libc::pid_t) -> Option<PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/exe")).ok()
 }
 
 /// Outcome of one health probe. Used to detect `Healthy`, which resets the
@@ -1004,6 +1074,63 @@ mod tests {
         }
         let _ = bystander.wait();
         let _ = pid;
+    }
+
+    /// A corrupt pidfile must never turn a reclaim into a group signal or a
+    /// broadcast. `u32::MAX` wraps to -1 as a `pid_t`, which is everything.
+    #[cfg(unix)]
+    #[test]
+    fn only_a_positive_pid_is_a_kill_target() {
+        assert_eq!(single_process_pid(0), None);
+        assert_eq!(single_process_pid(u32::MAX), None);
+        assert_eq!(single_process_pid(1 << 31), None);
+        assert_eq!(single_process_pid(4242), Some(4242));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_program_is_recognised_by_its_file_name_alone() {
+        let engine = ENGINE_EXECUTABLE_NAME;
+        assert!(executable_is_named(
+            Path::new("/opt/x/runtime/lucidos-engine"),
+            engine
+        ));
+        assert!(executable_is_named(
+            Path::new("/tmp/lucidos-engine (deleted)"),
+            engine
+        ));
+        assert!(!executable_is_named(Path::new("/bin/sleep"), engine));
+        assert!(!executable_is_named(
+            Path::new("/tmp/lucidos-engine-old"),
+            engine
+        ));
+    }
+
+    /// A live pid running some other program is reported as that program, and
+    /// one running the expected program is not.
+    #[cfg(unix)]
+    #[test]
+    fn a_reused_pid_is_named_by_what_it_now_runs() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = single_process_pid(child.id()).expect("a positive pid");
+        let exe = pid_executable(pid);
+        let other = other_program_at_pid(pid, ENGINE_EXECUTABLE_NAME);
+        // Named from the probe, since `sleep` may resolve to a multi-call binary.
+        let name = exe
+            .as_deref()
+            .and_then(Path::file_name)
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+        let itself = other_program_at_pid(pid, &name);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(exe.is_some(), "a live child's executable must be readable");
+        assert_eq!(other, exe);
+        assert_eq!(itself, None);
     }
 
     /// A pid that is not ours and not running (already reaped by its own parent,

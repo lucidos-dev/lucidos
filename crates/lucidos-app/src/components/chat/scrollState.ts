@@ -125,6 +125,21 @@ const SCROLL_MAX_MS = 760;         // ceiling, so a very long scroll stays brisk
 const SCROLL_PX_PER_MS = 6.5;      // distance to duration rate between the two; lower is more gradual
 const SCROLL_FRAME_MS = 1000 / 60; // head start, so the first painted frame already steps
 const easeOutCubic = (t: number) => 1 - Math.pow(1 - t, 3);
+const easeInOutCubic = (t: number) => (t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2);
+
+/** How one tween moves: its shortest duration and its curve. */
+interface ScrollPace {
+  minMs: number;
+  ease: (t: number) => number;
+}
+
+const NAVIGATION_PACE: ScrollPace = { minMs: SCROLL_MIN_MS, ease: easeOutCubic };
+
+/** A submit's glide: every landing glide, and a rider's glide to the turn their
+ *  submit created. The tap already got its reaction from the composer or the
+ *  card, so this one starts gently. Its distance is short, so the floor sets
+ *  its length. ADR 0065's amendment. */
+const SEND_PACE: ScrollPace = { minMs: 450, ease: easeInOutCubic };
 
 /** Active navigation rAF id (`animateScroll`, plus the reduced-motion
  *  re-assert). ONE at a time: every entry point cancels the one in flight, so a
@@ -182,7 +197,7 @@ function cancelScrollAnim() {
 }
 
 /** When one of our own navigations last wrote `scrollTop`, and to WHICH element.
- *  Every such write goes through `markNavigationScroll`, so these cannot fall
+ *  Every such write goes through `writeNavigationScroll`, so these cannot fall
  *  out of sync with the writes they describe. Same construction, and the same
  *  reason, as `lastNudgeAt` in utils/webkitRepaint.ts.
  *
@@ -221,7 +236,7 @@ let _navScrollTop: number | null = null;
  *
  *  One field rather than a flag per consumer, so a write carrying two kinds at
  *  once is not expressible. */
-type NavScrollKind = 'placement' | 'held' | 'carry' | 'anchor';
+export type NavScrollKind = 'placement' | 'held' | 'carry' | 'anchor';
 let _navScrollKind: NavScrollKind = 'placement';
 /** When our last write of any kind but `carry` happened. `markCarryScroll`
  *  reads it: a carry inside that write's event window leaves its kind alone. */
@@ -235,25 +250,30 @@ const NAV_SCROLL_EVENT_WINDOW_MS = 64;
 
 /** Write `top` to `el` and record it as OURS, so the scroll event it fires a
  *  frame later is not mistaken for the reader's (see `isNavigationScroll`).
+ *  The write is a PLACEMENT.
  *
- *  EVERY navigation write in this module goes through it, and so does
+ *  Every placement in this module goes through it, and so does
  *  `useScrollMemory`'s positioning of the transcript on open. A saved-position
  *  restore and the open-at-the-top reset are the app placing the reader, just
  *  as a chevron tap is. Unmarked, the mobile header reads either one as the
  *  reader scrolling down and hides. The render-window expansion reads it as the
  *  reader asking for older turns. */
 export function markNavigationScroll(el: HTMLElement, top: number) {
+  writeNavigationScroll(el, top, 'placement');
+}
+
+/** THE ONE WRITER behind every mark, so the stamp, the kind and the re-base
+ *  announcement always describe the same write. */
+function writeNavigationScroll(el: HTMLElement, top: number, kind: NavScrollKind) {
   _navScrollAt = nowMs();
   _uncarriedWriteAt = _navScrollAt;
   _navScrollEl = el;
-  // A PLACEMENT unless `markHeldScroll` or `markAnchorScroll` says otherwise
-  // once this returns. Reset here rather than left alone, so the kind always
-  // describes the write being recorded rather than the one before it.
-  _navScrollKind = 'placement';
+  _navScrollKind = kind;
   el.scrollTop = top;
   // What the browser settled, which a clamp or a fractional offset makes differ
   // from `top`. The write has already laid the container out, so this is free.
   _navScrollTop = el.scrollTop;
+  for (const listener of _rebasedScrollListeners) listener(el, kind);
 }
 
 /** Write `top` and record it as the app HOLDING the reader on the content they
@@ -272,34 +292,34 @@ export function markNavigationScroll(el: HTMLElement, top: number) {
  *  See `isAnchorScroll`. */
 export function markAnchorScroll(el: HTMLElement, top: number): void {
   const before = el.scrollTop;
-  markNavigationScroll(el, top);
+  writeNavigationScroll(el, top, 'anchor');
   if (_shiftTweenStart && el === resolveTarget()) _shiftTweenStart(el.scrollTop - before);
-  _navScrollKind = 'anchor';
-  for (const listener of _rebasedScrollListeners) listener(el);
 }
 
 /* ── Telling a DELTA consumer the offset was re-based ────────────────────────
- *  Two writes move the container without taking the reader anywhere: an anchor
- *  write and the follow's carry. `isAnchorScroll` and `isCarryScroll` answer a
- *  scroll event, and only one arriving inside `NAV_SCROLL_EVENT_WINDOW_MS`.
- *  That is enough for a consumer reading a POSITION: a late event finds the
- *  container settled and reads the same answer either way.
+ *  Every write of ours moves the container without the reader's finger.
+ *  `isNavigationScroll` and its kind checks answer a scroll event, and only one
+ *  arriving inside `NAV_SCROLL_EVENT_WINDOW_MS`. That is enough for a consumer
+ *  reading a POSITION: a late event finds the container settled and reads the
+ *  same answer either way.
  *
  *  It is not enough for one reading a DELTA. The mobile hide-on-scroll header
- *  is the one, and it turns every unattributed pixel into chrome sliding. Either
+ *  is the one, and it turns every unattributed pixel into chrome sliding. Any
  *  write can move the container hundreds of pixels at once, and a late event
- *  hands the header the whole jump.
+ *  hands the header the whole jump. A thread opening at its saved place is the
+ *  worst case: the heaviest render, then the largest jump.
  *
  *  Whether the event is late is a race, and a large programmatic jump loses it
  *  on WebKit under load. So a delta consumer is told SYNCHRONOUSLY, at the
  *  write, and re-takes its baseline there. The event then carries a delta of
- *  zero whenever it lands, and the window stops deciding anything. */
-const _rebasedScrollListeners = new Set<(el: HTMLElement) => void>();
+ *  zero whenever it lands, and the window stops deciding anything. The kind
+ *  tells it whether to act on the write as well. */
+const _rebasedScrollListeners = new Set<(el: HTMLElement, kind: NavScrollKind) => void>();
 
 /** Subscribe to the re-base above; returns the unsubscribe. Fires with the
  *  container AFTER the write, so a listener reading `scrollTop` sees where the
  *  browser actually settled it. */
-export function onRebasedScroll(listener: (el: HTMLElement) => void): () => void {
+export function onRebasedScroll(listener: (el: HTMLElement, kind: NavScrollKind) => void): () => void {
   _rebasedScrollListeners.add(listener);
   return () => { _rebasedScrollListeners.delete(listener); };
 }
@@ -680,6 +700,11 @@ let _pendingLanding: {
 /** Takes the reader to what a one-shot submit resolved. */
 type LandingAim = (el: HTMLElement, target: HTMLElement) => void;
 
+/** The RIDER's counterpart: a submit made while riding, waiting for the turn it
+ *  creates so `glideToSubmittedTurn` can glide to it. Cleared when the ride ends
+ *  or re-arms, and lapses after `LANDING_ADDRESSABLE_MS`. */
+let _rideArrival: { resolveTurn: TurnResolver; at: number } | null = null;
+
 /** TWO deadlines, because a landing can be waiting for two different things and
  *  they are not the same length.
  *
@@ -829,16 +854,19 @@ function holdPosition(el: HTMLElement | null) {
 }
 
 /** Write `top` and record it as OURS, so the scroll event it fires a frame later
- *  cannot be read as the reader taking over. Goes through `markNavigationScroll`
+ *  cannot be read as the reader taking over. Goes through `writeNavigationScroll`
  *  like every other write the app makes, so the mobile header and the
  *  render-window expansion keep standing down for it too.
  *
  *  And says which KIND of write it was, since a held write is not a PLACEMENT.
- *  This is the only place `_navScrollKind` is set to `held`. See
+ *  This and `markCarryScroll` are the only writers of `held`. See
  *  `isPlacementScroll` for what turns on the distinction. */
 function markHeldScroll(el: HTMLElement, top: number) {
-  markNavigationScroll(el, top);
-  _navScrollKind = 'held';
+  writeHeldScroll(el, top, 'held');
+}
+
+function writeHeldScroll(el: HTMLElement, top: number, kind: 'held' | 'carry') {
+  writeNavigationScroll(el, top, kind);
   holdPosition(el);
   // EVERY held write asks whether it landed, because every one of them is the
   // app aiming a reader at the live edge. Asking here rather than at the five
@@ -858,11 +886,9 @@ function markHeldScroll(el: HTMLElement, top: number) {
  *  until the other write's event window has closed. */
 function markCarryScroll(el: HTMLElement, top: number) {
   const uncarriedAt = _uncarriedWriteAt;
-  markHeldScroll(el, top);
+  const sharesAnEvent = nowMs() - uncarriedAt < NAV_SCROLL_EVENT_WINDOW_MS;
+  writeHeldScroll(el, top, sharesAnEvent ? 'held' : 'carry');
   _uncarriedWriteAt = uncarriedAt;
-  if (nowMs() - uncarriedAt < NAV_SCROLL_EVENT_WINDOW_MS) return;
-  _navScrollKind = 'carry';
-  for (const listener of _rebasedScrollListeners) listener(el);
 }
 
 /** Arm the standing follow at the position the caller's own scroll just reached,
@@ -890,6 +916,7 @@ function armFollowOn(el: HTMLElement | null) {
   // chevron, which supersedes it. Everything downstream (the growth branch, the
   // cancel in `onScroll`) may therefore assume at most one of the two.
   _pendingLanding = null;
+  _rideArrival = null;
   if (!wasArmed) for (const listener of _followRideListeners) listener();
 }
 
@@ -1069,6 +1096,7 @@ function leaveTheRide(next: 'off' | 'parked') {
   _follow.value = next;
   holdPosition(null);
   _pendingLanding = null;
+  _rideArrival = null;
 }
 
 /** Cancel a submit's LANDING: drop one still waiting for its turn to render, and
@@ -1660,8 +1688,11 @@ function snapToLiveEdge(el: HTMLElement): void {
  *
  *  A landing is therefore superseded by a RIDE, through `animateScroll`'s own
  *  cancel, since a caller arming the follow outranks a submit's landing. The
- *  reverse cannot arise: arming drops a pending landing (`armFollowOn`). */
-function glideToLiveEdge(el: HTMLElement, owner: HeldGlide, freeze = false): void {
+ *  reverse cannot arise: arming drops a pending landing (`armFollowOn`).
+ *
+ *  A landing always moves at `SEND_PACE`, since only a submit lands. A ride
+ *  takes the pace its caller names. */
+function glideToLiveEdge(el: HTMLElement, owner: HeldGlide, freeze = false, ridePace = NAVIGATION_PACE): void {
   if (_heldAnim && _heldAnimTarget === owner) {
     // The glide in flight is this owner's own, so its MOTION is left alone. A
     // freeze still reaches it, because a freeze changes where the glide is
@@ -1686,7 +1717,7 @@ function glideToLiveEdge(el: HTMLElement, owner: HeldGlide, freeze = false): voi
     if (owner !== 'landing') return;
     const cur = resolveTarget();
     if (cur) honourLanding(cur);
-  }, markHeldScroll);
+  }, markHeldScroll, owner === 'landing' ? SEND_PACE : ridePace);
   _heldAnimTarget = owner;
   // After `animateScroll`, whose own cancel clears the frozen target with the
   // tween it replaced.
@@ -1774,10 +1805,13 @@ function followSubmit(resolveTurn: TurnResolver, holds = true, aim?: LandingAim)
     unparkTheRide(el);
     // A rider already ON the live edge needs no write, and gets no redundant
     // tween, which on iOS would cancel a momentum scroll. The armed follow
-    // carries them through the turn rendering underneath. The LANDING cannot
-    // ask the same question here: its turn does not exist yet, so the live edge
-    // it would measure is the one BEFORE the submit.
-    if (!isAtLiveEdge(el)) glideToLiveEdge(el, 'ride');
+    // carries them through the turn rendering underneath, gliding as it
+    // arrives (`glideToSubmittedTurn`). The LANDING cannot ask the same question
+    // here: its turn does not exist yet, so the live edge it would measure is
+    // the one BEFORE the submit.
+    // A card's turn is already on screen, so there is no arrival to wait for.
+    _rideArrival = resolveTurn(el) ? null : { resolveTurn, at: nowMs() };
+    if (!isAtLiveEdge(el)) glideToLiveEdge(el, 'ride', false, SEND_PACE);
     return;
   }
   // A landing already PENDING keeps the floor, unless it has LAPSED. The two
@@ -2104,8 +2138,9 @@ function keepTheLiveEdge(el: HTMLElement): boolean {
  *  things. A submit's landing is in hand, so give it its round. A deep link or
  *  a restore has just put the reader somewhere, so keep them there
  *  (`holdTheArrival`). Or
- *  the follow is armed, so keep them on the live edge. Nothing at all for a
- *  reader who asked for none of these.
+ *  the follow is armed, so keep them on the live edge, gliding to the turn their
+ *  own submit just created. Nothing at all for a reader who asked for none of
+ *  these.
  *
  *  Stands down while a tween owns the scroll. A tween re-reads its own target
  *  every frame, so a write beside it would fight the easing rather than help it.
@@ -2133,7 +2168,30 @@ function honourGrowth(el: HTMLElement): void {
   }
   if (holdTheArrival(el)) return;
   if (wakeParkedRide(el)) return;
+  if (glideToSubmittedTurn(el)) return;
   keepTheLiveEdge(el);
+}
+
+/** Glide a rider to the turn their own submit just created, once.
+ *
+ *  The follow keeps a rider on the live edge by snapping, which suits a
+ *  streaming reply but not the reader's own message arriving. That one round
+ *  glides at `SEND_PACE`, and every later round snaps. */
+function glideToSubmittedTurn(el: HTMLElement): boolean {
+  const arrival = _rideArrival;
+  if (!arrival) return false;
+  if (_follow.value !== 'riding' || nowMs() - arrival.at >= LANDING_ADDRESSABLE_MS) {
+    _rideArrival = null;
+    return false;
+  }
+  if (!arrival.resolveTurn(el)) return false;
+  // Spent on the round the turn renders, glide or not. Left armed, it would
+  // hand the reply's first round a second glide.
+  _rideArrival = null;
+  // A tween already owns the scroll and re-reads the live edge every frame.
+  if (_scrollAnimRaf !== null || isAtLiveEdge(el)) return false;
+  glideToLiveEdge(el, 'ride', false, SEND_PACE);
+  return true;
 }
 
 /** Where the reader has just ARRIVED, held where they came to rest, or null.
@@ -2331,8 +2389,10 @@ function reportRideLandedShort(short: number, edge: number, view: number): void 
   postClientLog('follow', 'short', { short, edge, view });
 }
 
-/** rAF easeOutCubic scroll of the active container toward a target, shared by
- *  every transcript navigation. ADR 0065 (docs/adr/) is the shape and why.
+/** rAF eased scroll of the active container toward a target, shared by every
+ *  transcript navigation. ADR 0065 (docs/adr/) is the shape and why. `pace`
+ *  picks the floor and curve: a navigation's by default, `SEND_PACE` for a
+ *  submit's glide.
  *
  *  - `targetOf(el)` is re-read EVERY frame. The eased fraction is applied
  *    between the captured `start` and the LIVE target. A target that grows
@@ -2354,13 +2414,14 @@ function animateScroll(
   targetOf: (el: HTMLElement) => number,
   onDone?: () => void,
   mark: (el: HTMLElement, top: number) => void = markNavigationScroll,
+  pace: ScrollPace = NAVIGATION_PACE,
 ) {
   cancelScrollAnim();
   _heldAnim = mark === markHeldScroll;
   let started = false;
   let start = 0;
   let startTime = 0;
-  let duration = SCROLL_MIN_MS;
+  let duration = pace.minMs;
   // Before the first frame there is nothing to carry: `start` is read then.
   _shiftTweenStart = (delta) => { if (started) start += delta; };
   const step = (now: number) => {
@@ -2375,7 +2436,7 @@ function animateScroll(
       // deceleration shape stays elapsed-time based.
       startTime = now - SCROLL_FRAME_MS;
       const distance = Math.abs(targetOf(cur) - start);
-      duration = Math.min(SCROLL_MAX_MS, Math.max(SCROLL_MIN_MS, distance / SCROLL_PX_PER_MS));
+      duration = Math.min(SCROLL_MAX_MS, Math.max(pace.minMs, distance / SCROLL_PX_PER_MS));
     }
     const target = targetOf(cur);
     const t = Math.min(1, (now - startTime) / duration);
@@ -2385,7 +2446,7 @@ function animateScroll(
       onDone?.();
       return;
     }
-    mark(cur, start + (target - start) * easeOutCubic(t));
+    mark(cur, start + (target - start) * pace.ease(t));
     _scrollAnimRaf = requestAnimationFrame(step);
   };
   _scrollAnimRaf = requestAnimationFrame(step);

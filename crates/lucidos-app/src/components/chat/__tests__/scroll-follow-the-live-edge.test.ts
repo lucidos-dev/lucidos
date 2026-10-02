@@ -2528,6 +2528,117 @@ describe('sending a message lands the reader on the live edge', () => {
   });
 });
 
+// A submit's glide moves at the send pace, never a navigation's 240 ms floor and
+// front-loaded curve. A rider glides to their own new turn once, and the follow
+// snaps every round after it. ADR 0065's amendment.
+describe('the reader\'s own message glides into view, gently', () => {
+  beforeEach(() => { resetFollow(); vi.useFakeTimers(); });
+  afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); resetFollow(); });
+
+  /** A send from the live edge: the turn renders and grows the transcript 400px. */
+  function sendFromTheEdge(el: any, onResize: () => void) {
+    followSentMessage();
+    el.addUserMessage({ top: 2900, height: 120 });
+    el.scrollHeight = 3400;
+    onResize();
+  }
+
+  it('lands at the send pace: still under way past a navigation\'s floor, and starting slowly', () => {
+    const el = makeEl({ scrollTop: 0, scrollHeight: 3000 });
+    const { onResize } = makeScrollObservers(el);
+    setActiveScrollElement(el);
+    const parked = atBottom(el);
+
+    sendFromTheEdge(el, onResize);
+    vi.advanceTimersByTime(64);
+    // Eased in: barely moved after a few frames, where a front-loaded curve
+    // has covered most of the way.
+    expect(el.scrollTop - parked).toBeLessThan(40);
+    vi.advanceTimersByTime(250);
+    expect(el.scrollTop).toBeLessThan(2900);
+
+    vi.advanceTimersByTime(1000);
+    expect(el.scrollTop).toBe(2900);
+  });
+
+  it('glides a rider to their sent message instead of snapping them there', () => {
+    const el = makeEl({ scrollTop: 0, scrollHeight: 3000 });
+    const { onResize } = makeScrollObservers(el);
+    setActiveScrollElement(el);
+    setFollowLiveEdge(true);
+    vi.advanceTimersByTime(1500);
+    const parked = el.scrollTop;
+    expect(parked).toBe(2500);
+
+    sendFromTheEdge(el, onResize);
+    expect(el.scrollTop, 'the follow snapped the rider to the sent message').toBe(parked);
+    vi.advanceTimersByTime(250);
+    expect(el.scrollTop).toBeGreaterThan(parked);
+    expect(el.scrollTop).toBeLessThan(2900);
+
+    vi.advanceTimersByTime(1000);
+    expect(el.scrollTop).toBe(2900);
+    expect(followingLiveEdge.value).toBe(true);
+  });
+
+  it('glides only the arrival: the reply streaming after it is carried as before', () => {
+    const el = makeEl({ scrollTop: 0, scrollHeight: 3000 });
+    const { onResize } = makeScrollObservers(el);
+    setActiveScrollElement(el);
+    setFollowLiveEdge(true);
+    vi.advanceTimersByTime(1500);
+
+    sendFromTheEdge(el, onResize);
+    vi.advanceTimersByTime(1500);
+    expect(el.scrollTop).toBe(2900);
+
+    el.scrollHeight = 3700;
+    onResize();
+    expect(el.scrollTop).toBe(3200);
+  });
+
+  it('spends the arrival on a turn that renders inside a glide already running', () => {
+    // A rider off the edge glides at once. Their turn rendering mid-glide is
+    // carried by that glide, so the reply after it must snap, not glide again.
+    const el = makeEl({ scrollTop: 0, scrollHeight: 3000 });
+    const { onResize } = makeScrollObservers(el);
+    setActiveScrollElement(el);
+    setFollowLiveEdge(true);
+    vi.advanceTimersByTime(1500);
+    el.scrollHeight = 3200;   // grew while the reader looked away, so off the edge
+    el._scrollTop = 2400;
+
+    followSentMessage();
+    vi.advanceTimersByTime(48);
+    el.addUserMessage({ top: 3100, height: 120 });
+    el.scrollHeight = 3600;
+    onResize();
+    // Past the glide's end, and still inside the arrival's own window.
+    vi.advanceTimersByTime(600);
+    expect(el.scrollTop).toBe(3100);
+
+    el.scrollHeight = 3900;
+    onResize();
+    expect(el.scrollTop).toBe(3400);
+  });
+
+  it('records no arrival for a card answered while riding: the reply is carried', () => {
+    // The card's turn is on screen when tapped, so nothing is arriving.
+    const el = makeEl({ scrollTop: 0, scrollHeight: 3000 });
+    const { onResize } = makeScrollObservers(el);
+    setActiveScrollElement(el);
+    el.addQuestionCard({ toolUseId: 'q1', top: 2600, height: 300 });
+    setFollowLiveEdge(true);
+    vi.advanceTimersByTime(1500);
+    expect(el.scrollTop).toBe(2500);
+
+    followAnsweredQuestion('q1');
+    el.scrollHeight = 3300;
+    onResize();
+    expect(el.scrollTop).toBe(2800);
+  });
+});
+
 describe('a send moves nobody only when the live edge is already behind the reader', () => {
   beforeEach(() => { resetFollow(); vi.useFakeTimers(); });
   afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); resetFollow(); });
@@ -4472,10 +4583,10 @@ describe("the follow's carry holds the mobile dynamic bars", () => {
     el.scrollHeight = 3400;
     onResize();
     unsubscribe();
-    expect(rebased).toHaveBeenCalledWith(el);
+    expect(rebased).toHaveBeenCalledWith(el, 'carry');
   });
 
-  it("does not tell it about a carry sharing a resume's event, which must still reveal", () => {
+  it("tells it a carry sharing a resume's event is held, which must still reveal", () => {
     const el = makeEl({ scrollTop: 100, scrollHeight: 3000, clientHeight: 500 });
     const { onResize } = makeScrollObservers(el);
     setActiveScrollElement(el);
@@ -4485,7 +4596,20 @@ describe("the follow's carry holds the mobile dynamic bars", () => {
     el.scrollHeight = 3400;
     onResize();
     unsubscribe();
-    expect(rebased).not.toHaveBeenCalled();
+    expect(rebased).toHaveBeenCalled();
+    expect(rebased).not.toHaveBeenCalledWith(el, 'carry');
+  });
+
+  it('tells a delta consumer about a placement at the write, so a late event moves nothing', () => {
+    // A thread opening at its saved place is one, and the heaviest render.
+    // Its event can land past the window, and then reads as the reader.
+    const el = makeEl({ scrollTop: 100, scrollHeight: 3000, clientHeight: 500 });
+    const rebased = vi.fn();
+    const unsubscribe = onRebasedScroll(rebased);
+    markNavigationScroll(el as unknown as HTMLElement, 2200);
+    unsubscribe();
+    expect(rebased).toHaveBeenCalledWith(el, 'placement');
+    expect(el.scrollTop).toBe(2200);
   });
 
   it('marks a quiet thread\'s follow write a carry too, so a late resize holds the bars', () => {

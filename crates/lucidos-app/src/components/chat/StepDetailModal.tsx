@@ -15,6 +15,9 @@ import { StepOutcomeIcon } from '../shared/icons';
 import { LoadingFade } from '../shared/LoadingFade';
 import { SkText, SkeletonProvider, useSkeleton } from '../shared/Skeleton';
 
+/** Why a step's detail cannot be fetched: it was recorded with no event id. */
+const STEP_WITHOUT_ID = 'the step was saved without an id, so it cannot be looked up';
+
 function close() {
   stepDetailModal.value = null;
 }
@@ -72,7 +75,7 @@ function ResultArea({
   const loadable: Loadable<{ result: string | null }> = fetched
     ? fetched.value
     : missingId
-      ? toFailed<{ result: string | null }>(new Error('missing event id'))
+      ? toFailed<{ result: string | null }>(new Error(STEP_WITHOUT_ID))
       : { status: 'loaded', data: { result: inlineResult ?? null } };
 
   const showLoading = useDelayedLoading(loadable);
@@ -81,7 +84,7 @@ function ResultArea({
     content = (
       <>
         <div class="step-detail-section-label">Result</div>
-        <div class="step-detail-result-error" data-role="result-error">Failed to load result: {loadable.error}</div>
+        <div class="step-detail-result-error" data-role="result-error">Could not load this step’s result: {loadable.error}</div>
       </>
     );
   } else if (loadable.status === 'loaded' && loadable.data.result) {
@@ -140,7 +143,7 @@ function CommandArea({
   // The channel decides the formatter, because each has its own and the inline
   // label was built with that one. See `tool_channel`.
   const loadable: Loadable<{ full: string | undefined }> = useMemo(() => {
-    if (missingId) return toFailed<{ full: string | undefined }>(new Error('missing event id'));
+    if (missingId) return toFailed<{ full: string | undefined }>(new Error(STEP_WITHOUT_ID));
     if (!fetchedArgs) return { status: 'loaded', data: { full: inlineFull } };
     if (fetchedArgs.status !== 'loaded') return fetchedArgs;
     const format = toolChannel === 'chat' ? fullCommandForEngineTool : fullCommandForCCTool;
@@ -154,7 +157,7 @@ function CommandArea({
     content = (
       <>
         {descriptionLine}
-        <div class="step-detail-result-error" data-role="command-error">Failed to load command: {loadable.error}</div>
+        <div class="step-detail-result-error" data-role="command-error">Could not load this step’s command: {loadable.error}</div>
       </>
     );
   } else if (loadable.status === 'loaded') {

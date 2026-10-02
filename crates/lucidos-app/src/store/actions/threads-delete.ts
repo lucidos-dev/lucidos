@@ -31,6 +31,7 @@ import { collectThreadFamily, focusThread, unfocusThread, visibleCandidatesAroun
 import { resolveThreadActions } from './threadActions';
 import { forgetThreadEventsFailures } from './thread-loading';
 import { removeThreadNavEntries } from './thread-navigation';
+import { pruneRecents } from './entityReferences';
 
 /** The dialog, as the three things `showConfirm` takes. Pure, so the whole
  *  conditional-copy table is testable without a dialog or a network. */
@@ -189,6 +190,7 @@ export function dropDeletedThreads(ids: readonly string[]): void {
     forgetComposeState(id);
     forgetThreadEventsFailures(id);
     removeThreadNavEntries(id);
+    pruneRecents(id, 'threads');
   }
   threadMap.value = next;
 

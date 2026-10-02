@@ -771,6 +771,12 @@
     display: none;
 }
 
+/* .list-row-info clips its overflow, which would cut the rename field's focus
+   ring off at the row's edges. */
+.app-store-marketplace-renaming .list-row-info {
+    overflow: visible;
+}
+
 /* Same text as the .title .list-row-name it stands in for, spelled out rather
    than `font: inherit`, which would also reset the weight. The margin is that
    row's own, so the URL under it does not move when the field opens. */
@@ -779,10 +785,6 @@
     min-width: 0;
     margin-bottom: 0.25rem;
     padding: 0.125rem 0.25rem;
-    border: 1px solid var(--accent);
-    border-radius: calc(var(--radius-control) * 0.375);
-    background: var(--bg-primary);
-    color: var(--text-primary);
     font-family: inherit;
     font-size: var(--font-size-lg);
     font-weight: 500;

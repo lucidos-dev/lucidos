@@ -30,6 +30,7 @@ mod panel_preview;
 #[cfg(test)]
 mod test_support;
 mod traffic_lights;
+mod update_relay;
 mod updater;
 /// The displays attached right now, and the windows a change to them strands.
 mod window_desk;

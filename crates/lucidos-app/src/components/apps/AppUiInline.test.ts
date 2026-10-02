@@ -54,6 +54,10 @@ describe('app frame load cover', () => {
     expect(src).toMatch(/pushKeybindingsToFrame\(e\.currentTarget as HTMLIFrameElement\)/);
   });
 
+  it('hands the loaded frame the shell\'s appearance, so a change since the seed shows', () => {
+    expect(src).toMatch(/pushAppearanceToFrame\(e\.currentTarget as HTMLIFrameElement\)/);
+  });
+
   it('keeps the cover mounted through its fade-out, at any animation speed', () => {
     // Unmounting on `load` would hard-cut the app in instead of fading it. The
     // fade is a --duration-normal transition, and that token is scaled by the

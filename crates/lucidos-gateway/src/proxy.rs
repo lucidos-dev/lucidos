@@ -729,11 +729,15 @@ stalled/failed pages, where there is nothing else left to offer). */
     let escape_html = if escape { ESCAPE_LINK } else { "" };
     // The meta-refresh survives only for a browser with scripting off, where the
     // poller cannot run. Omitted entirely (not `content="0"`) when there is
-    // nothing to wait for.
-    let (refresh_html, poll_attr) = match refresh_secs {
+    // nothing to wait for. `data-ready-label` is what the poller shows before
+    // it reloads into the app.
+    let (refresh_html, poll_attrs) = match refresh_secs {
         Some(secs) => (
             format!(r#"<noscript><meta http-equiv="refresh" content="{secs}"></noscript>"#),
-            format!(r#" data-poll-secs="{secs}""#),
+            format!(
+                r#" data-poll-secs="{secs}" data-ready-label="{}""#,
+                escape_html_text(app_status_text())
+            ),
         ),
         None => (String::new(), String::new()),
     };
@@ -749,7 +753,7 @@ stalled/failed pages, where there is nothing else left to offer). */
     let viewport = app_viewport_meta();
     format!(
         "{HEAD_A}{refresh_html}\n{viewport}{HEAD_B}{title}{STYLE_OPEN}{css}{GATEWAY_CSS_AND_BODY}\
-         <div class=\"boot-splash\"{poll_attr}>\n{mark}\
+         <div class=\"boot-splash\"{poll_attrs}>\n{mark}\
          {MARK_TO_LABEL}{label}</div>\n{escape_html}\n</div>\n</div>\n{HANDOVER}\n{SPLASH_POLLER}\n</body></html>"
     )
 }
@@ -761,7 +765,12 @@ stalled/failed pages, where there is nothing else left to offer). */
 /// or failed one. `data-poll-secs` is the interval, and its absence (the
 /// failed page) means there is nothing to wait for. The 150ms before a swap
 /// waits out the `.boot-splash-status-swap` fade in index.html.
-const SPLASH_POLLER: &str = r##"<script>(function(){var splash=document.querySelector('.boot-splash'),secs=Number(splash&&splash.getAttribute('data-poll-secs'));if(!secs)return;var every=secs*1000;if(!window.fetch||!window.DOMParser){setTimeout(function(){location.reload()},every);return}var status=splash.querySelector('.boot-splash-status'),swap;function kind(doc){var s=doc.querySelector('.boot-splash');return s?s.getAttribute('data-poll-secs')+(s.querySelector('.boot-splash-escape')?'+escape':''):''}var mine=kind(document);function show(text){if(!status||text===status.textContent)return;clearTimeout(swap);status.classList.add('boot-splash-status-swap');swap=setTimeout(function(){status.textContent=text;status.classList.remove('boot-splash-status-swap')},document.documentElement.getAttribute('data-motion')==='reduce'?0:150)}function poll(){fetch(location.href,{headers:{Accept:'text/html'},cache:'no-store'}).then(function(r){if(!r.headers.get('x-lucidos-boot-splash'))return location.reload();return r.text().then(function(html){var doc=new DOMParser().parseFromString(html,'text/html');if(kind(doc)!==mine)return location.reload();var next=doc.querySelector('.boot-splash-status');if(next)show(next.textContent);setTimeout(poll,every)})}).catch(function(){setTimeout(poll,every)})}setTimeout(poll,every)})()</script>"##;
+///
+/// When the engine answers, the app document opens on its own baked status
+/// (`data-ready-label`). So the page crossfades to those words first, and
+/// reloads only once the 300ms fade-in has finished. The seam then joins two
+/// identical frames, instead of snapping a boot phase to new words.
+const SPLASH_POLLER: &str = r##"<script>(function(){var splash=document.querySelector('.boot-splash'),secs=Number(splash&&splash.getAttribute('data-poll-secs'));if(!secs)return;var every=secs*1000;if(!window.fetch||!window.DOMParser){setTimeout(function(){location.reload()},every);return}var status=splash.querySelector('.boot-splash-status'),ready=splash.getAttribute('data-ready-label'),swap;function reload(){location.reload()}function still(){return document.documentElement.getAttribute('data-motion')==='reduce'}function kind(doc){var s=doc.querySelector('.boot-splash');return s?s.getAttribute('data-poll-secs')+(s.querySelector('.boot-splash-escape')?'+escape':''):''}var mine=kind(document);function show(text,then){if(!status||text===status.textContent){if(then)then();return}clearTimeout(swap);status.classList.add('boot-splash-status-swap');swap=setTimeout(function(){status.textContent=text;status.classList.remove('boot-splash-status-swap');if(then)setTimeout(then,still()?0:300)},still()?0:150)}function poll(){fetch(location.href,{headers:{Accept:'text/html'},cache:'no-store'}).then(function(r){if(!r.headers.get('x-lucidos-boot-splash'))return r.ok&&ready?show(ready,reload):reload();return r.text().then(function(html){var doc=new DOMParser().parseFromString(html,'text/html');if(kind(doc)!==mine)return reload();var next=doc.querySelector('.boot-splash-status');if(next)show(next.textContent);setTimeout(poll,every)})}).catch(function(){setTimeout(poll,every)})}setTimeout(poll,every)})()</script>"##;
 
 /// The app document, embedded at COMPILE time. The splash must render with no
 /// engine reachable, so it cannot link the app's stylesheet; embedding the file
@@ -775,6 +784,8 @@ const CSS_START: &str = "/* lucidos-boot-splash-css-start */";
 const CSS_END: &str = "/* lucidos-boot-splash-css-end */";
 const MARK_START: &str = "<!-- lucidos-boot-splash-mark-start -->";
 const MARK_END: &str = "<!-- lucidos-boot-splash-mark-end -->";
+const STATUS_OPEN: &str =
+    r#"<div class="boot-splash-status boot-splash-status-shown" role="status" aria-live="polite">"#;
 
 /// The boot-splash stylesheet, verbatim from index.html (see its "SINGLE SOURCE
 /// FOR BOTH SPLASH SURFACES" comment). This is why the two splashes cannot
@@ -793,6 +804,13 @@ fn app_splash_css() -> &'static str {
 /// contract as [`app_splash_css`].
 fn app_mark_svg() -> &'static str {
     slice_between(APP_INDEX_HTML, MARK_START, MARK_END).unwrap_or("")
+}
+
+/// The status the app document bakes ("Opening your workspace…"), verbatim, so
+/// the poller hands over on the app's exact words. Empty if the element moves,
+/// and an empty label makes the poller reload without the crossfade.
+fn app_status_text() -> &'static str {
+    slice_between(APP_INDEX_HTML, STATUS_OPEN, "</div>").unwrap_or("")
 }
 
 /// The app document's viewport and iOS home-screen `<meta>` tags, verbatim.
@@ -897,6 +915,23 @@ mod tests {
         assert!(mark.contains(r#"<svg class="boot-splash-mark""#), "{mark}");
         assert!(mark.contains("<rect"), "{mark}");
         assert!(mark.contains("</svg>"), "{mark}");
+    }
+
+    /// The poller crossfades to the app's own status before it reloads, so the
+    /// app document opens on identical words. An empty lift would quietly
+    /// bring the snap back, so pin the extraction and the stamp together.
+    #[test]
+    fn a_waiting_page_hands_over_on_the_app_documents_status() {
+        assert_eq!(APP_INDEX_HTML.matches(STATUS_OPEN).count(), 1);
+        let text = app_status_text();
+        assert!(!text.trim().is_empty(), "the app's baked status must lift");
+        assert!(!text.contains('<') && !text.contains('\n'), "{text}");
+        let stamp = format!(r#"data-ready-label="{}""#, escape_html_text(text));
+        assert!(splash_page_html("Starting engine…", Some(2), false).contains(&stamp));
+        // The stalled page still polls, so a late recovery hands over too.
+        assert!(splash_page_html("Taking longer", Some(10), true).contains(&stamp));
+        // The failed page has nothing to wait for, so nothing to hand over to.
+        assert!(!splash_page_html("Cannot open", None, true).contains(r#"data-ready-label=""#));
     }
 
     /// The page renders the app's splash rather than a copy of it: same

@@ -31,7 +31,7 @@ const cssSource = readFileSync(resolve(here, '../../../styles/mobile.css'), 'utf
  *
  * Covered end-to-end by `e2e/welcome.spec.ts` "draft in progress: clicking a
  * suggestion confirms, then overrides the prompt text" on the mobile projects
- * (it passed on desktop chromium — the block is inside `max-width: 768px`).
+ * (it passed on desktop chromium — the block is inside `(--phone-layout)`).
  * Pinned here too because that spec only runs in the browser e2e suite, and
  * this is a one-line CSS rule that is easy to drop.
  */

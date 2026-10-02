@@ -58,6 +58,7 @@ mod server;
 mod shell_env;
 mod slowness;
 mod stack;
+mod update_relay;
 
 /// Lucidos umbrella release version (e.g. "0.7"), sourced from the repo-root
 /// `RELEASE` file at compile time. Mirrors `lucidos_engine::LUCIDOS_RELEASE`

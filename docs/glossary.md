@@ -538,6 +538,9 @@ The *boot splash*'s no-ceremony mode, used by a document whose load CONTINUES a 
 ### Shell chunk
 The built chunk holding `<App/>` and everything only the UI reaches: header, drawer, panes, the transcript and composer. `main.tsx` imports it lazily and asks for it as soon as the entry evaluates, and `index.html` modulepreloads it (`vite/shellChunkPreload.ts`). It loads beside the entry chunk, under the *boot splash*, while *client startup* is already fetching. So the entry chunk is the data layer alone, held to its budget by `vite/entryChunkBudget.ts` (ADR 0288). Anything a cold open can draw in its first frame belongs here, not behind an *idle prefetch*.
 
+### Safe-area floor
+The insets `utils/safeAreaFloor.ts` publishes as `--safe-area-floor-*` when an iOS home-screen app has lost its `env(safe-area-inset-*)` values. After a phone call, WebKit can report them as 0, which puts the header under the clock, and the loss may outlast a relaunch. The floor is the last real reading for the same orientation and width, kept in storage. It applies while the top, left or right side reads 0 against that reading and no side has gained an inset. Every stylesheet reads the insets through `var(--safe-area-*)` (`styles/global/base.css`), never `env()` directly, so the floor reaches all of them. A temporary measure (`docs/temporary-measures.md`).
+
 ### Idle prefetch
 Loading the chunk of a surface that only opens on demand once the *boot splash* has lifted (`prefetchWhenIdle` in `utils/idlePrefetch.ts`, started by `dismissBootSplash`). The surface's opener waits for its `preload()` before it opens, so it never opens empty. Only for a surface a cold open cannot draw: one whose open state survives a reload stays in the *shell chunk* (ADR 0288).
 
@@ -780,6 +783,8 @@ The shape an *event wait* had until 2026-08-06: `await_event` ended the turn wit
 
 ### Re-entry anchor
 The event a resolved *event wait* hangs its re-entry on, and the second half of every resolution: `emit_delivery` / `emit_expiry` write the resolution and then exactly one anchor, a `UserPromptInjected` carrying the payload as prose. It is an `EXCHANGE_START_TYPES` member on the frontend, so the delivery renders as the new turn it genuinely is. Two jobs in one shape: it is what `PreEmittedOrigin::WaitReentry` points at, and it is what makes a lost re-entry recognisable at boot, since a resolution followed only by its own anchor is one whose turn never ran (`lost_wait_reentries`, mirroring `refire_unprocessed_child_completions`).
+
+It carries an engine origin with the `event_wait` reason: the outcome, the watched event types and the agent's reason. That is how the transcript and the route popover say where its words came from. Its `mode` stays `agent`, because `held_deliveries` keys on it. Older anchors carry no origin, and `waitReentryReason` reads their shape instead.
 
 The anchor sets the thread `running`, except on a thread parked on a question. There the re-entry waits for the answer (ADR 0255), so the anchor keeps `waiting_for_user_answer` and the card reads "Held until you reply". See `docs/plans/2026-09-24-a-delivery-never-unparks-a-question.md`.
 
@@ -1169,6 +1174,12 @@ The host is the trusted side and three rules keep it that way. It forwards only 
 
 Storage is namespaced (`appbridge:`) and holds no host key, so the device id stays out of the frame. A read that must be device-scoped names the device instead, as `@device`, and the host substitutes the id on `/preferences` only.
 
+### Appearance push
+
+What the shell painted, sent to every app frame on the *app bridge*'s `appearance` channel. Only a frame that called `watchPreferences()` listens. It carries the mirrors the *appearance boot script* reads, shaped like the engine's first-paint seed and parsed the same way. The shell sends one per task in which it paints, plus one as a frame loads. So an app follows a scale drag or a theme switch with no request. From the first push on, the push owns the frame's appearance, and a slower fetch cannot paint over it.
+
+Host half: `store/actions/app-appearance.ts`. App half: `adoptHostAppearance` in `packages/lucidos-sdk/src/ui.ts`.
+
 ### App authority
 
 What an *app UI* can do over `/api/v1`: everything the user can, and by design. ADR 0144 enumerates every lever that was considered against it and why each fails. The **realm** an app holds it in narrowed with ADR 0227, and now depends on where the app is open.
@@ -1382,7 +1393,7 @@ The only other thing that moves the transcript is an *anchor write*, below.
 
 A held write is marked for the consumers above and for nothing else. Its OWN question, has the reader taken the container away from where we last put them, is answered by position rather than by this window: a streaming thread re-marks itself every frame, so a flick landing inside the 64ms would read as the app's. That one position stamp serves both things that hold a reader deliberately, and they are never both live: an armed follow retires any pending landing. See *standing follow* and *submit landing*.
 
-A **carry write** is the third kind (`markCarryScroll` / `isCarryScroll`): the *standing follow* keeping a rider ON the live edge as the thread moves under them, live or quiet. Its writers are `keepTheLiveEdge`, for growth, a BOX change or a PLATFORM scroll, and the ride's one-frame correction in `settleTheRide`. It is a held write in every respect but one: the mobile *dynamic bars* stay exactly where they are for it, as for an *anchor write*. A reply scrolling the thread is not the reader, and only the reader's finger moves the bars (ADR 0337). Like an anchor write, it announces itself to a delta consumer at the write (`onRebasedScroll`), so a late event moves nothing.
+A **carry write** is the third kind (`markCarryScroll` / `isCarryScroll`): the *standing follow* keeping a rider ON the live edge as the thread moves under them, live or quiet. Its writers are `keepTheLiveEdge`, for growth, a BOX change or a PLATFORM scroll, and the ride's one-frame correction in `settleTheRide`. It is a held write in every respect but one: the mobile *dynamic bars* stay exactly where they are for it, as for an *anchor write*. A reply scrolling the thread is not the reader, and only the reader's finger moves the bars (ADR 0337). Like every write of ours, it announces itself to a delta consumer at the write (`onRebasedScroll`), so a late event moves nothing.
 
 One case stays held. A write in the same frame as another held or placement write shares that write's one scroll event, which must still reveal.
 
@@ -1390,7 +1401,7 @@ An **anchor write** is the fourth kind (`markAnchorScroll` / `isAnchorScroll`). 
 
 The *anchor correction* writes a whole pixel, and a scroll offset holds nothing finer. Its sub-pixel rest goes into the **anchor spacer** (`--anchor-subpixel`, under 1px), which both top reserves of `.thread-content` add. Scroll and spacer cancel, so a press moves no line (ADR 0286).
 
-It also announces itself SYNCHRONOUSLY, to a consumer reading a DELTA rather than a position (`onRebasedScroll`). The 64ms window is a race that a large jump loses on WebKit. So the header re-takes its baseline at the write, and again on the settling frame. The browser clamps a shrinking transcript after it.
+Every write of ours, of any kind, also announces itself SYNCHRONOUSLY, with its kind, to a consumer reading a DELTA rather than a position (`onRebasedScroll`). The 64ms window is a race that a large jump loses on WebKit. A thread opening at its saved place is the largest such jump, and loses it most often. So the header re-takes its baseline at the write, and again on the settling frame, since the browser clamps a shrinking transcript after it. A placement or held write that moved the container reveals the bars right there. An anchor or carry write leaves them, and so does a write that moved nothing, such as focus landing on a control already on screen.
 
 A **placement scroll** is the narrower half: a navigation scroll that is not a held or carry write (`isPlacementScroll`, private to the module). An anchor write counts as one, which reads oddly for a write that places nobody, and is deliberate: the one consumer must stand down for both.
 
@@ -1512,7 +1523,9 @@ Its resting place has moved twice. Until 2026-08-11 it rested the status line on
 
 **It arms nothing.** The landing is over when the agent has started, and the *standing follow* is a separate request with a separate button. Until 2026-08-10 a send and an answer armed the follow instead. A reader who only wanted to see their message go through was then dragged through the whole reply.
 
-**It splits TWO ways, and only in WHEN.** *Already riding the live edge* goes at once, since the armed follow carries the reader through the turn rendering anyway. A rider already ON the edge gets no write at all, which is what keeps an iOS momentum scroll alive. *Everyone else* waits for the turn they acted on to render. Going earlier would aim at the bottom the transcript had BEFORE the submit, which is the blind jump the wait exists for.
+**It splits TWO ways, and only in WHEN.** *Already riding the live edge* goes at once, since the armed follow carries the reader through the turn rendering anyway. A rider already ON the edge gets no write at submit time, which is what keeps an iOS momentum scroll alive. The follow then glides them once to the turn their submit created, rather than snapping (`glideToSubmittedTurn`), and snaps every round after. *Everyone else* waits for the turn they acted on to render.
+
+**Every glide here moves at the *send pace*.** That covers each landing round and a rider's arrival glide. Going earlier would aim at the bottom the transcript had BEFORE the submit, which is the blind jump the wait exists for.
 
 It shipped splitting FOUR ways, and the two extra branches were the same mistake twice. Each asked about the transcript AS IT STANDS, to predict where a turn that had not rendered would sit. *At the live edge* wrote nothing, on the reasoning that the reader already sees the newest content. That holds until the submit APPENDS a turn below the fold, and sending from the bottom is the ordinary case. *Nowhere to take anybody* (`hasSomewhereToLand`) got the brand-new thread wrong the same way, since it holds no `.chat-exchange` at submit time. Both were reported on 2026-08-10.
 
@@ -1543,6 +1556,11 @@ A deferred landing that never becomes addressable LAPSES after `LANDING_ADDRESSA
 The two card submits resolve at once, from the card's own id, since the card is on screen by construction. `cardTurn` answers with the turn around it, which the hold then reads for drawn rows. The composer calls in TWICE for one send, its own tap and then the optimistic insert, in one synchronous task. So a landing already pending is KEPT rather than replaced. A second `awaitsNewTurn` built after the row rendered would wait for a message that will never come.
 
 **The reader's own scroll cancels it**, both while it waits and mid-glide, and it is not dragged back. That used to come free as a side effect of the follow's disarm. With a submit arming nothing, the landing takes a position stamp of its own the moment it is scheduled (see *navigation scroll*). Until its turn renders there is no write to read the gesture against. It asks only whether the reader MOVED, where the follow's disarm also asks whether they are off the live edge. One term is enough here: there is no standing request to protect, so a gesture simply ends the whole hold.
+
+### Send pace
+How a *submit*'s glide moves: a 450 ms floor and an ease-in-out curve (`SEND_PACE` in `components/chat/scrollState.ts`). Every other transcript glide moves at the navigation pace, a 240 ms floor and an ease-out curve that reacts at once to a tap. A submit has already reacted at the tap, in the composer or on the card, and its distance is short. So the navigation pace threw the turn into view. Both are paces of the one tween in ADR 0065, whose amendment records the split.
+
+It covers every *submit landing* glide, and a rider's one glide to the turn their submit created (`glideToSubmittedTurn`).
 
 ### Landing line
 Where a turn comes to rest when the app navigates to it: `scroll-margin-top` below the transcript's top edge, clear of the chrome stacked there (`turnLandingClearancePx` in `components/chat/scrollState.ts`, reading `.chat-exchange`'s computed value from `styles/chat/response.css`).
@@ -2245,7 +2263,28 @@ The sync `effect` lives beside the signal rather than in `store/effects.ts`, bec
 Holding is only honest because `ThreadList` is the one surface that renders from it, and it is exactly what the panel covers. Everything else reads the live signals and answers the tap at once: the panel's own checkboxes, its option lists (`repoFilterOptions` / `appFilterOptions` / `triggerFilterOptions`), and the header's Filter glyph (`threadFilterActive`).
 
 ### Edge swipe zone
-One of the two transparent host-owned strips pinned to the left and right screen edges on the mobile layout: `.edge-swipe-zone` + `.edge-swipe-left` (2.5rem) / `.edge-swipe-right` (1.25rem) in `crates/lucidos-app/src/styles/mobile.css`, rendered as a pair by the `EdgeSwipeZones` component (`components/layout/EdgeSwipeZones.tsx`). Their whole purpose is to be the topmost thing at the screen edge, ABOVE any app iframe, so a touch there reaches the host document instead of the frame. That buys two things. First, an iframe captures every touch it covers, so inside a *swipe pane* these strips are the only place a pane swipe over an app can begin. Second, and the reason they exist at all, they are what lets `MobileSwipeContainer`'s touchstart handler see an edge touch and `preventDefault()` it, which is the only way to suppress WebKit's native back/forward navigation gesture in the standalone iOS PWA (no CSS opt-out exists: neither `touch-action` nor `overscroll-behavior-x` disables it, and WebKit's edge recognizer commits before the in-app 8px horizontal lock, so an `onTouchMove` preventDefault runs too late). The strip widths are mirrored by `EDGE_NAV_GUARD_LEFT_PX` (40) / `EDGE_NAV_GUARD_RIGHT_PX` (24), the bounds of the pure `shouldSuppressEdgeNavigation` decision; change a width without its constant and a touch lands on a strip the suppression does not cover, which is exactly the 24-to-40px band that once popped the PWA out to the workspace gateway picker. Mounted in **two** places: inside every `.mobile-swipe-pane` (there, rather than on the swipe container, so they share a stacking context with `.prompt-area` and its `z-index: 2` buttons stay clickable), and inside a *pseudo-fullscreen* app overlay, which is `position: fixed` at `var(--z-app-fullscreen)` over the whole viewport and therefore covers the panes' own strips. **Mounted does not mean a pane swipe is available**: `shouldStartPaneSwipe` turns the pane swipe off entirely while an app is fullscreen, and the strips there earn their place purely by keeping WebKit's gesture suppressed. They go `pointer-events: none` under `:root[data-keyboard-active]`, so an edge touch while the on-screen keyboard is up belongs to whatever is underneath.
+One of the two transparent host-owned strips pinned to the left and right screen edges on the mobile layout. They are `.edge-swipe-zone` + `.edge-swipe-left` (2.5rem) / `.edge-swipe-right` (1.25rem) in `crates/lucidos-app/src/styles/mobile.css`. The `EdgeSwipeZones` component (`components/layout/EdgeSwipeZones.tsx`) renders them as a pair.
+
+They are the topmost thing at the screen edge, ABOVE any app iframe, so a touch there reaches the host document instead of the frame. That lets `MobileSwipeContainer`'s touchstart handler see an edge touch and `preventDefault()` it. Nothing else suppresses WebKit's native back/forward navigation gesture in the standalone iOS PWA:
+
+- no CSS opt-out exists, since neither `touch-action` nor `overscroll-behavior-x` disables it;
+- WebKit's edge recognizer commits before the in-app 8px horizontal lock, so an `onTouchMove` preventDefault runs too late.
+
+They are no longer the only place a *pane swipe* over an app can begin. An iframe captures every touch it covers, so the SDK tracks drags inside the frame and posts them up. One gesture model, `SwipeTouch` in `packages/lucidos-sdk/src/paneSwipe.ts`, decides the lock and the commit on both sides. The host reaches it through the `@lucidos/pane-swipe` alias.
+
+The frame posts `lucidos:app:swipe` (`dx`) and `lucidos:app:swipe-end` (`paneDelta`), measured in screen coordinates because the frame moves with the drag. The host accepts them only from a current app frame (`store/actions/app-swipe-bridge.ts`), and `MobileSwipeContainer` moves the track with the same code as its own touches.
+
+The strip widths are mirrored by `EDGE_NAV_GUARD_LEFT_REM` / `EDGE_NAV_GUARD_RIGHT_REM`, the bounds of the pure `shouldSuppressEdgeNavigation` decision. Change a width without its constant and a touch lands on a strip the suppression does not cover. A band like that once popped the PWA out to the workspace gateway picker.
+
+Mounted in **two** places:
+
+- inside every `.mobile-swipe-pane`, rather than on the swipe container, so they share a stacking context with `.prompt-area` and its `z-index: 2` buttons stay clickable;
+- inside a *pseudo-fullscreen* app overlay, which is `position: fixed` at `var(--z-app-fullscreen)` over the whole viewport and covers the panes' own strips.
+
+**Mounted does not mean a pane swipe is available**: `shouldStartPaneSwipe` turns the pane swipe off entirely while an app is fullscreen. The strips there earn their place purely by keeping WebKit's gesture suppressed. They go `pointer-events: none` under `:root[data-keyboard-active]`, so an edge touch while the on-screen keyboard is up belongs to whatever is underneath.
+
+### History bounce
+The installed iOS app's rule that it never rests on a page it reached by going back: that page steps forward again at once. An inline `<head>` script in `crates/lucidos-app/index.html` does it, on a `back_forward` load or a back-forward cache restore, gated on `navigator.standalone`. The *edge swipe zone* guard cannot catch every touch. An iOS notification tap loads a new document, which leaves the previous page one entry back. A browser tab and an Android install keep their back, since there it is the user's. Why: ADR 0340.
 
 ### Em-dash gate
 The deterministic enforcement of `.claude/rules/em-dashes.md`. A banned dash is an **unspaced** U+2014 EM DASH (a non-whitespace character touches it) or any U+2015 HORIZONTAL BAR. A spaced em dash passes, and U+2013 EN DASH is never checked.
@@ -2740,13 +2779,23 @@ The archive the in-app auto-updater installs: `Lucidos.app.tar.gz` plus its deta
 The gateway's hourly poll of `https://lucidos.dev/api/update-check`, and the answer it announces on `GET /~/api/v1/control/gateway/status` as `release_check`. One per install rather than one per open window, because a refresh re-polls only when the gateway's answer is older than the interval. It is fail closed, running only when `LUCIDOS_PACKAGED=1` is set and the executable resolves outside a source checkout, so a dev tree never polls. The request carries platform, arch, version and the caller's IP; `enabled` in `~/.lucidos/updates.toml` defaults true and is its one preference gate (ADR 0139). Distinct from *gateway binary check*, which asks whether a newer gateway binary sits on disk. It never installs: the client does that, via `install_app_update_and_restart` on macOS or a re-run of `install.sh` elsewhere (ADR 0108).
 
 ### Update route
-What a session can do about a release newer than the one running, as the single derivation `updateRoute()` in `store/actions/app-update.ts`. Four values, and deliberately none meaning "nothing". `install` is a Tauri client fronting a bundle, which takes the update here. `check` is no newer release known, plus a check this session can run. `guide` sends the reader to Settings, System, Overview, which carries the installer command for a headless install and the rebuild for a source checkout. That page, never the `system` submenu above it: the route sets a Maintenance scroll anchor, and the submenu has nothing to scroll to.
+What a session can do about a release newer than the one running, as the single derivation `updateRoute()` in `store/actions/app-update.ts`. Five values, and deliberately none meaning "nothing". `install` is a Tauri client fronting a bundle, which takes the update here. `check` is no newer release known, plus a check this session can run. `guide` sends the reader to Settings, System, Overview, which carries the installer command for a headless install and the rebuild for a source checkout. That page, never the `system` submenu above it: the route sets a Maintenance scroll anchor, and the submenu has nothing to scroll to.
 
-`desktop` is a mobile client, decided FIRST because none of the other three can be reached from a phone. Lucidos ships no mobile client, so `install` is already out. A check there ends at "up to date" or at this same sentence, and `guide` spends a page load to say it. Following it shows a toast naming the machine that runs the workspace, and navigates nowhere. A phone also raises no offer toast, and no update half of the *System attention badge*. Both of those clear on an install it can never run (ADR 0190).
+`relay` is a session that cannot install, facing a newer release and an attached desktop client that reports no *remote install blocker*. Following it asks the client to install, through the *update relay*. It is decided FIRST, ahead of `desktop`, because it is the one route that lets a phone act (ADR 0338).
+
+`desktop` is a mobile client with no relay on offer, since none of the remaining three can be reached from a phone. Lucidos ships no mobile client, so `install` is already out. A check there ends at "up to date" or at this same sentence, and `guide` spends a page load to say it. Following it shows a toast naming the machine that runs the workspace, and navigates nowhere. A phone also raises no offer toast, and no update half of the *System attention badge*. Both of those clear on an install it can never run (ADR 0190).
 
 Every surface that can name a newer release reads it: the offer toast, the *What's New* release list, and Overview's own button. The label comes from `updateControlLabel` and the click from `followUpdateRoute`, so a surface cannot invent either. `guide` and `desktop` share their words, because the reader's question is the same and only the answer's medium differs. It exists because the panel and the *release check* have independent sources. What's New routinely knows about a release no offer has named, and used to mark it `Newer` and offer nothing (ADR 0142).
 
-**A surface that has already named the release passes that fact in, so `check` never appears on it.** What's New does, by listing the published changelog. Offering a check there sends the reader to confirm what the `Newer` chip beside it just said. Overview's own button stays install-or-check, because it names no release and is where `guide` lands.
+**A surface that has already named the release passes that fact in, so `check` never appears on it.** What's New does, by listing the published changelog. Offering a check there sends the reader to confirm what the `Newer` chip beside it just said. Overview's own button is install, relay or check, because it names no release and is where `guide` lands.
+
+### Update relay
+How a session that cannot install gets the desktop client to install for it (ADR 0338). The client's Rust side sends the gateway a heartbeat every 5 seconds, with its version and its *remote install blocker*. A session following the `relay` *update route* posts a request. The gateway hands it to the next heartbeat, once. The client then runs the same install a click on the Mac runs, and posts each progress phase back.
+
+The state lives in gateway memory (`update_relay.rs`) and dies with the service restart the install causes. So the requesting session keeps its own in-flight marker, and proves success by the gateway's running version after it reconnects. An unclaimed request expires after 2 minutes, and a claim with no progress after 30 seconds. The heartbeat, which also carries the progress, takes only the machine-local token, so no browser session can pose as the client.
+
+### Remote install blocker
+Why an update could not run with nobody at the Mac, as the client reports it in the *update relay* heartbeat. It is the install's own blocker (a disk image, a translocated copy, a temp dir on another device). It also covers a bundle folder this user cannot write. That case sends the updater down its admin-password path, which a local click can answer and a relayed install would hang on. A client reporting one offers no `relay` route, and re-checks before it runs a request.
 
 ### Release notice cursor
 The `release_notice_cursor` preference: the id of the last *release notice* this workspace answered. Everything after it in `release-notices.toml`, and at or before the running release, is still owed. One scalar is the whole of the ordering and the one-time-ness, because the authored file is an ordered append-only sequence.
@@ -3045,6 +3094,8 @@ It exists because `savePreference` applies the value before the network call: th
 - **A write a newer `seq` has superseded stands down** instead of sending. The check runs per attempt, so it also covers the gap between a failed attempt and its retry.
 - **Deliberately in-memory**, so a page reload drops the queue. `loadPreferences` re-reads the server on boot and the UI snaps back to the stored value, which makes the divergence visible rather than silent.
 - **Silent below three consecutive undelivered writes**, then one keyed toast, retracted when the queue drains.
+- **A refetch keeps it.** `loadPreferences` lays the newest write per key over the engine's answer until the engine answers that write, in flight or parked. A write accepted while the read is out still wins, and one refused meanwhile does not.
+- **A scale preview is held the same way.** The scale panel saves on a debounce. A scale it painted but has not saved survives a refetch until it is saved or cancelled (`previewUiScale`).
 
 ### Undelivered compose draft
 A thread whose *compose draft* the engine has not accepted. It is parked in `store/actions/compose.ts` (`undeliveredComposeDrafts`) and re-sent from `startClient`'s resume handler and from `runResumeSync` on reconnect.
@@ -3611,7 +3662,7 @@ The resolver skips `EventWaitDelivered` and `EventWaitExpired` (`thread_to_resol
 
 The *sweep* is the same record at batch scope: `POST /api/v1/changes/apply-all?keep_going=true` arms every thread the sweep-candidate query returns, stamping each row with one `batch_id` so the Apply All Cancel button takes them all back.
 
-Taking one back has three scopes, and `DisarmScope` names the two bulk ones. `DELETE /api/v1/standing-applies/:thread_id` drops one thread's. `DELETE /api/v1/standing-applies` drops every arm here, which is the Changes panel's own off. Apply All Cancel keeps `DisarmScope::Sweep`, so an arm the owner set on one change survives it. A disarm stops future settles only: `fire_standing_apply` consumes the row BEFORE it applies, so a change already in flight carries no arm to cancel.
+Taking one back has three scopes, and `DisarmScope` names the two bulk ones. `DELETE /api/v1/standing-applies/:thread_id` drops one thread's. `DELETE /api/v1/standing-applies` drops every arm here, for the prompt and the CLI. The Changes panel's Not finished toggle drops only its own arms, one `DELETE /api/v1/standing-applies/:thread_id` each. Apply All Cancel keeps `DisarmScope::Sweep`, so an arm the owner set on one change survives it. A disarm stops future settles only: `fire_standing_apply` consumes the row BEFORE it applies, so a change already in flight carries no arm to cancel.
 
 ### Thread reach
 How far a verb may be aimed: the caller itself, plus every descendant, at any depth. The caller comes from the *thread-bound origin token*, so it is authenticated rather than claimed, and the ancestor chain is read from `thread_summaries`. A sibling, an ancestor and an unknown thread all refuse identically: out of reach, and nothing about whose it is. A caller with no token keeps its reach, which is the user's device and the local API surface (*unattributed caller*).
@@ -4021,6 +4072,14 @@ See also: ADR 0317, `docs/temporary-measures.md` § Drawn caret.
 A directory outside a repo that the repo's own committed `.claude/settings.json` grants its Claude Code sessions, through a relative `permissions.additionalDirectories` entry such as `../sibling-repo/`. From a worktree that entry names nothing, so the engine resolves it against the main checkout and passes it as `--add-dir` (`engine/repo_directory_grants.rs`). Not a *permission grant*: the repo decides it, not a click, and nothing is stored.
 
 See also: ADR 0327.
+
+### Phone layout
+The layout with one swipe pane at a time (`MobileSwipeContainer`), against the desktop split. A viewport gets it when it is narrow (768px or less) or is a *phone in landscape*. The single definition is `utils/layoutMedia.ts`: `isMobile()` evaluates it, and CSS names it as `@media (--phone-layout)` or `@media (--desktop-layout)`, which a PostCSS plugin in `vite.config.ts` expands. App frames get `global/shared-components.css` raw, outside Vite, so that file keeps plain width queries.
+
+### Phone in landscape
+A viewport at most 500px tall with a coarse primary pointer. It gets the *phone layout*, so rotating a phone never swaps layouts. The phone layout keeps it clear of the Dynamic Island and the rounded corners through `--phone-side-inset` (mobile.css), the larger of the two side safe-area insets. The transcript takes it inside `--thread-pane-gutter`, so the title band still reaches both edges.
+
+See also: ADR 0342.
 
 ## When to add a term
 

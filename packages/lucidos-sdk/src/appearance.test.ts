@@ -9,6 +9,8 @@
  */
 import { describe, it, expect, vi } from 'vitest';
 import {
+  readAppearancePush,
+  sanitizeAppearancePush,
   DEFAULT_FONT_PREFERENCE,
   DEFAULT_MOTION,
   DEFAULT_THEME_MODE,
@@ -348,5 +350,29 @@ describe('theme effects', () => {
     expect(parseThemeEffects(null)).toBe('system');
     expect(parseThemeEffects('toString')).toBe('system');
     expect(parseThemeEffects('REDUCE')).toBe('system');
+  });
+});
+
+describe('the appearance push', () => {
+  it('reads each value from the mirror the shell painted into', () => {
+    const mirror: Record<string, string> = {
+      'lucidos-theme-mode': 'light',
+      'lucidos-theme-resolved': '{"light":{},"dark":{}}',
+      'lucidos-ui-scale': '125',
+      'lucidos-style-overrides': '{"--accent":"red"}',
+    };
+    expect(readAppearancePush(key => mirror[key] ?? null)).toEqual({
+      'theme-mode': 'light',
+      theme_resolved: '{"light":{},"dark":{}}',
+      'ui-scale': '125',
+      style_overrides: '{"--accent":"red"}',
+    });
+  });
+
+  it('keeps only the known keys, and only strings', () => {
+    expect(sanitizeAppearancePush({ 'ui-scale': '150', motion: 3, chat_model: 'x' }))
+      .toEqual({ 'ui-scale': '150' });
+    expect(sanitizeAppearancePush(null)).toBeNull();
+    expect(sanitizeAppearancePush(['ui-scale'])).toBeNull();
   });
 });

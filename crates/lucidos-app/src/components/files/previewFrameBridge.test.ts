@@ -556,6 +556,18 @@ describe('routePreviewFrameMessage', () => {
     expect(anchor.click).toHaveBeenCalledOnce();
   });
 
+  it('keeps an encoded dot segment encoded, so a download cannot leave the data mount', () => {
+    vi.stubGlobal('navigator', { userActivation: { isActive: true } });
+    const anchor = { href: '', download: '', rel: '', click: vi.fn(), remove: vi.fn() };
+    vi.stubGlobal('document', { createElement: () => anchor, querySelector: () => null, body: { appendChild: () => {} } });
+    routePreviewFrameMessage(
+      { kind: 'download', href: '%2e%2e/%2E%2E/%2e%2e%2fapi/v1/x', name: '', baseUri: null },
+      { artifactPath: ARTIFACT, declaresOwnBase: false, frameWindow },
+    );
+    expect(anchor.href).not.toMatch(/\/\.\.(\/|$)/);
+    expect(anchor.href).toMatch(/\/data\/artifacts\/reports\/%252e%252e\/%252E%252E\/%252e%252e%252fapi\/v1\/x$/);
+  });
+
   it('sends a download under a declared off-site base where that base points', () => {
     vi.stubGlobal('navigator', { userActivation: { isActive: true } });
     routePreviewFrameMessage(

@@ -4,7 +4,8 @@ import { eventStreamTargets, openEventStream, type EventStreamTargets } from '@l
 import { getEventStream, setEventStream } from './event-stream';
 import { fanOutEventFrame, fanOutEventStreamStatus } from './app-bridge';
 import { threadMap, focusedThreadId, changes, appliedChanges, setAsideChanges, applyingChangeIds, applyingNowThreadIds, applyAllInProgress, applyAllBatch, applyAllCanceling, APPLY_ALL_SUMMARY_TOAST_KEY, applyEstimates, applyPhases, standingApplyThreadIds, generatedTitleIds, codingAgentSessionVersion, setFocusedThread, archivingThreadIds, removingQueuedMessageIds, queuedMessageRemovalKey } from '../store';
-import { findChangeById, memoryRebuildProgress, backupProgress, backupStatusVersion, backupPreferencesVersion, responseStylesVersion, appSourceEpoch, recoveryProgress, showConfirm, showToast, dismissToast, repoSource, TOAST_AUTO_DISMISS_MS } from '../store';
+import { findChangeById, memoryRebuildProgress, backupProgress, backupStatusVersion, backupPreferencesVersion, recommendedCleanupProgress, diskUsageVersion, responseStylesVersion, appSourceEpoch, recoveryProgress, showConfirm, showToast, dismissToast, repoSource, TOAST_AUTO_DISMISS_MS } from '../store';
+import { describeRecommendedCleanupOutcome } from '../../utils/recommendedCleanup';
 import { isFormRequest } from '../thread-events/thread-event-types';
 import { handleEvent, isChannelDefiningEvent, makeOptimisticThreadState, PENDING_TITLE_PLACEHOLDER, type ThreadAggregate, type ThreadMeta, type ThreadEvent, type TransientEvent } from '../thread-events';
 import { bumpThreadEvents } from '../threadActivity';
@@ -276,6 +277,9 @@ export function connectThreadEvents(): void {
       // during a listing asks for one more, and the newest unread read wins.
       refreshArtifacts();
       void loadUnreadNotifications();
+      // Preferences too, or a theme picked in that window never paints. The
+      // load applies what changed and owns its own failure state.
+      void loadPreferences();
       // Only resync after a reconnect. On the initial connect, startup.ts
       // already loads thread state. Without the flag we'd double-fetch on every
       // page load.
@@ -286,6 +290,10 @@ export function connectThreadEvents(): void {
         // signal so the user can retry. An in-flight backup repopulates on the
         // next BackupProgress event, and a duplicate POST returns 409.
         backupProgress.value = null;
+        // The recommended cleanup's terminal event is lost the same way. The
+        // Disk Usage page re-reads the running flag from its summary.
+        recommendedCleanupProgress.value = null;
+        diskUsageVersion.value++;
         // `resyncLoadedThreads` coalesces and surfaces its own failures, so
         // `void` here only acknowledges that the promise is not needed back.
         void resyncLoadedThreads();
@@ -1156,6 +1164,35 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
       backupStatusVersion.value++;
       break;
     }
+
+    case 'RecommendedCleanupStarted':
+      recommendedCleanupProgress.value = { done: 0, total: 0 };
+      break;
+
+    // The bus orders a pass's frames, so no progress frame follows its end.
+    case 'RecommendedCleanupProgress':
+      recommendedCleanupProgress.value = {
+        done: Number(data.done ?? 0),
+        total: Number(data.total ?? 0),
+      };
+      break;
+
+    case 'RecommendedCleanupCompleted': {
+      recommendedCleanupProgress.value = null;
+      showToast(describeRecommendedCleanupOutcome({
+        removedCount: Number(data.removed_count ?? 0),
+        cleanedCount: Number(data.cleaned_count ?? 0),
+        freedBytes: Number(data.freed_bytes ?? 0),
+      }), 'success');
+      diskUsageVersion.value++;
+      break;
+    }
+
+    case 'RecommendedCleanupFailed':
+      recommendedCleanupProgress.value = null;
+      showToast(`Cleanup failed: ${String(data.error ?? 'Unknown error')}`, 'error');
+      diskUsageVersion.value++;
+      break;
 
     case 'ProxyConfigRejected': {
       // The engine booted with entries in `apis.json` it will not serve, so

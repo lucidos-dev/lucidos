@@ -197,7 +197,7 @@ Create an entry with `./scripts/adr-new.sh`, never by hand. See
 - [0187: A talker turn ends when its words do, not when its output stream does](0187-a-talker-turn-ends-when-its-words-do.md)
 - [0188: One thing the talker said is one row, closed by the conversation moving](0188-one-thing-the-talker-said-is-one-row.md)
 - [0189: Coexisting installs are told apart by port contention, and the packaged port never moves](0189-coexisting-installs-are-told-apart-by-port.md)
-- [0190: A phone's update route is a toast, not the Maintenance page](0190-mobile-update-route-is-a-toast.md)
+- [0190: A phone's update route is a toast, not the Maintenance page](0190-mobile-update-route-is-a-toast.md) *(the "one answer on a phone" part superseded by 0338)*
 - [0191: A pause spends nothing: it ends no row on either side](0191-a-pause-spends-nothing.md)
 - [0192: A thread delete is the one sanctioned removal from the event log](0192-thread-delete-is-the-one-sanctioned-removal.md)
 - [0193: A restored window frame no attached display can hold is corruption, and the clamp runs where it can see it](0193-a-window-no-display-can-hold-is-corruption.md)
@@ -345,3 +345,9 @@ Create an entry with `./scripts/adr-new.sh`, never by hand. See
 - [0335: A backdrop dialog contains Tab; an anchored popover closes on a Tab from outside it](0335-overlay-tab-two-shapes.md)
 - [0336: The mobile dynamic bars glide on a compositor transition instead of tracking each scroll event](0336-dynamic-bars-glide.md)
 - [0337: Only the reader's finger moves the mobile dynamic bars; a reply's automatic scrolling holds them](0337-dynamic-bars-follow-the-finger.md)
+- [0338: A phone can update the desktop app through a relay to the running client, which runs the install it already has](0338-phone-update-relays-through-the-desktop-app.md)
+- [0339: A handshake script gets only well-formed CRED_* and OAUTH_* names, never a credential's custom alias](0339-handshake-env-is-an-allowlist.md)
+- [0340: The installed iOS app steps forward off a page it reached by going back](0340-ios-pwa-history-bounce.md)
+- [0341: Agent sessions and background tasks run at nice +5, below the engine that serves clients](0341-agent-sessions-run-below-the-engine.md)
+- [0342: A phone in landscape keeps the phone layout instead of the desktop split](0342-phone-in-landscape-keeps-the-phone-layout.md)
+- [0343: Agent compiles go to their own sccache daemon and cache, so agent rustc runs below the engine and the Apply rebuild keeps full priority](0343-agent-compiles-use-their-own-sccache-daemon.md)
