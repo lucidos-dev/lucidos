@@ -1073,3 +1073,24 @@ fn an_agent_archive_names_what_it_left_open() {
     .expect_err("a target left open is an error");
     assert!(left_open.contains("was left open"), "{left_open}");
 }
+
+/// A filter the model spells wrongly is refused, never read as "no filter":
+/// that would answer with the whole workspace.
+#[test]
+fn a_boolean_filter_arg_refuses_what_is_not_a_boolean() {
+    let args = serde_json::json!({
+        "a": true,
+        "b": "false",
+        "c": null,
+        "d": "yes",
+        "e": 1,
+    });
+    assert_eq!(super::bool_arg(&args, "a"), Ok(Some(true)));
+    assert_eq!(super::bool_arg(&args, "b"), Ok(Some(false)));
+    assert_eq!(super::bool_arg(&args, "c"), Ok(None));
+    assert_eq!(super::bool_arg(&args, "missing"), Ok(None));
+    for name in ["d", "e"] {
+        let err = super::bool_arg(&args, name).expect_err("not a boolean");
+        assert!(err.contains("true or false"), "{err}");
+    }
+}

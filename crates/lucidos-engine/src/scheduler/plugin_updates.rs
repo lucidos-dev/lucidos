@@ -433,17 +433,15 @@ fn build_update_notification(candidates: &[MarketplacePlugin]) -> (String, Strin
     )
 }
 
-/// Where the update notification's tap lands: the Plugins panel's Installed tab,
-/// scrolled to (and pulsing) the row of a plugin that has a pending update. With
-/// a single candidate that's its row; with several we focus the
-/// alphabetically-first by name (deterministic — matches the name ordering in the
-/// plural body) while the rest stay visibly chipped in the list. The `id` is the
-/// plugin id, which the Installed tab matches against each row's `data-plugin-id`.
+/// Where the update notification's tap lands: the Plugins panel's Installed tab.
+/// A single candidate also scrolls to and pulses its row; the `id` is the plugin
+/// id, matched against each row's `data-plugin-id`. Several candidates focus no
+/// row, since each one already carries its update chip.
 fn build_update_navigation(candidates: &[MarketplacePlugin]) -> NavigateUi {
-    let focus = candidates
-        .iter()
-        .min_by(|a, b| a.name.cmp(&b.name))
-        .map(|p| p.id.clone());
+    let focus = match candidates {
+        [only] => Some(only.id.clone()),
+        _ => None,
+    };
     NavigateUi {
         target: NavigateTarget::Plugins,
         id: focus,

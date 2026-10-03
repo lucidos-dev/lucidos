@@ -14,6 +14,7 @@ use uuid::Uuid;
 
 mod actions;
 pub(crate) mod archive;
+mod archive_all;
 mod background_tasks;
 mod delete;
 mod detach;
@@ -35,7 +36,7 @@ pub(super) use events_snapshot::{
 };
 pub(super) use list::{
     count_thread_summaries, get_archived_count, get_filter_facets, get_older_threads,
-    get_thread_summary, list_thread_summaries, list_threads,
+    get_thread_summary, list_drafts, list_held_messages, list_thread_summaries, list_threads,
 };
 pub(super) use search::search_threads;
 
@@ -93,11 +94,12 @@ pub(in crate::api) async fn available_thread_actions_for(
     } else {
         ThreadType::Chat
     };
-    let has_unsent_draft = f.compose_text.as_deref().is_some_and(|t| !t.is_empty())
-        || f.compose_images
+    let has_unsent_draft = crate::core::store::has_draft(
+        f.compose_text.as_deref().unwrap_or_default(),
+        f.compose_images
             .as_ref()
-            .and_then(|v| v.as_array())
-            .is_some_and(|a| !a.is_empty());
+            .unwrap_or(&serde_json::Value::Null),
+    );
     Ok(available_thread_actions(
         thread_type,
         ThreadStatus::parse(&f.status),
@@ -120,12 +122,20 @@ pub(super) fn router() -> Router<super::AppState> {
         .route("/threads", post(super::threads_compose::post_thread))
         .route("/threads/list", get(list_thread_summaries))
         .route("/threads/count", get(count_thread_summaries))
+        .route("/threads/drafts", get(list_drafts))
+        .route("/threads/held-messages", get(list_held_messages))
         .route("/threads/archived-count", get(get_archived_count))
         .route("/threads/search", get(search_threads))
         .route("/threads/save", post(save_thread))
         .route("/threads/unsave", post(unsave_thread))
         .route("/threads/rename", post(rename_thread))
         .route("/threads/archive", post(archive_thread))
+        .route(
+            "/threads/archive-all-preflight",
+            get(archive_all::archive_all_preflight),
+        )
+        .route("/threads/archive-all", post(archive_all::archive_all))
+        .route("/threads/unarchive", post(archive_all::unarchive))
         // The owner's delete, and the read that tells the confirmation what is
         // true of this family. Both are refused to anything but a registered
         // device (ADR 0192), which is stricter than the thread-reach ladder

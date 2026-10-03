@@ -1638,10 +1638,65 @@ impl<R: std::io::Read> std::io::Read for ExactLen<R> {
     }
 }
 
+/// Append `content` as one entry holding exactly the size `header` declares,
+/// whatever length the source yields. Returns the zero bytes written in place
+/// of data the source no longer had.
+fn append_exact<W: std::io::Write, R: std::io::Read>(
+    builder: &mut tar::Builder<W>,
+    header: &mut tar::Header,
+    archive_path: &Path,
+    content: R,
+) -> Result<u64, BoxError> {
+    let mut content = ExactLen::new(content, header.size()?);
+    builder.append_data(header, archive_path, &mut content)?;
+    Ok(content.padded)
+}
+
+/// How a file changed while `append_file` copied it. The archive stays well
+/// formed either way, but the entry holds a torn copy.
+#[derive(Debug, PartialEq)]
+enum CopyDrift {
+    /// The file grew. The entry holds its first `kept` bytes.
+    Grew { kept: u64 },
+    /// The file shrank. The entry ends in `padded` zero bytes.
+    Shrank { padded: u64 },
+    /// The file was written, and its final length matches no simpler case.
+    Rewritten,
+}
+
+impl std::fmt::Display for CopyDrift {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Grew { kept } => write!(f, "grew; the archive holds its first {kept} bytes"),
+            Self::Shrank { padded } => write!(f, "shrank; zero-filled its last {padded} bytes"),
+            Self::Rewritten => write!(f, "was rewritten; the archive may hold a torn copy"),
+        }
+    }
+}
+
+/// Compare the open handle's stat from before the copy with one from after it.
+/// `padded` is what [`append_exact`] zero-filled, the one change the read saw.
+fn copy_drift(
+    before: &std::fs::Metadata,
+    after: &std::fs::Metadata,
+    padded: u64,
+) -> Option<CopyDrift> {
+    if padded > 0 {
+        Some(CopyDrift::Shrank { padded })
+    } else if after.len() > before.len() {
+        Some(CopyDrift::Grew { kept: before.len() })
+    } else if after.len() != before.len() || after.modified().ok() != before.modified().ok() {
+        Some(CopyDrift::Rewritten)
+    } else {
+        None
+    }
+}
+
 /// Append a single file at `path` to the tar `builder` under archive path `archive_path`.
 ///
 /// The size comes from the open handle, not from an earlier stat of the path. A
-/// file replaced by a rename in between would otherwise bring another length.
+/// file replaced by a rename in between would otherwise bring another length. A
+/// file written during the copy is logged, as a vanished one is.
 fn append_file<W: std::io::Write>(
     builder: &mut tar::Builder<W>,
     path: &Path,
@@ -1651,18 +1706,16 @@ fn append_file<W: std::io::Write>(
     let Some(file) = skip_if_vanished(path, std::fs::File::open(path))? else {
         return Ok(());
     };
-    let metadata = file.metadata()?;
-    if !metadata.is_file() {
+    let before = file.metadata()?;
+    if !before.is_file() {
         return Ok(());
     }
-    let mut header = header_for_file(&metadata);
-    let mut content = ExactLen::new(&file, metadata.len());
-    builder.append_data(&mut header, archive_path, &mut content)?;
-    if content.padded > 0 {
+    let padded = append_exact(builder, &mut header_for_file(&before), archive_path, &file)?;
+    if let Some(drift) = copy_drift(&before, &file.metadata()?, padded) {
         crate::log!(
-            "[Backup] {} shrank while it was archived; zero-filled its last {} bytes",
+            "[Backup] {} changed while it was archived: it {}",
             path.display(),
-            content.padded
+            drift
         );
     }
     Ok(())

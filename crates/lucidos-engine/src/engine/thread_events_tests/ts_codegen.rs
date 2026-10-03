@@ -49,6 +49,7 @@ const TYPE_SOURCES: &[(&str, &str)] = &[
     ("QuestionOption", "engine/thread_events/question.rs"),
     ("TodoItem", "engine/thread_events/todo.rs"),
     ("TodoStatus", "engine/thread_events/todo.rs"),
+    ("TriageProposalEntry", "engine/thread_events/triage.rs"),
     ("ChildCompletionStatus", "engine/thread_events/session.rs"),
     ("SubThreadPendingChange", "engine/thread_events/session.rs"),
     ("SessionEndReason", "engine/thread_events/session.rs"),
@@ -111,9 +112,9 @@ const META_FIELDS: &[(&str, &str, &str)] = &[
 ///
 /// The wire type has to call them optional even though Rust requires them. See
 /// `strip_context_capture_sections`, `strip_tool_result_content` and
-/// `strip_tool_call_args` in `api/threads/events_snapshot.rs`. A live SSE
-/// emission carries the full value, except `CodingAgentToolResult.result`,
-/// which `EmittedEvent::to_sse_json` strips too. A lazy fetch covers the rest.
+/// `strip_tool_call_args` in `api/threads/events_snapshot.rs`. The live stream
+/// strips both tool calls' `args` and `CodingAgentToolResult.result` too
+/// (`EmittedEvent::to_sse_json`). A lazy fetch covers every one.
 ///
 /// The coding-agent rows are the heaviest a workspace holds, and for months
 /// the strips knew only the chat channel's names. `CodingAgentToolCalled.args`
@@ -124,6 +125,7 @@ const STRIPPED_FIELDS: &[(&str, &str)] = &[
     ("ToolResult", "result"),
     ("CodingAgentToolResult", "result"),
     ("CodingAgentToolCalled", "args"),
+    ("ToolCalled", "args"),
 ];
 
 /// Markers the snapshot endpoint STAMPS on, which no Rust variant declares.
@@ -149,6 +151,13 @@ const STAMPED_FIELDS: &[(&str, &str, &str)] = &[
         "Server dropped `args` here. The step detail lazy-fetches them. \
          `description` is filled from `describe_cc_tool` first, so the inline \
          step label never waits on that fetch.",
+    ),
+    (
+        "ToolCalled",
+        "args_stripped",
+        "Server dropped `args` here. The step detail lazy-fetches them. \
+         `description` is filled from `describe_tool` first. A `generate_image` \
+         call keeps its args, since its image is described by the prompt.",
     ),
 ];
 

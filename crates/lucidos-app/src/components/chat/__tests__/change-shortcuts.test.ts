@@ -16,6 +16,7 @@ vi.mock('../../../store/actions/repositories', () => ({
 }));
 vi.mock('../../../store/actions/threadActions', () => ({
   resolveThreadActions: vi.fn(() => []),
+  threadHasIncompleteChange: () => false,
 }));
 
 import { applyFocusedThreadChange, showFocusedThreadDiff } from '../WaitingBanner';

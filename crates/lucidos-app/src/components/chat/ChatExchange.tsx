@@ -1,5 +1,5 @@
 import { Fragment, type ComponentChildren } from 'preact';
-import type { Signal } from '@preact/signals';
+import type { ReadonlySignal, Signal } from '@preact/signals';
 import { memo } from 'preact/compat';
 import { useMemo, useState } from 'preact/hooks';
 import { loadedOr } from '../../store/types';
@@ -9,10 +9,11 @@ import type { Exchange, ReadMarker, StoredEvent, ThreadEvent, MessageOrigin, Res
 import { ENGINE_LABEL, SYSTEM_LABEL, API_CALLER_LABEL, LUCIDOS_AGENT_LABEL, abortPromisesAutoResume, exchangeUserMessage, exchangeUserImageHashes, exchangeTimestamp, exchangeResponseTimestamp, messageReadTimestamp, exchangeResponseText, exchangeEngineLimitDetail, exchangeSteps, exchangeResponseEvents, exchangeStatus, exchangeError, exchangeStarterId, dividerBodyIsSuppressed, hasRenderableResponseContent, isEmptyContinuedExchange, questionDividerResolution, changePanelHasContinuation, findCommandPermissionResolution, findMcpPermissionResolution, findPermissionResolution, findQuestionAnswer, isChangeLifecycleEvent, isLivePartialRow, isLiveReplyRow, isLiveUtteranceRow, isSpeechOnlyTurn, turnBodyFolded, modeToInitiator, originMode, continuationStartedSummary, responseAbortedSummary, eventWaitStoppedSummary, isTurnlessBoundary, agentMessageSender, waitReentryReason, RESPONSE_CANCELED_SUMMARY } from '../../store/thread-events';
 import { LucidosGlyph } from '../shared/LucidosMark';
 import { artifacts, appsList, stepsExpanded, detailsExpanded, collapsedExchanges, toggleExchangeCollapsed, expandExchange, collapsedInitiators, toggleInitiatorCollapsed, toggleMessageRoutePanel } from '../../store/store';
-import { editQueuedMessage, removeQueuedMessage } from '../../store/actions/chat';
+import { editQueuedMessage, removeQueuedMessage, retryUnsentMessage } from '../../store/actions/chat';
+import { unsentMessages } from '../../store/unsentMessages';
 import { withScrollAnchor } from './CreateThreadView';
-import { QuestionBody } from './QuestionCard';
-import { CommandPermissionBody, McpPermissionBody, PermissionBody, engineResolutionNote } from './PermissionCard';
+import { QuestionBody, pendingAnswers } from './QuestionCard';
+import { CommandPermissionBody, McpPermissionBody, PermissionBody, engineResolutionNote, pendingVerdicts } from './PermissionCard';
 import { ChildCompletionRow, ChildMovedOutRow, ChildStoppedRow } from './ChildCompletionRow';
 import { drawsResponseRow, liveStepInBody, responseBody, type BodyRow } from '../../store/event-rendering';
 import { Disclosure } from '../shared/Disclosure';
@@ -196,6 +197,15 @@ export function isUserBubbleEvent(userEvent: { type: string }): boolean {
   return userEvent.type === 'MessageReceived' || userEvent.type === 'SpokenMessageReceived';
 }
 
+/** The event id to retry when this exchange is an unsent message, else
+ *  undefined. Only an unsent message starts on a negative seq, and a Retry
+ *  already under way has taken its record, so the card offers nothing twice. */
+function unsentMessageOf(exchange: Exchange): string | undefined {
+  if (exchange.userSeq >= 0) return undefined;
+  const eventId = exchangeStarterId(exchange);
+  return eventId && unsentMessages.value.has(eventId) ? eventId : undefined;
+}
+
 /** Run `fn` with the control the reader pressed pinned exactly where it is.
  *
  *  The anchor is `currentTarget`, the element carrying this handler, so it IS
@@ -226,6 +236,7 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
   const events = exchangeResponseEvents(exchange, isLast, threadIdle);
   const status = exchangeStatus(exchange, streamingBuffer, isLast, hasPriorActive, threadIsCC, threadIdle, threadAwaitingAnswer);
   const error = exchangeError(exchange);
+  const unsentEventId = unsentMessageOf(exchange);
 
   // Cap detection reads `ResponseGenerated.text` directly via
   // `exchangeEngineLimitDetail`. The cap is emitted with no preceding
@@ -748,9 +759,15 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
         // `data-change-id`. Inline steps are NOT stamped, since the "Show
         // steps" toggle can hide them and an id there resolves only sometimes.
         <div class="exchange-error" data-event-id={error.eventId || undefined}>
-          <strong>The reply failed</strong>
+          <strong>{unsentEventId ? 'Not sent' : 'The reply failed'}</strong>
           <p>{error.message}</p>
-          <p>Send a message to try again.</p>
+          {unsentEventId
+            ? (
+              <button type="button" class="action-btn exchange-error-retry" onClick={() => void retryUnsentMessage(unsentEventId)}>
+                Retry
+              </button>
+            )
+            : <p>Send a message to try again.</p>}
         </div>
       )}
     </div>
@@ -1129,6 +1146,7 @@ type DividerTerminalKind = 'canceled' | 'superseded' | 'dropped';
  *    when Lucidos did (`permissionResolvedLabel`).
  *  - "Canceled" (✕) when they dismissed it.
  *  - "Unanswered" or "Unresolved" when the turn ended for any other reason.
+ *  - "Sending" from the user's pick until the engine confirms it.
  *  - "Needs your answer" while pending.
  *
  *  The response panel and the abort boundary carry the turn's own terminal
@@ -1141,6 +1159,7 @@ function dividerStatus(
   resolvedLabel: string,
   droppedLabel: string,
   terminal: DividerTerminalKind | null,
+  pick: PendingPick,
 ): ComponentChildren {
   if (resolved) return <span class="exchange-status-label exchange-status-done">{resolvedLabel}</span>;
   if (terminal === 'canceled') return <span class="exchange-status-label exchange-status-canceled">{'Canceled'}<span class="exchange-status-x exchange-status-glyph">{'✕'}</span></span>;
@@ -1149,7 +1168,18 @@ function dividerStatus(
   // past.
   if (terminal === 'superseded') return <span class="exchange-status-label exchange-status-dropped">{'Superseded'}</span>;
   if (terminal === 'dropped') return <span class="exchange-status-label exchange-status-dropped">{droppedLabel}</span>;
-  return <span class="exchange-status-label exchange-status-awaiting">{'Needs your answer'}</span>;
+  return <AwaitingStatus {...pick} />;
+}
+
+/** Where a divider's card keeps its optimistic pick, and the card's id there. */
+type PendingPick = { picks: ReadonlySignal<ReadonlyMap<string, unknown>>; id: string };
+
+/** A component, not a plain span, so it reads the pick itself. The descriptor
+ *  that holds it is memoized, so a signal read there would not re-render. */
+export function AwaitingStatus({ picks, id }: PendingPick) {
+  return picks.value.has(id)
+    ? <span class="exchange-status-label exchange-status-sending">{'Sending'}</span>
+    : <span class="exchange-status-label exchange-status-awaiting">{'Needs your answer'}</span>;
 }
 
 /** A permission step's verdict, in the one shape every permission card reads. */
@@ -1318,8 +1348,8 @@ export function describeInitiator(
         // is absent (every other injection, legacy rows) or unresolved (the
         // delivery scrolled out of the loaded window).
         //
-        // No summary line on the delivery: its event row already reads "Event
-        // arrived: <event>", so a header saying the same words prints it twice.
+        // No summary line on the delivery: its event row already names the
+        // event and says "Arrived", so a header saying the same prints it twice.
         // Same as the trigger and the child callback, whose rows own their
         // prefixes too.
         summary: matched?.eventType ? undefined : summary,
@@ -1449,6 +1479,7 @@ export function describeInitiator(
           'Answered',
           'Unanswered',
           unanswered ?? (responseTerminated ? 'dropped' : null),
+          { picks: pendingAnswers.map, id: ev.tool_use_id },
         ),
         details: (
           <QuestionBody
@@ -1471,7 +1502,7 @@ export function describeInitiator(
         variant: 'lucidos',
         icon: agent.icon,
         label: agent.label,
-        status: dividerStatus(!!resolvedStep, permissionResolvedLabel(resolved), 'Unresolved', responseTerminated ? 'dropped' : null),
+        status: dividerStatus(!!resolvedStep, permissionResolvedLabel(resolved), 'Unresolved', responseTerminated ? 'dropped' : null, { picks: pendingVerdicts.map, id: ev.request_id }),
         details: (
           <PermissionBody
             event={{
@@ -1496,7 +1527,7 @@ export function describeInitiator(
         variant: 'lucidos',
         icon: agent.icon,
         label: agent.label,
-        status: dividerStatus(!!resolvedStep, permissionResolvedLabel(resolved), 'Unresolved', responseTerminated ? 'dropped' : null),
+        status: dividerStatus(!!resolvedStep, permissionResolvedLabel(resolved), 'Unresolved', responseTerminated ? 'dropped' : null, { picks: pendingVerdicts.map, id: ev.request_id }),
         details: (
           <CommandPermissionBody
             event={{
@@ -1521,7 +1552,7 @@ export function describeInitiator(
         variant: 'lucidos',
         icon: agent.icon,
         label: agent.label,
-        status: dividerStatus(!!resolvedStep, permissionResolvedLabel(resolved), 'Unresolved', responseTerminated ? 'dropped' : null),
+        status: dividerStatus(!!resolvedStep, permissionResolvedLabel(resolved), 'Unresolved', responseTerminated ? 'dropped' : null, { picks: pendingVerdicts.map, id: ev.request_id }),
         details: (
           <McpPermissionBody
             event={{

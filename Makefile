@@ -76,10 +76,11 @@ lint-fmt:
 #   --all-features  lucidos-engine gates real code behind `e2e-test-hooks` (the
 #                   e2e workspace builds with it) and `real-embedder-tests`;
 #                   without this pass they are never linted.
-#   default         `e2e-test-hooks` compiles the PRODUCTION push transport OUT
-#                   — `scheduler/push.rs` is the repo's only `cfg(not(feature
-#                   …))`, and `fan_out_to_web_push` (VAPID, the real APNs/FCM
-#                   send loop) exists only when the feature is OFF. An
+#   default         `e2e-test-hooks` compiles the PRODUCTION push transport OUT.
+#                   `scheduler/push.rs` holds the repo's only production
+#                   `cfg(not(feature …))`: `fan_out_to_web_push` and `send_each`
+#                   (VAPID, the real APNs/FCM send) exist only when the
+#                   feature is OFF. An
 #                   --all-features-only gate is blind to ~100 lines of shipping
 #                   code; verified by planting a `ptr_arg` in that region, which
 #                   --all-features passed and this pass caught.

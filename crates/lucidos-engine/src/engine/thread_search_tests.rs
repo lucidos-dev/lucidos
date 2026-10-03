@@ -6,8 +6,8 @@ use chrono::{Duration, Utc};
 use std::cmp::Ordering;
 
 use super::{
-    combined_score, dampen_text_score, rank_order, recency_boost, text_hit_score, title_match,
-    RankKey, TitleMatch, TEXT_MATCH_DAMPEN_THRESHOLD,
+    combined_score, dampen_text_score, rank_order, recency_boost, text_hit_score, RankKey,
+    TitleMatch, TEXT_MATCH_DAMPEN_THRESHOLD,
 };
 
 /// A focused thread (few messages) keeps its full text score.
@@ -82,24 +82,6 @@ fn semantic_only_is_halved() {
 #[test]
 fn empty_signals_score_zero() {
     assert_eq!(combined_score(None, None), 0.0);
-}
-
-#[test]
-fn title_match_ignores_case_and_spacing() {
-    assert_eq!(
-        title_match("Fix  Search", " fix search "),
-        TitleMatch::Exact
-    );
-    assert_eq!(
-        title_match("Thread search ranking", "SEARCH"),
-        TitleMatch::Phrase
-    );
-    assert_eq!(
-        title_match("Ranking for search", "search ranking"),
-        TitleMatch::None,
-        "tokens out of order are not a phrase"
-    );
-    assert_eq!(title_match("Anything", "   "), TitleMatch::None);
 }
 
 #[test]

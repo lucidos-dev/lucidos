@@ -11,7 +11,7 @@ import { BrandMenuButton } from './HeaderMark';
 import { getContentTitle, getContentTitleShort, getDiffDescription } from './headerHelpers';
 import { threadSearchQuery, mobileView, MOBILE_VIEWS, focusedThreadId, threadMap, type MobileView } from '../../store/store';
 import { navigateToPane } from '../../store/actions/pane';
-import { useThreadsHeaderState } from '../../hooks/useThreadsHeaderState';
+import { useThreadSearch } from '../../hooks/useThreadSearch';
 import { ThreadFilterButton, ThreadsPaneTitle } from './ThreadFilterButton';
 import { ThreadTitleMenu } from '../chat/ThreadTitle';
 import { threadVisualStatus } from '../shared/ThreadStatusIcon';
@@ -41,7 +41,7 @@ export const MOBILE_PANE_CONFIGS: Record<MobileView, MobilePaneConfig> = {
 function MobileThreadsHeader() {
   // The Filter button and the title are the desktop row's own components, so
   // the two rows cannot drift.
-  const { searchOpen, searchInputRef, onSearchInput, onSearchKeyDown, closeSearch, openSearchHandlers } = useThreadsHeaderState();
+  const { searchOpen, searchInputRef, onSearchInput, onSearchKeyDown, closeSearch, openSearchHandlers } = useThreadSearch();
 
   return (
     <div class={`mobile-threads-header${searchOpen ? ' search-active' : ''}`}>
@@ -65,7 +65,7 @@ function MobileThreadsHeader() {
             Thread type panel, which renders down in the threads pane itself
             (see ThreadFilterPanel / ThreadDrawer). Packed left in the same slot
             the channel filter + view selector used to share. It is also the
-            panel's only way out, which is why it reads as held down while the
+            panel's visible way out, which is why it reads as held down while the
             panel is up (see filterButtonState). */}
         <div class="view-selector-slot">
           <ThreadFilterButton />

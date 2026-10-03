@@ -14,6 +14,43 @@ in `$PWD`. `FRESH` means HEAD still matches the SHA recorded by the last
 
 If the output is `ALREADY_HARDENED`, inform the user: "Already hardened — skipping." and stop. Do NOT re-run hardening.
 
+## Phase 0.3: Catch Up With main
+
+Merge `main` into the branch before you review or test anything. Then this
+one run certifies the work and the merge together. Otherwise a conflict at
+Apply spawns a resolver that hardens everything a second time (ADR 0345).
+
+Run it once per `/harden`, and only after Phase 0 printed `NOT_HARDENED`. A
+merge into a `FRESH` branch would make its marker stale.
+
+1. If `git rev-parse -q --verify MERGE_HEAD` succeeds, a merge is already in
+   progress. Go to step 4 and finish it, since any commit now concludes it.
+2. Commit your own uncommitted work, as its own commit. It must not ride
+   inside the merge commit.
+3. Merge:
+
+   ```bash
+   git merge main --no-edit
+   ```
+
+   A clean merge commits itself, and "Already up to date" needs nothing.
+   Either way, go on to Phase 0.4.
+4. On a conflict, resolve every file. Read both sides and keep what each one
+   meant, then `git add` the file. Ask the user when a conflict is ambiguous.
+5. Make sure no marker survives. This must print nothing, since `git add`
+   accepts a file that still holds markers:
+
+   ```bash
+   git diff --cached --name-only --diff-filter=d -z \
+     | xargs -0 grep -lE '^(<<<<<<<|>>>>>>>)( |$)' --
+   ```
+
+   Then `git commit --no-edit`.
+
+Then go on to Phase 0.4. The diff against `main` is now the branch's own
+change, and Phase 0.4 lists this merge when the branch was hardened before.
+Phase 4's merge for a failure that also fails on `main` still applies.
+
 ## Phase 0.4: Detect a Merge-Only or Incremental Diff
 
 A branch hardened once needs only its new lines reviewed, not its whole diff
@@ -54,9 +91,11 @@ The phases then run as follows:
 
 - Phases 0.5 and 0.6 are skipped. Phase 0.75 is skipped for `MERGE_ONLY`,
   which the earlier run settled. For `INCREMENTAL` it checks the new commits.
-- Phase 1 kickoff starts the early suite run unchanged. The Codex review runs
-  only when a `codex-base` line is printed, against that base. Otherwise it is
-  skipped, since its range would hold all of main's new code.
+- Phase 1 kickoff starts the early suite run unchanged. With a `codex-base`
+  line, the Codex review runs against that base. `INCREMENTAL` without one
+  runs it against `main`, which after Phase 0.3 is the branch's own change. A
+  hardened SHA as the base would pull in all of main's new code. `MERGE_ONLY`
+  skips it.
 - Phase 1 runs `code-review` with `.lucidos/review-target.diff` as its
   target. An empty file means a clean merge with nothing resolved: note
   "Phase 1: clean merge" and move on.
@@ -180,49 +219,24 @@ This step is **advisory**: its findings feed the same validate→fix pipeline as
 
 - **Claude Code only.** A Codex-backed `/harden` run is already Codex reviewing this diff — skip this step and note "Codex review: skipped (Codex-backend run)".
 - **Docs-only:** this whole phase is skipped, so Codex review is skipped too (it's a code reviewer, not a prose reviewer).
-- **Merge-only or incremental (Phase 0.4):** with a `codex-base <sha>` line, set `CODEX_BASE=<sha>` at the top of the launch call below. Without one, skip this step and note "Codex review: skipped (merge in range)". The earlier run already covered the rest of the branch.
+- **Merge-only or incremental (Phase 0.4):** with a `codex-base <sha>` line, prefix the script in the launch call below with `CODEX_BASE=<sha>`. `INCREMENTAL` without one keeps the default base `main`. `MERGE_ONLY` skips this step: note "Codex review: skipped (merge-only)", since the earlier run already covered the branch.
 
-Resolve the companion script (installed with the `codex` plugin; do not hardcode a path). Launch the review in **one** Bash call, so the resolved path and the launch share a shell: variables do not persist across Bash tool calls. Run that call with the tool's own `run_in_background: true`. It writes the review to `.lucidos/codex-review.out` and drops `.lucidos/codex-review.done` when it ends, which is what Phase 3 joins on: Claude Code has no blocking wait tool.
-
-The companion's `--background` flag does NOT work for `review`: it is parsed and then ignored, since only `task` honours it. So the flag is deliberately absent below, and the parallelism comes from the Bash tool instead. Passing it bought nothing and cost the phase its whole premise, since the call actually blocked for the length of the review. `--base "${CODEX_BASE:-main}"` matches `/harden`'s diff base of `main...HEAD`, or the hardened SHA in incremental mode:
+`./scripts/harden-codex-review.sh` runs the review. It resolves the companion installed with the `codex` plugin, so never hardcode a path. Run the launch below as **one** Bash call with the tool's own `run_in_background: true`. It writes the review to `.lucidos/codex-review.out` and drops `.lucidos/codex-review.done` when it ends, which is what Phase 3 joins on: Claude Code has no blocking wait tool. `CODEX_BASE` defaults to `main`, matching `/harden`'s diff base of `main...HEAD`:
 
 ```bash
 mkdir -p .lucidos && rm -f .lucidos/codex-review.done
-{
-CODEX_COMPANION=$(find "$HOME/.claude/plugins" -name codex-companion.mjs -path '*codex*' 2>/dev/null | sort | tail -1)
-if [ -z "$CODEX_COMPANION" ]; then
-  echo "Codex review: unavailable (plugin not installed), proceeding"
-else
-  echo "CODEX_COMPANION=$CODEX_COMPANION"
-  ready=""
-  for probe in 1 2 3; do
-    if codex --version > /dev/null 2>&1 && codex app-server --help > /dev/null 2>&1; then ready=1; break; fi
-    if [ "$probe" != 3 ]; then
-      echo "Codex CLI not answering (probe $probe of 3), an update may be rewriting it, retrying in 30s"
-      sleep 30
-    fi
-  done
-  if [ -n "$ready" ]; then
-    node "$CODEX_COMPANION" review --scope branch --base "${CODEX_BASE:-main}" --json
-  else
-    echo "Codex review: unavailable (CLI not answering after 3 probes), proceeding"
-  fi
-fi
-} > .lucidos/codex-review.out 2>&1
+./scripts/harden-codex-review.sh > .lucidos/codex-review.out 2>&1
 touch .lucidos/codex-review.done
 ```
 
-**The probe loop is not defensive padding.** The companion runs exactly those two
-checks before it will review, and collapses any failure of either into one generic
-`Codex CLI is not installed or is missing required runtime support`, discarding the
-real reason. An `npm install -g` of the Codex CLI empties and rewrites the directory
-the `codex` symlink points into, so for a few seconds mid-update neither check
-answers and the reviewer is written off for the whole run. Every recorded Codex
-failure on this repo is that one error, each returning in under a quarter of a
-second, against 25 reviews that completed. Retrying rides the window out instead,
-and costs nothing on the normal path because the whole call is backgrounded.
+The script header documents what it guarantees:
 
-**The `.done` marker is the handle for the Phase 3 join.** There is no companion job id to capture. The review runs in the foreground of that backgrounded shell, and prints its findings only when it finishes. If the plugin was unavailable, or all three probes failed, there is nothing to join. Do NOT wait for the review here, continue immediately into the `code-review` skill below.
+- **The last line of the output is always one status line**: a verdict, `NO VERDICT` with the upstream cause, or `unavailable`.
+- **It probes the CLI up to three times first.** An `npm install -g` of the Codex CLI breaks both of the companion's readiness checks for a few seconds.
+- **It retries a reviewer that returns no verdict once.**
+- **It never passes the companion's `--background` flag**, which `review` parses and then ignores. The parallelism comes from the Bash tool.
+
+**The `.done` marker is the handle for the Phase 3 join.** There is no companion job id to capture. Do NOT wait for the review here, continue immediately into the `code-review` skill below.
 
 ### Phase 1 review
 
@@ -337,28 +351,19 @@ If the diff edits the resource set or a staging/service/spawn-env path, run `./s
 
 ### Join the Codex review (if launched in Phase 1)
 
-If you launched a background Codex review in Phase 1, join it now: `.lucidos/codex-review.done` exists once it has ended, and `.lucidos/codex-review.out` is the review itself, not a status line.
+If you launched a background Codex review in Phase 1, join it now: `.lucidos/codex-review.done` exists once it has ended. The last line of `.lucidos/codex-review.out` is the status line, and everything above it is the review. Read the status line first: it decides which case below applies.
 
-- **Completed:** fold Codex's findings into the validation set below. Treat each finding exactly like one from the other reviewers (confirm against source, fix real 🔴 in Phase 4, discard false positives, log recurring dismissals to `docs/code-review-priors.md`). Codex frequently returns "no actionable bugs": record that outcome and move on.
-- **Still running:** give it one bounded foreground wait on the marker: `for i in $(seq 1 300); do [ -f .lucidos/codex-review.done ] && break; sleep 1; done`. Cap the wait at ~5 minutes *since it was launched in Phase 1*. Usually it is already done, since Phases 1 to 2 ran in parallel with it. Remember the probe loop can hold the task for up to a minute before the review even starts.
-- **Ran but returned nothing:** the JSON carries `"status": 1` and `"stdout": "Reviewer failed to output a response."` That is the reviewer starting, and its model call failing. Report it as a failure with that reason, never as "unavailable". It is still advisory, so proceed.
-- **Failed / unavailable / plugin not installed:** it is advisory. Note "Codex review: unavailable (advisory), proceeding" and continue. NEVER block the marker or stall the turn on Codex. (If a prior iteration's Codex task is still running when a new one launches, you may abandon the stale one.)
+- **`verdict returned`:** fold Codex's findings into the validation set below. Treat each like any other reviewer's finding: confirm it against source, fix a real 🔴 in Phase 4, discard a false positive. Log recurring dismissals to `docs/code-review-priors.md`. Codex frequently returns "no actionable bugs": record that outcome and move on.
+- **Still running:** give it one bounded foreground wait on the marker: `for i in $(seq 1 300); do [ -f .lucidos/codex-review.done ] && break; sleep 1; done`. Cap the wait at ~5 minutes *since it was launched in Phase 1*. Usually it is already done, since Phases 1 to 2 ran in parallel with it. Remember the probe loop can hold the task for up to a minute before the review even starts, and a retry runs a second review.
+- **`NO VERDICT`:** the reviewer started and failed twice. That is a lost review angle, never a pass and never "unavailable". Say so now, and quote the status line verbatim in the Phase 4 report, upstream cause included. It is still advisory, so proceed.
+- **`unavailable`, or abandoned after the wait:** it is advisory. Note "Codex review: unavailable (advisory), proceeding" and continue. NEVER block the marker or stall the turn on Codex. (If a prior iteration's Codex task is still running when a new one launches, you may abandon the stale one.)
 
 **A reviewer that returns nothing is configuration, not weather.** The companion
-discards the real cause. It survives only in Codex's own log, so read the newest
-entry:
-
-```bash
-sqlite3 -readonly "file:$(ls -t "$HOME"/.codex/logs_*.sqlite | head -1)?mode=ro" \
-  "select datetime(ts,'unixepoch','localtime'),
-          substr(feedback_log_body, instr(feedback_log_body,'sampling_error='), 200)
-   from logs where feedback_log_body like '%sampling_error=%' order by id desc limit 1"
-```
-
-This has bitten once. The CLI moved its default model to one the local login
-could not reach. Every review then 403'd, and each run wrote it off as a blip.
-`codex login status` names the login, and a reachable `model` in
-`~/.codex/config.toml` fixes it.
+folds the real cause into one generic sentence. The status line quotes it back
+from the reviewer's stderr, its JSON payload, or Codex's own log. This has
+bitten once. The CLI moved its default model to one the local login could not
+reach, and every review then 403'd. `codex login status` names the login, and a
+reachable `model` in `~/.codex/config.toml` fixes it.
 
 Then validate every finding (Codex's included) per the rest of this phase.
 
@@ -382,6 +387,7 @@ don't need an entry; recurring-shaped ones do.
 
 - If **no validated issues**: report "No bugs or compliance issues found."
 - If **validated issues found**: list each issue grouped by severity (🔴 Bug, 🟡 Nit) with file, line, and description. Fix 🔴 bugs directly. Ask the user about 🟡 nits.
+- **Either way, name what the Codex angle returned.** A `NO VERDICT` status line goes in verbatim, so the report never reads as four reviewers when it had three.
 
 **A failure that also fails on `main` is main's bug, and another thread may be fixing it.** Run `git merge main --no-edit` first, since main moves every few minutes. Fix it here only if it still fails after that merge.
 

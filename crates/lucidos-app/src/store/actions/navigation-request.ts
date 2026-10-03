@@ -163,12 +163,13 @@ export function handleNavigationRequest(nav: {
       // Land on the Plugins panel narrowed to Installed (the All | Installed
       // toggle on Installed) — where every installed plugin (app or not) shows
       // its update status + an Update button. The update-available notification
-      // deep-links here and carries the plugin id in `nav.id`; the list scrolls
-      // to and pulses that row once it renders (see StoreTab's pluginScrollTarget
-      // effect).
+      // deep-links here. For a single update it carries the plugin id in
+      // `nav.id`. The list then pulses that row once it renders (see StoreTab's
+      // pluginScrollTarget effect). A tap without an id drops any earlier,
+      // unconsumed target so no stale row pulses later.
       setPluginsInstalledOnly(true);
       switchMenuItem('plugins');
-      if (nav.id) pluginScrollTarget.value = nav.id;
+      pluginScrollTarget.value = nav.id ?? null;
       break;
     case 'settings': {
       if (!nav.settings_view) {

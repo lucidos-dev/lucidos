@@ -224,7 +224,9 @@ const BUILD_SLOT_RULE: &str = "\n\nHEAVY BUILDS TAKE A BUILD SLOT: Sessions run 
 /// The subagent arm exists because Claude Code runs an `Agent` launch in the
 /// background by default. Facing "do not end the turn" with no named wait, one
 /// session improvised a filler subagent and then a fabricated question. Naming
-/// `run_in_background: false` is what removes the incentive.
+/// `run_in_background: false` is what removes the incentive. Models still
+/// ended turns on a background subagent, so `lucidos cc-agent-guard` now
+/// refuses one.
 const BACKGROUND_PROCESS_RULE: &str = "BACKGROUND PROCESSES DON'T SURVIVE A TURN: When your turn \
     ends (you go idle), the Lucidos engine terminates your whole process group: you and every \
     process you spawned. A command started with `run_in_background` (or `&` / `nohup` / any \
@@ -245,8 +247,8 @@ const BACKGROUND_PROCESS_RULE: &str = "BACKGROUND PROCESSES DON'T SURVIVE A TURN
     \"$PWD\").log 2>&1`) and `tail` it, so a long log never floods your context. SUBAGENTS ARE \
     BACKGROUND WORK TOO: under Claude Code the `Agent` tool runs one in the BACKGROUND BY DEFAULT, \
     and its report never reaches you if your turn ends first, because the subagent dies with your \
-    process group. Launch a subagent whose result you need with `run_in_background: false`, which \
-    blocks and hands you the report inline. A fan-out still costs ONE wait: put every `Agent` call \
+    process group. Launch every subagent with `run_in_background: false`, which blocks and hands \
+    you the report inline. Lucidos refuses an `Agent` call without it. A fan-out still costs ONE wait: put every `Agent` call \
     in a single assistant message and they run in parallel. NEVER improvise a stall instead: a \
     filler subagent, a sleep loop, or a fabricated question to hold the turn open. Those waste the \
     turn, and a fabricated question also parks the thread on a card the user must clear.";

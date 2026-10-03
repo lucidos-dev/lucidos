@@ -100,7 +100,7 @@ fn error_response_line(id: &serde_json::Value, code: i64, message: &str) -> Stri
 /// unit tests can pin the shape without a child.
 ///
 /// `developerInstructions` carries the engine's system prompt on BOTH paths
-/// (matching CC, which re-passes `--append-system-prompt` on every resume).
+/// (matching CC, which re-passes `--append-system-prompt-file` on every resume).
 /// The `config` object mirrors the exec driver's `-c` overrides: sandbox
 /// network on, the same extra writable roots the exec driver passes as
 /// `--add-dir` (see `codex::sandbox_writable_roots`), and the `lucidos` MCP

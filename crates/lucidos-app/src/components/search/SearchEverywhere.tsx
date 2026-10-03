@@ -21,6 +21,7 @@ import { SearchField } from '../shared/SearchField';
 import { CategoryIcon } from '../shared/CategoryIcon';
 import { getSettingsSearchResults, findSettingsEntry } from './searchIndex';
 import { getMenuSearchResults, findMenuSearchEntry } from './menuIndex';
+import { OVERVIEW_LIMIT, rankedSections, tabAccessibleName, tabHits, type TabHits } from './searchSections';
 import './SearchEverywhere.css';
 
 const CATEGORIES: { id: SearchCategory; label: string }[] = [
@@ -31,9 +32,8 @@ const CATEGORIES: { id: SearchCategory; label: string }[] = [
   { id: 'threads', label: 'Threads' },
   { id: 'triggers', label: 'Triggers' },
   { id: 'changes', label: 'Changes' },
-  // Last, because a search is nearly always for a thing rather than for the
-  // page it lives on. The pages are a short fixed list, so the tab is where you
-  // go to read them all rather than the one you land on.
+  // Last, in the same place SECTION_ORDER breaks ties for the All tab. The
+  // strip never reorders: only the All tab's sections follow the hits.
   { id: 'menu', label: 'Menu' },
 ];
 
@@ -47,9 +47,6 @@ const SERVER_SECTIONS: ServerSection[] = ['apps', 'files', 'threads', 'triggers'
 /** Keystrokes coalesce this long before the engine is asked. Local hits skip it. */
 const SERVER_DEBOUNCE_MS = 150;
 
-/** Hits per section in the All tab. The engine is asked for no more. */
-const ALL_TAB_LIMIT = 5;
-
 /** The two categories the frontend answers itself, never the engine. */
 function isLocalCategory(category: SearchCategory): category is LocalCategory {
   return category === 'settings' || category === 'menu';
@@ -61,17 +58,9 @@ function localSection(section: LocalCategory, query: string, limit: number): Sea
     : getMenuSearchResults(query, limit);
 }
 
-/** The hits the frontend holds itself, so they render on the keystroke. */
-function localHits(query: string, category: SearchCategory): Record<string, SearchResultItem[]> {
-  if (category === 'all') {
-    return { settings: localSection('settings', query, ALL_TAB_LIMIT), menu: localSection('menu', query, ALL_TAB_LIMIT) };
-  }
-  return isLocalCategory(category) ? { [category]: localSection(category, query, 50) } : {};
-}
-
-function serverSectionsFor(category: SearchCategory): ServerSection[] {
-  if (category === 'all') return SERVER_SECTIONS;
-  return isLocalCategory(category) ? [] : [category];
+/** The local half of the overview, so it renders on the keystroke. */
+function localOverview(query: string): Record<LocalCategory, SearchResultItem[]> {
+  return { settings: localSection('settings', query, OVERVIEW_LIMIT), menu: localSection('menu', query, OVERVIEW_LIMIT) };
 }
 
 function sectionLabel(section: string): string {
@@ -144,43 +133,6 @@ function validateRecents(recents: SearchResultItem[]): SearchResultItem[] {
   return validated;
 }
 
-// `menu` last, for the reason CATEGORIES gives, and so the tab strip and the
-// All tab put the pages in the same place.
-const SECTION_ORDER = ['apps', 'files', 'settings', 'threads', 'triggers', 'changes', 'menu'];
-
-/** Flatten results by section order into a single indexed list for keyboard navigation. */
-function flattenResults(
-  results: Record<string, SearchResultItem[]>,
-  category: SearchCategory,
-): SearchResultItem[] {
-  if (category !== 'all') {
-    return results[category] ?? [];
-  }
-  const flat: SearchResultItem[] = [];
-  for (const section of SECTION_ORDER) {
-    const items = results[section];
-    if (!items?.length) continue;
-    for (let i = 0; i < Math.min(items.length, ALL_TAB_LIMIT); i++) {
-      flat.push(items[i]);
-    }
-  }
-  return flat;
-}
-
-/** Build section boundaries for the "All" tab with precomputed flat index offsets. */
-function getSections(results: Record<string, SearchResultItem[]>): { section: string; items: SearchResultItem[]; offset: number }[] {
-  const sections: { section: string; items: SearchResultItem[]; offset: number }[] = [];
-  let offset = 0;
-  for (const section of SECTION_ORDER) {
-    const items = results[section];
-    if (!items?.length) continue;
-    const capped = items.slice(0, ALL_TAB_LIMIT);
-    sections.push({ section, items: capped, offset });
-    offset += capped.length;
-  }
-  return sections;
-}
-
 /** One hit. With no `item`, inside a `SkeletonProvider`, it is the results
  *  list's loading placeholder, and carries no `data-role`: the keyboard
  *  selection counts rows by it. */
@@ -230,30 +182,84 @@ function PendingRow({ sections }: { sections: ServerSection[] }) {
  *  stamp is not the current search is still out, whatever it last held. */
 type ServerHits = { search: string; sections: Partial<Record<ServerSection, Loadable<SearchResultItem[]>>> };
 
+const NO_SERVER_HITS: ServerHits = { search: '', sections: {} };
+const NO_SECTIONS: ServerSection[] = [];
+
+/** Asks the engine one request per section, once the keystrokes pause, and
+ *  stamps each answer with `search`. Drops every answer on close, so a
+ *  reopened palette asks again rather than showing old ones. */
+function useServerHits(
+  isOpen: boolean,
+  search: string,
+  query: string,
+  sections: ServerSection[],
+  limit: number | undefined,
+): (section: ServerSection) => Loadable<SearchResultItem[]> {
+  const [hits, setHits] = useState<ServerHits>(NO_SERVER_HITS);
+
+  useEffect(() => {
+    if (!isOpen) setHits(NO_SERVER_HITS);
+  }, [isOpen]);
+
+  useEffect(() => {
+    if (!isOpen || sections.length === 0) return;
+    const controller = new AbortController();
+    const settle = (section: ServerSection, state: Loadable<SearchResultItem[]>) => {
+      if (controller.signal.aborted) return;
+      setHits(prev => ({
+        search,
+        sections: { ...(prev.search === search ? prev.sections : {}), [section]: state },
+      }));
+    };
+    const timer = setTimeout(() => {
+      for (const section of sections) {
+        searchEverywhere(query, section, { signal: controller.signal, limit }).then(
+          data => settle(section, { status: 'loaded', data: data.results[section] ?? [] }),
+          // Failed must not read as empty: the list says so under the rows.
+          err => settle(section, toFailed(err)),
+        );
+      }
+    }, SERVER_DEBOUNCE_MS);
+    return () => {
+      clearTimeout(timer);
+      controller.abort();
+    };
+  }, [search, query, sections, limit, isOpen]);
+
+  return section => (hits.search === search && hits.sections[section]) || { status: 'loading' };
+}
+
 export function SearchEverywhere() {
   const [query, setQuery] = useState('');
   const [category, setCategory] = useState<SearchCategory>('all');
-  const [server, setServer] = useState<ServerHits>({ search: '', sections: {} });
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const [recents, setRecents] = useState<SearchResultItem[]>([]);
   const inputRef = useRef<HTMLInputElement>(null);
   const resultsRef = useRef<HTMLDivElement>(null);
 
   const isRecentsMode = !query && category === 'all';
-  const search = `${category}\n${query}`;
-  const requested = useMemo(() => (isRecentsMode ? [] : serverSectionsFor(category)), [isRecentsMode, category]);
-  const serverState = (section: ServerSection): Loadable<SearchResultItem[]> =>
-    (server.search === search && server.sections[section]) || { status: 'loading' };
-  const pending = requested.filter(s => serverState(s).status === 'loading');
+  const isOpen = searchEverywhereOpen.value;
+  // The overview answers the All tab and every tab's count, so it is keyed by
+  // the query alone: switching tabs never asks it again.
+  const overviewState = useServerHits(isOpen, query, query, query ? SERVER_SECTIONS : NO_SECTIONS, OVERVIEW_LIMIT);
+  // A category tab also asks for its own full page.
+  const pageSections = useMemo(
+    () => (category === 'all' || isLocalCategory(category) ? NO_SECTIONS : [category]),
+    [category],
+  );
+  const pageState = useServerHits(isOpen, `${category}\n${query}`, query, pageSections, undefined);
+
+  const requested = category === 'all' ? (query ? SERVER_SECTIONS : NO_SECTIONS) : pageSections;
+  const listState = category === 'all' ? overviewState : pageState;
+  const pending = requested.filter(s => listState(s).status === 'loading');
   const failed = requested.flatMap(s => {
-    const state = serverState(s);
+    const state = listState(s);
     return state.status === 'failed' ? [{ section: s, error: state.error }] : [];
   });
   // Placeholder rows only once a search has run past the delay gate. Hits
   // still show the instant they arrive; the fade only lets the rows go.
   const showSearchLoading = useDelayedFlag(pending.length > 0);
 
-  const isOpen = searchEverywhereOpen.value;
   // Over the pane whose header holds the button that opened it. Opened with
   // no button (a shortcut, the Lucidos menu), it follows the focused pane group.
   // Resolved once per open: every keystroke re-renders, and it measures layout.
@@ -272,39 +278,9 @@ export function SearchEverywhere() {
     setSelectedKey(null);
   }, []);
 
-  // Load recents on open. On close, however it closed, drop the engine's
-  // answers, so a reopened palette asks again rather than showing old ones.
   useEffect(() => {
     if (isOpen) setRecents(validateRecents(loadRecents()));
-    else setServer({ search: '', sections: {} });
   }, [isOpen]);
-
-  // Ask the engine one request per category, once the keystrokes pause.
-  useEffect(() => {
-    if (!isOpen || requested.length === 0) return;
-    const controller = new AbortController();
-    const settle = (section: ServerSection, state: Loadable<SearchResultItem[]>) => {
-      if (controller.signal.aborted) return;
-      setServer(prev => ({
-        search,
-        sections: { ...(prev.search === search ? prev.sections : {}), [section]: state },
-      }));
-    };
-    const limit = category === 'all' ? ALL_TAB_LIMIT : undefined;
-    const timer = setTimeout(() => {
-      for (const section of requested) {
-        searchEverywhere(query, section, { signal: controller.signal, limit }).then(
-          data => settle(section, { status: 'loaded', data: data.results[section] ?? [] }),
-          // Failed must not read as empty: the list says so under the rows.
-          err => settle(section, toFailed(err)),
-        );
-      }
-    }, SERVER_DEBOUNCE_MS);
-    return () => {
-      clearTimeout(timer);
-      controller.abort();
-    };
-  }, [search, query, category, requested, isOpen]);
 
   // Auto-focus input on open
   useEffect(() => {
@@ -360,15 +336,30 @@ export function SearchEverywhere() {
     }
   }
 
-  const local = useMemo(() => (isRecentsMode ? {} : localHits(query, category)), [isRecentsMode, query, category]);
-  const results: Record<string, SearchResultItem[]> = { ...local };
+  const overviewLocal = useMemo(() => (query ? localOverview(query) : null), [query]);
+  const pageLocal = useMemo(
+    () => (isLocalCategory(category) ? localSection(category, query, 50) : []),
+    [category, query],
+  );
+
+  const results: Record<string, SearchResultItem[]> = category === 'all' ? { ...overviewLocal } : {};
+  if (isLocalCategory(category)) results[category] = pageLocal;
   for (const section of requested) {
-    const state = serverState(section);
+    const state = listState(section);
     if (state.status === 'loaded') results[section] = state.data;
   }
 
-  const flat = isRecentsMode ? recents : flattenResults(results, category);
-  const sections = category === 'all' && !isRecentsMode ? getSections(results) : [];
+  const sections = category === 'all' && !isRecentsMode ? rankedSections(results, query) : [];
+  const flat = isRecentsMode
+    ? recents
+    : category === 'all' ? sections.flatMap(s => s.items) : results[category] ?? [];
+
+  function hitsOnTab(tab: SearchCategory): TabHits {
+    if (tab === 'all' || !overviewLocal) return { kind: 'unknown' };
+    return isLocalCategory(tab)
+      ? tabHits({ status: 'loaded', data: overviewLocal[tab] })
+      : tabHits(overviewState(tab));
+  }
   // The selection follows its row, so a category landing above it cannot move
   // the cursor onto another hit.
   const selectedIndex = selectedKey === null ? -1 : flat.findIndex(item => itemKey(item) === selectedKey);
@@ -524,16 +515,23 @@ export function SearchEverywhere() {
           </button>
         </div>
         <div class="search-everywhere-tabs">
-          {CATEGORIES.map(cat => (
-            <button
-              key={cat.id}
-              class={`search-everywhere-tab${cat.id === category ? ' active' : ''}`}
-              aria-pressed={cat.id === category}
-              onClick={() => setCategory(cat.id)}
-            >
-              {cat.id === 'all' && !query ? 'Recent' : cat.label}
-            </button>
-          ))}
+          {CATEGORIES.map(cat => {
+            const hits = hitsOnTab(cat.id);
+            const label = cat.id === 'all' && !query ? 'Recent' : cat.label;
+            return (
+              <button
+                key={cat.id}
+                class={`search-everywhere-tab${cat.id === category ? ' active' : ''}`}
+                aria-pressed={cat.id === category}
+                aria-label={tabAccessibleName(label, hits)}
+                data-empty={hits.kind === 'none' ? '' : undefined}
+                onClick={() => setCategory(cat.id)}
+              >
+                {label}
+                {hits.kind === 'some' && <span class="search-everywhere-tab-count">{hits.count}</span>}
+              </button>
+            );
+          })}
         </div>
         <div class="search-everywhere-results" ref={resultsRef}>
           {isRecentsMode ? (

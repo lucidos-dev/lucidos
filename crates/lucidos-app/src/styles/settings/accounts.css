@@ -70,8 +70,10 @@
     gap: 0.5rem;
 }
 
+/* One button per registry provider, so the row outgrows a phone and wraps. */
 .oauth-quick-providers {
     display: flex;
+    flex-wrap: wrap;
     gap: 0.375rem;
 }
 

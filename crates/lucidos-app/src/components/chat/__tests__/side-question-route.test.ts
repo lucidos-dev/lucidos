@@ -1,14 +1,14 @@
 /**
- * The composer's `/btw` route (ADR 0318). A side question in a coding-agent
- * thread goes to the side-question endpoint and never to `sendFollowup`.
- * Everything else still reaches the normal send.
+ * The composer's side-question route (ADR 0320). In side-question mode, or
+ * from the Send button's hold, the box goes to the side-question endpoint and
+ * never to `sendFollowup`. Everything else still reaches the normal send.
  *
  * Source-pattern checks for PromptInput, as its sibling tests do: mounting it
  * drags in every chat signal. The routing decision itself is unit-tested in
  * `store/sideQuestions.test.ts`, and the browser flow in
  * `e2e/side-question.spec.ts`.
  */
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
 // @ts-expect-error: same
@@ -16,14 +16,11 @@ import { dirname, resolve } from 'node:path';
 // @ts-expect-error: same
 import { fileURLToPath } from 'node:url';
 
-vi.mock('../../../store/actions/chat', () => ({ sendMessage: vi.fn() }));
-
-import { withSideQuestionCommand } from '../CodingAgentControlMenu';
-
 const here: string = dirname(fileURLToPath(import.meta.url));
 const promptSource = readFileSync(resolve(here, '../PromptInput.tsx'), 'utf-8');
+const menuSource = readFileSync(resolve(here, '../CodingAgentControlMenu.tsx'), 'utf-8');
 
-describe('PromptInput submit routes /btw before any send', () => {
+describe('PromptInput submit routes a side question before any send', () => {
   const submit = promptSource.match(/async function submit\(asSideQuestion = false\)[\s\S]*?\n {2}\}/)?.[0] ?? '';
 
   it('decides the route ahead of the upload queue and the send', () => {
@@ -32,6 +29,17 @@ describe('PromptInput submit routes /btw before any send', () => {
     expect(routeIdx).toBeGreaterThan(-1);
     expect(submit.indexOf('queueUploadSend')).toBeGreaterThan(routeIdx);
     expect(submit.indexOf('beginSend')).toBeGreaterThan(routeIdx);
+  });
+
+  // In the mode the box asks, so a multi-select card stops taking its text and
+  // the lone Submit reads Ask.
+  it('lets side-question mode win over a waiting card', () => {
+    expect(promptSource).toMatch(/const hasPendingMultiQ = pendingMultiQ !== null && !sideQuestionMode;/);
+    expect(promptSource).toContain("{sideQuestionMode ? 'Ask' : 'Submit'}");
+  });
+
+  it('asks in side-question mode as well as from the hold', () => {
+    expect(submit).toMatch(/routeSideQuestion\(msg, \{[\s\S]*?\}, asSideQuestion \|\| sideQuestionMode\)/);
   });
 
   it('the ask branch asks with the images, or waits for them, and never sends', () => {
@@ -53,9 +61,21 @@ describe('PromptInput submit routes /btw before any send', () => {
     expect(helper).toContain('askSideQuestion(threadId, question, hashes)');
   });
 
+  // The emptied box turns the button into Stop or a card's Cancel at once.
+  it('asking arms the settle window, so a repeat tap cannot cancel', () => {
+    const helper = promptSource.match(/function askComposerSideQuestion\([\s\S]*?\n {2}\}/)?.[0] ?? '';
+    expect(helper.indexOf('armCancelSettle()')).toBeGreaterThan(-1);
+    expect(helper.indexOf('armCancelSettle()')).toBeLessThan(helper.indexOf("updateCompose(threadId, { text: '', image_hashes: [] })"));
+  });
+
+  it('asking turns side-question mode off', () => {
+    const helper = promptSource.match(/function askComposerSideQuestion\([\s\S]*?\n {2}\}/)?.[0] ?? '';
+    expect(helper).toContain('updateComposeSelection(threadId, { sideQuestionMode: false })');
+  });
+
   it('a queued ask routes as a side question once the upload lands', () => {
     const queued = promptSource.match(/function sendQueuedAfterUpload\([\s\S]*?\n {2}\}/)?.[0] ?? '';
-    expect(queued).toMatch(/routeSideQuestion\(msg, \{\s*started: thread\.meta\.state !== 'composing',[\s\S]*?\}, intent\.asSideQuestion\)/);
+    expect(queued).toMatch(/routeSideQuestion\(msg, \{\s*started: thread\.meta\.state !== 'composing',[\s\S]*?\}, intent\.asSideQuestion === true\)/);
     expect(queued.indexOf('routeSideQuestion(')).toBeLessThan(queued.indexOf('beginSend('));
   });
 
@@ -67,13 +87,13 @@ describe('PromptInput submit routes /btw before any send', () => {
   });
 });
 
-describe('the command menu offers /btw', () => {
-  it('in a live Claude Code thread only', () => {
-    expect(withSideQuestionCommand(['compact', 'context'], true)).toEqual(['btw', 'compact', 'context']);
-    expect(withSideQuestionCommand(['compact'], false)).toEqual(['compact']);
+// A typed `/btw` is ordinary text, and nothing hands it back as a side question.
+describe('nothing treats /btw as special', () => {
+  it('the command menu neither lists nor intercepts it', () => {
+    expect(menuSource).not.toMatch(/btw/i);
   });
 
-  it('once, should Claude Code ever register it itself', () => {
-    expect(withSideQuestionCommand(['btw', 'compact'], true)).toEqual(['btw', 'compact']);
+  it('the composer never writes it into the box', () => {
+    expect(promptSource).not.toMatch(/btw/i);
   });
 });

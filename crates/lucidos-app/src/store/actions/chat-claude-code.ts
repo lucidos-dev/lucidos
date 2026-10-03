@@ -167,12 +167,9 @@ export async function handleDiscardCCChanges(threadId: string): Promise<void> {
  *  named neither the cause nor a way out.
  *
  *  A transport rejection is the iOS PWA's stale connection, which the client
- *  already retried once (`answerThreadQuestion` in api/client/chat.ts). Not
- *  `getUnreachableEngineMsg`, the canonical copy for the same condition: it
- *  names the engine's URL and asks for a reload, and a tap the client just
- *  retried wants neither. A conflict is a question nobody is waiting on any
- *  more, so it says that rather than asking for a retry that would 409
- *  forever. */
+ *  already retried once (`answerThreadQuestion` in api/client/chat.ts). A
+ *  conflict is a question nobody is waiting on any more, so it says that
+ *  rather than asking for a retry that would 409 forever. */
 export function answerFailureMessage(
   failure: { kind: 'conflict' } | { kind: 'error'; err: unknown },
 ): string {

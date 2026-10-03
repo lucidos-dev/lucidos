@@ -16,6 +16,9 @@ const SECTION_PRIORITY: Record<DisplaySection, number> = {
     archive: 2,
 };
 
+/** Shared empty set for a caller with no revealed-archived state of its own. */
+const EMPTY_STRING_SET: ReadonlySet<string> = new Set();
+
 /** Walk parentThreadId up to the topmost ancestor present in `byId`. Stops at
  *  the first ancestor not in the map (paginated out / filtered) and returns
  *  that ancestor's child as the root — so an orphan child is its own family
@@ -116,7 +119,153 @@ export type FamilyDecorations = {
      *  an archived root in a live section is exactly the lifted-parent case,
      *  which owns that row's cue already (`liftedRoots`). */
     archivedSubThreads: ReadonlySet<string>;
+    /** Non-root members of `archivedSubThreads` whose entire branch — the
+     *  thread and every descendant — is naturally Archive. Excluded from the
+     *  rendered family tree by default (`filterHiddenArchived`), so a put-away
+     *  branch no longer clutters a live parent. A branch qualifies only as a
+     *  WHOLE. A thread partway down that is naturally Archive, but carries a
+     *  live descendant, stays out of this set. It stays rendered, dimmed via
+     *  `archivedSubThreads`, so that descendant keeps its place in the tree.
+     *  See `computeHiddenArchivedThreads`. */
+    hiddenArchivedThreads: ReadonlySet<string>;
+    /** Count of each thread's DIRECT children present in
+     *  `hiddenArchivedThreads`. The backend's `totalChildrenCount` counts an
+     *  archived child like any other (archiving never decrements it), so a
+     *  row's "N sub-threads" count subtracts this. Also drives the "N
+     *  archived" reveal toggle: shown whenever this is > 0. */
+    hiddenDirectChildCount: ReadonlyMap<string, number>;
 };
+
+/** Direct-child adjacency over `threads`, skipping excluded (composing /
+ *  discarded) threads. Shared by `computeHiddenArchivedThreads` and anything
+ *  else that needs to walk down from a thread rather than up from it. */
+function buildChildrenByParent(threads: ThreadState[]): Map<string, string[]> {
+    const childrenByParent = new Map<string, string[]>();
+    for (const t of threads) {
+        if (isExcludedFromSections(t)) continue;
+        const parentId = t.meta.parentThreadId;
+        if (!parentId) continue;
+        const siblings = childrenByParent.get(parentId);
+        if (siblings) siblings.push(t.meta.id);
+        else childrenByParent.set(parentId, [t.meta.id]);
+    }
+    return childrenByParent;
+}
+
+/** Non-root threads whose entire branch is naturally Archive, within a family
+ *  that routes to a live section: the "fully put-away" sub-trees a live
+ *  parent's tree hides by default. A branch counts only as a whole: a node
+ *  with a live descendant anywhere beneath it is never included. Nor is
+ *  anything above it, so an ancestor can never drop a live thread from the
+ *  render. Also returns each thread's hidden DIRECT child count, for the
+ *  row-level "N sub-threads" / "N archived" counts.
+ *
+ *  A `parentThreadId` cycle (data corruption) resolves every member to "not
+ *  fully archived". That is the same fail-open default `nestByParent` and
+ *  `hasCollapsedAncestor` take, so a cycle can never hide a live-looking
+ *  thread. */
+export function computeHiddenArchivedThreads(
+    threads: ThreadState[],
+    graph: FamilyGraph,
+    familySections?: FamilySectionMap,
+): { hidden: ReadonlySet<string>; hiddenDirectChildCount: ReadonlyMap<string, number> } {
+    const familySection = familySections ?? computeFamilySections(threads, graph);
+    const childrenByParent = buildChildrenByParent(threads);
+
+    const fullyArchived = new Map<string, boolean>();
+    const inProgress = new Set<string>();
+    const isFullyArchived = (id: string): boolean => {
+        const cached = fullyArchived.get(id);
+        if (cached !== undefined) return cached;
+        if (inProgress.has(id)) return false; // cycle guard: never hide on an unresolved cycle
+        inProgress.add(id);
+        const thread = graph.byId.get(id);
+        const ownArchive = !!thread && getThreadDisplaySection(thread) === 'archive';
+        const children = childrenByParent.get(id) ?? [];
+        const result = ownArchive && children.every(isFullyArchived);
+        inProgress.delete(id);
+        fullyArchived.set(id, result);
+        return result;
+    };
+
+    const hidden = new Set<string>();
+    const hiddenDirectChildCount = new Map<string, number>();
+    for (const t of threads) {
+        if (isExcludedFromSections(t)) continue;
+        const id = t.meta.id;
+        const root = graph.rootByThread.get(id);
+        if (root === undefined || root === id) continue; // family root is never hidden
+        if (familySection.get(root) === 'archive') continue; // whole family already renders in Archive
+        if (!isFullyArchived(id)) continue;
+        hidden.add(id);
+        const parentId = t.meta.parentThreadId!;
+        hiddenDirectChildCount.set(parentId, (hiddenDirectChildCount.get(parentId) ?? 0) + 1);
+    }
+    return { hidden, hiddenDirectChildCount };
+}
+
+/** Filters `threads` down to what the family tree renders: `hidden` branches
+ *  (from `computeHiddenArchivedThreads`) stay out unless their DIRECT parent
+ *  is in `revealed` — thread ids, mirroring `collapsedFamilies` — AND the
+ *  parent itself renders. Revealing one level does not cascade past it, so a
+ *  further-hidden grandchild needs its own reveal, exactly like
+ *  `collapsedFamilies`'s per-level chevrons. */
+export function filterHiddenArchived(
+    threads: ThreadState[],
+    hidden: ReadonlySet<string>,
+    revealed: ReadonlySet<string>,
+    graph: FamilyGraph,
+): ThreadState[] {
+    if (hidden.size === 0) return threads;
+    const resolved = new Map<string, boolean>();
+    const isVisible = (id: string): boolean => {
+        const cached = resolved.get(id);
+        if (cached !== undefined) return cached;
+        if (!hidden.has(id)) {
+            resolved.set(id, true);
+            return true;
+        }
+        resolved.set(id, false); // cycle guard: an unresolved cycle stays hidden
+        const parentId = graph.byId.get(id)?.meta.parentThreadId;
+        const result = !!parentId && revealed.has(parentId) && isVisible(parentId);
+        resolved.set(id, result);
+        return result;
+    };
+    return threads.filter(t => isVisible(t.meta.id));
+}
+
+/** `thread`'s direct-child count as the family tree actually renders it: the
+ *  backend's `totalChildrenCount` minus however many of its direct children
+ *  are hidden-by-default archived branches (`hiddenDirectChildCount`). Drives
+ *  a row's "N sub-threads" chevron/count/label, kept separate and constant
+ *  from the archived-reveal toggle (see `hiddenDirectChildCount`'s doc). */
+export function visibleChildrenCount(
+    thread: ThreadState,
+    decorations: Pick<FamilyDecorations, 'hiddenDirectChildCount'>,
+): number {
+    return thread.meta.totalChildrenCount - (decorations.hiddenDirectChildCount.get(thread.meta.id) ?? 0);
+}
+
+/** A section's rows as the drawer renders them: `visible` nested by parent,
+ *  minus the descendants of a collapsed family.
+ *
+ *  A collapse counts only on a family that draws its chevron, the reading the
+ *  row's own `isCollapsed` takes. A family whose sub-threads were all archived
+ *  draws none, so a stale collapse there could never be undone. It would also
+ *  swallow every row its archived-reveal toggle shows. */
+export function renderedFamilyRows(
+    visible: readonly ThreadState[],
+    collapsed: ReadonlySet<string>,
+    graph: FamilyGraph,
+    decorations: Pick<FamilyDecorations, 'hiddenDirectChildCount'>,
+): NestedThread[] {
+    const honoured = new Set<string>();
+    for (const id of collapsed) {
+        const thread = graph.byId.get(id);
+        if (thread && visibleChildrenCount(thread, decorations) > 0) honoured.add(id);
+    }
+    return nestByParent(visible).filter(n => !hasCollapsedAncestor(n.thread.meta.id, honoured, graph));
+}
 
 /** Map of family root id → the display section the family renders in. Default
  *  rule: the highest-priority section reached by any family member (current >
@@ -187,7 +336,9 @@ export function computeFamilyDecorations(
             liftedRoots.add(root);
         }
     }
-    return { routedByThread, liftedRoots, archivedSubThreads };
+    const { hidden: hiddenArchivedThreads, hiddenDirectChildCount } =
+        computeHiddenArchivedThreads(threads, graph, familySection);
+    return { routedByThread, liftedRoots, archivedSubThreads, hiddenArchivedThreads, hiddenDirectChildCount };
 }
 
 /** True if any ancestor of `threadId` (walking `parentThreadId` via `graph`)
@@ -351,9 +502,16 @@ export function orderedCurrentForReview(
     visible: ThreadState[],
     graph: FamilyGraph,
 ): ThreadState[] {
-    const current = categorizeThreads(visible, graph).current;
-    current.sort(byCreated);
-    return nestByParent(current).map(n => n.thread);
+    const familySections = computeFamilySections(visible, graph);
+    const current = categorizeThreads(visible, graph, familySections).current;
+    // Exclude default-hidden archived branches (`filterHiddenArchived` with no
+    // revealed families) so the post-archive picker never lands focus on a row
+    // the drawer isn't rendering. A session-local reveal toggle isn't visible
+    // here, which only ever makes this MORE conservative than before the fix.
+    const { hidden } = computeHiddenArchivedThreads(visible, graph, familySections);
+    const visibleCurrent = filterHiddenArchived(current, hidden, EMPTY_STRING_SET, graph);
+    visibleCurrent.sort(byCreated);
+    return nestByParent(visibleCurrent).map(n => n.thread);
 }
 
 /** Apply the drawer's per-section display sort in place.

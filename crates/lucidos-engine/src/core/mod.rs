@@ -1412,6 +1412,15 @@ fn search_label(verb: &str, args: &serde_json::Value) -> String {
     }
 }
 
+/// The step label for the `threads` tool's `drafts` action: one thread's draft
+/// when a `thread_id` is named, every draft otherwise.
+fn drafts_label(args: &serde_json::Value) -> String {
+    match args["thread_id"].as_str().map(str::trim) {
+        Some(id) if !id.is_empty() => "Reading a thread's draft...".to_string(),
+        _ => "Listing unsent drafts...".to_string(),
+    }
+}
+
 /// The known-tool half of [`describe_tool`]: `Some(label)` for a name we ship,
 /// `None` for anything else. Split out from the fallback so the exhaustiveness
 /// guard test can ask "is this name labelled?" and get an honest answer, which
@@ -1781,8 +1790,12 @@ pub(crate) fn tool_label(name: &str, args: &serde_json::Value) -> Option<String>
         "list_threads" => "Listing threads...".to_string(),
         "count_threads" => "Counting threads...".to_string(),
         "search_threads" => search_label("Searching past conversations", args),
+        "list_drafts" => drafts_label(args),
+        "list_held_messages" => "Listing held messages...".to_string(),
         "detach_child_thread" => "Moving a child thread to top level...".to_string(),
         "archive_thread" => "Archiving a thread...".to_string(),
+        "triage_threads" => "Triaging threads...".to_string(),
+        "apply_thread_triage" => "Applying the approved triage...".to_string(),
         "list_changes" => "Listing changes...".to_string(),
         "apply_change" => "Applying change...".to_string(),
         "apply_when_settled" => "Arming a standing apply...".to_string(),
@@ -1941,8 +1954,12 @@ pub(crate) fn tool_label(name: &str, args: &serde_json::Value) -> Option<String>
         "threads" => match args["action"].as_str() {
             Some("count") => "Counting threads...".to_string(),
             Some("search") => search_label("Searching past conversations", args),
+            Some("drafts") => drafts_label(args),
+            Some("held_messages") => "Listing held messages...".to_string(),
             Some("detach_child") => "Moving a child thread to top level...".to_string(),
             Some("archive") => "Archiving a thread...".to_string(),
+            Some("triage") => "Triaging threads...".to_string(),
+            Some("apply_triage") => "Applying the approved triage...".to_string(),
             _ => "Listing threads...".to_string(),
         },
         "mcp" => match args["action"].as_str() {

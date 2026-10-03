@@ -1732,6 +1732,8 @@ const THREADS_LIST_LLM_SCHEMA: &str = r#"{
   "status": {"type":"array","items":{"type":"string","enum":["idle","running","waiting","waiting_for_user_answer","paused","failed"]},"description":"Exactly these, the values each row's status carries. Precise form of active; passing both errors."},
   "source": {"type":"string","description":"Comma-separated 'chat', 'trigger', 'coding-agent' (legacy 'claude_code' accepted). Omit for all."},
   "my_children": {"type":"boolean","description":"Restrict to this thread's DIRECT children, not grandchildren; resolved from the calling thread, so no id. How you recover a child's thread_id."},
+  "has_draft": {"type":"boolean","description":"Holds an unsent draft; false inverts."},
+  "has_diff": {"type":"boolean","description":"Coding-agent branch differs from main; false inverts."},
   "limit": {"type":"integer","description":"1-1000, default 100."}
 }"#;
 const THREADS_COUNT_LLM_SCHEMA: &str = r#"{
@@ -1765,7 +1767,7 @@ const THREADS_SEARCH_LLM_SCHEMA: &str = r#"{
 const THREADS_OPS: &[Operation] = &[
     Operation {
         action: "list",
-        summary: "Thread summaries newest-first: thread_id, title, channel, status, last_activity, parent_thread_id, trigger_id.",
+        summary: "Thread summaries newest-first: thread_id, title, channel, status, section, parent_thread_id, has_draft, draft_preview, link.",
         method: Method::Get,
         path: "/threads/list",
         args: &[],
@@ -1792,6 +1794,39 @@ const THREADS_OPS: &[Operation] = &[
         llm: None,
         cli: None,
         sdk: None,
+    },
+    Operation {
+        action: "drafts",
+        summary: "Unsent drafts, newest edit first, each with preview and link. thread_id \
+                  returns that draft whole. A draft has no link: give its thread's.",
+        method: Method::Get,
+        path: "/threads/drafts",
+        args: &[],
+        cli_name: "drafts",
+        sdk_name: "drafts",
+        mutating: false,
+        llm_alias: Some("list_drafts"),
+        // `thread_id` and `limit` are already in the union, from `detach_child`
+        // and `list`. A schema here would only shadow or repeat them.
+        llm_schema: None,
+        llm: None,
+        cli: Some(false),
+        sdk: Some(false),
+    },
+    Operation {
+        action: "held_messages",
+        summary: "Agent messages held until the user answers a question, with link.",
+        method: Method::Get,
+        path: "/threads/held-messages",
+        args: &[],
+        cli_name: "held-messages",
+        sdk_name: "heldMessages",
+        mutating: false,
+        llm_alias: Some("list_held_messages"),
+        llm_schema: None,
+        llm: None,
+        cli: Some(false),
+        sdk: Some(false),
     },
     Operation {
         action: "search",
@@ -1846,12 +1881,46 @@ const THREADS_OPS: &[Operation] = &[
         cli: Some(false),
         sdk: Some(false),
     },
+    Operation {
+        action: "triage",
+        summary: "Propose an action per inbox thread, each with a reason. Show the user; \
+                  apply only after they reply.",
+        method: Method::Post,
+        path: "/threads/triage",
+        args: &[],
+        cli_name: "triage",
+        sdk_name: "triage",
+        mutating: true,
+        llm_alias: Some("triage_threads"),
+        llm_schema: None,
+        // In-process, LLM-only: it records the proposal on the calling thread.
+        llm: None,
+        cli: Some(false),
+        sdk: Some(false),
+    },
+    Operation {
+        action: "apply_triage",
+        summary: "Apply what the user approved from this thread's newest triage. (requires: entries)",
+        method: Method::Post,
+        path: "/threads/triage/apply",
+        args: &[],
+        cli_name: "apply-triage",
+        sdk_name: "applyTriage",
+        mutating: true,
+        llm_alias: Some("apply_thread_triage"),
+        llm_schema: Some(
+            r#"{"entries":{"type":"array","items":{"type":"object","properties":{"thread_id":{"type":"string"},"action":{"type":"string","enum":["archive","pin","dismiss_question"]}}}}}"#,
+        ),
+        llm: None,
+        cli: Some(false),
+        sdk: Some(false),
+    },
 ];
 
 const THREADS_DOMAIN: Domain = Domain {
     name: "threads",
     tool_name: "threads",
-    tool_summary: "Read threads, cheaper than querying events for what exists and its status, stop awaiting a child, or archive one. 'list' and 'count' share filters. To START a thread use run_thread or run_coding_agent, to REDIRECT one follow_up_child_thread.",
+    tool_summary: "Read threads, cheaper than querying events for what exists, its status and its unsent draft; each row has a link to paste. Stop awaiting a child, archive one, or triage the inbox. 'list' and 'count' share filters. To START a thread use run_thread or run_coding_agent, to REDIRECT one follow_up_child_thread.",
     llm: true,
     // The `lucidos threads list|count` CLI is hand-written (kept, not regenerated)
     // and no SDK consumer needs this. Grouped LLM tool only.
@@ -3305,10 +3374,22 @@ mod tests {
         // `search` answers "we talked about this", which `list` structurally
         // cannot: it filters by status and channel and never by topic.
         // `detach_child` stops waiting for a child (ADR 0278). `archive` closes
-        // the caller or one of its children (ADR 0310).
+        // the caller or one of its children (ADR 0310). `drafts` and
+        // `held_messages` say what a thread holds that nothing has sent.
+        // `triage` and `apply_triage` are thread triage (ADR 0349).
         assert_eq!(
             threads.actions(),
-            vec!["list", "count", "search", "detach_child", "archive"]
+            vec![
+                "list",
+                "count",
+                "drafts",
+                "held_messages",
+                "search",
+                "detach_child",
+                "archive",
+                "triage",
+                "apply_triage"
+            ]
         );
         assert!(threads.llm && !threads.cli && !threads.sdk);
         assert_eq!(domain_for_tool("list_threads").unwrap().name, "threads");
@@ -3319,6 +3400,26 @@ mod tests {
         // run_thread / run_coding_agent stay standalone — NOT folded here.
         assert!(domain_for_tool("run_thread").is_none());
         assert!(domain_for_tool("run_coding_agent").is_none());
+    }
+
+    /// What a thread holds unsent is READ-ONLY to every agent surface: the
+    /// two actions that read it are GETs, flagged non-mutating.
+    #[test]
+    fn the_unsent_reads_are_read_only() {
+        let threads = domains().iter().find(|d| d.name == "threads").unwrap();
+        for action in ["drafts", "held_messages"] {
+            let op = threads
+                .operations
+                .iter()
+                .find(|o| o.action == action)
+                .unwrap_or_else(|| panic!("the threads domain lost '{action}'"));
+            assert!(!op.mutating, "'{action}' must not be flagged mutating");
+            assert!(matches!(op.method, Method::Get), "'{action}' must be a GET");
+        }
+        assert_eq!(
+            threads.legacy_tool_for_action("drafts"),
+            Some("list_drafts")
+        );
     }
 
     /// The `threads` domain is READ-ONLY, and deleting is the reason to say so

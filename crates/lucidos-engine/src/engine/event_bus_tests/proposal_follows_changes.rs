@@ -1,6 +1,6 @@
-//! `coding_agent_proposed` and `coding_agent_requires_restart` are a cache of
-//! the `changes` table: after every event they equal what the thread's pending
-//! changes say.
+//! `coding_agent_proposed`, `coding_agent_requires_restart` and
+//! `coding_agent_incomplete` are a cache of the `changes` table: after every
+//! event they equal what the thread's pending changes say.
 
 use super::super::*;
 use super::*;
@@ -23,16 +23,40 @@ async fn proposal_and_truth(pool: &PgPool, thread_id: Uuid) -> ((bool, bool), (b
     ((row.0, row.1), (row.2, row.3))
 }
 
+/// `coding_agent_incomplete`, and whether any pending change is incomplete.
+async fn incomplete_and_truth(pool: &PgPool, thread_id: Uuid) -> (bool, bool) {
+    sqlx::query_as(
+        "SELECT t.coding_agent_incomplete, \
+                COALESCE((SELECT bool_or(c.incomplete) FROM changes c \
+                          WHERE c.thread_id = t.thread_id AND c.status = 'pending'), FALSE) \
+         FROM thread_summaries t WHERE t.thread_id = $1",
+    )
+    .bind(thread_id)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
 async fn assert_follows_changes(pool: &PgPool, thread_id: Uuid, context: &str) {
     let (columns, truth) = proposal_and_truth(pool, thread_id).await;
     assert_eq!(
         columns, truth,
         "(proposed, requires_restart) drifted from the changes table after {context}"
     );
+    let (column, truth) = incomplete_and_truth(pool, thread_id).await;
+    assert_eq!(
+        column, truth,
+        "incomplete drifted from the changes table after {context}"
+    );
 }
 
 fn propose(change_id: Uuid, branch: &str, requires_restart: bool) -> ThreadEvent {
-    proposal(change_id.to_string(), None, branch, requires_restart)
+    proposal(change_id.to_string(), None, branch, requires_restart, false)
+}
+
+/// What a user Stop proposes: the work the turn left, marked incomplete.
+fn propose_stopped(change_id: Uuid, branch: &str) -> ThreadEvent {
+    proposal(change_id.to_string(), None, branch, false, true)
 }
 
 /// A legacy per-commit proposal: no change id, a commit sha.
@@ -42,6 +66,7 @@ fn propose_per_commit(branch: &str, requires_restart: bool) -> ThreadEvent {
         Some("abc123".into()),
         branch,
         requires_restart,
+        false,
     )
 }
 
@@ -50,6 +75,7 @@ fn proposal(
     commit_sha: Option<String>,
     branch: &str,
     requires_restart: bool,
+    incomplete: bool,
 ) -> ThreadEvent {
     ThreadEvent::ChangeProposed {
         change_id,
@@ -61,7 +87,7 @@ fn proposal(
         branch_name: branch.into(),
         repo_root: "/tmp".into(),
         hardened: false,
-        incomplete: false,
+        incomplete,
         set_aside: false,
         path: String::new(),
         diff: String::new(),
@@ -125,6 +151,7 @@ async fn the_proposal_columns_equal_the_pending_changes_after_every_event() {
             let (change_id, branch) = &changes[rng.below(2) as usize];
             let restart = rng.below(2) == 0;
             let (label, event) = match rng.below(6) {
+                0 if rng.below(2) == 0 => ("stopped propose", propose_stopped(*change_id, branch)),
                 0 => ("propose", propose(*change_id, branch, restart)),
                 1 => ("per-commit propose", propose_per_commit(branch, restart)),
                 2 => ("apply", applied(*change_id)),
@@ -159,6 +186,77 @@ async fn the_proposal_columns_equal_the_pending_changes_after_every_event() {
             assert_follows_changes(&pool, thread_id, &format!("seed {seed}, {steps:?}")).await;
         }
     }
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// I3 of ADR 0346: a stopped turn's change keeps the proposal up, so it still
+/// blocks Archive, and marks it incomplete. A clean re-proposal of the same
+/// change clears the mark. Setting it aside clears both, and bringing it back
+/// restores what the row says.
+#[tokio::test]
+async fn an_incomplete_change_keeps_the_proposal_and_marks_it_incomplete() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    let change_id = Uuid::new_v4();
+    let branch = format!("claude-code/stop-{thread_id}");
+    start_cc_session(&bus, thread_id, &branch, None).await;
+
+    let emit = |event: ThreadEvent| {
+        bus.emit(BusEvent::Thread {
+            thread_id,
+            event,
+            meta: EventMeta {
+                channel: Some(EventChannel::ClaudeCode),
+                ..EventMeta::NONE
+            },
+        })
+    };
+    let state = || async {
+        (
+            proposal_and_truth(&pool, thread_id).await.0 .0,
+            incomplete_and_truth(&pool, thread_id).await.0,
+        )
+    };
+
+    emit(propose_stopped(change_id, &branch)).await.unwrap();
+    assert_eq!(
+        state().await,
+        (true, true),
+        "a Stop proposes incomplete work"
+    );
+
+    emit(propose(change_id, &branch, false)).await.unwrap();
+    assert_eq!(
+        state().await,
+        (true, false),
+        "a clean finish clears the mark"
+    );
+
+    emit(propose_stopped(change_id, &branch)).await.unwrap();
+    emit(ThreadEvent::ChangeSetAside {
+        change_id: change_id.to_string(),
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        state().await,
+        (false, false),
+        "a set-aside change is not pending"
+    );
+
+    emit(ThreadEvent::ChangeBroughtBack {
+        change_id: change_id.to_string(),
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        state().await,
+        (true, true),
+        "bringing it back restores the mark"
+    );
 
     pool.close().await;
     teardown_test_db(&db_name).await;
@@ -283,6 +381,44 @@ async fn a_change_rebuilt_from_events_raises_the_proposal_again() {
         .unwrap();
     assert_eq!(recovered, 1);
     assert_eq!(proposal_and_truth(&pool, thread_id).await.0, (true, true));
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// I3 of ADR 0346, on the rebuild path: an incomplete change rebuilt from its
+/// events marks the thread incomplete again.
+#[tokio::test]
+async fn an_incomplete_change_rebuilt_from_events_marks_the_thread_again() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    let change_id = Uuid::new_v4();
+    let branch = format!("claude-code/rebuilt-stop-{thread_id}");
+    start_cc_session(&bus, thread_id, &branch, None).await;
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: propose_stopped(change_id, &branch),
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+
+    sqlx::query("DELETE FROM changes WHERE id = $1")
+        .bind(change_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    ChangesProjection::sync_thread_proposal(&pool, thread_id)
+        .await
+        .unwrap();
+    assert!(!incomplete_and_truth(&pool, thread_id).await.0);
+
+    ChangesProjection::new(pool.clone())
+        .rebuild_missing_from_events()
+        .await
+        .unwrap();
+    assert_eq!(incomplete_and_truth(&pool, thread_id).await, (true, true));
 
     pool.close().await;
     teardown_test_db(&db_name).await;

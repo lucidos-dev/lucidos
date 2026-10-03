@@ -99,7 +99,7 @@ impl LucidosEngine {
             .await;
 
         // Include available API credentials so LLM knows which services are configured
-        let credentials_context = if !classification.needs_credentials {
+        let stored_credentials_context = if !classification.needs_credentials {
             log!("[Chat] Skipping credentials context (not needed for this query)");
             String::new()
         } else {
@@ -121,6 +121,17 @@ impl LucidosEngine {
                 }
             }
         };
+        // Every turn, unlike the stored list above. A builtin provider proxy is
+        // neither a credential row nor an apis.json entry. Without this block
+        // the agent asks the user for a key the engine already holds.
+        let builtin_proxies_context = crate::api::proxy_builtin::render_builtin_proxies_block(
+            &crate::api::proxy_builtin::builtin_proxy_states(&self.clone_arc()).await,
+        );
+        let credentials_context = [stored_credentials_context, builtin_proxies_context]
+            .into_iter()
+            .filter(|section| !section.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
 
         // Add configured email accounts to context
         let email_accounts_context = match EmailStore::list(&self.pool).await {

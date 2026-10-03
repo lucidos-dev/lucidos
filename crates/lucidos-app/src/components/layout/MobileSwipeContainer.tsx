@@ -4,7 +4,6 @@ import { navigateToPane, resolveSwipePane } from '../../store/actions/pane';
 import { MOBILE_PANE_CONFIGS } from './MobileAppHeader';
 import { EdgeSwipeZones } from './EdgeSwipeZones';
 import {
-  isTextInput,
   isInteractiveTarget,
   opensSoftwareKeyboard,
   getRemPx,
@@ -432,7 +431,7 @@ export function MobileSwipeContainer() {
     const target = e.target as Element;
     frameDrag.current = null;
 
-    const textInputFocused = isTextInput(document.activeElement);
+    const textInputFocused = opensSoftwareKeyboard(document.activeElement);
     // Don't hijack touches on horizontally-scrollable children (e.g., code blocks)
     // or range sliders (knob drag is horizontal and must not trigger pane swipe).
     touchTargetScrollable.current = isHorizontallyScrollable(target) ||
@@ -525,7 +524,7 @@ export function MobileSwipeContainer() {
       }
       if (drag?.source !== e.source) {
         const following = shouldStartPaneSwipe({
-          textInputFocused: isTextInput(document.activeElement),
+          textInputFocused: opensSoftwareKeyboard(document.activeElement),
           targetScrollable: false,
           appFullscreen: appPseudoFullscreen.value || nativeFullscreenElement() !== null,
         });

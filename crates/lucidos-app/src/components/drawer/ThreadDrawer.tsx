@@ -11,6 +11,7 @@ import { threadFilterPanelOpen, setThreadFilterPaneVisible, closeThreadFilterPan
 import { ThreadFilterCover } from './ThreadFilterCover';
 import { focusPane, showThreadList } from '../../store/actions/pane';
 import { focusThread } from '../../store/actions/threads';
+import { handleArchiveAll } from '../../store/actions/archive-all';
 import { openAttentionThread } from '../../store/actions/event-navigation';
 import { loadOlderThreads, reloadAfterFilterChange, filterChangedSinceLoad, ensureThreadInMap, loadThreadEvents } from '../../store/actions/thread-loading';
 import { ThreadStatusIcon, visualStatusFor, type VisualStatus } from '../shared/ThreadStatusIcon';
@@ -107,6 +108,11 @@ export type DrawerNavNode =
           parentId: string | null;
           /** Whether the row renders a family disclosure (has sub-threads). */
           hasChildren: boolean;
+          /** Direct children hidden by default as fully-archived branches
+           *  (`hiddenDirectChildCount`). > 0 means ←/→ can also reveal/hide
+           *  this row's archived-reveal toggle, since it has no Tab stop of
+           *  its own. 0/undefined in the flat alternate views. */
+          hiddenArchivedCount?: number;
           /** The lifecycle section this row lives in, or null in the flat
            *  alternate views (drafts/attention/review/running/search), which have
            *  no collapsible sections — ←/→ are inert there. */
@@ -172,18 +178,21 @@ export function selectHighlighted() {
 /** Open the highlighted thread row's overflow (⋯) menu: the keyboard route to
  *  every per-row action. The inline row buttons are `tabindex=-1`, so the drawer
  *  stays a single tab stop. Driven by the customizable `openThreadActions`
- *  shortcut, and a no-op unless the drawer is focused and a THREAD is
- *  highlighted. Opens by clicking the trigger, located the way the highlight
- *  scroller finds rows (`[data-thread-nav]`); the menu's Overlay then owns
- *  focus and Escape. */
-export function openHighlightedThreadActions(): void {
-    if (focusedPane.value !== 'drawer') return;
+ *  shortcut. Returns false, and does nothing, unless the drawer is focused and
+ *  a drawn THREAD row is highlighted; the shortcut then opens the open thread's
+ *  menu. Opens by clicking the trigger, located the way the highlight scroller
+ *  finds rows (`[data-thread-nav]`); the menu's Overlay then owns focus and
+ *  Escape. */
+export function openHighlightedThreadActions(): boolean {
+    if (focusedPane.value !== 'drawer') return false;
     const key = highlightedKey.value;
-    if (!key || isSectionNavKey(key)) return;
+    if (!key || isSectionNavKey(key)) return false;
     const trigger = document.querySelector<HTMLElement>(
         `[data-thread-nav="${key}"] button[aria-haspopup="menu"]`,
     );
-    trigger?.click();
+    if (!trigger) return false;
+    trigger.click();
+    return true;
 }
 
 /** Collapse or expand the FOCUSED thread's own sub-thread family, the keyboard
@@ -207,6 +216,8 @@ export function toggleFocusedThreadFamily(): void {
 export interface NavCollapseState {
     sectionCollapsed: (sectionKey: string) => boolean;
     familyCollapsed: (threadId: string) => boolean;
+    /** Whether this thread's archived-reveal toggle is currently on. */
+    archivedRevealed: (threadId: string) => boolean;
 }
 
 /** What ←/→ should do to the highlighted node. Computed purely by `leftAction` /
@@ -223,14 +234,21 @@ export type NavCollapseAction =
     | { type: 'collapseFamily'; threadId: string; focusKey: string }
     /** Expand a family; highlight stays on the thread. */
     | { type: 'expandFamily'; threadId: string }
+    /** Hide a thread's revealed archived children again, staying put. The
+     *  toggle has no Tab stop of its own, so ←/→ is its only keyboard path. */
+    | { type: 'hideArchived'; threadId: string }
+    /** Reveal a thread's hidden archived children; highlight stays put. */
+    | { type: 'revealArchived'; threadId: string }
     /** Pure move (descend into a revealed child / first row); highlight → `key`. */
     | { type: 'focusKey'; key: string };
 
 /** ← (collapse / ascend), tree-style. On a section header: collapse it (no-op if
  *  already collapsed). On a thread with an expanded family: collapse that family,
- *  staying put. On a sub-thread otherwise: collapse the PARENT's family (hiding
- *  it and its siblings) and focus the parent. On a top-level thread with nothing
- *  left to collapse: collapse the whole section and focus its header. Pure. */
+ *  staying put. Next, if its archived-reveal toggle is on: turn it off, staying
+ *  put — the toggle has no Tab stop, so this is its only keyboard path. On a
+ *  sub-thread otherwise: collapse the PARENT's family (hiding it and its
+ *  siblings) and focus the parent. On a top-level thread with nothing left to
+ *  collapse: collapse the whole section and focus its header. Pure. */
 export function leftAction(node: DrawerNavNode, st: NavCollapseState): NavCollapseAction {
     if (node.kind === 'section') {
         return st.sectionCollapsed(node.sectionKey)
@@ -239,6 +257,9 @@ export function leftAction(node: DrawerNavNode, st: NavCollapseState): NavCollap
     }
     if (node.hasChildren && !st.familyCollapsed(node.id)) {
         return { type: 'collapseFamily', threadId: node.id, focusKey: node.id };
+    }
+    if (node.hiddenArchivedCount && st.archivedRevealed(node.id)) {
+        return { type: 'hideArchived', threadId: node.id };
     }
     if (node.depth > 0 && node.parentId) {
         return { type: 'collapseFamily', threadId: node.parentId, focusKey: node.parentId };
@@ -250,9 +271,11 @@ export function leftAction(node: DrawerNavNode, st: NavCollapseState): NavCollap
 }
 
 /** → (expand / descend), tree-style. On a collapsed section/family: expand it,
- *  staying put. On an expanded section: descend to its first thread. On an
- *  expanded parent thread: descend to its first child. On a leaf: nothing.
- *  Pure — `nodes`/`idx` locate the node so descend can read the row that follows. */
+ *  staying put. Next, an off archived-reveal toggle: turn it on, staying put —
+ *  checked BEFORE descending, so a row with a live family too still reaches it
+ *  by keyboard. On an expanded section: descend to its first thread. On an
+ *  expanded parent with nothing left to reveal here: descend to its first
+ *  child. Pure — `nodes`/`idx` locate the node so descend reads the next row. */
 export function rightAction(
     node: DrawerNavNode,
     nodes: readonly DrawerNavNode[],
@@ -271,12 +294,15 @@ export function rightAction(
     if (node.hasChildren && st.familyCollapsed(node.id)) {
         return { type: 'expandFamily', threadId: node.id };
     }
+    if (node.hiddenArchivedCount && !st.archivedRevealed(node.id)) {
+        return { type: 'revealArchived', threadId: node.id };
+    }
     if (node.hasChildren && !st.familyCollapsed(node.id)) {
         // The first child renders immediately after the parent, one level deeper.
         const next = nodes[idx + 1];
-        return next && next.kind === 'thread' && next.depth > node.depth
-            ? { type: 'focusKey', key: nodeKey(next) }
-            : { type: 'none' };
+        if (next && next.kind === 'thread' && next.depth > node.depth) {
+            return { type: 'focusKey', key: nodeKey(next) };
+        }
     }
     return { type: 'none' };
 }
@@ -295,6 +321,7 @@ function liveCollapseState(): NavCollapseState {
     return {
         sectionCollapsed: (sectionKey) => collapsedSections.value.has(sectionKey),
         familyCollapsed: (threadId) => collapsedFamilies.value.has(threadId),
+        archivedRevealed: (threadId) => revealedArchivedFamilies.value.has(threadId),
     };
 }
 
@@ -315,6 +342,12 @@ function applyCollapseAction(action: NavCollapseAction): boolean {
             return true;
         case 'expandFamily':
             setFamilyCollapsed(action.threadId, false);
+            return true;
+        case 'hideArchived':
+            setArchivedRevealed(action.threadId, false);
+            return true;
+        case 'revealArchived':
+            setArchivedRevealed(action.threadId, true);
             return true;
         case 'focusKey':
             setHighlight(action.key);
@@ -383,8 +416,10 @@ export function seedDrawerHighlight(): void {
 
 /** What it takes to show a thread in the full thread list. */
 export type ThreadListReveal =
-    /** Expand `section` and each of `collapsedAncestors`, then scroll to the row. */
-    | { kind: 'reveal'; section: DisplaySection; collapsedAncestors: string[] }
+    /** Expand `section`, each of `collapsedAncestors`, and reveal each of
+     *  `archivedAncestorsToReveal`'s hidden archived children, then scroll to
+     *  the row. */
+    | { kind: 'reveal'; section: DisplaySection; collapsedAncestors: string[]; archivedAncestorsToReveal: string[] }
     /** The thread filter hides the thread's family. */
     | { kind: 'hidden-by-filter' }
     /** No section lists the thread, filter or not. */
@@ -401,7 +436,30 @@ function routeInList(threadId: string, threads: ThreadState[], filter: ThreadFil
     const { decorations, familyGraph } = computeDrawerCategorization(
         threads, filter.channels, filter.triggerIds, filter.repoIds, filter.appIds,
     );
-    return { section: decorations.routedByThread.get(threadId), familyGraph };
+    return { section: decorations.routedByThread.get(threadId), familyGraph, decorations };
+}
+
+/** Walks up from `threadId` while each step is hidden, collecting that step's
+ *  PARENT id: the parents whose archived-reveal toggle has to flip on so
+ *  `filterHiddenArchived` renders the whole chain down to `threadId`. Mirrors
+ *  `collapsedAncestorIds`'s shape, for the same reason: landing on a thread
+ *  must reveal it, wherever it is hidden from. */
+function hiddenArchivedRevealChain(
+    threadId: string,
+    hidden: ReadonlySet<string>,
+    graph: FamilyGraph,
+): string[] {
+    const toReveal: string[] = [];
+    const visited = new Set<string>();
+    let current: string | null | undefined = threadId;
+    while (current && hidden.has(current) && !visited.has(current)) {
+        visited.add(current);
+        const parentId: string | null | undefined = graph.byId.get(current)?.meta.parentThreadId;
+        if (!parentId) break;
+        toReveal.push(parentId);
+        current = parentId;
+    }
+    return toReveal;
 }
 
 /** Pure: decide how to reveal `threadId` in the full list, under `filter` and
@@ -413,9 +471,14 @@ export function planThreadListReveal(
     filter: ThreadFilterSelection,
     collapsed: ReadonlySet<string>,
 ): ThreadListReveal {
-    const { section, familyGraph } = routeInList(threadId, threads, filter);
+    const { section, familyGraph, decorations } = routeInList(threadId, threads, filter);
     if (section) {
-        return { kind: 'reveal', section, collapsedAncestors: collapsedAncestorIds(threadId, collapsed, familyGraph) };
+        return {
+            kind: 'reveal',
+            section,
+            collapsedAncestors: collapsedAncestorIds(threadId, collapsed, familyGraph),
+            archivedAncestorsToReveal: hiddenArchivedRevealChain(threadId, decorations.hiddenArchivedThreads, familyGraph),
+        };
     }
     return routeInList(threadId, threads, NO_THREAD_FILTER).section
         ? { kind: 'hidden-by-filter' }
@@ -451,6 +514,7 @@ export function revealThreadInList(threadId: string): void {
         setDrawerView('all');
         setSectionCollapsed(plan.section, false);
         for (const id of plan.collapsedAncestors) setFamilyCollapsed(id, false);
+        for (const id of plan.archivedAncestorsToReveal) setArchivedRevealed(id, true);
     });
     scrollToRevealedRow(threadId);
 }
@@ -675,8 +739,8 @@ export function ThreadDrawer({ forceVisible }: { forceVisible?: boolean } = {}) 
 }
 
 
-import { attentionThreads, reviewThreads, runningThreads, composingThreads, collapsedAncestorIds, computeDrawerCategorization, depthStyle, draftThreads, hasCollapsedAncestor, nestByParent, threadHasUnsentDraft } from './family-graph';
-import type { DrawerCategorization, NestedThread } from './family-graph';
+import { attentionThreads, reviewThreads, runningThreads, composingThreads, collapsedAncestorIds, computeDrawerCategorization, depthStyle, draftThreads, filterHiddenArchived, nestByParent, renderedFamilyRows, threadHasUnsentDraft, visibleChildrenCount } from './family-graph';
+import type { DrawerCategorization, FamilyGraph, NestedThread } from './family-graph';
 export * from './family-graph';
 function ThreadList() {
     const containerRef = useRef<HTMLDivElement>(null);
@@ -719,19 +783,31 @@ function ThreadList() {
             : {
                 categorized: { current: [], saved: [], archive: [], statusMap: new Map() },
                 familyGraph: { byId: new Map(), rootByThread: new Map() },
-                decorations: { routedByThread: new Map(), liftedRoots: new Set(), archivedSubThreads: new Set() },
+                decorations: {
+                    routedByThread: new Map(), liftedRoots: new Set(), archivedSubThreads: new Set(),
+                    hiddenArchivedThreads: new Set(), hiddenDirectChildCount: new Map(),
+                },
             },
         [hydrated, threadMapValue, applied],
     );
     const { current, saved, archive, statusMap } = categorized;
 
+    // Drop fully-archived branches a live family isn't revealing (per-row "N
+    // archived" toggle). Archive's own members are never in `hiddenArchivedThreads`
+    // (a fully-archived family already routes there), so it needs no filter.
+    const revealedArchivedSet = revealedArchivedFamilies.value;
+    const visibleCurrent = filterHiddenArchived(current, decorations.hiddenArchivedThreads, revealedArchivedSet, familyGraph);
+    const visibleSaved = filterHiddenArchived(saved, decorations.hiddenArchivedThreads, revealedArchivedSet, familyGraph);
+
     // Drop descendants of collapsed families. The parent itself stays visible
     // (its disclosure chevron lets the user re-expand).
     const collapsedFamiliesSet = collapsedFamilies.value;
-    const filterCollapsed = (nested: NestedThread[]) =>
-        nested.filter(n => !hasCollapsedAncestor(n.thread.meta.id, collapsedFamiliesSet, familyGraph));
+    const familyRows = (visible: ThreadState[]) =>
+        renderedFamilyRows(visible, collapsedFamiliesSet, familyGraph, decorations);
     // `count` is the section's full thread total, before family-collapse
-    // filtering, and is the number the section's count badge shows.
+    // filtering, and is the number the section's count badge shows. Archived
+    // branches hidden by default are excluded too, same as composing/discarded
+    // threads — they aren't part of this view until revealed.
     // `threads` is the post-collapse render list. Archive is special: its badge
     // reads the server-sourced `archiveThreadCount` (see `refreshArchivedCount`)
     // so it stays stable as rows page in and never drifts on a collapse.
@@ -746,14 +822,14 @@ function ThreadList() {
     const sectionHasRunning = (threads: ThreadState[]) =>
         threads.some(t => statusMap.get(t.meta.id) === 'running');
     const sectionByName: Record<DisplaySection, { name: DisplaySection; count: number; threads: NestedThread[]; hasRunning: boolean }> = {
-        saved: { name: 'saved', count: saved.length, threads: filterCollapsed(nestByParent(saved)), hasRunning: sectionHasRunning(saved) },
+        saved: { name: 'saved', count: visibleSaved.length, threads: familyRows(visibleSaved), hasRunning: sectionHasRunning(saved) },
         current: {
             name: 'current',
-            count: composingList.length + current.length,
-            threads: [...nestByParent(composingList), ...filterCollapsed(nestByParent(current))],
+            count: composingList.length + visibleCurrent.length,
+            threads: [...nestByParent(composingList), ...familyRows(visibleCurrent)],
             hasRunning: sectionHasRunning(current),
         },
-        archive: { name: 'archive', count: archiveCount, threads: filterCollapsed(nestByParent(archive)), hasRunning: sectionHasRunning(archive) },
+        archive: { name: 'archive', count: archiveCount, threads: familyRows(archive), hasRunning: sectionHasRunning(archive) },
     };
     const sections = THREAD_DRAWER_SECTION_ORDER.map(name => sectionByName[name]);
 
@@ -786,7 +862,10 @@ function ThreadList() {
                 // depth > 0 guarantees the direct parent is rendered (nestByParent
                 // only nests under a present parent), so it's a valid focus target.
                 parentId: n.depth > 0 ? (n.thread.meta.parentThreadId ?? null) : null,
-                hasChildren: n.thread.meta.totalChildrenCount > 0,
+                // Excludes default-hidden archived children: ←/→ here drives the
+                // live sub-thread collapse, not the separate archived-reveal toggle.
+                hasChildren: visibleChildrenCount(n.thread, decorations) > 0,
+                hiddenArchivedCount: decorations.hiddenDirectChildCount.get(n.thread.meta.id) ?? 0,
                 sectionKey: s.name,
             });
         }
@@ -796,16 +875,17 @@ function ThreadList() {
     const navKey = navList
         .map(n => n.kind === 'section'
             ? sectionNavKey(n.sectionKey)
-            : `${n.id}:${n.depth}:${n.parentId ?? ''}:${n.hasChildren ? 1 : 0}`)
+            : `${n.id}:${n.depth}:${n.parentId ?? ''}:${n.hasChildren ? 1 : 0}:${n.hiddenArchivedCount ?? 0}`)
         .join(',');
     useEffect(() => { navNodes.value = navList; }, [navKey]);
 
     // Reset key: the whole applied selection, not just its channel set. A filter
     // change re-populates the list wholesale, which is not threads moving
     // between sections, so nothing should fly. Keyed on the channels alone, a
-    // repo / app / trigger sub-selection change animated the swap. The two
-    // collapsed sets mark a family or section toggle, which unrolls its rows.
-    useFlipTransitions(containerRef, portalRef, sectionDefs, applied, [collapsedFamiliesSet, collapsed]);
+    // repo / app / trigger sub-selection change animated the swap. The three
+    // sets mark a family, section or archived-reveal toggle, which unrolls
+    // its rows instead of snapping them.
+    useFlipTransitions(containerRef, portalRef, sectionDefs, applied, [collapsedFamiliesSet, collapsed, revealedArchivedSet]);
 
     // Infinite scroll, part 1: the fill loop. Keep loading until the sentinel is
     // pushed back out of view, or there is nothing more. The loop is
@@ -941,7 +1021,8 @@ function ThreadList() {
                     if (s.threads.length === 0) return null;
                     const { title, Icon } = SECTION_META[s.name];
                     return (
-                        <DrawerSection key={s.name} sectionKey={s.name} title={title} Icon={Icon} count={s.count} hasRunning={s.hasRunning}>
+                        <DrawerSection key={s.name} sectionKey={s.name} title={title} Icon={Icon} count={s.count} hasRunning={s.hasRunning}
+                            action={s.name === 'current' && s.count > 0 ? <ArchiveAllButton /> : undefined}>
                             {s.threads.map(n => {
                                 if (n.thread.meta.state === 'composing') {
                                     return <ComposingThreadRow key={n.thread.meta.id} thread={n.thread} depth={n.depth} />;
@@ -963,6 +1044,8 @@ function ThreadList() {
                                         isLiftedParent={isLiftedParent}
                                         isResponsibleChild={isResponsibleChild}
                                         isArchivedSubThread={decorations.archivedSubThreads.has(id)}
+                                        hiddenArchivedCount={decorations.hiddenDirectChildCount.get(id) ?? 0}
+                                        isArchivedRevealed={revealedArchivedSet.has(id)}
                                         enableFamilyToggle
                                     />
                                 );
@@ -1036,6 +1119,30 @@ export function setFamilyCollapsed(threadId: string, collapse: boolean) {
 
 export function toggleFamilyCollapse(threadId: string) {
     setFamilyCollapsed(threadId, !collapsedFamilies.value.has(threadId));
+}
+
+const REVEALED_ARCHIVED_KEY = 'lucidos-drawer-revealed-archived';
+
+/** Per-parent "show archived children" state, keyed by parent thread id. A
+ *  fully-archived branch renders hidden under a live parent by default
+ *  (`computeHiddenArchivedThreads`); this is the opt-in to reveal it anyway,
+ *  dimmed as before. Mirrors `collapsedFamilies`: localStorage-backed,
+ *  per-device, not event-sourced. */
+const revealedArchivedFamilies = signal(loadStringSet(REVEALED_ARCHIVED_KEY));
+
+/** Reveal/hide a thread's archived children. The single source of truth for
+ *  the per-row "N archived" toggle switch. */
+export function setArchivedRevealed(threadId: string, revealed: boolean) {
+    if (revealedArchivedFamilies.value.has(threadId) === revealed) return;
+    const next = new Set(revealedArchivedFamilies.value);
+    if (revealed) next.add(threadId);
+    else next.delete(threadId);
+    revealedArchivedFamilies.value = next;
+    saveStringSet(REVEALED_ARCHIVED_KEY, next);
+}
+
+export function toggleArchivedRevealed(threadId: string) {
+    setArchivedRevealed(threadId, !revealedArchivedFamilies.value.has(threadId));
 }
 
 /** Page in older threads until the saved list position fits, so a reload deep
@@ -1121,13 +1228,13 @@ export function sentinelInView(sentinel: { top: number; bottom: number }, root: 
     return sentinel.top < root.bottom && sentinel.bottom > root.top;
 }
 
-function DrawerSection({ sectionKey, title, Icon, count, hasRunning, children }: { sectionKey: string; title: string; Icon?: ComponentType<{ size?: string }>; count: number; hasRunning?: boolean; children: ComponentChildren }) {
+function DrawerSection({ sectionKey, title, Icon, count, hasRunning, action, children }: { sectionKey: string; title: string; Icon?: ComponentType<{ size?: string }>; count: number; hasRunning?: boolean; action?: ComponentChildren; children: ComponentChildren }) {
     const collapsed = collapsedSections.value.has(sectionKey);
     return (
         <div class="drawer-section">
             <DrawerSectionTitle
                 sectionKey={sectionKey} title={title} Icon={Icon}
-                count={count} hasRunning={hasRunning} collapsed={collapsed}
+                count={count} hasRunning={hasRunning} collapsed={collapsed} action={action}
             />
             {!collapsed && children}
         </div>
@@ -1138,7 +1245,7 @@ function DrawerSection({ sectionKey, title, Icon, count, hasRunning, children }:
  *  DrawerSection so the highlight subscription (`highlightedKey`) lives here:
  *  moving the ↑/↓ highlight among threads then re-renders only the (≤3) section
  *  headers, not each section's whole subtree. */
-function DrawerSectionTitle({ sectionKey, title, Icon, count, hasRunning, collapsed }: { sectionKey: string; title: string; Icon?: ComponentType<{ size?: string }>; count: number; hasRunning?: boolean; collapsed: boolean }) {
+function DrawerSectionTitle({ sectionKey, title, Icon, count, hasRunning, collapsed, action }: { sectionKey: string; title: string; Icon?: ComponentType<{ size?: string }>; count: number; hasRunning?: boolean; collapsed: boolean; action?: ComponentChildren }) {
     const highlighted = highlightedKey.value === sectionNavKey(sectionKey);
     return (
         <div class={`list-section-title list-section-title-collapsible${collapsed ? ' collapsed' : ''}${highlighted ? ' list-section-title-highlighted' : ''}`}
@@ -1149,7 +1256,19 @@ function DrawerSectionTitle({ sectionKey, title, Icon, count, hasRunning, collap
              aria-selected={highlighted}
              aria-expanded={!collapsed}>
             <SectionHeaderContent Icon={Icon} title={title} count={count} running={hasRunning} />
+            {action && <span class="list-section-actions drawer-section-actions">{action}</span>}
         </div>
+    );
+}
+
+/** The Current header's Archive all (ADR 0349). Its click is its own: it
+ *  never also collapses the section underneath it. */
+function ArchiveAllButton() {
+    return (
+        <button type="button" class="drawer-archive-all"
+                onClick={(e) => { e.stopPropagation(); void handleArchiveAll(); }}>
+            Archive all
+        </button>
     );
 }
 
@@ -1352,6 +1471,15 @@ interface ThreadRowContentProps {
      *  check (like `onClick`) — the closure changes per parent render but
      *  always closes over the same thread id. */
     onToggleFamily?: () => void;
+    /** Direct children of this row that are fully-archived branches hidden by
+     *  default (`hiddenDirectChildCount`). > 0 shows the "N archived" reveal
+     *  toggle; absent or 0 shows nothing, even in a collapsible context. */
+    hiddenArchivedCount?: number;
+    /** Whether this row's hidden archived children are currently revealed. */
+    isArchivedRevealed?: boolean;
+    /** Toggle `isArchivedRevealed`. Excluded from the memo equality check,
+     *  like `onToggleFamily`. */
+    onToggleArchivedRevealed?: () => void;
     onClick: () => void;
 }
 
@@ -1365,7 +1493,9 @@ export function familyDisclosureLabel(totalChildren: number, isCollapsed: boolea
 function ThreadRowContentImpl(props: Partial<ThreadRowContentProps>) {
     const sk = useSkeleton();
     const depth = props.depth ?? 0;
-    const hasFamily = !!props.collapsible && (props.totalChildren ?? 0) > 0;
+    const hasLiveFamily = !!props.collapsible && (props.totalChildren ?? 0) > 0;
+    const hasArchivedToggle = (props.hiddenArchivedCount ?? 0) > 0;
+    const hasFamily = hasLiveFamily || hasArchivedToggle;
 
     const classes = ['list-row', 'thread-row'];
     if (props.isFocused) classes.push('thread-row-focused');
@@ -1384,6 +1514,13 @@ function ThreadRowContentImpl(props: Partial<ThreadRowContentProps>) {
     const toggleFamily = (e: Event) => {
         e.stopPropagation();
         props.onToggleFamily?.();
+    };
+
+    // Fires once per toggle, on the input's own `onChange` — the click that
+    // triggers it is stopped separately, on the wrapping label (see below).
+    const toggleArchived = (e: Event) => {
+        e.stopPropagation();
+        props.onToggleArchivedRevealed?.();
     };
 
     // Every thread carries a channel tag. The guard stays so an empty label, or
@@ -1452,43 +1589,62 @@ function ThreadRowContentImpl(props: Partial<ThreadRowContentProps>) {
                             </RowActions>
                         )}
                     </span>
-                    {/* A family row carries its chips on the sub-thread line
-                        instead, leaving the date alone on this one. */}
-                    {(sk || props.createdLabel || (!hasFamily && hasChips)) && (
+                    {(props.createdLabel || hasChips) && (
                         <span class="thread-row-meta">
                             {(sk || props.createdLabel) && <SkText class="thread-row-created" w="5rem">{props.createdLabel}</SkText>}
-                            {!hasFamily && chips}
+                            {chips}
                         </span>
                     )}
                     {hasFamily && (
                         <span class="thread-row-family-line">
-                            <button
-                                type="button"
-                                class="family-disclosure"
-                                // Mouse-only: the drawer is a single tab stop, so per-row
-                                // controls leave the Tab order. Keyboard collapses/expands
-                                // the family via ←/→ on the highlighted row instead.
-                                tabIndex={-1}
-                                onClick={toggleFamily}
-                                onKeyDown={(e) => {
-                                    // The drawer container's keydown handler intercepts
-                                    // Enter at the bubble phase and preventDefaults it,
-                                    // cancelling this button's Enter→click activation.
-                                    // So Enter and Space are handled here instead.
-                                    // `preventDefault` blocks Space page-scroll and the
-                                    // native synthetic click, firing the toggle exactly
-                                    // once, and `toggleFamily`'s `stopPropagation` keeps
-                                    // the drawer handler off the keystroke.
-                                    if (e.key === 'Enter' || e.key === ' ') {
-                                        e.preventDefault();
-                                        toggleFamily(e);
-                                    }
-                                }}
-                                aria-expanded={!props.isCollapsed}>
-                                <ChevronRightIcon />
-                                {familyDisclosureLabel(props.totalChildren ?? 0, props.isCollapsed ?? false)}
-                            </button>
-                            {chips && <span class="thread-row-family-chips">{chips}</span>}
+                            {hasLiveFamily && (
+                                <button
+                                    type="button"
+                                    class="family-disclosure"
+                                    // Mouse-only: the drawer is a single tab stop, so per-row
+                                    // controls leave the Tab order. Keyboard collapses/expands
+                                    // the family via ←/→ on the highlighted row instead.
+                                    tabIndex={-1}
+                                    onClick={toggleFamily}
+                                    onKeyDown={(e) => {
+                                        // The drawer container's keydown handler intercepts
+                                        // Enter at the bubble phase and preventDefaults it,
+                                        // cancelling this button's Enter→click activation.
+                                        // So Enter and Space are handled here instead.
+                                        // `preventDefault` blocks Space page-scroll and the
+                                        // native synthetic click, firing the toggle exactly
+                                        // once, and `toggleFamily`'s `stopPropagation` keeps
+                                        // the drawer handler off the keystroke.
+                                        if (e.key === 'Enter' || e.key === ' ') {
+                                            e.preventDefault();
+                                            toggleFamily(e);
+                                        }
+                                    }}
+                                    aria-expanded={!props.isCollapsed}>
+                                    <ChevronRightIcon />
+                                    {familyDisclosureLabel(props.totalChildren ?? 0, props.isCollapsed ?? false)}
+                                </button>
+                            )}
+                            {hasArchivedToggle && (
+                                // One label around the switch and its text, so a tap on
+                                // either flips it. The label's own click bubbles, and the
+                                // browser ALSO forwards a second, separate click onto the
+                                // input, so the label only stops propagation here. The
+                                // actual flip lives in onChange below, which fires once.
+                                <label class="archived-reveal" onClick={(e) => e.stopPropagation()}>
+                                    <span class="toggle-switch archived-reveal-toggle">
+                                        <input
+                                            type="checkbox"
+                                            tabIndex={-1}
+                                            checked={props.isArchivedRevealed ?? false}
+                                            onChange={toggleArchived}
+                                            aria-label={`${props.isArchivedRevealed ? 'Hide' : 'Show'} ${props.hiddenArchivedCount} archived sub-thread${props.hiddenArchivedCount === 1 ? '' : 's'}`}
+                                        />
+                                        <span class="toggle-slider"></span>
+                                    </span>
+                                    <span class="archived-reveal-label">{props.hiddenArchivedCount} archived</span>
+                                </label>
+                            )}
                         </span>
                     )}
                 </div>
@@ -1525,15 +1681,23 @@ const ThreadRowContent = memo(ThreadRowContentImpl, (prev, next) =>
     && prev.isArchivedSubThread === next.isArchivedSubThread
     && prev.collapsible === next.collapsible
     && prev.isCollapsed === next.isCollapsed
+    && prev.hiddenArchivedCount === next.hiddenArchivedCount
+    && prev.isArchivedRevealed === next.isArchivedRevealed
 );
 
-export function ThreadRow({ threadId, status, depth = 0, isLiftedParent, isResponsibleChild, isArchivedSubThread, enableFamilyToggle, onOpen = focusThread }: {
+export function ThreadRow({ threadId, status, depth = 0, isLiftedParent, isResponsibleChild, isArchivedSubThread, hiddenArchivedCount = 0, isArchivedRevealed, enableFamilyToggle, onOpen = focusThread }: {
     threadId: string;
     status: ThreadStatus;
     depth?: number;
     isLiftedParent?: boolean;
     isResponsibleChild?: boolean;
     isArchivedSubThread?: boolean;
+    /** This thread's direct children hidden by default as fully-archived
+     *  branches (`FamilyDecorations.hiddenDirectChildCount`). Only the nested
+     *  ThreadList passes it — search / drafts render flat lists with no
+     *  family tree to hide anything from. */
+    hiddenArchivedCount?: number;
+    isArchivedRevealed?: boolean;
     /** Render the bottom-left disclosure chevron when this thread has
      *  sub-threads. Only the nested ThreadList sets it — search / drafts render
      *  flat lists where collapsing nothing visible would be a no-op. */
@@ -1559,8 +1723,11 @@ export function ThreadRow({ threadId, status, depth = 0, isLiftedParent, isRespo
     const isFocused = focusedThreadId.value === meta.id;
     const isHighlighted = highlightedKey.value === meta.id;
     const hasDraft = threadHasUnsentDraft(thread);
-    const hasFamily = !!enableFamilyToggle && meta.totalChildrenCount > 0;
-    const isCollapsed = hasFamily && collapsedFamilies.value.has(meta.id);
+    // Archiving a child never decrements totalChildrenCount. Subtract the ones
+    // hidden by default, so the chevron names only what actually renders.
+    const liveChildrenCount = meta.totalChildrenCount - hiddenArchivedCount;
+    const hasLiveFamily = !!enableFamilyToggle && liveChildrenCount > 0;
+    const isCollapsed = hasLiveFamily && collapsedFamilies.value.has(meta.id);
 
     return (
         <ThreadRowContent
@@ -1573,7 +1740,7 @@ export function ThreadRow({ threadId, status, depth = 0, isLiftedParent, isRespo
             codingAgent={meta.codingAgent}
             visualStatus={visualStatus}
             contextName={threadContextName(meta)}
-            totalChildren={meta.totalChildrenCount}
+            totalChildren={liveChildrenCount}
             needsReview={meta.section === 'inbox' && status !== 'running'}
             hasDraft={hasDraft}
             isSaved={meta.saved}
@@ -1582,9 +1749,12 @@ export function ThreadRow({ threadId, status, depth = 0, isLiftedParent, isRespo
             isLiftedParent={isLiftedParent}
             isResponsibleChild={isResponsibleChild}
             isArchivedSubThread={isArchivedSubThread}
-            collapsible={hasFamily}
+            collapsible={hasLiveFamily}
             isCollapsed={isCollapsed}
             onToggleFamily={() => toggleFamilyCollapse(meta.id)}
+            hiddenArchivedCount={enableFamilyToggle ? hiddenArchivedCount : 0}
+            isArchivedRevealed={isArchivedRevealed}
+            onToggleArchivedRevealed={() => toggleArchivedRevealed(meta.id)}
             onClick={() => onOpen(meta.id)}
         />
     );

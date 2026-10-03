@@ -29,6 +29,10 @@ describe('toastTap', () => {
     expect(toastTap({ type: 'info', action: { label: 'Update & restart', onClick: noop, variant: 'confirm' } })).toBeNull();
   });
 
+  it('keeps a lone deliberate action, such as Undo, as a button a stray tap cannot reach', () => {
+    expect(toastTap({ type: 'success', action: { label: 'Undo', onClick: noop, deliberate: true } })).toBeNull();
+  });
+
   it('never closes a passive toast, since a reader may tap it looking for more', () => {
     expect(toastTap({ type: 'info' })).toBeNull();
     expect(toastTap({ type: 'success' })).toBeNull();

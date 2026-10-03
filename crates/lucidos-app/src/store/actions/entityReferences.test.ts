@@ -779,11 +779,16 @@ describe('processSSEForReferences', () => {
     });
 
     // The preview reaches wider than the list. A `config/` or `knowhow/` write
-    // changes no artifact list, and may still be the file on screen.
+    // changes no artifact list, and may still be the file on screen. The agent's
+    // file tools announce these too, which is how an agent edit reaches it.
     it('offers the preview every data path, artifacts or not', () => {
       artifacts.value = { status: 'loaded', data: [] };
       processSSEForReferences('DataFileWritten', { path: 'config/apis.json' });
+      processSSEForReferences('DataFileEdited', { path: 'knowhow/ops/deploy.md', operations_count: 1 });
+      processSSEForReferences('DataFileDeleted', { path: 'apps/demo/old.html' });
       expect(invalidateFilePreview).toHaveBeenCalledWith('config/apis.json');
+      expect(invalidateFilePreview).toHaveBeenCalledWith('knowhow/ops/deploy.md');
+      expect(invalidateFilePreview).toHaveBeenCalledWith('apps/demo/old.html');
     });
   });
 

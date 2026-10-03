@@ -1,4 +1,5 @@
 import { API, json, mutatingFetchIdempotent, throwIfNotOk } from './_core';
+import { postWithUploadProgress, type UploadObserver } from './uploadProgress';
 import type { ComposeSelectionOverride } from '../../store/composeSelections';
 
 // --- Compose state machine (threads-as-drafts) ---
@@ -12,15 +13,21 @@ import type { ComposeSelectionOverride } from '../../store/composeSelections';
  *  `{id, mode}` (POST /threads returns 200). 409 propagates — a different
  *  mode (Composing) or wrong state (Active/Archived) is a real conflict the
  *  caller must surface; swallowing it would silently overwrite the user's
- *  mode toggle when two devices race the first keystroke. */
+ *  mode toggle when two devices race the first keystroke.
+ *
+ *  Bounded by `THREAD_START_TIMEOUT_MS`, so an engine that never answers turns
+ *  into a transient failure the caller can retry, not a wait with no end. */
 export async function ensureThreadStarted(id: string, mode: string): Promise<void> {
   const res = await mutatingFetchIdempotent(`${API}/threads`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ id, mode }),
+    signal: AbortSignal.timeout(THREAD_START_TIMEOUT_MS),
   });
   await throwIfNotOk(res);
 }
+
+export const THREAD_START_TIMEOUT_MS = 15_000;
 
 /** What the engine did with a compose write.
  *
@@ -89,19 +96,19 @@ export interface BlobUploadResponse {
 
 /** Upload an image and get its content-addressed sha256 hash. Idempotent
  *  on the bytes (same upload twice = same hash, no extra disk write), so
- *  retries are safe. */
+ *  retries are safe. The caller owns the retry: this makes one attempt, under
+ *  the stall and response deadlines in `postWithUploadProgress`. */
 export async function uploadThreadBlob(
   threadId: string,
   file: File,
+  observer?: UploadObserver,
 ): Promise<BlobUploadResponse> {
   const form = new FormData();
   form.append('file', file);
-  const res = await mutatingFetchIdempotent(
+  const res = await postWithUploadProgress(
     `${API}/threads/${encodeURIComponent(threadId)}/blobs`,
-    {
-      method: 'POST',
-      body: form,
-    },
+    form,
+    observer,
   );
   await throwIfNotOk(res);
   return (await res.json()) as BlobUploadResponse;

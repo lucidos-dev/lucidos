@@ -82,6 +82,7 @@ function summary(overrides: Partial<ThreadSummary>): ThreadSummary {
     coding_agent_has_diff: false,
     coding_agent_proposed: false,
     coding_agent_requires_restart: false,
+    coding_agent_incomplete: false,
     coding_agent_is_external_repo: false,
     last_revived_at: null,
     state: 'active',

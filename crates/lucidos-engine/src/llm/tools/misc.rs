@@ -264,7 +264,7 @@ pub(super) fn request_credential_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: tn::REQUEST_CREDENTIAL.to_string(),
-            description: "Request an API credential through a secure modal, keeping the secret out of the conversation and the event log. ONE at a time: wait for each to resolve before requesting the next.".to_string(),
+            description: "Request an API credential through a secure modal, keeping the secret out of the conversation and the event log. ONE at a time: wait for each to resolve before requesting the next. Refused when a configured builtin provider proxy holds its key (e.g. 'openai', 'gpt'): call proxy_request instead. A non-token auth_type, or a host outside the proxy's base, proceeds.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": with_oauth_endpoints(json!({

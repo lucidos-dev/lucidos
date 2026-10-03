@@ -1,5 +1,5 @@
 import { connectionStatus, databaseReachable, dismissToast, removeToast, showToast, workspaceName, workspacePath, engineStartedAt, lucidosRelease, lucidosReleaseDirty, engineVersion, latestEngineVersion, latestTauriAppVersion, enginePackaged, llmConfigured, configuredProviders, updateAvailable, focusedThreadId, threadMap, engineRestarting, threadsLoaded, threadListFetched, restartRequired, engineVersionReady, TOAST_AUTO_DISMISS_MS, THREAD_EVENTS_FETCH_CONCURRENCY } from '../store';
-import { checkHealth, API_BASE } from '../../api/client';
+import { checkHealth } from '../../api/client';
 import type { HealthInfo } from '../../api/client';
 import { connectThreadEvents, disconnectThreadEvents } from './thread-sync';
 import { loadAllThreads, loadThreadEvents, refreshThreadEvents, clearThreadFetchGuards, markLoadedThreadsStale } from './thread-loading';
@@ -17,17 +17,6 @@ import { isNewerVersion } from '../../utils/version';
 import { syncClientUpdateFromBuild } from './client-update';
 import { gatewayPickerHref } from '../../utils/basePath';
 import { postClientLog } from '../../utils/clientLog';
-
-/** User-facing copy when `submitChat` couldn't reach the engine — laptop
- *  woke up to a stale connection, the engine is genuinely down, etc.
- *  Avoid claiming the engine is "disconnected": the engine is local to the
- *  user's machine and almost never down. The browser tab's stream to it is
- *  what broke — naming it that way + telling the user the recovery action
- *  is more honest than blaming the engine. */
-export function getUnreachableEngineMsg(): string {
-  const target = API_BASE || window.location.origin;
-  return `Could not reach engine at ${target} — check your connection and reload`;
-}
 
 /** True once we've been connected at least once (distinguishes initial connect from reconnect). */
 let hasEverConnected = false;

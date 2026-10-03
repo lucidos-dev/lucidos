@@ -18,6 +18,16 @@ export function ReloadIcon() {
   );
 }
 
+/** One arrow turning back on itself: try the same thing again. */
+export function RetryIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M3 12a9 9 0 1 0 3-6.7" />
+      <path d="M3 4v5h5" />
+    </svg>
+  );
+}
+
 // Hourglass: work that is waiting its turn rather than running, the still
 // counterpart of the spinning ReloadIcon on the brand badge. The glass has
 // straight walls under each cap, so at badge size it cannot read as an "X".

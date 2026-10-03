@@ -29,7 +29,7 @@ function ruleBody(source: string, selector: string): string {
 describe('both top reserves carry the anchor rest', () => {
   it('desktop: the .thread-content padding adds it on top', () => {
     const body = ruleBody(css('chat/input-messages.css'), '.thread-content');
-    expect(body).toMatch(/padding:\s*calc\([^;]*var\(--anchor-subpixel, 0px\)\)\s+var\(--thread-pane-gutter\)/);
+    expect(body).toMatch(/padding:\s*(calc\([^;]*)?var\(--anchor-subpixel, 0px\)\)?\s+var\(--thread-pane-gutter\)/);
   });
 
   it('mobile: the header spacer adds it to its height', () => {

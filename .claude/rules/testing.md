@@ -114,18 +114,20 @@ game where the daemon is not.
 
 Rust is the source of truth. TS is generated, so never hand-edit `src/generated/`.
 
-Regenerate all three:
+Regenerate the contract files (the full writer list is in the `run-tests` skill):
 
 ```bash
 cargo test -p lucidos-engine generate_typescript_file -- --ignored
 cargo test -p lucidos-engine generate_cross_validation_fixture_file -- --ignored
 cargo test -p lucidos-engine generate_thread_event_wire_file -- --ignored
+cargo test -p lucidos-engine --lib generate_title_match_fixture_file -- --ignored
 ```
 
 Staleness checks run as part of `cargo test`.
 
 **When to update:** changes to `available_thread_actions()`, `display_section()`,
-the `ThreadEvent` enum, or any payload type it reaches.
+the `ThreadEvent` enum, or any payload type it reaches, and to
+`engine/title_match.rs`.
 
 ### ThreadEvent payload types (generated, ADR 0166)
 

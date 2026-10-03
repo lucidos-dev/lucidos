@@ -1,9 +1,29 @@
-/** In-flight image uploads, scoped per-thread. Stays out of the persisted
- *  draft so a refresh never broadcasts a half-uploaded blob. */
+/** In-flight image uploads, scoped per-thread. Stays out of the engine's
+ *  draft, so other devices never see a half-uploaded image. The pipeline that
+ *  moves an entry between states is `store/actions/imageUploads.ts`. Each
+ *  entry's bytes are also kept on this device, so a reload can bring it back
+ *  (`store/pendingUploadRecords.ts`). */
 
 import { signal } from '@preact/signals';
 
 import { safeRevokeObjectUrl } from '../utils/objectUrl';
+
+/** Where one attached image is on its way to the engine. Every state but
+ *  `failed` is still in flight. The composer draws each one differently, so
+ *  an upload is never a chip that merely looks finished. */
+export type PendingUploadState =
+  /** The draft's `POST /threads` has not settled, so there is nowhere to upload to yet. */
+  | { kind: 'waiting-for-thread' }
+  | { kind: 'uploading'; sentBytes: number; totalBytes: number }
+  /** The browser took the whole body and the engine has not answered yet. The
+   *  bytes may still be in transit (`UploadObserver.onBodySent`). */
+  | { kind: 'finishing' }
+  /** A transient failure, backing off before attempt `attempt`. */
+  | { kind: 'retrying'; attempt: number; reason: string }
+  /** A transient failure while the engine connection is down. Resumes on reconnect. */
+  | { kind: 'offline'; reason: string }
+  /** Terminal. `retryable` is false for a verdict no retry can change. */
+  | { kind: 'failed'; reason: string; retryable: boolean };
 
 export interface PendingUpload {
   localId: string;
@@ -11,9 +31,8 @@ export interface PendingUpload {
   /** Caller MUST `URL.revokeObjectURL` once the entry is removed. */
   previewUrl: string;
   mime: string;
-  status: 'uploading' | 'failed';
-  error?: string;
-  /** Held so the retry path can re-upload without re-prompting. */
+  state: PendingUploadState;
+  /** Held so a retry can re-upload without re-prompting. */
   file: File;
 }
 
@@ -26,6 +45,10 @@ export function getPendingUploads(threadId: string | null | undefined): PendingU
   return pendingUploads.value.get(threadId) ?? EMPTY;
 }
 
+export function getPendingUpload(threadId: string, localId: string): PendingUpload | undefined {
+  return pendingUploads.value.get(threadId)?.find((u) => u.localId === localId);
+}
+
 export function addPendingUpload(entry: PendingUpload): void {
   const map = new Map(pendingUploads.value);
   const list = map.get(entry.threadId) ?? [];
@@ -33,17 +56,17 @@ export function addPendingUpload(entry: PendingUpload): void {
   pendingUploads.value = map;
 }
 
-export function patchPendingUpload(
+export function setPendingUploadState(
   threadId: string,
   localId: string,
-  patch: Partial<PendingUpload>,
+  state: PendingUploadState,
 ): void {
   const list = pendingUploads.value.get(threadId);
   if (!list) return;
   const idx = list.findIndex((u) => u.localId === localId);
   if (idx === -1) return;
   const next = [...list];
-  next[idx] = { ...next[idx], ...patch };
+  next[idx] = { ...next[idx], state };
   const map = new Map(pendingUploads.value);
   map.set(threadId, next);
   pendingUploads.value = map;
@@ -76,12 +99,23 @@ function writeWithoutEntry(threadId: string, localId: string, list: PendingUploa
   pendingUploads.value = map;
 }
 
-/** Send button reads this to disable while a hash isn't in the draft yet. */
+/** What a thread's pending uploads mean for a send:
+ *  - `clear`: nothing pending, every attached image is a confirmed hash;
+ *  - `in-flight`: wait, the hashes are on their way;
+ *  - `failed`: an image did not make it, and sending now would leave it out.
+ *  `failed` wins over `in-flight`: the user has to act on it either way. */
+export type UploadsGate = 'clear' | 'in-flight' | 'failed';
+
+export function uploadsGate(threadId: string | null | undefined): UploadsGate {
+  const list = getPendingUploads(threadId);
+  if (list.some((u) => u.state.kind === 'failed')) return 'failed';
+  return list.length > 0 ? 'in-flight' : 'clear';
+}
+
+/** True while any image on this thread is still on its way. A failed one is
+ *  not: it becomes a hash only if the user retries it. */
 export function hasInFlightUploads(threadId: string | null | undefined): boolean {
-  if (!threadId) return false;
-  const list = pendingUploads.value.get(threadId);
-  if (!list) return false;
-  return list.some((u) => u.status === 'uploading');
+  return getPendingUploads(threadId).some((u) => u.state.kind !== 'failed');
 }
 
 /** True when an entry for `localId` is still present on `threadId`. Used by
@@ -89,7 +123,7 @@ export function hasInFlightUploads(threadId: string | null | undefined): boolean
  *  the X removes the pending entry, so a returning POST whose entry vanished
  *  must not commit the resulting hash to the draft. */
 export function hasPendingUpload(threadId: string, localId: string): boolean {
-  return pendingUploads.value.get(threadId)?.some((u) => u.localId === localId) ?? false;
+  return getPendingUpload(threadId, localId) !== undefined;
 }
 
 export function _resetPendingUploadsForTesting(): void {

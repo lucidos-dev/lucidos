@@ -270,15 +270,26 @@ fn decision_to_ask(decision: &OpenDecision, holds_the_answer_tool: bool) -> Stri
             "[PERMISSION] Lucidos needs the caller's say-so before it can carry on."
         }
     };
+    const HAND_ITS_ID_BACK: &str = "They answer by saying which one they want, \
+                                    and you hand its id back. Never say an id out \
+                                    loud.";
     let how = match (holds_the_answer_tool, decision.kind) {
-        (true, _) => {
-            "They answer by saying which one they want, and you hand its id back. \
-             Never say an id out loud."
+        (true, DecisionKind::Question) => HAND_ITS_ID_BACK.to_string(),
+        // Exhaustive, so a new permission lane cannot skip the consent rule.
+        (true, DecisionKind::CommandPermission)
+        | (true, DecisionKind::McpPermission)
+        | (true, DecisionKind::CodingAgentPermission) => {
+            format!(
+                "{} {}",
+                HAND_ITS_ID_BACK,
+                super::PERMISSION_NEEDS_THEIR_WORDS
+            )
         }
         (false, DecisionKind::Question) => {
             "They answer by saying which one they want, in their own words. Hand \
              what they said over, which is what settles this. Never say an id out \
              loud."
+                .to_string()
         }
         // Exhaustive on this side too, like the opening above it. A fifth kind
         // has to say whether a tool-less talker can settle it, rather than
@@ -288,6 +299,7 @@ fn decision_to_ask(decision: &OpenDecision, holds_the_answer_tool: bool) -> Stri
         | (false, DecisionKind::CodingAgentPermission) => {
             "This one they settle on their screen rather than out loud. Tell them \
              the card is there. Never say an id out loud."
+                .to_string()
         }
     };
     // The prompt itself is NEVER cut, unlike everything else the talker reads.
@@ -295,10 +307,10 @@ fn decision_to_ask(decision: &OpenDecision, holds_the_answer_tool: bool) -> Stri
     // state it as the one being asked.
     format!(
         "{} Put this to them out loud, in your own words, and read them the \
-         choices. {}\n\n{}\n\n{}",
+         choices. {}\n\n{}\n{}",
         opening,
         how,
-        decision.prompt,
+        super::fenced_card_text(&decision.prompt),
         super::choices_for(&decision.choices),
     )
 }

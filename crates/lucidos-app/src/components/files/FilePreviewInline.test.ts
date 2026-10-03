@@ -1,12 +1,20 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
 // @ts-expect-error: same
 import { fileURLToPath } from 'node:url';
 // @ts-expect-error: same
 import { dirname, resolve } from 'node:path';
-import { basename, previewUrl, sourceLinesFor, EditorToolbar, editorToolbarState } from './FilePreviewInline';
+
+vi.mock('../../api/client', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../api/client')>();
+  return { ...actual, saveDataFile: vi.fn() };
+});
+
+import { basename, previewUrl, sourceLinesFor, EditorToolbar, editorToolbarState, toggleDataFileCheckbox } from './FilePreviewInline';
 import { vnodeToText } from '../chat/__tests__/vnodeToText';
+import { saveDataFile } from '../../api/client';
+import { toasts, removeToast } from '../../store/store';
 
 const here: string = dirname(fileURLToPath(import.meta.url));
 
@@ -233,5 +241,98 @@ describe('FileEditor shows the saving state only when it is worth showing', () =
     const textarea = /<textarea[\s\S]*?\/>/.exec(source)?.[0] ?? '';
     expect(textarea, 'no textarea found in FilePreviewInline.tsx').toContain('file-editor-textarea');
     expect(textarea).not.toContain('disabled');
+  });
+});
+
+// The checkbox click's save path: re-read, toggle, write, toast. The
+// returned text lets the caller adopt the saved content right away. That
+// is the fix for the checkbox blink: the write's own later file-change
+// refresh then finds nothing new to show. The toast key stops a burst of
+// clicks piling up a wall of "Saved" cards.
+describe('toggleDataFileCheckbox', () => {
+  const PATH = 'artifacts/plan.md';
+  const URL = '/data/artifacts/plan.md';
+  const TOAST_KEY = `task-toggle:${PATH}`;
+  const mockSave = vi.mocked(saveDataFile);
+
+  function stubFetch(body: string) {
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve({ ok: true, text: () => Promise.resolve(body) })));
+  }
+
+  beforeEach(() => {
+    mockSave.mockReset();
+    mockSave.mockResolvedValue({ success: true, path: PATH });
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    removeToast(TOAST_KEY);
+  });
+
+  it('writes the toggled text and returns it, so the caller can adopt it', async () => {
+    stubFetch('- [ ] One\n');
+    const result = await toggleDataFileCheckbox(PATH, URL, 0, 1);
+    expect(result).toEqual({ content: '- [x] One\n', isLatest: true });
+    expect(mockSave).toHaveBeenCalledExactlyOnceWith(PATH, '- [x] One\n');
+  });
+
+  it('toasts a short Saved success message under the file\'s key', async () => {
+    stubFetch('- [ ] One\n');
+    await toggleDataFileCheckbox(PATH, URL, 0, 1);
+    const toast = toasts.value.find((t) => t.key === TOAST_KEY);
+    expect(toast?.message).toBe('Saved');
+    expect(toast?.type).toBe('success');
+  });
+
+  it('refuses and toasts an error when the file changed under the click', async () => {
+    stubFetch('- [ ] One\n- [ ] Two\n'); // one more task item than expected
+    const result = await toggleDataFileCheckbox(PATH, URL, 0, 1);
+    expect(result).toBeNull();
+    expect(mockSave).not.toHaveBeenCalled();
+    expect(toasts.value.find((t) => t.key === TOAST_KEY)?.type).toBe('error');
+  });
+
+  it('toasts an error and returns null when the write itself fails', async () => {
+    stubFetch('- [ ] One\n');
+    mockSave.mockRejectedValue(new Error('disk full'));
+    const result = await toggleDataFileCheckbox(PATH, URL, 0, 1);
+    expect(result).toBeNull();
+    expect(toasts.value.find((t) => t.key === TOAST_KEY)?.type).toBe('error');
+  });
+
+  it('collapses a second toggle on the same file into the same toast', async () => {
+    stubFetch('- [ ] One\n- [ ] Two\n');
+    await toggleDataFileCheckbox(PATH, URL, 0, 2);
+    stubFetch('- [x] One\n- [ ] Two\n');
+    await toggleDataFileCheckbox(PATH, URL, 1, 2);
+    const matching = toasts.value.filter((t) => t.key === TOAST_KEY);
+    expect(matching).toHaveLength(1);
+    expect(matching[0].message).toBe('Saved');
+  });
+
+  // Two different checkboxes in the same file, toggled close enough together
+  // to overlap, must not race each other's read-modify-write. A disk stub
+  // that saveDataFile actually mutates: an unserialized pair would both read
+  // the pre-toggle text and the second save would discard the first toggle.
+  //
+  // `isLatest` also pins a second-order bug a code review found: only the
+  // toggle with nothing queued behind it may adopt its own text, or an
+  // earlier one would replace the whole subtree mid-save.
+  it('serializes two toggles on the same file so neither discards the other', async () => {
+    let disk = '- [ ] One\n- [ ] Two\n';
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve({ ok: true, text: () => Promise.resolve(disk) })));
+    mockSave.mockImplementation(async (_path: string, content: string) => {
+      disk = content;
+      return { success: true, path: PATH };
+    });
+
+    const [resultA, resultB] = await Promise.all([
+      toggleDataFileCheckbox(PATH, URL, 0, 2),
+      toggleDataFileCheckbox(PATH, URL, 1, 2),
+    ]);
+
+    expect(resultA).toEqual({ content: '- [x] One\n- [ ] Two\n', isLatest: false });
+    expect(resultB).toEqual({ content: '- [x] One\n- [x] Two\n', isLatest: true });
+    expect(disk).toBe('- [x] One\n- [x] Two\n');
   });
 });

@@ -1,12 +1,11 @@
 //! PreToolUse hook for Claude Code's `Bash` tool — blocks the kill patterns
 //! that have caught the engine's CC subprocesses by accident.
 //!
-//! Background: every CC subprocess is spawned with `--append-system-prompt
-//! <huge string>`, and that string contains the words `cargo`, `rustc`, etc.
-//! So a CC session running `ps aux | grep -E "rustc|cargo" | xargs kill` to
-//! clean up a stuck cargo build also matches every other CC subprocess's
-//! argv — SIGTERM cascades and every concurrent CC dies. This hook refuses
-//! the obvious patterns at the source.
+//! Background: a CC subprocess's argv names tools like `cargo` and `rustc`
+//! (its `--allowedTools` list, for one). So a CC session running
+//! `ps aux | grep -E "rustc|cargo" | xargs kill` to clean up a stuck cargo
+//! build also matches other CC subprocesses. SIGTERM cascades and every
+//! concurrent CC dies. This hook refuses the obvious patterns at the source.
 //!
 //! Wired into `<workspace>/.lucidos/cc-settings.json` via the engine's
 //! `cc_settings.rs`. Fails OPEN on parse / I/O errors so a hook bug can't
@@ -26,9 +25,9 @@ pub(crate) enum GuardDecision {
 
 const MSG_PS_XARGS_KILL: &str =
     "Refusing `ps`/`pgrep` piped to `xargs … kill`. Argv-based PID extraction \
-     is unsafe inside CC: every claude subprocess has the words `cargo`, \
-     `rustc`, etc. embedded in its `--append-system-prompt`, so a `ps | grep \
-     cargo` match catches every running claude and SIGTERMs it. Use `pkill -x \
+     is unsafe inside CC: a claude subprocess's arguments can name `cargo`, \
+     `rustc`, etc., so a `ps | grep cargo` match catches every running claude \
+     and SIGTERMs it. Use `pkill -x \
      <name>` (exact process-name match, no `-f`) or capture the PID at launch \
      (`cargo build & PID=$!; kill $PID`).";
 
@@ -205,7 +204,7 @@ mod tests {
     fn blocks_the_2026_05_10_incident_command() {
         // The exact command from the post-mortem (thread 8548dbd2, 09:35:44 local).
         // It killed every concurrent CC because `ps … | grep cargo` matches every
-        // claude subprocess's argv (the system prompt mentions `cargo` 3 times).
+        // claude subprocess's argv (its system prompt, then on argv, named `cargo`).
         let cmd = r#"ps aux | grep -E "rustc|cargo" | grep -v grep | awk '{print $2}' | xargs -r kill 2>&1 | head -5; sleep 2; ps aux | grep -E "rustc.*chromiumoxide" | grep -v grep | wc -l"#;
         assert_blocked(cmd);
     }

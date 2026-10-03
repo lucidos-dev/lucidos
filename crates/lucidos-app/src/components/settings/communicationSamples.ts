@@ -12,7 +12,7 @@ import type { ProgressDialogState } from '../../store/types';
 import type { AppUpdateRunning } from '../../utils/tauri';
 import type { DropdownOption } from '../shared/Dropdown';
 import type { WebhookIngressOutage, WebhookRefusal } from '../../api/client';
-import type { EventConditionModalState } from '../../store/store';
+import type { EventCondition } from '../../store/store';
 import type { SlownessEpisode } from '../../store/actions/slowness';
 
 /** Everything the communication-surface gallery fires, kept out of the page so
@@ -209,7 +209,7 @@ export const SAMPLE_WEBHOOK_VERIFICATION_REFUSAL: WebhookRefusal = {
 // --- Popovers ---
 
 /** The condition the waiting panel drills into. */
-export const SAMPLE_CONDITION: EventConditionModalState = {
+export const SAMPLE_CONDITION: EventCondition = {
   eventType: 'PullRequestReviewed',
   conditions: [{ repo: 'example-org/example-repo', pr: 412 }],
 };

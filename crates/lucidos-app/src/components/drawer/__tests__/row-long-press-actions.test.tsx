@@ -56,6 +56,7 @@ function makeThread(id: string): ThreadState {
     codingAgentHasDiff: false,
     codingAgentProposed: false,
     codingAgentRequiresRestart: false,
+    codingAgentIncomplete: false,
     codingAgentIsExternalRepo: false,
     lastRevivedAt: '',
     state: 'active',

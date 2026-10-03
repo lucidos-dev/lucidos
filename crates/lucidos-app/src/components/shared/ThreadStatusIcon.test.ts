@@ -28,6 +28,15 @@ describe('visualStatusFor', () => {
       .toBe('changes');
   });
 
+  // A Stop proposed what the turn left. It is not ready, so no changes dot,
+  // and the thread reads by its turn alone (ADR 0346).
+  it('draws no changes dot for an incomplete change', () => {
+    expect(visualStatusFor('idle', { ...idle, codingAgentProposed: true, codingAgentIncomplete: true }))
+      .toBe('idle');
+    expect(visualStatusFor('idle', { ...idle, activeChildrenCount: 1, codingAgentProposed: true, codingAgentIncomplete: true }))
+      .toBe('waiting');
+  });
+
   it('reads an absent count as zero', () => {
     const beforeTheField = {
       activeChildrenCount: 0,

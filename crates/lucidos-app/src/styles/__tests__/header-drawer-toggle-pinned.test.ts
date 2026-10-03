@@ -23,7 +23,7 @@ import { dirname, resolve } from 'node:path';
 // @ts-expect-error: same
 import { fileURLToPath } from 'node:url';
 
-import { cssRules, rulesTargeting, selectorList, type CssRule } from './css-rule-helpers';
+import { cssRules, focusRingWidthRem, rulesTargeting, selectorList, type CssRule } from './css-rule-helpers';
 
 const here: string = dirname(fileURLToPath(import.meta.url));
 const stylesDir: string = resolve(here, '..');
@@ -169,10 +169,8 @@ describe('a Conversation-pane collapse shrinks it away', () => {
     // has nothing to drop.
     const clip = desktopRule('.thread-toggle-slot').props.get('clip-path') ?? '';
     const slack = -parseFloat(/^inset\((-[\d.]+)rem\)$/.exec(clip)?.[1] ?? 'NaN');
-    // The header's own ring band, read where the header recolours it.
-    const ring = shellRules.find(r => selectorList(r.selector).includes('.app-header .icon-btn:focus-visible'));
-    const band = parseFloat(/0 0 0 ([\d.]+)rem/.exec(ring?.props.get('--focus-ring') ?? '')?.[1] ?? 'NaN');
-    expect(band, 'the header focus ring is no longer a rem band').toBeGreaterThan(0);
+    // The ring's band; focus-ring-width.test.ts holds the header's to it.
+    const band = focusRingWidthRem(styles('global/base.css'));
     expect(slack, `clip ${clip} cuts the ${band}rem focus ring`).toBeGreaterThanOrEqual(band);
     for (const rule of rulesTargeting(shellCss, 'thread-toggle-slot')) {
       expect(rule.props.get('overflow'), `${rule.selector} { overflow }`).toBeUndefined();

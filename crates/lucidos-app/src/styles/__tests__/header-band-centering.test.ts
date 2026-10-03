@@ -21,7 +21,7 @@ import { dirname, resolve } from 'node:path';
 // @ts-expect-error: same
 import { fileURLToPath } from 'node:url';
 
-import { block, cssRules, decl, rulesTargeting, selectorList, type CssRule } from './css-rule-helpers';
+import { block, cssRules, decl, focusRingWidthRem, rulesTargeting, selectorList, type CssRule } from './css-rule-helpers';
 
 const here: string = dirname(fileURLToPath(import.meta.url));
 const stylesDir: string = resolve(here, '..');
@@ -411,8 +411,7 @@ describe('the threads header clips sideways only, on both builds', () => {
     const clip = desktopRule('.threads-header').props.get('clip-path') ?? '';
     const [, top, right, bottom] = /^inset\((-?[\d.]+(?:rem)?) (-?[\d.]+(?:rem)?) (-?[\d.]+(?:rem)?) /
       .exec(clip) ?? [];
-    const ring = shellRules.find(r => selectorList(r.selector).includes('.app-header .icon-btn:focus-visible'));
-    const band = parseFloat(/0 0 0 ([\d.]+)rem/.exec(ring?.props.get('--focus-ring') ?? '')?.[1] ?? 'NaN');
+    const band = focusRingWidthRem(styles('global/base.css'));
     for (const edge of [top, bottom]) {
       expect(-parseFloat(edge), `clip ${clip} cuts the ${band}rem focus ring`).toBeGreaterThanOrEqual(band);
     }

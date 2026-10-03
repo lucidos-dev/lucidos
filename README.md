@@ -259,7 +259,7 @@ This starts one shared PostgreSQL Docker container, builds/runs the Rust engine 
 
 ### Ports
 
-The first workspace lands on `5173` for direct engine access. Each additional workspace gets the next engine-port offset (`5174`, `5175`, …), stored in `~/.lucidos/port-registry` so the same workspace gets the same engine port every run. The shared dev gateway listens on `5251` by default (`LUCIDOS_DEV_GATEWAY_PORT` overrides it) and serves workspaces at `http(s)://localhost:5251/<slug>/`, using `5251` (not the packaged app's `5252`) so a dev gateway and an installed `Lucidos.app` coexist out of the box. PostgreSQL uses one shared Docker container (`lucidos-pg-shared`) with one database per workspace; the chosen PG port is written to `<workspace>/.lucidos/ports`.
+The first workspace lands on `5173` for direct engine access: plain `http://`, loopback only, so it answers only on this machine (ADR 0096). Each additional workspace gets the next engine-port offset (`5174`, `5175`, …), stored in `~/.lucidos/port-registry` so the same workspace gets the same engine port every run. The shared dev gateway serves workspaces at `http(s)://localhost:5251/<slug>/`, and `LUCIDOS_DEV_GATEWAY_PORT` overrides the port. Dev uses `5251` rather than the packaged app's `5252`, so a dev gateway and an installed `Lucidos.app` coexist. PostgreSQL uses one shared Docker container (`lucidos-pg-shared`) with one database per workspace; the chosen PG port is written to `<workspace>/.lucidos/ports`.
 
 If the target port is already taken by something else (e.g. another Vite app on `5173`), Lucidos walks forward to the next free offset and persists the new assignment. It does **not** kill the squatter. To pin a specific port:
 
@@ -292,7 +292,7 @@ Env var beats `lucidos.toml`. Both still collision-walk forward if the chosen ba
 
 ## HTTPS for Local Development
 
-Lucidos uses [mkcert](https://github.com/FiloSottile/mkcert) to generate locally-trusted TLS certificates. When certs are present in `.certs/`, Vite automatically serves over HTTPS.
+Lucidos uses [mkcert](https://github.com/FiloSottile/mkcert) to generate locally-trusted TLS certificates. When certs are present in `.certs/`, the dev gateway serves HTTPS at `https://localhost:5251/<slug>/`, and so does a manual `vite serve`. The engine behind the gateway stays plain HTTP on loopback, because the gateway terminates TLS.
 
 ### Install mkcert and generate certs
 

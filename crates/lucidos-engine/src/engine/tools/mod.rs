@@ -28,6 +28,7 @@ mod repositories;
 pub(crate) mod scheduler;
 pub(crate) mod search;
 pub(crate) mod todo;
+mod unsent;
 mod web;
 
 pub(crate) use capabilities::TurnCapabilities;
@@ -300,8 +301,12 @@ impl LucidosEngine {
             tn::LIST_THREADS => self.execute_list_threads(args, thread_id).await,
             tn::COUNT_THREADS => self.execute_count_threads(args, thread_id).await,
             tn::SEARCH_THREADS => to_outcome(self.execute_search_threads(args).await),
+            tn::LIST_DRAFTS => self.execute_list_drafts(args).await,
+            tn::LIST_HELD_MESSAGES => self.execute_list_held_messages(args).await,
             tn::DETACH_CHILD_THREAD => self.execute_detach_child_thread(args, thread_id).await,
             tn::ARCHIVE_THREAD => self.execute_archive_thread(args, thread_id).await,
+            tn::TRIAGE_THREADS => self.execute_triage_threads(thread_id).await,
+            tn::APPLY_THREAD_TRIAGE => self.execute_apply_thread_triage(args, thread_id).await,
             tn::LIST_CHANGES => self.execute_list_changes(args, thread_id).await,
             tn::APPLY_CHANGE => self.execute_apply_change(args, thread_id).await,
             tn::APPLY_WHEN_SETTLED => self.execute_apply_when_settled(args, thread_id).await,
@@ -465,9 +470,6 @@ impl LucidosEngine {
         crate::scheduler::notifications::resolve_thread_tap_id(&mut tap, None)?;
 
         let notification_id = uuid::Uuid::new_v4();
-        // `tap` is non-Copy (it owns the `NavigateUi.to` strings) so we keep
-        // one copy for the emit and another for the spawned push fan-out.
-        let tap_for_push = tap.clone();
         self.event_bus
             .emit(crate::engine::event_bus::BusEvent::System(
                 crate::engine::event_bus::SystemEvent::NotificationCreated {
@@ -478,34 +480,23 @@ impl LucidosEngine {
                     app_id: app_id.map(str::to_string),
                     thread_id: link_thread_id.map(|t| t.to_string()),
                     event_id: link_event_id.map(|e| e.to_string()),
-                    tap,
+                    tap: tap.clone(),
                     actor,
                 },
             ))
             .await
             .map_err(|e| format!("failed to create notification: {}", e))?;
 
-        // Spawned so the create call doesn't block on the PresenceCheck
-        // deadline + N web push round-trips — the caller already has the
-        // notification id and the SSE NotificationCreated event has
-        // fanned out.
-        let engine = self.clone_arc();
-        let title_owned = title.to_string();
-        let message_owned = message.to_string();
-        let app_id_owned = app_id.map(str::to_string);
-        tokio::spawn(async move {
-            crate::scheduler::push::send_push_to_all_with_app(
-                &engine,
-                &title_owned,
-                &message_owned,
-                Some(notification_id),
-                app_id_owned.as_deref(),
-                link_thread_id,
-                link_event_id,
-                tap_for_push,
-            )
-            .await;
-        });
+        crate::scheduler::push::send_push_to_all_with_app(
+            &self.clone_arc(),
+            title,
+            message,
+            Some(notification_id),
+            app_id,
+            link_thread_id,
+            link_event_id,
+            tap,
+        );
 
         Ok(notification_id)
     }
@@ -800,7 +791,8 @@ impl LucidosEngine {
     }
 
     /// LLM tool: list thread summaries for the workspace. Mirrors
-    /// `GET /api/v1/threads/list` and `lucidos threads list`.
+    /// `GET /api/v1/threads/list` and `lucidos threads list`, except that a
+    /// row carries its draft as the preview reader fields, never in full.
     ///
     /// `caller_thread_id` is `execute_tool`'s ambient thread, which the model
     /// cannot set. It is what `my_children: true` resolves to.
@@ -818,24 +810,20 @@ impl LucidosEngine {
             .and_then(|v| v.as_i64())
             .unwrap_or(100)
             .clamp(1, 1000);
-        match self
+        let mut summaries = self
             .event_store
             .list_thread_summaries(crate::core::store::ThreadSummaryFilters {
                 status,
                 sources: sources.as_deref(),
                 parent,
+                has_draft: bool_arg(args, "has_draft")?,
+                has_diff: bool_arg(args, "has_diff")?,
                 limit,
             })
             .await
-        {
-            // Compact JSON: every tool that returns a JSON array does the
-            // same (see `query_events`, `count_threads`). Pretty-printing
-            // would inflate output tokens ~30% with no parsing benefit for
-            // the LLM.
-            Ok(summaries) => serde_json::to_string(&summaries)
-                .map_err(|e| format!("Error: failed to serialise thread summaries: {}", e)),
-            Err(e) => Err(format!("Error: failed to list thread summaries: {}", e)),
-        }
+            .map_err(|e| format!("Error: failed to list thread summaries: {}", e))?;
+        crate::core::store::attach_reader_fields(&mut summaries, &self.workspace_name());
+        unsent::list_rows_for_the_model(&summaries)
     }
 
     /// LLM tool: count thread summaries matching the same filters as
@@ -855,6 +843,8 @@ impl LucidosEngine {
                 status,
                 sources: sources.as_deref(),
                 parent,
+                has_draft: bool_arg(args, "has_draft")?,
+                has_diff: bool_arg(args, "has_diff")?,
                 limit: 0,
             })
             .await
@@ -1538,6 +1528,19 @@ const QUERY_EVENTS_TRUNCATION_HINT: &str =
      time window with since/until, or call count_events first to size the sweep \
      before drilling. Do not retry with a larger byte_limit unless you have \
      already narrowed the query.";
+
+/// A three-way boolean filter arg (`has_draft`, `has_diff`). Absent or null
+/// is no filter, and `"true"` / `"false"` spelled as strings are read as
+/// booleans. Anything else is refused: ignoring it would answer with the whole
+/// workspace, a question the model did not ask.
+fn bool_arg(args: &serde_json::Value, name: &str) -> Result<Option<bool>, String> {
+    match args.get(name) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Bool(b)) => Ok(Some(*b)),
+        Some(serde_json::Value::String(s)) if s == "true" || s == "false" => Ok(Some(s == "true")),
+        Some(other) => Err(format!("Error: {name} takes true or false, not {other}.")),
+    }
+}
 
 /// Resolve the parent filter for `list_threads` / `count_threads`.
 ///

@@ -162,8 +162,8 @@ function channelIcon(value: ThreadChannel): VNode {
  *  on the filters they were editing rather than on the list.
  *
  *  It carries neither a title row nor a footer: the pane header two rows up says
- *  "Filters" while this is up, and the way OUT is the header's own Filter
- *  button, held down while the panel is open (see `filterButtonState`). A
+ *  "Filters" while this is up, and the visible way out is the header's own
+ *  Filter button, held down while the panel is open (see `filterButtonState`). A
  *  Close button down here duplicated that exit and spent a strip of the pane's
  *  height on it.
  *

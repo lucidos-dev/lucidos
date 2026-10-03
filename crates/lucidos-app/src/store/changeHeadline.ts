@@ -25,7 +25,13 @@ export function changeCommitList(change: ChangeNaming): string[] {
 
 /** The one line naming a change. Never the newest subject of several. */
 export function changeHeadline(change: ChangeNaming): string {
-  return change.summary?.trim() || changeCommitList(change)[0] || 'Change';
+  return knownChangeHeadline(change) ?? 'Change';
+}
+
+/** The headline, or `undefined` when nothing names the change yet. For a
+ *  surface that already says "change" and would only repeat the fallback. */
+export function knownChangeHeadline(change: ChangeNaming): string | undefined {
+  return change.summary?.trim() || changeCommitList(change)[0] || undefined;
 }
 
 /** The event fields this reads. Loose, so any thread event type fits. */

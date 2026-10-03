@@ -137,6 +137,21 @@ const MIRRORING_TIMERS: Array<{ file: string; expr: RegExp; what: string }> = [
     what: "starts the marker's full-brightness hold where its ramp ends",
   },
   {
+    file: '../../components/shared/ArrivalList.tsx',
+    expr: /scaledDurationMs\(NAV_FOCUS_FADE_MS\)/,
+    what: 'retires the arrival marker once its dissolve has run',
+  },
+  {
+    file: '../../components/shared/ArrivalList.tsx',
+    expr: /scaledDurationMs\(NAV_FOCUS_RAMP_MS\) \+ NAV_FOCUS_HOLD_MS/,
+    what: "starts the arrival marker's full-brightness hold where its ramp ends",
+  },
+  {
+    file: '../../components/shared/ArrivalList.tsx',
+    expr: /scaledDurationMs\(DISCLOSURE_MAX_MS\) \+ ARRIVAL_CHECK_SLACK_MS/,
+    what: 'asks whether an arrived row is on screen once its roll has landed',
+  },
+  {
     file: '../../components/chat/CreateThreadView.tsx',
     expr: /scaledDurationMs\(DISCLOSURE_MAX_MS\) \+ ROLL_SETTLE_SLACK_MS/,
     what: 'holds the pressed turn control still until the rows its toggle rolled have landed',

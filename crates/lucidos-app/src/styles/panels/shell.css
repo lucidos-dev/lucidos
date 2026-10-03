@@ -517,10 +517,10 @@
        area — kill the desktop top-fade mask so it isn't ghosted. */
     -webkit-mask-image: none;
     mask-image: none;
-    /* The base .thread-content padding reserves room past the top/prompt fades
-       for a focus marker; neither applies to the compact welcome (mask killed,
-       no scroll), so drop back to a tight padding instead of the large fade
-       clearance. The horizontal inset still has to match `.prompt-area`'s so the
+    /* The base .thread-content padding reserves room past the prompt fade for a
+       focus marker. That does not apply to the compact welcome (no scroll), so
+       drop back to a tight padding instead of the fade clearance.
+       The horizontal inset still has to match `.prompt-area`'s so the
        welcome lines up with the composer directly below it, scroll gutter
        included: `overflow: visible` here means the base rule's
        `scrollbar-gutter: stable` reserves nothing, so add it explicitly.
@@ -1076,7 +1076,11 @@
         right: var(--header-padding-x);
         top: 50%;
         transform: translateY(calc(-50% - var(--header-band-lift)));
-        overflow: clip;
+        /* Clips at its own box plus ring room. The row is exactly one icon
+           tall with an icon at each end, so a flush clip cut every ring. A
+           clip-path, not `overflow: clip`: the packaged macOS webview makes a
+           `clip` box a scroll container (see .pane-header-brand). */
+        clip-path: inset(calc(-1 * var(--focus-ring-width)));
         transition: left var(--duration-slow) ease,
                     opacity var(--duration-slow) ease, visibility var(--duration-slow);
     }
@@ -1440,19 +1444,9 @@
            style-remote tunable, and the moment it passes the icon box the label
            hangs past this box, top and bottom.
 
-           That overflow is not cosmetic, and it is why this line exists. The
-           clip below is an `overflow-x: clip` beside an `overflow-y: visible`
-           that the packaged macOS webview does not honour (see the note on it),
-           and a clip you cannot tell apart from `hidden` is a SCROLL container.
-           A few pixels of vertical overflow are then something the webview can
-           scroll away when a control inside is clicked and restore afterwards,
-           which is the Lucidos mark and both chevrons jumping up and coming
-           back: reported twice against the packaged build, and invisible to
-           every automated surface here, since no WebDriver reaches WKWebView
-           (ADR 0016) and the shipped tuning has no overflow to scroll.
-
-           Sizing the box to what it centres leaves nothing to scroll, on any
-           engine and at any tuning. `min-height` rather than `height`, so a
+           Sizing the box to what it centres keeps every member inside it, on
+           any engine and at any tuning, whatever the clip below lets through.
+           `min-height` rather than `height`, so a
            taller in-flow cluster still grows the region. The region has no
            paint of its own, so growing it moves nothing: both it and the label
            stay centred on the same line (each is `top: 50%` plus a -50%
@@ -1463,8 +1457,17 @@
         top: 50%;
         transform: translateY(calc(-50% - var(--header-band-lift)));
         z-index: var(--z-control-panel);
-        overflow-x: clip;
-        overflow-y: visible;
+        /* Clips sideways at its own edges plus ring room, so the trailing
+           action keeps its focus ring at the divider. A full region height of
+           room above and below leaves the vertical axis unclipped.
+
+           A clip-path, never `overflow-x: clip` beside `overflow-y: visible`.
+           The packaged macOS webview does not honour that pair, and makes the
+           box a SCROLL container. It then scrolled the Lucidos mark and both
+           chevrons away on a click and back after, reported twice and out of
+           reach of every automated surface (no WebDriver reaches WKWebView,
+           ADR 0016). A clip-path is no scroll container on any engine. */
+        clip-path: inset(-100% calc(-1 * var(--focus-ring-width)));
         /* The actions cluster is the region's ONLY in-flow child (the
            brand-label is absolutely centred, below), so it is pinned to the
            trailing edge directly. This was `space-between`, which needed a
@@ -1638,11 +1641,9 @@
        As tall as the row, by construction rather than by luck: the row's height
        is its tallest in-flow child, the hamburger, and this box's tallest
        member is a chevron. Both are one --header-icon-box. That matters because
-       the row's `overflow: clip` behaves as a SCROLL container on the packaged
-       macOS webview, so a box that hung out of it vertically would be scrolled
-       away and back whenever a control inside was clicked (the same defect
-       .pane-header-brand's min-height note describes). Anything added here that
-       is taller than that token needs the row to reserve it.
+       the row clips at its own box plus only ring room, so a box that hung out
+       of it vertically would be cut. Anything added here that is taller than
+       that token needs the row to reserve it.
 
        No pointer-events juggling, unlike the two centred clusters this mirrors:
        the clamp keeps the box off both clusters, so the only thing under its
@@ -1949,9 +1950,16 @@
    as a mark on the brand rather than as a second attention mark competing with
    the one that means "you can switch right now". The Lucidos menu's pending
    row is the way back to its toast. */
+/* The unread count's box, so the mark's two badges share one size and one
+   column on its right edge. Ahead of the dot, whose round corners must win. */
+.brand-badge {
+    --badge-height: var(--header-mark-count-size);
+    border-radius: var(--radius-control);
+}
+
 .brand-badge-dot {
-    min-width: 0.5rem;
-    min-height: 0.5rem;
+    min-width: 0.4375rem;
+    min-height: 0.4375rem;
     /* The base .badge pads for a glyph and reserves a line box for one. Neither
        applies to an empty box, and both would stretch the dot out of round. */
     padding: 0;
@@ -1981,37 +1989,13 @@
 .brand-badge-spinner svg,
 .brand-badge-queued svg {
     display: block;
-    width: 0.625rem;
-    height: 0.625rem;
+    width: 0.5625rem;
+    height: 0.5625rem;
 }
 
 /* The still glyph a queued build shows in the spinner's place. */
 .brand-badge-queued {
     display: inline-flex;
-}
-
-/* Slightly smaller on mobile — the badge rides a tighter header bar there, so
-   trim the base .badge box + the spinner glyph a notch. */
-@media (--phone-layout) {
-    /* The base .badge derives its width, height and line box from this. */
-    .brand-badge {
-        font-size: var(--font-size-3xs);
-        --badge-height: 0.75rem;
-        border-radius: var(--radius-control);
-    }
-
-    .brand-badge-spinner svg,
-    .brand-badge-queued svg {
-        width: 0.5625rem;
-        height: 0.5625rem;
-    }
-
-    /* Trimmed a notch with the badge above, so it stays proportionally smaller
-       than the badge it sits beside. */
-    .brand-badge-dot {
-        min-width: 0.4375rem;
-        min-height: 0.4375rem;
-    }
 }
 
 /* ─── Brand-blue header: light foreground inversion ──────────────────────────

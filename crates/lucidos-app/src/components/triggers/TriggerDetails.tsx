@@ -751,19 +751,24 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
               </div>
 
               <div class="form-group">
+                {/* The toggle reads the stored `go_to_review` inverted: on means
+                    false, the default, so a run goes straight to Archive. */}
                 <label class="form-checkbox-row">
                   <input
                     type="checkbox"
-                    checked={goToReview}
-                    onChange={(e) => setGoToReview((e.target as HTMLInputElement).checked)}
+                    data-role="send-directly-to-archive"
+                    checked={!goToReview}
+                    onChange={(e) => setGoToReview(!(e.target as HTMLInputElement).checked)}
                   />
-                  <span>Send to Review on completion</span>
-                  <Explainer title="Send to Review on completion">
-                    <p>By default, runs land in Archive.</p>
+                  <span>Send directly to Archive</span>
+                  <Explainer title="Send directly to Archive">
+                    <p>On by default: each run goes to Archive when it finishes.</p>
                     <p>
-                      Turn this on for triggers whose output you're meant to read:
-                      daily summaries, alerts, scheduled reports.
+                      Turn it off for triggers whose output you're meant to read:
+                      daily summaries, alerts, scheduled reports. Their runs then
+                      stay in Current.
                     </p>
+                    <p>A run that asks you something stays in Current until you answer.</p>
                   </Explainer>
                 </label>
               </div>

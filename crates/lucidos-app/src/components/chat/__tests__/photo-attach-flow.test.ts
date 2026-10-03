@@ -29,6 +29,7 @@ import {
   _resetPendingUploadsForTesting,
   pendingUploads,
 } from '../../../store/pendingUploads';
+import { installXhrOverFetch, uninstallXhrOverFetch } from '../../../api/client/__tests__/xhrOverFetch';
 
 const originalFetch = globalThis.fetch;
 const originalCreateObjectURL = (globalThis as any).URL?.createObjectURL;
@@ -48,6 +49,7 @@ function makeActiveThread(overrides: Partial<ThreadMeta> = {}): ThreadState {
       summaryVersion: 0,
       codingAgentProposed: false,
       codingAgentRequiresRestart: false,
+      codingAgentIncomplete: false,
       codingAgentIsExternalRepo: false,
       codingAgentHasDiff: false,
       lastRevivedAt: '',
@@ -88,6 +90,7 @@ describe('photo attach reaches the draft preview', () => {
       }),
     );
     globalThis.fetch = mockFetch as unknown as typeof fetch;
+    installXhrOverFetch();
     (globalThis as any).URL.createObjectURL = vi.fn().mockReturnValue('blob:fake-preview-url');
     (globalThis as any).URL.revokeObjectURL = vi.fn();
     connectionStatus.value = 'connected';
@@ -100,6 +103,7 @@ describe('photo attach reaches the draft preview', () => {
 
   afterEach(() => {
     globalThis.fetch = originalFetch;
+    uninstallXhrOverFetch();
     if (originalCreateObjectURL) (globalThis as any).URL.createObjectURL = originalCreateObjectURL;
     if (originalRevokeObjectURL) (globalThis as any).URL.revokeObjectURL = originalRevokeObjectURL;
     connectionStatus.value = 'disconnected';
@@ -293,7 +297,6 @@ describe('photo attach reaches the draft preview', () => {
     // Pending entry remains so the user can retry / dismiss.
     const pending = pendingUploads.value.get('t-active');
     expect(pending).toHaveLength(1);
-    expect(pending![0].status).toBe('failed');
-    expect(pending![0].error).toContain('unsupported mime');
+    expect(pending![0].state).toEqual({ kind: 'failed', reason: 'unsupported mime', retryable: false });
   });
 });

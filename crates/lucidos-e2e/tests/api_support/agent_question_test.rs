@@ -775,6 +775,29 @@ async fn stop_on_a_parked_question_proposes_the_branch_work_as_incomplete() {
         "the Stop reads as the newest coding-agent terminal"
     );
 
+    // ADR 0346: the change is not ready to review, yet it still blocks Archive.
+    let (proposed, incomplete): (bool, bool) = sqlx::query_as(
+        "SELECT coding_agent_proposed, coding_agent_incomplete \
+         FROM thread_summaries WHERE thread_id = $1",
+    )
+    .bind(thread_id)
+    .fetch_one(&pool)
+    .await
+    .expect("thread summary");
+    assert_eq!(
+        (proposed, incomplete),
+        (true, true),
+        "the thread holds a pending change, marked incomplete"
+    );
+    let resp = post_archive(thread_id).await;
+    assert_eq!(
+        resp.status().as_u16(),
+        409,
+        "an incomplete change still blocks Archive"
+    );
+    let body: serde_json::Value = resp.json().await.expect("json body");
+    assert_eq!(body["reason"], "parent_has_pending_changes");
+
     let _ = git(&["branch", "-D", &branch]);
     let _ = sqlx::query("DELETE FROM changes WHERE branch_name = $1")
         .bind(&branch)

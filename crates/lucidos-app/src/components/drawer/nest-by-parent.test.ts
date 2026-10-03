@@ -30,6 +30,7 @@ function makeThread(id: string, parentId?: string): ThreadState {
         codingAgentHasDiff: false,
         codingAgentProposed: false,
         codingAgentRequiresRestart: false,
+        codingAgentIncomplete: false,
         codingAgentIsExternalRepo: false,
         lastRevivedAt: '',
         parentThreadId: parentId,

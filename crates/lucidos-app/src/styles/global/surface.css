@@ -169,13 +169,21 @@
 
 /* The gap above the buttons belongs to the foot, which stays put. A scrolling
    body's own padding scrolls with its content, so mid-scroll the text ran flush
-   into the buttons. */
+   into the buttons. The body keeps only ring room, so a field at its end keeps
+   its focus ring when the body scrolls, and the foot gives that much back. */
 .surface-body:has(+ .surface-foot) {
-    padding-bottom: 0;
+    padding-bottom: var(--focus-ring-width);
 }
 
 .surface-body + .surface-foot {
-    padding-top: var(--surface-inset);
+    padding-top: calc(var(--surface-inset) - var(--focus-ring-width));
+}
+
+/* Ring room at the top too, for a field that opens the body. The negative
+   margin takes it from the head's own padding, so the text does not move. */
+.surface-head + .surface-body {
+    padding-top: var(--focus-ring-width);
+    margin-top: calc(-1 * var(--focus-ring-width));
 }
 
 /* A surface button is the standard `.action-btn`, the same size as everywhere

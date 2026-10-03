@@ -56,12 +56,12 @@ the read is now two steps. A token that does leak is worth thirty seconds
 against one row. And a reveal that should not have happened leaves an attributed
 row somebody can find.
 
-**One way this is stricter than the gateway, and one place it is not.** The
-gateway lets a browser request with no `Referer` through. The mint refuses it,
-because a page which suppressed its `Referer` has removed the only thing telling
-it apart from an app.
+**The mint refuses a browser request with no `Referer`, and the redeem does
+not.** A page which suppressed its `Referer` has removed the only thing telling
+it apart from an app. The gateway's control plane first let such a request
+through, and later adopted the mint's rule (ADR 0014, last addendum).
 
-The redeem keeps the gateway's looser rule, and that asymmetry is deliberate.
+The redeem lets a missing `Referer` through, and that asymmetry is deliberate.
 The mint is a `POST`, which the service worker hands straight to the browser.
 The redeem is a `GET`, which the service worker re-issues on iOS. A re-issue is
 meant to carry the original referrer. A browser that dropped it would take the

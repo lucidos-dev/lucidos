@@ -64,6 +64,8 @@ pub mod thread_lifecycle;
 pub mod thread_queue;
 pub(crate) mod thread_search;
 pub mod thread_state;
+pub(crate) mod thread_triage;
+pub(crate) mod title_match;
 pub mod todo_consumer;
 pub(crate) mod tool_arg_entity_repair;
 pub(crate) mod tools;
@@ -91,6 +93,7 @@ pub(crate) use change_ops::SET_ASIDE_APPLY_REFUSAL;
 // refusal taxonomy: the delivery half stays reachable solely as
 // `LucidosEngine::follow_up_child_thread`, so there is no way to assemble a
 // second delivery path out of its parts.
+pub(crate) use chat::accepted_messages::chat_event_id_is_recorded;
 pub(crate) use chat::agent_archive::{AgentArchiveAck, AgentArchiveError};
 pub(crate) use chat::child_detach::{ChildDetachError, DetachAck, DetachCaller};
 pub(crate) use chat::child_follow_up::{
@@ -706,6 +709,9 @@ pub struct LucidosEngine {
     /// Keeps a thread's coding-agent follow-ups in the order they were sent.
     /// See `chat::follow_up_order`.
     pub(crate) follow_up_order: FollowUpOrder,
+    /// Client event ids `POST /chat/stream` already accepted, so a re-post
+    /// starts nothing. See `chat::accepted_messages`.
+    pub(crate) accepted_messages: chat::accepted_messages::AcceptedMessages,
     /// Per-thread spawn-coalescer. Phase 2 made every Claude Code subprocess exit on
     /// idle, so two rapid follow-ups (within ~250ms) used to either race two
     /// subprocesses or drop the second message with a "duplicate request"

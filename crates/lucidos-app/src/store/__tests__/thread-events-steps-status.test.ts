@@ -390,6 +390,32 @@ describe('step completion — no eternal spinners', () => {
     ]);
   });
 
+  // The engine stamps `success: false` on a failed call. A green Completed over
+  // it tells the reader the call worked. Rows that predate the flag stay green.
+  it('a failed result settles its row to error in both projections', () => {
+    const events = new Map<number, ThreadEvent>([
+      [1, { type: 'MessageReceived', text: 'run it', created: '2026-04-04T10:00:00Z' } as ThreadEvent],
+      [2, { type: 'ToolCalled', name: 'bash', args: { command: 'false' }, _eventId: 'call-a', created: '2026-04-04T10:00:01Z' } as StoredEvent],
+      [3, { type: 'ToolCalled', name: 'bash', args: { command: 'true' }, _eventId: 'call-b', created: '2026-04-04T10:00:01Z' } as StoredEvent],
+      [4, { type: 'ToolCalled', name: 'bash', args: { command: 'ls' }, _eventId: 'call-c', created: '2026-04-04T10:00:01Z' } as StoredEvent],
+      [5, { type: 'ToolResult', name: 'bash', result: 'Error: exit 1', success: false, tool_called_event_id: 'call-a', created: '2026-04-04T10:00:02Z' } as StoredEvent],
+      [6, { type: 'ToolResult', name: 'bash', result: 'ok', success: true, tool_called_event_id: 'call-b', created: '2026-04-04T10:00:02Z' } as StoredEvent],
+      [7, { type: 'ToolResult', name: 'bash', result: 'ok', tool_called_event_id: 'call-c', created: '2026-04-04T10:00:02Z' } as StoredEvent],
+      [8, { type: 'ResponseGenerated', created: '2026-04-04T10:00:03Z' } as ThreadEvent],
+    ]);
+    const expected = [
+      ['call-a', 'error'],
+      ['call-b', 'success'],
+      ['call-c', 'success'],
+    ];
+    const exchange = groupIntoExchanges(events)[0];
+    const respSteps = exchangeResponseEvents(exchange)
+      .filter(e => e.type === 'step') as { call_event_id?: string; outcome: StepOutcome; result?: string }[];
+    expect(respSteps.map(s => [s.call_event_id, s.outcome])).toEqual(expected);
+    expect(respSteps[0].result).toBe('Error: exit 1');
+    expect(exchangeSteps(exchange).map(s => [s.call_event_id, s.outcome])).toEqual(expected);
+  });
+
   it('exchangeSteps also resolves pending steps on completed exchange', () => {
     const thread = makeThreadState();
     thread.meta.channel = 'claude_code';

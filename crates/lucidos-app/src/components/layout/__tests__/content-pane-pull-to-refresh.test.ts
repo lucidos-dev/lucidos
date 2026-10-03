@@ -54,7 +54,7 @@ describe('content pane pull to refresh', () => {
     expect(indicator).toMatch(/const busy = state !== 'idle';/);
     expect(indicator).toMatch(/onClick: busy \? undefined : \(\) => void runPanelRefresh\(\)/);
     expect(indicator).toMatch(/'aria-disabled': String\(busy\)/);
-    expect(indicator).toMatch(/tooltip: 'Refresh',/);
+    expect(indicator).toMatch(/tooltip: tooltipWithShortcut\('Refresh', 'refreshPanel'\),/);
     expect(shellCss).toMatch(/\.app-header \.icon-btn:hover:where\(:not\(:disabled, \[aria-disabled="true"\]\)\)/);
     expect(shellCss).toMatch(/\.app-header \.icon-btn\[aria-disabled="true"\]\s*\{\s*cursor: default;/);
   });

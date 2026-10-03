@@ -1,6 +1,7 @@
 use super::*;
-use crate::core::ArtifactManager;
+use crate::core::{is_build_output_path, ArtifactManager};
 use crate::engine::thread_search::recency_boost;
+use crate::engine::title_match::{title_rank, TitleRank};
 
 #[derive(Debug, Deserialize)]
 pub struct SearchQuery {
@@ -8,7 +9,7 @@ pub struct SearchQuery {
     #[serde(default = "default_category")]
     pub category: String,
     /// Hits per category. Search Everywhere asks each category on its own,
-    /// so it passes the All tab's cap rather than taking a single-tab page.
+    /// for one past the All tab's cap, so a tab can say "5+".
     pub limit: Option<usize>,
 }
 
@@ -73,19 +74,19 @@ pub(super) async fn search(
             );
             results.insert(
                 "files".into(),
-                apply_recency_boosts(files.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?),
+                files.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?,
             );
             results.insert(
                 "apps".into(),
-                apply_recency_boosts(apps.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?),
+                apps.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?,
             );
             results.insert(
                 "triggers".into(),
-                apply_recency_boosts(triggers.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?),
+                triggers.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?,
             );
             results.insert(
                 "changes".into(),
-                apply_recency_boosts(changes.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?),
+                changes.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?,
             );
         }
         "threads" => {
@@ -98,19 +99,19 @@ pub(super) async fn search(
             let items = search_files_internal(&state, &q, limit)
                 .await
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-            results.insert("files".into(), apply_recency_boosts(items));
+            results.insert("files".into(), items);
         }
         "apps" => {
             let items = search_apps_internal(&state, &q, limit)
                 .await
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-            results.insert("apps".into(), apply_recency_boosts(items));
+            results.insert("apps".into(), items);
         }
         "triggers" => {
             let items = search_triggers_internal(&state, &q, limit)
                 .await
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-            results.insert("triggers".into(), apply_recency_boosts(items));
+            results.insert("triggers".into(), items);
         }
         "settings" => {
             results.insert("settings".into(), Vec::new());
@@ -119,7 +120,7 @@ pub(super) async fn search(
             let items = search_changes_internal(&state, &q, limit)
                 .await
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-            results.insert("changes".into(), apply_recency_boosts(items));
+            results.insert("changes".into(), items);
         }
         other => {
             return Err((
@@ -132,10 +133,11 @@ pub(super) async fn search(
     Ok(Json(SearchResponse { results }))
 }
 
-/// Apply recency boosts to a category's items and sort them. Threads skip it:
-/// `combined_thread_search` already ranks and boosts them.
-fn apply_recency_boosts(items: Vec<SearchResultItem>) -> Vec<SearchResultItem> {
-    let mut boosted: Vec<SearchResultItem> = items
+/// Rank a lexical category's matches best first and keep the top `limit`:
+/// title rank, then recency. Ranked before the cut, so a strong title past the
+/// listing's first page is never dropped for a weak one ahead of it.
+fn rank_lexical(items: Vec<SearchResultItem>, query: &str, limit: usize) -> Vec<SearchResultItem> {
+    let mut ranked: Vec<(TitleRank, SearchResultItem)> = items
         .into_iter()
         .map(|mut item| {
             let ts = item
@@ -144,15 +146,17 @@ fn apply_recency_boosts(items: Vec<SearchResultItem>) -> Vec<SearchResultItem> {
                 .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
                 .map(|dt| dt.with_timezone(&chrono::Utc));
             item.score = recency_boost(item.score, ts);
-            item
+            (title_rank(&item.title, query), item)
         })
         .collect();
-    boosted.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
+    ranked.sort_by(|(a_rank, a), (b_rank, b)| {
+        TitleRank::best_first(a_rank, b_rank).then_with(|| b.score.total_cmp(&a.score))
     });
-    boosted
+    ranked
+        .into_iter()
+        .take(limit)
+        .map(|(_, item)| item)
+        .collect()
 }
 
 fn thread_summary_to_item(
@@ -216,10 +220,16 @@ async fn search_files_internal(
     let artifacts = artifact_manager
         .list_artifacts()
         .map_err(|e| format!("File listing failed: {}", e))?;
+    Ok(file_hits(artifacts, query, limit))
+}
 
+fn file_hits(paths: Vec<String>, query: &str, limit: usize) -> Vec<SearchResultItem> {
     let query_lower = query.to_lowercase();
-    Ok(artifacts
+    let matches = paths
         .into_iter()
+        // Vendored trees and build output are not the user's files, and a
+        // single `node_modules` would otherwise fill the category.
+        .filter(|path| !is_build_output_path(path))
         .map(|path| {
             let filename = std::path::Path::new(&path)
                 .file_name()
@@ -239,8 +249,8 @@ async fn search_files_internal(
                 || item.title.to_lowercase().contains(&query_lower)
                 || item.subtitle.to_lowercase().contains(&query_lower)
         })
-        .take(limit)
-        .collect())
+        .collect();
+    rank_lexical(matches, query, limit)
 }
 
 async fn search_apps_internal(
@@ -254,14 +264,13 @@ async fn search_apps_internal(
         .map_err(|e| format!("App listing failed: {}", e))?;
 
     let query_lower = query.to_lowercase();
-    Ok(apps
+    let matches = apps
         .into_iter()
         .filter(|app| {
             query_lower.is_empty()
                 || app.name.to_lowercase().contains(&query_lower)
                 || app.description.to_lowercase().contains(&query_lower)
         })
-        .take(limit)
         .map(|app| SearchResultItem {
             id: app.id,
             title: app.name,
@@ -270,7 +279,8 @@ async fn search_apps_internal(
             score: 1.0,
             last_activity: None,
         })
-        .collect())
+        .collect();
+    Ok(rank_lexical(matches, query, limit))
 }
 
 async fn search_triggers_internal(
@@ -283,10 +293,9 @@ async fn search_triggers_internal(
     drop(scheduler);
 
     let query_lower = query.to_lowercase();
-    Ok(triggers
+    let matches = triggers
         .into_iter()
         .filter(|t| query_lower.is_empty() || t.name.to_lowercase().contains(&query_lower))
-        .take(limit)
         .map(|t| SearchResultItem {
             id: t.id,
             title: t.name,
@@ -295,7 +304,8 @@ async fn search_triggers_internal(
             score: 1.0,
             last_activity: None,
         })
-        .collect())
+        .collect();
+    Ok(rank_lexical(matches, query, limit))
 }
 
 async fn search_changes_internal(
@@ -311,13 +321,12 @@ async fn search_changes_internal(
     let all_changes = pending.into_iter().chain(applied.into_iter());
 
     let query_lower = query.to_lowercase();
-    Ok(all_changes
+    let matches = all_changes
         .filter(|c| {
             query_lower.is_empty()
                 || c.description.to_lowercase().contains(&query_lower)
                 || c.branch_name.to_lowercase().contains(&query_lower)
         })
-        .take(limit)
         .map(|c| SearchResultItem {
             id: c.id.to_string(),
             title: c.description.clone(),
@@ -326,7 +335,8 @@ async fn search_changes_internal(
             score: 1.0,
             last_activity: Some(c.created_at.to_rfc3339()),
         })
-        .collect())
+        .collect();
+    Ok(rank_lexical(matches, query, limit))
 }
 
 /// Route for the global `/search` surface.
@@ -349,5 +359,61 @@ mod tests {
         assert_eq!(result_limit(false, Some(5)), 5);
         assert_eq!(result_limit(false, Some(0)), 1);
         assert_eq!(result_limit(true, Some(10_000)), CATEGORY_LIMIT);
+    }
+
+    fn titles(items: &[SearchResultItem]) -> Vec<&str> {
+        items.iter().map(|i| i.title.as_str()).collect()
+    }
+
+    #[test]
+    fn the_best_title_survives_the_cap_even_when_it_lists_last() {
+        let paths = (0..8)
+            .map(|i| format!("artifacts/old/my-settings-backup-{i}.txt"))
+            .chain(["artifacts/zzz/settings".to_string()])
+            .collect();
+        let hits = file_hits(paths, "settings", 5);
+        assert_eq!(hits.len(), 5);
+        assert_eq!(hits[0].title, "settings");
+    }
+
+    #[test]
+    fn a_short_title_outranks_a_long_one_at_the_same_level() {
+        let paths = vec![
+            "artifacts/settings-system-after-dark.png".to_string(),
+            "artifacts/settings.md".to_string(),
+        ];
+        assert_eq!(
+            titles(&file_hits(paths, "settings", 5)),
+            ["settings.md", "settings-system-after-dark.png"]
+        );
+    }
+
+    #[test]
+    fn a_path_only_match_ranks_below_every_title_match() {
+        let paths = vec![
+            "artifacts/settings/readme.md".to_string(),
+            "artifacts/notes/TimeoutSettings.ts".to_string(),
+        ];
+        assert_eq!(
+            titles(&file_hits(paths, "settings", 5)),
+            ["TimeoutSettings.ts", "readme.md"]
+        );
+    }
+
+    #[test]
+    fn file_search_skips_vendored_trees_and_build_output() {
+        let paths = vec![
+            "apps/demo/node_modules/pkg/settings.js".to_string(),
+            "apps/demo/.venv/lib/settings.py".to_string(),
+            "apps/demo/scripts/__pycache__/settings.cpython.pyc".to_string(),
+            "apps/demo/scripts/settings.py".to_string(),
+        ];
+        assert_eq!(titles(&file_hits(paths, "settings", 5)), ["settings.py"]);
+    }
+
+    #[test]
+    fn an_empty_query_keeps_the_listing_order() {
+        let paths = vec!["artifacts/b.md".to_string(), "artifacts/a.md".to_string()];
+        assert_eq!(titles(&file_hits(paths, "", 5)), ["b.md", "a.md"]);
     }
 }

@@ -587,8 +587,8 @@ mod startup_sweep_coding_agent_has_diff {
 
 // -- Phase C: the final boot settle of `running` threads ----------------------
 //
-// `settle_orphaned_running_threads` is the last boot step that touches thread
-// status. A turn the restart interrupted gets an abort event, and anything else
+// `settle_orphaned_running_threads` settles every thread still `running` at
+// boot. A turn the restart interrupted gets an abort event, and anything else
 // goes to idle. So no thread leaves boot idle over a dead turn with no end. It is also
 // the floor that would have caught thread-72120ca6: a coding-agent thread left
 // `running` by a worktree-recovery skip path.
@@ -892,6 +892,237 @@ mod settle_orphaned_running_sweep {
             Some("waiting_for_user_answer")
         );
         assert_eq!(aborted_count(&pool, thread_id).await, 0);
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+}
+
+// -- Phase C2: trigger runs a restart stranded `idle` -------------------------
+//
+// An earlier boot reset flipped `running` to `idle` with no event. A trigger
+// run it cut off before any activity kept a bare `TriggerStarted`. No terminal
+// event ever ran the unattended guard, so the run sat in Current for good.
+mod settle_stranded_trigger_runs_sweep {
+    use crate::engine::agent_recovery::recovery::settle_stranded_trigger_runs;
+    use crate::engine::event_bus::{BusEvent, EventBus};
+    use crate::engine::thread_events::{EventChannel, EventMeta, ThreadEvent, TriggerInvocation};
+    use crate::test_support::{setup_test_db, teardown_test_db};
+    use uuid::Uuid;
+
+    async fn emit(bus: &EventBus, thread_id: Uuid, event: ThreadEvent) {
+        bus.emit(BusEvent::Thread {
+            thread_id,
+            event,
+            meta: EventMeta {
+                channel: Some(EventChannel::Trigger),
+                ..EventMeta::NONE
+            },
+        })
+        .await
+        .unwrap();
+    }
+
+    /// A trigger run the old boot reset left behind: a bare start, then the
+    /// event-less flip from `running` to `idle`.
+    async fn stranded_run(pool: &sqlx::PgPool, bus: &EventBus, go_to_review: bool) -> Uuid {
+        let thread_id = Uuid::new_v4();
+        emit(
+            bus,
+            thread_id,
+            ThreadEvent::TriggerStarted {
+                provider: None,
+                trigger_id: "t-stranded".into(),
+                trigger_name: Some("watch".into()),
+                prompt: None,
+                invocation: Some(TriggerInvocation::Schedule),
+                origin: None,
+                go_to_review,
+                model: None,
+                reasoning_effort: None,
+            },
+        )
+        .await;
+        sqlx::query("UPDATE thread_summaries SET status = 'idle' WHERE thread_id = $1")
+            .bind(thread_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        thread_id
+    }
+
+    async fn state_of(pool: &sqlx::PgPool, thread_id: Uuid) -> (String, String) {
+        sqlx::query_as("SELECT status, archive_state FROM thread_summaries WHERE thread_id = $1")
+            .bind(thread_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// Each abort's cause, and whether it names the run's start.
+    async fn aborts(pool: &sqlx::PgPool, thread_id: Uuid) -> Vec<(String, bool)> {
+        sqlx::query_as(
+            "SELECT payload->>'cause', \
+                    COALESCE(payload->>'request_event_id' = ( \
+                        SELECT id::text FROM events \
+                        WHERE aggregate_id = $1 AND event_type = 'TriggerStarted'), FALSE) \
+             FROM events WHERE aggregate_id = $1 AND event_type = 'ResponseAborted'",
+        )
+        .bind(thread_id.to_string())
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn abort_count(pool: &sqlx::PgPool, thread_id: Uuid) -> usize {
+        aborts(pool, thread_id).await.len()
+    }
+
+    #[tokio::test]
+    async fn settles_an_unattended_stranded_run_to_archived() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread_id = stranded_run(&pool, &bus, false).await;
+        assert_eq!(
+            state_of(&pool, thread_id).await,
+            ("idle".into(), "inbox".into())
+        );
+
+        settle_stranded_trigger_runs(&pool, &bus).await;
+
+        assert_eq!(
+            state_of(&pool, thread_id).await,
+            ("failed".into(), "archived".into()),
+            "the abort runs the unattended guard, which hides the run"
+        );
+        assert_eq!(
+            aborts(&pool, thread_id).await,
+            vec![("recovery_after_restart".to_string(), true)]
+        );
+
+        settle_stranded_trigger_runs(&pool, &bus).await;
+        assert_eq!(
+            abort_count(&pool, thread_id).await,
+            1,
+            "a second boot finds the run settled"
+        );
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// A run the user asked to review gets its abort, and the lifecycle
+    /// contract keeps it in Current, as designed.
+    #[tokio::test]
+    async fn a_review_run_settles_but_stays_in_the_inbox() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread_id = stranded_run(&pool, &bus, true).await;
+
+        settle_stranded_trigger_runs(&pool, &bus).await;
+
+        assert_eq!(
+            state_of(&pool, thread_id).await,
+            ("failed".into(), "inbox".into())
+        );
+        assert_eq!(abort_count(&pool, thread_id).await, 1);
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// A pinned thread is never archived (ADR 0312).
+    #[tokio::test]
+    async fn a_pinned_run_settles_but_is_never_archived() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread_id = stranded_run(&pool, &bus, false).await;
+        emit(&bus, thread_id, ThreadEvent::ThreadSaved).await;
+
+        settle_stranded_trigger_runs(&pool, &bus).await;
+
+        assert_eq!(
+            state_of(&pool, thread_id).await,
+            ("failed".into(), "inbox".into())
+        );
+        assert_eq!(abort_count(&pool, thread_id).await, 1);
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// A run waiting on the user is never archived (ADR 0259). It is not dead
+    /// either, so it gets no abort.
+    #[tokio::test]
+    async fn leaves_a_parked_run_alone() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread_id = stranded_run(&pool, &bus, false).await;
+        sqlx::query(
+            "UPDATE thread_summaries SET status = 'waiting_for_user_answer' WHERE thread_id = $1",
+        )
+        .bind(thread_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        settle_stranded_trigger_runs(&pool, &bus).await;
+
+        assert_eq!(
+            state_of(&pool, thread_id).await,
+            ("waiting_for_user_answer".into(), "inbox".into())
+        );
+        assert_eq!(abort_count(&pool, thread_id).await, 0);
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// The user archived a review run by hand. An abort would move it back to
+    /// the inbox and undo the user's decision.
+    #[tokio::test]
+    async fn leaves_an_archived_run_alone() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread_id = stranded_run(&pool, &bus, true).await;
+        sqlx::query("UPDATE thread_summaries SET archive_state = 'archived' WHERE thread_id = $1")
+            .bind(thread_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        settle_stranded_trigger_runs(&pool, &bus).await;
+
+        assert_eq!(
+            state_of(&pool, thread_id).await,
+            ("idle".into(), "archived".into())
+        );
+        assert_eq!(abort_count(&pool, thread_id).await, 0);
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// A run that recorded its completion ended, whatever its status says.
+    #[tokio::test]
+    async fn leaves_a_completed_run_alone() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread_id = stranded_run(&pool, &bus, true).await;
+        emit(
+            &bus,
+            thread_id,
+            ThreadEvent::TriggerCompleted {
+                trigger_id: "t-stranded".into(),
+                trigger_name: Some("watch".into()),
+                result_summary: Some("done".into()),
+            },
+        )
+        .await;
+
+        settle_stranded_trigger_runs(&pool, &bus).await;
+
+        assert_eq!(abort_count(&pool, thread_id).await, 0);
 
         pool.close().await;
         teardown_test_db(&db_name).await;

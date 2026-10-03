@@ -6,6 +6,7 @@ import {
   computeSubmitMultiCount,
   promptPlaceholder,
   PLACEHOLDER_ANSWERING,
+  PLACEHOLDER_SIDE_QUESTION,
   PLACEHOLDER_FOLLOW_UP,
   PLACEHOLDER_NEW_THREAD,
 } from '../../components/chat/PromptInput';
@@ -38,6 +39,7 @@ function buildThreadState(events: ThreadEvent[]): ThreadState {
     summaryVersion: 0,
     codingAgentProposed: false,
     codingAgentRequiresRestart: false,
+    codingAgentIncomplete: false,
     codingAgentIsExternalRepo: false,
     codingAgentHasDiff: false,
     lastRevivedAt: '',
@@ -232,7 +234,7 @@ describe('findLatestPendingQuestion', () => {
 
 describe('promptPlaceholder', () => {
   it('invites an answer while a question card is pending', () => {
-    expect(promptPlaceholder(true, true)).toBe(PLACEHOLDER_ANSWERING);
+    expect(promptPlaceholder(true, true, false)).toBe(PLACEHOLDER_ANSWERING);
   });
 
   // The card renders the question and its options, nothing else, so the two
@@ -250,11 +252,20 @@ describe('promptPlaceholder', () => {
   // A permission card leaves the thread `waiting_for_user_answer` with no
   // pending question, and typed text there is an ordinary message.
   it('keeps the follow-up placeholder when no question card is pending', () => {
-    expect(promptPlaceholder(true, false)).toBe(PLACEHOLDER_FOLLOW_UP);
+    expect(promptPlaceholder(true, false, false)).toBe(PLACEHOLDER_FOLLOW_UP);
   });
 
   it('keeps the compose placeholder with no focused thread', () => {
-    expect(promptPlaceholder(false, false)).toBe(PLACEHOLDER_NEW_THREAD);
+    expect(promptPlaceholder(false, false, false)).toBe(PLACEHOLDER_NEW_THREAD);
+  });
+
+  it('invites a side question in side-question mode', () => {
+    expect(promptPlaceholder(true, false, true)).toBe(PLACEHOLDER_SIDE_QUESTION);
+  });
+
+  // The mode wins over a pending card: Send asks, and the × goes back to it.
+  it('invites a side question over a pending card in side-question mode', () => {
+    expect(promptPlaceholder(true, true, true)).toBe(PLACEHOLDER_SIDE_QUESTION);
   });
 });
 

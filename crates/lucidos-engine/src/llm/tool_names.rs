@@ -128,15 +128,21 @@ pub const QUERY_EVENTS: &str = "query_events";
 pub const COUNT_EVENTS: &str = "count_events";
 pub const LIST_EVENT_TYPES: &str = "list_event_types";
 
-// Thread reads, moving a child to top level, and archiving: the grouped
-// `threads` tool (list/count/search/detach_child/archive) from the capability
-// parity manifest; the flat names below stay as back-compat aliases. (Spawning is the standalone run_thread/run_coding_agent.)
+// The grouped `threads` tool from the capability parity manifest: thread
+// reads, moving a child to top level, archiving, and thread triage. Its
+// actions are list, count, drafts, held_messages, search, detach_child,
+// archive, triage and apply_triage. The flat names below are their dispatch
+// aliases. Spawning stays with the standalone run_thread and run_coding_agent.
 pub const THREADS: &str = "threads";
 pub const LIST_THREADS: &str = "list_threads";
 pub const COUNT_THREADS: &str = "count_threads";
 pub const SEARCH_THREADS: &str = "search_threads";
+pub const LIST_DRAFTS: &str = "list_drafts";
+pub const LIST_HELD_MESSAGES: &str = "list_held_messages";
 pub const DETACH_CHILD_THREAD: &str = "detach_child_thread";
 pub const ARCHIVE_THREAD: &str = "archive_thread";
+pub const TRIAGE_THREADS: &str = "triage_threads";
+pub const APPLY_THREAD_TRIAGE: &str = "apply_thread_triage";
 
 // Changes (pending coding-agent-proposed changes) — grouped `changes` tool
 // (list/apply) from the capability parity manifest; flat names below are aliases.

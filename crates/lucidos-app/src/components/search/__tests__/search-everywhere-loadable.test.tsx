@@ -76,6 +76,15 @@ function rowTitles(): string[] {
     .map(el => el.textContent ?? '');
 }
 
+function tab(label: string): HTMLButtonElement {
+  return [...document.querySelectorAll<HTMLButtonElement>('.search-everywhere-tab')]
+    .find(el => el.firstChild?.textContent === label)!;
+}
+
+function tabCount(label: string): string | null {
+  return tab(label).querySelector('.search-everywhere-tab-count')?.textContent ?? null;
+}
+
 function selectedTitle(): string | null | undefined {
   return results().querySelector('.selected .search-everywhere-result-title')?.textContent;
 }
@@ -112,20 +121,29 @@ describe('hits before everything has loaded', () => {
     expect([...engine.asked].sort()).toEqual([...SERVER_CATEGORIES].sort());
   });
 
-  it('asks each category for no more than the All tab shows', async () => {
+  it('asks each category for one more than the All tab shows, to tell 5 from 5+', async () => {
     type(NO_LOCAL_HITS);
     await advance(DEBOUNCE_MS);
-    expect(new Set(engine.limits)).toEqual(new Set([5]));
+    expect(new Set(engine.limits)).toEqual(new Set([6]));
   });
 
-  it('asks a category tab for its own full page', async () => {
-    const threadsTab = [...document.querySelectorAll('.search-everywhere-tab')]
-      .find(el => el.textContent === 'Threads') as HTMLButtonElement;
-    act(() => { threadsTab.click(); });
+  it('asks a category tab for its own full page beside the overview', async () => {
+    act(() => { tab('Threads').click(); });
     type(NO_LOCAL_HITS);
     await advance(DEBOUNCE_MS);
-    expect(engine.asked).toEqual(['threads']);
-    expect(engine.limits).toEqual([undefined]);
+    const page = engine.asked.flatMap((c, i) => (engine.limits[i] === undefined ? [c] : []));
+    expect(page).toEqual(['threads']);
+    expect(engine.asked.filter((_, i) => engine.limits[i] === 6).sort()).toEqual([...SERVER_CATEGORIES].sort());
+  });
+
+  it('does not ask the overview again when the tab changes', async () => {
+    answerAll([]);
+    type(NO_LOCAL_HITS);
+    await advance(DEBOUNCE_MS);
+    const overviewAsks = engine.limits.filter(l => l === 6).length;
+    act(() => { tab('Files').click(); });
+    await advance(DEBOUNCE_MS);
+    expect(engine.limits.filter(l => l === 6).length).toBe(overviewAsks);
   });
 
   it('drops the engine answers on close, so a reopened palette asks again', async () => {
@@ -176,7 +194,7 @@ describe('hits before everything has loaded', () => {
     press('ArrowDown');
     expect(selectedTitle()).toBe(first);
 
-    // Apps sort above settings in the All tab.
+    // Neither title holds the query, so the tie keeps Apps above Settings.
     await act(async () => {
       landApps([hit('apps', 'habit-tracker')]);
       for (let i = 0; i < 5; i++) await Promise.resolve();
@@ -219,5 +237,68 @@ describe('loading and failure', () => {
     act(() => { vi.advanceTimersByTime(SPINNER_DELAY_MS); });
     type(NO_LOCAL_HITS);
     expect(results().querySelector('.sk-bar')).toBeNull();
+  });
+});
+
+describe('ranking and tab counts', () => {
+  it('lists a section with an exact title above one that lists first by default', async () => {
+    answerAll([]);
+    engine.answers.apps = [{ ...hit('apps', 'habit-tracker'), title: 'Habit Tracker', subtitle: 'daily settings' }];
+    type('settings');
+    await advance(DEBOUNCE_MS);
+    const headers = [...results().querySelectorAll('.search-everywhere-section-header')].map(h => h.textContent);
+    expect(headers.slice(0, 2)).toEqual(['menu', 'settings']);
+    expect(headers[headers.length - 1]).toBe('apps');
+    expect(rowTitles()[0]).toBe('Settings');
+  });
+
+  it('counts each tab once its category answers, capped at 5+', async () => {
+    answerAll([]);
+    engine.answers.files = Array.from({ length: 6 }, (_, i) => hit('files', `f${i}`));
+    engine.answers.apps = [hit('apps', 'habit-tracker')];
+    engine.answers.threads = 'hang';
+    type(NO_LOCAL_HITS);
+    await advance(DEBOUNCE_MS);
+    expect(tabCount('Files')).toBe('5+');
+    expect(tabCount('Apps')).toBe('1');
+    expect(tab('Files').getAttribute('aria-label')).toBe('Files, 5+ hits');
+    expect(tab('Apps').getAttribute('aria-label')).toBe('Apps, 1 hit');
+    expect(tab('Triggers').hasAttribute('data-empty')).toBe(true);
+    expect(tab('Triggers').getAttribute('aria-label')).toBe('Triggers, no hits');
+    // Still out: no count and not dimmed, so it never reads as empty.
+    expect(tabCount('Threads')).toBeNull();
+    expect(tab('Threads').hasAttribute('data-empty')).toBe(false);
+    expect(tab('Threads').hasAttribute('aria-label')).toBe(false);
+  });
+
+  it('never lets a late answer for an old query count the new one', async () => {
+    let landOld: (items: SearchResultItem[]) => void = () => {};
+    answerAll([]);
+    engine.answers.files = new Promise(resolve => { landOld = resolve; });
+    type('first');
+    await advance(DEBOUNCE_MS);
+    engine.answers.files = 'hang';
+    type('second');
+    await advance(DEBOUNCE_MS);
+    await act(async () => {
+      landOld(Array.from({ length: 6 }, (_, i) => hit('files', `old${i}`)));
+      for (let i = 0; i < 5; i++) await Promise.resolve();
+    });
+    expect(tabCount('Files')).toBeNull();
+    expect(rowTitles().some(t => t.startsWith('old'))).toBe(false);
+  });
+
+  it('never dims a tab whose category failed', async () => {
+    answerAll([]);
+    engine.answers.threads = 'fail';
+    type(NO_LOCAL_HITS);
+    await advance(DEBOUNCE_MS);
+    expect(tab('Threads').hasAttribute('data-empty')).toBe(false);
+    expect(tabCount('Threads')).toBeNull();
+  });
+
+  it('shows no counts before a query is typed', () => {
+    expect(document.querySelector('.search-everywhere-tab-count')).toBeNull();
+    expect(document.querySelector('.search-everywhere-tab[data-empty]')).toBeNull();
   });
 });

@@ -45,6 +45,7 @@ const SURFACES = [
   'dialog-body',          // the scrolling body of every centred dialog
   'step-detail-body',     // the scrolling body of the step-detail family
   'explainer-body',       // the explainer popover's scrolling copy
+  'event-condition-popover-body', // the condition popover's scrolling JSON
   'toast-heading',        // a toast's title, or its untitled message, a scroll box on its own
   'toast-text',           // a toast's message under its title, the main scroll box
 ] as const;

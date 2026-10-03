@@ -133,7 +133,10 @@ return (
 - **An inline toggle carries `aria-expanded`**, and its content rolls through `<Disclosure>`. A popover toggle pairs it with `aria-haspopup` and opens through `<Overlay>` instead.
 - **A fold is one element, never two swapped.** The side-question card is the worked case (`SideQuestionCard.tsx`): its head is the toggle, and its body sits in a `<Disclosure>`. Replacing the card with a separate row element cannot animate.
 - **A chevron turns with the roll**, on a `transition` of its `transform`.
-- **Enforced** by `components/shared/__tests__/expand-collapse-rolls-guard.test.ts`. A toggle that rolls elsewhere takes a row there saying where.
+- **A mount gated on an open flag rolls too, wherever its toggle lives.** `{searchOpen.value && <Bar />}` snaps even when the toggle is a pressed header button in another file. Render it as `<Disclosure open={searchOpen.value}>`. The Apps and Plugins search bar is the worked case (`components/apps/AppSearchBar.tsx`).
+- **Enforced** by `components/shared/__tests__/expand-collapse-rolls-guard.test.ts`, on both sides: the toggle's `aria-expanded`, and the content's gated mount. A toggle that rolls elsewhere takes a row there saying where.
+
+**A row that arrives in a live list rolls in through `<ArrivalList>`** (`components/shared/ArrivalList.tsx`), and wears the *arrival marker* where it is seen (`docs/glossary.md`). Call `useArrivals` from the view that stays mounted, not from inside a collapsible section. The Changes view is the worked case.
 
 **Whatever animates in animates out, by default and unasked.** A popover, pill, menu or panel with an entrance motion leaves with its reverse, however it is shut. That covers Escape, an outside click, a second press, and its own action. An instant unmount at dismiss is a bug, and the user should never have to ask for the exit.
 

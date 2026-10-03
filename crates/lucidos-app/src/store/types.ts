@@ -246,9 +246,9 @@ type ResponseEventKind =
        *  emits also stamp it. Used as the route key for
        *  `GET /events/:event_id/tool-result`. */
       result_event_id?: string;
-      /** `true` when the source tool call had its `args` field stripped on the
-       *  snapshot endpoint (see `strip_tool_call_args` in
-       *  `api/threads/events_snapshot.rs`). Paired with `call_event_id` so the
+      /** `true` when the source tool call had its `args` field stripped, which
+       *  the snapshot and the live stream both do (`ThreadEvent::strip_tool_call_args`).
+       *  Paired with `call_event_id` so the
        *  step-detail modal can lazy-fetch the un-elided command on open.
        *
        *  The step's inline label never needs the args: the strip fills
@@ -390,10 +390,6 @@ type ResponseEventKind =
        *  than of the thread's prior state. See
        *  `docs/plans/2026-08-13-a-delivery-does-not-know-the-thread-was-asleep.md`. */
       state: 'waiting' | 'matched' | 'timed_out' | 'canceled';
-      /** Set on `matched`: the event that matched, for the card's summary line
-       *  and its deep link into the source event. */
-      matched_event_type?: string;
-      matched_event_id?: string;
       /** Set on `matched`: when the delivery was recorded, for the pill. */
       matched_at?: string;
       /** Set on `canceled`: how it was stopped, which is what the row's note
@@ -850,6 +846,9 @@ export interface ToastAction {
   onClick: () => void;
   /** Visual intent. Default = neutral; 'danger' = destructive; 'confirm' = positive. */
   variant?: 'danger' | 'confirm';
+  /** A tap on the card must not run it, so it keeps its own button. For a
+   *  neutral action that changes state, such as Undo. */
+  deliberate?: boolean;
 }
 
 /** Progress as a run of steps: `done` is the fraction finished, and `working`

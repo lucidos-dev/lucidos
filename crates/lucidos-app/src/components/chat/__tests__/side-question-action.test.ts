@@ -1,16 +1,16 @@
 import { describe, it, expect } from 'vitest';
-import { sideQuestionAction } from '../prompt-input-helpers';
+import { sideQuestionAction, sideQuestionModeActive } from '../prompt-input-helpers';
 
-const onSend = { hasContent: true, stopShown: false, threadStarted: true, isCodex: false };
-const onStop = { ...onSend, hasContent: false, stopShown: true };
+const onSend = { hasContent: true, stopOrCancelShown: false, threadStarted: true, isCodex: false };
+const onStop = { ...onSend, hasContent: false, stopOrCancelShown: true };
 
 describe('sideQuestionAction', () => {
   it('asks the draft from Send on a started, non-Codex thread', () => {
     expect(sideQuestionAction(onSend)).toEqual({ kind: 'ask-draft' });
   });
 
-  it('starts a side question draft from Stop, where the box is empty', () => {
-    expect(sideQuestionAction(onStop)).toEqual({ kind: 'start-draft' });
+  it('turns on side-question mode from Stop, where the box is empty', () => {
+    expect(sideQuestionAction(onStop)).toEqual({ kind: 'start-mode' });
   });
 
   it('names a thread that has not started yet', () => {
@@ -30,7 +30,21 @@ describe('sideQuestionAction', () => {
   });
 
   it('names the thread before the draft, since typing would not help', () => {
-    expect(sideQuestionAction({ hasContent: false, stopShown: false, threadStarted: false, isCodex: true }))
+    expect(sideQuestionAction({ hasContent: false, stopOrCancelShown: false, threadStarted: false, isCodex: true }))
       .toEqual({ kind: 'unavailable', reason: 'Side questions need a started thread.' });
+  });
+});
+
+describe('sideQuestionModeActive', () => {
+  const on = { stored: true, threadStarted: true, isCodex: false };
+
+  it('is in force when stored on a started, non-Codex thread', () => {
+    expect(sideQuestionModeActive(on)).toBe(true);
+    expect(sideQuestionModeActive({ ...on, stored: false })).toBe(false);
+  });
+
+  it('is off in a draft or a Codex thread, whatever is stored', () => {
+    expect(sideQuestionModeActive({ ...on, threadStarted: false })).toBe(false);
+    expect(sideQuestionModeActive({ ...on, isCodex: true })).toBe(false);
   });
 });

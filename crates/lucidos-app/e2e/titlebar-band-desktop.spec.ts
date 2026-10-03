@@ -1,5 +1,5 @@
 import { test, expect, type Page } from './fixtures';
-import { assertHealthy, navigateToApp } from './helpers';
+import { assertHealthy, navigateToApp, watchPreferenceReads } from './helpers';
 
 /**
  * The bar the macOS traffic lights are centred on is the one on screen.
@@ -91,21 +91,12 @@ async function settleAt(page: Page, scale: number): Promise<Band> {
   return last!;
 }
 
-/** `loadPreferences` ends in `applyUiScale`, which persists the scale. Until it
- *  has, a scale this sweep writes is one write away from being replaced. */
-async function waitForScaleApplied(page: Page): Promise<void> {
-  await page.waitForFunction(
-    () => localStorage.getItem('lucidos-ui-scale') !== null,
-    undefined,
-    { timeout: 10_000 },
-  );
-}
-
 test.describe('the titlebar band the lights centre on', () => {
   test.beforeEach(async ({ page }) => {
     await assertHealthy(page);
+    const preferencesSettled = watchPreferenceReads(page);
     await navigateToApp(page);
-    await waitForScaleApplied(page);
+    await preferencesSettled();
   });
 
   test('packaged macOS: the band is the strip plus the header, at every scale', async ({ page }) => {

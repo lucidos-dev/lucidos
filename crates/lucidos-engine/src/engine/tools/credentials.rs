@@ -285,6 +285,69 @@ fn widen_scope_request(existing: &Credential, adding: &[String]) -> String {
     }))
 }
 
+/// The lowercased host a URL names, if it names one.
+fn host_of(url: &str) -> Option<String> {
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
+}
+
+/// Whether a request asks for something a configured builtin proxy does not
+/// already serve, so the refusal must not apply.
+///
+/// Two shapes count. A type that is not a bare token: a builtin injects a
+/// token, so `oauth_client`, `basic`, `password` and `secret` are other
+/// things. Or a host the builtin's base does not name.
+fn overrides_builtin_proxy(requested: AuthType, base_urls: &[String], builtin_base: &str) -> bool {
+    if !matches!(requested, AuthType::ApiKey | AuthType::Bearer) {
+        return true;
+    }
+    let builtin_host = host_of(builtin_base);
+    builtin_host.is_none() || base_urls.iter().any(|url| host_of(url) != builtin_host)
+}
+
+/// The refusal when a configured builtin proxy already serves the service.
+/// It names the proxy and the call, because the agent asked for a key only
+/// because it did not know the proxy existed.
+fn served_by_builtin_proxy(service_name: &str, proxy: &str, base_url: &str) -> String {
+    let path_hint = if crate::api::proxy_builtin::base_includes_v1(base_url) {
+        " The base already ends in /v1, so send '/models', not '/v1/models'."
+    } else {
+        ""
+    };
+    format!(
+        "Not requested: '{service_name}' is served by the builtin '{proxy}' proxy, which is \
+         already configured. It is not in data/config/apis.json. Call proxy_request with name \
+         '{proxy}' and a path relative to {base_url}, or run `lucidos proxy {proxy} <path>` \
+         from a script.{path_hint} Do not ask the user for a key. Only a different service \
+         needs its own credential: name a host other than the proxy's, or a non-token auth_type."
+    )
+}
+
+/// The refusal a request earns because a builtin proxy already holds its key,
+/// or `None` to carry on.
+///
+/// Only a builtin that resolves AND injects auth refuses. An unknown state
+/// falls through, since a failed check is not evidence the proxy works. A
+/// keyless `local` server holds no key, so asking for one is legitimate.
+fn builtin_proxy_refusal(
+    service_name: &str,
+    proxy: &str,
+    state: &crate::api::proxy_builtin::BuiltinProxyState,
+    requested: AuthType,
+    base_urls: &[String],
+) -> Option<String> {
+    let crate::api::proxy_builtin::BuiltinProxyState::Configured {
+        base_url,
+        injects_auth: true,
+    } = state
+    else {
+        return None;
+    };
+    (!overrides_builtin_proxy(requested, base_urls, base_url))
+        .then(|| served_by_builtin_proxy(service_name, proxy, base_url))
+}
+
 /// The service name a `request_credential` call actually writes under.
 ///
 /// For `oauth_client` this is NOT the agent's `service_name` verbatim: it is
@@ -500,6 +563,23 @@ impl LucidosEngine {
                     if let Err(rejection) = crate::core::environment_variables::validate_name(name)
                     {
                         return Ok(format!("Error: {}", rejection.message(name)));
+                    }
+                }
+
+                if let Some(proxy) =
+                    crate::api::proxy_builtin::builtin_proxy_for_service(service_name)
+                {
+                    let state =
+                        crate::api::proxy_builtin::builtin_proxy_state(&self.clone_arc(), proxy)
+                            .await;
+                    if let Some(refusal) = builtin_proxy_refusal(
+                        service_name,
+                        proxy.name,
+                        &state,
+                        requested,
+                        &base_urls,
+                    ) {
+                        return Ok(refusal);
                     }
                 }
 
@@ -1078,6 +1158,112 @@ mod tests {
         let payload = widen_scope_request(&existing, &scope(&["https://github.com"]));
         assert!(!payload.contains(&existing.auth_value), "{payload}");
         assert!(parse_payload(&payload).get("auth_value").is_none());
+    }
+
+    // ─── A configured builtin proxy already holds the key ──────────────────
+
+    const BUILTIN_BASE: &str = "https://api.provider.test/v1";
+
+    #[test]
+    fn a_token_for_the_builtin_host_does_not_override_the_proxy() {
+        for requested in [AuthType::ApiKey, AuthType::Bearer] {
+            assert!(!overrides_builtin_proxy(
+                requested,
+                &scope(&["https://api.provider.test"]),
+                BUILTIN_BASE
+            ));
+            assert!(
+                !overrides_builtin_proxy(
+                    requested,
+                    &scope(&["https://API.provider.test/v1/models"]),
+                    BUILTIN_BASE
+                ),
+                "host comparison ignores case and path"
+            );
+        }
+    }
+
+    #[test]
+    fn another_auth_type_or_another_host_overrides_the_proxy() {
+        for requested in [
+            AuthType::OauthClient,
+            AuthType::Basic,
+            AuthType::Password,
+            AuthType::Secret,
+        ] {
+            assert!(
+                overrides_builtin_proxy(
+                    requested,
+                    &scope(&["https://api.provider.test"]),
+                    BUILTIN_BASE
+                ),
+                "{requested} is not the token the builtin injects"
+            );
+        }
+        assert!(overrides_builtin_proxy(
+            AuthType::ApiKey,
+            &scope(&["https://relay.example.com"]),
+            BUILTIN_BASE
+        ));
+        assert!(
+            overrides_builtin_proxy(
+                AuthType::ApiKey,
+                &scope(&["https://api.provider.test", "https://relay.example.com"]),
+                BUILTIN_BASE
+            ),
+            "one host outside the builtin is enough"
+        );
+    }
+
+    /// Only a builtin that resolves and injects auth refuses. An unknown state
+    /// is not evidence the proxy works, and a keyless server has no key to
+    /// offer, so both let the request through.
+    #[test]
+    fn only_a_configured_builtin_that_injects_auth_refuses() {
+        use crate::api::proxy_builtin::BuiltinProxyState;
+        let token_request = |state: &BuiltinProxyState| {
+            builtin_proxy_refusal(
+                "openai",
+                "openai",
+                state,
+                AuthType::ApiKey,
+                &scope(&["https://api.provider.test"]),
+            )
+        };
+        let configured = |injects_auth| BuiltinProxyState::Configured {
+            base_url: BUILTIN_BASE.to_string(),
+            injects_auth,
+        };
+        assert!(token_request(&configured(true)).is_some());
+        assert!(
+            token_request(&configured(false)).is_none(),
+            "a keyless builtin holds no key, so a key may be asked for"
+        );
+        assert!(token_request(&BuiltinProxyState::NotConfigured).is_none());
+        assert!(
+            token_request(&BuiltinProxyState::Unknown).is_none(),
+            "a failed check never refuses"
+        );
+    }
+
+    #[test]
+    fn the_builtin_refusal_names_the_proxy_and_the_call() {
+        let message = served_by_builtin_proxy("OpenAI", "openai", "https://api.openai.com/v1");
+        for needle in [
+            "'OpenAI'",
+            "builtin 'openai' proxy",
+            "not in data/config/apis.json",
+            "proxy_request with name 'openai'",
+            "lucidos proxy openai",
+            "not '/v1/models'",
+            "Do not ask the user for a key",
+        ] {
+            assert!(message.contains(needle), "missing {needle:?}: {message}");
+        }
+        assert!(
+            !served_by_builtin_proxy("svc", "svc", "https://api.example.com").contains("/v1"),
+            "the /v1 hint only appears for a base that has it"
+        );
     }
 
     #[test]

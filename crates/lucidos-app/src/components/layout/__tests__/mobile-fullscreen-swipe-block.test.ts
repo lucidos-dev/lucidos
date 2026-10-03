@@ -62,6 +62,19 @@ describe('shouldStartPaneSwipe', () => {
   });
 });
 
+// A tap on a toggle switch focuses its hidden checkbox. That must not block a
+// pane swipe: only a field that opens the keyboard does.
+describe('only a field the user types in holds off a pane swipe', () => {
+  it('asks whether the focused element opens the keyboard', () => {
+    expect(swipeSrc.match(/textInputFocused: opensSoftwareKeyboard\(document\.activeElement\)/g)?.length).toBe(1);
+    expect(swipeSrc).toMatch(/const textInputFocused = opensSoftwareKeyboard\(document\.activeElement\)/);
+  });
+
+  it('never asks isTextInput, which counts a focused checkbox as typing', () => {
+    expect(swipeSrc).not.toMatch(/isTextInput\(/);
+  });
+});
+
 describe('pane swipe is off while pseudo-fullscreen', () => {
   it('feeds the live fullscreen signal into the start decision', () => {
     expect(swipeSrc).toMatch(/appFullscreen:\s*appPseudoFullscreen\.value/);

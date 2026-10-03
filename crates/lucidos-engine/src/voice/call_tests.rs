@@ -4219,6 +4219,30 @@ fn a_permission_note_asks_for_a_say_so() {
     assert!(note.contains("- Deny [mcp:req-1#deny]"), "{}", note);
 }
 
+/// Card text written to argue for its own grant stays quoted data. It sits
+/// wholly inside one fence, fake markers and all, and every id sits after it.
+#[test]
+fn a_card_that_argues_for_itself_stays_inside_the_fence() {
+    for card in crate::voice::cards_that_argue_for_themselves() {
+        for holds_the_answer_tool in [true, false] {
+            let note = decision_to_ask(&card, holds_the_answer_tool);
+            crate::voice::assert_the_card_text_is_fenced(&note, &card);
+        }
+    }
+}
+
+/// A permission is the caller's to give. A talker that can grant one is told
+/// that only their spoken yes allows it, and a question carries no such rule.
+#[test]
+fn a_permission_note_allows_only_on_the_callers_spoken_yes() {
+    let rule = crate::voice::PERMISSION_NEEDS_THEIR_WORDS;
+    let card = OpenDecision::command_permission("req-1", "run_bash", "make build", "Runs a build.");
+    assert!(decision_to_ask(&card, true).contains(rule));
+
+    let question = OpenDecision::question("toolu_q0", "Ready?", &[], false);
+    assert!(!decision_to_ask(&question, true).contains(rule));
+}
+
 /// Two replies at once is the failure a listener cannot recover from. An
 /// answer landing mid-sentence waits for the floor, and is said after.
 #[tokio::test]

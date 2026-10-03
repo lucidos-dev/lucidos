@@ -59,61 +59,7 @@ impl LucidosEngine {
             .map(|s| s.side_effect)
             .unwrap_or(PrefSideEffect::None);
 
-        // A timezone write updates in-memory `user_timezone` AND is loaded back
-        // at startup, so a malformed IANA name would silently degrade trigger
-        // scheduling to UTC (`scheduler::task_runner` falls back). The retired
-        // set_timezone tool validated; preserve that guarantee on the shared path
-        // (the tool also pre-validates, but a raw HTTP/SDK caller hits only here)
-        // — and BEFORE the store write, so a reject can't leave the DB holding a
-        // value the in-memory state never adopted.
-        if side_effect == PrefSideEffect::Timezone && value.parse::<chrono_tz::Tz>().is_err() {
-            return Err(format!(
-                "Invalid timezone '{}'. Use an IANA name like 'Europe/Oslo' or 'America/New_York'.",
-                value
-            ));
-        }
-
-        // The *style library* is one JSON document, and a bad one would cost
-        // the user every style they wrote. So it is checked here rather than in
-        // the tool handler: the Settings UI reaches only this path, and it is
-        // the writer that edits the document. Refused whole, never trimmed, and
-        // before the store write, so a rejected edit leaves the saved library
-        // exactly as it was.
-        if key == crate::core::PREF_RESPONSE_STYLES {
-            crate::core::response_style::validate_document(value)?;
-        }
-
-        // Any app can write the style remote, so part tokens in it pass the
-        // part grammar here, where every writer arrives (ADR 0307).
-        if key == crate::core::themes::STYLE_OVERRIDES_KEY {
-            crate::core::themes::validate_style_overrides(value)?;
-        }
-
-        // Keys whose catalog check every writer must pass, here where
-        // `PUT /api/v1/preferences` also arrives, not only in the tool:
-        // - the proxy reads its timeout on every call and fails loudly on a bad
-        //   value, so a bad write would break every proxied call;
-        // - `theme` named the light/dark mode before the rename, so an older
-        //   app still sends `theme=dark`, refused with the key it meant.
-        if key == crate::core::PREF_PROXY_TIMEOUT_SECS || key == crate::core::themes::THEME_KEY {
-            if let Some(spec) = preference_catalog::lookup(key) {
-                preference_catalog::validate(spec, value)?;
-            }
-        }
-
-        // A `backup_schedule` write re-registers the backup cron via the
-        // scheduler's `PreferencesChanged` subscriber. Validate the cron up front
-        // on this shared path (so a raw HTTP/SDK caller is covered, not just the
-        // catalog-gated `set_preference` tool) and BEFORE the store write — so a
-        // bad expression is rejected to the caller instead of silently failing to
-        // register later. `"off"` and other inactive values disable the schedule
-        // and skip cron parsing.
-        if key == crate::core::backup::PREF_BACKUP_SCHEDULE
-            && crate::core::backup::is_schedule_active(value)
-        {
-            crate::engine::tools::scheduler::parse_standard_cron(value)
-                .map_err(|e| format!("Invalid backup schedule cron '{}': {}", value, e))?;
-        }
+        refuse_bad_value(key, value, side_effect)?;
 
         // Persist. Scope follows the caller's device_id, matching the historical
         // HTTP behavior (frontend sends device_id for device-scoped keys, omits it
@@ -174,5 +120,102 @@ impl LucidosEngine {
         }
 
         Ok(PreferenceWriteOutcome { push_enabled })
+    }
+}
+
+/// The value checks every writer must pass, run BEFORE the store write so a
+/// refusal leaves the saved value exactly as it was.
+fn refuse_bad_value(key: &str, value: &str, side_effect: PrefSideEffect) -> Result<(), String> {
+    // A timezone write updates in-memory `user_timezone` and is loaded back at
+    // startup. A malformed IANA name would silently degrade trigger scheduling
+    // to UTC (`scheduler::task_runner` falls back). The tool pre-validates too,
+    // but a raw HTTP/SDK caller reaches only this check.
+    if side_effect == PrefSideEffect::Timezone && value.parse::<chrono_tz::Tz>().is_err() {
+        return Err(format!(
+            "Invalid timezone '{}'. Use an IANA name like 'Europe/Oslo' or 'America/New_York'.",
+            value
+        ));
+    }
+
+    // The *style library* is one JSON document, and a bad one would cost
+    // the user every style they wrote. So it is checked here rather than in
+    // the tool handler: the Settings UI reaches only this path, and it is
+    // the writer that edits the document. Refused whole, never trimmed.
+    if key == crate::core::PREF_RESPONSE_STYLES {
+        crate::core::response_style::validate_document(value)?;
+    }
+
+    // Any app can write the style remote, so part tokens in it pass the
+    // part grammar here, where every writer arrives (ADR 0307).
+    if key == crate::core::themes::STYLE_OVERRIDES_KEY {
+        crate::core::themes::validate_style_overrides(value)?;
+    }
+
+    // Keys whose catalog check every writer must pass, here where
+    // `PUT /api/v1/preferences` also arrives, not only in the tool:
+    // - the proxy reads its timeout on every call and fails loudly on a bad
+    //   value, so a bad write would break every proxied call;
+    // - `theme` named the light/dark mode before the rename, so an older
+    //   app still sends `theme=dark`, refused with the key it meant.
+    if key == crate::core::PREF_PROXY_TIMEOUT_SECS || key == crate::core::themes::THEME_KEY {
+        if let Some(spec) = preference_catalog::lookup(key) {
+            preference_catalog::validate(spec, value)?;
+        }
+    }
+
+    // Settings writes the local model host through this path, and so does any
+    // caller that can present itself as the shell (ADR 0156 decision 1). An
+    // empty value clears it, and every reader then falls back to env or default.
+    if key == crate::core::PREF_LOCAL_BASE_URL && !value.trim().is_empty() {
+        if let Some(reason) = crate::core::preferences::local_base_url_rejection(value) {
+            return Err(reason);
+        }
+    }
+
+    // A `backup_schedule` write re-registers the backup cron via the
+    // scheduler's `PreferencesChanged` subscriber. A bad expression is refused
+    // here, on the path every writer shares, rather than failing to register
+    // later. `"off"` and other inactive values skip cron parsing.
+    if key == crate::core::backup::PREF_BACKUP_SCHEDULE
+        && crate::core::backup::is_schedule_active(value)
+    {
+        crate::engine::tools::scheduler::parse_standard_cron(value)
+            .map_err(|e| format!("Invalid backup schedule cron '{}': {}", value, e))?;
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The write path Settings uses refuses a public model host, whoever sends
+    /// it, so the stored value stays as it was.
+    #[test]
+    fn a_public_local_base_url_is_refused_on_the_shared_write_path() {
+        let err = refuse_bad_value(
+            crate::core::PREF_LOCAL_BASE_URL,
+            "https://attacker.example/v1",
+            PrefSideEffect::None,
+        )
+        .expect_err("a public host must not become the local model host");
+        assert!(err.contains("attacker.example"), "{err}");
+    }
+
+    /// Settings saving a real local setup still works, and so does clearing the
+    /// field to fall back to `LUCIDOS_LOCAL_BASE_URL` or the default.
+    #[test]
+    fn a_loopback_or_lan_local_base_url_passes_the_shared_write_path() {
+        for url in [
+            crate::core::DEFAULT_LOCAL_BASE_URL,
+            "http://127.0.0.1:1234/v1",
+            "http://192.168.1.20:11434/v1",
+            "",
+            "  ",
+        ] {
+            refuse_bad_value(crate::core::PREF_LOCAL_BASE_URL, url, PrefSideEffect::None)
+                .unwrap_or_else(|e| panic!("{url}: {e}"));
+        }
     }
 }

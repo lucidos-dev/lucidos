@@ -2,12 +2,13 @@ import { SESSION_END_REASONS } from '../../generated/thread-lifecycle';
 import type { ThreadStatus } from '../../generated/thread-lifecycle';
 import { hasVisibleText, isMeaningfulText, mergeAdjacentTextEvents } from '../event-rendering';
 import { AWAIT_EVENT_TOOL } from './event-waits';
-import { describeCCTool, describeEngineTool, exchangeHasCCContent, exchangeResponseText, exchangeUserMessage, fullCommandForCCTool, fullCommandForEngineTool } from './exchange';
-import { TERMINAL_EVENT_TYPES, UNANCHORABLE_ASYNC_EVENTS, VOICE_ONLY_STEP_TYPES, dividerStillAwaitsUser, exchangeHoldsNoTurn, isCallBoundary, isLiveCallRow, isLiveReplyRow, isLiveUtteranceRow, isSettledLiveUtterance, isUningestedMessage, isWaitingTypedMessage, toolUseIdOf } from './exchange-grouping';
+import { describeCCTool, describeEngineTool, exchangeHasCCContent, exchangeResponseText, exchangeUserImageHashes, exchangeUserMessage, fullCommandForCCTool, fullCommandForEngineTool } from './exchange';
+import { TERMINAL_EVENT_TYPES, UNANCHORABLE_ASYNC_EVENTS, VOICE_ONLY_STEP_TYPES, computeExchanges, dividerStillAwaitsUser, exchangeHoldsNoTurn, isCallBoundary, isLiveCallRow, isLiveReplyRow, isLiveUtteranceRow, isSettledLiveUtterance, isUningestedMessage, isWaitingTypedMessage, toolUseIdOf } from './exchange-grouping';
 import { IDLE_ENGINE_RESTART_INTERRUPT_REASON, isEngineDownAbort, isSwitchTeardownAbort, isTurnlessBoundary, isUserStoppedWait } from './thread-event-types';
 import type { ExchangeStatus } from '../exchange-status';
 import type { ContextAssembledData, ContextCapture, ContextSection, ResponseEvent, Step, StepOutcome } from '../types';
 import type { Exchange } from './exchange';
+import type { ThreadState } from './thread-meta';
 import type { ActorMode, EventSubscription, EventWaitCancelCause, MessageOrigin, SequencedEvent, StoredEvent, ThreadEvent } from './thread-event-types';
 
 /** The two projections' step shapes, as far as the resolvers care. */
@@ -33,13 +34,20 @@ function pendingOutcomeFor(terminal: TerminalKind): StepOutcome {
 function resolveLastPendingStep(
   steps: StepLike[],
   pred?: (s: StepLike) => boolean,
+  outcome: StepOutcome = 'success',
 ): void {
   for (let i = steps.length - 1; i >= 0; i--) {
     if (steps[i].outcome === 'pending' && (!pred || pred(steps[i]))) {
-      steps[i].outcome = 'success';
+      steps[i].outcome = outcome;
       return;
     }
   }
+}
+
+/** What a chat `ToolResult` settles its row to. Only an explicit `false` is a
+ *  failure: rows written before the engine stamped `success` carry none. */
+function toolResultOutcome(event: StoredEvent): StepOutcome {
+  return (event as { success?: boolean }).success === false ? 'error' : 'success';
 }
 
 /** Which row a chat `ToolResult` resolves. A result names its call, because a
@@ -460,7 +468,7 @@ export function exchangeSteps(exchange: Exchange, isLast = true, threadIdle = fa
         break;
       }
       case 'ToolResult':
-        resolveLastPendingStep(steps, answeredBy(event, isNotThinking));
+        resolveLastPendingStep(steps, answeredBy(event, isNotThinking), toolResultOutcome(event));
         break;
       case 'CodingAgentPromptSent':
         steps.push({ description: 'Thinking', outcome: 'pending' });
@@ -589,17 +597,18 @@ function lastDeniedStepAwaitingResult(
   return step;
 }
 
-/** Mark the last pending step in a ResponseEvent[] as completed and return it
- *  so callers can attach extra payload (tool result text, images). Optional
+/** Settle the last pending step in a ResponseEvent[] to `outcome` and return
+ *  it so callers can attach extra payload (tool result text, images). Optional
  *  `pred` narrows which pending step to resolve. */
 function resolveLastPendingResponseStep(
   events: ResponseEvent[],
   pred?: (s: StepLike) => boolean,
+  outcome: StepOutcome = 'success',
 ): Extract<ResponseEvent, { type: 'step' }> | null {
   for (let i = events.length - 1; i >= 0; i--) {
     const e = events[i];
     if (e.type === 'step' && e.outcome === 'pending' && (!pred || pred(e))) {
-      e.outcome = 'success';
+      e.outcome = outcome;
       return e;
     }
   }
@@ -767,9 +776,9 @@ export function exchangeResponseEvents(exchange: Exchange, isLast = true, thread
         // second row. See `nameThinkingRow`.
         //
         // Carries the source event id and the strip marker for the same reason
-        // the coding-agent arm below does: the snapshot drops `args`, and the
-        // modal addresses this call to fetch them back. Live SSE leaves the
-        // marker absent and `full` is computed inline.
+        // the coding-agent arm below does: the engine drops `args`, and the
+        // modal addresses this call to fetch them back. Only a row that kept
+        // its args (`generate_image`, `include_context`) computes `full` inline.
         const e = event as { name: string; args?: unknown; description?: string; args_stripped?: boolean };
         const naming = {
           description: e.description || describeEngineTool(e.name, e.args),
@@ -798,7 +807,7 @@ export function exchangeResponseEvents(exchange: Exchange, isLast = true, thread
         // since started. It still resolves the real thing on the
         // rejected-subscription path, where no row replaced the step.
         const answers = answeredBy(event, toolResult.name === AWAIT_EVENT_TOOL ? isAwaitEventStep : isNotThinking);
-        const resolved = resolveLastPendingResponseStep(events, answers)
+        const resolved = resolveLastPendingResponseStep(events, answers, toolResultOutcome(event))
           ?? lastDeniedStepAwaitingResult(events, answers);
         if (resolved) {
           if (toolResult.result !== undefined) resolved.result = toolResult.result;
@@ -838,9 +847,9 @@ export function exchangeResponseEvents(exchange: Exchange, isLast = true, thread
       case 'CodingAgentToolCalled': {
         const e = event as { name: string; args?: unknown; description?: string; args_stripped?: boolean };
         // Always stamp the source event id so the modal can address this call,
-        // and stamp `args_stripped` only when the snapshot dropped the args.
-        // Live SSE leaves the marker absent and `full` is computed inline, the
-        // same split the `ToolResult` arm below draws.
+        // and stamp `args_stripped` only when the engine dropped the args. The
+        // snapshot and the live stream both drop them; an `include_context`
+        // row keeps them, and computes `full` inline.
         const naming = {
           description: e.description || describeCCTool(e.name, e.args),
           tool_name: e.name,
@@ -1045,28 +1054,19 @@ export function exchangeResponseEvents(exchange: Exchange, isLast = true, thread
       case 'EventWaitDelivered':
       case 'EventWaitExpired': {
         // Both RESOLVE the arming row in place, matched by wait_id: the same
-        // subject line, now carrying its outcome, and for a delivery the event
-        // that matched plus the jump to it. They enrich the row rather than
-        // relabelling it, which is why they may touch it at all.
+        // row, now carrying its outcome and, for a delivery, when it arrived.
+        // The row never names the matched event; the delivery card does.
         //
         // Either can arrive in a LATER exchange than the row that armed it,
         // since a subscription outlives its turn. There is then nothing here
         // to resolve and nothing more to draw: both RE-ENTER the thread, so
         // the delivery already reads as its own turn further down.
-        const e = event as {
-          wait_id: string;
-          event_type?: string;
-          event_id?: string;
-        };
+        const e = event as { wait_id: string };
         const state = event.type === 'EventWaitDelivered' ? 'matched' : 'timed_out';
         for (const prior of events) {
           if (prior.type === 'event_wait' && prior.wait_id === e.wait_id) {
             prior.state = state;
-            if (state === 'matched') {
-              prior.matched_event_type = e.event_type;
-              prior.matched_event_id = e.event_id;
-              prior.matched_at = created;
-            }
+            if (state === 'matched') prior.matched_at = created;
             break;
           }
         }
@@ -1479,10 +1479,9 @@ function newestStarterId(exchanges: Exchange[]): string | null {
  *  to go". The delivery and trigger rows then render no jump affordance rather
  *  than a tap that pulses something unrelated.
  *
- *  This is what the *event wait*'s "show it" needs, since a wait can match ANY
- *  event type and commonly matches a `CodingAgentIdled` from another thread.
- *  Notification deep-links point at addressable events by construction, so
- *  they deliberately do not use this. */
+ *  Every event deep link goes through it. The engine only checks that a
+ *  notification's event is in its thread, so a mid-turn `CredentialRequested`
+ *  is a step like any other. */
 export function deepLinkAnchorForEvent(
   exchanges: Exchange[],
   eventId: string,
@@ -1503,6 +1502,13 @@ export function deepLinkAnchorForEvent(
     }
   }
   return null;
+}
+
+/** {@link deepLinkAnchorForEvent} over a thread's own exchanges, and null for a
+ *  thread that is not here. `computeExchanges` is memoized per thread, so a
+ *  repeat call is a lookup rather than a regrouping. */
+export function deepLinkAnchorInThread(thread: ThreadState | undefined, eventId: string): string | null {
+  return thread ? deepLinkAnchorForEvent(computeExchanges(thread), eventId) : null;
 }
 
 /** True when this event is an abort that took the ENGINE down with it: an
@@ -1984,12 +1990,13 @@ export function queuedFollowupRun(
   };
 }
 
-/** A queued (uningested) chat follow-up: its retract id + message text. */
+/** A queued (uningested) chat follow-up: its retract id, text and images. */
 export interface QueuedMessage {
   /** The client `event_id` (the events-table PK), which is the `message_id`
    *  the `/chat/queued-message/remove` endpoint retracts by. */
   id: string;
   text: string;
+  imageHashes: string[];
 }
 
 /** The thread's queued (un-injected) chat follow-ups, in FIFO order: the set a
@@ -2011,7 +2018,7 @@ export function queuedMessagesFromExchanges(
   for (const idx of queuedOrder) {
     const id = exchanges[idx].userEvent._eventId;
     if (!id) continue;
-    out.push({ id, text: exchangeUserMessage(exchanges[idx]) });
+    out.push({ id, text: exchangeUserMessage(exchanges[idx]), imageHashes: exchangeUserImageHashes(exchanges[idx]) });
   }
   return out;
 }

@@ -1,4 +1,5 @@
 import type { ThreadMeta, ThreadStatus, ThreadState } from '../../store/thread-events';
+import { changeReadyToReview } from '../../store/thread-events';
 import { effectiveThreadStatus } from '../../store/store';
 import { PauseIcon } from './icons';
 
@@ -31,7 +32,7 @@ export type VisualStatus = ThreadStatus | 'changes' | 'question';
 export function resolveVisualStatus(
   status: ThreadStatus,
   waitsOnSubThreads: boolean,
-  codingAgentProposed: boolean,
+  changeReady: boolean,
   hasLiveEventWaits: boolean,
 ): VisualStatus {
   if (status === 'failed') return 'failed';
@@ -52,7 +53,9 @@ export function resolveVisualStatus(
   // change is not final and cannot be resolved yet. Reading it as "Changes to
   // review" invited an Apply that would merge a branch still being worked on.
   if (hasLiveEventWaits) return 'waiting';
-  if (codingAgentProposed) return 'changes';
+  // An incomplete change is not ready, so it draws no `changes` dot and the
+  // thread reads by its turn alone (ADR 0346).
+  if (changeReady) return 'changes';
   if (waitsOnSubThreads) return 'waiting';
   return 'idle';
 }
@@ -60,7 +63,7 @@ export function resolveVisualStatus(
 /** The meta facts `visualStatusFor` reads. */
 type VisualStatusFacts = Pick<
   ThreadMeta,
-  'activeChildrenCount' | 'waitingChildrenCount' | 'codingAgentProposed' | 'liveEventWaitCount'
+  'activeChildrenCount' | 'waitingChildrenCount' | 'codingAgentProposed' | 'codingAgentIncomplete' | 'liveEventWaitCount'
 >;
 
 /** `resolveVisualStatus` fed from a thread's meta, for a surface holding a
@@ -72,7 +75,7 @@ export function visualStatusFor(status: ThreadStatus, meta: VisualStatusFacts | 
   return resolveVisualStatus(
     status,
     meta.activeChildrenCount + (meta.waitingChildrenCount ?? 0) > 0,
-    meta.codingAgentProposed,
+    changeReadyToReview(meta),
     meta.liveEventWaitCount > 0,
   );
 }

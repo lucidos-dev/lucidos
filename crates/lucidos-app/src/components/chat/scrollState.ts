@@ -2807,15 +2807,18 @@ function pinHeaderForScroll(): void {
  *  chosen descendant is absent the pulse falls back to the whole target.
  *
  *  `addressedBy` is the attribute `selector` addresses the target by. The retry
- *  watches it as well as the DOM tree, see the observer below. */
+ *  watches it as well as the DOM tree, see the observer below.
+ *
+ *  `selector` is asked on every look, because an event link's target can change
+ *  once the thread's events arrive (see `EventDeepLinkOptions.anchorFor`). */
 function scrollToSelectorAndPulse(
-  selector: string,
+  selector: () => string,
   addressedBy: string,
   preferLast = false,
   pulseTarget?: string | ((target: HTMLElement) => HTMLElement | null),
   opts?: DeepLinkOptions,
 ): void {
-  if (!selector || typeof document === 'undefined' || !document.querySelectorAll) return;
+  if (typeof document === 'undefined' || !document.querySelectorAll) return;
 
   let resolved = false;
   let deadlineTimer: ReturnType<typeof setTimeout> | null = null;
@@ -2987,9 +2990,13 @@ function scrollToSelectorAndPulse(
     settleTimer = setTimeout(finish, SCROLL_SETTLE_FALLBACK_MS);
   };
 
+  /** The selector the last look searched for. The observer looks again when it
+   *  changes, because the new target may already be on screen. */
+  let lookedFor = '';
   const tryResolve = () => {
     if (resolved) return;
-    const matches = document.querySelectorAll<HTMLElement>(selector);
+    lookedFor = selector();
+    const matches = document.querySelectorAll<HTMLElement>(lookedFor);
     let target: HTMLElement | null = null;
     for (const el of matches) {
       if (isElementVisible(el)) {
@@ -3136,6 +3143,11 @@ function scrollToSelectorAndPulse(
   // keeps the second watch as cheap as the first: one attribute name, which
   // only ever changes when a turn gains the id.
   observer = new MutationObserver((records) => {
+    const current = selector();
+    if (current !== lookedFor) {
+      tryResolve();
+      return;
+    }
     for (const record of records) {
       if (record.type === 'attributes') {
         tryResolve();
@@ -3144,7 +3156,7 @@ function scrollToSelectorAndPulse(
       for (const node of record.addedNodes) {
         if (node.nodeType !== 1) continue;
         const el = node as Element;
-        if (el.matches(selector) || el.querySelector(selector)) {
+        if (el.matches(current) || el.querySelector(current)) {
           tryResolve();
           return;
         }
@@ -3194,7 +3206,7 @@ function scrollToSelectorAndPulse(
         // call, so leaning on that guard would sweep the whole transcript for a
         // report every landed link discards.
         if (!resolved) {
-          reportOutcome('superseded', document.querySelectorAll<HTMLElement>(selector));
+          reportOutcome('superseded', document.querySelectorAll<HTMLElement>(selector()));
         }
         return;
       }
@@ -3202,7 +3214,7 @@ function scrollToSelectorAndPulse(
       // DOM held when the link GAVE UP is the diagnostic. Zero says the event is
       // not in this thread. One with no box says it is, and something is
       // covering or collapsing it.
-      reportOutcome('unresolved', document.querySelectorAll<HTMLElement>(selector));
+      reportOutcome('unresolved', document.querySelectorAll<HTMLElement>(selector()));
       // A follow armed IN PLACE for this link stood off the edge only while the
       // link owned the position. Moving nobody, it ends there, so no lit toggle
       // outlives the link. `useScrollMemory`'s rescue re-arms it where it can.
@@ -3244,33 +3256,48 @@ export interface DeepLinkOptions {
   stillArriving?: () => boolean;
 }
 
-/** Land on the element carrying `data-event-id`: a notification deep link
- *  scrolling to the exact event that raised it. Two shapes of match, and the
- *  pulse scope differs per match, so the scope is resolved as a function.
+export interface EventDeepLinkOptions extends DeepLinkOptions {
+  /** The `data-event-id` that draws the event, or null to look for the event's
+   *  own id. A step stamps no element, so the turn holding it stands in
+   *  (`deepLinkAnchorForEvent`). Asked on every look, since a cold tap knows it
+   *  only once the thread's events arrive. The caller's, for the same reason
+   *  `stillArriving` is. */
+  anchorFor?: () => string | null;
+}
+
+/** Land on the element carrying the event's anchor as `data-event-id`: a
+ *  notification deep link scrolling to the event that raised it, or to the
+ *  turn holding it (`EventDeepLinkOptions.anchorFor`). Three shapes of match,
+ *  and the pulse scope differs per match, so the scope is resolved as a
+ *  function.
  *
- *   - **An exchange-start event** (`UserQuestionAsked`,
- *     `CodingAgentPermissionRequest`, `CredentialRequested`, and so on) stamps
- *     the whole `.chat-exchange`. Narrow the pulse to its `.initiator-panel`, so
- *     the agent response in the same turn is not highlighted too.
+ *   - **An event that starts its turn** (`UserQuestionAsked`,
+ *     `CodingAgentPermissionRequest`, and so on) stamps the whole
+ *     `.chat-exchange`. Narrow the pulse to its `.initiator-panel`, so the
+ *     agent response in the same turn is not highlighted too.
+ *   - **A step re-targeted to its turn** lives in that turn's reply. Narrow the
+ *     pulse to the `.response-panel`, since the user's message is not the
+ *     subject.
  *   - **A step-level event** stamps the specific card that renders it, today the
  *     `ResponseFailed` failure card. That element already IS the subject, so it
- *     must NOT be narrowed. There is no `.initiator-panel` inside it, and
- *     narrowing would highlight an unrelated descendant.
+ *     must NOT be narrowed. There is no panel inside it, and narrowing would
+ *     highlight an unrelated descendant.
  *
  *  Discriminating on the match keeps the intent explicit. The `?? target`
- *  fallback still covers a degenerate exchange with no `.initiator-panel`.
+ *  fallback still covers a degenerate exchange with neither panel.
  *
  *  `onUnresolved` is called when the event never renders inside the resolve
  *  deadline (see the deadline in `scrollToSelectorAndPulse`). */
-export function scrollToEventAndPulse(eventId: string, opts?: DeepLinkOptions): void {
+export function scrollToEventAndPulse(eventId: string, opts?: EventDeepLinkOptions): void {
   if (!eventId) return;
+  const anchor = () => opts?.anchorFor?.() ?? eventId;
   scrollToSelectorAndPulse(
-    `[data-event-id="${CSS.escape(eventId)}"]`,
+    () => `[data-event-id="${CSS.escape(anchor())}"]`,
     'data-event-id',
     false,
     (target) =>
       (target.matches?.('.chat-exchange')
-        ? target.querySelector?.('.initiator-panel')
+        ? target.querySelector?.(anchor() === eventId ? '.initiator-panel' : '.response-panel')
         : null) as HTMLElement | null,
     opts,
   );
@@ -3300,8 +3327,9 @@ const CHANGE_RESOLUTION_INITIATOR =
   '.initiator-panel-change-applied,.initiator-panel-change-discarded,.initiator-panel-change-reverted,.initiator-panel-change-failed';
 export function scrollToChangeAndPulse(changeId: string, opts?: DeepLinkOptions): void {
   if (!changeId) return;
+  const selector = `[data-change-id="${CSS.escape(changeId)}"]`;
   scrollToSelectorAndPulse(
-    `[data-change-id="${CSS.escape(changeId)}"]`,
+    () => selector,
     'data-change-id',
     true,
     (target) =>

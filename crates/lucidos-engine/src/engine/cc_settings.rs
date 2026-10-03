@@ -149,6 +149,13 @@ pub(crate) fn build_cc_settings_json(additional_directories: &[PathBuf]) -> Stri
                     }]
                 },
                 {
+                    "matcher": "Agent",
+                    "hooks": [{
+                        "type": "command",
+                        "command": "lucidos cc-agent-guard"
+                    }]
+                },
+                {
                     "matcher": "Edit",
                     "hooks": [{
                         "type": "command",
@@ -378,6 +385,25 @@ mod tests {
         assert_eq!(
             read_entry["hooks"][0]["command"], "lucidos cc-read-coerce",
             "must invoke the cc-read-coerce subcommand the engine ships",
+        );
+    }
+
+    /// A background subagent dies when the engine kills Claude Code at idle,
+    /// so its report never arrives. Without this matcher a session can end
+    /// its turn on one and leave the thread done with no changes.
+    #[test]
+    fn json_registers_pretooluse_hook_for_agent_guard() {
+        let json = build_cc_settings_json(&[]);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let entries = parsed["hooks"]["PreToolUse"].as_array().expect("array");
+        let agent_entry = entries
+            .iter()
+            .find(|e| e["matcher"] == "Agent")
+            .expect("must register an Agent matcher");
+        assert_eq!(agent_entry["hooks"][0]["type"], "command");
+        assert_eq!(
+            agent_entry["hooks"][0]["command"], "lucidos cc-agent-guard",
+            "must invoke the cc-agent-guard subcommand the engine ships",
         );
     }
 

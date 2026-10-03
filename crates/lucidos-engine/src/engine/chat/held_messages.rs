@@ -22,20 +22,123 @@ use crate::engine::thread_events::{
 use crate::engine::LucidosEngine;
 use crate::runtime::CodingAgent;
 
-/// The held messages on a thread that nothing has released yet, oldest first.
-/// `$1` is the thread id as text.
-pub(crate) const UNRELEASED_HELD_MESSAGES_SQL: &str = "\
-SELECT e.id, e.payload \
-  FROM events e \
- WHERE e.aggregate = 'thread' \
-   AND e.aggregate_id = $1 \
+/// The one definition of "still held": a `MessageHeld` row `e` that no
+/// `HeldMessageReleased` on its own thread names. A macro so both queries
+/// below can `concat!` it into a `const`.
+macro_rules! unreleased_held_message_sql {
+    () => {
+        "e.aggregate = 'thread' \
    AND e.event_type = 'MessageHeld' \
    AND NOT EXISTS ( \
          SELECT 1 FROM events r \
-          WHERE r.aggregate = 'thread' AND r.aggregate_id = $1 \
+          WHERE r.aggregate = 'thread' AND r.aggregate_id = e.aggregate_id \
             AND r.event_type = 'HeldMessageReleased' \
-            AND r.payload->>'held_message_id' = e.id::text) \
- ORDER BY e.sequence ASC";
+            AND r.payload->>'held_message_id' = e.id::text)"
+    };
+}
+
+/// The held messages on a thread that nothing has released yet, oldest first.
+/// `$1` is the thread id as text.
+pub(crate) const UNRELEASED_HELD_MESSAGES_SQL: &str = concat!(
+    "SELECT e.id, e.payload FROM events e WHERE e.aggregate_id = $1 AND ",
+    unreleased_held_message_sql!(),
+    " ORDER BY e.sequence ASC"
+);
+
+/// Every unreleased held message in the workspace with its owning thread,
+/// newest first. `$1` is the row limit.
+const WORKSPACE_HELD_MESSAGES_SQL: &str = concat!(
+    "SELECT e.id, e.aggregate_id, e.payload, e.created, \
+            t.title, t.first_message, t.source, t.archive_state, t.status \
+       FROM events e \
+       JOIN thread_summaries t ON t.thread_id::text = e.aggregate_id \
+      WHERE ",
+    unreleased_held_message_sql!(),
+    " ORDER BY e.created DESC LIMIT $1"
+);
+
+/// One held message as the `threads` tool's `held_messages` action reports
+/// it: what waits, on which thread, and the link that opens that thread.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HeldMessageSummary {
+    pub held_message_id: Uuid,
+    pub thread_id: String,
+    pub title: String,
+    pub channel: String,
+    pub section: String,
+    pub status: crate::engine::thread_lifecycle::ThreadStatus,
+    pub preview: String,
+    /// The whole message's length in characters.
+    pub length: usize,
+    pub image_count: usize,
+    pub held_at: chrono::DateTime<chrono::Utc>,
+    pub link: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct HeldMessageRow {
+    id: Uuid,
+    aggregate_id: String,
+    payload: serde_json::Value,
+    created: chrono::DateTime<chrono::Utc>,
+    title: Option<String>,
+    first_message: Option<String>,
+    source: String,
+    archive_state: String,
+    status: String,
+}
+
+impl LucidosEngine {
+    /// Every unreleased held message in this workspace, newest first.
+    /// Read-only.
+    pub async fn list_held_messages(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<HeldMessageSummary>, sqlx::Error> {
+        list_held_messages(self.pool(), &self.workspace_name(), limit).await
+    }
+}
+
+/// [`LucidosEngine::list_held_messages`] over an explicit pool and workspace,
+/// so a test can read two databases side by side.
+pub(crate) async fn list_held_messages(
+    pool: &sqlx::PgPool,
+    workspace: &str,
+    limit: i64,
+) -> Result<Vec<HeldMessageSummary>, sqlx::Error> {
+    use crate::core::store::{char_length, format_display_title, text_preview, thread_link};
+    let rows: Vec<HeldMessageRow> = sqlx::query_as(WORKSPACE_HELD_MESSAGES_SQL)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let text = row
+                .payload
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            HeldMessageSummary {
+                held_message_id: row.id,
+                link: thread_link(workspace, &row.aggregate_id),
+                thread_id: row.aggregate_id,
+                title: format_display_title(row.title, row.first_message),
+                channel: row.source,
+                section: row.archive_state,
+                status: crate::engine::thread_lifecycle::ThreadStatus::parse(&row.status),
+                preview: text_preview(text),
+                length: char_length(text),
+                image_count: row
+                    .payload
+                    .get("user_image_hashes")
+                    .and_then(|v| v.as_array())
+                    .map_or(0, Vec::len),
+                held_at: row.created,
+            }
+        })
+        .collect())
+}
 
 /// One held message, rebuilt for delivery.
 #[derive(Debug, Clone)]

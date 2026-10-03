@@ -179,6 +179,9 @@ mod cascade_archive_test;
 #[path = "api_support/delete_thread_test.rs"]
 mod delete_thread_test;
 
+#[path = "api_support/archive_all_test.rs"]
+mod archive_all_test;
+
 #[path = "api_support/notifications_presence_test.rs"]
 mod notifications_presence_test;
 

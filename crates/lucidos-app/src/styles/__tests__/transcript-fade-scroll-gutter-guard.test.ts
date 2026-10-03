@@ -69,6 +69,26 @@ describe('the transcript fades leave the scroll gutter alone', () => {
     expect(maskedTranscript()).not.toMatch(/mask-image:\s*linear-gradient/);
   });
 
+  it('drops the top fade at rest at the top, where it could only dissolve the first turn\'s marker', () => {
+    // The transcript keeps no fade clearance at the top, so the first turn
+    // sits inside the fade band. Keyed on the title row's scroll flag.
+    const atRest = block(
+      inputMessagesCss,
+      '.thread-view-header:not(.scrolled) + .thread-content-wrap > .thread-content {',
+    );
+    expect(decl(atRest, '--thread-top-fade-floor')).toBe('1');
+
+    // It EASES back once the reader scrolls. A mask toggled straight on would
+    // drop the first turn to half opacity after a 3px scroll.
+    const rule = maskedTranscript();
+    for (const prop of ['-webkit-mask', 'mask']) {
+      expect(decl(rule, prop)).toContain('rgb(0 0 0 / var(--thread-top-fade-floor, 0)) 0');
+    }
+    expect(decl(rule, 'transition')).toBe('--thread-top-fade-floor var(--duration-normal) ease');
+    // Only a registered property interpolates; an unregistered one snaps.
+    expect(inputMessagesCss).toMatch(/@property --thread-top-fade-floor\s*\{[^}]*syntax: '<number>'/);
+  });
+
   it('stops the bottom dissolve at the gutter, and sizes it from --prompt-fade', () => {
     const band = block(contentCss, '.prompt-area::before {');
     expect(decl(band, 'left')).toBe('0');

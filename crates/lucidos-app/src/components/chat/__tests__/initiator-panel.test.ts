@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { describeInitiator } from '../ChatExchange';
 import { ENGINE_LABEL, LUCIDOS_AGENT_LABEL, SYSTEM_LABEL, type Exchange } from '../../../store/thread-events';
 import type { ComponentChildren, VNode } from 'preact';
+import { vnodeToText } from './vnodeToText';
 
 function exchangeWith(userEvent: Exchange['userEvent']): Exchange {
   return { userEvent, userSeq: 0, steps: [] };
@@ -604,7 +605,7 @@ describe('describeInitiator — divider header reflects the QUESTION, not the tu
 
   it('pending (live) question reads "Needs your answer"', () => {
     const desc = describeInitiator(askedDivider(), '', [], 'tid', /*responseTerminated*/ false, /*threadIsCC*/ true);
-    expect(textOf(desc.status)).toContain('Needs your answer');
+    expect(vnodeToText(desc.status)).toContain('Needs your answer');
   });
 
   it('system-aborted unresolved permission reads "Unresolved", never "Canceled"', () => {

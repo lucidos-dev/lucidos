@@ -1088,7 +1088,8 @@ pub enum SystemEvent {
     /// A `PUT /api/v1/data/*path` write committed (file created or replaced).
     /// `commit` is the resulting git sha when the path lives under `artifacts/`
     /// (manager-committed); empty for non-artifact paths that bypass the
-    /// artifact-manager commit dance.
+    /// artifact-manager commit dance. The agent's `write_file` and `copy_file`
+    /// emit it too, with no actor, for a path outside `artifacts/`.
     DataFileWritten {
         path: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1096,7 +1097,8 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// A `DELETE /api/v1/data/*path` removed a file.
+    /// A `DELETE /api/v1/data/*path` removed a file. The agent's `delete_file`
+    /// emits it too, with no actor, for a path outside `artifacts/`.
     DataFileDeleted {
         path: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1108,7 +1110,8 @@ pub enum SystemEvent {
     /// (JSON-path or text find/replace). `operations_count` records how many
     /// op-blocks were applied; the per-op detail isn't broadcast because the
     /// values may carry user data we don't want to fan out to every SSE
-    /// subscriber.
+    /// subscriber. The agent's `edit_file` emits it too, with no actor and a
+    /// count of 1, for a workspace path outside `artifacts/`.
     DataFileEdited {
         path: String,
         operations_count: usize,

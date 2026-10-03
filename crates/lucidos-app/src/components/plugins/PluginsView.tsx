@@ -1,16 +1,11 @@
-import { useEffect, useRef } from 'preact/hooks';
 import {
   pluginsInstalledOnly,
   setPluginsInstalledOnly,
   pluginsMarketplaceFilter,
-  appSearchOpen,
-  appSearchQuery,
   marketplaceCatalog,
   installedPlugins,
 } from '../../store/store';
-import { closeAppSearch } from '../../store/actions/apps';
-import { CloseIcon } from '../shared/icons';
-import { SearchField } from '../shared/SearchField';
+import { AppSearchBar } from '../apps/AppSearchBar';
 import { Dropdown } from '../shared/Dropdown';
 import type { DropdownOption } from '../shared/Dropdown';
 import {
@@ -21,27 +16,6 @@ import {
   resolveActiveMarketplace,
 } from './StoreTab';
 import { CatalogFreshness } from './CatalogFreshness';
-
-function PluginSearchBar() {
-  const inputRef = useRef<HTMLInputElement>(null);
-  useEffect(() => { inputRef.current?.focus({ preventScroll: true }); }, []);
-  return (
-    <div class="apps-search-bar">
-      <SearchField
-        class="apps-search-field"
-        inputRef={inputRef}
-        data-role="plugins-search-input"
-        placeholder="Search plugins…"
-        value={appSearchQuery.value}
-        onInput={(e) => { appSearchQuery.value = e.currentTarget.value; }}
-        onKeyDown={(e) => { if (e.key === 'Escape') closeAppSearch(); }}
-      />
-      <button class="icon-btn header-icon" onClick={closeAppSearch} aria-label="Close search">
-        <CloseIcon />
-      </button>
-    </div>
-  );
-}
 
 /** Sentinels for the two dropdown rows that are not a marketplace. Both carry a
  *  colon. The engine builds a marketplace id out of ASCII alphanumerics and
@@ -128,7 +102,7 @@ export function PluginsView() {
         <CatalogFreshness />
       </div>
 
-      {appSearchOpen.value && <PluginSearchBar />}
+      <AppSearchBar placeholder="Search plugins…" dataRole="plugins-search-input" />
 
       <StoreTab />
     </div>

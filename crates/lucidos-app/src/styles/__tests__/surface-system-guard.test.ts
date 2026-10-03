@@ -221,7 +221,7 @@ describe('a surface closes from the X in its head, never from a text button', ()
     '../../components/chat/StepDetailModal.tsx',
     '../../components/chat/CheckpointDiffModal.tsx',
     '../../components/chat/ContextViewerModal.tsx',
-    '../../components/chat/EventConditionModal.tsx',
+    '../../components/chat/EventConditionPopover.tsx',
     '../../components/shared/Explainer.tsx',
     '../../components/files/FilePreviewModal.tsx',
     '../../components/settings/DirectoryPicker.tsx',

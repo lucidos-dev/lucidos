@@ -180,6 +180,16 @@ describe('pendingSections: Ready, then Not finished', () => {
     expect(pendingSections([stopped, settled], none).canApplyNow).toBe(true);
   });
 
+  // Its turn did not finish, though its thread is idle (ADR 0346).
+  it('lists incomplete work under Not finished, never Ready', () => {
+    const stopped = makeChange({ id: 'e', thread_id: 't-e', incomplete: true });
+    const s = pendingSections([settled, stopped], none);
+    expect(s.ready.map((c) => c.id)).toEqual(['a']);
+    expect(s.notFinished.map((c) => c.id)).toEqual(['e']);
+    // An idle stopped thread has nothing to settle, so there is nothing to arm.
+    expect(s.armable).toEqual([]);
+  });
+
   it('keeps Discard All to Ready, and to more than one change there', () => {
     expect(pendingSections([settled, settling], none).showDiscardAll).toBe(false);
     const other = makeChange({ id: 'f', thread_id: 't-f' });

@@ -13,6 +13,7 @@ pub(crate) const ENV_SOURCE_THREAD_ID: &str = "LUCIDOS_THREAD_ID";
 /// `--caller-event-id`.
 const ENV_EVENT_ID: &str = "LUCIDOS_EVENT_ID";
 
+#[derive(Default)]
 pub(crate) struct ListFilters<'a> {
     /// `Some(true)` selects the UNION of `running` and
     /// `waiting_for_user_answer`, `Some(false)` inverts it, `None` filters
@@ -35,6 +36,12 @@ pub(crate) struct ListFilters<'a> {
     /// `parent` query param and as the `my_children` filter the LLM tool
     /// resolves from its own ambient thread.
     pub parent: Option<String>,
+    /// `Some(true)` keeps threads holding an unsent draft, `Some(false)` the
+    /// rest, `None` filters nothing.
+    pub has_draft: Option<bool>,
+    /// The same three-way filter on whether a coding-agent branch differs
+    /// from main.
+    pub has_diff: Option<bool>,
 }
 
 /// Resolve `--parent <uuid>` / `--my-children` into the single `parent` value
@@ -69,7 +76,7 @@ pub(crate) fn resolve_parent_filter(
 
 pub(crate) fn cmd_list(ws: &Workspace, filters: ListFilters<'_>) -> Result<(), BoxError> {
     let url = format!("{}/api/v1/threads/list", ws.base_url());
-    send_filtered("GET", &url, &filters)
+    send_filtered(&url, &filters)
 }
 
 /// Same filters as `cmd_list`, against the count endpoint. `limit` is carried
@@ -77,22 +84,65 @@ pub(crate) fn cmd_list(ws: &Workspace, filters: ListFilters<'_>) -> Result<(), B
 /// and HTTP layers reuse one filter struct for both queries.
 pub(crate) fn cmd_count(ws: &Workspace, filters: ListFilters<'_>) -> Result<(), BoxError> {
     let url = format!("{}/api/v1/threads/count", ws.base_url());
-    send_filtered("GET", &url, &filters)
+    send_filtered(&url, &filters)
 }
 
-fn send_filtered(method: &str, url: &str, filters: &ListFilters<'_>) -> Result<(), BoxError> {
-    let params = build_query_params(
-        filters.active,
-        filters.status,
-        filters.source,
-        filters.limit,
-        filters.parent.as_deref(),
-    );
+fn send_filtered(url: &str, filters: &ListFilters<'_>) -> Result<(), BoxError> {
+    send_get(url, &build_query_params(filters))
+}
+
+/// GET `url` with `params`, printing the body verbatim like every read here.
+fn send_get(url: &str, params: &[(&'static str, String)]) -> Result<(), BoxError> {
     let mut req = http_client()?.get(url);
     if !params.is_empty() {
-        req = req.query(&params);
+        req = req.query(params);
     }
-    send_and_print(method, url, req)
+    send_and_print("GET", url, req)
+}
+
+/// `lucidos threads drafts`: every thread holding an unsent draft, or one
+/// thread's draft with its whole text. Read-only.
+pub(crate) fn cmd_drafts(
+    ws: &Workspace,
+    limit: Option<u32>,
+    thread: Option<&str>,
+) -> Result<(), BoxError> {
+    let url = format!("{}/api/v1/threads/drafts", ws.base_url());
+    send_get(&url, &drafts_query_params(limit, thread))
+}
+
+/// `lucidos threads held-messages`: every held message still waiting behind
+/// a human. Read-only.
+pub(crate) fn cmd_held_messages(ws: &Workspace, limit: Option<u32>) -> Result<(), BoxError> {
+    let url = format!("{}/api/v1/threads/held-messages", ws.base_url());
+    send_get(&url, &limit_param(limit))
+}
+
+/// `lucidos threads search`: find threads by what was said in them or typed
+/// into their draft. Read-only.
+pub(crate) fn cmd_search(ws: &Workspace, query: &str, limit: Option<u32>) -> Result<(), BoxError> {
+    if query.trim().is_empty() {
+        return Err("the search query must be non-empty. Say what was discussed.".into());
+    }
+    let url = format!("{}/api/v1/threads/search", ws.base_url());
+    let mut params = vec![("q", query.trim().to_string())];
+    params.extend(limit_param(limit));
+    send_get(&url, &params)
+}
+
+fn limit_param(limit: Option<u32>) -> Vec<(&'static str, String)> {
+    limit
+        .map(|l| ("limit", l.to_string()))
+        .into_iter()
+        .collect()
+}
+
+fn drafts_query_params(limit: Option<u32>, thread: Option<&str>) -> Vec<(&'static str, String)> {
+    let mut params = limit_param(limit);
+    if let Some(t) = thread.map(str::trim).filter(|t| !t.is_empty()) {
+        params.push(("thread_id", t.to_string()));
+    }
+    params
 }
 
 /// `lucidos threads follow-up`: send a message to one of the calling thread's
@@ -199,37 +249,35 @@ pub(crate) fn source_thread_id_from_env() -> Option<String> {
     std::env::var(ENV_SOURCE_THREAD_ID).ok()
 }
 
-fn build_query_params(
-    active: Option<bool>,
-    status: &[String],
-    source: Option<&str>,
-    limit: Option<u32>,
-    parent: Option<&str>,
-) -> Vec<(&'static str, String)> {
+fn build_query_params(filters: &ListFilters<'_>) -> Vec<(&'static str, String)> {
     let mut params: Vec<(&'static str, String)> = Vec::new();
-    if let Some(a) = active {
+    if let Some(a) = filters.active {
         params.push(("active", a.to_string()));
     }
     // Repeated `--status a --status b` and `--status a,b` are the same
     // request: both arrive as one comma-separated param. The engine owns
     // validation, so a bad value produces one wording rather than two.
-    if !status.is_empty() {
-        params.push(("status", status.join(",")));
+    if !filters.status.is_empty() {
+        params.push(("status", filters.status.join(",")));
     }
-    if let Some(s) = source {
+    if let Some(s) = filters.source {
         let trimmed = s.trim();
         if !trimmed.is_empty() {
             params.push(("source", trimmed.to_string()));
         }
     }
-    if let Some(l) = limit {
-        params.push(("limit", l.to_string()));
-    }
-    if let Some(p) = parent {
+    params.extend(limit_param(filters.limit));
+    if let Some(p) = filters.parent.as_deref() {
         let trimmed = p.trim();
         if !trimmed.is_empty() {
             params.push(("parent", trimmed.to_string()));
         }
+    }
+    if let Some(d) = filters.has_draft {
+        params.push(("has_draft", d.to_string()));
+    }
+    if let Some(d) = filters.has_diff {
+        params.push(("has_diff", d.to_string()));
     }
     params
 }
@@ -243,6 +291,52 @@ mod tests {
 
     fn statuses(values: &[&str]) -> Vec<String> {
         values.iter().map(|v| v.to_string()).collect()
+    }
+
+    /// The five original filter axes, positionally, so each test names only
+    /// what it sets.
+    fn build_query_params(
+        active: Option<bool>,
+        status: &[String],
+        source: Option<&str>,
+        limit: Option<u32>,
+        parent: Option<&str>,
+    ) -> Vec<(&'static str, String)> {
+        super::build_query_params(&ListFilters {
+            active,
+            status,
+            source,
+            limit,
+            parent: parent.map(str::to_string),
+            ..ListFilters::default()
+        })
+    }
+
+    #[test]
+    fn the_draft_and_diff_filters_go_out_as_explicit_booleans() {
+        let params = super::build_query_params(&ListFilters {
+            has_draft: Some(true),
+            has_diff: Some(false),
+            ..ListFilters::default()
+        });
+        assert_eq!(
+            params,
+            vec![
+                ("has_draft", "true".to_string()),
+                ("has_diff", "false".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn drafts_names_one_thread_only_when_asked() {
+        assert!(drafts_query_params(None, None).is_empty());
+        assert!(drafts_query_params(None, Some("  ")).is_empty());
+        let one = "12121212-1212-1212-1212-121212121212";
+        assert_eq!(
+            drafts_query_params(Some(5), Some(one)),
+            vec![("limit", "5".to_string()), ("thread_id", one.to_string())]
+        );
     }
 
     #[test]

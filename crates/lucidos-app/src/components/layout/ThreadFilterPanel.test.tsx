@@ -58,6 +58,7 @@ function makeThread(id: string, opts: {
       codingAgentHasDiff: false,
       codingAgentProposed: opts.codingAgentProposed ?? false,
       codingAgentRequiresRestart: false,
+      codingAgentIncomplete: false,
       codingAgentIsExternalRepo: false,
       lastRevivedAt: '',
       state: 'active',

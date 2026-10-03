@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { changeCommitList, changeHeadline, changeNamingFromEvents } from './changeHeadline';
+import { changeCommitList, changeHeadline, changeNamingFromEvents, knownChangeHeadline } from './changeHeadline';
 
 const NEWEST_FIRST = 'fix(engine): settle a withdraw\nfeat: add change summaries';
 
@@ -26,6 +26,12 @@ describe('changeHeadline', () => {
   it('falls back to a word when there is nothing to name it by', () => {
     expect(changeHeadline({})).toBe('Change');
     expect(changeHeadline({ description: ' \n ' })).toBe('Change');
+  });
+
+  it('has no known headline when there is nothing to name it by', () => {
+    expect(knownChangeHeadline({})).toBeUndefined();
+    expect(knownChangeHeadline({ description: ' \n ', summary: ' ' })).toBeUndefined();
+    expect(knownChangeHeadline({ description: 'feat: one thing' })).toBe('feat: one thing');
   });
 });
 

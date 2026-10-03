@@ -108,8 +108,8 @@ function ResultArea({
  *  or the description when that is all there is.
  *
  *  Two sources, one look. `inlineFull` is what the fold computed when the row
- *  still carried its args, which is every live SSE emission. A snapshot row has
- *  had them stripped, so this reads them from the step detail cache. It then
+ *  still carried its args, which only a `generate_image` call does. Every other
+ *  row has had them stripped, so this reads them from the step detail cache. It then
  *  runs the SAME formatter the fold would have, rather than asking the server
  *  for a rendered string. One formatter per channel, so the paths cannot drift.
  *

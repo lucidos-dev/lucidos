@@ -87,7 +87,7 @@ router, not a restatement of the route table.
   this enforces it rather than assuming it. Pointing a phone at an engine port
   is retired with the legacy no-gateway route.
 - A loopback engine is untouched. Dev, e2e, apps, the desktop app and the PWA at
-  `https://localhost:5173` all behave exactly as before, because the middleware
+  `http://localhost:5173` all behave exactly as before, because the middleware
   returns immediately.
 - The gateway mints a second 0600 file at boot, and treats a failure as fatal on
   the same terms as the first.

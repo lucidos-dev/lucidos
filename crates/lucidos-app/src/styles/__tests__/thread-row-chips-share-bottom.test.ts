@@ -3,8 +3,8 @@
  *
  * A long trigger name wraps inside its chip, so that chip grows taller than
  * the type tag beside it. Last-baseline alignment puts the short tag and the
- * date on the wrapped chip's last line. That is level with the sub-thread
- * link, and the tall chip grows upward only.
+ * date on the wrapped chip's last line, and the tall chip grows upward only.
+ * The sub-thread line below shares one text baseline the same way.
  */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
@@ -28,21 +28,31 @@ function rule(selector: string) {
 }
 
 describe('thread row meta line', () => {
-  // A family row carries its chips in a box on the sub-thread line instead,
-  // so that box needs the same alignment.
-  it.each(['.thread-row-meta', '.thread-row-family-chips'])(
-    '%s aligns its items on the last baseline',
-    (selector) => {
-      expect(rule(selector).props.get('align-items')).toBe('last baseline');
-    },
-  );
+  it('aligns the date and the chips on their last baseline', () => {
+    expect(rule('.thread-row-meta').props.get('align-items')).toBe('last baseline');
+  });
 
-  // Aligned against the whole chip box, the link stays at the bottom when the
-  // chips wrap to a second line.
-  // The link's own rule must say it too: the base `.family-disclosure` rule
-  // sets `align-self: flex-start`, which beats the line's `align-items`.
-  it('bottom-aligns the sub-thread link with the chip box beside it', () => {
-    expect(rule('.thread-row-family-line > .family-disclosure').props.get('align-self')).toBe('flex-end');
+  // The sub-thread link and the "N archived" label read as one line of text.
+  it('puts the sub-thread controls on one text baseline', () => {
+    expect(rule('.thread-row-family-line').props.get('align-items')).toBe('last baseline');
+  });
+
+  // The base `.family-disclosure` rule sets `align-self: flex-start`, which
+  // beats the line's `align-items` and lifts the link off the shared baseline.
+  it('lets the sub-thread link follow the line\'s baseline', () => {
+    expect(rule('.thread-row-family-line > .family-disclosure').props.get('align-self')).toBe('auto');
+  });
+
+  // Centred on the label's lowercase letters, not on its line box.
+  it('centres the archived switch on its label', () => {
+    expect(rule('.archived-reveal').props.get('display')).toBe('inline-block');
+    expect(rule('.archived-reveal-toggle').props.get('vertical-align')).toBe('middle');
+  });
+
+  // A line that cannot wrap overflows the row and scrolls the whole drawer
+  // sideways. The sub-thread line wraps instead.
+  it('wraps the sub-thread line rather than overflowing the row', () => {
+    expect(rule('.thread-row-family-line').props.get('flex-wrap')).toBe('wrap');
   });
 
   // The skeleton's chip is a bare bar with no text. Left on the baseline, it

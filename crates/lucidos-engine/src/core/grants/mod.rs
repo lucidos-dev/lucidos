@@ -161,7 +161,16 @@ pub fn parse_patterns(contents: &str) -> Vec<String> {
 
 /// Append `pattern` unless it is already granted. Creates the file with its
 /// header when absent.
+///
+/// Refuses a pattern holding a control character. The file is one grant per
+/// line, and a pattern derives from agent or MCP server input. An embedded
+/// newline would therefore write extra grants the user never saw.
 pub fn append(dir: &Path, file: GrantFile, pattern: &str) -> Result<(), BoxError> {
+    if pattern.chars().any(char::is_control) {
+        return Err(
+            format!("refusing a grant pattern with a control character: {pattern:?}").into(),
+        );
+    }
     // Held across the read AND the write: two concurrent grants would
     // otherwise both read the pre-state and the loser's pattern would vanish.
     let _guard = write_guard();

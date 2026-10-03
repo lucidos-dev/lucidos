@@ -826,8 +826,7 @@ async fn report_depth_cap(
                 e
             );
         }
-        crate::scheduler::push::send_push_to_all(engine, &title, &message, Some(notification_id))
-            .await;
+        crate::scheduler::push::send_push_to_all(engine, &title, &message, Some(notification_id));
     }
 }
 

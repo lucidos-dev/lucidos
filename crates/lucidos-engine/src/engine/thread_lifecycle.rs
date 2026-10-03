@@ -284,6 +284,10 @@ pub fn classify_event(event_type: &str) -> Option<EventClass> {
         // A request, not the archive: the resolver's `ThreadArchived` moves
         // the thread, so this bumps nothing.
         "ThreadArchiveRequested" => EventClass::Metadata,
+        // Undo restores the row where it was, so it bumps no recency.
+        "ThreadUnarchived" => EventClass::Metadata,
+        // A proposal records what the agent offered; the reply moves things.
+        "ThreadTriageProposed" => EventClass::Metadata,
         // Queued-message removal is a pure marker over a prior MessageReceived.
         // It must not bump recency, status, section, or message count.
         "QueuedMessageRemoved" => EventClass::Metadata,
@@ -494,6 +498,8 @@ pub fn all_persisted_event_types() -> Vec<&'static str> {
         "ThreadUnsaved",
         "ThreadArchived",
         "ThreadArchiveRequested",
+        "ThreadUnarchived",
+        "ThreadTriageProposed",
         "ThreadStarted",
         "ThreadDiscarded",
         "ImageUploaded",
@@ -667,6 +673,8 @@ pub fn resolve_transition(
         // A pinned thread is never archived (ADR 0312), so pinning an archived
         // one brings it back to the inbox.
         "ThreadSaved" => to_inbox,
+        // Archive all's Undo (ADR 0349).
+        "ThreadUnarchived" => to_inbox,
         // CC-only events illegal for Chat
         "SessionStarted"
         | "SessionEnded"
@@ -780,6 +788,7 @@ pub fn resolve_transition(
         | "ThreadTitleRenamed"
         | "ThreadUnsaved"
         | "ThreadArchiveRequested"
+        | "ThreadTriageProposed"
         | "TriggerStarted"
         | "TriggerCompleted"
         | "ChangeReverted"
@@ -922,10 +931,14 @@ pub fn resolve_transition(
     //
     // A coding-agent thread is exempt at every depth, because every session
     // ends needing Apply, Discard or Archive.
+    //
+    // `ThreadUnarchived` is exempt too: it is the user's own Undo, and the
+    // toast promises the thread is back in Current (ADR 0349).
     if is_unattended
         && thread_type != ThreadType::CodingAgent
         && result.new_section == Some(ArchiveState::Inbox)
         && !WAITING_FOR_USER_ANSWER_EVENTS.contains(&event_type)
+        && event_type != "ThreadUnarchived"
     {
         return Ok(TransitionResult {
             new_section: Some(ArchiveState::Archived),

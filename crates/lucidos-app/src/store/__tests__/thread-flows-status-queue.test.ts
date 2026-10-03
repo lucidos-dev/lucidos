@@ -723,6 +723,7 @@ describe('Bug: SSE-born scheduled trigger thread categorization', () => {
         blockingDescendantCount: 0, attentionDescendantCount: 0,
         codingAgentProposed: false,
         codingAgentRequiresRestart: false,
+        codingAgentIncomplete: false,
         codingAgentIsExternalRepo: false,
         codingAgentHasDiff: false,
         lastRevivedAt: '',

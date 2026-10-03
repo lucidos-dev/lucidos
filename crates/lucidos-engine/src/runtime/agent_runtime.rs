@@ -125,13 +125,11 @@ pub enum AgentEvent {
         duration_ms: u64,
         error: Option<String>,
     },
-    /// Per-LLM-call token usage reported by the agent. CC emits one
-    /// `message.usage` block per assistant message in its stream-json
-    /// output; the engine forwards these as `Usage` events so a
-    /// `ContextCaptured` can surface real input/output/cache counts in
-    /// the StepDetailModal — same event the main-LLM agentic loop emits,
-    /// just with `producer: ClaudeCode`. Cache fields are Anthropic-only
-    /// and stay zero on agents that don't expose them.
+    /// Token usage of one API call the agent made, exactly once per call. The
+    /// consumer records it as a `ContextCaptured`, the same event the main-LLM
+    /// agentic loop emits, with the coding agent as producer. Claude Code's
+    /// counts come from the call's `message_delta`, which holds the final
+    /// output count. Cache fields are Anthropic-only and stay zero elsewhere.
     Usage {
         model: Option<String>,
         input_tokens: u32,
@@ -139,6 +137,12 @@ pub enum AgentEvent {
         cache_read_tokens: u32,
         cache_creation_tokens: u32,
     },
+    /// Claude Code's driver read the last output line and flushed any call
+    /// left open. Only `Exited` can follow, once the process group is torn
+    /// down. A consumer that stopped the agent reads up to here to record a
+    /// cut-off call's usage without waiting out the teardown. Codex reports
+    /// usage per finished turn and holds no open call, so it never sends this.
+    OutputEnded,
     /// Process exited. Always the last event before `events_rx` closes.
     /// Stderr is logged inside the runtime — consumers don't need to handle it.
     ///

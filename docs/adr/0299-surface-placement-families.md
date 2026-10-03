@@ -76,3 +76,15 @@ their compact rows and buttons.
   scroller and its instruction is the one child that gives up height. A wrapper
   would re-home both contracts, so its children take the inset as side margins
   instead.
+
+## Amendment, 2026-10-02: a subscription's condition opens at its chip
+
+The condition behind a "with a condition" chip moves from the blocking-dialog
+family to the anchored popover family. It opened as transcript detail, pinned
+to the top of the Conversation pane. The chip sits on a wait row, which is
+usually the last thing in the transcript. So a press at the bottom of the pane
+put a small panel at the top, and the user reported it.
+
+The step detail family keeps its dialog. Those views carry a full tool call or
+a diff and need the height. A condition is a few lines of JSON, and the
+waiting panel already shows the same body inside a popover.

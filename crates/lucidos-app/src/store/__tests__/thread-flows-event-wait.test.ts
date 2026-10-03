@@ -205,13 +205,9 @@ describe('a turn parked on an event wait', () => {
     const exchange = getExchanges(map, id)[0];
     const events = exchangeResponseEvents(exchange);
     expect(waits(events)).toHaveLength(1);
-    // No `matched_event_id` assertion: `insertEvents` reads a top-level
-    // `event_id` as the row's OWN id and strips it, so the delivery's
-    // same-named payload field cannot survive this helper.
     // The row keeps its arming time and learns the delivery's own.
     expect(waits(events)[0]).toMatchObject({
       state: 'matched',
-      matched_event_type: 'ChangeProposed',
       created: TS,
       matched_at: '2026-04-17T01:00:00Z',
     });

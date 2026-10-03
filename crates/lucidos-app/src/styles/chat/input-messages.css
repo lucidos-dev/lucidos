@@ -27,32 +27,44 @@
     pointer-events: none;
 }
 
-/* .input-toggles-wrapper's align-items: flex-start sizes every child to its
-   own content width, so the row needs its own stretch to reach the wrapper's
-   full width, the same width .prompt-box resolves to as the wrapper's sibling. */
+/* On desktop the dropdown keeps its label's width: .input-toggles-wrapper's
+   align-items: flex-start sizes every child to its own content. */
 .compose-destination-row {
     display: flex;
     align-items: center;
     gap: 0.375rem;
-    width: 100%;
     max-width: 100%;
-    align-self: stretch;
 }
 
-/* Grows to fill the row, so its outer edge lands on .prompt-box's edge below
-   it. The coding-agent chip beside it keeps its own content width
-   (.compose-coding-agent-chip's flex-shrink: 0), so it is this picker that
-   absorbs the row's full width. */
 .compose-destination-row .compose-destination-picker {
     margin-bottom: 0;
-    flex: 1 1 auto;
+    flex-shrink: 1;
     min-width: 0;
 }
 
 .compose-destination-row .compose-destination-picker .dropdown-trigger {
-    width: 100%;
     min-width: 0;
-    justify-content: space-between;
+}
+
+/* On a phone the label alone nearly spans the pane, so a content-width
+   dropdown ends just short of .prompt-box's edge and reads as misaligned.
+   There the row stretches to the wrapper's width and the picker fills it. The
+   coding-agent chip keeps its content width (flex-shrink: 0), so the picker
+   absorbs the stretch. */
+@media (--phone-layout) {
+    .compose-destination-row {
+        width: 100%;
+        align-self: stretch;
+    }
+
+    .compose-destination-row .compose-destination-picker {
+        flex: 1 1 auto;
+    }
+
+    .compose-destination-row .compose-destination-picker .dropdown-trigger {
+        width: 100%;
+        justify-content: space-between;
+    }
 }
 
 .compose-destination-row .compose-destination-picker .dropdown-sizer > * {
@@ -110,6 +122,25 @@
     white-space: nowrap;
 }
 
+/* Side-question mode: Send asks the box as a side question. The × leaves it. */
+.side-question-mode-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.25rem;
+    margin-bottom: 0.375rem;
+    padding: 0.125rem 0.125rem 0.125rem 0.625rem;
+    background: color-mix(in srgb, var(--accent) 15%, transparent);
+    border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
+    border-radius: calc(var(--radius-control) * 2);
+    font-size: var(--font-size-sm);
+    color: var(--text-primary);
+}
+.side-question-mode-leave {
+    width: 1.25rem;
+    height: 1.25rem;
+    padding: 0;
+}
+
 .image-preview-strip {
     display: flex;
     gap: 0.5rem;
@@ -163,6 +194,102 @@
         color: white;
         border-color: var(--accent-red);
     }
+}
+
+/* A pending upload (`PendingUploadChip`): a scrim over the thumbnail with a
+   progress ring or an action. White on a dark scrim, because it sits over
+   image content whatever the theme. */
+.image-preview-pending-failed {
+    border-color: var(--accent-red);
+}
+
+.upload-overlay {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 0.125rem;
+    padding: 0;
+    border: 0;
+    border-radius: calc(var(--radius-surface) * 5 / 12);
+    background: rgba(0, 0, 0, 0.45);
+    color: #fff;
+    /* Taps reach the thumbnail underneath, which opens the preview. */
+    pointer-events: none;
+}
+
+.upload-caption {
+    font-size: var(--font-size-2xs);
+    font-weight: 600;
+}
+
+.upload-ring {
+    width: 1.75rem;
+    height: 1.75rem;
+    transform: rotate(-90deg);
+}
+
+.upload-ring circle {
+    fill: none;
+    stroke-width: 3;
+}
+
+.upload-ring-track {
+    stroke: rgba(255, 255, 255, 0.3);
+}
+
+.upload-ring-bar {
+    stroke: #fff;
+    stroke-linecap: round;
+    transition: stroke-dashoffset var(--duration-normal) ease;
+}
+
+/* A wait of unknown length turns. An indefinite animation keeps a literal
+   duration (frontend-css.md). */
+.upload-ring-spin {
+    animation: spin 1s linear infinite;
+}
+
+:root[data-motion="reduce"] .upload-ring-spin {
+    animation: none;
+}
+
+.upload-retry,
+.upload-refused {
+    background: rgba(0, 0, 0, 0.6);
+    pointer-events: auto;
+}
+
+.upload-retry {
+    cursor: pointer;
+}
+
+.upload-retry svg,
+.upload-refused svg {
+    width: var(--icon-size-lg);
+    height: var(--icon-size-lg);
+}
+
+/* What a send is waiting on, or why it did not go (`uploadSendNotice`). */
+.upload-send-notice {
+    display: flex;
+    align-items: center;
+    gap: 0.375rem;
+    margin-bottom: 0.375rem;
+    font-size: var(--font-size-sm);
+    color: var(--text-secondary);
+}
+
+.upload-send-notice-blocked {
+    color: var(--accent-red);
+}
+
+.upload-send-notice svg {
+    flex-shrink: 0;
+    width: var(--icon-size-sm);
+    height: var(--icon-size-sm);
 }
 
 /* User image thumbnails in chat exchange */
@@ -278,9 +405,11 @@
  * styles/__tests__/prompt-row-one-row-guard.test.ts.
  *
  * Every descendant, not just the row's own children: `.prompt-actions-right`
- * is a member AND a flex container, so its buttons would shrink inside it. */
+ * and the `.split-pill` inside it are flex containers, so their buttons would
+ * shrink inside them. */
 .prompt-actions-row > *,
-.prompt-actions-right > * {
+.prompt-actions-right > *,
+.split-pill > * {
     flex-shrink: 0;
 }
 
@@ -793,41 +922,61 @@
     min-width: 8.75rem;
 }
 
-/* The Side question half of the split pill Send opens into. It is out of
-   flow, so the row's fold never measures it and nothing in the row moves.
-   The box ends at Send's left edge and clips only there, so the half slides
-   out of Send. */
+/* The button at the row's end, Send or Submit, and the Side question half it
+   opens into. The half measures against this box, so it fits either button.
+   No z-index here: the half must outrank its neighbours in the row, and a
+   stacking context would trap it beneath them. */
+.split-pill {
+    --split-pill-radius: calc(var(--radius-control) * 0.5);
+    position: relative;
+    display: inline-flex;
+}
+.split-pill:has(> .send-cancel-round) {
+    --split-pill-radius: var(--radius-round);
+}
+/* Empty while banner buttons own the end of the row. It stays mounted, so the
+   pill still runs its close, but takes no gap the fold never counts. */
+.split-pill:empty {
+    display: none;
+}
+
+/* The Side question half. It is out of flow, so the row's fold never
+   measures it and nothing in the row moves. The box ends at the button's left
+   edge and clips only there, so the half slides out of the button. */
 .send-hold-menu {
     position: absolute;
     top: 0;
     bottom: 0;
-    right: var(--send-round-size);
+    right: 100%;
     display: flex;
     align-items: center;
     z-index: 1;
     clip-path: inset(-0.5rem 0 -0.5rem -0.5rem);
 }
 
+/* The half draws the seam's hairline, as a split button's caret does. It is
+   out of flow, so the line costs the row nothing. On the button it would
+   widen a Submit sized to its label, and the row's fold would re-measure. */
 .send-hold-menu > .action-btn {
-    height: var(--send-round-size);
+    height: 100%;
     padding: 0 0.625rem 0 0.75rem;
-    border-radius: var(--radius-round) 0 0 var(--radius-round);
+    border-right: 1px solid color-mix(in srgb, var(--text-on-accent) 30%, transparent);
+    border-radius: var(--split-pill-radius) 0 0 var(--split-pill-radius);
     font-size: var(--font-size-sm);
     animation: send-hold-slide-out var(--duration-normal) ease-out;
 }
 
-/* Send paints over the half, so its own focus ring shows at the seam. */
-.prompt-actions-right > .send-cancel-morph {
+/* The button paints over the half, so its own focus ring shows at the seam. */
+.split-pill > .action-btn {
     position: relative;
     z-index: 2;
 }
 
-/* Send is the pill's right half while it is open: its left side squares off
-   behind a hairline, as a split button's caret does. */
-.prompt-actions-right > .send-cancel-round.split-open {
+/* The button is the pill's right half while it is open: its left side squares
+   off at the seam. */
+.split-pill > .split-open {
     border-top-left-radius: 0;
     border-bottom-left-radius: 0;
-    border-left: 1px solid color-mix(in srgb, var(--text-on-accent) 30%, transparent);
     clip-path: inset(-0.25rem -0.25rem -0.25rem 0);
 }
 
@@ -835,14 +984,20 @@
    ring and each clips it at the seam, so the two join into one outline. The
    focused half lightens, to say which one Enter presses. The transparent
    outline is the forced-colors ring, where box-shadow is stripped. */
-.prompt-actions-right:has(.send-hold-menu > .action-btn:focus-visible) > .send-cancel-morph,
-.prompt-actions-right:has(> .send-cancel-round.split-open:focus-visible) .send-hold-menu > .action-btn {
+.split-pill:has(> .send-hold-menu > .action-btn:focus-visible) > .action-btn,
+.split-pill:has(> .split-open:focus-visible) > .send-hold-menu > .action-btn {
     outline: 0.125rem solid transparent;
     box-shadow: var(--focus-ring);
 }
 .send-hold-menu > .action-btn:focus-visible,
-.prompt-actions-right > .send-cancel-round.split-open:focus-visible {
+.split-pill > .split-open:focus-visible {
     background-color: color-mix(in srgb, var(--accent-action) 80%, var(--text-on-accent));
+}
+.split-pill > .split-open.action-btn-confirm:focus-visible {
+    background-color: color-mix(in srgb, var(--confirm-bg) 80%, var(--text-on-accent));
+}
+.split-pill > .split-open.action-btn-danger:focus-visible {
+    background-color: color-mix(in srgb, var(--accent-red) 80%, var(--text-on-accent));
 }
 
 /* Starts wholly behind the seam. */
@@ -1001,19 +1156,23 @@
     scrollbar-gutter: stable;
     overflow-anchor: none; /* manual scroll anchoring — prevent browser interference */
     overscroll-behavior: contain;
-    /* Top/bottom padding reserves room for a first/last turn's navigation focus
-       marker (.nav-focus-stuck) so it clears the fades instead of being dissolved
-       by them: past the desktop top-fade mask (--thread-top-fade) above, and past
-       the prompt dissolve (--prompt-fade) below, each plus the marker's reach
-       (--nav-focus-reach). scroll-margin-top handles navigated MID-thread turns,
-       but the boundary turns can't be scrolled clear (already at top/bottom), so
-       the padding is what gives them room. Mobile zeroes padding-top (uses a
-       ::before header spacer) and re-sets padding-bottom in mobile.css.
+    /* Bottom padding reserves room for the last turn's navigation focus marker
+       (.nav-focus-stuck): past the prompt dissolve (--prompt-fade), plus the
+       marker's reach (--nav-focus-reach). The last turn cannot scroll clear of
+       the dissolve, so the padding is what gives it room. Mobile re-sets
+       padding-bottom in mobile.css.
+
+       The top reserve holds no fade clearance. The first turn starts right
+       under the thread title, where the top fade begins, and its own feed
+       padding is the gap. That padding also outreaches the marker, and the
+       fade is off at rest at the top (below). Mobile uses a ::before header
+       spacer instead.
 
        --anchor-subpixel is the scroll anchor's sub-pixel rest, under 1px, set
-       inline by withScrollAnchor. Both top reserves add it (ADR 0286). */
+       inline by withScrollAnchor. It is all the desktop top reserve holds, and
+       both top reserves add it (ADR 0286). */
     padding:
-        calc(var(--thread-top-fade) + var(--nav-focus-reach) + var(--anchor-subpixel, 0px))
+        var(--anchor-subpixel, 0px)
         var(--thread-pane-gutter)
         calc(var(--prompt-fade) + var(--nav-focus-reach));
 }
@@ -1170,16 +1329,34 @@
      * 1 covers the full width, so this is a no-op there. */
     .thread-content {
         -webkit-mask:
-            linear-gradient(to bottom, transparent 0, #000 var(--thread-top-fade))
+            linear-gradient(to bottom, rgb(0 0 0 / var(--thread-top-fade-floor, 0)) 0, #000 var(--thread-top-fade))
                 left top / calc(100% - var(--scrollbar-gutter-width)) 100% no-repeat,
             linear-gradient(#000, #000)
                 right top / var(--scrollbar-gutter-width) 100% no-repeat;
         mask:
-            linear-gradient(to bottom, transparent 0, #000 var(--thread-top-fade))
+            linear-gradient(to bottom, rgb(0 0 0 / var(--thread-top-fade-floor, 0)) 0, #000 var(--thread-top-fade))
                 left top / calc(100% - var(--scrollbar-gutter-width)) 100% no-repeat,
             linear-gradient(#000, #000)
                 right top / var(--scrollbar-gutter-width) 100% no-repeat;
+        transition: --thread-top-fade-floor var(--duration-normal) ease;
     }
+
+    /* At rest at the top nothing sits under the title, so the fade could only
+       dissolve the first turn. With no fade clearance above it, that turn sits
+       inside the fade band. So the floor rises to opaque here, keeping the turn
+       and its marker whole. It eases back down once the reader scrolls, with
+       the title row's own band, so the first turn never pops to half opacity. */
+    .thread-view-header:not(.scrolled) + .thread-content-wrap > .thread-content {
+        --thread-top-fade-floor: 1;
+    }
+}
+
+/* The top fade's opacity at the transcript's top edge: 0 is the full fade, 1
+   is no fade. Registered so it can transition inside the mask gradient. */
+@property --thread-top-fade-floor {
+    syntax: '<number>';
+    inherits: false;
+    initial-value: 0;
 }
 
 @media (hover: hover) {
@@ -1528,7 +1705,7 @@ html[data-theme-mode="dark"] .thread-status-question-badge::after {
     padding: var(--turn-feed-pad-y) var(--turn-body-inset) 0 0;
 }
 
-/* `/btw` answers (ADR 0318) sit where they were asked. Each is a nested
+/* Side-question answers (ADR 0320) sit where they were asked. Each is a nested
    surface on the turn body edge, like a question card, so its text shares
    their column. */
 .side-questions {

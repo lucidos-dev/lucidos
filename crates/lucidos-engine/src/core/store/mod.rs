@@ -14,11 +14,13 @@ pub(crate) use messages::{
     CachedSummary, RESUME_VERBATIM_TOOL_TAIL,
 };
 use sqlx::PgPool;
+pub(crate) use threads::format_display_title;
 pub use threads::{
-    active_thread_statuses, fetch_thread_aggregate, parse_status_filter_csv,
-    parse_status_filter_values, status_value_list, EventWaitSummary, FilterFacet, FilterFacets,
-    LegacyInitiator, SpokenTurn, StatusFilter, ThreadAggregate, ThreadSearchResult, ThreadSummary,
-    ThreadSummaryFilters, UNTITLED_THREAD,
+    active_thread_statuses, attach_reader_fields, char_length, fetch_thread_aggregate, has_draft,
+    parse_status_filter_csv, parse_status_filter_values, status_value_list, text_preview,
+    thread_link, DraftSummary, EventWaitSummary, FilterFacet, FilterFacets, LegacyInitiator,
+    SpokenTurn, StatusFilter, ThreadAggregate, ThreadSearchResult, ThreadSummary,
+    ThreadSummaryFilters, HAS_DRAFT_SQL, PREVIEW_CHARS, UNTITLED_THREAD,
 };
 pub use types::*;
 use uuid::Uuid;

@@ -23,86 +23,55 @@ import {
   SIDE_QUESTION_NOT_STARTED,
   askSideQuestion,
   dismissSideQuestion,
-  isSideQuestionFilter,
   latestEventSeq,
   routeSideQuestion,
   localSideQuestions,
   dismissingSideQuestions,
   reopenSideQuestion,
   reopenedSideQuestions,
-  sideQuestionText,
+  sideQuestionModeOn,
   sideQuestionsFor,
-  withSideQuestionPrefix,
 } from './sideQuestions';
+import { composeSelections } from './composeSelections';
 import { threadMap } from './store';
 import type { StoredEvent } from './thread-events/thread-event-types';
 import type { ThreadState } from './thread-events/thread-meta';
 
 const STARTED = { started: true, codex: false };
 
-describe('sideQuestionText', () => {
-  it('reads /btw as the first word, like the engine', () => {
-    expect(sideQuestionText('/btw what is X?')).toBe('what is X?');
-    expect(sideQuestionText('  /btw  spaced  ')).toBe('spaced');
-    expect(sideQuestionText('/btw\nline one\nline two')).toBe('line one\nline two');
-    expect(sideQuestionText('/btw')).toBe('');
+describe('sideQuestionModeOn', () => {
+  afterEach(() => { composeSelections.value = new Map(); });
+
+  it('reads the flag from the draft\'s compose selection', () => {
+    composeSelections.value = new Map([['t1', { sideQuestionMode: true }], ['t2', { sideQuestionMode: false }]]);
+    expect(sideQuestionModeOn('t1')).toBe(true);
+    expect(sideQuestionModeOn('t2')).toBe(false);
+    expect(sideQuestionModeOn('t3')).toBe(false);
   });
 
-  it('leaves every other message alone', () => {
-    for (const text of ['/btwx q', 'btw q', 'fix the /btw route', '/compact', 'hello', '']) {
-      expect(sideQuestionText(text), text).toBeNull();
-    }
-  });
-});
-
-describe('isSideQuestionFilter', () => {
-  it('fires once btw is followed by a space', () => {
-    expect(isSideQuestionFilter('btw ')).toBe(true);
-    expect(isSideQuestionFilter('btw what')).toBe(true);
-    expect(isSideQuestionFilter('btw')).toBe(false);
-    expect(isSideQuestionFilter('bt')).toBe(false);
-    expect(isSideQuestionFilter('model')).toBe(false);
-  });
-});
-
-describe('withSideQuestionPrefix', () => {
-  it('fills an empty composer with the handed-back text', () => {
-    expect(withSideQuestionPrefix('/btw ', '')).toBe('/btw ');
-    expect(withSideQuestionPrefix('/btw ', '  \n')).toBe('/btw ');
-  });
-
-  it('keeps a draft, turning it into the question', () => {
-    expect(withSideQuestionPrefix('/btw ', 'why is the build slow?')).toBe('/btw why is the build slow?');
-    expect(withSideQuestionPrefix('/btw what', '  and why')).toBe('/btw what and why');
-  });
-
-  it('leaves a draft that already is a side question alone', () => {
-    expect(withSideQuestionPrefix('/btw ', '/btw what is X?')).toBe('/btw what is X?');
+  it('is off with no thread', () => {
+    composeSelections.value = new Map([['t1', { sideQuestionMode: true }]]);
+    expect(sideQuestionModeOn(null)).toBe(false);
   });
 });
 
 describe('routeSideQuestion', () => {
-  it('asks a side question in any started thread', () => {
-    expect(routeSideQuestion('/btw what is X?', STARTED)).toEqual({ kind: 'ask', question: 'what is X?' });
-  });
-
-  it('sends a normal message and other slash commands as usual', () => {
-    expect(routeSideQuestion('please fix the tests', STARTED)).toEqual({ kind: 'message' });
-    expect(routeSideQuestion('/compact', STARTED)).toEqual({ kind: 'message' });
-  });
-
-  it('asks the whole draft when the user chose to ask, with no /btw typed', () => {
+  it('asks the trimmed draft when the user chose a side question', () => {
     expect(routeSideQuestion('  what is X?  ', STARTED, true)).toEqual({ kind: 'ask', question: 'what is X?' });
-    expect(routeSideQuestion('/btw what is X?', STARTED, true)).toEqual({ kind: 'ask', question: 'what is X?' });
+  });
+
+  it('sends everything else as a message, /btw text included', () => {
+    expect(routeSideQuestion('please fix the tests', STARTED, false)).toEqual({ kind: 'message' });
+    expect(routeSideQuestion('/compact', STARTED, false)).toEqual({ kind: 'message' });
+    expect(routeSideQuestion('/btw what is X?', STARTED, false)).toEqual({ kind: 'message' });
   });
 
   it('refuses, keeping the draft, where it cannot be asked', () => {
-    expect(routeSideQuestion('/btw q', { started: false, codex: false }))
+    expect(routeSideQuestion('q', { started: false, codex: false }, true))
       .toEqual({ kind: 'refuse', toast: SIDE_QUESTION_NOT_STARTED });
-    expect(routeSideQuestion('/btw', STARTED)).toEqual({ kind: 'refuse', toast: SIDE_QUESTION_EMPTY });
     expect(routeSideQuestion('   ', STARTED, true)).toEqual({ kind: 'refuse', toast: SIDE_QUESTION_EMPTY });
     // A Codex thread takes none, and refusing here keeps the draft's images.
-    expect(routeSideQuestion('/btw q', { started: true, codex: true }))
+    expect(routeSideQuestion('q', { started: true, codex: true }, true))
       .toEqual({ kind: 'refuse', toast: SIDE_QUESTION_CODEX });
   });
 });

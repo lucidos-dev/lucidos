@@ -27,7 +27,7 @@ import { EventWaitClockIcon } from '../shared/icons';
 import { Overlay } from '../shared/Overlay';
 import { SurfaceHead } from '../shared/Surface';
 import { useEscapeStep } from '../../hooks/useEscapeStep';
-import type { EventConditionModalState } from '../../store/store';
+import type { EventCondition } from '../../store/store';
 import { eventConditionBody, eventConditionTitle } from './eventConditionBody';
 import { ThreadStatusIcon, threadVisualStatus } from '../shared/ThreadStatusIcon';
 import type { HeaderActionSpec } from '../layout/headerActions';
@@ -43,7 +43,7 @@ const waitingPanelAnchor = signal<HTMLElement | null>(null);
 /** The condition the panel has drilled into, or null on the list. A popover
  *  never opens a second layer, so the condition replaces the list in place,
  *  with a way back. Exported for the tests. */
-export const waitingPanelCondition = signal<EventConditionModalState | null>(null);
+export const waitingPanelCondition = signal<EventCondition | null>(null);
 
 function openWaitingPanel(anchor: HTMLElement | null): void {
   waitingPanelCondition.value = null;
@@ -370,7 +370,7 @@ export function waitingPanelBody({
   threadId: string;
   waits: EventWaitSummary[];
   subThreads: SubThreadWait;
-  condition?: EventConditionModalState | null;
+  condition?: EventCondition | null;
   onBack?: () => void;
   onClose: () => void;
 }) {

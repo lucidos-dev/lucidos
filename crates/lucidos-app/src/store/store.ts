@@ -43,7 +43,7 @@ import { holdSoftwareKeyboard } from '../utils/softwareKeyboard';
 import { restartDialogState, appUpdateDialogState } from './progressDialogCopy';
 import { clampToastText } from '../components/shared/toastMessage';
 import type { SubscriptionGroup, ThreadState, ThreadStatus, Exchange } from './thread-events';
-import { computeExchanges, isExcludedFromSections, plainEventName } from './thread-events';
+import { changeReadyToReview, computeExchanges, isExcludedFromSections, plainEventName } from './thread-events';
 import { getThreadEventsBump } from './threadActivity';
 import { DEFAULT_CHAT_MODEL } from './models';
 import { displaySection, EVENT_CHANNELS } from '../generated/thread-lifecycle';
@@ -1036,10 +1036,12 @@ export function threadNeedsAttention(thread: ThreadState): boolean {
 }
 
 /** Whether a thread is ready for review. It sits in the Current or Saved
- *  section, carries a coding-agent change (`codingAgentProposed`), AND the
- *  engine offers Apply for it. The badge must never claim a thread with no
- *  Apply button showing, so this mirrors the three states in which
- *  `available_thread_actions` withholds Apply:
+ *  section, carries a finished coding-agent change (`changeReadyToReview`),
+ *  AND the engine offers Apply for it. An incomplete change is left out: its
+ *  banner leads with Continue, and it waits under Not finished (ADR 0346).
+ *  The badge must never claim a thread with no Apply button showing, so this
+ *  mirrors the three states in which `available_thread_actions` withholds
+ *  Apply:
  *
  *  - `running`: a follow-up turn is in flight, so the WaitingBanner shows
  *    Cancel rather than Apply.
@@ -1057,7 +1059,7 @@ export function threadInReview(thread: ThreadState): boolean {
   const status = effectiveThreadStatus(thread);
   if (status === 'running' || status === 'waiting_for_user_answer') return false;
   if (thread.meta.liveEventWaitCount > 0) return false;
-  return thread.meta.codingAgentProposed;
+  return changeReadyToReview(thread.meta);
 }
 
 /** Count of threads where the agent is stuck waiting on the user (see
@@ -1599,19 +1601,32 @@ export function findChangeById(id: string): Change | undefined {
   const lazy = lazyChanges.value.get(id);
   return lazy?.status === 'loaded' ? lazy.data : undefined;
 }
-/** Pending changes the reader can act on now, because their thread has settled.
- *  A change still waiting on its thread is the standing apply's business, so it
- *  raises no badge. `null` until the list loads: a cold load or an outage must
- *  not draw a `0`. */
+/** A pending change is ready when its thread has settled and its turn
+ *  finished. An incomplete change waits under Not finished instead (ADR 0346).
+ *  The Changes panel's Ready section and the badge share this, so they agree. */
+export function changeIsReady(change: Change): boolean {
+  return !change.thread_unsettled && !change.incomplete;
+}
+
+/** Pending changes the reader can act on now: the ready ones. A change still
+ *  waiting on its thread is the standing apply's business, so it raises no
+ *  badge. `null` until the list loads: a cold load or an outage must not draw
+ *  a `0`. */
 export const actionableChangeCount = computed<number | null>(() => {
   const loadable = changes.value;
   if (loadable.status !== 'loaded') return null;
-  return loadable.data.filter((c) => !c.thread_unsettled).length;
+  return loadable.data.filter(changeIsReady).length;
 });
 /** Every change id currently being applied: the single source of truth,
- *  combining `applyingChangeIds` and `applyingNowThreadIds`. */
+ *  combining `applyingChangeIds`, `applyingNowThreadIds` and the unresolved
+ *  members of an Apply All. A reload restores the batch but not the live ids. */
 export const busyChangeIds = computed(() => {
   const ids = new Set(applyingChangeIds.value);
+  const batch = applyAllBatch.value;
+  if (batch) {
+    const resolved = new Set(batch.resolvedChangeIds);
+    for (const id of batch.changeIds) if (!resolved.has(id)) ids.add(id);
+  }
   const threadIds = applyingNowThreadIds.value;
   if (threadIds.size > 0 && changes.value.status === 'loaded') {
     for (const c of changes.value.data) {
@@ -2399,14 +2414,35 @@ export interface ContextViewerState {
 export const contextViewer = signal<ContextViewerState | null>(null);
 
 // --- Event subscription condition ---
-// Set to one event type's subscriptions to show the conditions filtering them;
-// null = closed. One type rather than the whole `on:` list, because that is
-// what the thing you pressed names. Any one condition matching resumes the thread.
-export interface EventConditionModalState {
+// One event type's subscriptions and the conditions filtering them. One type
+// rather than the whole `on:` list, because that is what the thing you pressed
+// names. Any one condition matching resumes the thread.
+export interface EventCondition {
   eventType: string;
   conditions: Record<string, unknown>[];
 }
-export const eventConditionModal = signal<EventConditionModalState | null>(null);
+// The transcript chip's popover, opened at the chip that `anchor` holds;
+// null = closed. The chip's identity is its wait plus its event type, never
+// the anchor node, because a re-render can replace that node.
+export interface EventConditionPopoverState extends EventCondition {
+  anchor: HTMLElement;
+  waitId: string;
+}
+export const eventConditionPopover = signal<EventConditionPopoverState | null>(null);
+
+/** Whether the popover is open for this wait's chip for `eventType`. */
+export function eventConditionPopoverOpenFor(waitId: string, eventType: string): boolean {
+  const open = eventConditionPopover.value;
+  return open?.waitId === waitId && open.eventType === eventType;
+}
+
+/** The chip's press. The chip is the popover's anchor, which the outside
+ *  dismiss exempts, so a second press on the same chip closes it here. */
+export function toggleEventConditionPopover(state: EventConditionPopoverState): void {
+  eventConditionPopover.value = eventConditionPopoverOpenFor(state.waitId, state.eventType)
+    ? null
+    : state;
+}
 
 /** The door to a subscription's condition, or `null` when it has none.
  *
@@ -2420,15 +2456,11 @@ export const eventConditionModal = signal<EventConditionModalState | null>(null)
  *  The label is the tooltip and accessible name of the chip that opens it. The
  *  exact type and the condition itself are inside, for a reader who drills in.
  *
- *  The panel is a backdrop-less popover and the modal is a top-anchored sheet.
- *  So opening one from the other STACKS on `overlayStack` rather than replacing
- *  it: Escape or an outside click closes the modal and lands back on the panel.
- *
  *  `conditions` is captured here rather than re-read at click time, which is
- *  what makes the returned `open` safe to hand to a handler. */
+ *  what makes the returned `condition` safe to hand to a handler. */
 export function eventConditionDoor(
   g: SubscriptionGroup,
-): { label: string; condition: EventConditionModalState; open: () => void } | null {
+): { label: string; condition: EventCondition } | null {
   const { event_type: eventType, conditions } = g;
   if (conditions.length === 0) return null;
   const condition = { eventType, conditions };
@@ -2437,12 +2469,9 @@ export function eventConditionDoor(
     label: conditions.length === 1
       ? `${plainName} · show the condition`
       : `${plainName} · show the ${conditions.length} conditions`,
-    // A popover drills in on `condition` instead, since it never opens a second
-    // layer. `open` is the modal, for the transcript chip.
+    // The transcript chip opens `condition` in its own popover. The waiting
+    // panel drills in on it, since a popover never opens a second layer.
     condition,
-    open: () => {
-      eventConditionModal.value = condition;
-    },
   };
 }
 

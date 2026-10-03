@@ -28,8 +28,8 @@ use crate::core::grants::{self, GrantFile};
 use crate::engine::cc_permission::{DedupKey, PermissionAnswer, PermissionState};
 use crate::engine::claude_code::AllowScope;
 use crate::engine::command_guard::{
-    self, GuardDecision, JudgeInput, JudgedClassification, RiskLane, SideEffectCategory,
-    StaticVerdict,
+    self, CommandSite, GuardDecision, JudgeInput, JudgedClassification, RiskLane,
+    SideEffectCategory, StaticVerdict,
 };
 use crate::engine::event_bus::{BusEvent, EventBus};
 use crate::engine::git_ops::CheckpointEffects;
@@ -83,10 +83,15 @@ pub fn derive_command_allow_pattern(
 /// Bash routes to [`command_guard::grant_covers_command`], the one predicate
 /// the coding-agent session lane also uses, so the two cannot drift. Python
 /// takes the coarse `Python` pattern: the python tool has no finer sub-scope.
-pub fn command_is_allowed(tool_name: &str, command: &str, allowed: impl Fn(&str) -> bool) -> bool {
+pub fn command_is_allowed(
+    tool_name: &str,
+    command: &str,
+    site: CommandSite<'_>,
+    allowed: impl Fn(&str) -> bool,
+) -> bool {
     match tool_name {
         tn::RUN_BASH | tn::RUN_BASH_BACKGROUND => {
-            command_guard::grant_covers_command("Bash", command, allowed)
+            command_guard::grant_covers_command("Bash", command, site, allowed)
         }
         tn::RUN_PYTHON | tn::RUN_PYTHON_BACKGROUND => allowed("Python"),
         _ => false,
@@ -477,9 +482,8 @@ pub async fn emit_command_permission_resolved(
 
 /// Per-response judge configuration + verdict cache, built once by the agentic
 /// loop and threaded through each bash/python tool call. The cache memoizes
-/// judge verdicts by command (ADR 0002's "cache by command hash for the turn"),
-/// so a re-emitted identical command within one response doesn't re-pay the
-/// LLM call. Loop-local — dropped at the end of the response, no GC needed.
+/// judge verdicts by [`JudgeInput::cache_key`], so a re-emitted identical
+/// command within one response doesn't re-pay the LLM call. Loop-local — dropped at the end of the response, no GC needed.
 pub(crate) struct CommandGuardCtx<'a> {
     /// Master `command_guard` toggle. `false` → the guard is a no-op.
     pub enabled: bool,
@@ -924,7 +928,8 @@ impl LucidosEngine {
         thread_id: Uuid,
         cancel_token: &CancellationToken,
     ) -> Option<JudgedClassification> {
-        match command_guard::static_classify(tool_name, input) {
+        let site = CommandSite::Workspace(self.workspace_path());
+        match command_guard::static_classify(tool_name, input, site) {
             // Settled lanes are only ever `Safe` / `Catastrophic` — neither
             // carries a side-effect category.
             StaticVerdict::Settled(lane) => Some(JudgedClassification {
@@ -957,6 +962,7 @@ impl LucidosEngine {
         if let Some(hit) = ctx.judge_cache.get(&key) {
             return hit.clone();
         }
+        let site = CommandSite::Workspace(self.workspace_path());
         let resolved = if ctx.judge_enabled {
             match self.judge_command(ctx.judge_model, &ji, thread_id).await {
                 Ok(verdict) => JudgedClassification {
@@ -969,11 +975,11 @@ impl LucidosEngine {
                         "[CommandGuard] judge failed ({}); falling back to the static classifier",
                         e
                     );
-                    command_guard::fallback_classify(&ji, Some(self.workspace_path()))
+                    command_guard::fallback_classify(&ji, site)
                 }
             }
         } else {
-            command_guard::fallback_classify(&ji, Some(self.workspace_path()))
+            command_guard::fallback_classify(&ji, site)
         };
         ctx.judge_cache.insert(key, resolved.clone());
         resolved
@@ -1016,7 +1022,8 @@ impl LucidosEngine {
                 .unwrap_or_default()
         };
         let persisted = grants::patterns(&self.grants_dir(), GrantFile::AgentCommands);
-        if command_is_allowed(tool_name, &command, |p| {
+        let site = CommandSite::Workspace(self.workspace_path());
+        if command_is_allowed(tool_name, &command, site, |p| {
             session_patterns.contains(p) || persisted.iter().any(|x| x == p)
         }) {
             return GuardDecision::Proceed;
@@ -1094,6 +1101,8 @@ impl LucidosEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TEXT_ONLY: CommandSite<'static> = CommandSite::TextOnly { root: None };
 
     /// Only a human's Deny tells the model the user refused. A superseded card
     /// and a closed channel used to fold into the same "do not retry".
@@ -1245,12 +1254,14 @@ mod tests {
         assert!(command_is_allowed(
             tn::RUN_BASH,
             "git pull --rebase",
+            TEXT_ONLY,
             allowed_in(&[stored.as_str()])
         ));
         // A broad grant covers any bash command.
         assert!(command_is_allowed(
             tn::RUN_BASH,
             "git pull",
+            TEXT_ONLY,
             allowed_in(&["Bash"])
         ));
     }
@@ -1267,7 +1278,7 @@ mod tests {
             "ls && LD_PRELOAD=/tmp/evil.so ls",
         ] {
             assert!(
-                !command_is_allowed(tn::RUN_BASH, cmd, allowed_in(&["Bash(ls:*)"])),
+                !command_is_allowed(tn::RUN_BASH, cmd, TEXT_ONLY, allowed_in(&["Bash(ls:*)"])),
                 "{cmd} must not be auto-allowed by a narrow grant"
             );
         }
@@ -1275,12 +1286,14 @@ mod tests {
         assert!(command_is_allowed(
             tn::RUN_BASH,
             "FOO=1 ls",
+            TEXT_ONLY,
             allowed_in(&["Bash(ls:*)"])
         ));
         // A broad grant means "any command", so it still covers it.
         assert!(command_is_allowed(
             tn::RUN_BASH,
             "LD_PRELOAD=/tmp/evil.so ls",
+            TEXT_ONLY,
             allowed_in(&["Bash"])
         ));
     }
@@ -1293,19 +1306,27 @@ mod tests {
         assert!(!command_is_allowed(
             tn::RUN_BASH,
             cmd,
+            TEXT_ONLY,
             allowed_in(&["Bash(git:*)"])
         ));
         // Covering every head (or going broad) does allow it.
         assert!(command_is_allowed(
             tn::RUN_BASH,
             cmd,
+            TEXT_ONLY,
             allowed_in(&["Bash(git:*)", "Bash(curl:*)"])
         ));
-        assert!(command_is_allowed(tn::RUN_BASH, cmd, allowed_in(&["Bash"])));
+        assert!(command_is_allowed(
+            tn::RUN_BASH,
+            cmd,
+            TEXT_ONLY,
+            allowed_in(&["Bash"])
+        ));
         // A command that runs nothing derivable is never auto-allowed.
         assert!(!command_is_allowed(
             tn::RUN_BASH,
             "",
+            TEXT_ONLY,
             allowed_in(&["Bash(git:*)"])
         ));
     }
@@ -1326,6 +1347,7 @@ mod tests {
                 !command_is_allowed(
                     tn::RUN_BASH,
                     cmd,
+                    TEXT_ONLY,
                     allowed_in(&["Bash(ls:*)", "Bash(cat:*)"])
                 ),
                 "{cmd} must not be auto-allowed by a bare-name grant"
@@ -1338,6 +1360,7 @@ mod tests {
                 command_is_allowed(
                     tn::RUN_BASH,
                     cmd,
+                    TEXT_ONLY,
                     allowed_in(&["Bash(ls:*)", "Bash(cat:*)"])
                 ),
                 "{cmd}"
@@ -1347,6 +1370,7 @@ mod tests {
         assert!(command_is_allowed(
             tn::RUN_BASH,
             "data/bin/ls",
+            TEXT_ONLY,
             allowed_in(&["Bash"])
         ));
         // Derivation is unchanged: the stored pattern is still the basename.
@@ -1361,17 +1385,20 @@ mod tests {
         assert!(command_is_allowed(
             tn::RUN_PYTHON,
             "requests.post(u)",
+            TEXT_ONLY,
             allowed_in(&["Python"])
         ));
         assert!(!command_is_allowed(
             tn::RUN_PYTHON,
             "requests.post(u)",
+            TEXT_ONLY,
             allowed_in(&["Bash"])
         ));
         // Non-command tools never auto-allow.
         assert!(!command_is_allowed(
             "read_file",
             "x",
+            TEXT_ONLY,
             allowed_in(&["Bash", "Python"])
         ));
     }
@@ -1612,7 +1639,7 @@ mod tests {
             out_of_workspace: false,
             fast_path_refused: false,
         };
-        let c = command_guard::fallback_classify(&ji, None);
+        let c = command_guard::fallback_classify(&ji, CommandSite::TextOnly { root: None });
         assert_eq!(c.lane, RiskLane::IrreversibleDanger);
         assert_eq!(c.category, Some(SideEffectCategory::ExternalApi));
     }

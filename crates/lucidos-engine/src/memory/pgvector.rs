@@ -258,10 +258,10 @@ impl PgVectorIndex {
         .await?;
 
         // Partial expression index on source->>'id' for event-source rows.
-        // Used by search_threads_by_text's entity_matches CTE to look up the
-        // event row for each memory entry. Partial (WHERE source->>'type' =
-        // 'event') keeps the index small since artifact-source rows are never
-        // joined this way.
+        // Thread delete (`api/threads/delete.rs`) finds a thread's memory
+        // entries by their source event ids through it. Partial (WHERE
+        // source->>'type' = 'event') keeps it small, since artifact-source rows
+        // are never looked up this way.
         sqlx::query(
             r#"
             CREATE INDEX IF NOT EXISTS memory_entries_source_event_id_idx

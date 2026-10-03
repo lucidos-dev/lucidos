@@ -25,6 +25,9 @@ export type ShortcutId =
   | 'focusNewestToast'
   | 'openThreadActions'
   | 'toggleSubthreads'
+  | 'toggleThreadFilter'
+  | 'searchThreads'
+  | 'toggleMenuDrawer'
   | 'historyBack'
   | 'historyForward'
   | 'prevTurnOrNotification'
@@ -38,6 +41,7 @@ export type ShortcutId =
   | 'narrowThreadDrawer'
   | 'widenThreadDrawer'
   | 'resetPaneLayout'
+  | 'refreshPanel'
   | 'toggleAppFullscreen'
   | 'toggleSourceView'
   | 'toggleLineWrap'
@@ -94,8 +98,11 @@ export const SHORTCUT_DEFS: readonly ShortcutDef[] = [
   { id: 'showShortcuts', label: 'Show keyboard shortcuts', category: 'Navigation', defaultBinding: B(true, false, false, '/'), mnemonic: 'The shortcut list in ChatGPT and Slack' },
   { id: 'openNotifications', label: 'Open notifications', category: 'Navigation', defaultBinding: B(true, true, false, 'i'), mnemonic: 'I for Inbox' },
   { id: 'focusNewestToast', label: 'Focus newest toast', category: 'Navigation', defaultBinding: B(true, true, false, 'n'), mnemonic: 'N for Notice' },
-  { id: 'openThreadActions', label: 'Open thread actions (highlighted drawer row)', category: 'Navigation', defaultBinding: B(true, true, false, 'm'), mnemonic: 'M for Menu' },
+  { id: 'openThreadActions', label: 'Open thread actions (highlighted drawer row, else open thread)', category: 'Navigation', defaultBinding: B(true, true, false, 'm'), mnemonic: 'M for Menu' },
   { id: 'toggleSubthreads', label: 'Expand or collapse sub-threads (focused thread)', category: 'Navigation', defaultBinding: B(true, true, false, 'e'), mnemonic: 'E for Expand' },
+  { id: 'toggleThreadFilter', label: 'Show the thread filter or the thread list', category: 'Navigation', defaultBinding: B(true, true, false, 'u') },
+  { id: 'searchThreads', label: 'Search threads (thread drawer)', category: 'Navigation', defaultBinding: B(true, true, false, 'k'), mnemonic: 'Search everywhere\'s K, for threads only' },
+  { id: 'toggleMenuDrawer', label: 'Open or close the menu drawer', category: 'Navigation', defaultBinding: B(true, true, false, 'x') },
   { id: 'historyBack', label: 'Back (focused pane)', category: 'Navigation', defaultBinding: B(true, false, true, 'ArrowDown') },
   { id: 'historyForward', label: 'Forward (focused pane)', category: 'Navigation', defaultBinding: B(true, false, true, 'ArrowUp') },
   { id: 'prevTurnOrNotification', label: 'Previous turn (thread) or newer notification', category: 'Navigation', defaultBinding: B(true, false, false, 'ArrowUp') },
@@ -119,6 +126,7 @@ export const SHORTCUT_DEFS: readonly ShortcutDef[] = [
   { id: 'narrowThreadDrawer', label: 'Narrow thread drawer', category: 'Panes', defaultBinding: B(true, true, true, 'ArrowLeft') },
   { id: 'widenThreadDrawer', label: 'Widen thread drawer', category: 'Panes', defaultBinding: B(true, true, true, 'ArrowRight') },
   { id: 'resetPaneLayout', label: 'Reset pane layout', category: 'Panes', defaultBinding: B(true, false, true, '0'), mnemonic: '0, as in Reset zoom' },
+  { id: 'refreshPanel', label: 'Refresh the content pane', category: 'View', defaultBinding: B(true, true, false, 'p'), mnemonic: 'P for Pull to refresh' },
   { id: 'toggleAppFullscreen', label: 'Fullscreen the open app', category: 'View', defaultBinding: B(true, true, false, 'f'), mnemonic: 'F for Fullscreen' },
   { id: 'toggleSourceView', label: 'Show source or rendered (file preview)', category: 'View', defaultBinding: B(true, true, false, 's'), mnemonic: 'S for Source' },
   { id: 'toggleLineWrap', label: 'Wrap long lines (source view)', category: 'View', defaultBinding: B(true, true, false, 'b'), mnemonic: 'B for line Break' },
@@ -131,6 +139,12 @@ export function shortcutDef(id: ShortcutId): ShortcutDef {
   const def = SHORTCUT_DEFS.find((d) => d.id === id);
   if (!def) throw new Error(`Unknown shortcut id: ${id}`);
   return def;
+}
+
+/** The `data-search-anchor` on a shortcut's Settings row, which its Search
+ *  Everywhere result scrolls to. */
+export function shortcutSearchAnchor(id: ShortcutId): string {
+  return `shortcut:${id}`;
 }
 
 /** Normalize a `KeyboardEvent.key` to the registry's canonical token: single

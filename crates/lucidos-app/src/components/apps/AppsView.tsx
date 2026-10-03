@@ -1,12 +1,11 @@
-import { useEffect, useRef } from 'preact/hooks';
-import { appsList, marketplaceCatalog, appSearchOpen, appSearchQuery } from '../../store/store';
+import { useEffect } from 'preact/hooks';
+import { appsList, marketplaceCatalog, appSearchQuery } from '../../store/store';
 import type { MarketplacePlugin } from '../../store/types';
 import {
   openApp,
   createNewApp,
   confirmDeleteApp,
   openEditApp,
-  closeAppSearch,
   refreshApps,
 } from '../../store/actions/apps';
 import { loadPluginCatalog, refreshPluginCatalog } from '../../store/actions/plugin-marketplaces';
@@ -17,9 +16,8 @@ import { LoadableError } from '../shared/LoadableError';
 import { ListRowAddCard } from '../shared/ListRowAddCard';
 import { ListSkeletonOf } from '../shared/Skeleton';
 import { LoadingFade } from '../shared/LoadingFade';
-import { CloseIcon } from '../shared/icons';
-import { SearchField } from '../shared/SearchField';
 import { AppRow, type AppPluginInfo } from './AppCard';
+import { AppSearchBar } from './AppSearchBar';
 import { resolvePluginInfo } from './pluginInfo';
 
 /** Installed app id → marketplace provenance + update status, from the loaded
@@ -28,27 +26,6 @@ import { resolvePluginInfo } from './pluginInfo';
 function pluginInfoByAppId(): Map<string, AppPluginInfo> {
   const cat = marketplaceCatalog.value;
   return cat.status === 'loaded' ? resolvePluginInfo(cat.data.plugins) : new Map();
-}
-
-function AppSearchBar() {
-  const inputRef = useRef<HTMLInputElement>(null);
-  useEffect(() => { inputRef.current?.focus({ preventScroll: true }); }, []);
-  return (
-    <div class="apps-search-bar">
-      <SearchField
-        class="apps-search-field"
-        inputRef={inputRef}
-        data-role="apps-search-input"
-        placeholder="Search apps…"
-        value={appSearchQuery.value}
-        onInput={(e) => { appSearchQuery.value = e.currentTarget.value; }}
-        onKeyDown={(e) => { if (e.key === 'Escape') closeAppSearch(); }}
-      />
-      <button class="icon-btn header-icon" onClick={closeAppSearch} aria-label="Close search">
-        <CloseIcon />
-      </button>
-    </div>
-  );
 }
 
 /** The apps list, and the catalog its rows read their plugin labels from. */
@@ -121,7 +98,7 @@ export function AppsView() {
 
   return (
     <div class="content-view active apps-view">
-      {appSearchOpen.value && <AppSearchBar />}
+      <AppSearchBar placeholder="Search apps…" dataRole="apps-search-input" />
       {body}
     </div>
   );

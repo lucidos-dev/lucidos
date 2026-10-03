@@ -9,7 +9,7 @@ import {
   waitingPanelCondition,
   type SubThreadWait,
 } from '../WaitingPanel';
-import { eventConditionModal } from '../../../store/store';
+import { eventConditionPopover } from '../../../store/store';
 import { SurfaceHead } from '../../shared/Surface';
 
 const focusThreadOrBootstrap = vi.fn();
@@ -75,6 +75,7 @@ function thread(id: string, over: Partial<ThreadMeta> = {}): ThreadState {
       codingAgentHasDiff: false,
       codingAgentProposed: false,
       codingAgentRequiresRestart: false,
+      codingAgentIncomplete: false,
       codingAgentIsExternalRepo: false,
       lastRevivedAt: '',
       state: 'active',
@@ -335,10 +336,10 @@ describe('waitingPanelBody', () => {
  *
  *  The joined LOOK survives: still one muted line reading `watching for A or B`.
  *  Only a filtered entry becomes a button, and it drills the popover into the
- *  condition rather than stacking a modal over it. */
+ *  condition rather than stacking a second popover over it. */
 describe('the panel subscription line', () => {
   afterEach(() => {
-    eventConditionModal.value = null;
+    eventConditionPopover.value = null;
     waitingPanelCondition.value = null;
   });
 
@@ -369,8 +370,8 @@ describe('the panel subscription line', () => {
       eventType: 'GithubWorkflowRunStateChanged',
       conditions: [CONDITION],
     });
-    // No second layer: the transcript's modal stays shut.
-    expect(eventConditionModal.value).toBeNull();
+    // No second layer: the transcript's popover stays shut.
+    expect(eventConditionPopover.value).toBeNull();
   });
 
   /** An entry with no condition promises nothing, so it must offer no door. Its

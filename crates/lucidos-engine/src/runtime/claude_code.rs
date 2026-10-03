@@ -521,11 +521,8 @@ pub async fn ask_side_question(
     }
     let settings =
         crate::engine::cc_settings::write_cc_side_question_settings(args.workspace_path).await?;
-    let child = super::spawn_env::spawn_below_engine(&mut build_side_question_command(
-        &args,
-        lucidos_cli_dir(),
-        &settings,
-    ))?;
+    let mut command = build_side_question_command(&args, lucidos_cli_dir(), &settings)?;
+    let child = super::spawn_env::spawn_below_engine(&mut command.cmd)?;
     ask_side_question_of(child, &side_question_message(question, images), deadline).await
 }
 
@@ -535,12 +532,14 @@ fn build_side_question_command(
     args: &SpawnArgs<'_>,
     cli_dir: Option<&Path>,
     settings: &Path,
-) -> tokio::process::Command {
-    let mut cmd = build_command_with_settings(args, cli_dir, settings);
-    cmd.arg("--no-session-persistence")
+) -> std::io::Result<CcCommand> {
+    let mut command = build_command_with_settings(args, cli_dir, settings)?;
+    command
+        .cmd
+        .arg("--no-session-persistence")
         .arg("--max-turns")
         .arg(crate::engine::agent_session::side_question::SIDE_QUESTION_MAX_TURNS.to_string());
-    cmd
+    Ok(command)
 }
 
 /// Send the side question's `message` to `child` and wait for its `result`,
@@ -653,15 +652,19 @@ pub async fn probe_cc_models(
         );
     }
     let deadline = tokio::time::Instant::now() + CC_MODEL_PROBE_TIMEOUT;
-    let mut cmd = build_command(&args, lucidos_cli_dir());
-    cmd.arg("--no-session-persistence");
+    let mut command = build_command(&args, lucidos_cli_dir())?;
+    command.cmd.arg("--no-session-persistence");
     let cc_version = super::probe_agent_version(
         CodingAgent::ClaudeCode,
-        Path::new(cmd.as_std().get_program()),
+        Path::new(command.cmd.as_std().get_program()),
         std::time::Duration::from_secs(10),
     )
     .await;
-    let models = probe_models_of(super::spawn_env::spawn_below_engine(&mut cmd)?, deadline).await?;
+    let models = probe_models_of(
+        super::spawn_env::spawn_below_engine(&mut command.cmd)?,
+        deadline,
+    )
+    .await?;
     Ok(super::cc_model_discovery::CcModelCache {
         cc_version,
         discovered_at: chrono::Utc::now(),
@@ -854,7 +857,10 @@ impl AgentRuntime for ClaudeCodeRuntime {
             );
         }
 
-        let mut cmd = build_command(&args, cli_dir);
+        let CcCommand {
+            mut cmd,
+            system_prompt_file,
+        } = build_command(&args, cli_dir)?;
         let stream_state = CcStreamState::with_notes_relayed(relays_vertex_calls(&cmd));
         let mut child = super::spawn_env::spawn_below_engine(&mut cmd)?;
         let stdin = child.stdin.take().ok_or("Failed to capture stdin")?;
@@ -867,19 +873,23 @@ impl AgentRuntime for ClaudeCodeRuntime {
         let (withdraw_tx, withdraw_rx) = mpsc::unbounded_channel::<WithdrawRequest>();
 
         let initial_session_id = args.resume_session_id.map(str::to_string);
-        tokio::spawn(driver_task(
-            child,
-            stdin,
-            BufReader::new(stdout),
-            BufReader::new(stderr),
-            events_tx,
-            input_rx,
-            control_rx,
-            withdraw_rx,
-            cancel,
-            initial_session_id,
-            stream_state,
-        ));
+        tokio::spawn(async move {
+            driver_task(
+                child,
+                stdin,
+                BufReader::new(stdout),
+                BufReader::new(stderr),
+                events_tx,
+                input_rx,
+                control_rx,
+                withdraw_rx,
+                cancel,
+                initial_session_id,
+                stream_state,
+            )
+            .await;
+            drop(system_prompt_file);
+        });
 
         Ok(RunningAgent {
             kind: CodingAgent::ClaudeCode,
@@ -991,10 +1001,66 @@ fn resolve_lucidos_binary(
 /// `docs/investigations/2026-08-02-cc-stream-idle-timeout.md`.
 const CC_BYTE_STREAM_IDLE_TIMEOUT_MS: u64 = 30 * 60 * 1000;
 
+/// A `claude` command and the file that holds its appended system prompt.
+///
+/// The prompt never rides on argv. Linux caps one argv string at 128 KiB, and
+/// a long thread's history outgrows that, so every spawn would fail with
+/// `E2BIG` for good. Argv is also world-readable in `/proc/<pid>/cmdline`.
+/// The file is 0600 and is deleted on drop, so hold this until the child exits.
+struct CcCommand {
+    cmd: tokio::process::Command,
+    system_prompt_file: Option<tempfile::TempPath>,
+}
+
+/// Where the system prompt files live. Inside the workspace rather than the
+/// shared temp dir, so this engine's boot sweep owns every file in it.
+fn system_prompt_dir(workspace: &Path) -> PathBuf {
+    workspace.join(".lucidos/cc-system-prompts")
+}
+
+/// Write `prompt` to a fresh file only its owner can read.
+fn write_system_prompt_file(workspace: &Path, prompt: &str) -> std::io::Result<tempfile::TempPath> {
+    let dir = system_prompt_dir(workspace);
+    std::fs::create_dir_all(&dir)?;
+    let mut file = tempfile::Builder::new()
+        .prefix("system-prompt-")
+        .suffix(".md")
+        .tempfile_in(&dir)?;
+    std::io::Write::write_all(&mut file, prompt.as_bytes())?;
+    Ok(file.into_temp_path())
+}
+
+/// Delete the system prompt files an earlier engine left behind. An engine
+/// that exits never drops its live sessions' file guards.
+///
+/// Call at boot, before any session spawns. A file younger than a minute may
+/// already belong to this engine, so it waits for the next boot.
+pub fn sweep_stale_system_prompt_files(workspace: &Path) {
+    let Ok(entries) = std::fs::read_dir(system_prompt_dir(workspace)) else {
+        return;
+    };
+    let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+    for entry in entries.flatten() {
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .is_ok_and(|modified| modified < cutoff);
+        if stale {
+            if let Err(e) = std::fs::remove_file(entry.path()) {
+                log!(
+                    "[ClaudeCode] failed to delete stale system prompt file {}: {}",
+                    entry.path().display(),
+                    e
+                );
+            }
+        }
+    }
+}
+
 /// Build the `claude` Command with all flags and env vars. Extracted so unit
 /// tests can inspect args/env without spawning. `cli_dir` is the directory
 /// containing the `lucidos` binary, prepended to PATH; pass `None` to skip.
-fn build_command(args: &SpawnArgs<'_>, cli_dir: Option<&Path>) -> tokio::process::Command {
+fn build_command(args: &SpawnArgs<'_>, cli_dir: Option<&Path>) -> std::io::Result<CcCommand> {
     build_command_with_settings(
         args,
         cli_dir,
@@ -1009,7 +1075,7 @@ fn build_command_with_settings(
     args: &SpawnArgs<'_>,
     cli_dir: Option<&Path>,
     settings: &Path,
-) -> tokio::process::Command {
+) -> std::io::Result<CcCommand> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let claude_bin = resolve_claude_binary(home.as_deref(), args.binary_override.map(Path::new));
     let mut cmd = tokio::process::Command::new(claude_bin);
@@ -1042,6 +1108,19 @@ fn build_command_with_settings(
     for dir in args.additional_directories {
         cmd.arg("--add-dir").arg(dir);
     }
+    if args.additional_directories.is_empty() {
+        cmd.env_remove(CC_ADDITIONAL_DIRECTORIES_ENV);
+    } else {
+        let dirs: Vec<_> = args
+            .additional_directories
+            .iter()
+            .map(|dir| dir.to_string_lossy())
+            .collect();
+        cmd.env(
+            CC_ADDITIONAL_DIRECTORIES_ENV,
+            serde_json::Value::from(dirs).to_string(),
+        );
+    }
     cmd.current_dir(args.worktree_path)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -1061,8 +1140,12 @@ fn build_command_with_settings(
     if let Some(m) = args.model {
         cmd.arg("--model").arg(m);
     }
-    if let Some(prompt) = args.system_prompt {
-        cmd.arg("--append-system-prompt").arg(prompt);
+    let system_prompt_file = args
+        .system_prompt
+        .map(|prompt| write_system_prompt_file(args.workspace_path, prompt))
+        .transpose()?;
+    if let Some(file) = &system_prompt_file {
+        cmd.arg("--append-system-prompt-file").arg(file);
     }
     // Agent-independent Lucidos env contract (workspace, host protection,
     // PG*, subprocess origin, spawn metadata, compile env, PATH), shared
@@ -1128,7 +1211,10 @@ fn build_command_with_settings(
     // No macOS TCC responsibility disclaim is attempted here, and adding one
     // back would be inert: a `pre_exec` hook forces the `fork()` path, where the
     // only effective knob is never consulted. See ADR 0075.
-    cmd
+    Ok(CcCommand {
+        cmd,
+        system_prompt_file,
+    })
 }
 
 /// Point the session's Vertex calls at the engine's relay, so an
@@ -1194,6 +1280,11 @@ pub(crate) enum CcPermissionMode {
 /// provider. We run on Vertex, and without it CC's gate drops the session to
 /// `default`, which cards MORE than `acceptEdits` does.
 const AUTO_MODE_OPT_IN_ENV: &str = "CLAUDE_CODE_ENABLE_AUTO_MODE";
+
+/// The session's `--add-dir` list as a JSON array of strings. Claude Code reads
+/// agent definitions from those directories, and the hook payload does not
+/// name them, so `lucidos cc-agent-guard` reads them here.
+const CC_ADDITIONAL_DIRECTORIES_ENV: &str = "LUCIDOS_CC_ADDITIONAL_DIRECTORIES";
 
 impl CcPermissionMode {
     /// CC's own spelling, for `--permission-mode`.
@@ -1618,6 +1709,12 @@ async fn driver_task(
             }
         }
     }
+
+    // A call cut off mid-stream still billed its prompt.
+    if let Some(usage) = stream_state.close_open_call() {
+        let _ = events_tx.send(usage);
+    }
+    let _ = events_tx.send(AgentEvent::OutputEnded);
 
     // If the child already died on its own but a different select! arm won the
     // race, reap it here BEFORE any teardown kill. Its true exit status then

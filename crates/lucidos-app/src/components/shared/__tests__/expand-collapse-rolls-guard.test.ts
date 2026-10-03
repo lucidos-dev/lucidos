@@ -11,7 +11,9 @@ import { dirname, resolve, relative } from 'node:path';
  * Expand and Collapse Rolls). An inline toggle says so with `aria-expanded`,
  * and its content rolls through `<Disclosure>`. A popover toggle also carries
  * `aria-expanded`, beside an `aria-haspopup`, and opens through `<Overlay>`
- * instead, so it is not counted here.
+ * instead, so it is not counted here. A pressed toggle, such as the header's
+ * search button, carries no `aria-expanded`, so this scan reads the content
+ * side too.
  *
  * A source scan, like `skeleton-guard`: jsdom runs no animation to assert.
  */
@@ -55,6 +57,16 @@ function hasInlineToggle(src: string): boolean {
   });
 }
 
+/** A mount gated on an open or expanded flag, as `{xOpen.value && <X />}` or
+ *  `xOpen.value ? <X /> : null`. It appears and vanishes in one frame, whoever
+ *  flips the flag. The toggle can be anywhere, even a header button in
+ *  another file, so this check reads the mount and not the toggle. A ternary
+ *  whose else branch is JSX swaps two drawings, an icon say, and is not one. */
+const GATED_MOUNT = new RegExp(
+  String.raw`(?<![!\w])\w*(?:[Oo]pen|[Ee]xpanded)(?:\.value)?\s*` +
+    String.raw`(?:&&\s*\(?\s*<|\?\s*\(?\s*<(?:(?!\s:\s*[<(])[\s\S]){0,600}?\s:\s*null\b)`,
+);
+
 const files = sourceFiles(resolve(SRC, 'components')).map((full) => ({
   path: relative(SRC, full),
   src: readFileSync(full, 'utf8'),
@@ -66,6 +78,27 @@ describe('every expand and collapse rolls', () => {
       .filter(({ path, src }) => hasInlineToggle(src) && !src.includes('<Disclosure') && !(path in ROLLS_ELSEWHERE))
       .map(({ path }) => path);
     expect(unrolled).toEqual([]);
+  });
+
+  it('rolls each mount gated on an open flag, or opens it as an <Overlay>', () => {
+    const bare = files
+      .filter(({ src }) => GATED_MOUNT.test(src) && !src.includes('<Disclosure') && !src.includes('<Overlay'))
+      .map(({ path }) => path);
+    expect(bare).toEqual([]);
+  });
+
+  it('reads a gated mount in both of its shapes', () => {
+    expect(GATED_MOUNT.test('{searchOpen.value && <SearchBar />}')).toBe(true);
+    expect(GATED_MOUNT.test('{expanded && (\n  <Rows />\n)}')).toBe(true);
+    expect(GATED_MOUNT.test('return cameraOpen.value ? <Camera /> : null;')).toBe(true);
+    expect(GATED_MOUNT.test('{open ? <Panel onClose={() => close()} /> : null}')).toBe(true);
+    expect(GATED_MOUNT.test('{open ? (\n  <div class="a">hi</div>\n) : null}')).toBe(true);
+  });
+
+  it('leaves a drawing swap and a negated flag alone', () => {
+    expect(GATED_MOUNT.test('{open ? <ChevronDownIcon /> : <ChevronRightIcon />}')).toBe(false);
+    expect(GATED_MOUNT.test('{open ? (\n  <Down />\n) : (\n  <Right />\n)}')).toBe(false);
+    expect(GATED_MOUNT.test('{!searchOpen.value && <Hint />}')).toBe(false);
   });
 
   it('keeps no stale exception', () => {

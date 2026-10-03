@@ -1,4 +1,4 @@
-//! Side questions (`/btw`): a quick question answered from a thread's context,
+//! Side questions: a quick question answered from a thread's context,
 //! beside any running turn, with no tools. A Claude Code thread asks a copy of
 //! its session. A Lucidos Agent thread asks its own model once
 //! (`chat::process::side_question`).
@@ -70,17 +70,12 @@ pub(crate) fn side_question_timeout_message(agent: &str) -> String {
 /// What startup recovery records for an ask a restart left unanswered.
 pub(crate) const INTERRUPTED_BY_RESTART: &str = "Interrupted by a restart. Ask again.";
 
-pub(crate) const EMPTY_QUESTION: &str = "Type a question after /btw.";
+pub(crate) const EMPTY_QUESTION: &str = "Type the side question first.";
 pub(crate) const NO_SUCH_THREAD: &str = "Side questions work once this thread has started.";
 pub(crate) const CODEX_UNSUPPORTED: &str =
     "Side questions are not available in Codex threads. Send it as a normal message instead.";
 const NO_SESSION_YET: &str =
     "This thread has no Claude Code session yet. Wait for its first reply, then ask again.";
-
-/// Refusal for a `/btw` message on the normal chat route. Sent there, it would
-/// become a real turn in the thread.
-pub(crate) const SIDE_QUESTION_ON_CHAT_ROUTE: &str =
-    "A /btw side question is never sent to the thread as a turn. Ask it through POST /api/v1/side-questions.";
 
 /// How many Claude Code spawn prompts the engine remembers. Each is a whole
 /// appended system prompt, so the cap bounds memory on a long-running engine.
@@ -89,14 +84,6 @@ const REMEMBERED_CC_PROMPTS: usize = 128;
 /// Serializes the duplicate-id check with the ask's record. Held only for
 /// those two quick writes, never across the answer.
 static ASK_ADMISSION: Mutex<()> = Mutex::const_new(());
-
-/// Whether `message` is a side question: `/btw` as its first word.
-pub(crate) fn is_side_question(message: &str) -> bool {
-    message
-        .trim_start()
-        .strip_prefix("/btw")
-        .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
-}
 
 /// Which agent answers a thread's side questions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

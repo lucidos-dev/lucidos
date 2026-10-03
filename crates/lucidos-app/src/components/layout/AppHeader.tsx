@@ -26,13 +26,14 @@ import { WorkspaceNameLabel } from './WorkspaceNameLabel';
 import { getContentTitle, getContentTitleShort, getDiffDescription } from './headerHelpers';
 import { headerDblClickRegion, resolveHeaderDblClick } from './headerDblClick';
 import { createDblClickGate } from '../../utils/dblClickGate';
-import { useThreadsHeaderState } from '../../hooks/useThreadsHeaderState';
+import { useThreadSearch } from '../../hooks/useThreadSearch';
 import { ThreadFilterButton, ThreadsPaneTitle } from './ThreadFilterButton';
 import { isMobile } from '../../utils/viewport';
 import { isTextInput } from '../../utils/dom';
+import { tooltipWithShortcut } from '../../store/actions/keybindings';
 
 function ThreadsHeader() {
-  const { searchOpen, searchInputRef, onSearchInput, onSearchKeyDown, closeSearch, openSearchHandlers } = useThreadsHeaderState();
+  const { searchOpen, searchInputRef, onSearchInput, onSearchKeyDown, closeSearch, openSearchHandlers } = useThreadSearch();
 
   // Header regions set the focused pane on `click`, NOT `pointerdown`: in the
   // Tauri build the whole header is a window-drag region (useWindowDragRegion),
@@ -70,16 +71,16 @@ function ThreadsHeader() {
           to the drawer toggle resting over it (.thread-toggle-slot).
           The button only toggles: the panel itself renders down in the drawer
           pane (see ThreadDrawer), so it is not `aria-haspopup` chrome anymore.
-          It is also the panel's only way out, which is why it reads as held
+          It is also the panel's visible way out, which is why it reads as held
           down while the panel is up (see filterButtonState). */}
       <div class="view-selector-slot">
-        <ThreadFilterButton class="threads-header-btn" tooltip="Filter threads" />
+        <ThreadFilterButton class="threads-header-btn" tooltip={tooltipWithShortcut('Filter threads', 'toggleThreadFilter')} />
       </div>
       <button
         class="icon-btn header-icon threads-header-btn"
         {...openSearchHandlers}
         aria-label="Search threads"
-        data-tooltip="Search threads"
+        data-tooltip={tooltipWithShortcut('Search threads', 'searchThreads')}
       >
         <SearchIcon />
       </button>

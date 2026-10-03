@@ -90,8 +90,12 @@ export interface EventRowChip {
   note?: string;
   /** Makes the chip ITSELF the link to the event it names. Absent whenever the
    *  event has nowhere to open, which is what keeps a dead tap unreachable
-   *  rather than merely unlikely (see `eventHasTarget`). */
-  onClick?: () => void;
+   *  rather than merely unlikely (see `eventHasTarget`). It receives the chip,
+   *  for a press that opens a popover at it. */
+  onClick?: (chip: HTMLButtonElement) => void;
+  /** Set when the press opens a popover at the chip: whether it is open now.
+   *  Absent for a jump, which opens nothing. */
+  popupOpen?: boolean;
   /** What pressing it does, as the accessible name and the tooltip. Defaults to
    *  the jump, which is what a chip has meant since the "Go to event" link was
    *  folded into it. A subscription chip opens its condition instead, and a chip
@@ -128,6 +132,9 @@ export interface EventRowProps {
   /** The state as a word. Omitted only when the row has no state to report. */
   stateLabel?: string;
   tone?: EventRowTone;
+  /** A sentence under the head line, at full weight, for a subject that is a
+   *  chip. The wait's pill says "Waiting for", and this says what. */
+  detail?: ComponentChildren;
   /** When the row's event was recorded, already formatted, and its ISO source.
    *  Drawn above the card. Only a row inside a response body needs one: a row
    *  in an initiator panel sits under that panel's own timestamp. */
@@ -155,6 +162,7 @@ export function eventRowBody({
   subject,
   stateLabel,
   tone = 'none',
+  detail,
   time,
   facts,
   fold,
@@ -178,6 +186,7 @@ export function eventRowBody({
           </span>
         )}
       </div>
+      {detail && <div class="event-row-detail">{detail}</div>}
       {shown.length > 0 && <div class="event-row-meta">{renderFacts(shown)}</div>}
       {fold && <EventRowFoldView {...fold} />}
       {actions && <div class="event-row-actions">{actions}</div>}
@@ -278,7 +287,8 @@ export function eventNameChip(chip: EventRowChip, key?: string): ComponentChildr
   const text = chip.sentenceStart ? plain.charAt(0).toUpperCase() + plain.slice(1) : plain;
   // The space is real text so a copied chip reads "coding agent stopped working 6 conditions".
   const note = chip.note && [' ', <span key="note" class="event-name-note">{chip.note}</span>];
-  if (!chip.onClick) {
+  const { onClick } = chip;
+  if (!onClick) {
     const meaning = chip.meaning ?? plainEventMeaning(chip.name);
     return <code key={key} class="event-name" data-tooltip={meaning}>{text}{note}</code>;
   }
@@ -292,9 +302,11 @@ export function eventNameChip(chip: EventRowChip, key?: string): ComponentChildr
       data-role={chip.role}
       aria-label={label}
       data-tooltip={label}
+      aria-haspopup={chip.popupOpen === undefined ? undefined : 'dialog'}
+      aria-expanded={chip.popupOpen}
       aria-busy={chip.pending ? 'true' : undefined}
       disabled={!!chip.pending}
-      onClick={chip.onClick}
+      onClick={(e) => onClick(e.currentTarget)}
     >
       {text}
       {note}

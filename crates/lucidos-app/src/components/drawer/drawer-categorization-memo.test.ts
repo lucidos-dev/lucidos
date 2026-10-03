@@ -59,6 +59,7 @@ function makeThread(id: string, opts: ThreadOpts = {}): ThreadState {
         codingAgentHasDiff: false,
         codingAgentProposed: false,
         codingAgentRequiresRestart: false,
+        codingAgentIncomplete: false,
         codingAgentIsExternalRepo: false,
         lastRevivedAt: '',
         parentThreadId: opts.parentId,
@@ -115,6 +116,8 @@ function snapshot(r: DrawerCategorization) {
         routedByThread: [...r.decorations.routedByThread.entries()].sort(),
         liftedRoots: [...r.decorations.liftedRoots].sort(),
         archivedSubThreads: [...r.decorations.archivedSubThreads].sort(),
+        hiddenArchivedThreads: [...r.decorations.hiddenArchivedThreads].sort(),
+        hiddenDirectChildCount: [...r.decorations.hiddenDirectChildCount.entries()].sort(),
     };
 }
 

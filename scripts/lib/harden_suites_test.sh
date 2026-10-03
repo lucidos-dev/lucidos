@@ -89,6 +89,9 @@ expect_eq "release" "shell-lint release" "$(select_for scripts/lib/release_draft
 expect_eq "self" "shell-lint harden-suites" "$(select_for scripts/lib/harden_suites.sh)"
 expect_eq "harden scope" "shell-lint harden-scope" "$(select_for scripts/harden-scope.sh)"
 expect_eq "harden scope test" "shell-lint harden-scope" "$(select_for scripts/lib/harden_scope_test.sh)"
+expect_eq "harden codex review" "shell-lint harden-codex-review" "$(select_for scripts/harden-codex-review.sh)"
+expect_eq "harden codex review test" "shell-lint harden-codex-review" \
+    "$(select_for scripts/lib/harden_codex_review_test.sh)"
 expect_eq "ts" "ts" "$(select_for crates/lucidos-app/src/a.ts)"
 expect_eq "css" "vite" "$(select_for crates/lucidos-app/src/a.css)"
 expect_eq "sdk iframe css" "rust vitest" "$(select_for crates/lucidos-engine/src/api/sdk_iframe.css)"

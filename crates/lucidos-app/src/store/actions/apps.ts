@@ -333,7 +333,7 @@ export async function refreshAppUI(appId?: string, options: RefreshAppUiOptions 
   }, REFRESH_DEBOUNCE_MS);
 }
 
-/** Open the inline apps search bar. The bar focuses itself on mount. */
+/** Open the inline apps search bar. The bar focuses itself as it opens. */
 export function openAppSearch(): void {
   appSearchOpen.value = true;
 }

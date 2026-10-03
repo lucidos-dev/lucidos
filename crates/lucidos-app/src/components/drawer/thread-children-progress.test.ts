@@ -31,6 +31,7 @@ function makeThread(id: string, overrides: Partial<ThreadMeta> = {}): ThreadStat
       summaryVersion: 0,
       codingAgentProposed: false,
       codingAgentRequiresRestart: false,
+      codingAgentIncomplete: false,
       codingAgentIsExternalRepo: false,
       codingAgentHasDiff: false,
       lastRevivedAt: '',

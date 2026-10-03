@@ -23,7 +23,12 @@
     flex-direction: column;
     gap: 0.375rem;
     margin: var(--space-sm) 0;
-    padding: 0.625rem var(--space-md);
+    /* The left inset adds back the lead badge's pull (its pad and border, see
+       `.event-row-subject > .event-name:first-child`). So the badge sits as far
+       from the left edge as from the top, and the text below lines up past it. */
+    --event-row-inset: 0.625rem;
+    padding: var(--event-row-inset) var(--space-md) var(--event-row-inset)
+        calc(var(--event-row-inset) + 0.375rem + 1px);
     background: var(--bg-secondary);
     border: 1px solid color-mix(in srgb, var(--border-color) 30%, transparent);
     border-radius: calc(var(--radius-surface) * 5 / 6);
@@ -91,6 +96,13 @@
        keeps that share from shrinking to one letter per line. */
     flex: 1 1 0;
     min-width: 0;
+    color: var(--text-primary);
+    overflow-wrap: anywhere;
+}
+
+/* The sentence under a chip subject. It wraps for the same reason the subject
+   does: a model wrote it, and an ellipsis would hide what the row is for. */
+.event-row-detail {
     color: var(--text-primary);
     overflow-wrap: anywhere;
 }
@@ -285,13 +297,18 @@
     transition: color var(--duration-fast) ease;
 }
 
+/* The icon is 1em on a 24-unit box, and its ink starts 8 units in (the
+   polyline at 9, less its round cap). Pulling it left by that bearing puts
+   the drawn chevron on the card's text edge, with the badge label above it. */
 .event-row-fold-chevron {
     display: inline-flex;
+    margin-left: calc(-8em / 24);
     transition: transform var(--duration-fast) ease;
 }
 
+/* Turned down, the ink starts 5 units in, not 8, so it shifts back by 3. */
 .event-row-fold-toggle[aria-expanded="true"] > .event-row-fold-chevron {
-    transform: rotate(90deg);
+    transform: translateX(calc(3em / 24)) rotate(90deg);
 }
 
 @media (hover: hover) {

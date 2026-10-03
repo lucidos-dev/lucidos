@@ -1,5 +1,53 @@
 # Changelog
 
+## v0.46.0 - 2026-10-03
+
+### Added
+- Archive all on Current. A confirm says how many threads it archives, and the toast has an Undo button.
+- The Lucidos Agent can triage your inbox. It proposes archive, pin or dismiss for each thread with a reason, and applies only what you approve.
+- Click a task-list checkbox in the markdown preview to toggle it in the file.
+- The agent and `lucidos threads` list unsent drafts and held messages, each with a link to its thread. Thread search also matches draft text.
+- Image uploads show progress on each chip, retry on their own after a dropped connection, and offer Retry when they fail. A send pressed during an upload shows a status line until it goes.
+- Pending images and a queued send come back after a page reload.
+- A send that gets no answer shows as Not sent, with Retry.
+- Keyboard shortcuts: Ctrl+Shift+U toggles the thread filter, Ctrl+Shift+K opens thread search, Ctrl+Shift+X opens or closes the menu drawer, and Ctrl+Shift+P refreshes the content pane.
+- Search Everywhere tabs show how many hits each tab has.
+
+### Changed
+- Side questions have their own mode. Hold Stop, or the Side question shortcut, over an empty box. A pill above the composer shows the mode, and its x or Escape leaves it. Holding a waiting card's Cancel starts one too. `/btw` is now ordinary text.
+- Search Everywhere ranks every section by title match, so "settings" leads with the Settings page.
+- Question and permission cards say Sending until the engine confirms your pick.
+- Archived sub-threads with no live work hide under their parent. A toggle on the row shows them again.
+- New changes roll into the Changes view and stay marked until you see them. An unfinished change leads with Continue in its thread banner.
+- The wait card leads with a Waiting for pill and the agent's reason, and the change card leads with a Change chip.
+- Open thread actions works on the open thread when no drawer row has the focus.
+- The live stream no longer carries tool-call arguments. An open file preview refreshes from file events.
+- Hardening merges main before it reviews, so one run covers the work and the merge.
+- The daily device sweep removes one-off devices, such as headless browser runs, after a week.
+- Coding-agent sessions refuse background subagents, which the session would kill at idle.
+
+### Fixed
+- Only Settings can set the local model host, and only to a loopback, private or tailnet address.
+- The gateway refuses a control-plane browser request that hides its Referer.
+- The command guard resolves workspace paths on disk, so a symlink cannot make an outside delete look like an inside one. Quoted, glued, bundled and abbreviated curl body flags all reach the judge.
+- Voice calls treat a permission card's quoted text as data, never as an instruction.
+- A grant pattern with a control character is refused.
+- A long thread's coding agent starts on Linux. The session prompt no longer goes on the command line.
+- A stalled push notification no longer blocks triggers, backups or event triggers.
+- Backup logs a file that changed while it was archived.
+- An allowlist Save keeps an Always allow granted while the editor was open.
+- A failed tool call shows as Failed, not Completed.
+- A trigger run cut off by a restart before it did anything no longer sits in Current.
+- Thread search in Search Everywhere no longer times out on a large workspace.
+- Stop, Edit and Retry return a queued message's images to the composer, not just its text.
+- The agent can reach the builtin provider proxies.
+- A notification tap lands on the step it names, even when the step arrives late.
+- A tap on the Archive all toast no longer undoes the batch.
+- An empty Codex review reports no verdict instead of passing.
+- Focus rings are never clipped, and anchored popovers open in place without a jump.
+- A subscription's condition opens as a popover at its chip.
+- The first turn starts right under the thread title, and the transcript top fade eases in.
+- A large image upload no longer stalls other requests.
 ## v0.45.0 - 2026-10-02
 
 ### Added

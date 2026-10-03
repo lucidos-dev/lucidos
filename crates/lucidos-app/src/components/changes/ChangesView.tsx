@@ -1,6 +1,7 @@
 import { useRef, useCallback, useEffect } from 'preact/hooks';
 import { useSignal } from '@preact/signals';
-import { changes, appliedChanges, setAsideChanges, findChangeById, threadMap, effectiveThreadStatus, isMidTurn, changesHasMore, changesLoadingMore, busyChangeIds, applyAllInProgress, showConfirm, standingApplyThreadIds, collapsedChangesSectionIds, toggleChangesSectionCollapsed } from '../../store/store';
+import { changes, appliedChanges, setAsideChanges, changeIsReady, findChangeById, threadMap, effectiveThreadStatus, isMidTurn, changesHasMore, changesLoadingMore, busyChangeIds, applyAllInProgress, applyAllBatch, applyPhases, showConfirm, standingApplyThreadIds, collapsedChangesSectionIds, toggleChangesSectionCollapsed, type ApplyAllBatch, type ApplyPhase, type ApplyPhaseReading } from '../../store/store';
+import { applyPhaseOf, isBatchMember } from '../../store/actions/applyProgress';
 import { applySingleChange, discardSingleChange, setAsideSingleChange, bringBackSingleChange, applyAllChanges, discardAllChanges, revertChange, loadMoreChanges, armStandingApply, disarmStandingApply, armStandingApplies, disarmStandingApplies, refreshChangesState, APPLY_NEW_VERSION_TOOLTIP } from '../../store/actions/chat-changes';
 import { APPLY_INCOMPLETE_CONFIRM } from '../../store/actions/threadActions';
 import { viewChangeDiff } from '../../store/actions/repositories';
@@ -17,6 +18,8 @@ import { CommitList } from '../shared/CommitList';
 import { SplitButton } from '../shared/SplitButton';
 import { SectionHeader } from '../shared/SectionHeader';
 import { Disclosure } from '../shared/Disclosure';
+import { ArrivalList } from '../shared/ArrivalList';
+import { useArrivals } from '../shared/arrivals';
 import { EventRowFoldView } from '../chat/EventRow';
 import { changeCommitList, changeHeadline } from '../../store/changeHeadline';
 
@@ -39,7 +42,10 @@ function ChangeHeadline({ change }: { change: Change }) {
 
 interface ChangeRowProps {
   change: Change;
-  busy: boolean;
+  /** The arrival marker's classes while the row is lit (`ArrivalList`). */
+  markerClass?: string;
+  /** What the action in flight is doing, or `null` when the row is idle. */
+  progressLabel: string | null;
   armed: boolean;
   onOpen: () => void;
   onDiff: () => void;
@@ -89,7 +95,7 @@ export type ChangeRowAction =
  *    moment it was pressed, so offering one is the same broken control in a
  *    new coat. The row's details line says the thread has not finished.
  *  - Apply resolving merge conflicts: nothing. That apply is already in
- *    flight, and the row wears its "Applying..." face.
+ *    flight, and the row wears its progress face.
  *  - Nothing left in the change: Discard alone. That IS how an emptied change
  *    is resolved, and Apply is removed rather than faded.
  *  - Otherwise: Discard, Set aside and Apply, all live. Set aside is offered
@@ -122,6 +128,42 @@ export function changeRowActions(change: Change, armed: boolean): ChangeRowActio
   ];
 }
 
+/** A row action this view runs itself and waits on. */
+export type LocalRowAction = 'apply' | 'discard' | 'set-aside' | 'bring-back' | 'revert';
+
+/** Short enough for the `.change-row-primary` slot, so Diff keeps its column.
+ *  The details line spells out a conflict in full. */
+const APPLY_PHASE_PROGRESS: Record<ApplyPhase, string> = {
+  merging: 'Applying...',
+  hardening: 'Hardening...',
+  'resolving-conflict': 'Resolving...',
+};
+
+/** What a busy row's one disabled face says. An apply names its phase, so a
+ *  long hardening reads as hardening.
+ *
+ *  An Apply All member names a phase only on evidence: an event this page saw,
+ *  the served conflict flag, or the engine listing it as applying. The live
+ *  stream does not say which member runs, and an unhardened member hardens
+ *  only once the batch reaches it. */
+export function rowProgressLabel(
+  change: Change,
+  local: LocalRowAction | undefined,
+  phases: ReadonlyMap<string, ApplyPhaseReading>,
+  batch: ApplyAllBatch | null,
+): string {
+  if (local === 'discard') return 'Discarding...';
+  if (local === 'set-aside') return 'Setting aside...';
+  const seen = change.thread_id ? phases.get(change.thread_id) : undefined;
+  const unplacedMember = isBatchMember(batch, change.id)
+    && !batch!.applyingChangeIds.includes(change.id)
+    && !seen
+    && !change.resolving_conflict;
+  if (unplacedMember) return APPLY_PHASE_PROGRESS.merging;
+  const reading = applyPhaseOf(change.thread_id, change, phases);
+  return APPLY_PHASE_PROGRESS[reading?.phase ?? 'merging'];
+}
+
 type ApplyRowAction = Extract<ChangeRowAction, { kind: 'apply' }>;
 
 /** How the row draws its actions. With an Apply, it is the thread's own change
@@ -141,7 +183,7 @@ export function rowActionLayout(actions: ChangeRowAction[]):
  *  SkeletonProvider (`<ChangeRow />`) it draws itself as a loading placeholder
  *  via the Sk* leaves; with real props it renders normally. Props are optional
  *  only to support the skeleton call; real call sites pass them all. */
-function ChangeRow({ change, busy, armed, onOpen, onDiff, onDiscard, onSetAside, onApply, onStanding }: Partial<ChangeRowProps>) {
+function ChangeRow({ change, markerClass, progressLabel, armed, onOpen, onDiff, onDiscard, onSetAside, onApply, onStanding }: Partial<ChangeRowProps>) {
   const sk = useSkeleton();
   const layout = rowActionLayout(change ? changeRowActions(change, !!armed) : []);
   const clickable = !sk && !!change?.thread_id;
@@ -153,7 +195,7 @@ function ChangeRow({ change, busy, armed, onOpen, onDiff, onDiscard, onSetAside,
   };
   return (
     <div
-      class={`list-row change-row${clickable ? ' clickable' : ''}`}
+      class={rowClass(clickable, markerClass)}
       onClick={clickable ? onOpen : undefined}
     >
       <div class="list-row-info">
@@ -188,12 +230,12 @@ function ChangeRow({ change, busy, armed, onOpen, onDiff, onDiscard, onSetAside,
         <SkBlock w="3rem" h="2rem" round>
           <button class="action-btn" onClick={(e) => { e.stopPropagation(); onDiff?.(); }}>Diff</button>
         </SkBlock>
-        {/* An apply in flight is progress, not a blocked action, so it takes
+        {/* An action in flight is progress, not a blocked action, so it takes
             the one disabled face on this row. It carries no tooltip, which is
             what the disabled ban is about. */}
-        {busy ? (
+        {progressLabel ? (
           <SkBlock w="4.75rem" h="2rem" round>
-            <button class="action-btn action-btn-confirm change-row-primary" disabled>Applying...</button>
+            <button class="action-btn action-btn-confirm change-row-primary" disabled>{progressLabel}</button>
           </SkBlock>
         ) : sk ? (
           <div class="change-row-primary"><SkBlock w="100%" h="2rem" round /></div>
@@ -236,6 +278,10 @@ function ChangeRow({ change, busy, armed, onOpen, onDiff, onDiscard, onSetAside,
   );
 }
 
+function rowClass(clickable: boolean, markerClass: string | undefined): string {
+  return ['list-row change-row', clickable && 'clickable', markerClass].filter(Boolean).join(' ');
+}
+
 export function rowActionClass(action: ChangeRowAction, armed: boolean): string {
   switch (action.kind) {
     case 'discard': return 'action-btn action-btn-danger';
@@ -276,8 +322,9 @@ export const BRING_BACK_ROW_TIP =
 
 /** A set-aside change's row: its headline, and the ways back or out. Discard
  *  is withheld while its thread works, since the engine refuses it then. */
-function SetAsideRow({ change, busy, onBringBack, onDiscard }: {
+function SetAsideRow({ change, markerClass, busy, onBringBack, onDiscard }: {
   change: Change;
+  markerClass: string | undefined;
   busy: boolean;
   onBringBack: () => void;
   onDiscard: () => void;
@@ -286,7 +333,7 @@ function SetAsideRow({ change, busy, onBringBack, onDiscard }: {
   const threadWorking = !!thread && isMidTurn(effectiveThreadStatus(thread));
   return (
     <div
-      class={`list-row change-row${change.thread_id ? ' clickable' : ''}`}
+      class={rowClass(!!change.thread_id, markerClass)}
       onClick={change.thread_id ? () => openChangeThread(change) : undefined}
     >
       <div class="list-row-info">
@@ -335,8 +382,9 @@ export const SETTLE_ALL_ARMED_TIP =
  *
  *  **Ready** holds changes whose thread has finished. Its row offers Discard
  *  All and Apply All. **Not finished** holds the rest: a thread settling, or
- *  parked on a question. Its row offers only "Apply all on settle", a TOGGLE
- *  over the settling changes it lists (ADR 0168). Discard never reaches it. */
+ *  parked on a question, and every incomplete change (ADR 0346). Its row
+ *  offers only "Apply all on settle", a TOGGLE over the settling changes it
+ *  lists (ADR 0168). Discard never reaches it. */
 export interface PendingSections {
   ready: Change[];
   notFinished: Change[];
@@ -357,10 +405,9 @@ export function pendingSections(
   armedThreadIds: ReadonlySet<string>,
   applyAllRunning = false,
 ): PendingSections {
-  const ready = pending.filter((c) => !c.thread_unsettled);
-  const notFinished = pending.filter((c) => c.thread_unsettled);
-  // Apply All passes incomplete work over, as the engine's batch does.
-  const canApplyNow = ready.some((c) => !applyBlockedReason(c) && !c.incomplete);
+  const ready = pending.filter(changeIsReady);
+  const notFinished = pending.filter((c) => !changeIsReady(c));
+  const canApplyNow = ready.some((c) => !applyBlockedReason(c));
   const armable = notFinished.filter((c) => c.thread_settling && !c.resolving_conflict && c.thread_id);
   return {
     ready,
@@ -387,13 +434,13 @@ export function openChangeThread(change: Change): void {
 export function ChangesView() {
   const sentinelRef = useRef<HTMLDivElement>(null);
   usePanelRefresh('changes', refreshChangesState);
-  const busyIds = useSignal<Set<string>>(new Set());
+  const busyIds = useSignal<Map<string, LocalRowAction>>(new Map());
 
-  const guardedAction = useCallback((id: string, action: (id: string) => Promise<void>) => {
+  const guardedAction = useCallback((id: string, kind: LocalRowAction, action: (id: string) => Promise<void>) => {
     if (busyIds.value.has(id)) return;
-    busyIds.value = new Set([...busyIds.value, id]);
+    busyIds.value = new Map([...busyIds.value, [id, kind]]);
     action(id).finally(() => {
-      const next = new Set(busyIds.value);
+      const next = new Map(busyIds.value);
       next.delete(id);
       busyIds.value = next;
     });
@@ -439,6 +486,19 @@ export function ChangesView() {
   // user is waiting on for the next render.
   const showLoading = useDelayedLoading(pendingLoadable);
 
+  const allLoaded =
+    pendingLoadable.status === 'loaded' &&
+    appliedLoadable.status === 'loaded' &&
+    setAsideLoadable.status === 'loaded';
+  const armedThreadIds = standingApplyThreadIds.value;
+  const sections = pendingLoadable.status === 'loaded'
+    ? pendingSections(pendingLoadable.data, armedThreadIds, applyAllInProgress.value)
+    : null;
+  const ids = (list: Change[] | undefined) => (allLoaded && list ? list.map(c => c.id) : null);
+  const readyArrived = useArrivals(ids(sections?.ready));
+  const notFinishedArrived = useArrivals(ids(sections?.notFinished));
+  const setAsideArrived = useArrivals(ids(setAsideLoadable.status === 'loaded' ? setAsideLoadable.data : undefined));
+
   if (pendingLoadable.status === 'failed' || appliedLoadable.status === 'failed' || setAsideLoadable.status === 'failed') {
     const err = pendingLoadable.status === 'failed' ? pendingLoadable.error
               : appliedLoadable.status === 'failed' ? appliedLoadable.error
@@ -450,25 +510,19 @@ export function ChangesView() {
       </div>
     );
   }
-  const allLoaded =
-    pendingLoadable.status === 'loaded' &&
-    appliedLoadable.status === 'loaded' &&
-    setAsideLoadable.status === 'loaded';
-
   return (
     <div class="panel-content protected-surface list-rows-divided">
       <LoadingFade showSkeleton={showLoading} skeleton={<ListSkeletonOf fill containerClass="list-rows" row={() => <ChangeRow />} />}>
-        {allLoaded ? (() => {
+        {allLoaded && sections ? (() => {
           const pending = pendingLoadable.data;
           const applied = appliedLoadable.data;
           const setAside = setAsideLoadable.data;
-          const armedThreadIds = standingApplyThreadIds.value;
-          const sections = pendingSections(pending, armedThreadIds, applyAllInProgress.value);
-          const renderRow = (change: Change) => {
-            const busy =
-              busyIds.value.has(change.id) ||
-              busyChangeIds.value.has(change.id) ||
-              !!change.resolving_conflict;
+          const renderRow = (change: Change, markerClass: string | undefined) => {
+            const local = busyIds.value.get(change.id);
+            const busy = !!local || busyChangeIds.value.has(change.id) || !!change.resolving_conflict;
+            const progressLabel = busy
+              ? rowProgressLabel(change, local, applyPhases.value, applyAllBatch.value)
+              : null;
             // A change whose thread is mid-turn can't be applied or discarded:
             // doing so races (or yanks the worktree from) the live coding-agent
             // session. The server refuses it too (guard_change_action). What the
@@ -476,15 +530,15 @@ export function ChangesView() {
             const armed = !!change.thread_id && armedThreadIds.has(change.thread_id);
             return (
               <ChangeRow
-                key={change.id}
                 change={change}
-                busy={busy}
+                markerClass={markerClass}
+                progressLabel={progressLabel}
                 armed={armed}
                 onOpen={() => openChangeThread(change)}
                 onDiff={() => void viewChangeDiff(change)}
-                onDiscard={() => guardedAction(change.id, discardSingleChange)}
-                onSetAside={() => guardedAction(change.id, setAsideSingleChange)}
-                onApply={() => guardedAction(change.id, applyFromRow)}
+                onDiscard={() => guardedAction(change.id, 'discard', discardSingleChange)}
+                onSetAside={() => guardedAction(change.id, 'set-aside', setAsideSingleChange)}
+                onApply={() => guardedAction(change.id, 'apply', applyFromRow)}
                 onStanding={() => {
                   if (!change.thread_id) return;
                   void (armed
@@ -498,107 +552,108 @@ export function ChangesView() {
             <div class="empty-state">No changes</div>
           ) : (
             <>
-          {sections.ready.length > 0 && (
-            <>
-              <SectionHeader
-                title="Ready"
-                count={sections.ready.length}
-                collapsed={readyCollapsed}
-                onToggle={() => toggleChangesSectionCollapsed('ready')}
-              />
-              <Disclosure open={!readyCollapsed}>
-                {(sections.showDiscardAll || sections.showApplyAll) && (
-                  <div class="changes-bulk-actions">
-                    <div class="changes-bulk-buttons">
-                      {sections.showDiscardAll && (
-                        <button class="action-btn action-btn-danger" disabled={applyAllInProgress.value} onClick={() => void discardAllChanges()}>Discard All</button>
-                      )}
-                      {/* Apply All never lights up for a batch the server would
-                          reject: enablement reads the same rule the per-row
-                          control and the server use. */}
-                      {sections.showApplyAll && (
-                        <button
-                          class="action-btn action-btn-confirm"
-                          disabled={applyAllInProgress.value || !sections.canApplyNow}
-                          onClick={() => void applyAllChanges()}
-                        >
-                          {applyAllInProgress.value ? 'Applying...' : 'Apply All'}
-                        </button>
-                      )}
-                    </div>
+          {/* Each section rolls in with its first row and out with its last. */}
+          <Disclosure open={sections.ready.length > 0}>
+            <SectionHeader
+              title="Ready"
+              count={sections.ready.length}
+              collapsed={readyCollapsed}
+              onToggle={() => toggleChangesSectionCollapsed('ready')}
+            />
+            <Disclosure open={!readyCollapsed}>
+              {(sections.showDiscardAll || sections.showApplyAll) && (
+                <div class="changes-bulk-actions">
+                  <div class="changes-bulk-buttons">
+                    {sections.showDiscardAll && (
+                      <button class="action-btn action-btn-danger" disabled={applyAllInProgress.value} onClick={() => void discardAllChanges()}>Discard All</button>
+                    )}
+                    {/* Apply All never lights up for a batch the server would
+                        reject: enablement reads the same rule the per-row
+                        control and the server use. */}
+                    {sections.showApplyAll && (
+                      <button
+                        class="action-btn action-btn-confirm"
+                        disabled={applyAllInProgress.value || !sections.canApplyNow}
+                        onClick={() => void applyAllChanges()}
+                      >
+                        {applyAllInProgress.value ? 'Applying...' : 'Apply All'}
+                      </button>
+                    )}
                   </div>
-                )}
-                {sections.ready.map(renderRow)}
-              </Disclosure>
-            </>
-          )}
-          {sections.notFinished.length > 0 && (
-            <>
-              <SectionHeader
-                title="Not finished"
-                count={sections.notFinished.length}
-                collapsed={notFinishedCollapsed}
-                onToggle={() => toggleChangesSectionCollapsed('not-finished')}
-              />
-              <Disclosure open={!notFinishedCollapsed}>
-                {/* ONE control with two faces. Armed it loses the green and
-                    cancels on click, the shape the per-change row and the
-                    prompt-row flag icon already wear, so all three surfaces read
-                    one state and all three can turn it off. Neither face is
-                    disabled: a faded control takes its explaining tooltip with
-                    it (ADR 0168). */}
-                {sections.armable.length > 0 && (
-                  <div class="changes-bulk-actions">
-                    <div class="changes-bulk-buttons">
-                      {sections.armed ? (
-                        <button
-                          class="action-btn"
-                          aria-pressed
-                          data-tooltip={SETTLE_ALL_ARMED_TIP}
-                          onClick={() => void disarmStandingApplies(sections.armable.map((c) => c.thread_id!))}
-                        >
-                          ✓ Applying all on settle
-                        </button>
-                      ) : (
-                        <button
-                          class="action-btn action-btn-confirm"
-                          aria-pressed={false}
-                          data-tooltip={SETTLE_ALL_TIP}
-                          onClick={() => void armStandingApplies(
-                            sections.armable.filter((c) => !armedThreadIds.has(c.thread_id!)),
-                          )}
-                        >
-                          Apply all on settle
-                        </button>
-                      )}
-                    </div>
+                </div>
+              )}
+              <ArrivalList items={sections.ready} keyOf={(c) => c.id} arrived={readyArrived}>
+                {renderRow}
+              </ArrivalList>
+            </Disclosure>
+          </Disclosure>
+          <Disclosure open={sections.notFinished.length > 0}>
+            <SectionHeader
+              title="Not finished"
+              count={sections.notFinished.length}
+              collapsed={notFinishedCollapsed}
+              onToggle={() => toggleChangesSectionCollapsed('not-finished')}
+            />
+            <Disclosure open={!notFinishedCollapsed}>
+              {/* ONE control with two faces. Armed it loses the green and
+                  cancels on click, the shape the per-change row and the
+                  prompt-row flag icon already wear, so all three surfaces read
+                  one state and all three can turn it off. Neither face is
+                  disabled: a faded control takes its explaining tooltip with
+                  it (ADR 0168). */}
+              {sections.armable.length > 0 && (
+                <div class="changes-bulk-actions">
+                  <div class="changes-bulk-buttons">
+                    {sections.armed ? (
+                      <button
+                        class="action-btn"
+                        aria-pressed
+                        data-tooltip={SETTLE_ALL_ARMED_TIP}
+                        onClick={() => void disarmStandingApplies(sections.armable.map((c) => c.thread_id!))}
+                      >
+                        ✓ Applying all on settle
+                      </button>
+                    ) : (
+                      <button
+                        class="action-btn action-btn-confirm"
+                        aria-pressed={false}
+                        data-tooltip={SETTLE_ALL_TIP}
+                        onClick={() => void armStandingApplies(
+                          sections.armable.filter((c) => !armedThreadIds.has(c.thread_id!)),
+                        )}
+                      >
+                        Apply all on settle
+                      </button>
+                    )}
                   </div>
-                )}
-                {sections.notFinished.map(renderRow)}
-              </Disclosure>
-            </>
-          )}
-          {setAside.length > 0 && (
-            <>
-              <SectionHeader
-                title="Set aside"
-                count={setAside.length}
-                collapsed={setAsideCollapsed}
-                onToggle={() => toggleChangesSectionCollapsed('set-aside')}
-              />
-              <Disclosure open={!setAsideCollapsed}>
-                {setAside.map(change => (
+                </div>
+              )}
+              <ArrivalList items={sections.notFinished} keyOf={(c) => c.id} arrived={notFinishedArrived}>
+                {renderRow}
+              </ArrivalList>
+            </Disclosure>
+          </Disclosure>
+          <Disclosure open={setAside.length > 0}>
+            <SectionHeader
+              title="Set aside"
+              count={setAside.length}
+              collapsed={setAsideCollapsed}
+              onToggle={() => toggleChangesSectionCollapsed('set-aside')}
+            />
+            <Disclosure open={!setAsideCollapsed}>
+              <ArrivalList items={setAside} keyOf={(c) => c.id} arrived={setAsideArrived}>
+                {(change, markerClass) => (
                   <SetAsideRow
-                    key={change.id}
                     change={change}
+                    markerClass={markerClass}
                     busy={busyIds.value.has(change.id)}
-                    onBringBack={() => guardedAction(change.id, bringBackSingleChange)}
-                    onDiscard={() => guardedAction(change.id, discardSingleChange)}
+                    onBringBack={() => guardedAction(change.id, 'bring-back', bringBackSingleChange)}
+                    onDiscard={() => guardedAction(change.id, 'discard', discardSingleChange)}
                   />
-                ))}
-              </Disclosure>
-            </>
-          )}
+                )}
+              </ArrivalList>
+            </Disclosure>
+          </Disclosure>
           {applied.length > 0 && (
             <>
               <SectionHeader
@@ -632,7 +687,7 @@ export function ChangesView() {
                         <button class="action-btn action-btn-danger change-row-primary" disabled={busyIds.value.has(change.id)} onClick={async (e) => {
                           e.stopPropagation();
                           if (await showConfirm('Revert this change? Any later applied changes that touch the same files may conflict.', 'Revert', { variant: 'default' })) {
-                            guardedAction(change.id, revertChange);
+                            guardedAction(change.id, 'revert', revertChange);
                           }
                         }}>Revert</button>
                       ) : (

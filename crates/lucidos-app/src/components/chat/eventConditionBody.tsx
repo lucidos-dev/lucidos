@@ -1,8 +1,8 @@
-import type { EventConditionModalState } from '../../store/store';
+import type { EventCondition } from '../../store/store';
 import { plainEventName } from '../../store/thread-events/event-waits';
 
 /** "Condition" or "Conditions", the title both surfaces give the view. */
-export function eventConditionTitle(open: EventConditionModalState): string {
+export function eventConditionTitle(open: EventCondition): string {
   return open.conditions.length > 1 ? 'Conditions' : 'Condition';
 }
 
@@ -11,12 +11,12 @@ export function eventConditionTitle(open: EventConditionModalState): string {
  *  its plain name moves to the tooltip.
  *
  *  One body for both places a condition opens, so they cannot drift: the
- *  transcript chip's modal, and the waiting panel's drill-in. A plain function
+ *  transcript chip's popover, and the waiting panel's drill-in. A plain function
  *  rather than a component, so a test can walk the tree without rendering it.
  *
- *  Keep these out of the modal's module. The modal is code-split, and a
+ *  Keep these out of the popover's module. The popover is code-split, and a
  *  static import of it from the waiting panel folds it into the shell chunk. */
-export function eventConditionBody(open: EventConditionModalState) {
+export function eventConditionBody(open: EventCondition) {
   const typeTooltip = plainEventName(open.eventType);
   return (
     <>

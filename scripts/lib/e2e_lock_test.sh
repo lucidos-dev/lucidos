@@ -469,7 +469,7 @@ spawn_sleeper; eng=$SLEEPER_PID      # e2e workspace engine (via pidfile)
 spawn_sleeper; cc=$SLEEPER_PID       # a Claude Code session that only MENTIONS the path
 # The cc row is the 2026-08-03 regression. Tokens are matched against argv[0], so
 # a process whose argv merely QUOTES the browsers-cache path is not a browser.
-# Claude Code carries the engine's thread history inside a huge
+# Claude Code carried the engine's thread history inside a huge
 # --append-system-prompt, and this branch SIGKILLs with no RSS threshold at all,
 # so a full-command-line match here kills the session that runs the suite.
 SYNTHETIC_PS="$wk /Users/x/Library/Caches/ms-playwright/webkit-2287/WebContent.app/Contents/MacOS/WebContent
@@ -530,7 +530,7 @@ fi
 #
 # The discriminator has to be the cwd. argv[0] is the same `.../bin/claude` for
 # the user's own sessions, and the rest of the command line is worse than
-# useless: a coding agent carries the thread history in a ~22 KB
+# useless: a coding agent carried the thread history in a ~22 KB
 # --append-system-prompt, so a session DISCUSSING this workspace quotes its
 # paths verbatim. That is the 2026-08-03 kill, reproduced here as the `mention`
 # fixture.

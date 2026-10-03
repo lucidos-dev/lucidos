@@ -1475,6 +1475,90 @@ describe('deep-link retry: a turn STAMPED with the change id resolves', () => {
   });
 });
 
+describe('deep-link anchor: an event that draws nothing lands on its turn', () => {
+  // Reported as a "needs login" notification tap that toasted "That event is
+  // not shown in this thread". Its `CredentialRequested` was a step inside a
+  // turn, and a step stamps no element. The turn holding it does.
+  let restore: (() => void) | null = null;
+  let container: any;
+  let onUnresolved: Mock<() => void>;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    container = makeContainer();
+    setActiveScrollElement(container);
+    onUnresolved = vi.fn<() => void>();
+  });
+  afterEach(() => {
+    clearNavFocus();
+    vi.clearAllTimers();
+    vi.useRealTimers();
+    setActiveScrollElement(null);
+    restore?.();
+    restore = null;
+  });
+
+  /** Only the turn root carries an id: `start-1`. */
+  function showTurn(absTop: number) {
+    const el = showMatch(container, absTop);
+    (globalThis.document as any).querySelectorAll = (sel: string) =>
+      sel === '[data-event-id="start-1"]' ? [el] : [];
+  }
+
+  it('lands on the anchor the caller names', () => {
+    restore = installFakeDom({});
+    showTurn(1800);
+
+    scrollToEventAndPulse('cred-1', { onUnresolved, anchorFor: () => 'start-1' });
+
+    vi.advanceTimersByTime(6000);
+    expect(container.scrollTop).toBe(1800);
+    expect(onUnresolved).not.toHaveBeenCalled();
+  });
+
+  // The anchor is computed from the thread's events, which a cold tap has not
+  // fetched yet. So it is asked again on every look.
+  it('asks for the anchor again once the thread has arrived', () => {
+    restore = installFakeDom({});
+    let anchor: string | null = null;
+
+    scrollToEventAndPulse('cred-1', { onUnresolved, anchorFor: () => anchor });
+    anchor = 'start-1';
+    showTurn(1800);
+    fireChildListMutation();
+
+    vi.advanceTimersByTime(6000);
+    expect(container.scrollTop).toBe(1800);
+    expect(onUnresolved).not.toHaveBeenCalled();
+  });
+
+  // The turn is already on screen when a catch-up adds the step. The node that
+  // arrives is the step's row, inside the turn, so it matches nothing itself.
+  it('looks again when the anchor moves to a turn already on screen', () => {
+    restore = installFakeDom({});
+    let anchor: string | null = null;
+    showTurn(1800);
+
+    scrollToEventAndPulse('cred-1', { onUnresolved, anchorFor: () => anchor });
+    anchor = 'start-1';
+    const stepRow = { nodeType: 1, matches: () => false, querySelector: () => null } as any;
+    lastMoCallback?.([{ addedNodes: [stepRow], type: 'childList' } as unknown as MutationRecord], {} as MutationObserver);
+
+    vi.advanceTimersByTime(6000);
+    expect(container.scrollTop).toBe(1800);
+    expect(onUnresolved).not.toHaveBeenCalled();
+  });
+
+  it('still reports a link with no anchor and no element', () => {
+    restore = installFakeDom({});
+
+    scrollToEventAndPulse('cred-1', { onUnresolved, anchorFor: () => null });
+
+    vi.advanceTimersByTime(EVENT_RESOLVE_DEADLINE_MS);
+    expect(onUnresolved).toHaveBeenCalledOnce();
+  });
+});
+
 describe('deep-link retry: a target that gains a BOX lands', () => {
   // Reported as a notification tap that kept the reader's position and
   // highlighted nothing. Both the scroll and the pulse live in `tryResolve`, so
@@ -1914,6 +1998,20 @@ describe('deep-link pulse — scoped to the subject panel, not the whole exchang
     };
     return el;
   }
+
+  // A re-targeted link landed on the turn because the event is a step in its
+  // reply. The user's message is not what the link was about.
+  it('a link re-targeted to its turn marks the .response-panel', () => {
+    const initiatorPanel = { classList: makeClassList() };
+    const responsePanel = { classList: makeClassList() };
+    const exchangeEl = makeExchangeEl({ initiator: initiatorPanel, response: responsePanel });
+    restore = installFakeDom({ dataEventMatches: [exchangeEl] });
+
+    scrollToEventAndPulse('cred-1', { anchorFor: () => 'start-1' });
+
+    expect(responsePanel.classList._classes.has('nav-focus-stuck')).toBe(true);
+    expect(initiatorPanel.classList._classes.has('nav-focus-stuck')).toBe(false);
+  });
 
   it('event deep-link marks the .initiator-panel, leaving the .chat-exchange wrapper unmarked', () => {
     const initiatorPanel = { classList: makeClassList() };

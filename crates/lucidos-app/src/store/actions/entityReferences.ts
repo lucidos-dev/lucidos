@@ -259,7 +259,8 @@ export function processSSEForReferences(type: string, data: Record<string, unkno
       refreshArtifacts();
       break;
     // Data-file mutations via the HTTP `/data/*` API (SDK `lucidos.data.*`,
-    // `lucidos` CLI), and the agent's file tools under `themes/`. These are the AUDIT events; the paired
+    // `lucidos` CLI), and the agent's file tools outside `artifacts/`. These
+    // are the AUDIT events; the paired
     // `Artifact*` entity event now fires alongside them, emitted from inside
     // `ArtifactManager`'s write path. This arm used to be the workaround for
     // its absence, and is kept because a data-API write to a non-artifact

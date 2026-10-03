@@ -771,12 +771,6 @@
     display: none;
 }
 
-/* .list-row-info clips its overflow, which would cut the rename field's focus
-   ring off at the row's edges. */
-.app-store-marketplace-renaming .list-row-info {
-    overflow: visible;
-}
-
 /* Same text as the .title .list-row-name it stands in for, spelled out rather
    than `font: inherit`, which would also reset the weight. The margin is that
    row's own, so the URL under it does not move when the field opens. */
@@ -968,13 +962,14 @@
    grows taller than a pill. Its padding carries the --space-lg gutter, and the
    mask fades a pill out as it passes under either gutter. At rest the gutters
    are empty, so nothing fades. The scroll padding keeps a pill reached by
-   keyboard out of the fade, and the top padding leaves room for the whole
-   focus ring. A mouse wheel cannot scroll a line sideways, so a fine pointer
-   gets the wrapping bar below instead. */
+   keyboard out of the fade. The padding is the ring room as well, so the
+   margin hands back only the touch reach. A mouse wheel cannot scroll a line
+   sideways, so a fine pointer gets the wrapping bar below instead. */
 .app-store-filter-pills {
     scroll-padding-inline: var(--space-lg);
-    padding: calc(0.1875rem + var(--pill-bar-hit-slop, 0rem)) var(--space-lg)
+    padding: calc(var(--focus-ring-width) + var(--pill-bar-hit-slop, 0rem)) var(--space-lg)
         calc(var(--space-sm) + var(--pill-bar-hit-slop, 0rem));
+    margin: calc(-1 * var(--pill-bar-hit-slop, 0rem)) 0;
     -webkit-mask: linear-gradient(to right, transparent, #000 var(--space-lg),
         #000 calc(100% - var(--space-lg)), transparent);
     mask: linear-gradient(to right, transparent, #000 var(--space-lg),

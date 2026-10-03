@@ -1,17 +1,16 @@
 //! Builtin model-provider proxies.
 //!
 //! An app calls `lucidos.proxy(<name>).fetch(path, init)` → the engine's
-//! `/api/v1/proxy/<name>/<path>` route. When `<name>` has no entry in
-//! `data/config/apis.json` but matches a provider the engine holds auth for
-//! (`vertex`, `openai`, `openrouter`, `xai`, `anthropic`, `local`,
-//! `typesafe`), the engine
-//! synthesizes the upstream target here — the provider's API base URL plus a
-//! server-side auth layer sourced from the engine's OWN provider auth, resolved
+//! `/api/v1/proxy/<name>/<path>` route. `lucidos proxy` and the agent's
+//! `proxy_request` tool resolve the same way. When `<name>` has no entry in
+//! `data/config/apis.json` but matches a row of [`BUILTIN_PROXIES`], the
+//! engine synthesizes the upstream target here: the provider's API base URL
+//! plus a server-side auth layer sourced from the engine's OWN provider auth, resolved
 //! exactly as the LLM providers resolve it (a stored credential first, then the
 //! provider's env fallback), so a workspace never has to duplicate a provider
 //! credential into `apis.json`.
 //!
-//! **A builtin name is not always a model-registry row.** The first six are
+//! **A builtin name is not always a model-registry row.** Six are
 //! `ProviderKind`s and `typesafe` is not. Jev answers typed questions rather
 //! than holding a conversation, so it never enters the model picker
 //! (ADR 0220). Nothing here needs a `ProviderKind`: a resolver reads a
@@ -36,7 +35,8 @@
 use crate::api::proxy_auth_layer::{AuthLayer, AuthMutation, LayerInput, RetryHint, ScopeBinding};
 use crate::api::proxy_static_layers::StaticHeaderLayer;
 use crate::core::{
-    AuthType, CredentialStore, PreferenceStore, DEFAULT_LOCAL_BASE_URL, PREF_LOCAL_BASE_URL,
+    preferences::local_base_url_rejection, AuthType, CredentialStore, PreferenceStore,
+    DEFAULT_LOCAL_BASE_URL, PREF_LOCAL_BASE_URL,
 };
 use crate::llm::judgment::{
     TYPESAFE_API_BASE_URL, TYPESAFE_API_KEY_ENV, TYPESAFE_CREDENTIAL_SERVICE,
@@ -55,6 +55,113 @@ use std::sync::{Arc, LazyLock};
 /// be dispatched, exactly as an `apis.json` pipeline is.
 type BuiltinTarget = (String, Vec<Arc<dyn AuthLayer>>);
 
+/// Which resolver serves a builtin. An enum, so the match in
+/// [`resolve_entry`] proves every catalog row has one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Resolver {
+    Anthropic,
+    Local,
+    OpenAi,
+    OpenRouter,
+    TypeSafe,
+    Vertex,
+    XAi,
+}
+
+/// One builtin provider proxy.
+#[derive(Debug)]
+pub(crate) struct BuiltinProxy {
+    /// The proxy name a caller addresses, as in `lucidos proxy <name>`.
+    pub name: &'static str,
+    /// Other spellings of the same service, compared after
+    /// [`normalized_service_name`]. `request_credential` reads them.
+    pub aliases: &'static [&'static str],
+    /// The base an unconfigured row shows. `None` for `vertex`, whose base
+    /// comes from the engine's project and region.
+    pub default_base_url: Option<&'static str>,
+    resolver: Resolver,
+}
+
+/// Every builtin provider proxy, in the order the agent's context lists them.
+/// The order is fixed so the rendered block is byte-stable across turns.
+pub(crate) const BUILTIN_PROXIES: [BuiltinProxy; 7] = [
+    BuiltinProxy {
+        name: "anthropic",
+        aliases: &["claude"],
+        default_base_url: Some(ANTHROPIC_API_BASE_URL),
+        resolver: Resolver::Anthropic,
+    },
+    BuiltinProxy {
+        name: "local",
+        aliases: &[],
+        default_base_url: Some(DEFAULT_LOCAL_BASE_URL),
+        resolver: Resolver::Local,
+    },
+    BuiltinProxy {
+        name: "openai",
+        aliases: &["gpt", "chatgpt"],
+        default_base_url: Some(OPENAI_DEFAULT_BASE_URL),
+        resolver: Resolver::OpenAi,
+    },
+    BuiltinProxy {
+        name: "openrouter",
+        aliases: &[],
+        default_base_url: Some(OPENROUTER_BASE_URL),
+        resolver: Resolver::OpenRouter,
+    },
+    BuiltinProxy {
+        name: TYPESAFE_CREDENTIAL_SERVICE,
+        aliases: &["jev"],
+        default_base_url: Some(TYPESAFE_API_BASE_URL),
+        resolver: Resolver::TypeSafe,
+    },
+    BuiltinProxy {
+        name: "vertex",
+        aliases: &["vertexai", "googlevertex"],
+        default_base_url: None,
+        resolver: Resolver::Vertex,
+    },
+    BuiltinProxy {
+        name: "xai",
+        aliases: &["grok"],
+        default_base_url: Some(XAI_BASE_URL),
+        resolver: Resolver::XAi,
+    },
+];
+
+/// Model providers with no builtin proxy, each with the reason the agent's
+/// context block shows. A test holds every `ProviderKind` to one of the two
+/// lists, so a new provider cannot be forgotten.
+///
+/// `opencode-free` is out by ADR 0104: nothing may build on an anonymous
+/// endpoint that can vanish without notice.
+pub(crate) const PROVIDERS_WITHOUT_PROXY: [(&str, &str); 1] = [(
+    "opencode-free",
+    "the keyless free tier serves chat only (ADR 0104)",
+)];
+
+/// A service name with case and separators removed, so `Open-AI`, `open_ai`
+/// and `openai` compare equal.
+pub(crate) fn normalized_service_name(name: &str) -> String {
+    name.chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+/// The builtin proxy a service name refers to, by name or alias.
+pub(crate) fn builtin_proxy_for_service(service_name: &str) -> Option<&'static BuiltinProxy> {
+    let wanted = normalized_service_name(service_name);
+    if wanted.is_empty() {
+        return None;
+    }
+    BUILTIN_PROXIES.iter().find(|proxy| {
+        std::iter::once(proxy.name)
+            .chain(proxy.aliases.iter().copied())
+            .any(|spelling| normalized_service_name(spelling) == wanted)
+    })
+}
+
 /// Resolve a builtin model-provider proxy target for `name`.
 ///
 /// - `Ok(None)` — `name` is not a builtin provider (caller returns the generic
@@ -62,23 +169,136 @@ type BuiltinTarget = (String, Vec<Arc<dyn AuthLayer>>);
 /// - `Err((404, msg))` — `name` IS a builtin provider but its credential/config
 ///   is absent; the message names what to configure.
 /// - `Ok(Some((base_url, layers)))` — resolved; forward through the layers.
+///
+/// Matches the exact proxy name only. Aliases serve `request_credential`, never
+/// routing.
 pub(crate) async fn resolve_builtin_provider(
     engine: &Arc<crate::engine::LucidosEngine>,
     name: &str,
 ) -> Result<Option<BuiltinTarget>, (StatusCode, String)> {
-    match name {
-        "openai" => resolve_openai(engine.pool()).await.map(Some),
-        "openrouter" => resolve_openrouter(engine.pool()).await.map(Some),
-        "xai" => resolve_xai(engine.pool()).await.map(Some),
-        "anthropic" => resolve_anthropic(engine.pool()).await.map(Some),
-        "local" => resolve_local(engine.pool()).await.map(Some),
-        "vertex" => resolve_vertex(engine).await.map(Some),
-        // A literal, like every arm above. A const path in pattern position is
-        // a constant only while its name stays SCREAMING_CASE: lowercase it and
-        // the arm silently becomes a catch-all binding.
-        "typesafe" => resolve_typesafe(engine.pool()).await.map(Some),
-        _ => Ok(None),
+    match BUILTIN_PROXIES.iter().find(|proxy| proxy.name == name) {
+        Some(proxy) => resolve_entry(engine, proxy).await.map(Some),
+        None => Ok(None),
     }
+}
+
+async fn resolve_entry(
+    engine: &Arc<crate::engine::LucidosEngine>,
+    proxy: &BuiltinProxy,
+) -> Result<BuiltinTarget, (StatusCode, String)> {
+    match proxy.resolver {
+        Resolver::Anthropic => resolve_anthropic(engine.pool()).await,
+        Resolver::Local => resolve_local(engine.pool()).await,
+        Resolver::OpenAi => resolve_openai(engine.pool()).await,
+        Resolver::OpenRouter => resolve_openrouter(engine.pool()).await,
+        Resolver::TypeSafe => resolve_typesafe(engine.pool()).await,
+        Resolver::Vertex => resolve_vertex(engine).await,
+        Resolver::XAi => resolve_xai(engine.pool()).await,
+    }
+}
+
+/// Whether a builtin would serve a request right now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BuiltinProxyState {
+    /// It resolves, to this base URL. `injects_auth` is false for a keyless
+    /// `local` server, which holds no key a caller could reuse.
+    Configured {
+        base_url: String,
+        injects_auth: bool,
+    },
+    /// It answers the actionable 404.
+    NotConfigured,
+    /// The resolver itself failed, so nobody knows. Never read as a no.
+    Unknown,
+}
+
+/// Ask the proxy's own resolver, so the answer cannot drift from what a call
+/// would do. The resolved auth layers are counted, never read.
+pub(crate) async fn builtin_proxy_state(
+    engine: &Arc<crate::engine::LucidosEngine>,
+    proxy: &BuiltinProxy,
+) -> BuiltinProxyState {
+    match resolve_entry(engine, proxy).await {
+        Ok((base_url, layers)) => BuiltinProxyState::Configured {
+            base_url,
+            injects_auth: !layers.is_empty(),
+        },
+        Err((StatusCode::NOT_FOUND, _)) => BuiltinProxyState::NotConfigured,
+        Err((status, msg)) => {
+            crate::log!(
+                "[Proxy] Cannot tell whether builtin '{}' is configured ({}): {}",
+                proxy.name,
+                status,
+                msg
+            );
+            BuiltinProxyState::Unknown
+        }
+    }
+}
+
+/// Every builtin with its state, in catalog order. The checks are independent,
+/// so they run concurrently: the chat turn waits for one, not seven.
+pub(crate) async fn builtin_proxy_states(
+    engine: &Arc<crate::engine::LucidosEngine>,
+) -> Vec<(&'static BuiltinProxy, BuiltinProxyState)> {
+    futures::future::join_all(
+        BUILTIN_PROXIES
+            .iter()
+            .map(|proxy| async move { (proxy, builtin_proxy_state(engine, proxy).await) }),
+    )
+    .await
+}
+
+/// Whether a base URL already carries the `/v1` version segment, so a caller
+/// must not add another.
+pub(crate) fn base_includes_v1(base_url: &str) -> bool {
+    reqwest::Url::parse(base_url)
+        .ok()
+        .and_then(|url| url.path_segments().map(|mut s| s.any(|seg| seg == "v1")))
+        .unwrap_or(false)
+}
+
+/// The agent's context block listing every builtin proxy.
+///
+/// Deterministic for a given state: catalog order, no timestamps, and no
+/// credential, since a state carries only a base URL.
+pub(crate) fn render_builtin_proxies_block(
+    states: &[(&'static BuiltinProxy, BuiltinProxyState)],
+) -> String {
+    let mut block = String::from(
+        "[BUILTIN PROVIDER PROXIES - engine-owned, NOT in data/config/apis.json]\n\
+         Call one with proxy_request(name, path) or `lucidos proxy <name> <path>`. The engine \
+         injects the auth. The path is relative to the base, so never repeat a /v1 the base \
+         already has: proxy_request(name: 'openai', path: '/models'), not '/v1/models'.\n",
+    );
+    for (proxy, state) in states {
+        let base = match state {
+            BuiltinProxyState::Configured { base_url, .. } => Some(base_url.as_str()),
+            _ => proxy.default_base_url,
+        };
+        let base_part = match base {
+            Some(url) if base_includes_v1(url) => format!("{url} (base includes /v1)"),
+            Some(url) => format!("{url} (base has no /v1)"),
+            None => "base set by the engine's Vertex project and region".to_string(),
+        };
+        let configured = match state {
+            BuiltinProxyState::Configured { .. } => "yes",
+            BuiltinProxyState::NotConfigured => "no",
+            BuiltinProxyState::Unknown => "unknown (the check failed)",
+        };
+        block.push_str(&format!(
+            "  - {}: {base_part}, configured: {configured}\n",
+            proxy.name
+        ));
+    }
+    for (name, reason) in PROVIDERS_WITHOUT_PROXY {
+        block.push_str(&format!("  - {name}: no proxy, {reason}\n"));
+    }
+    block.push_str(
+        "Never request_credential for a configured one. An unconfigured one is set up in \
+         Settings > Models > Providers.\n[END BUILTIN PROVIDER PROXIES]",
+    );
+    block
 }
 
 /// Message for a recognized-but-unconfigured builtin provider. Names the
@@ -272,9 +492,9 @@ fn anthropic_target(auth: Option<AnthropicAuth>) -> Result<BuiltinTarget, (Statu
 
 /// Where the `local` key came from, and therefore what binds it.
 ///
-/// `local` is the one builtin whose upstream a caller can rewrite:
-/// `local_base_url` is an ordinary settable preference. So the key's own source
-/// has to name the host, never the preference (ADR 0144 decision 4).
+/// `local` is the one builtin whose upstream a preference names, and
+/// `local_base_url` moves without the key being re-saved. So the key's own
+/// source has to name the host, never the preference (ADR 0144 decision 4).
 enum LocalKeySource {
     /// A stored `local` credential. Its `base_url` is the scope, and Settings
     /// can correct it.
@@ -288,13 +508,18 @@ enum LocalKeySource {
 /// then `LUCIDOS_LOCAL_BASE_URL`, then the built-in default.
 ///
 /// `None` when the preference read failed, so a caller cannot mistake a broken
-/// database for a configured host. The boot pass reads this to give an unscoped
-/// `local` credential the scope it needs (ADR 0144).
+/// database for a configured host. `None` too when the preference names a host
+/// off the user's own network, which the provider refuses. The boot pass reads
+/// this to give an unscoped `local` credential the scope it needs (ADR 0144).
 pub async fn local_upstream_base_url(pool: &sqlx::PgPool) -> Option<String> {
     let base_pref = PreferenceStore::get(pool, PREF_LOCAL_BASE_URL)
         .await
         .ok()?
         .filter(|s| !s.trim().is_empty());
+    if let Some(reason) = base_pref.as_deref().and_then(local_base_url_rejection) {
+        crate::log!("[Proxy] Not scoping the 'local' key: {}", reason);
+        return None;
+    }
     Some(
         base_pref
             .or_else(|| {
@@ -324,6 +549,11 @@ async fn resolve_local(pool: &sqlx::PgPool) -> Result<BuiltinTarget, (StatusCode
             ));
         }
     };
+    // A keyless call attaches no layer, so the proxy's scope gate never sees
+    // it. This check is what keeps the route from forwarding anywhere.
+    if let Some(reason) = base_pref.as_deref().and_then(local_base_url_rejection) {
+        return Err((StatusCode::BAD_GATEWAY, format!("proxy 'local': {reason}")));
+    }
     let base_env = std::env::var("LUCIDOS_LOCAL_BASE_URL")
         .ok()
         .filter(|s| !s.trim().is_empty());
@@ -563,6 +793,179 @@ mod tests {
         assert!(
             cache.lock().unwrap().is_none(),
             "cache cleared on invalidate"
+        );
+    }
+
+    // ---- The catalog and the agent's context block --------------------------
+
+    /// Every model provider is a builtin proxy or names its reason for not
+    /// being one. A provider added to the enum fails here until it is either.
+    #[test]
+    fn every_model_provider_is_a_builtin_proxy_or_says_why_not() {
+        for kind in crate::llm::ProviderKind::ALL {
+            let name = kind.as_str();
+            let proxied = BUILTIN_PROXIES.iter().any(|p| p.name == name);
+            let excluded = PROVIDERS_WITHOUT_PROXY.iter().any(|(n, _)| *n == name);
+            assert!(
+                proxied != excluded,
+                "provider '{name}' must be on exactly one list (proxied {proxied}, excluded {excluded})"
+            );
+        }
+        for (name, reason) in PROVIDERS_WITHOUT_PROXY {
+            assert!(
+                crate::llm::ProviderKind::from_name(name).is_some(),
+                "'{name}' is not a provider, so its exclusion is stale"
+            );
+            assert!(!reason.trim().is_empty(), "'{name}' needs a reason");
+        }
+    }
+
+    /// No two rows share a spelling, or `request_credential` would map one
+    /// service name to two proxies.
+    #[test]
+    fn builtin_names_and_aliases_are_unique() {
+        let mut seen = std::collections::HashSet::new();
+        for proxy in &BUILTIN_PROXIES {
+            for spelling in std::iter::once(proxy.name).chain(proxy.aliases.iter().copied()) {
+                assert!(
+                    seen.insert(normalized_service_name(spelling)),
+                    "'{spelling}' appears twice in the catalog"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_service_name_maps_to_its_builtin_by_name_or_alias() {
+        let name = |s: &str| builtin_proxy_for_service(s).map(|p| p.name);
+        for spelling in [
+            "openai", "OpenAI", "open-ai", "open_ai", "Open AI", "gpt", "ChatGPT",
+        ] {
+            assert_eq!(name(spelling), Some("openai"), "{spelling}");
+        }
+        assert_eq!(name("Claude"), Some("anthropic"));
+        assert_eq!(name("x-ai"), Some("xai"));
+        assert_eq!(name("grok"), Some("xai"));
+        assert_eq!(name("open-router"), Some("openrouter"));
+        assert_eq!(name("vertex-ai"), Some("vertex"));
+        assert_eq!(name("jev"), Some(TYPESAFE_CREDENTIAL_SERVICE));
+        for unrelated in ["oura", "github", "", "--", "openai-realtime-relay"] {
+            assert_eq!(name(unrelated), None, "{unrelated}");
+        }
+    }
+
+    #[test]
+    fn base_includes_v1_reads_the_path_segments() {
+        assert!(base_includes_v1(OPENAI_DEFAULT_BASE_URL));
+        assert!(base_includes_v1(OPENROUTER_BASE_URL));
+        assert!(base_includes_v1(&vertex_base_url("p", "europe-west1")));
+        assert!(!base_includes_v1("https://api.example.com"));
+        assert!(!base_includes_v1("https://api.example.com/v10"));
+        assert!(!base_includes_v1("not a url"));
+    }
+
+    /// Every default base the catalog ships already ends in the version
+    /// segment. That is the quirk the block warns about.
+    #[test]
+    fn every_shipped_default_base_includes_v1() {
+        for proxy in &BUILTIN_PROXIES {
+            if let Some(base) = proxy.default_base_url {
+                assert!(base_includes_v1(base), "{}: {base}", proxy.name);
+            }
+        }
+    }
+
+    fn states_with(configured: &[(&str, &str)]) -> Vec<(&'static BuiltinProxy, BuiltinProxyState)> {
+        BUILTIN_PROXIES
+            .iter()
+            .map(|proxy| {
+                let state = configured
+                    .iter()
+                    .find(|(name, _)| *name == proxy.name)
+                    .map(|(_, base)| BuiltinProxyState::Configured {
+                        base_url: base.to_string(),
+                        injects_auth: true,
+                    })
+                    .unwrap_or(BuiltinProxyState::NotConfigured);
+                (proxy, state)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_block_lists_every_builtin_in_catalog_order() {
+        let block =
+            render_builtin_proxies_block(&states_with(&[("openai", OPENAI_DEFAULT_BASE_URL)]));
+        assert!(block.starts_with("[BUILTIN PROVIDER PROXIES"), "{block}");
+        assert!(block.contains("NOT in data/config/apis.json"), "{block}");
+        assert!(block.ends_with("[END BUILTIN PROVIDER PROXIES]"), "{block}");
+        let mut last = 0;
+        for proxy in &BUILTIN_PROXIES {
+            let at = block
+                .find(&format!("  - {}: ", proxy.name))
+                .unwrap_or_else(|| panic!("{} missing: {block}", proxy.name));
+            assert!(at > last, "{} is out of order: {block}", proxy.name);
+            last = at;
+        }
+        assert!(
+            block.contains(
+                "  - openai: https://api.openai.com/v1 (base includes /v1), configured: yes\n"
+            ),
+            "{block}"
+        );
+        assert!(
+            block.contains("  - xai: https://api.x.ai/v1 (base includes /v1), configured: no\n"),
+            "{block}"
+        );
+        assert!(
+            block.contains(
+                "  - vertex: base set by the engine's Vertex project and region, configured: no\n"
+            ),
+            "{block}"
+        );
+        assert!(
+            block.contains("path: '/models'"),
+            "the worked example: {block}"
+        );
+        assert!(
+            block.contains("  - opencode-free: no proxy, "),
+            "an excluded provider says so rather than vanishing: {block}"
+        );
+    }
+
+    /// Same state, same bytes, so the block never churns the prompt.
+    #[test]
+    fn the_block_is_deterministic() {
+        let states = states_with(&[("anthropic", ANTHROPIC_API_BASE_URL)]);
+        assert_eq!(
+            render_builtin_proxies_block(&states),
+            render_builtin_proxies_block(&states)
+        );
+    }
+
+    #[test]
+    fn a_configured_base_wins_over_the_default_and_an_unknown_says_so() {
+        let mut states = states_with(&[
+            ("local", "http://localhost:1234/v1"),
+            ("vertex", &vertex_base_url("proj", "europe-west1")),
+        ]);
+        states[0].1 = BuiltinProxyState::Unknown;
+        let block = render_builtin_proxies_block(&states);
+        assert!(
+            block.contains(
+                "  - local: http://localhost:1234/v1 (base includes /v1), configured: yes\n"
+            ),
+            "{block}"
+        );
+        assert!(
+            block.contains(
+                "/projects/proj/locations/europe-west1 (base includes /v1), configured: yes"
+            ),
+            "{block}"
+        );
+        assert!(
+            block.contains("  - anthropic: https://api.anthropic.com/v1 (base includes /v1), configured: unknown"),
+            "an unknown is never rendered as a no: {block}"
         );
     }
 
@@ -845,6 +1248,35 @@ mod tests {
             injected_headers(&target).await.is_empty(),
             "keyless local server must get no auth header"
         );
+        assert!(
+            target.1.is_empty(),
+            "no layer at all, which is what reports `injects_auth: false` to request_credential"
+        );
+        teardown_test_db(&db).await;
+    }
+
+    /// A keyless call attaches no layer, so the scope gate never runs for it.
+    /// A public host stored before the write path checked it must therefore
+    /// be refused here, or the route forwards anywhere and hands back the body.
+    /// The boot pass must not scope the `local` key to that host either.
+    #[tokio::test]
+    async fn a_stored_public_local_base_url_is_not_forwarded_or_scoped() {
+        let (pool, db) = setup_test_db().await;
+        crate::test_support::seed_preference(
+            &pool,
+            PREF_LOCAL_BASE_URL,
+            "https://attacker.example/v1",
+        )
+        .await
+        .expect("seed local_base_url pref");
+
+        let err = match resolve_local(&pool).await {
+            Err(e) => e,
+            Ok(target) => panic!("forwarded to {}", target.0),
+        };
+        assert_eq!(err.0, StatusCode::BAD_GATEWAY);
+        assert!(err.1.contains("attacker.example"), "msg: {}", err.1);
+        assert_eq!(local_upstream_base_url(&pool).await, None);
         teardown_test_db(&db).await;
     }
 

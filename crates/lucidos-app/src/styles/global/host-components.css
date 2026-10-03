@@ -73,8 +73,13 @@
    This per-turn marker is why the `.thread-content` scroll region itself shows no
    focus outline (input-messages.css): the marker signals focus, not a ring around
    the whole conversation. Always-on; not applied to apps or whole-pane opens
-   (trigger detail, file preview). */
-.nav-focus-stuck {
+   (trigger detail, file preview).
+
+   The arrival marker (components/shared/ArrivalList.tsx) shares these rules: a
+   row that has just arrived wears the same light. It runs its own lifecycle with
+   the same timings, so it never takes the one navigation landing. */
+.nav-focus-stuck,
+.arrival-marker {
     border-radius: calc(var(--radius-control) * 0.75);
     box-shadow:
         inset 0 0 0 100vmax color-mix(in srgb, var(--nav-focus-glow) 16%, transparent),
@@ -189,7 +194,8 @@
    the moment jank shows most. The duration is short and the blurs are small, so it is
    left alone until someone actually measures a drop; shortening it further is the
    first knob, not a rewrite. */
-.nav-focus-stuck.nav-focus-fading {
+.nav-focus-stuck.nav-focus-fading,
+.arrival-marker.arrival-marker-fading {
     animation: nav-focus-spotlight-off calc(0.8s * var(--duration-scale)) linear forwards;
 }
 
@@ -211,11 +217,13 @@
    rather than inheriting the one above: it is a two-class selector, so it
    outranks a bare `.nav-focus-stuck { animation: none }` and would keep
    animating. */
-:root[data-motion="reduce"] .nav-focus-stuck {
+:root[data-motion="reduce"] .nav-focus-stuck,
+:root[data-motion="reduce"] .arrival-marker {
     animation: none;
 }
 
-:root[data-motion="reduce"] .nav-focus-stuck.nav-focus-fading {
+:root[data-motion="reduce"] .nav-focus-stuck.nav-focus-fading,
+:root[data-motion="reduce"] .arrival-marker.arrival-marker-fading {
     animation: none;
 }
 
@@ -1173,15 +1181,6 @@ html[data-theme-mode="dark"] .split-button.open::before {
     color: var(--search-field-muted);
 }
 
-/* A touch surface often focuses its search box on open (`keyboardHandoff.ts`),
-   and iOS zooms the page into any focused field under 16px. A LITERAL on
-   purpose: no token computes to 16px at every UI scale and on both roots. */
-@media (pointer: coarse) {
-    .search-field-input {
-        font-size: 16px;
-    }
-}
-
 .dropdown-no-results {
     color: var(--text-muted);
     cursor: default;
@@ -1548,6 +1547,20 @@ html[data-theme-mode="dark"] .split-button.open::before {
     display: flex;
     flex-direction: column;
     padding: 0.25rem;
+}
+
+/* The list holds focus only so the arrow keys reach it. Its focus indicator is
+   the active row, so the container draws no outline. The browser's default one
+   showed as a stray blue edge where the panel's scroller clipped it.
+   Forced-colors strips the row's background, so the row keeps a transparent
+   outline there, inset so the scroller cannot clip it. */
+.control-list:focus {
+    outline: none;
+}
+
+.control-list:focus .control-item-active {
+    outline: 0.125rem solid transparent;
+    outline-offset: -0.125rem;
 }
 
 /* The list opens scrolled to the model in force, which on a long registry is

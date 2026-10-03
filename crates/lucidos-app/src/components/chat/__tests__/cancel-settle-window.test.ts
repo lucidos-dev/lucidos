@@ -56,18 +56,24 @@ describe('post-submit cancel settle window', () => {
 // Escape first, in the capture phase, and stops propagation).
 describe('what Escape does in the prompt', () => {
   it('cancels when there is a live turn or a pending card to cancel', () => {
-    expect(computePromptEscapeAction(true, false)).toBe('cancel');
+    expect(computePromptEscapeAction(true, false, false)).toBe('cancel');
   });
 
   it('blurs when there is nothing to cancel, as it always did', () => {
-    expect(computePromptEscapeAction(false, false)).toBe('blur');
+    expect(computePromptEscapeAction(false, false, false)).toBe('blur');
   });
 
   it('does nothing during the settle window, so Enter then Escape cannot abort the new turn', () => {
-    expect(computePromptEscapeAction(true, true)).toBe('ignore');
+    expect(computePromptEscapeAction(true, true, false)).toBe('ignore');
   });
 
   it('still blurs during the settle window when there is nothing to cancel', () => {
-    expect(computePromptEscapeAction(false, true)).toBe('blur');
+    expect(computePromptEscapeAction(false, true, false)).toBe('blur');
+  });
+
+  it('leaves side-question mode first, before it would stop a turn', () => {
+    expect(computePromptEscapeAction(true, false, true)).toBe('leave-side-question');
+    expect(computePromptEscapeAction(true, true, true)).toBe('leave-side-question');
+    expect(computePromptEscapeAction(false, false, true)).toBe('leave-side-question');
   });
 });

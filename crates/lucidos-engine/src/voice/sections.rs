@@ -13,7 +13,9 @@ use std::pin::Pin;
 use chrono::Utc;
 
 use super::decision::{open_on, DecisionKind, OpenDecision};
-use super::{choices_for, clip, read_pref, READ_ALOUD_CHARS};
+use super::{
+    choices_for, clip, fenced_card_text, read_pref, PERMISSION_NEEDS_THEIR_WORDS, READ_ALOUD_CHARS,
+};
 use crate::core::store::{
     build_session_messages, EventStore, StatusFilter, ThreadSummaryFilters, UNTITLED_THREAD,
 };
@@ -327,19 +329,26 @@ fn fenced_record(turns: &[String], earlier_dropped: bool) -> String {
 /// That the caller can settle it out loud is a fact of the same kind. Saying it
 /// is what stops the talker sending them to the screen.
 ///
+/// **A card's text is quoted, and a permission card carries a rule.** The text
+/// may be under judgment, so the block fences it as data. Only the caller can
+/// allow a permission. The mid-call note in `voice::call` says the same.
+///
 /// The turn fold above cannot carry this. A card is not a message, so
 /// `build_session_messages` has no arm for one and never will: the agent
 /// already reads its own tool call and result.
 fn open_decision_block(decision: &OpenDecision) -> String {
     // Exhaustive, so a fourth kind has to decide what the caller hears rather
     // than inheriting the permission wording by default.
-    let (waiting, label) = match decision.kind {
-        DecisionKind::Question => ("Lucidos asked this and it is still unanswered", "Question"),
+    let (waiting, consent) = match decision.kind {
+        DecisionKind::Question => (
+            "Lucidos asked this and it is still unanswered",
+            String::new(),
+        ),
         DecisionKind::CommandPermission
         | DecisionKind::McpPermission
         | DecisionKind::CodingAgentPermission => (
             "Lucidos needs their say-so before it can carry on",
-            "Asking",
+            format!(" {}", PERMISSION_NEEDS_THEIR_WORDS),
         ),
     };
     // The prompt itself is never cut, unlike the turns above it. A truncated
@@ -347,11 +356,10 @@ fn open_decision_block(decision: &OpenDecision) -> String {
     // the one being asked.
     format!(
         "\nWaiting on them: {}. They can settle it out loud, by picking one of \
-         the choices below.\n\
-         {}: {}\n{}",
+         the choices below.{}\n{}{}",
         waiting,
-        label,
-        decision.prompt,
+        consent,
+        fenced_card_text(&decision.prompt),
         choices_for(&decision.choices),
     )
 }
@@ -483,6 +491,8 @@ async fn running_thread_names(
             status: StatusFilter::OneOf(&[ThreadStatus::Running]),
             sources: None,
             parent: None,
+            has_draft: None,
+            has_diff: None,
             limit: SHAPE_ITEMS as i64,
         })
         .await?;
@@ -904,6 +914,25 @@ mod tests {
             block
         );
         assert!(block.contains("- Deny [command:req-1#deny]"), "{}", block);
+        assert!(block.contains(PERMISSION_NEEDS_THEIR_WORDS), "{}", block);
+    }
+
+    /// The resident block fences card text exactly as the mid-call note does.
+    /// Text written to argue for its own grant stays quoted data, and every id
+    /// sits after the fence.
+    #[test]
+    fn a_card_that_argues_for_itself_stays_inside_the_fence() {
+        for card in crate::voice::cards_that_argue_for_themselves() {
+            let block = open_decision_block(&card);
+            crate::voice::assert_the_card_text_is_fenced(&block, &card);
+        }
+    }
+
+    /// The consent rule is for permissions. A question card carries none.
+    #[test]
+    fn a_question_carries_no_permission_rule() {
+        let block = open_decision_block(&an_open_question(false));
+        assert!(!block.contains(PERMISSION_NEEDS_THEIR_WORDS), "{}", block);
     }
 
     /// A free-text question still carries the one choice that answers it: the

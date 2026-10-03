@@ -45,6 +45,7 @@ function loadingLiterals(code: string): string[] {
 
 /** Consumers that may skip a skeleton, each with the rule that says so. */
 const CONSUMER_EXEMPT: Record<string, Exemption> = {
+  'components/chat/chat-exchange-parts.tsx': { tag: 'single-value', why: 'a change card holds its headline line empty until it loads' },
   'components/chat/ComposeDestinationRow.tsx': { tag: 'structure-first', why: 'destination dropdown; the lists only fill its options' },
   'components/chat/FrontendPreviewSection.tsx': { tag: 'structure-first', why: 'control menu section; dims its button until the slot is read' },
   'components/chat/LucidosControlMenu.tsx': { tag: 'structure-first', why: 'anchored menu; only kicks off the model list read' },

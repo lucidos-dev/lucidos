@@ -20,6 +20,8 @@ mod ask_user_question_hook;
 mod await_event;
 mod background_task;
 mod build_slot;
+mod cc_agent_definitions;
+mod cc_agent_guard;
 mod cc_bash_guard;
 mod cc_plan_gate;
 mod cc_read_coerce;
@@ -242,6 +244,12 @@ enum Command {
     #[command(name = "cc-read-coerce", hide = true)]
     CcReadCoerce,
     /// PreToolUse hook subcommand invoked by Claude Code via .lucidos/cc-settings.json
+    /// for every Agent tool call. Refuses a subagent that its call or its agent
+    /// definition sends to the background, since it dies when the turn ends.
+    /// Hidden; not for direct invocation.
+    #[command(name = "cc-agent-guard", hide = true)]
+    CcAgentGuard,
+    /// PreToolUse hook subcommand invoked by Claude Code via .lucidos/cc-settings.json
     /// for every Edit/Write tool call. Asks the engine whether this branch has a
     /// Planned marker; if not (and the worktree ships the implementation-plan
     /// skill), returns `permissionDecision: "deny"` instructing the model to run
@@ -300,10 +308,11 @@ enum Command {
     Notify(NotifyArgs),
     /// Query thread summaries on the parent workspace, and message your own
     /// child threads. `list` / `count` return the same shape as
-    /// `GET /api/v1/threads/list` and the `list_threads` LLM tool: a flat
-    /// newest-first list of every thread (with optional filters), distinct
-    /// from the UI-shaped `/api/v1/threads`. `follow-up` sends a message to one
-    /// of THIS thread's own direct children.
+    /// `GET /api/v1/threads/list`: a flat newest-first list of every thread
+    /// (with optional filters), distinct from the UI-shaped `/api/v1/threads`.
+    /// `drafts`, `held-messages` and `search` say what a thread holds and where
+    /// a topic lives. `follow-up` sends a message to one of THIS thread's own
+    /// direct children.
     Threads {
         #[command(subcommand)]
         action: ThreadsCmd,
@@ -538,6 +547,14 @@ enum ThreadsCmd {
         /// inside a Lucidos thread.
         #[arg(long)]
         my_children: bool,
+        /// Keep threads holding an unsent draft (`--has-draft`), or with
+        /// `--has-draft false` the rest.
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        has_draft: Option<bool>,
+        /// Keep coding-agent threads whose branch differs from main
+        /// (`--has-diff`), or with `--has-diff false` the rest.
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        has_diff: Option<bool>,
     },
     /// Count thread summaries matching the same filters as `list`.
     /// Outputs `{ "count": N }`.
@@ -562,6 +579,44 @@ enum ThreadsCmd {
         /// `--parent` with the calling thread's own id.
         #[arg(long)]
         my_children: bool,
+        /// Count threads holding an unsent draft, or with `false` the rest.
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        has_draft: Option<bool>,
+        /// Count coding-agent threads whose branch differs from main, or with
+        /// `false` the rest.
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        has_diff: Option<bool>,
+    },
+    /// List every thread holding an unsent draft as JSON, newest edit first:
+    /// thread_id, title, preview, length, last_edited, link. With `--thread`,
+    /// that one draft with its whole text. A draft has no link of its own;
+    /// its `link` opens the thread that holds it. Read-only.
+    Drafts {
+        /// One thread's uuid: print its draft with the whole text.
+        #[arg(long)]
+        thread: Option<String>,
+        /// Max drafts. Server clamps to 1..=1000 (default 100).
+        #[arg(long)]
+        limit: Option<u32>,
+    },
+    /// List every held message as JSON: an agent-sent message a thread keeps
+    /// back until the user answers its question. Each row names its thread
+    /// and carries its link. Read-only.
+    HeldMessages {
+        /// Max messages. Server clamps to 1..=1000 (default 100).
+        #[arg(long)]
+        limit: Option<u32>,
+    },
+    /// Find threads by what was said in them or typed into their draft, as
+    /// JSON. Title, content and draft text, plus semantic matches. Read-only.
+    Search {
+        /// What was discussed, in the words it would have been said in.
+        /// Quoting is optional: the words are joined with spaces.
+        #[arg(required = true, num_args = 1..)]
+        query: Vec<String>,
+        /// Max threads. Server clamps to 1..=50 (default 20).
+        #[arg(long)]
+        limit: Option<u32>,
     },
     /// Send a message to one of THIS thread's own child threads: redirect one
     /// going the wrong way, hand it something a sibling learned, or tell a
@@ -1340,6 +1395,10 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
             cc_read_coerce::run()?;
             Ok(0)
         }
+        Command::CcAgentGuard => {
+            cc_agent_guard::run()?;
+            Ok(0)
+        }
         Command::CcPlanGate => {
             cc_plan_gate::run()?;
             Ok(0)
@@ -1488,6 +1547,8 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
                     limit,
                     parent,
                     my_children,
+                    has_draft,
+                    has_diff,
                 } => threads::cmd_list(
                     &ws,
                     threads::ListFilters {
@@ -1500,6 +1561,8 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
                             my_children,
                             threads::source_thread_id_from_env(),
                         )?,
+                        has_draft,
+                        has_diff,
                     },
                 )?,
                 ThreadsCmd::Count {
@@ -1508,6 +1571,8 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
                     source,
                     parent,
                     my_children,
+                    has_draft,
+                    has_diff,
                 } => threads::cmd_count(
                     &ws,
                     threads::ListFilters {
@@ -1522,8 +1587,17 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
                             my_children,
                             threads::source_thread_id_from_env(),
                         )?,
+                        has_draft,
+                        has_diff,
                     },
                 )?,
+                ThreadsCmd::Drafts { thread, limit } => {
+                    threads::cmd_drafts(&ws, limit, thread.as_deref())?
+                }
+                ThreadsCmd::HeldMessages { limit } => threads::cmd_held_messages(&ws, limit)?,
+                ThreadsCmd::Search { query, limit } => {
+                    threads::cmd_search(&ws, &query.join(" "), limit)?
+                }
                 ThreadsCmd::FollowUp {
                     thread,
                     message,

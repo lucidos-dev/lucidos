@@ -105,6 +105,38 @@ Do not call this from scripts. It is scoped to the engine-installed hook and
 requires the Lucidos subprocess-origin headers that the CLI attaches in spawned
 subprocesses.
 
+### Hidden: `lucidos cc-agent-guard`
+
+The PreToolUse hook Claude Code runs before every `Agent` call in a Lucidos
+session. It refuses the call unless it sets `run_in_background: false`, and
+always refuses `isolation: "remote"`. The engine ends the Claude Code process
+when the turn ends, and a background subagent dies with it, so its report
+never arrives. Several foreground `Agent` calls in one message still run in
+parallel. With `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` or
+`CLAUDE_CODE_FORK_SUBAGENT` set, the schema has no such flag and every
+subagent already runs in the foreground, so a call without it passes.
+
+It also refuses a `subagent_type` whose agent definition sets
+`background: true` or `isolation: remote` in its frontmatter. Claude Code runs
+such an agent in the background whatever the call says, so the refusal asks
+for another `subagent_type`. A call that sets its own `isolation` overrides
+the definition's, and `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` overrides
+`background: true`. The hook finds the definition where Claude Code does:
+
+- `<dir>/.claude/agents/`, where `<dir>` is the session's `cwd` or a parent
+  up to the git root, never home itself. The deeper directory wins.
+- `$CLAUDE_CONFIG_DIR/agents/` (default `~/.claude/agents/`).
+- `<add-dir>/.claude/agents/` for each directory the session was granted,
+  such as the workspace's `data/`. These beat user agents and lose to project
+  ones.
+- `<managed dir>/.claude/agents/`, the managed-policy agents.
+- Enabled plugins, for a `<plugin>:<name>` type.
+
+The type is the frontmatter `name`, not the file name. Built-in types such as
+`general-purpose`, `Explore` and `Plan` never set `background`. A directory
+added mid-session with `/add-dir` is not covered. The hook lets a call
+through when it cannot read a definition. Do not call it directly.
+
 ### `lucidos data path <relative> [--mkdir]`
 
 Print the absolute filesystem path that `<relative>` resolves to inside the parent workspace's `data/` directory.
@@ -309,9 +341,15 @@ $ lucidos events count --type ToolResult --since 2026-05-18T00:00:00Z
 
 `byte_total` is `SUM(octet_length(payload::text))` — the raw payload byte sum, a reliable proxy for the token cost of a corresponding `lucidos events query` call. Use this before `query` on busy workspaces to budget which types to drill into (the recurring `workspace-learning` recipe failure that motivated this CLI was a `query --type ToolResult --limit 300` call returning 2.3 MB and blowing the next-turn prompt cap).
 
-### `lucidos threads list [--active | --status <list>] [--source <list>] [--limit N] [--parent <uuid> | --my-children]`
+### `lucidos threads list [--active | --status <list>] [--source <list>] [--limit N] [--parent <uuid> | --my-children] [--has-draft [false]] [--has-diff [false]]`
 
-List thread summaries from the parent workspace. Outputs the raw JSON array on stdout, newest-first by `last_activity`. Each row is a full `ThreadSummary` — the same shape returned by the `list_threads` LLM tool and by `lucidos.threads.list()` in the JS SDK, and the same shape the projection stores in `thread_summaries`.
+List thread summaries from the parent workspace. Outputs the raw JSON array on stdout, newest-first by `last_activity`. Each row is a full `ThreadSummary`, the shape `lucidos.threads.list()` returns in the JS SDK, plus the *reader fields*:
+
+- `has_draft`: whether the thread holds an unsent *draft*.
+- `draft_preview` and `draft_length`: its first 200 characters and its length in characters, present only when it does.
+- `link`: the *thread link*, `thread:<workspace>/<thread_id>`. Paste it as a markdown link target to point the user at the thread.
+
+The `threads` LLM tool's `list` returns the same rows without the raw `compose_*` fields. It reads a whole draft through `drafts` instead.
 
 ```bash
 $ lucidos threads list --status running --limit 5 | jq '.[].title'
@@ -330,6 +368,7 @@ $ lucidos threads list --status running --limit 5 | jq '.[].title'
 - `--limit` clamps to `1..=1000` server-side, default 100.
 - `--parent <uuid>` restricts to that thread's **direct** children only, never its grandchildren. A malformed uuid is a 400, never a silently unfiltered list.
 - `--my-children` is shorthand for `--parent` with the calling thread's own id, read from `$LUCIDOS_THREAD_ID`. Use it to recover a child's `thread_id`, to see which of your children are still working, and to spot one parked on a question. Outside a Lucidos-spawned subprocess it has nothing to resolve to and errors, rather than quietly listing the whole workspace. Pass the two together and the command refuses: one filter, one answer.
+- `--has-draft` keeps threads holding an unsent draft, and `--has-draft false` keeps the rest. `--has-diff` does the same for a coding-agent branch that differs from main. A pending question and a failure are statuses: filter them with `--status waiting_for_user_answer` and `--status failed`.
 
 ```bash
 # Which of my own children are still working, and what are they called?
@@ -346,9 +385,9 @@ Every row this command returns carries `pending_sub_thread_change_count`: the pe
 
 Use this from a script that needs to react to thread state — e.g. "is anything still running before I fire this trigger?" — without reconstructing it from raw `query_events`. The projection already tracks per-thread status; the list endpoint is just a read off it.
 
-### `lucidos threads count [--active | --status <list>] [--source <list>] [--parent <uuid> | --my-children]`
+### `lucidos threads count [--active | --status <list>] [--source <list>] [--parent <uuid> | --my-children] [--has-draft [false]] [--has-diff [false]]`
 
-Count thread summaries matching the same filters as `list`, including `--status` and the two child filters. Outputs `{"count": N}` on stdout.
+Count thread summaries matching the same filters as `list`, including `--status`, the two child filters, `--has-draft` and `--has-diff`. Outputs `{"count": N}` on stdout.
 
 ```bash
 # Is anything still running? (the idle-detector form)
@@ -366,6 +405,38 @@ $ lucidos threads count --active
 ```
 
 Cheaper than materialising the full list just to read `.length` on big workspaces.
+
+### `lucidos threads drafts [--thread <uuid>] [--limit N]`
+
+List every thread holding an unsent *draft*, newest edit first, as a JSON array. Wraps `GET /api/v1/threads/drafts`, the same read as the `threads` tool's `drafts` action. Read-only: nothing on any agent surface writes a draft.
+
+Each row carries `thread_id`, `title`, `channel`, `state`, `section`, `status`, `parent_thread_id`, `preview`, `length`, `image_count`, `last_edited` and `link`. `state` is `composing` for a thread never sent and `active` for one with history. `preview` is the first 200 characters, and `length` counts characters. `last_edited` is `null` for a draft typed before the engine recorded edit times.
+
+`--thread <uuid>` prints that one draft as an object, with its whole `text`. A thread holding no draft is a 404. `--limit` clamps to `1..=1000`, default 100.
+
+**A draft has no link of its own.** Its `link` opens the thread that holds it, which is where the user finds the composer with the text in it.
+
+```bash
+# Which threads hold a draft, and where?
+$ lucidos threads drafts | jq -r '.[] | "[\(.title)](\(.link))\t\(.preview)"'
+
+# Read one draft whole.
+$ lucidos threads drafts --thread 9c1f2b40-... | jq -r .text
+```
+
+### `lucidos threads held-messages [--limit N]`
+
+List every *held message* still waiting, newest first, as a JSON array. An agent-sent message to a coding-agent thread is held while that thread waits on the user, and released when they answer. Wraps `GET /api/v1/threads/held-messages`, the same read as the `threads` tool's `held_messages` action. Read-only.
+
+Each row carries `held_message_id`, `thread_id`, `title`, `channel`, `section`, `status`, `preview`, `length`, `image_count`, `held_at` and the owning thread's `link`. `--limit` clamps to `1..=1000`, default 100.
+
+### `lucidos threads search <query> [--limit N]`
+
+Find threads by what was said in them or typed into their draft. Wraps `GET /api/v1/threads/search`: title, message content and draft text, plus semantic matches. A draft matches only when it holds every word of the query. Outputs `{"results": [...]}`, each a full `ThreadSummary` with the reader fields and a `score`. `--limit` clamps to `1..=50`, default 20. Read-only.
+
+```bash
+$ lucidos threads search "cabin keys" | jq -r '.results[] | "[\(.title)](\(.link))"'
+```
 
 ### `lucidos threads follow-up --thread <child-uuid> --message <M> [--event-id <E>] [--urgent]`
 
@@ -1456,7 +1527,7 @@ $ lucidos knowhow read system-knowhow/building-an-app
 
 ### `lucidos proxy <name> [path] [-X METHOD] [-H "Hdr: val"] [-d body | --data-stdin] [-i] [--fail]`
 
-Call a backend configured in `data/config/apis.json` through the engine. The engine resolves the credential from the workspace's credential store and injects the configured auth header. It strips `Cookie`/`Origin`/`Referer`/`Host` from the forwarded request. It strips every `x-lucidos-*` header and the two `x-forwarded-*` ones the gateway owns with them, so no Lucidos credential reaches the upstream. **The credential value never reaches the script**: not in `argv`, env vars, the request line, nor any log.
+Call a backend through the engine: an entry in `data/config/apis.json`, or a builtin provider proxy (below). The engine resolves the credential from the workspace's credential store and injects the configured auth header. It strips `Cookie`/`Origin`/`Referer`/`Host` from the forwarded request. It strips every `x-lucidos-*` header and the two `x-forwarded-*` ones the gateway owns with them, so no Lucidos credential reaches the upstream. **The credential value never reaches the script**: not in `argv`, env vars, the request line, nor any log.
 
 The response comes back with an allowlisted set of upstream headers, the same for every caller. `Set-Cookie` and the other headers a browser acts on never arrive, so `--include` cannot read a login cookie. A cookie login belongs in a `script_handshake`, which makes its own requests. The full list is in `system-knowhow/js-sdk.md` § `lucidos.proxy`.
 
@@ -1494,6 +1565,30 @@ The response comes back with an allowlisted set of upstream headers, the same fo
 **A credential goes only where it is scoped.** The engine checks the entry's `base_url` against the *credential scope*, the set of base URLs the credential declares, before attaching it. Rewriting an entry's `base_url` therefore cannot redirect a secret (ADR 0144). One key covering several hostnames of one provider declares each of them, and `lucidos credentials` below is how you read and set that. A `script_handshake` credential is the exception, because the script presents it rather than the proxy: what binds there is the `injects` column of the approvals record, which pins the exact secret set that entry may hand the script.
 
 The engine also validates the upstream's certificate, and refuses a credential over plain `http://` unless the host is loopback. A self-signed dev backend or a keyed LAN device needs `"insecure_transport": true` on the entry, which is documented in `system-knowhow/building-an-auth-handshake.md`.
+
+#### Builtin provider proxies (no `apis.json` entry)
+
+Every model provider the engine holds auth for is also a proxy, with no `apis.json` entry and no credential to request. The names are `anthropic`, `local`, `openai`, `openrouter`, `typesafe`, `vertex` and `xai`. The engine injects the key it already uses for chat. So never ask the user for a key these already cover.
+
+**Each default base URL already includes `/v1`.** Send the path after it. A `local` base you configure may lack it, and the agent's context says which. `/v1/models` against `openai` reaches `https://api.openai.com/v1/v1/models` and answers 404.
+
+```bash
+# List the OpenAI models the engine's own key can reach
+lucidos proxy openai /models
+
+# A chat call through the builtin Anthropic proxy
+lucidos proxy anthropic /messages -X POST \
+  -H "Content-Type: application/json" -H "anthropic-version: 2023-06-01" \
+  -d '{"model":"<model-id>","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}'
+```
+
+- **Not configured answers 404**, and the message names what to set (Settings → Models → Providers, or an env var).
+- **An `apis.json` entry with the same name wins**, so you can still point `openai` at a gateway.
+- **`vertex` takes only the suffix**, `/publishers/<publisher>/models/<model>:<method>`. The engine owns the project and region prefix.
+- **`opencode-free` has no proxy.** The keyless free tier serves chat only, so nothing may build on it (ADR 0104).
+- The Lucidos Agent reaches the same proxies with `proxy_request`, and its context lists each one with its base and whether it is configured.
+
+The full table of bases and injected headers is in `system-knowhow/js-sdk.md` § `lucidos.proxy`.
 
 #### Usage (curl-style ergonomics)
 
@@ -1546,6 +1641,7 @@ A value outside 1 to 600 is refused. For the preference, the write fails and nam
 | Want to … | Use |
 |---|---|
 | Call a backend the workspace will reuse | `lucidos proxy` (configure once in `apis.json`, then no auth in script) |
+| Call a model provider (OpenAI, Anthropic, OpenRouter, xAI, Vertex, local, TypeSafe) | `lucidos proxy <builtin> <path>`, no `apis.json` entry and no credential request |
 | One-off `curl` to a service the workspace will never reuse | Plain `curl` (no proxy entry needed) |
 | Emit a domain event, or query the event store (domain AND engine events) | `lucidos events …` |
 | Write a file under `data/` | `lucidos data write …` |

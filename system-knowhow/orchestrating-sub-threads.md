@@ -175,6 +175,10 @@ you saw and carry on with your own work.
    or watching an event. Apply refuses it for the same reason. The card's
    settled state dates from when the card was sent. So read the list again
    before you tell the user a change is ready.
+8. **Don't restate a coding-agent child's defaults in its brief.** Review,
+   merge and hardening behavior already default correctly for the folder it
+   edits. Say one only to ask for something other than that default; see
+   `system-knowhow/coding-agent-events`.
 
 ## Reaching a child that already finished
 

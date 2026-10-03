@@ -23,7 +23,7 @@ use crate::llm::tool_names as tn;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::borrow::Cow;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::sync::LazyLock;
 
 /// How dangerous a single bash/python command is, and therefore how the command
@@ -114,6 +114,54 @@ impl SideEffectCategory {
     }
 }
 
+/// Where a command runs, which decides how far the guard can check its paths.
+#[derive(Debug, Clone, Copy)]
+pub enum CommandSite<'a> {
+    /// Only the command text is known, so containment is lexical. `root` lets
+    /// a `cd` to an absolute path under it stay in the workspace.
+    TextOnly { root: Option<&'a Path> },
+    /// The command runs in this workspace root. Every path resolves on disk,
+    /// symlinks included, and one that does not resolve reads as outside.
+    Workspace(&'a Path),
+}
+
+impl<'a> CommandSite<'a> {
+    fn root(self) -> Option<&'a Path> {
+        match self {
+            Self::TextOnly { root } => root,
+            Self::Workspace(root) => Some(root),
+        }
+    }
+
+    /// Run `f` with the on-disk view of this site, built once per command.
+    fn with_disk<T>(self, f: impl FnOnce(Option<OnDisk<'_>>) -> T) -> T {
+        match self {
+            Self::TextOnly { .. } => f(None),
+            Self::Workspace(root) => {
+                // A root that does not resolve keeps its raw form. Nothing
+                // resolves under that, so every path reads as outside.
+                let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+                let cwds = [root.clone()];
+                f(Some(OnDisk {
+                    root: &root,
+                    cwds: &cwds,
+                }))
+            }
+        }
+    }
+}
+
+/// The on-disk view of a [`CommandSite::Workspace`]. A path stays inside only
+/// when it resolves under `root` from EVERY directory in `cwds`. Those are all
+/// the directories the line can be in by then. A `cd` in a subshell or a
+/// `popd` leaves that set no smaller.
+#[derive(Debug, Clone, Copy)]
+struct OnDisk<'a> {
+    /// Canonical.
+    root: &'a Path,
+    cwds: &'a [PathBuf],
+}
+
 /// The outcome of the static (zero-cost, deterministic) classification pass.
 /// Either the lane is settled outright, or the command is the *ambiguous
 /// middle* and is handed to the LLM judge.
@@ -150,10 +198,15 @@ pub struct JudgeInput {
 }
 
 impl JudgeInput {
-    /// Stable per-turn cache key — same tool + same command text re-judges to
-    /// the same verdict, so the agentic loop caches by this string.
+    /// Per-turn cache key. The same tool, command text and marker re-judge to
+    /// the same verdict, so the agentic loop caches by this string. The marker
+    /// is in it because it reads the disk: a link laid down mid-turn changes
+    /// the verdict for the same text.
     pub fn cache_key(&self) -> String {
-        format!("{}\u{0}{}", self.tool_name, self.command)
+        format!(
+            "{}\u{0}{}\u{0}{}",
+            self.tool_name, self.command, self.out_of_workspace
+        )
     }
 }
 
@@ -529,7 +582,16 @@ fn tail_runs_more_commands(tail: &str) -> bool {
 ///
 /// Catastrophic wins over everything (checked first), so a command that is both
 /// catastrophic and side-effect-shaped is hard-blocked rather than judged.
-pub fn static_classify(tool_name: &str, input: &Value) -> StaticVerdict {
+pub fn static_classify(tool_name: &str, input: &Value, site: CommandSite<'_>) -> StaticVerdict {
+    site.with_disk(|disk| static_classify_at(tool_name, input, site.root(), disk))
+}
+
+fn static_classify_at(
+    tool_name: &str,
+    input: &Value,
+    root: Option<&Path>,
+    disk: Option<OnDisk<'_>>,
+) -> StaticVerdict {
     let Some(raw) = command_text(tool_name, input) else {
         return StaticVerdict::Settled(RiskLane::Safe);
     };
@@ -547,7 +609,7 @@ pub fn static_classify(tool_name: &str, input: &Value) -> StaticVerdict {
     // write, a destruction call), never an unlisted-head omission, so the
     // whole set is a refusal.
     let declined = if is_bash {
-        bash_fast_path(cmd)
+        bash_fast_path(cmd, disk)
     } else {
         (!python_is_statically_safe(cmd)).then_some(FastPathDecline::Refusal)
     };
@@ -557,9 +619,16 @@ pub fn static_classify(tool_name: &str, input: &Value) -> StaticVerdict {
     StaticVerdict::NeedsJudge(JudgeInput {
         tool_name: tool_name.to_string(),
         command: cmd.to_string(),
-        // The out-of-workspace marker is a bash-only path heuristic; Python code
-        // is handed to the judge verbatim, which reads any paths from the code.
-        out_of_workspace: is_bash && command_escapes_workspace(cmd),
+        // For bash the destruction scan adds what one token cannot show: a
+        // `cd` earlier in the line, or a link another segment can make first.
+        // For Python only a destruction call is weighed, against its literals.
+        out_of_workspace: if is_bash {
+            command_escapes_workspace(cmd, disk)
+                || bash_destruction_scope_at(cmd, 0, root, disk, false)
+                    == Some(DestructionScope::OutOfWorkspace)
+        } else {
+            python_destruction_scope(cmd, disk) == Some(DestructionScope::OutOfWorkspace)
+        },
         fast_path_refused: declined == FastPathDecline::Refusal,
     })
 }
@@ -582,9 +651,8 @@ pub fn static_classify(tool_name: &str, input: &Value) -> StaticVerdict {
 /// this does cover is the headline shapes: a delete, move, copy or truncating
 /// redirect onto a path outside the workspace.
 ///
-/// `root` is the workspace root, when the caller knows it. A `cd` to an
-/// absolute path under it then stays in the workspace.
-pub fn fallback_classify(ji: &JudgeInput, root: Option<&Path>) -> JudgedClassification {
+/// `site` is where the command runs, and decides how far its paths are checked.
+pub fn fallback_classify(ji: &JudgeInput, site: CommandSite<'_>) -> JudgedClassification {
     if let Some(cat) = static_side_effect_category(&ji.command) {
         return JudgedClassification {
             lane: RiskLane::IrreversibleDanger,
@@ -596,11 +664,13 @@ pub fn fallback_classify(ji: &JudgeInput, root: Option<&Path>) -> JudgedClassifi
         ji.tool_name.as_str(),
         tn::RUN_BASH | tn::RUN_BASH_BACKGROUND
     );
-    let scope = if is_bash {
-        bash_destruction_scope_at(&ji.command, 0, root, false)
-    } else {
-        python_destruction_scope(&ji.command)
-    };
+    let scope = site.with_disk(|disk| {
+        if is_bash {
+            bash_destruction_scope_at(&ji.command, 0, site.root(), disk, false)
+        } else {
+            python_destruction_scope(&ji.command, disk)
+        }
+    });
     match scope {
         Some(DestructionScope::OutOfWorkspace) => JudgedClassification {
             lane: RiskLane::IrreversibleDanger,
@@ -645,28 +715,37 @@ static DESTRUCTIVE_DEST_HEADS: &[&str] = &["mv", "cp"];
 /// no segment has a destruction shape.
 #[cfg(test)]
 fn bash_destruction_scope(command: &str) -> Option<DestructionScope> {
-    bash_destruction_scope_at(command, 0, None, false)
+    bash_destruction_scope_at(command, 0, None, None, false)
 }
 
 /// True when `command` destroys anything if it starts outside the workspace,
 /// where every relative path resolves out there too.
 pub fn destroys_when_started_outside(command: &str) -> bool {
-    bash_destruction_scope_at(command, 0, None, true).is_some()
+    bash_destruction_scope_at(command, 0, None, None, true).is_some()
 }
+
+/// How many directories the scan tracks a line through before it stops and
+/// reads every relative path as outside. Each `cd` can double the set.
+const MAX_TRACKED_CWDS: usize = 32;
 
 /// [`bash_destruction_scope`], carrying the substitution-recursion depth. A
 /// substitution body is scanned like a segment, for the reason
 /// [`substitution_bodies`] gives: without it `ls $(rm -rf ~)` resolves to head
 /// `ls`, finds no destruction, and the fallback settles it Safe.
 ///
-/// `starts_outside` is true when the line starts in a directory outside the
-/// workspace. Every relative path then resolves out there, as after a `cd`
-/// out, so a relative delete or overwrite escapes.
+/// `relative_paths_escape` is true when no relative path can be shown to stay
+/// inside. The line starts outside the workspace, or a link the enclosing line
+/// makes can redirect it. A relative delete or overwrite then escapes.
+///
+/// On disk, a segment's paths stay resolved only while no other segment can
+/// make a link ([`may_make_a_link`]). Otherwise `ln -s /etc data/x && rm -rf
+/// data/x/*` resolves its target before the link exists.
 fn bash_destruction_scope_at(
     command: &str,
     depth: usize,
     root: Option<&Path>,
-    starts_outside: bool,
+    disk: Option<OnDisk<'_>>,
+    relative_paths_escape: bool,
 ) -> Option<DestructionScope> {
     /// True when `scope` escapes the workspace; records an in-workspace hit.
     fn escapes(scope: Option<DestructionScope>, found_in_ws: &mut bool) -> bool {
@@ -680,14 +759,30 @@ fn bash_destruction_scope_at(
         }
     }
     let mut found_in_ws = false;
-    let mut left_workspace = starts_outside;
+    let mut left_workspace = relative_paths_escape;
     let cdpath_set = command.contains("CDPATH=");
-    for segment in command_segments(command) {
+    let segments: Vec<String> = command_segments(command).collect();
+    let may_link: Vec<bool> = segments
+        .iter()
+        .map(|segment| disk.is_some() && may_make_a_link(segment))
+        .collect();
+    let linkers = may_link.iter().filter(|&&links| links).count();
+    let reach = LinkReach::of(command);
+    let mut cwds: Vec<PathBuf> = disk.map(|d| d.cwds.to_vec()).unwrap_or_default();
+    for (i, segment) in segments.iter().enumerate() {
+        let here = disk.map(|d| OnDisk {
+            root: d.root,
+            cwds: &cwds,
+        });
         // After a `cd` out of the workspace, a relative path lands out there.
+        // So it does when another segment, or this one's own substitution or
+        // wrapper, can lay down a link before this segment runs.
+        let relinked = disk.is_some()
+            && (runs_more_than_its_head(segment)
+                || (0..segments.len()).any(|j| j != i && may_link[j] && reach.reaches(j, i)));
+        let escape = left_workspace || relinked;
         let relocate = |scope: Option<DestructionScope>| match scope {
-            Some(DestructionScope::InWorkspace) if left_workspace => {
-                Some(DestructionScope::OutOfWorkspace)
-            }
+            Some(DestructionScope::InWorkspace) if escape => Some(DestructionScope::OutOfWorkspace),
             other => other,
         };
         // BOTH readings, never just the unwrapped one. The raw segment is what
@@ -695,7 +790,7 @@ fn bash_destruction_scope_at(
         // wrapper's own preamble, as in `bash >/etc/crontab -c 'true'`, and the
         // unwrap discards everything before `-c` along with it.
         if escapes(
-            relocate(segment_destruction_scope(&segment)),
+            relocate(segment_destruction_scope(segment, here)),
             &mut found_in_ws,
         ) {
             return Some(DestructionScope::OutOfWorkspace);
@@ -703,10 +798,10 @@ fn bash_destruction_scope_at(
         // The unwrapped reading is what the head scan needs, for the reason
         // `catastrophic_reason_at` gives: a wrapper in a LATER segment leaves
         // the head token reading as `bash`, and the payload is never inspected.
-        let inner = unwrap_shell_command(&segment);
-        if inner != segment
+        let inner = unwrap_shell_command(segment);
+        if inner != segment.as_str()
             && escapes(
-                relocate(segment_destruction_scope(&inner)),
+                relocate(segment_destruction_scope(&inner, here)),
                 &mut found_in_ws,
             )
         {
@@ -714,15 +809,38 @@ fn bash_destruction_scope_at(
         }
         // The scope scan reads a relative overwrite as in-workspace, which the
         // fast path settles Safe. Out of the workspace it lands out there.
-        if left_workspace && (truncates_a_file(&segment) || truncates_a_file(&inner)) {
+        if escape && (truncates_a_file(segment) || truncates_a_file(&inner)) {
             return Some(DestructionScope::OutOfWorkspace);
         }
-        left_workspace |= changes_dir_out_of_workspace(&segment, root, cdpath_set)
-            || changes_dir_out_of_workspace(&inner, root, cdpath_set);
+        let left = changes_dir_out_of_workspace(segment, root, here, cdpath_set)
+            || changes_dir_out_of_workspace(&inner, root, here, cdpath_set);
+        left_workspace |= left;
+        if !left && disk.is_some() {
+            for target in [segment.as_str(), inner.as_ref()]
+                .into_iter()
+                .filter_map(cd_destination)
+            {
+                let moved: Vec<PathBuf> = cwds.iter().map(|cwd| cwd.join(&target)).collect();
+                cwds.extend(moved);
+                cwds.sort();
+                cwds.dedup();
+            }
+            left_workspace |= cwds.len() > MAX_TRACKED_CWDS;
+        }
     }
     if depth < MAX_SUBSTITUTION_DEPTH {
+        let here = disk.map(|d| OnDisk {
+            root: d.root,
+            cwds: &cwds,
+        });
         for body in substitution_bodies(command) {
-            let scope = bash_destruction_scope_at(body, depth + 1, root, left_workspace);
+            let scope = bash_destruction_scope_at(
+                body,
+                depth + 1,
+                root,
+                here,
+                left_workspace || linkers > 0,
+            );
             if escapes(scope, &mut found_in_ws) {
                 return Some(DestructionScope::OutOfWorkspace);
             }
@@ -731,12 +849,87 @@ fn bash_destruction_scope_at(
     found_in_ws.then_some(DestructionScope::InWorkspace)
 }
 
+/// True when `segment` may lay down a link, which would redirect a path that
+/// another segment of the line resolved. Only a head the Safe fast path
+/// settles, a `cd` and a plain delete are known not to: `ln`, `cp -s`, `tar`
+/// and any script can. A redirect writes a file, never a link.
+fn may_make_a_link(segment: &str) -> bool {
+    if runs_more_than_its_head(segment) {
+        return true;
+    }
+    if head_safety(segment, None).is_none() {
+        return false;
+    }
+    let toks: Vec<&str> = segment.split_whitespace().collect();
+    let heads = danger_head_candidates(&toks);
+    heads.is_empty()
+        || !heads.iter().all(|(base, _)| {
+            matches!(base.as_str(), "cd" | "pushd" | "popd")
+                || DESTRUCTIVE_HEADS.contains(&base.as_str())
+        })
+}
+
+/// True when `segment` runs a command its head does not name that may lay
+/// down a link: a shell wrapper's script, or such a substitution.
+fn runs_more_than_its_head(segment: &str) -> bool {
+    unwrap_shell_command(segment) != segment
+        || substitution_bodies(segment)
+            .into_iter()
+            .any(|body| command_segments(body).any(|s| may_make_a_link(&s)))
+}
+
+/// Which segments of a line can run before, or alongside, which others.
+/// `&&`, `||`, `;` and a newline run in order. A pipe runs its stages
+/// together, and a trailing `&` runs the job alongside everything after it.
+struct LinkReach {
+    /// The pipeline each segment belongs to.
+    pipeline: Vec<usize>,
+    /// Per pipeline: true when a `&` backgrounds it.
+    backgrounded: Vec<bool>,
+}
+
+impl LinkReach {
+    fn of(command: &str) -> Self {
+        let mut pipeline = vec![0];
+        let mut backgrounded = vec![false];
+        for sep in segment_separators(command) {
+            let current = backgrounded.len() - 1;
+            if sep == "|" {
+                pipeline.push(current);
+            } else {
+                backgrounded[current] = sep == "&";
+                backgrounded.push(false);
+                pipeline.push(current + 1);
+            }
+        }
+        Self {
+            pipeline,
+            backgrounded,
+        }
+    }
+
+    /// True when segment `from` can change the disk before segment `to` reads
+    /// its paths.
+    fn reaches(&self, from: usize, to: usize) -> bool {
+        let (Some(&a), Some(&b)) = (self.pipeline.get(from), self.pipeline.get(to)) else {
+            return true;
+        };
+        from < to || a == b || self.backgrounded[b]
+    }
+}
+
 /// True when `segment` is a `cd` or `pushd` that leaves the workspace. A bare
 /// `cd` goes home, and `cd -` or `pushd +1` goes to a directory the line never
 /// names, so each counts as leaving. So does zsh's two-argument `cd old new`, which
 /// rewrites part of `$PWD`. With `cdpath_set`, a relative target can resolve
-/// anywhere. An absolute target stays in only under `root`.
-fn changes_dir_out_of_workspace(segment: &str, root: Option<&Path>, cdpath_set: bool) -> bool {
+/// anywhere. An absolute target stays in only under `root`, and on disk only
+/// when it resolves there.
+fn changes_dir_out_of_workspace(
+    segment: &str,
+    root: Option<&Path>,
+    disk: Option<OnDisk<'_>>,
+    cdpath_set: bool,
+) -> bool {
     let toks: Vec<&str> = segment.split_whitespace().collect();
     danger_head_candidates(&toks)
         .into_iter()
@@ -746,9 +939,31 @@ fn changes_dir_out_of_workspace(segment: &str, root: Option<&Path>, cdpath_set: 
             }
             match cd_targets(args).as_slice() {
                 [target] if *target != "-" && !target.starts_with('+') => {
-                    !path_under_root(target, root) && (cdpath_set || !path_in_workspace(target))
+                    let under_root = path_under_root(target, root)
+                        && disk.is_none_or(|d| {
+                            plain_word(target)
+                                .is_some_and(|word| resolves_inside(Path::new(word), d.root, true))
+                        });
+                    !under_root && (cdpath_set || !path_in_workspace(target, disk))
                 }
                 _ => true,
+            }
+        })
+}
+
+/// The one directory a `cd` or `pushd` in `segment` names. Read only once
+/// [`changes_dir_out_of_workspace`] has found that the move stays inside.
+fn cd_destination(segment: &str) -> Option<String> {
+    let toks: Vec<&str> = segment.split_whitespace().collect();
+    danger_head_candidates(&toks)
+        .into_iter()
+        .find_map(|(base, args)| {
+            if !matches!(base.as_str(), "cd" | "pushd") {
+                return None;
+            }
+            match cd_targets(args).as_slice() {
+                [target] => Some(unquoted(target).to_string()),
+                _ => None,
             }
         })
 }
@@ -770,12 +985,12 @@ fn cd_targets<'a>(args: &[&'a str]) -> Vec<&'a str> {
 
 /// Destruction scope of one shell segment, or `None`. Skips the same benign
 /// prefixes the other scans do, so `sudo rm -rf /etc/x` is seen.
-fn segment_destruction_scope(segment: &str) -> Option<DestructionScope> {
+fn segment_destruction_scope(segment: &str, disk: Option<OnDisk<'_>>) -> Option<DestructionScope> {
     // A truncating redirect (`>`, not `>>`) onto a path outside the workspace
     // overwrites it — destruction no checkpoint covers. Append (`>>`) is an
     // out-of-workspace EDIT (wanted), and in-workspace overwrite redirects are
     // settled Safe upstream, so neither lands here.
-    if truncating_redirect_escapes(segment) {
+    if truncating_redirect_escapes(segment, disk) {
         return Some(DestructionScope::OutOfWorkspace);
     }
     let toks: Vec<&str> = segment.split_whitespace().collect();
@@ -783,7 +998,7 @@ fn segment_destruction_scope(segment: &str) -> Option<DestructionScope> {
     // the preamble, the same way it wins across segments.
     danger_head_candidates(&toks)
         .into_iter()
-        .filter_map(|(base, head_args)| head_destruction_scope(&base, head_args))
+        .filter_map(|(base, head_args)| head_destruction_scope(&base, head_args, disk))
         .max_by_key(|scope| match scope {
             DestructionScope::InWorkspace => 0,
             DestructionScope::OutOfWorkspace => 1,
@@ -791,14 +1006,18 @@ fn segment_destruction_scope(segment: &str) -> Option<DestructionScope> {
 }
 
 /// Destruction scope implied by one resolved command word plus its arguments.
-fn head_destruction_scope(base: &str, head_args: &[&str]) -> Option<DestructionScope> {
+fn head_destruction_scope(
+    base: &str,
+    head_args: &[&str],
+    disk: Option<OnDisk<'_>>,
+) -> Option<DestructionScope> {
     if base == "dd" {
         // dd overwrites its `of=` target (a block-device target is already
         // caught by the catastrophic scan upstream). No `of=` → stdout → not
         // destruction.
         let of_target = head_args.iter().find_map(|a| a.strip_prefix("of="));
         return of_target.map(|t| {
-            if !path_in_workspace(t) && !is_harmless_redirect(t) {
+            if !path_in_workspace(t, disk) && !is_harmless_redirect(t) {
                 DestructionScope::OutOfWorkspace
             } else {
                 DestructionScope::InWorkspace
@@ -811,14 +1030,17 @@ fn head_destruction_scope(base: &str, head_args: &[&str]) -> Option<DestructionS
         .filter(|a| !a.starts_with('-'))
         .collect();
     if DESTRUCTIVE_HEADS.contains(&base) {
-        return Some(if args.iter().any(|a| token_escapes_workspace(a)) {
+        return Some(if args.iter().any(|a| token_escapes_workspace(a, disk)) {
             DestructionScope::OutOfWorkspace
         } else {
             DestructionScope::InWorkspace
         });
     }
     if DESTRUCTIVE_DEST_HEADS.contains(&base) && args.len() >= 2 {
-        return Some(if args.last().is_some_and(|a| token_escapes_workspace(a)) {
+        let escapes = |dest: &str| {
+            token_escapes_workspace(dest, disk) || disk.is_some_and(|d| dir_entry_escapes(dest, d))
+        };
+        return Some(if args.last().is_some_and(|a| escapes(a)) {
             DestructionScope::OutOfWorkspace
         } else {
             DestructionScope::InWorkspace
@@ -829,8 +1051,8 @@ fn head_destruction_scope(base: &str, head_args: &[&str]) -> Option<DestructionS
 
 /// True when the segment has a TRUNCATING output redirect (`>`, not `>>`)
 /// whose target is a path outside the workspace.
-fn truncating_redirect_escapes(segment: &str) -> bool {
-    truncated_files(segment).any(|target| !path_in_workspace(target))
+fn truncating_redirect_escapes(segment: &str, disk: Option<OnDisk<'_>>) -> bool {
+    truncated_files(segment).any(|target| !path_in_workspace(target, disk))
 }
 
 /// True when the segment overwrites any real file through a truncating redirect.
@@ -864,6 +1086,9 @@ static PY_DESTRUCTION_CALLS: &[&str] = &[
     ".rmdir(",
 ];
 
+/// Python calls that make a link or change the working directory.
+static PY_RELOCATING_CALLS: &[&str] = &["symlink", "os.link(", "hardlink_to(", "chdir("];
+
 /// Destruction scope of Python `code`, or `None`. A destruction call paired
 /// with any string literal that looks like an escaping path is
 /// out-of-workspace. With only relative literals it is in-workspace, and so
@@ -872,11 +1097,14 @@ static PY_DESTRUCTION_CALLS: &[&str] = &[
 /// errs toward ask, the fallback's documented direction. A
 /// destruction call on a pure variable path stays in-workspace (the checkpoint
 /// covers the common case; the judge covers the rest when it's on).
-fn python_destruction_scope(code: &str) -> Option<DestructionScope> {
+fn python_destruction_scope(code: &str, disk: Option<OnDisk<'_>>) -> Option<DestructionScope> {
     if !PY_DESTRUCTION_CALLS.iter().any(|s| code.contains(s)) {
         return None;
     }
-    Some(if python_string_literal_escapes(code) {
+    // On disk, code that makes a link or changes directory can redirect any
+    // relative literal, so no literal resolves.
+    let relocates = disk.is_some() && PY_RELOCATING_CALLS.iter().any(|s| code.contains(s));
+    Some(if relocates || python_string_literal_escapes(code, disk) {
         DestructionScope::OutOfWorkspace
     } else {
         DestructionScope::InWorkspace
@@ -884,8 +1112,9 @@ fn python_destruction_scope(code: &str) -> Option<DestructionScope> {
 }
 
 /// True when any quoted string literal in `code` looks like a path escaping
-/// the workspace.
-fn python_string_literal_escapes(code: &str) -> bool {
+/// the workspace. On disk a relative literal must also resolve inside. Python
+/// expands no glob, so a `*` or a `{` in one is just a name.
+fn python_string_literal_escapes(code: &str, disk: Option<OnDisk<'_>>) -> bool {
     static LITERAL: LazyLock<regex::Regex> =
         LazyLock::new(|| regex::Regex::new(r#"'([^']*)'|"([^"]*)""#).unwrap());
     LITERAL.captures_iter(code).any(|c| {
@@ -894,7 +1123,17 @@ fn python_string_literal_escapes(code: &str) -> bool {
             .or_else(|| c.get(2))
             .map(|m| m.as_str())
             .unwrap_or("");
-        s.starts_with('/') || s.starts_with('~') || s == ".." || s.contains("../")
+        s.starts_with('/')
+            || s.starts_with('~')
+            || s == ".."
+            || s.contains("../")
+            || disk.is_some_and(|d| {
+                !s.is_empty()
+                    && !d
+                        .cwds
+                        .iter()
+                        .all(|cwd| resolves_inside(&cwd.join(s), d.root, false))
+            })
     })
 }
 
@@ -1174,10 +1413,10 @@ enum FastPathDecline {
 /// One not-safe segment poisons the whole line, since a chained `&&` or `|`
 /// could smuggle a dangerous command after a safe one. A refusal anywhere
 /// outranks an omission.
-fn bash_fast_path(command: &str) -> Option<FastPathDecline> {
+fn bash_fast_path(command: &str, disk: Option<OnDisk<'_>>) -> Option<FastPathDecline> {
     let mut declined = None;
     for segment in command_segments(command) {
-        match segment_safety(&segment) {
+        match segment_safety(&segment, disk) {
             Some(FastPathDecline::Refusal) => return Some(FastPathDecline::Refusal),
             Some(FastPathDecline::Omission) => declined = Some(FastPathDecline::Omission),
             None => {}
@@ -1204,12 +1443,12 @@ fn args_have_exec_capable_flag(args: &[&str]) -> bool {
 }
 
 /// Why one shell command segment is not obviously safe, or `None` when it is.
-fn segment_safety(segment: &str) -> Option<FastPathDecline> {
-    use FastPathDecline::{Omission, Refusal};
+fn segment_safety(segment: &str, disk: Option<OnDisk<'_>>) -> Option<FastPathDecline> {
+    use FastPathDecline::Refusal;
     // An output redirect to a path outside the workspace is a write outside the
     // workspace, not safe even behind a read-only head (`grep x f > /etc/y`).
     // Harmless device sinks (`/dev/null`, std streams) are exempt.
-    if redirect_targets(segment).any(|t| !path_in_workspace(t) && !is_harmless_redirect(t)) {
+    if redirect_targets(segment).any(|t| !path_in_workspace(t, disk) && !is_harmless_redirect(t)) {
         return Some(Refusal);
     }
     // Command/process substitution executes an embedded command under whatever
@@ -1217,6 +1456,13 @@ fn segment_safety(segment: &str) -> Option<FastPathDecline> {
     if has_command_substitution(segment) {
         return Some(Refusal);
     }
+    head_safety(segment, disk)
+}
+
+/// [`segment_safety`] past its redirect and substitution checks: why the head
+/// that runs, with its preamble and arguments, is not obviously safe.
+fn head_safety(segment: &str, disk: Option<OnDisk<'_>>) -> Option<FastPathDecline> {
+    use FastPathDecline::{Omission, Refusal};
     let toks: Vec<&str> = segment.split_whitespace().collect();
     let i = command_head_index(&toks);
     // A `VAR=value` preamble is skipped when resolving the head. But a handful
@@ -1254,7 +1500,7 @@ fn segment_safety(segment: &str) -> Option<FastPathDecline> {
         // A GET/download is safe unless it writes its output to a path outside
         // the workspace (`curl -o /etc/cron.d/evil …`). A mutating method is an
         // ordinary side-effect shape the fallback tags, not an evasion.
-        "curl" | "wget" if segment_escapes_workspace(segment) => Some(Refusal),
+        "curl" | "wget" if segment_escapes_workspace(segment, disk) => Some(Refusal),
         "curl" | "wget" => is_mutating_http(args).then_some(Omission),
         // A read-only head can still EXEC an arbitrary program through a flag.
         // On the allowlist such a call settles Safe and runs that program with
@@ -1271,7 +1517,7 @@ fn segment_safety(segment: &str) -> Option<FastPathDecline> {
         // same shape as the curl/wget arm above, and it must be tried BEFORE
         // the plain read-only arm below. See [`WRITE_CAPABLE_READ_ONLY_HEADS`].
         _ if WRITE_CAPABLE_READ_ONLY_HEADS.contains(&base) => {
-            segment_escapes_workspace(segment).then_some(Refusal)
+            segment_escapes_workspace(segment, disk).then_some(Refusal)
         }
         // On macOS `arch [-arch_name] <command> [args]` EXECS its operand, so
         // the coreutils reading (print the machine type) holds only with no
@@ -1289,7 +1535,7 @@ fn segment_safety(segment: &str) -> Option<FastPathDecline> {
         _ if CREATE_HEADS.contains(&base) => (!args
             .iter()
             .filter(|a| !a.starts_with('-'))
-            .all(|a| path_in_workspace(a)))
+            .all(|a| path_in_workspace(a, disk)))
         .then_some(Refusal),
         _ => Some(Omission),
     }
@@ -1419,17 +1665,19 @@ fn python_side_effect_signal(code: &str) -> bool {
 /// True when any segment of `command` touches a filesystem path or redirect
 /// outside the workspace. A *risk signal* passed to the judge, NOT a verdict:
 /// an out-of-workspace read is wanted, and only destruction is a threat.
-pub fn command_escapes_workspace(command: &str) -> bool {
-    command_segments(command).any(|s| segment_escapes_workspace(&s))
+fn command_escapes_workspace(command: &str, disk: Option<OnDisk<'_>>) -> bool {
+    command_segments(command).any(|s| segment_escapes_workspace(&s, disk))
 }
 
-fn segment_escapes_workspace(segment: &str) -> bool {
+fn segment_escapes_workspace(segment: &str, disk: Option<OnDisk<'_>>) -> bool {
     // Redirect targets (covers glued forms like `>/etc/y` the token scan misses)…
-    if redirect_targets(segment).any(|t| !path_in_workspace(t) && !is_harmless_redirect(t)) {
+    if redirect_targets(segment).any(|t| !path_in_workspace(t, disk) && !is_harmless_redirect(t)) {
         return true;
     }
     // …plus any token that names a path outside the workspace.
-    segment.split_whitespace().any(token_escapes_workspace)
+    segment
+        .split_whitespace()
+        .any(|tok| token_escapes_workspace(tok, disk))
 }
 
 /// True when a single token names a path outside the workspace, in any of the
@@ -1442,12 +1690,22 @@ fn segment_escapes_workspace(segment: &str) -> bool {
 /// therefore ride past both other branches, and reach the Safe verdict its
 /// spaced form is refused for. Over-flagging a flag that merely holds a slash
 /// costs one judge call, the direction this allowlist fails in.
-fn token_escapes_workspace(tok: &str) -> bool {
-    if is_pathish(tok) && !path_in_workspace(tok) && !is_harmless_redirect(tok) {
+///
+/// On disk a bare name counts as well, since it can be a link the line never
+/// shows: `truncate -s 0 hosts` writes wherever `hosts` points.
+fn token_escapes_workspace(tok: &str, disk: Option<OnDisk<'_>>) -> bool {
+    let escapes = |path: &str| {
+        if is_pathish(path) {
+            !path_in_workspace(path, disk) && !is_harmless_redirect(path)
+        } else {
+            disk.is_some_and(|d| name_leads_out(path, d))
+        }
+    };
+    if escapes(tok) {
         return true;
     }
     if let Some((_flag, value)) = tok.split_once('=') {
-        if is_pathish(value) && !path_in_workspace(value) && !is_harmless_redirect(value) {
+        if escapes(value) {
             return true;
         }
     }
@@ -1462,8 +1720,7 @@ fn token_escapes_workspace(tok: &str) -> bool {
         let mut chars = rest.char_indices();
         chars.next();
         if let Some((idx, _)) = chars.next() {
-            let value = &rest[idx..];
-            if is_pathish(value) && !path_in_workspace(value) && !is_harmless_redirect(value) {
+            if escapes(&rest[idx..]) {
                 return true;
             }
         }
@@ -1489,23 +1746,167 @@ fn is_pathish(token: &str) -> bool {
 /// or `./`-relative literal path stays in. An absolute or home-relative path
 /// escapes, and so does any `..` traversal. A `$VAR` or a backtick
 /// substitution escapes too, since either can resolve anywhere.
-fn path_in_workspace(token: &str) -> bool {
-    let t = token.trim_matches(|c| c == '"' || c == '\'');
+///
+/// On disk the path must also resolve inside from every directory the line can
+/// be in. A symlink makes a lexically contained path land anywhere.
+fn path_in_workspace(token: &str, disk: Option<OnDisk<'_>>) -> bool {
+    let t = unquoted(token);
     if t.starts_with('/') || t.starts_with('~') || t.contains(['$', '`']) {
         return false;
     }
     !t.split('/').any(|seg| seg == "..")
+        && disk.is_none_or(|d| {
+            plain_word(token).is_some_and(|word| {
+                d.cwds
+                    .iter()
+                    .all(|cwd| resolves_inside(&cwd.join(word), d.root, true))
+            })
+        })
+}
+
+/// The path a whitespace-split shell word names, or `None` when quoting or an
+/// escape inside it hides that path. `data/"x"/f` names `data/x/f`, and an
+/// opening quote with no close runs on past the next space.
+fn plain_word(token: &str) -> Option<&str> {
+    const QUOTES: [char; 2] = ['"', '\''];
+    if token.trim_matches(QUOTES).is_empty() {
+        return Some("");
+    }
+    let word = match token.chars().next() {
+        Some(q @ ('"' | '\'')) => token.strip_prefix(q)?.strip_suffix(q)?,
+        _ => token.trim_end_matches(QUOTES),
+    };
+    (!word.contains(['"', '\'', '\\'])).then_some(word)
+}
+
+/// Name characters the shell expands into names the command never spells.
+const GLOB_CHARS: [char; 4] = ['*', '?', '[', '{'];
+
+/// True when `path` resolves under `root`, a canonical path, with every
+/// symlink followed. A name that does not exist yet is fine, since no link can
+/// sit below it. Whatever else cannot be shown inside reads as outside:
+///
+///   * a dangling symlink, a symlink loop, or a lookup that fails,
+///   * a file with a second hard link, which a write reaches too,
+///   * with `globs`, a glob before the last name, which can walk through any
+///     link below the entries it matches.
+///
+/// A glob in the last name expands to entries of a resolved directory, so
+/// each of those entries must resolve inside too.
+fn resolves_inside(path: &Path, root: &Path, globs: bool) -> bool {
+    let names: Vec<Component<'_>> = path.components().collect();
+    let glob_at = names.iter().position(|c| {
+        globs && matches!(c, Component::Normal(name) if name.to_string_lossy().contains(GLOB_CHARS))
+    });
+    let literal: PathBuf = names[..glob_at.unwrap_or(names.len())].iter().collect();
+    let Some(existing) = deepest_existing(&literal) else {
+        return false;
+    };
+    let Ok(real) = std::fs::canonicalize(existing) else {
+        return false;
+    };
+    if !real.starts_with(root) {
+        return false;
+    }
+    if existing != literal {
+        return true;
+    }
+    match glob_at {
+        None => !has_another_hard_link(&real),
+        // A brace, or a glob like `.*`, `.?` or `.[.]`, can expand to `..`.
+        Some(at) if at + 1 == names.len() => {
+            let name = names[at].as_os_str().to_string_lossy();
+            let may_be_parent = name.contains('{')
+                || name
+                    .strip_prefix('.')
+                    .is_some_and(|rest| rest.starts_with(['*', '?', '[', '.']));
+            !may_be_parent && entries_resolve_inside(&real, root)
+        }
+        Some(_) => false,
+    }
+}
+
+/// The deepest ancestor of `path` that exists, `path` itself included. A
+/// dangling symlink exists. A name too long for the filesystem, or one holding
+/// a NUL, cannot exist, so it counts as absent. `None` when a lookup fails for
+/// any other reason.
+fn deepest_existing(path: &Path) -> Option<&Path> {
+    use std::io::ErrorKind::{InvalidFilename, InvalidInput, NotFound};
+    let mut current = path;
+    loop {
+        match std::fs::symlink_metadata(current) {
+            Ok(_) => return Some(current),
+            Err(e) if matches!(e.kind(), NotFound | InvalidFilename | InvalidInput) => {
+                current = current.parent()?
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+/// True when every entry of `dir` resolves under `root`. Only a link can lead
+/// out of a directory that resolved inside.
+fn entries_resolve_inside(dir: &Path, root: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.into_iter().all(|entry| {
+        let Ok(entry) = entry else {
+            return false;
+        };
+        match entry.file_type() {
+            Ok(kind) if kind.is_dir() => true,
+            Ok(kind) if kind.is_symlink() => std::fs::canonicalize(entry.path())
+                .is_ok_and(|real| real.starts_with(root) && !has_another_hard_link(&real)),
+            Ok(_) => !has_another_hard_link(&entry.path()),
+            Err(_) => false,
+        }
+    })
+}
+
+/// True when `path` is a file with a second hard link, so a write to it lands
+/// under that other name too. A failed lookup counts.
+fn has_another_hard_link(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match std::fs::metadata(path) {
+        Ok(meta) => !meta.is_dir() && meta.nlink() > 1,
+        Err(_) => true,
+    }
+}
+
+/// True when `token` names a directory with an entry that leads out of the
+/// workspace. A `cp` or `mv` into it writes through that entry.
+fn dir_entry_escapes(token: &str, disk: OnDisk<'_>) -> bool {
+    disk.cwds.iter().any(|cwd| {
+        let dir = cwd.join(unquoted(token));
+        dir.is_dir()
+            && std::fs::canonicalize(&dir)
+                .is_ok_and(|real| !entries_resolve_inside(&real, disk.root))
+    })
+}
+
+/// True when a bare name, one with no `/`, leads out of the workspace on disk.
+/// A flag or a variable is not a name.
+fn name_leads_out(token: &str, disk: OnDisk<'_>) -> bool {
+    let t = unquoted(token);
+    !t.is_empty()
+        && !t.starts_with('-')
+        && !t.contains(['$', '`'])
+        && !path_in_workspace(token, Some(disk))
+}
+
+/// `token` without the quotes around it.
+fn unquoted(token: &str) -> &str {
+    token.trim_matches(|c| c == '"' || c == '\'')
 }
 
 /// True when `token` is an absolute path lexically under `root` with no `..`.
 fn path_under_root(token: &str, root: Option<&Path>) -> bool {
-    let path = Path::new(token.trim_matches(|c| c == '"' || c == '\''));
+    let path = Path::new(unquoted(token));
     root.is_some_and(|root| {
         path.is_absolute()
             && path.starts_with(root)
-            && !path
-                .components()
-                .any(|c| matches!(c, std::path::Component::ParentDir))
+            && !path.components().any(|c| matches!(c, Component::ParentDir))
     })
 }
 
@@ -1519,10 +1920,11 @@ fn is_harmless_redirect(target: &str) -> bool {
 
 /// Output-redirect matcher (`>`, `>>`, `2>`, `&>`, …) capturing the target
 /// path. fd-duplications (`2>&1`) yield no path (the `&` stops the capture).
+/// Quotes stay in the capture, so `> data/"x"/f` is one target, not `data/`.
 /// Shared by [`redirect_targets`] (any redirect) and [`truncated_files`]
 /// (which inspects the full match to exclude appends).
 static REDIRECT_RE: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r#"(?:\d*|&)>>?\s*['"]?([^\s'"|&;<>]+)"#).unwrap());
+    LazyLock::new(|| regex::Regex::new(r"(?:\d*|&)>>?\s*([^\s|&;<>]+)").unwrap());
 
 /// The path targets of output redirects in a segment.
 fn redirect_targets(segment: &str) -> impl Iterator<Item = &str> {
@@ -1593,15 +1995,32 @@ fn catastrophic_reason_at(command: &str, depth: usize) -> Option<&'static str> {
 /// safe fast path for one of the most common shell shapes. The noclobber
 /// override `>|` becomes a plain `>`, since its `|` is no pipe.
 fn command_segments(command: &str) -> impl Iterator<Item = String> {
-    static FD_DUP: LazyLock<regex::Regex> =
-        LazyLock::new(|| regex::Regex::new(r"\d*>&\d+").unwrap());
-    static SEP: LazyLock<regex::Regex> =
-        LazyLock::new(|| regex::Regex::new(r"&&|\|\||;|\||&|\n").unwrap());
-    let cleaned = FD_DUP.replace_all(command, " ").replace(">|", "> ");
-    SEP.split(&cleaned)
+    let cleaned = segmentable(command);
+    SEGMENT_SEP
+        .split(&cleaned)
         .map(str::to_string)
         .collect::<Vec<_>>()
         .into_iter()
+}
+
+/// The control operators between [`command_segments`], in order, so there is
+/// one fewer than there are segments.
+fn segment_separators(command: &str) -> Vec<String> {
+    SEGMENT_SEP
+        .find_iter(&segmentable(command))
+        .map(|m| m.as_str().to_string())
+        .collect()
+}
+
+static SEGMENT_SEP: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"&&|\|\||;|\||&|\n").unwrap());
+
+/// `command` with the fd-duplications and the noclobber `|` taken out, ready
+/// to split. See [`command_segments`].
+fn segmentable(command: &str) -> String {
+    static FD_DUP: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"\d*>&\d+").unwrap());
+    FD_DUP.replace_all(command, " ").replace(">|", "> ")
 }
 
 /// Detect a fork bomb: a function whose body pipes itself into itself and
@@ -2371,61 +2790,100 @@ fn segment_side_effect_category(segment: &str) -> Option<SideEffectCategory> {
 /// the signal that the call mutates server state rather than just reading. A
 /// bare GET is NOT flagged.
 fn is_mutating_http(args: &[&str]) -> bool {
-    const MUTATING_METHODS: &[&str] = &["POST", "PUT", "DELETE", "PATCH"];
-    // Data / upload flags imply a body (curl defaults to POST when given data;
-    // `--json` is POST with JSON headers; wget's --post-data/--post-file
-    // always POST).
+    // Any other method may write, WebDAV's `MKCOL` and `MOVE` included.
+    const READ_METHODS: &[&str] = &["GET", "HEAD", "OPTIONS"];
+    // Long data / upload flags imply a body (curl defaults to POST when given
+    // data; `--json` is POST with JSON headers; wget's --post-data/--post-file
+    // always POST). The short forms `-d` / `-F` / `-T` are in
+    // `short_cluster_signal`.
     const BODY_FLAGS: &[&str] = &[
-        "--data",
-        "-d",
-        "--data-raw",
-        "--data-binary",
-        "--data-urlencode",
-        "--data-ascii",
-        "--json",
-        "--form",
-        "--form-string",
-        "-F",
-        "--upload-file",
-        "-T",
-        "--post-data",
-        "--post-file",
+        "data",
+        "data-raw",
+        "data-binary",
+        "data-urlencode",
+        "data-ascii",
+        "json",
+        "form",
+        "form-string",
+        "upload-file",
+        "post-data",
+        "post-file",
+        "body-data",
+        "body-file",
     ];
+    const METHOD_FLAGS: &[&str] = &["request", "method"];
+    let is_mutating_method = |m: &str| !READ_METHODS.contains(&m.to_ascii_uppercase().as_str());
     let mut prev_was_method_flag = false;
-    for arg in args {
-        let upper = arg.to_ascii_uppercase();
+    for raw in args {
+        // The shell strips quotes and escapes before curl sees `'-d@f'` or
+        // `\-d@f`, so drop them here too.
+        let arg = &*raw.replace(['\'', '"', '\\'], "");
         // `-X POST` / `--request PUT` — method in the next token.
-        if prev_was_method_flag {
-            if MUTATING_METHODS.iter().any(|m| upper == *m) {
+        if std::mem::take(&mut prev_was_method_flag) && is_mutating_method(arg) {
+            return true;
+        }
+        if let Some(long) = arg.strip_prefix("--") {
+            // curl accepts an `expand-` prefix on any option (`--expand-json`).
+            let long = long.strip_prefix("expand-").unwrap_or(long);
+            let (name, value) = long
+                .split_once('=')
+                .map_or((long, None), |(n, v)| (n, Some(v)));
+            // wget, and older curl, accept an unambiguous prefix of a long
+            // option, so `--post-f=x` is `--post-file=x`.
+            let abbreviates =
+                |flags: &[&str]| name.len() >= 2 && flags.iter().any(|f| f.starts_with(name));
+            if abbreviates(METHOD_FLAGS) {
+                match value {
+                    Some(method) if is_mutating_method(method) => return true,
+                    Some(_) => {}
+                    None => prev_was_method_flag = true,
+                }
+            } else if abbreviates(BODY_FLAGS) {
                 return true;
             }
-            prev_was_method_flag = false;
-        }
-        if *arg == "-X" || *arg == "--request" || *arg == "--method" {
-            prev_was_method_flag = true;
             continue;
         }
-        // Combined `-XPOST` / `--request=PUT` / `--method=POST`.
-        for pre in ["-X", "--request=", "--method="] {
-            if let Some(rest) = upper.strip_prefix(&pre.to_ascii_uppercase()) {
-                if MUTATING_METHODS.contains(&rest) {
-                    return true;
-                }
-            }
-        }
-        // Body / upload flags, both the space-separated form (`--data 'x'`) and
-        // the `=`-glued long-flag form (`--data=x`, `--post-data=x`). Glued
-        // short-flag forms (`-d@file`) are not matched — the LLM emits the
-        // space-separated form, and the Phase 3 judge covers the long tail.
-        if BODY_FLAGS.contains(arg)
-            || BODY_FLAGS
-                .iter()
-                .any(|f| f.len() > 2 && arg.starts_with(&format!("{f}=")))
-        {
-            return true;
+        match short_cluster_signal(arg) {
+            Some(ShortClusterSignal::Body) => return true,
+            Some(ShortClusterSignal::Method("")) => prev_was_method_flag = true,
+            Some(ShortClusterSignal::Method(m)) if is_mutating_method(m) => return true,
+            _ => {}
         }
     }
     false
+}
+
+/// What a curl short-option cluster says about the request.
+#[derive(Debug, PartialEq)]
+enum ShortClusterSignal<'a> {
+    /// `-d` / `-F` / `-T`: the request carries a body.
+    Body,
+    /// `-X`, with its glued value, or `""` when the method is the next token.
+    Method(&'a str),
+}
+
+/// Reads a single-dash cluster the way curl does: `-sSd@f` is `-s -S -d @f`,
+/// and the first value-taking letter claims the rest of the cluster. So the
+/// letters in `-oFeed.xml` or `-w%{http_code}` are a value, not flags.
+///
+/// Case-sensitive: `-D` dumps headers, `-d` sends a body. The scan reads a
+/// letter missing from `VALUE_LETTERS` as a flag. So a gap there only
+/// over-matches: a GET goes to the judge, and a body never settles Safe.
+fn short_cluster_signal(arg: &str) -> Option<ShortClusterSignal<'_>> {
+    const VALUE_LETTERS: &[char] = &[
+        'A', 'b', 'c', 'C', 'D', 'e', 'E', 'H', 'K', 'm', 'o', 'P', 'Q', 'r', 't', 'u', 'U', 'w',
+        'x', 'y', 'Y', 'z',
+    ];
+    let cluster = arg.strip_prefix('-').filter(|c| !c.starts_with('-'))?;
+    for (i, letter) in cluster.char_indices() {
+        match letter {
+            'd' | 'F' | 'T' => return Some(ShortClusterSignal::Body),
+            'X' => return Some(ShortClusterSignal::Method(&cluster[i + 1..])),
+            _ if VALUE_LETTERS.contains(&letter) => return None,
+            _ => {}
+        }
+    }
+    None
 }
 
 /// The side-effect category of Python `code`, or `None`. Best-effort substring
@@ -2534,12 +2992,17 @@ pub fn first_command_token(command: &str) -> Option<String> {
 ///
 /// A broad `label` grant is deliberately still honoured: it means "any
 /// command", which this is one of.
-pub fn grant_covers_command(label: &str, command: &str, allowed: impl Fn(&str) -> bool) -> bool {
+pub fn grant_covers_command(
+    label: &str,
+    command: &str,
+    site: CommandSite<'_>,
+    allowed: impl Fn(&str) -> bool,
+) -> bool {
     if allowed(label) {
         return true;
     }
     let unwrapped = unwrap_shell_command(command);
-    if bash_fast_path(&unwrapped) == Some(FastPathDecline::Refusal) {
+    if site.with_disk(|disk| bash_fast_path(&unwrapped, disk)) == Some(FastPathDecline::Refusal) {
         return false;
     }
     let heads = segment_heads_as_written(command);
@@ -2564,12 +3027,14 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    const TEXT_ONLY: CommandSite<'static> = CommandSite::TextOnly { root: None };
+
     fn bash(cmd: &str) -> StaticVerdict {
-        static_classify(tn::RUN_BASH, &json!({ "command": cmd }))
+        static_classify(tn::RUN_BASH, &json!({ "command": cmd }), TEXT_ONLY)
     }
 
     fn python(code: &str) -> StaticVerdict {
-        static_classify(tn::RUN_PYTHON, &json!({ "code": code }))
+        static_classify(tn::RUN_PYTHON, &json!({ "code": code }), TEXT_ONLY)
     }
 
     fn assert_settled(v: StaticVerdict, lane: RiskLane, ctx: &str) {
@@ -3103,7 +3568,7 @@ mod tests {
     /// [`grant_covers_command`]'s grant lane.
     #[test]
     fn code_injecting_env_is_detected_across_every_segment() {
-        let refuses = |cmd: &str| bash_fast_path(cmd) == Some(FastPathDecline::Refusal);
+        let refuses = |cmd: &str| bash_fast_path(cmd, None) == Some(FastPathDecline::Refusal);
         assert!(refuses("LD_PRELOAD=/tmp/evil.so ls"));
         assert!(refuses("PATH=data/bin ls"));
         // Not only the first segment.
@@ -3243,7 +3708,11 @@ mod tests {
                 !matches!(bash(cmd), StaticVerdict::Settled(RiskLane::Safe)),
                 "{cmd} must not settle Safe"
             );
-            assert_eq!(bash_fast_path(cmd), Some(FastPathDecline::Refusal), "{cmd}");
+            assert_eq!(
+                bash_fast_path(cmd, None),
+                Some(FastPathDecline::Refusal),
+                "{cmd}"
+            );
         }
         assert_settled(bash("git diff"), RiskLane::Safe, "git diff");
     }
@@ -3269,7 +3738,7 @@ mod tests {
             );
         }
         assert_eq!(
-            bash_fast_path("PATH+=:data/bin ls"),
+            bash_fast_path("PATH+=:data/bin ls", None),
             Some(FastPathDecline::Refusal)
         );
         // An ordinary append is unaffected.
@@ -3950,7 +4419,11 @@ mod tests {
             "sort /etc/passwd",
             "less /var/log/system.log",
         ] {
-            assert_eq!(bash_fast_path(cmd), Some(FastPathDecline::Refusal), "{cmd}");
+            assert_eq!(
+                bash_fast_path(cmd, None),
+                Some(FastPathDecline::Refusal),
+                "{cmd}"
+            );
         }
         // The way back onto the fast path: a bare head, output in-workspace,
         // and a plain read-only head for an out-of-workspace read.
@@ -3961,7 +4434,7 @@ mod tests {
             "grep x /etc/hosts",
         ] {
             assert_ne!(
-                bash_fast_path(cmd),
+                bash_fast_path(cmd, None),
                 Some(FastPathDecline::Refusal),
                 "{cmd} must stay off the refusal set"
             );
@@ -4112,12 +4585,16 @@ mod tests {
     #[test]
     fn non_command_tools_always_safe() {
         assert_settled(
-            static_classify(tn::WRITE_FILE, &json!({ "path": "/", "content": "x" })),
+            static_classify(
+                tn::WRITE_FILE,
+                &json!({ "path": "/", "content": "x" }),
+                TEXT_ONLY,
+            ),
             RiskLane::Safe,
             "write_file",
         );
         assert_settled(
-            static_classify(tn::READ_FILE, &json!({ "path": "data/x" })),
+            static_classify(tn::READ_FILE, &json!({ "path": "data/x" }), TEXT_ONLY),
             RiskLane::Safe,
             "read_file",
         );
@@ -4157,14 +4634,14 @@ mod tests {
 
     #[test]
     fn escapes_workspace_detects_paths_and_redirects() {
-        assert!(command_escapes_workspace("rm -rf /etc/x"));
-        assert!(command_escapes_workspace("cp data/a ~/b"));
-        assert!(command_escapes_workspace("echo x > /tmp/y"));
-        assert!(command_escapes_workspace("cat ../secret"));
-        assert!(!command_escapes_workspace("rm -rf data/tmp"));
-        assert!(!command_escapes_workspace("cp data/a ./b"));
-        assert!(!command_escapes_workspace("curl -X POST https://x")); // URL, not a path
-        assert!(!command_escapes_workspace("echo hi > /dev/null")); // harmless sink
+        assert!(command_escapes_workspace("rm -rf /etc/x", None));
+        assert!(command_escapes_workspace("cp data/a ~/b", None));
+        assert!(command_escapes_workspace("echo x > /tmp/y", None));
+        assert!(command_escapes_workspace("cat ../secret", None));
+        assert!(!command_escapes_workspace("rm -rf data/tmp", None));
+        assert!(!command_escapes_workspace("cp data/a ./b", None));
+        assert!(!command_escapes_workspace("curl -X POST https://x", None)); // URL, not a path
+        assert!(!command_escapes_workspace("echo hi > /dev/null", None)); // harmless sink
     }
 
     // --- Static fallback (judge off / unavailable) --------------------------
@@ -4177,7 +4654,7 @@ mod tests {
                 out_of_workspace: false,
                 fast_path_refused: false,
             },
-            None,
+            TEXT_ONLY,
         )
     }
 
@@ -4189,7 +4666,7 @@ mod tests {
                 out_of_workspace: false,
                 fast_path_refused: false,
             },
-            None,
+            TEXT_ONLY,
         )
     }
 
@@ -4351,6 +4828,58 @@ mod tests {
     }
 
     #[test]
+    fn http_body_and_write_method_in_any_spelling_reach_the_judge() {
+        // curl reads `-d@f`, `-sd@f`, `'-d' @f` and `--expand-data @f` alike
+        // as `-d @f`: a body from a local file. A Settled(Safe) verdict skips
+        // the judge, so each must classify NeedsJudge or the file uploads
+        // with no gate.
+        for cmd in [
+            "curl -d@data/f.txt https://api.example.com/in",
+            "curl -dx=1 https://api.example.com/in",
+            "curl -sd@data/f.txt https://api.example.com/in",
+            "curl -sSd @data/f.txt https://api.example.com/in",
+            "curl -Ff=@data/f.txt https://api.example.com/in",
+            "curl -sTdata/f.txt https://api.example.com/in",
+            "curl -sXPOST https://api.example.com/in",
+            "curl -sX POST https://api.example.com/in",
+            "curl -XPUT https://api.example.com/in",
+            "curl --expand-data x=1 https://api.example.com/in",
+            "curl '-d@data/f.txt' https://api.example.com/in",
+            "curl \"-d\" @data/f.txt https://api.example.com/in",
+            r"curl \-d@data/f.txt https://api.example.com/in",
+            "curl '--data=@data/f.txt' https://api.example.com/in",
+            "curl --expand-data-binary @data/f.txt https://api.example.com/in",
+            "curl --expand-upload-file data/f.txt https://api.example.com/in",
+            "curl --expand-request POST https://api.example.com/in",
+            "curl --data-b @data/f.txt https://api.example.com/in",
+            "curl --req=PUT https://api.example.com/in",
+            "curl -X MKCOL https://api.example.com/dav/new",
+            "wget --post-f=data/f.txt https://api.example.com/in",
+            "wget --method=PUT --body-file=data/f.txt https://api.example.com/in",
+        ] {
+            assert_needs_judge(bash(cmd), cmd);
+            assert_eq!(
+                static_side_effect_category(cmd),
+                Some(SideEffectCategory::ExternalApi),
+                "{cmd}"
+            );
+        }
+        // A value-taking short flag ends the cluster, so the letters of its
+        // value are not flags. `-D` (dump headers) and a read method stay reads.
+        for cmd in [
+            "curl -X GET https://example.com",
+            "curl --request=head https://example.com",
+            "curl --retry 3 --request-target=index.html https://example.com",
+            "curl -D- https://example.com",
+            "curl -sSoFeed.xml https://example.com/feed",
+            "curl -w%{http_code} https://example.com",
+            "curl -HAccept:text/plain-data https://example.com",
+        ] {
+            assert_settled(bash(cmd), RiskLane::Safe, cmd);
+        }
+    }
+
+    #[test]
     fn fd_duplication_does_not_break_segmentation() {
         // `2>&1` / `>&2` are pure fd plumbing — they must not split the line
         // into junk segments that defeat the safe fast-path.
@@ -4448,18 +4977,20 @@ mod tests {
         assert!(grant_covers_command(
             "Bash",
             "git status && rm -rf data/tmp",
+            TEXT_ONLY,
             granted(&["Bash(git:*)", "Bash(rm:*)"])
         ));
         // A trailing segment the grant does not name.
         assert!(!grant_covers_command(
             "Bash",
             "git status && rm -rf /",
+            TEXT_ONLY,
             granted(&["Bash(git:*)"])
         ));
         // A path-qualified or decorated head is never covered by a bare grant.
         for cmd in ["data/bin/ls", "./ls -la", "/tmp/ls", r"\ls", "\"ls\""] {
             assert!(
-                !grant_covers_command("Bash", cmd, granted(&["Bash(ls:*)"])),
+                !grant_covers_command("Bash", cmd, TEXT_ONLY, granted(&["Bash(ls:*)"])),
                 "{cmd}"
             );
         }
@@ -4467,17 +4998,20 @@ mod tests {
         assert!(grant_covers_command(
             "Bash",
             "data/bin/ls",
+            TEXT_ONLY,
             granted(&["Bash"])
         ));
         // The Codex label reads the inner script, not the wrapper.
         assert!(grant_covers_command(
             "command_execution",
             "/bin/zsh -lc 'git status'",
+            TEXT_ONLY,
             granted(&["command_execution(git:*)"])
         ));
         assert!(!grant_covers_command(
             "command_execution",
             "/bin/zsh -lc 'rm -rf /'",
+            TEXT_ONLY,
             granted(&["command_execution(git:*)"])
         ));
     }
@@ -4506,7 +5040,7 @@ mod tests {
             ("Bash", "git -c core.pager=reboot log"),
         ] {
             assert!(
-                !grant_covers_command(label, cmd, all),
+                !grant_covers_command(label, cmd, TEXT_ONLY, all),
                 "{cmd} must not ride a head grant"
             );
         }
@@ -4514,11 +5048,12 @@ mod tests {
         assert!(grant_covers_command(
             "Bash",
             "echo `rm -rf /`",
+            TEXT_ONLY,
             granted(&["Bash"])
         ));
         // And the ordinary forms of those same heads are still covered.
         for cmd in ["echo ok", "ls -la", "grep x data/f", "sort data/f"] {
-            assert!(grant_covers_command("Bash", cmd, all), "{cmd}");
+            assert!(grant_covers_command("Bash", cmd, TEXT_ONLY, all), "{cmd}");
         }
     }
 
@@ -4529,9 +5064,15 @@ mod tests {
         assert!(!grant_covers_command(
             "Bash",
             "bash -lc 'LD_PRELOAD=/tmp/evil.so ls'",
+            TEXT_ONLY,
             granted
         ));
-        assert!(grant_covers_command("Bash", "bash -lc 'FOO=1 ls'", granted));
+        assert!(grant_covers_command(
+            "Bash",
+            "bash -lc 'FOO=1 ls'",
+            TEXT_ONLY,
+            granted
+        ));
     }
 
     // --- Static side-effect category (trigger grant key + fallback summary) ---
@@ -4577,5 +5118,350 @@ mod tests {
         assert_eq!(static_side_effect_category("npm install"), None);
         // Out-of-workspace destruction is judge-only — never static.
         assert_eq!(static_side_effect_category("rm -rf /etc/x"), None);
+    }
+
+    // --- On-disk containment (a workspace site) -----------------------------
+
+    /// A workspace holding `data/sub/a.txt`, beside an `outside` directory
+    /// holding `keep.txt`. The temp dir is held so it outlives the test.
+    struct Disk {
+        _dir: tempfile::TempDir,
+        ws: PathBuf,
+        outside: PathBuf,
+    }
+
+    fn disk() -> Disk {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(ws.join("data/sub")).unwrap();
+        std::fs::write(ws.join("data/sub/a.txt"), "a").unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("keep.txt"), "keep").unwrap();
+        Disk {
+            _dir: dir,
+            ws,
+            outside,
+        }
+    }
+
+    impl Disk {
+        /// Lay down `data/<name>` as a symlink to `target`.
+        fn link(&self, name: &str, target: &Path) {
+            std::os::unix::fs::symlink(target, self.ws.join("data").join(name)).unwrap();
+        }
+
+        fn static_lane(&self, cmd: &str) -> StaticVerdict {
+            static_classify(
+                tn::RUN_BASH,
+                &json!({ "command": cmd }),
+                CommandSite::Workspace(&self.ws),
+            )
+        }
+
+        fn fallback(&self, tool_name: &str, cmd: &str) -> JudgedClassification {
+            fallback_classify(
+                &JudgeInput {
+                    tool_name: tool_name.to_string(),
+                    command: cmd.to_string(),
+                    out_of_workspace: false,
+                    fast_path_refused: false,
+                },
+                CommandSite::Workspace(&self.ws),
+            )
+        }
+
+        fn assert_escapes(&self, cmd: &str) {
+            let c = self.fallback(tn::RUN_BASH, cmd);
+            assert_eq!(c.lane, RiskLane::IrreversibleDanger, "{cmd}");
+            assert_eq!(
+                c.category,
+                Some(SideEffectCategory::OutOfWorkspaceDestruction),
+                "{cmd}"
+            );
+            let StaticVerdict::NeedsJudge(ji) = self.static_lane(cmd) else {
+                panic!("{cmd} must reach the judge");
+            };
+            assert!(ji.out_of_workspace, "{cmd} must carry the marker");
+        }
+
+        fn assert_checkpointed(&self, cmd: &str) {
+            assert_eq!(
+                self.fallback(tn::RUN_BASH, cmd).lane,
+                RiskLane::ReversibleDanger,
+                "{cmd}"
+            );
+        }
+    }
+
+    /// The finding this guards: a symlink laid down in one turn redirects a
+    /// delete in the next. The token reads as in-workspace, so the lexical
+    /// check took the checkpoint lane, and the checkpoint captured nothing.
+    #[test]
+    fn a_symlink_out_of_the_workspace_makes_destruction_escape() {
+        let d = disk();
+        d.link("x", &d.outside);
+        d.link("hosts", &d.outside.join("keep.txt"));
+        for cmd in [
+            "rm -rf data/x/*",
+            "rm -rf data/x/keep.txt",
+            "rm -rf data/x/",
+            "truncate -s 0 data/hosts",
+            "mv data/sub/a.txt data/x/",
+            "cp data/sub/a.txt data/x/keep.txt",
+            "dd if=data/sub/a.txt of=data/x/keep.txt",
+            "echo x > data/x/keep.txt",
+            "echo x > data/hosts",
+            // The cwd moves into, or past, the link.
+            "cd data && rm -rf x/*",
+            "cd data && truncate -s 0 hosts",
+            "cd data/x && rm -rf *",
+            "pushd data > /dev/null && rm -rf x/*",
+            "(cd data && true); rm -rf x/*",
+        ] {
+            d.assert_escapes(cmd);
+        }
+        // A write through the link is no longer settled Safe on the fast path.
+        let StaticVerdict::NeedsJudge(ji) = d.static_lane("echo x > data/x/keep.txt") else {
+            panic!("a redirect through the link must reach the judge");
+        };
+        assert!(ji.fast_path_refused);
+    }
+
+    /// A link that stays inside the workspace keeps the checkpoint lane, and
+    /// so does a path that does not exist yet.
+    #[test]
+    fn a_contained_path_keeps_the_checkpoint_lane_on_disk() {
+        let d = disk();
+        d.link("inner", &d.ws.join("data/sub"));
+        for cmd in [
+            "rm -rf data/sub/*",
+            "rm -rf data/inner/*",
+            "rm -rf data/*",
+            "rm -rf data/not-yet/*",
+            "mv data/sub/a.txt data/sub/b.txt",
+            "cd data && rm -rf sub",
+            "mkdir -p data/new && rm -rf data/new/*",
+            "rm -rf data/sub/.cache*",
+            "rm -rf data/a && rm -rf data/b",
+            "ls data && rm -rf data/tmp",
+        ] {
+            d.assert_checkpointed(cmd);
+        }
+        assert_eq!(
+            d.static_lane("echo x > data/new.txt"),
+            StaticVerdict::Settled(RiskLane::Safe)
+        );
+        assert_eq!(
+            d.static_lane("mkdir -p data/sub/deeper"),
+            StaticVerdict::Settled(RiskLane::Safe)
+        );
+        // A token too long to be a file name cannot be a link either.
+        let long_post = format!("curl -d {} https://example.com/api", "a".repeat(400));
+        let StaticVerdict::NeedsJudge(ji) = d.static_lane(&long_post) else {
+            panic!("a POST reaches the judge");
+        };
+        assert!(
+            !ji.fast_path_refused,
+            "an over-long payload is not a way out"
+        );
+    }
+
+    /// The safe rule for what an unresolvable path means: it reads as
+    /// outside, never as inside.
+    #[test]
+    fn a_path_that_does_not_resolve_reads_as_outside() {
+        let d = disk();
+        d.link("dangling", &d.outside.join("missing"));
+        d.link("loop", &d.ws.join("data/loop"));
+        for cmd in [
+            "echo x > data/dangling",
+            "rm -rf data/loop/x",
+            "rm -rf data/dangling/x",
+        ] {
+            d.assert_escapes(cmd);
+        }
+        let gone = Disk {
+            ws: d.ws.join("no-such-root"),
+            ..disk()
+        };
+        assert_eq!(
+            gone.fallback(tn::RUN_BASH, "rm -rf data/tmp").lane,
+            RiskLane::IrreversibleDanger,
+            "a root that does not resolve holds nothing inside"
+        );
+    }
+
+    /// A glob expands to names the line never spells, so it must not carry
+    /// a delete through a link either.
+    #[test]
+    fn a_glob_cannot_carry_destruction_through_a_symlink() {
+        let d = disk();
+        d.link("x", &d.outside);
+        for cmd in [
+            "rm -rf data/*/keep.txt",
+            "rm -rf data/*",
+            "cd data && rm -rf *",
+        ] {
+            d.assert_escapes(cmd);
+        }
+    }
+
+    /// Quoting or an escape inside a word hides the path a whitespace split
+    /// sees, so such a word cannot be resolved and reads as outside.
+    #[test]
+    fn a_quoted_word_cannot_hide_a_symlink() {
+        let d = disk();
+        d.link("x", &d.outside);
+        d.link("hosts", &d.outside.join("keep.txt"));
+        for cmd in [
+            r#"echo x > data/"x/keep.txt""#,
+            r#"echo x > "data/my link/keep.txt""#,
+            r"echo x > data/\x/keep.txt",
+            r#"rm -rf "data/x"/*"#,
+            r#"rm -rf data/"x"/*"#,
+            r#"truncate -s 0 data/"hosts""#,
+            r#"cd data/"x" && rm -rf *"#,
+        ] {
+            d.assert_escapes(cmd);
+        }
+        // A word wholly in quotes names its inside, and stays checkpointed.
+        d.assert_checkpointed(r#"rm -rf "data/sub""#);
+        assert_eq!(
+            d.static_lane("echo '<p>hi</p>' > data/page.html"),
+            StaticVerdict::Settled(RiskLane::Safe),
+            "a `>` inside quotes is no redirect"
+        );
+    }
+
+    /// Bash expands `.[.]`, `.?` and `{x,..}` to `..`, which no directory
+    /// entry shows.
+    #[test]
+    fn a_glob_that_can_expand_to_the_parent_escapes() {
+        let d = disk();
+        for cmd in [
+            "cp data/sub/a.txt .[.]",
+            "mv data/sub/a.txt .?",
+            "cp -r data/sub .*",
+            "mv data/sub {x,..}",
+        ] {
+            d.assert_escapes(cmd);
+        }
+    }
+
+    /// A pipe or a `&` runs segments together. In order, only an earlier
+    /// segment can lay down a link, so a heredoc body or a trailing `mv`
+    /// leaves a write checkpointed.
+    #[test]
+    fn only_a_segment_that_runs_first_or_alongside_can_relink() {
+        let d = disk();
+        for cmd in [
+            "cat > data/report.md <<'EOF'\n| a | b |\n|---|---|\nEOF",
+            "jq '.a=1' data/f.json > data/tmp.json && mv data/tmp.json data/f.json",
+            "rm -rf data/tmp && python3 build.py",
+            "echo \"Built $(date)\" > data/stamp.txt && rm -rf data/old",
+        ] {
+            assert_ne!(
+                d.fallback(tn::RUN_BASH, cmd).lane,
+                RiskLane::IrreversibleDanger,
+                "{cmd}"
+            );
+        }
+        for cmd in [
+            "rm -rf data/x/* | ln -s ../outside data/x",
+            "rm -rf data/x/* & ln -s ../outside data/x",
+            "echo $(ln -s ../outside data/x) > data/x/keep.txt",
+        ] {
+            d.assert_escapes(cmd);
+        }
+    }
+
+    /// A link made earlier in the same line does not exist yet when the line
+    /// is classified, so no resolution can see it.
+    #[test]
+    fn a_link_made_in_the_same_line_makes_destruction_escape() {
+        let d = disk();
+        for cmd in [
+            "ln -s ../outside data/x && rm -rf data/x/*",
+            "python3 mk.py; rm -rf data/x/*",
+            "ln -s ../outside data/x && echo pwned > data/x/keep.txt",
+            "rm -rf data/x/* & ln -s ../outside data/x",
+            "true && bash -c 'ln -s ../outside data/x; rm -rf data/x/*'",
+            "python3 -c 'import os; os.symlink(\"../outside\", \"data/x\")' && rm -rf data/x/*",
+        ] {
+            d.assert_escapes(cmd);
+        }
+    }
+
+    /// A write to a file with a second hard link lands under the other name.
+    #[test]
+    fn a_hard_link_out_of_the_workspace_makes_destruction_escape() {
+        let d = disk();
+        std::fs::hard_link(d.outside.join("keep.txt"), d.ws.join("data/h")).unwrap();
+        for cmd in ["echo x > data/h", "truncate -s 0 data/h"] {
+            d.assert_escapes(cmd);
+        }
+    }
+
+    #[test]
+    fn a_grant_does_not_cover_a_write_through_a_symlink() {
+        let d = disk();
+        d.link("x", &d.outside);
+        let granted = |p: &str| p == "Bash(echo:*)";
+        let site = CommandSite::Workspace(&d.ws);
+        assert!(!grant_covers_command(
+            "Bash",
+            "echo x > data/x/keep.txt",
+            site,
+            granted
+        ));
+        assert!(grant_covers_command(
+            "Bash",
+            "echo x > data/sub/b.txt",
+            site,
+            granted
+        ));
+    }
+
+    /// The per-turn judge cache must not hand back a verdict the disk has
+    /// since overturned: the same text can resolve elsewhere once a link lands.
+    #[test]
+    fn a_link_laid_down_mid_turn_changes_the_cache_key() {
+        let d = disk();
+        std::fs::create_dir_all(d.ws.join("data/x")).unwrap();
+        let key = |d: &Disk| match d.static_lane("rm -rf data/x/*") {
+            StaticVerdict::NeedsJudge(ji) => ji.cache_key(),
+            other => panic!("expected NeedsJudge, got {other:?}"),
+        };
+        let before = key(&d);
+        std::fs::remove_dir(d.ws.join("data/x")).unwrap();
+        d.link("x", &d.outside);
+        assert_ne!(before, key(&d));
+    }
+
+    /// Python resolves its string literals too, but expands no glob.
+    #[test]
+    fn python_destruction_through_a_symlink_escapes() {
+        let d = disk();
+        d.link("x", &d.outside);
+        let lane = |code: &str| d.fallback(tn::RUN_PYTHON, code).lane;
+        assert_eq!(
+            lane("import shutil; shutil.rmtree('data/x/sub')"),
+            RiskLane::IrreversibleDanger
+        );
+        assert_eq!(
+            lane("import os; os.remove('data/sub/a.txt')"),
+            RiskLane::ReversibleDanger
+        );
+        assert_eq!(
+            lane("import os; os.remove('{}/a.txt'.format(d))"),
+            RiskLane::ReversibleDanger
+        );
+        for code in [
+            "import os; os.symlink(os.environ['HOME'], 'data/h'); os.remove('data/h/.zshrc')",
+            "import os, shutil; os.chdir(os.environ['HOME']); shutil.rmtree('Documents')",
+        ] {
+            assert_eq!(lane(code), RiskLane::IrreversibleDanger, "{code}");
+        }
     }
 }

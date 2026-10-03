@@ -223,7 +223,14 @@ impl LucidosEngine {
             }
             RequestVerdict::Archive => {
                 let actor = Some(agent_thread_actor(thread_id));
-                match crate::api::threads::archive::archive_family(self, thread_id, actor).await {
+                match crate::api::threads::archive::archive_family(
+                    self,
+                    thread_id,
+                    actor,
+                    crate::api::threads::archive::PinnedMembers::ByActor,
+                )
+                .await
+                {
                     Ok(outcome) if outcome.archived.contains(&thread_id) => {
                         log!("[ArchiveRequest] {} settled and was archived", thread_id);
                         RequestState::Closed

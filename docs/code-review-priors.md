@@ -1290,6 +1290,16 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 
 ## Frontend
 
+- **The focus-ring walk measures a scroller against its scrollable extent, not
+  its visible scrollport, on purpose.** A reviewer reads this as letting a cut
+  ring pass. `e2e/focusRingClip.ts` asks whether ANY scroll position shows the
+  whole ring, so a row the scroller hides passes: its ring shows once the user
+  scrolls to it. The bug class is a ring no scroll position can reveal, since a
+  shadow adds nothing to scrollable overflow. Measuring the scrollport would
+  flag every row below the fold.
+
+  Re-flag only with a ring the walk passes that no scroll position shows whole.
+
 - **Search Everywhere's delay gate does not restart on a keystroke while a
   search is still out.** A reviewer reports the loader appearing on the old
   query's clock. `useDelayedFlag(pending.length > 0)` stays armed because the

@@ -1869,6 +1869,14 @@ impl ThreadQueue {
     /// row (emitted through the bus) is the durable record either way.
     async fn notify(&self, title: String, message: String) {
         let id = Uuid::new_v4();
+        // Every Thread Queue notification is about queue state. The inbox row
+        // and the push both open the Thread Queue panel, where the backlog is.
+        let tap = crate::scheduler::notifications::Tap::Navigate {
+            to: Box::new(crate::scheduler::notifications::NavigateUi {
+                target: crate::scheduler::notifications::NavigateTarget::ThreadQueue,
+                ..Default::default()
+            }),
+        };
         self.bus
             .emit_or_log(
                 BusEvent::System(SystemEvent::NotificationCreated {
@@ -1879,22 +1887,23 @@ impl ThreadQueue {
                     app_id: None,
                     thread_id: None,
                     event_id: None,
-                    // Every Thread Queue notification (backlog, at-capacity,
-                    // overflow-pause) is about queue state — tap lands on the
-                    // Thread Queue panel so the user sees the backlog directly.
-                    tap: crate::scheduler::notifications::Tap::Navigate {
-                        to: Box::new(crate::scheduler::notifications::NavigateUi {
-                            target: crate::scheduler::notifications::NavigateTarget::ThreadQueue,
-                            ..Default::default()
-                        }),
-                    },
+                    tap: tap.clone(),
                     actor: None,
                 }),
                 "[ThreadQueue] NotificationCreated",
             )
             .await;
         if let Some(engine) = self.engine.get().and_then(Weak::upgrade) {
-            crate::scheduler::push::send_push_to_all(&engine, &title, &message, Some(id)).await;
+            crate::scheduler::push::send_push_to_all_with_app(
+                &engine,
+                &title,
+                &message,
+                Some(id),
+                None,
+                None,
+                None,
+                tap,
+            );
         }
     }
 }

@@ -231,7 +231,7 @@ pub async fn get_or_create_vapid_keys(
 
 /// Send a push notification to all registered subscriptions. With a
 /// `notification_id`, clicking the notification deep-links to it.
-pub async fn send_push_to_all(
+pub fn send_push_to_all(
     engine: &SharedEngine,
     title: &str,
     body: &str,
@@ -246,8 +246,54 @@ pub async fn send_push_to_all(
         None,
         None,
         crate::scheduler::notifications::Tap::Modal,
-    )
-    .await;
+    );
+}
+
+/// Start [`fan_out_os_surface`] on its own task and return at once.
+///
+/// **Not async, on purpose.** The fan-out waits on the network, and its
+/// callers must never wait with it. Among them are the EventBus subscriber
+/// loop, the backup loop and a trigger's Thread Queue slot. Each of those
+/// stalls everything behind it while it waits.
+///
+/// The task carries the caller's event-trigger chain depth, because a
+/// task-local does not follow a `tokio::spawn`. Without it the events the
+/// fan-out emits would read depth 0 and could restart a chain the cap stopped.
+#[allow(clippy::too_many_arguments)]
+pub fn send_push_to_all_with_app(
+    engine: &SharedEngine,
+    title: &str,
+    body: &str,
+    notification_id: Option<uuid::Uuid>,
+    app_id: Option<&str>,
+    link_thread_id: Option<uuid::Uuid>,
+    link_event_id: Option<uuid::Uuid>,
+    tap: crate::scheduler::notifications::Tap,
+) {
+    let engine = engine.clone();
+    let title = title.to_string();
+    let body = body.to_string();
+    let app_id = app_id.map(str::to_string);
+    spawn_carrying_chain_depth(async move {
+        fan_out_os_surface(
+            &engine,
+            &title,
+            &body,
+            notification_id,
+            app_id.as_deref(),
+            link_thread_id,
+            link_event_id,
+            tap,
+        )
+        .await;
+    });
+}
+
+/// `tokio::spawn`, with the caller's event-trigger chain depth scoped onto the
+/// new task.
+fn spawn_carrying_chain_depth(work: impl std::future::Future<Output = ()> + Send + 'static) {
+    let depth = crate::scheduler::user_tasks::current_event_trigger_depth();
+    tokio::spawn(crate::scheduler::user_tasks::EVENT_TRIGGER_DEPTH.scope(depth, work));
 }
 
 /// Fan out the OS surface for a notification per the §2 matrix in
@@ -265,7 +311,7 @@ pub async fn send_push_to_all(
 ///
 /// Non-fatal throughout: one bad subscription must not sink the fan-out.
 #[allow(clippy::too_many_arguments)]
-pub async fn send_push_to_all_with_app(
+async fn fan_out_os_surface(
     engine: &SharedEngine,
     title: &str,
     body: &str,
@@ -1330,8 +1376,8 @@ fn build_push_payload(
     payload
 }
 
-/// Dispatch the per-subscription send loop. `kind` appears in log lines.
-/// Non-fatal: a per-subscription failure is logged and the loop continues.
+/// Send each payload to its subscription. `kind` appears in log lines.
+/// Non-fatal: a per-subscription failure is logged and the rest still send.
 /// Under `e2e-test-hooks` the network send becomes a `push_log` write, so
 /// browser e2e tests assert delivery without waiting on APNs or FCM.
 async fn fan_out_payload(
@@ -1373,11 +1419,9 @@ async fn fan_out_to_web_push(
         }
     };
 
-    let mut stale_endpoints: Vec<String> = Vec::new();
-    let mut delivered = 0usize;
-
-    for (sub, payload_bytes) in &deliveries {
-        let endpoint_label = &sub.endpoint[..sub.endpoint.floor_char_boundary(60)];
+    let (client, keys) = (&client, &keys);
+    let outcome = send_each(&deliveries, kind, move |sub, payload_bytes| {
+        let endpoint_label = endpoint_label(sub);
         let sub_info = web_push::SubscriptionInfo::new(&sub.endpoint, &sub.p256dh, &sub.auth);
 
         let sig = match web_push::VapidSignatureBuilder::from_pem(
@@ -1392,13 +1436,13 @@ async fn fan_out_to_web_push(
                     Ok(sig) => sig,
                     Err(e) => {
                         log!("[Push] Failed to build VAPID signature for {}: {}", kind, e);
-                        continue;
+                        return None;
                     }
                 }
             }
             Err(e) => {
                 log!("[Push] Failed to create VAPID builder for {}: {}", kind, e);
-                continue;
+                return None;
             }
         };
 
@@ -1426,17 +1470,77 @@ async fn fan_out_to_web_push(
                     payload_bytes.len(),
                     e
                 );
-                continue;
+                return None;
             }
         };
 
         use web_push::WebPushClient;
-        match client.send(message).await {
-            Ok(_) => {
-                delivered += 1;
+        Some(client.send(message))
+    })
+    .await;
+
+    for endpoint in outcome.stale_endpoints {
+        if let Err(e) = PushSubscriptionStore::unsubscribe(pool, &endpoint).await {
+            log!("[Push] Failed to remove stale subscription: {}", e);
+        }
+    }
+
+    outcome.delivered
+}
+
+/// How long one subscription's send may take before the fan-out gives up on it.
+///
+/// The transport sets no deadline of its own: web-push documents its client's
+/// `send` as "Never times out", and isahc bounds only the connect. A socket that
+/// finished its TLS handshake and then went quiet would park the fan-out for
+/// good. Generous, because a phone radio waking from idle is slow but not dead.
+#[cfg(not(feature = "e2e-test-hooks"))]
+const PUSH_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// What one pass over the subscriptions achieved.
+#[cfg(not(feature = "e2e-test-hooks"))]
+#[derive(Debug, Default, PartialEq)]
+struct SendOutcome {
+    delivered: usize,
+    /// Endpoints the push service answered 410 Gone for, to unsubscribe.
+    stale_endpoints: Vec<String>,
+}
+
+/// Send to every subscription at once, each bounded by [`PUSH_SEND_TIMEOUT`],
+/// so the whole pass takes at most one deadline however many devices are quiet.
+///
+/// `send` builds one subscription's request and returns `None` when it could
+/// not (it logs why). Generic over the transport so a test can hand it one
+/// that never answers. A send that runs out of time is a failure for that
+/// subscription only, and the subscription is kept: a silent socket says
+/// nothing about whether the endpoint is still valid.
+#[cfg(not(feature = "e2e-test-hooks"))]
+async fn send_each<'d, Fut, E>(
+    deliveries: &'d [(PushSubscription, String)],
+    kind: &str,
+    mut send: impl FnMut(&'d PushSubscription, &'d str) -> Option<Fut>,
+) -> SendOutcome
+where
+    Fut: std::future::Future<Output = Result<(), E>>,
+    E: std::fmt::Display,
+{
+    let requests = deliveries
+        .iter()
+        .filter_map(|(sub, payload_bytes)| send(sub, payload_bytes).map(|request| (sub, request)))
+        .map(|(sub, request)| async move {
+            (sub, tokio::time::timeout(PUSH_SEND_TIMEOUT, request).await)
+        });
+    let results = futures::future::join_all(requests).await;
+
+    let mut outcome = SendOutcome::default();
+    for (sub, result) in results {
+        let endpoint_label = endpoint_label(sub);
+        match result {
+            Ok(Ok(())) => {
+                outcome.delivered += 1;
                 log!("[Push] Sent {} to {}", kind, endpoint_label);
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 let err_str = e.to_string();
                 // 410 Gone means the subscription is no longer valid.
                 if err_str.contains("410") || err_str.contains("Gone") {
@@ -1444,7 +1548,7 @@ async fn fan_out_to_web_push(
                         "[Push] Subscription expired (410), will remove: {}",
                         endpoint_label
                     );
-                    stale_endpoints.push(sub.endpoint.clone());
+                    outcome.stale_endpoints.push(sub.endpoint.clone());
                 } else {
                     log!(
                         "[Push] Failed to send {} to {}: {}",
@@ -1454,16 +1558,21 @@ async fn fan_out_to_web_push(
                     );
                 }
             }
+            Err(_) => log!(
+                "[Push] Gave up sending {} to {} after {:?} with no answer; \
+                 keeping the subscription",
+                kind,
+                endpoint_label,
+                PUSH_SEND_TIMEOUT
+            ),
         }
     }
+    outcome
+}
 
-    for endpoint in stale_endpoints {
-        if let Err(e) = PushSubscriptionStore::unsubscribe(pool, &endpoint).await {
-            log!("[Push] Failed to remove stale subscription: {}", e);
-        }
-    }
-
-    delivered
+/// The start of a subscription's endpoint, short enough for a log line.
+fn endpoint_label(sub: &PushSubscription) -> &str {
+    &sub.endpoint[..sub.endpoint.floor_char_boundary(60)]
 }
 
 #[cfg(feature = "e2e-test-hooks")]
@@ -1480,7 +1589,7 @@ async fn fan_out_to_push_log(
     };
     let mut delivered = 0usize;
     for (sub, payload) in &deliveries {
-        let endpoint_label = &sub.endpoint[..sub.endpoint.floor_char_boundary(60)];
+        let endpoint_label = endpoint_label(sub);
         // A row without a device_id cannot be attributed, so the test log
         // holds only rows a test can assert against.
         let Some(device_id) = sub.device_id.as_deref() else {

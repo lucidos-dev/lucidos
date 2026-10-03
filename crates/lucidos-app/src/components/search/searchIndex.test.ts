@@ -148,11 +148,8 @@ describe('settings search — System section', () => {
   });
 
   it('never puts the System submenu above the sub-page the user named', () => {
-    // The match is a plain substring over label plus keywords, every hit
-    // scores 1.0, and results come back in array order. The `system` entry
-    // sits above the sub-pages, so any word of theirs in its keywords wins
-    // their own query: Enter on the top hit opens a list of ten rows instead
-    // of the page. Naming the sub-pages there is what did it.
+    // Enter on the top hit must open the page, not a list of ten rows. Ranking
+    // by label keeps a keyword-only hit on `system` below the page's own.
     for (const [query, id] of [
       ['backup', 'backup'],
       ['memory', 'memory'],
@@ -264,4 +261,17 @@ describe('settings search: the In-app toasts row', () => {
       expect(hit).toBe(true);
     },
   );
+});
+
+describe('settings search: ranked before the cut', () => {
+  it('puts a label hit first, even one the index lists last', () => {
+    // The shortcut entries are appended after the whole static index.
+    expect(getSettingsSearchResults('settings', 5)[0]?.id).toBe('shortcut:openSettings');
+  });
+
+  it('lists a label hit above a keyword-only hit', () => {
+    const ids = getSettingsSearchResults('theme', 50).map((r) => r.id);
+    expect(ids[0]).toBe('appearance:theme');
+    expect(ids.indexOf('appearance:theme')).toBeLessThan(ids.indexOf('appearance'));
+  });
 });

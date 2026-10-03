@@ -1,6 +1,7 @@
 import { threadMap, awaitedThreadId, focusedThreadId, setFocusedThread, showToast, removeToast, connectionStatus, threadsLoaded, threadListFetched, generatedTitleIds, threadHasMore, threadLoadingMore, archiveThreadCount, ALL_CHANNELS, filterFacets, codingAgentSessionVersion, engineRestarting, archivingThreadIds, CODING_AGENT_CHANNEL, toasts, THREAD_EVENTS_LOAD_TOAST_KEY, THREAD_EVENTS_REFRESH_TOAST_KEY, THREAD_EVENTS_FETCH_CONCURRENCY, THREAD_EVENTS_PREFETCH_LIMIT, threadChannelToFilterSource, type ThreadFilterSource } from '../store';
 import { appliedThreadFilter, type ThreadFilterSelection } from '../appliedThreadFilter';
 import { threadPassesChannelFilter } from '../threadFilter';
+import { settleDeliveredUnsentMessage } from '../unsentMessages';
 import { handleEvent, isCallerUtterance, isChannelDefiningEvent, offerCallerUtterance, PENDING_TITLE_PLACEHOLDER, applyAggregateToMeta, applySummaryVersion, isSummaryCurrent, createdKey, isExcludedFromSections, type ThreadAggregate, type ThreadState, type ThreadEvent, type StoredEvent, type ThreadMeta } from '../thread-events';
 import { bumpThreadEvents } from '../threadActivity';
 import { recordPerfSample } from '../../utils/perfQueue';
@@ -68,6 +69,7 @@ function makeThreadState(info: ThreadSummary, saved: boolean, batch?: DraftBatch
       codingAgentHasDiff: info.coding_agent_has_diff || false,
       codingAgentProposed: info.coding_agent_proposed || false,
       codingAgentRequiresRestart: info.coding_agent_requires_restart || false,
+      codingAgentIncomplete: info.coding_agent_incomplete || false,
       codingAgentIsExternalRepo: info.coding_agent_is_external_repo || false,
       lastRevivedAt: info.last_revived_at || '',
       parentThreadId: info.parent_thread_id || undefined,
@@ -215,6 +217,7 @@ export function upsertThread(
       if (info.live_event_waits) existing.meta.liveEventWaits = info.live_event_waits;
       existing.meta.codingAgentHasDiff = info.coding_agent_has_diff || false;
       existing.meta.codingAgentRequiresRestart = info.coding_agent_requires_restart || false;
+      existing.meta.codingAgentIncomplete = info.coding_agent_incomplete || false;
       existing.meta.codingAgentIsExternalRepo = info.coding_agent_is_external_repo || false;
       if (info.last_revived_at) existing.meta.lastRevivedAt = info.last_revived_at;
       // A null clears: a thread moved to top level has no parent any more, and
@@ -1740,7 +1743,8 @@ function applyEventRows(
   const liveReply = thread.liveReply;
   for (const row of rows) {
     const event = { type: row.event_type, ...row.payload } as ThreadEvent;
-    handleEvent(map, threadId, row.sequence, event, row.created, row.event_id);
+    const handled = handleEvent(map, threadId, row.sequence, event, row.created, row.event_id);
+    if (handled.retiredUnsentEventId) settleDeliveredUnsentMessage(handled.retiredUnsentEventId);
     if (row.sequence > thread.lastDbSeq) thread.lastDbSeq = row.sequence;
 
     if ((row.event_type === 'ThreadTitleGenerated' || row.event_type === 'ThreadTitleRenamed') && row.payload.title) {

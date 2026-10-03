@@ -65,12 +65,18 @@ export type ThreadAggregate = {
    *  lifecycle: a thread can have a diff mid-session before CC has formally
    *  proposed (and stays true between proposal and Apply / Discard). */
   codingAgentHasDiff: boolean;
-  /** CC's formal "ready for review" — set by `ChangeProposed`, cleared on
-   *  Apply / Discard / Archive. Backs the Apply / Discard buttons. */
+  /** The thread holds a pending change, complete or incomplete. Set by
+   *  `ChangeProposed`, cleared on Apply / Discard / Set aside / Archive. Backs
+   *  the Apply / Discard buttons and blocks Archive. Whether it is ready to
+   *  review is `changeReadyToReview`. */
   codingAgentProposed: boolean;
   /** Whether the proposed change requires an engine restart. Only meaningful
    *  when `codingAgentProposed` is true. */
   codingAgentRequiresRestart: boolean;
+  /** Whether the proposed change is incomplete: its turn did not finish, so it
+   *  is not ready to review (ADR 0346). Only meaningful when
+   *  `codingAgentProposed` is true. Read it through `changeReadyToReview`. */
+  codingAgentIncomplete: boolean;
   /** Whether the Claude Code session is bound to an external repo. External repos
    *  can't be Applied via the engine merge flow — the WaitingBanner shows
    *  Done / Archive instead. */
@@ -162,6 +168,7 @@ export function applyAggregateToMeta(meta: ThreadMeta, agg: ThreadAggregate): bo
   if (meta.codingAgentHasDiff !== agg.codingAgentHasDiff) { meta.codingAgentHasDiff = agg.codingAgentHasDiff; changed = true; }
   if (meta.codingAgentProposed !== agg.codingAgentProposed) { meta.codingAgentProposed = agg.codingAgentProposed; changed = true; }
   if (meta.codingAgentRequiresRestart !== agg.codingAgentRequiresRestart) { meta.codingAgentRequiresRestart = agg.codingAgentRequiresRestart; changed = true; }
+  if (meta.codingAgentIncomplete !== agg.codingAgentIncomplete) { meta.codingAgentIncomplete = agg.codingAgentIncomplete; changed = true; }
   if (meta.codingAgentIsExternalRepo !== agg.codingAgentIsExternalRepo) { meta.codingAgentIsExternalRepo = agg.codingAgentIsExternalRepo; changed = true; }
   if (meta.saved !== agg.isSaved) { meta.saved = agg.isSaved; changed = true; }
   // updatedAt / messageCount: overlay unconditionally, do NOT mark changed
@@ -277,12 +284,15 @@ export type ThreadMeta = {
    *  lifecycle: a thread can have a diff mid-session before CC has formally
    *  proposed (and stays true between proposal and Apply / Discard). */
   codingAgentHasDiff: boolean;
-  /** CC's formal "ready for review" — set by `ChangeProposed`, cleared on
-   *  Apply / Discard / Archive. Backs the Apply / Discard buttons. */
+  /** The thread holds a pending change. See `ThreadMeta.codingAgentProposed`. */
   codingAgentProposed: boolean;
   /** Whether the proposed change requires an engine restart. Only meaningful
    *  when `codingAgentProposed` is true. */
   codingAgentRequiresRestart: boolean;
+  /** Whether the proposed change is incomplete: its turn did not finish, so it
+   *  is not ready to review (ADR 0346). Only meaningful when
+   *  `codingAgentProposed` is true. Read it through `changeReadyToReview`. */
+  codingAgentIncomplete: boolean;
   /** Whether the Claude Code session is bound to an external repo — drives the
    *  WaitingBanner Done / Archive vs Apply choice. */
   codingAgentIsExternalRepo: boolean;
@@ -362,6 +372,10 @@ export type ComposeChannelMode = 'lucidos' | 'claude_code' | null;
 export type ThreadState = {
   meta: ThreadMeta;
   events: Map<number, StoredEvent>;
+  /** Each *unsent message* in `events`, by its client event id: the seq of its
+   *  client-only message row. Its failure card sits on the next seq. Written by
+   *  `showUnsentExchange` (actions/chat.ts), cleared by `retireUnsentExchange`. */
+  unsentMessageSeqs?: Map<string, number>;
   streamingBuffer: string;
   eventsLoaded: boolean;
   /** True when loadThreadEvents exhausted retries. The UI shows an error
@@ -539,6 +553,7 @@ export function makeOptimisticThreadState(opts: {
       codingAgentHasDiff: false,
       codingAgentProposed: false,
       codingAgentRequiresRestart: false,
+      codingAgentIncomplete: false,
       codingAgentIsExternalRepo: false,
       lastRevivedAt: ts,
       triggerId: opts.triggerId,
@@ -607,7 +622,7 @@ export const isExcludedFromSections = (t: ThreadState): boolean =>
  *    0 — WaitingForUserAnswer: a user question or permission request is
  *        blocking the agent. Most critical (nothing progresses until the user
  *        answers), so these float to the very top.
- *    1 — other CTA: codingAgentProposed (a change is ready to review) or Failed
+ *    1 — other CTA: `changeReadyToReview` (a finished change) or Failed
  *        (the last response errored), or Paused (an engine restart interrupted
  *        the turn). The user should act, but no agent is stalled waiting on
  *        them.
@@ -618,15 +633,23 @@ export const isExcludedFromSections = (t: ThreadState): boolean =>
  *  pending sends.
  *
  *  Tier 1 is deliberately WIDER than `threadNeedsAttention`, which covers tier 0
- *  plus Failed but neither Paused nor codingAgentProposed (that one has its own
+ *  plus Failed but neither Paused nor a ready change (that one has its own
  *  Review view). This is a sort key, not a badge: floating a paused thread to
  *  the top of Current costs the user nothing, whereas counting one in the
  *  needs-attention badge would light it on every version switch, for work the
  *  engine is about to resume by itself. */
 export function reviewTier(t: ThreadState, status: ThreadStatus): 0 | 1 | 2 {
   if (status === 'waiting_for_user_answer') return 0;
-  if (t.meta.codingAgentProposed || status === 'failed' || status === 'paused') return 1;
+  if (changeReadyToReview(t.meta) || status === 'failed' || status === 'paused') return 1;
   return 2;
+}
+
+/** The thread holds a change ready to review: pending, from a turn that
+ *  finished. An incomplete change still blocks Archive, through
+ *  `codingAgentProposed`, but never reads as ready (ADR 0346). The one place
+ *  that combines the two flags, for every "ready to review" reader. */
+export function changeReadyToReview(meta: Pick<ThreadMeta, 'codingAgentProposed' | 'codingAgentIncomplete'>): boolean {
+  return meta.codingAgentProposed && !meta.codingAgentIncomplete;
 }
 
 /** Whether this event type updates the thread's last_activity in the backend

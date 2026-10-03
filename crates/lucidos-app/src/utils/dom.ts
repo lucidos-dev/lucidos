@@ -43,10 +43,11 @@ const KEYBOARD_INPUT_TYPES = new Set([
 ]);
 
 /** True only for elements that bring up the on-screen keyboard when focused.
- *  Excludes range, checkbox, button, color, file, date, select, etc. — these
- *  focus without opening a keyboard, so triggering keyboard-related layout
- *  (mobile header hide-on-focus) for them is wrong. Use `isTextInput` for
- *  "is the user actively editing"; use this for "did focus open the OS keyboard". */
+ *  Excludes range, checkbox, button, color, file, date, select, etc.: these
+ *  focus without opening a keyboard. Use this for "is the user typing", such
+ *  as keyboard-related layout or holding off a pane swipe. Use `isTextInput`
+ *  where a focused checkbox or select must also count, as for keyboard
+ *  shortcuts. */
 export function opensSoftwareKeyboard(el: EventTarget | Element | null): boolean {
   if (!(el instanceof HTMLElement)) return false;
   if (el.isContentEditable) return true;

@@ -18,17 +18,17 @@ pub(super) fn proxy_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: tn::PROXY_REQUEST.to_string(),
-            description: "Call a backend configured in `data/config/apis.json` through the engine proxy. Prefer it over `http_request` whenever the API has a proxy entry: the engine resolves the credential, so it never appears in the tool args, the transcript, or any log, and it handles HMAC signing, script-handshake logins and WASM signers transparently. Returns the raw body for 2xx, or `HTTP Error N: ...`.".to_string(),
+            description: "Call a backend through the engine proxy: a `data/config/apis.json` entry, or a builtin provider proxy (openai, anthropic, openrouter, xai, vertex, local, typesafe; not in apis.json, listed in BUILTIN PROVIDER PROXIES). Prefer it over `http_request` whenever the API has a proxy: the engine resolves the credential, so it never appears in the tool args, the transcript, or any log, and it handles HMAC signing, script-handshake logins and WASM signers transparently. Returns the raw body for 2xx, or `HTTP Error N: ...`.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "name": {
                         "type": "string",
-                        "description": "Proxy name from `data/config/apis.json` (e.g. 'sonos')."
+                        "description": "Proxy name from `data/config/apis.json` (e.g. 'sonos') or a builtin (e.g. 'openai')."
                     },
                     "path": {
                         "type": "string",
-                        "description": "Path appended to the configured base_url (e.g. '/living-room/play'). Defaults to root."
+                        "description": "Path appended to the base URL (e.g. '/living-room/play'). Builtin bases include /v1: 'openai' takes '/models', not '/v1/models'. Defaults to root."
                     },
                     "method": {
                         "type": "string",
@@ -85,4 +85,27 @@ pub(super) fn proxy_tools() -> Vec<ToolDefinition> {
             }),
         },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The description names every builtin, so a row added to the catalog
+    /// cannot stay invisible to the agent.
+    #[test]
+    fn proxy_request_names_every_builtin_provider_proxy() {
+        let tools = proxy_tools();
+        let proxy_request = tools
+            .iter()
+            .find(|t| t.name == tn::PROXY_REQUEST)
+            .expect("proxy_request is defined");
+        for proxy in &crate::api::proxy_builtin::BUILTIN_PROXIES {
+            assert!(
+                proxy_request.description.contains(proxy.name),
+                "proxy_request must name the builtin '{}'",
+                proxy.name
+            );
+        }
+    }
 }

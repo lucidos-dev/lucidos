@@ -121,6 +121,8 @@
 .step-detail-body:focus-visible,
 .explainer-body:focus,
 .explainer-body:focus-visible,
+.event-condition-popover-body:focus,
+.event-condition-popover-body:focus-visible,
 .progress-dialog-body:focus,
 .progress-dialog-body:focus-visible,
 .toast-heading:focus,

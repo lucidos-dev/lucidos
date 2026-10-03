@@ -19,6 +19,8 @@ paths:
   - "scripts/lib/harden_suites*.sh"
   - "scripts/harden-scope.sh"
   - "scripts/lib/harden_scope_test.sh"
+  - "scripts/harden-codex-review.sh"
+  - "scripts/lib/harden_codex_review_test.sh"
   - "scripts/lib/proc_tree.sh"
   - "scripts/test-scripts.sh"
   - "scripts/with-build-slot.sh"
@@ -113,6 +115,7 @@ opt-in itself, and never starts a gateway.
 ./scripts/test-engine.sh [--full|--fresh] # Engine tests against a dedicated Docker PG
 ./scripts/harden-suites.sh start [--early]|stop|wait|verdict  # /harden's Phase 4.5 suites: selection, the early suite run, and whether its result still counts (ADR 0292). Tested by scripts/lib/harden_suites_test.sh
 ./scripts/harden-scope.sh <sha> [<base>]  # /harden Phase 0.4: MERGE_ONLY when every commit since the last hardening is a merge of main, INCREMENTAL when the branch also has commits of its own, else FULL <reason>. Tested by scripts/lib/harden_scope_test.sh
+./scripts/harden-codex-review.sh          # /harden Phase 1: the Codex review, retried once. The last line is one status line: verdict returned, NO VERDICT with the upstream cause, or unavailable. Tested by scripts/lib/harden_codex_review_test.sh
 ./scripts/test-scripts.sh                 # Run every scripts/lib/*_test.sh (= make test-scripts): per-suite pass/fail + a total, exits non-zero if any suite fails. Needs no Postgres; separate from `make lint` and the engine suite. See below
 ./scripts/preflight-reclaim-engines.sh    # Pre-flight: stop every engine that should not be running, and prove what it freed. Exits non-zero if one survived. See below
 ./scripts/memory-watch.sh --once          # Host memory watch, one tick: record any process over a share of RAM, kill one past physical RAM. See below
@@ -599,7 +602,7 @@ Two rules follow, and both are load-bearing:
   test against the full `ps -o command=` output cannot tell *is that process*
   from *mentions that path*, and the difference is a SIGKILL. This is not
   hypothetical: on 2026-08-03 it killed two Claude Code sessions. A coding agent
-  carries the engine's `THREAD HISTORY` block inside a roughly 22 KB
+  carried the engine's `THREAD HISTORY` block inside a roughly 22 KB
   `--append-system-prompt` argument (`agent_session/run_session/run.rs`), so any
   thread whose conversation quotes `ms-playwright/webkit` became a kill
   candidate, and the thread hardening the reaper quoted it while explaining the

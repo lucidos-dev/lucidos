@@ -131,6 +131,32 @@ Two consequences beyond the token block:
 - **Heavy-mount children that render in both layouts must skip the inactive one**: iframes, video/audio players, big WebGL canvases, anything that fetches on mount. If a component has a copy in each layout, both copies trigger the work, doubling network and resource cost (e.g. before the pane single-mount fix, opening an app fetched `/api/v1/sdk-prefs.js` twice). Pane children mount once now; the rule still binds for chrome with per-layout copies. Pattern: the parent takes `layout: 'desktop' | 'mobile'` and forwards it to the heavy child; the child gates the render with `layout === (viewportIsMobile.value ? 'mobile' : 'desktop')`. `viewportIsMobile` is the reactive signal in `utils/viewport.ts`. Example: `AppUiInline.tsx` (gate retained from the dual-mount era; harmless now that `ContentPane` mounts once).
 - **No `getElementById()`**: Banned except `#app`. Use `querySelector`/`querySelectorAll`
 
+### Focus rings: a box that clips leaves ring room
+
+`--focus-ring` is an outward `box-shadow`, and a shadow adds nothing to
+scrollable overflow. So any ancestor that scrolls or clips cuts the ring where a
+control sits flush with its edge. That is how the Rename dialog's input lost its
+ring's bottom edge.
+
+- **Fix the clipping box, never the control.** Give it *ring room*
+  (`docs/glossary.md`): padding of `--focus-ring-width` on the flush edge,
+  handed back with an equal negative margin or taken from a neighbour, so
+  nothing moves. `.pill-bar` and the surface body are the worked examples.
+- **A clip with no job goes.** `.list-row-info` lost its `overflow: hidden`:
+  `min-width: 0` already lets it shrink.
+- **A header row clips through `clip-path: inset(...)`** with ring room on the
+  axes it does not need, never `overflow: clip`. The packaged macOS webview makes
+  a `clip` box a scroll container.
+- **Inset is the last resort**, for a control with no room outside it, such as a
+  chevron pinned to a clip edge.
+- **The ring stays a literal**, since a theme replaces it whole.
+  `styles/__tests__/focus-ring-width.test.ts` holds every definition's band to
+  `--focus-ring-width`.
+
+`e2e/focus-ring-not-clipped.spec.ts` focuses every control on the settings
+pages, the forms a row opens and each sample dialog, and fails on a cut edge.
+Put a new surface in its visit list.
+
 ### Reduced motion keys on `data-motion`, never on the media query
 
 The *Motion* setting and the OS switch resolve to one value, published as

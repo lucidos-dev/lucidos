@@ -27,6 +27,7 @@ function makeThread(id: string, overrides: Partial<ThreadState> = {}): ThreadSta
       summaryVersion: 0,
       codingAgentProposed: false,
       codingAgentRequiresRestart: false,
+      codingAgentIncomplete: false,
       codingAgentIsExternalRepo: false,
       codingAgentHasDiff: false,
       lastRevivedAt: '',

@@ -324,8 +324,7 @@
        (.list-row-label) ellipsizes instead of growing the column to its
        intrinsic content width — which would drag .list-row-actions off-screen
        to the right. flex-shrink alone won't do it: align-items: flex-start
-       sizes children by intrinsic cross-axis content, and `overflow: hidden`
-       only clips visually. */
+       sizes children by intrinsic cross-axis content. */
     .list-row-info {
         width: 100%;
     }
@@ -1146,8 +1145,8 @@
     }
 
     /* The ::before spacer replaces padding-top, so zero out the base padding-top
-       on .thread-content (the base rule reserves top room past the desktop fade
-       mask, which mobile doesn't have — the sticky title covers the top instead).
+       on .thread-content. The spacer carries the anchor rest the desktop padding
+       does, and the sticky title covers the top.
        padding-bottom keeps the base's prompt-fade clearance (below). .thread-content
        must stay display:block: Safari ignores scrollTo on a flex-column scroll
        container. */

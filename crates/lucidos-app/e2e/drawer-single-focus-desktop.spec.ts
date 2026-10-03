@@ -163,4 +163,22 @@ test.describe('Thread drawer — single keyboard focus (aria-activedescendant)',
     await expect(menu).toBeVisible();
     await expect(menu.getByText(/Pin thread|Unpin thread/)).toBeVisible();
   });
+
+  test('with no drawer row focused, the shortcut opens the open thread\'s menu', async ({ page, context }) => {
+    const id = randomUUID();
+    const title = `open-${Date.now()}`;
+    psql(seedThreadRow({ id, title, now: new Date().toISOString() }));
+    await context.addInitScript((id) => {
+      localStorage.setItem('lucidos-focused-thread', id);
+      localStorage.setItem('lucidos-thread-drawer-open', 'false');
+    }, id);
+
+    await navigateToApp(page);
+    await waitForEventStream(page);
+    await expect(page.locator('.thread-view-header')).toContainText(title);
+
+    await page.keyboard.press('Control+Shift+M');
+    // Only the title's menu offers this item; a drawer row's menu never does.
+    await expect(page.getByRole('menuitem', { name: 'Show in thread list' })).toBeVisible();
+  });
 });

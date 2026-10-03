@@ -22,18 +22,16 @@ const baseCss = stripComments(
   readFileSync(resolve(here, '../../../styles/global/base.css'), 'utf-8'),
 );
 
-/** The `{…}` block for a TOP-LEVEL rule with exactly this selector. Two things keep
- *  it exact, and they are different mechanisms: the `\s*\{` right after the selector
- *  is what stops `.nav-focus-stuck` also matching `.nav-focus-stuck.nav-focus-fading`
- *  (both start at column 0), while anchoring at column 0 is what stops it swallowing
- *  the INDENTED same-selector overrides inside the reduced-motion media query, which
- *  would otherwise fold that block's `animation: none` into the base rule's
- *  declarations and quietly invert the bloom assertion. */
+/** The `{…}` blocks of every TOP-LEVEL rule whose selector list holds exactly this
+ *  selector. Comparing whole list entries is what stops `.nav-focus-stuck` also
+ *  matching `.nav-focus-stuck.nav-focus-fading`. A rule must start at column 0,
+ *  which keeps out anything indented inside an at-rule. */
 function block(selector: string): string {
-  const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const re = new RegExp(`^${escaped}\\s*\\{([^}]*)\\}`, 'gm');
-  const hits = [...css.matchAll(re)].map(m => m[1]);
-  return hits.join('\n');
+  const rules = [...css.matchAll(/^([^\s{}@][^{}]*?)\{([^}]*)\}/gm)];
+  return rules
+    .filter(m => m[1].split(',').map(part => part.trim()).includes(selector))
+    .map(m => m[2])
+    .join('\n');
 }
 
 function declaration(source: string, property: string): string | undefined {
@@ -286,13 +284,11 @@ describe('nav focus marker paint: background highlight, not a frame', () => {
   });
 
   it('drops both the turn-on and the dissolve under reduced motion', () => {
-    const R = String.raw`:root\[data-motion="reduce"\]\s+`;
-    expect(css).toMatch(new RegExp(`${R}\\.nav-focus-stuck\\s*\\{[^}]*animation:\\s*none`));
+    const reduce = ':root[data-motion="reduce"] ';
+    expect(declaration(block(`${reduce}.nav-focus-stuck`), 'animation')).toBe('none');
     // The fading arm needs its OWN rule. It is a two-class selector, so a bare
     // `.nav-focus-stuck` override could lose to it and leave it animating.
-    expect(css).toMatch(
-      new RegExp(`${R}\\.nav-focus-stuck\\.nav-focus-fading\\s*\\{[^}]*animation:\\s*none`),
-    );
+    expect(declaration(block(`${reduce}.nav-focus-stuck.nav-focus-fading`), 'animation')).toBe('none');
     // Keyed on the resolved attribute alone, so the in-app Motion setting reaches
     // it in both directions.
     expect(css).not.toMatch(/prefers-reduced-motion/);
@@ -303,5 +299,28 @@ describe('nav focus marker paint: background highlight, not a frame', () => {
       .toMatch(/calc\(0\.45s \* var\(--duration-scale\)\)/);
     expect(declaration(block('.nav-focus-stuck.nav-focus-fading'), 'animation'))
       .toMatch(/calc\(0\.8s \* var\(--duration-scale\)\)/);
+  });
+});
+
+// The arrival marker (components/shared/ArrivalList.tsx) wears the same light, so
+// "this is new" and "you landed here" read as one cue. It shares the rules rather
+// than copying them, so a retune of the nav marker reaches it too.
+describe('arrival marker paint: the nav marker light, from the same rules', () => {
+  const reduce = ':root[data-motion="reduce"] ';
+  const pairs: [string, string][] = [
+    ['.nav-focus-stuck', '.arrival-marker'],
+    ['.nav-focus-stuck.nav-focus-fading', '.arrival-marker.arrival-marker-fading'],
+    [`${reduce}.nav-focus-stuck`, `${reduce}.arrival-marker`],
+    [`${reduce}.nav-focus-stuck.nav-focus-fading`, `${reduce}.arrival-marker.arrival-marker-fading`],
+  ];
+
+  it.each(pairs)('%s and %s share one rule', (nav, arrival) => {
+    expect(block(arrival)).not.toBe('');
+    expect(block(arrival)).toBe(block(nav));
+  });
+
+  it('writes the wash once', () => {
+    const outsideKeyframes = css.replace(/@keyframes[^{]*\{[\s\S]*?\n\}/g, '');
+    expect(outsideKeyframes.match(/inset 0 0 0 100vmax/g)).toHaveLength(1);
   });
 });

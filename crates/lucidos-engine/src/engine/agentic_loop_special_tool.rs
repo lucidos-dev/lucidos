@@ -228,17 +228,19 @@ impl Relation {
                  thread finishes, this conversation will automatically resume with its \
                  results — you don't need to check on it. Continue with other work or \
                  tell the user you've delegated this subtask in the {ws} workspace: \
-                 [Open thread](thread:{ws}/{tid})",
+                 [Open thread]({link})",
                 ws = workspace,
-                tid = child_thread_id
+                tid = child_thread_id,
+                link = crate::core::store::thread_link(workspace, child_thread_id),
             ),
             Self::Top => format!(
                 "Top-level thread started in workspace '{ws}' (thread_id: {tid}). It \
                  runs independently and will NOT report back to this conversation. Tell \
                  the user you've started a separate thread in the {ws} workspace for \
-                 them to follow: [Open thread](thread:{ws}/{tid})",
+                 them to follow: [Open thread]({link})",
                 ws = workspace,
-                tid = child_thread_id
+                tid = child_thread_id,
+                link = crate::core::store::thread_link(workspace, child_thread_id),
             ),
         }
     }
@@ -278,19 +280,21 @@ impl Relation {
             Self::Child => format!(
                 "{label} session started in workspace '{ws}' (thread_id: {tid}). \
                  Tell the user you've started a new {label} thread in the {ws} \
-                 workspace and include this link: [Open thread](thread:{ws}/{tid})",
+                 workspace and include this link: [Open thread]({link})",
                 label = label,
                 ws = workspace,
-                tid = cc_thread_id
+                tid = cc_thread_id,
+                link = crate::core::store::thread_link(workspace, cc_thread_id),
             ),
             Self::Top => format!(
                 "Top-level {label} session started in workspace '{ws}' (thread_id: \
                  {tid}). It runs independently and will NOT report back to this \
                  conversation. Include the link in your reply so the user can follow it: \
-                 [Open thread](thread:{ws}/{tid})",
+                 [Open thread]({link})",
                 label = label,
                 ws = workspace,
-                tid = cc_thread_id
+                tid = cc_thread_id,
+                link = crate::core::store::thread_link(workspace, cc_thread_id),
             ),
         }
     }

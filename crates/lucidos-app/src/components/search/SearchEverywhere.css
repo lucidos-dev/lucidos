@@ -107,6 +107,25 @@
     color: var(--accent);
 }
 
+/* A category with no hits for the query. Still a button: its tab lists
+   nothing, but the reader may want to see that. */
+.search-everywhere-tab[data-empty] {
+    color: var(--text-muted);
+    opacity: 0.5;
+}
+
+.search-everywhere-tab-count {
+    margin-left: 0.375rem;
+    font-size: var(--font-size-xs);
+    font-variant-numeric: tabular-nums;
+    color: var(--text-muted);
+}
+
+.search-everywhere-tab.active .search-everywhere-tab-count {
+    color: inherit;
+    opacity: 0.7;
+}
+
 /* The transparent outline is the forced-colors fallback, same as
    .icon-btn:focus-visible. */
 .search-everywhere-tab:focus-visible {

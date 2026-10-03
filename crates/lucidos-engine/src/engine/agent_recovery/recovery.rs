@@ -1760,6 +1760,14 @@ pub(crate) async fn settle_unresumed_switch_threads(
     }
 }
 
+/// The events that start a turn, as an SQL list, for the two boot settles.
+macro_rules! turn_start_events {
+    () => {
+        "'MessageReceived','TriggerStarted','ChildThreadCompleted',\
+         'ContinuationRequested','ContinuationStarted','CodingAgentUserMessageSent'"
+    };
+}
+
 /// The start of a thread's latest turn, when that turn was interrupted: no
 /// terminator came after it, and either it did something or it was never
 /// going to run on its own. Two starts DO run on their own, so a bare one is
@@ -1774,9 +1782,9 @@ const INTERRUPTED_TURN_START_SQL: &str = concat!(
     "WITH start AS ( \
         SELECT id, event_type, payload->>'channel' AS channel, sequence FROM events \
         WHERE aggregate = 'thread' AND aggregate_id = $1::text \
-          AND event_type IN ('MessageReceived','TriggerStarted','ChildThreadCompleted', \
-                             'ContinuationRequested','ContinuationStarted', \
-                             'CodingAgentUserMessageSent') \
+          AND event_type IN (",
+    turn_start_events!(),
+    ") \
         ORDER BY sequence DESC LIMIT 1 \
     ), marks AS ( \
         SELECT MAX(sequence) FILTER (WHERE event_type IN (",
@@ -1793,9 +1801,10 @@ const INTERRUPTED_TURN_START_SQL: &str = concat!(
            OR s.event_type NOT IN ('ChildThreadCompleted','ContinuationRequested'))"
 );
 
-/// The last boot step that touches thread status: settle every thread still
-/// `running` once recovery has had its turn. No turn runs at boot, so each one
-/// is either a turn the restart interrupted or a status write no event backs.
+/// The boot step that settles every thread still `running`, once recovery has
+/// had its turn. Only [`settle_stranded_trigger_runs`] runs after it. No turn
+/// runs at boot, so each one is either a turn the restart interrupted or a
+/// status write no event backs.
 ///
 /// - **An interrupted turn** gets `ResponseAborted { RecoveryAfterRestart }`,
 ///   what the chat sweep emits, so it reads "Response interrupted" with a
@@ -1879,4 +1888,90 @@ async fn settle_one_orphaned_running_thread(
         tid
     );
     Ok(())
+}
+
+/// Trigger roots left `idle` in the inbox over a bare `TriggerStarted`: the
+/// latest turn start, with nothing after it that ends the run. `$1` is the
+/// idle status and `$2` the inbox state.
+///
+/// Every filter keeps a decision out of the sweep's hands:
+///
+/// - `idle` skips a thread parked on the user (ADR 0259). The running settle
+///   has already ended every `running` row.
+/// - The inbox skips a thread the user archived, since an abort moves a
+///   thread to the inbox.
+/// - `TriggerCompleted` counts as an end: the run recorded its completion.
+const STRANDED_TRIGGER_RUNS_SQL: &str = concat!(
+    "SELECT ts.thread_id, s.id, s.channel FROM thread_summaries ts \
+     CROSS JOIN LATERAL ( \
+        SELECT id, event_type, payload->>'channel' AS channel, sequence FROM events \
+        WHERE aggregate = 'thread' AND aggregate_id = ts.thread_id::text \
+          AND event_type IN (",
+    turn_start_events!(),
+    ") \
+        ORDER BY sequence DESC LIMIT 1 \
+     ) s \
+     WHERE ts.source = 'trigger' AND ts.parent_thread_id IS NULL \
+       AND ts.status = $1 AND ts.archive_state = $2 \
+       AND s.event_type = 'TriggerStarted' \
+       AND NOT EXISTS ( \
+        SELECT 1 FROM events t \
+        WHERE t.aggregate = 'thread' AND t.aggregate_id = ts.thread_id::text \
+          AND t.sequence > s.sequence \
+          AND t.event_type IN (",
+    crate::engine::chat::recovery::turn_terminal_events!(),
+    ",'TriggerCompleted'))"
+);
+
+/// Settle the trigger runs a restart cut off before any activity, whose
+/// `running` an event-less write already turned to `idle`. The running settle
+/// never sees them, and the chat sweep needs activity after the start.
+///
+/// Each gets the running settle's `ResponseAborted { RecoveryAfterRestart }`.
+/// The lifecycle contract then picks the section: an unattended run archives,
+/// while a review run or a pinned one stays in the inbox (ADR 0312). Nothing
+/// resumes the run, so a crash cannot loop.
+pub async fn settle_stranded_trigger_runs(
+    pool: &sqlx::PgPool,
+    bus: &crate::engine::event_bus::EventBus,
+) {
+    use crate::engine::chat::recovery::{
+        emit_restart_abort, start_channel, RESTART_INTERRUPTED_TEXT,
+    };
+    use crate::engine::thread_lifecycle::ArchiveState;
+
+    let stranded: Vec<(Uuid, Uuid, Option<String>)> =
+        match sqlx::query_as(STRANDED_TRIGGER_RUNS_SQL)
+            .bind(ThreadStatus::Idle.as_str())
+            .bind(ArchiveState::Inbox.as_str())
+            .fetch_all(pool)
+            .await
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                log!("[Recovery] stranded trigger run sweep query failed: {}", e);
+                return;
+            }
+        };
+    for (tid, start_id, stamped_channel) in stranded {
+        match emit_restart_abort(
+            bus,
+            tid,
+            RESTART_INTERRUPTED_TEXT.to_string(),
+            Some(start_id),
+            start_channel(stamped_channel.as_deref(), Some("TriggerStarted")),
+        )
+        .await
+        {
+            Ok(()) => log!(
+                "[Recovery] Settled stranded trigger run {}: a restart cut it off",
+                tid
+            ),
+            Err(e) => log!(
+                "[Recovery] Failed to settle stranded trigger run {}: {}",
+                tid,
+                e
+            ),
+        }
+    }
 }

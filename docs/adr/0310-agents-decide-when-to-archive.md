@@ -25,7 +25,8 @@ Agents get an archive action and decide when to use it:
   stated: the tool's own thread, or the verified origin token on the route. It
   may archive **itself** or **one of its own direct children**, and nothing
   else. No standing instruction widens it. A route caller with no token is the
-  user, exactly as on the detach route.
+  user, exactly as on the detach route. ADR 0349 adds one wider path, separate
+  from this action: an `apply_triage` the user replied to.
 - **It is the Archive button's cascade**, not a copy. The same gate refuses the
   same states with the same slugs, `parent_not_archivable` for a thread waiting
   on the user (ADR 0259). The target's own sub-threads go with it, as they do

@@ -1,5 +1,5 @@
 import { useState, useEffect, useLayoutEffect, useMemo, useRef } from 'preact/hooks';
-import { filePreviewRevision, filePreviewSource, filePreviewWrap, filePreviewEditing, handshakeScriptsVersion, showToast } from '../../store/store';
+import { filePreviewRevision, filePreviewSource, filePreviewWrap, filePreviewEditing, handshakeScriptsVersion, showToast, TOAST_AUTO_DISMISS_MS } from '../../store/store';
 import { lucidos } from '@lucidos/sdk';
 import { MarkdownDocument } from './MarkdownDocument';
 import { highlightFileLines } from '../../utils/syntaxHighlight';
@@ -14,9 +14,10 @@ import { handshakeWarningFor, type HandshakeScriptState } from './handshakeAppro
 import { useVersionedRefresh } from '../../hooks/useVersionedRefresh';
 import { openFilePreview, refreshFilePreview, registerPreviewTextBody, reportPreviewTextSettled } from '../../store/actions/artifacts';
 import { usePanelRefresh } from '../../hooks/usePanelRefresh';
-import { RENDERABLE_EXTS } from './previewExts';
+import { RENDERABLE_EXTS, isEditableDataFile } from './previewExts';
 import { dataPreviewBody, previewExt, type DataPreviewBody } from './previewBody';
 import { errorDetail } from '../../utils/errorDetail';
+import { toggleTaskListCheckbox, countTaskListItems } from '../../utils/taskListToggle';
 import { LoadableError } from '../shared/LoadableError';
 import { LineNumberedCode, fileRows } from './LineNumberedCode';
 import { FileSourceSkeleton, ProseSkeleton } from './previewSkeletons';
@@ -96,6 +97,87 @@ function fetchTextBody(url: string, path: string, withCapability: boolean): Prom
     })
     : Promise.resolve();
   return Promise.all([fetchText(url), pass]).then(([text]) => text);
+}
+
+/** One promise chain per file path, so two checkbox toggles on the SAME file
+ *  never race each other's read-modify-write. A different file always runs
+ *  right away, and the map holds an entry only while a toggle for that path
+ *  is in flight. */
+const checkboxToggleQueues = new Map<string, Promise<unknown>>();
+
+/** Toggle the Nth task-list checkbox in the data file at `path`, and persist
+ *  it through the same write path the file editor uses.
+ *
+ *  Queued per file: a second toggle fired while an earlier one on the same
+ *  file is still saving waits for it, rather than racing it. Two rapid
+ *  toggles on the same file could otherwise race: the second reads the file
+ *  before the first one's save lands. That loses the first toggle on disk
+ *  and reverts its just-shown success.
+ *
+ *  Re-reads `url` immediately before toggling, rather than reusing the
+ *  already-rendered content. The engine marks data reads `no-cache`, so this
+ *  is always the current file: a concurrent edit elsewhere in it is never
+ *  overwritten by a stale copy.
+ *
+ *  `expectedCount` is the task-item count the reader actually saw when they
+ *  clicked (from the rendered content). A concurrent edit can add or remove
+ *  an earlier task item, shifting every later index, without
+ *  `toggleTaskListCheckbox` ever returning `null`. Comparing counts first
+ *  catches that shift. It does not catch a same-count reorder, a narrower
+ *  case this does not try to solve.
+ *
+ *  Returns the file's new full text on success, so the caller can adopt it
+ *  right away instead of waiting on the save's own file-change event.
+ *  Returns `null` (after toasting) on any failure, so the caller can revert
+ *  its optimistic checkbox state.
+ *
+ *  `isLatest` tells the caller whether another toggle on this file is
+ *  already queued behind this one. Only the last-queued toggle should adopt
+ *  its text into shared state. An earlier one doing the same would replace
+ *  the whole subtree too soon. That wipes out a later toggle's own
+ *  in-flight checkbox state.
+ *
+ *  Toasts under one key per file: a toggle fired while an earlier one is
+ *  still saving replaces that toast rather than stacking a new one. */
+export function toggleDataFileCheckbox(
+  path: string, url: string, taskIndex: number, expectedCount: number,
+): Promise<{ content: string; isLatest: boolean } | null> {
+  const queuedAfter = checkboxToggleQueues.get(path) ?? Promise.resolve();
+  // Declared ahead of the IIFE that assigns it: the body reads `settled`
+  // past its own first `await`, by which point the assignment below has
+  // already run.
+  let settled!: Promise<{ content: string; isLatest: boolean } | null>;
+  settled = (async () => {
+    await queuedAfter;
+    const content = await runToggle(path, url, taskIndex, expectedCount);
+    const isLatest = checkboxToggleQueues.get(path) === settled;
+    if (isLatest) checkboxToggleQueues.delete(path);
+    return content === null ? null : { content, isLatest };
+  })();
+  checkboxToggleQueues.set(path, settled);
+  return settled;
+}
+
+async function runToggle(path: string, url: string, taskIndex: number, expectedCount: number): Promise<string | null> {
+  const toastKey = `task-toggle:${path}`;
+  try {
+    const fresh = await fetchText(url);
+    if (countTaskListItems(fresh) !== expectedCount) {
+      showToast(`Could not update the checkbox: ${path} changed`, 'error', { key: toastKey });
+      return null;
+    }
+    const updated = toggleTaskListCheckbox(fresh, taskIndex);
+    if (updated === null) {
+      showToast(`Could not update the checkbox: ${path} changed`, 'error', { key: toastKey });
+      return null;
+    }
+    await saveDataFile(path, updated);
+    showToast('Saved', 'success', { key: toastKey, autoDismissMs: TOAST_AUTO_DISMISS_MS });
+    return updated;
+  } catch (e) {
+    showToast(`Failed to update checkbox: ${errorDetail(e)}`, 'error', { key: toastKey });
+    return null;
+  }
 }
 
 interface Props {
@@ -406,7 +488,7 @@ function TextContent({ body, url, path, revision, servesPanel }: {
   const sourceMode = body === 'source' && RENDERABLE_EXTS.includes(ext);
   useEffect(() => (servesPanel ? registerPreviewTextBody() : undefined), [servesPanel]);
   const withCapability = wantsPreviewCapability(body, path);
-  const { loadable, showLoading } = useLoadableFetch<string>(() => fetchTextBody(url, path, withCapability), [url, withCapability], {
+  const { loadable, setLoadable, showLoading } = useLoadableFetch<string>(() => fetchTextBody(url, path, withCapability), [url, withCapability], {
     keepLoadedWhileRefetching: true,
     onSettled: servesPanel ? () => reportPreviewTextSettled(revision) : undefined,
   });
@@ -448,7 +530,30 @@ function TextContent({ body, url, path, revision, servesPanel }: {
     // shell, and the whole workspace reloads. Same routing as the HTML preview,
     // minus the fragment arm (see `handlePreviewLinkClick`).
     if (body === 'markdown') {
-      return <MarkdownDocument content={content} onClick={(e) => handlePreviewLinkClick(e, path)} />;
+      const editable = isEditableDataFile(path);
+      // Captured per render, from what the reader actually sees: the count a
+      // toggle's fresh read must still match, or it refuses to write (see
+      // toggleDataFileCheckbox). A new closure each render is fine here: the
+      // checkbox-wiring effect reads it through a ref, not as a dependency.
+      //
+      // Only `isLatest` adopts the saved text as this component's own
+      // state. See `toggleDataFileCheckbox`'s docstring for why an earlier
+      // toggle in the same burst must not.
+      function handleToggleCheckbox(taskIndex: number): Promise<boolean> {
+        return toggleDataFileCheckbox(path, url, taskIndex, countTaskListItems(content)).then((result) => {
+          if (result === null) return false;
+          if (result.isLatest) setLoadable({ status: 'loaded', data: result.content });
+          return true;
+        });
+      }
+      return (
+        <MarkdownDocument
+          content={content}
+          onClick={(e) => handlePreviewLinkClick(e, path)}
+          editable={editable}
+          onToggleCheckbox={editable ? handleToggleCheckbox : undefined}
+        />
+      );
     }
     if (body === 'csv') return <div dangerouslySetInnerHTML={{ __html: renderCsvTable(content) }} />;
     if (body === 'slides') return <SlidesPreview content={content} />;

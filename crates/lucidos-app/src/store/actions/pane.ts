@@ -18,6 +18,8 @@ import { isMobile } from '../../utils/viewport';
 import { focusPaneMainControl, paneHolding, reconcilePaneFocus } from '../../components/layout/paneFocus';
 import { isTextInput } from '../../utils/dom';
 import { markNavigationStart } from '../../utils/navigationMarks';
+import { threadFilterPanelOpen, openThreadFilterPanel, toggleThreadFilterPanel } from '../threadFilterPanel';
+import { openThreadSearch, closeThreadSearch, focusThreadSearchInput } from '../threadSearch';
 
 /** Set the focused pane AND move real DOM focus into it. Used by the keyboard
  *  toggles/shortcuts so "focus pane" actually lands focus on the pane's main
@@ -258,6 +260,35 @@ export function showThreadList(): void {
   if (isMobile()) { navigateToPane('threads'); return; }
   threadDrawerOpen.value = true;
   if (splitRatio.value <= 0) setSplitRatio(DEFAULT_SPLIT_RATIO);
+}
+
+/** Whether the thread list is on screen: the threads pane on mobile, and an
+ *  open drawer on an expanded Conversation side on desktop. */
+export function threadListShown(): boolean {
+  if (isMobile()) return mobileView.value === 'threads';
+  return threadDrawerOpen.value && splitRatio.value > 0;
+}
+
+/** The filter shortcut. A hidden thread list comes back with its filters up,
+ *  and a shown one toggles them. The drawer takes focus, so Tab walks what it
+ *  now shows. Showing the filters puts thread search away, as the reverse does. */
+export function toggleThreadFilter(): void {
+  if (threadListShown()) toggleThreadFilterPanel();
+  else {
+    showThreadList();
+    openThreadFilterPanel();
+  }
+  if (threadFilterPanelOpen.value) closeThreadSearch();
+  if (!isMobile()) focusPaneAndControl('drawer');
+}
+
+/** The thread search shortcut: show the thread list, open its search bar and
+ *  put the caret in it once the bar has rendered. */
+export function startThreadSearch(): void {
+  showThreadList();
+  openThreadSearch();
+  if (!isMobile()) focusedPane.value = 'drawer';
+  requestAnimationFrame(() => focusThreadSearchInput());
 }
 
 /** The divider double-click: a collapsed split (either side) returns to the

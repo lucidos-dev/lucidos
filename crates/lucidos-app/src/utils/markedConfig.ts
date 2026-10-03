@@ -37,6 +37,20 @@ renderer.code = ({ text, lang, escaped }: Tokens.Code) => {
   return `<div class="code-block-wrapper" ${CODE_COPY_ATTR}="${COPY_ID_NONCE}"><div class="code-block-header">${langLabel}<button type="button" class="copy-btn code-block-copy-btn" aria-label="Copy code">${COPY_ICON}</button></div><pre><code>${body}</code></pre></div>`;
 };
 
+/** Marks a GFM task-list checkbox this renderer wrote, carrying the same
+ *  nonce as the copy markers above. Raw HTML in markdown passes through
+ *  unchanged, and DOMPurify keeps `data-*` by default. So an authored
+ *  `<input type="checkbox">` is otherwise indistinguishable in the DOM from
+ *  one `marked` generated for a real `- [ ]` line.
+ *  `MarkdownDocument`'s checkbox-toggle wiring only counts the latter when
+ *  mapping a click back to a source line (`taskListToggle.ts`). Querying
+ *  every checkbox would pick up the authored one too, shifting every later
+ *  index and toggling the wrong line. */
+export const TASK_CHECKBOX_ATTR = 'data-task-checkbox';
+
+renderer.checkbox = ({ checked }: Tokens.Checkbox): string =>
+  `<input ${TASK_CHECKBOX_ATTR}="${COPY_ID_NONCE}"${checked ? ' checked' : ''} disabled type="checkbox"> `;
+
 /** Marks an email the GFM autolinker found in bare text, so `renderMarkdown`
  *  can unwrap one sitting inside a path. Its token's `raw` is the bare address;
  *  an authored `<x@y>` or `[x](mailto:x)` keeps its brackets in `raw`. */

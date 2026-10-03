@@ -3,6 +3,7 @@ import { CheckIcon, ReloadIcon } from '../shared/icons';
 import { panelRefreshAvailable, panelRefreshing, panelRefreshSucceeded, runPanelRefresh } from '../../store/panelRefresh';
 import { panelOverlay, parseRepoPath, type PanelOverlay } from '../../store/store';
 import { renderHeaderAction, type HeaderActionSpec } from './headerActions';
+import { tooltipWithShortcut } from '../../store/actions/keybindings';
 
 /** How long the spinner shows at least, so a quick refresh reads as one before
  *  it turns into the check. Holds only this status icon, never the content. */
@@ -50,6 +51,12 @@ export function refreshPinnedToDiff(overlay: PanelOverlay): boolean {
  *  the preview drops its registration in an effect, after this render. */
 export function panelRefreshLive(overlay: PanelOverlay, available: boolean): boolean {
   return available && !refreshPinnedToDiff(overlay);
+}
+
+/** The Refresh shortcut. It runs only where the header's Refresh can, so a
+ *  diff stays pinned to its change. */
+export function refreshPanelIfLive(): void {
+  if (panelRefreshLive(panelOverlay.value, panelRefreshAvailable.value)) void runPanelRefresh();
 }
 
 const LABELS: Record<RefreshIndicatorState, string | undefined> = {
@@ -122,7 +129,7 @@ export function ContentRefreshButton() {
   const spec: HeaderActionSpec = {
     key: 'refresh',
     label: LABELS[state] ?? 'Refresh',
-    tooltip: 'Refresh',
+    tooltip: tooltipWithShortcut('Refresh', 'refreshPanel'),
     icon: () => <RefreshGlyphs />,
     extraClass: 'content-refresh-btn',
   };

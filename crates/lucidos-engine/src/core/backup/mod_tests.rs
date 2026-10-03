@@ -862,51 +862,95 @@ fn exact_len_cuts_a_grown_source_and_zero_fills_a_shrunk_one() {
 }
 
 /// A file written while the backup archives it must not misalign the entries
-/// after it. The header is sized from one stat, and the file then grows before
-/// its bytes are read. Copied raw, the extra bytes land where the next header
-/// belongs, and the restore fails on every entry that follows.
+/// after it. The header is sized from one stat, and the source then yields a
+/// different length. Copied raw, the next header lands off its block, and the
+/// restore fails on every entry that follows.
+///
+/// The drift crosses a 512-byte tar block both ways. Inside one block, tar's
+/// own zero padding hides it, so the test would pass without the bound.
 #[test]
-fn a_file_that_grows_while_archived_keeps_the_archive_readable() {
+fn a_source_that_grows_or_shrinks_mid_copy_keeps_later_entries_aligned() {
     use std::io::Read;
 
     let dir = tempfile::tempdir().unwrap();
-    let growing = dir.path().join("growing.log");
     let after = dir.path().join("after.txt");
-    std::fs::write(&growing, "first").unwrap();
     std::fs::write(&after, "intact").unwrap();
 
-    let file = std::fs::File::open(&growing).unwrap();
-    let metadata = file.metadata().unwrap();
-    // The writer appends between the stat and the read.
-    std::fs::write(&growing, "first, and then a great deal more").unwrap();
-
-    let mut buf: Vec<u8> = Vec::new();
-    {
-        let mut builder = tar::Builder::new(&mut buf);
-        let mut header = header_for_file(&metadata);
-        let mut content = ExactLen::new(&file, metadata.len());
-        builder
-            .append_data(&mut header, Path::new("growing.log"), &mut content)
+    for (declared, source_len) in [(3u64, 600usize), (2000, 100)] {
+        let source = vec![b'x'; source_len];
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut buf);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(declared);
+            header.set_mode(0o644);
+            header.set_cksum();
+            append_exact(
+                &mut builder,
+                &mut header,
+                Path::new("drift.log"),
+                &source[..],
+            )
             .unwrap();
-        append_file(&mut builder, &after, Path::new("after.txt")).unwrap();
-        builder.finish().unwrap();
-    }
+            append_file(&mut builder, &after, Path::new("after.txt")).unwrap();
+            builder.finish().unwrap();
+        }
 
-    let mut archive = tar::Archive::new(&buf[..]);
-    let mut entries: Vec<(String, String)> = Vec::new();
-    for entry in archive.entries().unwrap() {
-        let mut entry = entry.unwrap();
-        let name = entry.path().unwrap().display().to_string();
-        let mut body = String::new();
-        entry.read_to_string(&mut body).unwrap();
-        entries.push((name, body));
+        let mut archive = tar::Archive::new(&buf[..]);
+        let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+        for entry in archive.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            let name = entry.path().unwrap().display().to_string();
+            let mut body = Vec::new();
+            entry.read_to_end(&mut body).unwrap();
+            entries.push((name, body));
+        }
+
+        let kept = source_len.min(declared as usize);
+        let mut expected = vec![b'x'; kept];
+        expected.resize(declared as usize, 0);
+        assert_eq!(
+            entries,
+            vec![
+                ("drift.log".to_string(), expected),
+                ("after.txt".to_string(), b"intact".to_vec()),
+            ],
+            "declared {declared} bytes, source yielded {source_len}"
+        );
     }
+}
+
+/// A file that changed during its read is reported, never stored silently.
+/// The bound keeps the archive well formed, but the copy is torn.
+#[test]
+fn copy_drift_names_how_a_file_changed_during_its_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("live.log");
+    std::fs::write(&path, "first").unwrap();
+    let before = std::fs::metadata(&path).unwrap();
+
+    assert_eq!(copy_drift(&before, &before, 0), None);
     assert_eq!(
-        entries,
-        vec![
-            ("growing.log".to_string(), "first".to_string()),
-            ("after.txt".to_string(), "intact".to_string()),
-        ]
+        copy_drift(&before, &before, 2),
+        Some(CopyDrift::Shrank { padded: 2 })
+    );
+
+    std::fs::write(&path, "first, and more").unwrap();
+    let grown = std::fs::metadata(&path).unwrap();
+    assert_eq!(
+        copy_drift(&before, &grown, 0),
+        Some(CopyDrift::Grew { kept: 5 })
+    );
+
+    // Same length, new bytes: only the mtime tells.
+    std::fs::write(&path, "FIRST").unwrap();
+    let file = std::fs::File::options().write(true).open(&path).unwrap();
+    file.set_modified(before.modified().unwrap() + std::time::Duration::from_secs(60))
+        .unwrap();
+    let rewritten = file.metadata().unwrap();
+    assert_eq!(
+        copy_drift(&before, &rewritten, 0),
+        Some(CopyDrift::Rewritten)
     );
 }
 

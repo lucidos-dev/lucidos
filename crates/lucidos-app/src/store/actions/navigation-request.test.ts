@@ -161,6 +161,12 @@ describe('handleNavigationRequest — plugins update deep-link', () => {
     expect(switchMenuItem).toHaveBeenCalledWith('plugins');
     expect(pluginScrollTarget.value).toBeNull();
   });
+
+  it('drops an earlier unconsumed focus target when no id is given', () => {
+    pluginScrollTarget.value = 'super-slides';
+    handleNavigationRequest({ target: 'plugins' });
+    expect(pluginScrollTarget.value).toBeNull();
+  });
 });
 
 describe('handleNavigationRequest — file target', () => {

@@ -9,6 +9,13 @@ fn collect_envs(
         .collect()
 }
 
+/// The command alone, for tests that only read its flags and env.
+fn session_command(args: &SpawnArgs<'_>, cli_dir: Option<&Path>) -> tokio::process::Command {
+    build_command(args, cli_dir)
+        .expect("the command builds")
+        .cmd
+}
+
 fn test_spawn_args<'a>(
     worktree: &'a Path,
     workspace: &'a Path,
@@ -119,7 +126,7 @@ fn build_command_injects_user_env_vars_and_engine_wins() {
         permission_mode: None,
         additional_directories: &[],
     };
-    let cmd = build_command(&args, None);
+    let cmd = session_command(&args, None);
     let env = collect_envs(&cmd);
     assert_eq!(
         env.get(std::ffi::OsStr::new("MY_FLAG"))
@@ -153,7 +160,7 @@ fn build_command_pins_claude_config_dir_over_user_env() {
         dir: "/home/u/.claude".to_string(),
     };
     args.account_pin = Some(&pin);
-    let cmd = build_command(&args, None);
+    let cmd = session_command(&args, None);
     let env = collect_envs(&cmd);
     assert_eq!(
         env.get(std::ffi::OsStr::new("CLAUDE_CONFIG_DIR"))
@@ -181,7 +188,7 @@ fn build_command_keeps_a_default_profile_pin_unset() {
         dir: "/home/u/.claude".to_string(),
     };
     args.account_pin = Some(&pin);
-    let cmd = build_command(&args, None);
+    let cmd = session_command(&args, None);
     let removed = cmd
         .as_std()
         .get_envs()
@@ -207,7 +214,7 @@ fn build_command_leaves_user_claude_config_dir_when_not_pinned() {
     let mut args = test_spawn_args(p, p, thread_id);
     args.user_env_vars = &user_env;
     // account_pin left None (fresh session)
-    let cmd = build_command(&args, None);
+    let cmd = session_command(&args, None);
     let env = collect_envs(&cmd);
     assert_eq!(
         env.get(std::ffi::OsStr::new("CLAUDE_CONFIG_DIR"))
@@ -221,7 +228,7 @@ fn build_command_leaves_user_claude_config_dir_when_not_pinned() {
 fn build_command_sets_lucidos_thread_id_env() {
     let thread_id = uuid::Uuid::new_v4();
     let p = std::path::Path::new("/tmp");
-    let cmd = build_command(&test_spawn_args(p, p, thread_id), None);
+    let cmd = session_command(&test_spawn_args(p, p, thread_id), None);
     let env = collect_envs(&cmd);
     let value = env
         .get(std::ffi::OsStr::new("LUCIDOS_THREAD_ID"))
@@ -234,7 +241,7 @@ fn build_command_sets_lucidos_workspace_env() {
     let thread_id = uuid::Uuid::new_v4();
     let workspace = std::path::Path::new("/some/workspace");
     let worktree = std::path::Path::new("/some/workspace/.lucidos/worktrees/abc");
-    let cmd = build_command(&test_spawn_args(worktree, workspace, thread_id), None);
+    let cmd = session_command(&test_spawn_args(worktree, workspace, thread_id), None);
     let env = collect_envs(&cmd);
     assert_eq!(
         env.get(std::ffi::OsStr::new("LUCIDOS_WORKSPACE"))
@@ -256,7 +263,7 @@ fn build_command_sets_cc_effort_level_env_from_reasoning_effort() {
     let p = std::path::Path::new("/tmp");
     let mut args = test_spawn_args(p, p, thread_id);
     args.reasoning_effort = Some("max");
-    let cmd = build_command(&args, None);
+    let cmd = session_command(&args, None);
     let env = collect_envs(&cmd);
     let value = env
         .get(std::ffi::OsStr::new("CLAUDE_CODE_EFFORT_LEVEL"))
@@ -270,7 +277,7 @@ fn build_command_sets_cc_effort_level_env_from_reasoning_effort() {
 fn build_command_omits_cc_effort_level_env_when_no_effort_resolved() {
     let thread_id = uuid::Uuid::new_v4();
     let p = std::path::Path::new("/tmp");
-    let cmd = build_command(&test_spawn_args(p, p, thread_id), None);
+    let cmd = session_command(&test_spawn_args(p, p, thread_id), None);
     assert!(
         !cmd.as_std()
             .get_envs()
@@ -305,13 +312,13 @@ fn build_command_runs_at_the_effort_the_thread_records() {
     args.user_env_vars = &user_env;
     args.reasoning_effort = recorded.as_deref();
     assert_eq!(
-        spawned_effort(&build_command(&args, None)),
+        spawned_effort(&session_command(&args, None)),
         recorded.as_deref().map(Into::into)
     );
 
     args.reasoning_effort = Some("max");
     assert_eq!(
-        spawned_effort(&build_command(&args, None)).as_deref(),
+        spawned_effort(&session_command(&args, None)).as_deref(),
         Some(std::ffi::OsStr::new("max")),
         "a pinned effort must beat the workspace env var"
     );
@@ -325,7 +332,7 @@ fn build_command_sets_lucidos_event_id_when_spawning_event_id_set() {
     let thread_id = uuid::Uuid::new_v4();
     let event_id = uuid::Uuid::new_v4();
     let p = std::path::Path::new("/tmp");
-    let cmd = build_command(
+    let cmd = session_command(
         &test_spawn_args_with_event(p, p, thread_id, Some(event_id)),
         None,
     );
@@ -343,7 +350,7 @@ fn build_command_omits_lucidos_event_id_when_spawning_event_id_none() {
     // `caller_event_id` rather than stamping a stale or fabricated id.
     let thread_id = uuid::Uuid::new_v4();
     let p = std::path::Path::new("/tmp");
-    let cmd = build_command(&test_spawn_args_with_event(p, p, thread_id, None), None);
+    let cmd = session_command(&test_spawn_args_with_event(p, p, thread_id, None), None);
     let env = collect_envs(&cmd);
     assert!(
         !env.contains_key(std::ffi::OsStr::new("LUCIDOS_EVENT_ID")),
@@ -361,7 +368,7 @@ fn build_command_sets_lucidos_session_kind_when_interactive() {
     let p = std::path::Path::new("/tmp");
     let mut args = test_spawn_args(p, p, thread_id);
     args.interactive = true;
-    let cmd = build_command(&args, None);
+    let cmd = session_command(&args, None);
     let env = collect_envs(&cmd);
     assert_eq!(
         env.get(std::ffi::OsStr::new("LUCIDOS_SESSION_KIND"))
@@ -379,7 +386,7 @@ fn build_command_omits_lucidos_session_kind_when_not_interactive() {
     let thread_id = uuid::Uuid::new_v4();
     let p = std::path::Path::new("/tmp");
     let args = test_spawn_args(p, p, thread_id); // interactive=false by default
-    let cmd = build_command(&args, None);
+    let cmd = session_command(&args, None);
     let env = collect_envs(&cmd);
     assert!(!env.contains_key(std::ffi::OsStr::new("LUCIDOS_SESSION_KIND")),);
 }
@@ -392,7 +399,7 @@ fn build_command_sets_lucidos_repo_when_repo_name_set() {
     // worktrees from multiple repos.
     let thread_id = uuid::Uuid::new_v4();
     let p = std::path::Path::new("/tmp");
-    let cmd = build_command(
+    let cmd = session_command(
         &test_spawn_args_with_repo(p, p, thread_id, Some("example-repo")),
         None,
     );
@@ -410,7 +417,7 @@ fn build_command_omits_lucidos_repo_when_repo_name_none() {
     // default repo rather than stamping a stale or fabricated name.
     let thread_id = uuid::Uuid::new_v4();
     let p = std::path::Path::new("/tmp");
-    let cmd = build_command(&test_spawn_args_with_repo(p, p, thread_id, None), None);
+    let cmd = session_command(&test_spawn_args_with_repo(p, p, thread_id, None), None);
     let env = collect_envs(&cmd);
     assert!(
         !env.contains_key(std::ffi::OsStr::new("LUCIDOS_REPO")),
@@ -423,7 +430,7 @@ fn build_command_prepends_cli_dir_to_path() {
     let thread_id = uuid::Uuid::new_v4();
     let p = std::path::Path::new("/tmp");
     let cli_dir = std::path::Path::new("/opt/lucidos/bin");
-    let cmd = build_command(&test_spawn_args(p, p, thread_id), Some(cli_dir));
+    let cmd = session_command(&test_spawn_args(p, p, thread_id), Some(cli_dir));
     let env = collect_envs(&cmd);
     let path = env
         .get(std::ffi::OsStr::new("PATH"))
@@ -456,7 +463,7 @@ fn build_command_uses_permission_prompt_tool_not_skip_permissions() {
     let cli = tempfile::TempDir::new().expect("tempdir");
     let lucidos_path = cli.path().join(LUCIDOS_BIN_NAME);
     std::fs::write(&lucidos_path, b"#!/bin/sh\n").expect("write fake lucidos");
-    let cmd = build_command(&test_spawn_args(p, p, thread_id), Some(cli.path()));
+    let cmd = session_command(&test_spawn_args(p, p, thread_id), Some(cli.path()));
     let args = collect_args(&cmd);
 
     assert!(
@@ -567,7 +574,7 @@ fn build_command_passes_settings_flag_with_workspace_path() {
     let thread_id = uuid::Uuid::new_v4();
     let workspace = std::path::Path::new("/some/workspace");
     let worktree = std::path::Path::new("/some/workspace/.lucidos/worktrees/abc");
-    let cmd = build_command(&test_spawn_args(worktree, workspace, thread_id), None);
+    let cmd = session_command(&test_spawn_args(worktree, workspace, thread_id), None);
     let args = collect_args(&cmd);
 
     let settings_idx = args
@@ -588,7 +595,7 @@ fn build_command_passes_settings_flag_with_workspace_path() {
 fn build_command_sets_permission_mode_accept_edits() {
     let thread_id = uuid::Uuid::new_v4();
     let p = std::path::Path::new("/tmp");
-    let cmd = build_command(&test_spawn_args(p, p, thread_id), None);
+    let cmd = session_command(&test_spawn_args(p, p, thread_id), None);
     let args = collect_args(&cmd);
 
     let mode_idx = args
@@ -617,7 +624,7 @@ fn build_command_includes_partial_messages_on_fresh_and_resumed_sessions() {
     let thread_id = uuid::Uuid::new_v4();
     let p = std::path::Path::new("/tmp");
 
-    let fresh = build_command(&test_spawn_args(p, p, thread_id), None);
+    let fresh = session_command(&test_spawn_args(p, p, thread_id), None);
     assert!(
         collect_args(&fresh)
             .iter()
@@ -627,7 +634,7 @@ fn build_command_includes_partial_messages_on_fresh_and_resumed_sessions() {
 
     let mut resumed_args = test_spawn_args(p, p, thread_id);
     resumed_args.resume_session_id = Some("sess-1");
-    let resumed = build_command(&resumed_args, None);
+    let resumed = session_command(&resumed_args, None);
     assert!(
         collect_args(&resumed)
             .iter()
@@ -645,7 +652,7 @@ fn build_command_sets_mcp_tool_timeout_to_effective_infinity() {
     // realistic user delay is covered.
     let thread_id = uuid::Uuid::new_v4();
     let p = std::path::Path::new("/tmp");
-    let cmd = build_command(&test_spawn_args(p, p, thread_id), None);
+    let cmd = session_command(&test_spawn_args(p, p, thread_id), None);
     let env = collect_envs(&cmd);
     let raw = env
         .get(std::ffi::OsStr::new("MCP_TOOL_TIMEOUT"))
@@ -672,7 +679,7 @@ fn build_command_sets_mcp_timeout_to_effective_infinity() {
     // bound is the user's patience.
     let thread_id = uuid::Uuid::new_v4();
     let p = std::path::Path::new("/tmp");
-    let cmd = build_command(&test_spawn_args(p, p, thread_id), None);
+    let cmd = session_command(&test_spawn_args(p, p, thread_id), None);
     let env = collect_envs(&cmd);
     let raw = env.get(std::ffi::OsStr::new("MCP_TIMEOUT")).expect(
         "MCP_TIMEOUT must be set so CC's MCP client doesn't cancel the permission RPC at 30s",
@@ -814,7 +821,7 @@ fn resolve_claude_binary_falls_back_when_no_home() {
 fn build_command_skips_path_injection_when_no_cli_dir() {
     let thread_id = uuid::Uuid::new_v4();
     let p = std::path::Path::new("/tmp");
-    let cmd = build_command(&test_spawn_args(p, p, thread_id), None);
+    let cmd = session_command(&test_spawn_args(p, p, thread_id), None);
     let env = collect_envs(&cmd);
     assert!(
         !env.contains_key(std::ffi::OsStr::new("PATH")),
@@ -833,7 +840,7 @@ fn build_command_forwards_host_protection_env_vars() {
     // integration: at minimum, LUCIDOS_HOST_PID is set to the engine's pid.
     let thread_id = uuid::Uuid::new_v4();
     let p = std::path::Path::new("/tmp");
-    let cmd = build_command(&test_spawn_args(p, p, thread_id), None);
+    let cmd = session_command(&test_spawn_args(p, p, thread_id), None);
     let env = collect_envs(&cmd);
     assert_eq!(
         env.get(std::ffi::OsStr::new("LUCIDOS_HOST_PID"))
@@ -853,7 +860,7 @@ fn build_command_carries_the_agent_compile_env() {
     // once and checks its shape. The helper's own tests pin the exact values.
     let thread_id = uuid::Uuid::new_v4();
     let p = std::path::Path::new("/tmp");
-    let cmd = build_command(&test_spawn_args(p, p, thread_id), None);
+    let cmd = session_command(&test_spawn_args(p, p, thread_id), None);
     let env = collect_envs(&cmd);
     let var = |key: &str| {
         env.get(std::ffi::OsStr::new(key))
@@ -933,7 +940,7 @@ fn build_command_raises_cc_byte_idle_deadline_past_the_engine_watchdog() {
     // the real constant so the two cannot drift into the wrong order.
     let thread_id = uuid::Uuid::new_v4();
     let p = std::path::Path::new("/tmp");
-    let cmd = build_command(&test_spawn_args(p, p, thread_id), None);
+    let cmd = session_command(&test_spawn_args(p, p, thread_id), None);
     let env = collect_envs(&cmd);
     let raw = env
         .get(std::ffi::OsStr::new("CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS"))
@@ -988,7 +995,7 @@ fn build_command_lets_a_workspace_env_var_override_the_byte_idle_deadline() {
     )];
     let mut args = test_spawn_args(p, p, thread_id);
     args.user_env_vars = &user_env;
-    let cmd = build_command(&args, None);
+    let cmd = session_command(&args, None);
     let env = collect_envs(&cmd);
     assert_eq!(
         env.get(std::ffi::OsStr::new("CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS"))
@@ -1019,7 +1026,7 @@ fn auto_opt_in(cmd: &tokio::process::Command) -> Option<std::ffi::OsString> {
 fn an_unset_preference_keeps_the_pre_existing_accept_edits_mode() {
     let thread_id = uuid::Uuid::new_v4();
     let p = std::path::Path::new("/tmp");
-    let cmd = build_command(&test_spawn_args(p, p, thread_id), None);
+    let cmd = session_command(&test_spawn_args(p, p, thread_id), None);
     assert_eq!(
         permission_mode_arg(&cmd).as_deref(),
         Some("acceptEdits"),
@@ -1040,7 +1047,7 @@ fn an_unrecognised_preference_falls_back_rather_than_reaching_cc() {
     for stored in ["", "  ", "garbage", "default", "bypassPermissions", "plan"] {
         let mut args = test_spawn_args(p, p, thread_id);
         args.permission_mode = Some(stored);
-        let cmd = build_command(&args, None);
+        let cmd = session_command(&args, None);
         assert_eq!(
             permission_mode_arg(&cmd).as_deref(),
             Some("acceptEdits"),
@@ -1059,7 +1066,7 @@ fn the_stored_default_value_resolves_to_accept_edits() {
     let p = std::path::Path::new("/tmp");
     let mut args = test_spawn_args(p, p, thread_id);
     args.permission_mode = Some("accept-edits");
-    let cmd = build_command(&args, None);
+    let cmd = session_command(&args, None);
     assert_eq!(
         permission_mode_arg(&cmd).as_deref(),
         Some("acceptEdits"),
@@ -1077,7 +1084,7 @@ fn auto_ships_the_flag_and_its_opt_in_together() {
     let p = std::path::Path::new("/tmp");
     let mut args = test_spawn_args(p, p, thread_id);
     args.permission_mode = Some("auto");
-    let cmd = build_command(&args, None);
+    let cmd = session_command(&args, None);
     assert_eq!(permission_mode_arg(&cmd).as_deref(), Some("auto"));
     assert_eq!(
         auto_opt_in(&cmd).as_deref(),
@@ -1097,7 +1104,7 @@ fn a_user_env_var_cannot_strand_a_session_that_asked_for_auto() {
     let mut args = test_spawn_args(p, p, thread_id);
     args.permission_mode = Some("auto");
     args.user_env_vars = &user_env;
-    let cmd = build_command(&args, None);
+    let cmd = session_command(&args, None);
     assert_eq!(
         auto_opt_in(&cmd).as_deref(),
         Some(std::ffi::OsStr::new("1")),
@@ -1181,13 +1188,13 @@ fn build_command_requests_input_replays_on_fresh_and_resumed_sessions() {
             .any(|a| a == "--replay-user-messages")
     };
 
-    assert!(replays(&build_command(
+    assert!(replays(&session_command(
         &test_spawn_args(p, p, thread_id),
         None
     )));
     let mut resumed_args = test_spawn_args(p, p, thread_id);
     resumed_args.resume_session_id = Some("sess-1");
-    assert!(replays(&build_command(&resumed_args, None)));
+    assert!(replays(&session_command(&resumed_args, None)));
 }
 
 /// A side question's copy resumes the thread's session with the session's own
@@ -1197,8 +1204,8 @@ fn build_command_requests_input_replays_on_fresh_and_resumed_sessions() {
 #[test]
 fn side_question_command_copies_the_session_without_persisting() {
     let worktree = PathBuf::from("/tmp/wt");
-    let workspace = PathBuf::from("/tmp/ws");
-    let mut args = test_spawn_args(&worktree, &workspace, uuid::Uuid::new_v4());
+    let workspace = tempfile::TempDir::new().unwrap();
+    let mut args = test_spawn_args(&worktree, workspace.path(), uuid::Uuid::new_v4());
     args.resume_session_id = Some("sess-9");
     args.model = Some("opus");
     args.system_prompt = Some("the session's prompt");
@@ -1206,14 +1213,16 @@ fn side_question_command_copies_the_session_without_persisting() {
     let grants = [PathBuf::from("/p/sibling"), PathBuf::from("/p/other")];
     args.additional_directories = &grants;
     let settings = PathBuf::from("/tmp/ws/.lucidos/cc-side-question-settings.json");
-    let argv = |cmd: tokio::process::Command| -> Vec<String> {
+    let argv = |cmd: &tokio::process::Command| -> Vec<String> {
         cmd.as_std()
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect()
     };
-    let copy = argv(build_side_question_command(&args, None, &settings));
-    let session = argv(build_command(&args, None));
+    let copy_command = build_side_question_command(&args, None, &settings).unwrap();
+    let session_command = build_command(&args, None).unwrap();
+    let copy = argv(&copy_command.cmd);
+    let session = argv(&session_command.cmd);
     let value_of = |argv: &[String], flag: &str| {
         argv.iter()
             .position(|a| a == flag)
@@ -1230,14 +1239,14 @@ fn side_question_command_copies_the_session_without_persisting() {
         value_of(&copy, "--settings").as_deref(),
         Some(settings.to_str().unwrap())
     );
-    for flag in [
-        "--model",
-        "--append-system-prompt",
-        "--allowedTools",
-        "--permission-mode",
-    ] {
+    for flag in ["--model", "--allowedTools", "--permission-mode"] {
         assert_eq!(value_of(&copy, flag), value_of(&session, flag), "{flag}");
     }
+    let prompt_of = |argv: &[String]| {
+        std::fs::read_to_string(value_of(argv, "--append-system-prompt-file").unwrap()).unwrap()
+    };
+    assert_eq!(prompt_of(&copy), "the session's prompt");
+    assert_eq!(prompt_of(&session), "the session's prompt");
     // Claude Code names the granted directories in its system prompt.
     assert_eq!(add_dirs(&copy), add_dirs(&session));
     assert_eq!(add_dirs(&copy), ["/p/sibling", "/p/other"]);
@@ -1259,7 +1268,7 @@ fn build_command_passes_each_repo_grant_as_add_dir() {
     let grants = [PathBuf::from("/p/sibling"), PathBuf::from("/p/other")];
     let mut args = test_spawn_args(p, p, uuid::Uuid::new_v4());
     args.additional_directories = &grants;
-    let argv = collect_args(&build_command(&args, None));
+    let argv = collect_args(&session_command(&args, None));
     assert_eq!(add_dirs(&argv), ["/p/sibling", "/p/other"]);
 }
 
@@ -1267,9 +1276,135 @@ fn build_command_passes_each_repo_grant_as_add_dir() {
 #[test]
 fn build_command_has_no_add_dir_without_repo_grants() {
     let p = Path::new("/tmp");
-    let argv = collect_args(&build_command(
+    let argv = collect_args(&session_command(
         &test_spawn_args(p, p, uuid::Uuid::new_v4()),
         None,
     ));
     assert!(add_dirs(&argv).is_empty());
+}
+
+/// `lucidos cc-agent-guard` reads agent definitions from the `--add-dir`
+/// directories, so both commands export exactly that list, in order.
+#[test]
+fn build_command_exports_the_add_dir_list_for_the_agent_guard() {
+    let p = Path::new("/tmp");
+    let grants = [
+        PathBuf::from("/p/with space"),
+        PathBuf::from("/p/with:colon"),
+    ];
+    let mut args = test_spawn_args(p, p, uuid::Uuid::new_v4());
+    args.additional_directories = &grants;
+    let settings = PathBuf::from("/tmp/ws/.lucidos/cc-side-question-settings.json");
+    for cmd in [
+        session_command(&args, None),
+        build_side_question_command(&args, None, &settings)
+            .expect("the command builds")
+            .cmd,
+    ] {
+        let exported = collect_envs(&cmd)
+            .remove(std::ffi::OsStr::new(CC_ADDITIONAL_DIRECTORIES_ENV))
+            .expect("the list is exported");
+        let exported: Vec<String> =
+            serde_json::from_str(exported.to_str().unwrap()).expect("a JSON array");
+        assert_eq!(exported, add_dirs(&collect_args(&cmd)));
+        assert_eq!(exported, ["/p/with space", "/p/with:colon"]);
+    }
+}
+
+/// With no grants the variable is removed, so an inherited one cannot leak in.
+#[test]
+fn build_command_removes_the_add_dir_list_without_grants() {
+    let p = Path::new("/tmp");
+    let cmd = session_command(&test_spawn_args(p, p, uuid::Uuid::new_v4()), None);
+    let removed = cmd
+        .as_std()
+        .get_envs()
+        .any(|(k, v)| k == std::ffi::OsStr::new(CC_ADDITIONAL_DIRECTORIES_ENV) && v.is_none());
+    assert!(removed);
+}
+
+/// Linux's `MAX_ARG_STRLEN`: the most bytes one argv string may hold.
+const LINUX_MAX_ARG_STRLEN: usize = 131_072;
+
+/// A long thread's system prompt never rides on argv. On argv it would fail
+/// every spawn with `E2BIG` once it passed the Linux cap, and anyone on the
+/// host could read it in `/proc/<pid>/cmdline`. It goes in a file only the
+/// owner can read, and the file goes when the command does.
+#[test]
+fn a_huge_system_prompt_travels_in_a_private_file_not_argv() {
+    let workspace = tempfile::TempDir::new().unwrap();
+    let p = workspace.path();
+    let marker = "THREAD-HISTORY-LINE ";
+    let prompt = marker.repeat(1024 * 1024 / marker.len());
+    let mut args = test_spawn_args(p, p, uuid::Uuid::new_v4());
+    args.system_prompt = Some(&prompt);
+    let command = build_command(&args, None).expect("the command builds");
+    let argv = collect_args(&command.cmd);
+
+    for arg in &argv {
+        assert!(
+            arg.len() <= LINUX_MAX_ARG_STRLEN,
+            "argv string of {} bytes",
+            arg.len()
+        );
+        assert!(!arg.contains(marker), "the prompt leaked into argv");
+    }
+    let at = argv
+        .iter()
+        .position(|a| a == "--append-system-prompt-file")
+        .expect("the prompt file is named");
+    let file = PathBuf::from(&argv[at + 1]);
+    assert!(
+        file.starts_with(system_prompt_dir(p)),
+        "the workspace owns the file"
+    );
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), prompt);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&file).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "only the owner may read the prompt");
+    }
+    drop(command);
+    assert!(!file.exists(), "the prompt file outlived its command");
+}
+
+/// No system prompt means no prompt file and no flag naming one.
+#[test]
+fn no_system_prompt_names_no_prompt_file() {
+    let p = Path::new("/tmp");
+    let command = build_command(&test_spawn_args(p, p, uuid::Uuid::new_v4()), None).unwrap();
+    assert!(command.system_prompt_file.is_none());
+    assert!(!collect_args(&command.cmd)
+        .iter()
+        .any(|a| a.starts_with("--append-system-prompt")));
+}
+
+/// Boot deletes the prompt files an exited engine left behind, and keeps one
+/// a side question may have written moments ago.
+#[test]
+fn the_boot_sweep_deletes_only_stale_system_prompt_files() {
+    let workspace = tempfile::TempDir::new().unwrap();
+    let dir = system_prompt_dir(workspace.path());
+    std::fs::create_dir_all(&dir).unwrap();
+    let stale = dir.join("system-prompt-old.md");
+    let fresh = dir.join("system-prompt-new.md");
+    std::fs::write(&fresh, "new").unwrap();
+    std::fs::File::create(&stale)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600))
+        .unwrap();
+
+    sweep_stale_system_prompt_files(workspace.path());
+
+    assert!(!stale.exists(), "a leftover file must go");
+    assert!(fresh.exists(), "a file this engine may own must stay");
+}
+
+/// A workspace that never ran a session has no prompt dir, and that is fine.
+#[test]
+fn the_boot_sweep_tolerates_a_missing_prompt_dir() {
+    let workspace = tempfile::TempDir::new().unwrap();
+    sweep_stale_system_prompt_files(workspace.path());
+    assert!(!system_prompt_dir(workspace.path()).exists());
 }

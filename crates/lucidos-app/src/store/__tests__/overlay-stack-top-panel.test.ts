@@ -48,15 +48,15 @@ describe('topPanelOverlay', () => {
     expect(topPanelOverlay()).toBeNull();
   });
 
-  /** The case the gate exists for: a modal opened from a popover. Only the
-   *  modal may answer a click, and closing it hands the pointer back. */
+  /** The case the gate exists for: a confirm raised by a modal. Only the
+   *  confirm may answer a click, and closing it hands the pointer back. */
   it('hands the pointer back to the lower panel when the upper one closes', () => {
-    pushOverlay(panel('waiting-panel'));
-    pushOverlay(panel('condition-modal'));
-    expect(topPanelOverlay()?.id).toBe('condition-modal');
+    pushOverlay(panel('modal'));
+    pushOverlay(panel('confirm-dialog'));
+    expect(topPanelOverlay()?.id).toBe('confirm-dialog');
 
-    removeOverlay('condition-modal');
-    expect(topPanelOverlay()?.id).toBe('waiting-panel');
+    removeOverlay('confirm-dialog');
+    expect(topPanelOverlay()?.id).toBe('modal');
   });
 
   /** A lone overlay is always both, which is what keeps every existing caller

@@ -5,7 +5,7 @@ use super::{
     is_parallel_safe, parallel_run_end, run_concurrently, run_tool_with_cancel,
     MAX_PARALLEL_TOOL_CALLS, PARALLEL_SAFE_TOOLS,
 };
-use crate::engine::command_guard::{static_classify, RiskLane, StaticVerdict};
+use crate::engine::command_guard::{static_classify, CommandSite, RiskLane, StaticVerdict};
 use crate::engine::tools::ToolOutcome;
 use crate::llm::provider::ToolCall;
 use crate::llm::tool_names as tn;
@@ -40,7 +40,7 @@ fn no_parallel_safe_tool_has_a_command_guard_lane() {
     let destructive = json!({ "command": "rm -rf /", "code": "import shutil; shutil.rmtree('/')" });
     for name in PARALLEL_SAFE_TOOLS {
         assert_eq!(
-            static_classify(name, &destructive),
+            static_classify(name, &destructive, CommandSite::TextOnly { root: None }),
             StaticVerdict::Settled(RiskLane::Safe),
             "{name} is classified by the command guard, so it cannot skip it in a parallel run"
         );

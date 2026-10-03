@@ -41,6 +41,7 @@ function makeThread(id: string, opts: ThreadOpts = {}): ThreadState {
         codingAgentHasDiff: false,
         codingAgentProposed: opts.codingAgentProposed ?? false,
         codingAgentRequiresRestart: false,
+        codingAgentIncomplete: false,
         codingAgentIsExternalRepo: false,
         lastRevivedAt: opts.lastRevivedAt ?? '',
         parentThreadId: opts.parentId,

@@ -130,18 +130,20 @@ impl PinnedAppStore {
         Ok(unpinned)
     }
 
-    /// Delete every pin for a device, silently. Called only from
-    /// `DeviceStore::delete`, whose `DeviceDeleted` is the announcement: the
+    /// Delete every pin for a device, silently. Called only from the device
+    /// store's delete cascade, whose `DeviceDeleted` is the announcement: the
     /// device is gone, so an unpin event per app would describe changes to a
-    /// device no client still tracks. Registered as the one `pinned_apps`
-    /// exemption in `core::announced_surfaces`.
+    /// device no client still tracks. Registered as a `pinned_apps` exemption in
+    /// `core::announced_surfaces`.
+    ///
+    /// Takes a connection, so the pins go in the same transaction as the device.
     pub async fn delete_for_device(
-        pool: &PgPool,
+        conn: &mut sqlx::PgConnection,
         device_id: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         sqlx::query("DELETE FROM pinned_apps WHERE device_id = $1")
             .bind(device_id)
-            .execute(pool)
+            .execute(conn)
             .await?;
         Ok(())
     }

@@ -17,6 +17,7 @@ export function makeThreadState(events: Map<number, ThreadEvent> = new Map()): T
     summaryVersion: 0,
     codingAgentProposed: false,
     codingAgentRequiresRestart: false,
+    codingAgentIncomplete: false,
     codingAgentIsExternalRepo: false,
     codingAgentHasDiff: false,
     lastRevivedAt: '',

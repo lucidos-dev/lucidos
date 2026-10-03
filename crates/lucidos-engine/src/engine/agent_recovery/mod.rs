@@ -26,9 +26,9 @@ pub(crate) use recovery::{
     newest_open_question, preserve_question_park_at_shutdown, thread_has_unanswered_question,
     thread_parked_on_question, unanswered_question_exists_sql,
 };
-// The last boot step that touches thread status, called from `main.rs` once
+// The last two boot steps that touch thread status, called from `main.rs` once
 // every recovery sweep has run.
-pub use recovery::settle_orphaned_running_threads;
+pub use recovery::{settle_orphaned_running_threads, settle_stranded_trigger_runs};
 // "Does a boundary already cover this turn?", in its two strengths. The
 // recovery pass asks the window-only form before emitting its own boundary; a
 // coding-agent session that registered mid-teardown asks the anchored form

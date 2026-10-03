@@ -31,6 +31,7 @@ type ThreadOpts = {
     status?: ThreadStatus;
     saved?: boolean;
     codingAgentProposed?: boolean;
+    codingAgentIncomplete?: boolean;
     state?: ThreadMeta['state'];
     updatedAt?: string;
     liveEventWaitCount?: number;
@@ -56,6 +57,7 @@ function makeThread(id: string, opts: ThreadOpts = {}): ThreadState {
         codingAgentHasDiff: false,
         codingAgentProposed: opts.codingAgentProposed ?? false,
         codingAgentRequiresRestart: false,
+        codingAgentIncomplete: opts.codingAgentIncomplete ?? false,
         codingAgentIsExternalRepo: false,
         lastRevivedAt: '',
         state: opts.state ?? 'active',
@@ -201,6 +203,14 @@ describe('reviewThreads', () => {
         // engine withholds Apply and the dot reads Waiting, not Changes.
         const parked = makeThread('a', { section: 'inbox', codingAgentProposed: true, liveEventWaitCount: 1 });
         expect(reviewThreads(asMap([parked]))).toEqual([]);
+    });
+
+    it('excludes a thread whose change is incomplete, since its turn did not finish (ADR 0346)', () => {
+        // A Stop proposed what the turn left. It still blocks Archive, but its
+        // banner leads with Continue, so the Review badge must not claim it.
+        const stopped = makeThread('a', { section: 'inbox', codingAgentProposed: true, codingAgentIncomplete: true });
+        expect(reviewThreads(asMap([stopped]))).toEqual([]);
+        expect(threadInReview(stopped)).toBe(false);
     });
 
     it('excludes a waiting/failed thread with no proposed change (that is attention)', () => {

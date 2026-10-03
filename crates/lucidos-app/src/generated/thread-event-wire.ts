@@ -502,6 +502,14 @@ export type TodoStatus =
   | 'waiting'
   | 'abandoned';
 
+/** One thread in a triage proposal: what was proposed, and why. `action` is a
+ *  `TriageAction` wire name, kept as a string so old rows always decode. */
+export interface TriageProposalEntry {
+  thread_id: string;
+  action: string;
+  reason: string;
+}
+
 /** Records *which path* fired a particular trigger run.
  *  Full reasoning is on the Rust variant. */
 export type TriggerInvocation =
@@ -712,8 +720,10 @@ export type ThreadEvent =
   | {
       type: 'ToolCalled';
       name: string;
-      args: unknown;
+      args?: unknown;
       description?: string;
+      /** Server dropped `args` here. The step detail lazy-fetches them. `description` is filled from `describe_tool` first. A `generate_image` call keeps its args, since its image is described by the prompt. */
+      args_stripped?: boolean;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
       /** Source channel. Always set on an origin event. */
@@ -1205,6 +1215,30 @@ export type ThreadEvent =
    *  Archive button's cascade after the settle; a newer message closes it. */
   | {
       type: 'ThreadArchiveRequested';
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
+  /** The user took a thread back out of the archive: Archive all's Undo
+   *  (ADR 0349). Moves it to the inbox and bumps nothing else. */
+  | {
+      type: 'ThreadUnarchived';
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
+  /** The Lucidos Agent proposed a *thread triage* in this thread (ADR 0349).
+   *  `apply_triage` acts only on these entries, and only after the user
+   *  replied to this event. */
+  | {
+      type: 'ThreadTriageProposed';
+      entries: TriageProposalEntry[];
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
       /** Source channel. Always set on an origin event. */
@@ -2174,7 +2208,7 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** The user asked a `/btw` side question.
+  /** The user asked a side question.
    *  Full reasoning is on the Rust variant. */
   | {
       type: 'SideQuestionAsked';
@@ -2408,6 +2442,8 @@ const THREAD_EVENT_TYPE_FLAGS = {
   ThreadUnsaved: true,
   ThreadArchived: true,
   ThreadArchiveRequested: true,
+  ThreadUnarchived: true,
+  ThreadTriageProposed: true,
   ThreadStarted: true,
   ThreadDiscarded: true,
   ImageUploaded: true,

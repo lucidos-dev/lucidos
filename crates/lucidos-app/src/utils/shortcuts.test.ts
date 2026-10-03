@@ -134,8 +134,8 @@ describe('SHORTCUT_DEFS registry invariants', () => {
     expect(shortcutDef('prevTurnOrNotification').category).toBe('Navigation');
     expect(shortcutDef('nextTurnOrNotification').category).toBe('Navigation');
   });
-  it('exposes the customizable "Open thread actions" drawer shortcut', () => {
-    // The keyboard route to a drawer row's ⋯ menu is a first-class registry entry
+  it('exposes the customizable "Open thread actions" shortcut', () => {
+    // The keyboard route to a thread's menu is a first-class registry entry
     // (so it is documented + rebindable in Settings → Keyboard Shortcuts), not a
     // hand-rolled key. The collision + bindable invariants above also cover it.
     const def = shortcutDef('openThreadActions');
@@ -154,6 +154,10 @@ describe('the toggle shortcuts', () => {
     ['toggleAppFullscreen', '⌃⇧F'],
     ['toggleSourceView', '⌃⇧S'],
     ['toggleLineWrap', '⌃⇧B'],
+    ['toggleThreadFilter', '⌃⇧U'],
+    ['searchThreads', '⌃⇧K'],
+    ['toggleMenuDrawer', '⌃⇧X'],
+    ['refreshPanel', '⌃⇧P'],
   ] as const)('%s defaults to %s on a Mac', (id, display) => {
     expect(formatBinding(shortcutDef(id).defaultBinding, true)).toBe(display);
   });

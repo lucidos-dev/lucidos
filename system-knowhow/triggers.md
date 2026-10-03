@@ -448,6 +448,8 @@ A run that stops to ask the user a question, or to ask permission, always surfac
 
 Set `go_to_review: true` when the trigger's *output is the point* — a daily summary the user is meant to read, an alert that needs acknowledgement, a scheduled report. The thread then surfaces in the Current section on completion so it's not lost in Archive.
 
+In the trigger form this is the **Send directly to Archive** toggle, which reads the field inverted: on (the default) is `go_to_review: false`, and off is `go_to_review: true`. Name the toggle that way when you point the user at it.
+
 | User phrasing that answers it | Flag |
 |---|---|
 | "import my data", "sync X", "keep Y up to date" — silent housekeeping | omit (default false) |

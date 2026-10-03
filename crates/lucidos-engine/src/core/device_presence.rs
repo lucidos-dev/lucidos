@@ -98,6 +98,22 @@ impl DevicePresenceStore {
         Ok(rows.into_iter().map(|(d,)| d).collect())
     }
 
+    /// Drop a deleted device's presence row. Called only from the device
+    /// store's delete cascade, inside its transaction. `device_id` carries no
+    /// foreign key, so nothing else would clear it.
+    ///
+    /// No announcement is owed: `DeviceDeleted` covers the whole device.
+    pub async fn delete_for_device(
+        conn: &mut sqlx::PgConnection,
+        device_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        sqlx::query("DELETE FROM device_presence WHERE device_id = $1")
+            .bind(device_id)
+            .execute(conn)
+            .await?;
+        Ok(())
+    }
+
     /// Move a device's presence row to a new id. Called only from
     /// `DeviceStore::hand_over`.
     ///

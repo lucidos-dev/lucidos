@@ -1,11 +1,12 @@
 import type { ComponentChildren } from 'preact';
 import { useEffect, useRef } from 'preact/hooks';
-import { useSignal } from '@preact/signals';
+import { useDelayedFlag } from '../../hooks/useDelayedLoading';
 import { showToast } from '../../store/store';
 import { resolveCodingAgentPermission, resolveCommandPermission, resolveMcpPermission } from '../../store/actions/permissions';
 import { changeKindName, type AllowScope } from '../../store/thread-events';
 import { errorDetail } from '../../utils/errorDetail';
 import { CHOICE_CARD_ROLE, handAnsweredCardFocusToPrompt, handleChoiceCardKeyDown, seedChoiceCardFocus } from './choiceCardNav';
+import { pendingDecisions } from './pendingDecisions';
 import { followResolvedPermission } from './scrollState';
 
 interface PermissionEvent {
@@ -476,7 +477,7 @@ export const DEFAULT_PERMISSION_CHOICE: PermissionChoice = 'allow';
  *  by all three cards: coding-agent, command-guard and MCP. */
 function renderPermissionButton(
   spec: ButtonSpec,
-  state: { selected: PermissionChoice | null; answered: boolean; terminated: boolean },
+  state: { selected: PermissionChoice | null; answered: boolean; sending: boolean; terminated: boolean },
 ) {
   const isPicked = state.selected === spec.choice;
   const { disabled, stateClass } = permissionButtonState({
@@ -496,7 +497,9 @@ function renderPermissionButton(
       // answered / terminated card must not advertise a focus seed target.
       data-default-choice={spec.choice === DEFAULT_PERMISSION_CHOICE && !disabled ? 'true' : undefined}
     >
-      {isPicked && <span class="permission-btn-check" aria-hidden="true">✓ </span>}
+      {isPicked && (state.sending
+        ? <span class="mini-spinner permission-btn-sending" aria-hidden="true" />
+        : <span class="permission-btn-check" aria-hidden="true">✓ </span>)}
       {spec.label}
     </button>
   );
@@ -511,6 +514,7 @@ function PermissionBodyShell({
   buttons,
   selected,
   answered,
+  sending,
   terminated,
   note,
 }: {
@@ -519,13 +523,14 @@ function PermissionBodyShell({
   buttons: ButtonSpec[];
   selected: PermissionChoice | null;
   answered: boolean;
+  sending: boolean;
   terminated: boolean;
   note: string | null;
 }) {
   const bodyStateClass = answered ? ' permission-body-answered'
     : terminated ? ' permission-body-terminated'
     : '';
-  const state = { selected, answered, terminated };
+  const state = { selected, answered, sending, terminated };
   // A live card is a *choice card* (see `choiceCardNav.ts`): arrows step across
   // its buttons in DOM order, and "Allow once" takes focus on arrival so Enter
   // resolves it. The marker and the
@@ -556,19 +561,34 @@ function PermissionBodyShell({
   );
 }
 
+type PendingVerdict = { allowed: boolean; persist_scope?: AllowScope };
+
+/** The three permission cards' optimistic picks, keyed by request id. The
+ *  divider header reads it to say "Sending". */
+export const pendingVerdicts = pendingDecisions<PendingVerdict>();
+
 /** Optimistic decide helper shared by all three cards: stamp the pending choice,
  *  fire the resolve action, roll back + toast on failure. `resolve` is the
  *  permission action (`resolveCodingAgentPermission` / `resolveCommandPermission`
- *  / `resolveMcpPermission`), which posts the consent and nothing else. */
+ *  / `resolveMcpPermission`), which posts the consent and nothing else. The
+ *  pick stays pending until `resolved` arrives over SSE, which drains it. */
 function usePermissionDecide(
   requestId: string,
+  resolved: PendingVerdict | undefined,
+  terminated: boolean | undefined,
   resolve: (id: string, allowed: boolean, persist?: AllowScope) => Promise<void>,
   broadGrant: () => string,
 ) {
-  const pending = useSignal<{ allowed: boolean; persist_scope?: AllowScope } | null>(null);
+  useEffect(() => {
+    if (resolved) pendingVerdicts.clear(requestId);
+  }, [resolved, requestId]);
+  // A dead card draws no unconfirmed pick, matching its "Unresolved" header.
+  // The pick stays stored, so a resolution that still lands shows it again.
+  const pending = terminated ? undefined : pendingVerdicts.map.value.get(requestId);
+  const sending = useDelayedFlag(!resolved && !!pending);
   const decide = async (allowed: boolean, persist?: AllowScope) => {
     handAnsweredCardFocusToPrompt();
-    pending.value = { allowed, persist_scope: persist };
+    pendingVerdicts.set(requestId, { allowed, persist_scope: persist });
     // Deciding a card is a SUBMIT: the agent is expected to respond to it, so it
     // gets the same one reaction every other submit gets, anchored on this card's
     // own turn. All three permission-shaped cards decide through this hook, so
@@ -582,11 +602,11 @@ function usePermissionDecide(
     try {
       await resolve(requestId, allowed, persist);
     } catch (e) {
-      pending.value = null;
+      pendingVerdicts.clear(requestId);
       showToast(`Could not send decision: ${errorDetail(e)}`, 'error');
     }
   };
-  return { pending, decide };
+  return { effective: resolved ?? pending, sending, decide };
 }
 
 /** Body of a `CodingAgentPermissionRequest` divider exchange — rendered inside
@@ -594,13 +614,13 @@ function usePermissionDecide(
  *  override; SSE swaps in `resolved` once the paired
  *  `CodingAgentPermissionResolved` event arrives. */
 export function PermissionBody({ event, resolved, terminated }: PermissionBodyProps) {
-  const { pending, decide } = usePermissionDecide(
+  const { effective, sending, decide } = usePermissionDecide(
     event.request_id,
+    resolved,
+    terminated,
     resolveCodingAgentPermission,
     () => toolText(event.tool_name),
   );
-
-  const effective = resolved ?? pending.value;
 
   const touchesProtected = inputTouchesProtectedPath(event.tool_name, event.input);
   const isCodexTool = CODEX_BACKEND_TOOLS.has(event.tool_name);
@@ -614,7 +634,7 @@ export function PermissionBody({ event, resolved, terminated }: PermissionBodyPr
   const session = sessionLabel(event.tool_name, event.input);
 
   const selected = effective ? resolvedChoice(effective) : null;
-  const answered = effective !== null && effective !== undefined;
+  const answered = effective !== undefined;
 
   const buttons: ButtonSpec[] = [
     {
@@ -661,6 +681,7 @@ export function PermissionBody({ event, resolved, terminated }: PermissionBodyPr
       buttons={buttons}
       selected={selected}
       answered={answered}
+      sending={sending}
       terminated={!!terminated}
       note={engineResolutionNote(resolved)}
     />
@@ -844,15 +865,16 @@ export function commandHead(command: string): string | null {
 
 /** Body of a `CommandPermissionRequested` divider exchange. */
 export function CommandPermissionBody({ event, resolved, terminated }: CommandPermissionBodyProps) {
-  const { pending, decide } = usePermissionDecide(
+  const { effective, sending, decide } = usePermissionDecide(
     event.request_id,
+    resolved,
+    terminated,
     resolveCommandPermission,
     () => (BASH_TOOLS.has(event.tool_name) ? 'Any shell command' : 'Any Python'),
   );
 
-  const effective = resolved ?? pending.value;
   const selected = effective ? resolvedChoice(effective) : null;
-  const answered = effective !== null && effective !== undefined;
+  const answered = effective !== undefined;
 
   const isBash = BASH_TOOLS.has(event.tool_name);
   const head = isBash ? commandHead(event.command) : null;
@@ -905,6 +927,7 @@ export function CommandPermissionBody({ event, resolved, terminated }: CommandPe
       buttons={buttons}
       selected={selected}
       answered={answered}
+      sending={sending}
       terminated={!!terminated}
       note={engineResolutionNote(resolved)}
     />
@@ -947,15 +970,16 @@ interface McpPermissionBodyProps {
 
 /** Body of an `McpPermissionRequested` divider exchange. */
 export function McpPermissionBody({ event, resolved, terminated }: McpPermissionBodyProps) {
-  const { pending, decide } = usePermissionDecide(
+  const { effective, sending, decide } = usePermissionDecide(
     event.request_id,
+    resolved,
+    terminated,
     resolveMcpPermission,
     () => `Any tool on ${event.server_name}`,
   );
 
-  const effective = resolved ?? pending.value;
   const selected = effective ? resolvedChoice(effective) : null;
-  const answered = effective !== null && effective !== undefined;
+  const answered = effective !== undefined;
 
   const buttons: ButtonSpec[] = [
     {
@@ -1002,6 +1026,7 @@ export function McpPermissionBody({ event, resolved, terminated }: McpPermission
       buttons={buttons}
       selected={selected}
       answered={answered}
+      sending={sending}
       terminated={!!terminated}
       note={engineResolutionNote(resolved)}
     />

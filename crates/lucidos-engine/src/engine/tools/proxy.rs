@@ -1,8 +1,9 @@
 //! `proxy_request` + `reload_proxy_modules` LLM tools.
 //!
-//! `proxy_request` calls a backend configured in `data/config/apis.json`
-//! through the engine proxy — the credential value never reaches the
-//! model; only the configured proxy *name* does.
+//! `proxy_request` calls a backend through the engine proxy: an entry in
+//! `data/config/apis.json`, or a builtin provider proxy. It resolves names
+//! exactly as `lucidos proxy` does. The credential value never reaches the
+//! model; only the proxy *name* does.
 //!
 //! `reload_proxy_modules` re-scans `data/auth-modules/` and atomically
 //! swaps the engine's compiled-module map. Same code path as the HTTP
@@ -40,10 +41,12 @@ impl LucidosEngine {
             Err(_) => return Ok(format!("Error: invalid HTTP method '{}'", method_str)),
         };
 
-        let config = match api_proxy::resolve_proxy_target(&self.workspace_path, name).await {
-            Ok(c) => c,
-            Err((_, msg)) => return Ok(format!("Error: {}", msg)),
-        };
+        let engine_arc = self.clone_arc();
+        let resolved =
+            match api_proxy::resolve_named_proxy(&engine_arc, &self.workspace_path, name).await {
+                Ok(r) => r,
+                Err((_, msg)) => return Ok(format!("Error: {}", msg)),
+            };
 
         let mut headers = HeaderMap::new();
         if let Some(h) = args.get("headers").and_then(|v| v.as_object()) {
@@ -60,11 +63,10 @@ impl LucidosEngine {
         }
 
         log!("[Proxy LLM] {} {}", method.as_str(), name);
-        let engine_arc = self.clone_arc();
-        let response = match api_proxy::dispatch_proxy_request(
+        let response = match api_proxy::dispatch_resolved(
             &engine_arc,
             name,
-            &config,
+            resolved,
             method,
             path.to_string(),
             None,
@@ -111,5 +113,23 @@ impl LucidosEngine {
             Ok(names) => Ok(serde_json::json!({"loaded": names}).to_string()),
             Err(e) => Ok(format!("Error: WASM module reload failed: {}", e)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// The tool resolves names through the same function as the HTTP route.
+    /// Calling `resolve_proxy_target` here again would read `apis.json` alone,
+    /// and every builtin provider proxy would answer "not configured".
+    #[test]
+    fn proxy_request_resolves_names_like_the_http_route() {
+        let production = include_str!("proxy.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the module has a body before its tests");
+        assert!(production.contains("api_proxy::resolve_named_proxy("));
+        assert!(production.contains("api_proxy::dispatch_resolved("));
+        assert!(!production.contains("resolve_proxy_target("));
+        assert!(!production.contains("dispatch_proxy_request("));
     }
 }

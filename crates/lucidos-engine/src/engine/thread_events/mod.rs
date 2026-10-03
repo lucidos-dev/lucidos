@@ -16,6 +16,7 @@ mod meta;
 mod question;
 mod session;
 mod todo;
+mod triage;
 
 pub use actor::{
     ActorMode, AgentParticipant, EngineReason, EventWaitOutcome, MessageOrigin,
@@ -31,6 +32,7 @@ pub use session::{
     ChildCompletionStatus, SessionEndReason, SubThreadPendingChange, VoiceSessionEndReason,
 };
 pub use todo::{TodoItem, TodoStatus};
+pub use triage::TriageProposalEntry;
 
 pub(crate) use emit::{
     emit_continuation_requested_or_log, emit_response_aborted, emit_response_canceled,

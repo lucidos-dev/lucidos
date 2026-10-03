@@ -34,12 +34,13 @@ export function drawerSideFor(anchorCenterX: number, viewportWidth: number, mobi
   return anchorCenterX > viewportWidth / 2 ? 'right' : 'left';
 }
 
-/** Open the drawer, resetting any stuck closing state */
+/** Open the drawer, resetting any stuck closing state. A shortcut passes no
+ *  anchor, which clears the one a past button press left. */
 export function openDrawer(anchor?: HTMLElement) {
   drawerClosing.value = false;
   drawerOpen.value = true;
+  drawerAnchor.value = anchor ?? null;
   if (anchor) {
-    drawerAnchor.value = anchor;
     const rect = anchor.getBoundingClientRect();
     drawerSide.value = drawerSideFor(rect.left + rect.width / 2, window.innerWidth, isMobile());
   }

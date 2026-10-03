@@ -54,8 +54,9 @@ a credentialed upstream call. That reasoning covers the whole API surface.
   the point, but the user feels it on the next reload.
 - The gateway proxies and health-probes over http rather than https in dev, the
   packaged behaviour.
-- `https://localhost:5173/` still works ON the machine, so the engine's own port
-  stays usable for debugging.
+- `http://localhost:5173/` still works ON the machine, so the engine's own port
+  stays usable for debugging. It is plain http, because `engine_tls` follows
+  `engine_loopback`, and it asks for no credential.
 - ADR 0014's dev-topology table and `.claude/rules/dev-runtime.md` both changed,
   because both said the opposite.
 - A deployment that genuinely wants the old shape sets

@@ -5,11 +5,12 @@ import {
   ApiError,
 } from '../api/client';
 import { errorDetail } from '../utils/errorDetail';
+import { getComposeSelectionOverride } from './composeSelections';
 import { showToast, threadMap } from './store';
 import { isSideQuestionEvent } from './thread-events/thread-event-types';
 import type { ThreadState } from './thread-events/thread-meta';
 
-/** A `/btw` side question and where its answer stands.
+/** A side question and where its answer stands.
  *
  *  Recorded as side-question thread events no agent ever reads (ADR 0320), so
  *  a card survives a reload and shows on every device. */
@@ -31,9 +32,6 @@ export type SideQuestion = {
   | { status: 'failed'; error: string }
 );
 
-/** The menu entry and composer prefix for a side question. */
-export const SIDE_QUESTION_COMMAND = 'btw';
-
 /** One shared empty list, so an imageless card keeps a stable prop. */
 const NO_IMAGES: readonly string[] = [];
 
@@ -48,26 +46,11 @@ export const dismissingSideQuestions = signal<ReadonlySet<string>>(new Set());
  *  nothing, so another device keeps its own view. */
 export const reopenedSideQuestions = signal<ReadonlySet<string>>(new Set());
 
-/** The question in `message` when it is a side question (`/btw` as its first
- *  word), else `null`. An empty string is a bare `/btw`. Mirrors the engine's
- *  `is_side_question`, which refuses the same text on the normal chat route. */
-export function sideQuestionText(message: string): string | null {
-  const match = /^\s*\/btw(?:\s+([\s\S]*))?$/.exec(message);
-  return match ? (match[1] ?? '').trim() : null;
-}
-
-/** The filter text that turns into a side question as the user types it in
- *  the command menu: `btw` and a space. */
-export function isSideQuestionFilter(filter: string): boolean {
-  return /^btw\s/.test(filter);
-}
-
-/** The composer text once the command menu hands back `handoff` (`/btw …`).
- *  A draft is never lost: it becomes the question. */
-export function withSideQuestionPrefix(handoff: string, draft: string): string {
-  if (draft.trim() === '') return handoff;
-  if (sideQuestionText(draft) !== null) return draft;
-  return `${handoff.trimEnd()} ${draft.trimStart()}`;
+/** Whether the composer for `threadId` is in side-question mode, where Send
+ *  asks the box as a side question. It lives in the draft's compose selection,
+ *  so a reload and every device keep it. */
+export function sideQuestionModeOn(threadId: string | null | undefined): boolean {
+  return !!threadId && getComposeSelectionOverride(threadId).sideQuestionMode === true;
 }
 
 /** What the composer does with a submitted message. */
@@ -80,23 +63,23 @@ export type SideQuestionRoute =
 
 export const SIDE_QUESTION_NOT_STARTED =
   'Side questions work once this thread has started. Send a normal message first.';
-export const SIDE_QUESTION_EMPTY = 'Type a question after /btw.';
+export const SIDE_QUESTION_EMPTY = 'Type the side question first.';
 export const SIDE_QUESTION_CODEX =
   'Side questions are not available in Codex threads. Send it as a normal message instead.';
 
-/** Route a submit. A side question never becomes a turn: it is asked, or
- *  refused with the draft kept. `asked` is true when the user chose to ask
- *  (the Send button's long press), so no `/btw` is needed. A Codex thread
- *  takes none, and refusing here keeps the draft and its images. */
+/** Route a submit. `asked` is true when the user chose a side question: the
+ *  composer is in side-question mode, or the Send button's hold asked. A side
+ *  question never becomes a turn: it is asked, or refused with the draft kept.
+ *  A Codex thread takes none, and refusing here keeps the draft and its images. */
 export function routeSideQuestion(
   message: string,
   thread: { started: boolean; codex: boolean },
-  asked = false,
+  asked: boolean,
 ): SideQuestionRoute {
-  const question = sideQuestionText(message) ?? (asked ? message.trim() : null);
-  if (question === null) return { kind: 'message' };
+  if (!asked) return { kind: 'message' };
   if (!thread.started) return { kind: 'refuse', toast: SIDE_QUESTION_NOT_STARTED };
   if (thread.codex) return { kind: 'refuse', toast: SIDE_QUESTION_CODEX };
+  const question = message.trim();
   if (question === '') return { kind: 'refuse', toast: SIDE_QUESTION_EMPTY };
   return { kind: 'ask', question };
 }

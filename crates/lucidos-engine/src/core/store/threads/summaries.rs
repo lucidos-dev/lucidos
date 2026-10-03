@@ -417,19 +417,20 @@ impl EventStore {
         let (statuses, negate) = filters.status.binds();
         let sql = format!(
             "SELECT {cols} FROM thread_summaries t \
-             WHERE {status} \
-               AND ($3::text[] IS NULL OR t.source = ANY($3)) \
-               AND ($5::uuid IS NULL OR t.parent_thread_id = $5) \
-             ORDER BY t.last_activity DESC LIMIT $4",
+             WHERE {status} AND {filters} \
+             ORDER BY t.last_activity DESC LIMIT $7",
             cols = THREAD_COLS.as_str(),
             status = STATUS_FILTER_SQL,
+            filters = SUMMARY_FILTER_SQL.as_str(),
         );
         let rows = sqlx::query_as::<_, ThreadRow>(&sql)
             .bind(statuses)
             .bind(negate)
             .bind(filters.sources)
-            .bind(filters.limit)
             .bind(filters.parent)
+            .bind(filters.has_draft)
+            .bind(filters.has_diff)
+            .bind(filters.limit)
             .fetch_all(&self.pool)
             .await?;
         let mut summaries = Self::rows_to_thread_summaries(rows)?;
@@ -458,25 +459,26 @@ impl EventStore {
     /// symmetry with the list helper: `limit` is irrelevant for `COUNT(*)`
     /// and is ignored here.
     ///
-    /// The status predicate is [`STATUS_FILTER_SQL`], shared verbatim with the
-    /// list query, so a count can never disagree with the rows it is counting.
+    /// The predicates are [`STATUS_FILTER_SQL`] and [`SUMMARY_FILTER_SQL`],
+    /// shared verbatim with the list query, so a count can never disagree with
+    /// the rows it is counting.
     pub async fn count_thread_summaries(
         &self,
         filters: ThreadSummaryFilters<'_>,
     ) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
         let (statuses, negate) = filters.status.binds();
         let sql = format!(
-            "SELECT COUNT(*)::bigint FROM thread_summaries t \
-             WHERE {status} \
-               AND ($3::text[] IS NULL OR t.source = ANY($3)) \
-               AND ($4::uuid IS NULL OR t.parent_thread_id = $4)",
+            "SELECT COUNT(*)::bigint FROM thread_summaries t WHERE {status} AND {filters}",
             status = STATUS_FILTER_SQL,
+            filters = SUMMARY_FILTER_SQL.as_str(),
         );
         let (count,): (i64,) = sqlx::query_as(&sql)
             .bind(statuses)
             .bind(negate)
             .bind(filters.sources)
             .bind(filters.parent)
+            .bind(filters.has_draft)
+            .bind(filters.has_diff)
             .fetch_one(&self.pool)
             .await?;
         Ok(count)

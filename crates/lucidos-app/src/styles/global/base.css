@@ -235,11 +235,10 @@ html {
     /* How far the navigation focus marker (.nav-focus-stuck, host-components.css)
        reaches beyond a turn's box. The marker is a background wash whose visible
        edge IS the box, plus a glow blooming past it; this is the reach the
-       transcript reserves for that bloom, as extra room past each fade (top
-       padding past --thread-top-fade, bottom padding past --prompt-fade) so a
-       marker on the first/last turn clears the fade instead of being dissolved by
-       it (the "highlight border isn't fully visible on the top/bottom turn"
-       report). Deliberately kept at the old outline frame's exact reach (its
+       transcript reserves for that bloom. At the bottom it is padding past
+       --prompt-fade. At the top the first turn's feed padding covers it, and
+       the fade is off at rest there. So a first or last turn's marker is never
+       dissolved by a fade. Deliberately kept at the old outline frame's exact reach (its
        0.1875rem offset + 0.1875rem width) rather than grown to the glow's full
        1.5rem blur: growing it would push every deep-link landing further down the
        transcript, and a soft halo half-dissolved in a fade is invisible in a way a
@@ -371,7 +370,14 @@ html {
        resolved per theme at use time, so one definition covers both. The
        transparent outline each rule keeps alongside this is the forced-colors
        fallback. Redefine --focus-ring on a context (e.g. the blue app header)
-       to recolor the ring there without touching every button rule. */
+       to recolor the ring there without touching every button rule.
+
+       The band paints outside the box and adds nothing to scrollable overflow,
+       so a box that clips cuts it at a flush edge. Such a box reserves ring
+       room of --focus-ring-width there (frontend-css.md § Focus rings). The
+       ring stays a literal because a theme replaces it whole, and
+       focus-ring-width.test.ts holds every definition's band to the width. */
+    --focus-ring-width: 0.1875rem;
     --focus-ring: 0 0 0 0.1875rem color-mix(in srgb, var(--accent) 55%, transparent);
 }
 

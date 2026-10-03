@@ -1621,12 +1621,64 @@ fn resolve_redirect_location(current_url: &str, location: &str) -> Option<reqwes
 /// request from `config.auth`; a builtin model-provider target carries its
 /// base URL + pre-built auth layers (sourced from the engine's own provider
 /// credentials — see [`crate::api::proxy_builtin`]).
-enum ResolvedProxy {
+pub(crate) enum ResolvedProxy {
     Config(ProxyConfig),
     Builtin {
         base_url: String,
         layers: Vec<Arc<dyn crate::api::proxy_auth_layer::AuthLayer>>,
     },
+}
+
+/// Resolve a proxy name the way every caller must: `apis.json` first, then the
+/// builtin provider of the same name, but only on a 404.
+///
+/// The HTTP route and the `proxy_request` LLM tool both call this. So the
+/// agent reaches exactly the backends `lucidos proxy` and the SDK reach. A
+/// rejected entry is a 502, not a 404, so it never falls through to a builtin.
+pub(crate) async fn resolve_named_proxy(
+    engine: &Arc<crate::engine::LucidosEngine>,
+    workspace_path: &std::path::Path,
+    name: &str,
+) -> Result<ResolvedProxy, (StatusCode, String)> {
+    match resolve_proxy_target(workspace_path, name).await {
+        Ok(config) => Ok(ResolvedProxy::Config(config)),
+        Err((StatusCode::NOT_FOUND, generic)) => {
+            match crate::api::proxy_builtin::resolve_builtin_provider(engine, name).await? {
+                Some((base_url, layers)) => Ok(ResolvedProxy::Builtin { base_url, layers }),
+                None => Err((StatusCode::NOT_FOUND, generic)),
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Dispatch a [`ResolvedProxy`]. Both arms bind a [`ScopedPipeline`] before
+/// anything reaches the network.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn dispatch_resolved(
+    engine: &Arc<crate::engine::LucidosEngine>,
+    name: &str,
+    resolved: ResolvedProxy,
+    method: Method,
+    path: String,
+    query: Option<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, (StatusCode, String)> {
+    match resolved {
+        ResolvedProxy::Config(config) => {
+            dispatch_proxy_request(engine, name, &config, method, path, query, headers, body).await
+        }
+        // The builtin arm builds its own layers, so it binds its own pipeline.
+        // Same gate, same type, no second way to reach the network.
+        ResolvedProxy::Builtin { base_url, layers } => {
+            let ctx = ScopeContext::from_engine(engine);
+            let scoped = ScopedPipeline::bind(&ctx, name, base_url, layers, false).await?;
+            // A builtin has no entry, so only the workspace value applies.
+            let timeout = crate::api::proxy_timeout::resolve(ctx.pool, None).await?;
+            dispatch_scoped(name, &scoped, timeout, method, path, query, headers, body).await
+        }
+    }
 }
 
 async fn proxy_handle_inner(
@@ -1645,20 +1697,8 @@ async fn proxy_handle_inner(
         )
             .into_response();
     }
-    // `apis.json` is resolved first, so an entry with the same name overrides
-    // the builtin. A builtin model-provider proxy (openai/openrouter/anthropic/
-    // vertex/local) fills the 404 gap when no entry exists.
-    let resolved = match resolve_proxy_target(&state.workspace_path, &name).await {
-        Ok(config) => ResolvedProxy::Config(config),
-        Err((StatusCode::NOT_FOUND, generic)) => {
-            match crate::api::proxy_builtin::resolve_builtin_provider(&state.engine, &name).await {
-                Ok(Some((base_url, layers))) => ResolvedProxy::Builtin { base_url, layers },
-                // Not a builtin either — the original "not configured" 404.
-                Ok(None) => return (StatusCode::NOT_FOUND, generic).into_response(),
-                // A recognized builtin whose credential/config is absent.
-                Err((status, msg)) => return (status, msg).into_response(),
-            }
-        }
+    let resolved = match resolve_named_proxy(&state.engine, &state.workspace_path, &name).await {
+        Ok(resolved) => resolved,
         Err((status, msg)) => return (status, msg).into_response(),
     };
 
@@ -1672,38 +1712,18 @@ async fn proxy_handle_inner(
         }
     };
 
-    let result = match resolved {
-        ResolvedProxy::Config(config) => {
-            dispatch_proxy_request(
-                &state.engine,
-                &name,
-                &config,
-                method,
-                path,
-                query,
-                headers,
-                body,
-            )
-            .await
-        }
-        // The builtin arm builds its own layers, so it binds its own pipeline.
-        // Same gate, same type, no second way to reach the network.
-        ResolvedProxy::Builtin { base_url, layers } => {
-            let ctx = ScopeContext::from_engine(&state.engine);
-            match ScopedPipeline::bind(&ctx, &name, base_url, layers, false).await {
-                // A builtin has no entry, so only the workspace value applies.
-                Ok(scoped) => match crate::api::proxy_timeout::resolve(ctx.pool, None).await {
-                    Ok(timeout) => {
-                        dispatch_scoped(&name, &scoped, timeout, method, path, query, headers, body)
-                            .await
-                    }
-                    Err(e) => Err(e),
-                },
-                Err(e) => Err(e),
-            }
-        }
-    };
-    match result {
+    match dispatch_resolved(
+        &state.engine,
+        &name,
+        resolved,
+        method,
+        path,
+        query,
+        headers,
+        body,
+    )
+    .await
+    {
         Ok(resp) => resp,
         Err((status, msg)) => (status, msg).into_response(),
     }

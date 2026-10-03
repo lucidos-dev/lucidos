@@ -722,6 +722,11 @@ does not prove that. **Remove** deletes the row of a device sitting right in
 front of you. And a device that paired before its two ids were unified keeps
 them apart until it next loads the page.
 
+A device used on one day and never again leaves the list by itself after a
+week. Most of these are automated browser runs, since every fresh browser
+profile arrives as a new device. A device someone named, paired, or turned push
+on for is never removed this way. See *one-off device* in the glossary.
+
 ### What a device is called
 
 Each half carries its own name, and the row prefers the one you can edit.

@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'preact/hooks';
-import { SHORTCUT_DEFS, shortcutDef, type ShortcutId } from '../../utils/shortcuts';
+import { SHORTCUT_DEFS, shortcutDef, shortcutSearchAnchor, type ShortcutId } from '../../utils/shortcuts';
 import { displayBinding, isCustomized, setBinding, resetBinding, recordChord } from '../../store/actions/keybindings';
 
 // Derived, not hand-maintained: a category added to the registry can't be
@@ -56,7 +56,7 @@ export function KeyboardShortcutsSection() {
           <div class="settings-section-title">{cat}</div>
           <div class="list-rows">
             {SHORTCUT_DEFS.filter((d) => d.category === cat).map((def) => (
-              <div class="list-row" key={def.id}>
+              <div class="list-row" key={def.id} data-search-anchor={shortcutSearchAnchor(def.id)}>
                 <div class="list-row-info">
                   <span class="title">{def.label}</span>
                   {/* It explains the default chord, so a rebound one hides it. */}

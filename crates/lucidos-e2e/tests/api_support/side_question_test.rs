@@ -1,5 +1,5 @@
-//! E2E coverage for `POST /api/v1/side-questions` and the chat route's `/btw`
-//! guard (ADR 0320).
+//! E2E coverage for `POST /api/v1/side-questions` (ADR 0320), and for `/btw`
+//! text on the chat route, which is an ordinary message.
 //!
 //! A Lucidos Agent thread is answered here by the mock model. Every Claude
 //! Code case is a refusal the engine gives before any Claude Code runs, so it
@@ -179,7 +179,10 @@ async fn a_claude_code_thread_with_no_session_yet_is_refused_without_spawning() 
     );
     let (status, body) = ask(&thread_id.to_string(), "   ").await;
     assert_eq!(status, 400, "{body}");
-    assert!(error_of(&body).contains("Type a question"), "{body}");
+    assert!(
+        error_of(&body).contains("Type the side question first"),
+        "{body}"
+    );
     assert_eq!(thread_event_count(&pool, thread_id).await, 0);
 }
 
@@ -201,62 +204,45 @@ async fn dismissing_a_side_question_nobody_asked_is_not_found() {
     assert_eq!(thread_event_count(&pool, thread_id).await, 0);
 }
 
-/// A caller that skips the composer must not turn `/btw` into a turn: the
-/// chat route refuses it on every kind of thread before recording anything.
+/// The chat route sends `/btw` text as an ordinary message.
 #[tokio::test]
-async fn the_chat_route_refuses_btw_in_any_thread() {
-    let pool = sqlx::PgPool::connect(&db_url()).await.unwrap();
-    for seed_cc in [true, false] {
-        let thread_id = Uuid::new_v4();
-        if seed_cc {
-            seed_cc_thread_summary(&pool, thread_id, "idle").await;
-        } else {
-            seed_chat_thread_summary(&pool, thread_id, "idle").await;
-        }
-        refuse_btw_on_the_chat_route(&pool, thread_id).await;
-    }
-}
-
-async fn refuse_btw_on_the_chat_route(pool: &sqlx::PgPool, thread_id: Uuid) {
-    let resp = user_client()
-        .await
-        .post(format!("{}/api/v1/chat/stream", base_url()))
-        .json(&json!({
-            "message": "/btw what is X?",
-            "mode": "human",
-            "thread_id": thread_id.to_string(),
-        }))
-        .send()
-        .await
-        .expect("chat request failed");
-    assert_eq!(resp.status().as_u16(), 400);
-    let body: Value = resp.json().await.unwrap();
-    assert_eq!(body["reason"], "side-question", "{body}");
-    assert_eq!(thread_event_count(pool, thread_id).await, 0);
-}
-
-/// Creating a coding-agent thread with `/btw` as its first message is refused
-/// too. Otherwise it would open the session as its first turn.
-#[tokio::test]
-async fn the_chat_route_refuses_btw_that_would_create_a_coding_agent_thread() {
+async fn the_chat_route_sends_btw_text_as_an_ordinary_message() {
     let pool = sqlx::PgPool::connect(&db_url()).await.unwrap();
     let thread_id = Uuid::new_v4();
+    seed_chat_thread_summary(&pool, thread_id, "idle").await;
 
+    let message = "/btw what is X?";
     let resp = user_client()
         .await
         .post(format!("{}/api/v1/chat/stream", base_url()))
         .json(&json!({
-            "message": "/btw what is X?",
+            "message": message,
             "mode": "human",
             "thread_id": thread_id.to_string(),
-            "new_thread": true,
-            "use_coding_agent": true,
         }))
         .send()
         .await
         .expect("chat request failed");
-    assert_eq!(resp.status().as_u16(), 400);
-    let body: Value = resp.json().await.unwrap();
-    assert_eq!(body["reason"], "side-question", "{body}");
-    assert_eq!(thread_event_count(&pool, thread_id).await, 0);
+    assert_eq!(resp.status().as_u16(), 200);
+    drop(resp);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let text: Option<String> = sqlx::query_scalar(
+            "SELECT payload->>'text' FROM events WHERE thread_id = $1 AND event_type = 'MessageReceived' LIMIT 1",
+        )
+        .bind(thread_id)
+        .fetch_optional(&pool)
+        .await
+        .expect("message lookup");
+        if let Some(text) = text {
+            assert_eq!(text, message);
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no MessageReceived landed on thread {thread_id}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 }

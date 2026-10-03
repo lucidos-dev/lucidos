@@ -195,7 +195,7 @@ pub(in crate::api) async fn archive_thread(
     .await
     .map_err(reach_rejection)?;
     let actor = crate::api::actor::user_actor(&headers, None);
-    archive_family(&state.engine, thread_uuid, actor)
+    archive_family(&state.engine, thread_uuid, actor, PinnedMembers::ByActor)
         .await
         .map(ArchiveOutcome::into_body)
 }
@@ -238,7 +238,7 @@ pub(in crate::api) async fn archive_thread_as_caller(
         },
         None => {
             let actor = crate::api::actor::user_actor(&headers, None);
-            archive_family(&state.engine, target, actor)
+            archive_family(&state.engine, target, actor, PinnedMembers::ByActor)
                 .await
                 .map(ArchiveOutcome::into_body)
         }
@@ -257,6 +257,16 @@ fn agent_ack_body(ack: AgentArchiveAck) -> axum::Json<serde_json::Value> {
     }
 }
 
+/// What a cascade does with a pinned member (ADR 0312).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PinnedMembers {
+    /// An agent leaves them open; the user's own Archive takes them.
+    ByActor,
+    /// Leave them open whoever asks. Archive all puts away only what is safe,
+    /// and a pin is the user's "keep this at hand" (ADR 0349).
+    LeaveOpen,
+}
+
 /// Which members of a locked family a cascade touches.
 struct CascadePlan {
     to_archive: Vec<Uuid>,
@@ -268,15 +278,16 @@ struct CascadePlan {
 /// Plan the cascade over a family the gate has already admitted. Pure, so the
 /// pin rule is testable without an engine.
 ///
-/// An agent never archives a pinned thread (ADR 0312). Its archive refuses a
-/// pinned target and leaves a pinned member open. The user's own Archive
-/// takes every member, and the drawer confirms before it unpins.
+/// An agent never archives a pinned thread (ADR 0312), and neither does
+/// Archive all (ADR 0349). Those refuse a pinned target and leave a pinned
+/// member open. The user's own Archive takes every member, and the drawer
+/// confirms before it unpins.
 fn plan_cascade(
     family: &[FamilyRow],
     target: Uuid,
-    by_agent: bool,
+    leave_pinned: bool,
 ) -> Result<CascadePlan, ArchiveRejection> {
-    let left_pinned: Vec<Uuid> = if by_agent {
+    let left_pinned: Vec<Uuid> = if leave_pinned {
         family
             .iter()
             .filter(|r| r.is_saved)
@@ -359,6 +370,7 @@ pub(crate) async fn archive_family(
     engine: &std::sync::Arc<LucidosEngine>,
     thread_uuid: Uuid,
     actor: Option<MessageOrigin>,
+    pinned: PinnedMembers,
 ) -> Result<ArchiveOutcome, ArchiveRejection> {
     // Before the transaction, so a refused target changes nothing. A
     // single-thread archive is exactly this case, and must not answer 200.
@@ -379,8 +391,9 @@ pub(crate) async fn archive_family(
         body["message"] = gate_refusal_message(&body, thread_uuid).into();
         return Err((status, axum::Json(body)));
     }
-    let by_agent = actor.as_ref().is_some_and(|a| a.mode() == ActorMode::Agent);
-    let plan = match plan_cascade(&family, thread_uuid, by_agent) {
+    let leave_pinned = pinned == PinnedMembers::LeaveOpen
+        || actor.as_ref().is_some_and(|a| a.mode() == ActorMode::Agent);
+    let plan = match plan_cascade(&family, thread_uuid, leave_pinned) {
         Ok(plan) => plan,
         Err(rejection) => {
             let _ = tx.rollback().await;

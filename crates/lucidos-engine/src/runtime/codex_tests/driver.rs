@@ -1,12 +1,13 @@
 use super::*;
 
 /// Stand up a driver over a stub "codex" shell script. The stub appends its
-/// argv to `args.log` in the temp dir (one line per invocation, `|`-joined)
-/// and prints the given JSONL body — the same seam CC's driver tests get
-/// from a pre-spawned `sh` child.
+/// argv to `args.log` and its stdin to `stdin.log` in the temp dir (one line
+/// per invocation each), then prints the given JSONL body. That is the same
+/// seam CC's driver tests get from a pre-spawned `sh` child.
 struct StubSession {
     _tmp: tempfile::TempDir,
     args_log: PathBuf,
+    stdin_log: PathBuf,
     agent: RunningAgent,
     cancel: CancellationToken,
 }
@@ -21,14 +22,26 @@ fn stub_driver(jsonl_body: &str, resume: Option<&str>) -> StubSession {
 /// [`stub_driver`] with the stub's output left to `script_tail`, a shell
 /// snippet that runs after the argv is logged.
 fn stub_driver_running(script_tail: &str, resume: Option<&str>) -> StubSession {
+    stub_driver_prompted("SYSPROMPT", script_tail, resume)
+}
+
+/// [`stub_driver_running`] under the given engine system prompt.
+fn stub_driver_prompted(
+    system_prompt: &str,
+    script_tail: &str,
+    resume: Option<&str>,
+) -> StubSession {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let args_log = tmp.path().join("args.log");
+    let stdin_log = tmp.path().join("stdin.log");
     let script = tmp.path().join("codex-stub.sh");
-    // One log line per invocation — the prompt argument is multi-line (the
-    // system-prompt block), so flatten newlines before appending.
+    // One log line per invocation in each log. The stdin prompt is
+    // multi-line (the system-prompt block), so flatten newlines first.
     let body = format!(
-        "#!/bin/sh\nprintf '%s' \"$*\" | tr '\\n' ' ' >> {log}\nprintf '\\n' >> {log}\n{script_tail}",
+        "#!/bin/sh\nprintf '%s' \"$*\" | tr '\\n' ' ' >> {log}\nprintf '\\n' >> {log}\n\
+         tr '\\n' ' ' >> {stdin}\nprintf '\\n' >> {stdin}\n{script_tail}",
         log = args_log.display(),
+        stdin = stdin_log.display(),
     );
     std::fs::write(&script, body).expect("write stub");
     #[cfg(unix)]
@@ -40,7 +53,7 @@ fn stub_driver_running(script_tail: &str, resume: Option<&str>) -> StubSession {
     let config = CodexConfig {
         codex_bin: script.into_os_string(),
         worktree_path: tmp.path().to_path_buf(),
-        system_prompt: Some("SYSPROMPT".into()),
+        system_prompt: Some(system_prompt.into()),
         model: None,
         reasoning_effort: None,
         sandbox_writable_roots: Vec::new(),
@@ -62,6 +75,7 @@ fn stub_driver_running(script_tail: &str, resume: Option<&str>) -> StubSession {
     StubSession {
         _tmp: tmp,
         args_log,
+        stdin_log,
         agent: RunningAgent {
             kind: CodingAgent::Codex,
             events_rx,
@@ -167,8 +181,10 @@ async fn one_turn_emits_init_message_usage_result_then_exited_on_close() {
     // First fresh turn must carry the system prompt inline and no resume.
     let invocations = logged_invocations(&s.args_log);
     assert_eq!(invocations.len(), 1);
-    assert!(invocations[0].contains("SYSPROMPT"));
     assert!(!invocations[0].contains("resume"));
+    let prompts = logged_invocations(&s.stdin_log);
+    assert!(prompts[0].contains("SYSPROMPT"));
+    assert!(prompts[0].ends_with("ping"));
 }
 
 #[tokio::test]
@@ -216,9 +232,11 @@ async fn follow_up_turn_resumes_with_session_id_from_first_turn() {
         "turn 2 must resume the thread id announced in turn 1; got {:?}",
         invocations[1]
     );
+    let prompts = logged_invocations(&s.stdin_log);
+    assert_eq!(prompts[1], "second");
     assert!(
-        !invocations[1].contains("SYSPROMPT"),
-        "resumed turns must not re-send the system prompt — it's already in the Codex-side history"
+        !prompts[1].contains("SYSPROMPT"),
+        "resumed turns must not re-send the system prompt: it is already in the Codex-side history"
     );
 
     s.cancel.cancel();
@@ -256,7 +274,48 @@ async fn a_resumed_session_runs_the_engine_continuation_as_an_input() {
     let invocations = logged_invocations(&s.args_log);
     assert_eq!(invocations.len(), 1);
     assert!(invocations[0].contains("resume sid-9"));
-    assert!(invocations[0].contains(continuation));
+    assert_eq!(logged_invocations(&s.stdin_log), [continuation]);
+
+    s.cancel.cancel();
+}
+
+/// Linux's `MAX_ARG_STRLEN`: the most bytes one argv string may hold.
+const LINUX_MAX_ARG_STRLEN: usize = 131_072;
+
+/// A first turn carrying a long thread's history reaches codex on stdin. On
+/// argv it would fail the spawn with `E2BIG` once it passed the Linux cap, and
+/// anyone on the host could read it in `/proc/<pid>/cmdline`.
+#[tokio::test]
+async fn a_huge_first_turn_prompt_travels_on_stdin_not_argv() {
+    let marker = "THREAD-HISTORY-LINE ";
+    let system_prompt = marker.repeat(1024 * 1024 / marker.len());
+    let script_tail = format!("cat <<'JSONL_EOF'\n{HAPPY_TURN}\nJSONL_EOF\n");
+    let mut s = stub_driver_prompted(&system_prompt, &script_tail, None);
+    s.agent
+        .input_tx
+        .send(AgentInput {
+            text: "ping".into(),
+            images: vec![],
+            uuid: uuid::Uuid::new_v4(),
+        })
+        .expect("send input");
+    loop {
+        if let AgentEvent::Result { error, .. } = next_event(&mut s.agent).await {
+            assert_eq!(error, None, "the turn must run");
+            break;
+        }
+    }
+
+    let invocations = logged_invocations(&s.args_log);
+    assert_eq!(invocations.len(), 1);
+    assert!(invocations[0].len() <= LINUX_MAX_ARG_STRLEN);
+    assert!(
+        !invocations[0].contains(marker),
+        "the prompt leaked into argv"
+    );
+    let prompts = logged_invocations(&s.stdin_log);
+    assert!(prompts[0].contains(&system_prompt));
+    assert!(prompts[0].ends_with("ping"));
 
     s.cancel.cancel();
 }

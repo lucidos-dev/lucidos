@@ -304,29 +304,32 @@ pub(crate) const TRIGGER_VS_EVENT_WAIT_RULE: &str =
 /// Routes the chat agent to the authoritative system-knowhow file before it
 /// touches a workspace asset.
 ///
-/// Deliberately covers **operating on an existing trigger**, not just creating
-/// one. Narrowing the trigger row back to create/update leaves "run my digest
-/// trigger now" with no route. The agent then guesses and reaches for resume,
-/// which restores the schedule and runs nothing. Pinned by
-/// `workspace_assets_rule_routes_existing_trigger_operations`.
+/// Deliberately covers **operating on an existing trigger or plugin**, not
+/// just creating one. Narrowing the trigger row back to create/update leaves
+/// "run my digest trigger now" with no route. The agent then guesses and
+/// reaches for resume, which restores the schedule and runs nothing.
+/// Narrowing the plugin row back to packaging likewise leaves "publish this
+/// plugin" with no route.
+/// Pinned by `workspace_assets_rule_routes_existing_trigger_operations` and
+/// `workspace_assets_rule_routes_existing_plugin_operations`.
 pub(crate) const WORKSPACE_ASSETS_KNOWHOW_RULE: &str =
     "WORKING WITH WORKSPACE ASSETS, LOAD KNOWHOW FIRST:\n\
      Before creating a trigger, app, knowhow file, or plugin, AND before \
-     acting on an EXISTING trigger, you MUST first call load_knowhow on the \
-     matching system-knowhow file:\n\
+     acting on an EXISTING trigger or plugin, you MUST first call load_knowhow \
+     on the matching system-knowhow file:\n\
      - triggers, ANY action (create, update, pause/resume, or run one now, \
      off-schedule) -> `system-knowhow/triggers`\n\
      - create_app -> `system-knowhow/building-an-app`\n\
      - a new file under knowhow/ -> `system-knowhow/building-knowhow`\n\
-     - packaging a plugin -> `system-knowhow/plugins`\n\
+     - plugins, ANY action (package, publish, update) -> \
+     `system-knowhow/plugins`\n\
      To run an existing trigger off-schedule, use triggers(action=\"run\"). Do \
      not improvise a substitute: resuming a paused trigger does not run it, \
      and a run_thread carrying a copy of the trigger's intent is not a run.\n\
      Each knowhow has a \"Questions to settle with the user before creating\" \
      section, which is the source of truth for what to ask. The ACTION FIRST \
      rule below does NOT apply to workspace assets: load the knowhow, ask what \
-     it says to ask, then act. Skip the load if you already loaded that \
-     knowhow earlier in this thread.";
+     it says to ask, then act. Skip a load you already did in this thread.";
 
 /// Routes a plugin *setup thread* to the `plugin-setup` knowhow.
 ///
@@ -494,6 +497,7 @@ MEMORY CORRECTIONS (the `memory` tool):
 - Afterwards, if user_profile.md or another artifact still carries the stale fact, ASK before editing it. Never edit an artifact automatically during a memory correction.
 
 BROWSER TOOLS:
+- A configured proxy (proxy_request) or an MCP tool comes first. Use the browser only when neither covers the task, and say so.
 - browser_open is ONLY for an external website the user asks you to visit. NEVER point it at your own app UIs, artifacts, or any Lucidos file: those are edited with the file tools and opened by the user in the frontend.
 - Use visible=true when the user says "show me" or "let me log in", or when a site blocks headless browsers or redirects you to a login page.
 
@@ -504,7 +508,7 @@ TRIGGERS:
 - In a trigger thread, send_notification only when there is something noteworthy to report. If nothing changed, just finish. Errors are reported automatically.
 
 IMPORTING DATA & CREDENTIALS:
-- API data: check credentials, request_credential if missing, http_request, write_file to imported/<service>/. A local file is import_file with the full path.
+- API data: check credentials and the builtin provider proxies (proxy_request), request_credential only if neither has it, http_request, write_file to imported/<service>/. A local file is import_file with the full path.
 - NEVER accept a token or key pasted in chat. request_credential opens a secure popup that keeps the secret out of the event log; if the user pastes one, redirect them to it.
 
 EMAIL SETUP:
@@ -1339,7 +1343,35 @@ mod tests {
     ///
     /// Lowered by 260 to a measured 121,748: the PARALLEL WORK rule on when to
     /// archive is gone (ADR 0330). No prompt says when to archive.
-    const ALWAYS_LOADED_BUDGET_CHARS: usize = 121_748;
+    ///
+    /// Raised by 409 to a measured 122,157 for `threads` 'drafts' and
+    /// 'held_messages', and the `has_draft` / `has_diff` filters. The agent
+    /// could not say which thread held a user's unsent draft, nor link it
+    /// (docs/plans/2026-10-02-threads-tool-which-thread-holds-what.md).
+    ///
+    /// Raised by 131 to a measured 122,288: `run_coding_agent`'s `prompt` now
+    /// says review, merge and hardening behavior are defaults set by the
+    /// folder, stated only to ask for something else. An orchestrator was
+    /// restating them in a child's brief as a prohibition. A stray "do not
+    /// harden" made a session skip a step its own kind required.
+    ///
+    /// Raised by 422 to a measured 122,710 for `threads` 'triage' and
+    /// 'apply_triage' (ADR 0349). A tester with a pile of stale threads had no
+    /// safe way to clear them. The how lives in the triage result, not here.
+    ///
+    /// Raised by 478 to a measured 123,188 for the builtin provider proxies.
+    /// `proxy_request` names them and the /v1 base quirk, `request_credential`
+    /// says it refuses a service one already serves, and the API-data line
+    /// points at them. An agent opened a key form for OpenAI while the engine
+    /// already held a working OpenAI proxy
+    /// (docs/plans/2026-10-02-agent-sees-builtin-provider-proxies.md).
+    ///
+    /// Raised by 118 to a measured 123,306 for the tool order in BROWSER
+    /// TOOLS: a configured proxy or an MCP tool first, the browser last and
+    /// announced. No line gave an order, so nothing kept the agent off a site
+    /// a proxy already served. The choice is made at the call, where no
+    /// knowhow loads.
+    const ALWAYS_LOADED_BUDGET_CHARS: usize = 123_306;
 
     /// The hand-written flat tool schemas the chat agent is offered.
     ///
@@ -1615,7 +1647,7 @@ mod tests {
         ),
         (
             "request_credential",
-            2_351,
+            2_434,
             "thirteen properties, seven of them the oauth_client endpoint set, \
              each already one line pointing at system-knowhow/oauth-providers. \
              Raised from 2,150 by the `secret` type: it adds a sixth enum \
@@ -1626,7 +1658,9 @@ mod tests {
              names every host it reaches, and that naming a missed host widens \
              the existing one. Knowhow cannot carry it, since the argument is \
              what the model writes, and the failure it prevents is storing one \
-             token under two service names",
+             token under two service names. Raised from 2,351 by the builtin \
+             proxy refusal: the agent must know before calling that a service \
+             a configured builtin serves is refused, and which overrides proceed",
         ),
         (
             "ask_user_question",
@@ -1667,14 +1701,18 @@ mod tests {
         ),
         (
             "threads",
-            2_243,
-            "three more actions on a domain whose two existing schemas \
+            3_159,
+            "five more actions on a domain whose two existing schemas \
              are almost entirely a spelled-out `status` enum pinned to \
              `ThreadStatus::ALL` by a test, repeated across both because \
              `llm_schema` is a const JSON literal and cannot compose. `search` \
              adds its own summary, `(requires: q)` and two properties, \
              `detach_child` its summary and a `thread_id` (ADR 0278), and \
-             `archive` the same again (ADR 0310)",
+             `archive` the same again (ADR 0310). Raised from 2,243 for \
+             `drafts` and `held_messages`, which reuse the union's properties, \
+             and the two filters `has_draft` and `has_diff`. Raised from \
+             2,737 for `triage` and `apply_triage` (ADR 0349), two short \
+             summaries and one `entries` array",
         ),
         (
             "events",
@@ -2141,6 +2179,31 @@ mod tests {
         );
     }
 
+    /// The browser is the slowest and most fragile way to reach a service, yet
+    /// BROWSER TOOLS gave no order. So nothing kept the agent off a site that
+    /// a configured proxy or an MCP tool already served. The section must name
+    /// both before the browser, and make the fallback visible to the user.
+    #[test]
+    fn the_browser_section_prefers_a_proxy_or_mcp_tool_and_says_when_it_falls_back() {
+        let body = static_prompt_body(false, 500, ContextMode::Off, "");
+        let from = body
+            .find("BROWSER TOOLS:\n")
+            .expect("the prompt no longer has a BROWSER TOOLS section");
+        let section = &body[from..];
+        let section = &section[..section.find("\n\n").unwrap_or(section.len())];
+
+        assert!(
+            section.contains("proxy_request") && section.contains("an MCP tool"),
+            "the section must name the configured proxy and MCP tools as the \
+             first choice over the browser:\n{section}"
+        );
+        assert!(
+            section.contains("only when neither covers the task, and say so"),
+            "the browser is the fallback, and the user must hear when it is \
+             used:\n{section}"
+        );
+    }
+
     /// The batch rule removes rounds only if the model reads it as general.
     /// Its two carve-outs are what keep "batch" from reaching a question card
     /// or a spawn that depends on the one before it.
@@ -2443,6 +2506,28 @@ mod tests {
             !rule.contains("action create/update"),
             "the create/update-only phrasing is what caused the miss:\n{rule}"
         );
+    }
+
+    /// Scoped to "packaging", the plugin row leaves "publish this plugin" with
+    /// no route, and a model that reads the rule literally skips the knowhow.
+    #[test]
+    fn workspace_assets_rule_routes_existing_plugin_operations() {
+        let rule = WORKSPACE_ASSETS_KNOWHOW_RULE;
+
+        assert!(
+            rule.contains("EXISTING trigger or plugin"),
+            "the rule must fire for an existing plugin, not only a create:\n{rule}"
+        );
+        let plugin_row = rule
+            .lines()
+            .find(|line| line.contains("`system-knowhow/plugins`"))
+            .expect("the rule must route plugins to system-knowhow/plugins");
+        for action in ["ANY action", "publish", "update"] {
+            assert!(
+                plugin_row.contains(action),
+                "the plugin row must cover {action:?}, not only packaging:\n{plugin_row}"
+            );
+        }
     }
 
     /// Every id in the routing block must be a real `system-knowhow/<id>`, or

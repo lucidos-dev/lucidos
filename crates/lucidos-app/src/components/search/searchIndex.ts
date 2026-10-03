@@ -1,6 +1,6 @@
 import { enginePackaged, type SettingsSubview } from '../../store/store';
 import type { SearchResultItem } from '../../api/client';
-import { SHORTCUT_DEFS, bindingSearchText } from '../../utils/shortcuts';
+import { SHORTCUT_DEFS, bindingSearchText, shortcutSearchAnchor } from '../../utils/shortcuts';
 import { displayBinding, bindingFor } from '../../store/actions/keybindings';
 import { isMobile } from '../../utils/viewport';
 import { isIOS, isTauri } from '../../utils/platform';
@@ -9,6 +9,7 @@ import { WORKSPACE_ID } from '../../utils/basePath';
 // target", shared with the Settings row and its nav entry so search can never
 // offer a result that lands on nothing.
 import { externalLinkTargetConfigurable } from '../../store/actions/preferences';
+import { rankByTitle } from './titleMatch';
 
 type Subview = Exclude<SettingsSubview, 'main'>;
 
@@ -77,10 +78,6 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   // Devices page rather than under Access. Still gateway-gated: with none, no
   // row carries a Revoke button and the word would land on nothing.
   { id: 'devices:paired', label: 'Paired devices', subview: 'devices', path: 'Settings → Devices', anchor: 'devices:list', keywords: 'paired pairing device revoke unpair sign out cut off network access', gatewayOnly: true },
-  // No keywords, deliberately. The match is a plain substring over label plus
-  // keywords, every hit scores the same, and results come back in array order.
-  // So naming this row's own sub-pages here would put "System" above every one
-  // of them: typing "backup" would offer the submenu first and Backup second.
   { id: 'system', label: 'System', subview: 'system', path: 'Settings' },
   { id: 'appearance', label: 'Appearance & Behavior', subview: 'appearance', path: 'Settings', keywords: 'appearance interface behavior theme font scale links browser' },
   { id: 'keyboard-shortcuts', label: 'Keyboard Shortcuts', subview: 'keyboard-shortcuts', path: 'Settings', keywords: 'keybindings hotkeys shortcut' },
@@ -204,13 +201,14 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
 /** Per-shortcut search entries, synthesized from the registry so they reflect
  *  the user's CURRENT (possibly-customized) binding. Each carries key-combo
  *  aliases ("ctrl k", "ctrl+k", "cmd k", …) as keywords so typing a combo finds
- *  it; selecting one opens the Keyboard Shortcuts cheat sheet. */
+ *  it; selecting one lands on that shortcut's row in Keyboard Shortcuts. */
 function shortcutSearchEntries(): SettingsSearchEntry[] {
   return SHORTCUT_DEFS.map((def) => ({
     id: `shortcut:${def.id}`,
     label: `${def.label} (${displayBinding(def.id)})`,
     subview: 'keyboard-shortcuts' as Subview,
     path: 'Settings → Keyboard Shortcuts',
+    anchor: shortcutSearchAnchor(def.id),
     keywords: `${def.label} ${bindingSearchText(bindingFor(def.id))} keyboard shortcut`,
   }));
 }
@@ -219,9 +217,10 @@ function allSettingsEntries(): SettingsSearchEntry[] {
   return [...SETTINGS_SEARCH_INDEX, ...shortcutSearchEntries()];
 }
 
-/** Filter the index by query (case-insensitive substring over label + keywords)
- *  and return as SearchResultItems. An empty query lists the static settings
- *  index only (not every shortcut). */
+/** Filter the index by query (case-insensitive substring over label + keywords),
+ *  rank by label best first, and return as SearchResultItems. Ranked before the
+ *  cut, so a strong label late in the index survives it. An empty query lists
+ *  the static settings index only (not every shortcut), in index order. */
 export function getSettingsSearchResults(query: string, limit: number): SearchResultItem[] {
   const q = query.trim().toLowerCase();
   // Mobile-only rows are hidden in Settings on desktop, so don't surface them as
@@ -235,7 +234,11 @@ export function getSettingsSearchResults(query: string, limit: number): SearchRe
     && (!e.tauriOnly || isTauri())
     && (!e.gatewayOnly || WORKSPACE_ID !== null);
   const matches = q
-    ? allSettingsEntries().filter(e => visible(e) && `${e.label} ${e.keywords ?? ''}`.toLowerCase().includes(q))
+    ? rankByTitle(
+        allSettingsEntries().filter(e => visible(e) && `${e.label} ${e.keywords ?? ''}`.toLowerCase().includes(q)),
+        q,
+        e => e.label,
+      )
     : SETTINGS_SEARCH_INDEX.filter(visible);
   return matches.slice(0, limit).map(e => ({
     id: e.id,
@@ -250,10 +253,10 @@ export function findSettingsEntry(id: string): SettingsSearchEntry | undefined {
   return allSettingsEntries().find(e => e.id === id);
 }
 
-/** Ids of the STATIC index (not the synthesized per-shortcut entries, which are
- *  uniform and anchor-less). Exists so the settings-nav guard can walk every
- *  entry and check its subview is live and its anchor is rendered, without this
- *  module exporting the whole array. */
+/** Ids of the STATIC index. The settings-nav guard walks them to check each
+ *  subview is live and each anchor renders, without this module exporting the
+ *  whole array. `shortcut-search-landing.test.tsx` checks the synthesized
+ *  per-shortcut entries instead. */
 export function settingsSearchEntryIds(): string[] {
   return SETTINGS_SEARCH_INDEX.map(e => e.id);
 }

@@ -1358,7 +1358,7 @@ wait_for_engine_shutdown() {
 #
 # CRITICAL: match the SCRIPT PATH token, never a substring of the whole
 # command line. `pgrep -f '<name>\.sh.*$WORKSPACE'` matches the phrase
-# ANYWHERE in a process's argv, and a coding agent carries the engine's thread
+# ANYWHERE in a process's argv, and a coding agent carried the engine's thread
 # history inside a roughly 22 KB `--append-system-prompt` argument. Any thread
 # quoting a dev script and then this workspace path became a kill candidate,
 # and the caller sends `pkill -P` plus a SIGTERM, so it takes the session's

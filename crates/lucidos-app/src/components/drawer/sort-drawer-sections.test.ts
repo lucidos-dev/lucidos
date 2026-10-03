@@ -37,6 +37,7 @@ function makeThread(id: string, createdAt: string, lastUserAction: string): Thre
         codingAgentHasDiff: false,
         codingAgentProposed: false,
         codingAgentRequiresRestart: false,
+        codingAgentIncomplete: false,
         codingAgentIsExternalRepo: false,
         lastRevivedAt: '',
         state: 'active',

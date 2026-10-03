@@ -15,9 +15,13 @@ function streamStep(): SequencedEvent {
 }
 
 /** A stepless MessageReceived exchange = a queued (uningested) follow-up. */
-function queued(text: string, id?: string): Exchange {
+function queued(text: string, id?: string, images?: string[]): Exchange {
   return {
-    userEvent: { type: 'MessageReceived', text, created: TS, ...(id ? { _eventId: id } : {}) } as Exchange['userEvent'],
+    userEvent: {
+      type: 'MessageReceived', text, created: TS,
+      ...(id ? { _eventId: id } : {}),
+      ...(images ? { user_image_hashes: images } : {}),
+    } as Exchange['userEvent'],
     userSeq: 1,
     steps: [],
   };
@@ -33,11 +37,11 @@ function activeStreaming(): Exchange {
 }
 
 describe('queuedMessagesFromExchanges', () => {
-  it('returns queued follow-ups in FIFO order with id + text', () => {
-    const list = [activeStreaming(), queued('first queued', 'q1'), queued('second queued', 'q2')];
+  it('returns queued follow-ups in FIFO order with id, text and images', () => {
+    const list = [activeStreaming(), queued('first queued', 'q1', ['img-a']), queued('second queued', 'q2')];
     expect(queuedMessagesFromExchanges(list, true, false)).toEqual([
-      { id: 'q1', text: 'first queued' },
-      { id: 'q2', text: 'second queued' },
+      { id: 'q1', text: 'first queued', imageHashes: ['img-a'] },
+      { id: 'q2', text: 'second queued', imageHashes: [] },
     ]);
   });
 
@@ -53,7 +57,7 @@ describe('queuedMessagesFromExchanges', () => {
 
   it('skips a queued exchange with no _eventId (cannot be retracted by id)', () => {
     const list = [activeStreaming(), queued('no id'), queued('has id', 'q2')];
-    expect(queuedMessagesFromExchanges(list, true, false)).toEqual([{ id: 'q2', text: 'has id' }]);
+    expect(queuedMessagesFromExchanges(list, true, false)).toEqual([{ id: 'q2', text: 'has id', imageHashes: [] }]);
   });
 
   it('keeps a queued follow-up queued when an async row merely landed in it', () => {
@@ -69,7 +73,7 @@ describe('queuedMessagesFromExchanges', () => {
     }];
     const list = [activeStreaming(), withAsyncRow];
     expect(queuedMessagesFromExchanges(list, true, false)).toEqual([
-      { id: 'q1', text: 'follow up' },
+      { id: 'q1', text: 'follow up', imageHashes: [] },
     ]);
   });
 
@@ -77,6 +81,6 @@ describe('queuedMessagesFromExchanges', () => {
     // Mirrors "a freshly-sent first message is active (Requesting), not queued":
     // with no non-uningested turn, the earliest candidate owns the active slot.
     const list = [queued('first', 'q1'), queued('second', 'q2')];
-    expect(queuedMessagesFromExchanges(list, true, false)).toEqual([{ id: 'q2', text: 'second' }]);
+    expect(queuedMessagesFromExchanges(list, true, false)).toEqual([{ id: 'q2', text: 'second', imageHashes: [] }]);
   });
 });

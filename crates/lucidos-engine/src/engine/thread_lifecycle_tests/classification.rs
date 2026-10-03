@@ -252,6 +252,21 @@ fn unattended_trigger_runs_route_to_archived() {
     }
 }
 
+// 14a2. undo_restores_an_unattended_trigger_run
+#[test]
+fn undo_restores_an_unattended_trigger_run() {
+    // Archive all can take a trigger run that is still unattended, such as
+    // one a restart stranded in Current. Its Undo must bring it back.
+    let result = resolve_transition(
+        "ThreadUnarchived",
+        ThreadType::Chat,
+        ArchiveState::Archived,
+        true,
+    )
+    .unwrap();
+    assert_eq!(result.new_section, Some(ArchiveState::Inbox));
+}
+
 // 14b. response_aborted_surfaces_both_thread_types_to_inbox
 #[test]
 fn response_aborted_surfaces_both_thread_types_to_inbox() {

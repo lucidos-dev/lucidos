@@ -46,19 +46,24 @@ function byType(node: ComponentChildren, type: unknown): AnyVNode | null {
 
 const base = {
   type: 'ChangeApplied' as const,
-  subject: 'Fix the bug',
+  headline: 'Fix the bug',
   stateLabel: 'Applied',
   tone: 'good' as const,
 };
 
 /** A change resolution wears the event-row card a child thread's return does. */
 describe('change event row', () => {
-  it('is an event row: subject, state word, file count', () => {
+  /** The same shape as every other event row: a chip leads the top line, and
+   *  the headline is the sentence under it. */
+  it('is an event row: chip, state word, headline, file count', () => {
     const row = changeEventRowBody({ ...base, fileCount: 3 }) as AnyVNode;
     expect(row.props.class).toBe('event-row');
     expect(row.props['data-kind']).toBe('change');
     expect(row.props['data-state']).toBe('ChangeApplied');
-    expect(text(byClass(row, 'event-row-subject'))).toBe('Fix the bug');
+    const subject = byClass(row, 'event-row-subject')!;
+    expect(byClass(subject, 'event-name')).not.toBeNull();
+    expect(text(subject)).toBe('Change');
+    expect(text(byClass(row, 'event-row-detail'))).toBe('Fix the bug');
     const state = byClass(row, 'event-row-state')!;
     expect(text(state)).toBe('Applied');
     expect(state.props['data-tone']).toBe('good');
@@ -87,7 +92,7 @@ describe('change event row', () => {
     const row = changeEventRowBody({
       ...base,
       type: 'ChangeApplyFailed',
-      subject: 'Change',
+      headline: undefined,
       stateLabel: 'Failed',
       tone: 'bad',
       error: 'merge conflict in a.ts',
@@ -125,8 +130,16 @@ describe('change event row', () => {
     expect(byType(row, EventRowFoldView)!.props.label).toBe('Error');
   });
 
+  /** A headline still loading keeps its line, so the card does not grow when
+   *  it lands. */
+  it('holds the headline line while the headline loads', () => {
+    const row = changeEventRowBody({ ...base, headline: undefined, headlinePending: true });
+    expect(text(byClass(row, 'event-row-detail'))).toBe('\u00a0');
+  });
+
   it('states no fact it does not have', () => {
-    const row = changeEventRowBody(base);
+    const row = changeEventRowBody({ ...base, headline: undefined });
+    expect(byClass(row, 'event-row-detail')).toBeNull();
     expect(byClass(row, 'event-row-meta')).toBeNull();
     expect(byType(row, EventRowFoldView)).toBeNull();
     expect(byClass(row, 'event-row-actions')).toBeNull();

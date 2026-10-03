@@ -728,11 +728,29 @@ async fn remove_queued_message(
     Ok(StatusCode::OK)
 }
 
+/// Did this engine already accept a message with this client event id? Asks
+/// the events table first, then `accepted_messages` for a message accepted but
+/// not yet recorded. A "no" admits the id, so the caller goes on to run it.
+async fn message_was_already_accepted(
+    engine: &crate::engine::LucidosEngine,
+    event_id: Uuid,
+) -> Result<bool, ApiError> {
+    let recorded = crate::engine::chat_event_id_is_recorded(engine.pool(), event_id)
+        .await
+        .map_err(|e| {
+            ApiError::internal(format!(
+                "Could not check whether message {event_id} was already recorded: {e}"
+            ))
+        })?;
+    Ok(recorded || !engine.accepted_messages.admit(event_id))
+}
+
 /// POST endpoint for chat with progress updates.
 /// Returns immediately with an `event_id` (the response's only field; the
 /// legacy `message_id` name survives solely as a request-body serde alias on
 /// `ChatRequest::event_id`). All progress events are sent via the global SSE
-/// stream as ThreadEvent events.
+/// stream as ThreadEvent events. A re-post of an accepted `event_id` returns
+/// the same ack and starts nothing (`message_was_already_accepted`).
 pub(super) async fn chat_submit(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -813,14 +831,6 @@ pub(super) async fn chat_submit(
             );
             return Err(ApiError::not_found(unknown_thread_message(tid)));
         }
-    }
-
-    // A side question never becomes a turn (ADR 0320).
-    if crate::engine::agent_session::side_question::is_side_question(&request.message) {
-        return Err(ApiError::bad_request(
-            crate::engine::agent_session::side_question::SIDE_QUESTION_ON_CHAT_ROUTE,
-        )
-        .with_reason("side-question"));
     }
 
     // Subprocess gate: see `subprocess_chat_legitimate` for the matrix, and
@@ -1230,6 +1240,26 @@ pub(super) async fn chat_submit(
         }
     }
 
+    // A re-post of a message this engine already accepted gets the same ack
+    // and starts nothing. Placed after every refusal, so a refused request
+    // leaves its id free for the corrected retry. A failure further down that
+    // starts nothing forgets `admitted_event_id` for the same reason.
+    let mut admitted_event_id = None;
+    if let Some(raw) = event_id.as_deref() {
+        if let Ok(id) = Uuid::parse_str(raw) {
+            if message_was_already_accepted(&state.engine, id).await? {
+                log!(
+                    "[Chat] Event {} was already accepted; acking the re-post",
+                    id
+                );
+                return Ok(Json(ChatSubmitResponse {
+                    event_id: raw.to_string(),
+                }));
+            }
+            admitted_event_id = Some(id);
+        }
+    }
+
     // ---- Thread Queue gate ----
     // Agent/Engine-mode POSTs that START a new thread are background spawns: a
     // cross-workspace task POST, or the `lucidos spawn-thread` CLI. They route
@@ -1302,6 +1332,9 @@ pub(super) async fn chat_submit(
             }
             Err(e) => {
                 log!("[Chat] pending_app_spawn poisoned, cannot stash: {}", e);
+                if let Some(id) = admitted_event_id {
+                    state.engine.accepted_messages.forget(id);
+                }
                 return Err(StatusCode::INTERNAL_SERVER_ERROR.into());
             }
         }

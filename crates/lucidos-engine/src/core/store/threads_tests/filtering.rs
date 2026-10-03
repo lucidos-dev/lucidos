@@ -537,6 +537,8 @@ fn filters(status: StatusFilter<'_>) -> ThreadSummaryFilters<'_> {
         status,
         sources: None,
         parent: None,
+        has_draft: None,
+        has_diff: None,
         limit: 1000,
     }
 }

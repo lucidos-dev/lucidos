@@ -13,22 +13,24 @@ export const SEND_HOLD_SLIDE_MS = 200;
 /** Fixed margin past the slide, so the leaving half never cuts off early. */
 export const SEND_HOLD_SLIDE_SLACK_MS = 50;
 
-/** The Side question half of the split pill Send or Stop opens into. A long
- *  press or a right-click on either opens it, and so does the Side question
- *  shortcut. From Send it asks the composer's contents as a side question,
- *  with no `/btw` typed. From Stop the box is empty, so it starts a `/btw`.
- *  Only a touch hold opens it on Stop: a mouse or the shortcut starts the
- *  `/btw` at once, since the open pill would keep the box from taking typing.
+/** The Side question half of the split pill the row's end button opens into:
+ *  Send, Stop, or, while a card waits, Submit or the lone Cancel. A long press
+ *  or a right-click opens it, and so does the Side question shortcut. From Send
+ *  or Submit it asks the composer's contents as a side question. Under Stop or
+ *  Cancel the box is empty, so it turns on side-question mode. There only a
+ *  touch hold opens it: a mouse or the shortcut turns the mode on at once,
+ *  since the open pill would keep the box from taking typing.
  *
- *  Send is the pill's other half, so it is the overlay's `anchor`: a tap on it
- *  sends and shuts the pill, rather than only dismissing it. Anywhere else
- *  dismisses (`.claude/rules/frontend.md` § Modals & Popovers).
+ *  That button is the pill's other half, so it is the overlay's `anchor`: a tap
+ *  on it does its own job and shuts the pill, rather than only dismissing it.
+ *  Anywhere else dismisses (`.claude/rules/frontend.md` § Modals & Popovers).
  *
- *  The shortcut focuses this half so Enter asks, and Tab moves on to Send. A
- *  hold must not take focus: on touch that drops the keyboard. */
+ *  The shortcut focuses this half so Enter asks, and Tab moves on to the
+ *  button. A hold must not take focus: on touch that drops the keyboard. */
 export function SendHoldMenu({ anchor, leaving, onAskSideQuestion, onClosed }: {
+  /** The button at the row's end, the pill's other half. */
   anchor: HTMLElement | null;
-  /** The pill has shut and its half is sliding back behind Send. */
+  /** The pill has shut and its half is sliding back behind its button. */
   leaving: boolean;
   onAskSideQuestion: () => void;
   /** Runs whenever the pill shuts, however it was shut. */

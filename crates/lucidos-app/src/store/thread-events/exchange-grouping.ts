@@ -2489,6 +2489,24 @@ export interface HandleEventResult {
    *  The focused thread uses this to keep the viewport pinned across the
    *  pending-row -> real-event swap. */
   clearedPendingUserMessage: boolean;
+  /** Set when this persisted event was the engine's own row for an unsent
+   *  message, whose client-only pair it retired. The caller settles the send
+   *  as accepted (`settleDeliveredUnsentMessage`). */
+  retiredUnsentEventId?: string;
+}
+
+/** Drop an unsent message's client-only pair, if the thread holds one for
+ *  `eventId` (see `ThreadState.unsentMessageSeqs`). The Map is replaced, per
+ *  the append-only contract on `thread.events`. Returns whether it held one. */
+export function retireUnsentExchange(thread: ThreadState, eventId: string): boolean {
+  const seq = thread.unsentMessageSeqs?.get(eventId);
+  if (seq === undefined) return false;
+  thread.unsentMessageSeqs!.delete(eventId);
+  const events = new Map(thread.events);
+  events.delete(seq);
+  events.delete(seq + 1);
+  thread.events = events;
+  return true;
 }
 
 export function handleEvent(
@@ -2505,6 +2523,7 @@ export function handleEvent(
 
   let metaChanged = false;
   let clearedPendingUserMessage = false;
+  let retiredUnsentEventId: string | undefined;
 
   // Backend-computed snapshot is the source of truth for thread.meta. Live
   // SSE attaches a per-event aggregate on persisted events; transient events
@@ -2530,6 +2549,11 @@ export function handleEvent(
       // for this row may be approximate. A toast would surface a backend bug
       // the user can't act on; the warning is for the developer console.
       console.warn(`[handleEvent] persisted event ${event.type} (seq=${seq}) missing created timestamp — this indicates a backend bug`);
+    }
+    // The engine's own row for an unsent message turned up after all (its POST
+    // landed and only the answer was lost). It replaces the client-only pair.
+    if (event.type === 'MessageReceived' && seq > 0 && eventId && retireUnsentExchange(thread, eventId)) {
+      retiredUnsentEventId = eventId;
     }
     const stored: StoredEvent = { ...(event as ThreadEvent), created, ...(eventId ? { _eventId: eventId } : {}) };
     // CONTRACT: `thread.events` is append-only with deduped seqs, so the
@@ -2654,7 +2678,7 @@ export function handleEvent(
       thread.meta.updatedAt = created;
     }
   }
-  return { applied: true, metaChanged, clearedPendingUserMessage };
+  return { applied: true, metaChanged, clearedPendingUserMessage, retiredUnsentEventId };
 }
 
 /** Synthesize a `MessageOrigin` for older DB rows that don't have one stamped.

@@ -51,6 +51,7 @@ function makeCCThread(id: string, overrides: Partial<ThreadState['meta']> = {}):
       blockingDescendantCount: 0, attentionDescendantCount: 0,
       codingAgentProposed: false,
       codingAgentRequiresRestart: false,
+      codingAgentIncomplete: false,
       codingAgentIsExternalRepo: false,
       codingAgentHasDiff: false,
       lastRevivedAt: '',
@@ -129,7 +130,7 @@ function buttonNodes(node: ComponentChildren): VNode<{ disabled?: boolean }>[] {
 // render from), not the rendered menu. The component's interaction contract is
 // covered by the Overlay contract tests + e2e.
 type SplitProps = {
-  primary: TaggedAction;
+  primary: { key: string; label: string; className: string };
   menuActions: TaggedAction[];
 };
 function splitProps(node: ComponentChildren): SplitProps {
@@ -179,7 +180,7 @@ describe('getBannerActions', () => {
     expect(members.map((m) => m.key)).toEqual(['thread-diff', 'change-actions']);
     expect(buttonLabels(rowOf(members[0]))).toEqual(['Diff']);
     const props = splitProps(rowOf(members[1]));
-    expect(props.primary.kind).toBe('apply');
+    expect(props.primary.key).toBe('apply');
     expect(props.menuActions.map((a) => a.kind)).toEqual(['discard']);
   });
 
@@ -194,7 +195,7 @@ describe('getBannerActions', () => {
 
     expect(members.map((m) => m.key)).toEqual(['change-actions']);
     const props = splitProps(rowOf(members[0]));
-    expect(props.primary.kind).toBe('apply');
+    expect(props.primary.key).toBe('apply');
     expect(props.menuActions.map((a) => a.kind)).toEqual(['discard']);
   });
 
@@ -259,6 +260,27 @@ describe('getBannerActions', () => {
     expect(buttonLabels(rows(members))).toEqual(['Discard...']);
   });
 
+  // A stopped turn's change is not ready to review (ADR 0346).
+  it('leads an incomplete change with Continue, and moves Apply into the caret', () => {
+    const members = getBannerActions({
+      type: 'actions',
+      actions: DISCARD_APPLY,
+      threadId: 'tid',
+      isArchiving: false,
+      showDiff: false,
+      incomplete: true,
+    });
+    expect(members.map((m) => m.key)).toEqual(['change-actions']);
+    const props = splitProps(rowOf(members[0]));
+    expect(props.primary.key).toBe('continue');
+    expect(props.primary.label).toBe('Continue');
+    expect(props.primary.className).toBe('action-btn');
+    expect(props.menuActions.map((a) => a.kind)).toEqual(['apply', 'discard']);
+
+    const ctx = { run: (fn: () => void) => () => fn(), anchor: null };
+    expect(buttonLabels(members[0].menuRows!(ctx))).toEqual(['Continue', 'Apply', 'Discard']);
+  });
+
   /** The caret's actions would go with the fold, so the composite contributes
    *  one menu row per action rather than one for the face. */
   it('folds the split button into a row per action', () => {
@@ -318,6 +340,22 @@ describe('showDiff is driven by codingAgentHasDiff alone', () => {
     if (state!.type === 'actions') {
       expect(state!.showDiff).toBe(false);
     }
+  });
+
+  it('marks the state incomplete from the thread flag, before the changes list names the change', () => {
+    const thread = makeCCThread('t1', {
+      status: 'idle',
+      section: 'inbox',
+      codingAgentProposed: true,
+      codingAgentIncomplete: true,
+      codingAgentHasDiff: true,
+    });
+    threadMap.value = new Map([['t1', thread]]);
+    focusedThreadId.value = 't1';
+
+    const state = getWaitingState();
+    expect(state?.type).toBe('actions');
+    if (state?.type === 'actions') expect(state.incomplete).toBe(true);
   });
 
   it('shows disabled "applying" for a QUEUED Apply All member (change applying, thread idle/waiting)', () => {

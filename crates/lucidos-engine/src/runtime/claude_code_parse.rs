@@ -23,6 +23,56 @@ pub struct CcStreamState {
     /// The model of the message now streaming, from its `message_start`. Its
     /// deltas carry no model of their own.
     streaming_model: Option<String>,
+    /// The parent's API call now streaming, opened by its `message_start` and
+    /// reported at its `message_delta`. See [`CcStreamState::close_open_call`].
+    open_call: Option<OpenCall>,
+}
+
+/// One API call's token counts, as Anthropic's `usage` block spells them.
+#[derive(Debug, Clone, Copy, Default)]
+struct CallUsage {
+    input: u32,
+    output: u32,
+    cache_read: u32,
+    cache_creation: u32,
+}
+
+impl CallUsage {
+    fn read(usage: &serde_json::Value) -> Self {
+        Self::default().updated_by(usage)
+    }
+
+    /// These counts with every count `usage` carries taking precedence. A
+    /// `message_delta` holds the final counts, and may omit the input ones.
+    fn updated_by(self, usage: &serde_json::Value) -> Self {
+        let count = |key: &str, fallback: u32| {
+            usage
+                .get(key)
+                .and_then(|v| v.as_u64())
+                .map_or(fallback, |n| {
+                    crate::llm::clamp_provider_token_count(n, "ClaudeCode")
+                })
+        };
+        Self {
+            input: count("input_tokens", self.input),
+            output: count("output_tokens", self.output),
+            cache_read: count("cache_read_input_tokens", self.cache_read),
+            cache_creation: count("cache_creation_input_tokens", self.cache_creation),
+        }
+    }
+
+    /// CC sometimes emits a continuation message with zeroed usage. No API
+    /// call happened, so reporting one would be misleading.
+    fn is_from_a_real_call(&self) -> bool {
+        self.input > 0 || self.output > 0 || self.cache_read > 0 || self.cache_creation > 0
+    }
+}
+
+#[derive(Debug)]
+struct OpenCall {
+    message_id: Option<String>,
+    model: Option<String>,
+    usage: CallUsage,
 }
 
 impl CcStreamState {
@@ -67,6 +117,47 @@ impl CcStreamState {
     /// the terminal re-reports its usage, which is the safe direction.
     fn end_turn(&mut self) {
         self.usage_reported_message_ids.clear();
+    }
+
+    /// The `Usage` event for one API call, unless it is all zero or its
+    /// message already reported.
+    fn report(
+        &mut self,
+        message_id: Option<&str>,
+        model: Option<String>,
+        usage: CallUsage,
+    ) -> Option<AgentEvent> {
+        // The `&&` order matters: an all-zero frame must not claim the id,
+        // so a later real frame carrying the same id still reports.
+        (usage.is_from_a_real_call() && self.claim_usage_report(message_id)).then_some(
+            AgentEvent::Usage {
+                model,
+                input_tokens: usage.input,
+                output_tokens: usage.output,
+                cache_read_tokens: usage.cache_read,
+                cache_creation_tokens: usage.cache_creation,
+            },
+        )
+    }
+
+    /// Whether the open call's `message_delta` will report this frame's
+    /// message, so the frame itself must not.
+    fn reports_at_message_delta(&self, message_id: Option<&str>) -> bool {
+        message_id.is_some()
+            && self
+                .open_call
+                .as_ref()
+                .is_some_and(|open| open.message_id.as_deref() == message_id)
+    }
+
+    /// Report the open call with the counts its `message_start` gave. This
+    /// runs when no `message_delta` came: the next call started, the turn
+    /// ended mid-stream, or the stream itself ended. The driver calls it once
+    /// stdout is done, since a killed process writes no `result`. The provider
+    /// billed the prompt either way.
+    pub fn close_open_call(&mut self) -> Option<AgentEvent> {
+        let open = self.open_call.take()?;
+        self.report(open.message_id.as_deref(), open.model, open.usage)
     }
 }
 
@@ -319,74 +410,25 @@ pub fn parse_line(state: &mut CcStreamState, line: &str) -> Vec<AgentEvent> {
                     }
                 }
             }
-            // CC mirrors Anthropic's `usage` block on each assistant frame, and
-            // surfacing it as a separate `Usage` event is how the consumer gets
-            // to emit `ContextCaptured`. But a frame is NOT an API call: CC
-            // splits one assistant message into one frame per content block
-            // (thinking, text, each tool_use), and every one of them carries the
-            // same `message.id` and the same cumulative usage. Reporting each
-            // frame therefore reported one call 2 to 4 times, which made
-            // `ContextCaptured` 1.73x the real call count in the dev workspace
-            // (521,038 rows for 300,499 calls, measured 2026-08-11, against
-            // 1.00x for Codex and the chat path). The all-zero skip below does
-            // not catch it: a repeat carries the same NON-zero numbers as the
-            // frame that already reported them.
+            // A `Usage` event is how the consumer emits `ContextCaptured`, but
+            // a frame is NOT an API call. CC splits one message into a frame
+            // per content block. Each repeats the same `message.id` and the
+            // usage `message_start` gave, whose output count is a placeholder.
             //
-            // So the message id is the dedup key, and it is the exact one
-            // rather than a heuristic: an id is unique per API response, so a
-            // second sighting of one is always a re-report and never a second
-            // call. Only the `Usage` event is suppressed. The frame's own
-            // content block is a distinct text / tool_use and still emits above.
+            // So the parent's calls report at their `message_delta`, which
+            // carries the final counts (the `stream_event` arm). A frame reports
+            // only a message no `message_start` announced, which is how a
+            // sub-agent's calls arrive. The message id dedups those: an id is
+            // unique per API response, so a second sighting is a re-report.
+            // Only the `Usage` is suppressed; the frame's content emits above.
             if let Some(usage) = message.and_then(|m| m.get("usage")) {
-                let model = model.map(String::from);
-                let input_tokens = crate::llm::clamp_provider_token_count(
-                    usage
-                        .get("input_tokens")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0),
-                    "ClaudeCode",
-                );
-                let output_tokens = crate::llm::clamp_provider_token_count(
-                    usage
-                        .get("output_tokens")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0),
-                    "ClaudeCode",
-                );
-                let cache_read_tokens = crate::llm::clamp_provider_token_count(
-                    usage
-                        .get("cache_read_input_tokens")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0),
-                    "ClaudeCode",
-                );
-                let cache_creation_tokens = crate::llm::clamp_provider_token_count(
-                    usage
-                        .get("cache_creation_input_tokens")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0),
-                    "ClaudeCode",
-                );
-                // Skip empty-usage frames (CC sometimes emits a continuation
-                // assistant message with zeroed usage — no real API call
-                // happened, so a snapshot would be misleading).
-                let usage_is_from_a_real_call = input_tokens > 0
-                    || output_tokens > 0
-                    || cache_read_tokens > 0
-                    || cache_creation_tokens > 0;
                 let message_id = message.and_then(|m| m.get("id")).and_then(|v| v.as_str());
-                // The two guards are orthogonal, and the `&&` order keeps them
-                // that way: an all-zero frame short-circuits before it can claim
-                // the id, so a later real frame carrying the same id is still
-                // reported.
-                if usage_is_from_a_real_call && state.claim_usage_report(message_id) {
-                    events.push(AgentEvent::Usage {
-                        model,
-                        input_tokens,
-                        output_tokens,
-                        cache_read_tokens,
-                        cache_creation_tokens,
-                    });
+                if !state.reports_at_message_delta(message_id) {
+                    events.extend(state.report(
+                        message_id,
+                        model.map(String::from),
+                        CallUsage::read(usage),
+                    ));
                 }
             }
             events
@@ -517,13 +559,16 @@ pub fn parse_line(state: &mut CcStreamState, line: &str) -> Vec<AgentEvent> {
             } else {
                 None
             };
-            // The turn is over, so the message ids it reported usage for can go.
+            // A call still open here was cut off before its `message_delta`.
+            // Then the turn is over, so the ids it reported can go.
+            let mut events: Vec<AgentEvent> = state.close_open_call().into_iter().collect();
             state.end_turn();
-            vec![AgentEvent::Result {
+            events.push(AgentEvent::Result {
                 text,
                 duration_ms: duration,
                 error,
-            }]
+            });
+            events
         }
         // CC 2.1.76+ sends streaming deltas as "type": "stream_event" wrappers.
         // Every one is positive proof the subprocess is alive and actively
@@ -562,12 +607,44 @@ pub fn parse_line(state: &mut CcStreamState, line: &str) -> Vec<AgentEvent> {
         "stream_event" => {
             let mut events = Vec::new();
             let event = val.get("event");
-            if event.and_then(|e| e.get("type")).and_then(|v| v.as_str()) == Some("message_start") {
-                state.streaming_model = event
-                    .and_then(|e| e.get("message"))
+            let event_type = event.and_then(|e| e.get("type")).and_then(|v| v.as_str());
+            let message = event.and_then(|e| e.get("message"));
+            if event_type == Some("message_start") {
+                state.streaming_model = message
                     .and_then(|m| m.get("model"))
                     .and_then(|v| v.as_str())
                     .map(String::from);
+            }
+            // Only the parent's own calls open and close here. A sub-agent's
+            // line names its spawning tool call, and its calls report from
+            // their frames instead (the `"assistant"` arm).
+            let from_the_parent = val
+                .get("parent_tool_use_id")
+                .is_none_or(serde_json::Value::is_null);
+            match event_type {
+                Some("message_start") if from_the_parent => {
+                    events.extend(state.close_open_call());
+                    state.open_call = Some(OpenCall {
+                        message_id: message
+                            .and_then(|m| m.get("id"))
+                            .and_then(|v| v.as_str())
+                            .map(String::from),
+                        model: state.streaming_model.clone(),
+                        usage: message
+                            .and_then(|m| m.get("usage"))
+                            .map(CallUsage::read)
+                            .unwrap_or_default(),
+                    });
+                }
+                Some("message_delta") if from_the_parent => {
+                    if let Some(open) = state.open_call.take() {
+                        let usage = event
+                            .and_then(|e| e.get("usage"))
+                            .map_or(open.usage, |u| open.usage.updated_by(u));
+                        events.extend(state.report(open.message_id.as_deref(), open.model, usage));
+                    }
+                }
+                _ => {}
             }
             // A relayed note arrives whole as a message, from the complete
             // assistant frame. Streaming it as a Thought too would show it twice.

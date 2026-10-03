@@ -71,15 +71,14 @@ fn single_candidate_navigation_focuses_that_plugin_in_the_installed_tab() {
 }
 
 #[test]
-fn multiple_candidates_navigation_focuses_alphabetically_first_by_name() {
-    // Candidate order is weather-then-habit; the focus is the name-first one
-    // (Habit Tracker), matching the plural body's name ordering.
+fn multiple_candidates_navigation_focuses_no_single_plugin() {
+    // Pulsing one row would single it out from equally pending siblings.
     let nav = build_update_navigation(&[
         candidate("weather", "Weather", "1.2.0"),
         candidate("habit", "Habit Tracker", "2.0.0"),
     ]);
     assert_eq!(nav.target, NavigateTarget::Plugins);
-    assert_eq!(nav.id.as_deref(), Some("habit"));
+    assert_eq!(nav.id, None);
 }
 
 /// Every accumulated failure reaches the log.

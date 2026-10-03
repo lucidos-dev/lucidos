@@ -36,7 +36,7 @@ fn collect_args(cmd: &tokio::process::Command) -> Vec<String> {
 #[test]
 fn fresh_turn_command_layout() {
     let config = test_config(Path::new("/tmp/wt"));
-    let cmd = build_codex_turn_command(&config, None, None, None, "do the thing", &[]);
+    let cmd = build_codex_turn_command(&config, None, None, None, &[]);
     let args = collect_args(&cmd);
     assert_eq!(args[0], "exec");
     assert!(
@@ -55,8 +55,8 @@ fn fresh_turn_command_layout() {
     );
     assert_eq!(
         args.last().map(String::as_str),
-        Some("do the thing"),
-        "prompt must be the trailing positional"
+        Some("-"),
+        "the trailing positional must read the prompt from stdin"
     );
     assert!(
         !args.iter().any(|a| a == "resume"),
@@ -83,7 +83,7 @@ fn fresh_turn_command_layout() {
 #[test]
 fn max_effort_is_model_scoped_in_exec_driver() {
     let config = test_config(Path::new("/tmp/wt"));
-    let cmd = build_codex_turn_command(&config, Some("gpt-5.6-sol"), Some("max"), None, "go", &[]);
+    let cmd = build_codex_turn_command(&config, Some("gpt-5.6-sol"), Some("max"), None, &[]);
     let args = collect_args(&cmd);
     assert!(
         args.windows(2)
@@ -93,7 +93,7 @@ fn max_effort_is_model_scoped_in_exec_driver() {
 
     // Older models reject Max. A stale selection must be omitted so Codex
     // applies its own default instead of failing the whole turn.
-    let cmd = build_codex_turn_command(&config, Some("gpt-5.5"), Some("max"), None, "go", &[]);
+    let cmd = build_codex_turn_command(&config, Some("gpt-5.5"), Some("max"), None, &[]);
     let args = collect_args(&cmd);
     assert!(
         !args
@@ -102,7 +102,7 @@ fn max_effort_is_model_scoped_in_exec_driver() {
         "Max must be omitted for pre-5.6 models"
     );
 
-    let cmd = build_codex_turn_command(&config, None, Some("max"), None, "go", &[]);
+    let cmd = build_codex_turn_command(&config, None, Some("max"), None, &[]);
     let args = collect_args(&cmd);
     assert!(
         !args
@@ -117,14 +117,8 @@ fn resume_turn_places_global_flags_before_subcommand() {
     // codex rejects exec-level flags after the `resume` subcommand
     // (`error: unexpected argument '--sandbox' found`) — pin the ordering.
     let config = test_config(Path::new("/tmp/wt"));
-    let cmd = build_codex_turn_command(
-        &config,
-        Some("gpt-5.5"),
-        Some("high"),
-        Some("sid-123"),
-        "follow up",
-        &[],
-    );
+    let cmd =
+        build_codex_turn_command(&config, Some("gpt-5.5"), Some("high"), Some("sid-123"), &[]);
     let args = collect_args(&cmd);
     let resume_idx = args.iter().position(|a| a == "resume").expect("resume");
     for flag in ["--json", "--sandbox", "-m", "-c"] {
@@ -139,23 +133,23 @@ fn resume_turn_places_global_flags_before_subcommand() {
     }
     assert_eq!(args[resume_idx + 1], "sid-123");
     assert_eq!(args[resume_idx + 2], "--");
-    assert_eq!(args[resume_idx + 3], "follow up");
+    assert_eq!(args[resume_idx + 3], "-");
 }
 
-/// A message that opens with a markdown bullet is still a prompt. Without the
-/// `--` separator codex parses `- also add tests` as a flag and refuses the
-/// whole turn, on the fresh and the resume path alike.
+/// The `-` that reads the prompt from stdin follows `--`, on the fresh and the
+/// resume path alike. Without it, `-i` takes the `-` as one more image.
 #[test]
-fn a_prompt_starting_with_a_dash_follows_the_separator() {
+fn the_stdin_marker_follows_the_separator() {
     let config = test_config(Path::new("/tmp/wt"));
+    let imgs = vec![PathBuf::from("/tmp/a.png")];
     for resume in [None, Some("sid-123")] {
-        let cmd = build_codex_turn_command(&config, None, None, resume, "- also add tests", &[]);
+        let cmd = build_codex_turn_command(&config, None, None, resume, &imgs);
         let args = collect_args(&cmd);
         let n = args.len();
         assert_eq!(
             &args[n - 2..],
-            ["--", "- also add tests"],
-            "resume {resume:?}: the prompt must follow `--`; got {args:?}"
+            ["--", "-"],
+            "resume {resume:?}: `-` must follow `--`; got {args:?}"
         );
     }
 }
@@ -170,7 +164,7 @@ fn a_prompt_starting_with_a_dash_follows_the_separator() {
 #[test]
 fn turn_command_wires_lucidos_mcp_server() {
     let config = test_config(Path::new("/tmp/wt"));
-    let cmd = build_codex_turn_command(&config, None, None, None, "p", &[]);
+    let cmd = build_codex_turn_command(&config, None, None, None, &[]);
     let args = collect_args(&cmd);
     for expected in lucidos_mcp_server_config_overrides(&config.env) {
         assert!(
@@ -219,10 +213,10 @@ fn ask_user_question_tool_name_matches_server_config() {
 fn model_default_sentinel_is_omitted() {
     // "default" mirrors CC's sentinel — let the user's codex config decide.
     let config = test_config(Path::new("/tmp/wt"));
-    let cmd = build_codex_turn_command(&config, Some("default"), None, None, "p", &[]);
+    let cmd = build_codex_turn_command(&config, Some("default"), None, None, &[]);
     assert!(!collect_args(&cmd).iter().any(|a| a == "-m"));
 
-    let cmd = build_codex_turn_command(&config, Some("gpt-5.4-mini"), None, None, "p", &[]);
+    let cmd = build_codex_turn_command(&config, Some("gpt-5.4-mini"), None, None, &[]);
     let args = collect_args(&cmd);
     let m_idx = args.iter().position(|a| a == "-m").expect("-m");
     assert_eq!(args[m_idx + 1], "gpt-5.4-mini");
@@ -231,7 +225,7 @@ fn model_default_sentinel_is_omitted() {
 #[test]
 fn effort_maps_to_model_reasoning_effort_config() {
     let config = test_config(Path::new("/tmp/wt"));
-    let cmd = build_codex_turn_command(&config, None, Some("xhigh"), None, "p", &[]);
+    let cmd = build_codex_turn_command(&config, None, Some("xhigh"), None, &[]);
     let args = collect_args(&cmd);
     assert!(
         args.windows(2)
@@ -255,7 +249,7 @@ fn every_sandbox_writable_root_becomes_an_add_dir() {
     //                 That command now PUTs to the engine and needs no root.
     let mut config = test_config(Path::new("/tmp/wt"));
     config.sandbox_writable_roots = vec![PathBuf::from("/repo/.git"), PathBuf::from("/ws/data")];
-    let cmd = build_codex_turn_command(&config, None, None, None, "p", &[]);
+    let cmd = build_codex_turn_command(&config, None, None, None, &[]);
     let args = collect_args(&cmd);
     let dirs: Vec<&String> = args
         .iter()
@@ -275,7 +269,7 @@ fn every_sandbox_writable_root_becomes_an_add_dir() {
 fn no_add_dir_when_there_are_no_writable_roots() {
     let config = test_config(Path::new("/tmp/wt"));
     assert!(config.sandbox_writable_roots.is_empty());
-    let cmd = build_codex_turn_command(&config, None, None, None, "p", &[]);
+    let cmd = build_codex_turn_command(&config, None, None, None, &[]);
     assert!(!collect_args(&cmd).iter().any(|a| a == "--add-dir"));
 }
 
@@ -423,7 +417,7 @@ async fn writable_roots_skip_a_missing_data_dir_rather_than_creating_it() {
 fn image_paths_become_i_flags() {
     let config = test_config(Path::new("/tmp/wt"));
     let imgs = vec![PathBuf::from("/tmp/a.png"), PathBuf::from("/tmp/b.jpg")];
-    let cmd = build_codex_turn_command(&config, None, None, None, "p", &imgs);
+    let cmd = build_codex_turn_command(&config, None, None, None, &imgs);
     let args = collect_args(&cmd);
     let i_positions: Vec<usize> = args
         .iter()
@@ -437,9 +431,9 @@ fn image_paths_become_i_flags() {
 }
 
 #[test]
-fn command_applies_config_env_and_null_stdin() {
+fn command_applies_config_env() {
     let config = test_config(Path::new("/tmp/wt"));
-    let cmd = build_codex_turn_command(&config, None, None, None, "p", &[]);
+    let cmd = build_codex_turn_command(&config, None, None, None, &[]);
     let envs: std::collections::HashMap<_, _> = cmd
         .as_std()
         .get_envs()

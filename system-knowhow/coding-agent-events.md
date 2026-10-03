@@ -35,6 +35,12 @@ subpath inside an app, a bare file path, the whole of `data/`,
 **Spawning returns immediately, and the spawn ack is not a result.** Read the
 child's final response text for pass or fail before you act on it or report it.
 
+**Review, merge and hardening behavior are defaults set by the `folder` kind,
+not something to restate in the brief.** The table above says what holds for
+`lucidos`, `app` and `external`. Restating one reads as a prohibition, and a
+stray "do not harden" has made a session skip a step its kind requires.
+Mention one only to ask for something other than its default.
+
 **Cross-workspace.** Set `workspace` to the target workspace's basename and the
 tool POSTs to that engine, where the session lands. It requires
 `relation: "top"`, because a child auto-resume callback does not cross
@@ -104,7 +110,7 @@ These fire many times per turn. `CodingAgentTextStreamed` and `CodingAgentThough
 |---|---|---|
 | `CodingAgentTextStreamed` | Each `text` chunk the coding agent streams to the user. One per assistant-message line / paragraph as the backend writes it. Carries what the MODEL wrote, never the backend's own API-error banner: Claude Code reports an upstream drop as a `<synthetic>` assistant message flagged `is_api_error_message`, and the engine skips it, because the identical string returns as the turn's failure reason and is already rendered from `ResponseFailed`. | **no (blocked: per-token streaming)** |
 | `CodingAgentThoughtStreamed` | Each chunk of streamed reasoning/thinking the coding agent produces before its visible output. CC sends it as a `stream_event` `thinking_delta` (text on `delta.thinking`; the persisted CC JSONL keeps only an encrypted signature, so the live stream is the only source); Codex sends `item/reasoning/summaryTextDelta` / `textDelta` (app-server) or a `reasoning` item (exec). Coalesced into a few rows per turn and rendered as the live "Thinking" step's content so a long reasoning pass shows progress. **Live on Codex, dormant on CC.** Codex: both drivers set `model_reasoning_summary=detailed` (codex's default summary mode emits no reasoning notifications at all, verified live on codex-cli 0.142.5), so Codex threads stream reasoning *summaries* into this event. CC: **dormant for the current models, and NOT provider-specific:** Anthropic's `thinking.display` defaults to `omitted` on every current model (Fable 5.1 and 5, Opus 4.7 through 5.5, Sonnet 5 and 5.5), so the `thinking_delta` carries empty text (signature only) and this event does not fire. That holds on **both** Vertex and the first-party Anthropic API (empirically confirmed), and even with `--thinking-display summarized` forced (an upstream Claude Code limitation in its headless `stream-json` path; the raw chain of thought is never returned regardless, since a summary is the most any display mode yields). Switching CC's provider does **not** fix it. See `docs/temporary-measures.md` § `cc-reasoning-dormant`. **Progress notes are separate.** Opus 5.5, Sonnet 5.5 and Fable 5.x write a short note between tool calls. The engine's Vertex relay asks for these notes, so they arrive as `CodingAgentTextStreamed`, the agent's visible text, and never as this event. | **no (blocked: per-token streaming)** |
-| `CodingAgentToolCalled` | Each tool invocation the coding agent makes. Carries `name`, `args` (full JSON), optional `description`, and `tool_use_id` so the matching `ToolResult` can be paired even when a permission prompt splits them across exchanges. | yes (use condition) |
+| `CodingAgentToolCalled` | Each tool invocation the coding agent makes. Carries `name`, `args` (full JSON, stripped from what a client reads), optional `description`, and `tool_use_id` so the matching `ToolResult` can be paired even when a permission prompt splits them across exchanges. | yes (use condition) |
 | `CodingAgentToolResult` | The result returned to the coding agent for a prior `ToolCalled`. Carries the same `tool_use_id`, and the call's tool as `name`. `result` holds the agent's whole output. See below. | yes (use condition) |
 
 **What `CodingAgentToolResult` stores.** The agent runs each tool in its own process and reads the full output there. Lucidos parses a copy of the agent's output stream to draw the steps, and this event records that copy.
@@ -113,6 +119,8 @@ These fire many times per turn. `CodingAgentTextStreamed` and `CodingAgentThough
 - **Older rows hold at most 200 chars.** Until full storage, the writer silently cut every result to its first 200 chars. `GET /api/v1/events/:event_id/tool-result` serves an exactly-200-char result with a note saying it may be cut short. The stored row is not rewritten.
 - **`name` is the call's tool name**, such as `Bash`. It is empty on older rows, and on a result whose call the session never saw.
 - **Neither the snapshot nor the live stream carries `result`.** Both stamp `result_stripped: true`, and the step detail fetches the text by event id. An SDK `lucidos.sse` listener sees the stripped shape too.
+
+The call's `args` get the same treatment. The snapshot and the live stream drop them and stamp `args_stripped: true`, so an SDK listener sees no `args` either. Fetch them from `GET /api/v1/events/:event_id/tool-args`. The stored row keeps them, so an `args.command` condition still matches.
 
 ### Transient — never persisted, broadcast over SSE only
 
@@ -171,7 +179,7 @@ All fields except `coding_agent` are `#[serde(skip_serializing_if = ...)]`-gated
 
 ### Side questions are recorded, and hidden from every agent
 
-A *side question* comes from `/btw <question>`, a long press on Send or Stop, or ⌥↵. It is answered beside any running turn, from the thread's own context, with no tools. It may carry images. It works in Claude Code and Lucidos Agent threads, and each takes one path, text and images alike:
+A *side question* comes from a long press on Send, Stop or Submit, or on a waiting card's Cancel, or from ⌥↵. Over an empty composer these turn on side-question mode, where Send asks the box. It is answered beside any running turn, from the thread's own context, with no tools. It may carry images. It works in Claude Code and Lucidos Agent threads, and each takes one path, text and images alike:
 
 - **Claude Code** asks a copy of the session: the session's own command resumed with `--no-session-persistence`, under a settings file whose PreToolUse hook refuses every tool. It keeps the session's tools and appended system prompt, so the prompt cache holds, and it writes nothing to the transcript. Its cost is recorded as `ContextCaptured` with purpose `side_question`. Claude Code's own `side_question` control request is not used, since it carries text only (ADR 0324).
 - **Lucidos Agent** makes one model call with a turn's system prompt, tools and history. A tool call is refused, never run. Its cost is recorded as `ContextCaptured` with purpose `side_question`.
@@ -183,7 +191,7 @@ The endpoints:
 - **Recorded:** `SideQuestionAsked` (with any `image_hashes`), then `SideQuestionAnswered` or `SideQuestionFailed`, and `SideQuestionDismissed`. So a card survives reload and shows on every device. Startup fails every ask a restart left unanswered.
 - **Hidden:** no agent ever reads them. `query_events`, triggers, event waits and every context builder leave them out, and they move no thread state.
 
-The normal chat route refuses `/btw` on every thread with a 400 (reason `side-question`), so it can never become a turn.
+A typed `/btw` is ordinary text. The chat route sends it as a normal message.
 
 ### `UserQuestionAsked`
 

@@ -1,5 +1,6 @@
-import { useState, useRef, useEffect, useCallback, useMemo } from 'preact/hooks';
+import { useRef, useEffect, useCallback, useMemo } from 'preact/hooks';
 import { threadSearchQuery, threadSearchResults } from '../store/store';
+import { threadSearchOpen, threadSearchSession, openThreadSearch, closeThreadSearch } from '../store/threadSearch';
 import { searchThreads } from '../api/threads';
 import { toFailed } from '../store/types';
 import { composeHandlers } from '../components/chat/promptFocus';
@@ -7,14 +8,18 @@ import { moveHighlight, selectHighlighted } from '../components/drawer/ThreadDra
 
 /** Shared thread search state and handlers for desktop and mobile headers. */
 export function useThreadSearch() {
-  const [searchOpen, setSearchOpen] = useState(false);
+  const searchOpen = threadSearchOpen.value;
   const searchInputRef = useRef<HTMLInputElement>(null);
   const searchAbortRef = useRef<AbortController | null>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const doSearch = useCallback((query: string) => {
+  const cancelPending = useCallback(() => {
     if (debounceRef.current) clearTimeout(debounceRef.current);
     if (searchAbortRef.current) searchAbortRef.current.abort();
+  }, []);
+
+  const doSearch = useCallback((query: string) => {
+    cancelPending();
 
     const trimmed = query.trim();
     if (!trimmed) {
@@ -22,35 +27,36 @@ export function useThreadSearch() {
       return;
     }
 
+    // A close aborts from an effect, a frame after the fact. So the timer and
+    // the response also check the session, and a closed search stays empty.
+    const session = threadSearchSession();
+    const stillWanted = (controller?: AbortController) =>
+      session === threadSearchSession() && !controller?.signal.aborted;
     debounceRef.current = setTimeout(async () => {
+      if (!stillWanted()) return;
       threadSearchResults.value = { status: 'loading' };
       const controller = new AbortController();
       searchAbortRef.current = controller;
       try {
         const results = await searchThreads(trimmed, controller.signal);
-        if (!controller.signal.aborted) {
+        if (stillWanted(controller)) {
           threadSearchResults.value = { status: 'loaded', data: results };
         }
       } catch (e) {
-        if (!controller.signal.aborted) {
+        if (stillWanted(controller)) {
           threadSearchResults.value = toFailed(e);
         }
       }
     }, 300);
-  }, []);
+  }, [cancelPending]);
 
-  const closeSearch = useCallback(() => {
-    setSearchOpen(false);
-    threadSearchQuery.value = '';
-    threadSearchResults.value = { status: 'not-loaded' };
-    if (searchAbortRef.current) searchAbortRef.current.abort();
-    if (debounceRef.current) clearTimeout(debounceRef.current);
-  }, []);
+  // The other header copy or a shortcut can close search too. So this copy
+  // drops its in-flight search when the shared state closes.
+  useEffect(() => {
+    if (!searchOpen) cancelPending();
+  }, [searchOpen, cancelPending]);
 
-  useEffect(() => () => {
-    if (debounceRef.current) clearTimeout(debounceRef.current);
-    if (searchAbortRef.current) searchAbortRef.current.abort();
-  }, []);
+  useEffect(() => cancelPending, [cancelPending]);
 
   const onSearchInput = useCallback((e: Event) => {
     const val = (e.target as HTMLInputElement).value;
@@ -59,11 +65,11 @@ export function useThreadSearch() {
   }, [doSearch]);
 
   const onSearchKeyDown = useCallback((e: KeyboardEvent) => {
-    if (e.key === 'Escape') closeSearch();
+    if (e.key === 'Escape') closeThreadSearch();
     else if (e.key === 'ArrowDown') { e.preventDefault(); moveHighlight(1); }
     else if (e.key === 'ArrowUp') { e.preventDefault(); moveHighlight(-1); }
     else if (e.key === 'Enter') { e.preventDefault(); selectHighlighted(); }
-  }, [closeSearch]);
+  }, []);
 
   /**
    * Handlers for the search button. Uses composeHandlers to focus the input
@@ -73,7 +79,7 @@ export function useThreadSearch() {
    */
   const openSearchHandlers = useMemo(
     () => composeHandlers(
-      () => setSearchOpen(true),
+      openThreadSearch,
       () => {
         // Expand the search bar BEFORE focusing so iOS calculates the caret
         // from the correct container dimensions. focus() must be synchronous
@@ -89,5 +95,5 @@ export function useThreadSearch() {
     [],
   );
 
-  return { searchOpen, searchInputRef, onSearchInput, onSearchKeyDown, closeSearch, openSearchHandlers };
+  return { searchOpen, searchInputRef, onSearchInput, onSearchKeyDown, closeSearch: closeThreadSearch, openSearchHandlers };
 }

@@ -1072,6 +1072,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     lucidos_engine::engine::todo_consumer::spawn(shared_engine.clone());
     boot_stages.lap("summary resets");
 
+    // Before recovery spawns a session that writes a new one.
+    lucidos_engine::runtime::claude_code::sweep_stale_system_prompt_files(
+        shared_engine.workspace_path(),
+    );
+
     // Recover worktrees whose in-flight session an engine crash interrupted. An
     // idle session stays idle, shown in the waiting UI for the user to act on.
     let recovering_threads = shared_engine.recover_orphaned_worktrees().await;
@@ -1101,6 +1106,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         shared_engine.pool(),
         &shared_engine.event_bus,
         &recovering_threads.iter().copied().collect(),
+    )
+    .await;
+
+    // Then the trigger runs a restart cut off before any activity, whose
+    // `running` an event-less write already turned to `idle`. The settle above
+    // never sees them, and without an abort they stay in Current for good.
+    lucidos_engine::engine::agent_recovery::settle_stranded_trigger_runs(
+        shared_engine.pool(),
+        &shared_engine.event_bus,
     )
     .await;
 

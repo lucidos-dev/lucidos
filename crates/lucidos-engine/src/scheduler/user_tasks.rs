@@ -238,7 +238,7 @@ async fn emit_failure_notification(
             emit_err
         );
     }
-    crate::scheduler::push::send_push_to_all(engine, &title, &message, Some(notification_id)).await;
+    crate::scheduler::push::send_push_to_all(engine, &title, &message, Some(notification_id));
 }
 
 /// `queue_entry_id` is the admitting *Thread Queue* entry (see

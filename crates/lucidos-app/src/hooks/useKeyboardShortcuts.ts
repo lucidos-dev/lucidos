@@ -20,7 +20,10 @@ import {
   toggleThreadPane, toggleContentPane,
   focusOrToggleThreadDrawer, toggleMaximizeFocusedPaneGroup,
   stepThreadPaneWidth, stepThreadDrawerWidth, resetPaneLayout, revealThreadPane,
+  toggleThreadFilter, startThreadSearch,
 } from '../store/actions/pane';
+import { toggleMenuDrawer } from '../components/layout/ContentNav';
+import { refreshPanelIfLive } from '../components/layout/RefreshIndicator';
 import { switchMenuItem, openSettingsSubview } from '../store/actions/menu';
 import { openFileSearch } from '../components/files/fileSearchActions';
 import { focusNewestToast } from '../components/shared/Toast';
@@ -29,6 +32,7 @@ import { promptRenameThread } from '../store/actions/threadRename';
 import { copyLastResponse } from '../components/chat/copyLastResponse';
 import { promptStopRequested, promptSideQuestionRequested } from '../components/chat/prompt-input-helpers';
 import { seedDrawerHighlight, openHighlightedThreadActions, toggleFocusedThreadFamily } from '../components/drawer/ThreadDrawer';
+import { openThreadTitleMenu } from '../components/chat/ThreadTitle';
 import { focusIntoPane, handlePaneTab, reconcilePaneFocus } from '../components/layout/paneFocus';
 import { historyBack, historyForward } from '../store/actions/focused-pane-history';
 import { stepThreadTurn, parseNavigatedTurn } from '../components/chat/scrollState';
@@ -119,14 +123,19 @@ const SHORTCUT_ACTIONS: Record<ShortcutId, () => void> = {
   // Never behind an open dialog: a second press while Apply's own confirm is
   // up would stack another one.
   applyChange: () => { if (overlayStack.value.length === 0) applyFocusedThreadChange(); },
-  // Context-gated: no-ops unless the thread drawer is focused with a thread row
-  // highlighted, then opens that row's ⋯ menu (the keyboard route to per-row
-  // actions, since the drawer is a single tab stop).
-  openThreadActions: openHighlightedThreadActions,
+  // A thread row highlighted in the focused drawer wins. Otherwise the open
+  // thread's own menu opens, from its title.
+  openThreadActions: () => {
+    if (openHighlightedThreadActions()) return;
+    if (focusedThreadId.value) focusInThreadPane(openThreadTitleMenu);
+  },
   // Toggles the OPEN (focused) thread's sub-thread family in the drawer — works
   // from any pane (no drawer-focus gate); no-op when the focused thread has no
   // sub-threads.
   toggleSubthreads: toggleFocusedThreadFamily,
+  toggleThreadFilter,
+  searchThreads: startThreadSearch,
+  toggleMenuDrawer,
   historyBack: () => historyBack(),
   historyForward: () => historyForward(),
   // Step the open notification newer/older when the content pane holds one.
@@ -143,6 +152,7 @@ const SHORTCUT_ACTIONS: Record<ShortcutId, () => void> = {
   narrowThreadDrawer: () => stepThreadDrawerWidth(-1),
   widenThreadDrawer: () => stepThreadDrawerWidth(1),
   resetPaneLayout,
+  refreshPanel: refreshPanelIfLive,
   toggleAppFullscreen: toggleAppFullscreenIfShown,
   toggleSourceView,
   toggleLineWrap,

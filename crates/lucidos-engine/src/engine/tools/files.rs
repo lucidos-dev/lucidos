@@ -282,6 +282,41 @@ fn app_lifecycle_event(
     }
 }
 
+/// What a file tool did to one `data/` path.
+#[derive(Clone, Copy)]
+enum DataFileChange<'a> {
+    Written { commit: &'a str },
+    Edited,
+    Deleted { commit: &'a str },
+}
+
+/// The `DataFile*` event announcing a file tool's change to a `data/` path.
+/// An open preview of that file refreshes on it, and so does the theme picker.
+/// `None` under `artifacts/`, whose own `Artifact*` events announce it.
+fn data_file_event(data_path: &str, change: DataFileChange) -> Option<SystemEvent> {
+    if data_path.starts_with("artifacts/") {
+        return None;
+    }
+    let path = data_path.to_string();
+    Some(match change {
+        DataFileChange::Written { commit } => SystemEvent::DataFileWritten {
+            path,
+            commit: Some(commit.to_string()),
+            actor: None,
+        },
+        DataFileChange::Edited => SystemEvent::DataFileEdited {
+            path,
+            operations_count: 1,
+            actor: None,
+        },
+        DataFileChange::Deleted { commit } => SystemEvent::DataFileDeleted {
+            path,
+            commit: Some(commit.to_string()),
+            actor: None,
+        },
+    })
+}
+
 impl LucidosEngine {
     /// If `data_path` is an app's `manifest.json`, emit the matching `App*`
     /// lifecycle event so the disk-backed apps list refreshes live (mirrors the
@@ -338,33 +373,16 @@ impl LucidosEngine {
         Ok(())
     }
 
-    /// Announce a change under `themes/` or `fonts/`, as the data route does.
-    /// An open theme picker, the font list and the active theme then refresh.
-    /// A no-op for every other path.
-    async fn announce_checked_change(
+    /// Announce a file tool's change to a `data/` path, as the data route does.
+    /// See `data_file_event` for which paths it covers.
+    async fn announce_data_file_change(
         &self,
         data_path: &str,
-        commit: &str,
-        is_delete: bool,
+        change: DataFileChange<'_>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if !crate::core::data_prefixes::is_checked_whole(data_path) {
-            return Ok(());
+        if let Some(event) = data_file_event(data_path, change) {
+            self.event_bus.emit(BusEvent::System(event)).await?;
         }
-        let (path, commit) = (data_path.to_string(), Some(commit.to_string()));
-        let event = if is_delete {
-            SystemEvent::DataFileDeleted {
-                path,
-                commit,
-                actor: None,
-            }
-        } else {
-            SystemEvent::DataFileWritten {
-                path,
-                commit,
-                actor: None,
-            }
-        };
-        self.event_bus.emit(BusEvent::System(event)).await?;
         Ok(())
     }
 
@@ -1359,8 +1377,13 @@ impl LucidosEngine {
 
                 self.emit_app_event_for_data_path(path, app_existed_before, false)
                     .await?;
-                self.announce_checked_change(path, &commit_sha, false)
-                    .await?;
+                self.announce_data_file_change(
+                    path,
+                    DataFileChange::Written {
+                        commit: &commit_sha,
+                    },
+                )
+                .await?;
 
                 let result_action = if file_exists { "UPDATED" } else { "CREATED" };
                 let sha_short = &commit_sha[..commit_sha.floor_char_boundary(7)];
@@ -1388,7 +1411,16 @@ impl LucidosEngine {
                     })
                     .await
                 {
-                    Ok(r) => Ok(r.tool_message()),
+                    // Announced here, not in `edit_file_at_path`: the data route
+                    // calls that too, and emits its own `DataFileEdited`. A repo
+                    // edit writes nothing under `data/`, so it announces nothing.
+                    Ok(r) => {
+                        if matches!(r.target, EditTarget::Workspace { .. }) {
+                            self.announce_data_file_change(&r.path, DataFileChange::Edited)
+                                .await?;
+                        }
+                        Ok(r.tool_message())
+                    }
                     Err(e) if e.contains("old_string not found") => {
                         // Show file content so the LLM can retry with the correct old_string
                         let resolved = match repo {
@@ -1646,8 +1678,13 @@ impl LucidosEngine {
 
                 self.emit_app_event_for_data_path(&dst_data_path, app_existed_before, false)
                     .await?;
-                self.announce_checked_change(&dst_data_path, &commit_sha, false)
-                    .await?;
+                self.announce_data_file_change(
+                    &dst_data_path,
+                    DataFileChange::Written {
+                        commit: &commit_sha,
+                    },
+                )
+                .await?;
 
                 let result_action = if file_exists { "OVERWRITTEN" } else { "COPIED" };
                 let sha_short = &commit_sha[..commit_sha.floor_char_boundary(7)];
@@ -1716,13 +1753,20 @@ and emits the PluginUninstalled event so the registry stays in sync.",
                     self.user_profile.artifact_deleted(artifact_path).await;
                 }
 
+                // A later file at this path starts unapproved, rather than
+                // inheriting the deleted one's standing. Before the emits,
+                // which can fail with the delete already committed.
+                self.forget_script_authorship(&full_path).await;
+
                 self.emit_app_event_for_data_path(path, app_existed_before, true)
                     .await?;
-                self.announce_checked_change(path, &commit_sha, true)
-                    .await?;
-                // A later file at this path starts unapproved, rather than
-                // inheriting the deleted one's standing.
-                self.forget_script_authorship(&full_path).await;
+                self.announce_data_file_change(
+                    path,
+                    DataFileChange::Deleted {
+                        commit: &commit_sha,
+                    },
+                )
+                .await?;
 
                 let sha_short = &commit_sha[..commit_sha.floor_char_boundary(7)];
                 Ok(format!(

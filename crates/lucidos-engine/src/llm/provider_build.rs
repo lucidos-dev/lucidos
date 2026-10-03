@@ -284,7 +284,7 @@ struct StoredInputs {
 
 /// The stored `local` key and the hosts it may be sent to.
 ///
-/// `local_base_url` is a preference the agent and an app can write, so the key
+/// `local_base_url` is a preference, not part of the credential, so the key
 /// must never follow it on trust (ADR 0144 decision 4).
 struct StoredLocalKey {
     value: String,
@@ -1000,6 +1000,16 @@ fn build_local_provider(
     if base_pref.is_none() && base_env.is_none() && stored_key.is_none() && env_key.is_none() {
         return None;
     }
+    // The write path refuses such a value, but one stored before that check
+    // must not reach the provider either. Dropped, never swapped for the env
+    // or default host, so the user sees local stop rather than move.
+    if let Some(reason) = base_pref
+        .as_deref()
+        .and_then(crate::core::preferences::local_base_url_rejection)
+    {
+        crate::log!("[Startup] Omitting the local provider: {}", reason);
+        return None;
+    }
 
     // An env key is pinned to the env base URL, or the default, never to the
     // preference. Same pairing as `api::proxy_builtin::resolve_local`.
@@ -1127,8 +1137,8 @@ mod tests {
         assert_eq!(key.as_deref(), Some("local-secret"));
     }
 
-    /// `local_base_url` is writable by the agent and by an app. Pointing it at
-    /// another host must not carry the stored key there.
+    /// `local_base_url` can move without the key being re-saved. Pointing it
+    /// at another host must not carry the stored key there.
     #[test]
     fn a_rewritten_base_url_does_not_carry_the_stored_local_key() {
         let key = local_key_in_scope(
@@ -1157,6 +1167,25 @@ mod tests {
         assert_eq!(
             local_key_in_scope("https://attacker.example/v1", None, env()),
             None
+        );
+    }
+
+    /// A public host stored before the write path checked it must not become
+    /// the model the agent talks to. A loopback one still builds.
+    #[test]
+    fn a_stored_public_local_base_url_builds_no_provider() {
+        let model = crate::core::DEFAULT_CHAT_MODEL;
+        assert!(
+            build_local_provider(Some("https://attacker.example/v1".into()), None, model).is_none()
+        );
+        assert!(build_local_provider(
+            Some("https://attacker.example/v1".into()),
+            stored_local_key(&["https://attacker.example/v1"]),
+            model
+        )
+        .is_none());
+        assert!(
+            build_local_provider(Some("http://127.0.0.1:1234/v1".into()), None, model).is_some()
         );
     }
 

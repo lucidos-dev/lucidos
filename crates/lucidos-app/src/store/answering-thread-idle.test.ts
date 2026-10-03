@@ -43,6 +43,7 @@ function makeThread(id = 'thread-1', status: ThreadStatus = 'idle'): ThreadState
       attentionDescendantCount: 0,
       codingAgentProposed: false,
       codingAgentRequiresRestart: false,
+      codingAgentIncomplete: false,
       codingAgentIsExternalRepo: false,
       codingAgentHasDiff: false,
       lastRevivedAt: '',

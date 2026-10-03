@@ -3,9 +3,9 @@ use std::sync::Arc;
 use crate::core::EventRow;
 use crate::engine::LucidosEngine;
 
-/// The events that end a turn, as an SQL list. Shared with the boot settle
-/// (`agent_recovery::settle_orphaned_running_threads`), so the two recovery
-/// passes agree on when a turn is over.
+/// The events that end a turn, as an SQL list. Shared with the two boot
+/// settles in `agent_recovery`, so every recovery pass agrees on when a turn
+/// is over.
 macro_rules! turn_terminal_events {
     () => {
         "'ResponseGenerated','ResponseCanceled','ResponseAborted','ResponseFailed',\
@@ -14,7 +14,7 @@ macro_rules! turn_terminal_events {
 }
 
 /// The events that show a turn did something, as an SQL list. Shared with the
-/// boot settle for the same reason.
+/// running settle in `agent_recovery` for the same reason.
 macro_rules! turn_activity_events {
     () => {
         "'TextStreamed','Thinking','ThoughtStreamed','ToolCalled','ToolResult',\
@@ -178,7 +178,7 @@ pub(crate) fn start_channel(
 /// Record that the restart interrupted a thread's turn: a
 /// `ResponseAborted { RecoveryAfterRestart }` anchored on the turn's start
 /// event, so it reads "Response interrupted" with a Continue. The chat sweep
-/// and the boot settle both end a dead turn this way.
+/// and both boot settles end a dead turn this way.
 ///
 /// Direct `.emit` rather than `emit_response_aborted`, so each caller can log
 /// the `Err` against the thread it was settling.

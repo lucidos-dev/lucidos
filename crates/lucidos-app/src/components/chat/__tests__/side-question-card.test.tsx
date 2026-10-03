@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-/** The `/btw` side-question card (ADR 0320): the question, then a delayed
+/** The side-question card (ADR 0320): the question, then a delayed
  *  "Thinking", the answer as markdown, or the error. It says the answer is not
  *  part of the conversation. Dismissed, it folds to a row that reopens. It
  *  stays where it was asked, and later turns draw below it. */

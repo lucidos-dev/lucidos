@@ -222,6 +222,122 @@ async fn search_threads_by_text_matches_via_entities() {
     teardown_test_db(&db).await;
 }
 
+/// A short token is checked only inside threads a long token matched. It must
+/// still be found in a different message from the long one.
+#[tokio::test]
+async fn a_short_token_matches_in_another_message_of_the_long_tokens_thread() {
+    let (pool, db) = setup_test_db().await;
+    ensure_memory_entries_table(&pool).await;
+    let store = EventStore::new(pool.clone());
+
+    let both = Uuid::new_v4();
+    insert_thread(&pool, both, "Kitchen").await;
+    insert_message(&pool, both, "MessageReceived", "the dishwasher leaks").await;
+    insert_message(&pool, both, "ResponseGenerated", "call them at 9 am").await;
+    let long_only = Uuid::new_v4();
+    insert_thread(&pool, long_only, "Laundry").await;
+    insert_message(&pool, long_only, "MessageReceived", "dishwasher broken").await;
+
+    let hits = store
+        .search_threads_by_text("dishwasher am", 20)
+        .await
+        .unwrap();
+    let ids: Vec<String> = hits.into_iter().map(|h| h.info.thread_id).collect();
+    assert_eq!(ids, vec![both.to_string()]);
+
+    teardown_test_db(&db).await;
+}
+
+/// Each arm counts distinct patterns, so a repeated token must not raise the
+/// count a thread has to reach.
+#[tokio::test]
+async fn a_repeated_token_still_matches_message_text() {
+    let (pool, db) = setup_test_db().await;
+    ensure_memory_entries_table(&pool).await;
+    let store = EventStore::new(pool.clone());
+
+    let thread = Uuid::new_v4();
+    insert_thread(&pool, thread, "Garden").await;
+    insert_message(&pool, thread, "MessageReceived", "prune the roses").await;
+
+    let hits = store
+        .search_threads_by_text("roses roses", 20)
+        .await
+        .unwrap();
+    let ids: Vec<String> = hits.into_iter().map(|h| h.info.thread_id).collect();
+    assert_eq!(ids, vec![thread.to_string()]);
+
+    teardown_test_db(&db).await;
+}
+
+/// No index can serve a 1 or 2 character token over every message, so a query
+/// made only of them skips message bodies. Titles still match it.
+#[tokio::test]
+async fn a_query_of_only_short_tokens_matches_titles_but_not_message_bodies() {
+    let (pool, db) = setup_test_db().await;
+    ensure_memory_entries_table(&pool).await;
+    let store = EventStore::new(pool.clone());
+
+    let titled = Uuid::new_v4();
+    insert_thread(&pool, titled, "QA notes").await;
+    let body_only = Uuid::new_v4();
+    insert_thread(&pool, body_only, "Release").await;
+    insert_message(&pool, body_only, "MessageReceived", "ask qa first").await;
+
+    let hits = store.search_threads_by_text("qa", 20).await.unwrap();
+    let ids: Vec<String> = hits.into_iter().map(|h| h.info.thread_id).collect();
+    assert_eq!(ids, vec![titled.to_string()]);
+
+    teardown_test_db(&db).await;
+}
+
+/// The message-text arm must reach `events` through the trigram index and the
+/// entity arm through the primary key. Either falling back to a scan of every
+/// message is what timed Search Everywhere out on a large workspace. Checked
+/// on the generic plan, since sqlx reuses prepared statements.
+#[tokio::test]
+async fn text_search_reaches_events_through_its_indexes() {
+    let (pool, db) = setup_test_db().await;
+    ensure_memory_entries_table(&pool).await;
+
+    // Enough messages, of a real length, that a pass over all of them costs
+    // more than the index, as on a real workspace.
+    sqlx::query(
+        "INSERT INTO events (id, event_type, payload, thread_id, aggregate, aggregate_id) \
+         SELECT gen_random_uuid(), 'MessageReceived', \
+                jsonb_build_object('text', repeat(md5(i::text), 10)), t, 'thread', t::text \
+         FROM generate_series(1, 20000) AS i, LATERAL (SELECT gen_random_uuid() AS t) g",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("ANALYZE events").execute(&pool).await.unwrap();
+
+    let explain = format!(
+        "EXPLAIN (GENERIC_PLAN) {}",
+        super::search::text_search_sql()
+    );
+    // The simple protocol, because a generic plan leaves `$n` unbound.
+    let plan = sqlx::raw_sql(&explain)
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| sqlx::Row::get::<String, _>(row, 0))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        plan.contains("idx_events_message_text_trgm"),
+        "message text is not searched through its trigram index:\n{plan}"
+    );
+    assert!(
+        plan.contains("events_pkey"),
+        "the entity arm does not join events by primary key:\n{plan}"
+    );
+
+    teardown_test_db(&db).await;
+}
+
 // ── Archive stayed searchable ─────────────────────────────────────────
 //
 // Decision 1 of `docs/plans/2026-09-15-deleting-a-thread.md`: archive is "put

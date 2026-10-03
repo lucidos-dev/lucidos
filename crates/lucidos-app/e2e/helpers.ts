@@ -1,4 +1,4 @@
-import { Page, APIResponse, expect, Locator } from '@playwright/test';
+import { Page, APIResponse, expect, Locator, Request } from '@playwright/test';
 import { HARNESS_DEVICE_ID, ensurePageDeviceRegistered, registerHarnessDevice } from './harnessDevice';
 
 /** Where the app keeps this browser's device id (`utils/deviceIdHeader.ts`). */
@@ -285,6 +285,56 @@ export async function waitForEventStream(page: Page, timeout = 10_000): Promise<
   await page.waitForFunction(() => {
     return document.documentElement.dataset.lucidosEventStream === 'connected';
   }, undefined, { timeout });
+}
+
+/** Watch the shell's preference reads. Call it before the page navigates.
+ *
+ *  Every read ends in `applyUiScale`, which rewrites `--user-ui-scale`. The
+ *  shell reads once at startup and again when its event stream opens, in
+ *  either order. A read that lands after a spec writes a scale replaces it.
+ *
+ *  The returned wait resolves once the stream is open and this document has
+ *  two successful reads, with none still out. A failed read applies nothing,
+ *  so it never counts.
+ *
+ *  A new document starts a new count. It keys on the document request,
+ *  because `framenavigated` also fires on the shell's own `replaceState`. */
+export function watchPreferenceReads(page: Page): () => Promise<void> {
+  let documentSeq = 0;
+  let answered = 0;
+  const pending = new Map<Request, number>();
+  const inMainFrame = (r: Request) => !r.serviceWorker() && r.frame() === page.mainFrame();
+  const isShellRead = (r: Request) => r.method() === 'GET'
+    && inMainFrame(r)
+    && new URL(r.url()).pathname.endsWith('/api/v1/preferences');
+  page.on('requestfinished', async (r) => {
+    const seq = pending.get(r);
+    if (seq === undefined) return;
+    pending.delete(r);
+    if (seq === documentSeq && (await r.response())?.ok()) answered++;
+  });
+  page.on('requestfailed', (r) => { pending.delete(r); });
+  page.on('request', (r) => {
+    if (r.isNavigationRequest() && inMainFrame(r)) {
+      documentSeq++;
+      answered = 0;
+    } else if (isShellRead(r)) {
+      pending.set(r, documentSeq);
+    }
+  });
+  return async () => {
+    await waitForEventStream(page);
+    await expect
+      .poll(() => answered >= 2 && [...pending.values()].every(seq => seq !== documentSeq), {
+        timeout: 10_000,
+        message: 'the shell\'s startup preference reads never all landed',
+      })
+      .toBe(true);
+    // The network answer lands before the shell parses and applies the body.
+    await page.evaluate(() => new Promise<void>(resolve => {
+      requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+    }));
+  };
 }
 
 export async function sendMessage(page: Page, text: string): Promise<void> {

@@ -297,6 +297,49 @@ describe('Disclosure', () => {
     expect(host.querySelector('.row')).not.toBeNull();
   });
 
+  it('rolls in on its first render when asked to appear', async () => {
+    // A row that arrives in a live list rolls in like a block being opened.
+    await act(() => {
+      render(<Disclosure open appear><div class="row">a</div></Disclosure>, host);
+    });
+    expect(host.querySelector('.row')).not.toBeNull();
+    const outer = anims.find(a => a.el.classList.contains('disclosure'))!;
+    expect(outer.keyframes.map(k => k.height)).toEqual(['0px', '120px']);
+  });
+
+  it('shows an appearing block at once under reduced motion', async () => {
+    motionPreference.value = 'reduce';
+    await act(() => {
+      render(<Disclosure open appear><div class="row">a</div></Disclosure>, host);
+    });
+    expect(host.querySelector('.row')).not.toBeNull();
+    expect(anims).toHaveLength(0);
+  });
+
+  it('reports its exit only once the roll has finished', async () => {
+    let closed = 0;
+    const view = (open: boolean) => (
+      <Disclosure open={open} onClosed={() => { closed++; }}><div class="row">a</div></Disclosure>
+    );
+    await act(() => { render(view(true), host); });
+    await act(() => { render(view(false), host); });
+    expect(closed).toBe(0);
+    await finishAll();
+    expect(closed).toBe(1);
+  });
+
+  it('reports a snapped exit at once', async () => {
+    motionPreference.value = 'reduce';
+    let closed = 0;
+    const view = (open: boolean) => (
+      <Disclosure open={open} onClosed={() => { closed++; }}><div class="row">a</div></Disclosure>
+    );
+    await act(() => { render(view(true), host); });
+    await act(() => { render(view(false), host); });
+    expect(closed).toBe(1);
+    expect(host.innerHTML).toBe('');
+  });
+
   it('snaps where the browser has no Web Animations', async () => {
     delete (HTMLElement.prototype as unknown as { animate?: unknown }).animate;
     await show(true);

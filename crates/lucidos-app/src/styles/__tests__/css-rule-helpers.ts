@@ -84,6 +84,14 @@ export function decl(body: string, prop: string): string | null {
   return m ? m[1].replace(/\s+/g, ' ').trim() : null;
 }
 
+/** The focus ring's band in rem, from `--focus-ring-width` in base.css's text.
+ *  A clip that must let the ring out compares its slack against this. */
+export function focusRingWidthRem(baseCss: string): number {
+  const m = /--focus-ring-width:\s*([\d.]+)rem;/.exec(baseCss);
+  expect(m, '--focus-ring-width is no longer a rem token in base.css').not.toBeNull();
+  return parseFloat(m![1]);
+}
+
 /** One style rule, with the at-rule preludes it is nested inside. */
 export interface CssRule {
   /** The rule's own selector list, whitespace-collapsed. */

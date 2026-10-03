@@ -2096,7 +2096,7 @@ test_a_direct_launch_defers_to_network_toml
 #
 # The Claude-Code-shaped fixture ADR 0025 requires of every process-selection
 # guard, the same one `webkit_reaper_test.sh` and `e2e_lock_test.sh` carry. A
-# coding agent holds the engine's thread history in a roughly 22 KB
+# coding agent held the engine's thread history in a roughly 22 KB
 # `--append-system-prompt` argument, so a thread merely DISCUSSING a dev script
 # and this workspace path used to match. The caller sends `pkill -P` and then a
 # `kill`, so a match takes that session's children with it.

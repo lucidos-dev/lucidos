@@ -210,6 +210,16 @@ input[type="checkbox"]:disabled {
     scrollbar-width: none;
 }
 
+/* The scroll box clips, so it pads out ring room on every side, plus the touch
+   reach above and below (below). A negative margin hands back only the room
+   above and below: handed back at the sides, a bar flush with an app page's
+   edge would overflow it sideways. Zero specificity, so an app's own padding
+   wins wherever its stylesheet sits. A bar that sets its own keeps both. */
+:where(.pill-bar) {
+    padding: calc(var(--focus-ring-width) + var(--pill-bar-hit-slop, 0rem)) var(--focus-ring-width);
+    margin-block: calc(-1 * (var(--focus-ring-width) + var(--pill-bar-hit-slop, 0rem)));
+}
+
 .pill-bar::-webkit-scrollbar {
     display: none;
 }
@@ -247,14 +257,11 @@ input[type="checkbox"]:disabled {
 
 /* A finger needs a taller target than a pointer does, but the pill keeps its
    size: an invisible layer takes the taps past it, above and below. The scroll
-   box clips taps too, so the bar pads out that reach and a negative margin
-   hands the room back. A bar that sets its own padding adds
-   var(--pill-bar-hit-slop, 0rem) to it. */
+   box clips taps too, so the bar's padding and margin above carry that reach.
+   A bar that sets its own padding adds var(--pill-bar-hit-slop, 0rem) to it. */
 @media (pointer: coarse) {
     .pill-bar {
         --pill-bar-hit-slop: 0.5rem;
-        padding-block: var(--pill-bar-hit-slop);
-        margin-block: calc(-1 * var(--pill-bar-hit-slop));
     }
 
     .pill-bar-btn {
@@ -774,10 +781,12 @@ html:not([data-theme-mode="light"]) .action-btn-confirm {
     background: var(--bg-tertiary);
 }
 
+/* No clip: `min-width: 0` lets the column shrink and the text rules wrap long
+   words, while a clip would cut the focus ring of every field and button
+   that fills the column. */
 .list-row-info {
     flex: 1;
     min-width: 0;
-    overflow: hidden;
     overflow-wrap: break-word;
     word-break: break-word;
 }
@@ -787,6 +796,12 @@ html:not([data-theme-mode="light"]) .action-btn-confirm {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+}
+
+/* A name that has become a field (a rename) has no text to ellipsize, and its
+   clip would cut the field's focus ring. */
+.list-row-name:has(> input) {
+    overflow: visible;
 }
 
 .list-row-label {

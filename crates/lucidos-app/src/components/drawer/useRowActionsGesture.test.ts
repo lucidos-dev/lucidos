@@ -3,7 +3,13 @@ import { makeLongPressHandlers, type LongPressCallback } from '../../hooks/useLo
 import { rowGestureHandlers } from './useRowActionsGesture';
 
 const row = { closest: () => null };
-const pinButton = { closest: (sel: string) => (sel === 'button' ? {} : null) };
+/** A fake target whose `closest` matches any of `tags` in a selector list. */
+const inside = (...tags: string[]) => ({
+  closest: (sel: string) => (sel.split(',').some((s) => tags.includes(s.trim())) ? {} : null),
+});
+const pinButton = inside('button');
+// The "N archived" text sits in the same <label> as the switch.
+const archivedLabelText = inside('label');
 
 function pointerDown(target: object = row, button = 0): PointerEvent {
   return { button, clientX: 0, clientY: 0, currentTarget: row, target } as unknown as PointerEvent;
@@ -110,6 +116,16 @@ describe('rowGestureHandlers', () => {
     it('a hold that starts on an inline control is left to it', () => {
       const h = build(true);
       h.onPointerDown!(pointerDown(pinButton));
+      vi.advanceTimersByTime(450);
+      expect(open).not.toHaveBeenCalled();
+      expect(prefetch).toHaveBeenCalledTimes(1);
+    });
+
+    it('a hold that starts on the archived-reveal toggle or its text is left to it', () => {
+      // The toggle is a <label>, not a <button>. Holding any part of it must
+      // not open the row's menu.
+      const h = build(true);
+      h.onPointerDown!(pointerDown(archivedLabelText));
       vi.advanceTimersByTime(450);
       expect(open).not.toHaveBeenCalled();
       expect(prefetch).toHaveBeenCalledTimes(1);

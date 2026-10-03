@@ -30,6 +30,7 @@ function makeThread(status: ThreadState['meta']['status']): ThreadState {
       attentionDescendantCount: 0,
       codingAgentProposed: false,
       codingAgentRequiresRestart: false,
+      codingAgentIncomplete: false,
       codingAgentIsExternalRepo: false,
       codingAgentHasDiff: false,
       lastRevivedAt: '',

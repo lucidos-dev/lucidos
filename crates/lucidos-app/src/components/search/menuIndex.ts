@@ -1,5 +1,6 @@
 import { MENU_ITEMS, MENU_ITEM_LABELS, type MenuItem } from '../../store/types';
 import type { SearchResultItem } from '../../api/client';
+import { rankByTitle } from './titleMatch';
 
 /**
  * The menu items themselves, as Search Everywhere results.
@@ -50,12 +51,17 @@ function toResult(entry: MenuSearchEntry): SearchResultItem {
 }
 
 /** Filter the index by query (case-insensitive substring over label plus
- *  keywords) and return as SearchResultItems. An empty query lists every menu
- *  item, which is what the Menu tab opens on. */
+ *  keywords), rank by label best first, and return as SearchResultItems. An
+ *  empty query lists every menu item in menu order, which is what the Menu tab
+ *  opens on. */
 export function getMenuSearchResults(query: string, limit: number): SearchResultItem[] {
   const q = query.trim().toLowerCase();
   const matches = q
-    ? MENU_SEARCH_INDEX.filter(e => `${MENU_ITEM_LABELS[e.id]} ${e.keywords}`.toLowerCase().includes(q))
+    ? rankByTitle(
+        MENU_SEARCH_INDEX.filter(e => `${MENU_ITEM_LABELS[e.id]} ${e.keywords}`.toLowerCase().includes(q)),
+        q,
+        e => MENU_ITEM_LABELS[e.id],
+      )
     : MENU_SEARCH_INDEX;
   return matches.slice(0, limit).map(toResult);
 }

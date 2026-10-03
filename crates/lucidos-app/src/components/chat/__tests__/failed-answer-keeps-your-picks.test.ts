@@ -94,6 +94,6 @@ describe('the submit sites leave the message to the action', () => {
 
   it('the single-select card rolls back and says nothing', () => {
     expect(cardSource).not.toMatch(/showToast\('Could not send answer/);
-    expect(cardSource).toMatch(/if \(!ok\) localPending\.value = null;/);
+    expect(cardSource).toMatch(/if \(!ok\) pendingAnswers\.clear\(toolUseId\);/);
   });
 });

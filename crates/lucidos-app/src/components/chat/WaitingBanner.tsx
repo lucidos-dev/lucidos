@@ -1,11 +1,12 @@
 import type { ComponentChildren } from 'preact';
 import { threadMap, focusedThreadId, applyingNowThreadIds, applyingChangeThreadIds, archivingThreadIds, discardingCCThreadIds, cancelingThreadIds, effectiveThreadStatus, isMidTurn, standingApplyThreadIds, armingStandingApplyThreadIds, setAsideChangeForThread } from '../../store/store';
 import { bringBackSingleChange } from '../../store/actions/chat-changes';
-import { resolveThreadActions, type TaggedAction } from '../../store/actions/threadActions';
+import { resolveThreadActions, threadHasIncompleteChange, type TaggedAction } from '../../store/actions/threadActions';
+import { continueStoppedThread } from './continueStoppedThread';
 import type { ThreadState } from '../../store/thread-events';
 import { viewThreadCcDiff } from '../../store/actions/repositories';
 import { SplitButton, type SplitButtonMenuItem } from '../shared/SplitButton';
-import { ArchiveIcon, CheckIcon, DiffIcon, MoveToTopIcon, SetAsideIcon, StandingApplyIcon, TrashIcon } from '../shared/icons';
+import { ArchiveIcon, CheckIcon, ContinuedIcon, DiffIcon, MoveToTopIcon, SetAsideIcon, StandingApplyIcon, TrashIcon } from '../shared/icons';
 import type { HeaderActionSpec } from '../layout/headerActions';
 import type { OverflowMenuContext } from '../shared/OverflowMenu';
 import { useTouchActivated } from '../../hooks/useTouchActivated';
@@ -39,6 +40,9 @@ type WaitingState =
       showDiff: boolean;
       /** The thread's set-aside change, which the banner offers to bring back. */
       setAsideChangeId?: string;
+      /** The pending change is incomplete, so Continue leads and Apply moves
+       *  into the caret menu (ADR 0346). */
+      incomplete?: boolean;
     };
 
 /** Banner state passed to `getBannerActions`. The 'canceling' variant is owned
@@ -118,7 +122,15 @@ export function getWaitingState(): WaitingState | null {
   // into an empty diff. `getStandaloneActions` reads the same gate.
   const showDiff = hasCcDiff(thread);
 
-  return { type: 'actions', actions, threadId: focused, isArchiving: false, showDiff, setAsideChangeId };
+  return {
+    type: 'actions',
+    actions,
+    threadId: focused,
+    isArchiving: false,
+    showDiff,
+    setAsideChangeId,
+    incomplete: threadHasIncompleteChange(focused),
+  };
 }
 
 /** ONE close-set action, as a ⋯ menu row. The composite split button folds into
@@ -174,22 +186,29 @@ export function getBannerActions(state: BannerState): HeaderActionSpec[] {
   const applyAction = state.actions.find((a) => a.kind === 'apply');
   if (applyAction) {
     // Discard goes last: the destructive choice sits furthest from the face.
-    const menuActions = state.actions
+    const others = state.actions
       .filter((a) => a !== applyAction)
       .sort((a, b) => Number(a.kind === 'discard') - Number(b.kind === 'discard'));
+    // An incomplete change is not ready to review, so the turn's own way
+    // forward leads and Apply, which confirms, joins the caret (ADR 0346).
+    const primary: SplitFace = state.incomplete ? continueFace(state.threadId) : applyFace(applyAction);
+    const menuActions = state.incomplete ? [applyAction, ...others] : others;
     members.push({
       key: 'change-actions',
-      label: applyAction.label,
-      tooltip: applyAction.tooltip,
-      icon: () => <CheckIcon />,
+      label: primary.label,
+      tooltip: primary.tooltip,
+      icon: primary.icon,
       render: (attrs) => (
         <ChangeActionSplitButton
-          primary={applyAction}
+          primary={primary}
           menuActions={menuActions}
           attrs={{ ...attrs, 'data-thread-action': '' }}
         />
       ),
-      menuRows: (ctx) => [applyAction, ...menuActions].map((a) => actionMenuRow(a, ctx)),
+      menuRows: (ctx) => [
+        faceMenuRow(primary, ctx),
+        ...menuActions.map((a) => actionMenuRow(a, ctx)),
+      ],
     });
     return members;
   }
@@ -381,20 +400,72 @@ function closeSetAction(action: TaggedAction): HeaderActionSpec {
   };
 }
 
-/** Change-action split button: a one-tap primary face (Apply / Apply*)
- *  plus a caret menu holding the remaining close-set actions (Discard, Archive).
- *  Diff is NOT in here — it lives permanently outside this cluster as its own
- *  member of `getBannerActions`. Built on the generic
- *  `SplitButton` (the same control the prompt's multi-select answer Submit
- *  uses), so the caret / Overlay-dismiss / inert-primary contract lives in one
- *  place. Labels, tooltips, and handlers all come from the same TaggedActions
+const CONTINUE_TOOLTIP =
+  'The turn that made this change did not finish. Continue resumes it. Apply, Set aside and Discard are in the menu.';
+
+/** The one-tap face of the change split button. */
+interface SplitFace {
+  key: string;
+  label: string;
+  tooltip: string;
+  /** The face's colour: green for Apply, the neutral blue for Continue. */
+  className: string;
+  icon: () => ComponentChildren;
+  invoke: () => void | Promise<unknown>;
+}
+
+function applyFace(apply: TaggedAction): SplitFace {
+  return {
+    key: apply.kind,
+    label: apply.label,
+    tooltip: tooltipWithShortcut(apply.tooltip ?? apply.label, 'applyChange'),
+    className: 'action-btn action-btn-confirm',
+    icon: () => <CheckIcon />,
+    invoke: apply.invoke,
+  };
+}
+
+function continueFace(threadId: string): SplitFace {
+  return {
+    key: 'continue',
+    label: 'Continue',
+    tooltip: CONTINUE_TOOLTIP,
+    className: 'action-btn',
+    icon: () => <ContinuedIcon />,
+    invoke: () => continueStoppedThread(threadId),
+  };
+}
+
+/** The face as a ⋯ menu row, for the folded rendering. */
+function faceMenuRow(face: SplitFace, ctx: OverflowMenuContext) {
+  return (
+    <button
+      key={face.key}
+      type="button"
+      class={`thread-overflow-item ${PROTECTED_SURFACE}`}
+      role="menuitem"
+      onClick={ctx.run(() => void face.invoke())}
+    >
+      {face.icon()}
+      {face.label}
+    </button>
+  );
+}
+
+/** Change-action split button: a one-tap face (Apply / Apply*, or Continue for
+ *  an incomplete change) plus a caret menu holding the remaining close-set
+ *  actions. Diff is NOT in here: it lives permanently outside this cluster as
+ *  its own member of `getBannerActions`. It is built on the generic
+ *  `SplitButton`, the control behind the prompt's multi-select answer Submit.
+ *  So the caret / Overlay-dismiss / inert-primary contract lives in one place.
+ *  The menu takes its labels, tooltips and handlers from the same TaggedActions
  *  the desktop buttons use, so there's no enablement drift. */
 function ChangeActionSplitButton({
   primary,
   menuActions,
   attrs,
 }: {
-  primary: TaggedAction;
+  primary: SplitFace;
   menuActions: TaggedAction[];
   attrs?: Record<string, string>;
 }) {
@@ -408,10 +479,10 @@ function ChangeActionSplitButton({
   return (
     <SplitButton
       primaryLabel={primary.label}
-      primaryClassName="action-btn action-btn-confirm"
-      primaryTooltip={tooltipWithShortcut(primary.tooltip ?? primary.label, 'applyChange')}
+      primaryClassName={primary.className}
+      primaryTooltip={primary.tooltip}
       onPrimary={() => void primary.invoke()}
-      caretClassName="action-btn action-btn-confirm"
+      caretClassName={primary.className}
       caretAriaLabel="More change actions"
       menuItems={menuItems}
       attrs={attrs}

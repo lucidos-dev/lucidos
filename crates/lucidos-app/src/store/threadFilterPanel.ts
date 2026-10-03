@@ -19,10 +19,8 @@ const PANEL_OPEN_KEY = 'lucidos-thread-filter-panel-open';
 
 /** Whether the thread filter panel is showing. The panel renders INSIDE the
  *  thread drawer pane (`ThreadDrawer`, which backs the desktop drawer and the
- *  mobile threads pane alike) while its toggle lives in the threads header, so
- *  the state cannot be local component state the way it was while the filter
- *  was an anchored dropdown: the two headers each instantiate
- *  `useThreadsHeaderState`, and neither of them is where the panel renders. */
+ *  mobile threads pane alike). Its toggles are the button in both threads
+ *  headers and a shortcut, so the state cannot be local to any one of them. */
 export const threadFilterPanelOpen = signal(localStorage.getItem(PANEL_OPEN_KEY) === 'true');
 
 /** All three parts of the state move together, and only here: the signal, the

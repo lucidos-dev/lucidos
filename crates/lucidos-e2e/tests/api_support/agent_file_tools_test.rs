@@ -161,6 +161,88 @@ async fn a_broken_theme_written_by_the_agent_is_refused_before_disk_or_git() {
     assert_eq!(data_event_count(&pool, "DataFileWritten", &rel).await, 0);
 }
 
+/// Every file tool announces a change outside `artifacts/`, once. An open
+/// preview of that file refreshes on the announcement alone, since the live
+/// tool call no longer carries the path it wrote.
+#[tokio::test]
+async fn every_file_tool_announces_a_knowhow_change_once() {
+    let _tree = workspace_tree_lock().read().await;
+    let pool = sqlx::PgPool::connect(&db_url()).await.unwrap();
+    let id = uuid::Uuid::new_v4().simple();
+    let rel = format!("knowhow/e2e/announce-{id}.md");
+    let copy = format!("knowhow/e2e/announce-{id}-copy.md");
+
+    let written = call_tool(
+        &pool,
+        "write_file",
+        json!({ "path": rel, "content": "# Notes\nfirst draft\n" }),
+    )
+    .await;
+    assert!(
+        written.contains(&format!("CREATED: {rel}")),
+        "got: {written}"
+    );
+    assert_eq!(data_event_count(&pool, "DataFileWritten", &rel).await, 1);
+
+    let edited = call_tool(
+        &pool,
+        "edit_file",
+        json!({ "path": rel, "old_string": "first draft", "new_string": "second draft" }),
+    )
+    .await;
+    assert!(!edited.starts_with("Error:"), "got: {edited}");
+    assert_eq!(data_event_count(&pool, "DataFileEdited", &rel).await, 1);
+
+    let copied = call_tool(
+        &pool,
+        "copy_file",
+        json!({ "source": rel, "destination": copy }),
+    )
+    .await;
+    assert!(!copied.starts_with("Error:"), "got: {copied}");
+    assert_eq!(data_event_count(&pool, "DataFileWritten", &copy).await, 1);
+
+    for path in [&rel, &copy] {
+        let deleted = call_tool(&pool, "delete_file", json!({ "path": path })).await;
+        assert!(
+            deleted.contains(&format!("DELETED: {path}")),
+            "got: {deleted}"
+        );
+        assert_eq!(data_event_count(&pool, "DataFileDeleted", path).await, 1);
+    }
+}
+
+/// An `artifacts/` write keeps its own `Artifact*` event and gains no
+/// `DataFile*`, so the Files list and the preview see one announcement.
+#[tokio::test]
+async fn an_artifact_written_by_the_agent_announces_no_data_file_event() {
+    let _tree = workspace_tree_lock().read().await;
+    let pool = sqlx::PgPool::connect(&db_url()).await.unwrap();
+    let rel = format!(
+        "artifacts/e2e/announce-{}.md",
+        uuid::Uuid::new_v4().simple()
+    );
+
+    let written = call_tool(
+        &pool,
+        "write_file",
+        json!({ "path": rel, "content": "x\n" }),
+    )
+    .await;
+    assert!(
+        written.contains(&format!("CREATED: {rel}")),
+        "got: {written}"
+    );
+    assert_eq!(data_event_count(&pool, "DataFileWritten", &rel).await, 0);
+
+    let deleted = call_tool(&pool, "delete_file", json!({ "path": rel })).await;
+    assert!(
+        deleted.contains(&format!("DELETED: {rel}")),
+        "got: {deleted}"
+    );
+    assert_eq!(data_event_count(&pool, "DataFileDeleted", &rel).await, 0);
+}
+
 /// A workspace font's manifest is checked like a theme: refused before disk or
 /// git when invalid, announced when written, and never edited in place.
 #[tokio::test]

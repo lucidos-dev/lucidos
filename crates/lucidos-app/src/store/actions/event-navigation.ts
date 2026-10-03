@@ -2,7 +2,7 @@ import { effect, signal } from '@preact/signals';
 import { ApiError } from '../../api/client';
 import { fetchEventLocation } from '../../api/threads';
 import { EVENT_RESOLVE_DEADLINE_MS } from '../../components/chat/scrollState';
-import { UNANCHORABLE_ASYNC_EVENTS, attentionTarget, computeExchanges, deepLinkAnchorForEvent } from '../thread-events';
+import { UNANCHORABLE_ASYNC_EVENTS, attentionTarget, computeExchanges, deepLinkAnchorInThread } from '../thread-events';
 import type { AttentionTarget } from '../thread-events';
 import { showToast, threadMap, focusedThreadId, effectiveThreadStatus } from '../store';
 import { errorDetail } from '../../utils/errorDetail';
@@ -91,11 +91,7 @@ async function owningThreadId(eventId: string): Promise<string | null> {
 /** The anchor for `eventId` within a thread whose events are in the store, or
  *  `null` when that thread draws nothing the jump can honestly land on. */
 function anchorInLoadedThread(threadId: string, eventId: string): string | null {
-  const thread = threadMap.value.get(threadId);
-  // `computeExchanges` is memoized per thread (`groupIntoExchangesCached`), so
-  // this is a map lookup on the second and later call rather than a re-grouping
-  // of the whole history.
-  return thread ? deepLinkAnchorForEvent(computeExchanges(thread), eventId) : null;
+  return deepLinkAnchorInThread(threadMap.value.get(threadId), eventId);
 }
 
 /** Does this thread's loaded history contain the event at all?

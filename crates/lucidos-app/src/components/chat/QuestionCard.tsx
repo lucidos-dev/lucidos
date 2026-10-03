@@ -1,7 +1,9 @@
-import { signal, useSignal } from '@preact/signals';
+import { signal } from '@preact/signals';
 import { useEffect, useMemo, useRef } from 'preact/hooks';
+import { useDelayedFlag } from '../../hooks/useDelayedLoading';
 import { answerThreadQuestion } from '../../store/actions/chat-claude-code';
 import { createTapGate } from '../../utils/tapGesture';
+import { pendingDecisions } from './pendingDecisions';
 import { renderMarkdown, renderMarkdownInline } from '../../utils/renderMarkdown';
 import { CHOICE_CARD_ROLE, handAnsweredCardFocusToPrompt, handleChoiceCardKeyDown, seedChoiceCardFocus } from './choiceCardNav';
 import { UserImages } from './chat-exchange-parts';
@@ -25,11 +27,12 @@ export interface QuestionBodyProps {
   terminated?: boolean;
 }
 
-// Multi-select state lives at module level so PromptInput can read selections
-// + write the optimistic answer. The QuestionBody useEffect below drains both
-// maps when the persisted UserQuestionAnswered lands.
+// Selections and optimistic answers live at module level. PromptInput reads
+// the selections and writes a multi-select answer, and the divider header reads
+// the answers to say "Sending". The QuestionBody useEffect below drains both
+// when the persisted UserQuestionAnswered lands.
 export const multiSelectedByToolUse = signal<Map<string, string[]>>(new Map());
-export const pendingAnswerByToolUse = signal<Map<string, ResolvedAnswer>>(new Map());
+export const pendingAnswers = pendingDecisions<ResolvedAnswer>();
 
 export function getMultiSelectedIds(toolUseId: string): string[] {
   return multiSelectedByToolUse.value.get(toolUseId) ?? [];
@@ -54,19 +57,6 @@ function toggleMultiSelectedId(toolUseId: string, optionId: string): void {
 
 function clearMultiSelected(toolUseId: string): void {
   setMultiSelectedIds(toolUseId, []);
-}
-
-export function setPendingAnswer(toolUseId: string, answer: ResolvedAnswer): void {
-  const next = new Map(pendingAnswerByToolUse.value);
-  next.set(toolUseId, answer);
-  pendingAnswerByToolUse.value = next;
-}
-
-export function clearPendingAnswer(toolUseId: string): void {
-  if (!pendingAnswerByToolUse.value.has(toolUseId)) return;
-  const next = new Map(pendingAnswerByToolUse.value);
-  next.delete(toolUseId);
-  pendingAnswerByToolUse.value = next;
 }
 
 /** Radio (single) vs checkbox (multi) shape on each option, distinct from the
@@ -94,14 +84,19 @@ function OptionContent({
   option,
   multiSelect,
   selected,
+  sending = false,
 }: {
   option: QuestionOption;
   multiSelect: boolean;
   selected: boolean;
+  /** The pick is on its way to the engine: the indicator spins in its place. */
+  sending?: boolean;
 }) {
   return (
     <>
-      <OptionIndicator multiSelect={multiSelect} selected={selected} />
+      {selected && sending
+        ? <span class="mini-spinner question-option-sending" aria-hidden="true" />
+        : <OptionIndicator multiSelect={multiSelect} selected={selected} />}
       <span class="question-option-label">{option.label}</span>
       {option.description && (
         <span
@@ -157,21 +152,21 @@ function QuestionText({ question }: { question: string }) {
  *  lives in the `ask_user_question` tool description and the question rules in
  *  the engine prompts. */
 export function QuestionBody({ threadId, toolUseId, question, options, multiSelect, resolved, terminated }: QuestionBodyProps) {
-  // Single-select keeps a local pending — nothing outside the card needs it.
-  const localPending = useSignal<ResolvedAnswer | null>(null);
-
   // Drain the module-level maps once the persisted answer lands. Without this,
   // selections + optimistic pending leak across the session.
   useEffect(() => {
     if (!resolved) return;
-    clearPendingAnswer(toolUseId);
+    pendingAnswers.clear(toolUseId);
     clearMultiSelected(toolUseId);
   }, [resolved, toolUseId]);
 
-  const liftedPending = pendingAnswerByToolUse.value.get(toolUseId);
-  const effective = resolved ?? liftedPending ?? localPending.value ?? undefined;
+  // A dead card draws no unconfirmed pick, matching its "Unanswered" header.
+  // The pick stays stored, so an answer that still lands shows it again.
+  const pending = terminated ? undefined : pendingAnswers.map.value.get(toolUseId);
+  const effective = resolved ?? pending;
+  const sending = useDelayedFlag(!resolved && !!pending);
   if (effective) {
-    return <AnsweredBody toolUseId={toolUseId} question={question} options={options} multiSelect={multiSelect} resolved={effective} />;
+    return <AnsweredBody toolUseId={toolUseId} question={question} options={options} multiSelect={multiSelect} resolved={effective} sending={sending} />;
   }
   if (terminated) {
     return <TerminatedQuestionBody question={question} options={options} multiSelect={multiSelect} />;
@@ -196,7 +191,7 @@ export function QuestionBody({ threadId, toolUseId, question, options, multiSele
 
   const onPick = async (optionId: string) => {
     handAnsweredCardFocusToPrompt();
-    localPending.value = { kind: 'Selected', option_id: optionId };
+    pendingAnswers.set(toolUseId, { kind: 'Selected', option_id: optionId });
     // Answering is a send: keep the reader at the live edge while the agent
     // resumes, landing on what they just answered when they were not already
     // riding it. Before the await, because the scroll is the composer's-tap half
@@ -207,7 +202,7 @@ export function QuestionBody({ threadId, toolUseId, question, options, multiSele
     // Roll the optimistic pick back so the card goes live again. The action
     // owns the message: a second toast here made one failed tap say two things,
     // neither of them the cause. See `answerFailureMessage`.
-    if (!ok) localPending.value = null;
+    if (!ok) pendingAnswers.clear(toolUseId);
   };
 
   return (
@@ -326,12 +321,14 @@ export function AnsweredBody({
   options,
   multiSelect,
   resolved,
+  sending = false,
 }: {
   toolUseId: string;
   question: string;
   options: QuestionBodyProps['options'];
   multiSelect: boolean | undefined;
   resolved: ResolvedAnswer;
+  sending?: boolean;
 }) {
   const isSelected = (id: string) =>
     (resolved.kind === 'Selected' && resolved.option_id === id) ||
@@ -352,7 +349,7 @@ export function AnsweredBody({
               key={opt.id}
               class={`question-option-static${isSelected(opt.id) ? ' question-option-selected' : ' question-option-dimmed'}`}
             >
-              <OptionContent option={opt} multiSelect={!!multiSelect} selected={isSelected(opt.id)} />
+              <OptionContent option={opt} multiSelect={!!multiSelect} selected={isSelected(opt.id)} sending={sending} />
             </div>
           ))}
         </div>

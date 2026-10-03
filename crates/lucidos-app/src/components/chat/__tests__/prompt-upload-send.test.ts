@@ -62,4 +62,20 @@ describe('PromptInput upload send queue', () => {
     expect(promptSource).toMatch(/if\s*\(\s*queuedUploadSends\.value\.has\(targetId\)\s*\)\s*\{[\s\S]*?clearQueuedUploadSend\(targetId\)/);
     expect(promptSource).not.toContain('Will send after image upload');
   });
+
+  // An image that failed to upload would be left out of the message without a
+  // word. The refusal sits ahead of every queue and dispatch in submit.
+  it('refuses a send while an image is failed, before any queue or dispatch', () => {
+    const fn = promptSource.match(/async function submit\(asSideQuestion = false\)[\s\S]*?\n  \}/);
+    const body = fn![0];
+    const refusal = body.search(/if \(threadId && uploadsGate\(threadId\) === 'failed'\) \{\s*markUploadBlockedSend\(threadId\);\s*return;/);
+    expect(refusal).toBeGreaterThan(-1);
+    for (const later of ['queueUploadSend(threadId', 'askComposerSideQuestion(', 'beginSend(']) {
+      expect(body.indexOf(later)).toBeGreaterThan(refusal);
+    }
+  });
+
+  it('settles queued sends through the one reconciler', () => {
+    expect(promptSource).toMatch(/settleQueuedUploadSends\(\(threadId, intent\) => \{[\s\S]*?sendQueuedAfterUpload\(threadId/);
+  });
 });

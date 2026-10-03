@@ -247,7 +247,7 @@ async fn emit_backup_notification(
         log!("[Backup] Failed to emit notification: {}", e);
     }
 
-    push::send_push_to_all(engine, title, message, Some(notification_id)).await;
+    push::send_push_to_all(engine, title, message, Some(notification_id));
 }
 
 /// Settings → System → Backup: the page carrying the health card with the last

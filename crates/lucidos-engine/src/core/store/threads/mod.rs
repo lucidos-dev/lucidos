@@ -104,7 +104,7 @@ pub struct SpokenTurn {
 
 /// Format a display title from optional title and first_message fields.
 /// Falls back to truncated first_message if title is None.
-fn format_display_title(title: Option<String>, first_message: Option<String>) -> String {
+pub(crate) fn format_display_title(title: Option<String>, first_message: Option<String>) -> String {
     title.unwrap_or_else(|| {
         let msg = first_message.unwrap_or_default();
         if msg.chars().count() > 40 {
@@ -207,14 +207,20 @@ pub struct ThreadSummary {
     /// session bootstrap, and reconciled by the startup sweep against on-disk
     /// git state. Drives the WaitingBanner Diff button.
     pub coding_agent_has_diff: bool,
-    /// Coding-agent thread's formal "ready for review" offer — set only by `ChangeProposed`,
-    /// cleared on Apply/Discard/Archive. Drives the Apply / Discard buttons.
+    /// The coding-agent thread holds a pending change, complete or incomplete.
+    /// Derived from the `changes` rows; cleared on Apply / Discard / Set aside.
+    /// Drives the Apply / Discard buttons and blocks Archive. Whether the
+    /// change is ready to review is `coding_agent_incomplete` (ADR 0346).
     /// Distinct from `coding_agent_has_diff` (the git fact): a thread can have
     /// a diff mid-session before the coding agent has formally proposed.
     pub coding_agent_proposed: bool,
     /// Whether the proposed change requires an engine restart. Only meaningful
     /// when `coding_agent_proposed = true`; cleared together with it.
     pub coding_agent_requires_restart: bool,
+    /// Whether the proposed change is incomplete: its turn did not finish, so
+    /// it is not ready to review (ADR 0346). Only meaningful when
+    /// `coding_agent_proposed = true`; cleared together with it.
+    pub coding_agent_incomplete: bool,
     /// Whether the coding-agent thread is bound to an external repo. External repos
     /// can't be Applied via the engine merge flow — the WaitingBanner shows
     /// Done/Archive instead, and `archive_thread` marks pending changes as
@@ -295,6 +301,23 @@ pub struct ThreadSummary {
     /// every other read path.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pending_sub_thread_change_count: Option<i64>,
+    /// The *reader fields* below are filled by [`attach_reader_fields`] on the
+    /// list and search paths an agent, the CLI or a script reads. Every other
+    /// read path omits them rather than reporting a default.
+    ///
+    /// Whether the thread holds a draft, by [`has_draft`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub has_draft: Option<bool>,
+    /// The draft's first [`PREVIEW_CHARS`] characters, present only
+    /// when the thread holds a draft.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub draft_preview: Option<String>,
+    /// The whole draft's length in characters, beside `draft_preview`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub draft_length: Option<usize>,
+    /// The *thread link*: `thread:<workspace>/<thread_id>`, by [`thread_link`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link: Option<String>,
 }
 
 /// SQL expression that extracts an app id from `{alias}.coding_agent_folder`.
@@ -397,10 +420,12 @@ struct ThreadRow {
     summary_version: i64,
     /// Pure git truth — `git diff main..branch` is non-empty.
     coding_agent_has_diff: bool,
-    /// Coding-agent thread's formal "ready for review" — set by `ChangeProposed` only.
+    /// See `ThreadSummary::coding_agent_proposed`.
     coding_agent_proposed: bool,
     /// Only meaningful when `coding_agent_proposed = true`.
     coding_agent_requires_restart: bool,
+    /// Only meaningful when `coding_agent_proposed = true`.
+    coding_agent_incomplete: bool,
     coding_agent_is_external_repo: bool,
     last_revived_at: Option<chrono::DateTime<chrono::Utc>>,
     is_saved: bool,
@@ -487,11 +512,12 @@ pub struct ThreadAggregate {
     pub live_event_waits: Vec<EventWaitSummary>,
     /// Pure git truth — drives the Diff button. See `ThreadSummary::coding_agent_has_diff`.
     pub coding_agent_has_diff: bool,
-    /// Coding-agent thread's formal "ready for review" offer — set by `ChangeProposed` only.
-    /// Drives the Apply / Discard buttons.
+    /// See `ThreadSummary::coding_agent_proposed`.
     pub coding_agent_proposed: bool,
     /// Only meaningful when `coding_agent_proposed = true`.
     pub coding_agent_requires_restart: bool,
+    /// See `ThreadSummary::coding_agent_incomplete`.
+    pub coding_agent_incomplete: bool,
     pub coding_agent_is_external_repo: bool,
     pub is_saved: bool,
     pub has_response: bool,
@@ -570,6 +596,7 @@ fn row_to_thread_aggregate(
         coding_agent_has_diff: r.coding_agent_has_diff,
         coding_agent_proposed: r.coding_agent_proposed,
         coding_agent_requires_restart: r.coding_agent_requires_restart,
+        coding_agent_incomplete: r.coding_agent_incomplete,
         coding_agent_is_external_repo: r.coding_agent_is_external_repo,
         is_saved: r.is_saved,
         has_response: r.has_response,
@@ -610,7 +637,7 @@ fn thread_cols(alias: &str) -> String {
         {a}.message_count::bigint, {a}.archive_state AS section, {a}.active_children_count::bigint, {a}.waiting_children_count::bigint, {a}.total_children_count::bigint, \
         {a}.blocking_descendant_count::bigint, {a}.attention_descendant_count::bigint, {a}.is_stopped_child, \
         {a}.live_event_wait_count::bigint, {a}.live_event_waits, \
-        {a}.status, {a}.summary_version, {a}.coding_agent_has_diff, {a}.coding_agent_proposed, {a}.coding_agent_requires_restart, \
+        {a}.status, {a}.summary_version, {a}.coding_agent_has_diff, {a}.coding_agent_proposed, {a}.coding_agent_requires_restart, {a}.coding_agent_incomplete, \
         {a}.coding_agent_is_external_repo, {a}.last_revived_at, \
         {a}.is_saved, {a}.has_response, \
         {a}.parent_thread_id::text AS parent_thread_id, \
@@ -704,6 +731,7 @@ fn row_to_thread_summary(
         coding_agent_has_diff: r.coding_agent_has_diff,
         coding_agent_proposed: r.coding_agent_proposed,
         coding_agent_requires_restart: r.coding_agent_requires_restart,
+        coding_agent_incomplete: r.coding_agent_incomplete,
         coding_agent_is_external_repo: r.coding_agent_is_external_repo,
         last_revived_at: r.last_revived_at,
         parent_thread_id: r.parent_thread_id,
@@ -722,6 +750,10 @@ fn row_to_thread_summary(
         compose_selection: r.compose_selection,
         compose_epoch: r.compose_epoch,
         pending_sub_thread_change_count: None,
+        has_draft: None,
+        draft_preview: None,
+        draft_length: None,
+        link: None,
     })
 }
 
@@ -748,8 +780,27 @@ pub struct ThreadSummaryFilters<'a> {
     /// orchestrating its own fan-out, and it is how the Lucidos Agent recovers
     /// a child's `thread_id` after history trimming drops the spawn result.
     pub parent: Option<uuid::Uuid>,
+    /// `Some(true)` keeps threads holding a draft, `Some(false)` keeps the
+    /// rest, `None` is no filter. "Holding a draft" is [`HAS_DRAFT_SQL`].
+    pub has_draft: Option<bool>,
+    /// The same three-way filter on `coding_agent_has_diff`, the git fact that
+    /// the branch differs from main.
+    pub has_diff: Option<bool>,
     pub limit: i64,
 }
+
+/// The `WHERE` fragment for every filter but status, shared by the list and
+/// count queries. `$3` sources, `$4` parent, `$5` has_draft, `$6` has_diff.
+/// The list query binds its limit as `$7`.
+static SUMMARY_FILTER_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        "($3::text[] IS NULL OR t.source = ANY($3)) \
+         AND ($4::uuid IS NULL OR t.parent_thread_id = $4) \
+         AND ($5::bool IS NULL OR ({has_draft}) = $5) \
+         AND ($6::bool IS NULL OR t.coding_agent_has_diff = $6)",
+        has_draft = HAS_DRAFT_SQL,
+    )
+});
 
 /// How a `list` / `count` query narrows by thread status.
 ///
@@ -901,7 +952,13 @@ pub struct ThreadTimelineEvent {
 }
 
 mod backfill;
+mod drafts;
 mod events;
+
+pub use drafts::{
+    attach_reader_fields, char_length, has_draft, text_preview, thread_link, DraftSummary,
+    HAS_DRAFT_SQL, PREVIEW_CHARS,
+};
 mod search;
 mod summaries;
 
@@ -924,6 +981,10 @@ mod backfill_tests;
 #[cfg(test)]
 #[path = "../threads_tests/search.rs"]
 mod search_tests;
+
+#[cfg(test)]
+#[path = "../threads_tests/drafts.rs"]
+mod drafts_tests;
 
 #[cfg(test)]
 #[path = "../threads_tests/extraction.rs"]

@@ -7,9 +7,10 @@ import { openThreadFilterPanel, closeThreadFilterPanel } from '../../store/threa
 
 // Pure ←/→ tree-navigation logic for the drawer — no signals, no DOM.
 
-const state = (sections: string[] = [], families: string[] = []): NavCollapseState => ({
+const state = (sections: string[] = [], families: string[] = [], revealed: string[] = []): NavCollapseState => ({
   sectionCollapsed: (k) => sections.includes(k),
   familyCollapsed: (id) => families.includes(id),
+  archivedRevealed: (id) => revealed.includes(id),
 });
 
 const section = (sectionKey: 'saved' | 'current' | 'archive'): DrawerNavNode =>
@@ -21,7 +22,8 @@ const thread = (
   parentId: string | null,
   hasChildren: boolean,
   sectionKey: 'saved' | 'current' | 'archive' | null,
-): DrawerNavNode => ({ kind: 'thread', id, depth, parentId, hasChildren, sectionKey });
+  hiddenArchivedCount = 0,
+): DrawerNavNode => ({ kind: 'thread', id, depth, parentId, hasChildren, hiddenArchivedCount, sectionKey });
 
 describe('nodeKey / sectionNavKey', () => {
   it('keys a section header by its prefixed name', () => {
@@ -79,6 +81,24 @@ describe('leftAction (collapse / ascend)', () => {
       type: 'collapseSection', sectionKey: 'current',
     });
   });
+
+  it('hides revealed archived children before collapsing the parent family / section', () => {
+    // No live family (hasChildren false), but archived children are revealed:
+    // ← turns the archived-reveal toggle off instead of jumping to the section.
+    const node = thread('p', 0, null, false, 'current', 2);
+    expect(leftAction(node, state([], [], ['p']))).toEqual({ type: 'hideArchived', threadId: 'p' });
+  });
+
+  it('collapses a live family before touching its own archived-reveal toggle', () => {
+    const node = thread('p', 0, null, true, 'current', 2);
+    expect(leftAction(node, state([], [], ['p']))).toEqual({
+      type: 'collapseFamily', threadId: 'p', focusKey: 'p',
+    });
+  });
+
+  it('is a no-op on a top-level thread with nothing revealed and no section to collapse', () => {
+    expect(leftAction(thread('p', 0, null, false, null, 2), state())).toEqual({ type: 'none' });
+  });
 });
 
 describe('rightAction (expand / descend)', () => {
@@ -102,6 +122,17 @@ describe('rightAction (expand / descend)', () => {
     const nodes = [thread('p', 0, null, true, 'current'), thread('c', 1, 'p', false, 'current')];
     expect(rightAction(nodes[0], nodes, 0, state())).toEqual({ type: 'focusKey', key: 'c' });
   });
+
+  it('reveals archived children before descending, on an already-expanded parent with both', () => {
+    // A row with one live child AND hidden archived children renders expanded
+    // by default (families aren't collapsed unless the user collapses them).
+    // Without this ordering, → always matched the descend branch below and the
+    // archived toggle was never reachable by keyboard for such a row at all.
+    const nodes = [thread('p', 0, null, true, 'current', 1), thread('c', 1, 'p', false, 'current')];
+    expect(rightAction(nodes[0], nodes, 0, state())).toEqual({ type: 'revealArchived', threadId: 'p' });
+    // A second → press, now that it's revealed, descends into the live child.
+    expect(rightAction(nodes[0], nodes, 0, state([], [], ['p']))).toEqual({ type: 'focusKey', key: 'c' });
+  });
   it('is a no-op on an expanded parent whose next row is a sibling (no rendered child)', () => {
     const nodes = [thread('p', 0, null, true, 'current'), thread('s', 0, null, false, 'current')];
     expect(rightAction(nodes[0], nodes, 0, state())).toEqual({ type: 'none' });
@@ -109,6 +140,28 @@ describe('rightAction (expand / descend)', () => {
   it('is a no-op on a leaf thread', () => {
     const nodes = [thread('t', 0, null, false, 'current')];
     expect(rightAction(nodes[0], nodes, 0, state())).toEqual({ type: 'none' });
+  });
+
+  it('reveals hidden archived children on a thread with no live family', () => {
+    const nodes = [thread('p', 0, null, false, 'current', 3)];
+    expect(rightAction(nodes[0], nodes, 0, state())).toEqual({ type: 'revealArchived', threadId: 'p' });
+  });
+
+  it('expands a collapsed live family before revealing its own archived children', () => {
+    const nodes = [thread('p', 0, null, true, 'current', 2)];
+    expect(rightAction(nodes[0], nodes, 0, state([], ['p']))).toEqual({ type: 'expandFamily', threadId: 'p' });
+  });
+
+  it('reveals archived children once the live family has nothing left to descend into', () => {
+    // Expanded live family with no rendered next child (edge case) still falls
+    // through to the archived-reveal toggle instead of stopping at none.
+    const nodes = [thread('p', 0, null, true, 'current', 2), thread('s', 0, null, false, 'current')];
+    expect(rightAction(nodes[0], nodes, 0, state())).toEqual({ type: 'revealArchived', threadId: 'p' });
+  });
+
+  it('is a no-op once archived children are already revealed and there is nothing else', () => {
+    const nodes = [thread('p', 0, null, false, 'current', 2)];
+    expect(rightAction(nodes[0], nodes, 0, state([], [], ['p']))).toEqual({ type: 'none' });
   });
 });
 

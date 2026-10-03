@@ -64,6 +64,8 @@ describe('InlineStep rendering per step outcome', () => {
     expect(props.class).toContain('error');
     expect(text).toContain(MARK.error);
     expect(text).not.toContain(MARK.unfinished);
+    expect(text).not.toContain(MARK.success);
+    expect(props['data-tooltip']).toBe('Failed');
   });
 
   // The reported bug: a command waiting on a permission card rendered exactly

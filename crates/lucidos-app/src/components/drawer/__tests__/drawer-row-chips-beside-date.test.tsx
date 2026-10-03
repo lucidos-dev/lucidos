@@ -1,8 +1,7 @@
 // @vitest-environment jsdom
 /**
- * A row with sub-threads carries its chips on the "Show N sub-threads" line,
- * leaving the date alone on its own line. A row without sub-threads keeps the
- * chips beside the date.
+ * Every drawer row carries its chips beside the date. A row with sub-threads
+ * puts its "Show N sub-threads" link and archived toggle on a line below them.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
@@ -46,6 +45,7 @@ function makeThread(totalChildrenCount: number): ThreadState {
     codingAgentHasDiff: false,
     codingAgentProposed: false,
     codingAgentRequiresRestart: false,
+    codingAgentIncomplete: false,
     codingAgentIsExternalRepo: false,
     lastRevivedAt: '',
     state: 'active',
@@ -82,20 +82,20 @@ afterEach(() => {
 });
 
 describe('where a drawer row puts its chips', () => {
-  it('puts them on the sub-thread line when the row has sub-threads', () => {
+  it('keeps them beside the date when the row has sub-threads', () => {
+    mount(3);
+    expect(host.querySelector('.thread-row-meta .thread-row-created')).not.toBeNull();
+    expect(host.querySelector('.thread-row-meta .message-channel-tag')).not.toBeNull();
+  });
+
+  it('puts only the sub-thread controls on the line below', () => {
     mount(3);
     const familyLine = host.querySelector('.thread-row-family-line');
     expect(familyLine, 'no sub-thread line rendered').not.toBeNull();
     expect(familyLine!.querySelector(':scope > .family-disclosure')).not.toBeNull();
-    // In their own box, so the link aligns with the bottom of all of them.
-    expect(familyLine!.querySelector(':scope > .thread-row-family-chips > .message-channel-tag')).not.toBeNull();
-  });
-
-  it('leaves the date alone on the meta line when the row has sub-threads', () => {
-    mount(3);
-    const meta = host.querySelector('.thread-row-meta');
-    expect(meta!.querySelector('.thread-row-created')).not.toBeNull();
-    expect(meta!.querySelector('.message-channel-tag')).toBeNull();
+    expect(familyLine!.querySelector('.label')).toBeNull();
+    // Below the chips, not above them.
+    expect(host.querySelector('.thread-row-meta + .thread-row-family-line')).not.toBeNull();
   });
 
   it('keeps them beside the date when the row has no sub-threads', () => {

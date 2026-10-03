@@ -79,7 +79,7 @@ pub(super) fn spawn_tools() -> Vec<ToolDefinition> {
                 "properties": {
                     "prompt": {
                         "type": "string",
-                        "description": "The coding task. Name the files and the outcome."
+                        "description": "The coding task. Name the files and the outcome. Its folder already sets defaults for review, merging and hardening: mention one only to ask for something other than that default."
                     },
                     "coding_agent": {
                         "type": "string",

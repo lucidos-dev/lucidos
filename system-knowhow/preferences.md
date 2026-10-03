@@ -128,7 +128,6 @@ globally does nothing on a device that has its own `theme-mode=light` override. 
 | `voice_talker_voice` | global | a provider voice name | `marin` | The voice a call is spoken in. Not a model, and not the language: `language` decides what is spoken, and this decides who speaks it. A name the provider does not know refuses the call, so change it to one the talker model offers. |
 | `voice_resident_sections` | global | comma-separated section ids | `who-and-where,this-thread,workspace-shape` | What a *voice session* loads at the start of a call. That block is the whole of what voice answers with no wait, since the talker cannot look anything up: everything else waits for the agent. `who-and-where` is the workspace name, timezone and local time; `this-thread` is the title, the recent turns, and any question the thread is parked on; `workspace-shape` is the names of apps, triggers and unread notifications, plus two thread lines. Those two are what Lucidos was working on as the call opened, and what is stopped waiting on an answer. An unknown id is ignored with a log line. A row that exists means exactly what it lists; only an absent row means the three above. Turning every section off writes an empty value, which `set_preference` rejects: it is a Settings-only state, reached by the toggles in Settings > Models > Voice. |
 | `vertex_region` | global | text | `europe-west1` | Google Vertex AI region. |
-| `local_base_url` | global | URL | `http://localhost:11434/v1` | Base URL for the `local` OpenAI-compatible provider. The saved `local` key is sent only where its credential scope covers this URL, and Settings moves the key with the URL. An app cannot set it. |
 | `opencode_free_enabled` | global | `true` \| `false` | `false` | Off by default. `true` makes the keyless OpenCode Free models available in the picker. No account and no API key: requests go anonymously to a third-party relay, and several of those free models may train on what they receive. Turn it on only if the user asked for free models and accepts that. |
 | `proxy_timeout_secs` | global | number 1–600 | `30` | How long the engine proxy waits on one upstream request before it answers 504, in seconds. Covers every proxied call: `lucidos proxy`, `lucidos.proxy` in an app, the `proxy_request` tool, and the builtin model routes such as `vertex` and `openai`. A streamed reply counts in full, because the proxy reads the whole body before it answers. Raise it when a long model call through the proxy times out. An `apis.json` entry's own `timeout_secs` wins over it for that entry. A value outside the range is refused on every write path. |
 | `notifications_filter` | global | `all` \| `unread` | `all` | Which notifications the bell shows. |
@@ -226,6 +225,14 @@ surface):
   provider you switch off may be the one answering this turn. Contrast
   `opencode_free_enabled` above, which IS settable, because turning a keyless
   free tier on cannot leave the workspace unable to answer.
+- `local_base_url`: the base URL of the `local` OpenAI-compatible provider,
+  `http://localhost:11434/v1` by default. The user sets it in Settings → Models
+  → Providers. Never via `set_preference`, and an app cannot set it either:
+  that host reads every prompt and writes the replies you run as tool calls.
+  The host must be loopback, a private or tailnet address, or a `.local` or
+  `.home.arpa` name. Any other host is refused when saved, and
+  one stored earlier is ignored, so the local provider drops out. The saved
+  `local` key goes only where its credential scope covers this URL.
 - `provider_enabled_typesafe`: the same switch for TypeSafe (Jev), on the same
   page. Same absent-means-**on** rule, and the same promise that off leaves the
   stored key alone. It is the master switch above `judgment_command_guard` and

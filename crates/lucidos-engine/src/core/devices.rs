@@ -93,10 +93,10 @@ pub enum HandOver {
 /// The registry of devices that have connected to this workspace.
 ///
 /// **No caller can skip the event.** [`Self::register`], [`Self::rename`],
-/// [`Self::set_push_enabled`] and [`Self::delete`] are the only reachable
-/// mutators; the raw row writes are private to this module.
-/// `Device{Registered,Renamed,PushChanged,Deleted}` is what reloads the
-/// Settings devices list on every other device.
+/// [`Self::set_push_enabled`], [`Self::delete`], [`Self::remove_one_off`] and
+/// [`Self::hand_over`] are the only reachable mutators; the raw row writes are
+/// private to this module. `Device{Registered,Renamed,PushChanged,Deleted,
+/// HandedOver}` is what reloads the Settings devices list on every other device.
 ///
 /// Same shape as `RepositoryStore`; see `core::announced_surfaces`.
 pub struct DeviceStore;
@@ -290,34 +290,55 @@ impl DeviceStore {
         Ok(result.rows_affected() > 0)
     }
 
-    /// Delete a device and everything scoped to it. **Private on purpose**:
-    /// [`Self::delete`] emits.
+    /// Delete a device and everything scoped to it, inside the caller's
+    /// transaction. **Private on purpose**: [`Self::delete`] and
+    /// [`Self::remove_one_off`] emit.
     ///
-    /// The cascade (per-device preferences, push subscriptions, pinned apps) is
-    /// deliberately silent. `DeviceDeleted` is the announcement for all of it:
-    /// the device is gone, so a `PreferencesChanged` or `PinnedAppUnpinned` per
-    /// row would describe changes to a device no client still tracks.
+    /// The cascade (per-device preferences, push subscriptions, pinned apps,
+    /// presence) is deliberately silent. `DeviceDeleted` is the announcement for
+    /// all of it: the device is gone, so a `PreferencesChanged` or
+    /// `PinnedAppUnpinned` per row would describe changes to a device no client
+    /// still tracks.
+    ///
+    /// The children go first: `push_subscriptions.device_id` is a foreign key
+    /// onto `devices(id)`.
+    async fn delete_device_rows(
+        conn: &mut sqlx::PgConnection,
+        id: &str,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        sqlx::query("DELETE FROM preferences WHERE device_id = $1")
+            .bind(id)
+            .execute(&mut *conn)
+            .await?;
+        sqlx::query("DELETE FROM push_subscriptions WHERE device_id = $1")
+            .bind(id)
+            .execute(&mut *conn)
+            .await?;
+        PinnedAppStore::delete_for_device(&mut *conn, id).await?;
+        DevicePresenceStore::delete_for_device(&mut *conn, id).await?;
+        let result = sqlx::query("DELETE FROM devices WHERE id = $1")
+            .bind(id)
+            .execute(conn)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Delete one device and its per-device state in one transaction.
+    ///
+    /// Locks the device row before touching its children, the order
+    /// [`Self::remove_one_off`] takes. The opposite order deadlocks against it.
     async fn delete_row(
         pool: &PgPool,
         id: &str,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-        // Delete per-device preferences first
-        sqlx::query("DELETE FROM preferences WHERE device_id = $1")
+        let mut tx = pool.begin().await?;
+        sqlx::query("SELECT 1 FROM devices WHERE id = $1 FOR UPDATE")
             .bind(id)
-            .execute(pool)
+            .execute(&mut *tx)
             .await?;
-        // Delete push subscriptions for this device
-        sqlx::query("DELETE FROM push_subscriptions WHERE device_id = $1")
-            .bind(id)
-            .execute(pool)
-            .await?;
-        // Delete pinned App UIs for this device
-        PinnedAppStore::delete_for_device(pool, id).await?;
-        let result = sqlx::query("DELETE FROM devices WHERE id = $1")
-            .bind(id)
-            .execute(pool)
-            .await?;
-        Ok(result.rows_affected() > 0)
+        let removed = Self::delete_device_rows(&mut tx, id).await?;
+        tx.commit().await?;
+        Ok(removed)
     }
 
     /// Set push_enabled on a device row. **Private on purpose**:
@@ -452,6 +473,60 @@ impl DeviceStore {
                 .await;
         }
         Ok(removed)
+    }
+
+    /// Remove every *one-off device* and announce each removal. Returns the
+    /// removed ids, oldest first.
+    ///
+    /// A one-off device was created more than `older_than_days` ago and never
+    /// seen again after its first 24 hours. Nobody named it, it never paired
+    /// through the gateway, and it holds no push state. A fresh browser profile
+    /// mints a fresh device id, so every headless test run leaves one behind.
+    /// The rule reads no user agent on purpose: emulated runs claim to be
+    /// phones. Rationale in `docs/plans/2026-10-02-one-off-devices-expire.md`.
+    ///
+    /// The rows are locked as they are selected, and deleted in the same
+    /// transaction. A device that registers mid-sweep is therefore never lost:
+    /// either its refreshed `last_seen_at` excludes it, or its upsert waits for
+    /// the commit and inserts it again as new.
+    pub async fn remove_one_off(
+        pool: &PgPool,
+        event_bus: &EventBus,
+        older_than_days: i32,
+    ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+        let mut tx = pool.begin().await?;
+        let ids: Vec<String> = sqlx::query_scalar(
+            "SELECT d.id FROM devices d
+             LEFT JOIN device_presence p ON p.device_id = d.id
+             WHERE d.created_at < now() - make_interval(days => $1)
+               AND GREATEST(d.last_seen_at, p.visible_at) < d.created_at + interval '1 day'
+               AND btrim(COALESCE(d.name, '')) = ''
+               AND d.pairing_label IS NULL
+               AND NOT d.push_enabled
+               AND NOT EXISTS (SELECT 1 FROM push_subscriptions s WHERE s.device_id = d.id)
+             ORDER BY d.created_at
+             FOR UPDATE OF d SKIP LOCKED",
+        )
+        .bind(older_than_days)
+        .fetch_all(&mut *tx)
+        .await?;
+        for id in &ids {
+            Self::delete_device_rows(&mut tx, id).await?;
+        }
+        tx.commit().await?;
+
+        for id in &ids {
+            event_bus
+                .emit_or_log(
+                    BusEvent::System(SystemEvent::DeviceDeleted {
+                        device_id: id.clone(),
+                        actor: None,
+                    }),
+                    "[Devices] DeviceDeleted",
+                )
+                .await;
+        }
+        Ok(ids)
     }
 
     /// Move every trace of `old_id` onto `new_id`, and announce the result.
@@ -1132,7 +1207,7 @@ mod tests {
             .unwrap()
     }
 
-    const HAND_OVER_TABLES: &[&str] = &[
+    const DEVICE_TABLES: &[&str] = &[
         "devices",
         "preferences",
         "pinned_apps",
@@ -1153,7 +1228,7 @@ mod tests {
             .unwrap();
         assert_eq!(outcome, HandOver::Moved);
 
-        for table in HAND_OVER_TABLES {
+        for table in DEVICE_TABLES {
             assert_eq!(
                 rows_for(&pool, table, "new").await,
                 1,
@@ -1357,6 +1432,177 @@ mod tests {
             .await
             .unwrap();
         assert!(stale.is_empty());
+
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    /// Ages a device: created `created_hours_ago`, last seen `seen_hours_ago`.
+    async fn age_device(pool: &PgPool, id: &str, created_hours_ago: i32, seen_hours_ago: i32) {
+        sqlx::query(
+            "UPDATE devices SET created_at = now() - make_interval(hours => $2), \
+             last_seen_at = now() - make_interval(hours => $3) WHERE id = $1",
+        )
+        .bind(id)
+        .bind(created_hours_ago)
+        .bind(seen_hours_ago)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    const MONTH_HOURS: i32 = 30 * 24;
+    const DESKTOP_SAFARI: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
+        AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15";
+
+    /// Registers a device that was used for 20 hours a month ago, then never again.
+    async fn seed_one_off(pool: &PgPool, bus: &EventBus, id: &str) {
+        DeviceStore::register(pool, bus, id, Some(DESKTOP_SAFARI), None, None)
+            .await
+            .unwrap();
+        age_device(pool, id, MONTH_HOURS, MONTH_HOURS - 20).await;
+    }
+
+    /// Only a device never seen past its first day, old enough, and holding no
+    /// name, pairing or push is removed. The user agent plays no part: the
+    /// removed row claims to be desktop Safari.
+    #[tokio::test]
+    async fn remove_one_off_takes_only_unclaimed_devices_never_seen_after_their_first_day() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let (bus, _callback_rx) = EventBus::new(pool.clone());
+
+        seed_one_off(&pool, &bus, "one-off").await;
+
+        seed_one_off(&pool, &bus, "came-back").await;
+        age_device(&pool, "came-back", MONTH_HOURS, MONTH_HOURS - 24).await;
+
+        seed_one_off(&pool, &bus, "young").await;
+        age_device(&pool, "young", 6 * 24, 6 * 24).await;
+
+        seed_one_off(&pool, &bus, "visible-now").await;
+        DevicePresenceStore::record_visible(&pool, "visible-now")
+            .await
+            .unwrap();
+
+        seed_one_off(&pool, &bus, "named").await;
+        DeviceStore::rename(&pool, &bus, "named", Some("My MacBook"), None)
+            .await
+            .unwrap();
+
+        DeviceStore::register(&pool, &bus, "paired", None, Some("My iPhone"), None)
+            .await
+            .unwrap();
+        age_device(&pool, "paired", MONTH_HOURS, MONTH_HOURS).await;
+
+        seed_one_off(&pool, &bus, "push-on").await;
+        DeviceStore::set_push_enabled(&pool, &bus, "push-on", true, None)
+            .await
+            .unwrap();
+
+        seed_one_off(&pool, &bus, "push-sub").await;
+        sqlx::query(
+            "INSERT INTO push_subscriptions (endpoint, p256dh, auth, device_id)
+             VALUES ('https://push.example/one-off', 'k', 'a', 'push-sub')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let removed = DeviceStore::remove_one_off(&pool, &bus, 7).await.unwrap();
+        assert_eq!(removed, vec!["one-off".to_string()]);
+        for kept in [
+            "came-back",
+            "young",
+            "visible-now",
+            "named",
+            "paired",
+            "push-on",
+            "push-sub",
+        ] {
+            assert_eq!(
+                rows_for(&pool, "devices", kept).await,
+                1,
+                "{kept} must stay"
+            );
+        }
+
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    /// Each removal announces once, unattributed, and takes the device's state
+    /// with it. A re-run finds nothing, and the device can still come back.
+    #[tokio::test]
+    async fn remove_one_off_announces_once_and_clears_the_device_state() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let (bus, _callback_rx) = EventBus::new(pool.clone());
+        seed_one_off(&pool, &bus, "one-off").await;
+        PinnedAppStore::pin(&pool, &bus, "habit-tracker", "main", "one-off", None)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO preferences (key, value, device_id) VALUES ('ui_scale', '1.25', 'one-off')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO device_presence (device_id, visible_at) \
+             VALUES ('one-off', now() - make_interval(hours => $1))",
+        )
+        .bind(MONTH_HOURS)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let removed = DeviceStore::remove_one_off(&pool, &bus, 7).await.unwrap();
+        assert_eq!(removed, vec!["one-off".to_string()]);
+        for table in ["devices", "preferences", "pinned_apps", "device_presence"] {
+            assert_eq!(
+                rows_for(&pool, table, "one-off").await,
+                0,
+                "{table} must keep nothing for a removed device"
+            );
+        }
+        let deleted: Vec<serde_json::Value> = sqlx::query_scalar(
+            "SELECT payload->'data' FROM events WHERE event_type = 'DeviceDeleted'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(deleted.len(), 1, "one announcement per removal");
+        assert_eq!(deleted[0]["device_id"], "one-off");
+        assert!(
+            deleted[0].get("actor").is_none(),
+            "an engine sweep names no actor: {}",
+            deleted[0]
+        );
+
+        let again = DeviceStore::remove_one_off(&pool, &bus, 7).await.unwrap();
+        assert!(again.is_empty(), "a re-run removes nothing");
+        let (_, inserted) =
+            DeviceStore::register(&pool, &bus, "one-off", Some(DESKTOP_SAFARI), None, None)
+                .await
+                .unwrap();
+        assert!(inserted, "a returning device registers again as new");
+
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    /// The Remove button clears the same state the sweep does, presence
+    /// included: `device_presence` has no foreign key to cascade it.
+    #[tokio::test]
+    async fn delete_clears_every_per_device_table() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let (bus, _callback_rx) = EventBus::new(pool.clone());
+        seed_device_state(&pool, &bus, "d1").await;
+
+        assert!(DeviceStore::delete(&pool, &bus, "d1", None).await.unwrap());
+        for table in DEVICE_TABLES {
+            assert_eq!(
+                rows_for(&pool, table, "d1").await,
+                0,
+                "{table} must keep nothing for a deleted device"
+            );
+        }
 
         crate::test_support::teardown_test_db(&db_name).await;
     }

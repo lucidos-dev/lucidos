@@ -197,7 +197,8 @@ pub const TABLES: &[TableRule] = &[
         owners: &["core/device_presence.rs"],
         announcement: Announcement::Projection {
             of: "DeviceVisible / DeviceHidden, applied by the EventBus as it \
-                 handles them",
+                 handles them; a deleted device's row goes with the \
+                 DeviceDeleted cascade",
         },
     },
     TableRule {
@@ -385,7 +386,8 @@ pub const TABLES: &[TableRule] = &[
             exempt: &[
                 ExemptWriter {
                     function: "delete_for_device",
-                    why: "The cascade from DeviceStore::delete. The device is gone, \
+                    why: "The cascade from DeviceStore::delete and \
+                          DeviceStore::remove_one_off. The device is gone, \
                           and DeviceDeleted already tells every client to drop it; \
                           an unpin event per pinned app would be noise about a \
                           device that no longer exists.",

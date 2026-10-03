@@ -1445,3 +1445,110 @@ async fn s3_deadline_long_enough_for_realistic_ios_cellular_pong() {
             .collect::<Vec<_>>(),
     );
 }
+
+/// A request the test transport hands back: settled at once, or never.
+#[cfg(not(feature = "e2e-test-hooks"))]
+type TestSend = std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>;
+
+/// A socket that finished its handshake and then went quiet. Before
+/// `PUSH_SEND_TIMEOUT` this parked the fan-out for good, and with it every
+/// caller awaiting it: the EventBus subscriber, the backup loop and a
+/// trigger's Thread Queue slot. Two quiet devices must still cost one
+/// deadline, not one each. The outer timeout turns a hang into a failure on
+/// the paused clock, rather than a test that never ends.
+#[cfg(not(feature = "e2e-test-hooks"))]
+#[tokio::test(start_paused = true)]
+async fn quiet_sends_give_up_at_one_deadline_and_the_healthy_device_still_gets_its_push() {
+    let quiet_phone = sub_with_device("quiet-phone");
+    let quiet_tablet = sub_with_device("quiet-tablet");
+    let healthy = sub_with_device("healthy");
+    let deliveries: Vec<(PushSubscription, String)> = [&quiet_phone, &quiet_tablet, &healthy]
+        .into_iter()
+        .map(|sub| (sub.clone(), "{}".to_string()))
+        .collect();
+    let mut attempted = Vec::new();
+    let started = tokio::time::Instant::now();
+
+    let outcome = tokio::time::timeout(
+        PUSH_SEND_TIMEOUT + std::time::Duration::from_secs(1),
+        send_each(&deliveries, "notification", |sub, _payload| {
+            attempted.push(sub.endpoint.clone());
+            let request: TestSend = if sub.endpoint == healthy.endpoint {
+                Box::pin(std::future::ready(Ok(())))
+            } else {
+                Box::pin(std::future::pending())
+            };
+            Some(request)
+        }),
+    )
+    .await
+    .expect("quiet sends must not hold the fan-out past one deadline");
+
+    assert_eq!(
+        attempted,
+        vec![
+            quiet_phone.endpoint,
+            quiet_tablet.endpoint,
+            healthy.endpoint
+        ]
+    );
+    assert_eq!(
+        outcome,
+        SendOutcome {
+            delivered: 1,
+            // Silence says nothing about the endpoint, so it stays subscribed.
+            stale_endpoints: Vec::new(),
+        }
+    );
+    assert_eq!(started.elapsed(), PUSH_SEND_TIMEOUT);
+}
+
+/// Moving the send into `send_each` must keep the one answer that drops a
+/// subscription.
+#[cfg(not(feature = "e2e-test-hooks"))]
+#[tokio::test]
+async fn a_410_still_marks_the_subscription_stale() {
+    let gone = sub_with_device("gone");
+    let deliveries = vec![(gone.clone(), "{}".to_string())];
+
+    let outcome = send_each(&deliveries, "notification", |_sub, _payload| {
+        let request: TestSend = Box::pin(std::future::ready(Err("410 Gone".to_string())));
+        Some(request)
+    })
+    .await;
+
+    assert_eq!(
+        outcome,
+        SendOutcome {
+            delivered: 0,
+            stale_endpoints: vec![gone.endpoint],
+        }
+    );
+}
+
+/// The caller must go on while the fan-out is still waiting on the network,
+/// and the fan-out must still sit at the caller's chain depth. Read at depth
+/// 0, its events could restart a chain the depth cap had just stopped.
+#[tokio::test(start_paused = true)]
+async fn the_fan_out_runs_on_its_own_task_at_the_callers_chain_depth() {
+    // Not async, so no caller can await the network through it. Making it
+    // async changes its type and stops this compiling. It calls
+    // `send_push_to_all_with_app` bare, so an async one there would leave an
+    // unused future, which the warnings-as-errors lint refuses.
+    let _: fn(&SharedEngine, &str, &str, Option<uuid::Uuid>) = send_push_to_all;
+
+    let (depth_tx, depth_rx) = tokio::sync::oneshot::channel();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        crate::scheduler::user_tasks::EVENT_TRIGGER_DEPTH.scope(3, async {
+            spawn_carrying_chain_depth(async move {
+                let _ = depth_tx.send(crate::scheduler::user_tasks::current_event_trigger_depth());
+                std::future::pending::<()>().await;
+            });
+        }),
+    )
+    .await
+    .expect("the caller must not wait on a fan-out that never finishes");
+
+    assert_eq!(depth_rx.await.expect("the fan-out task ran"), 3);
+}

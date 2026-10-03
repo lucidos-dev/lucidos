@@ -126,8 +126,8 @@ impl RevealTokens {
 /// load-bearing rather than an inconsistency.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RefererRule {
-    /// Refuse a browser that presents no `Referer`. Stricter than the gateway's
-    /// control plane, which lets one through.
+    /// Refuse a browser that presents no `Referer`, as the gateway's control
+    /// plane does.
     ///
     /// The mint can afford this. It is a `POST`, and the service worker hands
     /// every non-GET straight to the browser. So nothing sits between the page

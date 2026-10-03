@@ -97,11 +97,16 @@ impl ChangesProjection {
 
     // --- Write API (called from event_bus inside the event commit tx) ---
 
-    /// Recompute a thread's `coding_agent_proposed` and
-    /// `coding_agent_requires_restart` from its pending changes. The two
-    /// columns are a cache of this table, and nothing else writes them. Every
-    /// write below that moves a change in or out of `pending` calls this in its
-    /// transaction, as does one that changes a restart flag.
+    /// Recompute a thread's `coding_agent_proposed`,
+    /// `coding_agent_requires_restart` and `coding_agent_incomplete` from its
+    /// pending changes. The three columns are a cache of this table, and
+    /// nothing else writes them. Every write below calls this in its
+    /// transaction when it moves a change in or out of `pending`, or flips a
+    /// restart or incomplete flag.
+    ///
+    /// An incomplete change still sets `coding_agent_proposed`, because it
+    /// still blocks Archive. `coding_agent_incomplete` is what tells the
+    /// "ready to review" readers to pass it over (ADR 0346).
     pub(crate) async fn sync_thread_proposal<'e, E>(
         executor: E,
         thread_id: Uuid,
@@ -112,13 +117,16 @@ impl ChangesProjection {
         sqlx::query(
             "UPDATE thread_summaries t SET \
                 coding_agent_proposed = p.pending, \
-                coding_agent_requires_restart = p.requires_restart \
+                coding_agent_requires_restart = p.requires_restart, \
+                coding_agent_incomplete = p.incomplete \
              FROM (SELECT COUNT(*) > 0 AS pending, \
-                          COALESCE(bool_or(requires_restart), FALSE) AS requires_restart \
+                          COALESCE(bool_or(requires_restart), FALSE) AS requires_restart, \
+                          COALESCE(bool_or(incomplete), FALSE) AS incomplete \
                    FROM changes WHERE thread_id = $1 AND status = $2) p \
              WHERE t.thread_id = $1 \
-               AND (t.coding_agent_proposed, t.coding_agent_requires_restart) \
-                   IS DISTINCT FROM (p.pending, p.requires_restart)",
+               AND (t.coding_agent_proposed, t.coding_agent_requires_restart, \
+                    t.coding_agent_incomplete) \
+                   IS DISTINCT FROM (p.pending, p.requires_restart, p.incomplete)",
         )
         .bind(thread_id)
         .bind(ChangeStatus::Pending)

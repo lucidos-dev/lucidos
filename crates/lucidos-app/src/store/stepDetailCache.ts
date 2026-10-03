@@ -8,7 +8,7 @@ type Step = Extract<ResponseEvent, { type: 'step' }>;
  *  reopens the last few steps, not the whole transcript. */
 const MAX_ENTRIES = 32;
 
-/** The stripped half of a snapshot step, fetched once per event id.
+/** The stripped half of a step, fetched once per event id.
  *
  *  The step detail modal draws from here, and the row prefetches on press. The
  *  fetch then usually lands before the click opens the modal. So the modal

@@ -44,6 +44,7 @@ function aggregateFromMeta(meta: ThreadMeta): ThreadAggregate {
     liveEventWaitCount: meta.liveEventWaitCount,
     codingAgentProposed: meta.codingAgentProposed,
     codingAgentRequiresRestart: meta.codingAgentRequiresRestart,
+    codingAgentIncomplete: meta.codingAgentIncomplete,
     codingAgentIsExternalRepo: meta.codingAgentIsExternalRepo,
     codingAgentHasDiff: meta.codingAgentHasDiff,
     isSaved: meta.saved,
@@ -120,6 +121,7 @@ function applyEventRules(agg: ThreadAggregate, event: ThreadEvent | TransientEve
     if (reason === 'discarded') {
       out.codingAgentProposed = false;
       out.codingAgentRequiresRestart = false;
+      out.codingAgentIncomplete = false;
       out.codingAgentIsExternalRepo = false;
       out.status = 'idle';
       return out;
@@ -142,9 +144,11 @@ function applyEventRules(agg: ThreadAggregate, event: ThreadEvent | TransientEve
     if (event.requires_restart !== undefined) out.codingAgentRequiresRestart = !!event.requires_restart;
   } else if (t === 'ChangeProposed') {
     out.codingAgentProposed = true;
+    out.codingAgentIncomplete = (event as { incomplete?: boolean }).incomplete === true;
   } else if (t === 'ChangeApplied' || t === 'ChangeDiscarded' || t === 'ThreadArchived') {
     out.codingAgentProposed = false;
     out.codingAgentRequiresRestart = false;
+    out.codingAgentIncomplete = false;
     out.codingAgentIsExternalRepo = false;
   } else if (t === 'MergeConflictDetected') {
   } else if (t === 'ChangeApplyFailed') {

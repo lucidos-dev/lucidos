@@ -320,3 +320,59 @@ async fn an_agent_message_is_held_behind_a_pending_permission_card() {
     pool.close().await;
     teardown_test_db(&db_name).await;
 }
+
+/// The workspace-wide read names each message still held, on its owning
+/// thread, with the link that opens it. A released message drops out.
+#[tokio::test]
+async fn the_workspace_read_lists_what_is_still_held() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    seed_cc_thread(&bus, thread_id).await;
+    let released = hold(&bus, thread_id, "already delivered").await;
+    let waiting = hold(&bus, thread_id, &"é".repeat(250)).await;
+    emit(
+        &bus,
+        thread_id,
+        ThreadEvent::HeldMessageReleased {
+            held_message_id: released,
+        },
+    )
+    .await;
+
+    let held = list_held_messages(&pool, "myws", 50)
+        .await
+        .expect("list held messages");
+    assert_eq!(held.len(), 1, "a released message is no longer held");
+    let row = &held[0];
+    assert_eq!(row.held_message_id, waiting);
+    assert_eq!(row.thread_id, thread_id.to_string());
+    assert_eq!(row.link, format!("thread:myws/{thread_id}"));
+    assert_eq!(row.preview.chars().count(), 200);
+    assert_eq!(row.length, 250);
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// Each workspace is its own database, so one never lists another's.
+#[tokio::test]
+async fn the_workspace_read_sees_only_its_own_database() {
+    let (pool_a, db_a) = setup_test_db().await;
+    let (pool_b, db_b) = setup_test_db().await;
+    let (bus_a, _rx) = EventBus::new(pool_a.clone());
+    let thread_id = Uuid::new_v4();
+    seed_cc_thread(&bus_a, thread_id).await;
+    hold(&bus_a, thread_id, "only in a").await;
+
+    assert_eq!(list_held_messages(&pool_a, "a", 50).await.unwrap().len(), 1);
+    assert!(list_held_messages(&pool_b, "b", 50)
+        .await
+        .unwrap()
+        .is_empty());
+
+    pool_a.close().await;
+    teardown_test_db(&db_a).await;
+    pool_b.close().await;
+    teardown_test_db(&db_b).await;
+}

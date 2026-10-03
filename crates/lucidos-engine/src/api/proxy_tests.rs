@@ -2785,9 +2785,9 @@ async fn an_unapproved_script_is_left_to_the_runner() {
     );
 }
 
-/// FINDING 2. `local_base_url` is an ordinary settable preference, so the
-/// builtin `local` provider's upstream is caller data. Its key follows the
-/// credential's own scope, and the gate is what refuses the rewrite. The
+/// FINDING 2. `local_base_url` moves without the key being re-saved, so the
+/// builtin `local` provider's upstream is not the key's scope. Its key follows
+/// the credential's own scope, and the gate is what refuses the rewrite. The
 /// binding `resolve_local` hands over is pinned in `proxy_builtin`'s own tests.
 #[tokio::test]
 async fn the_builtin_local_key_is_refused_outside_its_credential_scope() {

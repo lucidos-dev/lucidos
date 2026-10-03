@@ -70,7 +70,7 @@ fn the_workspace_shell_is_allowed_under_either_rule() {
     }
 }
 
-/// The mint is stricter than the gateway's control plane, deliberately.
+/// The mint holds the gateway control plane's rule.
 ///
 /// A browser that suppressed its `Referer` removed the only thing telling it
 /// apart from an app. So `referrerPolicy: 'no-referrer'` cannot mint.

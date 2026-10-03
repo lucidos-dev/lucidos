@@ -86,10 +86,12 @@
          where it belongs; it is here so the remote can move it without
          reaching into the geometry. */
     --header-mark-badge-offset: 0rem;
-    /* The unread count's box, on the opposite corner. Smaller than the base
-       `.badge` (0.875rem), because that one is sized for a roomy icon button
-       and here it covers most of a 1.6rem glyph. The count still has to be
-       READ, unlike the pending dot, so it keeps a line box and its padding. */
+    /* The box BOTH badges take: the unread count, and the state badge on the
+       opposite corner (`.brand-badge` in panels/shell.css). One size, so they
+       read as a pair in one column. Smaller than the base `.badge` (0.875rem),
+       because that one is sized for a roomy icon button and here it covers
+       most of a 1.6rem glyph. The count still has to be READ, unlike the
+       pending dot, so it keeps a line box and its padding. */
     --header-mark-count-size: 0.75rem;
     /* NO ring token here, deliberately. Both of the mark's badges are ringed
        away from the glyph by `.app-header .badge` (panels/shell.css), the same

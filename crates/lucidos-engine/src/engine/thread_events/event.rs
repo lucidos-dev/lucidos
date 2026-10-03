@@ -636,6 +636,15 @@ pub enum ThreadEvent {
     /// The actor names the agent thread. The archive request resolver runs the
     /// Archive button's cascade after the settle; a newer message closes it.
     ThreadArchiveRequested,
+    /// The user took a thread back out of the archive: Archive all's Undo
+    /// (ADR 0349). Moves it to the inbox and bumps nothing else.
+    ThreadUnarchived,
+    /// The Lucidos Agent proposed a *thread triage* in this thread (ADR 0349).
+    /// `apply_triage` acts only on these entries, and only after the user
+    /// replied to this event.
+    ThreadTriageProposed {
+        entries: Vec<super::TriageProposalEntry>,
+    },
     /// A thread was created in `composing` state. Emitted by the first
     /// successful POST /threads (debounced first user input: keystroke,
     /// image attach, or mode toggle on a fresh compose). The thread can
@@ -1565,7 +1574,7 @@ pub enum ThreadEvent {
         reason: String,
     },
 
-    /// The user asked a `/btw` side question.
+    /// The user asked a side question.
     ///
     /// The four side-question events record a card, never a turn. No agent
     /// ever reads them: every generic reader excludes them through

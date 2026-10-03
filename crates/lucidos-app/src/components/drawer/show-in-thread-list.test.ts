@@ -36,6 +36,7 @@ function makeThread(id: string, opts: ThreadOpts = {}): ThreadState {
         codingAgentHasDiff: false,
         codingAgentProposed: false,
         codingAgentRequiresRestart: false,
+        codingAgentIncomplete: false,
         codingAgentIsExternalRepo: false,
         lastRevivedAt: '',
         parentThreadId: opts.parentId,
@@ -81,7 +82,7 @@ describe('planThreadListReveal', () => {
     it('reveals a top-level thread in its own section with nothing to expand', () => {
         const threads = [makeThread('t')];
         expect(planThreadListReveal('t', threads, ALL, new Set()))
-            .toEqual({ kind: 'reveal', section: 'current', collapsedAncestors: [] });
+            .toEqual({ kind: 'reveal', section: 'current', collapsedAncestors: [], archivedAncestorsToReveal: [] });
     });
 
     it('expands the collapsed ancestors of a nested sub-thread', () => {
@@ -89,7 +90,10 @@ describe('planThreadListReveal', () => {
             makeThread('root'), makeThread('mid', { parentId: 'root' }), makeThread('leaf', { parentId: 'mid' }),
         ];
         expect(planThreadListReveal('leaf', threads, ALL, new Set(['root', 'mid'])))
-            .toEqual({ kind: 'reveal', section: 'current', collapsedAncestors: ['mid', 'root'] });
+            .toEqual({
+                kind: 'reveal', section: 'current',
+                collapsedAncestors: ['mid', 'root'], archivedAncestorsToReveal: [],
+            });
     });
 
     it('names the section the family routes to, not the thread own section', () => {
@@ -97,6 +101,30 @@ describe('planThreadListReveal', () => {
         const threads = [makeThread('root'), makeThread('child', { parentId: 'root', section: 'archived' })];
         expect(planThreadListReveal('child', threads, ALL, new Set()))
             .toMatchObject({ kind: 'reveal', section: 'current' });
+    });
+
+    it('names the hidden-archived ancestor chain of a thread the family tree hides', () => {
+        // child is a fully-archived branch, hidden by default under the live
+        // root — landing on it (e.g. via search) must reveal it there too.
+        const threads = [makeThread('root'), makeThread('child', { parentId: 'root', section: 'archived' })];
+        expect(planThreadListReveal('child', threads, ALL, new Set()))
+            .toEqual({
+                kind: 'reveal', section: 'current',
+                collapsedAncestors: [], archivedAncestorsToReveal: ['root'],
+            });
+    });
+
+    it('names every hidden step up a fully-archived multi-level chain', () => {
+        const threads = [
+            makeThread('root'),
+            makeThread('mid', { parentId: 'root', section: 'archived' }),
+            makeThread('leaf', { parentId: 'mid', section: 'archived' }),
+        ];
+        expect(planThreadListReveal('leaf', threads, ALL, new Set()))
+            .toEqual({
+                kind: 'reveal', section: 'current',
+                collapsedAncestors: [], archivedAncestorsToReveal: ['mid', 'root'],
+            });
     });
 
     it('reports a thread the filter hides, without planning any expansion', () => {
@@ -154,6 +182,18 @@ describe('revealThreadInList', () => {
         revealThreadInList('t');
 
         expect(localStorage.getItem('lucidos-scroll-thread-drawer')).toBeNull();
+    });
+
+    it('reveals a fully-archived branch hidden under its live parent', () => {
+        threadMap.value = new Map([
+            ['root', makeThread('root')],
+            ['child', makeThread('child', { parentId: 'root', section: 'archived' })],
+        ]);
+
+        revealThreadInList('child');
+
+        expect(JSON.parse(localStorage.getItem('lucidos-drawer-revealed-archived') ?? '[]')).toEqual(['root']);
+        expect(toasts.value).toHaveLength(0);
     });
 
     it('leaves the filter alone for a filtered-out thread and offers to clear it', () => {

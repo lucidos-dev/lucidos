@@ -294,10 +294,10 @@ pub fn spawn_engine(
         }
     }
     if loopback {
-        // Packaged: loopback only. The gateway is the sole network-facing
-        // surface and terminates TLS, so the engine serves plain HTTP. Strip
-        // any inherited TLS config, or it would serve https and the gateway's
-        // http proxy would fail. `LUCIDOS_BIND_LOOPBACK=1` is the engine's
+        // Dev and packaged alike (ADR 0096): loopback only. The gateway is the
+        // sole network-facing surface and terminates TLS, so the engine serves
+        // plain HTTP. Strip any inherited TLS config, or it would serve https
+        // and the gateway's http proxy would fail. `LUCIDOS_BIND_LOOPBACK=1` is the engine's
         // `behind_gateway` signal, and the engine also defaults to a loopback
         // bind with `LUCIDOS_BIND_ALL` unset, so this stays loopback-only.
         cmd.env("LUCIDOS_BIND_LOOPBACK", "1")
@@ -305,7 +305,8 @@ pub fn spawn_engine(
             .env_remove("LUCIDOS_TLS_CERT")
             .env_remove("LUCIDOS_TLS_KEY");
     } else {
-        // Dev: the engine is the direct front on its port. KEEP the inherited
+        // Only `LUCIDOS_GATEWAY_ENGINE_LOOPBACK=0`, which nothing sets: the
+        // engine is the direct front on its port. KEEP the inherited
         // TLS so `https://localhost:<port>/` reaches it directly, and the
         // gateway proxies over the matching scheme. Clear the loopback flag so
         // a respawn stays network-capable and not flagged as behind-gateway.

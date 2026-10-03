@@ -1,13 +1,14 @@
-import { blobPreviewUrl, continueThread, postCommandCheckpointUndo } from '../../api/client';
+import { blobPreviewUrl, postCommandCheckpointUndo } from '../../api/client';
+import { CONTINUE_GUARD_MS, continueStoppedThread } from './continueStoppedThread';
 import type { Change } from '../../api/client';
 import { ensureChangeLoaded, revertChange } from '../../store/actions/chat-changes';
-import { changeCommitList, changeHeadline } from '../../store/changeHeadline';
+import { changeCommitList, knownChangeHeadline } from '../../store/changeHeadline';
 import { HELD_UNTIL_REPLY } from '../../store/exchange-status';
 import { ensureEventTargetResolved, eventHasTarget, jumpableEventId, showEventWhereItLives } from '../../store/actions/event-navigation';
 import { viewChangeDiff } from '../../store/actions/repositories';
-import { checkpointDiffModal, contextViewer, eventConditionDoor, findChangeById, lazyChanges, openImagePopupFromGroup, showToast, stepDetailModal } from '../../store/store';
+import { checkpointDiffModal, contextViewer, eventConditionDoor, eventConditionPopoverOpenFor, findChangeById, lazyChanges, openImagePopupFromGroup, showToast, stepDetailModal, toggleEventConditionPopover } from '../../store/store';
 import { prefetchStepDetail } from '../../store/stepDetailCache';
-import { LUCIDOS_AGENT_LABEL, continuationCause, eventWaitStoppedSummary, plainEventName, responseAbortedState, starterEngineReason, groupSubscriptions, isThinking, resumeEngineNote, stepStatus, subscriptionFilterNote, waitingFor } from '../../store/thread-events';
+import { LUCIDOS_AGENT_LABEL, awaitedSubject, continuationCause, plainEventName, responseAbortedState, starterEngineReason, groupSubscriptions, isThinking, resumeEngineNote, stepStatus, subscriptionFilterNote } from '../../store/thread-events';
 import { LucidosGlyph } from '../shared/LucidosMark';
 import { BlobImage } from '../shared/BlobImage';
 import { CommitList } from '../shared/CommitList';
@@ -23,7 +24,6 @@ import { formatMessageTimestamp, formatShortDate, formatShortTime, isSameDayInUs
 import { renderMarkdown } from '../../utils/renderMarkdown';
 import { EventRowFoldView, eventNameChip, eventRowBody } from './EventRow';
 import type { EventRowChip, EventRowFact, EventRowTone } from './EventRow';
-import { followContinuedThread } from './scrollState';
 import { contextPercent, formatTokens } from '../../utils/formatTokens';
 import { CallIcon, ClaudeIcon, CodexIcon, CollapseTurnIcon, FullResponseIcon, StepLogIcon, StepOutcomeIcon } from '../shared/icons';
 import { highlightEllipsis } from './highlightEllipsis';
@@ -95,9 +95,9 @@ export function UserMessageBody({ html, imageHashes }: { html: string; imageHash
 }
 
 /** A change resolution (applied, discarded, reverted, failed), as an **event
- *  row**: the same card a child thread's return wears. The subject names the
- *  change by the first line of its description, and Diff and Revert sit in the
- *  card's action slot.
+ *  row**: the same card a child thread's return wears. A "Change" chip leads,
+ *  as on every event row. The headline is the detail sentence under it. Diff
+ *  and Revert sit in the card's action slot.
  *
  *  `seedDescription` / `seedFileCount` / `seedSummary` come from the in-thread
  *  `ChangeProposed` and `ChangeSummarized` events, already loaded with the
@@ -132,7 +132,8 @@ export function ChangeEventRow({ type, changeId, error, seedDescription, seedFil
   const { label, tone } = CHANGE_STATE[type];
   return changeEventRowBody({
     type,
-    subject: changeHeadline(naming),
+    headline: knownChangeHeadline(naming),
+    headlinePending: !change && !seeded && !!changeId && (lazy.status === 'not-loaded' || lazy.status === 'loading'),
     stateLabel: label,
     tone,
     fileCount,
@@ -147,9 +148,12 @@ export function ChangeEventRow({ type, changeId, error, seedDescription, seedFil
  *
  *  `commits` is oldest first. The fold lists them only when there are several:
  *  a single commit IS the headline, and a fold repeating it adds nothing. */
-export function changeEventRowBody({ type, subject, stateLabel, tone, fileCount, commits = [], error, actions }: {
+export function changeEventRowBody({ type, headline, headlinePending, stateLabel, tone, fileCount, commits = [], error, actions }: {
   type: ChangeLifecycleType;
-  subject: string;
+  headline?: string;
+  /** The headline is still loading. Its line keeps its box, so the card does
+   *  not grow when it lands. */
+  headlinePending?: boolean;
   stateLabel: string;
   tone: EventRowTone;
   fileCount?: number;
@@ -161,9 +165,11 @@ export function changeEventRowBody({ type, subject, stateLabel, tone, fileCount,
     kind: 'change',
     state: type,
     role: 'change-event-row',
-    subject,
+    // The state word says how it resolved, so the chip names only the family.
+    subject: eventNameChip({ kind: 'chip', name: type, label: 'change', sentenceStart: true }),
     stateLabel,
     tone,
+    detail: headline ?? (headlinePending ? <span aria-hidden="true">{'\u00a0'}</span> : undefined),
     // The file count is a single value inside a real card, so an unseeded
     // card leaves its slot empty until the lazy read fills it.
     facts: [
@@ -181,32 +187,23 @@ export function changeEventRowBody({ type, subject, stateLabel, tone, fileCount,
 }
 
 /** "Continue" button rendered on the abort exchange the user may resume from
- *  (`continuableAbortIndex`). Disables itself between click and response so a
- *  double-click can't double-emit. Surfaces network failures via toast and
- *  re-enables. */
+ *  (`continuableAbortIndex`). Disables itself between click and response, and
+ *  `continueStoppedThread` refuses a second press, so a double-click can't
+ *  double-emit. Surfaces network failures via toast and re-enables. */
 export function ContinueButton({ threadId }: { threadId: string }) {
   const inFlight = useSignal(false);
   const onClick = async (e: MouseEvent) => {
     e.stopPropagation();
     if (inFlight.value) return;
     inFlight.value = true;
-    // A SUBMIT: the agent is expected to respond to it, so it gets the same one
-    // reaction a send does. Its turn does not exist yet (the continuation renders
-    // as a fresh `ContinuationStarted` exchange), so the landing waits for it.
-    // Before the awaited POST, because this is the button's own tap and must not
-    // wait on the round trip. See `followSubmit`.
-    followContinuedThread();
-    try {
-      await continueThread(threadId);
-    } catch (err) {
-      showToast(`Failed to continue: ${errorDetail(err)}`, 'error');
+    if (!(await continueStoppedThread(threadId))) {
       inFlight.value = false;
       return;
     }
     // ContinuationStarted will arrive via SSE and remove the button by hiding
     // this exchange's `isContinuableAbort`. Re-enable as a safety net in case
     // the SSE event is delayed.
-    setTimeout(() => { inFlight.value = false; }, 5000);
+    setTimeout(() => { inFlight.value = false; }, CONTINUE_GUARD_MS);
   };
   return (
     <button class="action-btn" onClick={onClick} disabled={inFlight.value}>
@@ -1022,6 +1019,7 @@ export function contextLabel(
 /** Outcomes whose row carries its `stepStatus` label as a tooltip. See the
  *  `data-tooltip` comment in `InlineStep` for what earns membership. */
 const NAMED_STEP_OUTCOMES: ReadonlySet<StepOutcome> = new Set<StepOutcome>([
+  'error',
   'unfinished',
   'blocked',
   'denied',
@@ -1088,8 +1086,9 @@ export function InlineStep(
       {...{ [ROW_ATTR]: event.call_event_id ?? event.result_event_id }}
       /* A row the user can't read at a glance needs naming, and the tooltip
          says what the mark means without a trip through the detail modal. The
-         three that earn one are the three that are neither a green check nor a
-         live shimmer: killed mid-call, held on a permission card, refused. */
+         four that earn one are the four that are neither a green check nor a
+         live shimmer: failed, killed mid-call, held on a permission card,
+         refused. */
       data-tooltip={NAMED_STEP_OUTCOMES.has(event.outcome) ? label : undefined}
     >
       <button
@@ -1352,46 +1351,42 @@ export function eventWaitRowBody({
 }: {
   event: Extract<ResponseEvent, { type: 'event_wait' }>;
 }) {
-  const tone = EVENT_WAIT_ROW_TONE[event.state];
-  const stopped = event.state === 'canceled';
-  // One phrasing for every label about a wait: "<verb> for <subject>". A stop
-  // takes it from `eventWaitStoppedSummary`, because the user's own stop renders
-  // as a TURN with that same header. The UI never says "event wait": that is
-  // the internal name (`system-knowhow/glossary.md` § Event wait).
-  const subject = stopped
-    ? eventWaitStoppedSummary(event.reason)
-    : waitingFor(event.state === 'waiting' ? 'Waiting' : 'Waited', event.reason);
-  const stopNote = stopped && event.cause ? EVENT_WAIT_STOP_NOTE[event.cause] : null;
+  const stopNote = event.state === 'canceled' && event.cause ? EVENT_WAIT_STOP_NOTE[event.cause] : null;
+  // One layout in every state, the delivery card's: a pill and the outcome
+  // word on top, then what it waits for. The pill names the wait and never
+  // changes; the state word says how it stands. Only the delivery card says
+  // what arrived. The UI never says "event wait": that is the internal name
+  // (`system-knowhow/glossary.md` § Event wait).
   return eventRowBody({
     kind: 'wait',
     state: event.state,
     role: 'event-wait-row',
-    subject,
+    subject: eventNameChip({ kind: 'chip', name: 'EventWaitStarted', label: WAIT_PILL }),
     stateLabel: eventWaitStateLabel(event.state, event.expires_at, event.matched_at),
-    tone,
+    tone: EVENT_WAIT_ROW_TONE[event.state],
+    detail: waitDetail(event.reason),
     time: eventWaitTime(event.created),
-    facts: [
-      // A stop names how it ended instead of what it watched: the subscription
-      // is over, and how it ended is the new fact.
-      stopNote ? { kind: 'text' as const, text: stopNote } : null,
-      // The matched event REPLACES the subscription list on a match: one of the
-      // types it was watching for is now a specific thing that happened.
-      ...(event.state === 'matched'
-        ? [event.matched_event_type ? { kind: 'chip' as const, name: event.matched_event_type } : null]
-        : event.state === 'waiting'
-          ? subscriptionFacts(event.subscriptions)
-          : []),
-      // **No jump from here.** This card records the ARMING: an action the
-      // agent took, at the moment it took it. A link out to the matched event
-      // belongs on a card about that event, which is the delivery below
-      // (`EventDeliveryBody`). Naming the matched type here is still right,
-      // since it says how this wait ended.
-      //
-      // A filtered subscription chip is pressable and does not break that:
-      // what it opens is the condition armed at this moment, not a route out
-      // to something that happened later. See `subscriptionFacts`.
-    ],
+    // Only a live wait lists what it watches: on a finished one the list would
+    // read as a watch still running. A stop says how it ended instead.
+    //
+    // **No jump from here.** A link out to the matched event belongs on the
+    // card about that event, the delivery (`EventDeliveryBody`). A filtered
+    // subscription chip is pressable and does not break that: it opens the
+    // condition armed at this moment. See `subscriptionFacts`.
+    facts: event.state === 'waiting'
+      ? subscriptionFacts(event.wait_id, event.subscriptions)
+      : [stopNote ? { kind: 'text' as const, text: stopNote } : null],
   });
+}
+
+export const WAIT_PILL = 'Waiting for';
+
+/** The agent's reason as the sentence under the pill. The pill already says
+ *  "Waiting for", so a leading "waiting for" goes (`awaitedSubject`). A legacy
+ *  stop row carries no reason and says the one thing it knows. */
+function waitDetail(reason: string): string {
+  const subject = awaitedSubject(reason).trim();
+  return subject ? subject.charAt(0).toUpperCase() + subject.slice(1) : 'An event';
 }
 
 /** An agent-sent message the coding agent holds until a human replies
@@ -1420,8 +1415,8 @@ export const HELD_MESSAGE_DELIVERED = 'Delivered';
  *  A filtered chip is the door to its conditions. Its note says a filter exists
  *  and nothing about what it says, since the raw operator JSON is far too wide
  *  for a facts line. So the summary stays on the row and the conditions open in
- *  a modal. */
-function subscriptionFacts(subscriptions: EventSubscription[]): EventRowFact[] {
+ *  a popover at the chip. */
+function subscriptionFacts(waitId: string, subscriptions: EventSubscription[]): EventRowFact[] {
   const chip = (g: SubscriptionGroup): EventRowChip => {
     const name = g.event_type;
     const note = subscriptionFilterNote(g);
@@ -1430,7 +1425,14 @@ function subscriptionFacts(subscriptions: EventSubscription[]): EventRowFact[] {
     // question through it, which keeps the two surfaces from drifting apart.
     const door = eventConditionDoor(g);
     if (!door) return { kind: 'chip', name, note };
-    return { kind: 'chip', name, note, action: door.label, onClick: door.open };
+    return {
+      kind: 'chip',
+      name,
+      note,
+      action: door.label,
+      popupOpen: eventConditionPopoverOpenFor(waitId, name),
+      onClick: (anchor) => toggleEventConditionPopover({ ...door.condition, anchor, waitId }),
+    };
   };
   return groupSubscriptions(subscriptions).flatMap((g, i) => [
     // "watching for", never "wakes on": a match can land in a running turn,

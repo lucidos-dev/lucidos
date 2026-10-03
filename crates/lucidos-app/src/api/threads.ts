@@ -71,12 +71,15 @@ export interface ThreadSummary {
    *  truth. Backs the WaitingBanner Diff button independently of the
    *  proposal lifecycle. */
   coding_agent_has_diff: boolean;
-  /** Coding-agent thread's formal "ready for review" — set by `ChangeProposed`. Backs the
-   *  Apply / Discard buttons. */
+  /** The thread holds a pending change, complete or incomplete. Backs the
+   *  Apply / Discard buttons and blocks Archive. See `ThreadMeta.codingAgentProposed`. */
   coding_agent_proposed: boolean;
   /** Whether the proposed change requires an engine restart. Only meaningful
    *  when `coding_agent_proposed` is true. */
   coding_agent_requires_restart: boolean;
+  /** Whether the proposed change is incomplete, so not ready to review
+   *  (ADR 0346). Only meaningful when `coding_agent_proposed` is true. */
+  coding_agent_incomplete: boolean;
   /** Whether the coding-agent thread is working on an external repo. */
   coding_agent_is_external_repo: boolean;
   /** When the thread last entered 'running' state (ISO string or null). */
@@ -217,6 +220,35 @@ export async function archiveThread(
   threadId: string,
 ): Promise<{ archived: string[]; skipped?: ArchiveSkippedMember[] }> {
     const res = await postThreadAction('archive', { thread_id: threadId });
+    return res.json();
+}
+
+/** What Archive all would do to the Current section (ADR 0349). `kept`
+ *  counts each thread that stays once, under its first reason:
+ *  `question` | `pending_change` | `unproposed_work` | `draft` | `failed_run` |
+ *  `busy`. Pinned threads sit in Pinned and are not counted. */
+export interface ArchiveAllPreflight {
+  safe: { thread_id: string; title: string }[];
+  kept: Record<string, number>;
+  kept_count: number;
+}
+
+export async function archiveAllPreflight(): Promise<ArchiveAllPreflight> {
+    return json<ArchiveAllPreflight>(`${API}/threads/archive-all-preflight`);
+}
+
+/** Archive the confirmed threads that are still safe. `archived` lists every
+ *  member the cascades took, which is what Undo hands back to `unarchiveThreads`. */
+export async function archiveAll(
+  threadIds: string[],
+): Promise<{ archived: string[]; kept: { thread_id: string; reason: string }[] }> {
+    const res = await postThreadAction('archive-all', { thread_ids: threadIds });
+    return res.json();
+}
+
+/** Move archived threads back to the inbox: Archive all's Undo. */
+export async function unarchiveThreads(threadIds: string[]): Promise<{ unarchived: string[] }> {
+    const res = await postThreadAction('unarchive', { thread_ids: threadIds });
     return res.json();
 }
 

@@ -151,7 +151,157 @@ fn unregistered_lucidos_root(
     Err(crate::engine::agent_session::err_no_lucidos_source())
 }
 
+/// The token counts of one `AgentEvent::Usage`, as the agent reported them.
+#[derive(Debug)]
+struct ReportedUsage {
+    input_tokens: u32,
+    output_tokens: u32,
+    cache_read_tokens: u32,
+    cache_creation_tokens: u32,
+}
+
+/// How long a stopped session waits for Claude Code's driver to flush a
+/// cut-off call. The flush follows the stop at once, ahead of the group
+/// teardown, so this bounds only a driver that is stuck.
+const USAGE_FLUSH_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The `Usage` events a stopped driver sends, read up to its `OutputEnded`
+/// (or `Exited`, or a closed channel) and at most for `wait`. Every other
+/// event is dropped, as the stopped loop would have dropped it.
+async fn usage_flushed_at_stop(
+    events_rx: &mut tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
+    wait: std::time::Duration,
+) -> Vec<(Option<String>, ReportedUsage)> {
+    let deadline = tokio::time::Instant::now() + wait;
+    let mut flushed = Vec::new();
+    loop {
+        match tokio::time::timeout_at(deadline, events_rx.recv()).await {
+            Ok(Some(AgentEvent::Usage {
+                model,
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_creation_tokens,
+            })) => flushed.push((
+                model,
+                ReportedUsage {
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens,
+                    cache_creation_tokens,
+                },
+            )),
+            Ok(Some(AgentEvent::OutputEnded | AgentEvent::Exited { .. })) | Ok(None) => break,
+            Ok(Some(_)) => {}
+            Err(_) => {
+                log!(
+                    "[AgentSession] no OutputEnded within {}s of the stop; a cut-off call may go unrecorded",
+                    wait.as_secs()
+                );
+                break;
+            }
+        }
+    }
+    flushed
+}
+
 impl LucidosEngine {
+    /// Record one coding-agent API call as a `ContextCaptured` carrying its
+    /// usage. `session_model` is the model the session was started on, and
+    /// `reported_model` the one the agent echoed for this call.
+    async fn record_coding_agent_usage(
+        &self,
+        thread_id: Uuid,
+        meta: &crate::engine::thread_events::EventMeta,
+        coding_agent: CodingAgent,
+        session_model: Option<&str>,
+        reported_model: Option<&str>,
+        reported: ReportedUsage,
+    ) {
+        // Sections stay empty, because CC does not expose its system prompt
+        // or tool schemas. CC strips the [1m] suffix on the per-message model
+        // echo, so reconcile against the session model before measuring.
+        let snapshot_model = reported_model
+            .map(|m| crate::runtime::claude_code::reconcile_cc_model(session_model, m))
+            .or_else(|| session_model.map(String::from))
+            .unwrap_or_default();
+        // The backend's own window wins, because this capture REPORTS a call
+        // the engine did not make. `context_window_for` answers for a Lucidos
+        // request, where 1M mode is gated on our `[1m]` suffix. A coding agent
+        // picks its own mode, so a bare Sonnet 5 id really does run 1M there.
+        let context_window =
+            crate::runtime::coding_agent_context_window(coding_agent, &snapshot_model)
+                .unwrap_or_else(|| self.context_window_for(&snapshot_model, None));
+        // Anthropic reports `input_tokens` as the uncached portion only.
+        // `ApiUsage.input_tokens` stores the TOTAL prompt size, the same
+        // convention `vertex.rs` uses. So the budget bar shows real context
+        // use, and the modal's cache-miss formula recovers the uncached count.
+        let total_input = reported
+            .input_tokens
+            .saturating_add(reported.cache_read_tokens)
+            .saturating_add(reported.cache_creation_tokens);
+        let estimated_total_tokens = (total_input as usize) + (reported.output_tokens as usize);
+        let usage = crate::engine::ApiUsage {
+            input_tokens: total_input,
+            output_tokens: reported.output_tokens,
+            cache_read_tokens: reported.cache_read_tokens,
+            cache_creation_tokens: reported.cache_creation_tokens,
+            // A coding agent reports one blended total per direction.
+            modality: None,
+        };
+        self.event_bus
+            .emit_or_log(
+                crate::engine::event_bus::BusEvent::Thread {
+                    thread_id,
+                    event: crate::engine::thread_events::ThreadEvent::ContextCaptured {
+                        producer: crate::engine::ContextProducer::from_coding_agent(coding_agent),
+                        model: snapshot_model,
+                        context_window,
+                        sections: Vec::new(),
+                        tools: Vec::new(),
+                        estimated_total_tokens,
+                        usage: Some(usage),
+                        trimmed: false,
+                        // This path never runs the trimmer, so no pass can have fired.
+                        trim_passes: Vec::new(),
+                        purpose: crate::engine::ContextPurpose::Turn,
+                        reconstructed: false,
+                    },
+                    meta: meta.clone(),
+                },
+                "[AgentSession] ContextCaptured",
+            )
+            .await;
+    }
+
+    /// After a hard stop, record the usage Claude Code's driver flushes for a
+    /// call cut off mid-stream. The provider billed its prompt, and the event
+    /// loop no longer reads. Reads up to `OutputEnded`, dropping everything
+    /// else, which the stopped loop would have dropped too.
+    async fn record_usage_flushed_at_stop(
+        &self,
+        events_rx: &mut tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
+        thread_id: Uuid,
+        meta: &crate::engine::thread_events::EventMeta,
+        coding_agent: CodingAgent,
+        session_model: Option<&str>,
+    ) {
+        if coding_agent != CodingAgent::ClaudeCode {
+            return;
+        }
+        for (model, reported) in usage_flushed_at_stop(events_rx, USAGE_FLUSH_WAIT).await {
+            self.record_coding_agent_usage(
+                thread_id,
+                meta,
+                coding_agent,
+                session_model,
+                model.as_deref(),
+                reported,
+            )
+            .await;
+        }
+    }
+
     /// Flush any reasoning accumulated in `buf` past `last_len` as a
     /// `CodingAgentThoughtStreamed`, advancing `last_len`. Idempotent: it emits
     /// only the new tail. Coalesces per-token reasoning deltas into a handful of
@@ -1155,6 +1305,12 @@ impl LucidosEngine {
                         );
                         break;
                     };
+                    // Not agent activity: it must not disarm a grace or start a
+                    // turn. Only a stopped session acts on it, through
+                    // `record_usage_flushed_at_stop`.
+                    if matches!(ev, AgentEvent::OutputEnded) {
+                        continue;
+                    }
                     silent_grace_at = None;
                     settle_answered_withdraws(&self.event_bus, thread_id, &mut inputs, &mut pending_withdraws).await;
                     // Only a read that settles an owed input can start a turn. A
@@ -1595,76 +1751,22 @@ impl LucidosEngine {
                             // (the parser drops all-zero ones), so this is the
                             // proof-of-model-call the resume-settle skip reads.
                             api_calls_seen = api_calls_seen.saturating_add(1);
-                            // Sections stay empty, because CC does not expose
-                            // its system prompt or tool schemas. CC strips the
-                            // [1m] suffix on the per-message model echo too, so
-                            // reconcile against `normalized_model` before
-                            // measuring the window.
-                            let snapshot_model = cc_msg_model
-                                .as_deref()
-                                .map(|m| crate::runtime::claude_code::reconcile_cc_model(
-                                    normalized_model.as_deref(),
-                                    m,
-                                ))
-                                .or_else(|| normalized_model.clone())
-                                .unwrap_or_default();
-                            // The backend's own window wins, because this
-                            // capture REPORTS a call the engine did not make.
-                            // `context_window_for` answers for a Lucidos
-                            // request, where 1M mode is gated on our `[1m]`
-                            // suffix. A coding agent picks its own mode, so a
-                            // bare Sonnet 5 id really does run 1M there.
-                            let context_window = crate::runtime::coding_agent_context_window(
+                            self.record_coding_agent_usage(
+                                thread_id,
+                                &meta,
                                 coding_agent,
-                                &snapshot_model,
+                                normalized_model.as_deref(),
+                                cc_msg_model.as_deref(),
+                                ReportedUsage {
+                                    input_tokens,
+                                    output_tokens,
+                                    cache_read_tokens,
+                                    cache_creation_tokens,
+                                },
                             )
-                            .unwrap_or_else(|| self.context_window_for(&snapshot_model, None));
-                            // Anthropic reports `input_tokens` as the
-                            // uncached portion only. `ApiUsage.input_tokens`
-                            // stores the TOTAL prompt size, the same
-                            // convention `vertex.rs` uses. So the budget bar
-                            // shows real context use, and the modal's
-                            // cache-miss formula recovers the uncached
-                            // count. `saturating_add` defends against a
-                            // pathologically large stream.
-                            let total_input = input_tokens
-                                .saturating_add(cache_read_tokens)
-                                .saturating_add(cache_creation_tokens);
-                            let estimated_total_tokens =
-                                (total_input as usize) + (output_tokens as usize);
-                            let usage = crate::engine::ApiUsage {
-                                input_tokens: total_input,
-                                output_tokens,
-                                cache_read_tokens,
-                                cache_creation_tokens,
-                                // A coding agent reports one blended total
-                                // per direction.
-                                modality: None,
-                            };
-                            self.event_bus
-                                .emit_or_log(
-                                    crate::engine::event_bus::BusEvent::Thread {
-                                        thread_id,
-                                        event: crate::engine::thread_events::ThreadEvent::ContextCaptured {
-                                            producer: crate::engine::ContextProducer::from_coding_agent(coding_agent),
-                                            model: snapshot_model,
-                                            context_window,
-                                            sections: Vec::new(),
-                                            tools: Vec::new(),
-                                            estimated_total_tokens,
-                                            usage: Some(usage),
-                                            trimmed: false,
-                                            // This path never runs the trimmer, so no pass can have fired.
-                                            trim_passes: Vec::new(),
-                                            purpose: crate::engine::ContextPurpose::Turn,
-                                            reconstructed: false,
-                                        },
-                                        meta: meta.clone(),
-                                    },
-                                    "[AgentSession] ContextCaptured",
-                                )
-                                .await;
+                            .await;
                         }
+                        AgentEvent::OutputEnded => unreachable!("OutputEnded skipped above"),
                         // Liveness-only ping from a streaming delta. The
                         // top-of-loop heartbeat bump already recorded that the
                         // subprocess is alive. That is what stops the watchdog
@@ -2495,6 +2597,9 @@ impl LucidosEngine {
                         coding_agent,
                     ).await;
                     emitted_terminal_event = true;
+                    self.record_usage_flushed_at_stop(
+                        &mut events_rx, thread_id, &meta, coding_agent, normalized_model.as_deref(),
+                    ).await;
                     break;
                 }
 
@@ -2577,6 +2682,9 @@ impl LucidosEngine {
                         coding_agent,
                     ).await;
                     emitted_terminal_event = true;
+                    self.record_usage_flushed_at_stop(
+                        &mut events_rx, thread_id, &meta, coding_agent, normalized_model.as_deref(),
+                    ).await;
                     break;
                 }
 
@@ -2599,6 +2707,9 @@ impl LucidosEngine {
                         coding_agent,
                     ).await;
                     emitted_terminal_event = true;
+                    self.record_usage_flushed_at_stop(
+                        &mut events_rx, thread_id, &meta, coding_agent, normalized_model.as_deref(),
+                    ).await;
                     break;
                 }
 
@@ -3127,5 +3238,70 @@ mod result_text_prose_tests {
     fn empty_text_is_never_emitted() {
         assert!(!result_text_is_own_prose("", None));
         assert!(!result_text_is_own_prose("   \n ", None));
+    }
+}
+
+/// A hard stop leaves the event loop at once, so the usage Claude Code's
+/// driver flushes for a cut-off call is read by `usage_flushed_at_stop`.
+#[cfg(test)]
+mod usage_flushed_at_stop_tests {
+    use super::{usage_flushed_at_stop, AgentEvent};
+    use tokio::sync::mpsc;
+
+    fn usage(cache_read_tokens: u32) -> AgentEvent {
+        AgentEvent::Usage {
+            model: Some("claude-sonnet-5".into()),
+            input_tokens: 2,
+            output_tokens: 4,
+            cache_read_tokens,
+            cache_creation_tokens: 0,
+        }
+    }
+
+    /// Every `Usage` up to `OutputEnded` is kept, and nothing after it is read.
+    #[tokio::test]
+    async fn it_keeps_each_usage_up_to_output_ended() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        for ev in [
+            usage(100),
+            AgentEvent::StreamActivity,
+            usage(200),
+            AgentEvent::OutputEnded,
+            usage(300),
+        ] {
+            tx.send(ev).expect("send");
+        }
+
+        let flushed = usage_flushed_at_stop(&mut rx, std::time::Duration::from_secs(5)).await;
+
+        let cache_reads: Vec<u32> = flushed.iter().map(|(_, u)| u.cache_read_tokens).collect();
+        assert_eq!(cache_reads, vec![100, 200]);
+        assert_eq!(flushed[0].0.as_deref(), Some("claude-sonnet-5"));
+        assert!(
+            matches!(rx.try_recv(), Ok(AgentEvent::Usage { .. })),
+            "the read stops at OutputEnded"
+        );
+    }
+
+    /// A closed channel ends the read too, with whatever arrived first.
+    #[tokio::test]
+    async fn a_closed_channel_ends_the_read() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tx.send(usage(7)).expect("send");
+        drop(tx);
+
+        let flushed = usage_flushed_at_stop(&mut rx, std::time::Duration::from_secs(5)).await;
+
+        assert_eq!(flushed.len(), 1);
+    }
+
+    /// A driver that never says it is done cannot hold the stop past `wait`.
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_driver_cannot_hold_the_stop() {
+        let (_tx, mut rx) = mpsc::unbounded_channel();
+
+        let flushed = usage_flushed_at_stop(&mut rx, std::time::Duration::from_secs(2)).await;
+
+        assert!(flushed.is_empty());
     }
 }

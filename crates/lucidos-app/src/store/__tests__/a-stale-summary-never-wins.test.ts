@@ -34,7 +34,7 @@ function aggregate(summaryVersion: number, status: ThreadAggregate['status']): T
     createdAt: AT, lastActivity: AT, messageCount: 1, section: 'inbox', status, summaryVersion,
     activeChildrenCount: 0, totalChildrenCount: 0, blockingDescendantCount: 0,
     attentionDescendantCount: 0, liveEventWaitCount: 0, codingAgentHasDiff: false,
-    codingAgentProposed: false, codingAgentRequiresRestart: false,
+    codingAgentProposed: false, codingAgentRequiresRestart: false, codingAgentIncomplete: false,
     codingAgentIsExternalRepo: false, isSaved: false, hasResponse: true, lastRevivedAt: null,
     parentThreadId: null, parentThreadTitle: null, state: 'active',
   };
@@ -48,6 +48,7 @@ function summary(summaryVersion: number, status: ThreadSummary['status']): Threa
     attention_descendant_count: 0, live_event_wait_count: 0, status, summary_version: summaryVersion,
     coding_agent_has_diff: false, coding_agent_proposed: false,
     coding_agent_requires_restart: false, coding_agent_is_external_repo: false,
+    coding_agent_incomplete: false,
     last_revived_at: null, state: 'active', compose_text: '', compose_images: [],
   };
 }

@@ -1,5 +1,7 @@
 import { test, expect, type Page } from './fixtures';
-import { assertHealthy, gotoWithRetry, navigateToApp, openThreadDrawer, stampOverlayBuild } from './helpers';
+import {
+  assertHealthy, gotoWithRetry, navigateToApp, openThreadDrawer, stampOverlayBuild, watchPreferenceReads,
+} from './helpers';
 
 /**
  * The Conversation header's centred brand cluster never paints on a flanking
@@ -114,8 +116,8 @@ function expectClear(m: RowMetrics, where: string): void {
  *  The root font size is part of what has to settle, not a precondition of it.
  *  `loadPreferences` re-applies the account's own scale over this write when it
  *  lands. A run that measured before waiting for it read a pane clamped at one
- *  scale and a header laid out at another. `waitForScaleApplied` rules that out
- *  once per test; this holds the invariant per sample. */
+ *  scale and a header laid out at another. `watchPreferenceReads` rules that
+ *  out once per document; this holds the invariant per sample. */
 async function settleRow(page: Page, wantRootPx: number | null, where: string): Promise<RowMetrics> {
   let last: RowMetrics | null = null;
   await expect
@@ -140,23 +142,12 @@ async function settleAt(page: Page, scale: number, toX: number): Promise<RowMetr
   return settleRow(page, 16 * scale / 100, `ui-scale ${scale}`);
 }
 
-/** Wait for the app's own preference load to have applied ITS ui-scale.
- *
- *  `loadPreferences` ends in `applyUiScale`, which writes `--user-ui-scale`
- *  inline and persists the scale to this key. Until that has happened, a scale
- *  the sweep writes is one write away from being replaced. */
-async function waitForScaleApplied(page: Page): Promise<void> {
-  await page.waitForFunction(
-    () => localStorage.getItem('lucidos-ui-scale') !== null,
-    undefined,
-    { timeout: 10_000 },
-  );
-}
-
 // The web build is swept alongside the packaged one as a control rather than as
 // padding. It never reproduced the bug, its toggle resting at 0.5rem. What it
 // says is that the fix did not move the collision to the other client.
 test.describe('the Conversation header cluster clears both flanking controls', () => {
+  let preferencesSettled: () => Promise<void>;
+
   test.beforeEach(async ({ page, context }) => {
     await assertHealthy(page);
     await context.addInitScript((width) => {
@@ -164,8 +155,9 @@ test.describe('the Conversation header cluster clears both flanking controls', (
       localStorage.setItem('lucidos-thread-drawer-open', 'false');
       localStorage.setItem('lucidos-thread-drawer-width', String(width));
     }, OPEN_DRAWER_WIDTH);
+    preferencesSettled = watchPreferenceReads(page);
     await navigateToApp(page);
-    await waitForScaleApplied(page);
+    await preferencesSettled();
   });
 
   for (const packaged of [true, false]) {
@@ -209,7 +201,7 @@ test.describe('the Conversation header cluster clears both flanking controls', (
         localStorage.setItem('lucidos-split-ratio', '0.234');
       });
       await gotoWithRetry(page, '/');
-      await waitForScaleApplied(page);
+      await preferencesSettled();
       if (packaged) await stampOverlayBuild(page);
 
       const m = await settleRow(page, null, 'after the sub-floor migration');

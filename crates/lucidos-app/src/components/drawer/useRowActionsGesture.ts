@@ -23,12 +23,13 @@ export interface RowActionsGesture {
   handlers: RowGestureHandlers;
 }
 
-/** A press that began on an inline control belongs to that control. The pin and
- *  the family disclosure both live inside the row, and both would otherwise
- *  arm the row's hold underneath them: holding the pin would pin the thread AND
- *  open the menu. */
+/** A press that began on an inline control belongs to that control. The pin,
+ *  the family disclosure and the archived-reveal toggle all live inside the
+ *  row, and each would otherwise arm the row's hold underneath it: holding the
+ *  pin would pin the thread AND open the menu. The toggle is a `<label>`
+ *  around its switch and its text, so a label counts as a control. */
 function startsOnControl(e: { target: EventTarget | null }): boolean {
-  return !!(e.target as Element | null)?.closest?.('button');
+  return !!(e.target as Element | null)?.closest?.('button, label');
 }
 
 /** The row's handlers for one layout, given the row's gesture machine. Pure, so

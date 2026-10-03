@@ -18,6 +18,7 @@ export function makeThread(overrides: Partial<ThreadState> = {}): ThreadState {
       summaryVersion: 0,
       codingAgentProposed: false,
       codingAgentRequiresRestart: false,
+      codingAgentIncomplete: false,
       codingAgentIsExternalRepo: false,
       codingAgentHasDiff: false,
       lastRevivedAt: '',

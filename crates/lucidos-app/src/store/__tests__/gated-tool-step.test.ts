@@ -236,6 +236,7 @@ describe('the chat MCP gate holds its call the same way', () => {
     expectOutcomes(exchange, ['denied']);
   });
 
+  // The refusal carries `success: false`, and a denial still reads Denied.
   it('the refusal lands on the refused row rather than an older one', () => {
     const exchange = chatCallExchange(
       ...upToRequest,
@@ -244,13 +245,13 @@ describe('the chat MCP gate holds its call the same way', () => {
         type: 'ToolResult',
         name: 'mcp__slack__search',
         result: DENIAL,
+        success: false,
         tool_called_event_id: 'tc-2',
         request_event_id: 'msg-1',
       } as ThreadEvent),
     );
-    const rows = inlineRows(exchange);
-    expect(rows.map(r => r.outcome)).toEqual(['denied']);
-    expect(rows[0].result).toBe(DENIAL);
+    expectOutcomes(exchange, ['denied']);
+    expect(inlineRows(exchange)[0].result).toBe(DENIAL);
   });
 });
 

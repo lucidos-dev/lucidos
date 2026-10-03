@@ -270,7 +270,8 @@ export function isTurnlessBoundary(event: { type: string; cause?: string }): boo
  *  At the label rather than at the stored reason, because the text is the
  *  model's and belongs on disk as written. The *waiting indicator* calls it
  *  wherever it supplies a verb: its aria-label, and each panel row under the
- *  "Waiting for" title. Its tooltip says the reason alone, as written.
+ *  "Waiting for" title. Its tooltip says the reason alone, as written. The
+ *  wait card's reason line calls it too, under its "Waiting for" pill.
  *
  *  Three judgments sit behind the two lines below, and each is a decision
  *  rather than a gap: `to` is not one of the prepositions, only a LEADING
@@ -292,8 +293,8 @@ const LEADING_GERUND =
  *  mid-sentence after "for", so they lose their capital there. */
 const LEADING_DETERMINER = /^(?:The|A|An|This|That|These|Those|All|Every|Each|Some|Any|My|Your|Its)\b/;
 
-/** `<verb> for <subject>`, the one phrasing every wait label shares:
- *  "Waiting for the release build", "Stopped waiting for the e2e lock".
+/** `<verb> for <subject>`, the phrasing a wait's one-line labels share:
+ *  "Stopped waiting for the e2e lock".
  *
  *  A reason that opens with a gerund takes a colon instead. The model writes
  *  "watching the deploy" as often as a noun phrase, and "Waiting for watching"
@@ -314,9 +315,8 @@ export function waitingFor(verb: string, reason: string): string {
  *  dropped it. A pre-2026-08-07 `EventWaitCanceled` carries no reason, and the
  *  line then says the one thing it knows.
  *
- *  Deliberately the same wording as the transcript's stop row, which is what a
- *  NON-user stop renders: one phrasing for one concept, whichever surface it
- *  lands on. */
+ *  A turn header is one line of text. So it spells out in words what the
+ *  wait card shows as a pill, a reason and a "Stopped" state word. */
 export function eventWaitStoppedSummary(reason: string | undefined): string {
   return reason ? waitingFor('Stopped waiting', reason) : 'Stopped waiting for an event';
 }

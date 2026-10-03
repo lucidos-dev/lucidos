@@ -293,17 +293,24 @@ pub const ROUTE_REACH: &[(&str, Reach, &[&str])] = &[
     ("/threads/:thread_id/images/:index", Host, &[]),
     ("/threads/:thread_id/messages", Host, &[]),
     ("/threads/archive", Host, &[]),
+    ("/threads/archive-all", Host, &[]),
+    ("/threads/archive-all-preflight", Host, &[]),
     ("/threads/archived-count", Host, &[]),
     ("/threads/count", App, &["GET"]),
     ("/threads/delete", Host, &[]),
     ("/threads/delete-preflight", Host, &[]),
+    // A user's unsent drafts and held messages are for the user and their
+    // agent. No app needs them, so the bridge refuses both.
+    ("/threads/drafts", Host, &[]),
     ("/threads/filter-facets", Host, &[]),
+    ("/threads/held-messages", Host, &[]),
     ("/threads/list", App, &["GET"]),
     ("/threads/older", Host, &[]),
     ("/threads/rename", Host, &[]),
     ("/threads/save", Host, &[]),
     ("/threads/search", Host, &[]),
     ("/threads/suggest-title", Host, &[]),
+    ("/threads/unarchive", Host, &[]),
     ("/threads/unsave", Host, &[]),
     ("/trigger-groups", App, &["GET"]),
     ("/trigger-groups/reorder", Host, &[]),
@@ -421,8 +428,8 @@ pub(crate) async fn enforce_app_reach(request: Request, next: Next) -> Response 
 ///
 /// `/preferences` is an `App` route, so an app can keep its own settings. The
 /// keys the agent may not write (`preference_catalog::INTERNAL_KEYS`) include
-/// the security switches: the command guard, the tool-call cap and the network
-/// bind. An app is no more trusted than the agent, so it may not write them
+/// the security switches: the command guard, the tool-call cap, the network
+/// bind and the local model host. An app is no more trusted than the agent, so it may not write them
 /// either. Every `key` parameter counts, so a repeated one cannot hide a key.
 ///
 /// [`APP_REFUSED_PREFERENCES`] adds keys the agent may write but an app may not.
@@ -453,14 +460,10 @@ fn human_only_preference(
 /// do unasked. An app writes files under its own folder, which is the app
 /// thread's working directory. So a path pointed at `/bin/sh` runs the app's
 /// own script as the user when the next session starts.
-///
-/// `local_base_url` chooses where local-model chat is sent. An app pointing it
-/// at its own host would receive every prompt and the conversation behind it.
 const APP_REFUSED_PREFERENCES: &[&str] = &[
     crate::core::PREF_CODING_AGENT_CLAUDE_PATH,
     crate::core::PREF_CODING_AGENT_CODEX_PATH,
     crate::core::PREF_CODING_AGENT_CLAUDE_PERMISSION_MODE,
-    crate::core::PREF_LOCAL_BASE_URL,
 ];
 
 /// Decode one `application/x-www-form-urlencoded` component, as axum's `Query`

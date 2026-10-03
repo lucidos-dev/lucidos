@@ -2,6 +2,7 @@ import { ThreadStatusIcon, type VisualStatus } from '../shared/ThreadStatusIcon'
 import { PinThreadButton } from '../shared/PinThreadButton';
 import { ThreadOverflowMenu } from '../shared/ThreadOverflowMenu';
 import { revealThreadInList } from '../drawer/ThreadDrawer';
+import { isElementVisible } from './scrollState';
 import type { ThreadState } from '../../store/thread-events';
 
 /** The desktop title row's pin, beside the title's menu button. A draft has
@@ -34,4 +35,15 @@ export function ThreadTitleMenu({ thread, title, status }: {
         children: <><ThreadStatusIcon status={status} />{title}</>,
       }} />
   );
+}
+
+/** Open the focused thread's menu by pressing the visible title. Both title
+ *  rows are mounted and CSS shows one, so a hidden copy is skipped. */
+export function openThreadTitleMenu(): void {
+  for (const button of document.querySelectorAll<HTMLElement>('.thread-title-menu')) {
+    if (isElementVisible(button)) {
+      button.click();
+      return;
+    }
+  }
 }

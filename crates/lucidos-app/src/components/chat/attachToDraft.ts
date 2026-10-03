@@ -1,34 +1,12 @@
-import { batch } from '@preact/signals';
-
-import { uploadThreadBlob, uploadPluginArchive, ApiError } from '../../api/client';
+import { uploadPluginArchive } from '../../api/client';
 import { showToast, showConfirm } from '../../store/store';
 import { uploadFiles } from '../../store/actions/artifacts';
-import { awaitThreadStarted, ensureFocusedComposeThread } from '../../store/actions/compose';
+import { ensureFocusedComposeThread } from '../../store/actions/compose';
+import { attachPendingUpload, describeUploadFailure } from '../../store/actions/imageUploads';
 import { sendMessage } from '../../store/actions/chat';
-import {
-  addPendingUpload,
-  detachPendingUpload,
-  hasPendingUpload,
-  patchPendingUpload,
-} from '../../store/pendingUploads';
-import { addAttachedImageHash, rememberSessionBlobUrl } from './pastedImages';
-import { generateUuid } from '../../utils/uuid';
 import { sniffImageBytes, imageRejectionMessage } from '../../utils/imageBytes';
 
 const PLUGIN_EXT = '.lucidos-plugin';
-
-/** What the composer says when the upload lands on bytes the draft already
- *  holds. See `addAttachedImageHash`. */
-const DUPLICATE_IMAGE_TOAST = 'That image is already attached to this message.';
-
-/** Why an upload failed, for the toast and the pending-upload row.
- *  Deliberately not `utils/errorDetail`: that one reads `Error.message`, and an
- *  `ApiError` carries the engine's sentence in `reason` instead. */
-function uploadFailureReason(err: unknown): string {
-  if (err instanceof ApiError) return err.reason;
-  if (err instanceof Error) return err.message;
-  return String(err);
-}
 
 export async function attachImageToActiveDraft(source: File): Promise<void> {
   const threadId = ensureFocusedComposeThread();
@@ -39,7 +17,7 @@ export async function attachImageToActiveDraft(source: File): Promise<void> {
   // synchronous event turn. macOS Universal Clipboard (an image copied on an
   // iPhone, pasted on the Mac) is the sharp case: the File's bytes live behind
   // a promised pasteboard resource that the browser releases once the paste
-  // event returns — the `await awaitThreadStarted` gap below is enough for that
+  // event returns — the upload's wait for the draft's thread row is enough for that
   // to happen, after which BOTH the `<img>` preview and the upload `fetch` fail
   // with a cryptic "Failed to fetch" (a broken thumbnail plus the error toast
   // the user sees). `arrayBuffer()` is invoked here, still inside the event
@@ -72,58 +50,7 @@ export async function attachImageToActiveDraft(source: File): Promise<void> {
   // makes the browser guess at the preview.
   const file = new File([bytes], name, { type: verdict.mime });
 
-  // Show the preview immediately, then upload in the background. The blob
-  // URL is handed off twice: first to the pending entry (preview while
-  // uploading), then to `sessionBlobUrls` via `rememberSessionBlobUrl` so
-  // the confirmed image keeps rendering from the same in-memory File. This
-  // dodges the per-browser quirk where preloading the server URL doesn't
-  // reliably warm the HTTP cache (notably iOS Safari PWA), which used to
-  // surface as a brief black flash when the preview swapped to a fresh
-  // `<img src="/api/v1/blobs/<hash>">` that re-fetched over the network.
-  const previewUrl = URL.createObjectURL(file);
-  const localId = generateUuid();
-  addPendingUpload({
-    localId,
-    threadId,
-    previewUrl,
-    mime: file.type,
-    status: 'uploading',
-    file,
-  });
-
-  try {
-    // ensureFocusedComposeThread fires POST /threads as fire-and-forget.
-    // The blob endpoint guards on thread_summaries existing, so without
-    // this await a fresh-draft paste 404s with "thread not found".
-    await awaitThreadStarted(threadId);
-    const { hash } = await uploadThreadBlob(threadId, file);
-    // Mid-flight cancel: the user clicked X on the preview while we were
-    // uploading. `removePendingUpload` dropped the entry and revoked the URL,
-    // so `hasPendingUpload` reads false. Bail without committing the hash to
-    // the draft.
-    if (!hasPendingUpload(threadId, localId)) return;
-    // Promote: hand the blob URL ownership to the session map FIRST so
-    // `getAttachedImages` will return it the moment the hash lands in the
-    // draft, then commit the hash and detach the pending entry without
-    // revoking the URL. `batch` collapses the writes into one render so
-    // the strip never momentarily renders with neither entry (an empty
-    // strip would unmount the wrapper and pop).
-    //
-    // The commit is refused when the draft already holds this hash, the shape
-    // a second paste of one screenshot takes. The preview URL is safe either
-    // way: `rememberSessionBlobUrl` keeps the first and revokes the duplicate.
-    let attached = true;
-    batch(() => {
-      rememberSessionBlobUrl(hash, previewUrl);
-      attached = addAttachedImageHash(threadId, hash);
-      detachPendingUpload(threadId, localId);
-    });
-    if (!attached) showToast(DUPLICATE_IMAGE_TOAST, 'info');
-  } catch (err) {
-    const reason = uploadFailureReason(err);
-    patchPendingUpload(threadId, localId, { status: 'failed', error: reason });
-    showToast(`Image upload failed: ${reason}`, 'error');
-  }
+  await attachPendingUpload({ threadId, file, bytes });
 }
 
 export interface DroppedFileSplit {
@@ -156,7 +83,7 @@ export async function uploadAndInstallPluginArchive(file: File): Promise<void> {
   try {
     ({ path } = await uploadPluginArchive(file));
   } catch (err) {
-    showToast(`Plugin upload failed: ${uploadFailureReason(err)}`, 'error');
+    showToast(`Plugin upload failed: ${describeUploadFailure(err)}`, 'error');
     return;
   }
   await sendMessage(`Install the plugin at ${path}`);

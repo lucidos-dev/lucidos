@@ -10,23 +10,6 @@ fn row(source: &str, coding_agent: Option<&str>) -> Option<ThreadRow> {
 }
 
 #[test]
-fn only_a_leading_btw_word_is_a_side_question() {
-    for yes in ["/btw what is X?", "/btw", "  /btw\nmultiline", "/btw\tq"] {
-        assert!(is_side_question(yes), "{yes:?}");
-    }
-    for no in [
-        "/btwx q",
-        "btw q",
-        "what about /btw q",
-        "/compact",
-        "hello",
-        "",
-    ] {
-        assert!(!is_side_question(no), "{no:?}");
-    }
-}
-
-#[test]
 fn claude_code_and_lucidos_threads_take_side_questions_and_codex_does_not() {
     assert_eq!(
         agent_for(row("claude_code", Some("claude-code"))),

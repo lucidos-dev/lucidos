@@ -145,7 +145,18 @@ Each card has a primary button that progresses **Install → Setup → Open**, p
 
 **Plugin uninstall is the single removal authority for a plugin's app.** A plugin-installed app cannot be removed by the **Delete** button on the Apps panel — that would `rm -rf` only the `apps/<id>/` dir and leave the plugin registered as installed with its sibling `triggers/`/`knowhow/`/`scripts/` orphaned. So `DELETE /api/v1/app?id=...` returns **409** with `{ error, plugin_id, plugin_name }` when the app belongs to an installed plugin (the app-level mirror of the `delete_file` guard, which already refuses raw deletes of plugin-owned files). The UI catches the 409 and routes the user to the plugin **Uninstall** panel instead — which removes the whole plugin tree and emits `PluginUninstalled`. Standalone apps (no `PluginInstalled` record) keep deleting directly.
 
-Installed marketplace plugins are **not** auto-updated — the engine notifies, the user decides. Registered marketplaces are scanned at startup, after a marketplace is registered or renamed, and every five minutes. When a scanned marketplace has a newer version of an already-installed plugin, the engine emits a single deduplicated `NotificationCreated` ("Plugin update(s) available") whose tap deep-links to the Plugins panel's installed list (the **Installed only** filter on) and scrolls to / pulse-highlights the plugin with the pending update (carried as the navigate `id`; with several updates it focuses the alphabetically-first by name, the rest stay chipped); it does NOT install anything. The user applies the update from that row's **Update button** (works for *any* plugin, app or not), the catalog card (with **Installed only** unchecked), or — for a plugin that ships an app — the app row's **Update** button on the Apps panel; each stages the same confirmation panel as any install. Dedup is tracked in a `.lucidos/plugin-update-notice.json` marker so the five-minute re-scan only re-notifies when a *new* update appears (a fresh plugin or a bumped version), not every cycle.
+Installed marketplace plugins are **not** auto-updated: the engine notifies, and the user decides. The engine scans registered marketplaces at startup, after a marketplace is registered or renamed, and every five minutes. A newer version of an installed plugin produces one deduplicated `NotificationCreated` ("Plugin update(s) available"). It does NOT install anything. Its tap opens the Plugins panel's installed list, with the **Installed only** filter on:
+
+- **One update**: the list scrolls to and pulse-highlights that plugin, carried as the navigate `id`.
+- **Several updates**: no row is highlighted, since each pending row already shows its update chip.
+
+The user applies an update from any of three places, and each stages the same confirmation panel as any install:
+
+- the plugin row's **Update** button, which works for *any* plugin, app or not;
+- the catalog card, with **Installed only** unchecked;
+- for a plugin that ships an app, the app row's **Update** button on the Apps panel.
+
+A `.lucidos/plugin-update-notice.json` marker tracks what the user was told. The five-minute re-scan re-notifies only for a *new* update (a fresh plugin or a bumped version), not every cycle.
 
 **A scan never runs on a page open.** `GET /api/v1/plugins/catalog` reads the *plugin catalog cache* (`.lucidos/plugin-catalog.json`), which the five-minute scan writes, so the Plugins panel and Settings → Marketplaces paint at once. The response carries `scanned_at`, `scanning` and `scan_error` beside the rows, and the panel shows that age rather than pretending the list is live. A cache older than five minutes, or none at all, starts a scan in the background and the request still answers immediately. `POST /api/v1/plugins/catalog/rescan` asks for a scan now, and returns as soon as it is queued.
 

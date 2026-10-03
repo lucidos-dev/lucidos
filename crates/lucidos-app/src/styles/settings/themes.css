@@ -16,6 +16,12 @@
     padding-top: var(--space-sm);
 }
 
+/* The settings row pads the frame, so the pill bar can hand back its side
+   ring room too, and the first pill stays on the cards' left edge. */
+.theme-carousel-frame > .pill-bar {
+    margin-inline: calc(-1 * var(--focus-ring-width));
+}
+
 /* Two half-transparent chevrons float over the strip's sides and page it.
    The one at a reached end hides. */
 .theme-carousel-body {

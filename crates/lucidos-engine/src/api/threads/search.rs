@@ -20,7 +20,8 @@ pub struct ThreadSearchQuery {
 }
 
 /// GET /api/v1/threads/search?q=<query>&limit=<n>: search threads by
-/// title/content (text + semantic).
+/// title, content and unsent draft (text + semantic). Each result carries its
+/// reader fields.
 pub(in crate::api) async fn search_threads(
     State(state): State<AppState>,
     Query(query): Query<ThreadSearchQuery>,
@@ -41,5 +42,9 @@ pub(in crate::api) async fn search_threads(
     // maximum, so it applies one, after the sort rather than before it: cutting
     // earlier would keep an arbitrary half instead of the best-scoring one.
     merged.truncate(limit.max(0) as usize);
+    crate::core::store::attach_reader_fields(
+        merged.iter_mut().map(|r| &mut r.info),
+        &state.engine.workspace_name(),
+    );
     Ok(Json(serde_json::json!({ "results": merged })))
 }

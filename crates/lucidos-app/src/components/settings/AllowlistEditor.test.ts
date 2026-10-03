@@ -1,5 +1,35 @@
 import { describe, it, expect } from 'vitest';
-import { parseAllowlist, serializeAllowlist } from './AllowlistEditor';
+import { mergeAllowlist, parseAllowlist, serializeAllowlist } from './AllowlistEditor';
+
+describe('mergeAllowlist', () => {
+  const base = ['Bash(git:*)', 'Python', 'Bash(ls:*)'];
+
+  it('keeps a pattern that appeared in the file since the draft started', () => {
+    expect(mergeAllowlist(base, base, [...base, 'Bash(git status)']))
+      .toEqual([...base, 'Bash(git status)']);
+  });
+
+  it('keeps a pattern the draft deleted deleted, even though the file still has it', () => {
+    expect(mergeAllowlist(base, ['Bash(git:*)', 'Bash(ls:*)'], base)).toEqual(['Bash(git:*)', 'Bash(ls:*)']);
+  });
+
+  it('applies the draft\'s adds and deletes on top of a grant', () => {
+    expect(mergeAllowlist(base, ['Bash(git:*)', 'Bash(ls:*)', 'Bash(pwd)'], [...base, 'Bash(git status)']))
+      .toEqual(['Bash(git:*)', 'Bash(ls:*)', 'Bash(pwd)', 'Bash(git status)']);
+  });
+
+  it('drops an untouched pattern the file dropped', () => {
+    expect(mergeAllowlist(base, base, ['Bash(git:*)', 'Bash(ls:*)'])).toEqual(['Bash(git:*)', 'Bash(ls:*)']);
+  });
+
+  it('writes a pattern both sides added once', () => {
+    expect(mergeAllowlist(base, [...base, 'Bash(pwd)'], [...base, 'Bash(pwd)'])).toEqual([...base, 'Bash(pwd)']);
+  });
+
+  it('keeps the draft\'s raw rows, empty and untrimmed ones included', () => {
+    expect(mergeAllowlist(base, [...base, '  Bash(pwd) ', ''], base)).toEqual([...base, '  Bash(pwd) ', '']);
+  });
+});
 
 describe('parseAllowlist', () => {
   it('splits the # header from editable pattern rows', () => {

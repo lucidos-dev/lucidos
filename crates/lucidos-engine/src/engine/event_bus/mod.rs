@@ -235,6 +235,7 @@ impl EmittedEvent {
                     if matches!(event, ThreadEvent::CodingAgentToolResult { .. }) {
                         ThreadEvent::strip_result_text(obj);
                     }
+                    ThreadEvent::strip_tool_call_args(event.event_type(), obj);
                 }
                 let mut data = serde_json::json!({
                     "thread_id": thread_id.to_string(),

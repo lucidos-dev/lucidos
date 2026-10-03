@@ -146,12 +146,11 @@ git ls-files '*.ts' '*.tsx' | xargs grep -l '@ts-expect-error' | grep -vE '\.tes
 (cd packages/lucidos-sdk && npx tsc --noEmit -p tsconfig.json); echo "SDK EXIT: $?"
 ```
 
-The currently-accepted categories, re-counted again later on 2026-10-01.
-Every Rust category was unchanged, and the cfg_attr grep printed nothing.
-`@ts-expect-error` rose 15 with the test suite. A tenth `eslint-disable`
-site had landed with no reason above it, and the cold-start one sat a line
-above the call it names. That run gave both a reason line and moved the
-second onto its call.
+The currently-accepted categories, re-counted on 2026-10-02.
+`too_many_arguments` gained one site, `dispatch_resolved` in
+`api/proxy.rs`, documented like its neighbours. Every other Rust category
+was unchanged, and the cfg_attr grep printed nothing. `@ts-expect-error`
+rose 12 with the test suite. The ten `eslint-disable` sites were unchanged.
 
 **The first grep and the bare-allow audit both print one false hit.** It is
 `git_ops_tests/branch_queries.rs`, where `#[allow(dead_code)]` sits inside
@@ -163,7 +162,7 @@ silencers from the gateway's slowness watcher, which the first grep above
 had missed. The cfg_attr grep now covers that form.
 Anything not on this list is fair game to remove and re-fix:
 
-- **`#[allow(clippy::too_many_arguments)]`**, 81 sites across 51 files,
+- **`#[allow(clippy::too_many_arguments)]`**, 82 sites across 51 files,
   by far the largest category. Internal helpers that legitimately need
   that many parameters (event constructors, runtime spawn helpers,
   scheduler entry points, `LucidosEngine::new`'s boot wiring). The
@@ -171,9 +170,9 @@ Anything not on this list is fair game to remove and re-fix:
   the justification is the function's role, and the strongest form of it,
   which `LucidosEngine::new` carries, is that no two parameters share a
   type, so the argument swap the lint guards against cannot compile.
-  One of the 81 shares an attribute with `format_in_format_args`, which is
+  One of the 82 shares an attribute with `format_in_format_args`, which is
   the same site that entry counts. Grepping the bare form alone therefore
-  reports 80 across 50 files. Both numbers here count the shared attribute.
+  reports 81 across 50 files. Both numbers here count the shared attribute.
 - **`#[allow(dead_code)]`**, 4 sites: the `SpawnTrigger` taxonomy enum
   (`agent_session/spawn_dispatcher.rs`, one attribute on the enum) and test
   scaffolding (`thread_lifecycle_tests/scenario_tests.rs`,
@@ -195,8 +194,8 @@ Anything not on this list is fair game to remove and re-fix:
   (see `tauri.conf.json`), so the deprecated cross-version call is the
   correct one to keep.
 - **`// @ts-expect-error`, Node APIs available at runtime via Vitest, no
-  `@types/node` in project**, 839 sites across 290 files, every one of them
-  test-only code: 277 `*.test.ts`, eleven `*.test.tsx`
+  `@types/node` in project**, 851 sites across 294 files, every one of them
+  test-only code: 281 `*.test.ts`, eleven `*.test.tsx`
   (`components/changes/__tests__/bulk-row-layout.test.tsx`,
   `components/chat/__tests__/question-card.test.tsx`,
   `components/chat/__tests__/welcome-onboarding.test.tsx`,

@@ -4,6 +4,9 @@ use crate::runtime::CodingAgent;
 
 use super::{EventMeta, ThreadEvent};
 
+/// The one tool whose args the inline render reads, so the args strip spares it.
+const GENERATE_IMAGE_TOOL: &str = "generate_image";
+
 impl ThreadEvent {
     /// Names of the four `Response*` events that close a request. A chat turn
     /// ends on one, and so does a coding-agent turn, which stamps its channel.
@@ -83,6 +86,42 @@ impl ThreadEvent {
         payload.insert("result_stripped".to_string(), Value::Bool(true));
     }
 
+    /// Drop a tool call's `args` from its serialized payload and mark it, so the
+    /// step modal fetches them from `GET /api/v1/events/:event_id/tool-args`.
+    /// The snapshot and the live stream both call this, which keeps a stripped
+    /// call one shape everywhere. A no-op for any other event type.
+    ///
+    /// `args` is the heaviest thing a call carries: a `Write`'s whole file, an
+    /// `Edit`'s two hunks, a `bash` call's script. Nothing inline renders it.
+    ///
+    /// **`description` is filled first, and that ordering is the whole trick.**
+    /// The inline label reads `description || describe(name, args)`, so a row
+    /// with no description would otherwise keep only its bare tool name.
+    pub fn strip_tool_call_args(event_type: &str, payload: &mut serde_json::Map<String, Value>) {
+        let describe: fn(&str, &Value) -> String = match event_type {
+            "ToolCalled" => crate::core::describe_tool,
+            "CodingAgentToolCalled" => crate::core::describe_cc_tool,
+            _ => return,
+        };
+        let name = payload.get("name").and_then(Value::as_str).unwrap_or("");
+        // The generated image takes its alt text from the call's prompt, so
+        // this one tool's args are read inline and stay.
+        if name == GENERATE_IMAGE_TOOL {
+            return;
+        }
+        let described = payload
+            .get("description")
+            .and_then(Value::as_str)
+            .is_some_and(|d| !d.is_empty());
+        if !described {
+            let args = payload.get("args").cloned().unwrap_or(Value::Null);
+            let description = describe(name, &args);
+            payload.insert("description".to_string(), description.into());
+        }
+        payload.remove("args");
+        payload.insert("args_stripped".to_string(), Value::Bool(true));
+    }
+
     /// Convert a control request into a CodingAgentSettingsChanged event,
     /// if applicable. `coding_agent` identifies which backend issued the change.
     pub fn from_control_request(
@@ -148,6 +187,8 @@ impl ThreadEvent {
             Self::ThreadUnsaved => "ThreadUnsaved",
             Self::ThreadArchived => "ThreadArchived",
             Self::ThreadArchiveRequested => "ThreadArchiveRequested",
+            Self::ThreadUnarchived => "ThreadUnarchived",
+            Self::ThreadTriageProposed { .. } => "ThreadTriageProposed",
             Self::ThreadStarted { .. } => "ThreadStarted",
             Self::ThreadDiscarded { .. } => "ThreadDiscarded",
             Self::ImageUploaded { .. } => "ImageUploaded",
@@ -271,6 +312,8 @@ impl ThreadEvent {
         "ThreadUnsaved",
         "ThreadArchived",
         "ThreadArchiveRequested",
+        "ThreadUnarchived",
+        "ThreadTriageProposed",
         "ThreadStarted",
         "ThreadDiscarded",
         "ImageUploaded",

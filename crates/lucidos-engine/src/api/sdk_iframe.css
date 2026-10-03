@@ -79,7 +79,9 @@
     --brand-blue-deep: #0a4ea8;
 
     /* Focus ring shared by the component classes below (.action-btn, .icon-btn).
-       `--accent` is resolved per theme at use time. Keep in sync with base.css. */
+       `--accent` is resolved per theme at use time. Keep in sync with base.css,
+       ring width included: a clipping box reserves --focus-ring-width. */
+    --focus-ring-width: 0.1875rem;
     --focus-ring: 0 0 0 0.1875rem color-mix(in srgb, var(--accent) 55%, transparent);
 }
 

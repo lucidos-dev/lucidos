@@ -27,6 +27,7 @@ pub use push::{PushSubscription, PushSubscriptionStore};
 
 use crate::api::SharedEngine;
 use crate::core::PreferenceStore;
+use crate::engine::event_bus::EventBus;
 use crate::triggers::{
     replay_trigger_events, replay_trigger_group_events, TriggerConfig, TriggerEventRow,
     TriggerGroup, TriggerGroupEventRow, TriggerRun,
@@ -46,6 +47,11 @@ const MISSED_TASK_GRACE_MINUTES: i64 = 60;
 /// auto-disabled. Tuned to skip biweekly-use devices while catching obvious
 /// PWA-reinstall ghosts.
 const STALE_DEVICE_DAYS: i64 = 30;
+
+/// Days after which a device never seen past its first day is removed (see
+/// `DeviceStore::remove_one_off`). Long enough that a device used again within
+/// a week keeps its per-device preferences.
+const ONE_OFF_DEVICE_DAYS: i32 = 7;
 
 /// Namespace UUID for deriving trigger UUIDs via v5 (SHA-1). The byte
 /// sequence spells the historical "cognos-trigger-n" — DO NOT change it;
@@ -312,28 +318,28 @@ impl SchedulerManager {
         // endpoint never returned 410 (so the per-fan-out 410 cleanup never ran).
         // Disable-not-delete: zero data loss, fully reversible from Settings, no
         // event spam beyond one DevicePushChanged per actually-flipped row.
+        // The same tick removes one-off devices, which hold no push at all.
         let engine_prune = self.engine.clone();
         let pool_prune = self.pool.clone();
         let prune_job = Job::new_async("0 0 3 * * *", move |_uuid, _lock| {
             let engine = engine_prune.clone();
             let pool = pool_prune.clone();
             Box::pin(async move {
-                disable_push_on_stale_devices(engine, pool, STALE_DEVICE_DAYS).await;
+                prune_devices(&pool, &engine.event_bus).await;
             })
         })?;
         self.scheduler.add(prune_job).await?;
         log!(
-            "[Scheduler] Registered system task: disable_push_on_stale_devices (daily 03:00 UTC, >{}d)",
-            STALE_DEVICE_DAYS
+            "[Scheduler] Registered system task: prune_devices (daily 03:00 UTC, push off >{}d, one-off removed >{}d)",
+            STALE_DEVICE_DAYS,
+            ONE_OFF_DEVICE_DAYS
         );
 
-        // Also run once at startup so accumulated stale rows get caught
-        // immediately after deploy without waiting for the first 03:00 tick.
-        // Awaited inline (not spawned) so a shutdown mid-prune can't emit
-        // DevicePushChanged events into a tearing-down EventBus — the work
-        // is bounded (one SELECT plus one UPDATE per stale row).
-        disable_push_on_stale_devices(self.engine.clone(), self.pool.clone(), STALE_DEVICE_DAYS)
-            .await;
+        // Also run once at startup so accumulated rows get caught right after
+        // deploy without waiting for the first 03:00 tick. Awaited inline (not
+        // spawned) so a shutdown mid-prune cannot emit Device* events into a
+        // tearing-down EventBus. The work is bounded by the rows it matches.
+        prune_devices(&self.pool, &self.engine.event_bus).await;
 
         // Daily 03:10 UTC: drop expired webhook delivery claims. Ten minutes
         // after the device sweep so two DELETE-heavy jobs do not share a tick.
@@ -1352,15 +1358,34 @@ pub(crate) async fn prune_webhook_delivery_claims(pool: PgPool) {
     }
 }
 
+/// The daily device sweep: one-off devices removed, then push off on stale
+/// devices. Order matters: removal reads the push flag, so it must see the flag
+/// as the day began, never one this sweep just turned off.
+async fn prune_devices(pool: &PgPool, event_bus: &EventBus) {
+    remove_one_off_devices(pool, event_bus, ONE_OFF_DEVICE_DAYS).await;
+    disable_push_on_stale_devices(pool, event_bus, STALE_DEVICE_DAYS).await;
+}
+
+/// Remove every device never seen past its first day, once older than
+/// `older_than_days`. `DeviceStore::remove_one_off` announces each removal.
+/// Engine-internal: emits `actor: None`.
+async fn remove_one_off_devices(pool: &PgPool, event_bus: &EventBus, older_than_days: i32) {
+    match crate::core::DeviceStore::remove_one_off(pool, event_bus, older_than_days).await {
+        Ok(removed) if removed.is_empty() => {}
+        Ok(removed) => log!(
+            "[Scheduler] Removed {} one-off device(s) (>{}d)",
+            removed.len(),
+            older_than_days
+        ),
+        Err(e) => log!("[Scheduler] remove_one_off_devices failed: {}", e),
+    }
+}
+
 /// Flip `push_enabled` to false on every device whose `last_seen_at` is older
 /// than `cutoff_days`. Devices already disabled are filtered at the SELECT
 /// layer so a re-run produces no events. Engine-internal: emits `actor: None`.
-pub(crate) async fn disable_push_on_stale_devices(
-    engine: SharedEngine,
-    pool: PgPool,
-    cutoff_days: i64,
-) {
-    let stale = match crate::core::DeviceStore::list_stale_push_enabled(&pool, cutoff_days).await {
+async fn disable_push_on_stale_devices(pool: &PgPool, event_bus: &EventBus, cutoff_days: i64) {
+    let stale = match crate::core::DeviceStore::list_stale_push_enabled(pool, cutoff_days).await {
         Ok(ids) => ids,
         Err(e) => {
             log!(
@@ -1382,14 +1407,8 @@ pub(crate) async fn disable_push_on_stale_devices(
     for device_id in stale {
         // `set_push_enabled` announces `DevicePushChanged` itself, and only when
         // a row actually flipped, so this sweep cannot report a device it missed.
-        match crate::core::DeviceStore::set_push_enabled(
-            &pool,
-            &engine.event_bus,
-            &device_id,
-            false,
-            None,
-        )
-        .await
+        match crate::core::DeviceStore::set_push_enabled(pool, event_bus, &device_id, false, None)
+            .await
         {
             Ok(true) => {}
             Ok(false) => {
@@ -1810,5 +1829,40 @@ mod tests {
         std::fs::create_dir_all(dir2.join("triggers/--/scripts")).unwrap();
         std::fs::write(dir2.join("triggers/--/scripts/run.py"), "# x").unwrap();
         assert_eq!(find_matching_script(dir2, "literally anything"), None);
+    }
+
+    /// A one-off device that began the sweep with push on survives it. The
+    /// push prune turns that flag off in the same sweep. Removal must run
+    /// first, or it reads the fresh flag and deletes the device.
+    #[tokio::test]
+    async fn prune_devices_keeps_a_device_whose_push_it_just_turned_off() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let (bus, _callback_rx) = EventBus::new(pool.clone());
+        crate::test_support::seed_device(&pool, "push-on", Some("UA"), None).await;
+        crate::core::DeviceStore::set_push_enabled(&pool, &bus, "push-on", true, None)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE devices SET created_at = now() - make_interval(days => 40), \
+             last_seen_at = now() - make_interval(days => 40) WHERE id = 'push-on'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        prune_devices(&pool, &bus).await;
+
+        let push_enabled: Option<bool> =
+            sqlx::query_scalar("SELECT push_enabled FROM devices WHERE id = 'push-on'")
+                .fetch_optional(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            push_enabled,
+            Some(false),
+            "the device stays, with push turned off by the stale prune"
+        );
+
+        crate::test_support::teardown_test_db(&db_name).await;
     }
 }

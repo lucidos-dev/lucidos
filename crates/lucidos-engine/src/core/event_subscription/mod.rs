@@ -361,7 +361,7 @@ pub fn validate_subscribable_event_type(
     }
     if ThreadEvent::SIDE_QUESTION_EVENT_TYPES.contains(&name) {
         return Err(format!(
-            "'{name}' records a /btw side question, which no agent, trigger or \
+            "'{name}' records a side question, which no agent, trigger or \
              event wait ever sees. It is dropped before any subscriber, so a \
              subscription on it can never match."
         ));

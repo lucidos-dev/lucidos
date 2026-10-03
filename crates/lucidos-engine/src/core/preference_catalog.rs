@@ -360,15 +360,6 @@ pub const CATALOG: &[PrefSpec] = &[
         side_effect: PrefSideEffect::None,
     },
     PrefSpec {
-        key: "local_base_url",
-        label: "Local provider base URL",
-        scope: PrefScope::Global,
-        value: PrefValue::Text,
-        default: super::preferences::DEFAULT_LOCAL_BASE_URL,
-        description: "Base URL for the 'local' OpenAI-compatible provider (Ollama / LM Studio / vLLM / llama.cpp).",
-        side_effect: PrefSideEffect::None,
-    },
-    PrefSpec {
         key: "opencode_free_enabled",
         label: "OpenCode Free models",
         scope: PrefScope::Global,
@@ -651,6 +642,9 @@ pub const INTERNAL_KEYS: &[(&str, &str)] = &[
     ("provider_enabled_openrouter", "whether the OpenRouter provider is switched on: managed in Settings → Models → Providers, never via set_preference"),
     ("provider_enabled_xai", "whether the xAI provider is switched on: managed in Settings → Models → Providers, never via set_preference"),
     ("provider_enabled_local", "whether the local OpenAI-compatible provider is switched on: managed in Settings → Models → Providers, never via set_preference"),
+    // Where local-model chat goes. The host there reads every prompt and writes
+    // the replies the agentic loop runs, so the agent must not choose it.
+    ("local_base_url", "the local provider's base URL, which receives every prompt and answers with the tool calls you run: the user sets it in Settings → Models → Providers, never via set_preference"),
     // The seventh switch, and internal for a different reason. Jev answers no
     // chat turn, so switching it off cannot leave the workspace unable to
     // answer. It is here because it turns the command guard's backend back to
@@ -846,6 +840,16 @@ mod tests {
     fn command_guard_is_not_settable_but_has_a_hint() {
         assert!(lookup("command_guard").is_none());
         assert!(internal_hint("command_guard").is_some());
+    }
+
+    /// The local model host reads every prompt and writes the replies the
+    /// agentic loop runs. The agent choosing it would let a prompt injection
+    /// move the agent onto a model the attacker controls.
+    #[test]
+    fn the_local_model_host_is_not_agent_settable() {
+        assert!(lookup(crate::core::PREF_LOCAL_BASE_URL).is_none());
+        let hint = internal_hint(crate::core::PREF_LOCAL_BASE_URL).expect("internal");
+        assert!(hint.contains("Settings → Models → Providers"), "{hint}");
     }
 
     /// Same shape as the command-guard test above, and for the same reason: the

@@ -24,7 +24,7 @@ interface AllowlistEditorProps {
   placeholder: string;
   /** Noun used in the failed-load message ("tool permissions" / "command permissions"). */
   noun: string;
-  /** Load the raw allowlist file contents. */
+  /** Load the raw allowlist file contents. Save re-reads through it, to merge. */
   load: () => Promise<string>;
   /** Persist the raw allowlist file contents (whole-file overwrite). */
   save: (contents: string) => Promise<void>;
@@ -45,6 +45,24 @@ export function parseAllowlist(contents: string): { header: string[]; patterns: 
 export function serializeAllowlist(header: string[], patterns: string[]): string {
   const clean = patterns.map((p) => p.trim()).filter((p) => p.length > 0);
   return [...header, ...clean].join('\n') + '\n';
+}
+
+/** Three-way merge of a draft onto the file as it is now. `base` is what the
+ *  draft started from, `mine` the draft, `theirs` the current file.
+ *
+ *  A pattern the draft added or kept stays, unless the file dropped a kept one.
+ *  A pattern the draft deleted stays deleted. The merge appends a pattern that
+ *  appeared in the file since `base`, so a grant made meanwhile survives. Patterns
+ *  compare trimmed, and `mine`'s rows keep their raw text, empty rows included,
+ *  so the merge never rewrites a row the user is typing in. */
+export function mergeAllowlist(base: string[], mine: string[], theirs: string[]): string[] {
+  const set = (rows: string[]) => new Set(rows.map((p) => p.trim()).filter((p) => p.length > 0));
+  const inBase = set(base);
+  const inMine = set(mine);
+  const inTheirs = set(theirs);
+  const kept = mine.filter((p) => !p.trim() || inTheirs.has(p.trim()) || !inBase.has(p.trim()));
+  const landed = [...inTheirs].filter((p) => !inBase.has(p) && !inMine.has(p));
+  return [...kept, ...landed];
 }
 
 /** Self-skeletonizing pattern row: rendered with no props inside a
@@ -148,8 +166,8 @@ export function AllowlistEditor(props: AllowlistEditorProps) {
 
   // The agent grants a permission by writing this very file, so the editor has
   // to follow it (ADR 0118). Paused while dirty: unsaved patterns are the
-  // user's and a re-read would drop them. Save and Revert both clear dirty,
-  // which is when a frame held back during the edit lands.
+  // user's and a re-read would drop them. Save merges what landed meanwhile.
+  // Save and Revert both clear dirty, which is when a held-back frame lands.
   useVersionedRefresh(permissionGrantsVersion.value, dirty, reload);
 
   function setPatternAt(i: number, value: string) {
@@ -167,17 +185,28 @@ export function AllowlistEditor(props: AllowlistEditorProps) {
   }
 
   async function save() {
-    const next = serializeAllowlist(header, patterns);
+    if (loadable.status !== 'loaded') return;
+    const loaded = parseAllowlist(loadable.data).patterns;
+    const drafted = patterns;
+    const startedAt = edits.current;
     setSaving(true);
     try {
+      // The file may have moved under the draft: an "Always allow" appends to
+      // it while the re-read is paused. Writing the draft alone would revoke
+      // that grant, so Save does not write a file it cannot re-read.
+      const onDisk = parseAllowlist(await props.load());
+      const next = serializeAllowlist(onDisk.header, mergeAllowlist(loaded, drafted, onDisk.patterns));
       await props.save(next);
-      // Re-parse so trimmed/empty rows collapse to their persisted form.
-      const parsed = parseAllowlist(next);
+      const persisted = parseAllowlist(next);
+      // The rows stay editable during the save. Rows edited meanwhile are a
+      // newer draft, so they stay, with what the merge brought in. Otherwise
+      // the rows collapse to their persisted form.
+      const typedMeanwhile = edits.current !== startedAt;
       edit(() => {
-        setHeader(parsed.header);
-        setPatterns(parsed.patterns);
-        setLoadable({ status: 'loaded', data: next });
+        setHeader(persisted.header);
+        setPatterns((typed) => (typedMeanwhile ? mergeAllowlist(drafted, typed, persisted.patterns) : persisted.patterns));
       });
+      setLoadable({ status: 'loaded', data: next });
       showToast('Saved', 'info');
     } catch (e) {
       showToast(`Save failed: ${errorDetail(e)}`, 'error');

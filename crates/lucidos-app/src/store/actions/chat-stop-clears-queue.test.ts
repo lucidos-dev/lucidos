@@ -1,11 +1,13 @@
 /**
- * Stop-clears-queue: pressing Stop on a chat thread with queued follow-ups must
- * (1) retract each un-injected queued message via `/chat/queued-message/remove`
- * BEFORE cancelling (so the backend `filter_removed_queued_prompts` drops it at
- * loop finalize instead of re-running it above "Response canceled"), (2) return
- * the retracted texts to the compose box in FIFO order, and (3) then cancel.
- * Already-injected messages (409) stay under the cancelled exchange — not moved
- * to compose. See docs/plans/2026-07-19-stop-clears-queued-messages.md.
+ * Stop-clears-queue. Pressing Stop on a chat thread with queued follow-ups does
+ * three things, in order:
+ * 1. Retract each un-injected queued message via `/chat/queued-message/remove`.
+ *    The backend's `filter_removed_queued_prompts` then drops it at loop
+ *    finalize, so it never re-runs above "Response canceled".
+ * 2. Return the retracted texts and images to the compose box, FIFO.
+ * 3. Cancel.
+ * Already-injected messages (409) stay under the cancelled exchange, out of
+ * compose. See docs/plans/2026-07-19-stop-clears-queued-messages.md.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
@@ -35,12 +37,14 @@ const originalFetch = globalThis.fetch;
 /** A running chat thread with one active streaming turn + N queued follow-ups
  *  (as optimistic pending messages, which computeExchanges folds into stepless
  *  queued exchanges — the same shape a persisted queued MessageReceived takes). */
-function makeQueuedThread(pending: Array<{ text: string; eventId: string }>): ThreadState {
+type QueuedFixture = { text: string; eventId: string; image_hashes?: string[] };
+
+function makeQueuedThread(pending: QueuedFixture[]): ThreadState {
   return {
     meta: {
       id: 't-1', title: '', channel: 'chat', initiator: 'user', saved: false,
       createdAt: '', updatedAt: '', summaryVersion: 0, status: 'running',
-      codingAgentProposed: false, codingAgentRequiresRestart: false,
+      codingAgentProposed: false, codingAgentRequiresRestart: false, codingAgentIncomplete: false,
       codingAgentIsExternalRepo: false, codingAgentHasDiff: false,
       lastRevivedAt: '', messageCount: 0, section: 'archived',
       activeChildrenCount: 0, totalChildrenCount: 0,
@@ -58,12 +62,12 @@ function makeQueuedThread(pending: Array<{ text: string; eventId: string }>): Th
     eventsLoadFailed: false,
     lastDbSeq: 2,
     pendingUserMessages: pending.map((p, i) => ({
-      text: p.text, eventId: p.eventId, created: `2026-07-19T00:00:0${i + 2}Z`,
+      text: p.text, eventId: p.eventId, created: `2026-07-19T00:00:0${i + 2}Z`, image_hashes: p.image_hashes,
     })),
   };
 }
 
-function setThread(pending: Array<{ text: string; eventId: string }>) {
+function setThread(pending: QueuedFixture[]) {
   const map = new Map<string, ThreadState>();
   map.set('t-1', makeQueuedThread(pending));
   threadMap.value = map;
@@ -143,6 +147,46 @@ describe('cancelCurrentExchange — stop clears queued messages to compose', () 
     await cancelCurrentExchange('t-1');
 
     expect(updateComposeSpy).toHaveBeenCalledWith('t-1', { text: 'my draft\n\nfollow 1' });
+  });
+
+  it('returns a queued message\'s images to compose with its text', async () => {
+    // Cancelling a question card takes this path too.
+    setThread([
+      { text: 'look at this', eventId: 'q1', image_hashes: ['img-a'] },
+      { text: '', eventId: 'q2', image_hashes: ['img-b'] },
+    ]);
+    setDraft('t-1', { text: '', image_hashes: ['img-draft'], mode: null });
+    installFetch([]);
+
+    await cancelCurrentExchange('t-1');
+
+    expect(updateComposeSpy).toHaveBeenCalledWith('t-1', { image_hashes: ['img-draft', 'img-a', 'img-b'] });
+    expect(updateComposeSpy).toHaveBeenCalledWith('t-1', { text: 'look at this' });
+  });
+
+  it('adds no image the draft already holds', async () => {
+    // The user re-attached the image before stopping. The draft refuses a
+    // duplicate on attach too (`addAttachedImageHash`).
+    setThread([
+      { text: '', eventId: 'q1', image_hashes: ['img-a'] },
+      { text: '', eventId: 'q2', image_hashes: ['img-a', 'img-b'] },
+    ]);
+    setDraft('t-1', { text: '', image_hashes: ['img-a'], mode: null });
+    installFetch([]);
+
+    await cancelCurrentExchange('t-1');
+
+    expect(updateComposeSpy).toHaveBeenCalledTimes(1);
+    expect(updateComposeSpy).toHaveBeenCalledWith('t-1', { image_hashes: ['img-a', 'img-b'] });
+  });
+
+  it('keeps an already-injected message\'s images out of compose', async () => {
+    setThread([{ text: 'follow 1', eventId: 'q1', image_hashes: ['img-a'] }]);
+    installFetch([], { removed409: new Set(['q1']) });
+
+    await cancelCurrentExchange('t-1');
+
+    expect(updateComposeSpy).not.toHaveBeenCalled();
   });
 
   it('excludes an already-injected (409) message from compose but still cancels', async () => {

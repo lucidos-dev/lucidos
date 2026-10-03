@@ -45,6 +45,31 @@ async fn spawn_driver_for_test(program: &str, args: &[&str]) -> (RunningAgent, C
     )
 }
 
+/// Read the driver's last two events, which are always `OutputEnded` then
+/// `Exited`, and return the `Exited`.
+async fn output_ended_then_exited(
+    events_rx: &mut mpsc::UnboundedReceiver<AgentEvent>,
+    within: std::time::Duration,
+) -> AgentEvent {
+    let deadline = tokio::time::Instant::now() + within;
+    let mut last_two = Vec::new();
+    for _ in 0..2 {
+        let ev = tokio::time::timeout_at(deadline, events_rx.recv())
+            .await
+            .expect("the driver ends its stream in time")
+            .expect("events channel should be open");
+        last_two.push(ev);
+    }
+    assert!(
+        matches!(
+            last_two.as_slice(),
+            [AgentEvent::OutputEnded, AgentEvent::Exited { .. }]
+        ),
+        "got {last_two:?}"
+    );
+    last_two.pop().expect("two events read")
+}
+
 #[tokio::test]
 async fn driver_task_parses_stdout_into_typed_events() {
     // Subprocess prints two CC-format lines then exits. The driver must
@@ -82,10 +107,8 @@ async fn driver_task_parses_stdout_into_typed_events() {
         other => panic!("expected Result, got {:?}", other),
     }
 
-    let exited = tokio::time::timeout(std::time::Duration::from_secs(5), agent.events_rx.recv())
-        .await
-        .expect("driver should emit Exited after EOF")
-        .expect("events channel should be open");
+    let exited =
+        output_ended_then_exited(&mut agent.events_rx, std::time::Duration::from_secs(5)).await;
     // Clean exit (printf then EOF) — not a signal kill.
     assert!(matches!(
         exited,
@@ -104,6 +127,14 @@ async fn driver_task_cancellation_terminates_process() {
     let (mut agent, cancel) = spawn_driver_for_test("sh", &["-c", "sleep 30"]).await;
 
     cancel.cancel();
+
+    // `OutputEnded` comes at once, ahead of the teardown below. A stopped
+    // session reads only up to it, so a stop never waits out the grace.
+    let ended = tokio::time::timeout(std::time::Duration::from_secs(1), agent.events_rx.recv())
+        .await
+        .expect("OutputEnded well inside the teardown grace")
+        .expect("events channel should be open");
+    assert!(matches!(ended, AgentEvent::OutputEnded), "got {ended:?}");
 
     // The cancel path is NOT instant: it runs `graceful_kill_child_process_group`,
     // whose `GROUP_TEARDOWN_GRACE` is a FIXED `tokio::time::sleep` (it can't
@@ -174,10 +205,7 @@ async fn driver_task_flags_stray_signal_kill() {
         libc::kill(pid as i32, libc::SIGTERM);
     }
 
-    let exited = tokio::time::timeout(std::time::Duration::from_secs(5), events_rx.recv())
-        .await
-        .expect("driver should emit Exited within 5s of the kill")
-        .expect("events channel should be open");
+    let exited = output_ended_then_exited(&mut events_rx, std::time::Duration::from_secs(5)).await;
     assert!(
         matches!(
             exited,
@@ -358,11 +386,11 @@ async fn driver_task_detects_subprocess_exit_when_grandchild_holds_stdout_busy()
         first,
     );
 
-    // Second event: Exited.
+    // Then OutputEnded and Exited.
     //
     // "noise" lines are not valid CC JSON, so parse_line returns no
-    // events for them — the events channel sees Init then Exited
-    // with no intermediate events. The parent shell exits within
+    // events for them — the events channel sees Init, then OutputEnded
+    // and Exited, with no intermediate events. The parent shell exits within
     // milliseconds of the echo; the OS delivers SIGCHLD immediately,
     // and child.wait() in the select! loop resolves on the next
     // poll. We allow 2 seconds to tolerate CI scheduler jitter.
@@ -371,23 +399,11 @@ async fn driver_task_detects_subprocess_exit_when_grandchild_holds_stdout_busy()
     // 2 seconds — the grandchild's 100ms noise cadence outpaces the
     // 500ms try_wait poll's re-arm cycle, and the driver never
     // notices the parent died.
-    let second = tokio::time::timeout(std::time::Duration::from_secs(2), agent.events_rx.recv())
-        .await
-        .expect(
-            "AgentEvent::Exited did not arrive within 2s of subprocess death. \
-             The grandchild keeps stdout busy with a noise line every ~100ms, \
-             starving the (removed) 500ms try_wait poll. driver_task needs \
-             `child.wait()` as a direct select! arm to detect parent exit \
-             regardless of stdout state — without it, the engine wedges at \
-             status='running' forever.",
-        )
-        .expect("events channel closed without Exited");
-    assert!(
-        matches!(second, AgentEvent::Exited { .. }),
-        "second event must be Exited (grandchild noise is unparseable and \
-         produces no events), got {:?}",
-        second,
-    );
+    // Without the `child.wait()` select! arm the grandchild's noise starves
+    // the driver, it never notices the parent died, and this times out.
+    let last =
+        output_ended_then_exited(&mut agent.events_rx, std::time::Duration::from_secs(2)).await;
+    assert!(matches!(last, AgentEvent::Exited { .. }), "got {last:?}");
 }
 
 /// A line that arrives in two chunks survives an input sent between them.
@@ -501,6 +517,44 @@ async fn a_split_last_line_ended_by_stdout_eof_still_arrives() {
             .iter()
             .any(|ev| matches!(ev, AgentEvent::Result { text, .. } if text == "done")),
         "the last line must arrive, got {events:?}"
+    );
+}
+
+/// A process that dies mid-call writes no `message_delta` and no `result`,
+/// but the provider already billed the prompt. The driver reports the open
+/// call when stdout ends, ahead of `Exited`.
+#[tokio::test]
+async fn a_call_open_when_the_process_dies_still_reports_its_usage() {
+    let start = r#"{"type":"stream_event","parent_tool_use_id":null,"event":{"type":"message_start","message":{"id":"msg_cut","model":"claude-sonnet-5","usage":{"input_tokens":2,"cache_read_input_tokens":40000,"cache_creation_input_tokens":300,"output_tokens":4}}}}"#;
+    let script = format!("printf '%s\\n' '{start}'; exit 1");
+    let (mut agent, _cancel) = spawn_driver_for_test("sh", &["-c", &script]).await;
+
+    let mut events = Vec::new();
+    loop {
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(10), agent.events_rx.recv())
+            .await
+            .expect("an event before the timeout")
+            .expect("events channel open");
+        let exited = matches!(ev, AgentEvent::Exited { .. });
+        events.push(ev);
+        if exited {
+            break;
+        }
+    }
+    let usage = events.iter().position(|ev| {
+        matches!(
+            ev,
+            AgentEvent::Usage {
+                input_tokens: 2,
+                cache_read_tokens: 40_000,
+                cache_creation_tokens: 300,
+                ..
+            }
+        )
+    });
+    assert!(
+        usage.is_some_and(|i| i + 3 == events.len()),
+        "the open call reports just ahead of OutputEnded and Exited, got {events:?}"
     );
 }
 
@@ -667,7 +721,7 @@ async fn a_withdraw_never_overtakes_its_input() {
             .expect("driver finishes")
     {
         assert!(
-            matches!(ev, AgentEvent::Exited { .. }),
+            matches!(ev, AgentEvent::OutputEnded | AgentEvent::Exited { .. }),
             "the withdraw reply must never reach the session: {ev:?}"
         );
     }

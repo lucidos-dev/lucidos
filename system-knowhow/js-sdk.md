@@ -289,7 +289,7 @@ stays out of the way of a drag that is not a pane swipe:
 | Text | `--text-primary`, `--text-secondary`, `--text-muted`, `--text-on-accent`, `--text-strong` (bold text where the UI font has no bold face). `<html>` carries `data-font-bold="none"` for such a font and `"face"` otherwise, and `sdk-iframe.css` then paints `strong` and `b` inside `.markdown-content` with it. Key your own bold on the same attribute: `html[data-font-bold="none"] .my-label b { color: var(--text-strong); }` |
 | Border | `--border-color` |
 | Accents | `--accent`, `--accent-light`, `--accent-green`, `--accent-yellow`, `--accent-red` |
-| Focus | `--focus-ring` — a ready-made `box-shadow` value (a soft accent band) for focus indicators; the `.action-btn`/`.icon-btn` classes use it, and your own controls match the host with `:focus-visible { box-shadow: var(--focus-ring); }` |
+| Focus | `--focus-ring` — a ready-made `box-shadow` value (a soft accent band) for focus indicators; the `.action-btn`/`.icon-btn` classes use it, and your own controls match the host with `:focus-visible { box-shadow: var(--focus-ring); }`. `--focus-ring-width` (`0.1875rem`) is that band's width. The band paints outside the control, so a box of yours that scrolls or clips (`overflow` other than `visible`) cuts it where a control touches its edge. Give such a box that much padding on the edge, and hand it back with a negative margin if nothing should move. |
 | Shadows | `--shadow-sm`, `--shadow-md`, `--shadow-lg` |
 | Shape | `--radius-control` (`0.5rem`), `--radius-surface` (`0.75rem`), `--radius-round` (`999px`): the theme's corner steps. The shared component classes round with them, so a square theme squares them. Scale one with `calc()` to follow the theme in your own CSS. |
 | Layout (theme-independent) | `--font-ui`, `--font-mono`, `--font-features-text`, `--font-features-code`, `--transition`, `--user-ui-scale`, plus the spacing / radius / motion scales below |
@@ -429,7 +429,7 @@ class names are the contract:
 | `.label` (+ `.label-success`, `.label-warning`, `.label-error`, `.label-neutral`) | A small uppercase chip for a status or a category: the host's own. The bare class is the accent tone, and the tones are additive: `class="label label-success"`. They use the toast's words, so a status reads the same in a chip and in a toast. **Use this instead of drawing your own badge, chip or pill.** A pill the user taps is a button, not a label: see `.pill-bar`. |
 | `.title` | A list/panel/modal title |
 | `.segmented-control` + `.segmented-btn` (`.active`) | A toggle button group: a few mutually exclusive options with one picked. Two or three segments is what it is for. Not page navigation, and not a long strip: the control has no room to say where a link goes, and past a handful of segments it wraps onto a second row and reads as options to weigh rather than places to go. Use `.pill-bar` as tabs to switch between views, or a list of rows to go somewhere. It does wrap when the segments pass their container, so a squeezed strip keeps every label on one line. |
-| `.pill-bar` + `.pill-bar-btn` | A row of pills with one picked, the one Settings > Theme filters its families with. Two uses, told apart by the markup. **Tabs** that switch between views: `<div class="pill-bar" role="tablist">` holding `<button class="pill-bar-btn" role="tab" aria-selected="true">`. A **filter** that narrows one list: `role="group"` with `aria-pressed` on each button. Set the attribute to `true` on the picked pill, and the bar marks it. It stays on one line and scrolls sideways when the pills do not fit. On a touch screen each pill takes taps `--pill-bar-hit-slop` (0.5rem) above and below itself without growing. A bar you give your own vertical padding adds `var(--pill-bar-hit-slop, 0rem)` to it, or the extra reach is cut off. **Use this instead of drawing your own tabs or filter pills.** |
+| `.pill-bar` + `.pill-bar-btn` | A row of pills with one picked, the one Settings > Theme filters its families with. Two uses, told apart by the markup. **Tabs** that switch between views: `<div class="pill-bar" role="tablist">` holding `<button class="pill-bar-btn" role="tab" aria-selected="true">`. A **filter** that narrows one list: `role="group"` with `aria-pressed` on each button. Set the attribute to `true` on the picked pill, and the bar marks it. It stays on one line and scrolls sideways when the pills do not fit. On a touch screen each pill takes taps `--pill-bar-hit-slop` (0.5rem) above and below itself without growing. The bar pads out room for that reach and for the pills' focus rings (`--focus-ring-width`). A negative margin hands back the room above and below, so the pills sit `--focus-ring-width` in from the bar's sides. A bar you give your own padding keeps both, or a ring or the extra reach is cut off. **Use this instead of drawing your own tabs or filter pills.** |
 | `.list-rows`, `.list-row`, `.list-row-info`, `.list-row-name`, `.list-row-actions`, `.list-section-title`, … | List/row layouts |
 | `.list-row-add-card` (+ `.list-row-add-icon`, `.list-row-add-label`) | The "+ Add <thing>" row that closes a list. **Put it on a `<button type="button">`**, not a clickable `<div>`: the class carries the UA button reset and a `:focus-visible` ring, so on a button the card is in the tab order and answers Enter and Space, and on a div it is reachable by pointer only. Markup is `<button class="list-row-add-card"><span class="list-row-add-icon">+</span><span class="list-row-add-label">Add Thing</span></button>`. |
 | `.list-row-details` (+ `.list-row-details-prose`) | The small muted line under a row title. The base class is a flex row of metadata fields whose 0.75rem gap IS the separator between them, so a **sentence** takes the additive prose variant (`class="list-row-details list-row-details-prose"`): under the bare flex class every inline `<strong>`/`<code>` becomes its own flex item, which opens gaps mid-sentence and strands the punctuation after the element at the start of the next line. |
@@ -792,6 +792,9 @@ The engine already holds working credentials + routing for every model provider 
 - **`apis.json` overrides the builtin.** An entry with the same name in `data/config/apis.json` is used instead — so you can still point `openai` at a mock/gateway or add extra auth layers.
 - **Vertex is addressed by suffix.** The engine owns the `…/projects/<project>/locations/<region>` prefix (project + region from its own Vertex config, region default `europe-west1`) and mints the OAuth token — so the app never needs the project id or a token. Send only `/publishers/<publisher>/models/<model>:<method>`. The region is fixed to the engine's configured region; a model that must run in another location (e.g. a `global`-only Gemini variant) needs an `apis.json` override.
 - **Not configured → 404.** If the provider has no credential/config (and no `apis.json` entry), the call returns 404 naming what to set.
+- **Every default base already includes `/v1`.** Send `/models`, never `/v1/models`, which doubles the segment and answers 404. A `local` base you configure yourself may lack it.
+- **`opencode-free` has no proxy.** The keyless free tier serves chat only, and an app must not build on an anonymous endpoint that can vanish without notice (ADR 0104).
+- **The same proxies serve scripts and the agent.** `lucidos proxy <name>` and the `proxy_request` tool resolve names exactly as this route does.
 
 ```js
 // Chat via the built-in OpenAI proxy — no apis.json, no key in the app
@@ -975,8 +978,8 @@ Denied, and each for a reason worth knowing:
 | answering a question, every consent route, the `/internal/` tree | an app never answers as the user |
 | applying a change, restarting, rebuilding, installing a plugin | an app does not change the platform under the user |
 | writing an env var (the read is open) | an env var reaches every command the agent runs, so a loader-hook name would be host code execution |
-| writing a preference the Lucidos Agent may not write | a security setting such as the command guard stays the user's, changed in Settings |
-| writing the coding-agent paths, their permission mode, or `local_base_url` | a path could run the app's own script as the user, and the URL would send local-model chat to the app's host |
+| writing a preference the Lucidos Agent may not write | a security setting such as the command guard or the local model host (`local_base_url`) stays the user's, changed in Settings |
+| writing the coding-agent paths or their permission mode | a path could run the app's own script as the user |
 | reading or writing engine bookkeeping such as `vapid_keys` | it is engine state, not a setting: a read leaves it out |
 | message bodies, history, search, memory | an app sees that a thread exists, never what is in it |
 | repositories, `/browse-directories`, `/workspaces` | outside the workspace |
@@ -1268,11 +1271,11 @@ workspace-scoped `ws:<slug>:lucidos-device-id`. Pass `null` to fetch only
 globally-scoped preferences.
 
 `set()` refuses a key the Lucidos Agent may not write either, such as
-`command_guard`, `max_tool_calls` or `network_bind`. Those are security
-settings, and the user changes them in Settings. It also refuses the keys that
-choose what a coding-agent session spawns (`coding_agent_claude_path`,
-`coding_agent_codex_path`, `coding_agent_claude_permission_mode`) and where
-local-model chat goes (`local_base_url`).
+`command_guard`, `max_tool_calls`, `network_bind` or `local_base_url`. Those
+are security settings, and the user changes them in Settings. It also refuses
+the keys that choose what a coding-agent session spawns
+(`coding_agent_claude_path`, `coding_agent_codex_path`,
+`coding_agent_claude_permission_mode`).
 
 The engine's own bookkeeping, such as the Web Push keypair in `vapid_keys`, is
 not a setting. `get()` leaves it out, and `set()` refuses it.
@@ -1583,6 +1586,15 @@ interface ThreadSummary {
   compose_text: string;
   compose_images: string[];
   compose_mode?: 'lucidos' | 'claude_code' | null;
+  /** The reader fields. Present on `lucidos.threads.list` rows only, like
+   *  `pending_sub_thread_change_count`. `has_draft` says whether the thread
+   *  holds an unsent *draft*; `draft_preview` (its first 200 characters) and
+   *  `draft_length` (in characters) appear only when it does. `link` is the
+   *  *thread link*, `thread:<workspace>/<thread_id>`. */
+  has_draft?: boolean;
+  draft_preview?: string;
+  draft_length?: number;
+  link?: string;
 }
 ```
 
@@ -1654,7 +1666,7 @@ discoverable and type-checked (§ Types, under lucidos.notifications).
 | `app` | `id` (or `app_id`), `fragment` (optional) | Open an app UI, optionally at a place inside it. See the fragment param below. |
 | `settings` | `settings_view` (optional) | Open Settings, optionally a sub-section: `models`, `permissions`, `mcp`, `coding-agents`, `accounts`, `locale`, `marketplaces`, `access`, `devices`, `appearance`, `keyboard-shortcuts`, or a System page (`system` is the list of them; `system-overview`, `release-notices`, `whats-new`, `backup`, `memory`, `disk-usage`, `environment-variables`, `thread-queue`, `debugging` are the pages themselves). Omit `settings_view` for the Settings home list. |
 | `new-chat` | `prompt` (optional) | Open a fresh chat thread, optionally prefilling the compose textarea. Prefer `lucidos.ui.startThread()` — it's the typed wrapper around this target. |
-| `plugins` | `id` (optional) | Open the Plugins panel's Installed tab. With `id` (a plugin id), scroll to and pulse-highlight that plugin's row — used by the plugin-update notification so a tap lands on the plugin that has the pending update. |
+| `plugins` | `id` (optional) | Open the Plugins panel's Installed tab. With `id` (a plugin id), scroll to and pulse-highlight that plugin's row — used by the plugin-update notification so a tap on a single update lands on its plugin. |
 | `app-store` | — | Open the Plugins panel's Store (marketplace) tab. |
 | `file` | `file_path`, `line` (optional), `line_end` (optional) | Open a file in the preview pane, optionally at a line. See the two accepted path forms and the line params below. |
 | _other panels_ | — | `files`, `apps`, `triggers`, `thread-queue`, `changes`, `notifications`; plus `trigger` (`id`), `url` (`url`), `new-app`, `new-trigger`. |

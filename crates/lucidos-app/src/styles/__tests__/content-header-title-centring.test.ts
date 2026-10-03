@@ -37,7 +37,7 @@ import { dirname, resolve } from 'node:path';
 // @ts-expect-error: same
 import { fileURLToPath } from 'node:url';
 
-import { cssRules, rulesTargeting, type CssRule } from './css-rule-helpers';
+import { cssRules, focusRingWidthRem, rulesTargeting, type CssRule } from './css-rule-helpers';
 
 const here: string = dirname(fileURLToPath(import.meta.url));
 const stylesDir: string = resolve(here, '..');
@@ -153,7 +153,7 @@ describe('the content title is centred on the row, not between the icons', () =>
     const iconBox = parseFloat(desktopRoot().props.get('--header-icon-box')!);
     const base = readFileSync(resolve(stylesDir, 'global/base.css'), 'utf-8');
     const glyph = parseFloat(/--icon-size-lg:\s*([\d.]+)rem/.exec(base)![1]);
-    const band = parseFloat(/0 0 0 ([\d.]+)rem/.exec(/--focus-ring:([^;]+);/.exec(base)![1])![1]);
+    const band = focusRingWidthRem(base);
     expect((iconBox - glyph) / 2, 'the inset band would paint over the glyph')
       .toBeGreaterThan(band);
   });

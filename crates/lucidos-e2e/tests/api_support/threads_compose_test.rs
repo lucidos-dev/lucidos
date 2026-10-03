@@ -922,3 +922,77 @@ async fn put_compose_without_an_epoch_is_unfenced() {
     let (_state, text, _images, _mode) = fetch_compose_row(&pool, id).await;
     assert_eq!(text, "from a client that predates the fence");
 }
+
+fn drafts_url() -> String {
+    format!("{}/api/v1/threads/drafts", base_url())
+}
+
+/// A draft typed through the composer is listed by `GET /threads/drafts`, with
+/// an edit time and its owning thread's link, and readable whole by id. This is
+/// the read the agent was missing: one call says which thread holds what.
+#[tokio::test]
+async fn a_composed_draft_is_listed_with_its_edit_time_and_thread_link() {
+    let client = user_client().await;
+    let id = Uuid::new_v4();
+    client
+        .post(threads_url())
+        .json(&json!({ "id": id, "mode": "lucidos" }))
+        .send()
+        .await
+        .expect("POST /threads failed");
+    let text = format!("Draft for the drafts read {id}");
+    let resp = client
+        .put(compose_url(&id))
+        .json(&json!({ "text": text }))
+        .send()
+        .await
+        .expect("PUT compose failed");
+    assert_eq!(resp.status(), 204);
+
+    let drafts: serde_json::Value = client
+        .get(format!("{}?limit=1000", drafts_url()))
+        .send()
+        .await
+        .expect("GET drafts failed")
+        .json()
+        .await
+        .expect("drafts JSON");
+    let row = drafts
+        .as_array()
+        .expect("an array")
+        .iter()
+        .find(|d| d["thread_id"] == id.to_string())
+        .expect("the composed draft is listed");
+    assert_eq!(row["preview"], text);
+    assert_eq!(row["state"], "composing");
+    assert!(row["last_edited"].is_string(), "the PUT dates the draft");
+    let link = row["link"].as_str().expect("a link");
+    assert!(
+        link.starts_with("thread:") && link.ends_with(&format!("/{id}")),
+        "the link is the owning thread's: {link}"
+    );
+    assert!(row.get("text").is_none(), "the list carries previews only");
+
+    let one: serde_json::Value = client
+        .get(format!("{}?thread_id={id}", drafts_url()))
+        .send()
+        .await
+        .expect("GET one draft failed")
+        .json()
+        .await
+        .expect("draft JSON");
+    assert_eq!(one["text"], text);
+
+    // Discarding the thread clears its draft, so it drops out.
+    client
+        .delete(thread_url(&id))
+        .send()
+        .await
+        .expect("DELETE failed");
+    let gone = client
+        .get(format!("{}?thread_id={id}", drafts_url()))
+        .send()
+        .await
+        .expect("GET discarded draft failed");
+    assert_eq!(gone.status(), 404, "a discarded thread holds no draft");
+}

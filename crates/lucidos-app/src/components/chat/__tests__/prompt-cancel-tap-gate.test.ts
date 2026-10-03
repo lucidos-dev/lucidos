@@ -40,6 +40,18 @@ function findActivationBody(name: string): string {
   throw new Error(`${name} call is unbalanced in PromptInput.tsx`);
 }
 
+/** The `holdHandlers` object literal, found by balancing braces. */
+function findHoldHandlers(): string {
+  const start = promptSource.indexOf('const holdHandlers = {');
+  if (start < 0) throw new Error('holdHandlers not found in PromptInput.tsx');
+  let depth = 0;
+  for (let i = promptSource.indexOf('{', start); i < promptSource.length; i++) {
+    if (promptSource[i] === '{') depth++;
+    else if (promptSource[i] === '}' && --depth === 0) return promptSource.slice(start, i + 1);
+  }
+  throw new Error('holdHandlers is unbalanced in PromptInput.tsx');
+}
+
 describe('send-cancel-morph button has tap-gate scroll protection', () => {
   it('imports createTapGate from utils/tapGesture', () => {
     expect(promptSource).toMatch(/import\s*\{[^}]*\bcreateTapGate\b[^}]*\}\s*from\s*['"]\.\.\/\.\.\/utils\/tapGesture['"]/);
@@ -49,19 +61,22 @@ describe('send-cancel-morph button has tap-gate scroll protection', () => {
     expect(promptSource).toMatch(/useMemo\(\s*\(\s*\)\s*=>\s*createTapGate\(\)/);
   });
 
+  // The pointer half lives in `holdHandlers`, shared with the lone Submit, so
+  // both faces that end the row feed the gate the same way.
+  it('takes its pointer handlers from the shared hold handlers', () => {
+    expect(findMorphButton()).toMatch(/\{\.\.\.holdHandlers\}/);
+  });
+
   it('wires onPointerDown to gate.down(event)', () => {
-    const btn = findMorphButton();
-    expect(btn).toMatch(/onPointerDown=\{\s*([a-zA-Z]+)\s*=>\s*\{?[^}]*?morphGate\.down\(\s*\1\s*\)/);
+    expect(findHoldHandlers()).toMatch(/onPointerDown: \(([a-zA-Z]+): PointerEvent\) => \{[^}]*?morphGate\.down\(\s*\1\s*\)/);
   });
 
   it('wires onPointerMove to gate.move(event)', () => {
-    const btn = findMorphButton();
-    expect(btn).toMatch(/onPointerMove=\{\s*([a-zA-Z]+)\s*=>\s*\{?[^}]*?morphGate\.move\(\s*\1\s*\)/);
+    expect(findHoldHandlers()).toMatch(/onPointerMove: \(([a-zA-Z]+): PointerEvent\) => \{[^}]*?morphGate\.move\(\s*\1\s*\)/);
   });
 
   it('wires onPointerCancel to gate.cancel()', () => {
-    const btn = findMorphButton();
-    expect(btn).toMatch(/onPointerCancel=\{[^}]*\.cancel\(\)/);
+    expect(findHoldHandlers()).toMatch(/onPointerCancel: \([^)]*\) => \{[^}]*morphGate\.cancel\(\)/);
   });
 
   it('hands the gate to every path that could fire from a scroll', () => {
@@ -113,6 +128,12 @@ describe('answer control Cancel/Submit have tap-gate scroll protection', () => {
     // Through `useTouchActivated`'s gate argument rather than inline, for the
     // reason the morph button's case above gives.
     expect(findActivationBody('answerSubmitActivate')).toMatch(/\}, true, morphActivationGate\)$/);
+  });
+
+  it('feeds the lone Submit\'s pointer to the gate through the shared hold handlers', () => {
+    const submit = promptSource.match(/answerMode === 'submit' \? \([\s\S]*?<\/button>/)?.[0] ?? '';
+    expect(submit, 'the lone Submit not found').not.toBe('');
+    expect(submit).toMatch(/\{\.\.\.holdHandlers\}/);
   });
 });
 
@@ -292,7 +313,10 @@ describe('the prompt row survives the iOS keyboard dropping a click', () => {
 
   it('never returns from submit without saying something', () => {
     // The queued-upload branch used to return with nothing on screen, which is
-    // the exact shape this whole change is about.
-    expect(promptSource).toMatch(/queueUploadSend\(threadId, \{ useCodingAgent, context \}\);[\s\S]{0,300}?showToast\(UPLOAD_QUEUED_SEND_TOAST/);
+    // the exact shape this whole change is about. The composer's upload line
+    // says it is waiting, for as long as it waits.
+    expect(promptSource).toMatch(/queueUploadSend\(threadId, \{ useCodingAgent, context \}\);/);
+    expect(promptSource).toContain('uploadSendNotice(queuedUploadSends.value.get(focusedTid)');
+    expect(promptSource).toContain('data-role="upload-send-notice"');
   });
 });

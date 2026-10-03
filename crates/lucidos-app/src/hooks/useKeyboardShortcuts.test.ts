@@ -21,6 +21,14 @@ vi.mock('../components/layout/ContentHeaderActions', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../components/layout/ContentHeaderActions')>();
   return { ...actual, toggleAppFullscreenIfShown: vi.fn(), toggleSourceView: vi.fn(), toggleLineWrap: vi.fn() };
 });
+vi.mock('../components/drawer/ThreadDrawer', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../components/drawer/ThreadDrawer')>();
+  return { ...actual, openHighlightedThreadActions: vi.fn(() => false) };
+});
+vi.mock('../components/chat/ThreadTitle', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../components/chat/ThreadTitle')>();
+  return { ...actual, openThreadTitleMenu: vi.fn() };
+});
 
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
@@ -31,7 +39,9 @@ import { fileURLToPath } from 'node:url';
 import { dispatchEscape, classifyChord, dispatchForwardedChord, dispatchPreviewIframeShortcut, shouldTypeToFocusPrompt, isMacTextEditingKey } from './useKeyboardShortcuts';
 import { isTextInput, isThreadTranscript } from '../utils/dom';
 import { pushOverlay, _resetOverlayStackForTesting } from '../store/overlayStack';
-import { focusedPane, splitRatio, searchEverywhereAnchor, searchEverywhereOpen } from '../store/store';
+import { focusedPane, focusedThreadId, splitRatio, searchEverywhereAnchor, searchEverywhereOpen } from '../store/store';
+import { openHighlightedThreadActions } from '../components/drawer/ThreadDrawer';
+import { openThreadTitleMenu } from '../components/chat/ThreadTitle';
 import { promptStopRequested, promptSideQuestionRequested } from '../components/chat/prompt-input-helpers';
 import { applyFocusedThreadChange, showFocusedThreadDiff } from '../components/chat/WaitingBanner';
 import { toggleFollowLiveEdge, pressCallToggleIfShown } from '../components/chat/PromptRowControls';
@@ -419,6 +429,37 @@ describe('the toggle shortcuts reach their actions', () => {
   ])('Ctrl+Shift+%s runs its action', (key, action) => {
     dispatchForwardedChord(ctrlShift(key));
     expect(action).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('the Open thread actions shortcut', () => {
+  const menuChord = { metaKey: false, ctrlKey: true, shiftKey: true, altKey: false, key: 'm' };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => { cb(0); return 0; });
+    splitRatio.value = 0.5;
+  });
+
+  it('opens the highlighted drawer row\'s menu, and not the open thread\'s too', () => {
+    vi.mocked(openHighlightedThreadActions).mockReturnValueOnce(true);
+    focusedThreadId.value = 't1';
+    dispatchForwardedChord(menuChord);
+    expect(openThreadTitleMenu).not.toHaveBeenCalled();
+    focusedThreadId.value = null;
+  });
+
+  it('opens the open thread\'s menu when no drawer row has the focus', () => {
+    focusedThreadId.value = 't1';
+    dispatchForwardedChord(menuChord);
+    expect(openThreadTitleMenu).toHaveBeenCalledTimes(1);
+    focusedThreadId.value = null;
+  });
+
+  it('does nothing with no thread open', () => {
+    focusedThreadId.value = null;
+    dispatchForwardedChord(menuChord);
+    expect(openThreadTitleMenu).not.toHaveBeenCalled();
   });
 });
 

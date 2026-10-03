@@ -1388,6 +1388,7 @@ impl LucidosEngine {
             spawns_in_flight: Arc::default(),
             pending_app_spawn: std::sync::Mutex::new(HashMap::new()),
             follow_up_order: Default::default(),
+            accepted_messages: Default::default(),
             cc_spawn_coalesce: agent_session::CcSpawnCoalescer::new(),
             cc_startup_semaphore: Arc::new(tokio::sync::Semaphore::new(2)),
             mcp_manager,

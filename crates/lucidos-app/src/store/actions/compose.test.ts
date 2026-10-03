@@ -23,7 +23,7 @@ vi.mock('../../api/threads', () => ({
   fetchThreadEvents: vi.fn().mockResolvedValue({ events: [], currentAggregate: null }),
 }));
 
-import { seedSuggestion, clearSupersededDraft, composeEditedAt, discardCompose, hasUnsentLocalDraft, ensureFocusedComposeThread, flushUndeliveredComposeDrafts, pendingComposePuts, prefillCompose, sendCompose, sendFollowup, startSetupInterview, updateCompose, applyRemoteCompose, _composeEpochForTesting, _resetUndeliveredComposeDraftsForTesting, _undeliveredComposeDraftsForTesting } from './compose';
+import { seedSuggestion, clearSupersededDraft, composeEditedAt, discardCompose, hasUnsentLocalDraft, ensureFocusedComposeThread, flushUndeliveredComposeDrafts, awaitThreadStarted, isThreadStartPending, pendingComposePuts, prefillCompose, sendCompose, sendFollowup, startSetupInterview, updateCompose, applyRemoteCompose, _composeEpochForTesting, _resetUndeliveredComposeDraftsForTesting, _undeliveredComposeDraftsForTesting } from './compose';
 import { focusThread, unfocusThread } from './threads';
 import { connectionStatus, confirmState, focusedThreadId, focusedPane, inputMode, threadMap, selectedScope, FOCUSED_THREAD_KEY, toasts } from '../store';
 import { promptOverrideSyncSeq, promptOverrideReplacesDraft } from '../../components/chat/promptValueSync';
@@ -39,6 +39,8 @@ import {
 } from './thread-navigation';
 import type { ThreadMeta, ThreadState } from '../thread-events';
 import { _resetComposeDraftsForTesting, getDraft, setDraft, type ComposeDraft } from '../composeDrafts';
+import { retryUnsentMessage } from './chat';
+import { unsentMessages } from '../unsentMessages';
 
 const originalFetch = globalThis.fetch;
 
@@ -75,6 +77,7 @@ function makeThread(overrides: MakeThreadOpts = {}): ThreadState {
       summaryVersion: 0,
       codingAgentProposed: false,
       codingAgentRequiresRestart: false,
+      codingAgentIncomplete: false,
       codingAgentIsExternalRepo: false,
       codingAgentHasDiff: false,
       lastRevivedAt: '',
@@ -1919,6 +1922,58 @@ describe('a send leaves the engine holding an empty draft', () => {
     expect(texts[texts.length - 1]).toBe('and one more thing');
   });
 
+  /** An unsent first send consumed nothing on the engine. Clearing its draft
+   *  there could only lose the text a reload would bring back. */
+  it('an unsent first send keeps the engine draft until a retry is accepted', async () => {
+    let chatAnswers = false;
+    mockFetch.mockImplementation((url: string) => {
+      if (String(url).endsWith('/chat/stream') && !chatAnswers) {
+        return Promise.reject(new TypeError('Load failed'));
+      }
+      return Promise.resolve(chatAccepted());
+    });
+    threadMap.value = new Map([['t-1', makeThread({ id: 't-1', state: 'composing', composeText: 'the draft' })]]);
+    patchComposeSelection('t-1', { model: 'claude-opus-5' });
+
+    await sendCompose('t-1', {});
+    await vi.runAllTimersAsync();
+
+    expect(composePutTexts()).not.toContain('');
+    expect(getComposeSelectionOverride('t-1').model).toBe('claude-opus-5');
+
+    chatAnswers = true;
+    const [eventId] = [...unsentMessages.value.keys()];
+    expect(await retryUnsentMessage(eventId)).toBe('sent');
+    await vi.runAllTimersAsync();
+
+    const texts = composePutTexts();
+    expect(texts[texts.length - 1]).toBe('');
+    expect(getComposeSelectionOverride('t-1').model).toBeUndefined();
+  });
+
+  it('a refused retry of an unsent first send rolls the draft back with its picks', async () => {
+    let chatAnswer: 'none' | 'refuse' = 'none';
+    mockFetch.mockImplementation((url: string) => {
+      if (String(url).endsWith('/chat/stream')) {
+        if (chatAnswer === 'none') return Promise.reject(new TypeError('Load failed'));
+        return Promise.resolve(new Response(JSON.stringify({ error: 'locked' }), { status: 409 }));
+      }
+      return Promise.resolve(chatAccepted());
+    });
+    threadMap.value = new Map([['t-1', makeThread({ id: 't-1', state: 'composing', composeText: 'the draft' })]]);
+    patchComposeSelection('t-1', { model: 'claude-opus-5' });
+
+    await sendCompose('t-1', {});
+    chatAnswer = 'refuse';
+    const [eventId] = [...unsentMessages.value.keys()];
+    expect(await retryUnsentMessage(eventId)).toBe('dropped');
+    await vi.runAllTimersAsync();
+
+    expect(threadMap.value.get('t-1')!.meta.state).toBe('composing');
+    expect(getDraft('t-1').text).toBe('the draft');
+    expect(getComposeSelectionOverride('t-1').model).toBe('claude-opus-5');
+  });
+
 });
 
 /**
@@ -2350,5 +2405,153 @@ describe('a compose backend pick is per-draft', () => {
     expect(chatBodies).toHaveLength(2);
     expect(chatBodies[0]).toMatchObject({ model: 'claude-opus-5-5', provider: 'anthropic' });
     expect(chatBodies[1].provider).toBeUndefined();
+  });
+});
+
+/**
+ * A first keystroke or a pasted image into a fresh draft fires `POST /threads`.
+ * An engine that does not answer has said nothing about the draft. So the
+ * draft, its row and its focus stay, and whoever needs the row next re-sends
+ * the start. Only a refusal rolls back. Plan:
+ * `docs/plans/2026-10-02-image-upload-progress-and-resilience.md`.
+ */
+describe('a thread start that gets no answer keeps the draft', () => {
+  /** No answer, one attempt: a `TimeoutError` skips `mutatingFetchIdempotent`'s
+   *  own transport retry. */
+  const noAnswer = () => new DOMException('signal timed out', 'TimeoutError');
+  const isStart = (url: unknown, init?: RequestInit) =>
+    String(url).endsWith('/threads') && init?.method === 'POST';
+
+  let mockFetch: ReturnType<typeof vi.fn>;
+  let startAnswers: Array<() => Promise<Response>>;
+
+  beforeEach(() => {
+    connectionStatus.value = 'connected';
+    focusedThreadId.value = null;
+    threadMap.value = new Map();
+    _resetComposeDraftsForTesting();
+    _resetUndeliveredComposeDraftsForTesting();
+    _resetThreadNavForTesting();
+    toasts.value = [];
+    startAnswers = [];
+    mockFetch = vi.fn((url: unknown, init?: RequestInit) => {
+      if (isStart(url, init)) {
+        const next = startAnswers.shift();
+        return next ? next() : Promise.resolve(new Response(null, { status: 200 }));
+      }
+      return Promise.resolve(new Response(null, { status: 204 }));
+    });
+    globalThis.fetch = mockFetch as unknown as typeof fetch;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    connectionStatus.value = 'disconnected';
+    focusedThreadId.value = null;
+    threadMap.value = new Map();
+    _resetComposeDraftsForTesting();
+    _resetUndeliveredComposeDraftsForTesting();
+    _resetThreadNavForTesting();
+    toasts.value = [];
+    vi.restoreAllMocks();
+  });
+
+  const starts = () => mockFetch.mock.calls.filter(([url, init]) => isStart(url, init as RequestInit));
+  const settle = () => new Promise((r) => setTimeout(r, 0));
+
+  it('keeps the row, the focus and the draft, and owes the start', async () => {
+    startAnswers.push(() => Promise.reject(noAnswer()));
+    const id = ensureFocusedComposeThread();
+    updateCompose(id, { text: 'typed while the engine was down' });
+    await settle();
+
+    expect(threadMap.value.has(id)).toBe(true);
+    expect(focusedThreadId.value).toBe(id);
+    expect(getDraft(id).text).toBe('typed while the engine was down');
+    expect(isThreadStartPending(id)).toBe(true);
+    expect(_undeliveredComposeDraftsForTesting()).toContain(id);
+    expect(toasts.value.some((t) => t.message.includes('Failed to start compose'))).toBe(false);
+  });
+
+  it('re-sends an owed start to whoever needs the row next', async () => {
+    startAnswers.push(() => Promise.reject(noAnswer()));
+    const id = ensureFocusedComposeThread();
+    await settle();
+    expect(starts()).toHaveLength(1);
+
+    await awaitThreadStarted(id);
+
+    expect(starts()).toHaveLength(2);
+    expect(isThreadStartPending(id)).toBe(false);
+    expect(threadMap.value.has(id)).toBe(true);
+  });
+
+  it('re-sends the start on the reconnect flush, then delivers the draft', async () => {
+    startAnswers.push(() => Promise.reject(noAnswer()));
+    const id = ensureFocusedComposeThread();
+    updateCompose(id, { text: 'kept' });
+    await settle();
+
+    flushUndeliveredComposeDrafts();
+    await vi.waitFor(() => expect(_undeliveredComposeDraftsForTesting()).toEqual([]));
+
+    expect(starts()).toHaveLength(2);
+    const puts = mockFetch.mock.calls.filter(([url, init]) =>
+      String(url).endsWith('/compose') && (init as RequestInit).method === 'PUT');
+    expect(puts.length).toBeGreaterThan(0);
+  });
+
+  it('still rolls back a start the engine refused', async () => {
+    startAnswers.push(() => Promise.resolve(new Response(JSON.stringify({ error: 'mode conflict' }), { status: 409 })));
+    const id = ensureFocusedComposeThread();
+    await settle();
+
+    expect(threadMap.value.has(id)).toBe(false);
+    expect(focusedThreadId.value).toBeNull();
+    expect(isThreadStartPending(id)).toBe(false);
+    expect(toasts.value.some((t) => t.message.includes('mode conflict'))).toBe(true);
+  });
+
+  it('a Send that gets no answer for the owed start keeps the draft and its row', async () => {
+    startAnswers.push(() => Promise.reject(noAnswer()), () => Promise.reject(noAnswer()));
+    const id = ensureFocusedComposeThread();
+    updateCompose(id, { text: 'send me' });
+    await settle();
+
+    await expect(sendCompose(id, { useCodingAgent: false })).rejects.toBeTruthy();
+
+    expect(threadMap.value.has(id)).toBe(true);
+    expect(getDraft(id).text).toBe('send me');
+    expect(isThreadStartPending(id)).toBe(true);
+  });
+
+  it('a re-sent start the engine refuses still says so and drops the nav entry and focus', async () => {
+    pushThreadNavState({ type: 'thread', id: 'prior-thread' });
+    startAnswers.push(
+      () => Promise.reject(noAnswer()),
+      () => Promise.resolve(new Response(JSON.stringify({ error: 'mode conflict' }), { status: 409 })),
+    );
+    const id = ensureFocusedComposeThread();
+    await settle();
+    expect(threadMap.value.has(id)).toBe(true);
+
+    await expect(awaitThreadStarted(id)).rejects.toBeTruthy();
+
+    expect(threadMap.value.has(id)).toBe(false);
+    expect(focusedThreadId.value).toBeNull();
+    expect(_threadNavStateForTesting().stack).toEqual([{ type: 'thread', id: 'prior-thread' }]);
+    expect(toasts.value.some((t) => t.message.includes('mode conflict'))).toBe(true);
+  });
+
+  it('discards an owed draft locally, with no DELETE to an engine that never held it', async () => {
+    startAnswers.push(() => Promise.reject(noAnswer()));
+    const id = ensureFocusedComposeThread();
+    await settle();
+
+    await discardCompose(id);
+
+    expect(threadMap.value.has(id)).toBe(false);
+    expect(isThreadStartPending(id)).toBe(false);
+    expect(mockFetch.mock.calls.some(([, init]) => (init as RequestInit | undefined)?.method === 'DELETE')).toBe(false);
   });
 });

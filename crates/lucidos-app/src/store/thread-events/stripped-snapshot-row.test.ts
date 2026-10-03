@@ -3,14 +3,13 @@ import { exchangeResponseEvents } from './exchange-render';
 import type { Exchange } from './exchange';
 import type { ResponseEvent } from '../types';
 
-/** A snapshot row arrives with its heavy fields already gone.
+/** A row arrives with its heavy fields already gone.
  *
  *  The engine strips `CodingAgentToolCalled.args` and
- *  `CodingAgentToolResult.result` (`api/threads/events_snapshot.rs`), because
- *  they were the bulk of a coding-agent thread's transfer and nothing renders
- *  them inline. Live SSE carries the args in full. It strips the result too
- *  (`EmittedEvent::to_sse_json`), because the result holds the agent's whole
- *  output. A full result row still reaches the fold from `include_context`.
+ *  `CodingAgentToolResult.result`, because they were the bulk of a coding-agent
+ *  thread's transfer and nothing renders them inline. The snapshot and the live
+ *  stream strip alike (`ThreadEvent::strip_tool_call_args`). A full row still
+ *  reaches the fold from `include_context`.
  *
  *  So the fold has to serve two shapes of the same event, and this pins what
  *  each owes. A stripped row must read identically in the transcript and must
@@ -36,8 +35,8 @@ function stepsOf(steps: Exchange['steps']): Extract<ResponseEvent, { type: 'step
     .filter((e): e is Extract<ResponseEvent, { type: 'step' }> => e.type === 'step');
 }
 
-/** The same call, as live SSE sends it and as the snapshot serves it. */
-const liveCall = () => ev({
+/** The same call, with its args (`include_context`) and stripped. */
+const fullCall = () => ev({
   type: 'CodingAgentToolCalled',
   name: 'Edit',
   description: 'Edit shell.css',
@@ -54,7 +53,7 @@ const strippedCall = () => ev({
   _eventId: 'evt-call',
 });
 
-const liveResult = () => ev({
+const fullResult = () => ev({
   type: 'CodingAgentToolResult',
   name: 'Edit',
   result: 'applied 1 hunk',
@@ -70,13 +69,13 @@ const strippedResult = () => ev({
 });
 
 describe('a stripped coding-agent tool call', () => {
-  it('renders the label a live one renders', () => {
+  it('renders the label a full one renders', () => {
     // The strip fills `description` before dropping `args`, so the two rows
     // reach the fold carrying the same label. That equality is the whole
     // safety of the strip: the label is the only thing the transcript draws.
-    const [live] = stepsOf([liveCall()]);
+    const [full] = stepsOf([fullCall()]);
     const [stripped] = stepsOf([strippedCall()]);
-    expect(stripped.description).toBe(live.description);
+    expect(stripped.description).toBe(full.description);
     expect(stripped.description).toBe('Edit shell.css');
   });
 
@@ -88,12 +87,31 @@ describe('a stripped coding-agent tool call', () => {
     expect(step.full).toBeUndefined();
   });
 
-  it('leaves a live row unmarked, with its command already resolved', () => {
-    const [step] = stepsOf([liveCall()]);
+  it('leaves a full row unmarked, with its command already resolved', () => {
+    const [step] = stepsOf([fullCall()]);
     expect(step.args_stripped).toBeUndefined();
     expect(step.full).toBe('/a/styles/shell.css');
     // Still addressed, so a modal opened on it can re-fetch if it ever needs to.
     expect(step.call_event_id).toBe('evt-call');
+  });
+});
+
+describe('a stripped chat tool call', () => {
+  // Every live chat call arrives this way, so the modal must know its channel
+  // to format the args it fetches back through the chat describer.
+  it('stamps the marker, the address and the chat channel', () => {
+    const [step] = stepsOf([ev({
+      type: 'ToolCalled',
+      name: 'run_bash',
+      description: 'Running ls',
+      args_stripped: true,
+      _eventId: 'evt-chat-call',
+    })]);
+    expect(step.description).toBe('Running ls');
+    expect(step.args_stripped).toBe(true);
+    expect(step.tool_channel).toBe('chat');
+    expect(step.call_event_id).toBe('evt-chat-call');
+    expect(step.full).toBeUndefined();
   });
 });
 
@@ -106,8 +124,8 @@ describe('a stripped coding-agent tool result', () => {
     expect(step.result_event_id).toBe('evt-result');
   });
 
-  it('leaves a live row unmarked, with its text already inline', () => {
-    const [step] = stepsOf([liveCall(), liveResult()]);
+  it('leaves a full row unmarked, with its text already inline', () => {
+    const [step] = stepsOf([fullCall(), fullResult()]);
     expect(step.result).toBe('applied 1 hunk');
     expect(step.result_stripped).toBeUndefined();
     expect(step.result_event_id).toBe('evt-result');

@@ -1073,10 +1073,19 @@
 }
 
 .question-option .question-option-indicator,
-.question-option-static .question-option-indicator {
+.question-option-static .question-option-indicator,
+.question-option-sending {
     /* Match the cap height of the option label so the dot aligns with the
        first line of text rather than floating above it. */
     margin-top: 0.1875rem;
+}
+
+/* Stands in for the picked indicator while the answer is in flight, at the
+   indicator's own size so the row does not move when it settles. */
+.question-option-sending.mini-spinner {
+    --spinner-color: var(--accent);
+    width: 0.875rem;
+    height: 0.875rem;
 }
 
 /* Two rules, and the split is the whole point. Same shape the toast's default
@@ -1420,6 +1429,12 @@
     margin-right: 0.125rem;
 }
 
+/* Stands in for the check while the decision is in flight. */
+.permission-btn-sending.mini-spinner {
+    --spinner-color: currentColor;
+    margin-right: 0.375rem;
+}
+
 /* Permissions settings: per-row editable allowlist (cc-allowed-tools and
    agent-allowed-commands). Each pattern is a monospace input + Delete button. */
 .allowlist-rows {
@@ -1672,6 +1687,9 @@ body:not(.is-touch) .code-block-copy-btn.copy-btn-copied {
 .exchange-error p {
     margin: 0;
     opacity: 0.85;
+}
+.exchange-error-retry {
+    margin-top: var(--space-sm);
 }
 
 /* Engine-limit notice, under the same no-stripe rule as .exchange-error.

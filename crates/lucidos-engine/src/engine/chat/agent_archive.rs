@@ -14,7 +14,9 @@
 
 use uuid::Uuid;
 
-use crate::api::threads::archive::{archive_family, ArchiveOutcome, ArchiveRejection};
+use crate::api::threads::archive::{
+    archive_family, ArchiveOutcome, ArchiveRejection, PinnedMembers,
+};
 use crate::engine::event_bus::BusEvent;
 use crate::engine::thread_events::{ActorMode, EventMeta, MessageOrigin, ThreadEvent};
 use crate::engine::thread_lifecycle::ThreadStatus;
@@ -212,10 +214,15 @@ impl crate::engine::LucidosEngine {
                 let engine = self.clone_arc();
                 // Boxed: the cascade's emits reach the fan-in, which can
                 // re-enter an agentic loop whose tool dispatch calls back here.
-                Box::pin(archive_family(&engine, target, actor))
-                    .await
-                    .map(AgentArchiveAck::Archived)
-                    .map_err(AgentArchiveError::Refused)
+                Box::pin(archive_family(
+                    &engine,
+                    target,
+                    actor,
+                    PinnedMembers::ByActor,
+                ))
+                .await
+                .map(AgentArchiveAck::Archived)
+                .map_err(AgentArchiveError::Refused)
             }
             AgentArchiveTarget::Caller => {
                 Box::pin(record_archive_request(&self.event_bus, target))

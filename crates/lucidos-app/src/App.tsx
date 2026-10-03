@@ -33,7 +33,7 @@ import {
   stepDetailModal,
   checkpointDiffModal,
   contextViewer,
-  eventConditionModal,
+  eventConditionPopover,
   searchEverywhereOpen,
   filePreviewModal,
 } from './store/store';
@@ -48,7 +48,7 @@ const MessageRoutePanel = lazyComponent(() => import('./components/chat/MessageR
 const StepDetailModal = lazyComponent(() => import('./components/chat/StepDetailModal').then(m => m.StepDetailModal));
 const CheckpointDiffModal = lazyComponent(() => import('./components/chat/CheckpointDiffModal').then(m => m.CheckpointDiffModal));
 const ContextViewerModal = lazyComponent(() => import('./components/chat/ContextViewerModal').then(m => m.ContextViewerModal));
-const EventConditionModal = lazyComponent(() => import('./components/chat/EventConditionModal').then(m => m.EventConditionModal));
+const EventConditionPopover = lazyComponent(() => import('./components/chat/EventConditionPopover').then(m => m.EventConditionPopover));
 const ScaleModal = lazyComponent(() => import('./components/shared/ScaleModal').then(m => m.ScaleModal));
 const SearchEverywhere = lazyComponent(() => import('./components/search/SearchEverywhere').then(m => m.SearchEverywhere));
 const FilePreviewModal = lazyComponent(() => import('./components/files/FilePreviewModal').then(m => m.FilePreviewModal));
@@ -61,7 +61,7 @@ function MessageRoutePanelSlot() { return messageRoutePanel.value    ? <MessageR
 function StepDetailModalSlot()   { return stepDetailModal.value      ? <StepDetailModal />   : null; }
 function CheckpointDiffSlot()    { return checkpointDiffModal.value  ? <CheckpointDiffModal /> : null; }
 function ContextViewerSlot()     { return contextViewer.value        ? <ContextViewerModal /> : null; }
-function EventConditionSlot()    { return eventConditionModal.value  ? <EventConditionModal /> : null; }
+function EventConditionSlot()    { return eventConditionPopover.value ? <EventConditionPopover /> : null; }
 function ScaleModalSlot()        { return scaleModalOpen.value       ? <ScaleModal />        : null; }
 // Slot-gated for a second reason beyond the leaf-scoped subscription: it keeps
 // the file preview renderers (which the content pane already lazy-loads) out of

@@ -29,6 +29,7 @@ import {
   systemAttentionBadge,
 } from '../../../store/systemAttentionBadge';
 import { drawerClosing, drawerOpen } from '../../layout/drawerState';
+import { tooltipWithShortcut } from '../../../store/actions/keybindings';
 
 const DRAWER = readFileSync(
   fileURLToPath(new URL('../../layout/Drawer.tsx', import.meta.url)), 'utf8',
@@ -112,14 +113,14 @@ describe('the menu hamburger', () => {
   it('names itself as before while there is no news', () => {
     const button = HamburgerButton() as AnyVNode;
     expect(button.props['aria-label']).toBe('Open menu');
-    expect(button.props['data-tooltip']).toBe('Open menu');
+    expect(button.props['data-tooltip']).toBe(tooltipWithShortcut('Open menu', 'toggleMenuDrawer'));
   });
 
   it('speaks the news in its own label, and its tooltip', () => {
     oweOne();
     const button = HamburgerButton() as AnyVNode;
     expect(button.props['aria-label']).toBe('Open menu · 1 thing to do');
-    expect(button.props['data-tooltip']).toBe('Open menu · 1 thing to do');
+    expect(button.props['data-tooltip']).toBe(tooltipWithShortcut('Open menu · 1 thing to do', 'toggleMenuDrawer'));
   });
 
   it('keeps the news beside the close action while the drawer is open', () => {

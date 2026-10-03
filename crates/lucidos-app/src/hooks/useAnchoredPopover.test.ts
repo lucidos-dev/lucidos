@@ -1012,8 +1012,8 @@ describe('makeDismissHandlers', () => {
   // behind whatever the user had just opened. `isTop` is the gate.
   //
   // A dropdown nested INSIDE a modal never showed this, because the modal's
-  // panel contains it. The pair that does is the event-wait condition modal
-  // opened from the waiting panel, which are siblings in the overlay layer.
+  // panel contains it. The pair that does is a confirm raised by a modal,
+  // which are siblings in the overlay layer.
   // ──────────────────────────────────────────────────────────────────────
   describe('when another overlay is stacked on top', () => {
     it('does not dismiss on a pointerdown meant for the overlay above', () => {

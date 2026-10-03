@@ -30,7 +30,10 @@
    the shell moved into its own file: `chat.css` imported `todo-list.css` after
    this file, and the shell's own `max-width` sat in there at the same
    specificity, so it beat this cap and the panel grew to the viewport. */
-.waiting-panel {
+/* The transcript chip's condition popover shows the same body as the drill-in,
+   so it shares these caps. */
+.waiting-panel,
+.event-condition-popover {
     min-width: min(18rem, var(--anchored-popover-fit));
     max-width: min(40rem, var(--anchored-popover-fit));
 }

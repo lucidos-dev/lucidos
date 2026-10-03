@@ -784,6 +784,9 @@ impl EventBus {
             // itself projects nothing (ADR 0310).
             ThreadEvent::ThreadArchiveRequested => Vec::new(),
 
+            // `resolve_transition` moves the thread; neither projects more.
+            ThreadEvent::ThreadUnarchived | ThreadEvent::ThreadTriageProposed { .. } => Vec::new(),
+
             // Save/unsave
             ThreadEvent::ThreadSaved => {
                 // The pin and the inbox land in ONE statement. A pinned thread
@@ -1786,7 +1789,7 @@ impl EventBus {
             .unwrap_or((None, false, false));
         // A trigger execution runs unattended, so its terminal event must not
         // surface it in REVIEW. Three things make one attended again.
-        // `trigger_go_to_review` ("Send to Review on completion") covers
+        // `trigger_go_to_review` ("Send directly to Archive" turned off) covers
         // reports the user is meant to read. A pin says the user is watching,
         // and a pinned thread is never archived (ADR 0312). A user follow-up
         // covers the rest: the latest start is a human `MessageReceived`.

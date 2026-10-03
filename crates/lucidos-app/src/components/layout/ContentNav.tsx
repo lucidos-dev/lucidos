@@ -21,8 +21,19 @@ import { NavChevron, type NavHistoryItem } from '../shared/NavChevron';
 import { SystemAttentionBadge } from '../shared/SystemAttentionBadge';
 import { systemAttentionBadge } from '../../store/systemAttentionBadge';
 
+function menuDrawerShown(): boolean {
+  return drawerOpen.value && !drawerClosing.value;
+}
+
+/** Open the menu drawer, or close it when it is open. `anchor` is the
+ *  hamburger pressed; the shortcut has none. */
+export function toggleMenuDrawer(anchor?: HTMLElement): void {
+  if (menuDrawerShown()) closeDrawer();
+  else openDrawer(anchor);
+}
+
 export function HamburgerButton() {
-  const isOpen = drawerOpen.value && !drawerClosing.value;
+  const isOpen = menuDrawerShown();
   // The first step of the path into System, so it carries the mark, and the
   // union of both causes because it leads to both tabs. The Settings row inside
   // the menu drawer carries the next step. The mark itself is decorative, so
@@ -40,12 +51,9 @@ export function HamburgerButton() {
   return (
     <button
       class={`icon-btn header-icon hamburger-panel${isOpen ? ' open' : ''}`}
-      onClick={(e) => {
-        if (isOpen) closeDrawer();
-        else openDrawer(e.currentTarget as HTMLElement);
-      }}
+      onClick={(e) => toggleMenuDrawer(e.currentTarget as HTMLElement)}
       aria-label={label}
-      data-tooltip={label}
+      data-tooltip={tooltipWithShortcut(label, 'toggleMenuDrawer')}
     >
       {isOpen ? <CloseIcon /> : <MenuIcon />}
       {changeCount > 0 && (

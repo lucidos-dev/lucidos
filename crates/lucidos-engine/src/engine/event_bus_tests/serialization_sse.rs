@@ -913,3 +913,52 @@ fn a_live_chat_tool_result_keeps_its_text() {
     assert_eq!(event["result"], "file body");
     assert!(event.get("result_stripped").is_none());
 }
+
+#[test]
+fn a_live_coding_agent_call_leaves_its_args_for_the_modal_to_fetch() {
+    let event = live_event_json(ThreadEvent::CodingAgentToolCalled {
+        name: "Write".into(),
+        args: serde_json::json!({
+            "file_path": "/tmp/notes.ts",
+            "content": "export const x = 1;\n".repeat(1_000),
+        }),
+        description: "Write notes.ts".into(),
+        coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+        tool_use_id: "toolu_1".into(),
+    });
+    assert!(
+        event.get("args").is_none(),
+        "live frame carried the args: {event}"
+    );
+    assert_eq!(event["args_stripped"], true);
+    assert_eq!(event["description"], "Write notes.ts");
+    assert_eq!(event["name"], "Write");
+    assert_eq!(event["tool_use_id"], "toolu_1");
+}
+
+#[test]
+fn a_live_chat_call_without_a_description_is_described_before_its_args_go() {
+    let event = live_event_json(ThreadEvent::ToolCalled {
+        name: "run_bash".into(),
+        args: serde_json::json!({ "command": "ls -la" }),
+        description: String::new(),
+    });
+    assert!(
+        event.get("args").is_none(),
+        "live frame carried the args: {event}"
+    );
+    assert_eq!(event["args_stripped"], true);
+    let description = event["description"].as_str().unwrap_or_default();
+    assert!(!description.is_empty(), "no label left: {event}");
+}
+
+#[test]
+fn a_live_generate_image_call_keeps_the_prompt_its_image_is_described_by() {
+    let event = live_event_json(ThreadEvent::ToolCalled {
+        name: "generate_image".into(),
+        args: serde_json::json!({ "prompt": "a red bicycle" }),
+        description: "Generate image".into(),
+    });
+    assert_eq!(event["args"]["prompt"], "a red bicycle");
+    assert!(event.get("args_stripped").is_none());
+}

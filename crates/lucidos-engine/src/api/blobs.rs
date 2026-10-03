@@ -90,7 +90,14 @@ pub(super) async fn post_blob(
     // it returns BlobError::UnsupportedMime → 415 with no disk write.
     // The error carries what the bytes turned out to be, so the 415 names
     // this upload's format rather than reciting the allowlist.
-    let resolved = match write_blob(&state.workspace_path, &bytes) {
+    //
+    // Hashing and the disk write are blocking work, so they run off the async
+    // runtime: a large photo must not stall a worker other requests need.
+    let workspace = state.workspace_path.clone();
+    let written = tokio::task::spawn_blocking(move || write_blob(&workspace, &bytes))
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let resolved = match written {
         Ok(r) => r,
         Err(e @ BlobError::UnsupportedMime(_)) => {
             return Err(ApiError::new(

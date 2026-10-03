@@ -31,6 +31,13 @@ An agent archiving a *thread* itself, through the `threads` tool's `archive` act
 
 An agent's own thread is archived once its turn ends and it has settled, and a new message before then keeps it open. Lucidos never archives a thread by itself, not even after its change is applied (ADR 0310).
 
+*Thread triage* is the one wider path: under a triage the user replied to, an agent may archive any inbox thread that needs nothing from the user (ADR 0349).
+
+### Archive all
+The **Archive all** action on the drawer's *Current section* header. It archives only what is safe, so a thread that needs the user stays, and so does a running one. Needing the user means an unanswered question, a pending *change*, unproposed branch work, an unsent *draft* or a failed run, here or in a sub-thread. A *pinned thread* sits in Pinned and is never touched.
+
+A confirm counts what goes and what stays, and the engine archives only the threads it listed, if they are still safe. The result toast offers **Undo**, which *unarchives* that batch (`ThreadUnarchived`). It is the owner's button only: an agent uses *thread triage* instead, through the same classifier (ADR 0349).
+
 <!--gloss-app-start-->
 ### App
 A user-installed mini-application with its own UI (HTML/CSS/JS) at `data/apps/<id>/`, plus optional *knowhow* / *intents* / *scripts* / *triggers*. Chat is not per-app: every conversation is a regular *chat thread*. When an app is open in the panel-overlay slot, its `manifest.json` and discovered context flow into the *Lucidos Agent*'s prompt, so the agent can answer in-context. Quick edits to an app happen through the agent's file tools on the chat path; heavier edits spawn an *app coding-agent thread*. The *app manifest* is user-facing metadata shown in the UI; `knowhow/` and `intents/` are engine-facing context loaded into the LLM when the app is active. The app's interactive surface is the *app UI* — see entry.
@@ -241,6 +248,11 @@ See also: *connected account*, *environment variable*, *config*, *webhook*.
 A link to a *thread* in a *workspace* your OTHER Lucidos install serves. Almost every machine runs one install, and there no link is ever cross-gateway. A machine running the packaged app beside a dev checkout runs two, each with its own workspaces. A link written in one used to say the other's workspace was not available.
 
 It opens in a tab on that install's own address, port and all. That install checks the browser itself, so a browser it has never met lands on its pairing screen rather than in the workspace: pairing is per gateway, see *paired device*. You reach it from the machine, or from wherever you reach Lucidos on its own port. Through a forwarded address (`tailscale serve`, an ssh tunnel) only one install is on the far end. There the link says where the workspace lives, rather than opening a tab that cannot load. A workspace neither install has heard of still says it is not available.
+
+### Draft
+What you typed into a *thread*'s composer and have not sent: text, images, or both. It lives with its thread and follows you to your other devices. A thread you never sent is all draft and shows in the Drafts view. A thread with history can hold one too, archived or not.
+
+The *Lucidos Agent* reads drafts and never writes them. The `threads` tool's `drafts` action lists each one with a preview, its last edit time and its owning thread, and returns one whole by `thread_id`. `lucidos threads drafts` is the same read. A draft has no link of its own, so the agent gives you its thread's *thread link*. Distinct from a *held message*, which an agent wrote and Lucidos keeps back.
 
 ### Disabled tool
 One tool on an *MCP* server that the user switched off, so the *Lucidos Agent*
@@ -506,7 +518,9 @@ OpenAI, OpenRouter, xAI, OpenCode Free and Local all speak the OpenAI Chat Compl
 One model can name several of them, and then it stays ONE entry in the picker, served by whichever the workspace has credentials for. The first-party Claude models list Vertex and Anthropic, since their ids are identical on both. A backend that spells a model differently says so per provider. Grok is bare on xAI (`grok-4.6`) and prefixed on OpenRouter (`x-ai/grok-4.6`).
 
 ### Builtin provider proxy
-A *provider*'s API exposed to app UIs through the engine's proxy route (`lucidos.proxy(<name>).fetch(path, init)` → `/api/v1/proxy/<name>/<path>`) **without** the workspace re-entering the credential in `data/config/apis.json`. The builtin names are `vertex`, `openai`, `openrouter`, `xai`, `anthropic` and `local`. When `<name>` matches one and no `apis.json` entry exists, the engine forwards to that provider's API root. It injects the credential configured under Settings → Models → Providers server-side, so the secret never reaches the iframe. An `apis.json` entry with the same name overrides the builtin (it is consulted first).
+A *provider*'s API exposed through the engine's proxy **without** the workspace re-entering the credential in `data/config/apis.json`. Apps reach it with `lucidos.proxy(<name>).fetch(path, init)`, scripts with `lucidos proxy <name>`, and the Lucidos Agent with `proxy_request`. The builtin names are `anthropic`, `local`, `openai`, `openrouter`, `typesafe`, `vertex` and `xai`. `opencode-free` has none (ADR 0104).
+
+When `<name>` matches one and no `apis.json` entry exists, the engine forwards to that provider's API root. Every default root already includes `/v1`. It injects the credential configured under Settings → Models → Providers server-side, so the secret never reaches the caller. An `apis.json` entry with the same name overrides the builtin (it is consulted first). The Lucidos Agent's context lists every builtin and whether it is configured, and `request_credential` refuses a key a configured one already injects (ADR 0350).
 
 `vertex` is addressed by the publisher/model suffix only: the engine owns the `…/projects/<project>/locations/<region>` URL prefix and mints the access token, so the app never needs the project id or a token. See `system-knowhow/js-sdk.md` § `lucidos.proxy`.
 
@@ -568,7 +582,11 @@ Two facts hang off one row, and they have different reach. Whether it may reach 
 Either half can be missing, and neither is an error. A device paired from another workspace holds nothing here yet. Its row says **Not set up in this workspace**, and its push toggle is off and disabled until it opens this one. The row never claims the device has never been here, because a missing half does not prove that: **Remove** deletes the half of a device sitting right in front of you. A browser reaching an engine directly never went through the gateway, so it has no pairing to revoke.
 
 **One device is one row.** The id comes from the *workspace gateway* when there is one, and both halves key on it. Reaching an engine port directly, the browser mints its own and keeps it. That is safe: no pairing list exists on that route to disagree with it.
-See also: *paired device*, *pairing code*, *preference*, *active device*.
+See also: *paired device*, *pairing code*, *preference*, *active device*, *one-off device*.
+
+### One-off device
+A *device* used on one day and never again. Lucidos removes it once it is a week old, unless someone named it, paired it, or turned push on for it. Most come from automated browser runs: a fresh browser profile mints a fresh device id, whatever browser it claims to be. A one-off device that does come back registers again under the same id, without its old device-scoped *preferences* and pinned apps.
+See also: *device*, `system-knowhow/remote-access.md` § The list of devices lives in Settings → Devices.
 
 ### Pairing label
 The name a device got when it paired, such as "Safari on iPhone". The pairing screen suggests it from the browser, and the person at the device may type their own. It is fixed until you revoke the device and pair it again. Every *workspace* knows it: the *workspace gateway* passes it along with each request. A device has one name everywhere: the name typed on its **Devices** row, else its pairing label, else its browser and machine, else `device-` and its id's start.
@@ -780,7 +798,7 @@ Any descendant in the *thread* tree (transitive). A *child thread* is a sub-thre
 A single conversation — a stream of events sharing one `aggregate_id`. Every chat reply, trigger run, and *coding-agent thread* run is a thread. Threads have a persisted `source` (`chat` / `trigger` / `claude_code` today — values are *channel* identifiers; see dev glossary), while user-facing/API source filters call the coding-agent bucket `coding-agent` and accept legacy `claude_code`. Threads also have a compose state (`composing` / `active` / `discarded` on the compose side; running / idled / failed on the runtime side), an archive flag (`inbox` / `archived`, orthogonal to compose state — an archived thread keeps `state='active'` and only flips `archive_state`), and may spawn other threads.
 
 ### Event wait
-The internal name for a **thread subscription**: a *thread* asking to be re-opened when something happens, instead of checking over and over. The word survives because it is on disk, in the persisted `EventWait*` events and in the `await_event` tool's own name. So the code and the event log say *event wait* where this glossary says *thread subscription*. They are the same thing. The screen says neither: the conversation row reads **Waiting for** the agent's reason, then **Waited for** or **Stopped waiting for** once it ends.
+The internal name for a **thread subscription**: a *thread* asking to be re-opened when something happens, instead of checking over and over. The word survives because it is on disk, in the persisted `EventWait*` events and in the `await_event` tool's own name. So the code and the event log say *event wait* where this glossary says *thread subscription*. They are the same thing. The screen says neither: the conversation row is a **Waiting for** card with the agent's reason under it, and its state word says how the wait ended.
 
 The agent says what it is waiting for (an *event subscription*, optionally filtered), why, and for how long, then finishes its turn. The thread holds nothing and blocks nothing while it watches. Lucidos re-opens it the moment a matching *event* arrives, or tells it the wait timed out. The *waiting indicator* shows what it is watching and how long is left. Available to the *Lucidos Agent* and to a *coding agent* alike. Each can also list what it is watching and stop watching (`list_event_waits` / `cancel_event_wait`, or `lucidos event-waits list` / `cancel`).
 
@@ -804,6 +822,12 @@ Each subscription reads **watching for** and the event in plain words ("backgrou
 
 Its subscriptions section is headed **EVENTS**, since a person waits for things to happen rather than for subscriptions. A *trigger subscription* belongs to a trigger and never appears on a thread screen, so the only species listed here is the thread one.
 
+### Thread link
+The address that opens a *thread*, written as a markdown link target: `[Plan dinner](thread:myws/<thread_id>)`. Every row the `threads` tool and `lucidos threads` return carries one as `link`, and a spawn result carries one too. The workspace in it is always the one that served the row. A *draft* or a *held message* has no address of its own, so its link is its thread's.
+
+### Reader fields
+Four fields on each row `lucidos threads list`, `lucidos threads search` and the `threads` tool return, so one call says what each *thread* holds and how to open it. `has_draft` says whether it holds a *draft*. `draft_preview` and `draft_length` give the draft's first 200 characters and its length, present only when there is one. `link` is its *thread link*. Other reads of a thread leave them out.
+
 ### Thread drawer
 The pane listing your *threads*: the Pinned, *Current* and Archive sections, with the attention badge and the thread filter. That badge has a second home: the same needs-attention count rides the **thread-drawer toggle** whenever the list itself is hidden (the drawer closed on desktop; any pane other than the threads pane on mobile), so a *thread* waiting on you stays visible from the conversation. Exactly one of the two shows it at a time. On mobile the toggle is the leading control of the *thread pane* header and takes you to the threads pane, with the hamburger **menu drawer** mirrored at that header's trailing edge (it slides out from the right, the edge its button sits on). First of the three panes; one of the two making up the *Conversation* side, the other being the *thread pane*. CSS container `.thread-drawer` (`FocusedPane = 'drawer'`; on mobile the leftmost swipe pane, `MobileView = 'threads'`). Always say *thread drawer*, never a bare "drawer". The hamburger **menu drawer** (Files / Apps / Plugins / Triggers plus pinned *apps*, `Drawer.tsx` / `drawerOpen`) is a different surface.
 
@@ -821,6 +845,11 @@ See also: *Conversation*, *thread drawer*, *content pane*.
 ### Thread Queue
 System-wide admission control for the shared thread pool. Every path that creates running work shares one capacity pool: background spawns — an event *trigger* firing, a scheduled (cron) fire, an agent-driven *sub-thread* or *coding-agent thread* spawn (`run_thread` / `run_coding_agent`, agent-mode `lucidos spawn-thread`, cross-workspace task POSTs) — AND user-initiated work (a person's chat / user-typed coding-agent threads). Within the *capacity policy* work runs immediately; over capacity it waits. User-initiated work is **prioritized, not exempt** (ADR 0008): it counts against the ceiling, drains ahead of background, ignores the per-kind/per-trigger caps, and queues only at true pool-max (a person briefly sees "requesting") — `reserved_background` keeps that priority from starving triggers/cron. Background ordering is FIFO (strict per trigger, best-effort across triggers) — except cron fires, which **coalesce** to at most one entry per trigger (a cron fire carries no distinct payload, so a redundant one is dropped rather than queued, and a restart's duplicate cron rows collapse to one on recovery; event triggers keep strict FIFO). Background entries are persisted (the `thread_queue` projection, event-sourced from `ThreadQueued` / `ThreadQueueAdmitted` / `ThreadQueueDropped` / `ThreadQueueCompleted`), so an engine restart re-queues work that never ran and drains it as capacity frees; user-initiated slots are in-memory only (a dead response is gone on restart, never re-fired). Surfaced in the **Thread Queue panel** (Running counts background + user; run now / drop / edit the capacity policy); a significantly delayed trigger or a pool at capacity raises notifications that tap through to the panel.
 See also: `system-knowhow/thread-queue.md`, ADR 0008.
+
+### Thread triage
+The Lucidos Agent sorting the user's inbox threads into proposed actions, each with a reason drawn from facts, never from a title. It is the `threads` tool's `triage` and `apply_triage` actions. A *triage action* is one of `archive`, `pin`, `delete`, `follow_up` (needs the user), `dismiss_question` or `keep`. Trigger runs group per trigger: the newest is kept, older ones are proposed for archive, and an older run's lone question for dismissal.
+
+`triage` records a `ThreadTriageProposed` event, and `apply_triage` runs only after the user replied to it in the same thread, re-checking every thread first. It never archives a thread that needs the user, and never deletes: a delete is the user's own, from the drawer (ADR 0192). See ADR 0349.
 
 ### Thread summary
 A projected snapshot of a *thread*'s metadata — title, source, status, last activity, parent / trigger / repo links, coding-agent flags. The engine maintains it from the event stream on the `thread_summaries` DB table. **Same name everywhere**: DB table `thread_summaries`, Rust struct `ThreadSummary`, TS / JS SDK type `ThreadSummary`, wire JSON, this glossary entry. Returned by `GET /api/v1/threads/list`, `lucidos threads list`, the `list_threads` LLM tool, and `lucidos.threads.list()` — the single canonical surface for "give me thread metadata." Distinct from the *thread* itself (the underlying event sequence is the source of truth).
@@ -984,6 +1013,12 @@ A *thread* spawned by a *trigger* firing. Distinguished by `source = 'trigger'`.
 
 ### Trigger group
 A user-visible folder that organizes *triggers* in the triggers panel. Pure label: belongs to no agent, has no schedule, runs no code. Each trigger may belong to at most one group via `group_id`; ungrouped triggers render under an implicit "Ungrouped" section. Useful for surfacing emergent workflows — chains of triggers connected by `emit_event` → `on_event` — as a single group in the panel, without changing how they fire. Lifecycle: `TriggerGroupCreated`, `TriggerGroupRenamed`, `TriggerGroupReordered`, `TriggerGroupDeleted`. Groups with at least one member cannot be deleted — the LLM (or user) must reassign or delete the triggers first. Panel order is governed by `order: i32`, ascending.
+
+### Unsent message
+A message you sent that got no answer from Lucidos, so it may never have arrived. It stays in the *thread* under a **Not sent** card with a **Retry** button, rather than vanishing or reading as a failed reply. Retry sends the same message again. If the first one did arrive and only the answer was lost, Lucidos recognizes the repeat and runs it once.
+
+An unsent message lives in the page you sent it from, and a reload drops it. A thread's first message leaves its *draft* on Lucidos untouched until a send is accepted. A reload then brings back that draft as it was last saved.
+See also: *draft*.
 
 ### Urgent follow-up
 A *child follow-up* the parent marked `urgent: true`, which stops the child's current turn so it reads the message now instead of at the child's next natural break. The default is the opposite, and deliberately so: an ordinary follow-up queues, because a steer should never throw away an in-flight build. The cost of urgency is exactly that, whatever the interrupted turn was mid-way through is lost, so it is for the messages that cannot wait (a cancellation, a "stop, you are working from a wrong assumption") and not for hurry. What it buys is unbounded otherwise: a child inside a long tool call reads a queued message only when that call returns, and a *coding-agent thread* parked in a ten-minute blocking wait really does sit on a STOP for ten minutes. The interrupted turn ends as "Superseded", not "Canceled": the work is being steered rather than abandoned, so the parent is not re-opened with a false completion card for a child that carries straight on in the next turn. Two caveats. A child parked on a question is blocked on a *human*, not on work, so urgency cannot unblock it. And on a **Codex** child it changes nothing, because a Codex turn cannot read a queued message at all until it ends, so every follow-up there already stops the current turn. Ask for it by what you mean, not by which backend the child runs.
@@ -1260,11 +1295,11 @@ It routes through `interrupt_agent` (`POST /api/v1/claude-code/stop`, default `S
 ### Change
 A *coding-agent*-proposed set of file edits shown as a pending branch in the UI. It is resolved by *Apply* or Discard, or kept for later with **Set aside**. Apply is a non-disruptive merge into main; an engine-affecting change then surfaces *New version available / Switch to new version*. Lifecycle events: `ChangeProposed`, `ChangeApplied`, `ChangeDiscarded`, `ChangeSetAside`, `ChangeBroughtBack`. Stored as a row in the `changes` table. Internal (Lucidos-repo) coding-agent threads produce changes; *external-repo coding-agent threads* skip this flow.
 
-The Changes panel lists pending changes in two sections. **Ready** comes first: changes whose thread has finished, with **Discard All** and **Apply All**. **Not finished** comes second: changes whose thread is *settling* or parked on a question, with **Apply all on settle**. Discard All never reaches Not finished. Below them sit **Set aside** and **Recently applied**.
+The Changes panel lists pending changes in two sections. **Ready** comes first: changes whose thread has finished, with **Discard All** and **Apply All**. **Not finished** comes second: changes whose thread is *settling* or parked on a question, and every *incomplete change*, with **Apply all on settle**. Discard All never reaches Not finished. Below them sit **Set aside** and **Recently applied**.
 
 A change's `status` is one of five values: `pending` (awaiting Apply or Discard), `set_aside` (a *set-aside change*), `applied`, `discarded`, or `reverted` (applied, then undone). No other value exists.
 
-A user **Stop** that leaves work on the branch proposes it as an *incomplete* change, so stopped work always has an Apply. Its Apply asks you to confirm, and *Apply All* passes it over. The next turn that finishes cleanly clears the mark.
+A user **Stop** that leaves work on the branch proposes it as an *incomplete change*, so stopped work always has an Apply.
 
 A change's file list tracks git: when later commits on the branch cancel the diff out (a commit plus its revert), the engine re-syncs the row to **zero files** and the card reads "No file changes" instead of claiming edits its Diff can't show. Such a change stays pending — the engine never resolves a change on the user's behalf — but *Apply* is refused (there is nothing to merge, and it would only add no-op commits); **Discard** is the resolution. The re-sync runs when the coding agent next idles, when its session ends, and as an engine-startup sweep for rows that went stale while nothing was running.
 
@@ -1274,6 +1309,11 @@ A *change* you keep for later, out of the way. **Set aside** sits in the Apply b
 **Bring back** returns it to pending, from that list or from its thread's banner. Apply it from there; a set-aside change is never applied directly. It also comes back by itself when its thread's agent proposes new work on the same branch.
 
 Lucidos sets work aside for you in one case. When a thread is archived with work on its branch that was never proposed, the work becomes a set-aside change instead of being lost.
+
+### Incomplete change
+A pending *change* from a turn that did not finish: you pressed **Stop**, or the engine went down mid-turn. It is not ready to review. It draws no change dot, stays out of the Review count, and the Changes panel lists it under **Not finished**. Its thread's banner leads with **Continue**, which resumes the stopped session.
+
+It still blocks Archive until you **Apply**, **Discard** or **Set aside** it. Apply asks you to confirm, because the work may be partial, and *Apply All* passes it over. The next turn that finishes cleanly makes it an ordinary change, ready to review (ADR 0346).
 
 ### Change summary
 One line saying what a *change* of several commits does, written by a background model once the change is proposed. It heads the change card in the thread, the Applied / Discarded / Reverted toasts, and the Changes panel row. The card and the panel row unfold to the change's commits, oldest first. A change of one commit gets no summary, since its commit subject already is the line. Until a summary lands, the oldest commit subject stands in, never the newest: the newest is usually a small fix. New commits clear the summary and a fresh one is written.
@@ -1325,10 +1365,13 @@ A *thread* driven by a *coding agent* (Claude Code or Codex) inside an isolated 
 See also: `system-knowhow/coding-agent-events.md`.
 
 ### Side question
-A quick question put to a thread by typing `/btw <question>` in its composer, or by holding Send and choosing "Side question". During a turn, holding Stop or pressing ⌥↵ (Alt+Enter) puts `/btw ` in the empty composer to finish (a touch hold shows "Side question" first). Over a typed draft, pressing ⌥↵ and then Enter asks one too. It may carry images. The thread's agent answers from the thread's full context, beside any running turn, with no tools: a Claude Code thread asks a copy of its session, a Lucidos Agent thread asks its own model once. The answer shows on a card at the moment it was asked, and later output draws below it.
+A quick question put to a thread by holding Send over a typed draft and choosing "Side question", or by pressing ⌥↵ (Alt+Enter) then Enter. Over the empty composer, holding Stop, holding a waiting card's Cancel, or pressing ⌥↵ turns on *side-question mode* (see). A typed `/btw` is ordinary text. It may carry images. The thread's agent answers from the thread's full context, beside any running turn, with no tools: a Claude Code thread asks a copy of its session, a Lucidos Agent thread asks its own model once. The answer shows on a card at the moment it was asked, and later output draws below it.
 
 Kept as events **no agent ever sees** (ADR 0320), the card survives reloads and shows on every device. A tap on its head folds it to one line, and a second tap unfolds it. Codex threads refuse side questions.
 See also: `system-knowhow/coding-agent-events.md` § Side questions are recorded, and hidden from every agent.
+
+### Side-question mode
+The composer state where Send asks the box as a *side question* rather than sending a message. Over an empty composer, holding Stop, holding a waiting card's Cancel, or pressing ⌥↵ turns it on. A "Side question" pill above the box shows it. The pill's ×, Escape, or asking the question turns it off. While it is on it wins over a waiting card, so the × is the way back to answering. It is kept with the draft, so it survives a reload and shows on every device.
 
 ### External-repo coding-agent thread
 A *coding-agent thread* (see) running against a user-registered external git *repository* rather than the Lucidos workspace itself. No Apply / Discard surface — the user reviews diffs via the external-repo diff viewer. Worktree creation and system prompt differ from the Lucidos-internal variant; documented in `docs/plans/2026-03-17-external-repos-plan.md`.

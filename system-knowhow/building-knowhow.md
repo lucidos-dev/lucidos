@@ -125,6 +125,8 @@ If the knowhow describes how to call an external HTTP API the workspace owns a c
 
 Configure the backend once in `data/config/apis.json` (schema in `system-knowhow/best-practices.md` § `config/`); knowhow then references it by name instead of restating credentials.
 
+**A model provider needs no entry at all.** Every model provider the engine holds auth for is a *builtin provider proxy*: `anthropic`, `local`, `openai`, `openrouter`, `typesafe`, `vertex` and `xai`. They are not in `apis.json`, and a recipe never asks for their key. Each default base already includes `/v1`, so a recipe writes `lucidos proxy openai /models`, never `/v1/models`. See `system-knowhow/lucidos-cli.md` § `lucidos proxy`.
+
 ## Writing knowhow during execution
 
 Knowhow is your *living* memory. When you discover something new while running a trigger or app — a quirk, a better approach, a failure mode — update the relevant knowhow before moving on. The engine prompt's `CONTINUOUS LEARNING` note is the explicit license to do this. Confirm with the user before creating a new top-level knowhow file (it shows up in retrieval forever); appending to one you're already maintaining for the task at hand is part of the work.

@@ -536,6 +536,148 @@ async fn follow_up_is_persisted_before_the_ack_and_keeps_send_order() {
     );
 }
 
+/// A client that lost the reply to its POST re-posts the same body, event id
+/// included. The engine must answer with the same ack and run nothing twice:
+/// one `MessageReceived`, one turn.
+#[tokio::test]
+async fn a_reposted_event_id_is_acked_once_and_runs_one_turn() {
+    let client = user_client().await;
+    let pool = sqlx::PgPool::connect(&db_url())
+        .await
+        .expect("Failed to connect to E2E workspace database");
+    let url = format!("{}/api/v1/chat/stream", base_url());
+    let marker = unique_marker("api-repost");
+
+    // Named by the client, as the frontend does: without one, the ack carries
+    // an id no event uses.
+    let opening_id = Uuid::new_v4().to_string();
+    client
+        .post(&url)
+        .json(&serde_json::json!({
+            "message": format!("Reply with one word. {marker}"),
+            "mode": "human",
+            "event_id": opening_id,
+        }))
+        .send()
+        .await
+        .expect("First chat request failed");
+    let thread_id = poll_thread_summary_by_marker(&pool, &marker, 15)
+        .await
+        .thread_id;
+
+    // How many turns started by `request` have ended.
+    let turns_ended = |request: String| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM events WHERE thread_id = $1 \
+                 AND payload->>'request_event_id' = $2 \
+                 AND event_type IN ('ResponseGenerated', 'ResponseCompleted', \
+                                    'ResponseFailed', 'ResponseCanceled', 'ResponseAborted')",
+            )
+            .bind(thread_id)
+            .bind(request)
+            .fetch_one(&pool)
+            .await
+            .expect("events query failed")
+        }
+    };
+    let wait_for_turn_end = |request: String| async move {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while turns_ended(request.clone()).await == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the turn for {request} never ended"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+    };
+    // A follow-up sent while that turn runs is injected into it rather than
+    // starting its own, so let it finish first.
+    wait_for_turn_end(opening_id).await;
+
+    let event_id = Uuid::new_v4().to_string();
+    let body = serde_json::json!({
+        "message": format!("Reply with one word again. {marker}"),
+        "mode": "human",
+        "thread_id": thread_id.to_string(),
+        "event_id": event_id,
+    });
+    for attempt in ["first post", "re-post"] {
+        let resp = client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("{attempt} failed: {e}"));
+        assert_eq!(resp.status(), 200, "{attempt} should be acked");
+        let ack: serde_json::Value = resp.json().await.expect("Invalid JSON");
+        assert_eq!(
+            ack["event_id"], event_id,
+            "{attempt} must ack the same event id"
+        );
+    }
+
+    wait_for_turn_end(event_id.clone()).await;
+    // Grace for a second turn, had the re-post started one.
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    assert_eq!(
+        turns_ended(event_id.clone()).await,
+        1,
+        "the re-post must not run a second turn"
+    );
+
+    let messages: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM events WHERE thread_id = $1 \
+         AND event_type = 'MessageReceived' AND id = $2::uuid",
+    )
+    .bind(thread_id)
+    .bind(&event_id)
+    .fetch_one(&pool)
+    .await
+    .expect("events query failed");
+    assert_eq!(messages, 1, "the message must be recorded once");
+}
+
+/// A refused post must leave its event id free, so the corrected retry runs.
+#[tokio::test]
+async fn a_refused_post_leaves_its_event_id_free_for_the_retry() {
+    let client = user_client().await;
+    let url = format!("{}/api/v1/chat/stream", base_url());
+    let event_id = Uuid::new_v4().to_string();
+
+    let refused = client
+        .post(&url)
+        .json(&serde_json::json!({
+            "message": "a refused post",
+            "mode": "human",
+            "event_id": event_id,
+            "parent_thread_id": "not-a-uuid",
+        }))
+        .send()
+        .await
+        .expect("Refused chat request failed");
+    assert_eq!(refused.status(), 400);
+
+    let pool = sqlx::PgPool::connect(&db_url())
+        .await
+        .expect("Failed to connect to E2E workspace database");
+    let marker = unique_marker("api-refused-retry");
+    let retried = client
+        .post(&url)
+        .json(&serde_json::json!({
+            "message": format!("Reply with one word. {marker}"),
+            "mode": "human",
+            "event_id": event_id,
+        }))
+        .send()
+        .await
+        .expect("Retried chat request failed");
+    assert_eq!(retried.status(), 200);
+    // The thread only exists if the retry really ran.
+    poll_thread_summary_by_marker(&pool, &marker, 15).await;
+}
+
 // ── Attribution and targeting refusals ──────────────────────────────
 //
 // Regression coverage for the 2026-08-06 incident. The Lucidos Agent was asked

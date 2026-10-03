@@ -359,6 +359,9 @@ pub(super) async fn put_compose(
     // (NULL bind) must preserve the draft's stored dropdown picks, while a
     // dropdown change sends the full object.
     //
+    // `compose_updated_at` dates the draft for the `threads` tool's `drafts`
+    // action. This UPDATE is the only writer of non-empty draft text.
+    //
     // `compose_epoch = $6` is the write fence. It costs nothing on the
     // keystroke path because the epoch counts SUBMISSIONS, not writes: every
     // PUT between two submissions carries the same value, so only a write that
@@ -369,6 +372,7 @@ pub(super) async fn put_compose(
                 compose_images = COALESCE($3, compose_images),
                 compose_mode = COALESCE($4, compose_mode),
                 compose_selection = COALESCE($5, compose_selection),
+                compose_updated_at = now(),
                 source = CASE $4::text
                     WHEN 'claude_code' THEN 'claude_code'
                     WHEN 'lucidos'     THEN 'chat'

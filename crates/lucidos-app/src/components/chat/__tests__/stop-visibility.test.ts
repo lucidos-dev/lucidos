@@ -21,6 +21,7 @@ vi.mock('../../../store/actions/threadActions', () => ({
   resolveThreadActions: () => [
     { kind: 'archive', category: 'close', label: 'Archive', invoke: () => {} },
   ],
+  threadHasIncompleteChange: () => false,
 }));
 vi.mock('../../../store/actions/repositories', () => ({
   viewChangeDiff: vi.fn(),
@@ -73,6 +74,7 @@ function makeThread(
       attentionDescendantCount: 0,
       codingAgentProposed: false,
       codingAgentRequiresRestart: false,
+      codingAgentIncomplete: false,
       codingAgentIsExternalRepo: false,
       codingAgentHasDiff: false,
       lastRevivedAt: '',

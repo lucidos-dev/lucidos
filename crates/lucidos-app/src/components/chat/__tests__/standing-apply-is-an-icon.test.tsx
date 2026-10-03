@@ -89,6 +89,7 @@ function makeThread(): ThreadState {
       attentionDescendantCount: 0,
       codingAgentProposed: true,
       codingAgentRequiresRestart: false,
+      codingAgentIncomplete: false,
       codingAgentIsExternalRepo: false,
       codingAgentHasDiff: true,
       lastRevivedAt: '',

@@ -13,6 +13,7 @@
 use std::collections::HashMap;
 use uuid::Uuid;
 
+use crate::engine::title_match::{title_match, TitleMatch};
 use crate::engine::LucidosEngine;
 use crate::memory::{
     EmbeddingProvider, MemorySource, RETRIEVAL_MIN_IMPORTANCE, RETRIEVAL_MIN_SIMILARITY,
@@ -39,38 +40,6 @@ pub(super) const TEXT_MATCH_DAMPEN_THRESHOLD: i64 = 100;
 /// gives such threads a chance to surface.
 const SEMANTIC_CANDIDATE_LIMIT: usize = 200;
 
-/// How much of the query a thread's title holds as one piece. Declared weakest
-/// first, so the derived `Ord` ranks an exact title above everything else.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(super) enum TitleMatch {
-    None,
-    /// The title contains the whole query as a phrase.
-    Phrase,
-    /// The title is the query.
-    Exact,
-}
-
-/// Case- and whitespace-insensitive, so "Fix  Search" is an exact hit for
-/// "fix search".
-pub(super) fn title_match(title: &str, query: &str) -> TitleMatch {
-    fn normalize(s: &str) -> String {
-        s.split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-            .to_lowercase()
-    }
-    let (title, query) = (normalize(title), normalize(query));
-    if query.is_empty() {
-        TitleMatch::None
-    } else if title == query {
-        TitleMatch::Exact
-    } else if title.contains(&query) {
-        TitleMatch::Phrase
-    } else {
-        TitleMatch::None
-    }
-}
-
 /// Scale a score by age: `score * (0.5 + 0.5 * exp(-age_days / 14))`. A hit
 /// from today keeps its score and a months-old one keeps half. Items with no
 /// timestamp keep their score.
@@ -92,7 +61,7 @@ pub(crate) fn recency_boost(
 pub(super) fn text_hit_score(score: f64, message_count: i64, title: TitleMatch) -> f64 {
     match title {
         TitleMatch::None => dampen_text_score(score, message_count),
-        TitleMatch::Phrase | TitleMatch::Exact => score,
+        TitleMatch::Phrase | TitleMatch::WordStart | TitleMatch::Exact => score,
     }
 }
 

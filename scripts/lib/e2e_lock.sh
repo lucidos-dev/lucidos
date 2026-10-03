@@ -171,9 +171,9 @@ _e2e_orphan_agent_basenames() {
 # This is a KERNEL FACT, which is the whole reason the `agent` kind keys on it.
 # argv[0] cannot separate an e2e coding-agent subprocess from the user's own
 # session (both are `.../bin/claude`), and the rest of the command line is
-# actively unsafe to match: a Claude Code process carries the engine's thread
+# actively unsafe to match: a Claude Code process carried the engine's thread
 # history inside a ~22 KB `--append-system-prompt`, so a session that merely
-# DISCUSSES the e2e workspace's paths contains them verbatim (the session that
+# DISCUSSED the e2e workspace's paths contains them verbatim (the session that
 # designed this sweep did). That is not hypothetical: the sibling matcher in
 # webkit_reaper.sh SIGKILLed two real sessions on 2026-08-03 for quoting a path.
 # No prompt text can forge a cwd.
@@ -291,7 +291,7 @@ EOF
         # the browsers cache, not if its arguments mention that path. This
         # branch SIGKILLs unconditionally with no RSS threshold, so a full
         # command-line match is especially dangerous here. A Claude Code process
-        # carries the engine's THREAD HISTORY inside a ~22 KB
+        # carried the engine's THREAD HISTORY inside a ~22 KB
         # --append-system-prompt argument, and on 2026-08-03 the sibling matcher
         # in webkit_reaper.sh killed two sessions that merely discussed these
         # paths.

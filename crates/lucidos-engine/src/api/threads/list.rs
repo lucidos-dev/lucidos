@@ -12,7 +12,8 @@ use serde::Deserialize;
 
 use crate::api::AppState;
 use crate::core::store::{
-    EventStore, FilterFacets, StatusFilter, ThreadSummary, ThreadSummaryFilters,
+    attach_reader_fields, EventStore, FilterFacets, StatusFilter, ThreadSummary,
+    ThreadSummaryFilters,
 };
 
 #[derive(Deserialize)]
@@ -240,6 +241,13 @@ pub struct ListThreadSummariesQuery {
     /// caller's own id, from its ambient `thread_id`.
     #[serde(default)]
     pub parent: Option<String>,
+    /// `true` keeps threads holding an unsent draft, `false` keeps the rest.
+    #[serde(default)]
+    pub has_draft: Option<bool>,
+    /// `true` keeps coding-agent threads whose branch differs from main,
+    /// `false` keeps the rest.
+    #[serde(default)]
+    pub has_diff: Option<bool>,
 }
 
 /// Resolve the `active` / `status` query params into the single filter the
@@ -286,15 +294,19 @@ fn status_filter<'a>(
     }
 }
 
-/// Parse the `parent` query param. A malformed uuid is a 400 rather than a
-/// silent "no filter", which would quietly return the whole workspace.
-fn parse_parent_filter(raw: &Option<String>) -> Result<Option<uuid::Uuid>, (StatusCode, String)> {
+/// Parse an optional thread-id query param (`parent`, `thread_id`). A
+/// malformed uuid is a 400 rather than a silent "no filter", which would
+/// quietly answer about the whole workspace.
+fn parse_thread_id_param(
+    raw: &Option<String>,
+    param: &str,
+) -> Result<Option<uuid::Uuid>, (StatusCode, String)> {
     match raw.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         None => Ok(None),
         Some(s) => s.parse::<uuid::Uuid>().map(Some).map_err(|_| {
             (
                 StatusCode::BAD_REQUEST,
-                format!("Invalid parent thread id: {s}"),
+                format!("Invalid {param}: '{s}' is not a thread id"),
             )
         }),
     }
@@ -327,7 +339,8 @@ fn parse_source_filter(raw: &Option<String>) -> Option<Vec<String>> {
 }
 
 /// GET /api/v1/threads/list — script/trigger/LLM-tool surface. Returns a flat
-/// newest-first list of `ThreadSummary` rows from the projection.
+/// newest-first list of `ThreadSummary` rows from the projection, each with
+/// its reader fields (draft preview and thread link).
 ///
 /// Distinct from `GET /api/v1/threads`, which is the UI-shaped fetch (returns
 /// a grouped saved / archive / active / composing / family payload).
@@ -336,16 +349,18 @@ pub(in crate::api) async fn list_thread_summaries(
     Query(q): Query<ListThreadSummariesQuery>,
 ) -> Result<Json<Vec<ThreadSummary>>, (StatusCode, String)> {
     let sources = parse_source_filter(&q.source);
-    let parent = parse_parent_filter(&q.parent)?;
+    let parent = parse_thread_id_param(&q.parent, "parent")?;
     let statuses = parse_status_filter(&q)?;
     let limit = q.limit.unwrap_or(100).clamp(1, 1000);
-    let summaries = state
+    let mut summaries = state
         .engine
         .event_store()
         .list_thread_summaries(ThreadSummaryFilters {
             status: status_filter(q.active, &statuses),
             sources: sources.as_deref(),
             parent,
+            has_draft: q.has_draft,
+            has_diff: q.has_diff,
             limit,
         })
         .await
@@ -356,7 +371,82 @@ pub(in crate::api) async fn list_thread_summaries(
                 format!("Failed to list thread summaries: {}", e),
             )
         })?;
+    attach_reader_fields(&mut summaries, &state.engine.workspace_name());
     Ok(Json(summaries))
+}
+
+/// Query params for `GET /api/v1/threads/drafts`.
+#[derive(Deserialize)]
+pub struct DraftsQuery {
+    /// Server clamps to 1..=1000. Default 100, the same as `list`.
+    #[serde(default)]
+    pub limit: Option<i64>,
+    /// One thread's draft, with its whole text. A thread holding no draft is
+    /// a 404, never an empty draft.
+    #[serde(default)]
+    pub thread_id: Option<String>,
+}
+
+/// GET /api/v1/threads/drafts — every thread holding an unsent draft, newest
+/// edit first, each with a preview and its owning thread's link. With
+/// `thread_id`, that one draft with its whole text. Read-only.
+pub(in crate::api) async fn list_drafts(
+    State(state): State<AppState>,
+    Query(q): Query<DraftsQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let store = state.engine.event_store();
+    let workspace = state.engine.workspace_name();
+    let internal = |e: Box<dyn std::error::Error + Send + Sync>| {
+        log!("[API] Failed to read drafts: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to read drafts: {}", e),
+        )
+    };
+    let Some(thread_id) = parse_thread_id_param(&q.thread_id, "thread_id")? else {
+        let limit = q.limit.unwrap_or(100).clamp(1, 1000);
+        let drafts = store
+            .list_drafts(&workspace, limit)
+            .await
+            .map_err(internal)?;
+        return Ok(Json(serde_json::json!(drafts)));
+    };
+    match store
+        .get_draft(&workspace, thread_id)
+        .await
+        .map_err(internal)?
+    {
+        Some(draft) => Ok(Json(serde_json::json!(draft))),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            format!("Thread {thread_id} holds no draft"),
+        )),
+    }
+}
+
+/// Query params for `GET /api/v1/threads/held-messages`.
+#[derive(Deserialize)]
+pub struct HeldMessagesQuery {
+    /// Server clamps to 1..=1000. Default 100, the same as `list`.
+    #[serde(default)]
+    pub limit: Option<i64>,
+}
+
+/// GET /api/v1/threads/held-messages — every *held message* still waiting
+/// behind a human, newest first, with its owning thread's link. Read-only.
+pub(in crate::api) async fn list_held_messages(
+    State(state): State<AppState>,
+    Query(q): Query<HeldMessagesQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let limit = q.limit.unwrap_or(100).clamp(1, 1000);
+    let held = state.engine.list_held_messages(limit).await.map_err(|e| {
+        log!("[API] Failed to list held messages: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to list held messages: {}", e),
+        )
+    })?;
+    Ok(Json(serde_json::json!(held)))
 }
 
 /// GET /api/v1/threads/:id — a single thread's summary by id (404 if the
@@ -400,7 +490,7 @@ pub(in crate::api) async fn count_thread_summaries(
     Query(q): Query<ListThreadSummariesQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let sources = parse_source_filter(&q.source);
-    let parent = parse_parent_filter(&q.parent)?;
+    let parent = parse_thread_id_param(&q.parent, "parent")?;
     let statuses = parse_status_filter(&q)?;
     let count = state
         .engine
@@ -412,6 +502,8 @@ pub(in crate::api) async fn count_thread_summaries(
             status: status_filter(q.active, &statuses),
             sources: sources.as_deref(),
             parent,
+            has_draft: q.has_draft,
+            has_diff: q.has_diff,
             limit: 0,
         })
         .await
@@ -592,6 +684,8 @@ mod tests {
             source: None,
             limit: None,
             parent: None,
+            has_draft: None,
+            has_diff: None,
         }
     }
 

@@ -155,6 +155,74 @@ pub const PREF_LOCAL_BASE_URL: &str = "local_base_url";
 /// `crates/lucidos-app/src/components/settings/LocalProviderSettings.tsx`.
 pub const DEFAULT_LOCAL_BASE_URL: &str = "http://localhost:11434/v1";
 
+/// Why `url` cannot be the `local_base_url` preference, or `None` when it can.
+///
+/// The host must be on this machine or the user's own network: loopback, a
+/// private or tailnet address, or a name public DNS cannot answer. A public
+/// host would read every prompt and write the replies the agent runs as tool
+/// calls. Link-local is refused too, since it holds the cloud metadata endpoint.
+///
+/// Checked where the value is written and again where it is read, so a value
+/// stored before the check existed is refused as well. `LUCIDOS_LOCAL_BASE_URL`
+/// is not checked: only the operator can set process env.
+pub fn local_base_url_rejection(url: &str) -> Option<String> {
+    let url = url.trim();
+    let refuse = |why: &str| {
+        Some(format!(
+            "local_base_url '{url}' {why}. Use an address on this machine or your own \
+             network, such as {DEFAULT_LOCAL_BASE_URL}"
+        ))
+    };
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return refuse("is not a URL");
+    };
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return refuse("must use http or https");
+    }
+    let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let local = match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip_is_on_own_network(ip),
+        Err(_) => name_is_on_own_network(host),
+    };
+    if local {
+        None
+    } else {
+        refuse("is not on this machine or a private network")
+    }
+}
+
+/// Loopback, RFC 1918, the tailnet range, IPv6 unique-local, or the unspecified
+/// address, which connects to this machine.
+fn ip_is_on_own_network(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    let v4 = |ip: std::net::Ipv4Addr| {
+        ip.is_loopback()
+            || ip.is_private()
+            || lucidos_tailscale::is_tailnet_addr(ip)
+            || ip.is_unspecified()
+    };
+    match ip {
+        IpAddr::V4(ip) => v4(ip),
+        IpAddr::V6(ip) => match ip.to_ipv4_mapped() {
+            Some(mapped) => v4(mapped),
+            None => ip.is_loopback() || ip.is_unspecified() || ip.segments()[0] & 0xfe00 == 0xfc00,
+        },
+    }
+}
+
+/// `localhost`, or a name under a suffix reserved for private use, so no public
+/// DNS answer can point it elsewhere: `.localhost` (RFC 6761), `.local` (mDNS,
+/// RFC 6762) and `.home.arpa` (RFC 8375). Not `.internal`: cloud hosts answer
+/// `metadata.google.internal` with the link-local metadata address.
+fn name_is_on_own_network(host: &str) -> bool {
+    let host = host.strip_suffix('.').unwrap_or(host);
+    host == "localhost"
+        || [".localhost", ".local", ".home.arpa"]
+            .iter()
+            .any(|suffix| host.ends_with(suffix))
+}
+
 // How long the engine proxy waits on one upstream request, in seconds. An
 // `apis.json` entry's own `timeout_secs` wins over it (`api::proxy_timeout`).
 pub const PREF_PROXY_TIMEOUT_SECS: &str = "proxy_timeout_secs";
@@ -970,6 +1038,51 @@ impl PreferenceStore {
 mod tests {
     use super::*;
     use crate::test_support::{setup_test_db, teardown_test_db};
+
+    /// The real local setups keep working: Ollama and LM Studio on loopback, a
+    /// LAN box on an RFC 1918 address, a tailnet box, and a private-use name.
+    #[test]
+    fn a_local_base_url_on_this_machine_or_own_network_is_accepted() {
+        for url in [
+            DEFAULT_LOCAL_BASE_URL,
+            "http://127.0.0.1:1234/v1",
+            "http://[::1]:8080/v1",
+            "http://0.0.0.0:11434/v1",
+            "http://192.168.1.20:11434/v1",
+            "http://10.0.0.5:8000/v1",
+            "https://172.16.4.2/v1",
+            "http://100.101.102.103:11434/v1",
+            "http://[fd12:3456::1]:11434/v1",
+            "http://gpu-box.local:11434/v1",
+            "http://ollama.home.arpa/v1",
+            "  http://localhost:11434/v1  ",
+        ] {
+            assert_eq!(local_base_url_rejection(url), None, "{url}");
+        }
+    }
+
+    /// A host the user's network does not own would receive every prompt.
+    /// Link-local is refused for the metadata endpoint it holds.
+    #[test]
+    fn a_local_base_url_off_the_own_network_is_refused() {
+        for url in [
+            "https://attacker.example/v1",
+            "http://8.8.8.8/v1",
+            "http://169.254.169.254/latest",
+            "http://metadata.google.internal/computeMetadata/v1",
+            "http://[fe80::1]/v1",
+            "http://[2001:db8::1]/v1",
+            "http://[::ffff:8.8.8.8]/v1",
+            "http://localhost.attacker.example/v1",
+            "http://gpubox:11434/v1",
+            "http://a.local@attacker.example/v1",
+            "ftp://localhost/v1",
+            "not a url",
+        ] {
+            let reason = local_base_url_rejection(url).unwrap_or_else(|| panic!("{url} passed"));
+            assert!(reason.contains("local_base_url"), "{reason}");
+        }
+    }
 
     /// The override triple a caller passes in. The cases below only ever pin
     /// a model or an effort, so the provider stays unset.

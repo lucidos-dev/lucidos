@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url';
 const here: string = dirname(fileURLToPath(import.meta.url));
 const inputCss = readFileSync(resolve(here, '../../../styles/chat/input-messages.css'), 'utf-8');
 const responseCss = readFileSync(resolve(here, '../../../styles/chat/response.css'), 'utf-8');
+const baseCss = readFileSync(resolve(here, '../../../styles/global/base.css'), 'utf-8');
 
 function getBlock(css: string, selector: string): string {
   const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -112,6 +113,25 @@ describe('turn header gutter', () => {
     // line while the other three sides keep their inset, which is the exact
     // asymmetry the marker rule exists to remove.
     expect(selectorTail).toContain(':not(.nav-focus-stuck)');
+  });
+
+  // The first turn starts right under the thread title: the transcript's top
+  // reserve holds only the anchor rest, and the turn's feed padding is the gap. No
+  // first-turn rule: the window draws older turns above as the reader scrolls
+  // up, and the old first turn would jump each time.
+  it('starts the first turn right under the title, on its own feed padding', () => {
+    const transcript = inputCss.match(/\n\.thread-content\s*\{([^}]*)\}/)?.[1] ?? '';
+    const top = declarationValue(transcript, 'padding')?.split('\n')[0].trim();
+    expect(top).toBe('var(--anchor-subpixel, 0px)');
+    expect(inputCss).not.toMatch(/\.chat-exchange:first-child > \.(initiator|response)-panel/);
+
+    // That padding is also the focus marker's room above the first turn: the
+    // wash grows up by the body inset, and its glow reaches past that.
+    const rem = (name: string) =>
+      parseFloat(baseCss.match(new RegExp(`${name}:\\s*([\\d.]+)rem`))?.[1] ?? 'NaN');
+    expect(rem('--turn-feed-pad-y') - rem('--turn-body-inset')).toBeGreaterThanOrEqual(
+      rem('--nav-focus-reach'),
+    );
   });
 
   // The nav focus marker washes the panel box edge to edge,

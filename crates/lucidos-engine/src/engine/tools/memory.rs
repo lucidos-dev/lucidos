@@ -396,15 +396,13 @@ If NONE should be deleted, reply with "none"."#,
             .unwrap_or(20)
             .clamp(1, 50);
         let found = crate::engine::thread_search::combined_thread_search(self, q, limit).await?;
-        // PROJECTED, never the raw `ThreadSearchResult`. That flattens the whole
-        // `ThreadSummary`, which carries the user's in-progress `compose_text`
-        // and `compose_images`: a half-typed private draft in a matching thread
-        // would be shipped to the model provider and quotable back, from a
-        // search the user only asked to find a topic with. It also carries ~30
-        // bookkeeping fields the model has no use for, and raw uuids the
-        // prompt's own NAMES-NOT-IDS rule tells it never to show. Returning the
-        // full row to the user's own browser was fine; the model is a new
-        // consumer with a different boundary.
+        // PROJECTED, never the raw `ThreadSearchResult`. That flattens ~30
+        // bookkeeping fields the model has no use for. It also carries the
+        // whole draft, and search may match a thread on its draft alone. So a
+        // row says only whether the thread holds one; the `drafts` action
+        // reads it. Each row carries its thread link, so the model can point
+        // the user at a hit.
+        let workspace = self.workspace_name();
         let projected: Vec<serde_json::Value> = found
             .iter()
             // The schema states 1-50, and the merge bounds each ARM rather than
@@ -412,13 +410,18 @@ If NONE should be deleted, reply with "none"."#,
             .take(limit.max(0) as usize)
             .map(|r| {
                 serde_json::json!({
-                    // The one id the model needs, and only to pass to the
-                    // `events` tool's 'query' to read the thread.
+                    // The id the model passes on: to the `events` tool's
+                    // 'query' to read the thread, or to 'drafts' for its draft.
                     "thread_id": r.info.thread_id,
                     "title": r.info.title,
                     "last_activity": r.info.last_activity,
                     "message_count": r.info.message_count,
                     "channel": r.info.channel,
+                    "has_draft": crate::core::store::has_draft(
+                        &r.info.compose_text,
+                        &r.info.compose_images,
+                    ),
+                    "link": crate::core::store::thread_link(&workspace, &r.info.thread_id),
                 })
             })
             .collect();

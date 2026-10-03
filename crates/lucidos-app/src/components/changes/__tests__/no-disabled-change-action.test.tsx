@@ -101,6 +101,7 @@ function makeThread(over: Partial<ThreadState['meta']> = {}): ThreadState {
       attentionDescendantCount: 0,
       codingAgentProposed: true,
       codingAgentRequiresRestart: false,
+      codingAgentIncomplete: false,
       codingAgentIsExternalRepo: false,
       codingAgentHasDiff: true,
       lastRevivedAt: '',
@@ -197,7 +198,7 @@ describe('the Changes panel row', () => {
     };
     render(<ChangesView />, host);
     expect(actionLabels()).not.toContain('Apply on settle');
-    expect(actionLabels()).toContain('Applying...');
+    expect(actionLabels()).toContain('Resolving...');
     expect(host.textContent).toContain('Resolving merge conflicts');
     expect(host.textContent).not.toContain('The thread has not finished');
   });

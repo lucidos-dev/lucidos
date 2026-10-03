@@ -2,6 +2,7 @@ import { signal } from '@preact/signals';
 import { focusedThreadId, isMidTurn } from '../../store/store';
 import { computeExchanges, findQuestionAnswer } from '../../store/thread-events';
 import type { ThreadState, ThreadStatus } from '../../store/thread-events';
+import { uploadsGate, type PendingUpload } from '../../store/pendingUploads';
 
 // Pure prompt-input logic + the optimistic-send signal. Extracted from
 // PromptInput.tsx (re-exported there); imported directly by *.test.ts.
@@ -23,25 +24,37 @@ export const promptStopRequested = signal(false);
 export const promptSideQuestionRequested = signal(false);
 
 /** What the Side question half of the split pill does, or why it is not
- *  offered. The hold on Send or Stop and the Side question shortcut share it.
- *  From Send it asks the draft. Stop shows only over an empty box, so there it
- *  starts a `/btw` draft for the user to finish while the turn runs. */
+ *  offered. The hold on the row's end button and the Side question shortcut
+ *  share it.
+ *  From Send it asks the draft. Stop, and the lone Cancel on a waiting card,
+ *  show only over an empty box, so there it turns on side-question mode. */
 export type SideQuestionAction =
   | { kind: 'ask-draft' }
-  | { kind: 'start-draft' }
+  | { kind: 'start-mode' }
   | { kind: 'unavailable'; reason: string };
 
 export function sideQuestionAction(args: {
   hasContent: boolean;
-  stopShown: boolean;
+  stopOrCancelShown: boolean;
   threadStarted: boolean;
   isCodex: boolean;
 }): SideQuestionAction {
   if (!args.threadStarted) return { kind: 'unavailable', reason: 'Side questions need a started thread.' };
   if (args.isCodex) return { kind: 'unavailable', reason: "Codex threads don't take side questions." };
   if (args.hasContent) return { kind: 'ask-draft' };
-  if (args.stopShown) return { kind: 'start-draft' };
+  if (args.stopOrCancelShown) return { kind: 'start-mode' };
   return { kind: 'unavailable', reason: 'Type the side question first.' };
+}
+
+/** Whether side-question mode is in force. The stored flag counts only where a
+ *  side question can be asked: a started, non-Codex thread. While it is on it
+ *  wins over a pending question card, so the box asks rather than answers. */
+export function sideQuestionModeActive(args: {
+  stored: boolean;
+  threadStarted: boolean;
+  isCodex: boolean;
+}): boolean {
+  return args.stored && args.threadStarted && !args.isCodex;
 }
 
 export interface UploadSendIntent<TContext = unknown> {
@@ -54,7 +67,8 @@ export interface UploadSendIntent<TContext = unknown> {
 /** Thread sends the user clicked while an attached image was still uploading.
  *  The draft stays intact and the actual send is retried once the pending
  *  upload entries settle into confirmed draft hashes. While queued, the same
- *  optimistic submitting signal as a normal send drives the Send→Cancel morph. */
+ *  optimistic submitting signal as a normal send drives the Send→Cancel morph,
+ *  and the composer shows the wait (`uploadSendNotice`). */
 export const queuedUploadSends = signal<Map<string, UploadSendIntent>>(new Map());
 
 export function queueUploadSend<TContext>(
@@ -82,6 +96,77 @@ export function clearQueuedUploadSend(threadId: string): void {
   next.delete(threadId);
   queuedUploadSends.value = next;
   clearSubmittingThread(threadId);
+}
+
+/** Threads where a send was refused, or a queued one released, because an
+ *  attached image failed to upload. The composer says why until the failed
+ *  image is retried or removed. */
+export const uploadBlockedSends = signal<Set<string>>(new Set());
+
+export function markUploadBlockedSend(threadId: string): void {
+  if (uploadBlockedSends.value.has(threadId)) return;
+  uploadBlockedSends.value = new Set(uploadBlockedSends.value).add(threadId);
+}
+
+export function clearUploadBlockedSend(threadId: string): void {
+  if (!uploadBlockedSends.value.has(threadId)) return;
+  const next = new Set(uploadBlockedSends.value);
+  next.delete(threadId);
+  uploadBlockedSends.value = next;
+}
+
+/** Settle each queued send once its uploads do. Every queued send ends in one
+ *  of three ways: dispatched, cancelled by the user, or released here.
+ *  - In flight, retries and an outage included: it stays queued.
+ *  - A terminal failure: released, the draft untouched, and the upload line
+ *    says why until nothing on the thread is failed.
+ *  - Clear: handed to `dispatch`. */
+export function settleQueuedUploadSends(dispatch: (threadId: string, intent: UploadSendIntent) => void): void {
+  for (const threadId of uploadBlockedSends.value) {
+    if (uploadsGate(threadId) !== 'failed') clearUploadBlockedSend(threadId);
+  }
+  for (const [threadId] of queuedUploadSends.value) {
+    const gate = uploadsGate(threadId);
+    if (gate === 'in-flight') continue;
+    if (gate === 'failed') {
+      clearQueuedUploadSend(threadId);
+      markUploadBlockedSend(threadId);
+      continue;
+    }
+    const intent = takeQueuedUploadSend(threadId);
+    if (intent) dispatch(threadId, intent);
+  }
+}
+
+/** What the composer's upload line says about a send:
+ *  - `queued`: Send was pressed and waits on `inFlight` images;
+ *  - `blocked`: a send was refused or released, `failed` images being why. */
+export type UploadSendNotice =
+  | { kind: 'queued'; inFlight: number; asSideQuestion: boolean }
+  | { kind: 'blocked'; failed: number };
+
+/** The notice for one thread, or null when there is nothing to say. Pure. */
+export function uploadSendNotice(
+  queued: UploadSendIntent | undefined,
+  blocked: boolean,
+  uploads: readonly PendingUpload[],
+): UploadSendNotice | null {
+  const failed = uploads.filter((u) => u.state.kind === 'failed').length;
+  if (blocked && failed > 0) return { kind: 'blocked', failed };
+  if (!queued) return null;
+  return { kind: 'queued', inFlight: uploads.length - failed, asSideQuestion: queued.asSideQuestion === true };
+}
+
+export function uploadSendNoticeText(notice: UploadSendNotice): string {
+  if (notice.kind === 'blocked') {
+    return notice.failed === 1
+      ? 'Not sent: an image failed to upload. Retry it or remove it, then send.'
+      : `Not sent: ${notice.failed} images failed to upload. Retry or remove them, then send.`;
+  }
+  const verb = notice.asSideQuestion ? 'Asks' : 'Sends';
+  return notice.inFlight > 1
+    ? `${verb} when the ${notice.inFlight} images finish uploading`
+    : `${verb} when the image finishes uploading`;
 }
 
 function markSubmittingThread(threadId: string): void {
@@ -143,6 +228,8 @@ export function isCancelSettling(now: number = Date.now()): boolean {
 }
 
 // What Escape does while the prompt textarea has focus.
+//   leave-side-question: the composer is in side-question mode, so Escape turns
+//           it off and keeps the text. It goes first, as the least destructive.
 //   cancel: there is something to cancel, so Escape is the keyboard twin of the
 //           row's red button: abort the running turn, or stamp the pending
 //           question `Canceled`.
@@ -154,12 +241,14 @@ export function isCancelSettling(now: number = Date.now()): boolean {
 //           one key away: submit with Enter, reflex Escape, turn gone. Nothing
 //           happens for that window, deliberately, rather than falling through
 //           to `blur` and teaching the user that Escape sometimes only blurs.
-export type PromptEscapeAction = 'cancel' | 'blur' | 'ignore';
+export type PromptEscapeAction = 'leave-side-question' | 'cancel' | 'blur' | 'ignore';
 
 export function computePromptEscapeAction(
   hasCancelTarget: boolean,
   settling: boolean,
+  sideQuestionMode: boolean,
 ): PromptEscapeAction {
+  if (sideQuestionMode) return 'leave-side-question';
   if (!hasCancelTarget) return 'blur';
   return settling ? 'ignore' : 'cancel';
 }
@@ -384,11 +473,16 @@ export function computeAnswerActionMode(args: {
 export const PLACEHOLDER_NEW_THREAD = 'What can I help with?';
 export const PLACEHOLDER_FOLLOW_UP = 'Post a follow up…';
 export const PLACEHOLDER_ANSWERING = 'Type custom answer here…';
+export const PLACEHOLDER_SIDE_QUESTION = 'Ask a side question…';
 
+/** Side-question mode wins over a pending question card: in the mode, Send
+ *  asks the side question, and the × goes back to answering the card. */
 export function promptPlaceholder(
   hasFocusedThread: boolean,
   answeringQuestionCard: boolean,
+  sideQuestionMode: boolean,
 ): string {
+  if (sideQuestionMode) return PLACEHOLDER_SIDE_QUESTION;
   if (answeringQuestionCard) return PLACEHOLDER_ANSWERING;
   return hasFocusedThread ? PLACEHOLDER_FOLLOW_UP : PLACEHOLDER_NEW_THREAD;
 }

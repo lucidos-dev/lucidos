@@ -215,7 +215,7 @@ hs_engine_filters() { # changed paths on stdin
 # files that way, and `make test` never runs its tests. A path in the
 # vitest-inputs file (hs_vitest_inputs) selects the Vitest suite.
 hs_select_suites() { # [compile-inputs-file] [cli-inputs-file] [vitest-inputs-file]
-    local inputs=${1:-/dev/null} cli_inputs=${2:-/dev/null} vitest_inputs=${3:-/dev/null} p rust="" shell="" app="" cli="" ts="" css="" vitest="" install="" release="" self="" scope="" paths=""
+    local inputs=${1:-/dev/null} cli_inputs=${2:-/dev/null} vitest_inputs=${3:-/dev/null} p rust="" shell="" app="" cli="" ts="" css="" vitest="" install="" release="" self="" scope="" codex="" paths=""
     while IFS= read -r p; do
         [ -n "$p" ] || continue
         paths="$paths$p
@@ -243,6 +243,7 @@ hs_select_suites() { # [compile-inputs-file] [cli-inputs-file] [vitest-inputs-fi
             scripts/release.sh | scripts/lib/release_draft.sh) release=1 ;;
             scripts/harden-suites.sh | scripts/lib/harden_suites*.sh | scripts/lib/proc_tree.sh) self=1 ;;
             scripts/harden-scope.sh | scripts/lib/harden_scope_test.sh) scope=1 ;;
+            scripts/harden-codex-review.sh | scripts/lib/harden_codex_review_test.sh) codex=1 ;;
         esac
         case "$p" in
             *.ts | *.tsx) ts=1 ;;
@@ -274,6 +275,7 @@ hs_select_suites() { # [compile-inputs-file] [cli-inputs-file] [vitest-inputs-fi
     [ -n "$release" ] && echo release
     [ -n "$self" ] && echo harden-suites
     [ -n "$scope" ] && echo harden-scope
+    [ -n "$codex" ] && echo harden-codex-review
     return 0
 }
 
@@ -306,6 +308,7 @@ hs_suite_command() { # <suite> <early|normal> <changed-paths-file>
         release) echo "bash scripts/lib/release_draft_test.sh && bash scripts/lib/release_rc_gate_test.sh" ;;
         harden-suites) echo "bash scripts/lib/harden_suites_test.sh" ;;
         harden-scope) echo "bash scripts/lib/harden_scope_test.sh" ;;
+        harden-codex-review) echo "bash scripts/lib/harden_codex_review_test.sh" ;;
         *)
             echo "unknown suite: $suite" >&2
             return 1

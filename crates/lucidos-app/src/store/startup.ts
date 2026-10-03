@@ -45,6 +45,7 @@ import { openThreadAcrossWorkspaces } from './actions/cross-workspace';
 import { inlineMarkdownImage, openImagePopupFromGroup } from './imagePopup';
 import { installMarkdownImageRetry } from '../utils/markdownImageRetry';
 import { installMarkdownImageFallback } from '../utils/markdownImageFallback';
+import { installPendingUploadRestore } from './actions/pendingUploadRestore';
 import { CHECK_ICON, COPY_ICON } from '../utils/markedConfig';
 import { clipboardOrReport } from '../utils/clipboard';
 import { activeMenuItem, notificationsFilter, settingsSubview, serviceWorkerBuildId, threadsLoaded, showToast, showConfirm, showPrompt, CONNECTION_POLL_INTERVAL_MS, FOCUSED_THREAD_KEY, setFocusedThread } from './store';
@@ -317,6 +318,8 @@ export function startClient(): () => void {
   const stopMarkdownImageRetry = installMarkdownImageRetry();
   // While it is failing, a notice says so in place of the broken-image glyph.
   const stopMarkdownImageFallback = installMarkdownImageFallback();
+  // Images a previous page load was still uploading come back as chips.
+  const stopPendingUploadRestore = installPendingUploadRestore();
 
   // Cold-start, warm hashchange, AND resume (visibilitychange / focus /
   // pageshow) all dispatch through one shared router. While its JS is
@@ -853,6 +856,7 @@ export function startClient(): () => void {
     stopNativeTap?.();
     document.removeEventListener('click', onGlobalClick);
     stopMarkdownImageRetry();
+    stopPendingUploadRestore();
     stopMarkdownImageFallback();
     document.removeEventListener('visibilitychange', handleVisibilityChange);
     window.removeEventListener('focus', onResumeCoalesced);

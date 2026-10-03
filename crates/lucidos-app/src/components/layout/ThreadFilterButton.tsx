@@ -41,7 +41,7 @@ export function FilterButtonBadge({ count }: { count: number }) {
  *  from `filterButtonState`.
  *
  *  It toggles a panel that renders down in the drawer pane (`ThreadDrawer`),
- *  and it is that panel's only way out. The accessible NAME stays "Filter
+ *  and it is that panel's visible way out. The accessible NAME stays "Filter
  *  threads" either way (the disclosure pattern): `aria-expanded` says which way
  *  the next press goes. */
 export function ThreadFilterButton({ class: extraClass, tooltip }: { class?: string; tooltip?: string }) {

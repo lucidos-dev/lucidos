@@ -1132,6 +1132,8 @@ async fn the_sub_thread_count_and_the_filter_agree_on_one_tree() {
             status: crate::core::store::StatusFilter::Any,
             sources: None,
             parent: None,
+            has_draft: None,
+            has_diff: None,
             limit: 100,
         })
         .await

@@ -554,7 +554,7 @@ How Lucidos shows where you are: the focused pane's header, the mobile pane dot,
 | `--focus-pill-glow` | The bloom around the active pane dot. | `--accent` |
 | `--nav-focus-glow` | The neutral spotlight on the item you navigated to. Keep it hue-free: it marks a place, not a state. | `--bg-primary`, `--text-primary` |
 | `--nav-focus-border-alpha` | How strong the spotlight's hairline border is. |  |
-| `--focus-ring` | The ring around the control that has keyboard focus. |  |
+| `--focus-ring` | The ring around the control that has keyboard focus. Keep its band within `0.1875rem`: that is the room a scrolling or clipping box leaves for it, and a wider ring is cut there. |  |
 
 ### Shape
 

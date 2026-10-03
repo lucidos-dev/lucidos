@@ -1,6 +1,8 @@
 # 0241: The session spawn path does not merge main
 
-- **Status**: Accepted
+- **Status**: Accepted, amended by
+  [0345](0345-harden-merges-main-before-it-reviews.md): `/harden` now merges
+  `main` at its start, as an agent step. The engine still never does.
 - **Date**: 2026-09-21
 
 ## Context

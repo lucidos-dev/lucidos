@@ -393,6 +393,176 @@ fn parse_assistant_all_zero_usage_does_not_consume_its_message_id() {
     );
 }
 
+/// A `stream_event` line wrapping one raw Anthropic SSE event. A sub-agent's
+/// line names the tool call that spawned it in `parent_tool_use_id`.
+fn stream_event(event: &str, parent_tool_use_id: Option<&str>) -> String {
+    let parent = parent_tool_use_id.map_or("null".to_string(), |p| format!(r#""{p}""#));
+    format!(r#"{{"type":"stream_event","event":{event},"parent_tool_use_id":{parent}}}"#)
+}
+
+fn message_start(message_id: &str, input: u64, cache_read: u64, cache_creation: u64) -> String {
+    stream_event(
+        &format!(
+            r#"{{"type":"message_start","message":{{"id":"{message_id}","model":"claude-sonnet-5","usage":{{"input_tokens":{input},"cache_read_input_tokens":{cache_read},"cache_creation_input_tokens":{cache_creation},"output_tokens":4}}}}}}"#
+        ),
+        None,
+    )
+}
+
+fn message_delta(input: u64, cache_read: u64, cache_creation: u64, output: u64) -> String {
+    stream_event(
+        &format!(
+            r#"{{"type":"message_delta","delta":{{"stop_reason":"tool_use"}},"usage":{{"input_tokens":{input},"cache_read_input_tokens":{cache_read},"cache_creation_input_tokens":{cache_creation},"output_tokens":{output}}}}}"#
+        ),
+        None,
+    )
+}
+
+/// An assistant frame as Claude Code streams it: one content block, and the
+/// usage snapshot from `message_start`, whose output count is a placeholder.
+fn streamed_frame(message_id: &str, block: &str, parent_tool_use_id: Option<&str>) -> String {
+    let parent = parent_tool_use_id.map_or("null".to_string(), |p| format!(r#""{p}""#));
+    format!(
+        r#"{{"type":"assistant","parent_tool_use_id":{parent},"message":{{"id":"{message_id}","role":"assistant","model":"claude-sonnet-5","content":[{block}],"usage":{{"input_tokens":2,"cache_read_input_tokens":0,"cache_creation_input_tokens":26845,"output_tokens":4}}}}}}"#
+    )
+}
+
+const TEXT_BLOCK: &str = r#"{"type":"text","text":"hi"}"#;
+const TOOL_BLOCK: &str = r#"{"type":"tool_use","id":"toolu_1","name":"Bash","input":{}}"#;
+
+fn usages(events: &[AgentEvent]) -> Vec<(u32, u32, u32, u32)> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Usage {
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_creation_tokens,
+                ..
+            } => Some((
+                *input_tokens,
+                *cache_read_tokens,
+                *cache_creation_tokens,
+                *output_tokens,
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The undercount behind the Token Cost gap. Every assistant frame repeats
+/// the usage `message_start` reported, whose output count is a placeholder (4
+/// in a real probe), while the call produced 121. Only the `message_delta`
+/// carries the final count, so the one `Usage` for the call comes from there.
+#[test]
+fn a_streamed_call_reports_the_final_output_count_from_its_message_delta() {
+    let mut state = CcStreamState::default();
+    let lines = [
+        message_start("msg_a", 2, 0, 26_845),
+        streamed_frame("msg_a", TEXT_BLOCK, None),
+        streamed_frame("msg_a", TOOL_BLOCK, None),
+        message_delta(2, 0, 26_845, 121),
+    ];
+    let per_line: Vec<Vec<AgentEvent>> = lines.iter().map(|l| parse_line(&mut state, l)).collect();
+
+    assert!(
+        per_line[..3].iter().all(|events| usage_count(events) == 0),
+        "no frame reports the call before its final count is known, got {per_line:?}"
+    );
+    assert_eq!(usages(&per_line[3]), vec![(2, 0, 26_845, 121)]);
+    let model = per_line[3].iter().find_map(|e| match e {
+        AgentEvent::Usage { model, .. } => model.clone(),
+        _ => None,
+    });
+    assert_eq!(model.as_deref(), Some("claude-sonnet-5"));
+}
+
+/// A call stopped mid-stream still billed its prompt. With no
+/// `message_delta`, the counts `message_start` reported are reported at the
+/// turn's `result`, ahead of the `Result` itself.
+#[test]
+fn a_call_cut_off_before_its_message_delta_reports_at_the_turn_terminal() {
+    let mut state = CcStreamState::default();
+    parse_line(&mut state, &message_start("msg_cut", 2, 50_000, 300));
+    parse_line(&mut state, &streamed_frame("msg_cut", TEXT_BLOCK, None));
+    let terminal = parse_line(
+        &mut state,
+        r#"{"type":"result","is_error":true,"subtype":"error_during_execution","duration_ms":10}"#,
+    );
+
+    assert_eq!(usages(&terminal), vec![(2, 50_000, 300, 4)]);
+    assert!(
+        matches!(terminal.last(), Some(AgentEvent::Result { .. })),
+        "the usage lands before the Result, got {terminal:?}"
+    );
+}
+
+/// The same when the next call starts first: an unfinished message is
+/// reported when the next `message_start` opens, so it is never lost.
+#[test]
+fn a_call_without_a_message_delta_reports_when_the_next_one_starts() {
+    let mut state = CcStreamState::default();
+    parse_line(&mut state, &message_start("msg_1", 2, 1_000, 10));
+    let second_start = parse_line(&mut state, &message_start("msg_2", 2, 1_010, 20));
+    let second_end = parse_line(&mut state, &message_delta(2, 1_010, 20, 33));
+
+    assert_eq!(usages(&second_start), vec![(2, 1_000, 10, 4)]);
+    assert_eq!(usages(&second_end), vec![(2, 1_010, 20, 33)]);
+}
+
+/// A sub-agent's calls stream no `message_start` or `message_delta` on the
+/// parent's stream, only frames tagged with `parent_tool_use_id`. Those keep
+/// reporting from the frame, even while a parent message is open.
+#[test]
+fn a_sub_agent_frame_still_reports_while_a_parent_message_is_open() {
+    let mut state = CcStreamState::default();
+    parse_line(&mut state, &message_start("msg_parent", 2, 0, 7_096));
+    let sub = parse_line(
+        &mut state,
+        &streamed_frame("msg_sub", TOOL_BLOCK, Some("toolu_parent")),
+    );
+    let parent_end = parse_line(&mut state, &message_delta(2, 0, 7_096, 168));
+
+    assert_eq!(usages(&sub), vec![(2, 0, 26_845, 4)]);
+    assert_eq!(usages(&parent_end), vec![(2, 0, 7_096, 168)]);
+}
+
+/// Defensive: should a sub-agent's stream events ever ride the parent's
+/// stream, they must not open or close the parent's message.
+#[test]
+fn a_sub_agent_stream_event_does_not_touch_the_parent_message() {
+    let mut state = CcStreamState::default();
+    parse_line(&mut state, &message_start("msg_parent", 2, 0, 500));
+    let sub_delta = parse_line(
+        &mut state,
+        &stream_event(
+            r#"{"type":"message_delta","usage":{"output_tokens":999}}"#,
+            Some("toolu_parent"),
+        ),
+    );
+    let parent_end = parse_line(&mut state, &message_delta(2, 0, 500, 40));
+
+    assert_eq!(usage_count(&sub_delta), 0);
+    assert_eq!(usages(&parent_end), vec![(2, 0, 500, 40)]);
+}
+
+/// A `message_delta` that omits a count keeps the one `message_start` gave.
+#[test]
+fn a_message_delta_without_input_counts_keeps_the_start_counts() {
+    let mut state = CcStreamState::default();
+    parse_line(&mut state, &message_start("msg_lean", 3, 9_000, 120));
+    let end = parse_line(
+        &mut state,
+        &stream_event(
+            r#"{"type":"message_delta","usage":{"output_tokens":57}}"#,
+            None,
+        ),
+    );
+
+    assert_eq!(usages(&end), vec![(3, 9_000, 120, 57)]);
+}
+
 #[test]
 fn parse_assistant_no_usage_block() {
     // Defensive: assistant frames without a usage block (e.g. older CC

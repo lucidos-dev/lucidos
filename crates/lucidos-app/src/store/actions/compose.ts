@@ -16,7 +16,7 @@
  * focused-textarea guards.
  */
 
-import { effect } from '@preact/signals';
+import { effect, signal } from '@preact/signals';
 import { threadMap, focusedThreadId, inputMode, showToast, removeToast, setFocusedThread, selectedScope, repositories, type Scope } from '../store';
 import { loadedOr } from '../types';
 import { generateUuid } from '../../utils/uuid';
@@ -303,11 +303,16 @@ export interface ServerDraft {
  *  its CURRENT compose state counts. */
 export const serverDraft = new Map<string, ServerDraft>();
 
+/** Bumped on every write to `serverDraft`, so a subscriber learns the engine's
+ *  draft moved. The pending-upload store releases a landed image on it. */
+export const serverDraftVersion = signal(0);
+
 /** Record a server report of the thread's stored draft. Copies the hash array:
  *  callers hand over an array they also stage into the local draft, and the two
  *  records must not alias. */
 export function noteServerDraft(threadId: string, text: string, imageHashes: readonly string[]): void {
   serverDraft.set(threadId, { text, imageHashes: [...imageHashes] });
+  serverDraftVersion.value = serverDraftVersion.peek() + 1;
 }
 
 /** This device's knowledge of each thread's *compose epoch*
@@ -719,6 +724,7 @@ export function _undeliveredComposeDraftsForTesting(): string[] {
  *  undelivered draft can't leak into the next. */
 export function _resetUndeliveredComposeDraftsForTesting(): void {
   undeliveredComposeDrafts.clear();
+  threadStarts.clear();
   runningComposePushes.clear();
   owedComposePushes.clear();
   composeEpoch.clear();
@@ -854,8 +860,8 @@ async function pushNow(threadId: string, staleRetries = 0): Promise<void> {
       // PUT 404s if the 250ms debounce elapses before POST /threads settles.
       await awaitThreadStarted(threadId);
     } catch {
-      // ensureFocusedComposeThread already toasts the start failure; a second
-      // toast from this PUT path would just duplicate the same error.
+      // `startThreadOnEngine` already reported a refused start, and one that got
+      // no answer is owed and re-sent by the flush. A toast here would repeat it.
       return;
     }
     const thread = threadMap.value.get(threadId);
@@ -1012,16 +1018,73 @@ export async function startComposeIfNeeded(threadId: string, mode: ComposeMode):
   }));
   threadMap.value = next;
   setDraft(threadId, { text: '', image_hashes: [], mode });
-  try {
-    await ensureThreadStarted(threadId, mode);
-  } catch (err) {
-    rollbackOptimistic(threadId);
-    throw err;
-  }
-  // The row now holds this mode: `ThreadStarted` stores it, and the endpoint
-  // 409s rather than accepting a different one. So the first keystroke write
-  // has nothing to state about the channel.
-  noteServerComposeMode(threadId, mode);
+  await startThreadOnEngine(threadId, mode);
+}
+
+/** Per draft, the `POST /threads` the engine has not confirmed yet: one in
+ *  flight, or one owed after a transient failure. No entry means the row
+ *  exists, or this client never started it. */
+type ThreadStart =
+  | { kind: 'in-flight'; promise: Promise<void> }
+  | { kind: 'owed'; mode: ComposeMode };
+
+const threadStarts = new Map<string, ThreadStart>();
+
+/** One `POST /threads` for an optimistic draft, single-flight per thread.
+ *
+ *  A transient failure keeps the draft, its images and its row: an engine that
+ *  did not answer has said nothing about the draft. The start is then owed,
+ *  and the draft joins the undelivered set, so the reconnect flush retries it.
+ *  Only a verdict rolls the optimistic row back. It is reported here, so a
+ *  refused re-send is heard whichever caller needed the row. */
+function startThreadOnEngine(threadId: string, mode: ComposeMode): Promise<void> {
+  const current = threadStarts.get(threadId);
+  if (current?.kind === 'in-flight') return current.promise;
+  const promise = (async () => {
+    try {
+      await ensureThreadStarted(threadId, mode);
+    } catch (err) {
+      // Live, not `composing`: `sendCompose` marks the row active before it
+      // waits on the start, and a send that got no answer keeps its draft too.
+      const thread = threadMap.value.get(threadId);
+      const live = thread !== undefined && thread.meta.state !== 'discarded';
+      if (live && isTransientFetchError(err)) {
+        threadStarts.set(threadId, { kind: 'owed', mode });
+        undeliveredComposeDrafts.add(threadId);
+        composePushFailures.recordFailure();
+        throw err;
+      }
+      threadStarts.delete(threadId);
+      rollbackOptimistic(threadId);
+      if (live) reportRefusedThreadStart(threadId, err);
+      throw err;
+    }
+    threadStarts.delete(threadId);
+    // The row now holds this mode: `ThreadStarted` stores it, and the endpoint
+    // 409s rather than accepting a different one. So the first keystroke write
+    // has nothing to state about the channel.
+    noteServerComposeMode(threadId, mode);
+  })();
+  threadStarts.set(threadId, { kind: 'in-flight', promise });
+  return promise;
+}
+
+/** The engine refused to start a draft's thread, and the row is gone. Drop the
+ *  nav entry so Forward cannot restore an id with no row, and the focus. */
+function reportRefusedThreadStart(threadId: string, err: unknown): void {
+  removeThreadNavEntries(threadId);
+  if (focusedThreadId.value === threadId) setFocusedThread(null);
+  showToast(`Failed to start compose: ${errorDetail(err)}`, 'error');
+}
+
+/** True while the engine has not confirmed this draft's thread row. */
+export function isThreadStartPending(threadId: string): boolean {
+  return threadStarts.has(threadId);
+}
+
+/** True when this draft's start failed transiently and nothing has re-sent it. */
+function isThreadStartOwed(threadId: string): boolean {
+  return threadStarts.get(threadId)?.kind === 'owed';
 }
 
 function rollbackOptimistic(threadId: string): void {
@@ -1040,24 +1103,23 @@ function rollbackOptimistic(threadId: string): void {
   clearComposeSelection(threadId);
 }
 
-/** In-flight POST /threads promises keyed by thread id. Callers needing the row
- *  to exist server-side before issuing their own request consult this via
- *  `awaitThreadStarted`. Image blob upload is the one attach path that fires
- *  synchronously, with no debounce to hide the race. */
-const pendingThreadStarts = new Map<string, Promise<void>>();
-
-/** Resolve once the in-flight `POST /threads` for this id has settled.
- *  No-op (resolves immediately) if no start is in flight — covers both the
- *  already-active thread case and any later race-free caller. */
+/** Resolve once the engine holds this draft's thread row. Callers that need
+ *  the row before their own request wait here: the draft PUT, the send, and
+ *  the image upload, which fires with no debounce to hide the race.
+ *
+ *  An owed start is re-sent here, so whoever needs the row next retries it.
+ *  Resolves at once when nothing is pending, and rejects if the start fails. */
 export async function awaitThreadStarted(threadId: string): Promise<void> {
-  const p = pendingThreadStarts.get(threadId);
-  if (p) await p;
+  const start = threadStarts.get(threadId);
+  if (!start) return;
+  if (start.kind === 'in-flight') return start.promise;
+  return startThreadOnEngine(threadId, start.mode);
 }
 
 /** Lazy-create a thread id when the user starts composing without a thread
  *  focused. The id is allocated client-side; `startComposeIfNeeded` POSTs the
- *  row server-side. Toast on POST failure — local optimism gets rolled back
- *  by `startComposeIfNeeded` itself. */
+ *  row server-side. A refused start rolls back and toasts, and one that got no
+ *  answer keeps the draft and stays owed (`startThreadOnEngine`). */
 export function ensureFocusedComposeThread(): string {
   let id = focusedThreadId.value;
   if (id) return id;
@@ -1074,23 +1136,10 @@ export function ensureFocusedComposeThread(): string {
   // Inlined instead of focusThread(): that also fires loadThreadEvents and
   // (on mobile) navigateToPane, neither of which the draft path wants.
   pushThreadNavState({ type: 'thread', id });
-  const startPromise = startComposeIfNeeded(id, currentComposeMode());
-  pendingThreadStarts.set(id, startPromise);
-  startPromise
-    .catch((err) => {
-      // Mirror rollbackOptimistic's threadMap drop in nav so Forward can't later
-      // restore an id whose threadMap entry no longer exists.
-      removeThreadNavEntries(id);
-      if (focusedThreadId.value === id) setFocusedThread(null);
-      showToast(`Failed to start compose: ${errorDetail(err)}`, 'error');
-    })
-    .finally(() => {
-      // Only clear if we still own the slot — a fresh ensureFocusedComposeThread
-      // for the same id (rare but possible after rollback + reuse) wins.
-      if (pendingThreadStarts.get(id) === startPromise) {
-        pendingThreadStarts.delete(id);
-      }
-    });
+  startComposeIfNeeded(id, currentComposeMode()).catch(() => {
+    // Already handled: a refused start reports itself in `startThreadOnEngine`,
+    // and one that got no answer is owed and re-sent.
+  });
   return id;
 }
 
@@ -1170,15 +1219,31 @@ function dropNonComposingFocus(): void {
  *
  *  Does NOT send: that is {@link sendSeededPrompt}'s extra step. */
 export function seedSuggestion(text: string): string {
-  dropNonComposingFocus();
-  const existingId = focusedThreadId.value;
-  if (existingId && !draftIsEmpty(getDraft(existingId))) unfocusThread();
+  stepOffDraftInProgress();
   // Target the Lucidos Agent. Set BEFORE prefill so a brand-new draft is born on
   // the chat channel, and so an existing coding-agent draft flips back to chat.
   applyDestination(focusedThreadId.value, { kind: 'lucidos-agent' });
   const threadId = prefillCompose(text);
   requestPromptOverrideSync('replace');
   return threadId;
+}
+
+/** Put text the engine refused back where it can be sent again: a fresh draft
+ *  on the destination the compose view would pick. A draft in progress is
+ *  stepped off, never overwritten, as in `seedSuggestion`. */
+export function composeInFreshDraft(text: string, imageHashes: string[]): void {
+  stepOffDraftInProgress();
+  const threadId = prefillCompose(text);
+  if (imageHashes.length > 0) updateCompose(threadId, { image_hashes: imageHashes });
+  requestPromptOverrideSync('replace');
+}
+
+/** Leave the focus on an empty draft or on nothing. The next prefill then
+ *  neither lands on a sent thread nor overwrites text the user is writing. */
+function stepOffDraftInProgress(): void {
+  dropNonComposingFocus();
+  const existingId = focusedThreadId.value;
+  if (existingId && !draftIsEmpty(getDraft(existingId))) unfocusThread();
 }
 
 /** The message the setup-interview entry points send.
@@ -1284,6 +1349,13 @@ export async function discardCompose(threadId: string): Promise<void> {
   // Pairs with the push in ensureFocusedComposeThread. Back and Forward must
   // not restore a discarded thread whose events would 404.
   removeThreadNavEntries(threadId);
+  if (isThreadStartOwed(threadId)) {
+    // The engine never held this draft. There is nothing to delete there, and
+    // no discard event will arrive to clear the local row.
+    threadStarts.delete(threadId);
+    rollbackOptimistic(threadId);
+    return;
+  }
   try {
     await deleteThread(threadId);
   } catch (err) {
@@ -1299,7 +1371,7 @@ export async function discardCompose(threadId: string): Promise<void> {
     // source rather than the repo the user picked.
     seedComposeSelection(threadId, restoreSelection);
     if (restoreEpoch !== undefined) composeEpoch.set(threadId, restoreEpoch);
-    if (restoreServerDraft !== undefined) serverDraft.set(threadId, restoreServerDraft);
+    if (restoreServerDraft !== undefined) noteServerDraft(threadId, restoreServerDraft.text, restoreServerDraft.imageHashes);
     showToast(`Discard failed: ${errorDetail(err)}`, 'error');
   }
 }
@@ -1450,6 +1522,24 @@ export async function sendCompose(
     // failed start rejects here and lands in the catch below, which rolls the
     // draft back and rethrows for the caller to toast.
     await awaitThreadStarted(threadId);
+    // What a send owes once the engine takes it. An unsent one owes nothing
+    // yet: clearing the engine's draft then could only lose the text.
+    const settleAcceptedSend = () => {
+      // A compose-view pick is a one-shot intent, now carried into this spawn's
+      // chat body, so consume the draft's selection. Without this the override
+      // would linger in `composeSelections` for a thread no longer composing.
+      // Follow-ups do not come through here: an active thread has no entry.
+      clearComposeSelection(threadId);
+      // Scheduled AFTER the send resolved and the selection was consumed, for
+      // two reasons. `cancelPendingPush` above dropped the debounced write, and
+      // an in-flight write cannot be recalled. Without this the engine's last
+      // word could be the pre-send text. And ordering it after
+      // `clearComposeSelection` keeps the write from carrying the draft's picks
+      // back onto a row whose `compose_selection` the projection just set to
+      // NULL. A send that FAILS consumed no draft, so `rollBack` writes the
+      // restored text instead.
+      pushClearedComposeAfterSend(threadId);
+    };
     const outcome = await sendMessage(text, wireHashes.length > 0 ? wireHashes : undefined, {
       useCodingAgent: opts.useCodingAgent,
       context: opts.context,
@@ -1460,26 +1550,14 @@ export async function sendCompose(
       providerOverride,
       ccModelOverride,
       ccReasoningEffortOverride,
+      settlement: { onAccepted: settleAcceptedSend, onRefused: rollBack },
     });
     if (outcome === 'dropped') {
       // `sendMessage` already toasted, and the draft is all that holds the text.
       rollBack();
       return false;
     }
-    // A compose-view pick is a one-shot intent, now carried into this spawn's
-    // chat body, so consume the draft's selection. Without this the override
-    // would linger in `composeSelections` for a thread no longer composing.
-    // Follow-ups do not come through here: an active thread has no entry.
-    clearComposeSelection(threadId);
-    // Scheduled here, AFTER the send resolved and the selection was consumed,
-    // for two reasons. `cancelPendingPush` above dropped the debounced write,
-    // and an in-flight write cannot be recalled. Without this the engine's last
-    // word could be the pre-send text. And ordering it after
-    // `clearComposeSelection` keeps the write from carrying the draft's picks
-    // back onto a row whose `compose_selection` the projection just set to
-    // NULL. A send that FAILS consumed no draft, so `rollBack` writes the
-    // restored text instead.
-    pushClearedComposeAfterSend(threadId);
+    if (outcome === 'sent') settleAcceptedSend();
     return true;
   } catch (err) {
     rollBack();
@@ -1506,15 +1584,22 @@ export async function sendFollowup(
   // scheduling a second write.
   updateCompose(threadId, { text: '', image_hashes: [] });
   lastSyncedImageHashes.delete(threadId);
-  const outcome = await sendMessage(text, imageHashes, { ...opts, threadId, focus: opts?.focus ?? true });
-  if (outcome !== 'dropped') return;
   // The refused send's row is gone, so the draft is all that can hold the text.
   // Typing that landed meanwhile wins, as in `sendCompose`'s roll-back.
-  const current = getDraft(threadId);
-  const restore: ComposePatch = {};
-  if (current.text === '') restore.text = text;
-  if (current.image_hashes.length === 0 && imageHashes?.length) restore.image_hashes = imageHashes;
-  if (Object.keys(restore).length > 0) updateCompose(threadId, restore);
+  const restoreRefused = () => {
+    const current = getDraft(threadId);
+    const restore: ComposePatch = {};
+    if (current.text === '') restore.text = text;
+    if (current.image_hashes.length === 0 && imageHashes?.length) restore.image_hashes = imageHashes;
+    if (Object.keys(restore).length > 0) updateCompose(threadId, restore);
+  };
+  const outcome = await sendMessage(text, imageHashes, {
+    ...opts,
+    threadId,
+    focus: opts?.focus ?? true,
+    settlement: { onRefused: restoreRefused },
+  });
+  if (outcome === 'dropped') restoreRefused();
 }
 
 /** Tab-close-safe flush. Each pending PUT goes out with `keepalive: true`, so

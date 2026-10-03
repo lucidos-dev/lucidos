@@ -134,7 +134,7 @@ reap_once() {
         # cache; what its arguments happen to say is irrelevant. Matching the
         # full command line cannot tell "is that process" from "mentions that
         # path", and on 2026-08-03 that killed two Claude Code sessions: a CC
-        # process carries the engine's THREAD HISTORY inside a ~22 KB
+        # process carried the engine's THREAD HISTORY inside a ~22 KB
         # --append-system-prompt argument, so a coding-agent thread discussing
         # this very file matched its own matcher and SIGKILLed itself.
         case "${command%% *}" in

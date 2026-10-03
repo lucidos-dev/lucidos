@@ -86,7 +86,7 @@ fn resume_thread_request_targets_the_stored_thread() {
     let (method, params) = build_thread_request(&test_config(), Some("sid-9"));
     assert_eq!(method, "thread/resume");
     assert_eq!(params["threadId"], "sid-9");
-    // Same instruction-recovery semantics as CC's --append-system-prompt on
+    // Same instruction-recovery semantics as CC's --append-system-prompt-file on
     // resume: the developer instructions ride every spawn.
     assert_eq!(params["developerInstructions"], "SYSPROMPT");
     assert_eq!(params["approvalPolicy"], "on-request");

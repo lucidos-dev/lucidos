@@ -431,3 +431,30 @@ passes through; the engine-side `boot_failure.rs` and its control endpoint; and
 `RESTART_CAP` itself.
 
 Plan: `docs/plans/2026-08-03-transient-provisioning-failure-retries.md`.
+
+## Addendum (2026-10-03): a browser request with no `Referer` is refused
+
+The 2026-06-29 gate ran its app-`Referer` check only when a `Referer` was
+present. A standalone app tab is same-origin, so its own `fetch` with
+`referrerPolicy: 'no-referrer'` passed the forge-proof checks and skipped the
+`Referer` one. It could stop a workspace or rewrite `network.toml` with the
+user's cookie.
+
+`control_request_allowed` now fails closed. A browser request (one carrying
+`Sec-Fetch-Site` or `Origin`) must present a `Referer` naming the picker or the
+workspace shell. The one exception is `Sec-Fetch-Site: none`, a navigation the
+user typed, which no page script can produce. A request with no browser metadata
+at all still passes, as before.
+
+No legitimate caller loses anything. The picker and the shell call the control
+and auth planes with a plain `fetch` under the default Referrer-Policy. The
+service worker never re-issues those requests. The desktop app's native calls,
+the CLI and the engine send no browser metadata.
+
+**Still residual:** an app tab can name a shell URL as its `referrer`. ADR 0144
+records why no same-origin signal closes that, and the distinct-origin fix above
+remains the complete one.
+
+Safari before 16.4 is a second residual. It sends no `Sec-Fetch-*`, and no
+`Origin` on a same-origin GET. So its GET with the Referer suppressed reads as a
+CLI call and passes. Its mutations still carry `Origin` and refuse.

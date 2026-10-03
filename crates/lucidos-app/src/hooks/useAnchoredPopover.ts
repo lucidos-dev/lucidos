@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
+import { useLayoutEffect, useRef, useState } from 'preact/hooks';
 import type { JSX } from 'preact';
 import { clampWithin, safeAreaTopPx } from '../utils/dom';
 import { notePressOutcome } from '../utils/tapGesture';
@@ -23,7 +23,7 @@ export interface AnchorPosition {
    *  makes `clampWithin` pin it to the container's leading edge, which is
    *  exactly where the panel belongs once it narrows to fill the container.
    *  `top` does NOT, because narrowing reflows the content taller, so the
-   *  hook watches the panel's size and re-measures once the cap lands. */
+   *  hook re-measures under the cap before the panel paints. */
   maxWidth: number;
   /** Tallest the panel may be and still fit between its anchor and the
    *  viewport edge on the side it opens, margins already deducted. A surface
@@ -186,7 +186,9 @@ export function useAnchoredPosition(
   align: AnchorAlign = 'start',
 ): AnchorPosition | null {
   const [pos, setPos] = useState<AnchorPosition | null>(null);
-  useEffect(() => {
+  const measureNow = useRef<(() => void) | null>(null);
+  // A layout effect, so the first position lands before the first paint.
+  useLayoutEffect(() => {
     if (!anchor) {
       setPos(null);
       return;
@@ -196,8 +198,7 @@ export function useAnchoredPosition(
       ? (anchor as HTMLElement).closest<HTMLElement>(containerSelector)
       : null;
     let rafId: number | null = null;
-    const recompute = () => {
-      rafId = null;
+    const measure = () => {
       const panel = panelRef.current;
       if (!panel) return;
       const next = computeAnchorPosition(
@@ -214,11 +215,16 @@ export function useAnchoredPosition(
           : next,
       );
     };
+    const recompute = () => {
+      rafId = null;
+      measure();
+    };
     const schedule = () => {
       if (rafId !== null) return;
       rafId = requestAnimationFrame(recompute);
     };
-    recompute();
+    measureNow.current = measure;
+    measure();
     // Capture-phase: the chat pane is its own scroll container, not window — bubbling
     // scrolls would never reach a non-capture window listener.
     window.addEventListener('scroll', schedule, { capture: true, passive: true });
@@ -240,19 +246,18 @@ export function useAnchoredPosition(
     }
     // The panel's own size is an INPUT to the position (`top` is derived from
     // its height whenever it opens upward off the bottom-docked prompt bar), so
-    // it has to be watched like the viewport is. Two ways it moves under us:
-    // the caller applies `maxWidth` as a cap, which narrows the panel and
-    // reflows its text onto more lines, and the content itself changes while
-    // open (a wait resolves, a todo row lands). Without this the first
-    // measurement is the only one until an unrelated scroll or resize, and an
-    // upward-opening panel that grew after being measured hangs down over the
-    // anchor that opened it. The observer's initial callback is free: an
+    // it has to be watched like the viewport is. The settling pass below covers
+    // the cap on open; this covers content that changes while open (a wait
+    // resolves, a todo row lands). Without it an upward-opening panel that grew
+    // after being measured hangs down over the anchor that opened it, until an
+    // unrelated scroll or resize. The observer's initial callback is free: an
     // unchanged position hits the equality guard above and re-renders nothing.
     // A new `--anchor-room` does resize a capped panel, but the position reads
     // the uncapped height (`naturalPanelHeight`), so this cannot cycle.
     const ro = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(schedule);
     if (ro && panelRef.current) ro.observe(panelRef.current);
     return () => {
+      measureNow.current = null;
       if (rafId !== null) cancelAnimationFrame(rafId);
       ro?.disconnect();
       window.removeEventListener('scroll', schedule, true);
@@ -263,6 +268,14 @@ export function useAnchoredPosition(
       }
     };
   }, [anchor, panelRef, containerSelector, align]);
+  // Every new position re-measures before paint. The caller has just applied
+  // its `maxWidth` cap, and a narrower panel wraps taller. A ResizeObserver
+  // fires after paint, so it cannot place the first frame. This converges
+  // only while no caller sizes its panel by `top`, `left`, `placement` or
+  // `maxHeight`; `maxWidth` depends on the container alone.
+  useLayoutEffect(() => {
+    measureNow.current?.();
+  }, [pos]);
   return pos;
 }
 
@@ -423,8 +436,7 @@ export function installPairedSwallow(arming?: Event): void {
  *  click to the lower one, which then closes invisibly behind it. Nesting hid
  *  that for years: a dropdown inside a modal sits physically inside the modal's
  *  panel, so the modal never saw it as outside. Two SIBLING overlays are the
- *  case that exposes it, and a condition modal opened from the waiting panel is
- *  exactly that.
+ *  case that exposes it, and a confirm raised by a modal is exactly that.
  *
  *  The caller answers it with the top PANEL rather than the raw `overlayStack`
  *  top, and `topPanelOverlay` says why. The CENTRAL Escape dispatcher keeps the

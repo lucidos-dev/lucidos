@@ -25,7 +25,8 @@ use std::sync::{Arc, Mutex, RwLock};
 use uuid::Uuid;
 
 use crate::engine::command_guard::{
-    self, unwrap_shell_command, JudgeInput, RiskLane, SideEffectCategory, StaticVerdict,
+    self, unwrap_shell_command, CommandSite, JudgeInput, RiskLane, SideEffectCategory,
+    StaticVerdict,
 };
 use crate::engine::event_bus::{BusEvent, EventBus};
 use crate::engine::thread_events::{
@@ -1015,7 +1016,11 @@ fn static_command_verdict(tool_name: &str, input: &serde_json::Value) -> Command
         CommandPayload::Unresolved => CommandStatic::Unreadable,
         CommandPayload::Known(cmd) => {
             let synthetic = serde_json::json!({ "command": unwrap_shell_command(cmd) });
-            CommandStatic::Verdict(command_guard::static_classify(tn::RUN_BASH, &synthetic))
+            CommandStatic::Verdict(command_guard::static_classify(
+                tn::RUN_BASH,
+                &synthetic,
+                CommandSite::TextOnly { root: None },
+            ))
         }
     }
 }
@@ -1056,7 +1061,10 @@ pub fn classify_coding_agent_request(
                 // rest defensively to benign.
                 StaticVerdict::Settled(_) => RequestVerdict::Benign,
                 StaticVerdict::NeedsJudge(ji) => {
-                    let judged = command_guard::fallback_classify(&ji, Some(workspace_path));
+                    let site = CommandSite::TextOnly {
+                        root: Some(workspace_path),
+                    };
+                    let judged = command_guard::fallback_classify(&ji, site);
                     match judged.lane {
                         RiskLane::Catastrophic => RequestVerdict::Catastrophic,
                         // Ahead of the category arm on purpose. The fast path
@@ -1251,7 +1259,12 @@ fn session_allow_covers(
         let Some(command) = input.get("command").and_then(|v| v.as_str()) else {
             return false;
         };
-        return command_guard::grant_covers_command(tool_name, command, allowed);
+        return command_guard::grant_covers_command(
+            tool_name,
+            command,
+            CommandSite::TextOnly { root: None },
+            allowed,
+        );
     }
     derive_allow_pattern(tool_name, input, AllowScope::Session).is_some_and(|p| allowed(&p))
 }
@@ -1287,7 +1300,12 @@ fn persisted_allow_covers(
         let Some(command) = input.get("command").and_then(|v| v.as_str()) else {
             return false;
         };
-        return command_guard::grant_covers_command(tool_name, command, allowed);
+        return command_guard::grant_covers_command(
+            tool_name,
+            command,
+            CommandSite::TextOnly { root: None },
+            allowed,
+        );
     }
     [AllowScope::Broad, AllowScope::Narrow]
         .into_iter()

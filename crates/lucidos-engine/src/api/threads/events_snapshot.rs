@@ -45,10 +45,6 @@ pub struct ThreadEventsQuery {
 /// unbounded read paging exists to end.
 const MAX_EVENTS_PAGE: i64 = 2_000;
 
-/// The one tool whose args the INLINE render reads, so the args strip spares
-/// it. See `strip_tool_call_args`.
-const GENERATE_IMAGE_TOOL: &str = "generate_image";
-
 /// Response shape for `GET /api/v1/threads/:thread_id/events`. Wraps the event
 /// rows with a `current_aggregate` snapshot of `thread_summaries` so the
 /// frontend's historical-replay path applies meta from a fetched snapshot
@@ -233,10 +229,6 @@ pub(super) fn is_tool_result_event(event_type: &str) -> bool {
 /// Measured on a reported thread they are its single largest share: 2,689 calls
 /// and 3.15 MB, a median of 711 bytes against a p90 of 2,273, because a `bash`
 /// call inlines its whole script.
-///
-/// `thread-sync.ts` does read the write target off `ToolCalled.args`, and that
-/// still works. It runs from `handleTransientSideEffects`, which only the live
-/// SSE dispatcher calls, and a live event is never stripped.
 pub(super) fn is_tool_call_event(event_type: &str) -> bool {
     matches!(event_type, "CodingAgentToolCalled" | "ToolCalled")
 }
@@ -455,67 +447,15 @@ pub(super) fn strip_tool_result_content(row: &mut ThreadEventRow) {
     crate::engine::thread_events::ThreadEvent::strip_result_text(obj);
 }
 
-/// Drop `args` from a tool call on the snapshot path. Stamp an
-/// `args_stripped: true` marker, so the frontend lazy-fetches via
-/// `GET /events/:event_id/tool-args` when the user opens the step-detail modal.
-///
-/// `args` is the single heaviest thing a snapshot carries, on both channels: an
-/// `Edit`'s two versions of a hunk, a `Write`'s whole file, a `bash` call's
-/// inlined script. Nothing inline renders it. The modal's un-elided command
-/// line is its only reader (`fullCommandForCCTool` in `exchange.ts`).
-///
-/// **`description` is filled first, and that ordering is the whole trick.**
-/// The inline label reads `description || describeCCTool(name, args)`, so
-/// dropping `args` from a row with no description would leave a bare tool
-/// name. The write path has stamped one since May 2026 (`run_session/run.rs`),
-/// so only older rows take this branch, and they take the very same function.
+/// Drop `args` from a tool call on the snapshot path, as the live stream does.
+/// The shape lives in `ThreadEvent::strip_tool_call_args`.
 pub(super) fn strip_tool_call_args(row: &mut ThreadEventRow) {
     if !is_tool_call_event(&row.event_type) {
         return;
     }
-    let name = row
-        .payload
-        .get("name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    // ONE tool's args are read by the inline render, so they stay.
-    // `generate_image` puts its bytes in the ToolResult, and the rendered image
-    // takes its tooltip and alt text from the call's prompt. Dropping it leaves
-    // a generated image undescribed after a reload. A prompt is a sentence, so
-    // there is nothing here worth the accessibility.
-    if name == GENERATE_IMAGE_TOOL {
-        return;
+    if let Some(obj) = row.payload.as_object_mut() {
+        crate::engine::thread_events::ThreadEvent::strip_tool_call_args(&row.event_type, obj);
     }
-    let described = row
-        .payload
-        .get("description")
-        .and_then(|v| v.as_str())
-        .is_some_and(|d| !d.is_empty());
-    let fallback = (!described).then(|| {
-        let args = row
-            .payload
-            .get("args")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null);
-        // The CHANNEL picks the describer, and the client's own fallback splits
-        // the same way. A chat tool named through the coding-agent describer
-        // gets a label for a tool it is not. The args are gone a line later, so
-        // nothing can repair it.
-        if row.event_type == "ToolCalled" {
-            crate::core::describe_tool(&name, &args)
-        } else {
-            crate::core::describe_cc_tool(&name, &args)
-        }
-    });
-    let Some(obj) = row.payload.as_object_mut() else {
-        return;
-    };
-    if let Some(description) = fallback {
-        obj.insert("description".to_string(), description.into());
-    }
-    obj.remove("args");
-    obj.insert("args_stripped".to_string(), serde_json::Value::Bool(true));
 }
 
 /// Lazy-fetch payload returned by `GET /events/:event_id/tool-result` — the

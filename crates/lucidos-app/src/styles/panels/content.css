@@ -528,6 +528,9 @@
     /* The shared ring; the transparent outline is the forced-colors fallback. */
     outline: 0.125rem solid transparent;
     box-shadow: var(--focus-ring);
+    /* The bar runs the scroller's full height, so a ring can only show on its
+       sides. Keep exactly those, and the drag reach of ::before on the right. */
+    clip-path: inset(0 calc(-1 * var(--space-xs)) 0 calc(-1 * var(--focus-ring-width)));
 }
 
 @media (hover: hover) {

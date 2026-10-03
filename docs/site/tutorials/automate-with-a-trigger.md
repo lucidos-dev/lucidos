@@ -81,7 +81,8 @@ syncs, nudges).
 
 Set **`go_to_review: true`** when you need to see the output: a daily summary to
 read, an alert to acknowledge, a scheduled report. The run then appears in the
-Current section when it finishes.
+Current section when it finishes. In the trigger form, that is the **Send
+directly to Archive** toggle turned off.
 
 Notifications and `go_to_review` are independent. If your phrasing leaves it
 unclear, the agent asks.

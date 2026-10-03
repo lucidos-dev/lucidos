@@ -176,7 +176,7 @@ WEBKIT_PATH="/Users/x/Library/Caches/ms-playwright/webkit-2287/com.apple.WebKit.
 CHROMIUM_PATH="/Users/x/Library/Caches/ms-playwright/chromium-1187/chrome-mac/Chromium.app/Contents/MacOS/Chromium"
 SAFARI_PATH="/Applications/Safari.app/Contents/MacOS/Safari"
 # A Claude Code process: argv[0] is the CC binary, and the matcher token appears
-# far down its argv because the engine embeds the thread history into a huge
+# far down its argv because the engine embedded the thread history into a huge
 # --append-system-prompt. This is the exact shape that got SIGKILLed on
 # 2026-08-03, so it stays as a fixture, not just as a comment.
 CLAUDE_CODE_CMD="/Users/x/.local/bin/claude --output-format stream-json --append-system-prompt THREAD HISTORY: the leaked binary lives at ~/Library/Caches/ms-playwright/webkit-2287/com.apple.WebKit.GPU.xpc/Contents/MacOS/com.apple.WebKit.GPU.Development and reached 18.9 GB"

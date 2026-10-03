@@ -123,20 +123,26 @@ pub fn router() -> Router<GatewayState> {
 //   * Cross-site / cross-origin browser requests are rejected via the
 //     forge-proof `Sec-Fetch-Site` + `Origin`/`Host` checks (a page cannot set
 //     these via `fetch()`). This fully closes the classic CSRF vector.
-//   * Browser requests whose `Referer` is an app document (`/<slug>/app/...`)
-//     are rejected. The picker (`/~/...`) and the workspace shell
-//     (`/<slug>/...`, no `app` segment) pass.
+//   * A same-origin browser request must carry a `Referer` naming the picker
+//     (`/~/...`) or the workspace shell (`/<slug>/...`, no `app` segment). An
+//     app document (`/<slug>/app/...`) is refused, and so is NO `Referer`:
+//     page script can suppress the header, so its absence proves nothing.
+//     `Sec-Fetch-Site: none` alone passes without one, as a user action.
 //
 // An app FRAME inside the shell is now an opaque origin (ADR 0227). The second
 // arm catches it on the forge-proof headers alone, and the third never has to.
 // What the third still carries is the app opened in its own TAB, a top-level
 // document on this origin.
 //
-// RESIDUAL: such a tab can influence its own `Referer`, since the fetch
-// `referrer` option accepts same-origin URLs. So for it the Referer block is
-// strong defense-in-depth rather than an absolute boundary. Serving an app tab
-// from a distinct origin would close that, and ADR 0014 records it as future
-// work.
+// RESIDUAL: such a tab can name a shell URL as its `referrer`, since the fetch
+// option accepts same-origin URLs. So for it the Referer rule is strong
+// defense-in-depth rather than an absolute boundary. ADR 0144 records why no
+// same-origin signal can close that, and ADR 0014 the distinct-origin fix.
+//
+// A second RESIDUAL: Safari before 16.4 sends no `Sec-Fetch-*`, and no `Origin`
+// on a same-origin GET. Such a GET with its Referer suppressed carries no
+// browser metadata, so it reads as a CLI call and passes. Mutations still
+// refuse, because they carry `Origin`.
 //
 // The auth plane's credentialed routes sit behind this same gate. They mint a
 // pairing code and list and revoke devices, which is worse in an app's hands
@@ -201,15 +207,14 @@ fn control_request_allowed(headers: &HeaderMap, host: Option<&str>) -> bool {
         }
     }
 
-    // Reject requests originating from an APP IFRAME document. Defense in depth
-    // (see RESIDUAL in the module note).
-    if let Some(referer) = referer {
-        if referer_is_app_iframe(referer) {
-            return false;
-        }
+    // No cross-site signal here, and only the Referer tells the shell from an
+    // app tab. A browser request without one is unattributable and fails closed.
+    // `none` is the exception: the user typed or bookmarked it, and no page
+    // script can produce it.
+    match referer {
+        Some(referer) => !referer_is_app_iframe(referer),
+        None => sec_fetch_site == Some("none"),
     }
-
-    true
 }
 
 /// Whether `origin` (e.g. `https://localhost:5251`) has the same authority as
@@ -966,6 +971,34 @@ mod authz_tests {
     }
 
     #[test]
+    fn a_browser_request_that_hides_its_referer_is_refused() {
+        // An app tab's own `fetch` with `referrerPolicy: 'no-referrer'`. The
+        // forge-proof headers read as the shell's, so the missing Referer is
+        // the only tell, and it must refuse rather than pass.
+        for pairs in [
+            &[
+                ("sec-fetch-site", "same-origin"),
+                ("origin", "https://localhost:5251"),
+            ][..],
+            &[("sec-fetch-site", "same-origin")][..],
+            &[("origin", "https://localhost:5251")][..],
+        ] {
+            assert!(
+                !control_request_allowed(&headers(pairs), Some(HOST)),
+                "a browser request with no Referer must be refused: {pairs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_navigation_the_user_typed_is_allowed() {
+        // `Sec-Fetch-Site: none` is a user action (the address bar, a
+        // bookmark). No document sent it, and no page script can produce it.
+        let h = headers(&[("sec-fetch-site", "none")]);
+        assert!(control_request_allowed(&h, Some(HOST)));
+    }
+
+    #[test]
     fn cross_site_browser_request_is_rejected() {
         for site in ["cross-site", "same-site"] {
             let h = headers(&[
@@ -1267,6 +1300,47 @@ mod authz_tests {
         assert_eq!(status, StatusCode::FORBIDDEN);
     }
 
+    #[tokio::test]
+    async fn the_shell_holding_a_real_credential_reaches_the_control_plane() {
+        // The shell's real request shape: same-origin, a matching Origin, and
+        // the default Referer policy's full shell URL.
+        let state = crate::server::GatewayState::for_tests();
+        let status = control_call(
+            &state,
+            "GET",
+            "/~/api/v1/control/restore-status",
+            &[
+                (auth::HEADER_LOCAL_TOKEN, "test-local-token"),
+                ("host", "localhost:5251"),
+                ("sec-fetch-site", "same-origin"),
+                ("origin", "https://localhost:5251"),
+                ("referer", "https://localhost:5251/dev/"),
+            ],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn an_app_tab_that_suppresses_its_referer_is_refused_with_a_real_credential() {
+        // The same caller as above, minus its Referer. `enforce` passes it on
+        // the credential, and the gate must still refuse it.
+        let state = crate::server::GatewayState::for_tests();
+        let status = control_call(
+            &state,
+            "POST",
+            "/~/api/v1/control/workspaces/dev/stop",
+            &[
+                (auth::HEADER_LOCAL_TOKEN, "test-local-token"),
+                ("host", "localhost:5251"),
+                ("sec-fetch-site", "same-origin"),
+                ("origin", "https://localhost:5251"),
+            ],
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
     // ── The update relay (ADR 0338) ─────────────────────────────────────────
 
     /// A state holding one paired phone, and the cookie that proves it.
@@ -1362,6 +1436,7 @@ mod authz_tests {
                 ("cookie", &cookie),
                 ("sec-fetch-site", "same-origin"),
                 ("origin", "https://localhost:5251"),
+                ("referer", "https://localhost:5251/dev/"),
                 ("host", "localhost:5251"),
             ],
             Value::Null,

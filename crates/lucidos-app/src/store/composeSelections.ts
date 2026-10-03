@@ -66,6 +66,9 @@ export interface ComposeSelectionOverride {
   ccModel?: CodingAgentModelValue | null;
   /** Coding-agent reasoning effort. */
   ccReasoningEffort?: CodingAgentReasoningEffort | null;
+  /** The composer is in side-question mode. Turned off as an explicit `false`,
+   *  since the compose PUT omits an empty selection and the engine keeps it. */
+  sideQuestionMode?: boolean;
 }
 
 export const composeSelections = signal<Map<string, ComposeSelectionOverride>>(new Map());

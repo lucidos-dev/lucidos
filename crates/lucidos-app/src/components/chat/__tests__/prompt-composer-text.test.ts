@@ -122,9 +122,12 @@ describe('the submit paths are wired to that one source', () => {
     // message nor a toast is the whole bug. The last one to fall was the empty
     // composer. It now speaks whenever the box holds characters, and stays
     // quiet only for Enter on a genuinely empty desktop composer. A side
-    // question speaks through its card rather than a toast.
+    // question speaks through its card rather than a toast. A send held or
+    // refused by an image upload speaks through the composer's upload line,
+    // which reads the queue and the blocked set (`uploadSendNotice`).
     const before = submitBody().split(/\breturn;/).slice(0, -1);
-    const silent = before.filter((seg) => !/showToast\(|ask\w*SideQuestion\(/.test(seg.slice(-400)));
+    const speaks = /showToast\(|ask\w*SideQuestion\(|queueUploadSend\(|markUploadBlockedSend\(/;
+    const silent = before.filter((seg) => !speaks.test(seg.slice(-400)));
     expect(silent).toHaveLength(0);
   });
 

@@ -9,6 +9,7 @@ import { describeRecommendedCleanupOutcome } from '../../utils/recommendedCleanu
 import { isFormRequest } from '../thread-events/thread-event-types';
 import { handleEvent, isChannelDefiningEvent, makeOptimisticThreadState, PENDING_TITLE_PLACEHOLDER, type ThreadAggregate, type ThreadMeta, type ThreadEvent, type TransientEvent } from '../thread-events';
 import { bumpThreadEvents } from '../threadActivity';
+import { settleDeliveredUnsentMessage } from '../unsentMessages';
 import type { ThreadChannel } from '../store';
 import { handleNotificationSSE, loadUnreadNotifications } from './notifications';
 import { dropDeletedThreads } from './threads-delete';
@@ -45,7 +46,7 @@ import { batchSummary, clearApplyPhase, isBatchMember, openApplyPhase, setApplyP
 import { syncClientUpdateFromBuild } from './client-update';
 import { loadPreferences, refreshActiveTheme } from './preferences';
 import { loadReleaseNotices } from './releaseNotices';
-import { loadArtifacts, refreshArtifacts, invalidateFilePreview } from './artifacts';
+import { loadArtifacts, refreshArtifacts } from './artifacts';
 import { refreshAppUI, captureAppUI } from './apps';
 import { clearWipIfMatches } from './wipPreview';
 import { closeResolvedFormRequest, openFormRequest, syncPendingFormRequests } from './form-requests';
@@ -445,7 +446,7 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
     // events (with seq) justify creating a new thread entry. Side effects
     // (e.g. CodingAgentThreadSpawned creating a child thread) still run.
     if (seq === null) {
-      handleTransientSideEffects(event, threadId, eventId);
+      handleTransientSideEffects(event, threadId);
       return;
     }
     // A persisted event with no aggregate has no DB row either, so it produces
@@ -531,6 +532,7 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
   // seq from SSE: present (number > 0) for persisted events, null for transient
   const handled = handleEvent(map, threadId, seq, event, created, eventId, aggregate);
   if (handled.metaChanged) metaChanged = true;
+  if (handled.retiredUnsentEventId) settleDeliveredUnsentMessage(handled.retiredUnsentEventId);
   if (event.type === 'QueuedMessageRemoved') {
     const key = queuedMessageRemovalKey(threadId, event.removed_message_id);
     if (removingQueuedMessageIds.value.has(key)) {
@@ -624,7 +626,7 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
   // No auto-read on focus — user must explicitly click Archive, Apply, or Discard.
 
   // Dispatch side effects for transient events
-  handleTransientSideEffects(event, threadId, eventId);
+  handleTransientSideEffects(event, threadId);
 
   // Manage optimistic "Apply Now" phase transitions.
   // 'requesting' → 'applying' on ChangeProposed (backend started the merge).
@@ -1335,12 +1337,12 @@ function clearComposeIfUnfocused(threadId: string): void {
 /** Tool names whose `ToolResult` means `data/` may have changed, so the Files
  *  list must re-read.
  *
- *  This governs the LIST only. Whether the open file preview re-reads is a
- *  separate question, answered per path by `invalidateFilePreview`: a write to
- *  something else must not restart a video the user is watching. `bash_output`
- *  and `BackgroundBashCompleted` name no path anywhere, so they refresh the
- *  list and leave the preview alone. The header Refresh button covers a log
- *  file a background job is still appending to.
+ *  This governs the LIST only. The open preview re-reads on the event that
+ *  names its path, `Artifact*` or `DataFile*` (`entityReferences.ts`). So a
+ *  write to another file never restarts a video the user is watching.
+ *  `bash_output` and `BackgroundBashCompleted` name no path anywhere, so they
+ *  refresh the list and leave the preview alone. The header Refresh button
+ *  covers a log file a background job is still appending to.
  *
  *  The five file tools are the obvious members. `bash_output` is here for a
  *  different reason: a background task writes to `data/` UNSTAGED by design, so
@@ -1361,61 +1363,15 @@ const ARTIFACT_REFRESHING_TOOLS = [
   'write_file', 'edit_file', 'copy_file', 'delete_file', 'import_file', 'bash_output',
 ];
 
-/** Which argument of a file tool names the path it WRITES, data-relative.
- *
- *  Every value here has to be in the same frame the preview addresses a file
- *  in, or it silently matches nothing. `copy_file` takes a source too, and only
- *  its destination (declared "under data/") can be the file on screen.
- *
- *  `import_file` is deliberately absent, though it looks like a member. Its
- *  destination is relative to `artifacts/imported/` rather than to `data/`, and
- *  it is optional, so the engine often derives the name. `ArtifactImported`
- *  announces the path it settled on, which is the one worth trusting. */
-const FILE_TOOL_TARGET_ARG: Record<string, string> = {
-  write_file: 'path',
-  edit_file: 'path',
-  delete_file: 'path',
-  copy_file: 'destination',
-};
-
-/** The path a file tool is about to write, remembered from its `ToolCalled`
- *  until the paired `ToolResult` says the write landed.
- *
- *  A `ToolResult` carries no path of its own, and the engine announces one
- *  only for `artifacts/` writes (`engine/tools/files.rs`). So this is how an
- *  open `knowhow/` or `apps/` preview learns that its own file changed.
- *
- *  One slot per thread, because a write never joins a parallel run: file
- *  writes still run one at a time. Every `ToolResult` clears the slot, so a
- *  path recorded for one call can never be attributed to a later one. A turn
- *  interrupted between the call and its result leaves one short string behind. */
-const pendingFileToolWrite = new Map<string, { eventId?: string; path: string }>();
-
-/** Take the thread's pending write and invalidate the preview for it.
- *
- *  Both ids present and different means the result belongs to some other call,
- *  so the recorded path proves nothing about it. */
-function consumePendingFileToolWrite(threadId: string, toolCalledEventId?: string): void {
-  const pending = pendingFileToolWrite.get(threadId);
-  pendingFileToolWrite.delete(threadId);
-  if (!pending) return;
-  if (toolCalledEventId && pending.eventId && toolCalledEventId !== pending.eventId) return;
-  invalidateFilePreview(pending.path);
-}
-
 /** Run the side effects a LIVE frame triggers: opening a form request's form,
  *  refreshes, navigation. A history replay never comes here.
  *
  *  `sourceThreadId` is the thread the event was emitted on. It scopes
  *  `NavigationRequested`, so a navigate from a sibling thread cannot hijack
- *  the page the user is viewing.
- *
- *  `eventId` is this event's own id, used to pair a `ToolResult` back to the
- *  `ToolCalled` whose path it wrote. */
+ *  the page the user is viewing. */
 function handleTransientSideEffects(
   event: ThreadEvent | TransientEvent,
   sourceThreadId: string,
-  eventId?: string,
 ): void {
   // A form request: open its form now. One this page misses is found by
   // `syncPendingFormRequests` on the next stream open.
@@ -1452,38 +1408,11 @@ function handleTransientSideEffects(
     // permission card (rendered in ChatExchange via PermissionCard), replacing
     // the old transient `McpConsentPromptRequested` + showConfirm modal.
 
-    // Remember where a file tool is about to write, for the ToolResult arm
-    // below. Any other tool clears the slot, so it always holds the newest
-    // call and a stale path can never outlive the call that recorded it.
-    case 'ToolCalled': {
-      const call = event as { name: string; args: unknown };
-      const arg = FILE_TOOL_TARGET_ARG[call.name];
-      const args = call.args as Record<string, unknown> | null | undefined;
-      // `edit_file` takes an optional `repo`, and with it `path` is relative to
-      // that repository's root instead of to `data/`. Such an edit writes
-      // nothing under `data/` at all, so its path says nothing about the file
-      // the preview shows.
-      const dataRelative = args?.repo === undefined;
-      const path = arg && dataRelative && typeof args?.[arg] === 'string'
-        ? args[arg] as string
-        : null;
-      if (path) pendingFileToolWrite.set(sourceThreadId, { eventId, path });
-      else pendingFileToolWrite.delete(sourceThreadId);
-      break;
-    }
-
-    // A tool call that may have changed `data/`. `loadArtifacts` refreshes the
-    // Files list; the preview re-reads only if the path this tool wrote is the
-    // one it shows. Together they are what makes an agent edit appear on its
-    // own. loadArtifacts sets `artifacts` to `failed` via toFailed on error.
+    // A tool call that may have changed `data/` refreshes the Files list.
+    // loadArtifacts sets `artifacts` to `failed` via toFailed on error.
     case 'ToolResult': {
-      const result = event as { name: string; tool_called_event_id?: string };
-      if (!ARTIFACT_REFRESHING_TOOLS.includes(result.name)) {
-        pendingFileToolWrite.delete(sourceThreadId);
-        break;
-      }
-      void loadArtifacts();
-      consumePendingFileToolWrite(sourceThreadId, result.tool_called_event_id);
+      const result = event as { name: string };
+      if (ARTIFACT_REFRESHING_TOOLS.includes(result.name)) void loadArtifacts();
       break;
     }
 

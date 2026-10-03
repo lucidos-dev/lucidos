@@ -12,7 +12,8 @@
  * Closed content is absent, as it would be under a plain `{open && …}`. It
  * stays only for its exit, inert, as it was last shown open: a caller may stop
  * computing it in the render that closes it. The first render never rolls, so
- * a surface that opens already unfolded simply shows it.
+ * a surface that opens already unfolded simply shows it. `appear` is the one
+ * exception: a row arriving in a live list rolls in on its first render.
  */
 import type { ComponentChildren } from 'preact';
 import { useLayoutEffect, useRef, useState } from 'preact/hooks';
@@ -56,11 +57,15 @@ function rollAfterCommit(measure: () => () => void) {
   queuedRolls.push(measure);
 }
 
-export function Disclosure({ open, instant = false, children, class: className, bodyClass }: {
+export function Disclosure({ open, instant = false, appear = false, onClosed, children, class: className, bodyClass }: {
   open: boolean;
   /** Toggle at once, with no roll. For a navigation that opens the block to
    *  land on a row inside it: a scroll mid-roll measures a box still moving. */
   instant?: boolean;
+  /** Roll open on the first render too, for a row arriving in a live list. */
+  appear?: boolean;
+  /** Called once the content has gone, after its exit roll or a snap. */
+  onClosed?: () => void;
   children: ComponentChildren;
   /** Extra classes on the outer box, the one that rolls its height. */
   class?: string;
@@ -70,7 +75,9 @@ export function Disclosure({ open, instant = false, children, class: className, 
 }) {
   const outer = useRef<HTMLDivElement>(null);
   const body = useRef<HTMLDivElement>(null);
-  const shown = useRef(open);
+  const shown = useRef(appear ? false : open);
+  const onClosedRef = useRef(onClosed);
+  onClosedRef.current = onClosed;
   const running = useRef<Animation[]>([]);
   // Bumped by every toggle, so a start still queued for an older one drops out.
   const toggles = useRef(0);
@@ -98,7 +105,10 @@ export function Disclosure({ open, instant = false, children, class: className, 
       setRolling(false);
       setLeaving(false);
       // The closing render drew the content for an exit that is now a snap.
-      if (!open) setRedraws(n => n + 1);
+      if (!open) {
+        setRedraws(n => n + 1);
+        onClosedRef.current?.();
+      }
     };
     if (!box || !content || !canAnimate(instant)) {
       snap();
@@ -145,6 +155,7 @@ export function Disclosure({ open, instant = false, children, class: className, 
           running.current = [];
           setRolling(false);
           setLeaving(false);
+          if (!open) onClosedRef.current?.();
         }, () => { /* a newer toggle cancelled it and owns the box now */ });
       };
     });

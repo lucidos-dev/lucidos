@@ -19,12 +19,12 @@ import {
 import type { ChatContext } from './chatContext';
 import type { ChatRequestBody } from '../../api/types';
 import { submitChat, cancelChat, stopClaudeCode, isTransportError, removeQueuedMessage as removeQueuedMessageRequest, ApiError, type CodingAgentModelValue, type CodingAgentReasoningEffort } from '../../api/client';
-import { getUnreachableEngineMsg } from './connection';
 import { getDeviceId } from './devices';
+import { recordUnsentMessage, takeUnsentMessage, type SendSettlement, type UnsentMessage } from '../unsentMessages';
 import { generateUuid } from '../../utils/uuid';
-import { handleEvent, makeOptimisticThreadState, computeExchanges, queuedMessagesFromExchanges, type StoredEvent, type QueuedMessage } from '../thread-events';
+import { handleEvent, makeOptimisticThreadState, computeExchanges, queuedMessagesFromExchanges, retireUnsentExchange, type StoredEvent, type QueuedMessage } from '../thread-events';
 import { getDraft } from '../composeDrafts';
-import { updateCompose } from './compose';
+import { composeInFreshDraft, updateCompose } from './compose';
 import { requestPromptOverrideSync } from '../../components/chat/promptValueSync';
 import { focusPromptNow } from '../../components/chat/promptFocus';
 import { bumpThreadEvents } from '../threadActivity';
@@ -50,7 +50,7 @@ export const PENDING_MESSAGE_SAFETY_MS = 30_000;
 
 /** How long a send waits for the thread's previous send to settle before going
  *  out anyway. `mutatingFetch` deliberately has no client-side timeout (a chat
- *  POST is not idempotent, so it must never be retried behind the user's back),
+ *  POST is re-sent only when the user presses Retry, never behind their back),
  *  which means a POST stalled on a half-open mobile connection can stay pending
  *  forever. Without a ceiling here, that one hung request would silently
  *  swallow every later message on the thread, which is far worse than the
@@ -224,27 +224,16 @@ export async function removeQueuedMessage(threadId: string, messageId: string): 
   reportFailedRetract(threadId, 'remove', error);
 }
 
-/** The queued message an Edit takes back into compose. */
-export interface QueuedMessageToEdit {
-  id: string;
-  text: string;
-  imageHashes: string[];
-}
-
 /** Edit a queued message: take it back, then put its text and images in the
  *  compose box after any draft. Compose changes only once the removal took, so
  *  a message the agent already read never also sits in compose. */
-export async function editQueuedMessage(threadId: string, message: QueuedMessageToEdit): Promise<void> {
+export async function editQueuedMessage(threadId: string, message: QueuedMessage): Promise<void> {
   const { outcome, error } = await retractQueuedMessage(threadId, message.id);
   if (outcome !== 'removed') {
     reportFailedRetract(threadId, 'edit', error);
     return;
   }
-  if (message.imageHashes.length > 0) {
-    const draftImages = getDraft(threadId).image_hashes;
-    updateCompose(threadId, { image_hashes: [...draftImages, ...message.imageHashes] });
-  }
-  appendQueuedTextToCompose(threadId, message.text.length > 0 ? [message.text] : []);
+  appendMessagesToCompose(threadId, [message]);
   focusPromptNow();
 }
 
@@ -426,8 +415,8 @@ export { loadRepositories } from './repositoriesLoader';
 
 /** What became of a send's text.
  *   - 'sent': the engine accepted it.
- *   - 'shown-as-failed': the engine was unreachable, so the text stays in the
- *     thread as a failed exchange.
+ *   - 'shown-as-failed': the POST got no answer, so the text stays in the
+ *     thread as an unsent message with a Retry (`showUnsentExchange`).
  *   - 'dropped': the engine refused it and the optimistic row is gone. A toast
  *     was shown, and the caller owns putting the text back. */
 export type SendOutcome = 'sent' | 'shown-as-failed' | 'dropped';
@@ -455,6 +444,8 @@ export async function sendMessage(
     providerOverride?: string;
     ccModelOverride?: CodingAgentModelValue | null;
     ccReasoningEffortOverride?: CodingAgentReasoningEffort | null;
+    /** What the caller owes if this send ends unsent and is decided later. */
+    settlement?: SendSettlement;
   },
 ): Promise<SendOutcome> {
   threadsLoaded.value = true;
@@ -625,12 +616,29 @@ export async function sendMessage(
       content: extractedContent,
     };
   }
-  try {
-    // Serialized per thread: the optimistic row is already on screen, so
-    // waiting for the thread's previous POST costs the user nothing visible and
-    // is what keeps the engine's record in the order they pressed send.
-    if (sendSlot.waitForTurn) await sendSlot.waitForTurn;
-    await submitChat(body);
+  return postSend({
+    threadId,
+    eventId,
+    body,
+    sendSlot,
+    failedRetries: 0,
+    settlement: options?.settlement ?? {},
+  });
+}
+
+/** One POST of a send whose optimistic row is already on screen. Shared by the
+ *  first attempt (`sendMessage`) and every Retry (`retryUnsentMessage`), so both
+ *  settle the same three ways. */
+async function postSend(send: {
+  threadId: string;
+  eventId: string;
+  body: ChatRequestBody;
+  sendSlot: SendSlot;
+  failedRetries: number;
+  settlement: SendSettlement;
+}): Promise<SendOutcome> {
+  const { threadId, eventId, body, sendSlot } = send;
+  const accepted = (): SendOutcome => {
     schedulePendingCleanup(threadId, eventId);
     // The pick (if any) is now stamped on the sent message and becomes the
     // thread's remembered value; drop the ephemeral pending override so future
@@ -638,39 +646,31 @@ export async function sendMessage(
     clearThreadModelOverride(threadId);
     void retireWelcomeAfterUse(threadMap.value.values());
     return 'sent';
+  };
+  try {
+    // Serialized per thread. The optimistic row is already on screen, so the
+    // wait costs the user nothing visible. It keeps the engine's record in the
+    // order they pressed send.
+    if (sendSlot.waitForTurn) await sendSlot.waitForTurn;
+    await submitChat(body);
+    return accepted();
   } catch (error: unknown) {
     if (isTransportError(error)) {
-      // Engine unreachable. Render the user's message as a failed in-thread
-      // exchange (toast alone hides the text they spent time writing).
-      // Passing eventId to handleEvent piggybacks on its pending-message
-      // cleanup so the optimistic row inserted by addPendingMessage clears
-      // without a second signal write via removePendingMessage.
-      const messageSeq = -Date.now() - 1;
-      const failedSeq = messageSeq + 1;
-      const now = new Date().toISOString();
-      handleEvent(threadMap.value, threadId, messageSeq, {
-        type: 'MessageReceived',
-        text: message,
-      } as StoredEvent, now, eventId);
-      handleEvent(threadMap.value, threadId, failedSeq, {
-        type: 'ResponseFailed',
-        error: getUnreachableEngineMsg(),
-      } as StoredEvent, now);
-      threadMap.value = new Map(threadMap.value);
-      // Per `addPendingMessage`: focused-thread computeds subscribe to the
-      // per-thread bump, not `threadMap`. Without this, the synthetic
-      // MessageReceived + ResponseFailed events land in `thread.events` but
-      // `activeExchanges` keeps its cached value until the next SSE event.
-      bumpThreadEvents(threadId);
+      // The engine's own row can beat the lost answer over SSE. The send
+      // landed, so it is accepted, and an unsent card would be a duplicate.
+      if (engineRecordedMessage(threadId, eventId)) return accepted();
+      // No answer, so the engine may never have seen it. Keep the text in the
+      // thread as an unsent message with a Retry; a toast alone would hide it.
+      showUnsentExchange(send);
       return 'shown-as-failed';
     }
-    // HTTP error (4xx/5xx with body) or unknown bug. Raw new sends create
-    // the thread optimistically (`threadBeforeSend === undefined`); the
-    // engine has no record of it, so leaving the row would render a phantom
-    // in the Active drawer that vanishes on refresh. Drop row + nav entries
-    // and unfocus. Established threads keep their row; their content
-    // predates this send and only the pending entry rolls back.
-    if (threadBeforeSend === undefined) {
+    // HTTP error (4xx/5xx with body) or unknown bug. A raw new send created
+    // its thread optimistically (`new_thread`), and the engine has no record
+    // of it. A row left behind would be a phantom in the Active drawer that
+    // vanishes on refresh. So drop row + nav entries and unfocus. Established
+    // threads keep their row; their content predates this send and only the
+    // pending entry rolls back.
+    if (body.new_thread) {
       const next = new Map(threadMap.value);
       next.delete(threadId);
       threadMap.value = next;
@@ -692,6 +692,111 @@ export async function sendMessage(
     // the wait is bounded rather than open-ended.
     sendSlot.release();
   }
+}
+
+/** Does the thread already hold the engine's own row for this message? */
+function engineRecordedMessage(threadId: string, eventId: string): boolean {
+  const thread = threadMap.value.get(threadId);
+  if (!thread) return false;
+  for (const [seq, stored] of thread.events) {
+    if (seq > 0 && stored._eventId === eventId) return true;
+  }
+  return false;
+}
+
+/** What an unsent message's card says. */
+export function unsentMessageCopy(failedRetries: number): string {
+  return failedRetries === 0
+    ? 'Lucidos did not answer, so this message was not sent.'
+    : 'Lucidos still did not answer. Try again in a moment.';
+}
+
+/** The next free client-only seq. Counting down keeps every unsent pair on its
+ *  own two seqs; a clock-derived seq let two sends a millisecond apart overlap. */
+let nextUnsentSeq = -1;
+
+/** Swap a send's optimistic row for an unsent exchange: its message plus a
+ *  `ResponseFailed`, both client-only on negative seqs, and record what Retry
+ *  needs. `handleEvent` drops the pair if the engine's own row for this event
+ *  id turns up after all. */
+function showUnsentExchange(send: {
+  threadId: string;
+  eventId: string;
+  body: ChatRequestBody;
+  failedRetries: number;
+  settlement: SendSettlement;
+}): void {
+  const { threadId, eventId, body } = send;
+  const failedSeq = nextUnsentSeq;
+  const messageSeq = failedSeq - 1;
+  nextUnsentSeq -= 2;
+  const now = new Date().toISOString();
+  // Passing eventId piggybacks on handleEvent's pending-message cleanup, so the
+  // optimistic row clears without a second write via removePendingMessage.
+  handleEvent(threadMap.value, threadId, messageSeq, {
+    type: 'MessageReceived',
+    text: body.message,
+    user_image_hashes: body.image_hashes,
+  } as StoredEvent, now, eventId);
+  handleEvent(threadMap.value, threadId, failedSeq, {
+    type: 'ResponseFailed',
+    error: unsentMessageCopy(send.failedRetries),
+  } as StoredEvent, now);
+  const thread = threadMap.value.get(threadId);
+  if (thread) (thread.unsentMessageSeqs ??= new Map()).set(eventId, messageSeq);
+  threadMap.value = new Map(threadMap.value);
+  // Per `addPendingMessage`: focused-thread computeds subscribe to the
+  // per-thread bump, not `threadMap`.
+  bumpThreadEvents(threadId);
+  recordUnsentMessage(eventId, {
+    threadId,
+    body,
+    failedRetries: send.failedRetries,
+    settlement: send.settlement,
+  });
+}
+
+/** Re-post an unsent message: the same request, event id included, so an
+ *  engine that did get the first one acks without running it twice. The card
+ *  turns back into a pending row while the POST runs. Resolves null when there
+ *  is nothing to retry, e.g. a second press. */
+export async function retryUnsentMessage(eventId: string): Promise<SendOutcome | null> {
+  const unsent = takeUnsentMessage(eventId);
+  if (!unsent) return null;
+  const { threadId, body } = unsent;
+  const thread = threadMap.value.get(threadId);
+  if (!thread) return null;
+  const sendSlot = enterSendChain(threadId);
+  retireUnsentExchange(thread, eventId);
+  addPendingMessage(threadId, body.message, eventId, body.image_hashes);
+  const outcome = await postSend({
+    threadId,
+    eventId,
+    body,
+    sendSlot,
+    failedRetries: unsent.failedRetries + 1,
+    settlement: unsent.settlement,
+  });
+  if (outcome === 'sent') unsent.settlement.onAccepted?.();
+  if (outcome === 'dropped') restoreRefusedRetry(unsent);
+  return outcome;
+}
+
+/** Put a refused Retry's text and images back where they can be sent again.
+ *  The sender knows best (`sendCompose` rolls its draft back). Without a hook,
+ *  a new thread's row is gone, so it starts a fresh draft; any other thread
+ *  takes it into its own draft. */
+function restoreRefusedRetry({ threadId, body, settlement }: UnsentMessage): void {
+  if (settlement.onRefused) {
+    settlement.onRefused();
+    return;
+  }
+  const images = body.image_hashes ?? [];
+  if (body.new_thread) {
+    composeInFreshDraft(body.message, images);
+    return;
+  }
+  appendMessagesToCompose(threadId, [{ text: body.message, imageHashes: images }]);
 }
 
 /** Outcome of a Cancel/Stop click:
@@ -722,11 +827,19 @@ function getQueuedMessages(threadId: string): QueuedMessage[] {
     .filter(q => !removing.has(queuedMessageRemovalKey(threadId, q.id)));
 }
 
-/** Append retracted queued-message texts (FIFO) to the thread's compose draft,
- *  after any existing draft (blank-line separated), and force the prompt input
- *  to show it (the compose→textarea sync skips a focused non-empty input, so a
- *  programmatic append needs the explicit override, as `seedSuggestion` does). */
-function appendQueuedTextToCompose(threadId: string, texts: string[]): void {
+/** Append taken-back messages (FIFO) to the thread's compose draft, after any
+ *  existing draft: retracted queued messages, or a refused Retry. Texts join
+ *  with a blank line, and images go after the draft's own, each hash once, as
+ *  `addAttachedImageHash` keeps it. Forces the prompt input to show the text.
+ *  The compose→textarea sync skips a focused non-empty input, so a
+ *  programmatic append needs the explicit override, as `seedSuggestion` does. */
+function appendMessagesToCompose(threadId: string, messages: Array<Pick<QueuedMessage, 'text' | 'imageHashes'>>): void {
+  const draftImages = getDraft(threadId).image_hashes;
+  const images = [...new Set(messages.flatMap(m => m.imageHashes))].filter(h => !draftImages.includes(h));
+  if (images.length > 0) {
+    updateCompose(threadId, { image_hashes: [...draftImages, ...images] });
+  }
+  const texts = messages.map(m => m.text).filter(t => t.length > 0);
   if (texts.length === 0) return;
   const existing = getDraft(threadId).text;
   const addition = texts.join('\n\n');
@@ -749,17 +862,17 @@ function appendQueuedTextToCompose(threadId: string, texts: string[]): void {
 async function clearQueuedMessagesToCompose(threadId: string): Promise<void> {
   const queued = getQueuedMessages(threadId);
   if (queued.length === 0) return;
-  const removedTexts: string[] = [];
+  const removed: QueuedMessage[] = [];
   let failed = 0;
   for (const q of queued) {
     const { outcome } = await retractQueuedMessage(threadId, q.id);
-    if (outcome === 'removed') removedTexts.push(q.text);
+    if (outcome === 'removed') removed.push(q);
     // 'already-injected' → now part of the cancelled response, so nothing is
     // owed. 'failed' → no tombstone persisted, so the loop will NOT drop it at
     // finalize. Neither goes to compose.
     if (outcome === 'failed') failed++;
   }
-  appendQueuedTextToCompose(threadId, removedTexts);
+  appendMessagesToCompose(threadId, removed);
   // The user pressed Stop, so this is theirs to know. A retract that got no
   // tombstone leaves the follow-up queued, and it runs as a fresh response
   // after the cancel. That is the exact outcome this function exists to

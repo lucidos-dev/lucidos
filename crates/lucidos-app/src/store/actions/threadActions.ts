@@ -66,6 +66,24 @@ export async function discardDraft(threadId: string): Promise<boolean> {
   return true;
 }
 
+/** The thread's pending change from the changes list, once the list names it. */
+function findPendingChange(threadId: string) {
+  const changesLoadable = changes.value;
+  if (changesLoadable.status !== 'loaded') return null;
+  return changesLoadable.data.find(
+    (c) => c.thread_id === threadId && c.status === 'pending' && c.file_count > 0,
+  ) ?? null;
+}
+
+/** Whether the thread's pending change is incomplete: its turn did not finish
+ *  (ADR 0346). Like the restart flag, it unions the change row with the
+ *  thread's projection flag, so it holds while either update is in flight.
+ *  Its Apply confirms, and the banner leads with Continue. */
+export function threadHasIncompleteChange(threadId: string): boolean {
+  return (findPendingChange(threadId)?.incomplete ?? false)
+    || (threadMap.value.get(threadId)?.meta.codingAgentIncomplete ?? false);
+}
+
 /**
  * Per-thread tagged actions in cascade priority order: the close set
  * (DiscardDraft → Discard/Apply → Archive) followed by the Save/Unsave toggle.
@@ -78,13 +96,7 @@ export function resolveThreadActions(threadId: string): TaggedAction[] {
   const status = effectiveThreadStatus(thread);
   const ccInfo = threadType === 'claude_code' ? getCodingAgentWaitingInfo(thread.meta) : null;
 
-  const changesLoadable = changes.value;
-  const pendingChange =
-    changesLoadable.status === 'loaded'
-      ? (changesLoadable.data.find(
-          (c) => c.thread_id === threadId && c.status === 'pending' && c.file_count > 0,
-        ) ?? null)
-      : null;
+  const pendingChange = findPendingChange(threadId);
   const hasPendingChanges = !!pendingChange || (ccInfo?.proposed ?? false);
   const descendantsBlockArchive = thread.meta.blockingDescendantCount > 0;
   const hasUnsentDraft = !draftIsEmpty(getDraft(threadId));
@@ -150,7 +162,7 @@ export function resolveThreadActions(threadId: string): TaggedAction[] {
     threadType === 'claude_code' &&
     kinds.includes('apply') &&
     (pendingChange?.requires_restart || ccInfo?.requiresRestart || false);
-  const incomplete = pendingChange?.incomplete ?? false;
+  const incomplete = threadHasIncompleteChange(threadId);
 
   // The standing apply is armed against the thread's CURRENT change where it
   // has one, so it cannot reach a change proposed after the owner pressed.

@@ -2,6 +2,7 @@ import { useEffect, useLayoutEffect, useRef } from 'preact/hooks';
 import { activeMenuItem, appPseudoFullscreen, panelOverlay, settingsSubview, notificationDetailPending, parseRepoPath } from '../../store/store';
 import { nativeFullscreenElement } from '../../store/appFullscreenHost';
 import { contentViewKey } from './contentViewKey';
+import { createContentLandingClaim } from './contentLanding';
 import { reportNavigation } from '../../utils/navigationMarks';
 import { useScrollMemory, contentScrollKey } from '../../hooks/useScrollMemory';
 import { useDelayedFlag } from '../../hooks/useDelayedLoading';
@@ -100,9 +101,15 @@ export function ContentPane({ layout }: { layout: 'desktop' | 'mobile' }) {
 
   const bodyRef = useRef<HTMLDivElement>(null);
   const viewKey = contentViewKey(active, overlay, subview);
+  const landingClaimRef = useRef(createContentLandingClaim());
   // resetOnEmpty: this body hosts every view; without it, a stale scrollTop
   // from the prior view persists on the DOM and reappears when content grows.
-  useScrollMemory(bodyRef, viewKey ? contentScrollKey(viewKey) : null, { resetOnEmpty: true });
+  // A landing on a row owns the open, so neither a restore nor the reset may
+  // scroll the reader away from it.
+  useScrollMemory(bodyRef, viewKey ? contentScrollKey(viewKey) : null, {
+    resetOnEmpty: true,
+    shouldRestore: () => !landingClaimRef.current(viewKey, bodyRef.current),
+  });
 
   // The content half of the navigation mark: a view swap is a navigation
   // whether or not anything arrives to be covered. The first render is not one.

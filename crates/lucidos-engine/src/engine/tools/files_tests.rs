@@ -86,6 +86,52 @@ fn app_lifecycle_event_is_birth_and_death_only() {
 }
 
 #[test]
+fn a_file_tool_announces_every_data_change_outside_artifacts() {
+    // An open preview of any of these files refreshes only on this event.
+    for path in [
+        "knowhow/cooking/bread.md",
+        "apps/habit-tracker/index.html",
+        "config/apis.json",
+        "themes/dusk.json",
+    ] {
+        assert!(
+            matches!(
+                data_file_event(path, DataFileChange::Written { commit: "abc" }),
+                Some(SystemEvent::DataFileWritten { path: p, commit: Some(c), actor: None })
+                    if p == path && c == "abc"
+            ),
+            "{path} written"
+        );
+        assert!(
+            matches!(
+                data_file_event(path, DataFileChange::Edited),
+                Some(SystemEvent::DataFileEdited { path: p, operations_count: 1, actor: None })
+                    if p == path
+            ),
+            "{path} edited"
+        );
+        assert!(
+            matches!(
+                data_file_event(path, DataFileChange::Deleted { commit: "abc" }),
+                Some(SystemEvent::DataFileDeleted { path: p, .. }) if p == path
+            ),
+            "{path} deleted"
+        );
+    }
+}
+
+#[test]
+fn an_artifact_change_is_left_to_its_own_artifact_event() {
+    for change in [
+        DataFileChange::Written { commit: "abc" },
+        DataFileChange::Edited,
+        DataFileChange::Deleted { commit: "abc" },
+    ] {
+        assert!(data_file_event("artifacts/notes.md", change).is_none());
+    }
+}
+
+#[test]
 fn read_only_reason_allows_user_paths() {
     assert!(read_only_reason("artifacts/notes.md").is_none());
     assert!(read_only_reason("knowhow/lucidos/best-practices.md").is_none());

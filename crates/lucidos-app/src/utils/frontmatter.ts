@@ -13,6 +13,28 @@ const FENCE_CLOSE = /^(---|\.\.\.)\s*$/;
 const KEY_LINE = /^([^\s#:\-[{][^:]*):(?:\s+(.*))?$/;
 const LIST_ITEM = /^\s*-\s+(.*)$/;
 
+/** `line` with a single trailing `\r` removed, so a caller whose lines still
+ *  carry one (`frontmatterLineCount`, below) matches the same regexes
+ *  `splitFrontmatter`'s `/\r?\n/`-split lines do. `$` does not match before a
+ *  bare `\r`, and `.` does not consume one. `KEY_LINE` refused every CRLF
+ *  line until this normalized them first. */
+function withoutTrailingCR(line: string): string {
+  return line.endsWith('\r') ? line.slice(0, -1) : line;
+}
+
+/** The index of the closing fence line in `lines`, or `null` when `lines`
+ *  does not open a frontmatter block. Shared by `splitFrontmatter` and
+ *  `frontmatterLineCount`, so both agree on exactly the same block. */
+function frontmatterCloseIndex(lines: string[]): number | null {
+  if (!FENCE_OPEN.test(withoutTrailingCR(lines[0] ?? ''))) return null;
+  const close = lines.findIndex((line, i) => i > 0 && FENCE_CLOSE.test(withoutTrailingCR(line)));
+  if (close < 0) return null;
+  const block = lines.slice(1, close);
+  const firstContent = block.find((line) => line.trim() !== '' && !line.trimStart().startsWith('#'));
+  if (!firstContent || !KEY_LINE.test(withoutTrailingCR(firstContent))) return null;
+  return close;
+}
+
 /** Split `md` into its frontmatter and the markdown body after it.
  *
  *  A block counts only when the file opens with a `---` fence, a closing fence
@@ -20,16 +42,28 @@ const LIST_ITEM = /^\s*-\s+(.*)$/;
  *  document that merely starts with a horizontal rule rendering as one. */
 export function splitFrontmatter(md: string): { frontmatter: Frontmatter | null; body: string } {
   const lines = md.replace(/^﻿/, '').split(/\r?\n/);
-  if (!FENCE_OPEN.test(lines[0] ?? '')) return { frontmatter: null, body: md };
-  const close = lines.findIndex((line, i) => i > 0 && FENCE_CLOSE.test(line));
-  if (close < 0) return { frontmatter: null, body: md };
+  const close = frontmatterCloseIndex(lines);
+  if (close === null) return { frontmatter: null, body: md };
   const block = lines.slice(1, close);
-  const firstContent = block.find((line) => line.trim() !== '' && !line.trimStart().startsWith('#'));
-  if (!firstContent || !KEY_LINE.test(firstContent)) return { frontmatter: null, body: md };
 
   const fields = parseFields(block);
   const frontmatter: Frontmatter = fields ? { kind: 'fields', fields } : { kind: 'raw', text: block.join('\n') };
   return { frontmatter, body: lines.slice(close + 1).join('\n') };
+}
+
+/** How many of `md`'s leading lines, split on `'\n'`, belong to its
+ *  frontmatter block (0 when it has none).
+ *
+ *  Shares `splitFrontmatter`'s own detection, so a caller counting lines in
+ *  the raw file skips exactly the lines that never reach render. `md` is
+ *  split on `'\n'` alone here, not `/\r?\n/`: a byte-identical rewrite needs
+ *  that same split. `withoutTrailingCR` is what lets the shared detection
+ *  still match a `\r\n` file's lines. The COUNT agrees either way: one line
+ *  ending is one split point under both patterns. */
+export function frontmatterLineCount(md: string): number {
+  const lines = md.replace(/^﻿/, '').split('\n');
+  const close = frontmatterCloseIndex(lines);
+  return close === null ? 0 : close + 1;
 }
 
 /** Top-level `key: value`, `key: [a, b]`, and `key:` over `- item` lines.

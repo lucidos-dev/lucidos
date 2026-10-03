@@ -2,7 +2,7 @@ import { showToast, showConfirm, threadMap, archivingThreadIds, applyingNowThrea
 import { appliedThreadFilter } from '../appliedThreadFilter';
 import { revealThreadPane } from './pane';
 import type { ThreadSection, ThreadState } from '../thread-events';
-import { describeWaitSubscription } from '../thread-events';
+import { deepLinkAnchorInThread, describeWaitSubscription } from '../thread-events';
 import type { ConfirmDetailGroup, ConfirmDetails } from '../types';
 import { threadPassesChannelFilter } from '../threadFilter';
 import { computeFamilyGraph, filterByTopThread, orderedCurrentForReview, attentionThreads, reviewThreads, runningThreads, draftThreads } from '../../components/drawer/family-graph';
@@ -160,9 +160,11 @@ export function focusThread(threadId: string, options?: FocusThreadOptions): voi
 
 /** Scroll the open thread to `eventId` and pulse it, or say why it can't.
  *  `focusThread`'s event deep link, and the late landing of a Needs attention
- *  open whose target was only known once the events arrived. */
+ *  open whose target was only known once the events arrived. An event drawn as
+ *  a step lands on the turn holding it. */
 export function landOnEvent(threadId: string, eventId: string): void {
   scrollToEventAndPulse(eventId, {
+    anchorFor: () => deepLinkAnchorInThread(threadMap.value.get(threadId), eventId),
     stillArriving: () => threadEventsStillArriving(threadId),
     onUnresolved: () => showToast(
       'That event is not shown in this thread.',

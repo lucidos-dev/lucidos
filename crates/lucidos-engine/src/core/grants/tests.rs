@@ -101,6 +101,33 @@ fn an_absent_grants_directory_reads_empty_rather_than_erroring() {
     }
 }
 
+/// A pattern derives from agent or MCP server input, such as a Skill name. A
+/// newline inside it must not smuggle a bare `Bash` grant into the file.
+#[test]
+fn append_refuses_a_pattern_that_would_split_into_extra_grants() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = grants_dir(tmp.path());
+
+    for file in GrantFile::ALL {
+        for pattern in [
+            "Skill(x\nBash\n#:*)",
+            "Mcp(a)\r\nMcp(github:*)",
+            "Bash(ls\t:*)",
+        ] {
+            assert!(
+                append(&dir, file, pattern).is_err(),
+                "{} must refuse {pattern:?}",
+                file.file_name()
+            );
+        }
+        assert!(
+            patterns(&dir, file).is_empty(),
+            "{} must hold no grant after a refused append",
+            file.file_name()
+        );
+    }
+}
+
 #[test]
 fn append_is_idempotent_and_seeds_the_header() {
     let tmp = tempfile::tempdir().unwrap();

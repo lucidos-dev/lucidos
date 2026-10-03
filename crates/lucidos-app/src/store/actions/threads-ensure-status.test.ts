@@ -117,6 +117,7 @@ describe('ensureThreadInMap', () => {
       summary_version: 0,
       coding_agent_proposed: false,
       coding_agent_requires_restart: false,
+      coding_agent_incomplete: false,
       coding_agent_is_external_repo: false,
       coding_agent_has_diff: false, last_revived_at: null,
       state: 'active',
@@ -157,6 +158,7 @@ describe('ensureThreadInMap', () => {
       summary_version: 0,
       coding_agent_proposed: false,
       coding_agent_requires_restart: false,
+      coding_agent_incomplete: false,
       coding_agent_is_external_repo: false,
       coding_agent_has_diff: false, last_revived_at: null,
       state: 'active',
@@ -193,6 +195,7 @@ describe('ensureThreadByIdInMap', () => {
       summary_version: 0,
       coding_agent_proposed: false,
       coding_agent_requires_restart: false,
+      coding_agent_incomplete: false,
       coding_agent_is_external_repo: false,
       last_revived_at: null,
       ...overrides,
@@ -304,6 +307,7 @@ describe('focusThreadOrBootstrapResult, optimistic focus while bootstrapping', (
       summary_version: 0,
       coding_agent_proposed: false,
       coding_agent_requires_restart: false,
+      coding_agent_incomplete: false,
       coding_agent_is_external_repo: false,
       last_revived_at: null,
     };
@@ -501,6 +505,7 @@ describe('CC thread spawned by chat — status from API is authoritative', () =>
         summaryVersion: 0,
       codingAgentProposed: false,
       codingAgentRequiresRestart: false,
+      codingAgentIncomplete: false,
       codingAgentIsExternalRepo: false,
        // Set by SSE skeleton
         lastRevivedAt: '',
@@ -547,6 +552,7 @@ describe('CC thread spawned by chat — status from API is authoritative', () =>
         summaryVersion: 0,
       codingAgentProposed: false,
       codingAgentRequiresRestart: false,
+      codingAgentIncomplete: false,
       codingAgentIsExternalRepo: false,
        // Was running before restart
         lastRevivedAt: '',
@@ -604,6 +610,7 @@ describe('event replay must not override API status', () => {
           status: 'idle',  // Backend says idle (session is dead)
           coding_agent_proposed: false,
           coding_agent_requires_restart: false,
+          coding_agent_incomplete: false,
           coding_agent_is_external_repo: false,
           coding_agent_has_diff: false, last_revived_at: null,
         },
@@ -671,6 +678,7 @@ describe('event replay must not override API status', () => {
       blockingDescendantCount: 0, attentionDescendantCount: 0,
       codingAgentProposed: false,
       codingAgentRequiresRestart: false,
+      codingAgentIncomplete: false,
       codingAgentIsExternalRepo: false,
       isSaved: false,
       hasResponse: true,
@@ -728,6 +736,7 @@ describe('event replay must not override API status', () => {
       blockingDescendantCount: 0, attentionDescendantCount: 0,
       codingAgentProposed: false,
       codingAgentRequiresRestart: false,
+      codingAgentIncomplete: false,
       codingAgentIsExternalRepo: false,
       isSaved: false,
       hasResponse: false,
@@ -1602,6 +1611,7 @@ describe('upsertThread — updatedAt monotonic', () => {
         updatedAt: '2026-03-31T19:31:54Z', // SSE-updated (newer)
         status: 'running', codingAgentProposed: false,
         codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, lastRevivedAt: '',
+        codingAgentIncomplete: false,
         messageCount: 0, section: 'archived', activeChildrenCount: 0,
       },
     }));
@@ -1631,6 +1641,7 @@ describe('upsertThread — updatedAt monotonic', () => {
         updatedAt: '2026-03-31T10:00:00Z',
         status: 'idle', codingAgentProposed: false,
         codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, lastRevivedAt: '',
+        codingAgentIncomplete: false,
         messageCount: 0, section: 'archived', activeChildrenCount: 0,
       },
     }));

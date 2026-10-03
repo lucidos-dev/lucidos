@@ -34,7 +34,7 @@ use async_trait::async_trait;
 use std::collections::VecDeque;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -447,12 +447,15 @@ async fn resolve_git_common_dir(worktree: &Path) -> Option<PathBuf> {
 
 /// Build one per-turn `codex exec` command. Pure over its inputs so the unit
 /// tests can pin flag layout without spawning.
+///
+/// The turn's prompt goes to stdin ([`send_prompt_on_stdin`]), never argv.
+/// Linux caps one argv string at 128 KiB, which a first turn carrying a long
+/// thread's history outgrows. Argv is also world-readable in `/proc`.
 fn build_codex_turn_command(
     config: &CodexConfig,
     model: Option<&str>,
     effort: Option<&str>,
     resume_session_id: Option<&str>,
-    prompt: &str,
     image_paths: &[PathBuf],
 ) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new(&config.codex_bin);
@@ -492,18 +495,15 @@ fn build_codex_turn_command(
     for img in image_paths {
         cmd.arg("-i").arg(img);
     }
-    // Global exec flags must precede the `resume` subcommand; the prompt is
-    // positional in both forms. The `--` keeps a prompt that starts with `-`
-    // (a markdown bullet) from being parsed as a flag, which fails the turn.
+    // Global exec flags must precede the `resume` subcommand. In both forms a
+    // `-` positional reads the prompt from stdin. The `--` keeps `-i` from
+    // taking that `-` as one more image.
     if let Some(sid) = resume_session_id {
         cmd.arg("resume").arg(sid);
     }
-    cmd.arg("--").arg(prompt);
+    cmd.arg("--").arg("-");
     cmd.current_dir(&config.worktree_path)
-        // /dev/null stdin — codex falls back to reading the prompt from
-        // stdin when it considers the arg incomplete; an inherited fd would
-        // make it block on "Reading additional input from stdin...".
-        .stdin(std::process::Stdio::null())
+        .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     for k in &config.env_removed {
@@ -690,6 +690,20 @@ fn compose_first_turn_prompt(system_prompt: Option<&str>, user_text: &str) -> St
     }
 }
 
+/// Write `prompt` to the turn's stdin, then close it so codex sees the end.
+/// A task, so a prompt bigger than the pipe buffer never stalls the turn loop.
+fn send_prompt_on_stdin(stdin: Option<tokio::process::ChildStdin>, prompt: String) {
+    let Some(mut stdin) = stdin else {
+        log!("[Codex] the turn has no stdin to send its prompt on");
+        return;
+    };
+    tokio::spawn(async move {
+        if let Err(e) = stdin.write_all(prompt.as_bytes()).await {
+            log!("[Codex] failed to send the turn's prompt on stdin: {}", e);
+        }
+    });
+}
+
 /// Materialize pasted images as temp files (`-i` flags on exec; `localImage`
 /// inputs on app-server). Returns the paths plus guards that delete the
 /// files on drop (kept alive until the turn ends).
@@ -851,8 +865,7 @@ async fn run_turn(
 
     let (image_paths, _image_guards) = write_image_files(&input.images);
     let text = if input.text.is_empty() && !image_paths.is_empty() {
-        // codex exec requires a prompt argument; an empty positional makes it
-        // fall back to stdin (nulled) and produce an empty turn.
+        // An empty prompt on stdin gives codex an empty turn.
         "See the attached image(s).".to_string()
     } else {
         input.text
@@ -871,7 +884,6 @@ async fn run_turn(
         turn_model.as_deref(),
         turn_effort.as_deref(),
         resume_sid.as_deref(),
-        &prompt,
         &image_paths,
     );
     let mut child = match super::spawn_env::spawn_below_engine(&mut cmd) {
@@ -886,6 +898,7 @@ async fn run_turn(
             return TurnOutcome::Continue;
         }
     };
+    send_prompt_on_stdin(child.stdin.take(), prompt);
     let child_pid = child.id();
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
