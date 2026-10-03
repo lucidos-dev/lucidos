@@ -162,35 +162,40 @@ export function handOverBootOwnership(): void {
 export function dismissBootSplash(): void {
   if (dismissed) return;
   dismissed = true;
-  // The first frame is up, so on-demand surfaces may load now (ADR 0288).
-  startIdlePrefetch();
-  // Revert the html + body backgrounds the boot document painted with the brand
-  // gradient for iOS safe-area coverage, so the app shell's own
-  // var(--bg-primary) backgrounds show once the splash is gone — otherwise the
-  // blue gradient lingers behind
-  // the app's bottom safe-area inset. Done ONLY after the splash node is
-  // actually removed: reverting during the `.boot-splash-leaving` fade would
-  // expose the uncovered bottom safe-area strip (reverting it to dark
-  // --bg-primary) while the splash is still visibly fading, briefly flashing
-  // the very black band this whole change removes.
-  const revertDocumentBackground = () => {
-    if (typeof document !== 'undefined' && document.documentElement) {
-      document.documentElement.style.background = '';
-      if (document.body) document.body.style.background = '';
+  // The boot document paints the brand gradient on both canvas layers. iOS
+  // fills the standalone bottom safe-area strip from the canvas, and no element
+  // reaches it. So the strip must leave on the veil's own curve and length. A
+  // snap at either end of the fade shows as a band.
+  const canvases = [document.documentElement, document.body].filter(Boolean);
+  // Once the splash is gone the stylesheet's own `html` background takes over,
+  // and on-demand surfaces may load (ADR 0288). Not before: the prefetch parses
+  // on the main thread, and WebKit has no idle callback to keep it off the fade.
+  const lifted = () => {
+    for (const canvas of canvases) {
+      canvas.style.background = '';
+      canvas.style.transition = '';
     }
+    startIdlePrefetch();
   };
   const el = document.querySelector(SPLASH_SELECTOR);
   if (!el) {
-    revertDocumentBackground();
+    lifted();
     return;
   }
   el.classList.add(LEAVING_CLASS);
+  // Read off the veil rather than restated: reduced motion and the quiet cover
+  // each give it a length of its own.
+  const veil = getComputedStyle(el);
+  for (const canvas of canvases) {
+    canvas.style.transition = `background-color ${veil.animationDuration} ${veil.animationTimingFunction}`;
+    canvas.style.background = 'var(--bg-primary)';
+  }
   let removed = false;
   const remove = () => {
     if (removed) return;
     removed = true;
     el.remove();
-    revertDocumentBackground();
+    lifted();
   };
   // Only THIS element's own fade may remove it. `animationend` bubbles, and the
   // exit choreography (index.html) runs shorter animations on the mark and the

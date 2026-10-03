@@ -127,8 +127,8 @@ fn a_running_scan_is_one_that_started_inside_the_cutoff() {
 }
 
 /// A clone has no timeout, so a wedged scan holds the single-flight guard for
-/// ever. Past the cutoff the cue must drop, or the panel shows "Updating…"
-/// permanently and never admits its data has stopped moving.
+/// ever. Past the cutoff it must stop counting as running, or the panel claims
+/// a scan is under way permanently.
 #[test]
 fn a_wedged_scan_stops_counting_as_running() {
     let now = Utc::now();

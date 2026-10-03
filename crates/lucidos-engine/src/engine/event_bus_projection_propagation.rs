@@ -116,7 +116,7 @@ pub(crate) async fn load_blocking_sample(
 /// Single in-tx writer of `active_children_count` on the terminal-event
 /// path. Each terminal-event arm in `update_thread_projection`
 /// (CodingAgentIdled, ResponseGenerated, ResponseFailed, ResponseCanceled,
-/// non-transient ResponseAborted, non-transient SessionEnded) calls this
+/// a ResponseAborted that promises no resume, non-transient SessionEnded) calls this
 /// after flipping the child's `status` to its terminal value, so the COUNT
 /// already excludes the just-terminated child. The companion `+1` paths
 /// (MessageReceived spawn, `reincrement_parent_active_count_if_revived`)

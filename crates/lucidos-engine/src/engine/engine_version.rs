@@ -762,6 +762,9 @@ impl LucidosEngine {
     /// teardown it belongs to. See [`open_teardown`] for both halves of that.
     pub fn begin_teardown(&self) -> Option<crate::engine::thread_events::MessageOrigin> {
         self.mark_shutting_down();
+        // A teardown abort can complete a child. Its parent's turn would open on
+        // an engine that is leaving, so the wake waits for the next boot's refire.
+        self.event_bus.hold_parent_wakes();
         open_teardown(
             &mut self.restart_actor.lock().unwrap(),
             &mut self.teardown_actor.lock().unwrap(),

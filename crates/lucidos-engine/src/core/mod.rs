@@ -311,7 +311,7 @@ pub fn write_json_atomic(
     Ok(())
 }
 
-pub use apps::{App, AppManager};
+pub use apps::{App, AppManager, AppReveal};
 pub use artifacts::{
     is_build_output_file, is_build_output_path, is_vendored_path, list_searchable_data_files,
     ArtifactManager, WriteAnnouncement, VENDORED_DIR_NAMES,

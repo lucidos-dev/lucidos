@@ -7,7 +7,8 @@
 
 import type { UploadSendIntent } from '../components/chat/prompt-input-helpers';
 import { WORKSPACE_ID } from '../utils/basePath';
-import { generateUuid } from '../utils/uuid';
+import { deviceDatabaseName, openDeviceDatabase } from './deviceDatabase';
+import { pageOwnerId } from './pageOwner';
 import { showToast } from './store';
 
 export interface PendingUploadRecord {
@@ -58,10 +59,9 @@ export const PENDING_UPLOAD_MAX_RECORDS = 20;
 export const PENDING_UPLOAD_MAX_BYTES = 100 * 1024 * 1024;
 export const PENDING_UPLOAD_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 
-/** Workspaces share one origin (ADR 0014), so each gets its own database.
- *  Otherwise one workspace's startup would drop another's records as gone. */
+/** One database per workspace (`deviceDatabaseName`). */
 export function pendingUploadDbName(workspaceId: string | null): string {
-  return workspaceId === null ? 'lucidos-pending-uploads' : `lucidos-pending-uploads:${workspaceId}`;
+  return deviceDatabaseName('lucidos-pending-uploads', workspaceId);
 }
 
 const DB_NAME = pendingUploadDbName(WORKSPACE_ID);
@@ -69,55 +69,10 @@ const UPLOADS = 'uploads';
 const QUEUED_UPLOAD_SENDS = 'queued-upload-sends';
 
 function createIndexedDbBackend(name: string): PendingUploadBackend {
-  let opening: Promise<IDBDatabase> | null = null;
-
-  function open(): Promise<IDBDatabase> {
-    if (opening) return opening;
-    const attempt = new Promise<IDBDatabase>((resolve, reject) => {
-      const req = indexedDB.open(name, 1);
-      req.onupgradeneeded = () => {
-        req.result.createObjectStore(UPLOADS, { keyPath: 'localId' });
-        req.result.createObjectStore(QUEUED_UPLOAD_SENDS, { keyPath: 'threadId' });
-      };
-      req.onsuccess = () => {
-        const db = req.result;
-        // Another tab is deleting or upgrading the database. The next write
-        // opens a fresh connection rather than using this closed one.
-        db.onversionchange = () => {
-          db.close();
-          if (opening === attempt) opening = null;
-        };
-        // WebKit can drop the connection while the page sits in the
-        // background. The next write reopens rather than failing for good.
-        db.onclose = () => {
-          if (opening === attempt) opening = null;
-        };
-        resolve(db);
-      };
-      req.onerror = () => reject(req.error);
-    });
-    opening = attempt;
-    // A failed open is retried by the next operation rather than remembered.
-    attempt.catch(() => {
-      if (opening === attempt) opening = null;
-    });
-    return attempt;
-  }
-
-  async function transact<T>(
-    storeName: string,
-    mode: IDBTransactionMode,
-    body: (store: IDBObjectStore) => IDBRequest<T> | void,
-  ): Promise<T | undefined> {
-    const db = await open();
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction(storeName, mode);
-      const req = body(tx.objectStore(storeName));
-      tx.oncomplete = () => resolve(req ? req.result : undefined);
-      tx.onerror = () => reject(tx.error);
-      tx.onabort = () => reject(tx.error ?? new DOMException('The write was aborted', 'AbortError'));
-    });
-  }
+  const { transact } = openDeviceDatabase(name, (db) => {
+    db.createObjectStore(UPLOADS, { keyPath: 'localId' });
+    db.createObjectStore(QUEUED_UPLOAD_SENDS, { keyPath: 'threadId' });
+  });
 
   return {
     putUpload: async (record) => { await transact(UPLOADS, 'readwrite', (s) => s.put(record)); },
@@ -174,9 +129,6 @@ function store(): PendingUploadBackend {
   backend ??= typeof indexedDB === 'undefined' ? createUnavailableBackend() : createIndexedDbBackend(DB_NAME);
   return backend;
 }
-
-/** This page load. Each record names the page that owns it. */
-export const pageOwnerId = generateUuid();
 
 /** What this page knows of a record it owns, read synchronously by the rules
  *  that decide when a record ends. */
@@ -301,32 +253,6 @@ export async function readPendingUploadStore(): Promise<{
   await writes;
   const [uploads, queuedUploadSendRecords] = await Promise.all([store().listUploads(), store().listQueuedUploadSends()]);
   return { uploads, queuedUploadSendRecords };
-}
-
-const OWNER_LOCK_PREFIX = `${DB_NAME}:owner:`;
-
-/** Hold a Web Lock named after this page for its whole life. Another tab
- *  reads the held locks to learn which records still have a live owner. */
-export function holdPageOwnerLock(): void {
-  if (typeof navigator === 'undefined' || !navigator.locks) return;
-  navigator.locks.request(OWNER_LOCK_PREFIX + pageOwnerId, () => new Promise<never>(() => {})).catch((err) => {
-    // Runs without user intent. Without the lock another tab may resume this
-    // page's images too. The blob store is content-addressed and the draft
-    // refuses a second copy of a hash, so the cost is a repeated upload.
-    console.warn('pending uploads: could not hold the owner lock', err);
-  });
-}
-
-/** The owners another open tab still holds, or null when this browser cannot
- *  tell. Null means every record is free to adopt. */
-export async function liveOwnerIds(): Promise<ReadonlySet<string> | null> {
-  if (typeof navigator === 'undefined' || !navigator.locks) return null;
-  const { held = [] } = await navigator.locks.query();
-  const owners = new Set<string>();
-  for (const lock of held) {
-    if (lock.name?.startsWith(OWNER_LOCK_PREFIX)) owners.add(lock.name.slice(OWNER_LOCK_PREFIX.length));
-  }
-  return owners;
 }
 
 /** `null` puts back the backend this runtime would pick on its own. */

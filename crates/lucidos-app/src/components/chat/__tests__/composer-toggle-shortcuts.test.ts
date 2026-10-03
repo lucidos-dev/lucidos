@@ -16,11 +16,7 @@ vi.mock('../scrollState', async (importOriginal) => {
     setFollowLiveEdge: vi.fn(),
   };
 });
-vi.mock('../../../store/voice', async () => {
-  const { signal } = await import('@preact/signals');
-  const { CALL_IDLE } = await import('../../../voice/callState');
-  return { voiceCall: signal(CALL_IDLE), pressCallToggle: vi.fn() };
-});
+vi.mock('../../../store/voice', () => ({ pressCallToggle: vi.fn() }));
 
 import { toggleFollowLiveEdge, pressCallToggleIfShown } from '../PromptRowControls';
 import { followingLiveEdge, followLiveEdgeSeed, setFollowLiveEdge } from '../scrollState';

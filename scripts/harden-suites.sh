@@ -21,6 +21,9 @@
 # suite also stamps the changed paths when it exits, so an edit made while it
 # ran voids it even if the edit was later undone.
 #
+# A cargo suite waits on the build memory gate before it starts, and exits 72
+# when the host never recovers (ADR 0351).
+#
 # The run stays in the caller's process group, so the turn-end teardown still
 # reaches it. `stop` walks the pid tree from the recorded pid, never by name.
 #
@@ -87,14 +90,29 @@ changed_now() {
         || echo "(git could not list the changed paths)"
 }
 
+# The build memory gate, or HS_MEMORY_GATE_CMD in the tests, which must never
+# read the real host.
+memory_gate() { # <label>
+    "${HS_MEMORY_GATE_CMD:-$SCRIPT_DIR/build-memory-gate.sh}" --label "$1"
+}
+
+# A cargo suite first waits on the build memory gate (ADR 0351). A refusal is
+# the suite's result, exit 72, and its command never runs.
 run_suite() { # <suite>
-    local suite=$1 cmd rc
+    local suite=$1 cmd rc=0 passed_at=""
     if ! cmd="$(hs_suite_command "$suite" "$(cat "$STATE/mode")" "$STATE/paths")"; then
         echo 1 > "$STATE/$suite.exit"
         return
     fi
-    (cd "$ROOT" && bash -c "$cmd") > "$STATE/$suite.log" 2>&1
-    rc=$?
+    : > "$STATE/$suite.log"
+    if hs_is_cargo_suite "$suite"; then
+        memory_gate "the /harden $suite suite" >> "$STATE/$suite.log" 2>&1 || rc=$?
+        passed_at="$(date +%s)"
+    fi
+    if [ "$rc" = 0 ]; then
+        (cd "$ROOT" && LUCIDOS_BUILD_MEMORY_GATE_PASSED_AT="$passed_at" bash -c "$cmd") >> "$STATE/$suite.log" 2>&1
+        rc=$?
+    fi
     changed_now > "$STATE/$suite.changed"
     # The exit file goes last: its presence is what marks the suite done.
     echo "$rc" > "$STATE/$suite.exit"
@@ -257,6 +275,10 @@ suite_state() { # <suite>
         | hs_unsafe_paths "$STATE/compile-inputs" "$disabled" | head -1)"
     if [ -n "$unsafe" ]; then
         echo "VOID $unsafe changed since the start commit"
+    elif [ "$(cat "$STATE/$suite.exit")" = 72 ] ||
+        grep -q '^ERROR: build refused on host memory' "$STATE/$suite.log" 2>/dev/null; then
+        # A gate nested inside `make` refuses with 72, and make exits 2.
+        echo "VOID refused by the build memory gate, see $STATE/$suite.log"
     elif [ "$(cat "$STATE/$suite.exit")" != 0 ]; then
         echo "FAIL see $STATE/$suite.log"
     elif hs_is_filtered_suite "$suite" && ! grep -q -E '^running [1-9]' "$STATE/$suite.log"; then

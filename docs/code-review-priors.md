@@ -1290,6 +1290,15 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 
 ## Frontend
 
+- **A send's unsent message record is queued, not awaited, before its POST.**
+  A reviewer reports that a reload before the IndexedDB write commits loses the
+  record (`persistSendingMessage` in `store/unsentMessageRecords.ts`). The gap
+  is the few milliseconds a warm connection takes to commit. The restore pass
+  opens that connection at startup, and iOS gives a backgrounded page seconds
+  before it suspends it. Awaiting would break the pinned synchronous dispatch
+  of a lone send (`chat-send-serialization.test.ts`). Re-flag only with a
+  measured commit time that a user action can reach.
+
 - **The focus-ring walk measures a scroller against its scrollable extent, not
   its visible scrollport, on purpose.** A reviewer reads this as letting a cut
   ring pass. `e2e/focusRingClip.ts` asks whether ANY scroll position shows the

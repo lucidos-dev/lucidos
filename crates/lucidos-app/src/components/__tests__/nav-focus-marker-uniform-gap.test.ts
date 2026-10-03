@@ -23,12 +23,12 @@ function declarationValue(block: string, property: string): string | undefined {
 
 // The navigation focus marker (.nav-focus-stuck, styles/global/host-components.css)
 // washes the marked element's padding box, so the gap it leaves around the content
-// on each side equals that side's padding. A settings row and a plugin row are
-// padded asymmetrically (settings: 0.5rem top/bottom, 0 sides; plugin row:
-// 0.75rem top/bottom, 1rem sides), so each gets a scoped rule that normalizes all
-// four sides to one gap with cancelling margins (no reflow): settings shrinks to
-// 0.375rem (the largest gap that still fits the clip container), plugins to their
-// 0.75rem vertical. These rules MUST stay attached to the current marker class; a
+// on each side equals that side's padding. A settings row is padded 0.5rem
+// top/bottom and 0 at the sides. A plugin row is padded 1rem all round, too wide
+// for the clip. Each gets a scoped rule that sets all four sides to one gap, with
+// cancelling margins so nothing reflows. Settings shrinks to 0.375rem, the largest
+// gap that fits the clip container, and plugins to 0.75rem. These rules MUST stay
+// attached to the current marker class; a
 // rename that leaves them on the old class silently drops the rule and the gap
 // regresses (the same failure mode the chat rule's guard protects against). The
 // numbers below predate the repaint from an outline frame to a background wash and
@@ -64,17 +64,17 @@ describe('nav focus marker — uniform gap outside chat', () => {
     expect(declarationValue(block, 'margin-left')).toBe('0.625rem');
   });
 
-  it('shrinks a focus-marked plugin row sideways to match its vertical gap', () => {
+  it('shrinks a focus-marked plugin row inward to a uniform gap', () => {
     const block = getBlock(pagesCss, '.app-store-plugin-row.nav-focus-stuck');
     expect(block).not.toBe('');
-    // Sides shrink from 1rem to the row's 0.75rem top/bottom padding, cancelled by a
-    // positive margin so the stretched row keeps its content box / position. With a
-    // wash rather than a frame, this is the width of the highlighted band beside the
-    // row's content.
-    expect(declarationValue(block, 'padding-left')).toBe('0.75rem');
-    expect(declarationValue(block, 'padding-right')).toBe('0.75rem');
-    expect(declarationValue(block, 'margin-left')).toBe('0.25rem');
-    expect(declarationValue(block, 'margin-right')).toBe('0.25rem');
+    // Every side shrinks from the row's 1rem padding to 0.75rem. A positive margin
+    // cancels it, so the row keeps its content box and position. With a wash rather
+    // than a frame, this is the width of the highlighted band around the content.
+    expect(declarationValue(block, 'padding')).toBe('var(--space-md)');
+    expect(declarationValue(block, 'margin')).toBe('var(--space-xs)');
+    const row = getBlock(pagesCss, '.list-row.app-store-plugin-row');
+    expect(declarationValue(row, 'padding-top')).toBe('var(--space-lg)');
+    expect(declarationValue(row, 'padding-bottom')).toBe('var(--space-lg)');
   });
 
   it('has no pre-rename marker class names left behind', () => {

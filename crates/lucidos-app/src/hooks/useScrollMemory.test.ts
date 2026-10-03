@@ -2,8 +2,6 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   parseSavedScroll,
   isFullyRestorable,
-  resetContentScroll,
-  contentScrollKey,
   attachScrollMemory,
   LIVE_EDGE_VALUE,
 } from './useScrollMemory';
@@ -134,35 +132,6 @@ describe('parseSavedScroll', () => {
   it('reads a marked live edge as the plain one, which is armed already', () => {
     // A value we never write, and it says the same thing twice.
     expect(parseSavedScroll(`following:${LIVE_EDGE_VALUE}`)).toEqual({ kind: 'live-edge' });
-  });
-});
-
-describe('contentScrollKey', () => {
-  it('matches the key shape ContentPane writes', () => {
-    // Tests the contract between writer (ContentPane) and invalidators
-    // (e.g., submitTrigger). If these drift, "reset on save" silently no-ops.
-    expect(contentScrollKey('triggers')).toBe('lucidos-scroll-content-triggers');
-  });
-});
-
-describe('resetContentScroll', () => {
-  beforeEach(() => localStorage.clear());
-
-  it('removes the saved offset for the view', () => {
-    localStorage.setItem('lucidos-scroll-content-triggers', '500');
-    resetContentScroll('triggers');
-    expect(localStorage.getItem('lucidos-scroll-content-triggers')).toBeNull();
-  });
-
-  it('is a no-op when nothing is saved', () => {
-    expect(() => resetContentScroll('triggers')).not.toThrow();
-  });
-
-  it('does not touch other views', () => {
-    localStorage.setItem('lucidos-scroll-content-triggers', '500');
-    localStorage.setItem('lucidos-scroll-content-apps', '200');
-    resetContentScroll('triggers');
-    expect(localStorage.getItem('lucidos-scroll-content-apps')).toBe('200');
   });
 });
 

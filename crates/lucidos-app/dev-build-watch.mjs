@@ -21,7 +21,7 @@
 // `.build-watch/pid`), waits for the initial build to produce dist/index.html,
 // and SIGTERMs it on teardown. A change mid-build is coalesced and rebuilt after.
 //
-// # Two things this does besides building
+// # Three things this does besides building
 //
 // **It installs what the manifest declares.** A coding agent's Apply can land a
 // new `package-lock.json` that the checkout never installed: `ensure_npm_deps`
@@ -35,9 +35,16 @@
 // and raises one notification, so nobody discovers it hours later.
 //
 // Both, and why: `docs/plans/2026-08-21-a-wedged-frontend-build-heals-itself-and-shouts.md`.
+//
+// **It serves an entry chunk over its budget, and says so.** Every other build
+// fails on that (`vite/entryChunkBudget.ts`). Here it would strand every later
+// Apply, so the child is told it runs under the watcher, and the overrun lands
+// in the status file and one notification instead. See
+// `docs/plans/2026-10-03-entry-chunk-headroom-and-watcher-report-only.md`.
 
 import { spawn, spawnSync } from 'node:child_process';
 import { mkdirSync, readFileSync, writeFileSync, watch } from 'node:fs';
+import { createRequire } from 'node:module';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -47,6 +54,11 @@ const DEPS_STATE = resolve(PROJECT_DIR, 'scripts/deps-state.sh');
 const STATE_DIR = resolve(APP_DIR, '.build-watch');
 const STATUS_FILE = resolve(STATE_DIR, 'status.json');
 const DEBOUNCE_MS = 200; // coalesce git-merge bursts (Apply touches many files at once)
+
+// Both mirror `vite/entryChunkBudget.ts`, which this JS cannot import.
+// `dev-build-watch.test.ts` fails when they drift apart.
+export const DEV_BUILD_WATCH_ENV = 'LUCIDOS_DEV_BUILD_WATCH';
+export const ENTRY_CHUNK_LINE_PREFIX = 'lucidos-entry-chunk ';
 
 /** Build output kept for the status file and the alert. Enough for a Rollup
  *  resolve error with its stack, small enough to hold for every build.
@@ -124,12 +136,57 @@ export function firstErrorLine(output) {
  * Written on success too. The engine reads this to explain an Apply that did
  * not land, and a stale failure from an hour ago would be a lie.
  */
-export function buildStatusRecord({ ok, at, error, skippedInstall }) {
+export function buildStatusRecord({ ok, at, error, skippedInstall, entryChunk }) {
   return {
     ok,
     at,
     error: ok ? null : (error ?? null),
     skippedInstall: skippedInstall ?? null,
+    entryChunk: entryChunk ?? null,
+  };
+}
+
+/**
+ * The environment of one `vite build` child.
+ *
+ * `LUCIDOS_ATOMIC_DIST` stages the build and publishes it onto `dist/` only on
+ * success. `DEV_BUILD_WATCH_ENV` names this process as the parent, which is the
+ * only form the budget plugin accepts as "report, do not fail".
+ */
+export function buildChildEnv(baseEnv, watcherPid) {
+  return { ...baseEnv, LUCIDOS_ATOMIC_DIST: '1', [DEV_BUILD_WATCH_ENV]: String(watcherPid) };
+}
+
+/**
+ * The entry chunk measurement on one line of build output, or `null`.
+ *
+ * `overBudget` is decided here rather than trusted from the line, so the status
+ * file cannot disagree with its own two numbers.
+ */
+export function entryChunkFromLine(line) {
+  if (!line.startsWith(ENTRY_CHUNK_LINE_PREFIX)) return null;
+  try {
+    const { fileName, bytes, budgetBytes } = JSON.parse(line.slice(ENTRY_CHUNK_LINE_PREFIX.length));
+    if (typeof fileName !== 'string' || !Number.isFinite(bytes) || !Number.isFinite(budgetBytes)) return null;
+    return { fileName, bytes, budgetBytes, overBudget: bytes > budgetBytes };
+  } catch {
+    return null;
+  }
+}
+
+/** The notification for an entry chunk crossing its budget, either way. */
+export function entryChunkAlert(transition, entryChunk) {
+  const kb = (bytes) => `${(bytes / 1000).toFixed(2)} kB`;
+  if (transition === 'broken') {
+    return {
+      title: 'Entry chunk is over its budget',
+      message: `${entryChunk.fileName} is ${kb(entryChunk.bytes)}, over ${kb(entryChunk.budgetBytes)}. `
+        + 'This checkout still serves it, but every other build now fails. See ADR 0288.',
+    };
+  }
+  return {
+    title: 'Entry chunk is back within its budget',
+    message: `${entryChunk.fileName} is ${kb(entryChunk.bytes)}, within ${kb(entryChunk.budgetBytes)}.`,
   };
 }
 
@@ -209,17 +266,13 @@ function ensureDeps() {
 
 /** Tell the user, once per transition. Best effort by construction: the watcher
  *  publishing the frontend matters more than any alert it can send. */
-function raiseAlert(kind, detail) {
+function raiseAlert({ title, message }) {
   const cli = process.env.LUCIDOS_CLI_BIN;
   const workspace = process.env.LUCIDOS_WORKSPACE;
   if (!cli || !workspace) {
     log(`no alert sent (${!cli ? 'LUCIDOS_CLI_BIN' : 'LUCIDOS_WORKSPACE'} unset)`);
     return;
   }
-  const title = kind === 'broken' ? 'Frontend build is failing' : 'Frontend build is green again';
-  const message = kind === 'broken'
-    ? `Nothing new is being served from this checkout until it builds. ${detail}`
-    : 'The checkout is publishing again.';
   try {
     const child = spawn(cli, ['notify', '--title', title, '--message', message], {
       stdio: 'ignore',
@@ -237,14 +290,16 @@ let pending = false;
 let child = null;
 /** `null` until this process has completed a build. See `alertTransition`. */
 let lastOk = null;
+/** `null` until a build has measured the entry chunk. The same edge rule. */
+let lastWithinBudget = null;
 
-function recordOutcome(ok, error, skippedInstall) {
+function recordOutcome(ok, error, skippedInstall, entryChunk) {
   try {
     mkdirSync(STATE_DIR, { recursive: true });
     writeFileSync(
       STATUS_FILE,
       `${JSON.stringify(
-        buildStatusRecord({ ok, at: new Date().toISOString(), error, skippedInstall }),
+        buildStatusRecord({ ok, at: new Date().toISOString(), error, skippedInstall, entryChunk }),
         null,
         2,
       )}\n`,
@@ -254,7 +309,29 @@ function recordOutcome(ok, error, skippedInstall) {
   }
   const transition = alertTransition(lastOk, ok);
   lastOk = ok;
-  if (transition) raiseAlert(transition, error ?? '');
+  if (transition === 'broken') {
+    raiseAlert({
+      title: 'Frontend build is failing',
+      message: `Nothing new is being served from this checkout until it builds. ${error ?? ''}`,
+    });
+  } else if (transition === 'recovered') {
+    raiseAlert({ title: 'Frontend build is green again', message: 'The checkout is publishing again.' });
+  }
+
+  if (!entryChunk) return;
+  if (entryChunk.overBudget) {
+    log(`ENTRY CHUNK OVER BUDGET: ${entryChunk.fileName} is ${entryChunk.bytes} bytes, `
+      + `budget ${entryChunk.budgetBytes}. Served anyway; every other build fails on it.`);
+  }
+  const budgetTransition = alertTransition(lastWithinBudget, !entryChunk.overBudget);
+  lastWithinBudget = !entryChunk.overBudget;
+  if (budgetTransition) raiseAlert(entryChunkAlert(budgetTransition, entryChunk));
+}
+
+/** Vite's CLI, run by this Node directly, so the child's parent is this process. */
+function viteBin() {
+  const require = createRequire(resolve(APP_DIR, 'package.json'));
+  return resolve(dirname(require.resolve('vite/package.json')), 'bin/vite.js');
 }
 
 function runBuild() {
@@ -264,33 +341,51 @@ function runBuild() {
   const skippedInstall = ensureDeps();
   if (skippedInstall) log(skippedInstall);
 
+  let bin;
+  try {
+    bin = viteBin();
+  } catch (err) {
+    building = false;
+    log(`vite build FAILED: cannot resolve vite (${err.message})`);
+    recordOutcome(false, `cannot resolve vite: ${err.message}`, skippedInstall, null);
+    return;
+  }
+
   // Fresh child process every time → no incremental cache to wedge.
-  // LUCIDOS_ATOMIC_DIST makes the build stage into dist.staging and atomically
-  // publish onto dist/ only on success, so a failed build never clobbers dist/.
   //
   // Piped rather than inherited, so the tail can be kept for the status file
   // and the alert. Everything still reaches this process's stdout, which
   // workspace.sh redirects to `.build-watch/log`, so the log is unchanged.
-  child = spawn('npx', ['vite', 'build'], {
+  child = spawn(process.execPath, [bin, 'build'], {
     cwd: APP_DIR,
-    env: { ...process.env, LUCIDOS_ATOMIC_DIST: '1' },
+    env: buildChildEnv(process.env, process.pid),
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let tail = '';
+  let partialLine = '';
+  let entryChunk = null;
   const keep = (chunk) => {
     process.stdout.write(chunk);
     tail = (tail + chunk.toString()).slice(-ERROR_TAIL_BYTES);
   };
-  child.stdout.on('data', keep);
+  // Whole lines only: the measurement can arrive split across two chunks.
+  const keepStdout = (chunk) => {
+    keep(chunk);
+    const lines = (partialLine + chunk.toString()).split('\n');
+    partialLine = lines.pop() ?? '';
+    for (const line of lines) entryChunk = entryChunkFromLine(line) ?? entryChunk;
+  };
+  child.stdout.on('data', keepStdout);
   child.stderr.on('data', keep);
 
   child.on('exit', (code) => {
     child = null;
     building = false;
+    entryChunk = entryChunkFromLine(partialLine) ?? entryChunk;
     const ms = Date.now() - started;
     const ok = code === 0;
     log(`vite build ${ok ? 'ok' : `FAILED (exit ${code})`} in ${ms}ms`);
-    recordOutcome(ok, ok ? null : firstErrorLine(tail), skippedInstall);
+    recordOutcome(ok, ok ? null : firstErrorLine(tail), skippedInstall, entryChunk);
     if (pending) { pending = false; runBuild(); }
   });
 }

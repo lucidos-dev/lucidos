@@ -41,15 +41,25 @@ const EXPORTED: string[] = [
   'label-warning',
   'label-error',
   'label-neutral',
+  'dropdown-trigger',
+  'dropdown-chevron',
+  'dropdown-placeholder',
+  'dropdown-option',
 ];
 
 const read = (path: string): string => readFileSync(path, 'utf-8');
 const parse = (path: string): Root => postcss.parse(read(path), { from: path });
 
-/** Rules that define the class itself: `.x` alone in a selector-list member. */
+/** Rules that define the class itself: `.x` alone in a selector-list member,
+ *  at the TOP LEVEL. A media-nested one is a refinement, gated by a
+ *  condition. mobile.css bumps `.dropdown-chevron`'s size under
+ *  `pointer: coarse`. That is the same "restyles in context" shape a
+ *  descendant selector already gets a pass for above, not a rival
+ *  definition. */
 function baseRules(css: string, className: string): string[] {
   return cssRules(css)
-    .filter(rule => postcss.list.comma(rule.selector).some(one => one.trim() === `.${className}`))
+    .filter(rule => rule.atRules === ''
+      && postcss.list.comma(rule.selector).some(one => one.trim() === `.${className}`))
     .map(rule => rule.selector);
 }
 

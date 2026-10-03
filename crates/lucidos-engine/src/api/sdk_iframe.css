@@ -105,6 +105,9 @@ html, html[data-theme-mode="dark"] {
     --border-color: #2c456a;
     --bg-hover: #122a4a;
     --bg-selected: #163356;
+    /* Surfaces: every toast, popover, menu and dialog (styles/global/surface.css).
+       Keep in sync with base.css. */
+    --surface-bg: var(--bg-secondary);
     --text-primary: #e6edf3;
     --text-secondary: #8b949e;
     --text-muted: #6e7681;
@@ -138,6 +141,9 @@ html[data-theme-mode="light"] {
     --border-color: #d0d7de;
     --bg-hover: #eaeef2;
     --bg-selected: #eff2f5;
+    /* Elevation runs toward white here, so a floating surface sits on the
+       brightest fill. Keep in sync with base.css. */
+    --surface-bg: var(--bg-primary);
     --text-primary: #1f2328;
     --text-secondary: #656d76;
     --text-muted: #8b949e;
@@ -267,7 +273,14 @@ button:hover {
     border-color: var(--text-muted);
 }
 
-/* Themed dropdown — lucidos.ui.Select (replaces native <select> popup) */
+/* Themed dropdown — lucidos.ui.Select (replaces native <select> popup).
+   select.ts renders the host's own `.dropdown-trigger` / `.dropdown-option`
+   classes (shared-components.css) and `.surface-box` (surface.css) for the
+   menu's box, so the look has one source with the host's own dropdown and
+   nothing to keep in sync. See
+   docs/plans/2026-10-03-sdk-dropdown-shares-host-css.md. What stays here is
+   only what those classes do not cover: the widget's own non-portaled
+   positioning and its open/closed toggle. */
 .lucidos-select {
     position: relative;
     display: inline-block;
@@ -275,37 +288,10 @@ button:hover {
     text-align: left;
 }
 
+/* The host's trigger sizes to its content via `.dropdown-sizer`; Select has
+   no such trick, so it fills its container instead. */
 .lucidos-select-trigger {
-    display: inline-flex;
-    align-items: center;
-    gap: var(--space-sm);
     width: 100%;
-    background: var(--bg-secondary);
-    color: var(--text-primary);
-    border: 1px solid var(--border-color);
-    border-radius: var(--radius-md);
-    padding: var(--space-sm) var(--space-md);
-    font-family: inherit;
-    font-size: var(--font-size-md);
-    line-height: 1.25;
-    text-align: left;
-    cursor: pointer;
-    transition: border-color var(--transition), background var(--transition);
-}
-
-.lucidos-select-trigger:hover:not(:disabled) {
-    border-color: var(--text-muted);
-}
-
-.lucidos-select-trigger:focus-visible,
-.lucidos-select[data-state="open"] > .lucidos-select-trigger {
-    border-color: var(--accent);
-    outline: none;
-}
-
-.lucidos-select-trigger:disabled {
-    opacity: 0.6;
-    cursor: not-allowed;
 }
 
 .lucidos-select-label {
@@ -316,17 +302,11 @@ button:hover {
     white-space: nowrap;
 }
 
-.lucidos-select-placeholder {
-    color: var(--text-muted);
-}
-
-.lucidos-select-chevron {
-    flex-shrink: 0;
-    color: var(--text-muted);
-    font-size: var(--font-size-sm);
-    line-height: 1;
-}
-
+/* Not portaled, so it stays in normal flow under the trigger: the host's
+   `.dropdown-menu` default (before `Dropdown.tsx`'s own portal/fixed
+   override) is this same absolute/top/left/min-width shape, but that rule
+   lives in host-components.css and never reaches an app frame, so the
+   position is restated here rather than shared with nothing to share it. */
 .lucidos-select-menu {
     display: none;
     position: absolute;
@@ -335,11 +315,6 @@ button:hover {
     min-width: 100%;
     max-height: 18.75rem;
     overflow-y: auto;
-    background: var(--bg-secondary);
-    border: 1px solid var(--border-color);
-    border-radius: var(--radius-md);
-    box-shadow: var(--shadow-md);
-    padding: var(--space-xs) 0;
     z-index: 1000;
 }
 
@@ -347,29 +322,17 @@ button:hover {
     display: block;
 }
 
-.lucidos-select-option {
-    padding: var(--space-sm) var(--space-md);
-    font-size: var(--font-size-md);
-    color: var(--text-primary);
-    cursor: pointer;
-    white-space: nowrap;
-    transition: background var(--transition);
-}
-
-.lucidos-select-option.focused:not(.disabled),
-.lucidos-select-option:hover:not(.disabled) {
-    background: var(--bg-hover);
-}
-
-.lucidos-select-option.active {
-    color: var(--accent);
-    font-weight: 500;
-}
-
+/* No host equivalent: the host's nearest concept, `.dropdown-option-header`,
+   is a non-selectable section heading, not a disabled-but-present option. */
 .lucidos-select-option.disabled {
     color: var(--text-muted);
     cursor: not-allowed;
     opacity: 0.6;
+}
+
+.lucidos-select-option.disabled:hover,
+.lucidos-select-option.disabled.focused {
+    background: transparent;
 }
 
 /* Scrollbar */
@@ -389,25 +352,4 @@ button:hover {
 
 ::-webkit-scrollbar-thumb:hover {
     background: var(--text-muted);
-}
-
-/* Theme parts for app frames (ADR 0307). An app that loads this stylesheet
-   paints the frame parts of the active theme; one without the SDK paints none.
-   Each rule reads one part token, with a fallback equal to the value above.
-   Last in the file, so the Select trigger's border shorthand does not undo it.
-   `data-theme-parts="off"` on the app's <html> resets every part token (see
-   the generated rules appended below). */
-body {
-    text-shadow: var(--part-app-text-text-shadow, none);
-    letter-spacing: var(--part-app-text-letter-spacing, normal);
-}
-
-a {
-    text-decoration-color: var(--part-app-link-text-decoration-color, currentcolor);
-    text-shadow: var(--part-app-link-text-shadow, var(--part-app-text-text-shadow, none));
-}
-
-input, textarea, select, button, .lucidos-select-trigger {
-    border-color: var(--part-app-control-border-color, var(--border-color));
-    box-shadow: var(--part-app-control-box-shadow, none);
 }

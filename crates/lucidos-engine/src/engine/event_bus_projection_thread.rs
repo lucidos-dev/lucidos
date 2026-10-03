@@ -601,13 +601,14 @@ impl EventBus {
                 .bind(thread_id)
                 .execute(&mut **tx)
                 .await?;
-                // Mirror the out-of-tx `notify_parent_if_child` gate: only
-                // non-transient causes are terminal (transient aborts are
-                // mid-retry — the resumed child's eventual SessionStarted
-                // would land before the parent's counter recovers if we
-                // reconciled here too). See ResponseGenerated for the
-                // IN-TX vs out-of-tx broadcast rationale.
-                if !cause.is_transient() {
+                // Mirror the out-of-tx `notify_parent_if_child` gate. Only the
+                // user's own switch promises a resume, so only its abort is
+                // mid-retry. Reconciling it would drop the parent's count
+                // under a child that comes straight back. A crash resumes
+                // nothing, so its child is no longer in flight. See
+                // ResponseGenerated for the IN-TX vs out-of-tx broadcast
+                // rationale.
+                if !cause.promises_auto_resume(meta.actor.as_ref()) {
                     if let Some(pid) =
                         reconcile_parent_active_children_count(tx, thread_id).await?
                     {

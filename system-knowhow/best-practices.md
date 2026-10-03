@@ -91,7 +91,7 @@ Each app: `apps/{id}/`
 | File/Dir | Purpose |
 |----------|---------|
 | `index.html` | App UI |
-| `manifest.json` | Name and description (user-facing, not loaded by engine) |
+| `manifest.json` | Name, description, icon, and `reveal` (when the loading cover lifts; see `js-sdk.md` § Showing the app once its content is ready). User-facing, not loaded into the LLM |
 | `knowhow/` | App-specific reference docs |
 | `intents/` | App-specific user intents |
 | `scripts/` | App-specific helper scripts |

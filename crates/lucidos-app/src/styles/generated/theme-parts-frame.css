@@ -50,6 +50,12 @@
     initial-value: #2c456a;
 }
 
+@property --surface-bg {
+    syntax: '<color>';
+    inherits: true;
+    initial-value: #0d2244;
+}
+
 @property --text-primary {
     syntax: '<color>';
     inherits: true;

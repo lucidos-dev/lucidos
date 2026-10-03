@@ -286,7 +286,7 @@ mod tests {
     #[test]
     fn every_data_prefix_list_matches_the_engine() {
         const ENGINE: &str = include_str!("../../lucidos-engine/src/core/data_prefixes.rs");
-        const FRONTEND: &str = include_str!("../../lucidos-app/src/utils/linkifyPaths.ts");
+        const FRONTEND: &str = include_str!("../../lucidos-app/src/utils/dataPathPrefixes.ts");
         let engine = quoted_list(ENGINE, "pub const MUTABLE_PREFIXES: &[&str] = &[", '"');
         assert!(engine.contains(&"themes/"), "parsed: {engine:?}");
 

@@ -18,7 +18,7 @@ import { put } from './call-fixtures';
 import { installLiveUtteranceRow } from '../liveUtterance';
 import { _applyEventRowsForTest } from '../actions/thread-loading';
 import { threadMap } from '../store';
-import { voiceCall } from '../voice';
+import { voiceCall } from '../voiceCall';
 import {
   computeExchanges,
   exchangeUserMessage,

@@ -704,44 +704,9 @@ html[data-theme-mode="dark"] .split-button.open::before {
     flex-shrink: 0;
 }
 
-/* The selected value reads as the legible anchor of the control in both themes:
-   the old dim (secondary) + grey glow made it look disabled/fuzzy on light, and
-   washed-out grey on dark. Primary text, no glow — crisp everywhere. Hover keeps
-   the same colour; affordance comes from the border-colour shift alone. */
-.dropdown-trigger {
-    background: var(--bg-secondary);
-    border: 1px solid var(--border-color);
-    border-radius: calc(var(--radius-control) * 0.75);
-    color: var(--text-primary);
-    font-family: var(--font-ui);
-    font-size: var(--font-size-xs);
-    padding: 0.25rem 0.5rem;
-    cursor: pointer;
-    outline: none;
-    transition: border-color var(--duration-normal), color var(--duration-normal);
-    display: flex;
-    align-items: center;
-    gap: 0.3125rem;
-    white-space: nowrap;
-}
-
-@media (hover: hover) {
-    .dropdown-trigger:hover {
-        border-color: var(--text-muted);
-    }
-}
-
-.dropdown-trigger:focus-visible {
-    color: var(--text-primary);
-    /* Shared --focus-ring — matches .action-btn / .icon-btn. */
-    outline: 0.125rem solid transparent;
-    box-shadow: var(--focus-ring);
-}
-
-.dropdown-trigger:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
-}
+/* `.dropdown-trigger` and `.dropdown-placeholder` live in
+   `shared-components.css` now — apps render them too via `lucidos.ui.Select`.
+   See docs/plans/2026-10-03-sdk-dropdown-shares-host-css.md. */
 
 /* The loading skeleton (`<DropdownSkeleton>`) borrows the trigger's box so the real
    control lands in exactly its place. It is a span rather than a button, so all
@@ -750,11 +715,6 @@ html[data-theme-mode="dark"] .split-button.open::before {
 .dropdown-trigger.dropdown-skeleton {
     pointer-events: none;
     cursor: default;
-}
-
-.dropdown-placeholder {
-    color: var(--text-muted);
-    opacity: 0.6;
 }
 
 .dropdown-sizer {
@@ -806,23 +766,9 @@ html[data-theme-mode="dark"] .split-button.open::before {
     white-space: nowrap;
 }
 
-.dropdown-chevron {
-    /* Push the chevron to the trailing edge whenever the trigger is wider than
-     * its content (e.g. a full-width `.form-group` dropdown) — content-width
-     * triggers have no slack, so this is a no-op there. */
-    margin-left: auto;
-    font-size: var(--font-size-2xs);
-    color: var(--text-muted);
-    /* Open flips this glyph rather than drawing `▴`, which can differ in
-       width and resize the trigger. The flip is vertical, so asymmetric
-       horizontal padding cannot move the glyph sideways. */
-    display: inline-block;
-    transition: transform var(--duration-fast);
-}
-
-.dropdown-chevron.open {
-    transform: scaleY(-1);
-}
+/* `.dropdown-chevron` lives in `shared-components.css` now (see
+   docs/plans/2026-10-03-sdk-dropdown-shares-host-css.md) — `lucidos.ui.Select`
+   wears it too, flipping the same glyph instead of swapping it. */
 
 /* Default styling for `.dropdown-menu` is `position: absolute`, anchored
  * to its `.dropdown` wrapper. The shared `Dropdown` component overrides
@@ -1186,59 +1132,11 @@ html[data-theme-mode="dark"] .split-button.open::before {
     cursor: default;
 }
 
-/* Option label sits at the primary text color so the muted second-line
- * description and the section headers (both --text-secondary) read as
- * de-emphasized beneath it — without this contrast every row is one flat
- * --text-secondary and the hierarchy disappears. */
-.dropdown-option {
-    padding: 0.25rem 0.5rem;
-    font-family: var(--font-ui);
-    font-size: var(--font-size-xs);
-    color: var(--text-primary);
-    cursor: pointer;
-    white-space: nowrap;
-    /* Below the fast token on purpose: a hover tint that lags the pointer down
-       a long option list reads as sticky. Scaled, so the slider still reaches
-       it. */
-    transition: background-color calc(0.1s * var(--duration-scale));
-}
-
-@media (hover: hover) {
-    .dropdown-option:hover {
-        background: var(--bg-tertiary);
-        color: var(--text-primary);
-    }
-}
-
-.dropdown-option.focused {
-    background: var(--bg-tertiary);
-    color: var(--text-primary);
-}
-
-/* Current-selection marker — a small accent dot at the trailing edge, NOT a
- * full-row color/background treatment. A blue-text (or background) active row
- * competed with the arrow-key `.focused` row (which owns the bg-tertiary
- * highlight): traversing showed two "special" rows and you couldn't tell which
- * one the arrows were on. The dot reads as "this is the current one" without
- * claiming the row highlight. `padding-right` reserves the dot's gutter so a
- * long label ellipsizes before it instead of underlapping the dot. Only shown
- * where the dropdown reflects a persisted current setting; transient "last
- * used" pickers pass markCurrent={false} (no `.active` class). */
-.dropdown-option.active {
-    position: relative;
-    padding-right: 1.25rem;
-}
-
-.dropdown-option.active::after {
-    content: '';
-    position: absolute;
-    top: 0.5rem;
-    right: 0.5rem;
-    width: 0.3125rem;
-    height: 0.3125rem;
-    border-radius: var(--radius-round);
-    background: var(--accent);
-}
+/* `.dropdown-option`'s base/hover/focused/active rules live in
+   `shared-components.css` now (see
+   docs/plans/2026-10-03-sdk-dropdown-shares-host-css.md) — `lucidos.ui.Select`
+   wears them too. The variants below (header, danger, nav-history, form-field
+   sizing) stay here: the SDK widget never applies these classes. */
 
 .dropdown-option.dropdown-option-header {
     color: var(--text-secondary);

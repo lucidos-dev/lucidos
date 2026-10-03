@@ -10,7 +10,6 @@ import {
   markPendingUploadLanded,
   notePendingUploadsOwnedElsewhere,
   ownedPendingUploadRecords,
-  pageOwnerId,
   pendingUploadDbName,
   pendingUploadStorageFailureMessage,
   persistPendingUpload,
@@ -19,6 +18,7 @@ import {
   type PendingUploadBackend,
   type PendingUploadRecord,
 } from './pendingUploadRecords';
+import { pageOwnerId } from './pageOwner';
 import { toasts } from './store';
 
 const bytes = (n: number) => new Uint8Array(n).buffer;

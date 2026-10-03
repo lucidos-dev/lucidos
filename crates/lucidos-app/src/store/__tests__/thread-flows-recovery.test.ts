@@ -551,8 +551,43 @@ describe('Flow: Edge cases', () => {
     expect(steps[1].description).toBe('Thinking');
 
     expect(stepEvents).toHaveLength(2);
-    // The recall step carries its classifier-derived queries as detail.
-    expect((stepEvents[0] as { detail?: string }).detail).toBe('birthday, date of birth');
+    // A row from before the engine recorded memories keeps only its queries.
+    expect((stepEvents[0] as { recall?: unknown }).recall)
+      .toEqual({ memories: [], queries: ['birthday', 'date of birth'] });
+  });
+
+  it('a recall step carries the memories the engine injected, in order', () => {
+    const { map, id } = makeThread();
+    const memories = [
+      {
+        id: 'm1', topic: 'family', summary: 'Birthday is January 1',
+        src_created_at: '2026-01-02T03:04:05Z', source: { type: 'event', id: 'e1' },
+      },
+      {
+        id: 'm2', topic: 'notes', summary: 'Party plan',
+        src_created_at: '2026-01-03T03:04:05Z', source: { type: 'artifact', path: 'party.md', commit: 'abc' },
+      },
+    ];
+    insertEvents(map, id, [
+      { type: 'MessageReceived', text: 'What is my birthday?' },
+      { type: 'MemoryRecalled', results: 2, queries: ['birthday'], memories } as ThreadEvent,
+      { type: 'TextStreamed', text: 'Jan 1.' },
+      { type: 'ResponseGenerated' },
+    ]);
+    const step = exchangeResponseEvents(getExchanges(map, id)[0]).find(e => e.type === 'step');
+    expect(step).toMatchObject({ description: 'Recalled 2 memories', recall: { memories, queries: ['birthday'] } });
+    expect((step as { detail?: string }).detail).toBeUndefined();
+  });
+
+  it('a recall step with nothing to list carries no recall', () => {
+    const { map, id } = makeThread();
+    insertEvents(map, id, [
+      { type: 'MessageReceived', text: 'hi' },
+      { type: 'MemoryRecalled', results: 0 } as ThreadEvent,
+      { type: 'ResponseGenerated' },
+    ]);
+    const step = exchangeResponseEvents(getExchanges(map, id)[0]).find(e => e.type === 'step');
+    expect((step as { recall?: unknown }).recall).toBeUndefined();
   });
 
   /** The label must not mirror the `memory` tool's own "Searching memory

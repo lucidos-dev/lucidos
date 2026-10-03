@@ -138,7 +138,7 @@ describe('app toast bridge: dismissToast', () => {
 });
 
 describe('app toast bridge: message ownership', () => {
-  // `startClient` routes on this boolean, and it is what lets the dismiss branch
+  // `onAppFrameMessage` routes on this boolean, and it is what lets the dismiss branch
   // sit ahead of the "confirm and prompt carry a message" guard.
   it('claims both toast messages and no others', () => {
     expect(toastMsg({ message: 'x' })).toBe(true);

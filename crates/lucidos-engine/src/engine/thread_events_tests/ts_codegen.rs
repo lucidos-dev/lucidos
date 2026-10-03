@@ -50,6 +50,8 @@ const TYPE_SOURCES: &[(&str, &str)] = &[
     ("TodoItem", "engine/thread_events/todo.rs"),
     ("TodoStatus", "engine/thread_events/todo.rs"),
     ("TriageProposalEntry", "engine/thread_events/triage.rs"),
+    ("RecalledMemory", "engine/thread_events/memory.rs"),
+    ("MemorySource", "memory/pgvector.rs"),
     ("ChildCompletionStatus", "engine/thread_events/session.rs"),
     ("SubThreadPendingChange", "engine/thread_events/session.rs"),
     ("SessionEndReason", "engine/thread_events/session.rs"),

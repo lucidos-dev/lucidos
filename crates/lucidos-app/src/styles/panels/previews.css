@@ -39,6 +39,54 @@
     transition: none;
 }
 
+/* Indeterminate bar along the top of the pane while an app opens. Mounted by
+   AppUiInline.tsx after a delay gate, so it is opaque from its first frame and
+   only fades on the way out. It sits above the cover and outlasts it when the
+   cover's fuse lifts first. */
+.app-ui-load-bar {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 0.1875rem;
+    overflow: hidden;
+    pointer-events: none;
+    background: color-mix(in srgb, var(--accent) 18%, transparent);
+    opacity: 1;
+    transition: opacity var(--duration-normal) ease;
+}
+
+.app-ui-load-bar::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    width: 35%;
+    border-radius: var(--radius-round);
+    background: var(--accent);
+    /* Indefinite activity indicator, so a literal duration (not a token). */
+    animation: app-ui-load-bar-sweep 1.2s ease-in-out infinite;
+}
+
+.app-ui-load-bar.is-clearing {
+    opacity: 0;
+}
+
+@keyframes app-ui-load-bar-sweep {
+    from { transform: translateX(-100%); }
+    to { transform: translateX(286%); }
+}
+
+:root[data-motion="reduce"] .app-ui-load-bar {
+    transition: none;
+}
+
+:root[data-motion="reduce"] .app-ui-load-bar::before {
+    animation: none;
+    left: 32.5%;
+}
+
 /* --- Pseudo-fullscreen (CSS fallback when native Fullscreen API is unavailable, e.g. iOS Safari) --- */
 
 /* --z-app-fullscreen (base.css) is above the header chrome and BELOW the modal
@@ -206,6 +254,16 @@
        value. */
     --code-gutter-inset: 0.75rem;
     padding: var(--code-gutter-inset);
+}
+
+/* An editable task item's text toggles its checkbox (`MarkdownDocument`).
+   It stays document text, so it undoes base.css's unselectable `label` rule:
+   a reader must still be able to select and copy it. */
+.file-preview-content .task-list-label {
+    cursor: pointer;
+    -webkit-touch-callout: default;
+    -webkit-user-select: text;
+    user-select: text;
 }
 
 /* A preview body fades in from its skeleton inside this wrapper. It passes the

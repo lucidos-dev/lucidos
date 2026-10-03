@@ -157,6 +157,7 @@ describe('ChildCompletionRow', () => {
     { status: 'failure' as const, word: 'Failure', tone: 'bad' },
     { status: 'no_changes' as const, word: 'No changes', tone: 'none' },
     { status: 'canceled' as const, word: 'Canceled', tone: 'halted' },
+    { status: 'interrupted' as const, word: 'Interrupted', tone: 'halted' },
   ])('status=$status reads "$word"', ({ status, word, tone }) => {
     const tree = ChildCompletionRow({ ...baseProps, status });
     expect(vnodeText(findByClass(tree, 'event-row-subject'))).toBe('Child thread returned');

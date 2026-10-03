@@ -194,7 +194,7 @@
       "kind": "color",
       "label": "Floating surface",
       "description": "Toasts, menus, popovers and dialogs.",
-      "frames": false,
+      "frames": true,
       "default": {
         "dark": "var(--bg-secondary)",
         "light": "var(--bg-primary)"

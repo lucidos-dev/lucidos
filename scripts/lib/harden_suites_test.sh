@@ -207,6 +207,7 @@ if [ -f "$d/$s.child" ]; then
     sleep 300 &
     echo $! > "$d/$s.childpid"
 fi
+[ -f "$d/$s.say" ] && cat "$d/$s.say"
 [ -f "$d/$s.sleep" ] && sleep "$(cat "$d/$s.sleep")"
 [ "$s" = driver ] && [ ! -f "$d/driver.notests" ] && echo "running 3 tests"
 exit "$(cat "$d/$s.rc" 2>/dev/null || echo 0)"
@@ -214,9 +215,20 @@ EOF
 chmod +x "$STUB_DIR/stub.sh"
 export HS_STUB_CMD="$STUB_DIR/stub.sh"
 
+# The build memory gate, stubbed so no test reads the real host. It records
+# each label it was asked about and exits with the code in gate.rc.
+cat > "$STUB_DIR/gate.sh" << 'EOF2'
+#!/bin/bash
+d=$(dirname "$0")
+printf '%s\n' "$2" >> "$d/gate.calls"
+exit "$(cat "$d/gate.rc" 2>/dev/null || echo 0)"
+EOF2
+chmod +x "$STUB_DIR/gate.sh"
+export HS_MEMORY_GATE_CMD="$STUB_DIR/gate.sh"
+
 hs() { (cd "$REPO" && bash "$CLI" "$@"); }
 reset_stub() { rm -f "$STUB_DIR"/*.rc "$STUB_DIR"/*.sleep "$STUB_DIR"/*.child "$STUB_DIR"/*.ran \
-    "$STUB_DIR"/*.pgid "$STUB_DIR"/*.childpid "$STUB_DIR"/driver.notests; }
+    "$STUB_DIR"/*.pgid "$STUB_DIR"/*.childpid "$STUB_DIR"/driver.notests "$STUB_DIR"/gate.calls "$STUB_DIR"/*.say; }
 commit_file() { # <relpath> <content>
     mkdir -p "$REPO/$(dirname "$1")"
     echo "$2" > "$REPO/$1"
@@ -234,6 +246,38 @@ expect_has "driver ran alone" "driver PASS" "$out"
 expect_has "rust passes" "rust PASS" "$out"
 expect_has "ts passes" "ts PASS" "$out"
 expect_eq "run shares the caller's process group" "$(ps -o pgid= -p $$ | tr -d ' ')" "$(cat "$STUB_DIR/rust.pgid")"
+
+expect_eq "the gate was asked before each cargo suite only" \
+    "the /harden rust suite
+the /harden driver suite" "$(cat "$STUB_DIR/gate.calls")"
+
+echo "a refused memory gate starts no cargo suite"
+reset_stub
+echo 72 > "$STUB_DIR/gate.rc"
+hs start --early > /dev/null 2>&1
+out="$(hs wait --budget 20)"
+rc=$?
+expect_eq "a refused suite asks for a rerun" 2 "$rc"
+expect_has "names the gate" "rust VOID refused by the build memory gate" "$out"
+if [ -f "$STUB_DIR/rust.ran" ]; then fail "the rust suite ran on a refused gate"; else pass "the rust suite never ran"; fi
+if [ -f "$STUB_DIR/ts.ran" ]; then pass "a non-cargo suite still ran"; else fail "the ts suite did not run"; fi
+rm -f "$STUB_DIR/gate.rc"
+hs start --early > /dev/null 2>&1
+hs wait --budget 20 > /dev/null
+expect_eq "a fresh run after recovery passes" 0 "$?"
+
+echo "a gate refused inside make reads VOID, not FAIL"
+reset_stub
+echo 2 > "$STUB_DIR/rust.rc"
+echo "ERROR: build refused on host memory: engine tests did not start" > "$STUB_DIR/rust.say"
+hs start --early > /dev/null 2>&1
+out="$(hs wait --budget 20)"
+expect_eq "a nested refusal asks for a rerun" 2 "$?"
+expect_has "names the gate" "rust VOID refused by the build memory gate" "$out"
+reset_stub
+hs start --early > /dev/null 2>&1
+hs wait --budget 20 > /dev/null
+expect_eq "the clean run the next cases build on passes" 0 "$?"
 
 echo "allowlisted changes keep the result"
 commit_file docs/plans/p.md plan

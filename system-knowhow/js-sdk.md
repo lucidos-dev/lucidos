@@ -48,6 +48,11 @@ What each piece does — include only what you need:
 | `lucidos.ui.applyPreferences()` | Reads the user's theme mode/theme/font/scale (resolving a `system` preference to the live OS light/dark) and sets `data-theme-mode`, `data-font-bold` and CSS vars on `<html>`. Pairs with `sdk-iframe.css` to apply the right palette. | **Don't skip if you include `sdk-iframe.css`**: without it the app ignores the user's light/system setting and stays on the default dark palette. Skip only when opting out of Lucidos theming entirely. |
 | `lucidos.ui.watchPreferences()` | Re-applies preferences live: when the user changes one (SSE `PreferencesChanged`), when the active theme's file or plugin changes, and, under a `system` preference, when the OS light/dark appearance flips. The OS half watches `prefers-color-scheme` and the frame's own resume, on every platform, matching the host shell. Inside the host shell the app also repaints as the shell does, mid-drag included (§ lucidos.ui) | Static apps that have opted out of Lucidos theming |
 
+**Hold the loading cover until your data is drawn.** An app that fetches
+its first data after page load declares `"reveal": "on-ready"` in its
+`manifest.json` and calls `lucidos.ui.ready()`. See § Showing the app once its
+content is ready, under lucidos.ui.
+
 **Inherit the theme by default.** A normal app includes the theme assets, calls `applyPreferences()` + `watchPreferences()`, and styles with the theme variables (below). It then follows the user's theme and light/dark appearance like the rest of Lucidos. Theme integration is *technically* opt-in, because the engine never auto-injects these tags. An app that omits both `<script src="/api/v1/sdk-prefs.js">` and `<link rel="stylesheet" href="/api/v1/sdk-iframe.css">` gets no `data-theme-mode` attribute, no CSS variables, and no Lucidos default styling.
 
 Opt out only for an app that ships its own complete visual identity (charts, games, embedded third-party UIs). Otherwise inheriting is the default, and **hardcoding colors is a bug** (a light-mode workspace gets a dark-only app, or vice versa).
@@ -439,6 +444,7 @@ class names are the contract:
 | `data-stack` + `data-label` (attributes, not classes) | Opt a wide table into the stacked mobile layout: put `data-stack` on the `<table>` and `data-label="<column header>"` on every `<td>`. At 768px and under each row becomes a card, the header row is hidden, and each cell shows its `data-label` above its value. Worth it from about 4 columns up; below that the scroll wrapper reads better. |
 | `.progress-bar` + `.progress-bar-fill`, `.progress-label` | A progress indicator |
 | `<input type="checkbox">` (element, no class) | A plain checkbox already renders as the Lucidos checkbox: a soft accent-tinted box with a tick that draws on, sized in `em` to its row's text, identical in every browser. The `indeterminate` DOM property shows a dash. Put it in a `<label>` with its text and set no width or height on it. |
+| `.text-input` | A free-text field, the exact box every host text field uses: `<input class="text-input">` or `<textarea class="text-input">`. Gives you the themed background, border, radius, placeholder colour and focus ring, with nothing to hand-roll. |
 | `.toggle-switch` + `.toggle-slider` | An on/off switch, the one Settings draws. Markup is `<label class="toggle-switch"><input type="checkbox" role="switch"><span class="toggle-slider"></span></label>`: the real checkbox stays in the markup and carries the state, so read and set `checked` as usual. `disabled` on the input dims it, and `toggle-switch-disabled` on the label adds the not-allowed cursor. Give it an accessible name with an `aria-label` on the input, or a visible `<label for>`. |
 | `.mini-spinner` | The spinning ring the host shows for a working state, such as a save in flight: `<span class="mini-spinner" aria-hidden="true"></span>` beside text that says what is happening. It stops under reduced motion and stays drawn. Recolour it with `--spinner-color`, for example `style="--spinner-color: currentColor"` inside a button. A busy button is a disabled `.action-btn` holding the ring and its label. Loading data draws a skeleton or nothing, never a spinner. |
 | `.empty-state`, `.error-text` | Empty/error placeholders |
@@ -676,7 +682,7 @@ for (const e of completions) {
     e.thread_id,                      // parent thread
     e.payload.child_thread_id,
     e.payload.child_thread_title,
-    e.payload.status,                 // success | failure | no_changes | canceled
+    e.payload.status,                 // success | failure | no_changes | canceled | interrupted
     e.payload.summary
   );
 }
@@ -1238,11 +1244,14 @@ interface App {
   /** Optional icon from the app's manifest.json (emoji or asset path).
    *  Omitted when the manifest has none. */
   icon?: string;
+  /** When the host lifts its loading cover, from the manifest's `reveal`.
+   *  Always present: `on-load` unless the manifest says `on-ready`. */
+  reveal: 'on-load' | 'on-ready';
 }
 ```
 
-The shape mirrors the app's `manifest.json` (`name` / `description` / `icon`) plus
-the `id` derived from its folder. `list()` hits `GET /api/v1/apps`; `get(id)`
+The shape mirrors the app's `manifest.json` (`name` / `description` / `icon` /
+`reveal`) plus the `id` derived from its folder. `list()` hits `GET /api/v1/apps`; `get(id)`
 hits `GET /api/v1/app?id=<id>` and throws a `404` `SdkError` for an unknown id.
 
 ### Example
@@ -1623,6 +1632,7 @@ lucidos.ui.previewFile(params: FilePreviewParams): Promise<void>
 lucidos.ui.confirm(options: ConfirmOptions): Promise<boolean>
 lucidos.ui.toast(message: string, type?: ToastType, opts?: ToastOptions): void
 lucidos.ui.dismissToast(key: string): void
+lucidos.ui.ready(): void
 lucidos.ui.prompt(options: PromptOptions): Promise<string | null>
 lucidos.ui.Select.create(opts: SelectCreateOptions): SelectInstance
 lucidos.ui.enhanceSelects(root?: ParentNode): SelectInstance[]
@@ -1657,6 +1667,48 @@ Under a `system` preference the OS appearance is watched two ways, because neith
 and `params` (`NavigateParams` = `NavigateUi` minus `target`) are typed against the
 generated navigation contract, so valid `target`s and `settings_view`s are
 discoverable and type-checked (§ Types, under lucidos.notifications).
+
+### Showing the app once its content is ready
+
+While your app opens, the host covers it with the theme background. After a
+short delay it also runs a thin progress bar along the top of the pane. By default
+the cover lifts on your page's `load` event. An app that fetches its data
+after `load` then shows an empty screen until that data arrives.
+
+To keep the cover up until your content is drawn, opt in from `manifest.json`
+and call `lucidos.ui.ready()` once the first data has rendered:
+
+```json
+{ "name": "Habit Tracker", "description": "Daily habits", "reveal": "on-ready" }
+```
+
+```js
+const habits = await lucidos.data.read('artifacts/habit-tracker/habits.json');
+renderHabits(JSON.parse(habits));
+lucidos.ui.ready();
+```
+
+| `reveal` | The cover lifts | Fuse if the signal never comes |
+|---|---|---|
+| `on-load` (default) | on the page's `load` event | 3 s |
+| `on-ready` | when the app calls `lucidos.ui.ready()` | 15 s |
+
+Four rules:
+
+- **Opt in only if you call it.** An `on-ready` app that never calls `ready()`
+  sits behind the cover for the full 15 s on every open.
+- **Call it on every path that finishes the first render**, including the
+  empty state and the error state. A `catch` that shows an error must call it
+  too, or the user waits 15 s to see the error.
+- **The call is harmless anywhere else.** A repeated call does nothing more,
+  and neither does a call from an `on-load` app. In its own browser tab the
+  app has no host, so nothing is sent.
+- **The manifest decides, not the call.** The host reads `reveal` before your
+  page loads, so the cover can wait for a call that has not happened yet. A
+  value other than `on-load` or `on-ready` opens the app as `on-load`.
+
+The progress bar needs nothing from you. It also keeps running when the 3 s
+fuse lifts the cover before `load`, so a slow page still says it is loading.
 
 ### Navigation targets
 
@@ -2136,6 +2188,8 @@ Both last for the life of the page.
 ### lucidos.ui.Select — themed dropdown
 
 Replaces native `<select>` (whose popup the OS draws and CSS can't reach) with a fully themed dropdown that uses the same tokens as the rest of Lucidos. Supports keyboard nav, type-to-select, light + dark mode.
+
+It renders the host's own `.dropdown-trigger` / `.dropdown-option` classes, plus `.surface-box` for the menu's box. So it always looks exactly like the dropdown in Settings, with no separate SDK copy to drift.
 
 #### Types
 

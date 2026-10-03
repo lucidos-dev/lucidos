@@ -171,6 +171,71 @@ test_cleanup_spares_real_cc_sessions() {
     fi
 }
 
+# A run killed between the fresh-workspace reset and the engine boot leaves the
+# workspace with no repo. The next run's cleanup must get through that under the
+# scripts' `set -e`, and git must not resolve some ENCLOSING repo instead.
+test_cleanup_survives_a_workspace_with_no_repo() {
+    echo "test: cleanup_e2e_worktrees passes over a workspace that has no repo yet"
+    local outer="$SANDBOX/outer" canon="$SANDBOX/canonical-norepo" rc
+    rm -rf "$outer" "$canon" "$SANDBOX/bare-ws"
+    git init -q -b main "$outer"
+    git -C "$outer" config user.email e2e@test
+    git -C "$outer" config user.name e2e
+    git -C "$outer" commit -q --allow-empty -m init
+    git -C "$outer" worktree add -q -b lucidos-outer-live "$SANDBOX/outer-wt" main >/dev/null 2>&1
+    git init -q -b main "$canon"
+    local saved_proj="$_E2E_PROJECT_DIR"
+    _E2E_PROJECT_DIR="$canon"
+
+    # Never `( … ) || rc=$?`: a tested subshell runs with set -e switched off.
+    local E2E_WORKSPACE="$SANDBOX/bare-ws/e2e-test"
+    mkdir -p "$E2E_WORKSPACE/.lucidos/worktrees"
+    ( set -e; cleanup_e2e_worktrees ) >/dev/null 2>&1
+    rc=$?
+    if [ "$rc" -eq 0 ]; then pass "it returns 0 under set -e"; else fail "it exited $rc"; fi
+
+    E2E_WORKSPACE="$outer/e2e-test"
+    mkdir -p "$E2E_WORKSPACE/.lucidos/worktrees"
+    ( set -e; cleanup_e2e_worktrees ) >/dev/null 2>&1
+    _E2E_PROJECT_DIR="$saved_proj"
+    if git -C "$outer" show-ref --verify --quiet refs/heads/lucidos-outer-live \
+        && git -C "$outer" worktree list | grep -q "outer-wt"; then
+        pass "the enclosing repo keeps its worktree and branch"
+    else
+        fail "the cleanup swept the enclosing repo"
+    fi
+}
+
+# The other side of that guard: once the workspace IS a repo, the sweep runs.
+# The sandbox sits under a symlinked temp dir, so this also pins that git's
+# top-level path and `pwd -P` resolve alike.
+test_cleanup_sweeps_the_workspace_repo() {
+    echo "test: cleanup_e2e_worktrees sweeps the workspace's own repo"
+    local E2E_WORKSPACE="$SANDBOX/own-repo/e2e-test" canon="$SANDBOX/canonical-own"
+    rm -rf "$SANDBOX/own-repo" "$canon" "$SANDBOX/own-wt"
+    mkdir -p "$E2E_WORKSPACE/.lucidos/worktrees"
+    git init -q -b main "$E2E_WORKSPACE"
+    git -C "$E2E_WORKSPACE" config user.email e2e@test
+    git -C "$E2E_WORKSPACE" config user.name e2e
+    git -C "$E2E_WORKSPACE" commit -q --allow-empty -m init
+    git -C "$E2E_WORKSPACE" worktree add -q -b lucidos-e2e-leftover "$SANDBOX/own-wt" main >/dev/null 2>&1
+    git init -q -b main "$canon"
+    local saved_proj="$_E2E_PROJECT_DIR"
+    _E2E_PROJECT_DIR="$canon"
+    ( set -e; cleanup_e2e_worktrees ) >/dev/null 2>&1
+    _E2E_PROJECT_DIR="$saved_proj"
+    if git -C "$E2E_WORKSPACE" worktree list | grep -q "own-wt"; then
+        fail "the leftover worktree survived"
+    else
+        pass "the leftover worktree is removed"
+    fi
+    if git -C "$E2E_WORKSPACE" show-ref --verify --quiet refs/heads/lucidos-e2e-leftover; then
+        fail "the leftover branch survived"
+    else
+        pass "the leftover branch is deleted"
+    fi
+}
+
 # ── ensure_frontend_built (stale dist/ guard) ─────────────────────────
 # The browser suite runs against whatever dist/ is on disk, so the old
 # existence-only guard let a checkout whose dist/ predated its own frontend
@@ -1024,6 +1089,117 @@ test_tree_assert_refuses_an_unreadable_tree() {
     fi
 }
 
+# ── reset_e2e_workspace_tree ──────────────────────────────────────────
+# A sandbox workspace with a sibling beside it, so a reset that strayed past
+# the workspace would show.
+new_fresh_ws() {
+    local ws="$SANDBOX/fresh/e2e-test"
+    rm -rf "$SANDBOX/fresh"
+    mkdir -p "$ws/.lucidos/worktrees" "$ws/data/apps/old-app" "$ws/artifacts" "$ws/.git" "$SANDBOX/fresh/e2e-test-old"
+    echo "API_PORT=5341" > "$ws/.lucidos/ports"
+    echo lock > "$ws/.lucidos/e2e.lock"
+    echo x > "$ws/data/apps/old-app/index.html"
+    echo x > "$ws/e2e-test1-01d859d3.txt"
+    echo x > "$ws/.gitignore"
+    echo x > "$ws/..odd"
+    echo keep > "$SANDBOX/fresh/e2e-test-old/sibling.txt"
+    echo "$ws"
+}
+
+test_tree_reset_keeps_only_lucidos() {
+    echo "test: reset_e2e_workspace_tree removes every top-level entry but .lucidos/"
+    local E2E_WORKSPACE left
+    E2E_WORKSPACE="$(new_fresh_ws)"
+    reset_e2e_workspace_tree > "$SANDBOX/fresh.out" 2>&1 || fail "the reset returned non-zero"
+    left="$(find "$E2E_WORKSPACE" -mindepth 1 -maxdepth 1 | sed 's|.*/||' | tr '\n' ' ')"
+    if [ "$left" = ".lucidos " ]; then pass "only .lucidos/ is left"; else fail "left behind: $left"; fi
+    if [ -f "$E2E_WORKSPACE/.lucidos/ports" ] && [ -f "$E2E_WORKSPACE/.lucidos/e2e.lock" ]; then
+        pass ".lucidos/ keeps the pinned ports and the lock"
+    else
+        fail ".lucidos/ lost its contents"
+    fi
+    if [ -f "$SANDBOX/fresh/e2e-test-old/sibling.txt" ]; then pass "a sibling of the workspace is untouched"; else fail "the reset reached a sibling"; fi
+    if grep -q "removed 6 top-level entries" "$SANDBOX/fresh.out"; then pass "it says what it removed"; else fail "no count: $(cat "$SANDBOX/fresh.out")"; fi
+}
+
+test_tree_reset_refuses_a_running_engine() {
+    echo "test: reset_e2e_workspace_tree refuses while the engine is running"
+    local E2E_WORKSPACE rc=0 live
+    E2E_WORKSPACE="$(new_fresh_ws)"
+    sleep 30 &
+    live=$!
+    echo "$live" > "$E2E_WORKSPACE/.lucidos/engine.pid"
+    reset_e2e_workspace_tree > "$SANDBOX/fresh-live.out" 2>&1 || rc=$?
+    kill "$live" 2>/dev/null
+    wait "$live" 2>/dev/null
+    if [ "$rc" -ne 0 ]; then pass "it refuses"; else fail "it reset the tree under a live engine"; fi
+    if [ -f "$E2E_WORKSPACE/data/apps/old-app/index.html" ]; then pass "nothing was removed"; else fail "it removed files before refusing"; fi
+}
+
+test_tree_reset_refuses_a_workspace_that_is_not_disposable() {
+    echo "test: reset_e2e_workspace_tree refuses a workspace not named e2e-*"
+    local E2E_WORKSPACE="$SANDBOX/fresh-dev/dev" rc=0
+    mkdir -p "$E2E_WORKSPACE/data"
+    echo x > "$E2E_WORKSPACE/data/keep.md"
+    reset_e2e_workspace_tree > /dev/null 2>&1 || rc=$?
+    if [ "$rc" -ne 0 ] && [ -f "$E2E_WORKSPACE/data/keep.md" ]; then
+        pass "a live-looking workspace is refused and untouched"
+    else
+        fail "rc=$rc, keep.md present: $([ -f "$E2E_WORKSPACE/data/keep.md" ] && echo yes || echo no)"
+    fi
+}
+
+test_the_fresh_reset_runs_between_the_engine_stop_and_the_boot() {
+    echo "test: reset_e2e_database --fresh-workspace resets the tree after the stop and before the boot"
+    local order plain
+    order="$(
+        e2e_workspace_env() { :; }
+        setup_postgres() { :; }
+        stop_e2e_engine() { echo stop; }
+        reset_e2e_workspace_tree() { echo tree; }
+        settle_e2e_workspace_tree() { echo settle; }
+        workspace_database_name() { echo db; }
+        _drop_shared_database() { :; }
+        _create_shared_database() { :; }
+        shared_pg_container() { echo pg; }
+        docker() { echo f; }
+        ensure_workspace_running() { echo boot; }
+        reset_e2e_database --fresh-workspace 2>/dev/null | grep -E '^(stop|tree|settle|boot)$' | tr '\n' ' '
+    )"
+    plain="$(
+        e2e_workspace_env() { :; }
+        setup_postgres() { :; }
+        stop_e2e_engine() { echo stop; }
+        reset_e2e_workspace_tree() { echo tree; }
+        settle_e2e_workspace_tree() { echo settle; }
+        workspace_database_name() { echo db; }
+        _drop_shared_database() { :; }
+        _create_shared_database() { :; }
+        shared_pg_container() { echo pg; }
+        docker() { echo f; }
+        ensure_workspace_running() { echo boot; }
+        reset_e2e_database 2>/dev/null | grep -E '^(stop|tree|settle|boot)$' | tr '\n' ' '
+    )"
+    if [ "$order" = "stop tree settle boot " ]; then pass "the tree resets between the stop and the boot"; else fail "order was '$order'"; fi
+    if [ "$plain" = "stop settle boot " ]; then pass "a plain reset leaves the tree alone"; else fail "plain order was '$plain'"; fi
+}
+
+test_only_the_start_of_a_run_asks_for_a_fresh_workspace() {
+    echo "test: a run asks for a fresh workspace once, at its start, and never under --no-reset"
+    local n
+    n="$(grep -c 'reset_e2e_database --fresh-workspace' "$SCRIPT_DIR/../e2e.sh")"
+    if [ "$n" = "1" ]; then pass "the umbrella asks once"; else fail "the umbrella asks $n times"; fi
+    n="$(sed -n '/^setup_e2e_session() {/,/^}/p' "$SCRIPT_DIR/e2e.sh" | grep -c 'reset_e2e_database --fresh-workspace')"
+    if [ "$n" = "1" ]; then pass "a standalone session asks once"; else fail "a standalone session asks $n times"; fi
+    if sed -n '/^setup_e2e_session() {/,/^}/p' "$SCRIPT_DIR/e2e.sh" | grep -A1 'NO_RESET:-}" \]; then$' | tail -1 | grep -q ensure_workspace_running; then
+        pass "--no-reset takes the plain start"
+    else
+        fail "--no-reset no longer takes the plain start"
+    fi
+    n="$(grep -c 'fresh-workspace' "$SCRIPT_DIR/../e2e-browser.sh")"
+    if [ "$n" = "0" ]; then pass "no mid-run reset touches the tree"; else fail "e2e-browser.sh resets the tree $n times"; fi
+}
+
 test_source_honors_pinned_workspace
 test_source_pins_the_engine_version_for_the_engine_it_starts
 test_the_engine_reads_the_variable_the_script_sets
@@ -1039,6 +1215,8 @@ test_prune_keeps_live_worktree
 test_prune_keeps_dir_without_git_pointer
 test_prune_handles_missing_root
 test_cleanup_spares_real_cc_sessions
+test_cleanup_survives_a_workspace_with_no_repo
+test_cleanup_sweeps_the_workspace_repo
 test_frontend_build_missing_dist_rebuilds
 test_frontend_build_stale_dist_rebuilds
 test_frontend_build_stale_via_workspace_local_sdk
@@ -1067,6 +1245,11 @@ test_tree_assert_does_not_blame_a_run_for_its_start
 test_tree_assert_waits_out_a_late_commit
 test_tree_assert_refuses_an_unreadable_tree
 
+test_tree_reset_keeps_only_lucidos
+test_tree_reset_refuses_a_running_engine
+test_tree_reset_refuses_a_workspace_that_is_not_disposable
+test_the_fresh_reset_runs_between_the_engine_stop_and_the_boot
+test_only_the_start_of_a_run_asks_for_a_fresh_workspace
 echo ""
 echo "Passed: $PASS  Failed: $FAIL"
 [ $FAIL -eq 0 ]

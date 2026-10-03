@@ -45,7 +45,7 @@ import { API, ApiError, ensureThreadStarted, putComposeOnThread, deleteThread, i
 import { errorDetail } from '../../utils/errorDetail';
 import { createFailureCounter } from '../../utils/failureCounter';
 import { instantMicros } from '../../utils/isoInstant';
-import { sendMessage } from './chat';
+import { appendMessagesToCompose, sendMessage } from './chat';
 import { refreshRepositories } from './repositoriesLoader';
 // Cycle-safe: `compose -> chat -> thread-loading -> compose` already exists, and
 // this is a function declaration called at runtime, never at module init.
@@ -1406,6 +1406,69 @@ function pushClearedComposeAfterSend(threadId: string): void {
   schedulePush(threadId);
 }
 
+/** A discarded unsent first send leaves its thread an empty draft, which is
+ *  what the engine holds. */
+export function reopenEmptyDraft(threadId: string): void {
+  mutateThreadMeta(threadId, { state: 'composing' });
+}
+
+/** A first send restored after a reload, on a thread the engine may still
+ *  have composing. Show it as sent, as `sendCompose` did. The engine's draft
+ *  may still be the one the message was written from. The composer must not
+ *  show that beside the message, so it is cleared here and on the engine. A
+ *  draft that changed since was typed after the send, and stays. */
+export function resumeUnsentFirstSend(threadId: string, engineDraftAtSend: ServerDraft | undefined): void {
+  if (threadMap.value.get(threadId)?.meta.state === 'composing') mutateThreadMeta(threadId, { state: 'active' });
+  const onEngine = serverDraft.get(threadId);
+  const local = getDraft(threadId);
+  const stale = engineDraftAtSend !== undefined && onEngine !== undefined
+    && sameServerDraft(onEngine, engineDraftAtSend)
+    && sameServerDraft(onEngine, { text: local.text, imageHashes: local.image_hashes });
+  if (stale && !draftIsEmpty(local)) updateCompose(threadId, { text: '', image_hashes: [] });
+}
+
+function sameServerDraft(a: ServerDraft, b: ServerDraft): boolean {
+  return a.text === b.text
+    && a.imageHashes.length === b.imageHashes.length
+    && a.imageHashes.every((h, i) => h === b.imageHashes[i]);
+}
+
+/** What a compose draft's first message owes once the engine takes it. */
+export function settleAcceptedFirstSend(threadId: string): void {
+  // A compose-view pick is a one-shot intent, now carried into this spawn's
+  // chat body, so consume the draft's selection. Without this the override
+  // would linger in `composeSelections` for a thread no longer composing.
+  clearComposeSelection(threadId);
+  // Scheduled AFTER the selection was consumed, for two reasons. `sendCompose`
+  // dropped the debounced write, and an in-flight write cannot be recalled, so
+  // without this the engine's last word could be the pre-send text. And the
+  // order keeps the write from carrying the draft's picks back onto a row whose
+  // `compose_selection` the projection just set to NULL.
+  pushClearedComposeAfterSend(threadId);
+}
+
+/** Put a refused first send back in its draft. Typing that landed meanwhile
+ *  wins, field by field, since overwriting fresh keystrokes would lose work the
+ *  user can see they typed. The draft's picks were never consumed. */
+export function rollBackFirstSend(
+  threadId: string,
+  sent: { text: string; imageHashes: string[]; mode: ComposeMode | null },
+): void {
+  mutateThreadMeta(threadId, { state: 'composing' });
+  const current = getDraft(threadId);
+  const restore: Partial<ComposeDraft> = {};
+  if (current.text === '') restore.text = sent.text;
+  if (current.image_hashes.length === 0) restore.image_hashes = sent.imageHashes;
+  if (current.mode === null) restore.mode = sent.mode;
+  if (Object.keys(restore).length === 0) return;
+  patchDraft(threadId, restore);
+  // The restored draft is unsent work again, and the send dropped the write
+  // that would have stored its last keystrokes. Owe the engine that write, or
+  // a reload brings back the older text.
+  markLocallyEdited(threadId);
+  schedulePush(threadId);
+}
+
 /** Send the focused thread's current compose contents as the first message.
  *  Reads text/images from the draft signal so the caller doesn't need to
  *  pass them. Optimistic local clear + state→active before the chat POST so
@@ -1431,6 +1494,7 @@ export async function sendCompose(
   const text = draft.text;
   const wireHashes = draft.image_hashes;
   const mode = draft.mode;
+  const engineDraftAtSend = serverDraft.get(threadId);
   if (!text.trim() && wireHashes.length === 0) {
     showToast('Could not send: the saved draft was empty.', 'error');
     return false;
@@ -1491,24 +1555,7 @@ export async function sendCompose(
   lastSyncedImageHashes.delete(threadId);
   const shouldFocus = opts.focus ?? true;
   if (shouldFocus) setFocusedThread(threadId);
-  // Restore text and images only if the user has not started typing into the
-  // now-empty textarea. Overwriting fresh keystrokes would lose work the user
-  // can see they typed.
-  const rollBack = () => {
-    mutateThreadMeta(threadId, { state: 'composing' });
-    const current = getDraft(threadId);
-    const restore: Partial<ComposeDraft> = {};
-    if (current.text === '') restore.text = text;
-    if (current.image_hashes.length === 0) restore.image_hashes = wireHashes;
-    if (current.mode === null) restore.mode = mode;
-    if (Object.keys(restore).length === 0) return;
-    patchDraft(threadId, restore);
-    // The restored draft is unsent work again, and `cancelPendingPush` above
-    // dropped the write that would have stored its last keystrokes. Owe the
-    // engine that write, or a reload brings back the older text.
-    markLocallyEdited(threadId);
-    schedulePush(threadId);
-  };
+  const rollBack = () => rollBackFirstSend(threadId, { text, imageHashes: wireHashes, mode });
   try {
     // The chat POST needs the thread row to exist server-side, and on a
     // first-send `POST /threads` may still be in flight.
@@ -1522,24 +1569,6 @@ export async function sendCompose(
     // failed start rejects here and lands in the catch below, which rolls the
     // draft back and rethrows for the caller to toast.
     await awaitThreadStarted(threadId);
-    // What a send owes once the engine takes it. An unsent one owes nothing
-    // yet: clearing the engine's draft then could only lose the text.
-    const settleAcceptedSend = () => {
-      // A compose-view pick is a one-shot intent, now carried into this spawn's
-      // chat body, so consume the draft's selection. Without this the override
-      // would linger in `composeSelections` for a thread no longer composing.
-      // Follow-ups do not come through here: an active thread has no entry.
-      clearComposeSelection(threadId);
-      // Scheduled AFTER the send resolved and the selection was consumed, for
-      // two reasons. `cancelPendingPush` above dropped the debounced write, and
-      // an in-flight write cannot be recalled. Without this the engine's last
-      // word could be the pre-send text. And ordering it after
-      // `clearComposeSelection` keeps the write from carrying the draft's picks
-      // back onto a row whose `compose_selection` the projection just set to
-      // NULL. A send that FAILS consumed no draft, so `rollBack` writes the
-      // restored text instead.
-      pushClearedComposeAfterSend(threadId);
-    };
     const outcome = await sendMessage(text, wireHashes.length > 0 ? wireHashes : undefined, {
       useCodingAgent: opts.useCodingAgent,
       context: opts.context,
@@ -1550,14 +1579,18 @@ export async function sendCompose(
       providerOverride,
       ccModelOverride,
       ccReasoningEffortOverride,
-      settlement: { onAccepted: settleAcceptedSend, onRefused: rollBack },
+      settlement: { kind: 'first-send', mode, engineDraftAtSend },
     });
     if (outcome === 'dropped') {
       // `sendMessage` already toasted, and the draft is all that holds the text.
       rollBack();
       return false;
     }
-    if (outcome === 'sent') settleAcceptedSend();
+    if (outcome === 'sent') settleAcceptedFirstSend(threadId);
+    // An unsent send consumed nothing, but the engine still holds the pre-send
+    // draft, and its unsent message is kept on this device. So write what the
+    // composer shows. The picks stay, for a Retry the engine refuses.
+    else pushClearedComposeAfterSend(threadId);
     return true;
   } catch (err) {
     rollBack();
@@ -1584,22 +1617,13 @@ export async function sendFollowup(
   // scheduling a second write.
   updateCompose(threadId, { text: '', image_hashes: [] });
   lastSyncedImageHashes.delete(threadId);
-  // The refused send's row is gone, so the draft is all that can hold the text.
-  // Typing that landed meanwhile wins, as in `sendCompose`'s roll-back.
-  const restoreRefused = () => {
-    const current = getDraft(threadId);
-    const restore: ComposePatch = {};
-    if (current.text === '') restore.text = text;
-    if (current.image_hashes.length === 0 && imageHashes?.length) restore.image_hashes = imageHashes;
-    if (Object.keys(restore).length > 0) updateCompose(threadId, restore);
-  };
   const outcome = await sendMessage(text, imageHashes, {
     ...opts,
     threadId,
     focus: opts?.focus ?? true,
-    settlement: { onRefused: restoreRefused },
   });
-  if (outcome === 'dropped') restoreRefused();
+  // The refused send's row is gone, so the draft is all that can hold the text.
+  if (outcome === 'dropped') appendMessagesToCompose(threadId, [{ text, imageHashes: imageHashes ?? [] }]);
 }
 
 /** Tab-close-safe flush. Each pending PUT goes out with `keepalive: true`, so

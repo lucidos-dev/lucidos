@@ -62,12 +62,12 @@ async fn test_active_children_decremented_on_canceled_child() {
     teardown_test_db(&db_name).await;
 }
 
-/// Transient `ResponseAborted` (engine shutdown, recovery sweep) is mid-retry —
-/// the engine resumes the child on next visit. The active-children counter
-/// must stay put so the parent's UI keeps showing the child as still running
-/// until either resume succeeds (no change) or the user explicitly cancels.
+/// The user's own switch promises a resume, so its abort is mid-retry. The
+/// active-children counter must stay put so the parent's UI keeps showing the
+/// child as running until the resumed turn ends. A crash promises nothing:
+/// see `crash_cut_child`.
 #[tokio::test]
-async fn test_active_children_not_decremented_on_transient_aborted_child() {
+async fn test_active_children_not_decremented_on_switch_aborted_child() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _callback_rx) = EventBus::new(pool.clone());
 
@@ -83,7 +83,7 @@ async fn test_active_children_not_decremented_on_transient_aborted_child() {
             reasoning_effort: None,
             cause: crate::engine::thread_events::AbortCause::EngineShutdown,
         },
-        meta: EventMeta::NONE,
+        meta: switch_meta(),
     })
     .await
     .unwrap();
@@ -92,8 +92,8 @@ async fn test_active_children_not_decremented_on_transient_aborted_child() {
         &pool,
         parent_id,
         1,
-        "parent active_children_count must stay at 1 after transient abort — \
-         the engine resumes the child on next visit",
+        "parent active_children_count must stay at 1 after a switch abort: \
+         the engine resumes the child",
     )
     .await;
 
@@ -273,10 +273,10 @@ async fn test_cc_child_canceled_without_session_ended_decrements_parent() {
     teardown_test_db(&db_name).await;
 }
 
-/// Transient-cause CC abort (EngineShutdown / RecoveryAfterRestart) is
-/// mid-retry — must NOT decrement, the engine resumes on next visit.
+/// A CC child's switch abort is mid-retry: it must NOT decrement, since the
+/// engine resumes the session.
 #[tokio::test]
-async fn test_cc_child_transient_abort_does_not_decrement_parent() {
+async fn test_cc_child_switch_abort_does_not_decrement_parent() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _callback_rx) = EventBus::new(pool.clone());
 
@@ -293,7 +293,7 @@ async fn test_cc_child_transient_abort_does_not_decrement_parent() {
             reasoning_effort: None,
             cause: crate::engine::thread_events::AbortCause::EngineShutdown,
         },
-        meta: EventMeta::NONE,
+        meta: switch_meta(),
     })
     .await
     .unwrap();
@@ -302,8 +302,8 @@ async fn test_cc_child_transient_abort_does_not_decrement_parent() {
         &pool,
         parent_id,
         1,
-        "parent active_children_count must stay at 1 after transient CC abort \
-         — the engine resumes the child on next visit",
+        "parent active_children_count must stay at 1 after a CC switch abort: \
+         the engine resumes the child",
     )
     .await;
 
@@ -328,8 +328,8 @@ async fn test_continuation_requested_re_increments_parent_after_restart_park() {
     emit_cc_session_started(&bus, child_id).await;
     assert_active_children(&pool, parent_id, 1, "baseline: 1 active CC child").await;
 
-    // Recovery's ResponseAborted with the transient cause — no decrement
-    // (existing behavior, asserted by the sibling transient-abort test).
+    // Recovery's ResponseAborted: a crash promises no resume, so the parked
+    // child is no longer in flight.
     bus.emit(BusEvent::Thread {
         thread_id: child_id,
         event: ThreadEvent::ResponseAborted {
@@ -1158,4 +1158,14 @@ async fn attribution_without_linkage_counts_no_child_and_wakes_nobody() {
 
     pool.close().await;
     teardown_test_db(&db_name).await;
+}
+
+/// The meta a user's *Switch to new version* stamps on its teardown abort.
+fn switch_meta() -> EventMeta {
+    EventMeta {
+        actor: Some(MessageOrigin::Device {
+            device_id: "test-device".into(),
+        }),
+        ..EventMeta::NONE
+    }
 }

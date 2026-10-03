@@ -320,8 +320,8 @@ export function emptyCatalogMessage(scanning: boolean): string {
   return scanning ? 'Scanning marketplaces…' : 'No plugins found.';
 }
 
-/** The panel's refresh. The catalog half asks for a fresh scan, as the
- *  "Updated …" control does: the mount's re-read returns the cached scan. */
+/** The panel's refresh. The catalog half asks for a fresh scan: the
+ *  mount's re-read returns the cached scan. */
 function refreshPluginsPanel(): Promise<unknown> {
   return Promise.all([
     rescanPluginCatalogAndSettle(),

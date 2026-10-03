@@ -50,7 +50,7 @@ The unread-notification *count* painted on the installed app's **icon**: a PWA's
 An open page **mirrors the icon's number in-app**, from the same computed, so the two cannot disagree. One mirror is a count badge on the **Lucidos mark**, at the mark's bottom-right corner. That leaves the artwork's sparkle, and the engine-state badge, the top corner. The other is a group of rows at the top of the **Lucidos menu**, one per workspace holding unreads. Each row routes to that workspace's notifications view. The mark is what carries a count onto the thread pane and the threads drawer, where the bell never appears.
 
 ### App manifest
-The metadata file for an app at `data/apps/<id>/manifest.json`. Holds name, description, icon — what the UI shows. **Not** loaded into the LLM context; operational knowledge belongs in `knowhow/`, not the manifest.
+The metadata file for an app at `data/apps/<id>/manifest.json`. Holds name, description, icon and `reveal` (see *ready signal*) — what the UI shows. **Not** loaded into the LLM context; operational knowledge belongs in `knowhow/`, not the manifest.
 
 ### App UI
 The iframe that renders an app's HTML/CSS/JS (from `data/apps/<id>/ui/`) inside Lucidos's panel-overlay slot. Distinct from the *app* (the whole installed unit — UI plus scoped chat, knowhow, intents, scripts, triggers): "open the app" means open its UI inline and make its chat the active conversation; "refresh the app UI" means reload the iframe without changing chat context. The `navigate_ui` tool's `app-ui` target and the `AppUiRefreshRequested` event name both refer to this iframe surface specifically.
@@ -122,7 +122,11 @@ A callback that lands under an open question, a returned child or an event-wait 
 See also: *child follow-up*, *read marker*.
 
 ### Child thread
-A direct descendant *thread* created by a `relation: "child"` spawn (`run_thread` / `run_coding_agent` / `lucidos spawn-thread --relation child`). The engine wires a callback so the *parent thread* resumes with the child's result when it terminates. The reverse direction also exists: the parent can address a child it already spawned with a *child follow-up*, and a child that is followed up on reports again when its next turn ends. Identifiers: DB column `parent_thread_id` on the child row points up to the parent; Rust struct field and event payload field `child_thread_id` (on the `Callback` struct and the `ChildThreadCompleted` event) name the child. A child is a *sub-thread*; the reverse isn't true.
+A direct descendant *thread* created by a `relation: "child"` spawn (`run_thread` / `run_coding_agent` / `lucidos spawn-thread --relation child`). When the child terminates, the engine resumes the *parent thread* with its result. So the parent never has to wait for it. A crash that cuts the child's turn reports it as `interrupted`, since nothing resumes it. A child is a *sub-thread*; the reverse isn't true.
+
+The reverse direction also exists. The parent can address a child it already spawned with a *child follow-up*. A child that is followed up on reports again when its next turn ends.
+
+Identifiers: the DB column `parent_thread_id` on the child row points up to the parent. The field `child_thread_id` names the child, on the `Callback` struct and the `ChildThreadCompleted` event alike.
 
 **Two ends of a turn send no callback.** A user Stop makes the child a *stopped child*, and its parent gets a note instead. A turn that ends holding an *event wait* sends nothing, because the turn the wait wakes reports.
 
@@ -416,7 +420,9 @@ A server whose stored id cannot be used on the wire is shown as unusable and off
 The approval card the *Lucidos Agent* shows when it wants to call a tool on an *MCP* server that isn't already trusted. Same UI as the *command permission card*: Deny, Allow once, Allow for this thread, Always allow this tool, or Always allow this server. "Always allow" choices are remembered in an editable list, per workspace (`<workspace>/.lucidos/mcp-allowed-tools`): per-tool (`Mcp(<server>:<tool>)`) or whole-server (`Mcp(<server>:*)`), and never shared with another workspace. Until answered, the thread waits on the user. A *trigger* fires unattended, so it never shows this card. MCP tool calls in a trigger thread are auto-approved silently, as is any call to a server with auto-approve set.
 
 ### Memory recall
-The engine reaching into long-term memory **for** the *Lucidos Agent*, automatically, before a turn starts. A classifier decomposes the user's message into sub-queries, the engine vector-searches memory, and the hits are injected into the turn's context, all before the agent has seen anything. It shows in the transcript as a step reading "Recalled 12 memories" (or "No memories recalled"), with the sub-queries as its detail, and it is recorded as the `MemoryRecalled` *event*, which a *trigger* can subscribe to. Distinct from a *memory search*, which the agent performs itself. Recall happens to a turn; a search is something the agent decides to do.
+The engine reaching into long-term memory **for** the *Lucidos Agent*, automatically, before a turn starts. A classifier decomposes the user's message into sub-queries, and the engine vector-searches memory with them. The hits are injected into the turn's context before the agent has seen anything. It shows in the transcript as a step reading "Recalled 12 memories" (or "No memories recalled"). Tapping it lists each memory recalled, linked to its source, above the sub-queries that found them.
+
+It is recorded as the `MemoryRecalled` *event*, which a *trigger* can subscribe to. Distinct from a *memory search*, which the agent performs itself. Recall happens to a turn; a search is something the agent decides to do.
 
 ### Memory search
 The *Lucidos Agent* looking through long-term memory itself, mid-turn, with a query it wrote. It is a tool call (the `memory` tool's `search` action) and shows in the transcript as "Searching memory for ...". It exists as the backstop for a *memory recall* that missed: the recall runs once, from queries derived before the agent had read anything, and without a search of its own the agent would have no way to ask again. Both rank the same corpus the same way, so a search never returns a different ordering from the facts already in context.
@@ -434,6 +440,9 @@ Cutting a *child thread* loose from its *parent thread*, so the parent stops wai
 
 The parent gets no further result, cannot follow up on it, and does not get the child slot back. An agent can move only its own direct children; the user can move any nested thread. It cannot be undone. Not the same as a *detached* event wait, which is about a subscription holding no turn.
 See also: *child thread*, *parent thread*.
+
+### Ready signal
+An app's call to `lucidos.ui.ready()`, saying its first content is drawn. The host covers an opening app and shows a progress bar until it can reveal it. An app whose *app manifest* declares `"reveal": "on-ready"` is revealed by its ready signal, with a 15 s fuse. Any other app is revealed on page load, and the call does nothing. See `system-knowhow/js-sdk.md` § Showing the app once its content is ready.
 
 ### Read marker
 The "Sent" or "Read" label on a message sent to a thread. "Sent" means the engine handed it to the agent. "Read" means the agent took it in. A message stuck on "Sent" never reached the agent.
@@ -1017,7 +1026,7 @@ A user-visible folder that organizes *triggers* in the triggers panel. Pure labe
 ### Unsent message
 A message you sent that got no answer from Lucidos, so it may never have arrived. It stays in the *thread* under a **Not sent** card with a **Retry** button, rather than vanishing or reading as a failed reply. Retry sends the same message again. If the first one did arrive and only the answer was lost, Lucidos recognizes the repeat and runs it once.
 
-An unsent message lives in the page you sent it from, and a reload drops it. A thread's first message leaves its *draft* on Lucidos untouched until a send is accepted. A reload then brings back that draft as it was last saved.
+An unsent message is kept on the device you sent it from, so a page reload brings it back, Retry included. That covers a send the reload cut off before Lucidos answered, whose card says so. If the message did arrive after all, it shows as sent instead. **Discard** removes the card without sending anything. Other devices never see an unsent message, and your *draft* never holds a copy of it.
 See also: *draft*.
 
 ### Urgent follow-up

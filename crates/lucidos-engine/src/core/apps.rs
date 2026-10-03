@@ -13,6 +13,41 @@ pub struct AppManifest {
     pub description: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
+    /// Kept verbatim, so a metadata rewrite never alters what the author
+    /// wrote. `AppReveal::from_manifest` reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reveal: Option<String>,
+}
+
+/// When the host lifts its cover off an opening app.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AppReveal {
+    /// On the frame's `load` event.
+    #[default]
+    OnLoad,
+    /// When the app calls `lucidos.ui.ready()`.
+    OnReady,
+}
+
+impl AppReveal {
+    /// An unrecognised value opens the app as `on-load` rather than failing
+    /// the manifest: a typo must not drop the app from the list. The workspace
+    /// audit reports it instead.
+    fn from_manifest(app_id: &str, value: Option<&str>) -> Self {
+        match value {
+            None | Some("on-load") => Self::OnLoad,
+            Some("on-ready") => Self::OnReady,
+            Some(other) => {
+                log!(
+                    "[Apps] {}: unrecognised manifest reveal {:?}, using on-load",
+                    app_id,
+                    other
+                );
+                Self::OnLoad
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -22,6 +57,7 @@ pub struct App {
     pub description: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
+    pub reveal: AppReveal,
 }
 
 /// Defence-in-depth: API handlers validate app ids at the boundary
@@ -127,6 +163,7 @@ impl AppManager {
         })?;
 
         Ok(App {
+            reveal: AppReveal::from_manifest(&id, manifest.reveal.as_deref()),
             id,
             name: manifest.name,
             description: manifest.description,
@@ -229,6 +266,7 @@ impl AppManager {
             name: name.to_string(),
             description: description.to_string(),
             icon: None,
+            reveal: None,
         };
         // The manifest lands LAST, because its presence is what `app_exists`
         // reads and what the guard above refuses on. A create that dies partway
@@ -303,8 +341,8 @@ impl AppManager {
         Ok(commit)
     }
 
-    /// Update an app's name and description in manifest.json (preserving icon),
-    /// commit, and announce it.
+    /// Update an app's name and description in manifest.json (preserving icon
+    /// and reveal), commit, and announce it.
     pub async fn update_app_metadata(
         &self,
         event_bus: &EventBus,
@@ -325,6 +363,7 @@ impl AppManager {
             name: name.to_string(),
             description: description.to_string(),
             icon: existing.icon,
+            reveal: existing.reveal,
         };
         std::fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)?;
 
@@ -548,12 +587,101 @@ mod tests {
             name: "Test App".to_string(),
             description: "A test application".to_string(),
             icon: Some("star".to_string()),
+            reveal: Some("on-ready".to_string()),
         };
         let json = serde_json::to_string(&manifest).unwrap();
         let deserialized: AppManifest = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.name, manifest.name);
         assert_eq!(deserialized.description, manifest.description);
         assert_eq!(deserialized.icon, manifest.icon);
+        assert_eq!(deserialized.reveal, manifest.reveal);
+    }
+
+    fn write_manifest(ws: &Path, app_id: &str, json: &str) {
+        let dir = ws.join("data/apps").join(app_id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("manifest.json"), json).unwrap();
+    }
+
+    #[test]
+    fn reveal_reads_from_the_manifest_and_defaults_to_on_load() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = AppManager::new(tmp.path()).unwrap();
+        write_manifest(tmp.path(), "plain", r#"{"name": "Plain"}"#);
+        write_manifest(
+            tmp.path(),
+            "waits",
+            r#"{"name": "Waits", "reveal": "on-ready"}"#,
+        );
+        write_manifest(
+            tmp.path(),
+            "explicit",
+            r#"{"name": "Explicit", "reveal": "on-load"}"#,
+        );
+
+        assert_eq!(manager.get_app("plain").unwrap().reveal, AppReveal::OnLoad);
+        assert_eq!(manager.get_app("waits").unwrap().reveal, AppReveal::OnReady);
+        assert_eq!(
+            manager.get_app("explicit").unwrap().reveal,
+            AppReveal::OnLoad
+        );
+    }
+
+    /// A typo in `reveal` must not make the manifest invalid, which would drop
+    /// the app from the list. It opens as on-load, and the audit reports it.
+    #[test]
+    fn an_unrecognised_reveal_still_lists_the_app_as_on_load() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = AppManager::new(tmp.path()).unwrap();
+        write_manifest(
+            tmp.path(),
+            "typo",
+            r#"{"name": "Typo", "reveal": "onready"}"#,
+        );
+
+        let apps = manager.list_apps().unwrap();
+        let typo = apps.iter().find(|a| a.id == "typo").expect("still listed");
+        assert_eq!(typo.reveal, AppReveal::OnLoad);
+    }
+
+    #[test]
+    fn the_api_shape_carries_reveal_in_kebab_case() {
+        let app = App {
+            id: "waits".to_string(),
+            name: "Waits".to_string(),
+            description: String::new(),
+            icon: None,
+            reveal: AppReveal::OnReady,
+        };
+        let json = serde_json::to_value(&app).unwrap();
+        assert_eq!(json["reveal"], "on-ready");
+    }
+
+    /// The rewrite rebuilds the manifest from its known fields, so a field it
+    /// forgot would be dropped by a rename.
+    #[tokio::test]
+    async fn a_metadata_update_keeps_the_reveal_opt_in() {
+        let bus = crate::test_support::offline_event_bus();
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = AppManager::new(tmp.path()).unwrap();
+        manager
+            .create_app(&bus, "waits", "Waits", "", "<h1>hi")
+            .await
+            .unwrap();
+        write_manifest(
+            tmp.path(),
+            "waits",
+            r#"{"name": "Waits", "reveal": "on-ready"}"#,
+        );
+
+        manager
+            .update_app_metadata(&bus, "waits", "Waits Renamed", "New", None)
+            .await
+            .unwrap();
+
+        let app = manager.get_app("waits").unwrap();
+        assert_eq!(app.name, "Waits Renamed");
+        assert_eq!(app.reveal, AppReveal::OnReady);
     }
 
     #[tokio::test]

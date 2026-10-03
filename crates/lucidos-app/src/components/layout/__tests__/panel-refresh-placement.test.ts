@@ -6,7 +6,7 @@ import type { App } from '../../../store/types';
 import { mobileRefreshActionShown } from '../ContentHeaderActions';
 import { panelRefreshLive, refreshPinnedToDiff } from '../RefreshIndicator';
 
-const app: App = { id: 'habit-tracker', name: 'Habit Tracker', description: '' };
+const app: App = { id: 'habit-tracker', name: 'Habit Tracker', description: '', reveal: 'on-load' };
 const diff = { type: 'file-preview' as const, path: 'repo:r1:diff#c1:src/main.rs' };
 
 describe('panelRefreshLive', () => {

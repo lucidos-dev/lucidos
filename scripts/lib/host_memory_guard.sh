@@ -673,9 +673,10 @@ stop_host_memory_sampler() {
         _host_mem_stop_runner "$HOST_MEMORY_RUNNER_PID"
     fi
     HOST_MEMORY_RUNNER_PID=""
+    stop_chunk_ceiling_watchdog
 
     rm -f "$pidfile" "$(_host_mem_samples_file)" "$(_host_mem_trip_file)" \
-        "$(_host_mem_runner_pidfile)" 2>/dev/null || true
+        "$(_host_mem_runner_pidfile)" "$(_host_mem_ceiling_file)" 2>/dev/null || true
     HOST_MEMORY_SAMPLER_PID=""
 }
 
@@ -991,6 +992,8 @@ _host_mem_attr_report() {
     # visible host demand (browser-host / node-host), never silently dropped:
     # losing it would hide real memory from the attributed-vs-compressor line.
     local meta_lines="" pids="" pid comm base kind cwd
+    HOST_MEMORY_AGENT_PIDS_NOW=""
+    HOST_MEMORY_ENGINE_MB_NOW=""
     while IFS=$'\t' read -r pid comm; do
         [ -n "$pid" ] || continue
         base="${comm##*/}"
@@ -1037,6 +1040,7 @@ _host_mem_attr_report() {
         esac
         [ -n "$kind" ] || continue
         meta_lines="${meta_lines}META"$'\t'"${pid}"$'\t'"${kind}"$'\t'"${base}"$'\n'
+        [ "$kind" = agent ] && HOST_MEMORY_AGENT_PIDS_NOW="$HOST_MEMORY_AGENT_PIDS_NOW $pid"
         pids="${pids} ${pid}"
     done <<EOF
 $(_host_mem_attr_proc_list)
@@ -1116,6 +1120,7 @@ EOF
     if [ -n "$engine_pid" ]; then
         if [ "${eng_measured:-0}" = "1" ]; then
             mb="$(awk -v v="$eng_bytes" 'BEGIN { printf "%.0f", v / 1048576 }')"
+            HOST_MEMORY_ENGINE_MB_NOW="$mb"
             echo "$tag after $where: e2e engine pid=$engine_pid ${mb} MB (primary suspect)"
         elif [ "${eng_present:-0}" = "1" ]; then
             echo "$tag after $where: e2e engine pid=$engine_pid was a candidate but footprint could not be read"
@@ -1220,6 +1225,7 @@ EOF
     # result is discarded (|| true) because a failed attribution must never change
     # the stop verdict below.
     _host_mem_attr_report "$where" "$gb_now" || true
+    _host_mem_left_behind_report "$where" || true
 
     # Four stops, and they mean different things about the host. The wording says
     # which one fired, because this line is what somebody reads at 06:30 to decide
@@ -1450,10 +1456,431 @@ report_memory_stop() {
     fi
     echo "[e2e-mem] Coverage is incomplete: work after that point did not run."
     echo "[e2e-mem] Exit $HOST_MEMORY_STOP_EXIT marks a memory stop, never a failing test."
-    echo "[e2e-mem] Free memory on the host and rerun. Chunk size cannot help:"
-    echo "[e2e-mem] LUCIDOS_E2E_WEBKIT_CHUNK bounds the per-chunk delta, not the total."
-    echo "[e2e-mem] To finish only what was lost, rerun with LUCIDOS_E2E_WEBKIT_CHUNKS=<first>-<last>."
-    echo "[e2e-mem] Add LUCIDOS_E2E_WEBKIT_PHASE=nav when the loss is in nav: the"
-    echo "[e2e-mem] range narrows nav only, and the CC phase it leaves whole owns"
-    echo "[e2e-mem] 93 to 97 percent of the memory a discharge costs."
+    echo "[e2e-mem] The harness already waited for the host and resumed while it could"
+    echo "[e2e-mem] ([e2e-resume] above). Chunk size cannot help: LUCIDOS_E2E_WEBKIT_CHUNK"
+    echo "[e2e-mem] bounds the per-chunk delta, not the total. The unverified range above is"
+    echo "[e2e-mem] the carry-over, for a cold host on a later run, never a second run now."
+}
+
+# ── the gate before a start ─────────────────────────────────────────────
+# The boundary check judges a run already going. This judges a host BEFORE
+# something heavy starts on it, and it applies the pre-flight gate's rule
+# exactly. Two callers: the build memory gate (scripts/build-memory-gate.sh),
+# and the recovery wait that decides when a stopped run may resume.
+#
+# Every heavy build passes this first (ADR 0351).
+
+# The build gate's distinct refusal. 71 is a memory stop inside a run and 75 a
+# host-load refusal. 72 says a build never started, so nothing was tested.
+HOST_MEMORY_BUILD_REFUSED_EXIT=72
+
+# The current time in epoch seconds, and the wait between polls. Seams, so the
+# tests drive a 15-minute wait without spending it.
+_host_mem_now() {
+    date +%s
+}
+
+_host_mem_gate_wait() {
+    sleep "$1"
+}
+
+# A positive whole number of seconds from $1, else the default $2.
+_host_mem_secs_or() {
+    case "$1" in
+        '' | *[!0-9]* | 0) printf '%s' "$2" ;;
+        *) printf '%s' "$((10#$1))" ;;
+    esac
+}
+
+# Judge the host once. $1 is the available line in GB: the pre-flight gate's
+# 8 GB for a build, the running guard's scaled floor for a resume. Returns 0
+# for GO. On NO-GO it returns 1 and prints one reason per line.
+#
+# The rule is the pre-flight gate's, arm for arm, and host_memory_guard_test.sh
+# replays the same readings through both. Critical refuses on collapse, swap, or
+# a level that holds through the confirm window. Available under the line
+# refuses only when warn or worse, or any swap, agrees. The compressor refuses
+# only past the runaway backstop. Warn alone never refuses.
+#
+# A host that cannot be read is GO, the posture of every reader in this file.
+host_memory_gate_verdict() {
+    local line="$1" level avail swap gb collapse ceiling reasons="" corroboration=""
+    level="$(_host_mem_read_pressure_level)"
+    avail="$(_host_mem_read_available_gb)"
+    swap="$(_host_mem_read_swap_used_gb)"
+    gb="$(_host_mem_read_compressor_gb)"
+    if [ -z "$level$avail$swap$gb" ]; then
+        return 0
+    fi
+    collapse="$(_host_mem_collapse_level_gb)"
+    ceiling="$(_host_mem_compressor_ceiling_gb)"
+
+    if [ "$level" = "$HOST_MEMORY_PRESSURE_CRITICAL" ]; then
+        if [ -n "$avail" ] && [ -n "$collapse" ] && ! _host_mem_over "$avail" "$collapse"; then
+            reasons="critical memory pressure with available $avail GB, at or under the $collapse GB collapse level: the freeze signature"
+        elif [ -n "$swap" ] && _host_mem_over "$swap" 0; then
+            reasons="critical memory pressure with $swap GB of swap in use"
+        else
+            local confirm c_taken c_of c_span c_word
+            if confirm="$(_host_mem_critical_persists)"; then
+                read -r c_taken c_of c_span c_word <<EOF2
+$confirm
+EOF2
+                reasons="critical memory pressure, held through all $c_of re-samples over ${c_span}s"
+            fi
+        fi
+    fi
+
+    if [ -n "$avail" ] && [ -n "$line" ] && _host_mem_over "$line" "$avail"; then
+        if _host_mem_pressure_is_warn_or_worse "$level"; then
+            corroboration="the kernel at $(_host_mem_pressure_word "$level") pressure"
+        fi
+        if [ -n "$swap" ] && _host_mem_over "$swap" 0; then
+            corroboration="${corroboration:+$corroboration and }$swap GB of swap in use"
+        fi
+        if [ -n "$corroboration" ]; then
+            reasons="${reasons:+$reasons
+}available $avail GB under $line GB, corroborated by $corroboration"
+        fi
+    fi
+
+    if [ -n "$gb" ] && [ -n "$ceiling" ] && _host_mem_over "$gb" "$ceiling"; then
+        reasons="${reasons:+$reasons
+}compressor $gb GB over the $ceiling GB runaway backstop"
+    fi
+
+    [ -n "$reasons" ] || return 0
+    printf '%s\n' "$reasons"
+    return 1
+}
+
+# The build memory gate. Wait for the host to read GO, then return 0. Past the
+# deadline, print one ERROR line naming every reason and return 72. $1 names
+# the build in every line it prints.
+#
+# The ERROR line starts the line on purpose: the engine's build-failure
+# classifier quotes such a line, so an Apply rebuild refused here says why.
+#
+#   LUCIDOS_BUILD_MEMORY_WAIT_SECS  how long to wait for recovery (default 900)
+#   LUCIDOS_BUILD_MEMORY_POLL_SECS  seconds between readings (default 30)
+host_memory_build_gate() {
+    local label="${1:-a cargo build}" limit poll start now elapsed=0 reasons announced=""
+    limit="$(_host_mem_secs_or "${LUCIDOS_BUILD_MEMORY_WAIT_SECS:-}" 900)"
+    poll="$(_host_mem_secs_or "${LUCIDOS_BUILD_MEMORY_POLL_SECS:-}" 30)"
+    start="$(_host_mem_now)"
+    while :; do
+        if reasons="$(host_memory_gate_verdict "$HOST_MEMORY_FREE_FLOOR_ABS_GB")"; then
+            if [ -n "$announced" ]; then
+                echo "[build-memory-gate] the host recovered after $(($(_host_mem_now) - start))s, starting $label"
+            fi
+            return 0
+        fi
+        now="$(_host_mem_now)"
+        elapsed=$((now - start))
+        if [ "$elapsed" -ge "$limit" ]; then
+            echo "ERROR: build refused on host memory: $label did not start, the host read NO-GO for ${elapsed}s: $(printf '%s' "$reasons" | paste -sd ';' - | sed 's/;/; /g')"
+            echo "[build-memory-gate] exit $HOST_MEMORY_BUILD_REFUSED_EXIT means the build never started. Free memory on the host, then rerun."
+            return "$HOST_MEMORY_BUILD_REFUSED_EXIT"
+        fi
+        if [ -z "$announced" ]; then
+            echo "[build-memory-gate] NO-GO for $label. Waiting up to ${limit}s for the host to recover:"
+            printf '%s\n' "$reasons" | sed 's/^/[build-memory-gate]   - /'
+            announced=1
+        fi
+        _host_mem_gate_wait "$poll"
+    done
+}
+
+# ── the chunk ceiling ───────────────────────────────────────────────────
+# The in-chunk stop catches a chunk that starves the host. This catches one
+# that hangs without starving it: a watchdog beside each chunk invocation
+# interrupts the runner once it runs past the ceiling. Real chunks take a
+# median of 25 s and at most about 4 minutes, so the 20-minute default only
+# ever meets a stuck one. Single-pass projects get no ceiling.
+#
+# It signals only the recorded runner and its descendants, through
+# _host_mem_stop_runner, and only while the runner pidfile still names it.
+#
+#   LUCIDOS_E2E_CHUNK_CEILING_SECS   seconds one chunk may run (default 1200)
+
+HOST_MEMORY_CEILING_PID=""
+
+_host_mem_ceiling_file() {
+    printf '%s' "${HOST_MEMORY_CEILING_FILE:-${E2E_WORKSPACE:-$HOME/workspaces/e2e-test}/.lucidos/host-memory-ceiling}"
+}
+
+host_memory_chunk_ceiling_secs() {
+    _host_mem_secs_or "${LUCIDOS_E2E_CHUNK_CEILING_SECS:-}" 1200
+}
+
+# The watchdog body. The sleep runs as a child so the stop can reach it, the
+# same shape as the sampler loop.
+_host_mem_ceiling_watch() {
+    local runner="$1" secs="$2" sleep_pid=""
+    trap '[ -n "$sleep_pid" ] && kill "$sleep_pid" 2>/dev/null; exit 0' TERM INT
+    sleep "$secs" &
+    sleep_pid=$!
+    wait "$sleep_pid" 2>/dev/null || exit 0
+    sleep_pid=""
+    kill -0 "$runner" 2>/dev/null || exit 0
+    [ "$(cat "$(_host_mem_runner_pidfile)" 2>/dev/null)" = "$runner" ] || exit 0
+    printf '%s\n' "The chunk ran past its ${secs}s wall-clock ceiling and was interrupted. Its tests have no verdict." \
+        > "$(_host_mem_ceiling_file)" 2>/dev/null || true
+    echo "[e2e-mem] CHUNK CEILING: the chunk ran past ${secs}s. Interrupting the Playwright runner."
+    _host_mem_stop_runner "$runner"
+}
+
+start_chunk_ceiling_watchdog() { # <runner-pid> <secs>
+    rm -f "$(_host_mem_ceiling_file)" 2>/dev/null || true
+    _host_mem_ceiling_watch "$1" "$2" &
+    HOST_MEMORY_CEILING_PID=$!
+}
+
+# Idempotent, and safe in an EXIT trap. A watchdog that already tripped is
+# waited for, never killed, so its stop runs to the end.
+stop_chunk_ceiling_watchdog() {
+    local pid="$HOST_MEMORY_CEILING_PID"
+    HOST_MEMORY_CEILING_PID=""
+    [ -n "$pid" ] || return 0
+    if ! host_memory_chunk_ceiling_tripped && kill -0 "$pid" 2>/dev/null; then
+        kill "$pid" 2>/dev/null || true
+    fi
+    wait "$pid" 2>/dev/null || true
+}
+
+# Returns 0 when the ceiling interrupted the invocation that just returned.
+host_memory_chunk_ceiling_tripped() {
+    [ -s "$(_host_mem_ceiling_file)" ]
+}
+
+clear_chunk_ceiling_trip() {
+    rm -f "$(_host_mem_ceiling_file)" 2>/dev/null || true
+}
+
+# ── the recovery wait ───────────────────────────────────────────────────
+# After a memory stop the harness tears down and asks this when it may resume.
+# Recovered means RECOVERY_POLLS readings in a row that each pass three tests:
+#
+#   1. host_memory_gate_verdict at the running guard's own floor, plus the
+#      boundary's swap ceiling. A host that would stop at the next boundary
+#      has not recovered.
+#   2. The 1-minute load under the host-load cap. A teardown sets off a burst
+#      of daemon work, and a resume into it is refused anyway.
+#   3. No jetsam report in the last few minutes. A GO taken minutes after the
+#      kernel was killing processes is not a cold host.
+#
+# Each wait is bounded by LUCIDOS_E2E_RECOVERY_WAIT_SECS, and by
+# LUCIDOS_E2E_RESUME_BY (local HH:MM) when that is set and comes sooner.
+#
+#   LUCIDOS_E2E_RECOVERY_WAIT_SECS   longest wait for one recovery (default 1800)
+#   LUCIDOS_E2E_RESUME_BY            HH:MM local time no wait may pass (default none)
+
+HOST_MEMORY_RECOVERY_POLLS=3
+HOST_MEMORY_RECOVERY_POLL_SECS=30
+HOST_MEMORY_JETSAM_QUIET_MINS=5
+
+# Names of jetsam reports newer than $1 minutes, one per line. Seam.
+_host_mem_recent_jetsam() {
+    local dir="${HOST_JETSAM_DIR:-/Library/Logs/DiagnosticReports}"
+    [ -d "$dir" ] || return 0
+    find "$dir" -maxdepth 1 -name 'JetsamEvent-*' -mmin "-$1" 2>/dev/null
+}
+
+# The epoch second of today's local HH:MM in $1, or nothing when $1 is not a
+# time. Seam-free: it reads the clock through _host_mem_now.
+_host_mem_epoch_of_local_time() {
+    local hh mm now midnight
+    case "$1" in
+        [0-2][0-9]:[0-5][0-9]) hh="${1%%:*}"; mm="${1##*:}" ;;
+        *) return 0 ;;
+    esac
+    [ "$((10#$hh))" -le 23 ] || return 0
+    now="$(_host_mem_now)"
+    midnight="$(date -r "$now" '+%H %M %S' 2>/dev/null | awk -v n="$now" '{ print n - ($1 * 3600 + $2 * 60 + $3) }')"
+    [ -n "$midnight" ] || return 0
+    printf '%s' "$((midnight + 10#$hh * 3600 + 10#$mm * 60))"
+}
+
+# The epoch second the current wait must end by.
+_host_mem_recovery_deadline() {
+    local now limit deadline by
+    now="$(_host_mem_now)"
+    limit="$(_host_mem_secs_or "${LUCIDOS_E2E_RECOVERY_WAIT_SECS:-}" 1800)"
+    deadline=$((now + limit))
+    by="$(_host_mem_epoch_of_local_time "${LUCIDOS_E2E_RESUME_BY:-}")"
+    if [ -n "$by" ] && [ "$by" -lt "$deadline" ]; then
+        deadline="$by"
+    fi
+    printf '%s' "$deadline"
+}
+
+# One recovery reading. Returns 0 when it passes all three tests, else prints
+# why not, one reason per line.
+_host_mem_recovery_reading() {
+    local reasons="" jetsam load ncpu cap swap swap_max
+    reasons="$(host_memory_gate_verdict "$(_host_mem_available_floor_gb)")"
+    swap="$(_host_mem_read_swap_used_gb)"
+    swap_max="$(_host_mem_swap_ceiling_gb)"
+    if [ -n "$swap" ] && _host_mem_over "$swap" "$swap_max"; then
+        reasons="${reasons:+$reasons
+}$swap GB of swap in use, over the $swap_max GB limit"
+    fi
+    if command -v _host_load_read_load1 >/dev/null 2>&1 && ! _host_load_guard_disabled; then
+        load="$(_host_load_read_load1)"
+        ncpu="$(_host_load_read_ncpu)"
+        cap="${HOST_LOAD_MAX_RATIO:-1.5}"
+        if _host_load_over_ratio "$load" "$ncpu" "$cap"; then
+            reasons="${reasons:+$reasons
+}load $load on $ncpu cores is over the ${cap}x host-load cap"
+        fi
+    fi
+    jetsam="$(_host_mem_recent_jetsam "$HOST_MEMORY_JETSAM_QUIET_MINS" | head -1)"
+    if [ -n "$jetsam" ]; then
+        reasons="${reasons:+$reasons
+}the kernel wrote ${jetsam##*/} in the last $HOST_MEMORY_JETSAM_QUIET_MINS minutes"
+    fi
+    [ -n "$reasons" ] || return 0
+    printf '%s\n' "$reasons"
+    return 1
+}
+
+# Wait until the host has recovered. Returns 0 to resume, 1 when the deadline
+# came first. Every reading prints one line, so the log shows the recovery.
+host_memory_wait_for_recovery() {
+    local deadline start now good=0 reasons
+    start="$(_host_mem_now)"
+    deadline="$(_host_mem_recovery_deadline)"
+    echo "[e2e-resume] waiting for the host to recover, until $(date -r "$deadline" '+%H:%M' 2>/dev/null || echo "$deadline"): $HOST_MEMORY_RECOVERY_POLLS clean readings in a row, ${HOST_MEMORY_RECOVERY_POLL_SECS}s apart."
+    while :; do
+        if reasons="$(_host_mem_recovery_reading)"; then
+            good=$((good + 1))
+            echo "[e2e-resume] reading $good of $HOST_MEMORY_RECOVERY_POLLS is clean"
+            # A reading can take up to the critical confirm window, so the
+            # deadline is checked again before a resume is allowed.
+            if [ "$good" -ge "$HOST_MEMORY_RECOVERY_POLLS" ]; then
+                now="$(_host_mem_now)"
+                if [ "$now" -gt "$deadline" ]; then
+                    echo "[e2e-resume] the host recovered, but only after the wait's deadline: no resume"
+                    return 1
+                fi
+                echo "[e2e-resume] the host recovered after $((now - start))s"
+                return 0
+            fi
+        else
+            good=0
+            echo "[e2e-resume] not recovered: $(printf '%s' "$reasons" | paste -sd ';' - | sed 's/;/; /g')"
+        fi
+        now="$(_host_mem_now)"
+        if [ $((now + HOST_MEMORY_RECOVERY_POLL_SECS)) -gt "$deadline" ]; then
+            echo "[e2e-resume] the host did not recover in time: the wait ended after $((now - start))s"
+            return 1
+        fi
+        _host_mem_gate_wait "$HOST_MEMORY_RECOVERY_POLL_SECS"
+    done
+}
+
+# Clear what a memory stop left recorded, so the resumed run starts clean: the
+# trip, the stop's detail and the sampler's window, which describes a host
+# from before the teardown.
+clear_host_memory_stop() {
+    MEMORY_STOPPED=""
+    MEMORY_STOP_DETAIL=""
+    rm -f "$(_host_mem_trip_file)" 2>/dev/null || true
+    : > "$(_host_mem_samples_file)" 2>/dev/null || true
+}
+
+# ── what the run leaves behind ──────────────────────────────────────────
+# One line per boundary saying what the run holds that a finished chunk should
+# have given back: the e2e engine's footprint and its growth since the first
+# boundary on that engine, the coding-agent subprocesses still alive, and the
+# workspace's apps, files and commits. A subprocess alive at two boundaries in
+# a row has outlived a whole chunk, and is named LEFTOVER.
+#
+# Purely additive, like the attribution above it: it never changes a stop.
+# _host_mem_attr_report fills HOST_MEMORY_AGENT_PIDS_NOW and
+# HOST_MEMORY_ENGINE_MB_NOW for it. It reports and never kills, because killing
+# an engine child mid-run would put a failure into the next chunk's page.
+
+HOST_MEMORY_AGENT_PIDS_NOW=""
+HOST_MEMORY_ENGINE_MB_NOW=""
+HOST_MEMORY_LB_AGENTS_PREV=""
+HOST_MEMORY_LB_ENGINE_PID=""
+HOST_MEMORY_LB_ENGINE_FIRST_MB=""
+HOST_MEMORY_LB_FIRST=""
+HOST_MEMORY_LB_LAST=""
+HOST_MEMORY_LB_MAX_AGENTS=0
+HOST_MEMORY_LB_LEFTOVERS=0
+
+# A pid's start time, so a recycled pid never reads as the same process. Seam.
+_host_mem_proc_started() {
+    ps -o lstart= -p "$1" 2>/dev/null | sed 's/^ *//; s/ *$//' | tr ' ' '_'
+}
+
+# "<apps> <files> <commits>" for the workspace in $1, "?" where unreadable. Seam.
+_host_mem_workspace_counts() {
+    local ws="$1" apps files commits
+    apps="$(find "$ws/data/apps" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')"
+    files="$(find "$ws" -path "$ws/.lucidos" -prune -o -path "$ws/.git" -prune -o -type f -print 2>/dev/null | wc -l | tr -d ' ')"
+    commits="$(git -C "$ws" rev-list --count HEAD 2>/dev/null)" || commits="?"
+    printf '%s %s %s' "${apps:-?}" "${files:-?}" "${commits:-?}"
+}
+
+_host_mem_left_behind_report() {
+    local where="$1" tag="$HOST_MEMORY_ATTR_TAG" ws engine_pid counts apps files commits
+    local agents_now="" pid started n=0 engine_part="e2e engine unmeasured"
+    ws="${E2E_WORKSPACE:-$HOME/workspaces/e2e-test}"
+    engine_pid="$(cat "$ws/.lucidos/engine.pid" 2>/dev/null || true)"
+
+    if [ -n "$HOST_MEMORY_ENGINE_MB_NOW" ]; then
+        if [ "$engine_pid" != "$HOST_MEMORY_LB_ENGINE_PID" ] || [ -z "$HOST_MEMORY_LB_ENGINE_FIRST_MB" ]; then
+            HOST_MEMORY_LB_ENGINE_PID="$engine_pid"
+            HOST_MEMORY_LB_ENGINE_FIRST_MB="$HOST_MEMORY_ENGINE_MB_NOW"
+        fi
+        engine_part="e2e engine $HOST_MEMORY_ENGINE_MB_NOW MB ($((HOST_MEMORY_ENGINE_MB_NOW - HOST_MEMORY_LB_ENGINE_FIRST_MB)) MB since its first boundary)"
+    fi
+
+    for pid in $HOST_MEMORY_AGENT_PIDS_NOW; do
+        started="$(_host_mem_proc_started "$pid")"
+        [ -n "$started" ] || continue
+        agents_now="$agents_now $pid@$started"
+        n=$((n + 1))
+    done
+    [ "$n" -le "$HOST_MEMORY_LB_MAX_AGENTS" ] || HOST_MEMORY_LB_MAX_AGENTS="$n"
+
+    counts="$(_host_mem_workspace_counts "$ws")"
+    read -r apps files commits <<EOF2
+$counts
+EOF2
+    echo "$tag after $where: left behind: $engine_part, $n coding-agent subprocess(es), workspace $apps apps, $files files, $commits commits"
+
+    local token
+    for token in $agents_now; do
+        case " $HOST_MEMORY_LB_AGENTS_PREV " in
+            *" $token "*)
+                HOST_MEMORY_LB_LEFTOVERS=$((HOST_MEMORY_LB_LEFTOVERS + 1))
+                echo "$tag after $where: LEFTOVER coding-agent subprocess pid=${token%%@*}, alive since the previous boundary, so it outlived a whole chunk"
+                ;;
+        esac
+    done
+    HOST_MEMORY_LB_AGENTS_PREV="$agents_now"
+
+    local snapshot="${HOST_MEMORY_ENGINE_MB_NOW:-?} $apps $files $commits"
+    [ -n "$HOST_MEMORY_LB_FIRST" ] || HOST_MEMORY_LB_FIRST="$snapshot"
+    HOST_MEMORY_LB_LAST="$snapshot"
+    return 0
+}
+
+# One summary of what the run left behind, first boundary to last. finish
+# calls it, so the run's growth is one line rather than a log to grep.
+report_left_behind_summary() {
+    [ -n "$HOST_MEMORY_LB_FIRST" ] || return 0
+    local f_eng f_apps f_files f_commits l_eng l_apps l_files l_commits
+    read -r f_eng f_apps f_files f_commits <<EOF2
+$HOST_MEMORY_LB_FIRST
+EOF2
+    read -r l_eng l_apps l_files l_commits <<EOF2
+$HOST_MEMORY_LB_LAST
+EOF2
+    echo ""
+    echo "$HOST_MEMORY_ATTR_TAG left behind over the run, first boundary to last: e2e engine $f_eng to $l_eng MB, workspace apps $f_apps to $l_apps, files $f_files to $l_files, commits $f_commits to $l_commits; at most $HOST_MEMORY_LB_MAX_AGENTS coding-agent subprocess(es) at one boundary, $HOST_MEMORY_LB_LEFTOVERS LEFTOVER."
 }

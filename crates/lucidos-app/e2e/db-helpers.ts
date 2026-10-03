@@ -172,6 +172,45 @@ export function seedStepHeavyThread({ turns, stepsPerTurn, title }: {
   return { threadId, messageIds };
 }
 
+/** Seed an archived chat thread whose every step row carries a context
+ *  counter, and return its id. A legacy `ThoughtStreamed` with
+ *  `context_tokens` is the smallest payload that gives a step a snapshot,
+ *  which is what makes its counter a button. */
+export function seedThreadOfCounters({ turns, stepsPerTurn, title }: {
+  turns: number;
+  stepsPerTurn: number;
+  title: string;
+}): string {
+  const threadId = randomUUID();
+  const base = Date.now();
+  let n = 0;
+  const at = () => new Date(base + n++ * 1000).toISOString();
+  const rows: string[] = [];
+  const row = (type: string, payload: string) =>
+    `('${randomUUID()}', '${type}', '${payload}'::jsonb, '${at()}', 'thread', '${threadId}', '${threadId}')`;
+
+  for (let t = 0; t < turns; t++) {
+    const messageId = randomUUID();
+    rows.push(`('${messageId}', 'MessageReceived', '{"text":"turn ${t}","mode":"human","channel":"chat"}'::jsonb, '${at()}', 'thread', '${threadId}', '${threadId}')`);
+    for (let i = 0; i < stepsPerTurn; i++) {
+      const ref = `"request_event_id":"${messageId}"`;
+      rows.push(
+        row('ThoughtStreamed', `{"text":"","context_tokens":${40_000 + i * 1000},"context_messages":${i + 2},${ref}}`),
+        row('ToolCalled', `{"name":"read_file","args":{"path":"notes/${t}-${i}.md"},${ref}}`),
+        row('ToolResult', `{"name":"read_file","result":"ok",${ref}}`),
+      );
+    }
+    rows.push(row('ResponseGenerated', `{"text":"Done ${t}.","images":[],"request_event_id":"${messageId}"}`));
+  }
+
+  psql([
+    `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, state, is_coding_agent, active_children_count, total_children_count, coding_agent_proposed, coding_agent_requires_restart, coding_agent_is_external_repo) ` +
+      `VALUES ('${threadId}', '${title}', 'chat', '${new Date(base).toISOString()}', ${turns}, false, true, 'idle', 'archived', 'active', false, 0, 0, false, false, false)`,
+    `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES\n` + rows.join(',\n'),
+  ].join(';\n'));
+  return threadId;
+}
+
 /** Create a CC thread with a pending change (git branch + DB rows). */
 export function createCCThreadWithChange(titlePrefix: string, suffix: string, opts: {
   requiresRestart?: boolean;

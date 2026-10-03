@@ -8,7 +8,7 @@ import {
 } from '../store';
 import { settingsViewKey } from '../../components/layout/contentViewKey';
 import { credentialAnchor } from '../../components/credentials/credentialAnchor';
-import { resetContentScroll } from '../../hooks/useScrollMemory';
+import { resetContentScroll } from '../savedScroll';
 import type { PanelOverlay } from '../store';
 import { revealContentPane } from './pane';
 import type { SettingsSubview } from '../store';

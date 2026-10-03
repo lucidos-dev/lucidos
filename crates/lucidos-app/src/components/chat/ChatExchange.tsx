@@ -9,7 +9,7 @@ import type { Exchange, ReadMarker, StoredEvent, ThreadEvent, MessageOrigin, Res
 import { ENGINE_LABEL, SYSTEM_LABEL, API_CALLER_LABEL, LUCIDOS_AGENT_LABEL, abortPromisesAutoResume, exchangeUserMessage, exchangeUserImageHashes, exchangeTimestamp, exchangeResponseTimestamp, messageReadTimestamp, exchangeResponseText, exchangeEngineLimitDetail, exchangeSteps, exchangeResponseEvents, exchangeStatus, exchangeError, exchangeStarterId, dividerBodyIsSuppressed, hasRenderableResponseContent, isEmptyContinuedExchange, questionDividerResolution, changePanelHasContinuation, findCommandPermissionResolution, findMcpPermissionResolution, findPermissionResolution, findQuestionAnswer, isChangeLifecycleEvent, isLivePartialRow, isLiveReplyRow, isLiveUtteranceRow, isSpeechOnlyTurn, turnBodyFolded, modeToInitiator, originMode, continuationStartedSummary, responseAbortedSummary, eventWaitStoppedSummary, isTurnlessBoundary, agentMessageSender, waitReentryReason, RESPONSE_CANCELED_SUMMARY } from '../../store/thread-events';
 import { LucidosGlyph } from '../shared/LucidosMark';
 import { artifacts, appsList, stepsExpanded, detailsExpanded, collapsedExchanges, toggleExchangeCollapsed, expandExchange, collapsedInitiators, toggleInitiatorCollapsed, toggleMessageRoutePanel } from '../../store/store';
-import { editQueuedMessage, removeQueuedMessage, retryUnsentMessage } from '../../store/actions/chat';
+import { discardUnsentMessage, editQueuedMessage, removeQueuedMessage, retryUnsentMessage } from '../../store/actions/chat';
 import { unsentMessages } from '../../store/unsentMessages';
 import { withScrollAnchor } from './CreateThreadView';
 import { QuestionBody, pendingAnswers } from './QuestionCard';
@@ -763,9 +763,14 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
           <p>{error.message}</p>
           {unsentEventId
             ? (
-              <button type="button" class="action-btn exchange-error-retry" onClick={() => void retryUnsentMessage(unsentEventId)}>
-                Retry
-              </button>
+              <div class="exchange-error-actions">
+                <button type="button" class="action-btn exchange-error-retry" onClick={() => void retryUnsentMessage(unsentEventId)}>
+                  Retry
+                </button>
+                <button type="button" class="action-btn action-btn-secondary exchange-error-discard" onClick={() => discardUnsentMessage(unsentEventId)}>
+                  Discard
+                </button>
+              </div>
             )
             : <p>Send a message to try again.</p>}
         </div>

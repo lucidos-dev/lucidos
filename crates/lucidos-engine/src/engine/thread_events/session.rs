@@ -102,10 +102,13 @@ pub enum ChildCompletionStatus {
     /// The child is not continuing. The user archived, deleted or discarded
     /// it, or an agent canceled its own child. A person's Stop is never this:
     /// it sends `ChildThreadStopped` (ADR 0252). The summary says what ended
-    /// it; the parent can decide whether to retry, prompt again, or give up. `ResponseAborted` (system-driven, e.g.
-    /// engine restart) deliberately does NOT surface here — that case is
-    /// transient and the engine resumes the child on next visit.
+    /// it; the parent can decide whether to retry, prompt again, or give up.
     Canceled,
+    /// An engine restart cut the child's turn, and nothing promised to resume
+    /// it: a crash, or a teardown the user did not ask for. The child is not
+    /// done and not dead. A follow-up continues it. The user's own switch is
+    /// never this: it resumes the child, and the resumed turn reports.
+    Interrupted,
 }
 
 /// One pending change held by a sub-thread of the thread a

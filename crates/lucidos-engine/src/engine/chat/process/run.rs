@@ -1421,7 +1421,7 @@ impl LucidosEngine {
 
         // Retrieve relevant context from memory (skipped if classification says not needed)
         let response_meta = cancel_exit.meta.clone();
-        let Some((mut memory_context, memory_results)) = until_canceled(
+        let Some((mut memory_context, recalled_memories)) = until_canceled(
             &cancel_token,
             self.retrieve_context(user_message, &classification),
         )
@@ -1441,8 +1441,9 @@ impl LucidosEngine {
                     crate::engine::event_bus::BusEvent::Thread {
                         thread_id,
                         event: crate::engine::thread_events::ThreadEvent::MemoryRecalled {
-                            results: memory_results,
+                            results: recalled_memories.len(),
                             queries: classification.sub_queries.clone(),
+                            memories: recalled_memories,
                         },
                         meta: response_meta,
                     },

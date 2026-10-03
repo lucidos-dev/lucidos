@@ -51,7 +51,7 @@ describe('currentChatContext', () => {
   });
 
   it('prefers an open app over any file preview', () => {
-    panelOverlay.value = { type: 'app-ui', app: { id: 'habit-tracker', name: 'Habit Tracker', description: '' } };
+    panelOverlay.value = { type: 'app-ui', app: { id: 'habit-tracker', name: 'Habit Tracker', description: '', reveal: 'on-load' } };
     selectedLines.value = { start: 1, end: 2 };
 
     expect(currentChatContext()).toEqual({ app_context: { app_id: 'habit-tracker' } });

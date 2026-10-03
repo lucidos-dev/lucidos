@@ -145,6 +145,7 @@ export const FRAME_COLOUR_TOKENS: readonly string[] = [
   '--bg-hover',
   '--bg-selected',
   '--border-color',
+  '--surface-bg',
   '--text-primary',
   '--text-secondary',
   '--text-muted',

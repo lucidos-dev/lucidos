@@ -19,7 +19,7 @@ import { loadRepositories } from './repositoriesLoader';
 import { pushNavState, replaceNavState } from './navigation';
 import { errorDetail } from '../../utils/errorDetail';
 import { appIdFromFolder } from '../../utils/appIdFromFolder';
-import { resetContentScroll } from '../../hooks/useScrollMemory';
+import { resetContentScroll } from '../savedScroll';
 
 /** Bumped by every Files panel navigation. A diff load checks it after each
  *  await and stops writing once a newer navigation has taken the panel. */

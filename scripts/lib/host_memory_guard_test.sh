@@ -42,6 +42,15 @@ source "$SCRIPT_DIR/host_memory_guard.sh"
 # shellcheck disable=SC2329 # a seam: invoked by the sourced guard, not from this file
 _host_mem_attr_proc_list() { return 0; }
 
+# The left-behind line runs at every boundary too. Its two readers would run
+# real ps and git, so they are stubbed for the whole file. The real counter is
+# kept under another name for the one test that exercises it.
+eval "real_$(declare -f _host_mem_workspace_counts)"
+# shellcheck disable=SC2329 # a seam: invoked by the sourced guard, not from this file
+_host_mem_workspace_counts() { echo "0 0 0"; }
+# shellcheck disable=SC2329 # a seam: invoked by the sourced guard, not from this file
+_host_mem_proc_started() { return 0; }
+
 # Point the attribution's engine-pidfile read and cwd resolve at the sandbox, not
 # the real ~/workspaces/e2e-test, so a test host with a live e2e run cannot leak
 # into these results. The attribution tests below override this per test.
@@ -2135,13 +2144,13 @@ test_stop_report_states_what_this_run_itself_cost() {
 }
 
 test_stop_report_does_not_advise_raising_the_ceiling() {
-    echo "test: the advice is to free memory, never to raise a threshold"
+    echo "test: the advice is a carry-over, never a raised threshold or a second run"
     reset_state
     MEMORY_STOPPED="project mobile-webkit"
     MEMORY_STOP_DETAIL="whatever"
     report_memory_stop >"$OUT/advice.out" 2>&1
     assert_silent_about "$OUT/advice.out" "raises the ceiling" "no advice to raise the ceiling"
-    assert_says "$OUT/advice.out" "Free memory on the host and rerun." "the advice is to free memory"
+    assert_says "$OUT/advice.out" "never a second run now" "the advice is a carry-over, never a second run tonight"
 }
 
 test_stop_exit_code_is_the_os_error_code() {
@@ -2388,6 +2397,482 @@ test_attribution_classifies_by_run_membership_not_name() {
     assert_says "$OUT/member.out" "attributed 1.17 GB across 5 procs" "host demand stays counted, not dropped"
 }
 
+# ── the build memory gate ───────────────────────────────────────────────
+BUILD_GATE="$SCRIPT_DIR/../build-memory-gate.sh"
+
+# Run the gate script as its own process against the PATH stubs, the way the
+# pre-flight gate runs. The file-wide HOST_*_OVERRIDE seams are dropped, so the
+# stubs are the only host it sees.
+run_build_gate_once() { # <bin> <out>
+    env -u HOST_PRESSURE_LEVEL_OVERRIDE -u HOST_AVAIL_GB_OVERRIDE \
+        -u HOST_COMPRESSOR_GB_OVERRIDE -u HOST_SWAP_USED_GB_OVERRIDE \
+        -u HOST_PHYSMEM_GB_OVERRIDE -u LUCIDOS_BUILD_MEMORY_GATE_PASSED_AT \
+        PATH="$1:$PATH" bash "$BUILD_GATE" --once >"$2" 2>&1
+}
+
+# The gate and the pre-flight gate must give one verdict per reading. Five
+# readings, the same five the running guard is replayed against above: the
+# oscillating idle host, the freeze, a held critical, the idle host and a
+# corroborated low host. Plus warn alone over the line, and warn under it.
+test_the_build_gate_agrees_with_the_preflight_gate() {
+    echo "test: the build memory gate gives the pre-flight gate's verdict on every replayed reading"
+    local name avail levels swap_mb comp want bin rc grc
+    reset_state
+    while IFS='|' read -r name avail levels swap_mb comp want; do
+        [ -n "$name" ] || continue
+        bin="$(install_gate_host_stubs "$avail" "$levels" "$swap_mb" "$comp" 48)"
+        run_build_gate_once "$bin" "$OUT/bg-$name.out"
+        rc=$?
+        if [ "$want" = GO ]; then
+            assert_eq "0" "$rc" "build gate: $name is GO"
+        else
+            assert_eq "72" "$rc" "build gate: $name is NO-GO, exit 72"
+        fi
+        if [ ! -f "$PREFLIGHT_GATE" ]; then
+            skip "the pre-flight gate is not on this machine, so $name is unverified against it"
+            continue
+        fi
+        bin="$(install_gate_host_stubs "$avail" "$levels" "$swap_mb" "$comp" 48)"
+        PATH="$bin:$PATH" bash "$PREFLIGHT_GATE" >"$OUT/pf-$name.out" 2>&1
+        grc=$?
+        if { [ "$rc" = 0 ] && [ "$grc" = 0 ]; } || { [ "$rc" = 72 ] && [ "$grc" = 1 ]; }; then
+            pass "build gate and pre-flight gate agree on $name"
+        else
+            fail "build gate exit $rc and pre-flight gate exit $grc disagree on $name"
+        fi
+    done <<'CASES'
+oscillation|11.01|4 4 2 4 4 2|0.00|17.28|GO
+freeze|0.30|4|0.00|17.41|NO-GO
+held-critical|11.00|4|0.00|17.28|NO-GO
+idle-host|8.79|1|0.00|14.30|GO
+corroborated-low|3.00|1|256.00|10.00|NO-GO
+warn-over-the-line|9.50|2|0.00|14.00|GO
+warn-under-the-line|6.66|2|0.00|14.00|NO-GO
+runaway|20.00|1|0.00|25.00|NO-GO
+CASES
+    assert_says "$OUT/bg-freeze.out" "the freeze signature" "the refusal names the freeze signature"
+    assert_says "$OUT/bg-warn-under-the-line.out" "available 6.66 GB under 8 GB, corroborated by the kernel at warn pressure" "the refusal names the corroboration"
+    assert_says "$OUT/bg-held-critical.out" "held through all 8 re-samples over 40s" "a held critical spent the whole window"
+}
+
+# A host nobody can read is never refused, so a clone on Linux builds.
+test_the_build_gate_fails_open_on_an_unreadable_host() {
+    echo "test: the build gate is GO when no reading can be taken"
+    local rc
+    reset_state
+    (
+        _host_mem_read_pressure_level() { return 0; }
+        _host_mem_read_available_gb() { return 0; }
+        _host_mem_read_swap_used_gb() { return 0; }
+        _host_mem_read_compressor_gb() { return 0; }
+        host_memory_gate_verdict 8
+    ) >"$OUT/bg-unreadable.out" 2>&1
+    rc=$?
+    assert_eq "0" "$rc" "an unreadable host is GO"
+    assert_eq "" "$(cat "$OUT/bg-unreadable.out")" "and no reason is printed"
+}
+
+# The wait: a NO-GO host that recovers lets the build start, and one that
+# never does is refused at the deadline with exit 72 and an ERROR line. The
+# clock and the wait are seams, so 15 minutes cost nothing.
+BG_CLOCK="$SANDBOX/bg-clock"
+BG_WAITS="$SANDBOX/bg-waits"
+test_the_build_gate_waits_for_recovery_then_refuses_at_the_deadline() {
+    echo "test: the build gate waits for recovery, and refuses with 72 at its deadline"
+    local rc
+    reset_state
+    echo 1000 > "$BG_CLOCK"
+    : > "$BG_WAITS"
+    (
+        _host_mem_now() { cat "$BG_CLOCK"; }
+        _host_mem_gate_wait() {
+            echo "$1" >> "$BG_WAITS"
+            echo $(($(cat "$BG_CLOCK") + $1)) > "$BG_CLOCK"
+        }
+        # NO-GO for the first two readings, then the host recovers.
+        _host_mem_read_available_gb() {
+            if [ "$(wc -l < "$BG_WAITS" | tr -d ' ')" -lt 2 ]; then printf '5.00'; else printf '20.00'; fi
+        }
+        HOST_PRESSURE_LEVEL_OVERRIDE=2 HOST_SWAP_USED_GB_OVERRIDE=0.00 \
+            HOST_COMPRESSOR_GB_OVERRIDE=5 HOST_PHYSMEM_GB_OVERRIDE=48 \
+            host_memory_build_gate "the e2e engine build"
+    ) >"$OUT/bg-recover.out" 2>&1
+    rc=$?
+    assert_eq "0" "$rc" "a host that recovers lets the build start"
+    assert_eq "2" "$(wc -l < "$BG_WAITS" | tr -d ' ')" "it waited exactly until the recovery"
+    assert_eq "30" "$(sort -u "$BG_WAITS")" "polls are 30 s apart by default"
+    assert_says "$OUT/bg-recover.out" "NO-GO for the e2e engine build. Waiting up to 900s" "the wait is announced once, with its bound"
+    assert_says "$OUT/bg-recover.out" "the host recovered after 60s, starting the e2e engine build" "the recovery is announced"
+
+    echo 1000 > "$BG_CLOCK"
+    : > "$BG_WAITS"
+    (
+        _host_mem_now() { cat "$BG_CLOCK"; }
+        _host_mem_gate_wait() {
+            echo "$1" >> "$BG_WAITS"
+            echo $(($(cat "$BG_CLOCK") + $1)) > "$BG_CLOCK"
+        }
+        LUCIDOS_BUILD_MEMORY_WAIT_SECS=120 HOST_PRESSURE_LEVEL_OVERRIDE=2 \
+            HOST_AVAIL_GB_OVERRIDE=5.00 HOST_SWAP_USED_GB_OVERRIDE=0.00 \
+            HOST_COMPRESSOR_GB_OVERRIDE=5 HOST_PHYSMEM_GB_OVERRIDE=48 \
+            host_memory_build_gate "the /harden rust suite"
+    ) >"$OUT/bg-refuse.out" 2>&1
+    rc=$?
+    assert_eq "72" "$rc" "a host that never recovers is refused with 72"
+    assert_eq "4" "$(wc -l < "$BG_WAITS" | tr -d ' ')" "it stopped waiting at the 120 s deadline"
+    assert_says "$OUT/bg-refuse.out" "ERROR: build refused on host memory: the /harden rust suite did not start, the host read NO-GO for 120s: available 5.00 GB under 8 GB" "the refusal is one ERROR line naming the reason"
+}
+
+# A pass holds for 60 s in the process tree, so a nested build skips the
+# readings. An older pass does not.
+test_a_recent_pass_holds_and_an_old_one_does_not() {
+    echo "test: a pass exported in the last 60 s holds, an older one is re-judged"
+    local rc bin now
+    reset_state
+    bin="$(install_gate_host_stubs 0.30 4 0.00 17.41 48)"
+    now="$(date +%s)"
+    env -u HOST_PRESSURE_LEVEL_OVERRIDE PATH="$bin:$PATH" \
+        LUCIDOS_BUILD_MEMORY_GATE_PASSED_AT="$now" bash "$BUILD_GATE" --once >"$OUT/bg-held.out" 2>&1
+    rc=$?
+    assert_eq "0" "$rc" "a pass from this second holds on the freeze reading"
+    env -u HOST_PRESSURE_LEVEL_OVERRIDE PATH="$bin:$PATH" \
+        LUCIDOS_BUILD_MEMORY_GATE_PASSED_AT="$((now - 120))" bash "$BUILD_GATE" --once >"$OUT/bg-stale.out" 2>&1
+    rc=$?
+    assert_eq "72" "$rc" "a pass from two minutes ago is re-judged and refused"
+}
+
+# ── the chunk ceiling watchdog ──────────────────────────────────────────
+# Real processes, so the signal path is the real one: a fake runner that would
+# sleep for 30 s, and a 1 s ceiling.
+export HOST_MEMORY_CEILING_FILE="$SANDBOX/host-memory-ceiling"
+
+test_the_ceiling_interrupts_a_runner_that_outlives_it() {
+    echo "test: a runner past the chunk ceiling is interrupted and the trip is recorded"
+    local runner waited=0
+    reset_state
+    sleep 30 &
+    runner=$!
+    record_host_memory_runner "$runner"
+    LUCIDOS_E2E_TRIP_GRACE_SECS=1 start_chunk_ceiling_watchdog "$runner" 1 >"$OUT/ceiling.out" 2>&1
+    while kill -0 "$runner" 2>/dev/null && [ "$waited" -lt 10 ]; do
+        sleep 1
+        waited=$((waited + 1))
+    done
+    if kill -0 "$runner" 2>/dev/null; then
+        fail "the runner outlived its ceiling by ${waited}s"
+        kill -KILL "$runner" 2>/dev/null
+    else
+        pass "the runner is gone within ${waited}s of a 1 s ceiling"
+    fi
+    wait "$runner" 2>/dev/null
+    stop_chunk_ceiling_watchdog
+    if host_memory_chunk_ceiling_tripped; then pass "the trip is recorded"; else fail "no trip recorded"; fi
+    assert_says "$HOST_MEMORY_CEILING_FILE" "wall-clock ceiling" "the record says which net fired"
+    assert_says "$OUT/ceiling.out" "CHUNK CEILING" "the log names the ceiling"
+    clear_chunk_ceiling_trip
+    if host_memory_chunk_ceiling_tripped; then fail "the trip survived its clear"; else pass "the trip clears"; fi
+    clear_host_memory_runner
+}
+
+test_the_ceiling_leaves_a_finished_runner_alone() {
+    echo "test: a runner that finishes inside its ceiling leaves no trip and no watchdog"
+    local runner wd
+    reset_state
+    sleep 0.2 &
+    runner=$!
+    record_host_memory_runner "$runner"
+    start_chunk_ceiling_watchdog "$runner" 5 >/dev/null 2>&1
+    wd="$HOST_MEMORY_CEILING_PID"
+    wait "$runner"
+    stop_chunk_ceiling_watchdog
+    if kill -0 "$wd" 2>/dev/null; then fail "the watchdog outlived its stop"; else pass "the watchdog is gone"; fi
+    if host_memory_chunk_ceiling_tripped; then fail "a trip was recorded"; else pass "no trip was recorded"; fi
+    clear_host_memory_runner
+}
+
+test_the_ceiling_never_signals_a_runner_it_was_not_given() {
+    echo "test: the watchdog stands down when the runner pidfile names another pid"
+    local runner waited=0
+    reset_state
+    sleep 5 &
+    runner=$!
+    echo 999999 > "$HOST_MEMORY_RUNNER_PIDFILE"
+    start_chunk_ceiling_watchdog "$runner" 1 >/dev/null 2>&1
+    while [ -n "$HOST_MEMORY_CEILING_PID" ] && kill -0 "$HOST_MEMORY_CEILING_PID" 2>/dev/null && [ "$waited" -lt 5 ]; do
+        sleep 1
+        waited=$((waited + 1))
+    done
+    if kill -0 "$runner" 2>/dev/null; then pass "the unrecorded runner was not signalled"; else fail "the watchdog signalled a pid the run never recorded"; fi
+    kill "$runner" 2>/dev/null
+    wait "$runner" 2>/dev/null
+    stop_chunk_ceiling_watchdog
+    rm -f "$HOST_MEMORY_RUNNER_PIDFILE"
+}
+
+test_the_ceiling_knob_falls_back() {
+    echo "test: the ceiling defaults to 1200 s and refuses a garbage value"
+    assert_eq "1200" "$(host_memory_chunk_ceiling_secs)" "the default is 20 minutes"
+    assert_eq "600" "$(LUCIDOS_E2E_CHUNK_CEILING_SECS=600 host_memory_chunk_ceiling_secs)" "an explicit value wins"
+    assert_eq "1200" "$(LUCIDOS_E2E_CHUNK_CEILING_SECS=0 host_memory_chunk_ceiling_secs)" "zero would trip every chunk, so it falls back"
+    assert_eq "1200" "$(LUCIDOS_E2E_CHUNK_CEILING_SECS=20m host_memory_chunk_ceiling_secs)" "a unit suffix falls back"
+}
+
+# ── the recovery wait ───────────────────────────────────────────────────
+RW_CLOCK="$SANDBOX/rw-clock"
+RW_WAITS="$SANDBOX/rw-waits"
+RW_AVAIL="$SANDBOX/rw-avail"
+export HOST_JETSAM_DIR="$SANDBOX/jetsam"
+mkdir -p "$HOST_JETSAM_DIR"
+
+# Drive the wait with a stub clock, and one available reading per poll from
+# RW_AVAIL (last repeats). Pressure normal and swap zero unless a case says.
+drive_recovery() { # <out> [env assignments...]
+    local out="$1"; shift
+    echo 1000000000 > "$RW_CLOCK"
+    : > "$RW_WAITS"
+    (
+        _host_mem_now() { cat "$RW_CLOCK"; }
+        _host_mem_gate_wait() {
+            echo "$1" >> "$RW_WAITS"
+            echo $(($(cat "$RW_CLOCK") + $1)) > "$RW_CLOCK"
+        }
+        _host_mem_read_available_gb() {
+            local i
+            i="$(wc -l < "$RW_WAITS" | tr -d ' ')"
+            awk -v s="$(cat "$RW_AVAIL")" -v i="$i" 'BEGIN { n = split(s, a, " "); printf "%s", (i + 1 <= n) ? a[i + 1] : a[n] }'
+        }
+        export HOST_PRESSURE_LEVEL_OVERRIDE="${RW_PRESSURE:-1}" HOST_SWAP_USED_GB_OVERRIDE=0.00 \
+            HOST_COMPRESSOR_GB_OVERRIDE=10 HOST_PHYSMEM_GB_OVERRIDE=48
+        for kv in "$@"; do export "${kv?}"; done
+        host_memory_wait_for_recovery
+    ) >"$out" 2>&1
+}
+
+rw_wait_count() { wc -l < "$RW_WAITS" | tr -d ' '; }
+
+test_recovery_needs_three_clean_readings_in_a_row() {
+    echo "test: recovery takes three clean readings in a row, and a dirty one starts the count over"
+    local rc
+    reset_state
+    rm -f "$HOST_JETSAM_DIR"/*
+    echo "12" > "$RW_AVAIL"
+    drive_recovery "$OUT/rw-clean.out"
+    rc=$?
+    assert_eq "0" "$rc" "a clean host recovers"
+    assert_eq "2" "$(rw_wait_count)" "three readings take two waits"
+    assert_says "$OUT/rw-clean.out" "the host recovered after 60s" "the recovery is announced with its cost"
+
+    # Warn with available under the 9.60 GB floor is a boundary stop, so it is
+    # not recovered. Two clean, one dirty, then three clean.
+    echo "12 12 7 12 12 12" > "$RW_AVAIL"
+    drive_recovery "$OUT/rw-reset.out" HOST_PRESSURE_LEVEL_OVERRIDE=2
+    rc=$?
+    assert_eq "0" "$rc" "the host recovers in the end"
+    assert_eq "5" "$(rw_wait_count)" "the dirty reading started the count over"
+    assert_says "$OUT/rw-reset.out" "not recovered: available 7 GB under 9.60 GB, corroborated by the kernel at warn pressure" "the dirty reading names the boundary rule"
+}
+
+test_recovery_waits_out_a_recent_jetsam_report() {
+    echo "test: a jetsam report in the last few minutes is not a recovered host, and the wait is bounded"
+    local rc
+    reset_state
+    echo "20" > "$RW_AVAIL"
+    touch "$HOST_JETSAM_DIR/JetsamEvent-2026-10-03-050654.ips"
+    drive_recovery "$OUT/rw-jetsam.out" LUCIDOS_E2E_RECOVERY_WAIT_SECS=90
+    rc=$?
+    rm -f "$HOST_JETSAM_DIR"/*
+    assert_eq "1" "$rc" "a host the kernel was just killing on does not recover"
+    assert_says "$OUT/rw-jetsam.out" "the kernel wrote JetsamEvent-2026-10-03-050654.ips" "the report is named"
+    assert_says "$OUT/rw-jetsam.out" "the host did not recover in time" "the deadline is announced"
+    assert_eq "3" "$(rw_wait_count)" "a 90 s wait polls no longer than its bound"
+}
+
+test_recovery_waits_out_a_saturated_host() {
+    echo "test: load over the host-load cap is not a recovered host"
+    local rc
+    reset_state
+    rm -f "$HOST_JETSAM_DIR"/*
+    echo "20" > "$RW_AVAIL"
+    (
+        _host_load_read_load1() { echo 80; }
+        _host_load_read_ncpu() { echo 18; }
+        _host_load_over_ratio() { awk -v l="$1" -v n="$2" -v c="$3" 'BEGIN { exit !(l / n > c) }'; }
+        _host_load_guard_disabled() { return 1; }
+        drive_recovery "$OUT/rw-load.out" LUCIDOS_E2E_RECOVERY_WAIT_SECS=60
+    )
+    rc=$?
+    assert_eq "1" "$rc" "a saturated host does not recover"
+    assert_says "$OUT/rw-load.out" "load 80 on 18 cores is over the 1.5x host-load cap" "the load is named"
+}
+
+test_recovery_waits_out_swap_over_its_ceiling() {
+    echo "test: swap over the boundary's ceiling is not a recovered host, whatever else reads fine"
+    local rc
+    reset_state
+    rm -f "$HOST_JETSAM_DIR"/*
+    echo "20" > "$RW_AVAIL"
+    drive_recovery "$OUT/rw-swap.out" HOST_SWAP_USED_GB_OVERRIDE=1.50 LUCIDOS_E2E_RECOVERY_WAIT_SECS=60
+    rc=$?
+    assert_eq "1" "$rc" "a host the next boundary would stop on swap does not recover"
+    assert_says "$OUT/rw-swap.out" "1.50 GB of swap in use, over the 1 GB limit" "the swap reading is named"
+}
+
+test_a_recovery_that_lands_past_the_deadline_does_not_resume() {
+    echo "test: a clean third reading that finishes after the deadline is not a resume"
+    local rc
+    reset_state
+    rm -f "$HOST_JETSAM_DIR"/*
+    echo "20" > "$RW_AVAIL"
+    (
+        # The third reading takes 100 s, as a critical confirm window can.
+        _host_mem_read_compressor_gb() {
+            if [ "$(wc -l < "$RW_WAITS" | tr -d ' ')" -ge 2 ]; then
+                echo $(($(cat "$RW_CLOCK") + 100)) > "$RW_CLOCK"
+            fi
+            printf '10'
+        }
+        drive_recovery "$OUT/rw-late.out" LUCIDOS_E2E_RECOVERY_WAIT_SECS=90
+    )
+    rc=$?
+    assert_eq "1" "$rc" "the late recovery does not resume"
+    assert_says "$OUT/rw-late.out" "only after the wait's deadline" "it says why"
+}
+
+test_resume_by_bounds_every_wait() {
+    echo "test: LUCIDOS_E2E_RESUME_BY ends a wait at that local time, and a past time means no wait"
+    local got
+    reset_state
+    # 1000000000 is 01:46:40 UTC.
+    got="$(TZ=UTC bash -c 'source "'"$SCRIPT_DIR"'/host_memory_guard.sh"; _host_mem_now() { echo 1000000000; }; _host_mem_epoch_of_local_time 05:00')"
+    assert_eq "1000011600" "$got" "05:00 resolves to today's epoch second"
+    got="$(TZ=UTC bash -c 'source "'"$SCRIPT_DIR"'/host_memory_guard.sh"; _host_mem_now() { echo 1000000000; }; LUCIDOS_E2E_RESUME_BY=02:00 _host_mem_recovery_deadline')"
+    assert_eq "1000000800" "$got" "a resume-by sooner than the wait wins"
+    got="$(TZ=UTC bash -c 'source "'"$SCRIPT_DIR"'/host_memory_guard.sh"; _host_mem_now() { echo 1000000000; }; LUCIDOS_E2E_RESUME_BY=09:00 _host_mem_recovery_deadline')"
+    assert_eq "1000001800" "$got" "a later resume-by leaves the 30-minute wait"
+    got="$(TZ=UTC bash -c 'source "'"$SCRIPT_DIR"'/host_memory_guard.sh"; _host_mem_now() { echo 1000000000; }; LUCIDOS_E2E_RESUME_BY=banana _host_mem_recovery_deadline')"
+    assert_eq "1000001800" "$got" "a garbage resume-by is ignored"
+    rm -f "$HOST_JETSAM_DIR"/*
+    echo "20" > "$RW_AVAIL"
+    drive_recovery "$OUT/rw-past.out" TZ=UTC LUCIDOS_E2E_RESUME_BY=01:00
+    assert_eq "1" "$?" "a resume-by already past ends the wait at once"
+    assert_eq "0" "$(rw_wait_count)" "and nothing waits"
+}
+
+test_clearing_a_stop_leaves_a_clean_slate() {
+    echo "test: clearing a stop removes the trip, the detail and the stale window"
+    reset_state
+    MEMORY_STOPPED="mobile-webkit"
+    MEMORY_STOP_DETAIL="whatever"
+    echo "trip" > "$HOST_MEMORY_TRIP_FILE"
+    echo "4 17.00 0.50 0.00" > "$HOST_MEMORY_SAMPLES_FILE"
+    clear_host_memory_stop
+    assert_eq "" "$MEMORY_STOPPED" "the stop is cleared"
+    assert_eq "" "$MEMORY_STOP_DETAIL" "the detail is cleared"
+    if host_memory_stopped_mid_chunk; then fail "the trip survived"; else pass "the trip is gone"; fi
+    if [ -s "$HOST_MEMORY_SAMPLES_FILE" ]; then fail "the stale window survived"; else pass "the window is empty"; fi
+}
+
+# ── what the run leaves behind ──────────────────────────────────────────
+reset_left_behind() {
+    HOST_MEMORY_LB_AGENTS_PREV=""
+    HOST_MEMORY_LB_ENGINE_PID=""
+    HOST_MEMORY_LB_ENGINE_FIRST_MB=""
+    HOST_MEMORY_LB_FIRST=""
+    HOST_MEMORY_LB_LAST=""
+    HOST_MEMORY_LB_MAX_AGENTS=0
+    HOST_MEMORY_LB_LEFTOVERS=0
+}
+
+test_an_agent_alive_at_two_boundaries_is_a_leftover() {
+    echo "test: a coding-agent subprocess alive at two boundaries in a row is named LEFTOVER"
+    local ws="$SANDBOX/lb-ws"
+    reset_state
+    reset_left_behind
+    mkdir -p "$ws/.lucidos"
+    echo 4242 > "$ws/.lucidos/engine.pid"
+    (
+        E2E_WORKSPACE="$ws"
+        _host_mem_workspace_counts() { echo "3 40 12"; }
+        _host_mem_proc_started() {
+            case "$1" in
+                111) echo "Sat_Oct__3_04:10:00_2026" ;;
+                222) echo "${PID222_START:-Sat_Oct__3_04:11:00_2026}" ;;
+            esac
+        }
+        HOST_MEMORY_ENGINE_MB_NOW=1000 HOST_MEMORY_AGENT_PIDS_NOW=" 111"
+        _host_mem_left_behind_report "nav chunk 1/52"
+        HOST_MEMORY_ENGINE_MB_NOW=1010 HOST_MEMORY_AGENT_PIDS_NOW=" 111 222"
+        _host_mem_left_behind_report "nav chunk 2/52"
+        # 222 is a NEW process on a recycled pid: same number, new start time.
+        PID222_START="Sat_Oct__3_04:20:00_2026"
+        HOST_MEMORY_ENGINE_MB_NOW=1012 HOST_MEMORY_AGENT_PIDS_NOW=" 222"
+        _host_mem_left_behind_report "nav chunk 3/52"
+        report_left_behind_summary
+    ) >"$OUT/lb.out" 2>&1
+    assert_says "$OUT/lb.out" "after nav chunk 1/52: left behind: e2e engine 1000 MB (0 MB since its first boundary), 1 coding-agent subprocess(es), workspace 3 apps, 40 files, 12 commits" "the first boundary states the baseline"
+    assert_says "$OUT/lb.out" "after nav chunk 2/52: left behind: e2e engine 1010 MB (10 MB since its first boundary)" "engine growth is measured against its first boundary"
+    assert_says "$OUT/lb.out" "after nav chunk 2/52: LEFTOVER coding-agent subprocess pid=111" "the agent alive across a whole chunk is named"
+    assert_silent_about "$OUT/lb.out" "LEFTOVER coding-agent subprocess pid=222" "a recycled pid is a new process, never a leftover"
+    assert_says "$OUT/lb.out" "e2e engine 1000 to 1012 MB, workspace apps 3 to 3, files 40 to 40, commits 12 to 12; at most 2 coding-agent subprocess(es) at one boundary, 1 LEFTOVER." "the run summary adds it up"
+}
+
+test_a_new_engine_starts_a_new_growth_baseline() {
+    echo "test: after a restart the engine's growth is measured from the new engine"
+    local ws="$SANDBOX/lb-ws2"
+    reset_state
+    reset_left_behind
+    mkdir -p "$ws/.lucidos"
+    (
+        E2E_WORKSPACE="$ws"
+        _host_mem_workspace_counts() { echo "0 0 1"; }
+        echo 100 > "$ws/.lucidos/engine.pid"
+        HOST_MEMORY_ENGINE_MB_NOW=1500
+        _host_mem_left_behind_report "nav chunk 40/52"
+        echo 200 > "$ws/.lucidos/engine.pid"
+        HOST_MEMORY_ENGINE_MB_NOW=900
+        _host_mem_left_behind_report "nav chunk 41/52"
+    ) >"$OUT/lb2.out" 2>&1
+    assert_says "$OUT/lb2.out" "after nav chunk 41/52: left behind: e2e engine 900 MB (0 MB since its first boundary)" "the restarted engine is its own baseline"
+}
+
+test_an_unreadable_engine_pid_still_gives_a_baseline() {
+    echo "test: a measured engine with an unreadable pidfile still gets a growth baseline"
+    local ws="$SANDBOX/lb-ws3"
+    reset_state
+    reset_left_behind
+    mkdir -p "$ws/.lucidos"
+    (
+        E2E_WORKSPACE="$ws"
+        HOST_MEMORY_ENGINE_MB_NOW=800
+        _host_mem_left_behind_report "nav chunk 1/52"
+    ) >"$OUT/lb3.out" 2>&1
+    assert_says "$OUT/lb3.out" "e2e engine 800 MB (0 MB since its first boundary)" "the baseline is set"
+    assert_silent_about "$OUT/lb3.out" "syntax error" "no arithmetic error reaches the log"
+}
+
+test_a_label_with_no_value_is_refused() {
+    echo "test: the gate script refuses a --label with no value instead of looping"
+    local rc=0
+    env -u HOST_PRESSURE_LEVEL_OVERRIDE bash "$BUILD_GATE" --label >"$OUT/bg-nolabel.out" 2>&1 || rc=$?
+    assert_eq "2" "$rc" "a valueless --label is a usage error"
+    assert_says "$OUT/bg-nolabel.out" "--label needs a value" "it says why"
+}
+
+test_the_workspace_counts_read_apps_files_and_commits() {
+    echo "test: the workspace counts read apps, files outside .lucidos/ and .git/, and commits"
+    local ws="$SANDBOX/lb-repo"
+    rm -rf "$ws"
+    mkdir -p "$ws/data/apps/a" "$ws/data/apps/b" "$ws/.lucidos"
+    echo x > "$ws/data/apps/a/index.html"
+    echo x > "$ws/data/apps/b/index.html"
+    echo x > "$ws/.lucidos/engine.log"
+    git init -q "$ws"
+    git -C "$ws" -c user.name=t -c user.email=t@t commit -q --allow-empty -m one
+    git -C "$ws" -c user.name=t -c user.email=t@t commit -q --allow-empty -m two
+    assert_eq "2 2 2" "$(real__host_mem_workspace_counts "$ws")" "two apps, two files, two commits"
+    assert_eq "0 0 ?" "$(real__host_mem_workspace_counts "$SANDBOX/no-such-ws")" "a missing workspace reads as zero and unknown"
+}
+
 test_the_old_ceiling_no_longer_stops_a_healthy_host
 test_tonights_reading_runs_on
 test_swap_over_the_limit_stops
@@ -2483,6 +2968,29 @@ test_attribution_degrades_to_a_note_on_measurement_failure
 test_attribution_does_not_change_the_stop_decision
 test_attribution_classifies_by_run_membership_not_name
 
+test_the_build_gate_agrees_with_the_preflight_gate
+test_the_build_gate_fails_open_on_an_unreadable_host
+test_the_build_gate_waits_for_recovery_then_refuses_at_the_deadline
+test_a_recent_pass_holds_and_an_old_one_does_not
+
+test_the_ceiling_interrupts_a_runner_that_outlives_it
+test_the_ceiling_leaves_a_finished_runner_alone
+test_the_ceiling_never_signals_a_runner_it_was_not_given
+test_the_ceiling_knob_falls_back
+test_recovery_needs_three_clean_readings_in_a_row
+test_recovery_waits_out_a_recent_jetsam_report
+test_recovery_waits_out_a_saturated_host
+test_resume_by_bounds_every_wait
+test_clearing_a_stop_leaves_a_clean_slate
+
+test_an_agent_alive_at_two_boundaries_is_a_leftover
+test_a_new_engine_starts_a_new_growth_baseline
+test_the_workspace_counts_read_apps_files_and_commits
+
+test_an_unreadable_engine_pid_still_gives_a_baseline
+test_a_label_with_no_value_is_refused
+test_recovery_waits_out_swap_over_its_ceiling
+test_a_recovery_that_lands_past_the_deadline_does_not_resume
 echo ""
 echo "Passed: $PASS  Failed: $FAIL  Skipped: $SKIPPED"
 # A skip is never a pass. It is counted and named so a run that could not reach

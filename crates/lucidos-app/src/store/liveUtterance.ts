@@ -19,7 +19,7 @@
 import { type Signal, effect } from '@preact/signals';
 import { threadMap } from './store';
 import { bumpThreadEvents } from './threadActivity';
-import { voiceCall } from './voice';
+import { voiceCall } from './voiceCall';
 import { claimUtteranceRows } from './thread-events';
 import type { CallState } from '../voice/callState';
 import type { LiveReply, LiveUtterance } from './thread-events';

@@ -1,6 +1,8 @@
 # 0243: The plugin catalog is a cached projection, served stale by default
 
-- **Status**: Accepted
+- **Status**: Accepted, amended by
+  [0354](0354-plugins-panel-shows-scan-failures-not-age.md): the panel no longer
+  shows the catalog's age, only a failed scan's reason.
 - **Date**: 2026-09-22
 
 ## Context

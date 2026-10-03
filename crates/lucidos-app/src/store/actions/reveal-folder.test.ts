@@ -3,7 +3,7 @@ import {
   activeMenuItem, expandedFolders, panelOverlay, repoExpandedFolders, repoFiles,
   repoSource, repoViewMode, revealedFolder,
 } from '../store';
-import { contentScrollKey } from '../../hooks/useScrollMemory';
+import { contentScrollKey } from '../savedScroll';
 
 const { pushNavState, revealContentPane, listRepoFiles } = vi.hoisted(() => ({
   pushNavState: vi.fn(),

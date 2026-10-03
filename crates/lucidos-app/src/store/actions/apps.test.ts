@@ -29,13 +29,13 @@ vi.mock('./navigation', () => ({
 const notesApp: App = {
   id: 'notes-app',
   name: 'Notes App',
-  description: 'Daily notes',
+  description: 'Daily notes', reveal: 'on-load',
 };
 
 const tripPlanner: App = {
   id: 'trip-planner-2026',
   name: 'Trip Planner 2026',
-  description: 'Vacation planner',
+  description: 'Vacation planner', reveal: 'on-load',
 };
 
 describe('captureAppUI', () => {

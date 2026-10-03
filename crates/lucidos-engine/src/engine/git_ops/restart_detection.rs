@@ -28,6 +28,8 @@ const EMBEDDED_FILES: &[&str] = &[
     "crates/lucidos-app/index.html",
     "crates/lucidos-app/public/favicon.svg",
     "crates/lucidos-app/src/styles/global/shared-components.css",
+    "crates/lucidos-app/src/styles/global/surface.css",
+    "crates/lucidos-app/src/styles/global/text-input.css",
     "crates/lucidos-app/src/styles/generated/theme-parts-frame.css",
 ];
 

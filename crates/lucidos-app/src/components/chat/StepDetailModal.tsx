@@ -7,6 +7,7 @@ import { stepStatus } from '../../store/thread-events';
 import type { Loadable, StepOutcome } from '../../store/types';
 import { toFailed } from '../../store/types';
 import { highlightEllipsis } from './highlightEllipsis';
+import { StepRecallList } from './StepRecallList';
 import { requestToolArgs, requestToolResult } from '../../store/stepDetailCache';
 import { fullCommandForCCTool, fullCommandForEngineTool } from '../../store/thread-events/exchange';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
@@ -247,6 +248,7 @@ export function StepDetailModal() {
           toolChannel={step.tool_channel}
         />
         {step.detail && <div class="step-detail-detail">{highlightEllipsis(step.detail)}</div>}
+        {step.recall && <StepRecallList recall={step.recall} />}
         {STEP_DETAIL_NOTE[step.outcome] && (
           <div class="step-detail-note">{STEP_DETAIL_NOTE[step.outcome]}</div>
         )}

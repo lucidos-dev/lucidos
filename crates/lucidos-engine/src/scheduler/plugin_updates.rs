@@ -304,7 +304,7 @@ async fn check_marketplaces_for_updates(
     // The scan is the only producer of the plugin catalog cache, so it bookends
     // itself: a start stamp, then either a result or a recorded failure. Both
     // ends announce, which is what raises and lowers the Plugins panel's
-    // "Updating…" cue on every connected client. The stamp is re-taken here
+    // scanning state on every connected client. The stamp is re-taken here
     // rather than trusted from `note_scan_queued`, so the scheduler's own run
     // (which nobody queued) is stamped too.
     note_scan_queued(&workspace);
@@ -312,9 +312,9 @@ async fn check_marketplaces_for_updates(
 
     let scanned = scan_into_cache(&pool, &workspace, &guard, &mut report).await;
 
-    // A slot taken over mid-scan means a newer pass owns the cache and the cue.
-    // Announcing here would lower that pass's "Updating…" and send every client
-    // to re-read a result this one was not allowed to write.
+    // A slot taken over mid-scan means a newer pass owns the cache and the
+    // scanning state. Announcing here would lower that pass's state, and send
+    // every client to re-read a result this one was not allowed to write.
     if !guard.still_held() {
         return (report, false);
     }

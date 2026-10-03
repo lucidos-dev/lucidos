@@ -9,6 +9,7 @@ use chrono::Utc;
 use uuid::Uuid;
 
 use super::{BusEvent, EmittedEvent, EventBus, ParentCallback};
+use crate::engine::agent_recovery::ENGINE_RESTART_INTERRUPT_REASON;
 use crate::engine::thread_events::{
     CancelCause, ChildCompletionStatus, EventMeta, EventWaitCancelCause, ThreadEvent,
 };
@@ -47,6 +48,27 @@ const CHILD_ROW_SQL: &str = "SELECT c.parent_thread_id, c.is_coding_agent, c.tit
 /// context.
 const SUCCESS_SUMMARY_CAP: usize = 2000;
 const FAILURE_SUMMARY_CAP: usize = 200;
+
+/// What an `interrupted` card tells the parent. Nothing resumes the child, so
+/// the parent must know the way to continue it.
+const INTERRUPTED_SUMMARY: &str = "An engine restart cut this child's turn before it \
+     finished, and nothing will resume it on its own. Its work so far is kept. To continue, \
+     send it a follow-up with follow_up_child_thread. If its own work may have \
+     crashed the engine, such as a heavy build or test run, ask the user before restarting it.";
+
+/// Whether `event` is a restart abort that nobody promised to resume: a crash,
+/// or a teardown the user did not ask for. The user's own switch resumes the
+/// turn, so its abort is not a completion.
+fn restart_cut_without_resume(
+    event: &ThreadEvent,
+    actor: Option<&crate::engine::thread_events::MessageOrigin>,
+) -> bool {
+    matches!(
+        event,
+        ThreadEvent::ResponseAborted { cause, .. }
+            if cause.is_transient() && !cause.promises_auto_resume(actor)
+    )
+}
 
 /// Cut `summary` to `cap` bytes on a char boundary, marking the cut.
 fn cap_summary(summary: String, cap: usize) -> String {
@@ -196,11 +218,15 @@ impl EventBus {
     /// the caller has no row to name: [`Self::announce_withheld_completion`]
     /// replays a terminal whose own fan-in already stood down, and the gate then
     /// abstains, which is the fail-open side.
+    ///
+    /// `actor` is the terminal's own, which tells the user's switch from a
+    /// crash: see [`restart_cut_without_resume`].
     pub(super) async fn notify_parent_if_child(
         &self,
         child_thread_id: Uuid,
         terminal_event_id: Option<Uuid>,
         event: &ThreadEvent,
+        actor: Option<&crate::engine::thread_events::MessageOrigin>,
     ) {
         // Not a terminal, and still sometimes the moment a card falls due:
         // see `announce_when_last_wait_ends`.
@@ -210,13 +236,15 @@ impl EventBus {
             return;
         }
 
-        // Cancel = user-driven, terminal. Abort splits on `AbortCause::is_transient`:
-        // EngineShutdown / RecoveryAfterRestart are mid-retry (no decrement, no
-        // callback — the resumed child's eventual idle would be orphaned);
-        // SafetyNet / ProcessKilled / Unknown are terminal (decrement so the
-        // parent doesn't display as Active forever, but no card — the user
-        // already sees the child's error state). Same `is_transient` shape as
-        // `SessionEnded { reason }` below.
+        // Cancel = user-driven, terminal. Abort splits three ways:
+        // - The user's own switch promises a resume: no decrement, no
+        //   callback, since the resumed turn reports.
+        // - A restart nobody promised to undo is a completion, reported as
+        //   `interrupted`. A coding-agent child's recovery idle may follow,
+        //   and the pending-card guard below swallows it.
+        // - SafetyNet / ProcessKilled / Unknown are terminal (decrement so
+        //   the parent doesn't display as Active forever, but no card: the
+        //   user already sees the child's error state).
         //
         // Cancel splits on `CancelCause` for the same reason. A
         // `SupersededByFollowup` is the mid-turn redirect `arm_followup_redirect`
@@ -229,6 +257,7 @@ impl EventBus {
         // set here leaves the in-tx `reconcile_parent_active_children_count`
         // (which runs in the `ResponseCanceled` projection arm, cause-agnostic)
         // as the only thing that fires, so no counter drifts.
+        let cut_without_resume = restart_cut_without_resume(event, actor);
         let is_terminal = match event {
             ThreadEvent::CodingAgentIdled { .. }
             | ThreadEvent::ResponseGenerated { .. }
@@ -236,7 +265,7 @@ impl EventBus {
             ThreadEvent::ResponseCanceled { cause, .. } => {
                 !matches!(cause, CancelCause::SupersededByFollowup)
             }
-            ThreadEvent::ResponseAborted { cause, .. } => !cause.is_transient(),
+            ThreadEvent::ResponseAborted { cause, .. } => !cause.promises_auto_resume(actor),
             ThreadEvent::SessionEnded { reason } => !reason.is_transient(),
             _ => false,
         };
@@ -369,8 +398,8 @@ impl EventBus {
         // Idled early-returns via the dedup guard and never decrements. Add
         // ResponseFailed here so the decrement happens on the ResponseFailed
         // itself; otherwise the parent's count leaks by 1 per failed turn
-        // and the parent pulses as "waiting for children" forever. Transient
-        // aborts (engine shutdown, recovery) already early-returned via
+        // and the parent pulses as "waiting for children" forever. A switch
+        // abort, which promises a resume, already early-returned via
         // `is_terminal`.
         let should_decrement = if is_coding_agent {
             matches!(event, ThreadEvent::CodingAgentIdled { .. })
@@ -397,26 +426,28 @@ impl EventBus {
         // to inbox. ResponseCanceled is included for a cancel that is not a
         // person's Stop: an agent cancelling its own child, or a `UserAction`.
         // A person's Stop and a `SupersededByFollowup` redirect returned above.
-        // ResponseAborted is NOT — the user already sees the child's error
-        // state (SafetyNet/ProcessKilled), and engine-shutdown aborts are
-        // transient (and were filtered out above). For coding-agent children,
-        // SessionEnded also counts when the run's callback is still pending:
-        // handles coding-agent sessions that end without ever idling.
+        // ResponseAborted reports only for a child a restart cut with no
+        // resume promised. The user already sees any other abort's error state
+        // (SafetyNet/ProcessKilled), and a switch abort was filtered out above.
+        // For coding-agent children, SessionEnded also counts when the run's
+        // callback is still pending: handles sessions that end without idling.
         let should_callback = matches!(
             (is_coding_agent, event),
             (true, ThreadEvent::CodingAgentIdled { .. })
                 | (false, ThreadEvent::ResponseGenerated { .. })
                 | (_, ThreadEvent::ResponseFailed { .. })
                 | (_, ThreadEvent::ResponseCanceled { .. })
-        ) || (is_coding_agent
-            && parent_callback_pending
-            && matches!(event, ThreadEvent::SessionEnded { .. }));
+        ) || (cut_without_resume
+            && (parent_callback_pending || !is_coding_agent))
+            || (is_coding_agent
+                && parent_callback_pending
+                && matches!(event, ThreadEvent::SessionEnded { .. }));
 
         // Decrement-only paths must still clear the marker or a follow-up event
         // (CodingAgentIdled, SessionEnded) re-decrements via the
         // `parent_callback_pending` gate above. The should_callback path clears
-        // in-tx via the ChildThreadCompleted projection arm; abort never
-        // emits a typed event, so clear here directly.
+        // in-tx via the ChildThreadCompleted projection arm; an abort that
+        // sends no card emits no typed event, so clear here directly.
         // Non-CC chat children emit exactly one terminator per request (the
         // agentic loop's `has_terminator_for` guard), so they need no marker; CC
         // children can have multiple terminal events for the same turn.
@@ -449,6 +480,21 @@ impl EventBus {
         let last_response = self.last_response_text(child_thread_id).await;
 
         let (status, summary, cap) = match event {
+            // The cut turn produced no result, and the newest response text
+            // belongs to an earlier turn. Say what happened instead.
+            ThreadEvent::CodingAgentIdled {
+                reason: Some(reason),
+                ..
+            } if reason == ENGINE_RESTART_INTERRUPT_REASON => (
+                ChildCompletionStatus::Interrupted,
+                INTERRUPTED_SUMMARY.to_string(),
+                SUCCESS_SUMMARY_CAP,
+            ),
+            ThreadEvent::ResponseAborted { .. } => (
+                ChildCompletionStatus::Interrupted,
+                INTERRUPTED_SUMMARY.to_string(),
+                SUCCESS_SUMMARY_CAP,
+            ),
             ThreadEvent::CodingAgentIdled {
                 has_changes: true, ..
             } => (
@@ -886,6 +932,7 @@ impl EventBus {
             child_thread_id,
             None,
             &ThreadEvent::ResponseFailed { error },
+            None,
         ))
         .await;
     }
@@ -1038,12 +1085,12 @@ impl EventBus {
         }
     }
 
-    /// Settle the child's `parent_callback_pending` marker on a decrement-only
-    /// terminal (a coding-agent child whose terminal is a crash-class
-    /// `ResponseAborted`). Nothing further is owed to the parent: the counter
-    /// already came down through the in-tx reconcile, no card is sent by
-    /// design, and the user is looking at the child's error state. The child
-    /// keeps FALSE until a start event sets it again.
+    /// Settle the child's `parent_callback_pending` marker on a coding-agent
+    /// child's terminal `ResponseAborted`. The counter already came down
+    /// through the in-tx reconcile. A crash-class abort sends no card, and the
+    /// user is looking at the child's error state. A restart abort's
+    /// `interrupted` card follows this clear, and its projection arm clears the
+    /// marker too. The child keeps FALSE until a start event sets it again.
     async fn clear_pending_parent_callback(&self, child_thread_id: Uuid) {
         if let Err(e) = sqlx::query(
             "UPDATE thread_summaries SET parent_callback_pending = FALSE WHERE thread_id = $1",
@@ -1076,9 +1123,11 @@ impl EventBus {
     /// CC auto-resume recovery instead, not re-fired here. This makes the sweep
     /// idempotent across boots via the event-id anchor, with no double-handling.
     ///
-    /// Each candidate is re-injected onto the same `parent_callback_tx` the live
-    /// fan-in uses, so the already-running listener drains it through the exact
-    /// same `notify_parent_of_child_completion` path — the recovery duplicates no
+    /// Each candidate is re-injected through the same `send_parent_callback` the
+    /// live fan-in uses. At boot the parent wake hold queues it. A second wake
+    /// for a card recovery already queued is dropped. After the release the
+    /// listener drains it through the exact same
+    /// `notify_parent_of_child_completion` path — the recovery duplicates no
     /// resume logic, it only re-delivers the lost wake. Returns the number of
     /// wakes re-fired (for the boot log). Mirrors
     /// `propose_held_back_changes_on_startup`: the persisted event is the source
@@ -1188,9 +1237,9 @@ impl EventBus {
         refired
     }
 
-    /// Hand the wake to the listener task. Returns whether it was accepted, so
-    /// a caller that already marked the parent awake can roll that back when
-    /// no turn will follow.
+    /// Hand the wake to the listener task, or to the parent wake hold during
+    /// boot recovery and teardown. Returns whether it was accepted, so a caller that already
+    /// marked the parent awake can roll that back when no turn will follow.
     fn send_parent_callback(
         &self,
         parent_thread_id: Uuid,
@@ -1199,13 +1248,16 @@ impl EventBus {
         child_terminal_event_id: Option<Uuid>,
         parent_is_coding_agent: bool,
     ) -> bool {
-        if let Err(e) = self.parent_callback_tx.send(ParentCallback {
+        let Some(callback) = self.parent_wake_hold.intercept(ParentCallback {
             parent_thread_id,
             child_thread_id,
             child_completed_event_id,
             child_terminal_event_id,
             parent_is_coding_agent,
-        }) {
+        }) else {
+            return true;
+        };
+        if let Err(e) = self.parent_callback_tx.send(callback) {
             crate::log!(
                 "[FanOut] Failed to send parent callback for child {}: {}",
                 child_thread_id,

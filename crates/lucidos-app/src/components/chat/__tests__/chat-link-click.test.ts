@@ -38,8 +38,8 @@ const here: string = dirname(fileURLToPath(import.meta.url));
 const routerSource = readFileSync(resolve(here, '../../shared/markdownLinkClick.ts'), 'utf-8');
 
 const APPS: App[] = [
-  { id: 'work-tracker', name: 'Lucidos Work', description: 'x' },
-  { id: 'habit-tracker', name: 'Habit Tracker', description: 'y' },
+  { id: 'work-tracker', name: 'Lucidos Work', description: 'x', reveal: 'on-load' },
+  { id: 'habit-tracker', name: 'Habit Tracker', description: 'y', reveal: 'on-load' },
 ];
 
 interface MockAnchor {

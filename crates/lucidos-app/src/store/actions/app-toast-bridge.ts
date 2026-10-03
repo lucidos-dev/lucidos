@@ -19,14 +19,11 @@ const TOAST_TYPES = ['success', 'info', 'warning', 'error'] as const;
 /** Handle the app-facing toast bridge (`lucidos.ui.toast` / `lucidos.ui.dismissToast`).
  *  Returns true when it owned the message, so the caller can stop routing.
  *
- *  Split out of `startClient`'s `onAppFrameMessage` so these two branches are
- *  reachable from a unit test: the hook itself wires SSE, service workers and a
- *  dozen timers, and the frontend test environment is deliberately non-jsdom, so
- *  standing it up to prove that a dismiss removes a toast is not practical. The
- *  confirm / prompt / preview-file branches stay in the hook (they need the
- *  `event.source` to post their result back), as does the app-frame
- *  authenticity check, which runs BEFORE this and is what makes the payload
- *  merely untrusted rather than unattributed.
+ *  Its caller is `onAppFrameMessage` (`app-frame-messages.ts`). That keeps the
+ *  confirm / prompt / preview-file branches, which need `event.source` to post
+ *  their result back. It also runs the app-frame authenticity check BEFORE
+ *  this, which is what makes the payload merely untrusted rather than
+ *  unattributed. These two branches need no frame, so they test without one.
  *
  *  Both branches are fire-and-forget: no id, no result reply.
  *

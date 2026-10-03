@@ -30,7 +30,7 @@ const appSrc = src('../../../App.tsx');
 const layerSrc = src('../OverlayLayer.tsx');
 const appUiSrc = src('../../apps/AppUiInline.tsx');
 const appsActionsSrc = src('../../../store/actions/apps.ts');
-const startupSrc = src('../../../store/startup.ts');
+const appFrameMessagesSrc = src('../../../store/actions/app-frame-messages.ts');
 const modalCss = src('../../../styles/global/modal-overlay.css');
 const previewsCss = src('../../../styles/panels/previews.css');
 
@@ -188,7 +188,7 @@ describe('the fullscreen host is kept in step with the DOM', () => {
   // instant, or the host refuses a preview it could show (or, worse, shows one
   // nobody can see). The bridge re-derives immediately before deciding.
   it('re-derives in the app bridge before deciding whether it can show', () => {
-    const branch = startupSrc.match(/if \(data\.type === 'lucidos:ui:preview-file'\) \{[\s\S]*?\n {6}\}/)?.[0] ?? '';
+    const branch = appFrameMessagesSrc.match(/if \(data\.type === 'lucidos:ui:preview-file'\) \{[\s\S]*?\n {4}\}/)?.[0] ?? '';
     expect(branch).not.toBe('');
     const syncAt = branch.indexOf('syncAppFullscreenHost()');
     const decideAt = branch.indexOf('filePreviewBlockedReason()');

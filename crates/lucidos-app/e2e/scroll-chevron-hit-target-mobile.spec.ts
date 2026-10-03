@@ -8,49 +8,14 @@
  * circle (chat/input-messages.css, `--scroll-chevron-reach`). The circle and
  * the glyph stay where they were. A hidden chevron's reach takes no taps.
  */
-import { randomUUID } from 'crypto';
 import { test, expect, Page } from './fixtures';
-import { assertHealthy, disarmFollowSeed, ensureMobileView, navigateToApp, revealSteps } from './helpers';
-import { psql } from './db-helpers';
+import { assertHealthy, disarmFollowSeed, ensureMobileView, navigateToApp, revealSteps, waitForScrollSettled } from './helpers';
+import { psql, seedThreadOfCounters as seedCounters } from './db-helpers';
 
 test.use({ viewport: { width: 393, height: 852 } });
 
-const TURNS = 5;
-const STEPS_PER_TURN = 14;
-
-/** A chat thread whose every step row carries a context counter. A legacy
- *  `ThoughtStreamed` with `context_tokens` is the smallest payload that gives a
- *  step a snapshot, which is what makes its counter a button. */
-function seedThreadOfCounters(): string {
-  const threadId = randomUUID();
-  const base = Date.now();
-  let n = 0;
-  const at = () => new Date(base + n++ * 1000).toISOString();
-  const rows: string[] = [];
-  const row = (type: string, payload: string) =>
-    `('${randomUUID()}', '${type}', '${payload}'::jsonb, '${at()}', 'thread', '${threadId}', '${threadId}')`;
-
-  for (let t = 0; t < TURNS; t++) {
-    const messageId = randomUUID();
-    rows.push(`('${messageId}', 'MessageReceived', '{"text":"turn ${t}","mode":"human","channel":"chat"}'::jsonb, '${at()}', 'thread', '${threadId}', '${threadId}')`);
-    for (let i = 0; i < STEPS_PER_TURN; i++) {
-      const ref = `"request_event_id":"${messageId}"`;
-      rows.push(
-        row('ThoughtStreamed', `{"text":"","context_tokens":${40_000 + i * 1000},"context_messages":${i + 2},${ref}}`),
-        row('ToolCalled', `{"name":"read_file","args":{"path":"notes/${t}-${i}.md"},${ref}}`),
-        row('ToolResult', `{"name":"read_file","result":"ok",${ref}}`),
-      );
-    }
-    rows.push(row('ResponseGenerated', `{"text":"Done ${t}.","images":[],"request_event_id":"${messageId}"}`));
-  }
-
-  psql([
-    `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, state, is_coding_agent, active_children_count, total_children_count, coding_agent_proposed, coding_agent_requires_restart, coding_agent_is_external_repo) ` +
-      `VALUES ('${threadId}', 'E2E scroll chevron reach', 'chat', '${new Date(base).toISOString()}', ${TURNS}, false, true, 'idle', 'archived', 'active', false, 0, 0, false, false, false)`,
-    `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES\n` + rows.join(',\n'),
-  ].join(';\n'));
-  return threadId;
-}
+const seedThreadOfCounters = () =>
+  seedCounters({ turns: 5, stepsPerTurn: 14, title: 'E2E scroll chevron reach' });
 
 const CHEVRONS = [
   { name: 'up', sel: '.mobile-swipe-pane .scroll-to-top' },
@@ -129,6 +94,15 @@ async function parkCounterUnderPoint(page: Page, y: number): Promise<void> {
     const best = counters.reduce((a, c) => (Math.abs(centre(c) - y) < Math.abs(centre(a) - y) ? c : a));
     scroller.scrollTop += centre(best) - y;
   }, y);
+}
+
+/** Wait out a chevron's glide: it reaches the end it scrolls to, then holds. */
+async function waitForGlideToLand(page: Page, end: 'top' | 'bottom', where: string): Promise<void> {
+  await expect.poll(() => page.evaluate((end) => {
+    const el = document.querySelector('.mobile-swipe-pane .thread-content') as HTMLElement;
+    return end === 'top' ? el.scrollTop === 0 : el.scrollTop >= el.scrollHeight - el.clientHeight - 1;
+  }, end), { message: `${where}: the glide never landed` }).toBe(true);
+  await waitForScrollSettled(page);
 }
 
 async function setScale(page: Page, scale: string, rootPx: number): Promise<void> {
@@ -274,6 +248,9 @@ test.describe('The floating scroll chevrons take a near miss', () => {
           await expect(page.locator(`${c.sel}.visible`), `${where}: the chevron did not fire`).toHaveCount(0, { timeout: 5_000 });
           await expect(page.locator(CONTEXT_MODAL), `${where}: the context viewer opened`).toHaveCount(0);
           await expect(page.locator(STEP_MODAL), `${where}: the step detail opened`).toHaveCount(0);
+          // The glide outlives `.visible`. Left running, it overwrites the next
+          // pass's re-centre and park, and that pass taps whatever it moved in.
+          await waitForGlideToLand(page, c.name === 'up' ? 'top' : 'bottom', where);
         }
       }
     }

@@ -32,18 +32,43 @@ const SDK_IFRAME_BASE_CSS: &str = include_str!("sdk_iframe.css");
 const SHARED_COMPONENTS_CSS: &str =
     include_str!("../../../lucidos-app/src/styles/global/shared-components.css");
 
+/// The surface anatomy. `.surface-box` is the menu/popover box every host
+/// dropdown and control panel uses. `lucidos.ui.Select`'s own menu wears it
+/// too (`global/surface.css`). The rest of the file is dialog head/body/foot.
+/// An app never uses it, the same as any unused class in
+/// `SHARED_COMPONENTS_CSS`. See docs/plans/2026-10-03-sdk-dropdown-shares-host-css.md.
+const SURFACE_CSS: &str = include_str!("../../../lucidos-app/src/styles/global/surface.css");
+
+/// The host's text-field look (`.text-input`, opt-in). Apps get the same box,
+/// placeholder colour and focus ring as every host text field, from one
+/// source. See docs/plans/2026-10-03-sdk-dropdown-shares-host-css.md.
+const TEXT_INPUT_CSS: &str = include_str!("../../../lucidos-app/src/styles/global/text-input.css");
+
 /// The theme part rules for app frames, generated from the part catalog: the
 /// `@property` rules for the frame colour tokens, the protected reset, the
 /// `theme-effects` reduce rule and the app opt-out (ADR 0307).
 const THEME_PARTS_CSS: &str =
     include_str!("../../../lucidos-app/src/styles/generated/theme-parts-frame.css");
 
+/// The theme-part rules that tint app CONTROLS (`.lucidos-select-trigger` /
+/// `.text-input` / bare `input`/`select`/`button` border-color + box-shadow).
+/// Concatenated LAST. It names `.lucidos-select-trigger` and `.text-input`
+/// directly, tying their specificity with those classes' own `border`
+/// shorthand in the shared files. The later rule wins a tie, so this file
+/// must come after them.
+const CONTROL_THEME_PARTS_CSS: &str = include_str!("sdk_iframe_control_theme_parts.css");
+
 /// The served `/api/v1/sdk-iframe.css` body: iframe tokens and defaults, the
-/// shared component layer, then the theme part rules. Concatenated once and
-/// cached.
+/// shared component layers, then the theme part rules. Concatenated once and
+/// cached. `CONTROL_THEME_PARTS_CSS` must stay last — see its own comment.
 fn sdk_iframe_css() -> &'static str {
     static CSS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    CSS.get_or_init(|| format!("{SDK_IFRAME_BASE_CSS}\n{SHARED_COMPONENTS_CSS}\n{THEME_PARTS_CSS}"))
+    CSS.get_or_init(|| {
+        format!(
+            "{SDK_IFRAME_BASE_CSS}\n{SHARED_COMPONENTS_CSS}\n{SURFACE_CSS}\n{TEXT_INPUT_CSS}\n\
+             {THEME_PARTS_CSS}\n{CONTROL_THEME_PARTS_CSS}"
+        )
+    })
 }
 
 /// Audio unlock shim — monkey-patches `AudioContext` so app code reuses a
@@ -322,6 +347,31 @@ mod tests {
                 "`{selector}` must name --font-ui: a control inherits no family \
                  from body, so without it the app paints in the UA face. \
                  Found:\n{rule}"
+            );
+        }
+    }
+
+    /// The control theme-part rule names `.lucidos-select-trigger` and
+    /// `.text-input` directly, tying its specificity with those classes' own
+    /// `border` shorthand (`.dropdown-trigger` and `.text-input`, one class
+    /// each). A tie goes to whichever rule is later. So the theme-part rule
+    /// must come after both, or the tie-break picks the shorthand instead of
+    /// the tint (ADR 0307). This is the regression `CONTROL_THEME_PARTS_CSS`
+    /// exists to prevent — see its own doc comment.
+    #[test]
+    fn the_control_theme_part_rule_outruns_the_shared_border_shorthands() {
+        let css = sdk_iframe_css();
+        let theme_part_pos = css
+            .find(", .lucidos-select-trigger, .text-input {")
+            .expect("control theme-part rule must be in the served stylesheet");
+        for needle in ["\n.dropdown-trigger {", "\n.text-input,"] {
+            let pos = css
+                .find(needle)
+                .unwrap_or_else(|| panic!("served stylesheet lacks {needle}"));
+            assert!(
+                pos < theme_part_pos,
+                "{needle} must come BEFORE the control theme-part rule, or its \
+                 border shorthand undoes the theme's tint"
             );
         }
     }

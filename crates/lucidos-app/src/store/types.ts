@@ -9,7 +9,7 @@ import type {
   FormRequestOutcome,
   QuestionOption,
 } from './thread-events/thread-event-types';
-import type { ApiUsage, ContextProducer, ContextSection } from '../generated/thread-event-wire';
+import type { ApiUsage, ContextProducer, ContextSection, RecalledMemory } from '../generated/thread-event-wire';
 import type { Tap } from '@lucidos/sdk';
 
 // Generated from the Rust payload types. Re-exported so a consumer reaching
@@ -19,7 +19,9 @@ export type {
   ContextProducer,
   ContextRole,
   ContextSection,
+  MemorySource,
   ModalityUsage,
+  RecalledMemory,
 } from '../generated/thread-event-wire';
 
 // --- Async data loading ---
@@ -270,6 +272,8 @@ type ResponseEventKind =
       contextCapture?: ContextCapture;
       /** Accumulated reasoning text for a "Thinking" step — see Step.thinkingText. */
       thinkingText?: string;
+      /** A pre-turn recall's findings, for the step detail to list. */
+      recall?: StepRecall;
     }
   | { type: 'section_break'; channel: string }
   | {
@@ -427,6 +431,13 @@ type ResponseEventKind =
        *  `exchangeResponseEvents`, never sent by the backend. */
       type: 'empty';
     };
+
+/** What a `MemoryRecalled` step found. `memories` is empty on rows written
+ *  before the engine recorded them, which leaves only the queries. */
+export interface StepRecall {
+  memories: RecalledMemory[];
+  queries: string[];
+}
 
 /** A response event, and where it sits on the thread's clock. */
 export type ResponseEvent = ResponseEventKind & {
@@ -741,11 +752,16 @@ export interface KnownOAuthProviders {
 }
 
 // An app definition — the app IS the UI component (flat structure)
+/** When the host lifts its cover off an opening app, from the manifest's
+ *  `reveal`. `on-ready` waits for the app's `lucidos.ui.ready()`. */
+export type AppReveal = 'on-load' | 'on-ready';
+
 export interface App {
   id: string;
   name: string;
   description: string;
   icon?: string;
+  reveal: AppReveal;
 }
 
 // A pinned app entry

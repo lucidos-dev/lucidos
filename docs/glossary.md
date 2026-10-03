@@ -537,10 +537,16 @@ It **leaves in two beats**, which only the app document ever plays (`boot-splash
 The *boot splash*'s no-ceremony mode, used by a document whose load CONTINUES a session rather than starting one (`boot-splash-quiet`, set by an inline script in `crates/lucidos-app/index.html` before first paint). Two triggers: a **refresh the user asked for** (`refreshClient` stamps the one-shot `lucidos-splash-quiet` flag before reloading, covering the control-panel button, the "New version available" toast, the applied-change / reconnect toasts, the recovery Reload buttons and the stale-chunk auto-reload), and a **notification deep link** on the URL. It drops the mark, the baked "Opening your workspace…" status and the brand gradient, painting the app's own `--bg-primary` on the splash and on both canvas layers, and `bootSplashPlaysNoReveal()` lets `useBootSplashReady` skip the min-reveal floor. It exists because such a reload would otherwise play a cold-launch animation over a session the user was already in. (The notification-tap trigger is only needed because WebKit gives a push tap no reload-free channel into an open PWA window, so the tap arrives as a full cross-document load; that URL design is registered in `docs/temporary-measures.md`, the cover is not, see `system-knowhow/notifications.md` §4.5.) Quiet, not silent: the *delayed* status still writes past `STATUS_DELAY_MS`, so a stuck load still says so. It stands down for a document the *Workspace gateway* handed a standing mark to (`boot-splash-formed`), which is a cold boot the user already watched rather than a continuation.
 
 ### Client startup
-`startClient()` in `crates/lucidos-app/src/store/startup.ts`: the initial loads, the event stream, and every document-level listener and poll of one app document. `main.tsx`'s `boot()` calls it before it renders anything, so the startup fetches run while the *shell chunk* loads (ADR 0288). It returns its teardown. It was the `useStartup` hook inside `<App/>`, which made every fetch wait for the whole UI to parse and render once.
+`startClient()` in `crates/lucidos-app/src/store/startup.ts`: the initial loads, the event stream, and the document-level listeners and polls the data layer needs. `main.tsx`'s `boot()` calls it before it renders anything, so the startup fetches run while the *shell chunk* loads (ADR 0288). It returns its teardown. A listener only a drawn UI can need belongs in *shell startup* instead. It was the `useStartup` hook inside `<App/>`, which made every fetch wait for the whole UI to parse and render once.
 
 ### Shell chunk
-The built chunk holding `<App/>` and everything only the UI reaches: header, drawer, panes, the transcript and composer. `main.tsx` imports it lazily and asks for it as soon as the entry evaluates, and `index.html` modulepreloads it (`vite/shellChunkPreload.ts`). It loads beside the entry chunk, under the *boot splash*, while *client startup* is already fetching. So the entry chunk is the data layer alone, held to its budget by `vite/entryChunkBudget.ts` (ADR 0288). Anything a cold open can draw in its first frame belongs here, not behind an *idle prefetch*.
+The built chunk holding `<App/>` and everything only the UI reaches: header, drawer, panes, the transcript and composer. `main.tsx` imports it lazily and asks for it as soon as the entry evaluates, and `index.html` modulepreloads it (`vite/shellChunkPreload.ts`). It loads beside the entry chunk, under the *boot splash*, while *client startup* is already fetching. So the entry chunk is the data layer alone, held to its *entry chunk budget* (ADR 0288). Anything a cold open can draw in its first frame belongs here, not behind an *idle prefetch*.
+
+### Shell startup
+`startShell()` in `crates/lucidos-app/src/shellStartup.ts`: the document-level listeners only a drawn UI can need. `main.tsx`'s shell loader runs it once the *shell chunk* resolves, before `<App/>` first renders, so nothing it installs can be needed earlier. It holds the composer and toast diagnostic probes, the app keybindings sync, the app frame messages, and the pending upload and unsent message restores. Their code then ships in the shell chunk rather than the entry chunk (ADR 0353). It returns its teardown.
+
+### Entry chunk budget
+The first-paint ceiling on the built entry chunk, `build.chunkSizeWarningLimit` (600 kB), enforced by `vite/entryChunkBudget.ts`. Past it, every single-shot build fails. Past the **soft line** at 90 %, every build warns with the headroom left, so the nightly goes red before an Apply is blocked. The dev *shared build-watch* only reports an overrun, recorded as `entryChunk` in `.build-watch/status.json`. It names itself to the plugin through `LUCIDOS_DEV_BUILD_WATCH`, honoured only when the value is the build's parent pid (ADR 0288, ADR 0353).
 
 ### Safe-area floor
 The insets `utils/safeAreaFloor.ts` publishes as `--safe-area-floor-*` when an iOS home-screen app has lost its `env(safe-area-inset-*)` values. After a phone call, WebKit can report them as 0, which puts the header under the clock, and the loss may outlast a relaunch. The floor is the last real reading for the same orientation and width, kept in storage. It applies while the top, left or right side reads 0 against that reading and no side has gained an inset. Every stylesheet reads the insets through `var(--safe-area-*)` (`styles/global/base.css`), never `env()` directly, so the floor reaches all of them. A temporary measure (`docs/temporary-measures.md`).
@@ -887,6 +893,11 @@ A mark the engine puts on a coding-agent child whose current terminal it is abou
 
 The hold decides nothing on its own: `auto_resume_after_api_error` does, so past `MAX_API_ERROR_AUTO_RESUMES` no hold is taken and the card fires as it always did. It is also deliberately blind to durable state and clears no `parent_callback_pending`. That is what lets the resumed turn report, and what makes an engine death mid-hold safe. Where a resume is decided but never actuated, `held_completion_release` answers `Announce` and the withheld failure reaches the parent after all. See ADR 0199 and `docs/plans/2026-09-16-a-terminal-the-engine-will-resume-is-not-a-completion.md`.
 
+### Parent wake hold
+The queue that holds parent wakes back while the engine cannot run a turn (`event_bus/parent_wake_hold.rs`). The card still persists; only the wake waits. Unlike the *auto-resume hold*, it withholds no card.
+
+Boot engages it before recovery and releases it after the event-wait rebuild, so no woken parent races the recovery sweeps. Teardown engages it and never releases it, so the next boot's refire wakes the parent. It drops a second wake for a queued card, which is how the refire and recovery's own wake come to one turn. See `docs/plans/2026-10-03-crash-cut-child-reports-truthfully.md`.
+
 ### Callback linkage
 The `parent_thread_id` field on a spawned thread's first `MessageReceived` (projected onto `thread_summaries.parent_thread_id`), and the single field that makes a thread somebody's *child thread*: it is what fires the parent callback when the child terminates (`notify_parent_if_child`), what increments `active_children_count` / `total_children_count`, what sets `parent_callback_pending`, and what `resolve_attend_mode` hops along when deciding whether a coding-agent permission card inherits a trigger's *side-effect grant*. Deliberately NOT the same thing as the *attribution* carried in `MessageOrigin::ThreadLink`, which only names the *spawning thread* for the message route popover. A `relation: "child"` spawn carries both; a *top-thread* and a *child follow-up* carry attribution with no linkage. Conflating them is what made a top-thread render its Origin as "Unknown" (`agentic_loop_special_tool::spawn_origin` versus `Relation::spawn_linkage`); anything deciding parent-ness reads the linkage, never the origin.
 
@@ -1167,6 +1178,10 @@ Scoped to `command_execution` by tool name, so it is Codex-only by construction.
 Three deliberate narrowings, each closing a way a `Safe` verdict could mean less than it says. `ReversibleDanger` cards, unlike on the chat lane, because that lane brackets it with a *command checkpoint* and this gate has no undo. A `fast_path_refused` shape never reaches the *judge*, which is handed the command text alone and cannot see the refusal. And `command_guard::command_escalates_privilege` cards a command run as another user: the head walk treats `sudo` as a benign prefix, settling `sudo cat` on the strength of `cat`.
 
 The static half always runs and needs no model. The *ambiguous middle* reaches the judge only under BOTH command-guard toggles (`command_guard`, then `command_guard_judge`), so it ships off with the master. A judge that is off, absent, erroring or timed out leaves the card. Position matters: the gate sits below every grant, so a granted command never pays for a judge call, and below the unattended branch, which returns above it.
+
+### App load bar
+
+The indeterminate accent bar along the top of the app pane while an *app frame* opens (`.app-ui-load-bar`, mounted by `components/apps/AppUiInline.tsx`). It is delay-gated by `SPINNER_DELAY_MS`, so a fast open shows none. It follows "not yet loaded or ready", not the cover: when the 3 s fuse lifts an on-load app's cover first, the bar keeps running until `load`. The rules live in `components/apps/appFrameReveal.ts`, beside the user-facing *ready signal* that ends it for an on-ready app.
 
 ### App frame
 
@@ -2483,6 +2498,15 @@ The random id one hold of the *e2e lock* carries. The orphan sweep and the WebKi
 
 A `browser` orphan needs two facts: its argv[0] lies in the Playwright browsers cache, and its environment holds the marker. The cache path alone matched every Playwright browser on the host. Teardown sweeps its own run's marker, a reclaim the dead owner's, and a lock file with no `RUN_ID` finds no browser orphans. Read from the environment only, never argv (ADR 0251).
 
+### Build memory gate
+The check every heavy cargo build passes before it starts: `scripts/build-memory-gate.sh`, run by `scripts/with-build-slot.sh` before it asks for a slot and by `scripts/harden-suites.sh` before each cargo suite. Its verdict is the pre-flight gate's rule, applied by `host_memory_gate_verdict` in `scripts/lib/host_memory_guard.sh`. On NO-GO it waits up to 15 minutes for the host to recover, then exits 72, which says the build never started. A host it cannot read is GO. A pass holds for 60 s in the process tree, so a nested build skips the readings (ADR 0351).
+
+### Memory-stop resume
+What the e2e harness does after its own memory stop, instead of ending the run. `recover_after_memory_stop` in `scripts/e2e-browser.sh` tears down, waits for the host to recover, restarts the engine on a fresh database, and carries on. A boundary stop resumes at the next chunk, an in-chunk stop runs its chunk again, and a stop in nav never re-runs the CC phase. Recovered means three clean readings in a row: the running guard's boundary rule, load under the host-load cap, and no recent jetsam report. A run spends at most three resumes, each wait is bounded, and `LUCIDOS_E2E_RESUME_BY` caps them at a local time. A run whose host never recovers exits 71 and names the exact chunks with no verdict (ADR 0351).
+
+### Chunk ceiling
+The wall-clock limit on one mobile-webkit chunk invocation, 20 minutes by default (`LUCIDOS_E2E_CHUNK_CEILING_SECS`). A watchdog beside the runner interrupts it past the limit, through the guard's pid-tree stop. The second net beside the in-chunk stop: that one catches a chunk that starves the host, this one a chunk that hangs without starving it. A tripped chunk is a failure, the engine restarts before the next chunk, and a second trip ends the project (ADR 0351).
+
 ### Pre-flight engine reclaim
 The nightly step that stops every `lucidos-engine` which should not be running, ahead of the pipeline's memory gate. Entry point `scripts/preflight-reclaim-engines.sh`, logic in `scripts/lib/preflight_reclaim.sh`, offline-tested by `preflight_reclaim_test.sh`. Three rules are load-bearing, and each replaces a way the pasted bash snippet it grew out of was a silent no-op.
 
@@ -3026,6 +3050,21 @@ The engine's record of the client event ids that `POST /api/v1/chat/stream` alre
 
 - **Admitted after every refusal.** A request the handler refuses leaves its id free, so the corrected retry runs. A failure later on that starts nothing calls `forget`.
 - **Lost on restart, by design.** Past a restart the events table answers, and a coding-agent turn the restart killed had nothing to duplicate.
+
+
+### Unsent message record
+The stored copy of a send on the sending device (`store/unsentMessageRecords.ts`), in a per-workspace IndexedDB database. `sendMessage` writes it before the POST, in phase `sending`. No answer marks it `unsent` with its retry count. An accepted or refused send, the engine's own row, Discard, and deleting the thread all end it. So a record found at startup is a send whose outcome the page never learned.
+
+`store/actions/unsentMessageRestore.ts` brings each one back once the engine serves the thread list, where it was sent (`sentAt`). It is adopted only if no live tab owns it (`store/pageOwner.ts`). See ADR 0352.
+
+### Send settlement
+What a sender owes once the engine decides its send after the first attempt (`SendSettlement` in `store/unsentMessages.ts`). It is data, not a callback, so an *unsent message record* settles after a reload exactly as in the page that sent it. It has three kinds:
+
+- `first-send`: accepted consumes the draft's picks, and refused rolls the draft back.
+- `follow-up`: refused appends the text to the draft.
+- `raw-new`: refused starts a fresh draft.
+
+`store/actions/sendSettlement.ts` runs them.
 
 ### ModelRegistry
 The in-memory model routing map, `Arc<RwLock<HashMap<String, ModelRouting>>>` in `crates/lucidos-engine/src/llm/model_registry.rs`. A `ModelRouting` is a model's ordered *route* list plus its *preferred provider*. Projected from the `models` config table (`load_from_db`) and cloned into `RoutingProvider`. The engine's `spawn_models_registry_subscriber` hot-swaps it on any `Model{Created,Updated,Deleted}` event, so re-routing a model in Settings takes effect without a restart. 

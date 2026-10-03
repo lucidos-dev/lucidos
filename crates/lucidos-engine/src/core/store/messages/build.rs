@@ -176,6 +176,9 @@ pub fn format_child_thread_completed_block(event: &EventRow) -> String {
         // its own child. The summary says which. A person's Stop never lands
         // here: it sends `ChildThreadStopped` (ADR 0252).
         Ok(ChildCompletionStatus::Canceled) => "canceled",
+        // Not finished: a restart cut the turn. The summary says how to
+        // continue it.
+        Ok(ChildCompletionStatus::Interrupted) => "interrupted by an engine restart",
         Err(_) => "completed",
     };
     let summary = event

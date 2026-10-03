@@ -51,9 +51,16 @@ const sharedSheet: Sheet = {
   file: 'global/shared-components.css',
   rules: cssRules(read(resolve(styles, 'global/shared-components.css'))),
 };
+/** The two engine files carrying frame-part CONSUMER rules. The control one
+ *  is its own file, concatenated last in the served stylesheet, because a
+ *  `.dropdown-trigger` / `.text-input` border shorthand would otherwise undo
+ *  it (`crates/lucidos-engine/src/api/sdk.rs`). */
 const frameSheet: Sheet = {
   file: 'sdk_iframe.css',
-  rules: cssRules(read(resolve(repo, 'crates/lucidos-engine/src/api/sdk_iframe.css'))),
+  rules: [
+    ...cssRules(read(resolve(repo, 'crates/lucidos-engine/src/api/sdk_iframe.css'))),
+    ...cssRules(read(resolve(repo, 'crates/lucidos-engine/src/api/sdk_iframe_control_theme_parts.css'))),
+  ],
 };
 
 const PART_REF = /var\(\s*(--part-[a-z0-9-]+)/g;

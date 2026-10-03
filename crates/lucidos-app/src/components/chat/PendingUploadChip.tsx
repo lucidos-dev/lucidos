@@ -53,6 +53,7 @@ function ProgressRing({ ring }: { ring: number | 'spin' }) {
         cx="18"
         cy="18"
         r={RING_RADIUS}
+        transform="rotate(-90 18 18)"
         stroke-dasharray={RING_CIRCUMFERENCE}
         stroke-dashoffset={RING_CIRCUMFERENCE * (1 - fraction)}
       />

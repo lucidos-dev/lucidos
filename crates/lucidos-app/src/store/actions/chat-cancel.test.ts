@@ -26,7 +26,7 @@ vi.mock('./thread-loading', async (importOriginal) => ({
 
 import { cancelCurrentExchange, handleCancelExchange } from './chat';
 import { cancelingThreadIds, focusedThreadId, threadMap } from '../store';
-import { setCanceledQuestion, canceledQuestionByThread } from '../../components/chat/prompt-input-helpers';
+import { setCanceledQuestion, canceledQuestionByThread } from '../canceledQuestions';
 import type { ThreadMeta, ThreadState } from '../thread-events';
 
 const originalFetch = globalThis.fetch;

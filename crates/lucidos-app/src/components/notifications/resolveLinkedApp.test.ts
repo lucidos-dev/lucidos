@@ -3,8 +3,8 @@ import { resolveLinkedApp } from './resolveLinkedApp';
 import type { App, Loadable } from '../../store/types';
 
 const appList: App[] = [
-  { id: 'morning-dashboard', name: 'Dashboard', description: '' },
-  { id: 'habit-tracker', name: 'Habit Tracker', description: '' },
+  { id: 'morning-dashboard', name: 'Dashboard', description: '', reveal: 'on-load' },
+  { id: 'habit-tracker', name: 'Habit Tracker', description: '', reveal: 'on-load' },
 ];
 const loaded: Loadable<App[]> = { status: 'loaded', data: appList };
 

@@ -721,7 +721,7 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// A marketplace scan began. Raises the Plugins panel's "Updating…" cue.
+    /// A marketplace scan began. Raises the Plugins panel's scanning state.
     ///
     /// TRANSIENT (never persisted), like `MemoryRebuildProgress`. The scan runs
     /// at startup and every five minutes. Persisting it would add a heartbeat

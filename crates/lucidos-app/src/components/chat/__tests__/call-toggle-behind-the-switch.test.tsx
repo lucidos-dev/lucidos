@@ -13,7 +13,7 @@ import { describe, it, expect, afterEach, beforeEach } from 'vitest';
 import { render } from 'preact';
 import { CallToggle } from '../CallToggle';
 import { preferences } from '../../../store/store';
-import { voiceCall } from '../../../store/voice';
+import { voiceCall } from '../../../store/voiceCall';
 import { CALL_IDLE } from '../../../voice/callState';
 
 let host: HTMLDivElement;

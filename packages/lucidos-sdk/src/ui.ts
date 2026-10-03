@@ -856,6 +856,18 @@ export const ui = {
   },
 
   /**
+   * Tell the host your content is on screen, so it can lift its loading cover.
+   * Only an app whose `manifest.json` declares `"reveal": "on-ready"` is held
+   * for this; any other app is revealed on its page `load`, and the call does
+   * nothing. Call it once your first data has rendered. A repeated call is
+   * harmless, and in its own tab the app has no host, so nothing is sent.
+   */
+  ready(): void {
+    if (window.parent === window) return;
+    window.parent.postMessage({ type: 'lucidos:ui:ready' }, '*');
+  },
+
+  /**
    * Prompt for a line of text via a modal rendered by the host shell (above all
    * app content, themed by the user's preferences). Resolves to the entered
    * string on OK/Enter, or `null` on Cancel / Esc / backdrop click. If another

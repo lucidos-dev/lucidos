@@ -14,15 +14,12 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
 
-vi.mock('../../../store/voice', async () => {
-  const { signal } = await import('@preact/signals');
-  const { CALL_IDLE } = await import('../../../voice/callState');
-  return { voiceCall: signal(CALL_IDLE), pressCallToggle: vi.fn() };
-});
+vi.mock('../../../store/voice', () => ({ pressCallToggle: vi.fn() }));
 
 import { CallToggle } from '../CallToggle';
 import { preferences } from '../../../store/store';
-import { pressCallToggle, voiceCall } from '../../../store/voice';
+import { pressCallToggle } from '../../../store/voice';
+import { voiceCall } from '../../../store/voiceCall';
 import { microphones } from '../../../store/microphones';
 import { CALL_IDLE, callStatusLabel } from '../../../voice/callState';
 import { tooltipWithShortcut } from '../../../store/actions/keybindings';

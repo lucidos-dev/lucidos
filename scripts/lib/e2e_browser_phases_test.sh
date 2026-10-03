@@ -114,6 +114,12 @@ lift() {
 }
 
 lift merge_rc
+lift webkit_chunk_size
+lift memory_resume_budget
+lift recover_after_memory_stop
+lift note_unverified
+lift report_memory_resumes
+lift restart_e2e_after_chunk_ceiling
 lift webkit_chunk_range
 lift report_webkit_chunk_range
 lift webkit_phase_selection
@@ -138,6 +144,18 @@ CMD=(npx playwright test)
 OUTPUT_ARG=()
 WEBKIT_CHUNK_RANGE_APPLIED=""
 WEBKIT_PHASE_APPLIED=""
+MEMORY_RESUMES=0
+MEMORY_STOP_HISTORY=""
+RUN_UNVERIFIED=""
+CHUNK_CEILING_TRIPS=0
+CHUNK_CEILING_STOPPED=""
+# shellcheck disable=SC2034 # read by the lifted recover_after_memory_stop
+MEMORY_STOP_DETAIL=""
+
+# The cases written before the harness owned its recovery describe a stop that
+# ends the run. A budget of 0 is exactly that behaviour, so they keep their
+# meaning, and the resume cases below set their own budget.
+export LUCIDOS_E2E_MEMORY_RESUMES=0
 
 # ── the stubs ───────────────────────────────────────────────────────────
 # Each one echoes, and the driver captures stdout, so the trace is ONE ordered
@@ -154,6 +172,11 @@ STUB_TRIP_RC=130
 STUB_FAIL_ON_CALL=""
 PW_CALLS=0
 TRIPPED=""
+# The chunk ceiling: the calls (space separated) during which it trips.
+STUB_CEILING_ON_CALLS=""
+CEILING_TRIPPED=""
+# The recovery wait: 0 the host recovers, 1 it never does.
+STUB_RECOVERS=0
 
 reset_stubs() {
     STUB_PW_RC=0
@@ -163,6 +186,11 @@ reset_stubs() {
     STUB_FAIL_ON_CALL=""
     PW_CALLS=0
     TRIPPED=""
+    STUB_CEILING_ON_CALLS=""
+    CEILING_TRIPPED=""
+    STUB_RECOVERS=0
+    STUB_RESET_RC=0
+    export LUCIDOS_E2E_MEMORY_RESUMES=0
 }
 
 # shellcheck disable=SC2329 # a seam: invoked by the lifted code, not from this file
@@ -176,7 +204,10 @@ set_output_dir() { OUTPUT_ARG=(--output="stub-output/$1"); }
 # shellcheck disable=SC2329 # a seam: invoked by the lifted code, not from this file
 run_playwright() {
     PW_CALLS=$((PW_CALLS + 1))
-    echo "playwright: $*"
+    echo "playwright: $* [ceiling ${CHUNK_CEILING_SECS:-none}]"
+    case " $STUB_CEILING_ON_CALLS " in
+        *" $PW_CALLS "*) CEILING_TRIPPED=1; return 130 ;;
+    esac
     if [ "$PW_CALLS" = "$STUB_TRIP_ON_CALL" ]; then
         TRIPPED=1
         return "$STUB_TRIP_RC"
@@ -205,9 +236,33 @@ report_playwright_totals() { echo "tally: $1"; return "$STUB_TALLY_RC"; }
 # shellcheck disable=SC2329 # a seam: invoked by the lifted code, not from this file
 check_host_memory_at_boundary() {
     echo "boundary: $1"
-    [ "$1" = "$STUB_BOUNDARY_FAIL_AT" ] && return 1
+    printf '%s\n' "$STUB_BOUNDARY_FAIL_AT" | grep -qxF -- "$1" && return 1
     return 0
 }
+
+# The chunk ceiling and the recovery collaborators. Each one echoes into the
+# trace, so a test can see the teardown, the wait and the restart happen.
+# shellcheck disable=SC2329 # a seam: invoked by the lifted code, not from this file
+host_memory_chunk_ceiling_secs() { echo 1200; }
+# shellcheck disable=SC2329 # a seam: invoked by the lifted code, not from this file
+host_memory_chunk_ceiling_tripped() { [ -n "$CEILING_TRIPPED" ]; }
+# shellcheck disable=SC2329 # a seam: invoked by the lifted code, not from this file
+clear_chunk_ceiling_trip() { CEILING_TRIPPED=""; }
+# shellcheck disable=SC2329 # a seam: invoked by the lifted code, not from this file
+stop_e2e_workspace() { echo "teardown: engine stopped"; }
+# shellcheck disable=SC2329 # a seam: invoked by the lifted code, not from this file
+sweep_e2e_orphans() { echo "teardown: orphans swept"; }
+# shellcheck disable=SC2329 # a seam: invoked by the lifted code, not from this file
+cleanup_e2e_worktrees() { echo "teardown: worktrees cleaned"; }
+# shellcheck disable=SC2329 # a seam: invoked by the lifted code, not from this file
+host_memory_wait_for_recovery() { echo "recovery: waited"; return "$STUB_RECOVERS"; }
+# shellcheck disable=SC2329 # a seam: invoked by the lifted code, not from this file
+clear_host_memory_stop() { TRIPPED=""; MEMORY_STOPPED=""; echo "recovery: stop cleared"; }
+# STUB_RESET_RC makes the engine restart fail, for the case where it does not
+# come back.
+STUB_RESET_RC=0
+# shellcheck disable=SC2329 # a seam: invoked by the lifted code, not from this file
+reset_e2e_database() { echo "engine: fresh database"; return "$STUB_RESET_RC"; }
 
 # ── the fixture ─────────────────────────────────────────────────────────
 # Two CC specs, three nav specs, and one *-desktop.spec.ts that also calls the CC
@@ -251,6 +306,12 @@ drive_in() {
     MEMORY_STOPPED=""
     WEBKIT_CHUNK_RANGE_APPLIED=""
     WEBKIT_PHASE_APPLIED=""
+    MEMORY_RESUMES=0
+    MEMORY_STOP_HISTORY=""
+    RUN_UNVERIFIED=""
+    # shellcheck disable=SC2034 # read by the lifted run_specs_chunked
+    CHUNK_CEILING_TRIPS=0
+    CHUNK_CEILING_STOPPED=""
     # shellcheck disable=SC2034 # cleared per run; set_output_dir refills it for the lifted code
     OUTPUT_ARG=()
     cd "$dir" || return 99
@@ -312,7 +373,7 @@ test_a_stop_at_the_phase_boundary_skips_navigation() {
     rc=$?
     assert_eq "71" "$rc" "the memory-stop code is returned"
     assert_says "$OUT/stop.out" "boundary: mobile-webkit phase 1/2 (CC)" "the boundary is checked between the phases"
-    assert_says "$OUT/stop.out" "phase 2/2 SKIPPED: stopped on host memory" "the skip is announced"
+    assert_says "$OUT/stop.out" "phase 2/2 SKIPPED: the CC phase stopped the project" "the skip is announced"
     assert_silent_about "$OUT/stop.out" "mobile-webkit nav chunk" "no navigation spec ran after the stop"
     assert_eq "mobile-webkit" "$MEMORY_STOPPED" "the project is recorded as stopped"
     # The CC half still got its verdict, which is the entire reason it goes first.
@@ -721,7 +782,7 @@ test_a_trip_inside_the_cc_phase_skips_navigation() {
     STUB_TRIP_ON_CALL=1
     drive_in "$FAKE" "$OUT/tripcc.out" || rc=$?
     assert_eq "71" "$rc" "the run exits with the memory stop code"
-    assert_says "$OUT/tripcc.out" "phase 2/2 SKIPPED: stopped on host memory" "navigation is skipped and says why"
+    assert_says "$OUT/tripcc.out" "phase 2/2 SKIPPED: the CC phase stopped the project" "navigation is skipped and says why"
     assert_eq "1" "$(grep -c '^playwright:' "$OUT/tripcc.out")" "only the interrupted chunk ran"
     assert_silent_about "$OUT/tripcc.out" "boundary: mobile-webkit phase 1/2 (CC)" "the phase boundary is not checked again"
 }
@@ -818,6 +879,8 @@ test_run_playwright_records_its_runner_and_keeps_its_contract() {
         clear_host_memory_runner() { echo "clear" >> "$log"; }
         # shellcheck disable=SC2329 # a seam: invoked by the lifted code, not from this file
         interrupt_host_memory_runner_if_tripped() { echo "late-check" >> "$log"; }
+        # shellcheck disable=SC2329 # a seam: invoked by the lifted code, not from this file
+        stop_chunk_ceiling_watchdog() { echo "ceiling-stop" >> "$log"; }
         # shellcheck disable=SC2016 # expanded by the inner sh, not here
         real_run_playwright sh -c 'echo "pid=$$"; echo out-line; echo err-line >&2; exit 3'
     ) >"$OUT/realpw.out" 2>&1 || rc=$?
@@ -830,6 +893,263 @@ test_run_playwright_records_its_runner_and_keeps_its_contract() {
     assert_says "$log" "record $pid" "the recorded pid is the runner's own"
     assert_before "$log" "record" "clear" "the record is cleared once the runner returns"
     assert_before "$log" "record" "late-check" "a trip that landed during the start is checked once recorded"
+}
+
+# ── recovery after a memory stop (ADR 0351) ─────────────────────────────
+# The harness tears down, waits for the host, and carries on where the stop
+# landed. Every case asserts what ran, how often, and what has no verdict.
+
+count_of() { grep -cF -- "$2" "$1"; }
+
+test_a_boundary_stop_resumes_at_the_next_chunk() {
+    echo "test: a stop between nav chunks resumes at the next chunk, and CC never runs again"
+    local rc=0
+    reset_stubs
+    export LUCIDOS_E2E_MEMORY_RESUMES=3
+    STUB_BOUNDARY_FAIL_AT="mobile-webkit nav chunk 1/2"
+    drive_in "$FAKE" "$OUT/resume-boundary.out" || rc=$?
+    assert_eq "0" "$rc" "a run that resumed and finished reports the tests' own verdict"
+    assert_eq "" "$MEMORY_STOPPED" "no stop stands at the end"
+    assert_eq "1" "$MEMORY_RESUMES" "one resume was spent"
+    assert_eq "" "$RUN_UNVERIFIED" "nothing is left without a verdict"
+    assert_before "$OUT/resume-boundary.out" "boundary: mobile-webkit nav chunk 1/2" "teardown: engine stopped" "the teardown follows the stop"
+    assert_before "$OUT/resume-boundary.out" "recovery: waited" "engine: fresh database" "the engine restarts only after the wait"
+    assert_before "$OUT/resume-boundary.out" "engine: fresh database" "nav chunk 2/2: 1 specs" "the next chunk runs after the restart"
+    assert_eq "1" "$(count_of "$OUT/resume-boundary.out" "nav chunk 1/2: 2 specs")" "the finished chunk is not run again"
+    assert_eq "1" "$(count_of "$OUT/resume-boundary.out" "CC chunk 1/1: 2 specs")" "the CC phase is not run again"
+}
+
+test_an_in_chunk_stop_runs_that_chunk_again() {
+    echo "test: a stop inside nav chunk 1/2 runs that same chunk again after the recovery"
+    local rc=0
+    reset_stubs
+    export LUCIDOS_E2E_MEMORY_RESUMES=3
+    STUB_TRIP_ON_CALL=2
+    drive_in "$FAKE" "$OUT/resume-inside.out" || rc=$?
+    assert_eq "0" "$rc" "the interrupted chunk's code is dropped, the re-run's counts"
+    assert_eq "2" "$(count_of "$OUT/resume-inside.out" "nav chunk 1/2: 2 specs")" "the interrupted chunk ran twice"
+    assert_says "$OUT/resume-inside.out" "nav chunk 1/2: RUNNING AGAIN after the recovery" "the re-run is announced"
+    assert_eq "1" "$(count_of "$OUT/resume-inside.out" "nav chunk 2/2: 1 specs")" "the next chunk ran once"
+    assert_eq "4" "$(grep -c '^playwright:' "$OUT/resume-inside.out")" "CC once, nav 1 twice, nav 2 once"
+}
+
+test_a_stop_at_the_phase_boundary_resumes_into_navigation() {
+    echo "test: a stop at the CC/nav boundary resumes straight into navigation"
+    local rc=0
+    reset_stubs
+    export LUCIDOS_E2E_MEMORY_RESUMES=3
+    STUB_BOUNDARY_FAIL_AT="mobile-webkit phase 1/2 (CC)"
+    drive_in "$FAKE" "$OUT/resume-phase.out" || rc=$?
+    assert_eq "0" "$rc" "the run finishes"
+    assert_before "$OUT/resume-phase.out" "engine: fresh database" "phase 2/2: 3 navigation specs" "navigation starts after the recovery"
+    assert_eq "1" "$(count_of "$OUT/resume-phase.out" "CC chunk 1/1: 2 specs")" "the CC phase ran once"
+}
+
+test_a_host_that_never_recovers_names_the_exact_range() {
+    echo "test: a host that never recovers exits 71 and names the chunks with no verdict"
+    local rc=0
+    reset_stubs
+    export LUCIDOS_E2E_MEMORY_RESUMES=3
+    STUB_RECOVERS=1
+    STUB_BOUNDARY_FAIL_AT="mobile-webkit nav chunk 2/4"
+    drive_in "$RANGE" "$OUT/noresume.out" || rc=$?
+    assert_eq "71" "$rc" "the run exits with the memory stop code"
+    assert_eq "mobile-webkit" "$MEMORY_STOPPED" "the stop stands"
+    assert_eq "mobile-webkit nav chunks 3-4 of 4" "$(printf '%s' "$RUN_UNVERIFIED" | sed '/^$/d')" "the unverified range is exact"
+    assert_silent_about "$OUT/noresume.out" "engine: fresh database" "nothing restarts onto a host that did not recover"
+    assert_silent_about "$OUT/noresume.out" "nav chunk 3/4: 2 specs" "no chunk runs after the stop"
+}
+
+test_the_resume_budget_is_bounded() {
+    echo "test: once the resume budget is spent, the next stop ends the run"
+    local rc=0
+    reset_stubs
+    export LUCIDOS_E2E_MEMORY_RESUMES=1
+    STUB_BOUNDARY_FAIL_AT="mobile-webkit nav chunk 1/4
+mobile-webkit nav chunk 2/4"
+    drive_in "$RANGE" "$OUT/budget.out" || rc=$?
+    assert_eq "71" "$rc" "the second stop ends the run"
+    assert_eq "1" "$MEMORY_RESUMES" "exactly one resume was spent"
+    assert_says "$OUT/budget.out" "1 of 1 resumes are spent" "the refusal says why"
+    assert_eq "mobile-webkit nav chunks 3-4 of 4" "$(printf '%s' "$RUN_UNVERIFIED" | sed '/^$/d')" "the range starts after the last chunk that ran"
+    assert_eq "2" "$(printf '%s' "$MEMORY_STOP_HISTORY" | grep -c .)" "both stops are on the record"
+}
+
+test_a_failing_chunk_survives_a_resume() {
+    echo "test: a red CC chunk keeps its code through a later resume"
+    local rc=0
+    reset_stubs
+    export LUCIDOS_E2E_MEMORY_RESUMES=3
+    STUB_FAIL_ON_CALL=1
+    STUB_BOUNDARY_FAIL_AT="mobile-webkit nav chunk 1/2"
+    drive_in "$FAKE" "$OUT/redresume.out" || rc=$?
+    assert_eq "1" "$rc" "the failure is not hidden by the resume"
+}
+
+test_a_cc_stop_that_cannot_resume_leaves_all_navigation_unverified() {
+    echo "test: a CC stop with no resume names the rest of CC and the whole navigation phase"
+    local rc=0
+    reset_stubs
+    STUB_TRIP_ON_CALL=1
+    drive_in "$FAKE" "$OUT/ccunverified.out" || rc=$?
+    assert_eq "71" "$rc" "the run exits with the memory stop code"
+    assert_eq "mobile-webkit CC chunks 1-1 of 1
+mobile-webkit nav chunks 1-2 of 2 (the whole navigation phase)" "$(printf '%s' "$RUN_UNVERIFIED" | sed '/^$/d')" "both stretches are named, in run order"
+}
+
+test_a_single_pass_project_runs_again_after_a_recovery() {
+    echo "test: a stop inside a one-pass project runs the pass again after the recovery"
+    local rc=0 prev="$PWD"
+    reset_stubs
+    export LUCIDOS_E2E_MEMORY_RESUMES=3
+    STUB_TRIP_ON_CALL=1
+    MEMORY_STOPPED=""
+    MEMORY_RESUMES=0
+    # shellcheck disable=SC2034 # cleared per run; set_output_dir refills it for the lifted code
+    OUTPUT_ARG=()
+    cd "$FAKE" || return
+    _run_browser_project_body chromium >"$OUT/onepass-resume.out" 2>&1 || rc=$?
+    cd "$prev" || return
+    assert_eq "0" "$rc" "the second pass gives the verdict"
+    assert_eq "2" "$(grep -c '^playwright:' "$OUT/onepass-resume.out")" "the pass ran twice"
+    assert_says "$OUT/onepass-resume.out" "chromium: RUNNING AGAIN after the recovery" "the re-run is announced"
+}
+
+# ── the chunk ceiling ───────────────────────────────────────────────────
+test_every_chunk_carries_the_ceiling() {
+    echo "test: each chunk invocation is armed with the ceiling, and a one-pass project is not"
+    reset_stubs
+    drive_in "$FAKE" "$OUT/ceiling-armed.out" || true
+    assert_eq "3" "$(grep -c '^playwright:.*\[ceiling 1200\]' "$OUT/ceiling-armed.out")" "all three chunks carry the 1200 s ceiling"
+}
+
+test_a_chunk_past_the_ceiling_fails_and_the_engine_restarts() {
+    echo "test: a chunk that hits the ceiling is a failure, the engine restarts, and the run goes on"
+    local rc=0
+    reset_stubs
+    STUB_CEILING_ON_CALLS="2"
+    drive_in "$FAKE" "$OUT/ceiling-one.out" || rc=$?
+    assert_eq "1" "$rc" "a chunk with no verdict is a failure, never a pass"
+    assert_says "$OUT/ceiling-one.out" "nav chunk 1/2: CHUNK CEILING, interrupted after 1200s" "the trip is named"
+    assert_before "$OUT/ceiling-one.out" "CHUNK CEILING" "restarting the e2e engine on a fresh database" "the engine restarts after the trip"
+    assert_says "$OUT/ceiling-one.out" "nav chunk 2/2: 1 specs" "the next chunk still runs"
+    assert_eq "" "$CHUNK_CEILING_STOPPED" "one trip does not stop the project"
+}
+
+test_a_ceiling_trip_on_the_last_cc_chunk_restarts_before_navigation() {
+    echo "test: a ceiling trip on the CC phase's last chunk still restarts the engine before nav"
+    local rc=0
+    reset_stubs
+    STUB_CEILING_ON_CALLS="1"
+    drive_in "$FAKE" "$OUT/ceiling-cc-last.out" || rc=$?
+    assert_eq "1" "$rc" "the tripped chunk is a failure"
+    assert_before "$OUT/ceiling-cc-last.out" "restarting the e2e engine on a fresh database" "phase 2/2: 3 navigation specs" "nav starts on a restarted engine"
+}
+
+test_a_failed_restart_keeps_the_stop_on_the_record() {
+    echo "test: when the engine does not come back after a recovery, the stop stays recorded"
+    local rc=0
+    reset_stubs
+    export LUCIDOS_E2E_MEMORY_RESUMES=3
+    STUB_RESET_RC=1
+    STUB_TRIP_ON_CALL=2
+    drive_in "$FAKE" "$OUT/resume-norestart.out" || rc=$?
+    assert_eq "71" "$rc" "the run exits as a memory stop"
+    assert_silent_about "$OUT/resume-norestart.out" "recovery: stop cleared" "the stop's record is not cleared before the engine is back"
+    assert_says "$OUT/resume-norestart.out" "the e2e engine did not come back up" "it says why the run stops"
+    assert_eq "0" "$MEMORY_RESUMES" "no resume is counted"
+}
+
+test_a_second_ceiling_trip_ends_the_project() {
+    echo "test: a second chunk past the ceiling ends the project and names what had no verdict"
+    local rc=0
+    reset_stubs
+    STUB_CEILING_ON_CALLS="2 3"
+    drive_in "$RANGE" "$OUT/ceiling-two.out" || rc=$?
+    assert_eq "1" "$rc" "the project fails"
+    assert_eq "mobile-webkit" "$CHUNK_CEILING_STOPPED" "the second trip stops the project"
+    assert_says "$OUT/ceiling-two.out" "a second chunk hit the ceiling, so the project stops here" "it says why"
+    assert_silent_about "$OUT/ceiling-two.out" "nav chunk 3/4: 2 specs" "no chunk runs after the second trip"
+    assert_eq "mobile-webkit nav chunks 3-4 of 4 (a second chunk hit the wall-clock ceiling)" \
+        "$(printf '%s' "$RUN_UNVERIFIED" | sed '/^$/d')" "the rest of nav is named"
+}
+
+test_a_second_ceiling_trip_in_cc_skips_navigation() {
+    echo "test: two ceiling trips in the CC phase skip navigation out loud"
+    local rc=0
+    reset_stubs
+    LUCIDOS_E2E_WEBKIT_CHUNK=1 drive_in "$FAKE" "$OUT/ceiling-cc.out" || rc=$?
+    reset_stubs
+    STUB_CEILING_ON_CALLS="1 2"
+    rc=0
+    LUCIDOS_E2E_WEBKIT_CHUNK=1 drive_in "$FAKE" "$OUT/ceiling-cc.out" || rc=$?
+    assert_eq "1" "$rc" "the project fails"
+    assert_says "$OUT/ceiling-cc.out" "phase 2/2 SKIPPED: the CC phase stopped the project" "navigation is skipped and says why"
+    assert_silent_about "$OUT/ceiling-cc.out" "mobile-webkit nav chunk" "no navigation chunk runs"
+}
+
+# ── the one verdict ─────────────────────────────────────────────────────
+test_the_report_names_every_stop_and_says_whether_coverage_is_complete() {
+    echo "test: the final report lists the stops, then says complete or names the carry-over"
+    MEMORY_STOP_HISTORY="mobile-webkit nav chunk 4/52 (boundary): low memory
+"
+    MEMORY_RESUMES=1
+    RUN_UNVERIFIED=""
+    report_memory_resumes >"$OUT/report-complete.out" 2>&1
+    assert_says "$OUT/report-complete.out" "met 1 memory stop(s) and resumed 1 time(s)" "the stops are counted"
+    assert_says "$OUT/report-complete.out" "coverage is COMPLETE" "a finished run says so"
+    RUN_UNVERIFIED="mobile-webkit nav chunks 48-52 of 52
+"
+    report_memory_resumes >"$OUT/report-incomplete.out" 2>&1
+    assert_says "$OUT/report-incomplete.out" "Coverage is INCOMPLETE" "an unfinished run says so"
+    assert_says "$OUT/report-incomplete.out" "[e2e-resume]   - mobile-webkit nav chunks 48-52 of 52" "and names the range"
+    assert_says "$OUT/report-incomplete.out" "Do not start a second run tonight" "and forbids an improvised second leg"
+    MEMORY_STOP_HISTORY=""
+    RUN_UNVERIFIED=""
+    report_memory_resumes >"$OUT/report-clean.out" 2>&1
+    assert_eq "" "$(cat "$OUT/report-clean.out")" "a run with no stop prints nothing"
+}
+
+test_an_interrupted_invocation_stays_out_of_the_tally() {
+    echo "test: the output of an invocation stopped on host memory never reaches the tally"
+    (
+        PW_TALLY_LOG="$SANDBOX/tally-trip"
+        : > "$PW_TALLY_LOG"
+        # shellcheck source=/dev/null
+        source "$REAL_RUN_PW"
+        # shellcheck disable=SC2329 # a seam: invoked by the lifted code, not from this file
+        record_host_memory_runner() { :; }
+        # shellcheck disable=SC2329 # a seam: invoked by the lifted code, not from this file
+        clear_host_memory_runner() { :; }
+        # shellcheck disable=SC2329 # a seam: invoked by the lifted code, not from this file
+        interrupt_host_memory_runner_if_tripped() { :; }
+        # shellcheck disable=SC2329 # a seam: invoked by the lifted code, not from this file
+        stop_chunk_ceiling_watchdog() { :; }
+        # shellcheck disable=SC2329 # a seam: invoked by the lifted code, not from this file
+        start_chunk_ceiling_watchdog() { echo "armed $2" >> "$SANDBOX/armed"; }
+        TRIPPED=""
+        CHUNK_CEILING_SECS=7 real_run_playwright sh -c "echo counted-line" >/dev/null 2>&1
+    ) >"$OUT/tallytrip2.out" 2>&1
+    assert_says "$SANDBOX/tally-trip" "counted-line" "an untripped invocation reaches the tally"
+    assert_says "$SANDBOX/armed" "armed 7" "the ceiling is armed with the caller's seconds"
+    (
+        PW_TALLY_LOG="$SANDBOX/tally-trip3"
+        : > "$PW_TALLY_LOG"
+        # shellcheck source=/dev/null
+        source "$REAL_RUN_PW"
+        # shellcheck disable=SC2329 # a seam: invoked by the lifted code, not from this file
+        record_host_memory_runner() { :; }
+        # The trip lands while the invocation runs, so it reads as tripped after.
+        # shellcheck disable=SC2329 # a seam: invoked by the lifted code, not from this file
+        clear_host_memory_runner() { TRIPPED=1; }
+        # shellcheck disable=SC2329 # a seam: invoked by the lifted code, not from this file
+        interrupt_host_memory_runner_if_tripped() { :; }
+        # shellcheck disable=SC2329 # a seam: invoked by the lifted code, not from this file
+        stop_chunk_ceiling_watchdog() { :; }
+        TRIPPED=""
+        real_run_playwright sh -c "echo stopped-line" >/dev/null 2>&1
+    ) >"$OUT/tallytrip3.out" 2>&1
+    assert_silent_about "$SANDBOX/tally-trip3" "stopped-line" "a tripped invocation stays out of the tally"
 }
 
 test_the_cc_phase_runs_first_and_nav_second
@@ -862,6 +1182,23 @@ test_run_playwright_records_its_runner_and_keeps_its_contract
 test_an_interrupted_project_still_exits_as_a_memory_stop
 test_run_playwright_does_not_start_after_a_trip
 
+test_a_boundary_stop_resumes_at_the_next_chunk
+test_an_in_chunk_stop_runs_that_chunk_again
+test_a_stop_at_the_phase_boundary_resumes_into_navigation
+test_a_host_that_never_recovers_names_the_exact_range
+test_the_resume_budget_is_bounded
+test_a_failing_chunk_survives_a_resume
+test_a_cc_stop_that_cannot_resume_leaves_all_navigation_unverified
+test_a_single_pass_project_runs_again_after_a_recovery
+test_every_chunk_carries_the_ceiling
+test_a_chunk_past_the_ceiling_fails_and_the_engine_restarts
+test_a_second_ceiling_trip_ends_the_project
+test_a_second_ceiling_trip_in_cc_skips_navigation
+test_the_report_names_every_stop_and_says_whether_coverage_is_complete
+test_an_interrupted_invocation_stays_out_of_the_tally
+
+test_a_ceiling_trip_on_the_last_cc_chunk_restarts_before_navigation
+test_a_failed_restart_keeps_the_stop_on_the_record
 echo ""
 echo "Passed: $PASS  Failed: $FAIL"
 [ "$FAIL" -eq 0 ]

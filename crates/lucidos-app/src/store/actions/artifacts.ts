@@ -18,7 +18,7 @@ import { revealContentPane } from './pane';
 import { pushNavState } from './navigation';
 import { isTauri } from '../../utils/platform';
 import { openExternalUrl, refuseDangerousUrl } from '../../utils/openExternalUrl';
-import { DATA_PATH_PREFIXES } from '../../utils/linkifyPaths';
+import { DATA_PATH_PREFIXES } from '../../utils/dataPathPrefixes';
 import { openExternal } from '../../utils/tauri';
 import { errorDetail } from '../../utils/errorDetail';
 import { inAppBrowserAvailable } from './preferences';

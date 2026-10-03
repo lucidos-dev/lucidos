@@ -244,11 +244,11 @@ describe('FileEditor shows the saving state only when it is worth showing', () =
   });
 });
 
-// The checkbox click's save path: re-read, toggle, write, toast. The
-// returned text lets the caller adopt the saved content right away. That
-// is the fix for the checkbox blink: the write's own later file-change
-// refresh then finds nothing new to show. The toast key stops a burst of
-// clicks piling up a wall of "Saved" cards.
+// The checkbox click's save path: re-read, toggle, write. The returned
+// text lets the caller adopt the saved content right away. That is the fix
+// for the checkbox blink: the write's own later file-change refresh then
+// finds nothing new to show. Only a failure toasts, and the toast key stops
+// a burst of failing clicks piling up a wall of error cards.
 describe('toggleDataFileCheckbox', () => {
   const PATH = 'artifacts/plan.md';
   const URL = '/data/artifacts/plan.md';
@@ -276,12 +276,19 @@ describe('toggleDataFileCheckbox', () => {
     expect(mockSave).toHaveBeenCalledExactlyOnceWith(PATH, '- [x] One\n');
   });
 
-  it('toasts a short Saved success message under the file\'s key', async () => {
+  it('shows no toast when the save succeeds', async () => {
     stubFetch('- [ ] One\n');
     await toggleDataFileCheckbox(PATH, URL, 0, 1);
-    const toast = toasts.value.find((t) => t.key === TOAST_KEY);
-    expect(toast?.message).toBe('Saved');
-    expect(toast?.type).toBe('success');
+    expect(toasts.value.find((t) => t.key === TOAST_KEY)).toBeUndefined();
+  });
+
+  it('clears an earlier failure toast once a later save succeeds', async () => {
+    stubFetch('- [ ] One\n');
+    mockSave.mockRejectedValueOnce(new Error('disk full'));
+    await toggleDataFileCheckbox(PATH, URL, 0, 1);
+    expect(toasts.value.find((t) => t.key === TOAST_KEY)?.type).toBe('error');
+    await toggleDataFileCheckbox(PATH, URL, 0, 1);
+    expect(toasts.value.find((t) => t.key === TOAST_KEY)).toBeUndefined();
   });
 
   it('refuses and toasts an error when the file changed under the click', async () => {
@@ -300,14 +307,14 @@ describe('toggleDataFileCheckbox', () => {
     expect(toasts.value.find((t) => t.key === TOAST_KEY)?.type).toBe('error');
   });
 
-  it('collapses a second toggle on the same file into the same toast', async () => {
+  it('collapses a second failure on the same file into the same toast', async () => {
     stubFetch('- [ ] One\n- [ ] Two\n');
+    mockSave.mockRejectedValue(new Error('disk full'));
     await toggleDataFileCheckbox(PATH, URL, 0, 2);
-    stubFetch('- [x] One\n- [ ] Two\n');
     await toggleDataFileCheckbox(PATH, URL, 1, 2);
     const matching = toasts.value.filter((t) => t.key === TOAST_KEY);
     expect(matching).toHaveLength(1);
-    expect(matching[0].message).toBe('Saved');
+    expect(matching[0].type).toBe('error');
   });
 
   // Two different checkboxes in the same file, toggled close enough together

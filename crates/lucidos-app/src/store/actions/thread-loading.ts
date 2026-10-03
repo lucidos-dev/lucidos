@@ -1,7 +1,7 @@
 import { threadMap, awaitedThreadId, focusedThreadId, setFocusedThread, showToast, removeToast, connectionStatus, threadsLoaded, threadListFetched, generatedTitleIds, threadHasMore, threadLoadingMore, archiveThreadCount, ALL_CHANNELS, filterFacets, codingAgentSessionVersion, engineRestarting, archivingThreadIds, CODING_AGENT_CHANNEL, toasts, THREAD_EVENTS_LOAD_TOAST_KEY, THREAD_EVENTS_REFRESH_TOAST_KEY, THREAD_EVENTS_FETCH_CONCURRENCY, THREAD_EVENTS_PREFETCH_LIMIT, threadChannelToFilterSource, type ThreadFilterSource } from '../store';
 import { appliedThreadFilter, type ThreadFilterSelection } from '../appliedThreadFilter';
 import { threadPassesChannelFilter } from '../threadFilter';
-import { settleDeliveredUnsentMessage } from '../unsentMessages';
+import { settleDeliveredUnsentMessage } from './sendSettlement';
 import { handleEvent, isCallerUtterance, isChannelDefiningEvent, offerCallerUtterance, PENDING_TITLE_PLACEHOLDER, applyAggregateToMeta, applySummaryVersion, isSummaryCurrent, createdKey, isExcludedFromSections, type ThreadAggregate, type ThreadState, type ThreadEvent, type StoredEvent, type ThreadMeta } from '../thread-events';
 import { bumpThreadEvents } from '../threadActivity';
 import { recordPerfSample } from '../../utils/perfQueue';
@@ -238,24 +238,32 @@ export function upsertThread(
     // a composing row, so the thread surfaces in no drawer section even after
     // the projection moved on.
     //
-    // Three conditions skip the compose fields:
+    // Four conditions skip the compose fields:
     //   1. The user is mid-edit on this thread's textarea, and ONLY for a
     //      NON-empty snapshot (see below).
     //   2. A debounced or in-flight PUT covers the value the API would clobber.
     //   3. A local edit happened AFTER this GET went out, so the response is
     //      stale with respect to compose by definition.
+    //   4. A first send from this device is unsettled (`firstSendUnsettled`).
     //
     // `>=` because both timestamps come from `Date.now()`, at 1ms resolution.
     // A request fired in the same millisecond as the edit can race ahead of
     // the edit's PUT and would otherwise pass the guard.
     const lastLocalChange = Math.max(composeEditedAt.get(info.thread_id) ?? 0, composeSentAt.get(info.thread_id) ?? 0);
     const editedSinceRequest = lastLocalChange >= requestStartedAt;
+    // The engine still has the thread composing, but this device sent its
+    // first message and has no engine row for it yet: a pending row, or an
+    // unsent message. The row predates the send however late it was read, so
+    // its lifecycle and its draft (the one the message was written from) are
+    // stale.
+    const firstSendUnsettled = info.state === 'composing'
+      && (existing.pendingUserMessages.length > 0 || (existing.unsentMessageSeqs?.size ?? 0) > 0);
     // The lifecycle marker takes the version guard of `status` above, AND the
     // local-edit guard. A GET fired before a send lands after it, still saying
     // `composing`, and often at the SAME version: nothing has raised it until
     // the send's `MessageReceived` arrives. `ThreadPane` would then swap the
     // transcript back for the compose view. `sendCompose` stamps `composeSentAt`.
-    if (summaryIsCurrent && !editedSinceRequest) existing.meta.state = info.state;
+    if (summaryIsCurrent && !editedSinceRequest && !firstSendUnsettled) existing.meta.state = info.state;
     const isFocusedThread = info.thread_id === focusedThreadId.value;
     // An EMPTY server snapshot genuinely means the shared draft was sent or
     // discarded by somebody, since the backend clears compose_text on those
@@ -275,7 +283,7 @@ export function upsertThread(
     // longer covers it, since it cleared at exactly the moment
     // `composePutSettledAt` records.
     const putSettledSinceRequest = (composePutSettledAt.get(info.thread_id) ?? 0) >= requestStartedAt;
-    if (!userIsTypingHere && !pendingComposePuts.has(info.thread_id) && !editedSinceRequest && !putSettledSinceRequest) {
+    if (!userIsTypingHere && !pendingComposePuts.has(info.thread_id) && !editedSinceRequest && !putSettledSinceRequest && !firstSendUnsettled) {
       stageDraftFromApi(info, draftBatch);
     }
   }

@@ -35,12 +35,12 @@ import { ApiError, uploadThreadBlob } from '../../api/client';
 import {
   PENDING_UPLOAD_MAX_AGE_MS,
   createMemoryPendingUploadBackend,
-  pendingUploadDbName,
   readPendingUploadStore,
   _resetPendingUploadRecordsForTesting,
   type PendingUploadBackend,
   type PendingUploadRecord,
 } from '../pendingUploadRecords';
+import { PAGE_OWNER_LOCK_PREFIX } from '../pageOwner';
 import {
   addPendingUpload,
   detachPendingUpload,
@@ -211,7 +211,7 @@ describe('restorePendingUploads', () => {
   });
 
   it("leaves another open tab's images alone", async () => {
-    const prefix = `${pendingUploadDbName(null)}:owner:`;
+    const prefix = PAGE_OWNER_LOCK_PREFIX;
     Object.defineProperty(globalThis.navigator, 'locks', {
       configurable: true,
       value: { query: async () => ({ held: [{ name: prefix + 'other-tab' }] }), request: async () => {} },

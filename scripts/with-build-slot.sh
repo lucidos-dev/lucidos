@@ -11,10 +11,15 @@
 # Usage:
 #   scripts/with-build-slot.sh [--label "<text>"] -- <command> [args...]
 #
-# It FAILS OPEN, always. A plain `git clone` has no `lucidos` binary, and
+# The SLOT fails open, always. A plain `git clone` has no `lucidos` binary, and
 # `make lint` must still work there, so a missing broker means the command runs
 # unrestricted with one line on stderr. A limiter must never be the reason a
 # build cannot happen.
+#
+# The MEMORY GATE does not fail open on a host in trouble. Before asking for a
+# slot, scripts/build-memory-gate.sh waits for the host to read GO and exits 72
+# when it never does (ADR 0351). It is GO on a host it cannot read, so a clone
+# on Linux builds unchanged. A build waiting on memory holds no slot.
 #
 # Resolution order for the broker:
 #   1. `lucidos` on PATH. The engine puts it there for every spawned session.
@@ -107,6 +112,10 @@ _resolve_broker() {
     fi
     return 1
 }
+
+"$SCRIPT_DIR/build-memory-gate.sh" --label "${LABEL:-$1}" || exit $?
+LUCIDOS_BUILD_MEMORY_GATE_PASSED_AT="$(date +%s)"
+export LUCIDOS_BUILD_MEMORY_GATE_PASSED_AT
 
 if ! BROKER="$(_resolve_broker)"; then
     echo "with-build-slot.sh: no \`lucidos\` that knows \`build-slot\`, running the build unrestricted" >&2

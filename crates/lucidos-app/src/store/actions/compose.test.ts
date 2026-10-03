@@ -40,7 +40,9 @@ import {
 import type { ThreadMeta, ThreadState } from '../thread-events';
 import { _resetComposeDraftsForTesting, getDraft, setDraft, type ComposeDraft } from '../composeDrafts';
 import { retryUnsentMessage } from './chat';
+import { upsertThread } from './thread-loading';
 import { unsentMessages } from '../unsentMessages';
+import type { ThreadSummary } from '../../api/threads';
 
 const originalFetch = globalThis.fetch;
 
@@ -103,6 +105,36 @@ function makeThread(overrides: MakeThreadOpts = {}): ThreadState {
 
 function makeActiveThread(overrides: MakeThreadOpts = {}): ThreadState {
   return makeThread({ state: 'active', ...overrides });
+}
+
+/** The row of a thread the engine still has composing, holding `composeText`. */
+function staleComposingSummary(threadId: string, composeText: string): ThreadSummary {
+  return {
+    thread_id: threadId,
+    title: '',
+    channel: 'chat',
+    initiator: 'user',
+    created_at: '2026-06-15T16:35:54.000Z',
+    last_activity: '2026-06-15T16:35:54.000Z',
+    message_count: 0,
+    section: 'inbox',
+    active_children_count: 0,
+    total_children_count: 0,
+    blocking_descendant_count: 0,
+    attention_descendant_count: 0,
+    live_event_wait_count: 0,
+    status: 'idle',
+    summary_version: 0,
+    coding_agent_has_diff: false,
+    coding_agent_proposed: false,
+    coding_agent_requires_restart: false,
+    coding_agent_incomplete: false,
+    coding_agent_is_external_repo: false,
+    last_revived_at: null,
+    state: 'composing',
+    compose_text: composeText,
+    compose_images: [],
+  };
 }
 
 describe('sendFollowup clears the active-thread draft', () => {
@@ -1827,6 +1859,7 @@ describe('a send leaves the engine holding an empty draft', () => {
   const composePutTexts = () => mockFetch.mock.calls
     .filter(([url, init]) => String(url).endsWith('/compose') && (init as RequestInit | undefined)?.method === 'PUT')
     .map(([, init]) => JSON.parse(String((init as RequestInit).body)).text as string);
+  const lastComposePutText = () => composePutTexts().slice(-1)[0];
 
   beforeEach(() => {
     vi.useFakeTimers();
@@ -1849,6 +1882,7 @@ describe('a send leaves the engine holding an empty draft', () => {
     _resetComposeDraftsForTesting();
     _resetUndeliveredComposeDraftsForTesting();
     _resetComposeSelectionsForTesting();
+    unsentMessages.value = new Map();
     toasts.value = [];
     vi.restoreAllMocks();
   });
@@ -1922,9 +1956,10 @@ describe('a send leaves the engine holding an empty draft', () => {
     expect(texts[texts.length - 1]).toBe('and one more thing');
   });
 
-  /** An unsent first send consumed nothing on the engine. Clearing its draft
-   *  there could only lose the text a reload would bring back. */
-  it('an unsent first send keeps the engine draft until a retry is accepted', async () => {
+  /** The unsent message is kept on this device, so the engine's draft holds
+   *  what the composer shows. The picks stay until a send is accepted, so a
+   *  refused Retry can still roll the draft back with them. */
+  it('an unsent first send clears the engine draft but keeps its picks until a retry is accepted', async () => {
     let chatAnswers = false;
     mockFetch.mockImplementation((url: string) => {
       if (String(url).endsWith('/chat/stream') && !chatAnswers) {
@@ -1938,7 +1973,8 @@ describe('a send leaves the engine holding an empty draft', () => {
     await sendCompose('t-1', {});
     await vi.runAllTimersAsync();
 
-    expect(composePutTexts()).not.toContain('');
+    const sent = composePutTexts();
+    expect(sent[sent.length - 1]).toBe('');
     expect(getComposeSelectionOverride('t-1').model).toBe('claude-opus-5');
 
     chatAnswers = true;
@@ -1949,6 +1985,41 @@ describe('a send leaves the engine holding an empty draft', () => {
     const texts = composePutTexts();
     expect(texts[texts.length - 1]).toBe('');
     expect(getComposeSelectionOverride('t-1').model).toBeUndefined();
+  });
+
+  /** The engine still holds the last draft write from typing, a prefix of the
+   *  message, because it never saw the send. A resync (an iOS wake) reads that
+   *  row. The thread must stay sent, the composer empty, and the accepted Retry
+   *  must leave no draft behind. */
+  it('a resync while a first send sits unsent does not restage the pre-send draft', async () => {
+    let chatAnswers = false;
+    mockFetch.mockImplementation((url: string) => {
+      if (String(url).endsWith('/chat/stream') && !chatAnswers) {
+        return Promise.reject(new TypeError('Load failed'));
+      }
+      return Promise.resolve(chatAccepted());
+    });
+    threadMap.value = new Map([['t-1', makeThread({ id: 't-1', state: 'composing', composeText: 'the draft, typed in full' })]]);
+
+    await sendCompose('t-1', {});
+    await vi.runAllTimersAsync();
+    vi.advanceTimersByTime(1000);
+
+    const map = new Map(threadMap.value);
+    upsertThread(map, staleComposingSummary('t-1', 'the draft, ty'), false, Date.now());
+    threadMap.value = map;
+
+    expect(threadMap.value.get('t-1')!.meta.state).toBe('active');
+    expect(getDraft('t-1').text).toBe('');
+
+    chatAnswers = true;
+    const [eventId] = [...unsentMessages.value.keys()];
+    expect(await retryUnsentMessage(eventId)).toBe('sent');
+    await vi.runAllTimersAsync();
+
+    expect(composePutTexts()).not.toContain('the draft, ty');
+    const texts = composePutTexts();
+    expect(texts[texts.length - 1]).toBe('');
   });
 
   it('a refused retry of an unsent first send rolls the draft back with its picks', async () => {
@@ -1972,6 +2043,8 @@ describe('a send leaves the engine holding an empty draft', () => {
     expect(threadMap.value.get('t-1')!.meta.state).toBe('composing');
     expect(getDraft('t-1').text).toBe('the draft');
     expect(getComposeSelectionOverride('t-1').model).toBe('claude-opus-5');
+    // Back in the local draft, so the engine stores it once, not twice.
+    expect(lastComposePutText()).toBe('the draft');
   });
 
 });
@@ -2050,7 +2123,7 @@ describe('a send the engine refuses keeps the typed text', () => {
     expect(texts[texts.length - 1]).toBe('a follow-up');
   });
 
-  it('sendFollowup leaves new typing alone', async () => {
+  it('sendFollowup keeps new typing and puts the refused text after it', async () => {
     threadMap.value = new Map([['t-1', makeActiveThread({ id: 't-1', composeText: 'a follow-up' })]]);
 
     const send = sendFollowup('t-1', 'a follow-up');
@@ -2058,7 +2131,7 @@ describe('a send the engine refuses keeps the typed text', () => {
     await send;
     await vi.runAllTimersAsync();
 
-    expect(getDraft('t-1').text).toBe('typed meanwhile');
+    expect(getDraft('t-1').text).toBe('typed meanwhile\n\na follow-up');
   });
 });
 

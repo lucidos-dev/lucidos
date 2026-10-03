@@ -117,6 +117,7 @@ fn thread_event_type_name_extraction() {
             ThreadEvent::MemoryRecalled {
                 results: 5,
                 queries: vec!["birthday".into()],
+                memories: vec![],
             },
             "MemoryRecalled",
         ),
@@ -516,6 +517,7 @@ fn all_db_event_types_have_variants() {
         r#"{"type":"MemorySearched","results":3}"#,
         r#"{"type":"MemoryRecalled","results":3}"#,
         r#"{"type":"MemoryRecalled","results":5,"queries":["birthday","date of birth"]}"#,
+        r#"{"type":"MemoryRecalled","results":1,"queries":["birthday"],"memories":[{"id":"00000000-0000-0000-0000-000000000001","topic":"family","summary":"Birthday is in May","src_created_at":"2026-01-02T03:04:05Z","source":{"type":"event","id":"00000000-0000-0000-0000-000000000002"}}]}"#,
         r#"{"type":"ToolCalled","name":"x","args":{}}"#,
         r#"{"type":"ToolResult","name":"x","result":"ok"}"#,
         // TodoListWritten — empty + full list, all three statuses

@@ -15,7 +15,7 @@ import {
   availableMarketplaces,
   resolveActiveMarketplace,
 } from './StoreTab';
-import { CatalogFreshness } from './CatalogFreshness';
+import { CatalogScanFailure } from './CatalogScanFailure';
 
 /** Sentinels for the two dropdown rows that are not a marketplace. Both carry a
  *  colon. The engine builds a marketplace id out of ASCII alphanumerics and
@@ -93,14 +93,7 @@ export function PluginsView() {
         />
       </div>
 
-      {/* How old the plugin rows are, under the controls that filter them.
-          The list comes from a cache the engine refreshes on a timer, so the
-          panel says its age rather than pretending the rows are live. The
-          line holds its height while the value is absent, so the list below
-          does not move when the catalog lands. */}
-      <div class="plugins-freshness-line">
-        <CatalogFreshness />
-      </div>
+      <CatalogScanFailure />
 
       <AppSearchBar placeholder="Search plugins…" dataRole="plugins-search-input" />
 

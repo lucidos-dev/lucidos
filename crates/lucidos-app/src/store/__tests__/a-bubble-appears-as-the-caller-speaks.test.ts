@@ -15,7 +15,7 @@ import { heard, put } from './call-fixtures';
 import { signal } from '@preact/signals';
 import { createLiveUtteranceBridge, installLiveUtteranceRow, liveUtteranceId } from '../liveUtterance';
 import { effectiveThreadStatus, threadMap } from '../store';
-import { voiceCall } from '../voice';
+import { voiceCall } from '../voiceCall';
 import {
   computeExchanges,
   handleEvent,

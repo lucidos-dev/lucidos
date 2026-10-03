@@ -23,14 +23,16 @@ interface Props {
  *  legitimately shows a pass or a fail, because the verdict it reports is the
  *  CHILD's outcome rather than the row's own.
  *
- *  The four appear together in one stream, so each has to be distinguishable
- *  from the other three. `canceled` is warm rather than the cool neutral, so it
- *  is not a near-twin of the untinted `no changes` word beside it. */
+ *  They appear together in one stream, so each word has to be distinguishable
+ *  from the others. `canceled` is warm rather than the cool neutral, so it is
+ *  not a near-twin of the untinted `no changes` word beside it. `interrupted`
+ *  shares the warm tone: the child stopped short, and its word tells why. */
 const CHILD_STATE: Record<ChildCompletionStatus, { label: string; tone: EventRowTone }> = {
   success: { label: 'Success', tone: 'good' },
   failure: { label: 'Failure', tone: 'bad' },
   no_changes: { label: 'No changes', tone: 'none' },
   canceled: { label: 'Canceled', tone: 'halted' },
+  interrupted: { label: 'Interrupted', tone: 'halted' },
 };
 
 /** A link that opens `threadId`, labelled with its title. Routed through

@@ -6,7 +6,7 @@ use crate::runtime::CodingAgent;
 
 use super::{
     AbortCause, ActorMode, AnswerKind, CancelCause, ChildCompletionStatus, EventWaitCancelCause,
-    FormRequestOutcome, MessageOrigin, QuestionOption, SessionEndReason, TodoItem,
+    FormRequestOutcome, MessageOrigin, QuestionOption, RecalledMemory, SessionEndReason, TodoItem,
     TriggerInvocation, VoiceSessionEndReason,
 };
 
@@ -244,6 +244,10 @@ pub enum ThreadEvent {
         results: usize,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         queries: Vec<String>,
+        /// The memories injected, in the order the model saw them, so
+        /// `memories.len() == results`. Absent on rows written before it.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        memories: Vec<RecalledMemory>,
     },
     ToolCalled {
         name: String,

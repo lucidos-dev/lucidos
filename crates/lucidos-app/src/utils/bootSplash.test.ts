@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, afterEach } from 'vitest';
+import { describe, it, expect, vi, afterEach, onTestFinished } from 'vitest';
 import {
   hasDeepLinkParams,
   parseDeepLinkFromUrl,
@@ -261,22 +261,57 @@ describe('bootSplash controller', () => {
     delete win.__lucidosGatewayEscape;
   });
 
-  it('dismiss reverts the boot background only AFTER the splash node is removed (not mid-fade)', async () => {
+  // The boot script paints the brand gradient on <html>, because iOS fills the
+  // standalone bottom safe-area strip from the canvas and no element reaches
+  // it. That strip must leave WITH the veil, at whatever length the veil runs:
+  // a snap at either end of the fade shows as a band.
+  it('dismiss fades the canvas to the app background on the veil curve, then hands it back', async () => {
     fake = installFakeSplash(true);
     const doc = (globalThis as any).document;
-    // Boot script (index.html) paints the brand gradient on <html> to cover the
-    // iOS bottom safe-area strip. Dismiss reverts it so no blue lingers behind
-    // the app's own safe-area inset, but only once the splash is gone.
-    doc.documentElement.style.background =
-      '#145eb9 radial-gradient(125% 125% at 30% 22%, #2d83e0 0%, #0a4ea8 100%) no-repeat fixed';
+    const gradient = '#145eb9 radial-gradient(125% 125% at 30% 22%, #2d83e0 0%, #0a4ea8 100%) no-repeat fixed';
+    doc.documentElement.style.background = gradient;
+    doc.body = { style: { background: gradient } };
+    onTestFinished(() => { delete doc.body; });
+    // The reduced-motion veil: a fixed 0.15s, NOT the collapsed duration scale.
+    // It only exists once the leaving class is on.
+    const prevGetComputedStyle = (globalThis as any).getComputedStyle;
+    (globalThis as any).getComputedStyle = () => fake.hasLeaving()
+      ? { animationDuration: '0.15s', animationTimingFunction: 'ease' }
+      : { animationDuration: '0s', animationTimingFunction: 'ease' };
+    onTestFinished(() => { (globalThis as any).getComputedStyle = prevGetComputedStyle; });
     const c = await freshController();
     c.dismissBootSplash();
-    // Still painted through the `.boot-splash-leaving` fade: reverting now
-    // would flash the dark safe-area strip while the splash is visible.
-    expect(doc.documentElement.style.background).not.toBe('');
+    for (const style of [doc.documentElement.style, doc.body.style]) {
+      expect(style.background).toBe('var(--bg-primary)');
+      expect(style.transition).toBe('background-color 0.15s ease');
+    }
     fake.fireAnimationEnd();
-    // Reverted once the splash node is actually removed.
-    expect(doc.documentElement.style.background).toBe('');
+    // The stylesheet's own `html { background: var(--bg-primary) }` takes over.
+    for (const style of [doc.documentElement.style, doc.body.style]) {
+      expect(style.background).toBe('');
+      expect(style.transition).toBe('');
+    }
+  });
+
+  // The idle prefetch parses chunks on the main thread, and WebKit has no
+  // requestIdleCallback to defer it with. So it must stay off the fade's frames.
+  it('dismiss starts the idle prefetch only once the splash is gone', async () => {
+    vi.useFakeTimers();
+    try {
+      fake = installFakeSplash(true);
+      const c = await freshController();
+      const { prefetchWhenIdle } = await import('./idlePrefetch');
+      const surface = { preload: vi.fn(() => Promise.resolve()) };
+      prefetchWhenIdle(surface);
+      c.dismissBootSplash();
+      vi.advanceTimersByTime(0);
+      expect(surface.preload).not.toHaveBeenCalled();
+      fake.fireAnimationEnd();
+      vi.advanceTimersByTime(0);
+      expect(surface.preload).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   // The one thing a quiet cover or a gateway handover changes for the controller:

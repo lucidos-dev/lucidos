@@ -24,6 +24,7 @@ import { storedVoiceInputDevice } from './actions/preferences';
 import { effectiveCodingAgentBackend } from '../components/chat/promptToggleMode';
 import { createCallRunner } from '../voice/call';
 import { CALL_IDLE, type CallState } from '../voice/callState';
+import { voiceCall } from './voiceCall';
 import { type CallPorts, browserPorts } from '../voice/ports';
 import { isSettingsProblem } from '../voice/refusals';
 import { errorDetail } from '../utils/errorDetail';
@@ -51,6 +52,8 @@ export interface VoiceCallStore {
 }
 
 export interface VoiceCallDeps {
+  /** Where the call state lives. A fresh signal when left out, as in a test. */
+  call?: Signal<CallState>;
   ports: CallPorts;
   /** The thread on screen. A call ends when it stops being its own. */
   focused: Signal<string | null>;
@@ -69,7 +72,7 @@ export interface VoiceCallDeps {
 }
 
 export function createVoiceCallStore(deps: VoiceCallDeps): VoiceCallStore {
-  const call = signal<CallState>(CALL_IDLE);
+  const call = deps.call ?? signal<CallState>(CALL_IDLE);
 
   const runner = createCallRunner({
     ports: deps.ports,
@@ -222,6 +225,7 @@ export function reportCallProblem(message: string): void {
 }
 
 const live = createVoiceCallStore({
+  call: voiceCall,
   ports: browserPorts,
   focused: focusedThreadId,
   // The focused thread when there is one, active threads included. In the
@@ -234,9 +238,6 @@ const live = createVoiceCallStore({
   microphone: () => storedVoiceInputDevice() || null,
   reachable: callReachesTheFocusedThread,
 });
-
-/** The live call, for the toggle to read. */
-export const voiceCall: Signal<CallState> = live.call;
 
 /** Press the call toggle: place a call, or ring off. */
 export const pressCallToggle = live.press;

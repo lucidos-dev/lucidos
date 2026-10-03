@@ -1,3 +1,4 @@
+use super::format_long_term_memory;
 use super::format_memory_bullet;
 use super::jaccard_similarity;
 use crate::engine::memory::relevance_score;
@@ -512,4 +513,58 @@ fn time_decay_curve_is_gradual() {
         "730-day-old should be ~0.333, got {:.3}",
         at_730
     );
+}
+
+fn topic(name: &str, summaries: &[&str]) -> (String, Vec<(MemoryEntry, f64)>) {
+    let entries = summaries
+        .iter()
+        .map(|s| (make_entry(s, name, 0.5, 1), 1.0))
+        .collect();
+    (name.to_string(), entries)
+}
+
+#[test]
+fn recalled_list_matches_the_injected_block_in_order() {
+    let topics = vec![
+        topic("work", &["Ships on Fridays", "Uses Postgres"]),
+        topic("home", &["Has a cat"]),
+    ];
+    let (block, recalled) = format_long_term_memory(&topics, 50_000);
+
+    let summaries: Vec<&str> = recalled.iter().map(|m| m.summary.as_str()).collect();
+    assert_eq!(
+        summaries,
+        ["Ships on Fridays", "Uses Postgres", "Has a cat"]
+    );
+    for memory in &recalled {
+        assert!(
+            block.contains(&format!("[id: {}]", memory.id)),
+            "every listed memory is in the block the model saw"
+        );
+    }
+    assert_eq!(recalled[0].source, topics[0].1[0].0.source);
+}
+
+#[test]
+fn a_topic_over_budget_is_in_neither_the_block_nor_the_list() {
+    let long = "x".repeat(400);
+    let topics = vec![
+        topic("first", &["Fits easily"]),
+        topic("second", &[long.as_str()]),
+        topic("third", &["Would fit, but comes after the overflow"]),
+    ];
+    let (block, recalled) = format_long_term_memory(&topics, 200);
+
+    assert_eq!(recalled.len(), 1);
+    assert_eq!(recalled[0].summary, "Fits easily");
+    assert!(!block.contains("## second"));
+    assert!(!block.contains("## third"));
+}
+
+#[test]
+fn nothing_fits_gives_no_block_and_no_list() {
+    let long = "x".repeat(400);
+    let (block, recalled) = format_long_term_memory(&[topic("big", &[long.as_str()])], 100);
+    assert!(block.is_empty());
+    assert!(recalled.is_empty());
 }

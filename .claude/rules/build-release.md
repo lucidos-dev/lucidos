@@ -278,7 +278,11 @@ That container is the **glibc 2.35 floor**. A binary built on the raw 24.04 runn
 
 **Every refusal is a fallback, never a failed release.** No rc run, a run that failed, expired artifacts, a sha256 that does not verify, a missing platform. A run still building when the wait budget runs out joins them. Each says why, and the tag-triggered wait takes over unchanged. Degrade to slow, never to wrong.
 
+A network error mid-download is not one of those refusals. `release_draft_stage_run_artifacts` retries it, and only a "final" answer from `release_artifact_download_failure_class` (expired, never uploaded) gives up at once. On v0.46.0 one connection reset was reported as expiry and cost the head start.
+
 Two consequences hold that together. `release_tarball_run_verdict` **ignores `rc/`-branch runs**, because both runs carry the same head commit. A finished rc run beside an unregistered tag run would otherwise read as success-with-nothing-attached, and dispatch a needless backfill.
+
+**An unreadable run listing decides nothing (v0.46.0).** The wait read a failed `gh run list` as "no run exists" and dispatched a 30-minute backfill while the tag run was mid-build. A failed read, or an empty listing after a run was seen, is now the verdict `unknown`, which never dispatches. And a green run that left assets missing is first re-attached from its own artifacts, pinned by `head_sha` like the rc arm. Only when that fails does the backfill go out.
 
 And the CI attach step **never deletes an asset from a PUBLISHED release**, only from a draft. The fallback run now reaches a live release half an hour late, and the gap between DELETE and POST is a window where `curl … | sh` 404s. Retention splits the same way: 7 days on the rc arm, which Phase B downloads, against the tag arm's 1-day inspection copy.
 

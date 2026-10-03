@@ -1,4 +1,5 @@
 use super::memory::{jaccard_similarity, KEYWORD_BOOST, KEYWORD_SIMILARITY_PROXY};
+use super::thread_events::RecalledMemory;
 use super::LucidosEngine;
 use crate::core::store::types::Step;
 use crate::llm::{ContentBlock, Message, MessageContent};
@@ -1196,12 +1197,48 @@ fn format_memory_bullet(entry: &MemoryEntry) -> String {
     format!("- {}: {} [id: {}]\n", date, entry.summary, entry.id)
 }
 
+/// Render the `[Long-term Memory]` block from topic groups already in
+/// presentation order, and list the memories it holds in the same order.
+///
+/// One pass builds both, so the list is exactly what the model saw. A topic
+/// group that would push the block past `max_chars` ends it. Neither the block
+/// nor the list holds that group or any later one.
+fn format_long_term_memory(
+    sorted_topics: &[(String, Vec<(MemoryEntry, f64)>)],
+    max_chars: usize,
+) -> (String, Vec<RecalledMemory>) {
+    let mut memory_section = String::from("[Long-term Memory]\n\n");
+    let mut current_size = 0;
+    let mut recalled = Vec::new();
+
+    for (topic, entries) in sorted_topics {
+        let mut topic_block = format!("## {}\n", topic);
+        for (entry, _) in entries {
+            topic_block.push_str(&format_memory_bullet(entry));
+        }
+        topic_block.push('\n');
+
+        if current_size + topic_block.len() > max_chars {
+            break;
+        }
+
+        memory_section.push_str(&topic_block);
+        current_size += topic_block.len();
+        recalled.extend(entries.iter().map(|(entry, _)| RecalledMemory::from(entry)));
+    }
+
+    if recalled.is_empty() {
+        return (String::new(), recalled);
+    }
+    (memory_section, recalled)
+}
+
 impl LucidosEngine {
     pub(crate) async fn retrieve_context(
         &self,
         query: &str,
         classification: &QueryClassification,
-    ) -> (String, usize) {
+    ) -> (String, Vec<RecalledMemory>) {
         const MAX_CONTEXT_CHARS: usize = 50_000;
         use crate::memory::{
             RETRIEVAL_MIN_IMPORTANCE as MIN_IMPORTANCE, RETRIEVAL_MIN_SIMILARITY as MIN_SIMILARITY,
@@ -1210,17 +1247,14 @@ impl LucidosEngine {
         const MAX_FACTS: usize = 25;
         const JACCARD_DEDUP_THRESHOLD: f32 = 0.8;
 
-        let mut context = String::new();
-        let mut current_size = 0;
-
         // Skip memory retrieval entirely if classification says it's not needed
         if !classification.needs_memory {
             log!(@Memory, "Query classified as not needing memory — skipping retrieval");
-            return (context, 0);
+            return (String::new(), Vec::new());
         }
 
         let Some(ref index) = self.memory_index else {
-            return (context, 0);
+            return (String::new(), Vec::new());
         };
 
         // Use pre-decomposed sub-queries from classification (already done in classify_query)
@@ -1242,7 +1276,7 @@ impl LucidosEngine {
             Ok(e) => e,
             Err(e) => {
                 log!(@Memory, "Batch embedding failed: {}", e);
-                return (context, 0);
+                return (String::new(), Vec::new());
             }
         };
 
@@ -1323,7 +1357,7 @@ impl LucidosEngine {
         }
 
         if all_entries.is_empty() {
-            return (context, 0);
+            return (String::new(), Vec::new());
         }
 
         // Take top-N by relevance score
@@ -1381,31 +1415,7 @@ impl LucidosEngine {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        // Format as structured timeline
-        let mut memory_section = String::from("[Long-term Memory]\n\n");
-        let mut total_facts = 0;
-
-        for (topic, entries) in &sorted_topics {
-            let mut topic_block = format!("## {}\n", topic);
-            for (entry, _) in entries {
-                topic_block.push_str(&format_memory_bullet(entry));
-            }
-            topic_block.push('\n');
-
-            if current_size + topic_block.len() > MAX_CONTEXT_CHARS {
-                break;
-            }
-
-            memory_section.push_str(&topic_block);
-            current_size += topic_block.len();
-            total_facts += entries.len();
-        }
-
-        if total_facts > 0 {
-            context.push_str(&memory_section);
-        }
-
-        (context, total_facts)
+        format_long_term_memory(&sorted_topics, MAX_CONTEXT_CHARS)
     }
 }
 

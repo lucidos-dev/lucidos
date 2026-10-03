@@ -35,8 +35,8 @@ describe('appFilterOptions — only apps with CC sessions', () => {
     appsList.value = {
       status: 'loaded',
       data: [
-        { id: 'habit-tracker', name: 'Habit Tracker', description: '' },
-        { id: 'habit', name: 'Habit', description: '' },
+        { id: 'habit-tracker', name: 'Habit Tracker', description: '', reveal: 'on-load' },
+        { id: 'habit', name: 'Habit', description: '', reveal: 'on-load' },
       ],
     };
     // Only habit-tracker has a thread.
@@ -47,7 +47,7 @@ describe('appFilterOptions — only apps with CC sessions', () => {
   it('labels a session app from the live appsList (not deleted)', () => {
     appsList.value = {
       status: 'loaded',
-      data: [{ id: 'habit-tracker', name: 'Habit Tracker', description: '' }],
+      data: [{ id: 'habit-tracker', name: 'Habit Tracker', description: '', reveal: 'on-load' }],
     };
     threadMap.value = new Map([['t1', appThread('/ws/data/apps/habit-tracker')]]);
     expect(appFilterOptions.value).toEqual([{ id: 'habit-tracker', label: 'Habit Tracker', deleted: false }]);
@@ -64,7 +64,7 @@ describe('appFilterOptions — only apps with CC sessions', () => {
   it('keeps a selected app even with no session so it stays clearable', () => {
     appsList.value = {
       status: 'loaded',
-      data: [{ id: 'habit-tracker', name: 'Habit Tracker', description: '' }],
+      data: [{ id: 'habit-tracker', name: 'Habit Tracker', description: '', reveal: 'on-load' }],
     };
     threadMap.value = new Map();
     selectedAppIds.value = new Set(['habit-tracker']);
@@ -74,7 +74,7 @@ describe('appFilterOptions — only apps with CC sessions', () => {
   it('ignores non-app coding-agent threads', () => {
     appsList.value = {
       status: 'loaded',
-      data: [{ id: 'habit-tracker', name: 'Habit Tracker', description: '' }],
+      data: [{ id: 'habit-tracker', name: 'Habit Tracker', description: '', reveal: 'on-load' }],
     };
     threadMap.value = new Map([
       ['t1', { meta: { codingAgentKind: 'lucidos', codingAgentFolder: '/ws/data/apps/habit-tracker' } } as unknown as ThreadState],
@@ -85,7 +85,7 @@ describe('appFilterOptions — only apps with CC sessions', () => {
   it('lists an app from filterFacets even with no loaded thread (complete option list)', () => {
     appsList.value = {
       status: 'loaded',
-      data: [{ id: 'habit-tracker', name: 'Habit Tracker', description: '' }],
+      data: [{ id: 'habit-tracker', name: 'Habit Tracker', description: '', reveal: 'on-load' }],
     };
     threadMap.value = new Map();
     filterFacets.value = {
@@ -109,7 +109,7 @@ describe('appFilterOptions — only apps with CC sessions', () => {
 
 describe('appFilterOptions — include-deleted toggle', () => {
   beforeEach(() => {
-    appsList.value = { status: 'loaded', data: [{ id: 'habit-tracker', name: 'Habit Tracker', description: '' }] };
+    appsList.value = { status: 'loaded', data: [{ id: 'habit-tracker', name: 'Habit Tracker', description: '', reveal: 'on-load' }] };
     threadMap.value = new Map([
       ['t1', appThread('/ws/data/apps/habit-tracker')],
       ['t2', appThread('/ws/data/apps/gone')],

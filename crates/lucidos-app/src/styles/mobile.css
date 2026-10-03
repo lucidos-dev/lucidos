@@ -503,6 +503,15 @@
         height: var(--mobile-header-fade);
         background: linear-gradient(to bottom, var(--bg-primary), transparent);
         pointer-events: none;
+        transition: opacity var(--duration-normal) ease;
+    }
+
+    /* The app load bar (previews.css) runs along the pane's top edge, which is
+       exactly where this fade hangs, and the header paints above the pane. So
+       the fade stands down while the bar is mounted. Over the load cover it is
+       the cover's own colour, so nothing visible is lost. */
+    :root:has(.app-ui-load-bar) .app-header[data-mobile-view="content"]::after {
+        opacity: 0;
     }
 
     /* A thread's sticky title bar sits under the header and carries its own
@@ -1507,6 +1516,15 @@
         background-color: color-mix(in srgb, var(--composer-background-color) 70%, transparent);
         -webkit-backdrop-filter: blur(0.75rem) saturate(140%);
         backdrop-filter: blur(0.75rem) saturate(140%);
+    }
+
+    /* Opaque while the keyboard is up: there iOS Safari draws the backdrop
+       above the box with the wrong corners, a second outline behind the focus
+       ring (docs/temporary-measures.md § Composer frost off under the keyboard). */
+    :root[data-mobile-dynamic-bars][data-keyboard-active] .thread-pane:not(.compose-empty) .prompt-area .prompt-box {
+        background-color: var(--composer-background-color);
+        -webkit-backdrop-filter: none;
+        backdrop-filter: none;
     }
 
     :root[data-mobile-dynamic-bars] .mobile-swipe-pane .thread-pane:not(.compose-empty) .thread-content {

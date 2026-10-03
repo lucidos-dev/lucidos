@@ -12,6 +12,7 @@ mod emit;
 mod event;
 mod event_impl;
 mod form_request;
+mod memory;
 mod meta;
 mod question;
 mod session;
@@ -26,6 +27,7 @@ pub use cause::{AbortCause, CancelCause, EventWaitCancelCause};
 pub use channel::{EventChannel, TriggerInvocation};
 pub use event::ThreadEvent;
 pub use form_request::FormRequestOutcome;
+pub use memory::RecalledMemory;
 pub use meta::EventMeta;
 pub use question::{AnswerKind, QuestionOption};
 pub use session::{

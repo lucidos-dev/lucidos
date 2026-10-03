@@ -668,7 +668,7 @@ why the rule reads the compiler's own list.
 is the engine crate alone, and `make lint` compiles the CLI tests without
 running them. Yet CLI tests `include_str!` engine files to pin the CLI against
 them: the two menu JSONs for `--reasoning-effort`, and `api/data_api.rs` plus
-the frontend's `linkifyPaths.ts` for the data prefixes. An edit to one of those
+the frontend's `dataPathPrefixes.ts` for the data prefixes. An edit to one of those
 is a diff outside `crates/lucidos-cli/`. So `start` records the CLI's own
 includes in `cli-inputs`, and a listed path selects the CLI row. A hand-kept menu-JSON row once let the guard miss the change it
 watches.

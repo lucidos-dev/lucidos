@@ -5,6 +5,9 @@ export interface App {
   name: string;
   description: string;
   icon?: string;
+  /** When the host lifts its loading cover, from the manifest's `reveal`.
+   *  `on-ready` waits for `lucidos.ui.ready()`. */
+  reveal: 'on-load' | 'on-ready';
 }
 
 export const apps = {

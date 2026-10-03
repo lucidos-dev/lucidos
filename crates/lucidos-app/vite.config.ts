@@ -6,7 +6,7 @@ import fs from 'fs';
 import crypto from 'crypto';
 import { previewAuthGate, previewGatewayFromEnv, previewProxy } from './vite/frontendPreviewGateway';
 import { askGatewaySession } from './vite/gatewaySession';
-import { entryChunkBudget } from './vite/entryChunkBudget';
+import { entryChunkBudget, underDevBuildWatch } from './vite/entryChunkBudget';
 import { shellChunkPreload } from './vite/shellChunkPreload';
 import { inlineBootScript } from './vite/inlineBootScript';
 import { layoutMediaPlugin } from './vite/layoutMediaPlugin';
@@ -290,7 +290,8 @@ export default defineConfig({
       ? [previewAuthGate(previewGateway, (cookie) => askGatewaySession(previewGateway, cookie))]
       : []),
     buildIdVirtualModule(), suppressMergeReload(), inlineAppearanceBoot(), syncPublicDir(),
-    stampServiceWorker(), preact(), entryChunkBudget(), shellChunkPreload(), atomicDistPublish(),
+    stampServiceWorker(), preact(), entryChunkBudget(underDevBuildWatch(process.env, process.ppid)),
+    shellChunkPreload(), atomicDistPublish(),
   ],
   css: { postcss: { plugins: [layoutMediaPlugin()] } },
   build: {

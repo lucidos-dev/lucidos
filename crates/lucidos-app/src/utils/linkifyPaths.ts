@@ -10,6 +10,7 @@ import { makeInertBody } from './escapeHtml';
 import { escapeHtmlAttr } from './markedConfig';
 import { addLinkifyMs } from './renderPhaseTimers';
 import { parseRepoPath, type RepoLocator } from '../store/repoPath';
+import { DATA_PATH_PREFIXES } from './dataPathPrefixes';
 
 // Cap how many alternatives go into a single regex. WebKit's YARR throws
 // "regular expression too large" on big alternations; V8 has no such limit.
@@ -215,27 +216,6 @@ export function browserHandlesHref(href: string): boolean {
   if (!hasUrlScheme(href)) return false;
   return BROWSER_NAVIGABLE_SCHEMES.has(href.slice(0, href.indexOf(':')).toLowerCase());
 }
-
-/** The `data/` sub-trees the `/data/*` mount serves: the engine's
- *  `MUTABLE_PREFIXES` in `core/data_prefixes.rs`, plus the read-only
- *  `system-knowhow/`. `every_data_prefix_list_matches_the_engine` in the CLI
- *  crate pins it to the engine's list.
- *
- *  It drives the href recognizer below, relative image sources, and
- *  `normalizeDataPath`, which prefixes anything else with `artifacts/`. A tree
- *  missing here opens the wrong file, and a link to it reloads the workspace. */
-export const DATA_PATH_PREFIXES: readonly string[] = [
-  'artifacts/',
-  'apps/',
-  'knowhow/',
-  'triggers/',
-  'config/',
-  'auth-modules/',
-  'scripts/',
-  'themes/',
-  'fonts/',
-  'system-knowhow/',
-];
 
 /** The trees a bare path in PROSE links into. Narrower than
  *  `DATA_PATH_PREFIXES`, because prose is not a deliberate anchor. A coding

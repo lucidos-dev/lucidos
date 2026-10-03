@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.46.1 - 2026-10-03
+
+### Added
+- Apps show a load bar along the top of the pane while they open.
+- An app can set `"reveal": "on-ready"` in its manifest and call `lucidos.ui.ready()` when its content is drawn. Lucidos keeps the loading cover up until then, for at most 15 seconds.
+- Apps get a shared `.text-input` class that matches the host's text fields. Custom themes tint it like the other controls.
+- Unsent messages come back after a page reload, as Not sent cards with Retry. A Discard button drops one without sending it.
+- Tap "Recalled N memories" on a step to see each memory it used, with its date and topic. A tap opens the conversation or file it came from.
+
+### Changed
+- `lucidos.ui.Select` uses the host's own dropdown look: the same size, corners and focus ring.
+- Click the text of a task item in the markdown preview to toggle its checkbox. A successful toggle no longer shows a Saved toast.
+- The Plugins panel drops its "Updated" line. It shows a notice only when the last marketplace scan failed, with a Try again link.
+
+### Fixed
+- An unsent first message comes back whole after a reload, not cut short at the last saved draft.
+- A child thread cut off by a restart reports to its parent as interrupted, with how to continue. A coding-agent child no longer reports success, and a chat child no longer leaves its parent waiting.
+- A parent thread no longer starts its turn while the engine is still recovering from a restart.
+- On a phone, the step context counter takes a slightly-off tap.
+- The upload progress ring spins smoothly.
+- The app load bar shows on phones.
+- On an installed iPhone app, the bottom strip fades with the splash screen.
+- On iPhone, the message box no longer shows a second outline behind the focus ring while the keyboard is up.
 ## v0.46.0 - 2026-10-03
 
 ### Added

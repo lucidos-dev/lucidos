@@ -551,8 +551,8 @@ describe('a scan landing', () => {
     expect(mockFetchPluginCatalog).not.toHaveBeenCalled();
   });
 
-  // The reported bug: a pull re-read the cached catalog, so "Updated 3 minutes
-  // ago" never moved. A refresh asks for a scan, as the freshness button does.
+  // The reported bug: a pull re-read the cached catalog, so the list never
+  // moved. A refresh asks for a scan.
   it('refreshes by asking for a scan, and settles once its result is on screen', async () => {
     marketplaceScanning.value = false;
     marketplaceCatalog.value = { status: 'loaded', data: catalogOf({ scanned_at: '2026-09-22T09:00:00Z' }) };

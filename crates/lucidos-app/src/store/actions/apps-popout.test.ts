@@ -51,7 +51,7 @@ const { popOutApp } = await import('./apps');
 const habitTracker: App = {
   id: 'habit-tracker',
   name: 'Habit Tracker',
-  description: 'Daily habits',
+  description: 'Daily habits', reveal: 'on-load',
 };
 
 /** The page the packaged client is on: the gateway origin, under the workspace

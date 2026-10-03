@@ -62,9 +62,14 @@ function createSelect(opts: SelectCreateOptions): SelectInstance {
   }
   root.dataset.state = 'closed';
 
+  // The dropdown-*/surface-box classes render this exactly like the host's
+  // own dropdown, from shared-components.css / surface.css — nothing to keep
+  // in sync. See docs/plans/2026-10-03-sdk-dropdown-shares-host-css.md.
+  // lucidos-select-* stays as a stable hook for this file's own queries and
+  // for apps that already target it.
   const trigger = document.createElement('button');
   trigger.type = 'button';
-  trigger.className = 'lucidos-select-trigger';
+  trigger.className = 'lucidos-select-trigger dropdown-trigger';
   trigger.id = id;
   trigger.setAttribute('aria-haspopup', 'listbox');
   trigger.setAttribute('aria-expanded', 'false');
@@ -75,7 +80,7 @@ function createSelect(opts: SelectCreateOptions): SelectInstance {
   labelEl.className = 'lucidos-select-label';
 
   const chevron = document.createElement('span');
-  chevron.className = 'lucidos-select-chevron';
+  chevron.className = 'lucidos-select-chevron dropdown-chevron';
   chevron.setAttribute('aria-hidden', 'true');
   chevron.textContent = '▾';
 
@@ -83,7 +88,7 @@ function createSelect(opts: SelectCreateOptions): SelectInstance {
   trigger.appendChild(chevron);
 
   const menu = document.createElement('div');
-  menu.className = 'lucidos-select-menu';
+  menu.className = 'lucidos-select-menu surface-box';
   menu.id = listboxId;
   menu.setAttribute('role', 'listbox');
 
@@ -98,10 +103,10 @@ function createSelect(opts: SelectCreateOptions): SelectInstance {
     const sel = selectedOption();
     if (sel) {
       labelEl.textContent = sel.label;
-      labelEl.classList.remove('lucidos-select-placeholder');
+      labelEl.classList.remove('lucidos-select-placeholder', 'dropdown-placeholder');
     } else {
       labelEl.textContent = placeholder ?? '';
-      labelEl.classList.add('lucidos-select-placeholder');
+      labelEl.classList.add('lucidos-select-placeholder', 'dropdown-placeholder');
     }
   }
 
@@ -109,7 +114,7 @@ function createSelect(opts: SelectCreateOptions): SelectInstance {
     menu.innerHTML = '';
     options.forEach((o, i) => {
       const item = document.createElement('div');
-      item.className = 'lucidos-select-option';
+      item.className = 'lucidos-select-option dropdown-option';
       item.setAttribute('role', 'option');
       item.id = `${id}-opt-${i}`;
       item.dataset.value = o.value;
@@ -242,7 +247,9 @@ function createSelect(opts: SelectCreateOptions): SelectInstance {
     isOpen = next;
     root.dataset.state = next ? 'open' : 'closed';
     trigger.setAttribute('aria-expanded', next ? 'true' : 'false');
-    chevron.textContent = next ? '▴' : '▾';
+    // Flips the glyph in place, like the host's dropdown-chevron. A swapped
+    // glyph can differ in width and resize the trigger.
+    chevron.classList.toggle('open', next);
     if (next) {
       const sel = selectedOption();
       const idx = sel ? options.indexOf(sel) : -1;

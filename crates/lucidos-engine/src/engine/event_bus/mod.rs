@@ -211,6 +211,9 @@ pub use system_event::SystemEvent;
 mod auto_resume_hold;
 pub(crate) use auto_resume_hold::AutoResumeHolds;
 
+mod parent_wake_hold;
+use parent_wake_hold::ParentWakeHold;
+
 mod parent_callback;
 pub(crate) use parent_callback::ChildSettle;
 
@@ -395,6 +398,9 @@ pub struct EventBus {
     /// Children the engine is about to auto-resume, so `notify_parent_if_child`
     /// withholds their completion card. See [`AutoResumeHolds`].
     auto_resume_holds: AutoResumeHolds,
+    /// Parent wakes queued during boot recovery and teardown. See
+    /// [`ParentWakeHold`].
+    parent_wake_hold: ParentWakeHold,
 }
 
 impl EventBus {
@@ -410,6 +416,7 @@ impl EventBus {
                 parent_callback_tx,
                 changes_projection,
                 auto_resume_holds: AutoResumeHolds::default(),
+                parent_wake_hold: ParentWakeHold::default(),
             },
             parent_callback_rx,
         )
@@ -419,6 +426,31 @@ impl EventBus {
     /// intends to auto-resume past.
     pub(crate) fn auto_resume_holds(&self) -> &AutoResumeHolds {
         &self.auto_resume_holds
+    }
+
+    /// Queue every parent wake until [`Self::release_held_parent_wakes`]. Boot
+    /// calls this before any recovery sweep emits, and teardown before its
+    /// aborts.
+    pub fn hold_parent_wakes(&self) {
+        self.parent_wake_hold.engage();
+    }
+
+    /// Send every parent wake queued since [`Self::hold_parent_wakes`],
+    /// and send later ones straight away. Returns how many went out.
+    pub fn release_held_parent_wakes(&self) -> usize {
+        let held = self.parent_wake_hold.release();
+        let count = held.len();
+        for callback in held {
+            let child_thread_id = callback.child_thread_id;
+            if let Err(e) = self.parent_callback_tx.send(callback) {
+                crate::log!(
+                    "[FanOut] Failed to release the boot-held parent wake for child {}: {}",
+                    child_thread_id,
+                    e
+                );
+            }
+        }
+        count
     }
 
     pub fn changes_projection(&self) -> &crate::core::changes_projection::ChangesProjection {
@@ -927,6 +959,7 @@ impl EventBus {
                     // Capture what notify_parent_if_child needs before event is moved
                     let notify_thread_id = *thread_id;
                     let notify_event = te.clone();
+                    let notify_actor = meta.actor.clone();
 
                     let _ = self.event_tx.send(EmittedEvent {
                         event_id,
@@ -968,8 +1001,13 @@ impl EventBus {
                         );
                     }
                     // Run after broadcast so a panic here can't skip SSE delivery
-                    self.notify_parent_if_child(notify_thread_id, Some(event_id), &notify_event)
-                        .await;
+                    self.notify_parent_if_child(
+                        notify_thread_id,
+                        Some(event_id),
+                        &notify_event,
+                        notify_actor.as_ref(),
+                    )
+                    .await;
                     // If a child was just created, notify the parent with updated counts
                     if let ThreadEvent::MessageReceived {
                         parent_thread_id: Some(pid),

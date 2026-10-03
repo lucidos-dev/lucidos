@@ -17,17 +17,15 @@ import {
   adoptQueuedUploadSendRecord,
   forgetPendingUploadRecord,
   forgetQueuedUploadSend,
-  holdPageOwnerLock,
-  liveOwnerIds,
   notePendingUploadsOwnedElsewhere,
   ownedPendingUploadRecords,
   ownedQueuedUploadSends,
-  pageOwnerId,
   persistQueuedUploadSend,
   readPendingUploadStore,
   type PendingUploadRecord,
   type QueuedUploadSendSnapshot,
 } from '../pendingUploadRecords';
+import { holdPageOwnerLock, liveOwnerIds, ownedByAnotherLiveTab, pageOwnerId } from '../pageOwner';
 import { isConnected, showToast, threadListFetched, threadMap } from '../store';
 import { errorDetail } from '../../utils/errorDetail';
 import { resumePendingUpload } from './imageUploads';
@@ -121,7 +119,7 @@ async function restorePass(now: number): Promise<RestoreOutcome> {
   const outcome: RestoreOutcome = { restored: 0, gone: 0, expired: 0, unsentQueuedUploadSends: 0, unresolved: 0 };
   const { uploads, queuedUploadSendRecords } = await readPendingUploadStore();
   const liveOwners = await liveOwnerIds();
-  const ownedElsewhere = (ownerId: string) => ownerId !== pageOwnerId && liveOwners?.has(ownerId) === true;
+  const ownedElsewhere = (ownerId: string) => ownedByAnotherLiveTab(ownerId, liveOwners);
   notePendingUploadsOwnedElsewhere(uploads.filter((r) => ownedElsewhere(r.ownerId)));
 
   const alreadyOwned = new Set(ownedPendingUploadRecords().map((r) => r.localId));

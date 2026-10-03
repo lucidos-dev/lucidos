@@ -24,7 +24,7 @@ const APP_ID = 'habit-tracker';
 const GROUP_ID = 'group-nightly';
 
 function app(over: Partial<App> = {}): App {
-  return { id: APP_ID, name: 'Habit Tracker', description: 'Tracks habits', ...over };
+  return { id: APP_ID, name: 'Habit Tracker', description: 'Tracks habits', reveal: 'on-load', ...over };
 }
 
 function group(over: Partial<TriggerGroup> = {}): TriggerGroup {

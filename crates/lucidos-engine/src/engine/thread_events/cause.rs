@@ -81,25 +81,18 @@ pub enum AbortCause {
 }
 
 impl AbortCause {
-    /// True when the abort is expected to be followed by a fresh `SessionStarted`
-    /// (engine shutdown, recovery sweep) — the child is mid-retry, not done.
-    /// Callers must NOT decrement the parent's `active_children_count` or fire
-    /// the completion callback in this case, or the resumed child's eventual
-    /// `CodingAgentIdled` would be orphaned.
+    /// True when the abort came from an engine restart (shutdown or recovery
+    /// sweep) rather than from the turn itself failing. `SafetyNet`,
+    /// `ProcessKilled`, `StaleSettle`, `SessionDropped` and the legacy
+    /// `Unknown` are not.
     ///
-    /// `SafetyNet`, `ProcessKilled`, and `StaleSettle` are NOT transient: the
-    /// thread sits in error state (or, for stale-settle, was already done and
-    /// is just being projection-cleaned) and no fresh `SessionStarted` will
-    /// follow — the parent's counter must drop so it doesn't display as Active
-    /// forever. `Unknown` is legacy; treat as terminal so the prior
-    /// decrement-on-abort behavior holds for old DB rows.
-    ///
-    /// This is a question about the **parent's counter**, not about how the turn
-    /// reads to the user. It has no actor axis, so it cannot tell the user's own
-    /// *Switch to new version* (which auto-resumes) from a crash recovery sweep
-    /// (which does not). [`status_sql`](Self::status_sql) keyed on it until
-    /// 2026-08-06 and got crashes wrong for exactly that reason; the verdict now
-    /// keys on [`promises_auto_resume`](Self::promises_auto_resume) instead.
+    /// **It does not say whether the child comes back.** It has no actor axis,
+    /// so it cannot tell the user's own *Switch to new version* (which
+    /// auto-resumes) from a crash (which does not). Whatever depends on a
+    /// resume keys on [`promises_auto_resume`](Self::promises_auto_resume):
+    /// the turn's verdict, the parent fan-in and its in-tx counter mirror. The
+    /// fan-in uses this one only to tell a restart cut, which it reports as
+    /// `interrupted`, from a turn that failed on its own.
     pub fn is_transient(&self) -> bool {
         matches!(self, Self::EngineShutdown | Self::RecoveryAfterRestart)
     }
@@ -132,9 +125,8 @@ impl AbortCause {
     /// the actor: see
     /// `docs/plans/2026-08-07-teardown-actor-is-one-value-for-the-whole-teardown.md`.
     ///
-    /// Deliberately NOT [`is_transient`](Self::is_transient), which answers a
-    /// different question (may the parent's `active_children_count` decrement?)
-    /// and has no actor axis at all.
+    /// Deliberately NOT [`is_transient`](Self::is_transient), which only says a
+    /// restart caused the abort and has no actor axis at all.
     pub fn promises_auto_resume(&self, actor: Option<&super::MessageOrigin>) -> bool {
         matches!(self, Self::EngineShutdown)
             && matches!(actor, Some(super::MessageOrigin::Device { .. }))
@@ -160,9 +152,9 @@ impl AbortCause {
     ///   not keep), and a system-actor `EngineShutdown`.
     ///
     /// The paused arm keyed on [`is_transient`](Self::is_transient) until it got
-    /// crashes wrong for the reason that method's own doc gives. Transience is
-    /// about the parent's child counter; the verdict is about whether anyone is
-    /// coming back for this turn, and only the actor can say.
+    /// crashes wrong for the reason that method's own doc gives. The verdict is
+    /// about whether anyone is coming back for this turn, and only the actor
+    /// can say.
     ///
     /// **A pending change does not change the answer.** Both verdict arms used
     /// to open `CASE WHEN coding_agent_proposed THEN 'waiting'`, on the

@@ -42,6 +42,7 @@ const REPO_ROOT = resolve(here, '../../../../..');
  *  new one here in the same change that adds the `include_str!`. */
 const ENGINE_SERVED_CSS = [
   'crates/lucidos-engine/src/api/sdk_iframe.css',
+  'crates/lucidos-engine/src/api/sdk_iframe_control_theme_parts.css',
   'crates/lucidos-app/src/styles/generated/theme-parts-frame.css',
 ] as const;
 

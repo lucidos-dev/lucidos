@@ -540,7 +540,7 @@ WAITING FOR A STATE CHANGE IN LUCIDOS: USE `await_event`, NEVER A POLL LOOP:
 - Everything above is about the OUTPUT of a process you started. A STATE CHANGE in Lucidos is a different thing: a change being proposed, a trigger firing, a thread you did NOT spawn going idle, a domain event. `await_event` subscribes you and re-opens this thread when it arrives.
 - Reach for it INSTEAD of a bash_output drain loop, a sleep-and-recheck script, or a `threads list` / `changes list` poll: a poll costs a turn per check and can miss a transition between samples. It is ALSO how you deliver, not only how you wait, so nothing has to be blocking you. It is NOT for external state with no Lucidos event (a third-party API, a file another process writes), which you poll with the background tools.
 - Whether the watch is one-shot is the duration half of the choice; the destination half is TELL ME WHEN X HAPPENS above, which decides "let me know HERE".
-- IT WATCHES THE WHOLE WORKSPACE, not just this thread, so ANY thread's completion is a first-class wait, someone else's coding-agent session included: `CodingAgentIdled` with a `condition` of `{"thread_id": "<uuid>"}`, which scopes ANY thread event to one thread. NOT YOUR OWN CHILD: it already re-opens this thread with its status, summary and pending change ids, so a wait on it is a second wake. Say you'll report back, and end the turn.
+- IT WATCHES THE WHOLE WORKSPACE, not just this thread, so ANY thread's completion is a first-class wait, someone else's coding-agent session included: `CodingAgentIdled` with a `condition` of `{"thread_id": "<uuid>"}`, which scopes ANY thread event to one thread. NOT YOUR OWN CHILD: it reports back on its own (FAN-OUT below), so a wait on it is a second wake.
 - "WAIT UNTIL THE RUNNING ONES ARE DONE" IS A SET YOU DISCOVER, THEN RE-CHECK ON EVERY WAKE: `threads` list with status ["running"], then ONE wait naming each session in `on` (any wakes you), or a bare `CodingAgentIdled`. A wake means ONE finished, never the last, since the subscription is SPENT: list again, re-subscribe if any still are, and report only once it is empty.
 - "WHEN X FINISHES, DO Y" NAMES A PRECONDITION, NOT A GO-AHEAD: wait for X, then do Y. "Auto approved" pre-approves Y for when X has happened; it never replaces X.
 - IT RETURNS IMMEDIATELY AND BLOCKS NOTHING, so say what you're waiting for and END YOUR TURN. The tool's own schema carries the rest.
@@ -568,7 +568,9 @@ EVENTS (the `events` tool):
 
 PARALLEL WORK (FAN-OUT):
 - run_coding_agent starts a coding-agent thread for code work; run_thread starts a Lucidos thread for non-code work; follow_up_child_thread steers a child you already spawned, and `threads` 'detach_child' stops waiting for one. You can only address your own DIRECT children, which the `threads` tool's 'list' action lists with `my_children: true`.
-- The resume callback that reports a child's result back here only works for same-workspace children spawned with these tools.
+- A DIRECT CHILD REPORTS BACK ON ITS OWN: when it finishes, fails, is canceled or is cut by an engine crash, the engine re-opens THIS thread with its status, summary and pending change ids. Say what you're waiting for and END YOUR TURN.
+- NEVER `await_event` ON YOUR OWN CHILD's `CodingAgentIdled`, `ResponseGenerated` or `ChildThreadCompleted`: a second wake for one finish.
+- `interrupted` means a crash cut its turn and nothing resumes it: follow_up_child_thread continues it. Only same-workspace children spawned with these tools report; a grandchild reports to your child, not you.
 - For a pipeline where step N depends on step N-1, spawn ONE child per response and wait for the callback. Never batch sequential spawns into one response.
 - SPAWN SPARINGLY. Default to doing the work yourself. Spawn only for genuinely independent subtasks that gain from running in parallel, never for what a few sequential tool calls would do, and never one thread per item in a list. Maximum __MAX_CHILDREN_PER_THREAD__ children per thread, maximum depth 3.
 
@@ -1371,7 +1373,14 @@ mod tests {
     /// announced. No line gave an order, so nothing kept the agent off a site
     /// a proxy already served. The choice is made at the call, where no
     /// knowhow loads.
-    const ALWAYS_LOADED_BUDGET_CHARS: usize = 123_306;
+    ///
+    /// Raised by 365 to a measured 123,671: PARALLEL WORK now says a direct
+    /// child reports back on its own. It names the finishing events never to
+    /// wait on, and what `interrupted` asks of the parent. An orchestrator
+    /// subscribed to its own child's idle, and a workspace knowhow was
+    /// carrying a rule the engine should state
+    /// (docs/plans/2026-10-03-crash-cut-child-reports-truthfully.md).
+    const ALWAYS_LOADED_BUDGET_CHARS: usize = 123_671;
 
     /// The hand-written flat tool schemas the chat agent is offered.
     ///
@@ -2202,6 +2211,35 @@ mod tests {
             "the browser is the fallback, and the user must hear when it is \
              used:\n{section}"
         );
+    }
+
+    /// A nightly orchestrator armed `await_event` on its own child's
+    /// `CodingAgentIdled`, though the fan-in re-opens it anyway. The FAN-OUT
+    /// section named the callback only in passing, so the rule has to be
+    /// stated where the model spawns, with every finishing event named.
+    #[test]
+    fn the_fan_out_section_says_a_direct_child_reports_back_on_its_own() {
+        let body = static_prompt_body(false, 500, ContextMode::Off, "");
+        let from = body
+            .find("PARALLEL WORK (FAN-OUT):\n")
+            .expect("the prompt no longer has a FAN-OUT section");
+        let section = &body[from..];
+        let section = &section[..section.find("\n\n").unwrap_or(section.len())];
+
+        for needle in [
+            "A DIRECT CHILD REPORTS BACK ON ITS OWN",
+            "cut by an engine crash",
+            "END YOUR TURN",
+            "NEVER `await_event` ON YOUR OWN CHILD",
+            "`CodingAgentIdled`, `ResponseGenerated` or `ChildThreadCompleted`",
+            "`interrupted`",
+            "a grandchild reports to your child, not you",
+        ] {
+            assert!(
+                section.contains(needle),
+                "the FAN-OUT section must carry {needle:?}:\n{section}"
+            );
+        }
     }
 
     /// The batch rule removes rounds only if the model reads it as general.

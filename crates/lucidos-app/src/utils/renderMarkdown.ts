@@ -6,7 +6,7 @@ import { BARE_EMAIL_ATTR, CODE_COPY_ATTR, COPY_ICON, COPY_ID_NONCE, escapeHtmlAt
 import { makeInertBody } from './escapeHtml';
 import { addMarkdownParseMs } from './renderPhaseTimers';
 import { WORKSPACE_ID } from './basePath';
-import { DATA_PATH_PREFIXES } from './linkifyPaths';
+import { DATA_PATH_PREFIXES } from './dataPathPrefixes';
 import { slugifyWorkspaceName } from './slug';
 
 /** Real destination for a thread link, so hovering shows where it goes instead

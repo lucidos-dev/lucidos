@@ -132,7 +132,8 @@ export type ChildCompletionStatus =
   | 'success'
   | 'failure'
   | 'no_changes'
-  | 'canceled';
+  | 'canceled'
+  | 'interrupted';
 
 /** Identifier for the coding-agent backend. The engine maps each kind to a
  *  concrete `AgentRuntime` implementation in its agent registry. */
@@ -329,6 +330,17 @@ export type FormRequestOutcome =
   | 'expired'
   | 'unknown';
 
+export type MemorySource =
+  | {
+      type: 'artifact';
+      path: string;
+      commit: string;
+    }
+  | {
+      type: 'event';
+      id: string;
+    };
+
 /** Who this thread event is the work of.
  *  Full reasoning is on the Rust variant. */
 export type MessageOrigin =
@@ -459,6 +471,18 @@ export interface QuestionOption {
   /** Markdown the card shows under the option: a picture, or a short text
    *  sample. Claude Code's native tool names it `preview`. */
   preview?: string;
+}
+
+/** One long-term memory the pre-turn recall injected into the turn's context,
+ *  as the model saw it.
+ *  Full reasoning is on the Rust variant. */
+export interface RecalledMemory {
+  id: string;
+  topic: string;
+  summary: string;
+  /** When the source content was created, which is the date the model saw. */
+  src_created_at: string;
+  source: MemorySource;
 }
 
 /** One pending change held by a sub-thread of the thread a
@@ -710,6 +734,9 @@ export type ThreadEvent =
       type: 'MemoryRecalled';
       results?: number;
       queries?: string[];
+      /** The memories injected, in the order the model saw them, so
+       *  `memories.len() == results`. Absent on rows written before it. */
+      memories?: RecalledMemory[];
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
       /** Source channel. Always set on an origin event. */

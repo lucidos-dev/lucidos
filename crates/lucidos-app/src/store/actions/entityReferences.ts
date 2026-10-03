@@ -331,9 +331,9 @@ export function processSSEForReferences(type: string, data: Record<string, unkno
       break;
     // A marketplace scan bookends itself, and these two frames are how every
     // client learns about one it did not start: the scheduler's five-minute
-    // pass, or another device's refresh. They drive the panel's "Updating…"
-    // cue, which is what the user sees instead of a skeleton over rows the
-    // client already holds.
+    // pass, or another device's refresh. They drive the panel's scanning
+    // state: the empty list's "Scanning marketplaces…", and the scan-failure
+    // notice's "Checking again…".
     case 'PluginCatalogScanStarted':
       marketplaceScanning.value = true;
       break;

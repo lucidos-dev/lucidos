@@ -50,13 +50,13 @@ pub(super) struct TriggerContext {
 /// prompt block. The threading model: events are persisted in PostgreSQL, so
 /// when the user returns to a thread its full history reloads on the next LLM
 /// turn (see the `Load conversation history from DB` step in the same module).
-/// What does NOT survive is anything in-flight — a streaming response, a
-/// pending child callback, an autonomous loop. The earlier wording said the
+/// What does NOT survive is anything in-flight: a streaming response or an
+/// autonomous loop. A child's report does survive, since its card is durable. The earlier wording said the
 /// thread itself was "wiped" and the LLM had "NO memory", which led the LLM
 /// to instruct users to start a NEW thread after a restart instead of
 /// returning to the existing one (observed in the
 /// `Status of Authentication Migration` thread).
-pub(super) const ENGINE_RESTART_RULE: &str = "ENGINE RESTARTS INTERRUPT IN-FLIGHT WORK, NOT THREAD MEMORY:\nThe thread survives a restart: every message, tool call and response is persisted, and your next turn loads the full history. Send the user back to THIS thread to re-prompt, never to a fresh one. In-flight work does NOT survive: a streaming response, a child callback you were waiting on, an autonomous loop, a `sleep N minutes then check back` intent. You do not run between turns, and nothing resumes on its own once a restart cuts a response off, so never promise anything \"after the restart\", \"once it comes back up\", or \"check back later\".";
+pub(super) const ENGINE_RESTART_RULE: &str = "ENGINE RESTARTS INTERRUPT IN-FLIGHT WORK, NOT THREAD MEMORY:\nThe thread survives a restart: every message, tool call and response is persisted, and your next turn loads the full history. Send the user back to THIS thread to re-prompt, never to a fresh one. In-flight work does NOT survive: a streaming response, an autonomous loop, a `sleep N minutes then check back` intent. You do not run between turns, and nothing resumes on its own once a restart cuts a response off, so never promise anything \"after the restart\", \"once it comes back up\", or \"check back later\".";
 
 /// Stops the chat agent from bouncing yes/no "did you apply it? / did you
 /// restart?" confirmations back at the user during the apply→restart loop.

@@ -586,12 +586,56 @@ ticks: critical pressure with available memory at or under the collapse level
   records the runner's pid. The sampler sends SIGINT to that pid and its
   descendants by parent pid, then SIGKILL to what is left after
   `LUCIDOS_E2E_TRIP_GRACE_SECS` (15).
-- **The run then reads as a memory stop**: exit 71, and no later chunk, phase
-  or project starts. A trip that lands between invocations stops the next
-  boundary, and no new invocation starts after it. The interrupted invocation
-  never prints its summary, so the project's tally is excused from adding up.
+- **The run then goes to its memory-stop resume**, below. When that cannot
+  resume, it reads as a memory stop: exit 71, and no later chunk, phase or
+  project starts. A trip that lands between invocations stops the next
+  boundary, and no new invocation starts after it. The interrupted invocation's
+  output stays out of the project's tally, so a re-run chunk counts once.
 - **A run torn down on a signal interrupts its own runner too**, using the pid
   it holds in memory, never one a stale file names. Plan: `docs/plans/2026-09-24-host-memory-watch-and-in-chunk-stop.md`.
+
+**A hung chunk meets a wall-clock ceiling** (ADR 0351). The in-chunk stop
+catches a chunk that starves the host. A chunk can also hang with memory fine,
+so each chunk invocation carries a 20-minute ceiling
+(`LUCIDOS_E2E_CHUNK_CEILING_SECS`). Real chunks take a median of 25 s and at
+most about 4 minutes. A chunk past the ceiling is interrupted through the same
+pid-tree stop and reads `CHUNK CEILING`, as a failure: no verdict must never
+read as green. The engine restarts on a fresh database before the
+next chunk, and a second trip ends the project.
+
+**The harness owns its recovery** (ADR 0351). A memory stop used to end the run,
+and a coding-agent child then improvised a second leg at 05:00. Those legs are
+where the nights failed: a retry that paid for the CC phase again, a launch
+over a NO-GO, a cargo build on a starved host. Now every stop site calls
+`recover_after_memory_stop`:
+
+- **It tears down** the engine, the orphans and the worktrees, then **waits**
+  for three clean readings in a row, 30 s apart. Clean means the running
+  guard's own boundary rule, load under the host-load cap, and no jetsam report
+  in the last five minutes.
+- **It resumes where the stop landed**, on a fresh database: the next chunk
+  after a boundary stop, the same chunk after an in-chunk stop. A stop in nav
+  never re-runs the CC phase.
+- **It is bounded.** At most 30 minutes per wait
+  (`LUCIDOS_E2E_RECOVERY_WAIT_SECS`), at most three resumes per run
+  (`LUCIDOS_E2E_MEMORY_RESUMES`, 0 for the old behaviour), and never past
+  `LUCIDOS_E2E_RESUME_BY` (local `HH:MM`).
+- **One verdict.** A run that resumed and finished exits with the tests' own
+  code and lists every stop. A run whose host never recovered exits 71, lists
+  the exact chunks with no verdict, and says not to start a second run.
+
+**Every run starts on a fresh workspace tree** (ADR 0351). The database was
+already rebuilt each run; the tree was not, and it had grown to 1,025 apps and
+27,341 commits. `reset_e2e_database --fresh-workspace`, called once at the
+start of a run, removes everything but `.lucidos/` with the engine stopped. The
+engine then bootstraps a brand-new workspace. Each boundary prints a
+`left behind` line: engine growth, live coding-agent subprocesses, and the
+workspace's apps, files and commits. A subprocess alive at two boundaries in a
+row is named `LEFTOVER`.
+
+**No cargo build starts on a host in trouble** (ADR 0351). The e2e engine build
+goes through `with-build-slot.sh`, which now runs the build memory gate first.
+On NO-GO it waits up to 15 minutes, then exits 72 and the run never starts.
 
 **No caller may export a ceiling, and that lesson outlived the cap.**
 `e2e-browser.sh` sets none and the umbrella sets none, so an unset run gets the

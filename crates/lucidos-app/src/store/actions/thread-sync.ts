@@ -9,10 +9,10 @@ import { describeRecommendedCleanupOutcome } from '../../utils/recommendedCleanu
 import { isFormRequest } from '../thread-events/thread-event-types';
 import { handleEvent, isChannelDefiningEvent, makeOptimisticThreadState, PENDING_TITLE_PLACEHOLDER, type ThreadAggregate, type ThreadMeta, type ThreadEvent, type TransientEvent } from '../thread-events';
 import { bumpThreadEvents } from '../threadActivity';
-import { settleDeliveredUnsentMessage } from '../unsentMessages';
+import { settleDeliveredUnsentMessage } from './sendSettlement';
 import type { ThreadChannel } from '../store';
 import { handleNotificationSSE, loadUnreadNotifications } from './notifications';
-import { dropDeletedThreads } from './threads-delete';
+import { dropDeletedThreads } from './threads-drop';
 import { loadThreadQueue } from './threadQueue';
 import { handlePresenceCheck, type PresenceCheckPayload } from './presence-pong';
 import {

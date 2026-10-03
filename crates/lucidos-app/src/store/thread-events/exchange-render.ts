@@ -6,7 +6,7 @@ import { describeCCTool, describeEngineTool, exchangeHasCCContent, exchangeRespo
 import { TERMINAL_EVENT_TYPES, UNANCHORABLE_ASYNC_EVENTS, VOICE_ONLY_STEP_TYPES, computeExchanges, dividerStillAwaitsUser, exchangeHoldsNoTurn, isCallBoundary, isLiveCallRow, isLiveReplyRow, isLiveUtteranceRow, isSettledLiveUtterance, isUningestedMessage, isWaitingTypedMessage, toolUseIdOf } from './exchange-grouping';
 import { IDLE_ENGINE_RESTART_INTERRUPT_REASON, isEngineDownAbort, isSwitchTeardownAbort, isTurnlessBoundary, isUserStoppedWait } from './thread-event-types';
 import type { ExchangeStatus } from '../exchange-status';
-import type { ContextAssembledData, ContextCapture, ContextSection, ResponseEvent, Step, StepOutcome } from '../types';
+import type { ContextAssembledData, ContextCapture, ContextSection, RecalledMemory, ResponseEvent, Step, StepOutcome } from '../types';
 import type { Exchange } from './exchange';
 import type { ThreadState } from './thread-meta';
 import type { ActorMode, EventSubscription, EventWaitCancelCause, MessageOrigin, SequencedEvent, StoredEvent, ThreadEvent } from './thread-event-types';
@@ -694,10 +694,15 @@ export function exchangeResponseEvents(exchange: Exchange, isLast = true, thread
       // Legacy name kept alongside the current one, as in `exchangeSteps`.
       case 'MemoryRecalled':
       case 'MemorySearched': {
-        const ms = event as { results?: number; queries?: string[] };
-        const results = ms.results ?? 0;
-        const detail = ms.queries?.length ? ms.queries.join(', ') : undefined;
-        pushStep({ type: 'step', description: memoryRecalledLabel(results), outcome: 'success', detail, created });
+        const ms = event as { results?: number; queries?: string[]; memories?: RecalledMemory[] };
+        const recall = { memories: ms.memories ?? [], queries: ms.queries ?? [] };
+        pushStep({
+          type: 'step',
+          description: memoryRecalledLabel(ms.results ?? 0),
+          outcome: 'success',
+          recall: recall.memories.length || recall.queries.length ? recall : undefined,
+          created,
+        });
         break;
       }
       // See the same case in `exchangeSteps`.

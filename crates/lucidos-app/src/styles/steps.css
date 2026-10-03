@@ -6,9 +6,13 @@
    the two targets, rather than the row itself being a <button>: a button may
    not contain another interactive element. */
 .inline-step {
+    /* Shared with the counter's touch reach, which covers this gap. */
+    --step-row-gap: 0.375rem;
+    --step-context-lead: 0.25rem;
+    --step-context-scale: 0.85;
     display: flex;
     align-items: baseline;
-    gap: 0.375rem;
+    gap: var(--step-row-gap);
     padding: 0.0625rem 0;
     font-size: var(--font-size-sm);
     color: var(--text-secondary);
@@ -255,11 +259,43 @@
        so a Fira Code user does not get ligatures back here. */
     font-feature-settings: inherit;
     text-align: left;
-    margin-left: 0.25rem;
+    margin-left: var(--step-context-lead);
     color: var(--text-muted);
-    font-size: 0.85em;
+    font-size: calc(var(--step-context-scale) * 1em);
     white-space: nowrap;
     flex-shrink: 0;
+    /* Anchors the touch reach below. */
+    position: relative;
+}
+
+/* On touch, the counter takes a tap that lands near it. Drawn, it is a
+   percentage about 20px wide. Without the reach, a near miss lands on bare
+   transcript and opens nothing, and on the right it reads as an edge gesture.
+   WebKit, unlike Chromium, never snaps a near miss onto a nearby button.
+
+   The reach is transparent and absolute, so nothing drawn moves. It covers:
+   - on the left, the row gap and the counter's own margin, less an eighth
+     of a rem. WebKit hits a box up to 2px left of its drawn edge, and the
+     inset keeps a tap on the step's own text from opening the context;
+   - on the right, the turn inset and the pane gutter;
+   - vertically, one row line's height. The counter is smaller type on the
+     row's baseline, so its own box is shorter than the row's line. The reach
+     sits within the row's padding, so a near miss never opens a neighbour.
+
+   `any-pointer`, not `pointer`: a tablet with a trackpad has a fine primary
+   pointer, and its finger taps still need the reach.
+
+   Pinned by `e2e/step-context-hit-target-mobile.spec.ts`. */
+@media (any-pointer: coarse) {
+    .inline-step button.step-context::before {
+        content: '';
+        position: absolute;
+        --step-context-reach-y: calc((1 / var(--step-context-scale) - 1) * 0.5lh);
+        top: calc(-1 * var(--step-context-reach-y));
+        bottom: calc(-1 * var(--step-context-reach-y));
+        left: calc(0.125rem - var(--step-row-gap) - var(--step-context-lead));
+        right: calc(-1 * (var(--thread-pane-gutter) + var(--turn-body-inset)));
+    }
 }
 
 /* Which counter the user sees is a WIDTH question, not a device one: a phone is
@@ -646,6 +682,57 @@
     color: var(--text-muted);
     font-weight: 600;
     margin-top: 0.25rem;
+}
+
+/* A recall step's memories, each a link to its source (`StepRecallList`). */
+.step-recall-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-xs);
+}
+
+.step-recall-item {
+    display: flex;
+    flex-direction: column;
+    gap: 0.125rem;
+    width: 100%;
+    padding: var(--space-sm) var(--space-md);
+    border: none;
+    border-radius: calc(var(--radius-surface) * 0.5);
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+    text-align: left;
+    cursor: pointer;
+}
+
+@media (hover: hover) {
+    .step-recall-item:hover {
+        background: var(--border-color);
+    }
+}
+
+.step-recall-item:focus-visible {
+    outline: none;
+    box-shadow: var(--focus-ring);
+}
+
+.step-recall-meta {
+    color: var(--text-muted);
+    font-size: var(--font-size-xs);
+}
+
+.step-recall-summary {
+    overflow-wrap: break-word;
+    word-break: break-word;
+}
+
+.step-recall-queries {
+    margin: 0;
+    padding-left: var(--space-lg);
+    color: var(--text-secondary);
 }
 
 .step-detail-result {

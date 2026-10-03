@@ -358,3 +358,7 @@ Create an entry with `./scripts/adr-new.sh`, never by hand. See
 - [0348: Search Everywhere ranks every category by one generic title rank, match level then coverage, and orders the All tab's sections by their best hit, rather than keeping a per-keyword map of the most relevant category.](0348-rank-search-generically.md)
 - [0349: Thread triage and Archive all share one safety classifier; triage applies only after the user replies; Archive all skips what needs the user and carries Undo](0349-thread-triage-and-archive-all.md)
 - [0350: The Lucidos Agent sees every builtin provider proxy, and request_credential refuses a key one already holds](0350-agent-sees-builtin-provider-proxies.md)
+- [0351: Heavy builds wait on a host-memory gate, and the e2e harness resumes after its own memory stops](0351-e2e-harness-owns-memory-recovery.md)
+- [0352: An unsent message lives on the device that sent it; the engine draft never holds a copy](0352-unsent-messages-live-on-the-sending-device.md)
+- [0353: UI-only listeners install from shell startup; the entry chunk warns past 90% of its budget; the build-watch reports an overrun through a parent-bound signal](0353-entry-chunk-headroom-shell-startup.md)
+- [0354: The Plugins panel names a failed catalog scan and shows no age](0354-plugins-panel-shows-scan-failures-not-age.md)

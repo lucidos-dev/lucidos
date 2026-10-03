@@ -1115,7 +1115,7 @@ describe('route rows contribute exactly two grid cells', () => {
     };
     appsList.value = {
       status: 'loaded',
-      data: [{ id: 'habit-tracker', name: 'Habit Tracker', description: '', icon: '\u{1F9ED}' }],
+      data: [{ id: 'habit-tracker', name: 'Habit Tracker', description: '', reveal: 'on-load', icon: '\u{1F9ED}' }],
     };
     const created = '2026-08-10T12:00:00.000Z';
     const userEvent: StoredEvent = { type: 'MessageReceived', text: 'go', created };
@@ -1203,7 +1203,7 @@ describe('the App row names its app in ordinary value text', () => {
   it('gives the name no class of its own', () => {
     appsList.value = {
       status: 'loaded',
-      data: [{ id: 'habit-tracker', name: 'Habit Tracker', description: '', icon: '\u{1F9ED}' }],
+      data: [{ id: 'habit-tracker', name: 'Habit Tracker', description: '', reveal: 'on-load', icon: '\u{1F9ED}' }],
     };
     expect(appNameSpan(render()).props.class).toBeUndefined();
   });

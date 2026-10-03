@@ -1,5 +1,5 @@
-/** Deleting a thread: the confirmation, the call, and dropping the rows from
- *  the client.
+/** Deleting a thread: the confirmation and the call. Dropping the rows from
+ *  the client is `threads-drop.ts`.
  *
  *  Separate from `threads.ts` (archive, pin, focus) because the two actions are
  *  deliberately different weights. Archive puts a thread down and keeps it
@@ -20,18 +20,14 @@ import { deletePreflight, deleteThreadFamily, type DeletePreflight } from '../..
 import type { ConfirmDetails } from '../types';
 import {
   archivingThreadIds,
-  focusedThreadId,
   showConfirm,
   showToast,
   threadMap,
 } from '../store';
 import { errorDetail } from '../../utils/errorDetail';
-import { forgetComposeState } from './compose';
-import { collectThreadFamily, focusThread, unfocusThread, visibleCandidatesAround } from './threads';
+import { collectThreadFamily } from './threads';
 import { resolveThreadActions } from './threadActions';
-import { forgetThreadEventsFailures } from './thread-loading';
-import { removeThreadNavEntries } from './thread-navigation';
-import { pruneRecents } from './entityReferences';
+import { dropDeletedThreads } from './threads-drop';
 
 /** The dialog, as the three things `showConfirm` takes. Pure, so the whole
  *  conditional-copy table is testable without a dialog or a network. */
@@ -160,45 +156,6 @@ export function formatDeleteErrorToast(err: unknown, target?: string): string {
     }
   }
   return `Failed to delete thread: ${errorDetail(err)}`;
-}
-
-/** Drop a deleted family from the client.
- *
- *  Idempotent, and called from two places: the delete this device made, and
- *  the `ThreadsDeleted` frame every other device receives. Neither can wait for
- *  the other, and running both is harmless.
- *
- *  The focus hand-off does NOT reveal the thread pane, because deleting is not
- *  navigation. The thread drawer is its own pane on mobile, so a reveal would
- *  swipe the user away on every tap.
- */
-export function dropDeletedThreads(ids: readonly string[]): void {
-  const gone = new Set(ids);
-  if (gone.size === 0) return;
-
-  const focused = focusedThreadId.value;
-  // Snapshot the position anchor BEFORE the rows leave the map: once they are
-  // gone, `visibleCandidatesAround` cannot find the one the user was on.
-  const candidates = focused && gone.has(focused) ? visibleCandidatesAround(focused) : [];
-
-  const next = new Map(threadMap.value);
-  for (const id of gone) {
-    next.delete(id);
-    // A thread that will never be fetched again owes the same cleanup a
-    // discarded draft does: nothing may hold a pointer into it. `compose.ts`
-    // owns eight private per-thread maps, so it does its own half.
-    forgetComposeState(id);
-    forgetThreadEventsFailures(id);
-    removeThreadNavEntries(id);
-    pruneRecents(id, 'threads');
-  }
-  threadMap.value = next;
-
-  if (focused && gone.has(focused)) {
-    const nextId = candidates.find((id) => !gone.has(id)) ?? null;
-    if (nextId) focusThread(nextId, { revealPane: false });
-    else unfocusThread({ revealPane: false });
-  }
 }
 
 /** Ask the engine what the delete would take, confirm it, then do it.

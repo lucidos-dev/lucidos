@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import type { ComponentChildren, VNode } from 'preact';
 import { PluginsView } from '../PluginsView';
 import { StoreTab } from '../StoreTab';
-import { CatalogFreshness } from '../CatalogFreshness';
+import { CatalogScanFailure } from '../CatalogScanFailure';
 import {
   pluginsInstalledOnly,
   setPluginsInstalledOnly,
@@ -104,30 +104,8 @@ describe('PluginsView — All | Installed toggle over one unified list', () => {
   });
 });
 
-/** The first element vnode carrying `cls`, found without invoking components. */
-function findByClass(node: ComponentChildren, cls: string): VNode<Record<string, unknown>> | null {
-  if (node === null || node === undefined || typeof node !== 'object') return null;
-  if (Array.isArray(node)) {
-    for (const n of node) {
-      const hit = findByClass(n, cls);
-      if (hit) return hit;
-    }
-    return null;
-  }
-  const v = node as VNode<Record<string, unknown>>;
-  if (typeof v.type === 'function') return null;
-  if (typeof v.props?.class === 'string' && v.props.class.split(' ').includes(cls)) return v;
-  return findByClass(v.props?.children as ComponentChildren, cls);
-}
-
-describe('PluginsView: the freshness caption cannot move the list', () => {
-  it('holds CatalogFreshness in a line that renders even while it draws nothing', () => {
-    // CatalogFreshness renders null until the catalog loads. The wrapper line
-    // owns the height, so the rows below do not jump when the age appears.
-    const line = findByClass(PluginsView(), 'plugins-freshness-line');
-    expect(line).not.toBeNull();
-    const acc = { types: new Set<unknown>(), buttons: [] as VNode<Record<string, unknown>>[] };
-    inspect(line?.props?.children as ComponentChildren, acc);
-    expect(acc.types.has(CatalogFreshness)).toBe(true);
+describe('PluginsView: a failed catalog scan is never silent', () => {
+  it('mounts the scan-failure notice above the list', () => {
+    expect(render().types.has(CatalogScanFailure)).toBe(true);
   });
 });

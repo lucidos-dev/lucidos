@@ -1012,7 +1012,7 @@ describe('foldEntry', () => {
 
 describe('pruneEntries', () => {
   const files = makeEntry();
-  const app = makeEntry({ overlay: { type: 'app-ui', app: { id: 'habit-tracker', name: 'Habit Tracker', description: '' } } });
+  const app = makeEntry({ overlay: { type: 'app-ui', app: { id: 'habit-tracker', name: 'Habit Tracker', description: '', reveal: 'on-load' } } });
   const apps = makeEntry({ menuItem: 'apps' });
   const isApp = (e: NavEntry) => e.overlay?.type === 'app-ui';
 
@@ -1041,7 +1041,7 @@ describe('pruneEntries', () => {
 // The prune edits the stack in memory, so no later save can write a deleted
 // app's rows back into the saved copy.
 describe('pruneNavHistory edits the live stack', () => {
-  const app: PanelOverlay = { type: 'app-ui', app: { id: 'habit-tracker', name: 'Habit Tracker', description: '' } };
+  const app: PanelOverlay = { type: 'app-ui', app: { id: 'habit-tracker', name: 'Habit Tracker', description: '', reveal: 'on-load' } };
 
   beforeEach(() => {
     vi.resetModules();

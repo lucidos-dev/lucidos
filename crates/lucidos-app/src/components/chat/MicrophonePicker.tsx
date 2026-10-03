@@ -22,7 +22,7 @@ import { preferences } from '../../store/store';
 import { setVoiceInputDevice, storedVoiceInputDevice } from '../../store/actions/preferences';
 import { anyMicrophoneNamed, microphoneChoices } from '../../voice/microphone';
 import { isOnCall } from '../../voice/callState';
-import { voiceCall } from '../../store/voice';
+import { voiceCall } from '../../store/voiceCall';
 
 /** Mounted only while the menu is open, which is what makes the device read and
  *  the hardware listener cost nothing the rest of the time. */

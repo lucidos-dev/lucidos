@@ -158,7 +158,9 @@ finish() {
     local rc="$1"
     stop_host_load_sampler
     report_host_load_saturation "$rc"
+    report_memory_resumes
     report_memory_stop
+    report_left_behind_summary
     report_webkit_chunk_range
     report_webkit_phase_selection
     report_webkit_excluded "$SKIP_WEBKIT"
@@ -171,8 +173,13 @@ finish() {
 # the memory sampler's in-chunk stop (host_memory_guard.sh). A FIFO feeds `tee`,
 # so `wait` returns Playwright's own exit code and never tee's. Tee's code is the
 # false-green the repo's own "never pipe a test command" rule warns about.
+#
+# CHUNK_CEILING_SECS, when the caller sets it, arms the chunk ceiling for this
+# invocation. An invocation the sampler stopped on host memory never reaches
+# the tally: the harness re-runs that chunk after recovery, and counting both
+# would break the tally's sum.
 run_playwright() {
-    local rc=0 fifo tee_pid pw_pid
+    local rc=0 fifo tee_pid pw_pid inv_log
     # The sampler already tripped with no runner to interrupt. Nothing new
     # starts on a host that showed the freeze signature.
     if host_memory_stopped_mid_chunk; then
@@ -189,19 +196,25 @@ run_playwright() {
         set -e
         return "$rc"
     fi
-    tee -a "$PW_TALLY_LOG" < "$fifo" &
+    inv_log="$(mktemp -t lucidos-pw-invocation)"
+    tee "$inv_log" < "$fifo" &
     tee_pid=$!
     set +e
     "$@" > "$fifo" 2>&1 &
     pw_pid=$!
     record_host_memory_runner "$pw_pid"
     interrupt_host_memory_runner_if_tripped
+    if [ -n "${CHUNK_CEILING_SECS:-}" ]; then
+        start_chunk_ceiling_watchdog "$pw_pid" "$CHUNK_CEILING_SECS"
+    fi
     wait "$pw_pid"
     rc=$?
+    stop_chunk_ceiling_watchdog
     clear_host_memory_runner
     wait "$tee_pid"
     set -e
-    rm -f "$fifo"
+    host_memory_stopped_mid_chunk || cat "$inv_log" >> "$PW_TALLY_LOG"
+    rm -f "$fifo" "$inv_log"
     return "$rc"
 }
 
@@ -378,15 +391,127 @@ merge_rc() {
     fi
 }
 
+# ── recovery after a memory stop (ADR 0351) ───────────────────────────
+# The harness owns the recovery from its own memory stops: tear down, wait for
+# the host to recover, restart on a fresh database, and carry on where the
+# stop landed. The whole run still reports one verdict.
+
+# How many resumes one run may spend. LUCIDOS_E2E_MEMORY_RESUMES, default 3,
+# and 0 stops the run at the first memory stop. Garbage keeps the default and
+# says so.
+memory_resume_budget() {
+    local v="${LUCIDOS_E2E_MEMORY_RESUMES:-}"
+    case "$v" in
+        '') echo 3 ;;
+        *[!0-9]*)
+            echo "e2e-browser.sh: LUCIDOS_E2E_MEMORY_RESUMES='$v' is not a count, using 3" >&2
+            echo 3
+            ;;
+        *) echo "$((10#$v))" ;;
+    esac
+}
+
+MEMORY_RESUMES=0
+MEMORY_STOP_HISTORY=""
+
+# Recover from the memory stop at $1, then return 0 so the caller resumes.
+# Returns 1 when the budget is spent or the host never recovers, and the caller
+# stops as before. $2 `no-restart` skips the engine restart, for a caller that
+# restarts the engine itself.
+recover_after_memory_stop() {
+    local where="$1" restart="${2:-restart}" budget
+    budget="$(memory_resume_budget)"
+    MEMORY_STOP_HISTORY="${MEMORY_STOP_HISTORY}${where}: ${MEMORY_STOP_DETAIL}
+"
+    if [ "$MEMORY_RESUMES" -ge "$budget" ]; then
+        echo "[e2e-resume] memory stop at $where, and $MEMORY_RESUMES of $budget resumes are spent, so the run stops here."
+        return 1
+    fi
+    echo ""
+    echo "[e2e-resume] memory stop at $where. Tearing down, waiting for the host to recover, then resuming."
+    stop_e2e_workspace
+    sweep_e2e_orphans
+    cleanup_e2e_worktrees
+    if ! host_memory_wait_for_recovery; then
+        echo "[e2e-resume] the run stops here."
+        return 1
+    fi
+    # The stop's record stays until the engine is back, so a failed restart
+    # still reports the stop that caused it.
+    if [ "$restart" != no-restart ] && ! reset_e2e_database; then
+        echo "[e2e-resume] the e2e engine did not come back up, so the run stops here."
+        return 1
+    fi
+    clear_host_memory_stop
+    MEMORY_RESUMES=$((MEMORY_RESUMES + 1))
+    echo "[e2e-resume] resumed ($MEMORY_RESUMES of $budget) on a fresh database."
+    return 0
+}
+
+# What this run never gave a verdict, one line per stretch, in run order. A
+# stop records it from the chunk list it holds, never from an estimate.
+RUN_UNVERIFIED=""
+
+note_unverified() {
+    RUN_UNVERIFIED="${RUN_UNVERIFIED}$1
+"
+}
+
+# Read once by finish(): every stop, every resume, and what has no verdict.
+report_memory_resumes() {
+    if [ -n "$MEMORY_STOP_HISTORY" ]; then
+        echo ""
+        echo "[e2e-resume] This run met $(printf '%s' "$MEMORY_STOP_HISTORY" | grep -c .) memory stop(s) and resumed $MEMORY_RESUMES time(s):"
+        printf '%s' "$MEMORY_STOP_HISTORY" | sed '/^$/d; s/^/[e2e-resume]   - /'
+    fi
+    if [ -n "$RUN_UNVERIFIED" ]; then
+        echo ""
+        echo "[e2e-resume] Coverage is INCOMPLETE. No verdict for:"
+        printf '%s' "$RUN_UNVERIFIED" | sed '/^$/d; s/^/[e2e-resume]   - /'
+        echo "[e2e-resume] That is the carry-over. Do not start a second run tonight."
+    elif [ -n "$MEMORY_STOP_HISTORY" ]; then
+        echo "[e2e-resume] Every chunk ran after the last resume, so coverage is COMPLETE and the exit code is the tests' own verdict."
+    fi
+}
+
+# The engine restart a chunk ceiling trip asks for, since a stuck chunk can
+# leave a wedged engine behind. Its own function so the tests can see it run.
+restart_e2e_after_chunk_ceiling() {
+    echo "── restarting the e2e engine on a fresh database before the next chunk ──"
+    stop_e2e_workspace
+    sweep_e2e_orphans
+    cleanup_e2e_worktrees
+    reset_e2e_database
+}
+
+# Chunk ceiling trips this run, and the project a second trip ended.
+CHUNK_CEILING_TRIPS=0
+CHUNK_CEILING_STOPPED=""
+
+# LUCIDOS_E2E_WEBKIT_CHUNK as a positive integer, default 3. A size that is not
+# one HANGS the chunk loop rather than failing: bash arithmetic reads `2-3` as
+# -1, the chunk count goes negative, and the loop counts down forever. One
+# character separates this knob from LUCIDOS_E2E_WEBKIT_CHUNKS.
+webkit_chunk_size() {
+    local size="${LUCIDOS_E2E_WEBKIT_CHUNK:-3}"
+    case "$size" in
+        '' | *[!0-9]* | 0)
+            echo "e2e-browser.sh: LUCIDOS_E2E_WEBKIT_CHUNK='$size' is not a positive integer, using 3" >&2
+            size=3
+            ;;
+    esac
+    echo "$((10#$size))"
+}
+
 # Run a browser project. For mobile-webkit, split the run into two ordered
 # phases: the specs that SPAWN a coding-agent thread FIRST, then everything else.
 # Other projects run in one pass.
 #
 # "Everything else" is the nav phase, and it is NOT free of Claude Code
 # subprocesses. coding-agent-question.spec.ts lands there and makes the engine
-# dispatch a real Continue (`--resume`), which keeps working for about 45s after
-# the spec ends. The partition detects a SPAWN through the compose destination
-# picker, which is the expensive thing, not every subprocess the engine starts.
+# dispatch a real Continue (`--resume`), which the spec stops before it ends.
+# The partition detects a SPAWN through the compose destination picker, which
+# is the expensive thing, not every subprocess the engine starts.
 #
 # WHY THE CHEAP HALF GOES FIRST. The two halves cost wildly different amounts.
 # Nav grew the compressor 12.64 GB in one nightly; the whole CC phase costs about
@@ -463,19 +588,11 @@ run_specs_chunked() {
     local label="$1"; shift
     local specs=("$@")
     local total="${#specs[@]}"
-    # A chunk size that is not a positive integer HANGS this loop rather than
-    # failing: bash arithmetic reads `2-3` as -1, `nchunks` goes negative, and
-    # `start` then counts down forever. One character separates this knob from
-    # LUCIDOS_E2E_WEBKIT_CHUNKS, so that typo is a live way in.
-    local size="${LUCIDOS_E2E_WEBKIT_CHUNK:-3}"
-    case "$size" in
-        '' | *[!0-9]* | 0)
-            echo "e2e-browser.sh: LUCIDOS_E2E_WEBKIT_CHUNK='$size' is not a positive integer, using 3" >&2
-            size=3
-            ;;
-    esac
-    local rc=0 start=0 chunk_no=0 nchunks
+    local size
+    size="$(webkit_chunk_size)"
+    local rc=0 start=0 chunk_no=0 nchunks ceiling
     nchunks=$(( (total + size - 1) / size ))
+    ceiling="$(host_memory_chunk_ceiling_secs)"
 
     # The range, resolved once. Only the nav phase honours it; the CC phase
     # always gets 1..nchunks.
@@ -513,20 +630,46 @@ run_specs_chunked() {
         # would erase the previous chunk's failure traces/screenshots.
         set_output_dir "$project-$label-$chunk_no"
         local chunk_rc=0
-        run_playwright "${CMD[@]}" --project="$project" "${OUTPUT_ARG[@]}" "${filters[@]}" || chunk_rc=$?
-        start=$(( start + size ))
+        CHUNK_CEILING_SECS="$ceiling" run_playwright "${CMD[@]}" --project="$project" "${OUTPUT_ARG[@]}" "${filters[@]}" || chunk_rc=$?
         # The sampler interrupted this chunk on the freeze signature. An
-        # interrupted runner's exit code is not a test verdict, so the memory
-        # stop replaces it. No boundary check follows a stop.
+        # interrupted runner's exit code is not a test verdict, so it is dropped.
+        # After a recovery the SAME chunk runs again; otherwise the stop stands
+        # and this chunk onwards has no verdict.
         if host_memory_stopped_mid_chunk; then
             echo "── mobile-webkit $label chunk $chunk_no/$nchunks: STOPPED inside the chunk on host memory ──"
+            if recover_after_memory_stop "mobile-webkit $label chunk $chunk_no/$nchunks (inside the chunk)"; then
+                echo "── mobile-webkit $label chunk $chunk_no/$nchunks: RUNNING AGAIN after the recovery ──"
+                chunk_no=$(( chunk_no - 1 ))
+                continue
+            fi
             MEMORY_STOPPED="$project"
+            note_unverified "mobile-webkit $label chunks $chunk_no-$last of $nchunks"
             rc="$(merge_rc "$rc" "$HOST_MEMORY_STOP_EXIT")"
             break
         fi
-        if [ "$chunk_rc" -ne 0 ]; then
-            rc="$chunk_rc"
+        start=$(( start + size ))
+        # The chunk hung past its ceiling. No verdict is a failure, never a
+        # pass. One trip restarts the engine, since a stuck chunk can leave it
+        # wedged; a second ends the project rather than spend the night on it.
+        if host_memory_chunk_ceiling_tripped; then
+            clear_chunk_ceiling_trip
+            CHUNK_CEILING_TRIPS=$(( CHUNK_CEILING_TRIPS + 1 ))
+            echo "── mobile-webkit $label chunk $chunk_no/$nchunks: CHUNK CEILING, interrupted after ${ceiling}s, so its tests have no verdict ──"
+            chunk_rc=1
+            if [ "$CHUNK_CEILING_TRIPS" -ge 2 ]; then
+                echo "── mobile-webkit: a second chunk hit the ceiling, so the project stops here ──"
+                CHUNK_CEILING_STOPPED="$project"
+                rc="$(merge_rc "$rc" "$chunk_rc")"
+                if [ "$chunk_no" -lt "$last" ]; then
+                    note_unverified "mobile-webkit $label chunks $(( chunk_no + 1 ))-$last of $nchunks (a second chunk hit the wall-clock ceiling)"
+                fi
+                break
+            fi
+            # Restart even after this loop's last chunk: the next phase or
+            # project would otherwise start on the engine that may be wedged.
+            restart_e2e_after_chunk_ceiling
         fi
+        rc="$(merge_rc "$rc" "$chunk_rc")"
         # BETWEEN chunks only. The boundary after the LAST one belongs to the
         # caller, which is the only code that knows whether another phase or
         # another project follows it. A stop needs something left to stop: with
@@ -543,7 +686,11 @@ run_specs_chunked() {
         # silent, which is the one thing a range must never be.
         if [ "$start" -lt "$total" ] && [ "$chunk_no" -lt "$last" ] &&
             ! check_host_memory_at_boundary "$project $label chunk $chunk_no/$nchunks"; then
+            if recover_after_memory_stop "mobile-webkit $label chunk $chunk_no/$nchunks (boundary)"; then
+                continue
+            fi
             MEMORY_STOPPED="$project"
+            note_unverified "mobile-webkit $label chunks $(( chunk_no + 1 ))-$last of $nchunks"
             # MEMORY_STOPPED carries the stop on its own, so merge_rc can keep a
             # failing chunk's code and neither signal hides the other.
             rc="$(merge_rc "$rc" "$HOST_MEMORY_STOP_EXIT")"
@@ -565,8 +712,9 @@ run_browser_project() {
     # harness verdict: it says the project was not measured, which must not read
     # green, and must not overwrite a real test failure either.
     report_playwright_totals "$project" "$PW_TALLY_LOG" || tally_rc=$?
-    # An invocation the sampler interrupted never printed its summary, so the
-    # tally cannot add up. The memory stop already says so; it is no harness bug.
+    # An invocation the sampler interrupted stays out of the tally. When it was
+    # the project's only one, the tally is empty. The memory stop already says
+    # so; it is no harness bug.
     if [ "$tally_rc" -ne 0 ] && [ "$MEMORY_STOPPED" = "$project" ] && host_memory_stopped_mid_chunk; then
         echo "   (expected: the invocation stopped on host memory did not report)"
         tally_rc=0
@@ -634,18 +782,23 @@ _run_browser_project_body() {
                 # to its caller. It is checked only when BOTH phases are in this
                 # run: a stop needs work left to stop, and with the CC phase
                 # skipped there is no CC-to-nav boundary to stand at.
-                if [ "$phase_sel" = "both" ] && [ -z "$MEMORY_STOPPED" ] \
-                    && ! check_host_memory_at_boundary "$project phase 1/2 (CC)"; then
+                if [ "$phase_sel" = "both" ] && [ -z "$MEMORY_STOPPED" ] && [ -z "$CHUNK_CEILING_STOPPED" ] \
+                    && ! check_host_memory_at_boundary "$project phase 1/2 (CC)" \
+                    && ! recover_after_memory_stop "mobile-webkit phase 1/2 (CC)"; then
                     MEMORY_STOPPED="$project"
                     cc_rc="$(merge_rc "$cc_rc" "$HOST_MEMORY_STOP_EXIT")"
                 fi
-                if [ -n "$MEMORY_STOPPED" ]; then
+                if [ -n "$MEMORY_STOPPED" ] || [ -n "$CHUNK_CEILING_STOPPED" ]; then
                     # Phase 2 is the heavier half, and it is last ON PURPOSE:
                     # this is where we chose a shortfall to land. Nav carries
                     # over as a partial chunk range, so what is lost here is the
                     # recoverable half rather than ten specs that have gone
                     # unverified for weeks.
-                    echo "── mobile-webkit phase 2/2 SKIPPED: stopped on host memory ──"
+                    local size nav_chunks
+                    size="$(webkit_chunk_size)"
+                    nav_chunks=$(( (${#nav_specs[@]} + size - 1) / size ))
+                    echo "── mobile-webkit phase 2/2 SKIPPED: the CC phase stopped the project ──"
+                    note_unverified "mobile-webkit nav chunks 1-$nav_chunks of $nav_chunks (the whole navigation phase)"
                     return "$cc_rc"
                 fi
                 echo "── mobile-webkit phase 2/2: ${#nav_specs[@]} navigation specs (sharded) ──"
@@ -666,13 +819,23 @@ _run_browser_project_body() {
     fi
     # Own output dir per project (see set_output_dir) — otherwise the NEXT
     # project's invocation would wipe this one's, chunk dirs included.
-    set_output_dir "$project"
-    run_playwright "${CMD[@]}" --project="$project" "${OUTPUT_ARG[@]}" || rc=$?
-    if host_memory_stopped_mid_chunk; then
+    # A stop inside a single pass runs the whole pass again after a recovery,
+    # since a pass has no chunk to resume from.
+    while :; do
+        rc=0
+        set_output_dir "$project"
+        run_playwright "${CMD[@]}" --project="$project" "${OUTPUT_ARG[@]}" || rc=$?
+        host_memory_stopped_mid_chunk || break
         echo "── $project: STOPPED inside the run on host memory ──"
+        if recover_after_memory_stop "$project (inside its single pass)"; then
+            echo "── $project: RUNNING AGAIN after the recovery ──"
+            continue
+        fi
         MEMORY_STOPPED="$project"
+        note_unverified "project $project (stopped inside its single pass)"
         rc="$HOST_MEMORY_STOP_EXIT"
-    fi
+        break
+    done
     return "$rc"
 }
 
@@ -749,12 +912,13 @@ else
     for i in "${!PROJECTS[@]}"; do
         project="${PROJECTS[$i]}"
         if [ -n "$MEMORY_STOPPED" ]; then
-            # The host is over the compressor ceiling, so the projects after the
-            # stop do not run. Record the stop code rather than leaving a hole.
-            # A project with no rc reads as a harness bug in the table below. An
-            # rc of 0 would read as green work that never ran.
+            # A memory stop the harness could not recover from, so the projects
+            # after it do not run. Record the stop code rather than leaving a
+            # hole. A project with no rc reads as a harness bug in the table
+            # below. An rc of 0 would read as green work that never ran.
             echo ""
             echo "── Skipping project (stopped on host memory): $project ──"
+            note_unverified "project $project"
             PROJECT_RCS+=("$HOST_MEMORY_STOP_EXIT")
             continue
         fi
@@ -781,8 +945,14 @@ else
         # last one left behind. Skipped after the LAST project, where nothing
         # follows: a stop needs something left to stop. This project's own rc
         # stays untouched either way, because it finished.
+        # The next project resets the database and restarts the engine itself,
+        # so a recovery here skips its own restart. Under --no-reset nothing
+        # else would bring the engine back, so the recovery does.
+        restart_after=no-restart
+        [ -z "$NO_RESET" ] || restart_after=restart
         if [ -z "$MEMORY_STOPPED" ] && [ "$i" -lt "$(( ${#PROJECTS[@]} - 1 ))" ] \
-            && ! check_host_memory_at_boundary "the boundary after project $project"; then
+            && ! check_host_memory_at_boundary "the boundary after project $project" \
+            && ! recover_after_memory_stop "the boundary after project $project" "$restart_after"; then
             MEMORY_STOPPED="$project"
             overall_rc="$(merge_rc "$overall_rc" "$HOST_MEMORY_STOP_EXIT")"
         fi

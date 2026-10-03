@@ -37,7 +37,7 @@ Don't design on paper. Once the questions are answered, scaffold the smallest th
   3. **Styles with the theme CSS variables — never hardcoded colors:** `var(--bg-primary)`, `var(--text-primary)`, `var(--accent)`, `var(--border-color)`, etc. (full list in `js-sdk.md` § Theme variables). These flip light↔dark automatically; hex literals do not.
 
      **The same goes for the font — and here the best move is to write nothing at all.** `sdk-iframe.css` already sets `body { font-family: var(--font-ui) }` (plus inputs and `.action-btn`, since form controls don't inherit the page font on their own), so an app that never mentions `font-family` inherits the user's chosen font for free. Declaring your own stack on `body` — `font-family: system-ui, sans-serif`, `-apple-system, "Segoe UI", …` — *overrides* that default and ships the system font instead, silently: nothing errors, it just isn't the user's font. Only re-declare `font-family` when you deliberately want a different face (e.g. `var(--font-mono)` for code or numeric columns), and then use the token. The UI-font token is **`--font-ui`**.
-  4. **Reuses Lucidos's shared component classes for controls** — `sdk-iframe.css` ships the same component layer the host shell uses, so the app looks like part of Lucidos instead of a bare HTML form: primary buttons are `<button class="action-btn">` (with `.action-btn-confirm` / `.action-btn-danger` variants, and `.action-btn-secondary` for a neutral secondary button beside a primary CTA), plus `.icon-btn`, `.label`, `.title`, `.list-row*`, `.segmented-control`, `.markdown-content`, `.progress-bar`, `.empty-state` (full table in `js-sdk.md` § Component classes). A plain unclassed `<button>` does **not** match Lucidos's blue primary button — reach for `.action-btn`, and **don't hand-roll an outlined "secondary" button** — use `.action-btn-secondary`.
+  4. **Reuses Lucidos's shared component classes for controls.** `sdk-iframe.css` ships the same component layer the host shell uses, so the app looks like part of Lucidos instead of a bare HTML form. Primary buttons are `<button class="action-btn">`, with `.action-btn-confirm` / `.action-btn-danger` variants, and `.action-btn-secondary` for a neutral secondary button beside a primary CTA. Also available: `.icon-btn`, `.label`, `.title`, `.list-row*`, `.segmented-control`, `.markdown-content`, `.progress-bar`, `.empty-state`, and `.text-input` for a free-text field (full table in `js-sdk.md` § Component classes). A plain unclassed `<button>` does **not** match Lucidos's blue primary button — reach for `.action-btn`, and **don't hand-roll an outlined "secondary" button** — use `.action-btn-secondary`. `lucidos.ui.Select` draws from the same layer too, so a themed dropdown matches Settings' own.
 
      **The `.action-btn` variants are *additive* — always keep the base class.** This is the standard base-plus-modifier shape (Bootstrap's `btn btn-primary`, BEM's `block block--modifier`): the base `.action-btn` carries *all* the geometry (padding, radius, sizing, font), and `-confirm` / `-danger` / `-secondary` only swap the color or fill. So every variant is `class="action-btn action-btn-X"`, never the variant alone:
 
@@ -97,6 +97,15 @@ Don't design on paper. Once the questions are answered, scaffold the smallest th
   ```
 
   Opt out only for an app that ships its own complete visual identity (a game, a full-bleed chart canvas, an embedded third-party UI). For everything else, inheriting is the default — a workspace in light mode must never get a dark-only app.
+
+- **An app that loads data at startup opts into the ready signal.** Most apps
+  read their data with `lucidos.data`, `lucidos.events` or `lucidos.proxy`
+  after the page has loaded. By default the host reveals the app on page load,
+  so the user sees an empty screen until that data arrives. Add
+  `"reveal": "on-ready"` to `manifest.json`, and call `lucidos.ui.ready()`
+  once the first render is done, on the error and empty paths too. The host
+  then keeps its loading cover and progress bar up until the call. The rules
+  are in `js-sdk.md` § Showing the app once its content is ready.
 
 ## Responsive by default: a phone is a first-class target
 

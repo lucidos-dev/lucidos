@@ -335,6 +335,7 @@
     "--bg-hover",
     "--bg-selected",
     "--border-color",
+    "--surface-bg",
     "--text-primary",
     "--text-secondary",
     "--text-muted",

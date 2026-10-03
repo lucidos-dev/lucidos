@@ -28,8 +28,8 @@ import { THEME_MODE_ATTRIBUTE, THEME_MODE_STORAGE_KEY } from '../appearance';
  * Both radii are percentages of their own axis, so the figures are
  * aspect-independent and hold on every device.
  *
- * `dismissBootSplash()` (`utils/bootSplash.ts`) reverts this to
- * `var(--bg-primary)` once the splash is gone, so no blue lingers behind the
+ * `dismissBootSplash()` (`utils/bootSplash.ts`) fades this to
+ * `var(--bg-primary)` alongside the splash veil, so no blue lingers behind the
  * app's own bottom safe-area inset.
  */
 const SPLASH_BACKGROUND =

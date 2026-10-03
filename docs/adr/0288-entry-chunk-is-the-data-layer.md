@@ -29,7 +29,8 @@ Two facts in the code decided the fix:
 
 The entry chunk is the data layer and startup: store, actions, event stream,
 API client, SDK, and the diagnostic probes. `boot()` calls `startClient()`
-(`store/startup.ts`) before it renders anything.
+(`store/startup.ts`) before it renders anything. ADR 0353 later moved the
+probes, and other listeners only a drawn UI needs, into shell startup.
 
 The UI is the **shell chunk**: `main.tsx` imports `<App/>` lazily and asks for
 it as soon as the entry evaluates, and `index.html` modulepreloads it. It
@@ -61,9 +62,11 @@ shell chunk, because a cold open onto a waiting thread draws them at once. So
 does the thread filter panel, whose open state survives a reload. An idle
 prefetch starts after the splash lifts, so any of those would flash.
 
-The guard reports rather than fails under `vite build --watch`. The dev
-build-watch serves the workspace, and a failed rebuild keeps serving the old
-`dist/`. So one overrun would strand every later Apply behind it.
+The guard reports rather than fails under the dev build-watch. It serves the
+workspace, and a failed rebuild keeps serving the old `dist/`. So one overrun
+would strand every later Apply behind it. The guard first keyed this on
+`vite build --watch`, which the build-watch no longer runs. ADR 0353 replaced
+that with a signal the build-watch sets, and added a 90 % warning line.
 
 ## Consequences
 
@@ -87,5 +90,5 @@ build-watch serves the workspace, and a failed rebuild keeps serving the old
   a loading flash on every permission prompt.
 - **Split the store and actions layer.** Densely connected, and almost all of it
   runs at boot. No single action module retained more than its own bytes.
-- **Fail the build under `--watch` too.** It would strand the shared
+- **Fail the build under the build-watch too.** It would strand the shared
   build-watch, as above.

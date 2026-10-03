@@ -80,11 +80,12 @@ trap teardown_e2e EXIT
 trap 'exit 130' INT TERM
 
 cleanup_e2e_worktrees
-# Recreates the workspace database from zero and boots the engine on it, so the
-# whole migration chain (seeds included) runs against an empty database. The
-# engine has to start AFTER the recreate, so the reset owns the boot — there is
-# deliberately no ensure_workspace_running before this.
-reset_e2e_database
+# Recreates the workspace database from zero, resets the workspace tree, and
+# boots the engine on both, so the whole migration chain (seeds included) runs
+# against an empty database in a brand-new workspace. The engine has to start
+# AFTER the recreate, so the reset owns the boot — there is deliberately no
+# ensure_workspace_running before this.
+reset_e2e_database --fresh-workspace
 
 # Read by setup_e2e_session in sub-scripts to skip their own lifecycle work.
 export LUCIDOS_E2E_UMBRELLA=1

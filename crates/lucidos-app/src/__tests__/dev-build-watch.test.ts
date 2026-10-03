@@ -13,7 +13,24 @@
  */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: dev tooling, JS with no type declarations
-import { alertTransition, buildStatusRecord, firstErrorLine } from '../../dev-build-watch.mjs';
+import * as watcher from '../../dev-build-watch.mjs';
+import {
+  DEV_BUILD_WATCH_ENV,
+  ENTRY_CHUNK_LINE_PREFIX,
+  entryChunkLine,
+  underDevBuildWatch,
+} from '../../vite/entryChunkBudget';
+
+const {
+  DEV_BUILD_WATCH_ENV: WATCHER_ENV,
+  ENTRY_CHUNK_LINE_PREFIX: WATCHER_PREFIX,
+  alertTransition,
+  buildChildEnv,
+  buildStatusRecord,
+  entryChunkAlert,
+  entryChunkFromLine,
+  firstErrorLine,
+} = watcher;
 
 describe('when a build outcome is announced', () => {
   it('speaks on the way into failing, and on the way out', () => {
@@ -80,7 +97,17 @@ describe('the status record', () => {
       at,
       error: null,
       skippedInstall: null,
+      entryChunk: null,
     });
+  });
+
+  it('keeps a served build green while recording its entry chunk overrun', () => {
+    // The overrun is reported, never a failure: `ok: false` would tell the
+    // engine nothing new is being served, which is the opposite of true.
+    const entryChunk = { fileName: 'assets/index-a.js', bytes: 600_230, budgetBytes: 600_000, overBudget: true };
+    const record = buildStatusRecord({ ok: true, at, entryChunk });
+    expect(record.ok).toBe(true);
+    expect(record.entryChunk).toEqual(entryChunk);
   });
 
   it('records a refused install alongside the outcome', () => {
@@ -102,5 +129,53 @@ describe('the status record', () => {
     const record = buildStatusRecord({ ok: false, at });
     expect(record.error).toBeNull();
     expect(JSON.parse(JSON.stringify(record))).toHaveProperty('error');
+  });
+});
+
+describe('the vite build child', () => {
+  it('is told it runs under the watcher, bound to the watcher\'s own pid', () => {
+    const env = buildChildEnv({ PATH: '/usr/bin' }, 4242);
+    expect(env[WATCHER_ENV]).toBe('4242');
+    expect(env.LUCIDOS_ATOMIC_DIST).toBe('1');
+    expect(env.PATH).toBe('/usr/bin');
+    // The child Vite is spawned directly, so its parent IS the watcher, and the
+    // budget plugin accepts the signal only in exactly that case.
+    expect(underDevBuildWatch(env, 4242)).toBe(true);
+  });
+
+  it('overrides a stale value inherited from whatever started the watcher', () => {
+    expect(buildChildEnv({ [WATCHER_ENV]: '1' }, 4242)[WATCHER_ENV]).toBe('4242');
+  });
+
+  it('shares its two names with the budget plugin', () => {
+    expect(WATCHER_ENV).toBe(DEV_BUILD_WATCH_ENV);
+    expect(WATCHER_PREFIX).toBe(ENTRY_CHUNK_LINE_PREFIX);
+  });
+});
+
+describe('reading the entry chunk measurement', () => {
+  it('parses the line the budget plugin prints', () => {
+    const line = entryChunkLine({ fileName: 'assets/index-a.js', bytes: 600_230 }, 600);
+    expect(entryChunkFromLine(line)).toEqual({
+      fileName: 'assets/index-a.js', bytes: 600_230, budgetBytes: 600_000, overBudget: true,
+    });
+    expect(entryChunkFromLine(entryChunkLine({ fileName: 'a.js', bytes: 500_000 }, 600))?.overBudget)
+      .toBe(false);
+  });
+
+  it('ignores every other line, and a malformed measurement', () => {
+    expect(entryChunkFromLine('dist/assets/index-a.js  600.23 kB')).toBeNull();
+    expect(entryChunkFromLine(`${WATCHER_PREFIX}{not json`)).toBeNull();
+    expect(entryChunkFromLine(`${WATCHER_PREFIX}{"fileName":"a.js"}`)).toBeNull();
+  });
+
+  it('names the size and the budget in the overrun alert', () => {
+    const over = { fileName: 'assets/index-a.js', bytes: 600_230, budgetBytes: 600_000, overBudget: true };
+    const alert = entryChunkAlert('broken', over);
+    expect(alert.title).toContain('over its budget');
+    expect(alert.message).toContain('600.23 kB');
+    expect(alert.message).toContain('600.00 kB');
+    expect(entryChunkAlert('recovered', { ...over, bytes: 520_000, overBudget: false }).title)
+      .toContain('back within');
   });
 });

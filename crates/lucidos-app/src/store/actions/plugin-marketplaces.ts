@@ -142,7 +142,7 @@ export async function refreshPluginCatalog(): Promise<void> {
   await loadPluginCatalog(true);
 }
 
-/** The Plugins panel's "Updated …" control: the panel refresh, from a click.
+/** The scan-failure notice's Try again: the panel refresh, from a click.
  *  A failed request is toasted here, since no panel refresh names it. */
 export async function rescanPluginCatalogAction(): Promise<void> {
   try {
@@ -202,7 +202,7 @@ function settleScanWaitersReadAfter(readSeq: number): void {
 }
 
 /** A scan ended, whoever started it: the engine's `PluginCatalogScanned`.
- *  Lowers the "Updating…" cue, then re-reads. */
+ *  Lowers the scanning flag, then re-reads. */
 export function pluginCatalogScanned(): void {
   marketplaceScanning.value = false;
   for (const w of scanWaiters) if (w.afterRead === null) w.landedEarly = true;
@@ -219,8 +219,8 @@ export function resyncPluginCatalog(): void {
 }
 
 /** The Plugins panel refresh: a fresh scan, settled once its result is on
- *  screen. A re-read alone returns the engine's cached scan, so the list and
- *  its "Updated …" age would never move. A failed request rejects, so the
+ *  screen. A re-read alone returns the engine's cached scan, so the list
+ *  would never move. A failed request rejects, so the
  *  panel refresh names it. */
 export async function rescanPluginCatalogAndSettle(): Promise<void> {
   let settle!: () => void;

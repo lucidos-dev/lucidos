@@ -253,53 +253,6 @@ export function computePromptEscapeAction(
   return settling ? 'ignore' : 'cancel';
 }
 
-/** For a thread whose Cancel was clicked while a question was on screen, the
- *  `tool_use_id` of the question that was pending at click time. The cleanup
- *  effect (PromptInput) keys the optimistic `cancelingThreadIds` release off
- *  this: once the targeted question is no longer the thread's latest pending
- *  one — it resolved (as Canceled) and the agent either idled or re-asked —
- *  the flag drops so the morph button stops sticking in disabled "Cancel...".
- *  Without it, a cancel the agent answers by re-asking leaves the thread
- *  mid-turn forever (waiting → running → waiting) and the not-mid-turn release
- *  never fires. A running-turn cancel records no entry (no question to key on)
- *  and falls back to the not-mid-turn release. */
-export const canceledQuestionByThread = signal<Map<string, string>>(new Map());
-
-/** Record (or clear) the question a thread's Cancel targeted. Pass `undefined`
- *  for a running-turn cancel so any stale entry is dropped rather than
- *  mis-keying the next release. */
-export function setCanceledQuestion(threadId: string, toolUseId: string | undefined): void {
-  const map = canceledQuestionByThread.value;
-  if (toolUseId === undefined && !map.has(threadId)) return;
-  const next = new Map(map);
-  if (toolUseId === undefined) next.delete(threadId);
-  else next.set(threadId, toolUseId);
-  canceledQuestionByThread.value = next;
-}
-
-/** Threads whose Cancel was clicked while the thread was already
- *  `waiting_for_user_answer` (a question OR permission card on screen). The
- *  cleanup effect reads this to keep a card cancel bridged through
- *  `waiting_for_user_answer` (via `shouldClearCanceling`'s awaiting branch),
- *  while a generic running-turn cancel — which records no entry here — is
- *  released the instant the turn leaves `running`, so a superseded cancel that
- *  lands on a new card can't wedge "Canceling" forever. Complements
- *  `canceledQuestionByThread`, which only covers `UserQuestionAsked` cards
- *  (permission cards set this but not that). */
-export const canceledWhileAwaitingByThread = signal<Set<string>>(new Set());
-
-/** Record (or clear) whether a thread's Cancel was clicked while awaiting a
- *  user answer. Clear it (pass `false`) on the same release the optimistic
- *  canceling flag drops, so a later running-turn cancel isn't mis-keyed. */
-export function setCanceledWhileAwaiting(threadId: string, awaiting: boolean): void {
-  const set = canceledWhileAwaitingByThread.value;
-  if (awaiting === set.has(threadId)) return;
-  const next = new Set(set);
-  if (awaiting) next.add(threadId);
-  else next.delete(threadId);
-  canceledWhileAwaitingByThread.value = next;
-}
-
 /** Is there anything to send? ONE reading, and both the Send face's lit-ness
  *  and `submit()`'s dispatch take it.
  *

@@ -168,6 +168,19 @@ describe('upsertThread: the version guard (loadAllThreads path)', () => {
     }
   });
 
+  /** A GET that goes out AFTER the send, while its POST is still in flight,
+   *  passes the send stamp. The engine has not seen the message yet, so its row
+   *  still holds the last draft write from typing. */
+  it('does not restage the pre-send draft while the send is still pending', () => {
+    const map = new Map([['t1', liveThread({
+      meta: { id: 't1', state: 'active' } as ThreadState['meta'],
+      pendingUserMessages: [{ text: 'hello there', eventId: 'e1', created: IDLE_AT }],
+    })]]);
+    upsertThread(map, summary({ state: 'composing', summary_version: LIVE, compose_text: 'hello th' }), false, Date.now());
+    expect(map.get('t1')!.meta.state).toBe('active');
+    expect(getDraft('t1').text).toBe('');
+  });
+
   /** The guard must stay one-sided. A fresh snapshot is still what rescues an
    *  SSE skeleton stuck at `composing`, which no drawer section draws. */
   it('applies state from a newer GET snapshot', () => {

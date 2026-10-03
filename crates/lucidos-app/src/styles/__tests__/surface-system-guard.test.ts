@@ -52,7 +52,7 @@ describe('only a surface that blocks dims the app, and all of them alike', () =>
 
 describe('every surface takes its corner and shadow from a token', () => {
   const surfaces: [string, string][] = [
-    [css.surface, '.surface,\n.surface-box'],
+    [css.surface, '.surface,\n.surface-box,\n.lucidos-select-menu'],
     [css.components, '.confirm-dialog'],
     [css.components, '.toast'],
     [css.components, '.file-preview-modal'],
@@ -114,7 +114,7 @@ describe('menus wear the shared box instead of a copy of it', () => {
   });
 
   it('keeps typography and the button size off the box alone', () => {
-    const box = rule(css.surface, '.surface,\n.surface-box');
+    const box = rule(css.surface, '.surface,\n.surface-box,\n.lucidos-select-menu');
     for (const prop of ['line-height', 'color', '--surface-inset']) {
       expect(decl(box, prop), prop).toBeNull();
     }

@@ -482,6 +482,7 @@ mod ancestor_rebroadcast;
 mod blocking_attention_counts;
 mod change_apply_archive;
 mod command_permission;
+mod crash_cut_child;
 mod fan_out_callback;
 mod has_diff_and_actor;
 mod has_response;

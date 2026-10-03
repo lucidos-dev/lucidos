@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { linkifyPaths, extractAppTargetFromHref, extractNavTargetFromHref, extractLocalFileTarget, extractBareAppRef, extractTriggerIdFromHref, extractRepoFileTargetFromHref, browserHandlesHref, _resetLinkifyCacheForTesting, DATA_PATH_PREFIXES, PROSE_DATA_PATH_PREFIXES } from './linkifyPaths';
+import { linkifyPaths, extractAppTargetFromHref, extractNavTargetFromHref, extractLocalFileTarget, extractBareAppRef, extractTriggerIdFromHref, extractRepoFileTargetFromHref, browserHandlesHref, _resetLinkifyCacheForTesting, PROSE_DATA_PATH_PREFIXES } from './linkifyPaths';
+import { DATA_PATH_PREFIXES } from './dataPathPrefixes';
 
 describe('DATA_PATH_PREFIXES', () => {
   // `every_data_prefix_list_matches_the_engine` in the CLI crate pins the full

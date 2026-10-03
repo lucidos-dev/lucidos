@@ -3,9 +3,14 @@
    icon, never in the frame. See docs/plans/2026-09-26-one-surface-system.md. */
 
 /* The box alone. A menu wears `.surface-box`: it shares the frame but keeps
-   its compact rows, its own line height and its own button sizes. */
+   its compact rows, its own line height and its own button sizes.
+   `lucidos.ui.Select`'s menu wears it too (`.lucidos-select-menu`), so an
+   app's themed dropdown gets the exact same box as the host's — this file is
+   `include_str!`'d into the served `/api/v1/sdk-iframe.css`. See
+   docs/plans/2026-10-03-sdk-dropdown-shares-host-css.md. */
 .surface,
-.surface-box {
+.surface-box,
+.lucidos-select-menu {
     background: var(--surface-bg);
     border: 1px solid var(--border-color);
     border-radius: var(--radius-surface);
@@ -14,7 +19,11 @@
 
 /* The surface part (ADR 0313): a theme may draw a double frame. The :where()
    keeps a protected dialog out at the base rule's specificity, so every rule
-   that restyles a surface's border still wins, as it does without a theme. */
+   that restyles a surface's border still wins, as it does without a theme.
+   Shell-only (the catalog marks this part `frames: false`): the part token
+   is never published into an app frame, so `.lucidos-select-menu` stays out
+   of this rule — it would read nothing but its own `solid`/`1px`/
+   `var(--border-color)` fallback forever, a theme can't reach it. */
 .surface:where(:not(.protected-surface)),
 .surface-box:where(:not(.protected-surface)) {
     border-style: var(--part-surface-border-style, solid);

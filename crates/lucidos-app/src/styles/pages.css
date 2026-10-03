@@ -567,7 +567,7 @@
     display: flex;
     align-items: stretch;
     gap: var(--space-sm);
-    margin: 0 var(--space-lg) var(--space-xs);
+    margin: 0 var(--space-lg) var(--space-md);
 }
 
 .plugins-filter-bar .segmented-control {
@@ -603,48 +603,10 @@
     text-overflow: ellipsis;
 }
 
-/* How old the plugin rows are, and the control that refreshes them. Quiet on
-   purpose: it reports on content the user is already reading, so it must not
-   compete with it. One element in two states (a button, or a plain status while
-   a scan runs), which is why the base rule carries no button chrome.
-   The line is a caption under the filter bar. Its min-height is one line of
-   the caption's text, so it keeps that height while the catalog loads and the
-   control renders nothing. */
-.plugins-freshness-line {
-    min-height: 1.5em;
+.plugins-scan-failure {
     margin: 0 var(--space-lg) var(--space-md);
     font-size: var(--font-size-xs);
     line-height: 1.5;
-}
-
-.plugins-freshness {
-    padding: 0;
-    border: none;
-    background: none;
-    color: var(--text-muted);
-    font-family: var(--font-ui);
-    line-height: inherit;
-    white-space: nowrap;
-    cursor: pointer;
-    transition: color var(--duration-fast) ease;
-}
-
-@media (hover: hover) {
-    .plugins-freshness:hover {
-        color: var(--text-secondary);
-    }
-}
-
-/* The busy state is a status, not a target. It keeps the same box so the row
-   does not shift when a scan starts. */
-.plugins-freshness-busy {
-    cursor: default;
-}
-
-@media (hover: hover) {
-    .plugins-freshness-busy:hover {
-        color: var(--text-muted);
-    }
 }
 
 .apps-search-bar {
@@ -818,8 +780,8 @@
         "meta meta";
     align-items: center;
     gap: 0 var(--space-md);
-    padding-top: var(--space-md);
-    padding-bottom: var(--space-md);
+    padding-top: var(--space-lg);
+    padding-bottom: var(--space-lg);
 }
 
 .app-store-plugin-row .list-row-info {
@@ -860,12 +822,10 @@
 /* Uniform gap for the navigation focus marker on a plugin row (a plugins
    deep-link / Search-Everywhere jump). The marker (.nav-focus-stuck wash + glow,
    host-components.css) fills the row's padding box, and a plugin row is padded
-   0.75rem top/bottom but 1rem left/right. So the marker's SIDE gaps outgrow its
-   top/bottom (the mirror of the settings-row case). Shrink the sides to the same
-   0.75rem with a padding / positive margin pair that cancels for layout: the row is
-   a stretch flex item in .list-rows, so it keeps its content-box width and the
-   content stays put while the box (and the wash filling it) pull inward to an even
-   gap. The box only shrinks inward, so the WASH (the hard-edged part, and the whole
+   1rem all round, which would run the wash to the pane edge. So every side
+   shrinks to 0.75rem, and an equal margin cancels it for layout. The row is a
+   flex item in .list-rows, so the margins do not collapse and the content stays
+   put. The box only shrinks inward, so the WASH (the hard-edged part, and the whole
    of what the eye reads as the highlight) is comfortably inside the row's clip
    ancestor, .content-pane-body { overflow-x: hidden }. The soft halo around it is a
    different matter and IS cut there: a plugin row is full-bleed against that clip,
@@ -878,10 +838,8 @@
    the row's content for a halo nobody can see. The wash is an inset box-shadow, so
    the row's own hover background still shows through beneath it. */
 .app-store-plugin-row.nav-focus-stuck {
-    padding-left: 0.75rem;
-    padding-right: 0.75rem;
-    margin-left: 0.25rem;
-    margin-right: 0.25rem;
+    padding: var(--space-md);
+    margin: var(--space-xs);
 }
 
 .app-store-plugin-title-row {

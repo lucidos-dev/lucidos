@@ -163,6 +163,58 @@ describe('MarkdownDocument task-list checkboxes', () => {
     expect(boxes[0].disabled).toBe(false);
   });
 
+  it('toggles the box when the reader clicks its label text', async () => {
+    const onToggleCheckbox = vi.fn(() => Promise.resolve(true));
+    const el = mount('- [ ] One\n- [ ] Two\n', { editable: true, onToggleCheckbox });
+    const boxes = checkboxes(el);
+    await flushEffects(() => !boxes[1].disabled);
+    const label = boxes[1].closest('label');
+    expect(label?.textContent?.trim()).toBe('Two');
+    label!.click();
+    expect(boxes[1].checked).toBe(true);
+    expect(onToggleCheckbox).toHaveBeenCalledExactlyOnceWith(1);
+  });
+
+  it('keeps a nested list out of its parent item\'s label', async () => {
+    const boxes = checkboxes(mount('- [ ] Parent\n  - [ ] Child\n', { editable: true, onToggleCheckbox: () => Promise.resolve(true) }));
+    await flushEffects(() => !boxes[0].disabled);
+    const parentLabel = boxes[0].closest('label');
+    expect(parentLabel?.textContent?.trim()).toBe('Parent');
+    expect(parentLabel?.contains(boxes[1])).toBe(false);
+    expect(boxes[1].closest('label')?.textContent?.trim()).toBe('Child');
+  });
+
+  it('labels the text of a loose list item, whose box sits in a paragraph', async () => {
+    const boxes = checkboxes(mount('- [ ] One\n\n- [ ] Two\n', { editable: true, onToggleCheckbox: () => Promise.resolve(true) }));
+    await flushEffects(() => !boxes[0].disabled);
+    expect(boxes[0].closest('label')?.textContent?.trim()).toBe('One');
+  });
+
+  it('keeps a heading nested in the item out of its label', async () => {
+    const boxes = checkboxes(mount('- [ ] Task\n  # Heading\n', { editable: true, onToggleCheckbox: () => Promise.resolve(true) }));
+    await flushEffects(() => !boxes[0].disabled);
+    expect(boxes[0].closest('label')?.textContent?.trim()).toBe('Task');
+  });
+
+  it('toggles once, not twice, on a double click that selects a word', async () => {
+    const onToggleCheckbox = vi.fn(() => Promise.resolve(true));
+    const boxes = checkboxes(mount('- [ ] One\n', { editable: true, onToggleCheckbox }));
+    await flushEffects(() => !boxes[0].disabled);
+    const label = boxes[0].closest('label')!;
+    label.click();
+    await Promise.resolve();
+    await Promise.resolve(); // the save settles and re-enables the box
+    expect(boxes[0].disabled).toBe(false);
+    label.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, detail: 2 }));
+    expect(boxes[0].checked).toBe(true);
+    expect(onToggleCheckbox).toHaveBeenCalledOnce();
+  });
+
+  it('adds no label where the checkboxes stay disabled', () => {
+    const el = mount('- [ ] One\n');
+    expect(el.querySelector('label')).toBeNull();
+  });
+
   // A successful save adopts the new text as the `content` prop right away
   // (see `handleToggleCheckbox` in FilePreviewInline.tsx). That swaps this
   // whole subtree for a freshly rendered one, and `marked` renders every

@@ -113,6 +113,7 @@ for calling a category clean.
 | `theme-rename` | names from before *look* became *theme* | 2 |
 | `hand-rolled-ui` | a control the app draws itself that the SDK provides | 2 |
 | `attr-escape` | a text-only escaper writing into an attribute value | 2 |
+| `ready-signal` | the manifest's `reveal`, and calls to `lucidos.ui.ready()` | 2 |
 | `tap-strings` | the retired `tap` string forms | 1 |
 | `removed-flags` | CLI flags and tool args that were removed | 7 |
 | `removed-fields` | thread-summary fields the engine no longer sends | 7 |
@@ -153,9 +154,11 @@ scan url-mutation "history\.(replaceState|pushState)|location\.(href|assign|repl
 
 scan theme-rename "data-theme([^-]|\$)|data-look-|look-effects|lucidos-look|/looks?[/?'\"\`]|preferences\.(set|get)\(['\"](look|theme)['\"]" $inc --include=*.css apps
 
-scan hand-rolled-ui "(^|[^.[:alnum:]_])(alert|confirm|prompt)\(|window\.(alert|confirm|prompt)\(|function[[:space:]]+(toast|showToast|snackbar)[[:space:]]*\(|class=[\"'][^\"']*(toast|snackbar)|^[[:space:]]*\.(toast|snackbar)[[:space:]{.,:]|<select[[:space:]>]|[[:space:]]title=[\"']|role=[\"']switch|(toggle|switch)[[:alnum:]_-]*(thumb|knob)|^[[:space:]]*\.[[:alnum:]_-]*(spinner|loader|badge|chip|pill|tabs?)[[:space:]{.,:]|role=[\"']tab[\"']" $inc --include=*.css --exclude-dir=tests apps
+scan hand-rolled-ui "(^|[^.[:alnum:]_])(alert|confirm|prompt)\(|window\.(alert|confirm|prompt)\(|function[[:space:]]+(toast|showToast|snackbar)[[:space:]]*\(|class=[\"'][^\"']*(toast|snackbar)|^[[:space:]]*\.(toast|snackbar)[[:space:]{.,:]|<select[[:space:]>]|[[:space:]]title=[\"']|role=[\"']switch|(toggle|switch)[[:alnum:]_-]*(thumb|knob)|^[[:space:]]*\.[[:alnum:]_-]*(spinner|loader|badge|chip|pill|tabs?)[[:space:]{.,:]|role=[\"']tab[\"']|^[[:space:]]*(input|textarea)[[:space:]{.,:[]" $inc --include=*.css --exclude-dir=tests apps
 
 scan attr-escape "=[[:space:]]*[\"'](\\\$\{|[\"'][[:space:]]*\+)[^}]*escapeHtml\(" $inc apps
+
+scan ready-signal "\"reveal\"[[:space:]]*:|lucidos\.ui\.ready\(" --include=manifest.json $inc apps
 
 scan tap-strings "\"tap\"[[:space:]]*:[[:space:]]*\"(modal|none|open_app|open_thread)\"|tap:[[:space:]]*'(modal|none|open_app|open_thread)'|kind:[[:space:]]*'none'" $all
 
@@ -344,6 +347,8 @@ Per `system-knowhow/js-sdk.md`:
     a category. A pill the user taps to filter or switch views is the next case.
   - **drift**: tabs or filter pills the app draws itself. A `role="tab"` button
     with the `pill-bar-btn` class is the shared one and is correct.
+  - **drift**: a bare `input`/`textarea` CSS rule giving it its own border or
+    background. The `.text-input` class already is correct and is not a hit.
 
   Read the call site before you report a hit. An app can define its own
   `confirm()` method, and a `title` on an `<iframe>` or `<abbr>` is an
@@ -353,6 +358,26 @@ Per `system-knowhow/js-sdk.md`:
   modals have none yet, so an app that draws its own is correct. Owns the rule: `system-knowhow/js-sdk.md` § Toasts, § Confirmation
   dialogs, § Prompts, § Tooltips, § lucidos.ui.Select and § Component classes.
   § Remediation carries the replacements.
+
+- **The ready signal.** An app can hold the host's loading cover until its
+  content is drawn: `"reveal": "on-ready"` in `manifest.json`, then a
+  `lucidos.ui.ready()` call. The `ready-signal` scan lists both halves per
+  app. Read them together, plus the app's startup code. Owns the rule:
+  `system-knowhow/js-sdk.md` § Showing the app once its content is ready.
+  - **broken**: the manifest says `on-ready` and no app code calls
+    `lucidos.ui.ready()`. Every open sits behind the cover for the full
+    15 s fuse.
+  - **broken**: `reveal` holds any value other than `on-load` or `on-ready`.
+    The app opens as `on-load`, so the opt-in the author meant is ignored.
+  - **stale**: the app calls `lucidos.ui.ready()` but its manifest does not
+    say `on-ready`. The call does nothing.
+  - **stale**: the call exists, but a startup path that finishes the first
+    render skips it, typically the `catch` that shows an error. That path
+    waits for the fuse.
+  - **nit**: no opt-in, and the startup code awaits `lucidos.data`,
+    `lucidos.events`, `lucidos.proxy` or `lucidos.request` before its first
+    render. The user sees an empty app until the data lands. Recommend the
+    opt-in. Skip an app that draws a skeleton or its own placeholder first.
 
 Per `system-knowhow/best-practices.md`:
 
@@ -567,6 +592,20 @@ this table and the two rules under it:
   covers an uncovered route, and a route the engine denies has no remedy by
   design.
 
+### Opting an app into the ready signal
+
+Hand a fix thread this table and the rule under it:
+
+| Old | New |
+|---|---|
+| an app that renders empty until its startup data loads | add `"reveal": "on-ready"` to `manifest.json`, and call `lucidos.ui.ready()` after the first render on every path, error and empty included |
+| `"reveal": "on-ready"` with no `lucidos.ui.ready()` call | add the call after the first render, or drop the opt-in |
+| `reveal` set to anything else, such as `"onready"` | `"on-ready"` if the app calls `lucidos.ui.ready()`, else delete the field |
+
+- **Find every path that ends the first render.** The success path is easy.
+  A fix tends to miss the empty state and the `catch` that shows an error.
+  Each of those then waits 15 s for the fuse.
+
 ### Replacing a control the app draws itself
 
 Hand a fix thread this table and the rules under it:
@@ -584,6 +623,7 @@ Hand a fix thread this table and the rules under it:
 | a status or category chip the app draws itself | `<span class="label">`, plus `label-success`, `label-warning`, `label-error` or `label-neutral` for a status. Map the app's own colours onto those four and the bare accent, then delete its chip CSS |
 | tabs the app draws itself | `<div class="pill-bar" role="tablist">` with a `<button class="pill-bar-btn" role="tab" aria-selected>` per view, then delete the app's own tab CSS |
 | filter pills the app draws itself | the same `.pill-bar`, with `role="group"` and `aria-pressed` on each button |
+| a text input or textarea the app draws itself | `<input class="text-input">` / `<textarea class="text-input">`, then delete the app's own border/background/focus CSS for it |
 
 - **Confirm and prompt become asynchronous.** The browser's dialogs block, and
   the SDK's return a promise. The calling function becomes `async`, and every
@@ -648,5 +688,10 @@ The hand-rolled-control check owns its list of what the SDK replaces. When the
 SDK or the shared component layer gains a control, its hand-drawn form becomes
 drift. Add it to the `hand-rolled-ui` scan, the check and the § Remediation
 table in the same change. Then drop it from the "no SDK counterpart" list.
+
+The ready-signal check owns its scan pattern too. Change the manifest's
+`reveal` values, the fuse lengths or `lucidos.ui.ready()`, and update three
+places in the same change: the `ready-signal` scan, the check, and its
+§ Remediation table.
 
 When a deprecated CLI flag or tool arg is fully removed, add it to check 7's "Removed CLI flags and tool args" list. Include its replacement and any live same-named flag to exclude. The source is `docs/temporary-measures.md` § sunset deprecations.

@@ -272,6 +272,7 @@ pub(crate) fn build_app_knowhow_listing(app_id: &str, summaries: &[KnowhowSummar
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::AppReveal;
     use std::fs;
     use std::path::Path;
 
@@ -724,6 +725,7 @@ mod tests {
             name: "Demo".to_string(),
             description: long.clone(),
             icon: None,
+            reveal: AppReveal::OnLoad,
         }];
         let rendered = build_apps_section(&apps);
         let bullet = rendered
@@ -747,6 +749,7 @@ mod tests {
             name: "Documents".to_string(),
             description: "Browse and search saved documents.".to_string(),
             icon: None,
+            reveal: AppReveal::OnLoad,
         }];
         assert!(build_apps_section(&apps)
             .contains("- **Documents** (id: `documents`): Browse and search saved documents.\n"));

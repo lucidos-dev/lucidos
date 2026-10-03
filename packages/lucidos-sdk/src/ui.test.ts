@@ -594,6 +594,39 @@ describe('lucidos.ui.toast', () => {
   });
 });
 
+describe('lucidos.ui.ready', () => {
+  let origParent: unknown;
+  let postMessage: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    origParent = (globalThis as { parent?: unknown }).parent;
+    postMessage = vi.fn();
+    (globalThis as { parent?: unknown }).parent = { postMessage };
+  });
+  afterEach(() => {
+    (globalThis as { parent?: unknown }).parent = origParent;
+  });
+
+  it('posts lucidos:ui:ready to the host and returns void', () => {
+    expect(ui.ready()).toBeUndefined();
+    expect(postMessage).toHaveBeenCalledWith({ type: 'lucidos:ui:ready' }, '*');
+  });
+
+  // The host ignores a ready for a frame it already revealed. So the SDK keeps
+  // no state, and a second call is just another message.
+  it('stays harmless when called again', () => {
+    ui.ready();
+    expect(() => ui.ready()).not.toThrow();
+    expect(postMessage).toHaveBeenCalledTimes(2);
+  });
+
+  it('standalone (no host parent): sends nothing and does not throw', () => {
+    (globalThis as { parent?: unknown }).parent = globalThis;
+    expect(() => ui.ready()).not.toThrow();
+    expect(postMessage).not.toHaveBeenCalled();
+  });
+});
+
 describe('lucidos.ui.dismissToast', () => {
   let origParent: unknown;
   let postMessage: ReturnType<typeof vi.fn>;

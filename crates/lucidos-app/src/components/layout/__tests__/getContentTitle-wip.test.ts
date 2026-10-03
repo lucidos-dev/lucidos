@@ -14,7 +14,7 @@ vi.mock('../../../api/client', () => ({
 const fakeApp: App = {
   id: 'habit-tracker',
   name: 'Habit Tracker',
-  description: 'A test app',
+  description: 'A test app', reveal: 'on-load',
 };
 
 function seedThread(id: string, title: string): void {

@@ -1688,7 +1688,9 @@ body:not(.is-touch) .code-block-copy-btn.copy-btn-copied {
     margin: 0;
     opacity: 0.85;
 }
-.exchange-error-retry {
+.exchange-error-actions {
+    display: flex;
+    gap: var(--space-sm);
     margin-top: var(--space-sm);
 }
 

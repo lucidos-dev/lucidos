@@ -7,7 +7,8 @@ import { countTaskListItems } from '../../utils/taskListToggle';
 /** A markdown file as a document: its frontmatter as a properties card, then
  *  the rendered body. The raw text stays in the editor and the Source view.
  *
- *  `editable` lets the reader flip a GFM task-list checkbox in place. Left
+ *  `editable` lets the reader flip a GFM task-list checkbox in place, by the
+ *  box or by its text. Left
  *  unset, every checkbox stays `disabled`, which is `marked`'s own default
  *  for a task-list item. `onToggleCheckbox` takes the clicked checkbox's
  *  0-based index among all task items in the body, matching
@@ -65,6 +66,7 @@ export function MarkdownDocument({ content, onClick, editable = false, onToggleC
     const cleanups = boxes.map((box, index) => {
       box.removeAttribute(TASK_CHECKBOX_ATTR);
       box.disabled = false;
+      const label = wrapInTaskLabel(box);
       const handleClick = () => {
         const toggle = onToggleRef.current;
         if (!toggle) return;
@@ -80,7 +82,14 @@ export function MarkdownDocument({ content, onClick, editable = false, onToggleC
         });
       };
       box.addEventListener('click', handleClick);
-      return () => box.removeEventListener('click', handleClick);
+      label.addEventListener('click', ignoreRepeatClicks);
+      return () => {
+        box.removeEventListener('click', handleClick);
+        label.removeEventListener('click', ignoreRepeatClicks);
+        label.replaceWith(...label.childNodes);
+        box.setAttribute(TASK_CHECKBOX_ATTR, COPY_ID_NONCE);
+        box.disabled = true;
+      };
     });
     return () => cleanups.forEach((cleanup) => cleanup());
     // `!!onToggleCheckbox`, not the callback itself: presence is what gates
@@ -99,6 +108,36 @@ export function MarkdownDocument({ content, onClick, editable = false, onToggleC
       />
     </>
   );
+}
+
+/** The inline elements `marked` puts on a task item's own line. Anything else,
+ *  such as a nested list or a heading, ends the label, so an unknown tag only
+ *  makes the label shorter. */
+const TASK_LINE_INLINE = new Set([
+  'A', 'ABBR', 'B', 'BR', 'CODE', 'DEL', 'EM', 'I', 'IMG', 'INPUT', 'INS',
+  'KBD', 'MARK', 'S', 'SMALL', 'SPAN', 'STRONG', 'SUB', 'SUP', 'U',
+]);
+
+/** Wraps a task checkbox and the rest of its line in a `<label>`, so a click
+ *  on the text toggles the box. A link inside stays a link: the browser skips
+ *  label activation for a click on interactive content. */
+function wrapInTaskLabel(box: HTMLInputElement): HTMLLabelElement {
+  const label = document.createElement('label');
+  label.className = 'task-list-label';
+  box.before(label);
+  let node: ChildNode | null = box;
+  while (node && !(node instanceof Element && !TASK_LINE_INLINE.has(node.tagName))) {
+    const next: ChildNode | null = node.nextSibling;
+    label.append(node);
+    node = next;
+  }
+  return label;
+}
+
+/** Lets only the first click of a double or triple click on the text reach
+ *  the box. Selecting a word then toggles once, never twice. */
+function ignoreRepeatClicks(e: MouseEvent): void {
+  if (e.detail > 1 && !(e.target instanceof HTMLInputElement)) e.preventDefault();
 }
 
 export function FrontmatterCard({ frontmatter }: { frontmatter: Frontmatter }) {

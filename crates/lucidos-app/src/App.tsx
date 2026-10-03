@@ -42,6 +42,9 @@ import { releaseNoticeModalOpen } from './store/releaseNotices';
 import { viewportIsMobile } from './utils/viewport';
 import { CameraCaptureSlot } from './components/chat/PromptInput';
 
+// Re-exported so it ships in the shell chunk, which `main.tsx` runs it from.
+export { startShell } from './shellStartup';
+
 const FileSearchModal = lazyComponent(() => import('./components/files/FileSearchModal').then(m => m.FileSearchModal));
 const ImagePopup = lazyComponent(() => import('./components/shared/ImagePopup').then(m => m.ImagePopup));
 const MessageRoutePanel = lazyComponent(() => import('./components/chat/MessageRoutePanel').then(m => m.MessageRoutePanel));

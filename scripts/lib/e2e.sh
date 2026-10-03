@@ -436,28 +436,34 @@ cleanup_e2e_worktrees() {
     e2e_ws_resolved="$(cd "$E2E_WORKSPACE" 2>/dev/null && pwd -P)" || true
     [ -z "$e2e_ws_resolved" ] && e2e_ws_resolved="$E2E_WORKSPACE"
 
-    # Prune stale worktree entries (paths that no longer exist on disk)
-    git worktree prune 2>/dev/null
-
-    # Remove all non-main worktrees (created by CC tests)
     local removed=0
     # Same rule as the readiness counter in ensure_workspace_running: this
     # function is called from inside e2e-browser.sh's project loop, so its
     # iteration variables must not leak back into the caller.
     local line
-    while IFS= read -r line; do
-        local wt_path
-        wt_path=$(echo "$line" | awk '{print $1}')
-        # Skip the main working tree
-        [ "$wt_path" = "$e2e_ws_resolved" ] && continue
-        git worktree remove --force "$wt_path" 2>/dev/null && removed=$((removed + 1))
-    done < <(git worktree list 2>/dev/null)
 
-    # Clean up leftover e2e-test branches. Safe to match by NAME here and only
-    # here: this is the disposable e2e workspace's own git, which no real
-    # session ever branches in. `lucidos-*` is the current coding-agent branch
-    # prefix, `claude-code/*` the legacy one.
-    git branch --list 'e2e-test/*' 'lucidos-*' 'claude-code/*' 'merge-tmp/*' 2>/dev/null | xargs -r git branch -D 2>/dev/null
+    # The workspace's own repo only. A run killed between the fresh-workspace
+    # reset and the engine boot leaves no repo here. Then a bare `git` call
+    # fails the run under `set -e`, or resolves an ENCLOSING repo and sweeps it.
+    if [ "$(git rev-parse --show-toplevel 2>/dev/null)" = "$e2e_ws_resolved" ]; then
+        # Prune stale worktree entries (paths that no longer exist on disk)
+        git worktree prune 2>/dev/null
+
+        # Remove all non-main worktrees (created by coding-agent tests)
+        while IFS= read -r line; do
+            local wt_path
+            wt_path=$(echo "$line" | awk '{print $1}')
+            # Skip the main working tree
+            [ "$wt_path" = "$e2e_ws_resolved" ] && continue
+            git worktree remove --force "$wt_path" 2>/dev/null && removed=$((removed + 1))
+        done < <(git worktree list 2>/dev/null)
+
+        # Clean up leftover e2e-test branches. Safe to match by NAME here and
+        # only here: this is the disposable e2e workspace's own git, which no
+        # real session ever branches in. `lucidos-*` is the current coding-agent
+        # branch prefix, `claude-code/*` the legacy one.
+        git branch --list 'e2e-test/*' 'lucidos-*' 'claude-code/*' 'merge-tmp/*' 2>/dev/null | xargs -r git branch -D 2>/dev/null
+    fi
 
     # CC test worktrees are physically inside this workspace but registered in
     # the canonical lucidos repo (where `git worktree add` ran). Without this the
@@ -835,10 +841,11 @@ setup_e2e_session() {
         ensure_workspace_running
     else
         cleanup_e2e_worktrees
-        # Recreates the database from zero and boots the workspace on it. The
-        # engine must start AFTER the recreate to run the migration chain, so the
-        # reset owns the boot — don't add an ensure_workspace_running before it.
-        reset_e2e_database
+        # Recreates the database from zero, resets the workspace tree, and boots
+        # the workspace on both. The engine must start AFTER the recreate to run
+        # the migration chain, so the reset owns the boot — don't add an
+        # ensure_workspace_running before it.
+        reset_e2e_database --fresh-workspace
     fi
 }
 
@@ -887,6 +894,35 @@ settle_e2e_workspace_tree() {
         echo "WARNING: could not commit the e2e workspace tree; apply tests may refuse it as dirty." >&2
     fi
     return 0
+}
+
+# ── reset_e2e_workspace_tree ──────────────────────────────────────────────
+# Every run starts on a FRESH workspace tree, the counterpart of the database
+# rebuilt from zero (ADR 0351). No test may depend on what an earlier run left.
+#
+# It removes every top-level entry except `.lucidos/`, which holds the lock,
+# the pinned ports and the shared-Postgres marker. The engine then bootstraps
+# the workspace on its next boot, exactly as a brand-new one.
+#
+# Refuses a workspace that is not disposable, and one whose engine is running:
+# the tree is the engine's working copy. Call it with the engine stopped, after
+# cleanup_e2e_worktrees, which reads the workspace's own git.
+reset_e2e_workspace_tree() {
+    assert_e2e_workspace_is_disposable || return 1
+    local ws="$E2E_WORKSPACE" pid entry removed=0
+    [ -d "$ws" ] || return 0
+    pid="$(cat "$ws/.lucidos/engine.pid" 2>/dev/null || true)"
+    case "$pid" in '' | *[!0-9]*) pid="" ;; esac
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        echo "ERROR: the e2e engine (pid $pid) is still running, so its workspace tree was not reset." >&2
+        return 1
+    fi
+    for entry in "$ws"/* "$ws"/.[!.]* "$ws"/..?*; do
+        { [ -e "$entry" ] || [ -L "$entry" ]; } || continue
+        [ "${entry##*/}" = ".lucidos" ] && continue
+        rm -rf "$entry" && removed=$((removed + 1))
+    done
+    echo "Fresh e2e workspace: removed $removed top-level entries, kept .lucidos/. The engine bootstraps the rest."
 }
 
 # ── e2e_workspace_tree_status / assert_e2e_workspace_tree_clean ───────────
@@ -950,11 +986,24 @@ assert_e2e_workspace_tree_clean() {
 # memory/pgvector.rs, and no migration uses a pgvector type). Adding it would
 # make the e2e database differ from the thing it is supposed to reproduce, and
 # would hide a migration that starts depending on the extension.
+#
+# `--fresh-workspace` also resets the workspace TREE, between the engine stop
+# and the boot. A run passes it once, at its start; resets between projects
+# and on a resume do not.
 reset_e2e_database() {
+    local fresh=""
+    case "${1:-}" in
+        --fresh-workspace) fresh=1 ;;
+        "") ;;
+        *) echo "reset_e2e_database: unknown option '$1'" >&2; return 1 ;;
+    esac
     e2e_workspace_env
     setup_postgres
 
     stop_e2e_engine
+    if [ -n "$fresh" ]; then
+        reset_e2e_workspace_tree || return 1
+    fi
     settle_e2e_workspace_tree
 
     local db

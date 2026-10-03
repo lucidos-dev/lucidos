@@ -77,11 +77,14 @@ import {
   selectedScope,
   connectionStatus,
 } from '../store';
-import { sendMessage, retryUnsentMessage, unsentMessageCopy } from './chat';
+import { discardUnsentMessage, sendMessage, retryUnsentMessage, unsentMessageCopy } from './chat';
+import { readUnsentMessageStore, _resetUnsentMessageRecordsForTesting } from '../unsentMessageRecords';
 import { _resetComposeDraftsForTesting, getDraft } from '../composeDrafts';
-import { settleDeliveredUnsentMessage, unsentMessages } from '../unsentMessages';
+import { forgetUnsentMessagesOfThread, unsentMessages } from '../unsentMessages';
+import { settleDeliveredUnsentMessage } from './sendSettlement';
+import { getComposeSelectionOverride, patchComposeSelection, _resetComposeSelectionsForTesting } from '../composeSelections';
 import { ApiError, submitChat } from '../../api/client';
-import { groupIntoExchanges, exchangeError, exchangeUserMessage, exchangeUserImageHashes, handleEvent, type StoredEvent } from '../thread-events';
+import { groupIntoExchanges, exchangeError, exchangeUserMessage, exchangeUserImageHashes, handleEvent, makeOptimisticThreadState, type StoredEvent } from '../thread-events';
 
 const mockedSubmitChat = vi.mocked(submitChat);
 
@@ -93,10 +96,23 @@ beforeEach(() => {
   unsentMessages.value = new Map();
   mockedSubmitChat.mockReset();
   _resetComposeDraftsForTesting();
+  _resetComposeSelectionsForTesting();
+  _resetUnsentMessageRecordsForTesting();
 });
 
 function exchangesOf(threadId: string) {
   return groupIntoExchanges(threadMap.value.get(threadId)!.events);
+}
+
+/** A compose draft's first message that got no answer, on thread `t-1` with a
+ *  model pick. Returns the unsent event id. */
+async function sendFirstUnanswered(text: string): Promise<string> {
+  threadMap.value = new Map([['t-1', makeOptimisticThreadState({ id: 't-1', title: '', channel: 'chat', initiator: 'user', eventsLoaded: true })]]);
+  patchComposeSelection('t-1', { model: 'claude-opus-5' });
+  mockedSubmitChat.mockRejectedValueOnce(new TypeError('Load failed'));
+  await sendMessage(text, undefined, { threadId: 't-1', settlement: { kind: 'first-send', mode: 'lucidos' } });
+  const [eventId] = [...unsentMessages.value.keys()];
+  return eventId;
 }
 
 /** Send once with no answer, and return the thread and the unsent event id. */
@@ -194,20 +210,17 @@ describe('Retry on an unsent message', () => {
     expect(unsentMessages.value.size).toBe(0);
   });
 
-  it('runs the sender\'s owed settle only once a retry is accepted', async () => {
-    const onAccepted = vi.fn();
-    mockedSubmitChat.mockRejectedValueOnce(new TypeError('Load failed'));
-    await sendMessage('compose first send', undefined, { settlement: { onAccepted } });
-    const [eventId] = [...unsentMessages.value.keys()];
-    expect(onAccepted).not.toHaveBeenCalled();
+  it('consumes a first send\'s picks only once a retry is accepted', async () => {
+    const eventId = await sendFirstUnanswered('compose first send');
+    expect(getComposeSelectionOverride('t-1').model).toBe('claude-opus-5');
 
     mockedSubmitChat.mockRejectedValueOnce(new TypeError('Load failed'));
     await retryUnsentMessage(eventId);
-    expect(onAccepted).not.toHaveBeenCalled();
+    expect(getComposeSelectionOverride('t-1').model).toBe('claude-opus-5');
 
     mockedSubmitChat.mockResolvedValueOnce({ event_id: eventId });
     await retryUnsentMessage(eventId);
-    expect(onAccepted).toHaveBeenCalledTimes(1);
+    expect(getComposeSelectionOverride('t-1').model).toBeUndefined();
   });
 
   it('a retry that also gets no answer shows the unsent message again', async () => {
@@ -238,16 +251,16 @@ describe('Retry on an unsent message', () => {
     expect(threadMap.value.get(threadId)!.pendingUserMessages.some(p => p.eventId === eventId)).toBe(false);
   });
 
-  it('a refused retry hands the text to the sender\'s own restore when it has one', async () => {
-    const onRefused = vi.fn();
-    mockedSubmitChat.mockRejectedValueOnce(new TypeError('Load failed'));
-    await sendMessage('compose first send', undefined, { settlement: { onRefused } });
-    const [eventId] = [...unsentMessages.value.keys()];
+  it('a refused retry of a first send rolls its draft back, mode and picks included', async () => {
+    const eventId = await sendFirstUnanswered('compose first send');
     mockedSubmitChat.mockRejectedValueOnce(new ApiError(409, 'locked'));
 
     await retryUnsentMessage(eventId);
 
-    expect(onRefused).toHaveBeenCalledTimes(1);
+    expect(threadMap.value.get('t-1')!.meta.state).toBe('composing');
+    expect(getDraft('t-1').text).toBe('compose first send');
+    expect(getDraft('t-1').mode).toBe('lucidos');
+    expect(getComposeSelectionOverride('t-1').model).toBe('claude-opus-5');
   });
 
   it('a refused retry of a new thread starts a fresh draft with its text and images', async () => {
@@ -295,11 +308,8 @@ describe('Retry on an unsent message', () => {
   });
 
   it('the engine\'s own row for the message replaces the unsent pair and settles it', async () => {
-    const onAccepted = vi.fn();
-    mockedSubmitChat.mockRejectedValueOnce(new TypeError('Load failed'));
-    await sendMessage('it did land', undefined, { settlement: { onAccepted } });
-    const threadId = focusedThreadId.value!;
-    const [eventId] = [...unsentMessages.value.keys()];
+    const eventId = await sendFirstUnanswered('it did land');
+    const threadId = 't-1';
 
     const handled = handleEvent(threadMap.value, threadId, 42, {
       type: 'MessageReceived',
@@ -312,7 +322,110 @@ describe('Retry on an unsent message', () => {
     expect(exchanges).toHaveLength(1);
     expect(exchangeError(exchanges[0])).toBeNull();
     expect([...threadMap.value.get(threadId)!.events.keys()]).toEqual([42]);
-    expect(onAccepted).toHaveBeenCalledTimes(1);
+    expect(getComposeSelectionOverride(threadId).model).toBeUndefined();
     expect(unsentMessages.value.size).toBe(0);
+  });
+});
+
+describe('the stored copy of a send', () => {
+  const stored = async () => (await readUnsentMessageStore()).map(r => ({ eventId: r.eventId, phase: r.phase, failedRetries: r.failedRetries }));
+
+  it('is kept from before the POST goes out, with the exact request', async () => {
+    let answer!: (v: { event_id: string }) => void;
+    mockedSubmitChat.mockReturnValueOnce(new Promise(resolve => { answer = resolve; }));
+
+    const send = sendMessage('in flight', ['hash-a']);
+    const [record] = await readUnsentMessageStore();
+
+    expect(record.phase).toBe('sending');
+    expect(record.body).toEqual(mockedSubmitChat.mock.calls[0][0]);
+    expect(record.settlement).toEqual({ kind: 'raw-new' });
+    expect(Number.isNaN(Date.parse(record.sentAt))).toBe(false);
+    answer({ event_id: record.eventId });
+    await send;
+  });
+
+  it('ends when the engine takes the send', async () => {
+    mockedSubmitChat.mockResolvedValueOnce({ event_id: 'e' });
+    await sendMessage('accepted');
+    expect(await stored()).toEqual([]);
+  });
+
+  it('ends when the engine refuses the send', async () => {
+    mockedSubmitChat.mockRejectedValueOnce(new ApiError(400, 'bad request'));
+    await sendMessage('refused');
+    expect(await stored()).toEqual([]);
+  });
+
+  it('stays as unsent when the send gets no answer, counting retries', async () => {
+    const { eventId } = await sendUnanswered('no answer');
+    expect(await stored()).toEqual([{ eventId, phase: 'unsent', failedRetries: 0 }]);
+
+    mockedSubmitChat.mockRejectedValueOnce(new TypeError('Load failed'));
+    await retryUnsentMessage(eventId);
+    expect(await stored()).toEqual([{ eventId, phase: 'unsent', failedRetries: 1 }]);
+  });
+
+  it('ends when a retry is accepted, or refused', async () => {
+    const first = await sendUnanswered('accept me');
+    mockedSubmitChat.mockResolvedValueOnce({ event_id: first.eventId });
+    await retryUnsentMessage(first.eventId);
+    expect(await stored()).toEqual([]);
+
+    const second = await sendUnanswered('refuse me');
+    mockedSubmitChat.mockRejectedValueOnce(new ApiError(409, 'locked'));
+    await retryUnsentMessage(second.eventId);
+    expect(await stored()).toEqual([]);
+  });
+
+  it('ends when the engine\'s own row for it arrives', async () => {
+    const eventId = await sendFirstUnanswered('it did land');
+    handleEvent(threadMap.value, 't-1', 42, { type: 'MessageReceived', text: 'it did land' } as StoredEvent, new Date().toISOString(), eventId);
+    settleDeliveredUnsentMessage(eventId);
+    expect(await stored()).toEqual([]);
+  });
+
+  it('ends with its card when the thread is deleted', async () => {
+    const { threadId, eventId } = await sendUnanswered('deleted with its thread');
+    forgetUnsentMessagesOfThread(threadId);
+    expect(unsentMessages.value.has(eventId)).toBe(false);
+    expect(await stored()).toEqual([]);
+  });
+});
+
+describe('Discard on an unsent message', () => {
+  it('drops a follow-up\'s card and its stored copy, and sends nothing', async () => {
+    mockedSubmitChat.mockResolvedValueOnce({ event_id: 'first' });
+    await sendMessage('opens the thread');
+    const threadId = focusedThreadId.value!;
+    mockedSubmitChat.mockRejectedValueOnce(new TypeError('Load failed'));
+    await sendMessage('never mind');
+    const [eventId] = [...unsentMessages.value.keys()];
+
+    discardUnsentMessage(eventId);
+
+    expect(exchangesOf(threadId).map(exchangeUserMessage)).not.toContain('never mind');
+    expect(unsentMessages.value.size).toBe(0);
+    expect(await readUnsentMessageStore()).toEqual([]);
+    expect(mockedSubmitChat).toHaveBeenCalledTimes(2);
+    expect(getDraft(threadId).text).toBe('');
+  });
+
+  it('removes the thread a raw new send would have made, which only this device has', async () => {
+    const { threadId, eventId } = await sendUnanswered('a thread never made');
+
+    discardUnsentMessage(eventId);
+
+    expect(threadMap.value.has(threadId)).toBe(false);
+    expect(focusedThreadId.value).toBeNull();
+    expect(await readUnsentMessageStore()).toEqual([]);
+  });
+
+  it('leaves a first send\'s thread an empty draft that keeps its picks', async () => {
+    const eventId = await sendFirstUnanswered('never mind');
+    discardUnsentMessage(eventId);
+    expect(threadMap.value.get('t-1')!.meta.state).toBe('composing');
+    expect(getDraft('t-1').text).toBe('');
+    expect(getComposeSelectionOverride('t-1').model).toBe('claude-opus-5');
   });
 });

@@ -21,6 +21,7 @@
  * mechanism instead of the requirement.
  */
 import { describe, it, expect } from 'vitest';
+import { handlerBody, stripComments } from './__tests__/sourceScan';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
 // @ts-expect-error: same
@@ -30,34 +31,6 @@ import { dirname, resolve } from 'node:path';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const SOURCE = resolve(here, 'startup.ts');
-
-/** Strip `//` and block comments so a surviving comment can never stand in for
- *  a deleted call. Dropping the call and leaving the prose that explains it is
- *  the exact shape this guard has to catch.
- *
- *  A `//` preceded by a backslash is left alone: that is the tail of a regex
- *  literal such as `/^https?:\/\//`, whose escaped slash and closing delimiter
- *  read as a line comment and would otherwise swallow the rest of the line
- *  (taking the scheme test the external-link guard asserts on with it). */
-function stripComments(src: string): string {
-  return src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^\\])\/\/.*$/gm, '$1');
-}
-
-/** The body of a `function <name>(…)` declaration, by brace matching from its
- *  opening `{`. Comments are stripped first, so a brace inside one cannot skew
- *  the match. */
-function handlerBody(src: string, declaration: string): string {
-  const stripped = stripComments(src);
-  const start = stripped.indexOf(declaration);
-  expect(start, `startup.ts must declare \`${declaration}\``).toBeGreaterThan(-1);
-  const open = stripped.indexOf('{', start);
-  let depth = 0;
-  for (let i = open; i < stripped.length; i++) {
-    if (stripped[i] === '{') depth++;
-    else if (stripped[i] === '}' && --depth === 0) return stripped.slice(open + 1, i);
-  }
-  throw new Error(`unbalanced braces in \`${declaration}\`, so the guard cannot bound the handler`);
-}
 
 /** Every update surface that MUST be reconciled when the page comes back to the
  *  foreground, and what silently rots if its call goes missing. */
@@ -174,47 +147,6 @@ describe('startClient coalesces the iOS wake burst', () => {
 });
 
 /**
- * The app-facing toast bridge reaches the handler at all.
- *
- * `lucidos.ui.dismissToast(key)` posts a payload carrying a key and NO message,
- * which puts it between two filters that would each swallow it silently and
- * identically: the message-type allow-list at the top of `onAppFrameMessage`,
- * and the "confirm and prompt carry a message" early return further down. Either
- * one drops the message with no error anywhere, so from the app's side a dismiss
- * simply does nothing and the spinner it was meant to clear spins forever.
- *
- * What the bridge DOES once reached is behaviour, tested as behaviour in
- * `components/shared/__tests__/toast-app-bridge.test.tsx`. Only the two ordering
- * facts that live in this file are pinned here, for the same reason as the
- * guards above: the routing is unreachable without starting the whole client.
- */
-describe('startClient app toast bridge wiring', () => {
-  const src = stripComments(readFileSync(SOURCE, 'utf8'));
-  const body = handlerBody(src, 'function onAppFrameMessage(');
-
-  it('admits the dismiss message type past the allow-list', () => {
-    expect(body, 'a type missing from the allow-list never reaches any branch')
-      .toContain(`data.type !== 'lucidos:ui:dismissToast'`);
-  });
-
-  it('routes the toast bridge BEFORE the message guard that would swallow a dismiss', () => {
-    const bridgeAt = body.indexOf('handleAppToastMessage(');
-    const guardAt = body.indexOf(`typeof payload.message !== 'string'`);
-    expect(bridgeAt, 'the toast bridge must be wired into the handler').toBeGreaterThan(-1);
-    expect(guardAt).toBeGreaterThan(-1);
-    expect(guardAt, 'a dismiss carries no message, so the guard must come second').toBeGreaterThan(bridgeAt);
-  });
-
-  it('keeps the frame-authenticity check ahead of both', () => {
-    // An unattributed frame gets no host chrome, whatever it asked for: a nested
-    // embed must not be able to clear a toast the real app is showing.
-    const frameAt = body.indexOf('isKnownAppFrame(source)');
-    expect(frameAt).toBeGreaterThan(-1);
-    expect(body.indexOf('handleAppToastMessage(')).toBeGreaterThan(frameAt);
-  });
-});
-
-/**
  * Cold-starting on the Notifications panel does not wait out the preferences
  * round-trip before asking for the inbox.
  *
@@ -284,6 +216,49 @@ describe('startClient runs before the shell renders', () => {
     expect(preloadAt, 'main.tsx must preload the shell chunk').toBeGreaterThan(-1);
     expect(preloadAt).toBeLessThan(main.indexOf('async function boot('));
   });
+});
+
+/**
+ * Shell startup installs what only a drawn UI can need, and it must finish
+ * before `<App/>` first renders. The loader that resolves the shell chunk is
+ * the one place that holds for: `lazyComponent` renders only what it returns.
+ */
+describe('startShell runs when the shell chunk resolves', () => {
+  const main = stripComments(readFileSync(resolve(dirname(SOURCE), '../main.tsx'), 'utf8'));
+  const app = stripComments(readFileSync(resolve(dirname(SOURCE), '../App.tsx'), 'utf8'));
+  const shell = stripComments(readFileSync(resolve(dirname(SOURCE), '../shellStartup.ts'), 'utf8'));
+  const client = stripComments(readFileSync(SOURCE, 'utf8'));
+
+  it('is called in the shell loader, before it hands <App/> back', () => {
+    const loader = main.slice(main.indexOf("import('./App')"));
+    const startAt = loader.indexOf('m.startShell()');
+    expect(startAt, 'the shell loader must start the shell').toBeGreaterThan(-1);
+    expect(startAt).toBeLessThan(loader.indexOf('return m.App'));
+  });
+
+  it('ships in the shell chunk, not the entry', () => {
+    expect(app).toContain("export { startShell } from './shellStartup'");
+    expect(main).not.toMatch(/import [^;]*from '\.\/shellStartup'/);
+  });
+
+  // Each of these once sat in the entry chunk through client startup or
+  // main.tsx. Moving one back costs its whole subtree on first paint.
+  const SHELL_INSTALLS = [
+    'installDeadPressProbe()',
+    'installDeadKeystrokeProbe()',
+    'installToastPressProbe()',
+    'installAppKeybindingsSync()',
+    'installAppFrameMessages()',
+    'installPendingUploadRestore()',
+    'installUnsentMessageRestore()',
+  ];
+  for (const install of SHELL_INSTALLS) {
+    it(`installs ${install} there, and nowhere on the entry path`, () => {
+      expect(shell).toContain(install);
+      expect(client).not.toContain(install);
+      expect(main).not.toContain(install);
+    });
+  }
 });
 
 /**

@@ -1,5 +1,5 @@
 import { useState, useEffect, useLayoutEffect, useMemo, useRef } from 'preact/hooks';
-import { filePreviewRevision, filePreviewSource, filePreviewWrap, filePreviewEditing, handshakeScriptsVersion, showToast, TOAST_AUTO_DISMISS_MS } from '../../store/store';
+import { filePreviewRevision, filePreviewSource, filePreviewWrap, filePreviewEditing, handshakeScriptsVersion, showToast, removeToast } from '../../store/store';
 import { lucidos } from '@lucidos/sdk';
 import { MarkdownDocument } from './MarkdownDocument';
 import { highlightFileLines } from '../../utils/syntaxHighlight';
@@ -137,8 +137,9 @@ const checkboxToggleQueues = new Map<string, Promise<unknown>>();
  *  the whole subtree too soon. That wipes out a later toggle's own
  *  in-flight checkbox state.
  *
- *  Toasts under one key per file: a toggle fired while an earlier one is
- *  still saving replaces that toast rather than stacking a new one. */
+ *  Toasts only on failure, under one key per file, so failures replace
+ *  each other rather than stack. A successful save clears that key's
+ *  toast, so an earlier failure does not outlive the save that fixed it. */
 export function toggleDataFileCheckbox(
   path: string, url: string, taskIndex: number, expectedCount: number,
 ): Promise<{ content: string; isLatest: boolean } | null> {
@@ -172,7 +173,7 @@ async function runToggle(path: string, url: string, taskIndex: number, expectedC
       return null;
     }
     await saveDataFile(path, updated);
-    showToast('Saved', 'success', { key: toastKey, autoDismissMs: TOAST_AUTO_DISMISS_MS });
+    removeToast(toastKey);
     return updated;
   } catch (e) {
     showToast(`Failed to update checkbox: ${errorDetail(e)}`, 'error', { key: toastKey });

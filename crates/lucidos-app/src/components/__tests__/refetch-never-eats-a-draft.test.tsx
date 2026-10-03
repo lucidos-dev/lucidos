@@ -36,7 +36,7 @@ import type { App } from '../../store/types';
 const APP_ID = 'habit-tracker';
 
 function app(): App {
-  return { id: APP_ID, name: 'Habit Tracker', description: 'Tracks habits' };
+  return { id: APP_ID, name: 'Habit Tracker', description: 'Tracks habits', reveal: 'on-load' };
 }
 
 async function waitFor(done: () => boolean, budgetMs = 1000): Promise<void> {

@@ -9,10 +9,10 @@
     overflow: hidden;
     /* Opaque base surface so the panes (which are transparent and would
        otherwise show the document background) never reveal the boot-splash brand
-       gradient painted on <html>/<body>. That gradient is reverted to
-       var(--bg-primary) only AFTER the splash node is removed at the end of its
-       fade-out (bootSplash.ts / index.html), so without this the panels flash
-       blue for the ~0.65s the splash spends fading. */
+       gradient painted on <html>/<body>. That canvas only fades to
+       var(--bg-primary) alongside the splash veil (bootSplash.ts / index.html),
+       so without this the panels show blue for the ~0.65s the splash spends
+       fading. */
     background-color: var(--bg-primary);
 }
 

@@ -1,19 +1,25 @@
 import { signal } from '@preact/signals';
 import type { ChatRequestBody } from '../api/types';
+import type { ComposeMode, ServerDraft } from './actions/compose';
+import { forgetUnsentMessageRecord } from './unsentMessageRecords';
 
-/** What a sender still owes once its send is decided after the first attempt.
- *  The first attempt reports its own outcome, so these run only for a later
- *  decision. */
-export interface SendSettlement {
-  /** The engine took the send: a Retry was accepted, or its own row arrived. */
-  onAccepted?: () => void;
-  /** The engine refused a Retry. Puts the text back where it can be sent. */
-  onRefused?: () => void;
-}
+/** Which kind of send this was, which decides what is owed once the engine
+ *  takes or refuses it (`settleAcceptedSend`, `restoreRefusedSend`). Plain
+ *  data, so a record kept across a reload settles exactly as it would have. */
+export type SendSettlement =
+  /** A compose draft's first message. Accepted consumes the draft's picks;
+   *  refused rolls the draft back, mode included. `engineDraftAtSend` is the
+   *  engine's draft as it stood at the send, when this device knew it. */
+  | { kind: 'first-send'; mode: ComposeMode | null; engineDraftAtSend?: ServerDraft }
+  /** A message to a thread the engine has. Refused takes it into the draft. */
+  | { kind: 'follow-up' }
+  /** A message that creates its thread. Refused starts a fresh draft. */
+  | { kind: 'raw-new' };
 
 /** A send whose POST never got an answer, so the engine may never have seen it.
  *  The thread shows it as an *unsent message* with a Retry button
- *  (`actions/chat.ts`). Page memory only: a reload drops it. */
+ *  (`actions/chat.ts`). Its stored copy (`unsentMessageRecords.ts`) brings it
+ *  back after a reload. */
 export interface UnsentMessage {
   threadId: string;
   /** The exact request the send built. Retry re-posts it, event id included,
@@ -44,8 +50,16 @@ export function takeUnsentMessage(eventId: string): UnsentMessage | undefined {
   return message;
 }
 
-/** The engine's own row for an unsent message arrived: its POST landed and
- *  only the answer was lost. Settle it as accepted. */
-export function settleDeliveredUnsentMessage(eventId: string): void {
-  takeUnsentMessage(eventId)?.settlement.onAccepted?.();
+/** Take the record and end its stored copy: the send was decided after the
+ *  first attempt, or the user discarded it. */
+export function endUnsentMessage(eventId: string): UnsentMessage | undefined {
+  forgetUnsentMessageRecord(eventId);
+  return takeUnsentMessage(eventId);
+}
+
+/** A deleted thread's unsent messages go with it. */
+export function forgetUnsentMessagesOfThread(threadId: string): void {
+  for (const [eventId, message] of unsentMessages.value) {
+    if (message.threadId === threadId) endUnsentMessage(eventId);
+  }
 }

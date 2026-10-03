@@ -92,6 +92,23 @@ coding-agent worktree. See ADR 0021.)
 **Inside `/harden`, stay in the turn.** Apply reads the next idle as a finished
 `/harden`, so there use the exit-file join `/harden` Phase 4.5 describes.
 
+## A memory stop is the harness's to recover, never yours
+
+The harness waits out a host in memory trouble and resumes on its own, so one
+run gives one verdict (ADR 0351). Read the exit code, then the `[e2e-resume]`
+lines at the end of the log:
+
+| Exit | Meaning | What you do |
+|---|---|---|
+| 71 | memory stop the harness could not resume | report the unverified range it printed as the carry-over |
+| 72 | the build memory gate refused: nothing was built or tested | report it; the host was in trouble |
+| 75 | the host-load guard refused the launch | report it; nothing ran |
+
+**After one of these, never start a second leg, a discharge or a retry.** Never
+start a cargo build or `/harden` suites while the host reads NO-GO either. Each
+of those is how a night failed before the harness owned its recovery. The
+unverified range goes to a later run on a cold host.
+
 ## Targeted sub-scripts
 
 After the first full run identifies failures, iterate with the targeted

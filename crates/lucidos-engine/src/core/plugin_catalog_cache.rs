@@ -35,9 +35,9 @@ const CACHE_TTL_SECS: i64 = 300;
 /// How long a scan may claim to be running before we stop believing it.
 ///
 /// `shallow_clone` has no timeout, so a wedged clone holds the single-flight
-/// guard for good. Without this bound the panel would show "Updating…" for
-/// ever, hiding the fact that its data has stopped moving. Past the cutoff the
-/// cue drops and the data's real age is shown instead.
+/// guard for good. Without this bound the panel would believe a scan is
+/// running for ever, and a failure notice would say "Checking again…" with
+/// nothing behind it. Past the cutoff the scan stops counting as running.
 pub const SCAN_STALL_CUTOFF_SECS: i64 = 600;
 
 /// What the last scan produced, plus what is known about the scan itself.
@@ -117,8 +117,8 @@ fn lock_cache() -> MutexGuard<'static, ()> {
 /// Record that a scan has begun, keeping whatever the last one found.
 ///
 /// The stamp is what `scan_is_running` reads, so it is the whole basis of the
-/// "Updating…" cue. Every client learns a scan started, including one that did
-/// not ask for it.
+/// panel's scanning state. Every client learns a scan started, including one
+/// that did not ask for it.
 pub fn mark_scan_started(workspace_path: &Path, now: DateTime<Utc>) {
     let _serialized = lock_cache();
     let mut cached = load(workspace_path);

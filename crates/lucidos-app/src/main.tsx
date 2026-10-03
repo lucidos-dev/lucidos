@@ -7,9 +7,6 @@ import { IS_PICKER, WORKSPACE_ID, baseContextIsValid } from './utils/basePath';
 import { rememberLastWorkspace } from './utils/lastWorkspace';
 import { updateAvailable } from './store/store';
 import { installActionBtnBlurListener } from './components/chat/promptFocus';
-import { installDeadPressProbe } from './components/chat/deadPressProbe';
-import { installDeadKeystrokeProbe } from './components/chat/deadKeystrokeProbe';
-import { installToastPressProbe } from './components/shared/toastPressProbe';
 import { installNoAutofill } from './utils/noAutofill';
 import { currentAutocorrect } from './store/actions/preferences';
 import { installNoDrag } from './utils/noDrag';
@@ -51,6 +48,13 @@ import './styles/badges.css';
 import './store/effects';
 import './store/actions/wipPreview';
 
+// What a hot update must tear down before this module runs again. Vite keeps
+// ONE dispose callback per module, so every teardown goes through this list.
+const hmrTeardowns: (() => void)[] = [];
+import.meta.hot?.dispose(() => {
+  for (const stop of hmrTeardowns.splice(0)) stop();
+});
+
 // The shell chunk (ADR 0288): `<App/>` and everything only the UI reaches. It
 // is modulepreloaded from index.html and asked for here, as soon as the entry
 // evaluates. Its download and parse then overlap boot's own awaits and the
@@ -60,8 +64,12 @@ import './store/actions/wipPreview';
 // the top level. For the app that is when this chunk resolves, so the watchdog
 // in index.html still guards the fetch. The picker hands over from its loader
 // below, and the pre-gateway desktop splash from `stayOnStartingSplash`.
+//
+// Shell startup runs here too, once per document: this resolves before
+// `<App/>` first renders, and `lazyComponent` caches a load that succeeded.
 const App = lazyComponent(() =>
   import('./App').then((m) => {
+    hmrTeardowns.push(m.startShell());
     handOverBootOwnership();
     return m.App;
   }),
@@ -82,11 +90,6 @@ if (isIOSPwa()) {
 installSafeAreaFloor();
 
 installActionBtnBlurListener();
-// Three diagnostics, not features: the composer's buttons, its textarea and the
-// toasts' buttons. See their headers and docs/temporary-measures.md.
-installDeadPressProbe();
-installDeadKeystrokeProbe();
-installToastPressProbe();
 // Preferences have not loaded yet, so this is the mirror, or on when it is empty.
 installNoAutofill(currentAutocorrect());
 installNoDrag();
@@ -262,8 +265,7 @@ async function boot() {
     if (!IS_PICKER) {
       startPerfProbe();
       installMainThreadStallProbe();
-      const stopClient = startClient();
-      import.meta.hot?.dispose(stopClient);
+      hmrTeardowns.push(startClient());
     }
     render(
       IS_PICKER ? (

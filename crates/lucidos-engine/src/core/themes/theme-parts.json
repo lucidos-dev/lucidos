@@ -517,7 +517,7 @@
       "label": "App controls",
       "group": "app",
       "description": "Buttons, inputs and the SDK select in an app frame.",
-      "selector": "input, textarea, select, button, .lucidos-select-trigger",
+      "selector": "input, textarea, select, button, .lucidos-select-trigger, .text-input",
       "frames": true,
       "properties": [
         {

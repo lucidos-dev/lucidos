@@ -37,6 +37,7 @@ import { fileURLToPath } from 'node:url';
 const here: string = dirname(fileURLToPath(import.meta.url));
 const src = readFileSync(resolve(here, 'AppUiInline.tsx'), 'utf-8');
 const css = readFileSync(resolve(here, '../../styles/panels/previews.css'), 'utf-8');
+const mobileCss = readFileSync(resolve(here, '../../styles/mobile.css'), 'utf-8');
 
 describe('app frame load cover', () => {
   it('mounts a cover element alongside the iframe', () => {
@@ -65,7 +66,7 @@ describe('app frame load cover', () => {
     // partway through its own fade at a slow setting. The slack is a fixed
     // margin, not animation, so it stays outside the scaled term.
     expect(src).toMatch(
-      /useLingeringFlag\(!loaded, scaledDurationMs\(COVER_FADE_MS\) \+ COVER_FADE_SLACK_MS\)/,
+      /useLingeringFlag\(!revealed, scaledDurationMs\(COVER_FADE_MS\) \+ COVER_FADE_SLACK_MS\)/,
     );
     expect(src).toMatch(/const COVER_FADE_MS = 200;/);
   });
@@ -81,9 +82,18 @@ describe('app frame load cover', () => {
 
   it('reveals the frame anyway if load never fires', () => {
     // A request that hangs must not leave the pane covered forever. Whatever
-    // the frame painted beats a blank panel.
-    expect(src).toMatch(/COVER_MAX_MS/);
-    expect(src).toMatch(/setTimeout\(\(\) => setLoaded\(true\), COVER_MAX_MS\)/);
+    // the frame painted beats a blank panel. The fuse length per reveal mode
+    // is pinned in appFrameReveal.test.ts.
+    expect(src).toMatch(/setTimeout\(\(\) => setFused\(true\), revealFuseMs\(reveal\)\)/);
+  });
+
+  it('reveals through the shared decision, fed by load, ready and the fuse', () => {
+    expect(src).toMatch(/const revealed = appFrameRevealed\(reveal, signals\)/);
+    expect(src).toMatch(/addEventListener\(APP_FRAME_READY_EVENT, onReady\)/);
+    // Attached in the layout phase, before paint, so an early ready from a
+    // cached app cannot fire on the element before anyone listens.
+    expect(src).toMatch(/useLayoutEffect\(\(\) => \{\s*const iframe = iframeRef\.current;\s*if \(!iframe\) return;\s*const onReady/);
+    expect(src).toMatch(/class=\{`app-ui-cover\$\{revealed \? ' is-clearing' : ''\}`\}/);
   });
 
   it('paints the cover with the theme background, opaque and click-through', () => {
@@ -100,6 +110,51 @@ describe('app frame load cover', () => {
   it('positions the cover over the frame', () => {
     expect(css).toMatch(/\.app-ui-inline\s*\{[^}]*position:\s*relative/);
     expect(css).toMatch(/\.app-ui-cover\s*\{[^}]*position:\s*absolute/);
+  });
+});
+
+describe('app panel refresh', () => {
+  it('caps its wait at the open app\'s own reveal fuse', () => {
+    // A cap sized to the longest fuse would hold the header spinner 15 s on an
+    // on-load app whose refresh mounts no new frame.
+    expect(src).toMatch(/setTimeout\(settle, revealFuseMs\(reveal\) \+ REFRESH_SETTLE_SLACK_MS\)/);
+    expect(src).toMatch(/\(\) => refreshOpenApp\(reveal\)/);
+  });
+});
+
+describe('app frame load bar', () => {
+  it('is delay-gated, so a fast open shows no bar', () => {
+    expect(src).toMatch(/const barShown = useDelayedFlag\(appFrameLoading\(reveal, signals\)\)/);
+  });
+
+  it('lingers through its fade-out at any animation speed', () => {
+    expect(src).toMatch(
+      /useLingeringFlag\(barShown, scaledDurationMs\(COVER_FADE_MS\) \+ COVER_FADE_SLACK_MS\)/,
+    );
+  });
+
+  it('is opaque from its first frame and fades only on the way out', () => {
+    // A loader the gate let through must not fade in: a second gate stacked on
+    // the delay gate leaves a short wait with no legible loader at all.
+    const rule = css.match(/\.app-ui-load-bar\s*\{[^}]*\}/)?.[0] ?? '';
+    expect(rule).toMatch(/opacity:\s*1/);
+    expect(rule).toMatch(/pointer-events:\s*none/);
+    expect(css).toMatch(/\.app-ui-load-bar\.is-clearing\s*\{[^}]*opacity:\s*0/);
+    expect(css).not.toMatch(/@keyframes app-ui-load-bar-[a-z-]*\s*\{[^}]*opacity/);
+  });
+
+  it('is not painted over by the phone header\'s fade', () => {
+    // The phone header hangs an opaque-to-clear fade below itself, over the
+    // pane's top edge, and paints above the pane. Left up, it hid the 3px bar
+    // entirely on phones while desktop, with no fade, showed it.
+    expect(mobileCss).toMatch(
+      /:root:has\(\.app-ui-load-bar\) \.app-header\[data-mobile-view="content"\]::after\s*\{\s*opacity:\s*0;/,
+    );
+  });
+
+  it('names itself to assistive tech as a progress bar', () => {
+    expect(src).toMatch(/role="progressbar"/);
+    expect(src).toMatch(/aria-label="Loading app"/);
   });
 });
 

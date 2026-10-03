@@ -47,7 +47,7 @@ import { linkifyPaths } from '../../utils/linkifyPaths';
 import { renderMarkdown } from '../../utils/renderMarkdown';
 import type { App } from '../../store/types';
 
-const APPS: App[] = [{ id: 'pr-understanding', name: 'PR Understanding', description: '' }];
+const APPS: App[] = [{ id: 'pr-understanding', name: 'PR Understanding', description: '', reveal: 'on-load' }];
 
 /** Render markdown the way the notification detail does (no known artifact
  *  paths), click its first anchor, and report whether the default was stopped. */

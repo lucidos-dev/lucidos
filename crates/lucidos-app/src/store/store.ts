@@ -48,7 +48,7 @@ import { getThreadEventsBump } from './threadActivity';
 import { DEFAULT_CHAT_MODEL } from './models';
 import { displaySection, EVENT_CHANNELS } from '../generated/thread-lifecycle';
 import type { EventChannel, ArchiveState, DisplaySection } from '../generated/thread-lifecycle';
-import { resetContentScroll } from '../hooks/useScrollMemory';
+import { resetContentScroll } from './savedScroll';
 import type { Change, ChangelogRelease, CodingAgentModelValue, CodingAgentReasoningEffort, PendingCommits, ReleaseNoticeView } from '../api/client';
 import type { UpdateRelay, ReleaseCheck } from '../api/client/control';
 import type { ApplyEstimates } from '../api/client/changes';

@@ -58,11 +58,12 @@ describe('the failure card', () => {
       threadId: 'tid',
       body: { message: 'hello', mode: 'human', event_id: 'e-1', thread_id: 'tid' } as never,
       failedRetries: 0,
-      settlement: {},
+      settlement: { kind: 'follow-up' },
     }]]);
     const card = mountFailed(-2);
     expect(card?.querySelector('strong')?.textContent).toBe('Not sent');
     expect(card?.querySelector('button.exchange-error-retry')?.textContent?.trim()).toBe('Retry');
+    expect(card?.querySelector('button.exchange-error-discard')?.textContent?.trim()).toBe('Discard');
   });
 
   it('keeps the failed-reply card for a turn the engine recorded', () => {
@@ -70,7 +71,7 @@ describe('the failure card', () => {
       threadId: 'tid',
       body: { message: 'hello', mode: 'human', event_id: 'e-1', thread_id: 'tid' } as never,
       failedRetries: 0,
-      settlement: {},
+      settlement: { kind: 'follow-up' },
     }]]);
     const card = mountFailed(10);
     expect(card?.querySelector('strong')?.textContent).toBe('The reply failed');

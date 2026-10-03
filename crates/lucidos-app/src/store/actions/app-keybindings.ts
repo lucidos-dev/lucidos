@@ -15,9 +15,10 @@ export function pushKeybindingsToFrame(frame: HTMLIFrameElement): void {
 }
 
 /** Keep every open app frame's copy current. `forwardableBindings` reads the
- *  preferences signal, so a rebind in Settings re-runs this. */
-export function installAppKeybindingsSync(): void {
-  effect(() => {
+ *  preferences signal, so a rebind in Settings re-runs this. Returns the
+ *  teardown. */
+export function installAppKeybindingsSync(): () => void {
+  return effect(() => {
     const bindings = forwardableBindings();
     for (const frame of document.querySelectorAll<HTMLIFrameElement>('iframe[data-role="app-ui-frame"]')) {
       postToAppFrame(frame, APP_KEYBINDINGS_CHANNEL, { bindings });

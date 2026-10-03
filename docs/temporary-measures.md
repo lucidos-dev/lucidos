@@ -145,7 +145,7 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
 - **Added:** 2026-09-23
 - **Lives in:** `crates/lucidos-app/src/components/shared/toastPressProbe.ts`
   (one `postClientLog('toast-press', …)` per press on a toast control),
-  installed from `main.tsx`.
+  installed from `src/shellStartup.ts`.
 - **Impermanent because:** pure telemetry chasing a bug. On the iOS PWA a
   toast's Open sometimes does nothing on the first tap and works on the second.
   The failed tap left no trace in the log. Nothing could say whether iOS
@@ -163,7 +163,7 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
 
 - **Added:** 2026-08-26. **Widened:** 2026-08-27, twice; 2026-08-28; 2026-08-29.
 - **Lives in:** `crates/lucidos-app/src/components/chat/deadPressProbe.ts`, its
-  install call in `src/main.tsx`, and
+  install call in `src/shellStartup.ts`, and
   `src/components/chat/__tests__/dead-press-probe.test.ts` and
   `src/components/chat/__tests__/dead-press-probe-ledger.test.ts`. The `PressOutcome`
   pair in `src/utils/tapGesture.ts` is part of it: the probe cannot tell a
@@ -652,7 +652,7 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
 
 - **Added:** 2026-08-29
 - **Lives in:** `crates/lucidos-app/src/components/chat/deadKeystrokeProbe.ts`,
-  its install call in `src/main.tsx`, its `reportDraftClobbered` caller in
+  its install call in `src/shellStartup.ts`, its `reportDraftClobbered` caller in
   `src/components/chat/PromptInput.tsx`, and
   `src/components/chat/__tests__/dead-keystroke-probe.test.ts`.
   `src/components/chat/probeViewport.ts` is shared with the press probe above,
@@ -1304,6 +1304,27 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
 - **Status:** active
 - **Investigation:** n/a (the cause is known and upstream; nothing is being
   chased here, only waited on)
+
+### Composer frost off under the keyboard
+
+- **Added:** 2026-10-03
+- **Lives in:** the `[data-keyboard-active]` composer rule in
+  `crates/lucidos-app/src/styles/mobile.css`, just after the frosted composer.
+- **Scope note:** the frosted composer itself is **permanent**. Only the opaque
+  fallback while the keyboard is up is the workaround.
+- **Impermanent because:** with the keyboard up, iOS Safari paints the
+  composer's `backdrop-filter` layer about 8px above the box, with the desktop
+  corner radius. A faint second outline then shows behind the focus ring. The
+  likely trigger is the prompt area, a `will-change: translate` layer that
+  snaps its slide back to zero as the keyboard opens. Seen on a device only,
+  never reproduced in Playwright's WebKit.
+- **Removal / resolution condition:** an iOS release paints the backdrop in
+  place. Verify on an iPhone in Safari with Dynamic bars on. Delete the rule,
+  scroll the transcript so the composer slides partway, then tap the composer.
+  The blurred fill must sit exactly inside the focus ring, with no outline
+  above it. Repeat in the installed PWA.
+- **Status:** active
+- **Investigation:** n/a (the cause is upstream in WebKit's compositor)
 
 ### Safe-area floor
 

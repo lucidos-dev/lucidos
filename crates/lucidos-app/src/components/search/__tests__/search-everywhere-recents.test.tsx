@@ -18,7 +18,7 @@ vi.mock('../../../store/actions/thread-loading', async (importOriginal) => ({
 import { SearchEverywhere } from '../SearchEverywhere';
 import { searchEverywhereOpen, threadMap, threadsLoaded } from '../../../store/store';
 import { RECENTS_KEY } from '../../../store/actions/entityReferences';
-import { dropDeletedThreads } from '../../../store/actions/threads-delete';
+import { dropDeletedThreads } from '../../../store/actions/threads-drop';
 
 const THREAD_RECENT: SearchResultItem = {
   id: 'thread-outside-the-window',

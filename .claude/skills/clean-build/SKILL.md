@@ -318,23 +318,43 @@ Where "When to give up" (below) sends an unfixable finding. Kept inside
 
 - **Phase 4's entry chunk is no longer an exception.** It sat at 857.58 kB
   against its 600 kB ceiling until 2026-09-26, when the first-paint split
-  took it to 488 kB (ADR 0288). The entry chunk is now the data layer and
-  startup. The UI is the shell chunk, loaded beside it under the boot splash.
+  took it to 488 kB (ADR 0288). It regrew to 600.23 kB in a week, and
+  2026-10-03 took it to 509.13 kB (ADR 0353). The entry chunk is the data
+  layer and startup. The UI is the shell chunk, loaded beside it under the
+  boot splash.
 
-  `entryChunkBudget` (`crates/lucidos-app/vite/entryChunkBudget.ts`) now
-  FAILS a single-shot `vite build` whose entry chunk passes
-  `chunkSizeWarningLimit`, naming the measured size. So this phase fails
-  outright rather than printing an advisory, and never lands here again.
+  `entryChunkBudget` (`crates/lucidos-app/vite/entryChunkBudget.ts`) FAILS a
+  single-shot `vite build` whose entry chunk passes `chunkSizeWarningLimit`,
+  naming the measured size. Past 90 % of the budget it WARNS, naming the
+  headroom left, and this phase counts that warning. So the phase goes red
+  while there is still room, which is the point.
 
-  When it fires, move the next thing the first frame does not need behind a
-  dynamic import. Never raise the number. The usual cause is a new static
-  import from the data layer into UI code. It pulls that code and its imports
-  back into the entry.
+  When either fires, move the next thing the first frame does not need out of
+  the entry. Never raise the number. The usual cause is a static import from
+  the data layer into UI code, which pulls that code and its imports back in.
+  Two fixes cover most cases:
 
-  - **Attribute built bytes, not source bytes.** Run
-    `npx vite build --sourcemap --outDir /tmp/<dir>` in `crates/lucidos-app`
-    and decode the entry map's `mappings`, charging each segment to its
-    source. Use a scratch outDir, never a `build.sourcemap` config edit.
+  - **The store needs one export of a UI module.** Move that export into its
+    own small module, as `utils/dataPathPrefixes.ts` and `store/savedScroll.ts`
+    did.
+  - **A listener only a drawn UI can need.** Install it from `startShell`
+    (`src/shellStartup.ts`), not from client startup or `main.tsx`.
+
+  How to find them:
+
+  - **Attribute built bytes, not source bytes.** Run a sourcemap build into a
+    scratch outDir and decode the entry map's `mappings`, charging each
+    segment to its source. Never edit `build.sourcemap` in the config.
+  - **Over the budget that build fails before it writes.** Make the guard
+    report by naming your own process as Vite's parent, the way the
+    build-watch does:
+
+    ```sh
+    cd crates/lucidos-app && node -e "require('node:child_process').spawnSync(process.execPath, ['../../node_modules/vite/bin/vite.js', 'build', '--sourcemap', '--outDir', '/tmp/entry-attr', '--emptyOutDir'], { stdio: 'inherit', env: { ...process.env, LUCIDOS_DEV_BUILD_WATCH: String(process.pid) } })"
+    ```
+  - **Find why a module is in the entry.** Rollup's `getModuleInfo` gives
+    each module's importers. A dominator tree over the static graph inside the
+    entry gives what a cut would actually free.
   - **Ask the two regression questions.** Does any module sit in two chunks?
     Does any `import()` target sit in the entry chunk?
   - **Do not reach for `manualChunks` for our own code.** It moves shared code

@@ -1,18 +1,21 @@
 import { useRef, useLayoutEffect, useState, useEffect } from 'preact/hooks';
-import { currentApp, appPseudoFullscreen, appRefreshKey, scaledDurationMs } from '../../store/store';
+import { currentApp, appPseudoFullscreen, appRefreshKey, appsList, scaledDurationMs } from '../../store/store';
 import { appFullscreenHost, syncAppFullscreenHost } from '../../store/appFullscreenHost';
 import { getAppFrameSrc, exitPseudoFullscreen, refreshAppUI } from '../../store/actions/apps';
 import { usePanelRefresh } from '../../hooks/usePanelRefresh';
 import { showPullTravel } from '../../store/panelRefresh';
 import { ExitFullscreenIcon } from '../shared/icons';
 import { viewportIsMobile } from '../../utils/viewport';
-import { useLingeringFlag } from '../../hooks/useDelayedLoading';
+import { useDelayedFlag, useLingeringFlag } from '../../hooks/useDelayedLoading';
 import { setAppFrameHash, splitFrameSrc } from './iframeNav';
 import { APP_FRAME_SANDBOX, APP_FRAME_ALLOW } from './appFrameSandbox';
 import { EdgeSwipeZones } from '../layout/EdgeSwipeZones';
 import { pushKeybindingsToFrame } from '../../store/actions/app-keybindings';
 import { pushAppearanceToFrame } from '../../store/actions/app-appearance';
 import { IframeTabExit } from '../shared/IframeTabExit';
+import { APP_FRAME_READY_EVENT } from '../../store/actions/app-ready-bridge';
+import type { AppReveal } from '../../store/types';
+import { appFrameLoading, appFrameRevealed, liveAppReveal, revealFuseMs } from './appFrameReveal';
 
 /** The load cover's CSS opacity transition at 1x (var(--duration-normal)). The
  *  cover lingers for this, scaled by the Animation speed slider, plus fixed
@@ -21,13 +24,9 @@ import { IframeTabExit } from '../shared/IframeTabExit';
 const COVER_FADE_MS = 200;
 const COVER_FADE_SLACK_MS = 50;
 
-/** Reveal fuse for a frame whose `load` never arrives (a hung request). A pane
- *  covered forever is worse than whatever the frame managed to paint. */
-const COVER_MAX_MS = 3000;
-
-/** How long an app refresh waits for the new frame's `load` before it settles
- *  anyway: the reveal fuse, plus the refresh's own debounce and some slack. */
-const REFRESH_SETTLE_MAX_MS = COVER_MAX_MS + 500;
+/** Added to the open app's reveal fuse to cap how long a refresh waits for
+ *  the new frame: the refresh's own debounce plus some slack. */
+const REFRESH_SETTLE_SLACK_MS = 500;
 
 /** Counts frame mounts. A refresh waits for a frame newer than the one on
  *  screen, whose own first load may still be pending. */
@@ -46,9 +45,9 @@ function settleFrameLoad(frame: number): void {
  *  settle once the new one has loaded. preserveWip, because a refresh re-reads
  *  whatever the frame points at, WIP included. Apply landing and direct
  *  file-source edits call `refreshAppUI` with the default instead. */
-function refreshOpenApp(): Promise<void> {
+function refreshOpenApp(reveal: AppReveal): Promise<void> {
   return new Promise((resolve) => {
-    const fuse = setTimeout(settle, REFRESH_SETTLE_MAX_MS);
+    const fuse = setTimeout(settle, revealFuseMs(reveal) + REFRESH_SETTLE_SLACK_MS);
     function settle() {
       clearTimeout(fuse);
       resolve();
@@ -72,7 +71,7 @@ function cacheBust(url: string, key: number): string {
  *  history (WebKit #9166). The PWA's edge-swipe-back gesture then surfaces a
  *  snapshot of a previous app state mid-swipe. An app switch remounts this
  *  component instead, and a first load adds no entry. */
-function AppFrame({ src }: { src: string }) {
+function AppFrame({ src, reveal }: { src: string; reveal: AppReveal }) {
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const [initialSrc] = useState(src);
   const lastSrcRef = useRef(initialSrc);
@@ -85,21 +84,43 @@ function AppFrame({ src }: { src: string }) {
   // theme-coloured cover from mount, crossfaded out once the frame has
   // something to show. See AppUiInline.test.ts for why the cover is a sibling
   // element rather than an opacity on the iframe itself.
+  //
+  // An app whose manifest says `"reveal": "on-ready"` keeps the cover until it
+  // calls `lucidos.ui.ready()`, so its first data fetch is hidden too. The
+  // decision is in appFrameReveal.ts.
   const [loaded, setLoaded] = useState(false);
-  const coverMounted = useLingeringFlag(!loaded, scaledDurationMs(COVER_FADE_MS) + COVER_FADE_SLACK_MS);
+  const [ready, setReady] = useState(false);
+  const [fused, setFused] = useState(false);
+  const signals = { loaded, ready, fused };
+  const revealed = appFrameRevealed(reveal, signals);
+  const coverMounted = useLingeringFlag(!revealed, scaledDurationMs(COVER_FADE_MS) + COVER_FADE_SLACK_MS);
+  // The load bar is delay-gated, so a fast open shows none. It shows opaque
+  // the frame the gate lets it through, and fades only on the way out.
+  const barShown = useDelayedFlag(appFrameLoading(reveal, signals));
+  const barMounted = useLingeringFlag(barShown, scaledDurationMs(COVER_FADE_MS) + COVER_FADE_SLACK_MS);
   const [frame] = useState(() => ++framesMounted);
 
   // A pull the frame was posting ends with it, so the arrow comes down.
   useEffect(() => () => showPullTravel(0), []);
 
+  // Layout phase, so the listener is on the element before the browser paints
+  // and before any frame script can run.
+  useLayoutEffect(() => {
+    const iframe = iframeRef.current;
+    if (!iframe) return;
+    const onReady = () => setReady(true);
+    iframe.addEventListener(APP_FRAME_READY_EVENT, onReady);
+    return () => iframe.removeEventListener(APP_FRAME_READY_EVENT, onReady);
+  }, []);
+
   useEffect(() => {
-    if (loaded) {
+    if (revealed) {
       settleFrameLoad(frame);
       return;
     }
-    const fuse = setTimeout(() => setLoaded(true), COVER_MAX_MS);
+    const fuse = setTimeout(() => setFused(true), revealFuseMs(reveal));
     return () => clearTimeout(fuse);
-  }, [loaded]);
+  }, [revealed]);
 
   // A FRAGMENT change only. The caller keys this component on the document. A
   // change of document therefore remounts it, and the new element carries the
@@ -143,7 +164,14 @@ function AppFrame({ src }: { src: string }) {
       />
       <IframeTabExit />
       {coverMounted && (
-        <div class={`app-ui-cover${loaded ? ' is-clearing' : ''}`} aria-hidden="true" />
+        <div class={`app-ui-cover${revealed ? ' is-clearing' : ''}`} aria-hidden="true" />
+      )}
+      {barMounted && (
+        <div
+          class={`app-ui-load-bar${barShown ? '' : ' is-clearing'}`}
+          role="progressbar"
+          aria-label="Loading app"
+        />
       )}
     </>
   );
@@ -153,10 +181,11 @@ export function AppUiInline({ layout }: { layout: 'desktop' | 'mobile' }) {
   const app = currentApp.value;
   const refreshKey = appRefreshKey.value;
   const isPseudo = appPseudoFullscreen.value;
+  const reveal = app ? liveAppReveal(app, appsList.value) : 'on-load';
   // Skip mounting the iframe in the inactive dual-rendered layout — otherwise
   // every app open spawns two iframes loading the same id.
   const isActiveLayout = layout === (viewportIsMobile.value ? 'mobile' : 'desktop');
-  usePanelRefresh(`app "${app?.name ?? ''}"`, app && isActiveLayout ? refreshOpenApp : null);
+  usePanelRefresh(`app "${app?.name ?? ''}"`, app && isActiveLayout ? () => refreshOpenApp(reveal) : null);
 
   // Gate the layout effect on isActiveLayout so the inactive copy doesn't fight
   // the active one over the global attribute (its cleanup would clear what the
@@ -229,7 +258,9 @@ export function AppUiInline({ layout }: { layout: 'desktop' | 'mobile' }) {
           {layout === 'mobile' && <EdgeSwipeZones />}
         </>
       )}
-      {frameSrc && <AppFrame key={`${refreshKey}:${splitFrameSrc(frameSrc).doc}`} src={frameSrc} />}
+      {frameSrc && (
+        <AppFrame key={`${refreshKey}:${splitFrameSrc(frameSrc).doc}`} src={frameSrc} reveal={reveal} />
+      )}
       {/* Where the host's overlay layer renders while this panel is natively
           fullscreen (OverlayLayer portals into it, found by this marker). Always
           mounted, always empty: it has no vnode children, so the portal is the

@@ -53,7 +53,7 @@ const CONSUMER_EXEMPT: Record<string, Exemption> = {
   'components/chat/MicrophonePicker.tsx': { tag: 'structure-first', why: 'anchored popover drawn from the first frame' },
   'components/layout/Drawer.tsx': { tag: 'no-visual', why: 'derives the pinned set; draws nothing itself' },
   'components/picker/NetworkAccessPopover.tsx': { tag: 'structure-first', why: 'the canonical structure-first popover' },
-  'components/plugins/CatalogFreshness.tsx': { tag: 'single-value', why: 'an age label beside a list with its own skeleton' },
+  'components/plugins/CatalogScanFailure.tsx': { tag: 'single-value', why: 'a failure notice beside a list with its own skeleton' },
   'components/settings/AddDeviceSection.tsx': { tag: 'working-state', why: 'mints a pairing code on a button press' },
   'components/settings/DebuggingSection.tsx': { tag: 'structure-first', why: 'LoadableToggle holds the switch and defers its value' },
   'components/settings/JudgmentModelRow.tsx': { tag: 'structure-first', why: 'real picker row; defers which choices it offers' },

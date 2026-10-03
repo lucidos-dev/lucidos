@@ -953,6 +953,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let shared_engine: SharedEngine = Arc::new(engine);
     shared_engine.set_self_arc(&shared_engine);
+    // Recovery below emits child terminals, and the fan-in turns each into a
+    // parent wake. Queue them until recovery is over, or the woken turn races
+    // the sweeps, which read it as a dead one. Released after the event-wait
+    // rebuild.
+    shared_engine.event_bus.hold_parent_wakes();
     shared_engine.start_parent_callback_listener();
     shared_engine.start_apply_all_driver();
     shared_engine.start_standing_apply_resolver();
@@ -1099,8 +1104,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Settle every thread still `running`, now that each recovery sweep has
     // had its turn. A turn the restart interrupted gets an abort event, and
     // anything else goes to idle. No live turn exists yet, so nothing
-    // legitimate is settled: event-wait re-entries, child-completion refires
-    // and switch resumes all start below. No thread leaves boot idle over a
+    // legitimate is settled: event-wait re-entries, the held child-completion
+    // wakes and switch resumes all start below. No thread leaves boot idle over a
     // dead turn with no terminator, the state the client read as a crash.
     lucidos_engine::engine::agent_recovery::settle_orphaned_running_threads(
         shared_engine.pool(),
@@ -1119,8 +1124,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     .await;
 
     // Reconcile the three child counts in either drift direction. After the
-    // settle above, because a recovery abort is transient: it leaves a parent's
-    // count alone, expecting a resume, and this is what drops a dead child out.
+    // settle above, because a status write the settle makes directly reaches no
+    // in-tx reconcile, and this is what drops a dead child out.
     // The query and its reasons live with the in-tx reconcile it must agree
     // with, so the two cannot drift apart on what "in flight" means.
     if let Err(e) =
@@ -1192,9 +1197,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // completed while the engine was down left a persisted ChildThreadCompleted
     // with no resume fired.
     //
-    // This re-injects those onto the channel `start_parent_callback_listener`
-    // is already draining, so the parent resumes through the live path. Runs
-    // after the recovery sweeps, so a parent mid-resume when the engine died is
+    // This re-injects those through the live path, into the parent wake hold,
+    // which drops a second wake for a card recovery already queued. Runs after
+    // the recovery sweeps, so a parent mid-resume when the engine died is
     // recovered there rather than double-fired here.
     shared_engine
         .event_bus
@@ -1245,6 +1250,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     shared_engine.rebuild_event_waits().await;
     boot_stages.lap("event waits");
+
+    // Recovery is over, so the parent wakes held since boot may run. After the
+    // rebuild on purpose: a parent that was itself waiting for the child has
+    // just had that wait resolved, and the fan-in then stands down for it.
+    let released = shared_engine.event_bus.release_held_parent_wakes();
+    if released > 0 {
+        log!("[Startup] Released {released} parent wake(s) held during recovery");
+    }
 
     // Rebuild the Apply-All batch registry from the durable table and resolve
     // any batch the previous process abandoned mid-flight. Runs AFTER the agent

@@ -32,7 +32,7 @@ import { type ThreadState } from '../thread-events';
 import { fetchThreads } from '../../api/threads';
 import { awayFromBottom, followSurvivesScroll, notAtTop, setActiveScrollElement, setFollowLiveEdge, stopFollowingBottom } from '../../components/chat/scrollState';
 import { drawerOpen } from '../../components/layout/drawerState';
-import { threadScrollKey } from '../../hooks/useScrollMemory';
+import { threadScrollKey } from '../savedScroll';
 import { _resetComposeDraftsForTesting, getDraft } from '../composeDrafts';
 import { archiveThreadCount, archivingThreadIds, codingAgentPendingModel, codingAgentPendingReasoningEffort, focusedPane, focusedThreadId, generatedTitleIds, mobileView, resetCodingAgentPendingPreferences, threadDrawerOpen, threadMap, threadsLoaded, THREAD_EVENTS_FETCH_CONCURRENCY, THREAD_EVENTS_PREFETCH_LIMIT } from '../store';
 import { _resetThreadOpenMarksForTesting, takeThreadOpenStart } from '../../utils/threadOpenMarks';
