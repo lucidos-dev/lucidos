@@ -1302,6 +1302,15 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 
 ## Frontend
 
+- **An overlay field keeps a header the composer already hid.** A reviewer
+  reports that `useHideOnScroll` skips an overlay field without restoring the
+  header, so a menu opened from the composer keeps the collapsed spacer. That
+  is the rule working: an overlay's field moves nothing behind it, either way.
+  Restoring the header would slide it and shift the transcript under the
+  overlay, the flicker the skip exists to stop. `keepsHeaderAway` holds it on
+  the composer's focusout for the same reason. Re-flag only if overlays stop
+  being the opening surface.
+
 - **`refreshChangesState()` never rejects, so awaiting it needs no `try`.** A
   reviewer reports an unguarded `await` that strands the caller's error path
   when both fetch attempts fail. But the function's last `.catch` swallows a

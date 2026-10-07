@@ -1221,6 +1221,48 @@
         animation: none;
     }
 
+    /* The transcript's find bar floats on the header's visible bottom edge.
+       In flow it sat at viewport y=0, behind the fixed header, and under the
+       Dynamic Island once the header slid away. It covers the sticky title row
+       while open, and its floor keeps it clear of the status bar, as the
+       scroll-to-top chevron's does. The offset rides `translate`, never a
+       layout property, for the reason on .mobile-thread-title-row. */
+    .mobile-swipe-pane .thread-view {
+        position: relative;
+    }
+
+    .mobile-swipe-pane .thread-view > .find-bar-slot {
+        position: absolute;
+        top: var(--mobile-header-height, 3rem);
+        left: 0;
+        right: 0;
+        translate: 0 max(
+            calc(var(--safe-area-top) - var(--mobile-header-height, 3rem)),
+            var(--mobile-header-offset, 0rem)
+        );
+        /* `top` moves only when the keyboard opens or closes, as the header
+           height swaps for the safe area. It glides with the header, which
+           would otherwise cover the bar on its way out. */
+        transition: top var(--bars-glide-duration, 0s) ease,
+            translate var(--bars-glide-duration, 0s) ease;
+        will-change: translate;
+        /* Above .thread-content (z-index 2) and its sticky title row. */
+        z-index: 3;
+        background: var(--bg-secondary);
+    }
+
+    .mobile-swipe-pane .thread-view > .find-bar-slot .find-bar {
+        padding-inline: calc(var(--space-lg) + var(--phone-side-inset));
+    }
+
+    /* The up chevron rests below the title row, which the open bar replaces.
+       With the header away it lands on the bar's Close and Next buttons, so it
+       stands down while the bar is open. The bar's own steps move the reader. */
+    .mobile-swipe-pane .thread-view:has(> .find-bar-slot) .scroll-to-top.visible {
+        opacity: 0;
+        pointer-events: none;
+    }
+
     /* Position scroll-to-top chevron below the sticky thread title bar.
        --mobile-thread-title-height is the actual measured height of the
        title bar (set by useHideOnScroll via ResizeObserver) so the chevron

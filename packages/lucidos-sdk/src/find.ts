@@ -236,6 +236,16 @@ export interface FindPainter {
   clear(): void;
 }
 
+/** Put `ranges` under `name`, or take the name away when there are none.
+ *  WebKit repaints a range only when its own Highlight drops it, not when the
+ *  registry drops the Highlight. So the old one is emptied first, or its
+ *  matches stay painted. */
+function setHighlight(name: string, ranges: Range[]): void {
+  CSS.highlights.get(name)?.clear();
+  if (ranges.length > 0) CSS.highlights.set(name, new Highlight(...ranges));
+  else CSS.highlights.delete(name);
+}
+
 /** Paints with the two CSS Custom Highlights when `highlights()` says they
  *  show, and otherwise selects the current match. One per document: the
  *  highlight registry is the document's. */
@@ -245,9 +255,8 @@ export function createPainter(highlights: () => boolean): FindPainter {
     paint(ranges, current) {
       const at = current >= 0 ? ranges[current] : undefined;
       if (highlights()) {
-        CSS.highlights.set(ALL_HIGHLIGHT, new Highlight(...ranges));
-        if (at) CSS.highlights.set(CURRENT_HIGHLIGHT, new Highlight(at));
-        else CSS.highlights.delete(CURRENT_HIGHLIGHT);
+        setHighlight(ALL_HIGHLIGHT, ranges);
+        setHighlight(CURRENT_HIGHLIGHT, at ? [at] : []);
         return;
       }
       const selection = window.getSelection();
@@ -258,8 +267,8 @@ export function createPainter(highlights: () => boolean): FindPainter {
     },
     clear() {
       if (typeof CSS !== 'undefined' && 'highlights' in CSS) {
-        CSS.highlights.delete(ALL_HIGHLIGHT);
-        CSS.highlights.delete(CURRENT_HIGHLIGHT);
+        setHighlight(ALL_HIGHLIGHT, []);
+        setHighlight(CURRENT_HIGHLIGHT, []);
       }
       if (selectionOwned) {
         window.getSelection()?.removeAllRanges();

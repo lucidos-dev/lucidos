@@ -193,6 +193,39 @@ export function seedStepHeavyThread({ turns, stepsPerTurn, title }: {
   return { threadId, messageIds };
 }
 
+/** Seed an archived chat thread of `turns` turns, titled `title`, and return
+ *  its id. Turn N asks "Question N" and answers "Answer N.", except the turns
+ *  in `needles`, whose reply says "Answer N mentions the zebra." */
+export function seedChatThread({ turns, needles, title }: {
+  turns: number;
+  needles: number[];
+  title: string;
+}): string {
+  const threadId = randomUUID();
+  const base = Date.now() - turns * 10_000;
+  let n = 0;
+  const at = () => new Date(base + n++ * 1000).toISOString();
+  const rows: string[] = [];
+  const row = (id: string, type: string, payload: string) =>
+    `('${id}', '${type}', '${payload}'::jsonb, '${at()}', 'thread', '${threadId}', '${threadId}')`;
+  for (let t = 0; t < turns; t++) {
+    const messageId = randomUUID();
+    const reply = needles.includes(t) ? `Answer ${t} mentions the zebra.` : `Answer ${t}.`;
+    const ref = `"request_event_id":"${messageId}"`;
+    rows.push(
+      row(messageId, 'MessageReceived', `{"text":"Question ${t}","mode":"human","channel":"chat"}`),
+      row(randomUUID(), 'TextStreamed', `{"text":"${reply}",${ref}}`),
+      row(randomUUID(), 'ResponseGenerated', `{"text":"${reply}","images":[],${ref}}`),
+    );
+  }
+  psql([
+    `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, state, is_coding_agent, active_children_count, total_children_count, coding_agent_proposed, coding_agent_requires_restart, coding_agent_is_external_repo) `
+      + `VALUES ('${threadId}', '${title}', 'chat', '${new Date().toISOString()}', ${turns}, false, true, 'idle', 'archived', 'active', false, 0, 0, false, false, false)`,
+    `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES\n${rows.join(',\n')}`,
+  ].join(';\n'));
+  return threadId;
+}
+
 /** Seed an archived chat thread whose every step row carries a context
  *  counter, and return its id. A legacy `ThoughtStreamed` with
  *  `context_tokens` is the smallest payload that gives a step a snapshot,

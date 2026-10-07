@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.47.1 — 2026-10-07
+
+### Fixed
+- Safari no longer leaves old find highlights painted after the search changes or closes.
+- On a phone, the transcript find bar stays clear of the header and the Dynamic Island, and moves with the header when the keyboard opens. The up chevron steps aside while the find bar is open.
+- On a phone, typing in Search Everywhere or another overlay field no longer makes the header and the thread jump.
 ## v0.47.0 — 2026-10-07
 
 ### Added

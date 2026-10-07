@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { holdSoftwareKeyboard } from './softwareKeyboard';
+import { holdSoftwareKeyboard, isOverlayField } from './softwareKeyboard';
 import { promptState, showPrompt } from '../store/store';
 
 function setCoarsePointer(coarse: boolean): void {
@@ -35,6 +35,23 @@ describe('holdSoftwareKeyboard', () => {
     opener.focus();
     holdSoftwareKeyboard();
     expect(document.activeElement).toBe(opener);
+  });
+});
+
+// The header keeps still for these, since the screen behind an overlay must.
+describe('isOverlayField', () => {
+  afterEach(() => {
+    document.body.innerHTML = '';
+  });
+
+  it('counts the proxy and a field inside an overlay panel, and nothing else', () => {
+    setCoarsePointer(true);
+    holdSoftwareKeyboard();
+    expect(isOverlayField(document.activeElement as Element)).toBe(true);
+
+    document.body.innerHTML = '<div data-overlay-panel="overlay-1"><input id="in"></div><textarea id="out"></textarea>';
+    expect(isOverlayField(document.querySelector('#in')!)).toBe(true);
+    expect(isOverlayField(document.querySelector('#out')!)).toBe(false);
   });
 });
 

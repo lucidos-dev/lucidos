@@ -250,7 +250,7 @@ describe('promptCanSlide (dynamic bars)', () => {
 describe('--mobile-header-offset stays off the document root', () => {
   // Custom properties inherit, so writing the var on `documentElement`
   // invalidates style for every node in the document. The thread transcript is
-  // the largest tree in the app, so the var goes on its two consumers instead.
+  // the largest tree in the app, so the var goes on its consumers instead.
   //
   // A source scan rather than a behavioral test because the regression is about
   // WHICH element is written, and this suite has no DOM (the scroll logic is
@@ -267,12 +267,13 @@ describe('--mobile-header-offset stays off the document root', () => {
     expect(rootWrites).toHaveLength(0);
   });
 
-  it('writes the offset on both consumer elements', () => {
-    // Both, not one: the sticky title bar AND the scroll-to-top chevron read it
-    // (styles/mobile.css). Dropping either leaves that element at its resting
-    // position while the header scrolls away.
+  it('writes the offset on every consumer element', () => {
+    // The sticky title bar, the scroll-to-top chevron and the transcript's find
+    // bar all read it (styles/mobile.css). Dropping one leaves that element at
+    // its resting position while the header scrolls away.
     expect(hookSource).toMatch(/titleBarEl\?\.style\.setProperty\(\s*['"]--mobile-header-offset/);
     expect(hookSource).toMatch(/chevronEl\?\.style\.setProperty\(\s*['"]--mobile-header-offset/);
+    expect(hookSource).toMatch(/findBarEl\?\.style\.setProperty\(\s*['"]--mobile-header-offset/);
   });
 
   const mobileCss = readFileSync(
@@ -345,14 +346,15 @@ describe('--mobile-header-offset stays off the document root', () => {
   });
 
   it('keeps the offset off `top`, which would reinstate the forced layout', () => {
-    // Both consumers take the offset on `translate` (composited) so the write
+    // All three consumers (the title bar, the up chevron and the transcript's
+    // find bar) take the offset on `translate` (composited) so the write
     // cannot dirty layout. A `top` that reads it means the next scroll event's
     // scrollTop read forces a style+layout flush of the whole transcript again.
     const offsetOnTop = mobileCss.match(/top:[^;]*--mobile-header-offset/g) ?? [];
     expect(offsetOnTop).toHaveLength(0);
     const offsetOnTransform = mobileCss.match(/transform:[^;]*--mobile-header-offset/g) ?? [];
     expect(offsetOnTransform).toHaveLength(0);
-    expect(mobileCss.match(/translate:[^;]*--mobile-header-offset/g) ?? []).toHaveLength(2);
+    expect(mobileCss.match(/translate:[^;]*--mobile-header-offset/g) ?? []).toHaveLength(3);
   });
 });
 

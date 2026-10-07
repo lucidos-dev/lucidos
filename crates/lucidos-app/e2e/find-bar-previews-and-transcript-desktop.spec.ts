@@ -1,8 +1,7 @@
 import { test, expect, type Page } from './fixtures';
 import { mkdirSync, writeFileSync, rmSync } from 'fs';
 import { resolve } from 'path';
-import { randomUUID } from 'crypto';
-import { WORKSPACE, psql } from './db-helpers';
+import { WORKSPACE, seedChatThread } from './db-helpers';
 import {
   apiRequest, assertHealthy, clickHeaderAction, disarmFollowSeed, navigateToApp, waitForEventStream,
   waitForScrollSettled,
@@ -33,33 +32,6 @@ async function openFile(page: Page, path: string): Promise<void> {
     data: { target: 'file', params: { file_path: path } },
   });
   expect(res.ok(), `POST /api/v1/ui/navigate -> ${res.status()}`).toBeTruthy();
-}
-
-/** A chat thread of `turns` turns, `needles` of whose replies say "zebra". */
-function seedChatThread(turns: number, needles: number[]): string {
-  const threadId = randomUUID();
-  const base = Date.now() - turns * 10_000;
-  let n = 0;
-  const at = () => new Date(base + n++ * 1000).toISOString();
-  const rows: string[] = [];
-  const row = (id: string, type: string, payload: string) =>
-    `('${id}', '${type}', '${payload}'::jsonb, '${at()}', 'thread', '${threadId}', '${threadId}')`;
-  for (let t = 0; t < turns; t++) {
-    const messageId = randomUUID();
-    const reply = needles.includes(t) ? `Answer ${t} mentions the zebra.` : `Answer ${t}.`;
-    const ref = `"request_event_id":"${messageId}"`;
-    rows.push(
-      row(messageId, 'MessageReceived', `{"text":"Question ${t}","mode":"human","channel":"chat"}`),
-      row(randomUUID(), 'TextStreamed', `{"text":"${reply}",${ref}}`),
-      row(randomUUID(), 'ResponseGenerated', `{"text":"${reply}","images":[],${ref}}`),
-    );
-  }
-  psql([
-    `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, state, is_coding_agent, active_children_count, total_children_count, coding_agent_proposed, coding_agent_requires_restart, coding_agent_is_external_repo) `
-      + `VALUES ('${threadId}', 'Find bar transcript', 'chat', '${new Date().toISOString()}', ${turns}, false, true, 'idle', 'archived', 'active', false, 0, 0, false, false, false)`,
-    `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES\n${rows.join(',\n')}`,
-  ].join(';\n'));
-  return threadId;
 }
 
 test.describe('the find bar', () => {
@@ -120,7 +92,7 @@ test.describe('the find bar', () => {
   test('finds in the whole transcript, and a step reaches a turn not yet drawn', async ({ page }) => {
     // Forty turns: the transcript draws a tail of about twenty, so turn 2 is
     // not drawn when the thread opens at its end.
-    const threadId = seedChatThread(40, [2, 38]);
+    const threadId = seedChatThread({ turns: 40, needles: [2, 38], title: 'Find bar transcript' });
     await page.addInitScript((tid: string) => localStorage.setItem('lucidos-focused-thread', tid), threadId);
     await disarmFollowSeed(page);
     await assertHealthy(page);

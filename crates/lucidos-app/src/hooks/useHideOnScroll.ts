@@ -1,6 +1,7 @@
 import { useEffect } from 'preact/hooks';
 import { composeViewActive, mobileView, panelOverlay, preferences, type MobileView, type PanelOverlay } from '../store/store';
 import { opensSoftwareKeyboard, getRemPx } from '../utils/dom';
+import { isOverlayField } from '../utils/softwareKeyboard';
 import { afterPressSettles } from '../utils/pointerPress';
 import {
   holdAcrossRelayout,
@@ -231,8 +232,12 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
     let threadScroller: Element | null = null;
     // A freshly bound title bar has no position to glide from, so it lands.
     let titleBarFresh = false;
-    // The scroll-to-top chevron, the other `--mobile-header-offset` consumer.
+    // The scroll-to-top chevron and the transcript's open find bar, the other
+    // two `--mobile-header-offset` consumers.
     let chevronEl: HTMLElement | null = null;
+    let findBarEl: HTMLElement | null = null;
+    // Like the title bar, a freshly mounted find bar lands rather than glides.
+    let findBarFresh = false;
     let titleBarResizeObserver: ResizeObserver | null = null;
     let currentContainer: Element | null = null;
     let currentContainerPane: Element | null = null;
@@ -334,12 +339,12 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
       }
     }
 
-    /** Bind the two elements that CONSUME `--mobile-header-offset`, so the
+    /** Bind the elements that CONSUME `--mobile-header-offset`, so the
      *  offset write can target them instead of `documentElement`.
      *
      *  Custom properties inherit, so setting one on the root invalidates style
      *  for every node in the document, and the transcript is the largest tree
-     *  in the app. Writing it on the consumers narrows invalidation to two
+     *  in the app. Writing it on the consumers narrows invalidation to a few
      *  tiny subtrees. The CSS needs no change either way, since `var()` resolves
      *  a custom property from the element's own computed value.
      *
@@ -365,12 +370,18 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
       // The down chevron is the third consumer, of the PROMPT's offset: it sits
       // just above the prompt, so it has to slide with it on every pane.
       const nextDownChevron = (threadScroller?.parentElement?.querySelector(':scope > .scroll-to-bottom') ?? null) as HTMLElement | null;
-      if (nextTitleBar === titleBarEl && nextChevron === chevronEl && nextDownChevron === downChevronEl) return false;
+      // The find bar mounts only while open, above the transcript's wrap. Its
+      // mount and unmount reach the MutationObserver, which rebinds it here.
+      const nextFindBar = threadScroller?.closest('.thread-view')?.querySelector<HTMLElement>(':scope > .find-bar-slot') ?? null;
+      if (nextTitleBar === titleBarEl && nextChevron === chevronEl && nextDownChevron === downChevronEl
+        && nextFindBar === findBarEl) return false;
       // The outgoing up chevron keeps its last value. A pane swipe has already
       // revealed it (`attachListener`), so it glides in as it slides out.
       bindTitleBar(nextTitleBar);
       chevronEl = nextChevron;
       downChevronEl = nextDownChevron;
+      findBarFresh = nextFindBar !== null && nextFindBar !== findBarEl;
+      findBarEl = nextFindBar;
       // Force the next applyTransform to write. The freshly-bound elements carry
       // no value (or a stale one), and the change-detection guard below would
       // otherwise skip them because the OFFSET itself has not moved.
@@ -454,6 +465,9 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
         if (offsetRem !== lastOffsetRem) {
           lastOffsetRem = offsetRem;
           chevronEl?.style.setProperty('--mobile-header-offset', `${offsetRem}rem`);
+          findBarEl?.style.setProperty('--mobile-header-offset', `${offsetRem}rem`);
+          if (findBarEl && findBarFresh) landWithoutGlide(findBarEl);
+          findBarFresh = false;
         }
         if (titleOffsetRem !== lastTitleOffsetRem) {
           lastTitleOffsetRem = titleOffsetRem;
@@ -705,6 +719,9 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
       // Title bar is inside the scroll pane (not the header) but should
       // behave like a header input — don't hide when editing the title.
       if (target.closest('.mobile-thread-title-row')) return;
+      // An overlay's field moves nothing behind the overlay: header, spacer
+      // and transcript all hold still.
+      if (isOverlayField(target)) return;
       // Header pinned visible (pinned bars / app-ui): it never slides off for
       // the keyboard, so the spacer must stay full-height. Collapsing it here
       // would slide content up behind the still-visible header (editing a

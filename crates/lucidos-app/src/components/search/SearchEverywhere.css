@@ -9,12 +9,9 @@
        follows whichever header is on screen and the mobile block below no
        longer restates it. Declared as a var because the mobile max-height has
        to subtract exactly this.
-       On mobile the anchor MOVES while the palette is open, and that is the
-       anchor working rather than a glitch: --mobile-header-height collapses to
-       the safe-area inset when the header slides off for the keyboard, which
-       this palette's own auto-focused input is what triggers. The palette rides
-       up with the header it is hung from and takes the freed height, instead of
-       holding a gap under a header that is no longer there. */
+       Focusing the palette's own field never moves this anchor: a field inside
+       an overlay does not slide the header off for the keyboard
+       (useHideOnScroll). */
     --search-everywhere-top: calc(var(--app-header-bottom) + var(--header-surface-gap));
     align-items: flex-start;
     padding-top: var(--search-everywhere-top);

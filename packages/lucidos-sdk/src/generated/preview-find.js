@@ -202,15 +202,19 @@ var __lucidosPreviewFind = (() => {
     const dx = centring(r.left, r.width, 0, window.innerWidth);
     if (dx || dy) window.scrollBy(dx, dy);
   }
+  function setHighlight(name, ranges) {
+    CSS.highlights.get(name)?.clear();
+    if (ranges.length > 0) CSS.highlights.set(name, new Highlight(...ranges));
+    else CSS.highlights.delete(name);
+  }
   function createPainter(highlights) {
     let selectionOwned = false;
     return {
       paint(ranges, current) {
         const at = current >= 0 ? ranges[current] : void 0;
         if (highlights()) {
-          CSS.highlights.set(ALL_HIGHLIGHT, new Highlight(...ranges));
-          if (at) CSS.highlights.set(CURRENT_HIGHLIGHT, new Highlight(at));
-          else CSS.highlights.delete(CURRENT_HIGHLIGHT);
+          setHighlight(ALL_HIGHLIGHT, ranges);
+          setHighlight(CURRENT_HIGHLIGHT, at ? [at] : []);
           return;
         }
         const selection = window.getSelection();
@@ -221,8 +225,8 @@ var __lucidosPreviewFind = (() => {
       },
       clear() {
         if (typeof CSS !== "undefined" && "highlights" in CSS) {
-          CSS.highlights.delete(ALL_HIGHLIGHT);
-          CSS.highlights.delete(CURRENT_HIGHLIGHT);
+          setHighlight(ALL_HIGHLIGHT, []);
+          setHighlight(CURRENT_HIGHLIGHT, []);
         }
         if (selectionOwned) {
           window.getSelection()?.removeAllRanges();

@@ -83,7 +83,7 @@ export function FindBar({ surface, scope, placeholder }: {
   }, [surface, scope]);
 
   return (
-    <Disclosure open={open}>
+    <Disclosure open={open} class="find-bar-slot">
       <FindRow inputRef={inputRef} placeholder={placeholder} />
     </Disclosure>
   );

@@ -169,12 +169,16 @@ describe('find over a document', () => {
 });
 
 describe('find with the highlight API and sdk-iframe.css', () => {
-  const highlights = new Map<string, { ranges: Range[] }>();
+  const highlights = new Map<string, Set<Range>>();
+  let built: Set<Range>[] = [];
 
   beforeEach(() => {
     highlights.clear();
+    built = [];
     vi.stubGlobal('CSS', { highlights });
-    vi.stubGlobal('Highlight', class { ranges: Range[]; constructor(...r: Range[]) { this.ranges = r; } });
+    vi.stubGlobal('Highlight', class extends Set<Range> {
+      constructor(...r: Range[]) { super(r); built.push(this); }
+    });
     document.documentElement.style.setProperty('--find-highlights', 'styled');
     clearFind();
   });
@@ -189,9 +193,23 @@ describe('find with the highlight API and sdk-iframe.css', () => {
     document.body.innerHTML = '<p>one two one</p>';
     find('one');
     find('one', 1);
-    expect(highlights.get('lucidos-find')?.ranges).toHaveLength(2);
-    expect(highlights.get('lucidos-find-current')?.ranges[0].startOffset).toBe(8);
+    expect(highlights.get('lucidos-find')?.size).toBe(2);
+    expect([...highlights.get('lucidos-find-current')!][0].startOffset).toBe(8);
     expect(window.getSelection()?.rangeCount ?? 0).toBe(0);
+  });
+
+  // WebKit repaints a range only when its own Highlight drops it. A Highlight
+  // the registry drops while still full stays painted.
+  const unregisteredStillFull = () => built.filter(
+    (h) => h.size > 0 && ![...highlights.values()].includes(h),
+  );
+
+  it('empties the last query\'s highlights before a new query replaces them', () => {
+    document.body.innerHTML = '<p>one two orchestrator</p>';
+    find('o');
+    find('orc');
+    expect(unregisteredStillFull()).toEqual([]);
+    expect(highlights.get('lucidos-find')?.size).toBe(1);
   });
 
   it('takes both highlights away on clear', () => {
@@ -199,6 +217,14 @@ describe('find with the highlight API and sdk-iframe.css', () => {
     find('one');
     serveFind({ clear: true });
     expect(highlights.size).toBe(0);
+    expect(unregisteredStillFull()).toEqual([]);
+  });
+
+  it('empties the current highlight when the new query has no match', () => {
+    document.body.innerHTML = '<p>one</p>';
+    find('one');
+    find('onex');
+    expect(unregisteredStillFull()).toEqual([]);
   });
 
   it('falls back to the selection in an app that loads no sdk-iframe.css', () => {
